@@ -22,18 +22,66 @@ use datafusion::{
     catalog::{Session, TableProvider},
     datasource::TableType,
     error::Result as DataFusionResult,
-    logical_expr::Expr,
+    logical_expr::{Expr, TableProviderFilterPushDown},
     physical_plan::ExecutionPlan,
 };
 use mailparse::{ParsedMail, dateparse, parse_mail};
 use snafu::prelude::*;
 
-use crate::arrow::write::MemTable;
+use data_components::arrow::write::MemTable;
 
 use super::{
     EmailMessage, Error, FailedToLogoutSnafu, FailedToParseHeaderSnafu, FetchMessagesSnafu,
-    GetMailboxStatusSnafu, ImapTableProvider,
+    GetMailboxStatusSnafu, ImapTableProvider, SearchMessagesSnafu, search,
 };
+
+/// Longest identifier set to send in a single fetch.
+///
+/// A match set that alternates rather than running contiguously can compact into
+/// an identifier set past a server's command-line limit. Fetching the whole
+/// mailbox instead is slower but always valid, and the filters are re-applied
+/// above the scan either way.
+const MAX_ID_SET_LEN: usize = 8 * 1024;
+
+/// The message attributes every scan asks for: the envelope backing the header
+/// columns, and the raw message backing `content`.
+///
+/// The raw message is requested for every scan, including one whose table has no
+/// `content` column and therefore discards it — see #12045.
+const FETCH_QUERY: &str = "(ENVELOPE BODY.PEEK[HEADER] BODY.PEEK[])";
+
+/// Which messages a scan asks the server for.
+#[derive(Debug, PartialEq, Eq)]
+enum FetchSet {
+    /// UIDs, used whenever a subset was resolved by `UID SEARCH`.
+    Uid(String),
+    /// Sequence numbers, used for the unnarrowed `1:N` fetch of the mailbox.
+    Sequence(String),
+}
+
+/// The identifier set covering the messages `UID SEARCH` matched, or `None` when
+/// it matched nothing — there is then nothing to ask the server for, and an empty
+/// identifier set is not valid syntax.
+///
+/// `uids` must be ascending. A set too long to send falls back to the whole
+/// mailbox, which is slower but always valid.
+fn narrowed_fetch_set(uids: &[u32]) -> Option<FetchSet> {
+    search::id_set(uids).map(|set| {
+        if set.len() > MAX_ID_SET_LEN {
+            FetchSet::Uid(search::ALL_MESSAGES.to_string())
+        } else {
+            FetchSet::Uid(set)
+        }
+    })
+}
+
+/// The sequence set covering the whole mailbox, capped at `limit` when the query
+/// set one, or `None` for an empty mailbox — `1:0` is not a valid identifier set.
+fn full_fetch_set(exists: usize, limit: Option<usize>) -> Option<FetchSet> {
+    let message_count = limit.map_or(exists, |limit| limit.min(exists));
+
+    (message_count > 0).then(|| FetchSet::Sequence(format!("1:{message_count}")))
+}
 
 fn decode(value: &[u8]) -> String {
     match String::from_utf8(value.to_vec()) {
@@ -183,6 +231,27 @@ impl TableProvider for ImapTableProvider {
         TableType::Base
     }
 
+    /// Report the filters the mailbox can narrow with `SEARCH`.
+    ///
+    /// Always `Inexact`: `SEARCH` matches on the calendar day of the `Date:`
+    /// header, so the server returns a superset of the rows the filter keeps and
+    /// `DataFusion` has to apply it exactly on top.
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        Ok(filters
+            .iter()
+            .map(|filter| {
+                if search::search_criteria([*filter]).is_some() {
+                    TableProviderFilterPushDown::Inexact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
+            .collect())
+    }
+
     async fn scan(
         &self,
         state: &dyn Session,
@@ -192,60 +261,84 @@ impl TableProvider for ImapTableProvider {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let mut session = self.session.connect()?;
 
-        let status = session
-            .status(self.session.mailbox(), "(MESSAGES)")
-            .context(GetMailboxStatusSnafu)?;
-        let message_count = if let Some(limit) = limit {
-            limit.min(status.exists as usize)
+        // Let the server pick the candidate messages where the filters allow it,
+        // so refresh cost tracks new mail rather than mailbox size (#11548).
+        //
+        // The narrowed path addresses messages by UID: a concurrent `EXPUNGE`
+        // renumbers sequence numbers, so a set resolved by `SEARCH` could name
+        // different messages by the time the fetch runs. UIDs never change.
+        let fetch = if let Some(criteria) = search::search_criteria(filters) {
+            // `limit` is deliberately ignored here. Reporting the filters as
+            // `Inexact` leaves a filter above this scan, so some of the messages
+            // fetched will be discarded — capping the fetch at `limit` could then
+            // yield fewer rows than the query asked for while matching messages
+            // were left in the mailbox. Returning more rows than `limit` is
+            // always allowed; returning fewer than are available is not.
+            let mut uids: Vec<u32> = session
+                .uid_search(&criteria)
+                .context(SearchMessagesSnafu { criteria })?
+                .into_iter()
+                .collect();
+            uids.sort_unstable();
+
+            narrowed_fetch_set(&uids)
         } else {
-            status.exists as usize
+            let status = session
+                .status(self.session.mailbox(), "(MESSAGES)")
+                .context(GetMailboxStatusSnafu)?;
+
+            full_fetch_set(status.exists as usize, limit)
         };
 
-        let fetch_messages = session
-            .fetch(
-                format!("1:{message_count}"),
-                "(ENVELOPE BODY.PEEK[HEADER] BODY.PEEK[])",
-            )
-            .context(FetchMessagesSnafu)?;
         let mut messages = vec![];
 
-        for i in 0..fetch_messages.len() {
-            let message = fetch_messages.get(i).ok_or(Error::MessageNotFound {})?;
-            let envelope = message.envelope().ok_or(Error::EnvelopeNotFound {
-                segment: "envelope".to_string(),
-            })?;
-            let subject = envelope.subject.as_ref().map(|v| decode(v));
-            let date = parse_date_millis(&decode(envelope.date.as_ref().ok_or(
-                Error::EnvelopeNotFound {
-                    segment: "date".to_string(),
-                },
-            )?))
-            .context(FailedToParseHeaderSnafu)?;
-            let message_id = envelope.message_id.as_ref().map(|v| decode(v));
-            let in_reply_to = envelope.in_reply_to.as_ref().map(|v| decode(v));
-            let message_froms = parse_addreses_from_envelope!(envelope, from);
-            let message_tos = parse_addreses_from_envelope!(envelope, to);
-            let message_ccs = parse_addreses_from_envelope!(envelope, cc);
-            let message_blind_ccs = parse_addreses_from_envelope!(envelope, bcc);
-            let message_reply_tos = parse_addreses_from_envelope!(envelope, reply_to);
-            let body = if self.fetch_content {
-                message.body().as_ref().map(|v| extract_text_body(v))
-            } else {
-                None
-            };
+        // An empty mailbox, or no message matching the filters, means there is
+        // nothing to ask for — and `1:0` is not a valid identifier set.
+        if let Some(fetch) = fetch {
+            let fetch_messages = match fetch {
+                FetchSet::Uid(uids) => session.uid_fetch(uids, FETCH_QUERY),
+                FetchSet::Sequence(sequence_set) => session.fetch(sequence_set, FETCH_QUERY),
+            }
+            .context(FetchMessagesSnafu)?;
 
-            messages.push(EmailMessage {
-                date,
-                subject,
-                from: message_froms,
-                to: message_tos,
-                cc: message_ccs,
-                bcc: message_blind_ccs,
-                reply_to: message_reply_tos,
-                message_id,
-                in_reply_to,
-                body,
-            });
+            for i in 0..fetch_messages.len() {
+                let message = fetch_messages.get(i).ok_or(Error::MessageNotFound {})?;
+                let envelope = message.envelope().ok_or(Error::EnvelopeNotFound {
+                    segment: "envelope".to_string(),
+                })?;
+                let subject = envelope.subject.as_ref().map(|v| decode(v));
+                let date = parse_date_millis(&decode(envelope.date.as_ref().ok_or(
+                    Error::EnvelopeNotFound {
+                        segment: "date".to_string(),
+                    },
+                )?))
+                .context(FailedToParseHeaderSnafu)?;
+                let message_id = envelope.message_id.as_ref().map(|v| decode(v));
+                let in_reply_to = envelope.in_reply_to.as_ref().map(|v| decode(v));
+                let message_froms = parse_addreses_from_envelope!(envelope, from);
+                let message_tos = parse_addreses_from_envelope!(envelope, to);
+                let message_ccs = parse_addreses_from_envelope!(envelope, cc);
+                let message_blind_ccs = parse_addreses_from_envelope!(envelope, bcc);
+                let message_reply_tos = parse_addreses_from_envelope!(envelope, reply_to);
+                let body = if self.fetch_content {
+                    message.body().as_ref().map(|v| extract_text_body(v))
+                } else {
+                    None
+                };
+
+                messages.push(EmailMessage {
+                    date,
+                    subject,
+                    from: message_froms,
+                    to: message_tos,
+                    cc: message_ccs,
+                    bcc: message_blind_ccs,
+                    reply_to: message_reply_tos,
+                    message_id,
+                    in_reply_to,
+                    body,
+                });
+            }
         }
 
         session.logout().context(FailedToLogoutSnafu)?; // good IMAP etiquette to not leave the session open
@@ -406,5 +499,87 @@ mod tests {
         // A simple non-multipart message decodes to its body.
         let raw = b"Content-Type: text/plain\r\n\r\njust some text\r\n";
         assert_eq!(extract_text_body(raw).trim(), "just some text");
+    }
+
+    #[test]
+    fn narrowed_fetch_set_addresses_matches_by_uid() {
+        // The messages `SEARCH` matched are fetched by UID — a concurrent
+        // `EXPUNGE` renumbers sequence numbers but never UIDs — and contiguous
+        // runs collapse so the command stays short.
+        assert_eq!(
+            narrowed_fetch_set(&[4, 5, 6, 9]),
+            Some(FetchSet::Uid("4:6,9".to_string()))
+        );
+    }
+
+    #[test]
+    fn narrowed_fetch_set_of_no_matches_is_nothing_to_fetch() {
+        // Regression for #11548: a filter matching nothing must fetch nothing
+        // rather than falling back to the whole mailbox. An empty identifier set
+        // is also not valid syntax, so there is no set to send either.
+        assert_eq!(narrowed_fetch_set(&[]), None);
+    }
+
+    #[test]
+    fn narrowed_fetch_set_falls_back_to_the_mailbox_when_the_set_is_too_long() {
+        // An alternating match set collapses into no runs, so its identifier set
+        // grows past what a server will accept on one command line. Fetching the
+        // whole mailbox is slower but valid, and the filters are re-applied above
+        // the scan, so the rows are the same either way.
+        let alternating: Vec<u32> = (1..=5_000).map(|id| id * 2).collect();
+        assert!(
+            search::id_set(&alternating).is_some_and(|set| set.len() > MAX_ID_SET_LEN),
+            "the alternating set should exceed the fetch limit"
+        );
+
+        assert_eq!(
+            narrowed_fetch_set(&alternating),
+            Some(FetchSet::Uid(search::ALL_MESSAGES.to_string()))
+        );
+    }
+
+    #[test]
+    fn narrowed_fetch_set_keeps_a_long_run_that_compacts_short() {
+        // The fallback keys on the length of the identifier *set*, not the number
+        // of messages: a contiguous run of far more UIDs than the limit still
+        // compacts to one short range and is fetched as the narrowed set.
+        let limit = u32::try_from(MAX_ID_SET_LEN).expect("the fetch limit fits in a u32");
+        let ids: Vec<u32> = (1..=limit).collect();
+
+        assert_eq!(
+            narrowed_fetch_set(&ids),
+            Some(FetchSet::Uid(format!("1:{limit}")))
+        );
+    }
+
+    #[test]
+    fn full_fetch_set_covers_the_whole_mailbox() {
+        assert_eq!(
+            full_fetch_set(42, None),
+            Some(FetchSet::Sequence("1:42".to_string()))
+        );
+    }
+
+    #[test]
+    fn full_fetch_set_of_an_empty_mailbox_is_nothing_to_fetch() {
+        // `1:0` is not a valid identifier set, so an empty mailbox must fetch
+        // nothing at all.
+        assert_eq!(full_fetch_set(0, None), None);
+        assert_eq!(full_fetch_set(0, Some(10)), None);
+    }
+
+    #[test]
+    fn full_fetch_set_caps_at_the_limit() {
+        // Without filters no row is discarded above the scan, so a `LIMIT` can
+        // cap the fetch — but never above what the mailbox holds.
+        assert_eq!(
+            full_fetch_set(42, Some(10)),
+            Some(FetchSet::Sequence("1:10".to_string()))
+        );
+        assert_eq!(
+            full_fetch_set(5, Some(10)),
+            Some(FetchSet::Sequence("1:5".to_string()))
+        );
+        assert_eq!(full_fetch_set(42, Some(0)), None);
     }
 }

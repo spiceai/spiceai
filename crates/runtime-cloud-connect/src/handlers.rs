@@ -135,6 +135,32 @@ pub trait RuntimeHandle: Send + Sync + 'static {
             "note": "UpgradeRuntime is not implemented in v0",
         }))
     }
+
+    /// Return recent runtime log output for a `GetPodLogs` command, as a
+    /// single verbatim text blob (newest lines last). `tail_lines` bounds how
+    /// many trailing lines to return; `<= 0` means an implementation-defined
+    /// default. The returned string is sent verbatim in
+    /// `CommandResult.payload_json` (a raw string, not JSON-encoded).
+    ///
+    /// The default returns an error so out-of-the-box `CloudConnect` (and
+    /// test mocks) don't claim to serve logs they never captured. Real
+    /// adapters override this to drain their log buffer.
+    async fn get_pod_logs(&self, _tail_lines: i64) -> Result<String, String> {
+        Err("GetPodLogs is not implemented in this build".to_string())
+    }
+
+    /// Return a status document for a `GetStatus` command, sent as JSON in
+    /// `CommandResult.payload_json`. The document carries a top-level
+    /// `phase` (`Ready` | `Progressing` | `Failed`) and `reason` — matching
+    /// the shape the control plane parses — and may carry richer detail
+    /// (per-component states, restart-pending) that opaque consumers relay
+    /// through.
+    ///
+    /// The default returns an error so mocks don't fabricate a status. Real
+    /// adapters override this to report actual runtime readiness.
+    async fn get_status(&self) -> Result<serde_json::Value, String> {
+        Err("GetStatus is not implemented in this build".to_string())
+    }
 }
 
 /// Minimal no-op runtime handle, useful for unit tests and as a stand-in
@@ -164,5 +190,11 @@ mod tests {
             .await
             .expect("upgrade_runtime returns Ok");
         assert_eq!(up["status"], "unsupported");
+        h.get_pod_logs(100)
+            .await
+            .expect_err("get_pod_logs is unimplemented for the no-op handle");
+        h.get_status()
+            .await
+            .expect_err("get_status is unimplemented for the no-op handle");
     }
 }

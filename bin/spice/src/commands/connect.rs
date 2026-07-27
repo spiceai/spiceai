@@ -34,6 +34,7 @@ limitations under the License.
 //!    Spice.ai Cloud authentication headers.
 
 use std::path::PathBuf;
+use std::process::Stdio;
 
 use crate::commands::add::{AddArgs, execute_add_or_connect};
 use crate::context::RuntimeContext;
@@ -87,9 +88,10 @@ pub struct ConnectArgs {
     #[arg(value_name = "TARGET")]
     pub target: Option<String>,
 
-    /// Override the Spice Cloud Connect endpoint. Defaults to
-    /// `https://cloud.spice.ai`. Also configurable via
-    /// `SPICE_CLOUD_ENDPOINT`.
+    /// Override the Spice Cloud enroll endpoint the runtime presents its
+    /// adoption code to. Defaults to `https://cloud.spice.ai`. Also
+    /// configurable via `SPICE_CLOUD_ENDPOINT`. The gateway (stream)
+    /// address is issued by the enroll response, not configured here.
     #[arg(long, value_name = "URL")]
     pub endpoint: Option<String>,
 }
@@ -122,7 +124,7 @@ pub async fn execute(ctx: &RuntimeContext, args: ConnectArgs) -> Result<()> {
     };
 
     if runtime_cloud_connect::is_valid_adoption_code(target) {
-        return stage_adoption_code(target, args.endpoint.as_deref());
+        return stage_adoption_code(ctx, target, args.endpoint.as_deref()).await;
     }
 
     // An input that clearly looks like an adoption code but fails validation
@@ -154,7 +156,11 @@ fn execute_subcommand(cmd: &ConnectCommand) -> Result<()> {
     }
 }
 
-fn stage_adoption_code(code: &str, endpoint: Option<&str>) -> Result<()> {
+async fn stage_adoption_code(
+    ctx: &RuntimeContext,
+    code: &str,
+    endpoint: Option<&str>,
+) -> Result<()> {
     let pending_path =
         runtime_cloud_connect::config::CloudConnectConfig::default_pending_adopt_code_path();
     if let Some(parent) = pending_path.parent() {
@@ -193,29 +199,52 @@ fn stage_adoption_code(code: &str, endpoint: Option<&str>) -> Result<()> {
     // Write the endpoint override BEFORE printing success. If the override
     // can't be persisted, roll the staged code back so adoption can't
     // proceed against the wrong control plane on the next `spiced` start.
-    if let Some(ep) = endpoint {
-        if let Err(e) = atomic_write_0600(&endpoint_path, ep.as_bytes()) {
-            // Best-effort rollback of the staged code; surface the
-            // original endpoint-write failure to the caller.
-            let _ = std::fs::remove_file(&pending_path);
-            return Err(crate::error::Error::CloudConnectIo {
-                message: format!(
-                    "write endpoint override {}: {e} (adoption code not staged)",
-                    endpoint_path.display()
-                ),
-            });
-        }
-        println!(
-            "Adoption code stored at {}.\nStart `spiced` (or restart if already running) to begin adoption.",
-            pending_path.display()
-        );
-        println!("Endpoint override stored at {}.", endpoint_path.display());
-    } else {
-        println!(
-            "Adoption code stored at {}.\nStart `spiced` (or restart if already running) to begin adoption.",
-            pending_path.display()
-        );
+    if let Some(ep) = endpoint
+        && let Err(e) = atomic_write_0600(&endpoint_path, ep.as_bytes())
+    {
+        // Best-effort rollback of the staged code; surface the
+        // original endpoint-write failure to the caller.
+        let _ = std::fs::remove_file(&pending_path);
+        return Err(crate::error::Error::CloudConnectIo {
+            message: format!(
+                "write endpoint override {}: {e} (adoption code not staged)",
+                endpoint_path.display()
+            ),
+        });
     }
+
+    println!("Attaching this Spice Runtime to Spice Cloud Connect...");
+
+    ctx.ensure_local_runtime_supported()?;
+
+    // Auto-install runtime if not present
+    if !ctx.is_runtime_installed() {
+        tracing::info!("Spice.ai runtime is not installed. Installing now...");
+        crate::commands::install::execute(ctx, &crate::commands::install::InstallArgs::default())
+            .await?;
+    }
+
+    // Start spiced in the foreground — inheriting stdio and forwarding
+    // signals — exactly as `spice run` does, so the user sees the runtime
+    // logs and adoption progress and can Ctrl-C to stop it. The staged
+    // adoption code drives the connection on startup.
+    let mut cmd = tokio::process::Command::from(ctx.get_run_cmd(&[], None)?);
+    cmd.stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| crate::error::Error::CloudConnectIo {
+            message: format!("Failed to start spiced: {e}"),
+        })?;
+
+    let status = crate::commands::run::run_with_signal_forwarding(&mut child).await?;
+
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+
     Ok(())
 }
 
@@ -238,6 +267,9 @@ fn print_status() -> Result<()> {
         println!("Spice Cloud Connect: adopted");
         println!("  identifier:  {}", id.identifier);
         println!("  identity:    {}", identity_path.display());
+        if !id.gateway_addr.is_empty() {
+            println!("  gateway:     {}", id.gateway_addr);
+        }
         println!("  expiry:      {expiry}");
         return Ok(());
     }
@@ -254,7 +286,7 @@ fn print_status() -> Result<()> {
         let mask = mask_code(preview);
         println!("  code (masked):   {mask}");
         println!(
-            "  start `spiced` to send the code to {} and finish adoption.",
+            "  start `spiced` to enroll with {} and finish adoption.",
             resolved_endpoint(&pending_path)
         );
         return Ok(());
@@ -347,15 +379,37 @@ fn looks_like_adoption_code(target: &str) -> bool {
 }
 
 fn mask_code(code: &str) -> String {
-    let mut parts = code.split('-').collect::<Vec<_>>();
-    let len = parts.len();
-    if len < 3 {
-        return code.to_string();
+    // Grouped form (`SPICE-ADOPT-XXXXX-XXXXX-...`): mask the interior segments,
+    // keeping the `SPICE-ADOPT` prefix and the final segment for recognition.
+    if code.contains('-') {
+        let mut parts = code.split('-').collect::<Vec<_>>();
+        let len = parts.len();
+        if len < 3 {
+            return code.to_string();
+        }
+        for part in parts.iter_mut().take(len - 1).skip(2) {
+            *part = "****";
+        }
+        return parts.join("-");
     }
-    for part in parts.iter_mut().take(len - 1).skip(2) {
-        *part = "****";
+    // Dash-less token (the raw 64-hex code the portal mints today): a single-use
+    // secret, so mask the middle by characters rather than printing it whole.
+    // Short strings have nothing meaningful to hide and are left as-is.
+    mask_opaque_token(code)
+}
+
+/// Mask an opaque single-use token, keeping a short prefix and suffix for
+/// recognition and replacing the middle with `****`. Tokens short enough that
+/// masking would reveal most of them are returned unchanged.
+fn mask_opaque_token(token: &str) -> String {
+    const KEEP: usize = 4;
+    let chars: Vec<char> = token.chars().collect();
+    if chars.len() <= KEEP * 2 {
+        return token.to_string();
     }
-    parts.join("-")
+    let prefix: String = chars[..KEEP].iter().collect();
+    let suffix: String = chars[chars.len() - KEEP..].iter().collect();
+    format!("{prefix}****{suffix}")
 }
 
 #[cfg(unix)]
@@ -417,6 +471,20 @@ mod tests {
     fn mask_code_short_codes_unchanged() {
         assert_eq!(mask_code("SHORT"), "SHORT");
         assert_eq!(mask_code("FOO-BAR"), "FOO-BAR");
+    }
+
+    #[test]
+    fn mask_code_masks_raw_hex_token() {
+        // The cloud portal mints randomBytes(32).toString('hex') — a 64-char
+        // dash-less single-use secret. `spice connect status` must NOT print it
+        // whole: mask the middle, keeping only a short prefix/suffix.
+        let code = "9f500bdec2f2dcf06e50f255d6d8291603e9b10f5abf500a5de5ad6d2069837d";
+        let masked = mask_code(code);
+        assert_eq!(masked, "9f50****837d");
+        assert!(
+            !masked.contains("bdec2f2"),
+            "the interior of the adoption code must not be shown: {masked}"
+        );
     }
 
     #[test]

@@ -34,6 +34,9 @@ make lint-rust-fix      # Auto-fix lint issues
 - Investigate before destructive ops (`reset --hard`, `checkout --`, `clean -f`): unfamiliar files or branches may be in-progress work.
 - Branch from `trunk`, link the issue, add tests. Style: `docs/dev/style_guide.md`, `docs/dev/error_handling.md`.
 - If a PR's checks stop triggering (only ~2 checks appear), check for a merge conflict first (`mergeStateStatus: DIRTY`) — merge `trunk` into the branch to re-trigger.
+- **PR descriptions** *may* describe the old behavior and what was wrong with it — that context is what makes the `git` history worth reading. But never use internal/local tracking labels in a PR (title, body, or commits): phase/step numbers, plan-item IDs, or any shorthand coined in a planning doc or working session (e.g. `PR 6.1`, `Phase 3`, `step 2b`) mean nothing to a reviewer or a future reader and must stay in your local notes.
+- **Code comments describe how the code works or *why it is the way it is* — never how it *used to* work** (that is what `git` history is for). Drop "previously/originally/historically/moved from…" narration. A comment may cite a GitHub issue when it adds context the code can't — especially a regression test that exists because of that issue (`// regression test for #NNNN`).
+- **Use standard, discoverable terminology** in names and comments — the term someone would search for — not a coinage from a specific conversation or plan.
 
 ## Architecture
 

@@ -2137,6 +2137,9 @@ impl RefreshTask {
                 Some(TimeFormat::UnixSeconds) => {
                     value *= 1_000_000_000;
                 }
+                Some(TimeFormat::UnixNanos) => {
+                    // value is already in nanoseconds; no scaling needed.
+                }
                 Some(
                     TimeFormat::ISO8601
                     | TimeFormat::Timestamp

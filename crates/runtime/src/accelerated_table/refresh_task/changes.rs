@@ -1776,6 +1776,22 @@ impl RefreshTask {
     /// finalize task itself (and surfacing any finalize error) before calling
     /// this; here the finalize is known to have succeeded. Returns `false` when
     /// a fatal commit error was surfaced and the stream should stop.
+    /// Signal the dataset Ready: flip `initial_load_completed`, wake readiness
+    /// waiters, then publish the `Ready` component status — in that order, so a
+    /// waiter woken by the notify observes the completed flag. The single
+    /// definition of the readiness side effect for every apply path (write,
+    /// post-finalize, and readiness-only heartbeat runs).
+    async fn signal_dataset_ready(&self, context: &ApplyContext<'_>) {
+        context
+            .initial_load_completed
+            .store(true, Ordering::Relaxed);
+        if let Some(sender) = context.ready_sender {
+            sender.notify_waiters();
+        }
+        self.update_component_status(status::ComponentStatus::Ready)
+            .await;
+    }
+
     async fn run_finalize_side_effects(
         &self,
         context: &mut ApplyContext<'_>,
@@ -1783,14 +1799,7 @@ impl RefreshTask {
         ready_after_finalize: bool,
     ) -> bool {
         if ready_after_finalize {
-            context
-                .initial_load_completed
-                .store(true, Ordering::Relaxed);
-            if let Some(sender) = context.ready_sender {
-                sender.notify_waiters();
-            }
-            self.update_component_status(status::ComponentStatus::Ready)
-                .await;
+            self.signal_dataset_ready(context).await;
         }
 
         if let Some(cache_provider_ref) = context.caching
@@ -1858,7 +1867,7 @@ impl RefreshTask {
     async fn apply_envelope_run(
         &self,
         context: &mut ApplyContext<'_>,
-        envelopes: Vec<cdc::ChangeEnvelope>,
+        mut envelopes: Vec<cdc::ChangeEnvelope>,
     ) -> bool {
         debug_assert!(
             !envelopes.is_empty(),
@@ -1871,6 +1880,41 @@ impl RefreshTask {
         // Status Update` carrying the latest LSN, Kafka per-partition
         // offsets) require this ordering.
         let any_ready = envelopes.iter().any(cdc::ChangeEnvelope::is_dataset_ready);
+
+        // Strip zero-row readiness heartbeats from the write/durability path
+        // (#12007). Lag-based readiness (#11777) makes CDC connectors emit a
+        // heartbeat roughly every second on a caught-up source; the heartbeat's
+        // committer is a no-op by construction, but a no-op committer does not
+        // support deferral, so leaving heartbeats in the burst forced
+        // `requires_durable_cdc_path` — a mem-tier checkpoint plus a durable
+        // write transition per heartbeat. Under load those once-a-second forced
+        // checkpoints raced Cayenne's pipelined Stage-B staged-append finalize,
+        // and its staged-WAL crash recovery "recovered" (double-published or
+        // rolled back) in-flight appends — duplicating rows. A heartbeat's only
+        // observable effect is its ready flag, already folded into `any_ready`
+        // above; dropping its committer is exact because `is_no_op_heartbeat`
+        // requires `CommitChange::is_no_op` (nothing to acknowledge). Zero-row
+        // envelopes carrying a REAL committer (e.g. the MySQL snapshot-boundary
+        // envelope persisting the initial resume token) are not heartbeats
+        // under that predicate and keep durability-then-commit ordering.
+        envelopes.retain(|env| !env.is_no_op_heartbeat());
+
+        // Readiness-only run: every envelope was a heartbeat. Honor the ready
+        // flag and stop — there is nothing to write and nothing to commit, so
+        // the run must not touch the write path or force a checkpoint.
+        if envelopes.is_empty() {
+            if any_ready {
+                if let Some(pending) = context.pending_finalize.as_mut() {
+                    // A previous durable burst's Stage-B publish is still
+                    // pending; readiness follows its completion, mirroring the
+                    // `!current_finalize_pending` gate on the write path.
+                    pending.ready_after_finalize = true;
+                } else {
+                    self.signal_dataset_ready(context).await;
+                }
+            }
+            return true;
+        }
         let mut committers: Vec<Box<dyn cdc::CommitChange + Send + Sync>> =
             Vec::with_capacity(envelopes.len());
         let mut batches: Vec<ChangeBatch> = Vec::with_capacity(envelopes.len());
@@ -2087,14 +2131,7 @@ impl RefreshTask {
 
                 let current_finalize_pending = write_outcome.pending_finalize.is_some();
                 if mark_ready && !current_finalize_pending {
-                    context
-                        .initial_load_completed
-                        .store(true, Ordering::Relaxed);
-                    if let Some(sender) = context.ready_sender {
-                        sender.notify_waiters();
-                    }
-                    self.update_component_status(status::ComponentStatus::Ready)
-                        .await;
+                    self.signal_dataset_ready(context).await;
                 }
                 if write_outcome.result == WriteChangeResult::DataWritten
                     && !current_finalize_pending
@@ -6596,6 +6633,101 @@ mod tests {
         assert!(
             notified.await.expect("ready notifier task must finish"),
             "ready_sender.notify_waiters() must fire when a ready envelope is processed"
+        );
+    }
+
+    // -- Correctness: readiness heartbeats bypass the write/durability path ---
+
+    /// Build a zero-row readiness heartbeat envelope over the unit-test data
+    /// schema, as CDC connectors emit (#11777) roughly once a second on a
+    /// caught-up source.
+    fn make_heartbeat_envelope(is_ready: bool) -> ChangeEnvelope {
+        let schema = Arc::new(create_test_data_schema());
+        cdc::build_heartbeat_envelope(&schema, cdc::now_unix_ms(), is_ready)
+            .expect("heartbeat envelope builds")
+    }
+
+    /// A run of pure readiness heartbeats must flip the dataset Ready without
+    /// ever reaching the accelerator write path — no insert plan is built and
+    /// no write executes (#12007: heartbeats forcing the durable CDC path per
+    /// beat made Cayenne duplicate rows).
+    #[tokio::test]
+    async fn test_heartbeat_only_stream_signals_ready_without_touching_the_accelerator() {
+        let insert_plan_calls = Arc::new(AtomicUsize::new(0));
+        let insert_execution_calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(CountingInsertProvider {
+            inner: make_mem_table() as Arc<dyn TableProvider>,
+            insert_plan_calls: Arc::clone(&insert_plan_calls),
+            insert_execution_calls: Arc::clone(&insert_execution_calls),
+        });
+        let task = make_refresh_task(provider as Arc<dyn TableProvider>);
+        let initial_load = Arc::new(AtomicBool::new(false));
+        let notify = Arc::new(Notify::new());
+
+        let stream = make_changes_stream(vec![
+            Ok(make_heartbeat_envelope(false)),
+            Ok(make_heartbeat_envelope(true)),
+            Ok(make_heartbeat_envelope(false)),
+        ]);
+        run_changes_stream(
+            &task,
+            stream,
+            Some(Arc::clone(&notify)),
+            Arc::clone(&initial_load),
+        )
+        .await
+        .expect("heartbeat-only stream should succeed");
+
+        assert!(
+            initial_load.load(Ordering::Relaxed),
+            "a ready heartbeat must still flip initial_load_completed"
+        );
+        assert_eq!(
+            insert_plan_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "readiness heartbeats must never reach the accelerator write path"
+        );
+        assert_eq!(
+            insert_execution_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "readiness heartbeats must never execute a write"
+        );
+    }
+
+    /// Heartbeats interleaved with real change envelopes must not disturb the
+    /// data path: every row lands, every real committer commits in stream
+    /// order, and the ready flag carried by a heartbeat is honored.
+    #[tokio::test]
+    async fn test_heartbeats_interleaved_with_data_preserve_apply_and_commit_order() {
+        let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);
+        let log = CommitLog::new();
+        let initial_load = Arc::new(AtomicBool::new(false));
+        let notify = Arc::new(Notify::new());
+
+        let stream = make_changes_stream(vec![
+            Ok(make_tracked_envelope(1, Arc::clone(&log), false)),
+            Ok(make_heartbeat_envelope(false)),
+            Ok(make_tracked_envelope(2, Arc::clone(&log), false)),
+            Ok(make_heartbeat_envelope(true)),
+            Ok(make_tracked_envelope(3, Arc::clone(&log), false)),
+        ]);
+        run_changes_stream(
+            &task,
+            stream,
+            Some(Arc::clone(&notify)),
+            Arc::clone(&initial_load),
+        )
+        .await
+        .expect("mixed stream should succeed");
+
+        assert_eq!(
+            log.ids().await,
+            vec![1, 2, 3],
+            "real committers must commit exactly once, in stream order, with heartbeats stripped"
+        );
+        assert!(
+            initial_load.load(Ordering::Relaxed),
+            "the ready flag carried by a heartbeat must be honored"
         );
     }
 

@@ -87,6 +87,16 @@ async fn test_cayenne_memory_mode_full_refresh_and_query() -> Result<(), anyhow:
                 std::path::PathBuf::from(runtime::spice_data_base_path()).join("cayenne_mem_it");
             let _ = std::fs::remove_dir_all(&data_path);
 
+            // #11922: memory mode must also not leave a stray, empty `file:`
+            // directory in the process working directory. `CayenneCatalog::init()`
+            // took `Path::parent()` of the in-RAM metastore path
+            // (`file:/cayenne-mem-N?vfs=memdb`), which is the bare `file:` scheme
+            // component, and `create_dir_all`'d it. Compute and clear it up front
+            // (like `data_path`) so the end-of-test assertion reflects only what
+            // THIS run wrote.
+            let stray_file_dir = std::env::current_dir()?.join("file:");
+            let _ = std::fs::remove_dir_all(&stray_file_dir);
+
             let mut dataset = Dataset::new(format!("file://{}", csv.display()), "cayenne_mem_it");
             dataset.acceleration = Some(Acceleration {
                 enabled: true,
@@ -152,6 +162,15 @@ async fn test_cayenne_memory_mode_full_refresh_and_query() -> Result<(), anyhow:
             assert!(
                 !data_path.exists(),
                 "memory mode must not write anything to disk, but {data_path:?} exists"
+            );
+
+            // Regression for #11922: init() must skip metastore-directory setup
+            // for the in-RAM memdb, so no `file:` directory is created. It was
+            // cleared before the run, so its presence now would mean init()
+            // created it.
+            assert!(
+                !stray_file_dir.exists(),
+                "memory mode must not create a stray {stray_file_dir:?} directory (#11922)"
             );
 
             Ok(())
