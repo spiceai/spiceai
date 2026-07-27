@@ -22,8 +22,21 @@ Do not gate or interpret these tests as performance regressions.
 | Binary | Feature | Engines | Suites |
 |--------|---------|---------|--------|
 | `result_correctness_inventory_test` | (none) | — | Completeness of the query inventory + pure `compare_query_result_batches` |
-| `result_correctness_vs_duckdb_test` | `result-correctness-duckdb` | Cayenne ↔ DuckDB | TPC-H SF1, TPC-DS SF1, ClickBench, CH-benCHmark SF1, SpiceBench (TPC-H scenario) SF1, SQLLancer corpus, micro SQL shapes |
+| `result_correctness_vs_duckdb_test` | `result-correctness-duckdb` | Cayenne ↔ DuckDB | TPC-H SF1, TPC-DS SF1, ClickBench, **CH-benCHmark SF1 × {full, append, changes}**, SpiceBench (TPC-H scenario) SF1, SQLLancer corpus, micro SQL shapes |
 | `result_correctness_vs_chdb_test` | `result-correctness-chdb` | Cayenne ↔ chDB | SQLLancer + micro (analytical suite SQL inventory-excluded with dialect reasons) |
+
+### CH-benCHmark load-mode matrix
+
+For CH-benCHmark only, Cayenne is loaded three ways (spicepod `refresh_mode` analogs)
+against the same DuckDB final state:
+
+| Mode | Cayenne API |
+|------|-------------|
+| `full` | `InsertOp::Overwrite` (bulk replace) |
+| `append` | multiple `InsertOp::Append` chunks |
+| `changes` | `write_cdc_append_stream` + `finish()` |
+
+Query result content must match DuckDB after every mode.
 
 DuckDB and chDB cannot be linked in one process; three-engine coverage is
 **pairwise**.

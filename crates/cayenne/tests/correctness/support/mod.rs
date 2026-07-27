@@ -144,6 +144,36 @@ pub const TPCH_TABLES: &[&str] = &[
     "customer", "lineitem", "nation", "orders", "part", "partsupp", "region", "supplier",
 ];
 
+/// How data is loaded into Cayenne — mirrors spicepod `refresh_mode` surfaces.
+///
+/// Correctness only: after load, query results must match the same final
+/// dataset regardless of mode. Not a performance matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LoadMode {
+    /// Single bulk load via `InsertOp::Overwrite` (refresh_mode: full).
+    Full,
+    /// Multiple `InsertOp::Append` batches (refresh_mode: append).
+    Append,
+    /// CDC path `write_cdc_append_stream` + `finish()` (refresh_mode: changes).
+    Changes,
+}
+
+impl LoadMode {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LoadMode::Full => "full",
+            LoadMode::Append => "append",
+            LoadMode::Changes => "changes",
+        }
+    }
+
+    #[must_use]
+    pub fn all() -> &'static [LoadMode] {
+        &[LoadMode::Full, LoadMode::Append, LoadMode::Changes]
+    }
+}
+
 /// Build a Cayenne catalog + temp data dir.
 pub struct CayenneHarness {
     pub _temp_dir: tempfile::TempDir,
@@ -171,7 +201,19 @@ impl CayenneHarness {
     }
 
     /// Create a Cayenne table from a parquet file (schema inferred via DataFusion).
+    /// Default load path is [`LoadMode::Full`].
     pub async fn load_parquet_table(&mut self, table_name: &str, parquet_path: &Path) {
+        self.load_parquet_table_with_mode(table_name, parquet_path, LoadMode::Full)
+            .await;
+    }
+
+    /// Load parquet into Cayenne using the given refresh-mode analog.
+    pub async fn load_parquet_table_with_mode(
+        &mut self,
+        table_name: &str,
+        parquet_path: &Path,
+        mode: LoadMode,
+    ) {
         let ctx = SessionContext::new();
         let path_str = parquet_path.to_string_lossy().into_owned();
         let df = ctx
@@ -181,7 +223,7 @@ impl CayenneHarness {
         let schema = df.schema().as_arrow().clone();
         let schema = Arc::new(Schema::from(schema));
 
-        let table_path = self.data_path.join(table_name);
+        let table_path = self.data_path.join(format!("{table_name}_{}", mode.as_str()));
         std::fs::create_dir_all(&table_path).expect("table data dir");
 
         let table = Arc::new(
@@ -202,17 +244,68 @@ impl CayenneHarness {
             .expect("create cayenne table"),
         );
 
-        let input_exec = df
-            .create_physical_plan()
-            .await
-            .expect("parquet physical plan");
-        let insert_plan = table
-            .insert_into(&ctx.state(), input_exec, InsertOp::Append)
-            .await
-            .expect("insert plan");
-        let _ = collect(insert_plan, ctx.task_ctx())
-            .await
-            .expect("insert collect");
+        match mode {
+            LoadMode::Full => {
+                let input_exec = df
+                    .create_physical_plan()
+                    .await
+                    .expect("parquet physical plan");
+                let insert_plan = table
+                    .insert_into(&ctx.state(), input_exec, InsertOp::Overwrite)
+                    .await
+                    .expect("overwrite insert plan");
+                let _ = collect(insert_plan, ctx.task_ctx())
+                    .await
+                    .expect("overwrite insert collect");
+            }
+            LoadMode::Append => {
+                // Chunk the source into several Append ops (simulates append refresh).
+                let batches = df.collect().await.expect("collect parquet batches");
+                let chunks = split_batches_into_chunks(&batches, 4);
+                for chunk in chunks {
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    let chunk_schema = chunk[0].schema();
+                    let input_exec =
+                        datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
+                            &[chunk],
+                            chunk_schema,
+                            None,
+                        )
+                        .expect("memory exec");
+                    let insert_plan = table
+                        .insert_into(&ctx.state(), input_exec, InsertOp::Append)
+                        .await
+                        .expect("append insert plan");
+                    let _ = collect(insert_plan, ctx.task_ctx())
+                        .await
+                        .expect("append insert collect");
+                }
+            }
+            LoadMode::Changes => {
+                // CDC path: stream each RecordBatch through write_cdc_append_stream.
+                let batches = df.collect().await.expect("collect parquet for cdc");
+                let task_ctx = ctx.task_ctx();
+                for batch in batches {
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    let schema = batch.schema();
+                    let stream = Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                        schema,
+                        futures::stream::iter(vec![
+                            Ok::<_, datafusion::error::DataFusionError>(batch),
+                        ]),
+                    ));
+                    let cdc = table
+                        .write_cdc_append_stream(stream, &task_ctx)
+                        .await
+                        .expect("cdc write stage A");
+                    cdc.finish().await.expect("cdc write finish");
+                }
+            }
+        }
 
         self.tables.insert(table_name.to_string(), table);
     }
@@ -281,6 +374,32 @@ impl CayenneHarness {
         let df = ctx.sql(sql).await.map_err(|e| format!("sql: {e}"))?;
         df.collect().await.map_err(|e| format!("collect: {e}"))
     }
+}
+
+/// Split batches into up to `n_chunks` non-empty groups for append-mode loads.
+fn split_batches_into_chunks(batches: &[RecordBatch], n_chunks: usize) -> Vec<Vec<RecordBatch>> {
+    let n_chunks = n_chunks.max(1);
+    if batches.is_empty() {
+        return vec![vec![]; n_chunks];
+    }
+    let mut chunks: Vec<Vec<RecordBatch>> = (0..n_chunks).map(|_| Vec::new()).collect();
+    for (i, batch) in batches.iter().enumerate() {
+        chunks[i % n_chunks].push(batch.clone());
+    }
+    // If a single large batch, slice it across chunks.
+    if batches.len() == 1 && batches[0].num_rows() > n_chunks {
+        let batch = &batches[0];
+        let rows = batch.num_rows();
+        let step = rows.div_ceil(n_chunks);
+        chunks = Vec::new();
+        let mut start = 0;
+        while start < rows {
+            let end = (start + step).min(rows);
+            chunks.push(vec![batch.slice(start, end - start)]);
+            start = end;
+        }
+    }
+    chunks.into_iter().filter(|c| !c.is_empty()).collect()
 }
 
 /// Write a RecordBatch to parquet.

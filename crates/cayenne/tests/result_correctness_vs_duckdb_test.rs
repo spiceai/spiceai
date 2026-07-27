@@ -114,10 +114,20 @@ fn load_duckdb_from_parquet(parquet_dir: &Path, tables: &[&str]) -> (tempfile::T
 }
 
 async fn load_cayenne_from_parquet(parquet_dir: &Path, tables: &[&str]) -> CayenneHarness {
+    load_cayenne_from_parquet_with_mode(parquet_dir, tables, support::LoadMode::Full).await
+}
+
+async fn load_cayenne_from_parquet_with_mode(
+    parquet_dir: &Path,
+    tables: &[&str],
+    mode: support::LoadMode,
+) -> CayenneHarness {
     let mut harness = CayenneHarness::new().await;
     for table in tables {
         let path = parquet_dir.join(format!("{table}.parquet"));
-        harness.load_parquet_table(table, &path).await;
+        harness
+            .load_parquet_table_with_mode(table, &path, mode)
+            .await;
     }
     harness
 }
@@ -1016,70 +1026,73 @@ fn generate_chbench_parquet(out_dir: &Path, warehouses: i64) {
         .unwrap_or_else(|e| panic!("chbench generate: {e}"));
 }
 
+/// CH-benCHmark SF1 result correctness across **full / append / changes** load
+/// modes (spicepod `refresh_mode` analogs). DuckDB holds the final dataset;
+/// Cayenne loads the same parquet bytes via each mode; query results must match.
 #[tokio::test(flavor = "multi_thread")]
-async fn chbench_sf1_parity_vs_duckdb() {
+async fn chbench_sf1_load_mode_matrix_vs_duckdb() {
+    use support::LoadMode;
     use support::chbench_data::CHBENCH_TABLES;
     use test_framework::queries::get_chbench_test_queries;
 
     let scratch = scratch_dir();
     std::fs::create_dir_all(&scratch).ok();
     let warehouses = env_f64("CAYENNE_PARITY_CHBENCH_SF", 1.0) as i64;
-    eprintln!("CH-benCHmark parity at SF={warehouses} (warehouses)");
+    eprintln!("CH-benCHmark SF={warehouses} correctness matrix: full|append|changes");
 
     let chbench_dir = scratch.join(format!("chbench_sf{warehouses}"));
     if !chbench_dir.join("order_line.parquet").exists() {
         generate_chbench_parquet(&chbench_dir, warehouses);
     }
 
-    let cayenne = load_cayenne_from_parquet(&chbench_dir, CHBENCH_TABLES).await;
+    // DuckDB: single final state (mode-independent reference).
     let (duck_temp, duck) = load_duckdb_from_parquet(&chbench_dir, CHBENCH_TABLES);
     let _keep = duck_temp;
 
     let mut results = Vec::new();
-    for q in get_chbench_test_queries(None) {
-        // DataFusion uses `%` for modulo; CH-benCH SQL from the suite uses
-        // `mod(a,b)` (Postgres/DuckDB). Rewrite only the Cayenne/DataFusion side.
-        let cayenne_sql = chbench_sql_for_datafusion(&q.sql);
-        let duck_sql = q.sql.as_ref();
-        let q_c = Query::new(q.name.clone(), cayenne_sql.into(), false);
-        let outcome = run_pair_with_df_baseline(
-            "chbench",
-            &q_c,
-            &cayenne,
-            &duck,
-            Some(duck_sql),
-            Some(&chbench_dir),
-        )
-        .await;
-        // DF baseline must use the same rewritten SQL as Cayenne.
-        let outcome = match outcome {
-            ParityOutcome::Fail { detail }
-                if detail.contains("DataFusion baseline failed")
-                    || detail.contains("Invalid function 'mod'") =>
-            {
-                // Re-run baseline comparison is already done with cayenne SQL via
-                // run_pair — if still failing on mod, treat as rewrite gap.
-                ParityOutcome::Fail { detail }
-            }
-            other => other,
-        };
-        eprintln!("chbench/{} -> {outcome:?}", q.name);
-        results.push(RunResult {
-            suite: "chbench".into(),
-            name: q.name.to_string(),
-            engine_pair: "cayenne-duckdb",
-            outcome,
-        });
+    for &mode in LoadMode::all() {
+        eprintln!("--- load_mode={} ---", mode.as_str());
+        let cayenne =
+            load_cayenne_from_parquet_with_mode(&chbench_dir, CHBENCH_TABLES, mode).await;
+
+        for q in get_chbench_test_queries(None) {
+            let cayenne_sql = chbench_sql_for_datafusion(&q.sql);
+            let duck_sql = q.sql.as_ref();
+            let q_c = Query::new(q.name.clone(), cayenne_sql.into(), false);
+            let outcome = run_pair_with_df_baseline(
+                "chbench",
+                &q_c,
+                &cayenne,
+                &duck,
+                Some(duck_sql),
+                Some(&chbench_dir),
+            )
+            .await;
+            let label = format!("{}/{}", mode.as_str(), q.name);
+            eprintln!("chbench/{label} -> {outcome:?}");
+            results.push(RunResult {
+                suite: format!("chbench[{}]", mode.as_str()),
+                name: q.name.to_string(),
+                engine_pair: "cayenne-duckdb",
+                outcome,
+            });
+        }
     }
 
-    let log_path = scratch.join("cayenne_duckdb_chbench_parity.log");
-    let mut log = format!("CH-benCHmark SF={warehouses}\n");
+    let log_path = scratch.join("cayenne_duckdb_chbench_mode_matrix.log");
+    let mut log = format!("CH-benCHmark SF={warehouses} modes=full,append,changes\n");
     for r in &results {
-        log.push_str(&format!("{}: {:?}\n", r.name, r.outcome));
+        log.push_str(&format!("{}/{}: {:?}\n", r.suite, r.name, r.outcome));
     }
     log.push_str(&summary_line(&results));
     log.push('\n');
-    std::fs::write(&log_path, &log).expect("write chbench log");
+    std::fs::write(&log_path, &log).expect("write chbench mode matrix log");
+    // Also write under the historical name for tooling that looks for it.
+    std::fs::write(
+        scratch.join("cayenne_duckdb_chbench_parity.log"),
+        &log,
+    )
+    .ok();
     eprintln!("{}", summary_line(&results));
 
     let fails: Vec<_> = results
@@ -1088,7 +1101,7 @@ async fn chbench_sf1_parity_vs_duckdb() {
         .collect();
     assert!(
         fails.is_empty(),
-        "CH-benCHmark SF1 full-result parity failures: {fails:#?}\nsee {}",
+        "CH-benCHmark load-mode matrix failures: {fails:#?}\nsee {}",
         log_path.display()
     );
 }
