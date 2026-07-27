@@ -26,6 +26,7 @@ use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use elasticsearch::{Client, Elasticsearch};
 use search::generation::util::get_primary_keys;
+use search::index::chunking::{CHUNKED_INDEX_CHUNK_KEY, ChunkedSearchIndex};
 pub(crate) use search::index::elasticsearch::{
     ElasticsearchIndex, ElasticsearchIndexWriteMaintenance,
 };
@@ -93,6 +94,18 @@ pub async fn try_from_table(
             }
         })
         .collect::<Result<Vec<_>, Box<dyn std::error::Error + Send + Sync>>>()?;
+
+    // When chunking is enabled the index gains an extra `_spice.chunk_id` primary-key field
+    // (one row per chunk). Augmenting the primary key here — rather than patching it in the
+    // caller after `source_schema` and the mapping are built — makes the chunk key flow into
+    // the returned index, `source_schema` (so `knn_hits_to_batch` extracts it from `_source`),
+    // and the Elasticsearch mapping, keeping the chunked and non-chunked paths uniform.
+    let chunked = config.chunking.as_ref().is_some_and(|c| c.enabled);
+    let primary_key = if chunked {
+        ChunkedSearchIndex::augment_primary_key(primary_key)
+    } else {
+        primary_key
+    };
 
     let params = get_store_params(vector_store_config, Arc::clone(&secrets)).await?;
 
@@ -252,6 +265,18 @@ pub async fn try_from_table(
         )));
     }
 
+    // The chunk key is not part of the base table schema (chunking injects it per chunk), so
+    // append it explicitly when chunked. Without it in `source_schema`, `knn_hits_to_batch`
+    // could not extract `_spice.chunk_id` from `_source` and would null-fill a non-nullable
+    // field.
+    if chunked && !source_fields.iter().any(|f| f.name() == CHUNKED_INDEX_CHUNK_KEY) {
+        source_fields.push(Arc::new(arrow_schema::Field::new(
+            CHUNKED_INDEX_CHUNK_KEY,
+            DataType::UInt64,
+            false,
+        )));
+    }
+
     let source_schema = Arc::new(arrow_schema::Schema::new_with_metadata(
         source_fields,
         inner_schema.metadata().clone(),
@@ -271,6 +296,7 @@ pub async fn try_from_table(
             mapping_opts: &mapping_opts,
             metadata_columns: &metadata_columns,
             index_settings: index_settings.as_ref(),
+            chunk_key: chunked.then_some(CHUNKED_INDEX_CHUNK_KEY),
         },
     )
     .await?;
@@ -345,6 +371,7 @@ async fn ensure_index_with_mapping(
         mapping_opts,
         metadata_columns,
         index_settings,
+        chunk_key,
     } = mapping;
 
     if dims <= 0 {
@@ -424,6 +451,18 @@ async fn ensure_index_with_mapping(
         properties.insert(name, mapping);
     }
 
+    // Explicitly map the chunk key when chunking is enabled. `_source` retrieval works via
+    // dynamic mapping regardless; the explicit `index: false` mapping documents that it is a
+    // never-filtered ordering key.
+    if let Some(chunk_key) = chunk_key
+        && !properties.contains_key(chunk_key)
+    {
+        properties.insert(
+            chunk_key.to_string(),
+            serde_json::json!({ "type": "long", "index": false }),
+        );
+    }
+
     let exists = client
         .index_exists(es_index)
         .await
@@ -482,6 +521,10 @@ struct VectorIndexMapping<'a> {
     mapping_opts: &'a VectorMappingOptions,
     metadata_columns: &'a MetadataColumns,
     index_settings: Option<&'a serde_json::Value>,
+    /// When chunking is enabled, the injected `_spice.chunk_id` field name. Mapped as a
+    /// non-indexed `long` so `_source` retrieval works with clear intent (it is a primary-key
+    /// ordering field, never filtered on).
+    chunk_key: Option<&'a str>,
 }
 
 /// Check whether an error from `create_index` indicates the index already exists
@@ -528,15 +571,25 @@ fn arrow_type_to_es_mapping(dt: &DataType) -> serde_json::Value {
 /// Normalize an Arrow [`DataType`] to match what the Elasticsearch HTTP client produces.
 ///
 /// - `LargeUtf8` → `Utf8`: ES always deserializes strings as `StringArray` (Utf8).
-/// - `FixedSizeList` with any inner field → `FixedSizeList` with `Field::new("item", Float32, false)`:
-///   `build_dense_vector_array` always produces this exact inner field.
+/// - Floating-point `FixedSizeList` (the dense embedding vector) → `FixedSizeList` with
+///   `Field::new("item", Float32, false)`: `build_dense_vector_array` always produces this
+///   exact inner field.
+/// - Integer `FixedSizeList` (e.g. the chunk `{start, end}` offset pair) keeps its inner
+///   type; the reader decodes it back as integers. Coercing it to `Float32` here would make
+///   the advertised offset column type diverge from what the reader produces.
 pub(crate) fn normalize_es_data_type(dt: &DataType) -> DataType {
     match dt {
         DataType::LargeUtf8 | DataType::Utf8View => DataType::Utf8,
-        DataType::FixedSizeList(_, dim) => DataType::FixedSizeList(
-            Arc::new(arrow_schema::Field::new("item", DataType::Float32, false)),
-            *dim,
-        ),
+        DataType::FixedSizeList(inner, dim) => {
+            let inner_type = match inner.data_type() {
+                DataType::Float32 | DataType::Float64 => DataType::Float32,
+                other => other.clone(),
+            };
+            DataType::FixedSizeList(
+                Arc::new(arrow_schema::Field::new("item", inner_type, false)),
+                *dim,
+            )
+        }
         other => other.clone(),
     }
 }
