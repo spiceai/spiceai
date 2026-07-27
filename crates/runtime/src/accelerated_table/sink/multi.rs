@@ -40,7 +40,10 @@ use data_components::index_maintenance::perform_index_maintenance;
 use runtime_datafusion_index::Index;
 
 use crate::{
-    accelerated_table::{refresh_task::retry_from_df_error, synchronized_table::SynchronizedTable},
+    accelerated_table::{
+        refresh_task::retry_from_df_error, sink::finalize_indexes,
+        synchronized_table::SynchronizedTable,
+    },
     datafusion::error::find_datafusion_root,
     dataupdate::StreamingDataUpdateExecutionPlan,
 };
@@ -252,18 +255,9 @@ impl MultiSink {
         }
 
         // Run on_write_complete for all sink_indexes.
-        for index in &self.sink_indexes {
-            tracing::debug!(
-                "MultiSink: running on_write_complete for index '{}'",
-                index.name()
-            );
-            if let Err(e) = index.on_write_complete().await {
-                tracing::warn!(
-                    "MultiSink: on_write_complete failed for index '{}': {e}. Index may be stale until next refresh.",
-                    index.name()
-                );
-            }
-        }
+        finalize_indexes("MultiSink", self.sink_indexes.iter())
+            .await
+            .map_err(retry_from_df_error)?;
 
         Ok(())
     }

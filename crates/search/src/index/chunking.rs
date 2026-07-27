@@ -99,6 +99,10 @@ impl Index for ChunkedSearchIndex {
         self.inner.on_write_complete().await
     }
 
+    fn write_complete_failure_is_fatal(&self) -> bool {
+        self.inner.write_complete_failure_is_fatal()
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -202,6 +206,12 @@ impl ChunkedSearchIndex {
             inner,
             chunker,
         }
+    }
+
+    /// The index this chunking wrapper writes chunked batches through to.
+    #[must_use]
+    pub fn inner(&self) -> &Arc<dyn SearchIndex> {
+        &self.inner
     }
 
     /// Build the intermediate "chunked" [`RecordBatch`] for a contiguous group of input rows
@@ -765,6 +775,10 @@ impl Index for ChunkedVectorIndex {
         self.inner.on_write_complete().await
     }
 
+    fn write_complete_failure_is_fatal(&self) -> bool {
+        self.inner.write_complete_failure_is_fatal()
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -1019,6 +1033,8 @@ mod tests {
         search_column: String,
         calls: AtomicUsize,
         row_counts: std::sync::Mutex<Vec<usize>>,
+        /// What this mock reports from [`Index::write_complete_failure_is_fatal`].
+        write_complete_fatal: bool,
     }
 
     impl RecordingInner {
@@ -1027,6 +1043,14 @@ mod tests {
                 search_column: search_column.to_string(),
                 calls: AtomicUsize::new(0),
                 row_counts: std::sync::Mutex::new(Vec::new()),
+                write_complete_fatal: false,
+            }
+        }
+
+        fn with_fatal_write_complete(search_column: &str) -> Self {
+            Self {
+                write_complete_fatal: true,
+                ..Self::new(search_column)
             }
         }
     }
@@ -1039,8 +1063,24 @@ mod tests {
         fn required_columns(&self) -> Vec<String> {
             vec![self.search_column.clone()]
         }
+        fn write_complete_failure_is_fatal(&self) -> bool {
+            self.write_complete_fatal
+        }
         fn as_any(&self) -> &dyn Any {
             self
+        }
+    }
+
+    #[async_trait]
+    impl VectorIndex for RecordingInner {
+        fn list_table_provider(&self) -> Result<LogicalPlan, DataFusionError> {
+            Err(DataFusionError::NotImplemented(
+                "RecordingInner stores embeddings in the underlying table".to_string(),
+            ))
+        }
+
+        fn dimension(&self) -> i32 {
+            4
         }
     }
 
@@ -1134,6 +1174,43 @@ mod tests {
             ],
         )
         .expect("valid batch")
+    }
+
+    /// The chunking layer must not downgrade a fatal inner index to best-effort — a
+    /// wrapper inheriting the trait default is exactly the silent no-op #12038 fixes.
+    #[test]
+    fn chunked_search_index_forwards_write_complete_fatality() {
+        let chunker = || Arc::new(DelimChunker { delim: ' ' }) as Arc<dyn Chunker>;
+
+        let best_effort = ChunkedSearchIndex::new(
+            Arc::new(RecordingInner::new("content")) as Arc<dyn SearchIndex>,
+            chunker(),
+        );
+        assert!(!best_effort.write_complete_failure_is_fatal());
+
+        let fatal = ChunkedSearchIndex::new(
+            Arc::new(RecordingInner::with_fatal_write_complete("content")) as Arc<dyn SearchIndex>,
+            chunker(),
+        );
+        assert!(fatal.write_complete_failure_is_fatal());
+    }
+
+    #[test]
+    fn chunked_vector_index_forwards_write_complete_fatality() {
+        let chunker = || Arc::new(DelimChunker { delim: ' ' }) as Arc<dyn Chunker>;
+
+        let best_effort = ChunkedVectorIndex {
+            inner: Arc::new(RecordingInner::new("content")) as Arc<dyn VectorIndex>,
+            chunker: chunker(),
+        };
+        assert!(!best_effort.write_complete_failure_is_fatal());
+
+        let fatal = ChunkedVectorIndex {
+            inner: Arc::new(RecordingInner::with_fatal_write_complete("content"))
+                as Arc<dyn VectorIndex>,
+            chunker: chunker(),
+        };
+        assert!(fatal.write_complete_failure_is_fatal());
     }
 
     /// Smoke test: a tiny input that fits comfortably under the budget should result in exactly

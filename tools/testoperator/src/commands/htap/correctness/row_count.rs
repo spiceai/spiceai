@@ -101,6 +101,77 @@ impl Convergence {
     }
 }
 
+/// Three-way `MAX(_bench_ts)` check for one table, run once when the drain
+/// loop ends — converged or timed out (a timed-out gate is exactly when the
+/// three-way comparison helps localize the cause).
+///
+/// The drain loop's source-side maximum comes from the driver's in-memory
+/// watermark, which is a *claim* about what it committed. A bookkeeping bug there
+/// would make the gate agree while replication had actually lost data, so once the
+/// loop converges each table is checked against an authoritative
+/// `SELECT MAX(_bench_ts)`. Reporting all three values localizes a failure:
+/// watermark ≠ source means driver bookkeeping, source ≠ Spice means replication.
+#[derive(Debug, Clone)]
+pub struct BenchTsAudit {
+    pub table: String,
+    /// The driver's in-memory watermark.
+    pub watermark: Option<i64>,
+    /// `SELECT MAX(_bench_ts)` against the source.
+    pub source_exact: Option<i64>,
+    /// `MAX(_bench_ts)` from Spice.
+    pub spice: Option<i64>,
+    /// Set when a probe failed, in which case the values above prove nothing.
+    pub error: Option<String>,
+}
+
+impl BenchTsAudit {
+    /// Whether the source's real maximum reached Spice.
+    fn replicated(&self) -> bool {
+        self.error.is_none() && self.source_exact == self.spice
+    }
+
+    /// Whether the driver's watermark matched the source's real maximum.
+    ///
+    /// Delete-bearing tables answer `max_bench_ts` from the server, so their
+    /// watermark trivially equals `source_exact`; this is meaningful for the
+    /// tables the in-memory watermark actually serves.
+    fn watermark_exact(&self) -> bool {
+        self.error.is_none() && self.watermark == self.source_exact
+    }
+
+    /// A one-line failure description, or `None` if the audit passed.
+    fn failure(&self) -> Option<String> {
+        if let Some(e) = &self.error {
+            return Some(format!(
+                "{}: _bench_ts audit probe failed — {e}",
+                self.table
+            ));
+        }
+        let fmt = |v: Option<i64>| v.map_or_else(|| "empty".to_string(), |v| v.to_string());
+        if !self.watermark_exact() {
+            return Some(format!(
+                "{}: driver watermark {} != source MAX(_bench_ts) {} — driver bookkeeping bug \
+                 (spice={})",
+                self.table,
+                fmt(self.watermark),
+                fmt(self.source_exact),
+                fmt(self.spice),
+            ));
+        }
+        if !self.replicated() {
+            return Some(format!(
+                "{}: source MAX(_bench_ts) {} != spice {} — replication lost data \
+                 (watermark={})",
+                self.table,
+                fmt(self.source_exact),
+                fmt(self.spice),
+                fmt(self.watermark),
+            ));
+        }
+        None
+    }
+}
+
 /// Final data-correctness report produced after replication drains.
 #[derive(Debug)]
 pub struct CorrectnessReport {
@@ -110,6 +181,8 @@ pub struct CorrectnessReport {
     pub convergence: Convergence,
     /// How long the drain wait took.
     pub wait_duration: Duration,
+    /// Post-convergence authoritative `MAX(_bench_ts)` audit, one entry per table.
+    pub bench_ts_audit: Vec<BenchTsAudit>,
 }
 
 impl CorrectnessReport {
@@ -171,7 +244,27 @@ impl CorrectnessReport {
             );
         }
 
-        let failed = mismatches + u64::from(!self.convergence.converged());
+        let audit_failures: Vec<String> = self
+            .bench_ts_audit
+            .iter()
+            .filter_map(BenchTsAudit::failure)
+            .collect();
+        if self.bench_ts_audit.is_empty() {
+            println!("  _bench_ts audit: not run");
+        } else if audit_failures.is_empty() {
+            println!(
+                "  _bench_ts audit: {} table(s) — driver watermark == source MAX(_bench_ts) == spice",
+                self.bench_ts_audit.len()
+            );
+        } else {
+            println!("  _bench_ts audit: FAILED");
+            for failure in &audit_failures {
+                println!("    └─ {failure}");
+            }
+        }
+
+        let failed =
+            mismatches + u64::from(!self.convergence.converged()) + audit_failures.len() as u64;
         crate::metrics::CORRECTNESS_ROUNDS_TOTAL.record(1, &[]);
         crate::metrics::CORRECTNESS_ROUNDS_PASSED.record(u64::from(failed == 0), &[]);
         crate::metrics::CORRECTNESS_ROUNDS_FAILED.record(u64::from(failed != 0), &[]);
@@ -180,7 +273,8 @@ impl CorrectnessReport {
             println!("  verdict: PASSED — all {} tables match", self.tables.len());
         } else {
             println!(
-                "  verdict: FAILED — {mismatches} table(s) mismatched{}",
+                "  verdict: FAILED — {mismatches} table(s) mismatched, {} audit failure(s){}",
+                audit_failures.len(),
                 if self.convergence.converged() {
                     String::new()
                 } else {
@@ -200,6 +294,7 @@ impl CorrectnessReport {
                 self.wait_duration.as_millis()
             ));
         }
+        problems.extend(self.bench_ts_audit.iter().filter_map(BenchTsAudit::failure));
         for t in &self.tables {
             if !t.counts_matched() {
                 problems.push(format!(
@@ -419,11 +514,76 @@ pub async fn verify_after_drain(
         });
     }
 
+    // The authoritative pass: once per run, not once per poll. This is what
+    // makes a driver bookkeeping bug fail the gate rather than pass it — the
+    // drain loop above compared Spice against an in-memory *claim* about the
+    // source. Run for every table, including ones that already latched, and even
+    // when the drain timed out: a timed-out gate is exactly when the three-way
+    // comparison is most useful for localizing the cause.
+    let bench_ts_audit = audit_bench_ts(&driver, spice, tables).await;
+
     Ok(CorrectnessReport {
         tables: table_results,
         convergence: resolve_convergence(converged_at, final_snapshot_caught_up, start.elapsed()),
         wait_duration,
+        bench_ts_audit,
     })
+}
+
+/// Compare driver watermark, authoritative source `MAX(_bench_ts)`, and Spice for
+/// every table.
+///
+/// The source-side scan is expensive (a full scan wherever `_bench_ts` is
+/// unindexed), so the per-table probes run concurrently — they are independent,
+/// and wall-clock is then the slowest table rather than their sum. Each table is
+/// timed so a slow one is attributable.
+async fn audit_bench_ts(
+    driver: &Arc<dyn ChBenchDriver>,
+    spice: &SpiceClients,
+    tables: &[String],
+) -> Vec<BenchTsAudit> {
+    // Both max_bench_ts and max_bench_ts_exact are fetched even where they
+    // resolve to the same scan (Postgres today; MySQL's delete-bearing
+    // new_order): the watermark-vs-source comparison is then vacuous by
+    // construction, and the duplicate scan is accepted — once per run, in the
+    // post-drain tail where it cannot affect any measured number.
+    println!("\nAuditing MAX(_bench_ts) against the source (once per run)");
+    let probes = tables.iter().map(|table| async move {
+        let started = Instant::now();
+        let (watermark, source_exact, spice_max) = tokio::join!(
+            driver.max_bench_ts(table),
+            driver.max_bench_ts_exact(table),
+            spice.max_bench_ts(table),
+        );
+        let mut audit = BenchTsAudit {
+            table: table.clone(),
+            watermark: None,
+            source_exact: None,
+            spice: None,
+            error: None,
+        };
+        match (watermark, source_exact, spice_max) {
+            (Ok(w), Ok(src), Ok(spc)) => {
+                audit.watermark = w;
+                audit.source_exact = src;
+                audit.spice = spc;
+            }
+            (w, src, spc) => {
+                audit.error = Some(format!(
+                    "watermark={w:?} source_exact={src:?} spice={spc:?}"
+                ));
+            }
+        }
+        println!(
+            "  audit {table:<11} watermark={:?} source={:?} spice={:?} ({:.1}s)",
+            audit.watermark,
+            audit.source_exact,
+            audit.spice,
+            started.elapsed().as_secs_f64(),
+        );
+        audit
+    });
+    futures::future::join_all(probes).await
 }
 
 /// Compute and compare a per-column content fingerprint for `table`.
@@ -633,6 +793,7 @@ mod tests {
             tables: vec![matched_table("customer"), matched_table("order_line")],
             convergence: Convergence::ObservedAtFinalSnapshot(Duration::from_secs(1002)),
             wait_duration: Duration::from_mins(15),
+            bench_ts_audit: Vec::new(),
         };
         assert_eq!(report.failure_message(), None);
     }
@@ -643,6 +804,7 @@ mod tests {
             tables: vec![matched_table("customer")],
             convergence: Convergence::No,
             wait_duration: Duration::from_mins(15),
+            bench_ts_audit: Vec::new(),
         };
         let message = report
             .failure_message()
@@ -664,6 +826,7 @@ mod tests {
             }],
             convergence: Convergence::Within(Duration::from_secs(5)),
             wait_duration: Duration::from_secs(5),
+            bench_ts_audit: Vec::new(),
         };
         let message = report
             .failure_message()
