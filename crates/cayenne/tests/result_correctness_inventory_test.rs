@@ -33,7 +33,7 @@ use std::sync::Arc;
 use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use support::compare_results;
+use support::compare_actual_results;
 use support::inventory::{assert_inventory_complete, build_inventory, inventory_by_suite};
 use test_framework::queries::Query;
 use test_framework::queries::validation::{
@@ -181,14 +181,14 @@ fn compare_results_wrapper_uses_order_by_from_sql() {
     let unordered = Query::new("unordered".into(), "SELECT v FROM t".into(), false);
 
     // ORDER BY without LIMIT: multiset (tie order is not guaranteed).
-    let out = compare_results(&ordered, &[a.clone()], &[b.clone()]);
+    let out = compare_actual_results(&ordered, &[a.clone()], &[b.clone()]);
     assert!(
         matches!(out, support::ParityOutcome::Pass),
         "ORDER BY without LIMIT must accept multiset reordering: {out:?}"
     );
 
     // Multiset path: same multiset → pass
-    let out = compare_results(&unordered, &[a.clone()], &[b.clone()]);
+    let out = compare_actual_results(&unordered, &[a.clone()], &[b.clone()]);
     assert!(
         matches!(out, support::ParityOutcome::Pass),
         "unordered must accept multiset: {out:?}"
@@ -200,9 +200,52 @@ fn compare_results_wrapper_uses_order_by_from_sql() {
         "SELECT v FROM t ORDER BY v LIMIT 10".into(),
         false,
     );
-    let out = compare_results(&ordered_lim, &[a], &[b]);
+    let out = compare_actual_results(&ordered_lim, &[a], &[b]);
     assert!(
         matches!(out, support::ParityOutcome::Fail { .. }),
         "ORDER BY+LIMIT must preserve order: {out:?}"
     );
+}
+
+/// Prove the harness routes through the shipped `compare_query_result_batches`.
+#[test]
+fn harness_compare_actual_results_drives_shipped_path() {
+    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+    let left = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+    )
+    .expect("left");
+    let right_reorder = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![3, 1, 2]))],
+    )
+    .expect("reorder");
+    let right_wrong = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![1, 2, 99]))],
+    )
+    .expect("wrong");
+    let q = Query::new("t".into(), "SELECT v FROM t".into(), false);
+
+    assert!(
+        matches!(
+            compare_actual_results(&q, &[left.clone()], &[right_reorder]),
+            support::ParityOutcome::Pass
+        ),
+        "harness must Pass on multiset-equal reordered actual batches"
+    );
+    assert!(
+        matches!(
+            compare_actual_results(&q, &[left.clone()], &[right_wrong.clone()]),
+            support::ParityOutcome::Fail { .. }
+        ),
+        "harness must Fail on value mismatch in actual batches"
+    );
+    let shipped = compare_query_result_batches("t", &[left], &[right_wrong], RowOrder::Multiset)
+        .expect("shipped");
+    assert!(matches!(
+        shipped,
+        QueryValidationResult::Fail(QueryValidationFailReason::DataMismatch { .. })
+    ));
 }

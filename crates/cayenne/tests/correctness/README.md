@@ -70,10 +70,24 @@ Optional env:
 
 ```
 tests/correctness/README.md          ← this file
-tests/correctness/support/           ← inventory, fixtures, SQLLancer corpus, reports
-tests/result_correctness_*.rs        ← integration test binaries
+tests/correctness/support/
+  harness.rs                         ← execute SQL + compare actual batches (only oracle)
+  inventory.rs / sqllancer.rs / …    ← suites, fixtures, reports
+tests/result_correctness_*.rs        ← integration test binaries that call the harness
 ```
 
-Shared comparison logic used by the gate is shipped in
-`test_framework::queries::validation::compare_query_result_batches` so tests
-drive the real validation path (not a reimplementation).
+## Who compares results?
+
+**The harness does — not a human and not ad-hoc scripts.**
+
+1. Integration tests **execute** SQL on Cayenne / DuckDB / chDB.
+2. They pass the **actual** `RecordBatch` (or chDB CSV→Arrow) results into
+   `support::compare_actual_results` → shipped
+   `test_framework::queries::validation::compare_query_result_batches`.
+3. They **`assert!`** / `assert_all_pass_or_excluded` on harness outcomes.
+
+Logs under `CAYENNE_PARITY_SCRATCH` are diagnostics only; CI green/red is the
+harness assertion. Do not “grade” logs by hand as the pass criterion.
+
+CH-benCH load modes additionally run **cross-mode** actual-result compares
+(`full` vs `append` vs `changes`) in the harness, not by transitive reasoning.

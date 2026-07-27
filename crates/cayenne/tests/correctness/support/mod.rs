@@ -25,9 +25,16 @@
 #![allow(clippy::missing_errors_doc)]
 
 pub mod chbench_data;
+pub mod harness;
 pub mod inventory;
 pub mod report;
 pub mod sqllancer;
+
+#[expect(unused_imports)] // re-exported for integration test crates
+pub use harness::{
+    assert_all_pass_or_excluded, assert_modes_agree_on_actual_results, compare_actual_results,
+    execute_and_compare_cayenne_to_batches, execute_cayenne,
+};
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -51,6 +58,7 @@ use test_framework::queries::{
 };
 
 /// Outcome for one inventory query on one engine pair.
+/// Outcome of the **harness** after executing SQL and comparing actual batches.
 #[derive(Debug, Clone)]
 pub enum ParityOutcome {
     Pass,

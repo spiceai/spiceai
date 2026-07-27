@@ -41,8 +41,8 @@ use chdb_rust::session::SessionBuilder;
 use support::inventory::build_inventory;
 use support::report::{RunResult, summary_line, write_coverage_report};
 use support::{
-    CayenneHarness, ParityOutcome, compare_results, make_dim_batch, make_fact_batch,
-    micro_bench_queries, write_parquet,
+    CayenneHarness, ParityOutcome, assert_all_pass_or_excluded, compare_actual_results,
+    execute_cayenne, make_dim_batch, make_fact_batch, micro_bench_queries, write_parquet,
 };
 use test_framework::queries::Query;
 
@@ -193,25 +193,15 @@ async fn micro_bench_shapes_full_result_parity_vs_chdb_inner() {
             continue;
         }
 
-        let cayenne_res = cayenne.query(&q.sql).await;
+        // Execute both engines; harness compares actual result batches.
+        let cayenne_res = execute_cayenne(&cayenne, &q.sql).await;
         let chdb_sql_text = chdb_sql(&q.sql);
         let chdb_res = chdb
             .query_csv(&chdb_sql_text)
             .and_then(|csv| csv_to_batches(&csv));
 
         let outcome = match (cayenne_res, chdb_res) {
-            (Ok(c), Ok(d)) => {
-                // chDB CSV inference may widen integers to floats / utf8; use
-                // multiset string comparison which already allows type
-                // equivalence only via string forms — so cast Cayenne side to
-                // strings by going through the same compare path. Schema
-                // equivalence in compare_query_result_batches is lenient for
-                // numeric/string mixes in validate path, but equivalent_schemas
-                // must still pass. If schema mismatch from CSV inference,
-                // stringify both via pretty path by re-comparing after casting
-                // is not available — fall back to row-string multiset.
-                compare_results_lenient(&q, &c, &d)
-            }
+            (Ok(c), Ok(d)) => compare_results_lenient(&q, &c, &d),
             (Err(e), Ok(_)) => ParityOutcome::EngineError {
                 side: "cayenne",
                 detail: e,
@@ -274,19 +264,19 @@ async fn micro_bench_shapes_full_result_parity_vs_chdb_inner() {
     );
 }
 
-/// Like [`compare_results`], but if schema types differ (chDB CSV often types
-/// aggregates as Float64 vs Int64), fall back to comparing stringified row
-/// multisets built with the same `array_value_to_string` rules.
+/// Prefer harness `compare_actual_results` (shipped path). If chDB CSV typing
+/// yields a schema-only fail, fall back to string-row multiset still built with
+/// `array_value_to_string` from the validation module (not a reimplementation
+/// of equality logic).
 fn compare_results_lenient(
     query: &Query,
     cayenne: &[RecordBatch],
     reference: &[RecordBatch],
 ) -> ParityOutcome {
-    let direct = compare_results(query, cayenne, reference);
+    let direct = compare_actual_results(query, cayenne, reference);
     if matches!(direct, ParityOutcome::Pass) {
         return direct;
     }
-    // Schema mismatch from CSV typing: compare as sorted row-key multisets.
     if let ParityOutcome::Fail { detail } = &direct
         && (detail.contains("SchemaMismatch") || detail.contains("schema"))
     {
@@ -404,7 +394,7 @@ async fn sqllancer_corpus_parity_vs_chdb_inner() {
             });
             continue;
         }
-        let cayenne_res = cayenne.query(&q.sql).await;
+        let cayenne_res = execute_cayenne(&cayenne, &q.sql).await;
         let ch_sql = sqllancer_sql_for_chdb(&q.sql);
         let chdb_res = chdb
             .query_csv(&ch_sql)

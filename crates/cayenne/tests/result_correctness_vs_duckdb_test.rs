@@ -46,8 +46,9 @@ use duckdb::Connection;
 use support::inventory::build_inventory;
 use support::report::{RunResult, summary_line, write_coverage_report};
 use support::{
-    CayenneHarness, ParityOutcome, TPCH_TABLES, compare_results, make_dim_batch, make_fact_batch,
-    micro_bench_queries, write_parquet,
+    CayenneHarness, ParityOutcome, TPCH_TABLES, assert_all_pass_or_excluded,
+    assert_modes_agree_on_actual_results, compare_actual_results, execute_cayenne, make_dim_batch,
+    make_fact_batch, micro_bench_queries, write_parquet,
 };
 use test_framework::queries::{
     Query, get_clickbench_test_queries, get_tpcds_test_queries, get_tpch_test_queries,
@@ -142,10 +143,12 @@ async fn run_pair(
     run_pair_with_df_baseline(_suite, query, cayenne, duck, duck_sql, None).await
 }
 
-/// Like [`run_pair`], but when Cayenne and DuckDB disagree on content, compare
-/// Cayenne to a pure DataFusion parquet baseline. If Cayenne matches DataFusion,
-/// the mismatch is DataFusion↔DuckDB dialect/arithmetic (not a Cayenne storage
-/// bug) and is recorded as a justified exclusion.
+/// Execute SQL on Cayenne and DuckDB, then compare **actual returned batches**
+/// via the shared harness (shipped `compare_query_result_batches` only).
+///
+/// When Cayenne and DuckDB disagree, the harness also executes the same SQL on
+/// a DataFusion parquet baseline so dialect mismatches are classified in code
+/// (not by a human reading logs).
 async fn run_pair_with_df_baseline(
     _suite: &str,
     query: &Query,
@@ -157,46 +160,47 @@ async fn run_pair_with_df_baseline(
     let sql_c = query.sql.as_ref();
     let sql_d = duck_sql.unwrap_or(sql_c);
 
-    let cayenne_res = cayenne.query(sql_c).await;
+    // --- Execute real engines ---
+    let cayenne_res = execute_cayenne(cayenne, sql_c).await;
     let duck_res = duckdb_query_batches(duck, sql_d);
 
     match (cayenne_res, duck_res) {
         (Ok(c), Ok(d)) => {
-            let direct = compare_results(query, &c, &d);
+            // --- Harness compares actual result batches ---
+            let direct = compare_actual_results(query, &c, &d);
             if matches!(direct, ParityOutcome::Pass) {
                 return direct;
             }
-            // Timestamp representation only (ns vs us fractional padding)?
             if let ParityOutcome::Fail { ref detail } = direct
                 && is_timestamp_padding_mismatch(detail)
             {
                 return ParityOutcome::Pass;
             }
-            // Optional DF baseline to separate Cayenne bugs from DF↔DuckDB dialect.
             if let Some(dir) = parquet_dir {
                 match datafusion_query_parquet(dir, cayenne.tables.keys(), sql_c).await {
                     Ok(df_batches) => {
-                        let vs_df = compare_results(query, &c, &df_batches);
+                        // Again: harness compares actual batches only.
+                        let vs_df = compare_actual_results(query, &c, &df_batches);
                         if matches!(vs_df, ParityOutcome::Pass) {
                             return ParityOutcome::Excluded {
                                 reason: format!(
-                                    "Cayenne matches DataFusion parquet baseline; \
+                                    "harness: Cayenne actual results match DataFusion baseline; \
                                      DuckDB differs (SQL dialect/arithmetic): {direct:?}"
                                 ),
                             };
                         }
-                        // Cayenne disagrees with both DuckDB and DataFusion → real bug.
                         return ParityOutcome::Fail {
                             detail: format!(
-                                "Cayenne vs DuckDB: {direct:?}; Cayenne vs DataFusion: {vs_df:?}"
+                                "harness: Cayenne vs DuckDB actual results {direct:?}; \
+                                 Cayenne vs DataFusion actual results {vs_df:?}"
                             ),
                         };
                     }
                     Err(e) => {
                         return ParityOutcome::Fail {
                             detail: format!(
-                                "Cayenne vs DuckDB mismatch ({direct:?}); \
-                                 DataFusion baseline failed: {e}"
+                                "harness: Cayenne vs DuckDB mismatch ({direct:?}); \
+                                 DataFusion baseline execute failed: {e}"
                             ),
                         };
                     }
@@ -209,8 +213,6 @@ async fn run_pair_with_df_baseline(
             detail: e,
         },
         (Ok(_), Err(e)) => {
-            // DuckDB dialect rejection (reserved words, etc.) is a justified exclusion
-            // when Cayenne successfully executes the Spice SQL.
             if e.contains("Parser Error") || e.contains("syntax error") {
                 ParityOutcome::Excluded {
                     reason: format!("DuckDB dialect/parser rejects Spice SQL: {e}"),
@@ -1026,9 +1028,9 @@ fn generate_chbench_parquet(out_dir: &Path, warehouses: i64) {
         .unwrap_or_else(|e| panic!("chbench generate: {e}"));
 }
 
-/// CH-benCHmark SF1 result correctness across **full / append / changes** load
-/// modes (spicepod `refresh_mode` analogs). DuckDB holds the final dataset;
-/// Cayenne loads the same parquet bytes via each mode; query results must match.
+/// CH-benCHmark SF1: harness executes each query on Cayenne (full/append/changes)
+/// and DuckDB, compares **actual result batches**, and also compares modes to
+/// each other — all via `compare_actual_results` (shipped validation path).
 #[tokio::test(flavor = "multi_thread")]
 async fn chbench_sf1_load_mode_matrix_vs_duckdb() {
     use support::LoadMode;
@@ -1038,72 +1040,132 @@ async fn chbench_sf1_load_mode_matrix_vs_duckdb() {
     let scratch = scratch_dir();
     std::fs::create_dir_all(&scratch).ok();
     let warehouses = env_f64("CAYENNE_PARITY_CHBENCH_SF", 1.0) as i64;
-    eprintln!("CH-benCHmark SF={warehouses} correctness matrix: full|append|changes");
+    eprintln!("CH-benCHmark SF={warehouses} harness matrix: full|append|changes vs DuckDB + cross-mode");
 
     let chbench_dir = scratch.join(format!("chbench_sf{warehouses}"));
     if !chbench_dir.join("order_line.parquet").exists() {
         generate_chbench_parquet(&chbench_dir, warehouses);
     }
 
-    // DuckDB: single final state (mode-independent reference).
     let (duck_temp, duck) = load_duckdb_from_parquet(&chbench_dir, CHBENCH_TABLES);
     let _keep = duck_temp;
 
-    let mut results = Vec::new();
+    // Load all three Cayenne modes once; harness reuses them per query.
+    let mut cayenne_by_mode = Vec::new();
     for &mode in LoadMode::all() {
-        eprintln!("--- load_mode={} ---", mode.as_str());
-        let cayenne =
-            load_cayenne_from_parquet_with_mode(&chbench_dir, CHBENCH_TABLES, mode).await;
+        eprintln!("loading Cayenne mode={}", mode.as_str());
+        let h = load_cayenne_from_parquet_with_mode(&chbench_dir, CHBENCH_TABLES, mode).await;
+        cayenne_by_mode.push((mode, h));
+    }
 
-        for q in get_chbench_test_queries(None) {
-            let cayenne_sql = chbench_sql_for_datafusion(&q.sql);
-            let duck_sql = q.sql.as_ref();
-            let q_c = Query::new(q.name.clone(), cayenne_sql.into(), false);
-            let outcome = run_pair_with_df_baseline(
-                "chbench",
-                &q_c,
-                &cayenne,
-                &duck,
-                Some(duck_sql),
-                Some(&chbench_dir),
-            )
-            .await;
-            let label = format!("{}/{}", mode.as_str(), q.name);
-            eprintln!("chbench/{label} -> {outcome:?}");
+    let mut results = Vec::new();
+    let mut labeled: Vec<(String, ParityOutcome)> = Vec::new();
+
+    for q in get_chbench_test_queries(None) {
+        let cayenne_sql = chbench_sql_for_datafusion(&q.sql);
+        let duck_sql = q.sql.as_ref();
+        let q_c = Query::new(q.name.clone(), cayenne_sql.clone().into(), false);
+
+        // 1) Execute DuckDB once — actual result batches from the engine.
+        let duck_batches = match duckdb_query_batches(&duck, duck_sql) {
+            Ok(b) => b,
+            Err(e) => {
+                let outcome = if e.contains("Parser Error") || e.contains("syntax error") {
+                    ParityOutcome::Excluded {
+                        reason: format!("DuckDB dialect/parser: {e}"),
+                    }
+                } else {
+                    ParityOutcome::EngineError {
+                        side: "duckdb",
+                        detail: e,
+                    }
+                };
+                for (mode, _) in &cayenne_by_mode {
+                    results.push(RunResult {
+                        suite: format!("chbench[{}]", mode.as_str()),
+                        name: q.name.to_string(),
+                        engine_pair: "cayenne-duckdb",
+                        outcome: outcome.clone(),
+                    });
+                    labeled.push((format!("{}/{}", mode.as_str(), q.name), outcome.clone()));
+                }
+                continue;
+            }
+        };
+
+        // 2) Execute each Cayenne mode; harness compares actual batches to DuckDB.
+        let mut mode_owned: Vec<(String, Vec<RecordBatch>)> = Vec::new();
+        for (mode, cayenne) in &cayenne_by_mode {
+            let cayenne_batches = match execute_cayenne(cayenne, &cayenne_sql).await {
+                Ok(b) => b,
+                Err(e) => {
+                    let outcome = ParityOutcome::EngineError {
+                        side: "cayenne",
+                        detail: e,
+                    };
+                    eprintln!("chbench/{}/{} -> {outcome:?}", mode.as_str(), q.name);
+                    results.push(RunResult {
+                        suite: format!("chbench[{}]", mode.as_str()),
+                        name: q.name.to_string(),
+                        engine_pair: "cayenne-duckdb",
+                        outcome: outcome.clone(),
+                    });
+                    labeled.push((format!("{}/{}", mode.as_str(), q.name), outcome));
+                    continue;
+                }
+            };
+
+            // Harness: compare actual Cayenne batches to actual DuckDB batches.
+            let vs_duck = compare_actual_results(&q_c, &cayenne_batches, &duck_batches);
+            eprintln!(
+                "chbench/{}/{} vs DuckDB -> {vs_duck:?}",
+                mode.as_str(),
+                q.name
+            );
             results.push(RunResult {
                 suite: format!("chbench[{}]", mode.as_str()),
                 name: q.name.to_string(),
                 engine_pair: "cayenne-duckdb",
-                outcome,
+                outcome: vs_duck.clone(),
             });
+            labeled.push((format!("{}/{}", mode.as_str(), q.name), vs_duck));
+            mode_owned.push((mode.as_str().to_string(), cayenne_batches));
+        }
+
+        // 3) Harness: cross-mode compare of actual Cayenne results (not transitive).
+        if mode_owned.len() >= 2 {
+            let refs: Vec<(&str, &[RecordBatch])> = mode_owned
+                .iter()
+                .map(|(m, b)| (m.as_str(), b.as_slice()))
+                .collect();
+            let cross = assert_modes_agree_on_actual_results(&q_c, &refs);
+            eprintln!("chbench/cross-mode/{} -> {cross:?}", q.name);
+            results.push(RunResult {
+                suite: "chbench[cross-mode]".into(),
+                name: q.name.to_string(),
+                engine_pair: "cayenne-modes",
+                outcome: cross.clone(),
+            });
+            labeled.push((format!("cross-mode/{}", q.name), cross));
         }
     }
 
     let log_path = scratch.join("cayenne_duckdb_chbench_mode_matrix.log");
-    let mut log = format!("CH-benCHmark SF={warehouses} modes=full,append,changes\n");
+    let mut log = format!(
+        "CH-benCHmark SF={warehouses} harness: execute SQL + compare actual batches\n\
+         modes=full,append,changes vs DuckDB + cross-mode\n"
+    );
     for r in &results {
         log.push_str(&format!("{}/{}: {:?}\n", r.suite, r.name, r.outcome));
     }
     log.push_str(&summary_line(&results));
     log.push('\n');
     std::fs::write(&log_path, &log).expect("write chbench mode matrix log");
-    // Also write under the historical name for tooling that looks for it.
-    std::fs::write(
-        scratch.join("cayenne_duckdb_chbench_parity.log"),
-        &log,
-    )
-    .ok();
+    std::fs::write(scratch.join("cayenne_duckdb_chbench_parity.log"), &log).ok();
     eprintln!("{}", summary_line(&results));
 
-    let fails: Vec<_> = results
-        .iter()
-        .filter(|r| !r.outcome.is_pass_or_excluded())
-        .collect();
-    assert!(
-        fails.is_empty(),
-        "CH-benCHmark load-mode matrix failures: {fails:#?}\nsee {}",
-        log_path.display()
-    );
+    // Harness assertion — tests fail in CI without human analysis of logs.
+    assert_all_pass_or_excluded(&labeled, "CH-benCHmark load-mode matrix");
 }
 
 /// SpiceBench SF1 built-in scenario is TPC-H — same data/SQL as TPC-H SF1 with
