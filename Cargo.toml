@@ -242,7 +242,7 @@ delta_kernel = { version = "0.23.0", features = [
     "internal-api",
 ] }
 derive_builder = "0.20.2"
-dotenv = { package = "spice-dotenv", path = "crates/dotenv" }
+dotenv = { path = "crates/dotenv" }
 duration-parse = { path = "crates/duration-parse" }
 duckdb = "1.10503" # 1.10503.x corresponds to DuckDB v1.5.3
 dyn-hash = "1.0.0"
