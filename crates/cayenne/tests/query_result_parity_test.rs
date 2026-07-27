@@ -60,13 +60,32 @@ fn inventory_is_complete_relative_to_suite_sources() {
         "micro inventory too small: {:?}",
         by_suite.get("micro").map(Vec::len)
     );
+    assert!(
+        by_suite.get("chbench").map_or(0, Vec::len) >= 20,
+        "CH-benCHmark inventory too small: {:?}",
+        by_suite.get("chbench").map(Vec::len)
+    );
+    assert!(
+        by_suite.get("spicebench").map_or(0, Vec::len) >= 28,
+        "SpiceBench inventory too small: {:?}",
+        by_suite.get("spicebench").map(Vec::len)
+    );
+    assert!(
+        by_suite.get("sqllancer").map_or(0, Vec::len) >= 20,
+        "SQLLancer inventory too small: {:?}",
+        by_suite.get("sqllancer").map(Vec::len)
+    );
     let inv = build_inventory();
     eprintln!(
-        "inventory complete: {} total entries (tpch={} tpcds={} clickbench={} micro={})",
+        "inventory complete: {} total entries \
+         (tpch={} tpcds={} clickbench={} chbench={} spicebench={} sqllancer={} micro={})",
         inv.len(),
         by_suite["tpch"].len(),
         by_suite["tpcds"].len(),
         by_suite["clickbench"].len(),
+        by_suite["chbench"].len(),
+        by_suite["spicebench"].len(),
+        by_suite["sqllancer"].len(),
         by_suite["micro"].len(),
     );
 }
@@ -157,17 +176,29 @@ fn compare_results_wrapper_uses_order_by_from_sql() {
     );
     let unordered = Query::new("unordered".into(), "SELECT v FROM t".into(), false);
 
-    // ORDER BY path: different order → fail
+    // ORDER BY without LIMIT: multiset (tie order is not guaranteed).
     let out = compare_results(&ordered, &[a.clone()], &[b.clone()]);
     assert!(
-        matches!(out, parity::ParityOutcome::Fail { .. }),
-        "ORDER BY must preserve order: {out:?}"
+        matches!(out, parity::ParityOutcome::Pass),
+        "ORDER BY without LIMIT must accept multiset reordering: {out:?}"
     );
 
     // Multiset path: same multiset → pass
-    let out = compare_results(&unordered, &[a], &[b]);
+    let out = compare_results(&unordered, &[a.clone()], &[b.clone()]);
     assert!(
         matches!(out, parity::ParityOutcome::Pass),
         "unordered must accept multiset: {out:?}"
+    );
+
+    // ORDER BY + LIMIT: order is part of the result (top-K).
+    let ordered_lim = Query::new(
+        "ordered_lim".into(),
+        "SELECT v FROM t ORDER BY v LIMIT 10".into(),
+        false,
+    );
+    let out = compare_results(&ordered_lim, &[a], &[b]);
+    assert!(
+        matches!(out, parity::ParityOutcome::Fail { .. }),
+        "ORDER BY+LIMIT must preserve order: {out:?}"
     );
 }

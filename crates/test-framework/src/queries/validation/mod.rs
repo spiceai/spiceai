@@ -277,6 +277,9 @@ pub fn array_value_to_string(array: &dyn Array, index: usize) -> Result<Option<S
     }
 
     match array.data_type() {
+        // Entirely-null columns (e.g. CSV import of all-`\\N` field) collapse to
+        // Arrow `Null` — every cell is null.
+        DataType::Null => Ok(None),
         DataType::Int64 => downcast_and_stringify!(array, index, Int64Array),
         DataType::Int32 => downcast_and_stringify!(array, index, Int32Array),
         DataType::Int16 => downcast_and_stringify!(array, index, Int16Array),

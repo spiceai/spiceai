@@ -15,9 +15,12 @@
 //! Full-result Cayenne ↔ chDB parity for expressible inventory queries.
 //!
 //! Requires `--features chdb-bench`. Does **not** link DuckDB (the two
-//! engines cannot co-exist in one process). Compares micro-bench SQL shapes
-//! on identical parquet. TPC-H / TPC-DS / ClickBench suite SQL is inventory-
-//! excluded for chDB with documented dialect reasons — see
+//! engines cannot co-exist in one process). Runs:
+//! - micro-bench SQL shapes
+//! - SQLLancer curated corpus (three-engine gate; DuckDB lane is separate)
+//!
+//! TPC-H / TPC-DS / ClickBench / CH-benCHmark / SpiceBench suite SQL is
+//! inventory-excluded for chDB with documented dialect reasons — see
 //! `parity::inventory`.
 
 #![allow(clippy::expect_used)]
@@ -108,7 +111,10 @@ fn csv_to_batches(csv: &str) -> Result<Vec<RecordBatch>, String> {
     if csv.trim().is_empty() {
         return Ok(vec![]);
     }
-    let mut cursor = Cursor::new(csv.as_bytes());
+    // ClickHouse CSV encodes SQL NULL as `\N`. Normalize to empty unquoted fields
+    // so Arrow's null handling matches Cayenne's true nulls under string compare.
+    let normalized = csv.replace("\\N", "");
+    let mut cursor = Cursor::new(normalized.as_bytes());
     let format = Format::default().with_header(true);
     let (schema, _) = format
         .infer_schema(&mut cursor, None)
@@ -132,8 +138,15 @@ fn chdb_sql(sql: &str) -> String {
     sql.to_string()
 }
 
+/// chDB is process-global — only one session at a time. Keep micro + SQLLancer
+/// sequential inside this single test so they never co-construct fixtures.
 #[tokio::test(flavor = "multi_thread")]
-async fn micro_bench_shapes_full_result_parity_vs_chdb() {
+async fn micro_and_sqllancer_parity_vs_chdb() {
+    micro_bench_shapes_full_result_parity_vs_chdb_inner().await;
+    sqllancer_corpus_parity_vs_chdb_inner().await;
+}
+
+async fn micro_bench_shapes_full_result_parity_vs_chdb_inner() {
     let scratch = scratch_dir();
     std::fs::create_dir_all(&scratch).ok();
 
@@ -336,4 +349,132 @@ fn compare_as_string_rows(
             ),
         }
     }
+}
+
+async fn sqllancer_corpus_parity_vs_chdb_inner() {
+    use parity::sqllancer::{
+        make_t0_batch, make_t1_batch, sqllancer_queries, sqllancer_sql_for_chdb,
+    };
+
+    let scratch = scratch_dir();
+    std::fs::create_dir_all(&scratch).ok();
+    eprintln!("SQLLancer corpus parity Cayenne↔chDB");
+
+    let rows = 200usize;
+    let t0 = make_t0_batch(rows);
+    let t1 = make_t1_batch(rows / 2);
+    let parquet_dir = tempfile::tempdir().expect("sqllancer parquet");
+    let t0_path = parquet_dir.path().join("sqllancer_t0.parquet");
+    let t1_path = parquet_dir.path().join("sqllancer_t1.parquet");
+    write_parquet(&t0, &t0_path);
+    write_parquet(&t1, &t1_path);
+
+    let mut cayenne = CayenneHarness::new().await;
+    cayenne.load_batch("sqllancer_t0", t0).await;
+    cayenne.load_batch("sqllancer_t1", t1).await;
+
+    let chdb = ChdbSession::new();
+    chdb.load_parquet(
+        "sqllancer_t0",
+        "c0 Nullable(Int64), c1 Nullable(Int64), c2 Nullable(String), c3 Nullable(Float64)",
+        "tuple()",
+        &t0_path,
+    );
+    chdb.load_parquet(
+        "sqllancer_t1",
+        "c0 Nullable(Int64), c1 Nullable(Int64), c2 Nullable(String)",
+        "tuple()",
+        &t1_path,
+    );
+
+    let inventory = build_inventory();
+    let mut results = Vec::new();
+    for q in sqllancer_queries() {
+        if let Some(e) = inventory.iter().find(|e| e.name == q.name.as_ref())
+            && let Some(reason) = e.chdb_exclusion
+        {
+            results.push(RunResult {
+                suite: "sqllancer".into(),
+                name: q.name.to_string(),
+                engine_pair: "cayenne-chdb",
+                outcome: ParityOutcome::Excluded {
+                    reason: reason.to_string(),
+                },
+            });
+            continue;
+        }
+        let cayenne_res = cayenne.query(&q.sql).await;
+        let ch_sql = sqllancer_sql_for_chdb(&q.sql);
+        let chdb_res = chdb
+            .query_csv(&ch_sql)
+            .and_then(|csv| csv_to_batches(&csv));
+
+        let outcome = match (cayenne_res, chdb_res) {
+            (Ok(c), Ok(d)) => compare_results_lenient(&q, &c, &d),
+            (Err(e), Ok(_)) => ParityOutcome::EngineError {
+                side: "cayenne",
+                detail: e,
+            },
+            (Ok(_), Err(e)) => {
+                // ClickHouse dialect rejection of a corpus query → exclusion.
+                if e.contains("Code:") || e.contains("Syntax") || e.contains("Unknown") {
+                    ParityOutcome::Excluded {
+                        reason: format!("chDB dialect rejects SQLLancer query: {e}"),
+                    }
+                } else {
+                    ParityOutcome::EngineError {
+                        side: "chdb",
+                        detail: e,
+                    }
+                }
+            }
+            (Err(ce), Err(de)) => ParityOutcome::Excluded {
+                reason: format!("both engines error: cayenne={ce}; chdb={de}"),
+            },
+        };
+        eprintln!("sqllancer/{} -> {outcome:?}", q.name);
+        results.push(RunResult {
+            suite: "sqllancer".into(),
+            name: q.name.to_string(),
+            engine_pair: "cayenne-chdb",
+            outcome,
+        });
+    }
+
+    // Record suite-level chDB exclusions for inventory completeness reporting.
+    for e in build_inventory() {
+        if e.suite != "micro" && e.suite != "sqllancer"
+            && let Some(reason) = e.chdb_exclusion
+        {
+            results.push(RunResult {
+                suite: e.suite.into(),
+                name: e.name.clone(),
+                engine_pair: "cayenne-chdb",
+                outcome: ParityOutcome::Excluded {
+                    reason: reason.to_string(),
+                },
+            });
+        }
+    }
+
+    let log_path = scratch.join("cayenne_chdb_sqllancer_parity.log");
+    let mut log = String::from("SQLLancer + inventory Cayenne↔chDB\n");
+    for r in &results {
+        log.push_str(&format!("{}/{}: {:?}\n", r.suite, r.name, r.outcome));
+    }
+    log.push_str(&summary_line(&results));
+    log.push('\n');
+    std::fs::write(&log_path, &log).expect("write chdb sqllancer log");
+    write_coverage_report(&scratch.join("parity_coverage_chdb.md"), &results).ok();
+    eprintln!("{}", summary_line(&results));
+
+    let sl_fails: Vec<_> = results
+        .iter()
+        .filter(|r| r.suite == "sqllancer" && !r.outcome.is_pass_or_excluded())
+        .collect();
+    assert!(
+        sl_fails.is_empty(),
+        "SQLLancer Cayenne↔chDB failures: {sl_fails:#?}\nsee {}",
+        log_path.display()
+    );
 }

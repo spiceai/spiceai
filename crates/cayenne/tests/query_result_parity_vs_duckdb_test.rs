@@ -941,3 +941,295 @@ fn make_reduced_hits(rows: usize) -> RecordBatch {
 fn _tpcds_tables_doc() -> &'static [&'static str] {
     TPCDS_TABLES
 }
+
+/// Rewrite CH-benCH SQL for DataFusion: `mod(a, b)` → `(a % b)`.
+fn chbench_sql_for_datafusion(sql: &str) -> String {
+    // Simple token rewrite: mod(x, y) appears with nested arithmetic in CH-benCH.
+    // Use a conservative approach: replace "mod(" with temporary and parse pairs.
+    let mut out = String::with_capacity(sql.len() + 16);
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 4 <= bytes.len()
+            && bytes[i].eq_ignore_ascii_case(&b'm')
+            && bytes[i + 1].eq_ignore_ascii_case(&b'o')
+            && bytes[i + 2].eq_ignore_ascii_case(&b'd')
+            && bytes[i + 3] == b'('
+        {
+            // Find matching close paren for mod( ... )
+            let mut depth = 1usize;
+            let mut j = i + 4;
+            let start_args = j;
+            while j < bytes.len() && depth > 0 {
+                match bytes[j] {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            let args = &sql[start_args..j - 1];
+            // Split on top-level comma.
+            let mut comma = None;
+            let mut d = 0i32;
+            for (k, ch) in args.char_indices() {
+                match ch {
+                    '(' => d += 1,
+                    ')' => d -= 1,
+                    ',' if d == 0 => {
+                        comma = Some(k);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(c) = comma {
+                let left = args[..c].trim();
+                let right = args[c + 1..].trim();
+                out.push('(');
+                out.push_str(left);
+                out.push_str(" % ");
+                out.push_str(right);
+                out.push(')');
+            } else {
+                out.push_str(&sql[i..j]);
+            }
+            i = j;
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn generate_chbench_parquet(out_dir: &Path, warehouses: i64) {
+    use parity::chbench_data::generate_chbench_duckdb_sql;
+    std::fs::create_dir_all(out_dir).expect("chbench out dir");
+    let gen_db = out_dir.join("gen.duckdb");
+    let conn = Connection::open(&gen_db).expect("duckdb open for chbench gen");
+    let sql = generate_chbench_duckdb_sql(out_dir, warehouses);
+    conn.execute_batch(&sql)
+        .unwrap_or_else(|e| panic!("chbench generate: {e}"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn chbench_sf1_parity_vs_duckdb() {
+    use parity::chbench_data::CHBENCH_TABLES;
+    use test_framework::queries::get_chbench_test_queries;
+
+    let scratch = scratch_dir();
+    std::fs::create_dir_all(&scratch).ok();
+    let warehouses = env_f64("CAYENNE_PARITY_CHBENCH_SF", 1.0) as i64;
+    eprintln!("CH-benCHmark parity at SF={warehouses} (warehouses)");
+
+    let chbench_dir = scratch.join(format!("chbench_sf{warehouses}"));
+    if !chbench_dir.join("order_line.parquet").exists() {
+        generate_chbench_parquet(&chbench_dir, warehouses);
+    }
+
+    let cayenne = load_cayenne_from_parquet(&chbench_dir, CHBENCH_TABLES).await;
+    let (duck_temp, duck) = load_duckdb_from_parquet(&chbench_dir, CHBENCH_TABLES);
+    let _keep = duck_temp;
+
+    let mut results = Vec::new();
+    for q in get_chbench_test_queries(None) {
+        // DataFusion uses `%` for modulo; CH-benCH SQL from the suite uses
+        // `mod(a,b)` (Postgres/DuckDB). Rewrite only the Cayenne/DataFusion side.
+        let cayenne_sql = chbench_sql_for_datafusion(&q.sql);
+        let duck_sql = q.sql.as_ref();
+        let q_c = Query::new(q.name.clone(), cayenne_sql.into(), false);
+        let outcome = run_pair_with_df_baseline(
+            "chbench",
+            &q_c,
+            &cayenne,
+            &duck,
+            Some(duck_sql),
+            Some(&chbench_dir),
+        )
+        .await;
+        // DF baseline must use the same rewritten SQL as Cayenne.
+        let outcome = match outcome {
+            ParityOutcome::Fail { detail }
+                if detail.contains("DataFusion baseline failed")
+                    || detail.contains("Invalid function 'mod'") =>
+            {
+                // Re-run baseline comparison is already done with cayenne SQL via
+                // run_pair — if still failing on mod, treat as rewrite gap.
+                ParityOutcome::Fail { detail }
+            }
+            other => other,
+        };
+        eprintln!("chbench/{} -> {outcome:?}", q.name);
+        results.push(RunResult {
+            suite: "chbench".into(),
+            name: q.name.to_string(),
+            engine_pair: "cayenne-duckdb",
+            outcome,
+        });
+    }
+
+    let log_path = scratch.join("cayenne_duckdb_chbench_parity.log");
+    let mut log = format!("CH-benCHmark SF={warehouses}\n");
+    for r in &results {
+        log.push_str(&format!("{}: {:?}\n", r.name, r.outcome));
+    }
+    log.push_str(&summary_line(&results));
+    log.push('\n');
+    std::fs::write(&log_path, &log).expect("write chbench log");
+    eprintln!("{}", summary_line(&results));
+
+    let fails: Vec<_> = results
+        .iter()
+        .filter(|r| !r.outcome.is_pass_or_excluded())
+        .collect();
+    assert!(
+        fails.is_empty(),
+        "CH-benCHmark SF1 full-result parity failures: {fails:#?}\nsee {}",
+        log_path.display()
+    );
+}
+
+/// SpiceBench SF1 built-in scenario is TPC-H — same data/SQL as TPC-H SF1 with
+/// inventory names under the `spicebench` suite.
+#[tokio::test(flavor = "multi_thread")]
+async fn spicebench_sf1_tpch_scenario_parity_vs_duckdb() {
+    let scratch = scratch_dir();
+    std::fs::create_dir_all(&scratch).ok();
+    let sf = env_f64("CAYENNE_PARITY_TPCH_SF", 1.0);
+    eprintln!("SpiceBench SF1 (TPC-H scenario) parity at SF={sf}");
+
+    let parquet_dir = scratch.join(format!("tpch_sf{sf}"));
+    if !parquet_dir.join("lineitem.parquet").exists() {
+        generate_tpch_parquet(&parquet_dir, sf);
+    }
+
+    let cayenne = load_cayenne_from_parquet(&parquet_dir, TPCH_TABLES).await;
+    let (duck_temp, duck) = load_duckdb_from_parquet(&parquet_dir, TPCH_TABLES);
+    let _keep = duck_temp;
+    let inventory = build_inventory();
+
+    let mut results = Vec::new();
+    for q in get_tpch_test_queries(None) {
+        let sb_name = q.name.replacen("tpch_", "spicebench_", 1);
+        let sb_query = Query::new(sb_name.clone().into(), std::sync::Arc::clone(&q.sql), false);
+        if let Some(e) = inventory.iter().find(|e| e.name == sb_name)
+            && let Some(reason) = e.duckdb_exclusion
+        {
+            results.push(RunResult {
+                suite: "spicebench".into(),
+                name: sb_name,
+                engine_pair: "cayenne-duckdb",
+                outcome: ParityOutcome::Excluded {
+                    reason: reason.to_string(),
+                },
+            });
+            continue;
+        }
+        let outcome = run_pair_with_df_baseline(
+            "spicebench",
+            &sb_query,
+            &cayenne,
+            &duck,
+            None,
+            Some(&parquet_dir),
+        )
+        .await;
+        eprintln!("spicebench/{sb_name} -> {outcome:?}");
+        results.push(RunResult {
+            suite: "spicebench".into(),
+            name: sb_name,
+            engine_pair: "cayenne-duckdb",
+            outcome,
+        });
+    }
+
+    let log_path = scratch.join("cayenne_duckdb_spicebench_parity.log");
+    let mut log = format!("SpiceBench SF1 TPC-H scenario SF={sf}\n");
+    for r in &results {
+        log.push_str(&format!("{}: {:?}\n", r.name, r.outcome));
+    }
+    log.push_str(&summary_line(&results));
+    log.push('\n');
+    std::fs::write(&log_path, &log).expect("write spicebench log");
+    eprintln!("{}", summary_line(&results));
+
+    let fails: Vec<_> = results
+        .iter()
+        .filter(|r| !r.outcome.is_pass_or_excluded())
+        .collect();
+    assert!(
+        fails.is_empty(),
+        "SpiceBench SF1 parity failures: {fails:#?}\nsee {}",
+        log_path.display()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sqllancer_corpus_parity_vs_duckdb() {
+    use parity::sqllancer::{
+        SQLLANCER_TABLES, make_t0_batch, make_t1_batch, sqllancer_queries, t0_schema, t1_schema,
+    };
+
+    let scratch = scratch_dir();
+    std::fs::create_dir_all(&scratch).ok();
+    eprintln!("SQLLancer corpus parity Cayenne↔DuckDB");
+
+    let rows = 200usize;
+    let t0 = make_t0_batch(rows);
+    let t1 = make_t1_batch(rows / 2);
+    let parquet_dir = tempfile::tempdir().expect("sqllancer parquet");
+    let t0_path = parquet_dir.path().join("sqllancer_t0.parquet");
+    let t1_path = parquet_dir.path().join("sqllancer_t1.parquet");
+    write_parquet(&t0, &t0_path);
+    write_parquet(&t1, &t1_path);
+
+    let mut cayenne = CayenneHarness::new().await;
+    cayenne.load_batch("sqllancer_t0", t0).await;
+    cayenne.load_batch("sqllancer_t1", t1).await;
+
+    let (duck_temp, duck) = load_duckdb_from_parquet(parquet_dir.path(), SQLLANCER_TABLES);
+    let _keep = duck_temp;
+    let _ = (t0_schema(), t1_schema()); // schemas used by batch builders
+
+    let mut results = Vec::new();
+    for q in sqllancer_queries() {
+        let outcome = run_pair_with_df_baseline(
+            "sqllancer",
+            &q,
+            &cayenne,
+            &duck,
+            None,
+            Some(parquet_dir.path()),
+        )
+        .await;
+        eprintln!("sqllancer/{} -> {outcome:?}", q.name);
+        results.push(RunResult {
+            suite: "sqllancer".into(),
+            name: q.name.to_string(),
+            engine_pair: "cayenne-duckdb",
+            outcome,
+        });
+    }
+
+    let log_path = scratch.join("cayenne_duckdb_sqllancer_parity.log");
+    let mut log = String::from("SQLLancer corpus Cayenne↔DuckDB\n");
+    for r in &results {
+        log.push_str(&format!("{}: {:?}\n", r.name, r.outcome));
+    }
+    log.push_str(&summary_line(&results));
+    log.push('\n');
+    std::fs::write(&log_path, &log).expect("write sqllancer log");
+    write_coverage_report(&scratch.join("parity_coverage.md"), &results).ok();
+    eprintln!("{}", summary_line(&results));
+
+    let fails: Vec<_> = results
+        .iter()
+        .filter(|r| !r.outcome.is_pass_or_excluded())
+        .collect();
+    assert!(
+        fails.is_empty(),
+        "SQLLancer corpus parity failures: {fails:#?}\nsee {}",
+        log_path.display()
+    );
+}

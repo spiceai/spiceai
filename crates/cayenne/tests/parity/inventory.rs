@@ -14,25 +14,22 @@
 
 //! Machine-checkable coverage inventory for Cayenne query-result parity.
 //!
-//! Every in-scope analytical suite query is listed with expressibility notes
-//! for DuckDB and chDB. The inventory is built from the same sources as
-//! `test_framework::queries` so completeness can be asserted in a unit test.
+//! Suites (all SF1 unless noted):
+//! - TPC-H, TPC-DS, ClickBench, CH-benCHmark, SpiceBench (TPC-H scenario),
+//!   SQLLancer corpus, micro-bench shapes.
+//!
+//! Engines: Cayenne, DuckDB, chDB (pairwise — DuckDB and chDB cannot co-link).
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use test_framework::queries::{
-    Query, get_clickbench_test_queries, get_tpcds_test_queries, get_tpch_test_queries,
+    Query, get_chbench_test_queries, get_clickbench_test_queries, get_tpcds_test_queries,
+    get_tpch_test_queries,
 };
 
 use super::micro_bench_queries;
-
-/// Engines that can execute a query for parity comparison.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Engine {
-    Cayenne,
-    DuckDb,
-    ChDb,
-}
+use super::sqllancer::sqllancer_queries;
 
 /// One inventory entry: suite query + per-engine status.
 #[derive(Debug, Clone)]
@@ -42,12 +39,11 @@ pub struct InventoryEntry {
     pub sql: String,
     /// `None` means the engine runs the query; `Some(reason)` is a justified exclusion.
     pub duckdb_exclusion: Option<&'static str>,
-    /// `None` means expressible in chDB (possibly with dialect adaptation);
-    /// `Some(reason)` means not compared against chDB.
+    /// `None` means expressible in chDB; `Some(reason)` means not compared vs chDB.
     pub chdb_exclusion: Option<&'static str>,
 }
 
-/// Build the full inventory from suite sources + micro-bench shapes.
+/// Build the full inventory from suite sources + micro + SQLLancer.
 #[must_use]
 pub fn build_inventory() -> Vec<InventoryEntry> {
     let mut entries = Vec::new();
@@ -58,11 +54,9 @@ pub fn build_inventory() -> Vec<InventoryEntry> {
             name: q.name.to_string(),
             sql: q.sql.to_string(),
             duckdb_exclusion: tpch_duckdb_exclusion(&q),
-            // Multi-table TPC-H in chDB requires ClickHouse SQL dialect rewrites
-            // (e.g. date literals, correlated subqueries) beyond this parity gate.
             chdb_exclusion: Some(
-                "TPC-H suite multi-table SQL targets DataFusion/DuckDB dialect; \
-                 chDB comparison limited to micro-bench shapes",
+                "TPC-H multi-table SQL targets DataFusion/DuckDB dialect; \
+                 chDB runs SQLLancer + micro on all three engines",
             ),
         });
     }
@@ -74,26 +68,58 @@ pub fn build_inventory() -> Vec<InventoryEntry> {
             sql: q.sql.to_string(),
             duckdb_exclusion: None,
             chdb_exclusion: Some(
-                "TPC-DS suite multi-table SQL targets DataFusion/DuckDB dialect; \
-                 chDB comparison limited to micro-bench shapes",
+                "TPC-DS multi-table SQL targets DataFusion/DuckDB dialect; \
+                 chDB runs SQLLancer + micro on all three engines",
             ),
         });
     }
 
     for q in get_clickbench_test_queries(None) {
-        // Full ClickBench hits schema is not generated in-process; only a
-        // reduced hits fixture is loaded. Queries needing ungenerated columns
-        // are excluded at run time when the fixture is partial — inventory
-        // still lists every suite query so coverage is 100% accounted for.
         entries.push(InventoryEntry {
             suite: "clickbench",
             name: q.name.to_string(),
             sql: q.sql.to_string(),
-            duckdb_exclusion: clickbench_duckdb_note(&q),
+            duckdb_exclusion: None,
             chdb_exclusion: Some(
-                "ClickBench hits full-width schema not loaded in chDB parity process; \
-                 micro-bench shapes cover scan/agg/join shapes instead",
+                "ClickBench full hits loaded in DuckDB lane; chDB runs SQLLancer + micro",
             ),
+        });
+    }
+
+    for q in get_chbench_test_queries(None) {
+        entries.push(InventoryEntry {
+            suite: "chbench",
+            name: q.name.to_string(),
+            sql: q.sql.to_string(),
+            duckdb_exclusion: None,
+            chdb_exclusion: Some(
+                "CH-benCHmark multi-table TPC-C/H hybrid SQL targets DataFusion/DuckDB dialect",
+            ),
+        });
+    }
+
+    // SpiceBench SF1 scenario is TPC-H (spiceai/spicebench built-in scenario).
+    for q in get_tpch_test_queries(None) {
+        let name = q.name.replacen("tpch_", "spicebench_", 1);
+        let sq = Query::new(name.clone().into(), Arc::clone(&q.sql), false);
+        entries.push(InventoryEntry {
+            suite: "spicebench",
+            name,
+            sql: q.sql.to_string(),
+            duckdb_exclusion: tpch_duckdb_exclusion(&sq).or(tpch_duckdb_exclusion(&q)),
+            chdb_exclusion: Some(
+                "SpiceBench SF1 scenario is TPC-H; chDB dialect exclusion same as TPC-H suite",
+            ),
+        });
+    }
+
+    for q in sqllancer_queries() {
+        entries.push(InventoryEntry {
+            suite: "sqllancer",
+            name: q.name.to_string(),
+            sql: q.sql.to_string(),
+            duckdb_exclusion: None,
+            chdb_exclusion: sqllancer_chdb_exclusion(&q),
         });
     }
 
@@ -103,60 +129,43 @@ pub fn build_inventory() -> Vec<InventoryEntry> {
             name: q.name.to_string(),
             sql: q.sql.to_string(),
             duckdb_exclusion: None,
-            chdb_exclusion: micro_chdb_note(&q),
+            chdb_exclusion: None,
         });
     }
 
     entries
 }
 
-/// TPC-H queries where engine-vs-engine full-result equality is not well-defined
-/// because `ORDER BY` keys are non-unique and `LIMIT` therefore may pick
-/// different tied rows on each engine. Not a Cayenne correctness bug.
-fn tpch_duckdb_exclusion(q: &Query) -> Option<&'static str> {
+fn sqllancer_chdb_exclusion(q: &Query) -> Option<&'static str> {
     match q.name.as_ref() {
-        "tpch_simple_q3" | "tpch_simple_q4" => Some(
-            "ORDER BY non-unique key + LIMIT yields engine-dependent tied-row sets; \
-             not a content correctness defect",
-        ),
-        "tpch_simple_q6" | "tpch_simple_q7" => Some(
-            "LIMIT without ORDER BY is nondeterministic across engines and scale factors; \
-             not a content correctness defect",
+        // ClickHouse NULL semantics in MIN/aggregates and three-valued logic
+        // differ from SQL standard / DataFusion for some scalar subqueries.
+        "sl_subquery_scalar" => Some(
+            "chDB NULL/MIN three-valued logic differs from DataFusion on scalar subquery filter",
         ),
         _ => None,
     }
 }
 
-fn clickbench_duckdb_note(q: &Query) -> Option<&'static str> {
-    // In-process fixture uses a reduced hits schema. Queries that only need
-    // COUNT(*) / simple aggregates on generated columns run; others are
-    // excluded at execution when column resolution fails, with this standing
-    // reason for inventory completeness when the full dataset is absent.
-    let _ = q;
-    None
-}
-
-fn micro_chdb_note(q: &Query) -> Option<&'static str> {
-    // Join shapes need two chDB tables in one session — supported via dual load.
-    // All micro shapes are expressible with ClickHouse-compatible SQL when
-    // rewritten (table names, string quotes). Default: no exclusion.
-    let _ = q;
-    None
+fn tpch_duckdb_exclusion(q: &Query) -> Option<&'static str> {
+    match q.name.as_ref() {
+        "tpch_simple_q3" | "tpch_simple_q4" | "spicebench_simple_q3" | "spicebench_simple_q4" => {
+            Some(
+                "ORDER BY non-unique key + LIMIT yields engine-dependent tied-row sets; \
+                 not a content correctness defect",
+            )
+        }
+        "tpch_simple_q6" | "tpch_simple_q7" | "spicebench_simple_q6" | "spicebench_simple_q7" => {
+            Some(
+                "LIMIT without ORDER BY is nondeterministic across engines and scale factors; \
+                 not a content correctness defect",
+            )
+        }
+        _ => None,
+    }
 }
 
 /// Assert inventory is complete relative to suite sources.
-///
-/// Returns `(suite → query names in inventory)` for reporting.
-#[must_use]
-pub fn inventory_by_suite() -> BTreeMap<&'static str, Vec<String>> {
-    let mut map: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
-    for e in build_inventory() {
-        map.entry(e.suite).or_default().push(e.name);
-    }
-    map
-}
-
-/// Completeness check: every query from the suite sources appears in inventory.
 pub fn assert_inventory_complete() {
     let inv = build_inventory();
     let inv_names: std::collections::BTreeSet<_> =
@@ -167,6 +176,11 @@ pub fn assert_inventory_complete() {
             inv_names.contains(&("tpch", q.name.as_ref())),
             "inventory missing TPC-H query {}",
             q.name
+        );
+        let sb = q.name.replacen("tpch_", "spicebench_", 1);
+        assert!(
+            inv_names.contains(&("spicebench", sb.as_str())),
+            "inventory missing SpiceBench query {sb}"
         );
     }
     for q in get_tpcds_test_queries(None, Some(1.0)) {
@@ -183,6 +197,20 @@ pub fn assert_inventory_complete() {
             q.name
         );
     }
+    for q in get_chbench_test_queries(None) {
+        assert!(
+            inv_names.contains(&("chbench", q.name.as_ref())),
+            "inventory missing CH-benCHmark query {}",
+            q.name
+        );
+    }
+    for q in sqllancer_queries() {
+        assert!(
+            inv_names.contains(&("sqllancer", q.name.as_ref())),
+            "inventory missing SQLLancer query {}",
+            q.name
+        );
+    }
     for q in micro_bench_queries() {
         assert!(
             inv_names.contains(&("micro", q.name.as_ref())),
@@ -190,4 +218,13 @@ pub fn assert_inventory_complete() {
             q.name
         );
     }
+}
+
+#[must_use]
+pub fn inventory_by_suite() -> BTreeMap<&'static str, Vec<String>> {
+    let mut map: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+    for e in build_inventory() {
+        map.entry(e.suite).or_default().push(e.name);
+    }
+    map
 }

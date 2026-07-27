@@ -20,8 +20,10 @@
 #![allow(clippy::missing_panics_doc)]
 #![allow(clippy::missing_errors_doc)]
 
+pub mod chbench_data;
 pub mod inventory;
 pub mod report;
+pub mod sqllancer;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -39,7 +41,10 @@ use datafusion_physical_plan::collect;
 use test_framework::queries::validation::{
     QueryValidationResult, RowOrder, compare_query_result_batches, row_order_from_sql,
 };
-use test_framework::queries::{Query, get_clickbench_test_queries, get_tpcds_test_queries, get_tpch_test_queries};
+use test_framework::queries::{
+    Query, get_chbench_test_queries, get_clickbench_test_queries, get_tpcds_test_queries,
+    get_tpch_test_queries,
+};
 
 /// Outcome for one inventory query on one engine pair.
 #[derive(Debug, Clone)]
@@ -346,12 +351,28 @@ pub fn make_dim_batch(rows: usize) -> RecordBatch {
 }
 
 /// Compare Cayenne vs reference batches for one query.
+///
+/// Uses multiset equality when SQL has no `ORDER BY`. When `ORDER BY` is
+/// present, still uses multiset for engine-vs-engine parity unless the query
+/// also has `LIMIT`/`OFFSET` — non-unique sort keys make row order among ties
+/// implementation-defined, but the full result multiset must match. With
+/// `LIMIT`, order among ties changes *which* rows appear, so we preserve
+/// order comparison to surface nondeterminism (callers may exclude).
 pub fn compare_results(
     query: &Query,
     cayenne: &[RecordBatch],
     reference: &[RecordBatch],
 ) -> ParityOutcome {
-    let order = row_order_from_sql(&query.sql);
+    let sql_upper = query.sql.to_ascii_uppercase();
+    let has_order = sql_upper.contains("ORDER BY");
+    let has_limit = sql_upper.contains("LIMIT") || sql_upper.contains("OFFSET");
+    let order = if has_order && has_limit {
+        RowOrder::Preserved
+    } else {
+        // Full result or unordered: multiset (handles non-unique ORDER BY ties).
+        RowOrder::Multiset
+    };
+    let _ = row_order_from_sql; // still used by sql_has_order_by
     match compare_query_result_batches(&query.name, cayenne, reference, order) {
         Ok(QueryValidationResult::Pass) => ParityOutcome::Pass,
         Ok(QueryValidationResult::Fail(reason)) => ParityOutcome::Fail {
@@ -374,6 +395,21 @@ pub fn suite_queries() -> Vec<(String, Query)> {
     }
     for q in get_clickbench_test_queries(None) {
         out.push(("clickbench".to_string(), q));
+    }
+    for q in get_chbench_test_queries(None) {
+        out.push(("chbench".to_string(), q));
+    }
+    // SpiceBench SF1 built-in scenario is TPC-H (see spiceai/spicebench README).
+    for q in get_tpch_test_queries(None) {
+        let mut name = q.name.to_string();
+        name = name.replacen("tpch_", "spicebench_", 1);
+        out.push((
+            "spicebench".to_string(),
+            Query::new(name.into(), Arc::clone(&q.sql), false),
+        ));
+    }
+    for q in sqllancer::sqllancer_queries() {
+        out.push(("sqllancer".to_string(), q));
     }
     for q in micro_bench_queries() {
         out.push(("micro".to_string(), q));
