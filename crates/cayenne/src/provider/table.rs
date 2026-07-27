@@ -988,6 +988,15 @@ struct RawScanInput {
     /// snapshot dirs alive for the full execution even after the builder evicts the
     /// view. Ref-hold churns per VIEW-publish, not per query.
     scan_guard: Arc<SnapshotScanRef>,
+    /// The (gated) read schema (`read_schema()`) captured under the SAME fence +
+    /// seqlock-validated window as the rest of this snapshot. Every scan-plan branch
+    /// (main file scan, protected snapshots, inline + RAM tiers) is built from THIS
+    /// schema rather than re-reading the live `table_schema` per branch, so a
+    /// concurrent `evolve_schema_live` swap between capture and plan-build can never
+    /// desync the branches from each other or from the captured data. Determined by
+    /// `structural_version` (a schema-evolve advances the generation → a fresh key),
+    /// so it needs no separate `ScanViewKey` component.
+    read_schema: SchemaRef,
 }
 
 impl RawScanInput {
@@ -20081,6 +20090,12 @@ impl CayenneTableProvider {
         let current_snapshot_id = self.get_current_snapshot_id();
         let structural_epoch = self.inlined_structural_epoch.load(Ordering::Relaxed);
 
+        // Capture the (gated) read schema under the SAME held fence + seqlock-validated
+        // window, so it is consistent with the data captured above and every scan-plan
+        // branch can build from this one schema instead of re-reading the live
+        // `table_schema` (which a concurrent `evolve_schema_live` could swap mid-plan).
+        let read_schema = self.read_schema();
+
         // Pin the snapshot dirs this scan reads (the captured current snapshot + all
         // protected snapshots) against concurrent-compaction GC for the FULL scan
         // lifetime — plan-build AND execution. Created under the read fence, so the
@@ -20103,6 +20118,7 @@ impl CayenneTableProvider {
             current_snapshot_id,
             structural_epoch,
             scan_guard,
+            read_schema,
         })
     }
 
@@ -20290,9 +20306,15 @@ impl CayenneTableProvider {
         // Read-current fast path: serve a recent, structurally-current completed view.
         if !freshness.is_zero() {
             let now = Instant::now();
-            let structural = self.structural_version.current();
             let mut cache = self.scan_view_cache.lock();
             cache.drain_completed();
+            // Read the seqlock generation UNDER the cache mutex, immediately before the
+            // servability check, so no live schema-evolution can slip in between the
+            // read and the compare (a pre-lock read left a TOCTOU window across the
+            // `.lock()` + `drain_completed()`). An in-flight evolution reads ODD and can
+            // never equal a completed view's always-EVEN `structural_version`, so a
+            // straddling evolution falls through to the read-your-writes rebuild below.
+            let structural = self.structural_version.current();
             if let Some(view) = cache.servable_within_lag(now, freshness, structural) {
                 return Ok(view);
             }
@@ -22933,6 +22955,7 @@ impl CayenneTableProvider {
         effective_projection: Option<&Vec<usize>>,
         pruning_predicate: Option<&Arc<dyn PhysicalExpr>>,
         target_partitions: usize,
+        read_schema: &SchemaRef,
     ) -> datafusion_common::Result<Option<Arc<dyn ExecutionPlan>>> {
         if segments.is_empty() {
             return Ok(None);
@@ -22955,7 +22978,12 @@ impl CayenneTableProvider {
         if visible_batches.is_empty() {
             return Ok(None);
         }
-        self.finish_mem_tier_scan_plan(visible_batches, effective_projection, target_partitions)
+        self.finish_mem_tier_scan_plan(
+            visible_batches,
+            effective_projection,
+            target_partitions,
+            read_schema,
+        )
     }
 
     /// Build the per-segment, deletion-filtered visible batches for every shard,
@@ -23005,12 +23033,13 @@ impl CayenneTableProvider {
         visible_batches: Vec<RecordBatch>,
         effective_projection: Option<&Vec<usize>>,
         target_partitions: usize,
+        read_schema: &SchemaRef,
     ) -> datafusion_common::Result<Option<Arc<dyn ExecutionPlan>>> {
         // Project to the effective projection (reusing the inlined-plan logic).
-        // Build from the (gated) read schema so the RAM-tier branch matches the
-        // main file scan: view types when force_view is on, stored Utf8/Binary
-        // otherwise. Cast each batch to that target (a no-op when force_view off).
-        let read_schema = self.read_schema();
+        // Build from the CAPTURED (gated) read schema (threaded down from `scan()`)
+        // so the RAM-tier branch matches the main file scan: view types when
+        // force_view is on, stored Utf8/Binary otherwise. Cast each batch to that
+        // target (a no-op when force_view off).
         let proj_schema = if let Some(proj) = effective_projection {
             let schema_fields = read_schema.fields();
             let fields: Vec<arrow_schema::FieldRef> = proj
@@ -23019,7 +23048,7 @@ impl CayenneTableProvider {
                 .collect();
             Arc::new(arrow_schema::Schema::new(fields))
         } else {
-            read_schema
+            Arc::clone(read_schema)
         };
 
         let projected_batches: Vec<RecordBatch> = visible_batches
@@ -25981,6 +26010,10 @@ impl TableProvider for CayenneTableProvider {
         let deletion_snapshot = scan_view.merged_deletions.clone();
         let visible_segments = Arc::clone(&scan_view.visible_segments);
         let mem_tier_union_tombstones = scan_view.union_tombstones.clone();
+        // The read schema captured atomically with this snapshot; every plan branch
+        // below builds from it (not a live re-read) so they stay mutually consistent
+        // across a concurrent schema-evolution.
+        let read_schema = Arc::clone(&scan_view.raw.read_schema);
         drop(scan_view);
         let need_pk_deletion = deletion_snapshot.has_deletions();
 
@@ -26150,10 +26183,11 @@ impl TableProvider for CayenneTableProvider {
             && protected_map.is_empty()
             && inlined_batches.is_empty();
         // View-typed schema for the query scan output (string/binary -> view),
-        // matching the advertised `TableProvider::schema()`. Threaded into every
-        // union branch (file scan, protected snapshots, inline + RAM tiers) so
-        // they agree and joins plan on view arrays. See `viewify_read_schema`.
-        let read_schema = self.read_schema();
+        // matching the advertised `TableProvider::schema()`. This is the schema
+        // CAPTURED with the scan snapshot (above), threaded into every union branch
+        // (file scan, protected snapshots, inline + RAM tiers) so they agree with
+        // each other and with the captured data even across a concurrent
+        // schema-evolution, and joins plan on view arrays. See `viewify_read_schema`.
         let listing_scan_start = Instant::now();
         let main_plan_result = self
             .create_snapshot_scan_plan_with_config(
@@ -26228,8 +26262,9 @@ impl TableProvider for CayenneTableProvider {
             // branch matches the main file scan exactly: view types when
             // force_view is on, stored Utf8/Binary otherwise. The inline corpus
             // holds stored Utf8/Binary, so cast each batch to that target (a no-op
-            // reschema when force_view is off).
-            let read_schema = self.read_schema();
+            // reschema when force_view is off). Use the CAPTURED schema (not a live
+            // re-read) so this branch agrees with the file/protected/RAM branches.
+            let read_schema = Arc::clone(&read_schema);
             let proj_schema = if let Some(ref proj) = effective_projection {
                 let schema_fields = read_schema.fields();
                 let fields: Vec<arrow_schema::FieldRef> = proj
@@ -26307,6 +26342,7 @@ impl TableProvider for CayenneTableProvider {
                 mem_tier_pruning_predicate.as_ref(),
                 // Scan-resolved (1 for PK point lookups) — see the inline branch.
                 scan_listing_config.target_partitions(),
+                &read_schema,
             )?
             .map(|mem_exec| self.wrap_memory_branch_with_scan_filters(mem_exec, filters));
 
