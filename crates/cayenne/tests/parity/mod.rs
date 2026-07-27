@@ -1,0 +1,388 @@
+// Copyright 2024-2026 The Spice.ai OSS Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Cayenne query-result parity helpers: inventory, fixture setup, and report.
+
+#![allow(dead_code)]
+#![allow(clippy::expect_used)]
+#![allow(clippy::unwrap_used)]
+#![allow(clippy::missing_panics_doc)]
+#![allow(clippy::missing_errors_doc)]
+
+pub mod inventory;
+pub mod report;
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use arrow::array::RecordBatch;
+use arrow::datatypes::Schema;
+use cayenne::metadata::CreateTableOptions;
+use cayenne::{CayenneCatalog, CayenneTableProvider, MetadataCatalog};
+use datafusion::datasource::TableProvider;
+use datafusion::execution::runtime_env::RuntimeEnv;
+use datafusion::prelude::{ParquetReadOptions, SessionContext};
+use datafusion_expr::dml::InsertOp;
+use datafusion_physical_plan::collect;
+use test_framework::queries::validation::{
+    QueryValidationResult, RowOrder, compare_query_result_batches, row_order_from_sql,
+};
+use test_framework::queries::{Query, get_clickbench_test_queries, get_tpcds_test_queries, get_tpch_test_queries};
+
+/// Outcome for one inventory query on one engine pair.
+#[derive(Debug, Clone)]
+pub enum ParityOutcome {
+    Pass,
+    Fail { detail: String },
+    Excluded { reason: String },
+    EngineError { side: &'static str, detail: String },
+}
+
+impl ParityOutcome {
+    #[must_use]
+    pub fn is_pass_or_excluded(&self) -> bool {
+        matches!(self, Self::Pass | Self::Excluded { .. })
+    }
+}
+
+/// Micro-bench SQL shapes shared by `vs_duckdb_*` / `vs_chdb_*` benches.
+/// Table names: fact `t` (id, name, value), dim `d` (id, region).
+#[must_use]
+pub fn micro_bench_queries() -> Vec<Query> {
+    vec![
+        Query::new(
+            "micro_count_star".into(),
+            "SELECT COUNT(*) FROM t".into(),
+            false,
+        ),
+        Query::new(
+            "micro_sum_value".into(),
+            "SELECT SUM(value) FROM t".into(),
+            false,
+        ),
+        Query::new(
+            "micro_filter_sum".into(),
+            "SELECT SUM(value) FROM t WHERE id BETWEEN 10 AND 50".into(),
+            false,
+        ),
+        Query::new(
+            "micro_count_value".into(),
+            "SELECT COUNT(value) FROM t".into(),
+            false,
+        ),
+        Query::new(
+            "micro_min_value".into(),
+            "SELECT MIN(value) FROM t".into(),
+            false,
+        ),
+        Query::new(
+            "micro_max_value".into(),
+            "SELECT MAX(value) FROM t".into(),
+            false,
+        ),
+        Query::new(
+            "micro_avg_value".into(),
+            "SELECT AVG(value) FROM t".into(),
+            false,
+        ),
+        Query::new(
+            "micro_agg_rollup".into(),
+            "SELECT COUNT(*), SUM(value), MIN(value), MAX(value), AVG(value) FROM t".into(),
+            false,
+        ),
+        Query::new(
+            "micro_groupby_name".into(),
+            "SELECT name, COUNT(*), SUM(value) FROM t GROUP BY name".into(),
+            false,
+        ),
+        Query::new(
+            "micro_join_agg".into(),
+            "SELECT d.region, SUM(t.value) FROM t JOIN d ON t.id = d.id GROUP BY d.region".into(),
+            false,
+        ),
+        Query::new(
+            "micro_join_filter".into(),
+            "SELECT SUM(t.value) FROM t JOIN d ON t.id = d.id WHERE d.region = 'NA'".into(),
+            false,
+        ),
+        Query::new(
+            "micro_pk_lookup".into(),
+            "SELECT id, name, value FROM t WHERE id = 42".into(),
+            false,
+        ),
+        Query::new(
+            "micro_order_limit".into(),
+            "SELECT id, name, value FROM t ORDER BY id LIMIT 10".into(),
+            false,
+        ),
+    ]
+}
+
+/// TPC-H tables produced by DuckDB `dbgen`.
+pub const TPCH_TABLES: &[&str] = &[
+    "customer", "lineitem", "nation", "orders", "part", "partsupp", "region", "supplier",
+];
+
+/// Build a Cayenne catalog + temp data dir.
+pub struct CayenneHarness {
+    pub _temp_dir: tempfile::TempDir,
+    pub catalog: Arc<dyn MetadataCatalog>,
+    pub data_path: PathBuf,
+    pub tables: BTreeMap<String, Arc<CayenneTableProvider>>,
+}
+
+impl CayenneHarness {
+    pub async fn new() -> Self {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let data_path = temp_dir.path().join("data");
+        std::fs::create_dir_all(&data_path).expect("data dir");
+        let db_path = temp_dir.path().join("catalog.db");
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!("sqlite://{}", db_path.display())).expect("catalog"),
+        );
+        catalog.init().await.expect("catalog init");
+        Self {
+            _temp_dir: temp_dir,
+            catalog: catalog as Arc<dyn MetadataCatalog>,
+            data_path,
+            tables: BTreeMap::new(),
+        }
+    }
+
+    /// Create a Cayenne table from a parquet file (schema inferred via DataFusion).
+    pub async fn load_parquet_table(&mut self, table_name: &str, parquet_path: &Path) {
+        let ctx = SessionContext::new();
+        let path_str = parquet_path.to_string_lossy().into_owned();
+        let df = ctx
+            .read_parquet(path_str.as_str(), ParquetReadOptions::default())
+            .await
+            .expect("read parquet for schema");
+        let schema = df.schema().as_arrow().clone();
+        let schema = Arc::new(Schema::from(schema));
+
+        let table_path = self.data_path.join(table_name);
+        std::fs::create_dir_all(&table_path).expect("table data dir");
+
+        let table = Arc::new(
+            CayenneTableProvider::create_table(
+                Arc::clone(&self.catalog),
+                CreateTableOptions {
+                    table_name: table_name.to_string(),
+                    schema: Arc::clone(&schema),
+                    primary_key: vec![],
+                    on_conflict: None,
+                    base_path: table_path.to_string_lossy().to_string(),
+                    partition_column: None,
+                    vortex_config: cayenne::metadata::VortexConfig::default(),
+                },
+                Arc::new(RuntimeEnv::default()),
+            )
+            .await
+            .expect("create cayenne table"),
+        );
+
+        let input_exec = df
+            .create_physical_plan()
+            .await
+            .expect("parquet physical plan");
+        let insert_plan = table
+            .insert_into(&ctx.state(), input_exec, InsertOp::Append)
+            .await
+            .expect("insert plan");
+        let _ = collect(insert_plan, ctx.task_ctx())
+            .await
+            .expect("insert collect");
+
+        self.tables.insert(table_name.to_string(), table);
+    }
+
+    /// Load an in-memory RecordBatch as a named table.
+    pub async fn load_batch(&mut self, table_name: &str, batch: RecordBatch) {
+        let schema = batch.schema();
+        let table_path = self.data_path.join(table_name);
+        std::fs::create_dir_all(&table_path).expect("table data dir");
+
+        let table = Arc::new(
+            CayenneTableProvider::create_table(
+                Arc::clone(&self.catalog),
+                CreateTableOptions {
+                    table_name: table_name.to_string(),
+                    schema: Arc::clone(&schema),
+                    primary_key: vec![],
+                    on_conflict: None,
+                    base_path: table_path.to_string_lossy().to_string(),
+                    partition_column: None,
+                    vortex_config: cayenne::metadata::VortexConfig::default(),
+                },
+                Arc::new(RuntimeEnv::default()),
+            )
+            .await
+            .expect("create cayenne table"),
+        );
+
+        let ctx = SessionContext::new();
+        let input_exec = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
+            &[vec![batch]],
+            schema,
+            None,
+        )
+        .expect("memory exec");
+        let insert_plan = table
+            .insert_into(&ctx.state(), input_exec, InsertOp::Append)
+            .await
+            .expect("insert plan");
+        let _ = collect(insert_plan, ctx.task_ctx())
+            .await
+            .expect("insert collect");
+
+        self.tables.insert(table_name.to_string(), table);
+    }
+
+    pub async fn query(&self, sql: &str) -> Result<Vec<RecordBatch>, String> {
+        use cayenne::optimizer_rules::{
+            CayenneAntiJoinSortMergeRewriter, CayenneDynamicFilterSharing,
+            CayenneMaintainedAggregateRewriter, CayenneStatsAggregateRewriter,
+        };
+        use datafusion::execution::session_state::SessionStateBuilder;
+
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_physical_optimizer_rule(Arc::new(CayenneDynamicFilterSharing::new()))
+            .with_physical_optimizer_rule(Arc::new(CayenneMaintainedAggregateRewriter::new()))
+            .with_physical_optimizer_rule(Arc::new(CayenneStatsAggregateRewriter::new()))
+            .with_physical_optimizer_rule(Arc::new(CayenneAntiJoinSortMergeRewriter::new()))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        for (name, table) in &self.tables {
+            ctx.register_table(name.as_str(), Arc::clone(table) as Arc<dyn TableProvider>)
+                .map_err(|e| format!("register {name}: {e}"))?;
+        }
+        let df = ctx.sql(sql).await.map_err(|e| format!("sql: {e}"))?;
+        df.collect().await.map_err(|e| format!("collect: {e}"))
+    }
+}
+
+/// Write a RecordBatch to parquet.
+pub fn write_parquet(batch: &RecordBatch, path: &Path) {
+    use datafusion::parquet::arrow::ArrowWriter;
+    use datafusion::parquet::file::properties::WriterProperties;
+
+    let file = std::fs::File::create(path).expect("create parquet");
+    let props = WriterProperties::builder().build();
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).expect("writer");
+    writer.write(batch).expect("write");
+    writer.close().expect("close");
+}
+
+/// Canonical micro-bench fact schema (id, name, value).
+#[must_use]
+pub fn micro_fact_schema() -> Arc<Schema> {
+    use arrow::datatypes::{DataType, Field};
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+    ]))
+}
+
+/// Canonical micro-bench dim schema (id, region).
+#[must_use]
+pub fn micro_dim_schema() -> Arc<Schema> {
+    use arrow::datatypes::{DataType, Field};
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("region", DataType::Utf8, false),
+    ]))
+}
+
+#[must_use]
+pub fn make_fact_batch(rows: usize, groups: usize) -> RecordBatch {
+    use arrow::array::{Int64Array, StringArray};
+    let schema = micro_fact_schema();
+    let group_count = groups.max(1);
+    let ids: Vec<i64> = (0..rows as i64).collect();
+    let names: Vec<String> = (0..rows)
+        .map(|i| format!("group_{}", i % group_count))
+        .collect();
+    let values: Vec<i64> = ids.iter().map(|id| id * 100).collect();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(names)),
+            Arc::new(Int64Array::from(values)),
+        ],
+    )
+    .expect("fact batch")
+}
+
+#[must_use]
+pub fn make_dim_batch(rows: usize) -> RecordBatch {
+    use arrow::array::{Int64Array, StringArray};
+    const REGIONS: [&str; 4] = ["NA", "EU", "APAC", "LATAM"];
+    let schema = micro_dim_schema();
+    let ids: Vec<i64> = (0..rows as i64).collect();
+    let regions: Vec<&str> = (0..rows).map(|i| REGIONS[i % REGIONS.len()]).collect();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(regions)),
+        ],
+    )
+    .expect("dim batch")
+}
+
+/// Compare Cayenne vs reference batches for one query.
+pub fn compare_results(
+    query: &Query,
+    cayenne: &[RecordBatch],
+    reference: &[RecordBatch],
+) -> ParityOutcome {
+    let order = row_order_from_sql(&query.sql);
+    match compare_query_result_batches(&query.name, cayenne, reference, order) {
+        Ok(QueryValidationResult::Pass) => ParityOutcome::Pass,
+        Ok(QueryValidationResult::Fail(reason)) => ParityOutcome::Fail {
+            detail: format!("{reason:?}"),
+        },
+        Err(e) => ParityOutcome::Fail {
+            detail: format!("compare error: {e}"),
+        },
+    }
+}
+
+/// All suite queries that form the parity inventory (no exclusions applied).
+pub fn suite_queries() -> Vec<(String, Query)> {
+    let mut out = Vec::new();
+    for q in get_tpch_test_queries(None) {
+        out.push(("tpch".to_string(), q));
+    }
+    for q in get_tpcds_test_queries(None, Some(1.0)) {
+        out.push(("tpcds".to_string(), q));
+    }
+    for q in get_clickbench_test_queries(None) {
+        out.push(("clickbench".to_string(), q));
+    }
+    for q in micro_bench_queries() {
+        out.push(("micro".to_string(), q));
+    }
+    out
+}
+
+/// Detect whether SQL contains an explicit ORDER BY (for reporting).
+#[must_use]
+pub fn sql_has_order_by(sql: &str) -> bool {
+    row_order_from_sql(sql) == RowOrder::Preserved
+}

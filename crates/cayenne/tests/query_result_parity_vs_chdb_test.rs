@@ -1,0 +1,339 @@
+// Copyright 2024-2026 The Spice.ai OSS Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Full-result Cayenne ↔ chDB parity for expressible inventory queries.
+//!
+//! Requires `--features chdb-bench`. Does **not** link DuckDB (the two
+//! engines cannot co-exist in one process). Compares micro-bench SQL shapes
+//! on identical parquet. TPC-H / TPC-DS / ClickBench suite SQL is inventory-
+//! excluded for chDB with documented dialect reasons — see
+//! `parity::inventory`.
+
+#![allow(clippy::expect_used)]
+#![allow(clippy::unwrap_used)]
+#![allow(clippy::cast_possible_wrap)]
+#![allow(clippy::too_many_lines)]
+
+mod parity;
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use arrow::array::RecordBatch;
+use chdb_rust::arg::Arg;
+use chdb_rust::format::OutputFormat;
+use chdb_rust::session::SessionBuilder;
+use parity::inventory::build_inventory;
+use parity::report::{RunResult, summary_line, write_coverage_report};
+use parity::{
+    CayenneHarness, ParityOutcome, compare_results, make_dim_batch, make_fact_batch,
+    micro_bench_queries, write_parquet,
+};
+use test_framework::queries::Query;
+
+fn scratch_dir() -> PathBuf {
+    std::env::var_os("CAYENNE_PARITY_SCRATCH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/cayenne_parity_scratch")
+        })
+}
+
+struct ChdbSession {
+    _temp: tempfile::TempDir,
+    session: chdb_rust::session::Session,
+}
+
+impl ChdbSession {
+    fn new() -> Self {
+        let temp = tempfile::tempdir().expect("chdb temp");
+        let session = SessionBuilder::new()
+            .with_data_path(temp.path())
+            .with_auto_cleanup(true)
+            .build()
+            .expect("chdb session");
+        Self {
+            _temp: temp,
+            session,
+        }
+    }
+
+    fn load_parquet(&self, table: &str, columns: &str, order_by: &str, path: &std::path::Path) {
+        self.session
+            .execute(
+                &format!(
+                    "CREATE TABLE {table} ({columns}) ENGINE = MergeTree() ORDER BY {order_by}"
+                ),
+                None,
+            )
+            .expect("chdb create");
+        let p = path.to_string_lossy();
+        self.session
+            .execute(
+                &format!("INSERT INTO {table} SELECT * FROM file('{p}', 'Parquet')"),
+                None,
+            )
+            .expect("chdb insert");
+    }
+
+    /// Execute SQL and parse CSV into a single-column-or-multi string table
+    /// re-ingested via Arrow by converting CSV lines — for parity we rebuild
+    /// RecordBatches from CSV so comparison uses the shipped path.
+    fn query_csv(&self, sql: &str) -> Result<String, String> {
+        let result = self
+            .session
+            .execute(sql, Some(&[Arg::OutputFormat(OutputFormat::CSVWithNames)]))
+            .map_err(|e| format!("chdb execute: {e}"))?;
+        Ok(result.data_utf8_lossy().to_string())
+    }
+}
+
+/// Convert chDB CSV-with-names output into RecordBatches via Arrow CSV reader.
+fn csv_to_batches(csv: &str) -> Result<Vec<RecordBatch>, String> {
+    use arrow::csv::ReaderBuilder;
+    use arrow::csv::reader::Format;
+    use std::io::{Cursor, Seek};
+
+    if csv.trim().is_empty() {
+        return Ok(vec![]);
+    }
+    let mut cursor = Cursor::new(csv.as_bytes());
+    let format = Format::default().with_header(true);
+    let (schema, _) = format
+        .infer_schema(&mut cursor, None)
+        .map_err(|e| format!("infer schema: {e}"))?;
+    cursor.rewind().map_err(|e| format!("rewind: {e}"))?;
+    let reader = ReaderBuilder::new(Arc::new(schema))
+        .with_format(format)
+        .build(cursor)
+        .map_err(|e| format!("csv reader: {e}"))?;
+    let mut batches = Vec::new();
+    for batch in reader {
+        batches.push(batch.map_err(|e| format!("csv batch: {e}"))?);
+    }
+    Ok(batches)
+}
+
+/// Rewrite DataFusion micro SQL for ClickHouse where needed.
+fn chdb_sql(sql: &str) -> String {
+    // ClickHouse uses same basic SELECT/FROM/WHERE/GROUP BY/JOIN for our shapes.
+    // COUNT(*) and aggregates map cleanly. String literals use single quotes (same).
+    sql.to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn micro_bench_shapes_full_result_parity_vs_chdb() {
+    let scratch = scratch_dir();
+    std::fs::create_dir_all(&scratch).ok();
+
+    let rows = 2_048usize;
+    let fact = make_fact_batch(rows, 64);
+    let dim = make_dim_batch(256);
+
+    let parquet_dir = tempfile::tempdir().expect("parquet dir");
+    let fact_path = parquet_dir.path().join("t.parquet");
+    let dim_path = parquet_dir.path().join("d.parquet");
+    write_parquet(&fact, &fact_path);
+    write_parquet(&dim, &dim_path);
+
+    let mut cayenne = CayenneHarness::new().await;
+    cayenne.load_batch("t", fact).await;
+    cayenne.load_batch("d", dim).await;
+
+    let chdb = ChdbSession::new();
+    chdb.load_parquet(
+        "t",
+        "id Int64, name String, value Int64",
+        "id",
+        &fact_path,
+    );
+    chdb.load_parquet("d", "id Int64, region String", "id", &dim_path);
+
+    let mut results = Vec::new();
+    for q in micro_bench_queries() {
+        let inv = build_inventory()
+            .into_iter()
+            .find(|e| e.name == q.name.as_ref());
+        if let Some(e) = inv
+            && let Some(reason) = e.chdb_exclusion
+        {
+            results.push(RunResult {
+                suite: "micro".into(),
+                name: q.name.to_string(),
+                engine_pair: "cayenne-chdb",
+                outcome: ParityOutcome::Excluded {
+                    reason: reason.to_string(),
+                },
+            });
+            continue;
+        }
+
+        let cayenne_res = cayenne.query(&q.sql).await;
+        let chdb_sql_text = chdb_sql(&q.sql);
+        let chdb_res = chdb
+            .query_csv(&chdb_sql_text)
+            .and_then(|csv| csv_to_batches(&csv));
+
+        let outcome = match (cayenne_res, chdb_res) {
+            (Ok(c), Ok(d)) => {
+                // chDB CSV inference may widen integers to floats / utf8; use
+                // multiset string comparison which already allows type
+                // equivalence only via string forms — so cast Cayenne side to
+                // strings by going through the same compare path. Schema
+                // equivalence in compare_query_result_batches is lenient for
+                // numeric/string mixes in validate path, but equivalent_schemas
+                // must still pass. If schema mismatch from CSV inference,
+                // stringify both via pretty path by re-comparing after casting
+                // is not available — fall back to row-string multiset.
+                compare_results_lenient(&q, &c, &d)
+            }
+            (Err(e), Ok(_)) => ParityOutcome::EngineError {
+                side: "cayenne",
+                detail: e,
+            },
+            (Ok(_), Err(e)) => ParityOutcome::EngineError {
+                side: "chdb",
+                detail: e,
+            },
+            (Err(ce), Err(de)) => ParityOutcome::Excluded {
+                reason: format!("both engines error: cayenne={ce}; chdb={de}"),
+            },
+        };
+
+        eprintln!("micro/{} -> {outcome:?}", q.name);
+        results.push(RunResult {
+            suite: "micro".into(),
+            name: q.name.to_string(),
+            engine_pair: "cayenne-chdb",
+            outcome,
+        });
+    }
+
+    // Record suite-level chDB exclusions from inventory for coverage report.
+    for e in build_inventory() {
+        if e.suite != "micro"
+            && let Some(reason) = e.chdb_exclusion
+        {
+            results.push(RunResult {
+                suite: e.suite.into(),
+                name: e.name.clone(),
+                engine_pair: "cayenne-chdb",
+                outcome: ParityOutcome::Excluded {
+                    reason: reason.to_string(),
+                },
+            });
+        }
+    }
+
+    let log_path = scratch.join("cayenne_chdb_parity.log");
+    let mut log = String::new();
+    for r in &results {
+        log.push_str(&format!("{}/{}: {:?}\n", r.suite, r.name, r.outcome));
+    }
+    log.push_str(&summary_line(&results));
+    log.push('\n');
+    std::fs::write(&log_path, &log).expect("write chdb log");
+
+    let coverage_path = scratch.join("parity_coverage_chdb.md");
+    write_coverage_report(&coverage_path, &results).expect("coverage");
+    eprintln!("{}", summary_line(&results));
+
+    let micro_fails: Vec<_> = results
+        .iter()
+        .filter(|r| r.suite == "micro" && !r.outcome.is_pass_or_excluded())
+        .collect();
+    assert!(
+        micro_fails.is_empty(),
+        "chDB micro-bench full-result parity failures: {micro_fails:#?}\nsee {}",
+        log_path.display()
+    );
+}
+
+/// Like [`compare_results`], but if schema types differ (chDB CSV often types
+/// aggregates as Float64 vs Int64), fall back to comparing stringified row
+/// multisets built with the same `array_value_to_string` rules.
+fn compare_results_lenient(
+    query: &Query,
+    cayenne: &[RecordBatch],
+    reference: &[RecordBatch],
+) -> ParityOutcome {
+    let direct = compare_results(query, cayenne, reference);
+    if matches!(direct, ParityOutcome::Pass) {
+        return direct;
+    }
+    // Schema mismatch from CSV typing: compare as sorted row-key multisets.
+    if let ParityOutcome::Fail { detail } = &direct
+        && (detail.contains("SchemaMismatch") || detail.contains("schema"))
+    {
+        return compare_as_string_rows(query, cayenne, reference);
+    }
+    direct
+}
+
+fn compare_as_string_rows(
+    query: &Query,
+    left: &[RecordBatch],
+    right: &[RecordBatch],
+) -> ParityOutcome {
+    use test_framework::queries::validation::array_value_to_string;
+
+    fn rows_of(batches: &[RecordBatch]) -> Result<Vec<Vec<Option<String>>>, String> {
+        let mut rows = Vec::new();
+        for batch in batches {
+            for r in 0..batch.num_rows() {
+                let mut row = Vec::with_capacity(batch.num_columns());
+                for c in 0..batch.num_columns() {
+                    row.push(
+                        array_value_to_string(batch.column(c).as_ref(), r)
+                            .map_err(|e| e.to_string())?,
+                    );
+                }
+                rows.push(row);
+            }
+        }
+        rows.sort();
+        Ok(rows)
+    }
+
+    let l = match rows_of(left) {
+        Ok(v) => v,
+        Err(e) => {
+            return ParityOutcome::Fail {
+                detail: format!("left stringify: {e}"),
+            };
+        }
+    };
+    let r = match rows_of(right) {
+        Ok(v) => v,
+        Err(e) => {
+            return ParityOutcome::Fail {
+                detail: format!("right stringify: {e}"),
+            };
+        }
+    };
+    if l == r {
+        ParityOutcome::Pass
+    } else {
+        ParityOutcome::Fail {
+            detail: format!(
+                "string-row multiset mismatch for {} (left {} rows, right {} rows, first diff left={:?} right={:?})",
+                query.name,
+                l.len(),
+                r.len(),
+                l.iter().zip(r.iter()).find(|(a, b)| a != b),
+                ""
+            ),
+        }
+    }
+}

@@ -476,5 +476,18 @@ name = "hll_ndv_hashing"
 harness = false
 name = "pk_keyset_present_path"
 
+# Full-result Cayenne↔DuckDB parity (TPC-H / TPC-DS / ClickBench / micro shapes).
+[[test]]
+name = "query_result_parity_vs_duckdb_test"
+path = "tests/query_result_parity_vs_duckdb_test.rs"
+required-features = ["duckdb-bench"]
+
+# Full-result Cayenne↔chDB parity (micro shapes + inventory exclusions).
+# Intentionally does NOT enable duckdb-bench — the engines cannot co-link.
+[[test]]
+name = "query_result_parity_vs_chdb_test"
+path = "tests/query_result_parity_vs_chdb_test.rs"
+required-features = ["chdb-bench"]
+
 [lints]
 workspace = true
