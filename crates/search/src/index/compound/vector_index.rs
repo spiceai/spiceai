@@ -76,6 +76,11 @@ impl CompoundVectorIndex {
             read_mode,
         }
     }
+
+    #[must_use]
+    pub fn read_mode(&self) -> CompoundReadMode {
+        self.read_mode
+    }
 }
 
 impl VectorIndex for CompoundVectorIndex {
@@ -148,6 +153,12 @@ impl Index for CompoundVectorIndex {
             self.secondary.on_write_complete()
         );
         primary_result.and(secondary_result)
+    }
+
+    fn write_complete_failure_is_fatal(&self) -> bool {
+        // Either half failing to finalize leaves this compound index stale.
+        self.primary.write_complete_failure_is_fatal()
+            || self.secondary.write_complete_failure_is_fatal()
     }
 
     fn as_any(&self) -> &dyn Any {
