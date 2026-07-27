@@ -53,6 +53,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+mod connection;
 mod replication;
 
 #[derive(Debug, Snafu)]
@@ -97,9 +98,12 @@ const POSTGRES_DOCS: &str = "https://spiceai.org/docs/components/data-connectors
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("connection_string")
         .description(
-            "Full libpq-style connection string. Overrides other connection params if set.",
+            "Full libpq-style connection string (key=value or postgres:// URI). Overrides other connection params if set.",
         )
-        .examples(&["host=db.example.com port=5432 dbname=app user=ro sslmode=require"])
+        .examples(&[
+            "host=db.example.com port=5432 dbname=app user=ro sslmode=require",
+            "postgresql://ro@db.example.com:5432/app?sslmode=require",
+        ])
         .help_link(POSTGRES_DOCS)
         .secret(),
     ParameterSpec::component("user")
@@ -157,6 +161,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     // --- Logical replication (WAL streaming) ---
     ParameterSpec::component("replication_slot").description(
         "Name of the Postgres replication slot to create/reuse for this dataset. \
+         Must match [a-z0-9_]{1,63} (lowercase letters, digits, underscores only) and \
+         must not be the reserved name `pg_conflict_detection`. \
          Defaults to `spice_<dataset>_<dataset-hash>_<instance-hash>`. Datasets on the \
          same connection that name the same slot SHARE it: one replication connection, \
          one publication, with decoded changes routed per table. Each Spice replica \
@@ -170,10 +176,14 @@ const PARAMETERS: &[ParameterSpec] = &[
     ),
     ParameterSpec::component("replication_initial_snapshot")
         .description(
-            "Whether to take an initial snapshot of the table's existing rows on first \
-             connection, before streaming WAL changes. Default: true.",
+            "When `refresh_mode: changes` first loads the table's existing rows: 'auto' \
+             (default) snapshots a freshly-created replication slot and resumes an existing one \
+             without a snapshot (a non-persistent accelerator still re-snapshots on every start); \
+             'disabled' streams WAL changes only; 'always' snapshots on every start, including \
+             slot resume. The legacy booleans 'true'/'false' map to 'auto'/'disabled'. \
+             Default: auto.",
         )
-        .default("true"),
+        .default("auto"),
     ParameterSpec::component("replication_temporary_slot")
         .description(
             "If true, create a temporary replication slot that is dropped when the \
@@ -186,6 +196,14 @@ const PARAMETERS: &[ParameterSpec] = &[
              Default: 10s.",
         )
         .default("10s"),
+    ParameterSpec::component("replication_ready_lag")
+        .description(
+            "For `refresh_mode: changes`, the dataset is marked Ready once its \
+             replication lag (now minus the newest applied commit's source time) \
+             falls below this. It stays not-ready while snapshotting or draining a \
+             backlog on resume, so it never serves stale data. Default: 2s.",
+        )
+        .default("2s"),
     ParameterSpec::component("replication_bootstrap_batch_size")
         .description(
             "Rows per emitted batch during the initial replication snapshot. \
@@ -621,15 +639,20 @@ async fn postgres_inferred_schema_metadata(
     // are resolved against the row estimate.
     let mut row_count: Option<u64> = None;
     let mut table_bytes: Option<u64> = None;
-    if let Ok(size_rows) = conn.conn.query(TABLE_SIZE_SQL, &[&table_path]).await
-        && let Some(row) = size_rows.first()
-    {
-        row_count = row
-            .get::<_, Option<i64>>("row_estimate")
-            .and_then(|rows| u64::try_from(rows).ok());
-        table_bytes = row
-            .get::<_, Option<i64>>("table_bytes")
-            .and_then(|bytes| u64::try_from(bytes).ok());
+    match conn.conn.query(TABLE_SIZE_SQL, &[&table_path]).await {
+        Ok(size_rows) => {
+            if let Some(row) = size_rows.first() {
+                row_count = row
+                    .get::<_, Option<i64>>("row_estimate")
+                    .and_then(|rows| u64::try_from(rows).ok());
+                table_bytes = row
+                    .get::<_, Option<i64>>("table_bytes")
+                    .and_then(|bytes| u64::try_from(bytes).ok());
+            }
+        }
+        Err(error) => {
+            tracing::debug!(%error, "Failed to query PostgreSQL table sizing; continuing without it");
+        }
     }
 
     // Per-column statistics (best-effort; empty when the table was never
@@ -840,8 +863,11 @@ fn natural_order_sort_candidate(
 }
 
 /// Enrich the provider's schema with `PostgreSQL` metadata: column/table comments
-/// and source types (always), plus inferred primary key / indexes / sort columns
-/// when the dataset opts into `schema_inference: extended`.
+/// and source types, plus inferred primary key / indexes / sort columns. Schema
+/// inference is always attempted. If the base `pg_catalog` query is blocked it
+/// degrades to base column/type inference with an **info** log (see below); the
+/// best-effort sub-queries (partition key, sizing, per-column stats) fail
+/// independently at debug level, so a partial gap may surface no info log.
 async fn enrich_with_postgres_metadata(
     pool: &Arc<PostgresConnectionPool>,
     dataset: &Dataset,
@@ -861,31 +887,36 @@ async fn enrich_with_postgres_metadata(
             }
         };
 
-    if dataset.schema_inference.is_extended() {
-        match postgres_inferred_schema_metadata(pool, dataset.path()).await {
-            Ok(inferred) => {
-                if !inferred.is_empty() {
-                    tracing::debug!(
-                        dataset = %dataset.name,
-                        source = %dataset.path(),
-                        primary_key = ?inferred.primary_key,
-                        indexes = inferred.indexes.len(),
-                        sort_columns = inferred.sort_columns.len(),
-                        row_count = ?inferred.row_count,
-                        table_bytes = ?inferred.table_bytes,
-                        "Inferred extended schema metadata from PostgreSQL catalog"
-                    );
-                }
-                table_metadata.extend(inferred.to_metadata());
-            }
-            Err(error) => {
-                tracing::warn!(
+    // Always attempt maximum schema inference; degrade gracefully when the source
+    // blocks the catalog queries (commonly the connection role lacks read access to
+    // pg_catalog), falling back to base column/type inference only.
+    match postgres_inferred_schema_metadata(pool, dataset.path()).await {
+        Ok(inferred) => {
+            if !inferred.is_empty() {
+                tracing::debug!(
                     dataset = %dataset.name,
                     source = %dataset.path(),
-                    error = %error,
-                    "Failed to infer extended schema from PostgreSQL catalog; registering without inferred metadata"
+                    primary_key = ?inferred.primary_key,
+                    indexes = inferred.indexes.len(),
+                    sort_columns = inferred.sort_columns.len(),
+                    row_count = ?inferred.row_count,
+                    table_bytes = ?inferred.table_bytes,
+                    "Inferred schema metadata from PostgreSQL catalog"
                 );
             }
+            table_metadata.extend(inferred.to_metadata());
+        }
+        Err(error) => {
+            // Graceful degradation, not a failure: the source blocked the catalog
+            // inference queries (commonly the connection role lacks pg_catalog read
+            // access). Fall back to base column/type inference — primary key,
+            // indexes, and sort are simply not inferred — and log at info.
+            tracing::info!(
+                dataset = %dataset.name,
+                source = %dataset.path(),
+                error = %error,
+                "Schema inference degraded to base column/type inference (postgres): could not read the PostgreSQL catalog, usually because the connection role lacks read access. Primary key, indexes, sort order, table sizing, and column statistics were not inferred; grant catalog read access for full inference."
+            );
         }
     }
 
@@ -1039,9 +1070,6 @@ impl DataConnector for Postgres {
         &self,
         federated_table: Arc<runtime::federated_table::FederatedTable>,
         dataset: &Dataset,
-        _accelerated_table_provider: Arc<dyn TableProvider>,
-        _accelerator_write_mutex: Arc<tokio::sync::Mutex<()>>,
-        _cpu_runtime: Option<tokio::runtime::Handle>,
     ) -> Option<data_components::cdc::ChangesStream> {
         Some(replication::build_changes_stream(
             &self.params,
@@ -1650,3 +1678,13 @@ mod inferred_schema_tests {
         assert_eq!(unknown.normalize(Some(10_000)).distinct_count, None);
     }
 }
+
+// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// should see this connector must force-link the crate (`use connector_postgres as _;`) -- a plain
+// Cargo dependency won't link the slice static. See `register_data_connector!` docs.
+runtime::register_data_connector!(
+    register_postgres_connector,
+    POSTGRES_CONNECTOR_REGISTRATION,
+    CONNECTOR_NAME,
+    PostgresFactory
+);

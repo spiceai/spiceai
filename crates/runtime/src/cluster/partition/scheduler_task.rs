@@ -33,6 +33,7 @@ use crate::datafusion::DataFusion;
 use crate::status::{ComponentStatus, RuntimeStatus};
 
 pub use runtime_cluster::scheduler_task_config::{ConfigError, PartitionAssignmentConfig};
+use runtime_cluster::service::ReconcileOutcome;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -197,16 +198,24 @@ impl PartitionAssignmentTask {
             return Ok(());
         }
 
-        service
+        let outcome = service
             .reconcile_all(self.df.as_ref())
             .await
             .map_err(|e| Error::AssignmentCycle { source: e })?;
 
-        // The first completed cycle has fairly distributed partitions across the
-        // executors connected during the startup window. Opening this gate lets
-        // `allocate_initial_partitions` return each executor its assigned share,
-        // so their initial snapshot loads the right partitions.
-        service.mark_first_assignment_complete();
+        // Only open the gate once a cycle has run its assignment pass with the
+        // executors connected during the startup window. `reconcile_all` returns
+        // `NoAssignment` when no executors were connected (or there were no
+        // partitioned tables), i.e. before the scheduler could distribute to any
+        // executor; opening the gate then would let a later-connecting executor
+        // proceed with an empty initial share — the exact failure the gate
+        // prevents. A subsequent cycle that runs the assignment pass will open it.
+        //
+        // Opening lets `allocate_initial_partitions` return each executor its
+        // assigned share so its initial snapshot loads the right partitions.
+        if outcome == ReconcileOutcome::Assigned {
+            service.mark_first_assignment_complete();
+        }
         Ok(())
     }
 

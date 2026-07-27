@@ -14,16 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::parameters::ParameterSpec;
+use runtime_parameters::TypedParams;
+use secrecy::SecretString;
 
-const GOOGLE_PARAM_LEN: usize = 2;
-
-pub const PARAMETERS: &[ParameterSpec] = &GOOGLE_PARAMETERS;
-
-pub(crate) const GOOGLE_PARAMETERS: [ParameterSpec; GOOGLE_PARAM_LEN] = [
-    ParameterSpec::component("api_key")
-        .secret()
-        .description("The Google API key."),
-    ParameterSpec::component("dimensions")
-        .description("The number of dimensions for the embedding output."),
-];
+/// Parameters for `from: google` embedding models.
+#[derive(TypedParams)]
+#[params(prefix = "google")]
+pub struct GoogleEmbeddingParams {
+    /// The Google API key.
+    #[param(autoload_secret)]
+    pub api_key: SecretString,
+    /// The number of dimensions for the embedding output.
+    #[param(runtime)]
+    pub dimensions: Option<u32>,
+}

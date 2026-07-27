@@ -21,13 +21,11 @@ use super::{
     GitHubQueryMode, GitHubTableArgs, GitHubTableGraphQLParams, filter_pushdown, inject_parameters,
     search_inject_parameters,
 };
+use crate::github::error_checker;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use data_components::{
-    github::error_checker,
-    graphql::{
-        ErrorChecker, FilterPushdownResult, GraphQLContext, Result,
-        client::{DuplicateBehavior, GraphQLQuery, UnnestBehavior, unnest_json_object_to_depth},
-    },
+use connector_graphql::graphql::{
+    ErrorChecker, FilterPushdownResult, GraphQLContext, Result,
+    client::{DuplicateBehavior, GraphQLQuery, UnnestBehavior, unnest_json_object_to_depth},
 };
 use datafusion::{logical_expr::TableProviderFilterPushDown, prelude::Expr};
 use serde_json::Value;
@@ -346,7 +344,7 @@ impl GitHubTableArgs for PullRequestTableArgs {
                     r#"
             {{
                 repository(owner: "{owner}", name: "{name}") {{
-                    pullRequests(first: {page_size}) {{
+                    pullRequests(first: {page_size}, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{
                         pageInfo {{
                             hasNextPage
                             endCursor
@@ -385,7 +383,7 @@ fn flatten_author_field(comment: &mut Value) {
 
 fn custom_unnestter(object: &Value) -> Result<Vec<Value>> {
     // Unnest normally, then handle the `thread_comments` and `discussion` fields
-    unnest_json_object_to_depth(object, 1, &DuplicateBehavior::Error).map(|mut values| {
+    unnest_json_object_to_depth(object.clone(), 1, &DuplicateBehavior::Error).map(|mut values| {
         for value in &mut values {
             if let Value::Object(obj) = value {
                 if let Some(thread_comments) = obj.remove("thread_comments") {
@@ -554,7 +552,7 @@ fn gql_schema(comments_type: &PullRequestCommentType) -> SchemaRef {
 #[cfg(test)]
 mod tests {
     use super::{PullRequestCommentType, PullRequestTableArgs};
-    use crate::GitHubQueryMode;
+    use crate::{GitHubQueryMode, GitHubTableArgs};
     use app::AppBuilder;
     use runtime::builder::RuntimeBuilder;
     use runtime::component::dataset::builder::DatasetBuilder;
@@ -565,7 +563,11 @@ mod tests {
     /// construction. Cache a single shared instance so the unit tests don't
     /// spin up a tokio runtime per invocation.
     fn shared_component() -> ConnectorComponent {
-        static COMPONENT: OnceLock<ConnectorComponent> = OnceLock::new();
+        // The tokio runtime is cached alongside the component and never dropped:
+        // `RuntimeBuilder::build` defaults `io_runtime` to `Handle::current()`, so
+        // dropping the runtime that built it would leave the constructed `Runtime`
+        // holding handles to a dead tokio runtime.
+        static COMPONENT: OnceLock<(tokio::runtime::Runtime, ConnectorComponent)> = OnceLock::new();
         COMPONENT
             .get_or_init(|| {
                 let app = AppBuilder::new("test").build();
@@ -577,8 +579,9 @@ mod tests {
                     .with_runtime(Arc::new(spice_runtime))
                     .build()
                     .expect("to create dataset");
-                ConnectorComponent::from(&dataset)
+                (runtime, ConnectorComponent::from(&dataset))
             })
+            .1
             .clone()
     }
 
@@ -637,5 +640,18 @@ mod tests {
         let mut a = args(PullRequestCommentType::All, 1_000);
         a.max_comments_fetched = 2_000;
         assert!(a.check_node_limit().is_err());
+    }
+
+    #[test]
+    fn auto_mode_query_orders_by_updated_at_desc() {
+        // Deterministic UPDATED_AT-descending order is the prerequisite for
+        // watermark-based early-exit pagination on append refreshes.
+        let a = args(PullRequestCommentType::None, 25);
+        let params = a.get_graphql_values();
+        let query = params.query.as_ref();
+        assert!(
+            query.contains("orderBy: {field: UPDATED_AT, direction: DESC}"),
+            "auto-mode pull_requests query must order by UPDATED_AT DESC, got:\n{query}"
+        );
     }
 }

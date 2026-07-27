@@ -18,7 +18,7 @@ use runtime::dataconnector::ConnectorComponent;
 
 use super::{GitHubTableArgs, GitHubTableGraphQLParams};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use data_components::graphql::{GraphQLContext, client::UnnestBehavior};
+use connector_graphql::graphql::{GraphQLContext, client::UnnestBehavior};
 use std::sync::Arc;
 
 // https://docs.github.com/en/graphql/reference/objects#repository

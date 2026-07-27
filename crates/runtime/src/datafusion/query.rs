@@ -56,6 +56,10 @@ pub(crate) use tracker::QueryTracker;
 pub mod builder;
 pub use builder::QueryBuilder;
 mod cache;
+pub mod transaction;
+pub use transaction::{
+    TransactionError, TransactionOutcome, run_transaction, schema_statement, transaction_statements,
+};
 pub mod error_code;
 mod handle;
 pub mod plan_capture;
@@ -220,6 +224,16 @@ impl Display for QueryMethod {
     }
 }
 
+/// Controls how a query interacts with the SQL results cache.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ResultsCacheMode {
+    /// Apply the request context's normal results-cache behavior.
+    #[default]
+    Default,
+    /// Skip both results-cache lookup and storage.
+    Bypass,
+}
+
 pub struct Query {
     df: Arc<crate::datafusion::DataFusion>,
     sql: QueryMethod,
@@ -238,6 +252,9 @@ pub struct Query {
     /// regardless of per-catalog writability. Set via [`QueryBuilder::read_only`];
     /// used by `/v1/tools/sql` and `/v1/nsql` to contain LLM-generated SQL.
     read_only: bool,
+    /// Controls results-cache lookup and storage. Set via
+    /// [`QueryBuilder::results_cache_mode`].
+    results_cache_mode: ResultsCacheMode,
 }
 
 macro_rules! handle_error {
@@ -652,6 +669,7 @@ impl Query {
         // Get the scheduler server
         let scheduler = Self::get_scheduler_server(&self.df)?;
         let tracker = self.tracker;
+        let results_cache_mode = self.results_cache_mode;
         let query_start = std::time::Instant::now();
         let sql_preview: Arc<str> = match &self.sql {
             QueryMethod::Text { sql, .. } => Arc::clone(sql),
@@ -717,17 +735,33 @@ impl Query {
                     // cache itself is namespaced per principal and refuses to
                     // store write-capable plans, so a read-only caller cannot
                     // observe a cached entry produced by a write-capable plan.
-                    match Query::get_plan_or_cached(
-                        &self.df,
-                        &session,
-                        Arc::clone(&request_context),
-                        sql.as_ref(),
-                        parameters,
-                        tracker,
-                        pre_parsed_plan,
-                    )
-                    .await?
-                    {
+                    let plan_or_cached = match results_cache_mode {
+                        ResultsCacheMode::Default => {
+                            Query::get_plan_or_cached(
+                                &self.df,
+                                &session,
+                                Arc::clone(&request_context),
+                                sql.as_ref(),
+                                parameters,
+                                tracker,
+                                pre_parsed_plan,
+                            )
+                            .await?
+                        }
+                        ResultsCacheMode::Bypass => {
+                            Query::get_plan_without_results_cache(
+                                &self.df,
+                                &session,
+                                &request_context,
+                                sql.as_ref(),
+                                parameters,
+                                tracker,
+                                pre_parsed_plan,
+                            )
+                            .await?
+                        }
+                    };
+                    match plan_or_cached {
                         cache::PlanOrCached::Cached(cached_result) => {
                             tracing::debug!(
                                 job_id,
@@ -773,6 +807,7 @@ impl Query {
                 // Resume drives the persisted graph, so skip the short-circuit
                 // entirely (returning a cached result would orphan the job).
                 if mode != DistributedSubmitMode::Resume
+                    && results_cache_mode == ResultsCacheMode::Default
                     && let Some(cache_provider) = self.df.results_cache_provider()
                     && let Ok(Some(cached_result)) =
                         cache_provider.get_raw_key(&plan_cache_key).await
@@ -788,7 +823,7 @@ impl Query {
                             "Returning cached result for distributed query (plan)"
                         );
                         let stream = ::cache::result::query::CachedStream::new(
-                            Arc::new(records),
+                            records,
                             cached_result.schema,
                         );
                         return Ok(QueryHandle::new_with_cached_result(
@@ -803,8 +838,10 @@ impl Query {
                     }
                 }
 
-                // Don't cache results for a recovered job.
-                let cache_key = (mode != DistributedSubmitMode::Resume).then_some(plan_cache_key);
+                // Don't cache results for a recovered job or a query that bypasses caching.
+                let cache_key = (mode != DistributedSubmitMode::Resume
+                    && results_cache_mode == ResultsCacheMode::Default)
+                    .then_some(plan_cache_key);
                 (*logical_plan, tracker, cache_key)
             }
         };
@@ -822,7 +859,7 @@ impl Query {
         }
 
         // Get the schema from the logical plan
-        let schema = Arc::new(plan.schema().as_arrow().clone());
+        let schema = Arc::clone(plan.schema().inner());
 
         let input_tables = get_logical_plan_input_tables(&plan);
         if input_tables
@@ -867,7 +904,7 @@ impl Query {
         // the Ballista job id so it can be addressed across schedulers.
         let ballista_job_id = if mode == DistributedSubmitMode::Resume {
             scheduler
-                .recover_job(job_id)
+                .recover_job(&ballista_core::JobId::from(job_id))
                 .await
                 .map_err(|e| Error::JobSubmissionFailed {
                     message: e.to_string(),
@@ -1032,6 +1069,7 @@ impl Query {
                 let mut session = self.get_session_state(&request_context);
 
                 let ctx = self;
+                let results_cache_mode = ctx.results_cache_mode;
                 let tracker = ctx.tracker;
 
                 // Sets the request context as an extension on DataFusion, to allow recovering it to track telemetry
@@ -1112,17 +1150,33 @@ impl Query {
                         table_allowlist: None,
                         pre_parsed_plan,
                     } => {
-                        match Self::get_plan_or_cached(
-                            &ctx.df,
-                            &session,
-                            Arc::clone(&request_context),
-                            sql.as_ref(),
-                            parameters,
-                            tracker,
-                            pre_parsed_plan,
-                        )
-                        .await?
-                        {
+                        let plan_or_cached = match results_cache_mode {
+                            ResultsCacheMode::Default => {
+                                Self::get_plan_or_cached(
+                                    &ctx.df,
+                                    &session,
+                                    Arc::clone(&request_context),
+                                    sql.as_ref(),
+                                    parameters,
+                                    tracker,
+                                    pre_parsed_plan,
+                                )
+                                .await?
+                            }
+                            ResultsCacheMode::Bypass => {
+                                Self::get_plan_without_results_cache(
+                                    &ctx.df,
+                                    &session,
+                                    &request_context,
+                                    sql.as_ref(),
+                                    parameters,
+                                    tracker,
+                                    pre_parsed_plan,
+                                )
+                                .await?
+                            }
+                        };
+                        match plan_or_cached {
                             PlanOrCached::Plan(plan, tracker, cache_manager) => {
                                 Self::ensure_not_cancelled(
                                     &query_cancel_token,
@@ -1152,8 +1206,12 @@ impl Query {
                         // plan-submitted result is never reused across principals.
                         let cache_namespace = request_context.cache_namespace();
                         let (ns_tag, ns_id) = cache_namespace.hash_inputs();
+                        let cache_status = match results_cache_mode {
+                            ResultsCacheMode::Default => CacheStatus::CacheMiss,
+                            ResultsCacheMode::Bypass => CacheStatus::CacheDisabled,
+                        };
                         let cache_manager = RequestCacheManager::new(
-                            CacheStatus::CacheMiss,
+                            cache_status,
                             CacheKey::LogicalPlan(&logical_plan).as_raw_key_in_namespace(
                                 Query::plan_hasher(&ctx.df),
                                 ns_tag,
@@ -1386,8 +1444,10 @@ impl Query {
                         }
                     };
 
-                    let mut execution_session = session.clone();
-                    if let Some(batch_size) =
+                    // Only clone SessionState when adaptive Flight batch sizing
+                    // rebuilds the physical plan; otherwise TaskContext can borrow
+                    // the existing session.
+                    let task_ctx = if let Some(batch_size) =
                         Self::adaptive_flight_batch_size(&session, &request_context, &physical_plan)
                     {
                         Self::ensure_not_cancelled(
@@ -1410,11 +1470,12 @@ impl Query {
                                 )
                             }
                         };
-                        execution_session = adaptive_session;
-                    }
+                        Arc::new(TaskContext::from(&adaptive_session))
+                    } else {
+                        Arc::new(TaskContext::from(&session))
+                    };
 
                     Self::ensure_not_cancelled(&query_cancel_token, &query_id_str, &timeout_state)?;
-                    let task_ctx = Arc::new(TaskContext::from(&execution_session));
 
                     let stream = match execute_stream_preserving_output_order(
                         Arc::clone(&physical_plan),
@@ -1566,6 +1627,7 @@ impl Query {
             query_id: uuid::Uuid::new_v4(),
             cancellation_token: None,
             read_only: false,
+            results_cache_mode: ResultsCacheMode::default(),
         }
     }
 
@@ -1767,8 +1829,9 @@ fn attach_query_tracker_to_stream(
             }
         }
 
-        runtime_metrics::telemetry::track_bytes_returned(num_output_bytes, &request_context.to_dimensions());
-        runtime_metrics::telemetry::track_rows_returned(num_records, &request_context.to_dimensions());
+        let dims = request_context.to_dimensions();
+        runtime_metrics::telemetry::track_bytes_returned(num_output_bytes, &dims);
+        runtime_metrics::telemetry::track_rows_returned(num_records, &dims);
 
         tracker
             .schema(schema_copy)
@@ -1984,9 +2047,10 @@ fn attach_physical_plan_metrics_to_stream(
         let mut totals = PhysicalPlanMetricsTotals::default();
         collect_physical_plan_metrics(physical_plan.as_ref(), &mut totals);
 
-        runtime_metrics::telemetry::track_produced_spills(totals.produced_spills, &request_context.to_dimensions());
-        runtime_metrics::telemetry::track_spilled_bytes(totals.spilled_bytes, &request_context.to_dimensions());
-        runtime_metrics::telemetry::track_spilled_rows(totals.spilled_rows, &request_context.to_dimensions());
+        let dims = request_context.to_dimensions();
+        runtime_metrics::telemetry::track_produced_spills(totals.produced_spills, &dims);
+        runtime_metrics::telemetry::track_spilled_bytes(totals.spilled_bytes, &dims);
+        runtime_metrics::telemetry::track_spilled_rows(totals.spilled_rows, &dims);
 
         if let Some(ctx) = plan_capture.as_ref() {
             let elapsed_ms = ctx.query_start.elapsed().as_secs_f64() * 1000.0;

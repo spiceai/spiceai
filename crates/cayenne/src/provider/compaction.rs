@@ -323,8 +323,11 @@ pub(crate) struct CompactionPickerConfig {
     /// Minimum number of files in a tier required to consider compaction.
     pub trigger_files: usize,
     /// Maximum number of file paths retained in the candidate for tracing and
-    /// selection. The current runner still rewrites the whole snapshot once a
-    /// candidate is found.
+    /// selection. When the candidate is a proper subset of the current snapshot
+    /// (key-delete, no protected snapshots, no sort columns),
+    /// `compact_current_snapshot_small_files` rewrites only those paths and
+    /// hard-links the rest; otherwise the runner falls back to a full-snapshot
+    /// rewrite.
     pub max_files_per_pick: usize,
     /// Tier thresholds derived from `target_vortex_file_size_mb`.
     pub tiers: CompactionTiers,
@@ -908,7 +911,7 @@ impl BackgroundColdTierPromoter {
                 tracing::trace!(
                     target: "cayenne::compaction",
                     table = runner.cold_tier_promotion_target_name(),
-                    "Periodic cold-tier promotion wake",
+                    "Datalake background tiering check: wake",
                 );
 
                 let Some(_pass) = try_track_compaction_pass() else {

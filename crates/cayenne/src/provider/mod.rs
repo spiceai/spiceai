@@ -96,13 +96,16 @@ pub(crate) mod on_conflict;
 pub(crate) mod overwrite;
 pub mod partitioned_wal;
 pub(crate) mod pk_index;
+pub(crate) mod predicate_stats;
 pub(crate) mod query_admission;
 pub(crate) mod retention;
 pub(crate) mod scan;
 pub(crate) mod sink;
+pub(crate) mod staged_upsert;
 pub(crate) mod staging_wal;
 pub(crate) mod streaming;
 pub(crate) mod table;
+pub(crate) mod transaction;
 pub(crate) mod tuning;
 pub(crate) mod utils;
 pub(crate) mod vortex_format;
@@ -118,16 +121,24 @@ pub use compaction::{
 pub use context::CayenneContext;
 pub use mem_tier::SlotAdvancer;
 pub use mem_tier_budget::{
-    global_mem_tier_total, global_mem_tier_used, set_global_mem_tier_bytes,
-    update_global_mem_tier_total,
+    clear_global_mem_tier_pool_account, global_mem_tier_pool_account_bytes, global_mem_tier_total,
+    global_mem_tier_used, release_bytes as release_global_mem_tier_bytes,
+    set_global_mem_tier_bytes, set_global_mem_tier_pool_account,
+    try_reserve_bytes as try_reserve_global_mem_tier_bytes, update_global_mem_tier_total,
 };
+pub use on_conflict::PreparedOnConflictDeletionPublish;
 pub use overwrite::PreparedOverwrite;
 pub use partitioned_wal::{PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry};
 pub use query_admission::set_query_admission_governor;
 pub use retention::TimeRetentionFilterBuilder;
 pub use scan::CayenneAccelerationExec;
-pub use staging_wal::{CayenneStagedAppend, PreparedStagedAppend};
-pub use table::{CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder};
+pub use staged_upsert::{CayenneStagedUpsert, PreparedTxnCommit, TransactionWriteToken};
+pub use staging_wal::{CayenneStagedAppend, PartitionedWalObjectStore, PreparedStagedAppend};
+pub use table::{
+    CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder, LastSmallFileCompactPath,
+    PreparedAppendSnapshotPublish,
+};
+pub use transaction::{CayenneTransaction, TransactionCommit, TxnTable};
 pub use tuning::{
     QueryObservations, deregister_query_observations, global_qph, record_global_query,
     record_query_latency, register_query_observations, set_cpu_burstable, set_global_memory_budget,
@@ -243,6 +254,14 @@ pub enum Error {
     /// Operation is not yet implemented.
     #[snafu(display("Unsupported operation: {operation}"))]
     Unsupported { operation: &'static str },
+
+    /// A transaction lost an optimistic-concurrency race: the
+    /// target table was committed to between this transaction's start and its
+    /// commit. Retryable at the newest committed state.
+    #[snafu(display(
+        "Transaction write conflict on table '{table}': the table changed since the transaction started; retry"
+    ))]
+    WriteConflict { table: String },
 
     /// Invalid number of children provided to an execution plan.
     #[snafu(display(

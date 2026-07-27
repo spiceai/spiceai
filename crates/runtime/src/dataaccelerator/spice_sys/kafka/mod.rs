@@ -70,6 +70,10 @@ impl KafkaSys {
         })
     }
 
+    #[cfg_attr(
+        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        expect(clippy::unused_async)
+    )]
     pub async fn get(&self) -> Result<Option<KafkaMetadata>> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
@@ -92,6 +96,10 @@ impl KafkaSys {
         }
     }
 
+    #[cfg_attr(
+        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        expect(clippy::unused_async)
+    )]
     pub async fn upsert(&self, metadata: &KafkaMetadata) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
@@ -114,6 +122,10 @@ impl KafkaSys {
         }
     }
 
+    #[cfg_attr(
+        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        expect(clippy::unused_async)
+    )]
     pub async fn upsert_offsets(&self, offsets: &[KafkaOffset]) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]

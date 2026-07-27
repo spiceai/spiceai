@@ -13,12 +13,16 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+#![allow(clippy::missing_errors_doc)]
 
-use async_trait::async_trait;
-use data_components::graphql::{
-    self, builder::GraphQLClientBuilder, client::GraphQLClient,
-    provider::GraphQLTableProviderBuilder,
+//! GraphQL data connector for Spice.ai runtime.
+
+pub mod graphql;
+
+use crate::graphql::{
+    builder::GraphQLClientBuilder, client::GraphQLClient, provider::GraphQLTableProviderBuilder,
 };
+use async_trait::async_trait;
 use data_components::rate_limit::RateLimiter;
 use datafusion::datasource::TableProvider;
 use runtime::component::dataset::Dataset;
@@ -523,3 +527,13 @@ mod tests {
         assert!(DataConnector::metrics_provider(&graphql).is_none());
     }
 }
+
+// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// should see this connector must force-link the crate (`use connector_graphql as _;`) -- a plain
+// Cargo dependency won't link the slice static. See `register_data_connector!` docs.
+runtime::register_data_connector!(
+    register_graphql_connector,
+    GRAPHQL_CONNECTOR_REGISTRATION,
+    CONNECTOR_NAME,
+    GraphQLFactory
+);

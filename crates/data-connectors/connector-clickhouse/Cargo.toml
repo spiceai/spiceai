@@ -23,12 +23,17 @@ license-file.workspace = true
 description = "ClickHouse data connector for Spice.ai runtime"
 
 [dependencies]
+arrow.workspace = true
+async-stream.workspace = true
 async-trait.workspace = true
+bigdecimal.workspace = true
+chrono.workspace = true
+chrono-tz = "0.8.6"
 clickhouse-rs.workspace = true
-data_components = { path = "../../data_components", features = ["clickhouse"] }
+data_components = { path = "../../data_components", features = ["federation"] }
 datafusion.workspace = true
 datafusion-table-providers.workspace = true
-db_connection_pool = { path = "../../db_connection_pool", features = ["clickhouse"] }
+futures.workspace = true
 linkme.workspace = true
 ns_lookup = { path = "../../ns_lookup" }
 paste.workspace = true
@@ -36,6 +41,7 @@ runtime = { path = "../../runtime" }
 secrecy.workspace = true
 snafu.workspace = true
 url.workspace = true
+uuid.workspace = true
 
 [features]
 default = []

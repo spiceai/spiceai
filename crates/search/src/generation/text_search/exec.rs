@@ -125,13 +125,16 @@ impl ExecutionPlan for FullTextSearchExec {
                         match item {
                             Err(e) => yield Err(e),
                             Ok(rb) => {
-                                let data_columns: Vec<_> = rb.schema().fields().iter().map(|f| f.name().clone()).collect();
-
                                 // Apply projection. Must return in the order it exists in
-                                // `self.schema()`, not in the record batch.
-                                let proj = schema.fields().iter().filter_map(|f| {
-                                    data_columns.iter().position(|data_col| data_col == f.name())
-                                }).collect::<Vec<_>>();
+                                // `self.schema()`, not in the record batch. Use
+                                // `Schema::index_of` instead of cloning all field names
+                                // and doing a linear search per projected column.
+                                let rb_schema = rb.schema();
+                                let proj: Vec<usize> = schema
+                                    .fields()
+                                    .iter()
+                                    .filter_map(|f| rb_schema.index_of(f.name()).ok())
+                                    .collect();
 
                                 yield rb.project(proj.as_slice()).map_err(DataFusionError::from)
                             }

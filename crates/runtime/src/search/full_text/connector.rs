@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
 use datafusion::datasource::TableProvider;
 use runtime_datafusion_index::IndexedTableProvider;
+use search::generation::text_search::index::FullTextDatabaseIndex;
 use std::any::Any;
 use std::sync::Arc;
 
@@ -32,7 +33,6 @@ use crate::search::full_text::table::add_full_text_search_to_table;
 use crate::search::util::find_concrete_table_provider;
 use futures::StreamExt;
 use runtime_metrics::component::MetricsProvider;
-use tokio::sync::Mutex;
 
 /// A [`DataConnector`] middleware that, for [`Dataset`]s needing full text search capabilies, creates a [`IndexedTableProvider`] using the underlying [`TableProvider`]s and a [`FullTextDatabaseIndex`]. If no full text search capabilities are needed it is not unnecessarily nested.
 #[derive(Debug)]
@@ -60,7 +60,19 @@ impl FullTextConnector {
         // This will process all `Index`s, including vector indexes if provided (i.e. from `EmbeddingConnector`).
         // This is required so that [`IndexedTableProvider`] can be unwrapped (i.e. [`IndexedTableProvider::get_underlying`])
         //  in both cases there is and isn't a `EmbeddingConnector` underneath.
-        let indexes = Indexes::new(indexed_table.get_all_indexes());
+        let all_indexes = indexed_table.get_all_indexes();
+
+        // A full-text index written by this change stream must not defer its commits
+        // to the sink write lifecycle: the two share one tantivy writer, so a window
+        // commit would publish a partial refresh and a window rollback would discard
+        // these change-stream documents.
+        for index in &all_indexes {
+            if let Some(full_text) = index.as_any().downcast_ref::<FullTextDatabaseIndex>() {
+                full_text.mark_cdc_attached();
+            }
+        }
+
+        let indexes = Indexes::new(all_indexes);
         let ft = Arc::new(FederatedTable::Immediate(indexed_table.get_underlying()));
 
         let stream = f(&self.inner_connector, ft)?;
@@ -83,18 +95,15 @@ impl DataConnector for FullTextConnector {
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        add_full_text_search_to_table(
-            self.inner_connector.read_provider(dataset).await?,
-            &dataset.columns,
-            &dataset.name,
-        )
-        .map(|idx| Arc::new(idx) as Arc<dyn TableProvider>)
-        .map_err(|e| DataConnectorError::InvalidConfiguration {
-            dataconnector: dataset.source().to_string(),
-            message: e.to_string(),
-            connector_component: dataset.into(),
-            source: e,
-        })
+        let inner = self.inner_connector.read_provider(dataset).await?;
+        add_full_text_search_to_table(&inner, &dataset.columns, &dataset.name)
+            .map(|idx| Arc::new(idx) as Arc<dyn TableProvider>)
+            .map_err(|e| DataConnectorError::InvalidConfiguration {
+                dataconnector: dataset.source().to_string(),
+                message: e.to_string(),
+                connector_component: dataset.into(),
+                source: e,
+            })
     }
 
     async fn read_write_provider(
@@ -103,7 +112,7 @@ impl DataConnector for FullTextConnector {
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         match self.inner_connector.read_write_provider(dataset).await {
             Some(Ok(inner)) => Some(
-                add_full_text_search_to_table(inner, &dataset.columns, &dataset.name)
+                add_full_text_search_to_table(&inner, &dataset.columns, &dataset.name)
                     .map(|idx| Arc::new(idx) as Arc<dyn TableProvider>)
                     .map_err(|e| DataConnectorError::InvalidConfiguration {
                         dataconnector: dataset.source().to_string(),
@@ -174,18 +183,9 @@ impl DataConnector for FullTextConnector {
         &self,
         federated_table: Arc<FederatedTable>,
         dataset: &Dataset,
-        accelerated_table_provider: Arc<dyn TableProvider>,
-        accelerator_write_mutex: Arc<Mutex<()>>,
-        cpu_runtime: Option<tokio::runtime::Handle>,
     ) -> Option<ChangesStream> {
         self.with_indexed_stream(federated_table, |inner, ft| {
-            inner.changes_stream(
-                ft,
-                dataset,
-                Arc::clone(&accelerated_table_provider),
-                Arc::clone(&accelerator_write_mutex),
-                cpu_runtime.clone(),
-            )
+            inner.changes_stream(ft, dataset)
         })
     }
 

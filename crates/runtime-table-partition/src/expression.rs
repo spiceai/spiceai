@@ -94,6 +94,18 @@ pub fn partition_by_expressions(
                 .simplify(expression)
                 .context(SimplifyingExpressionSnafu)?;
             PartitionCriteria.validate(&expression, df_schema)?;
+            ensure!(
+                !p.name.is_empty()
+                    && p.name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'),
+                InvalidExpressionSnafu {
+                    message: format!(
+                        "partition name '{}' must contain only ASCII letters, digits, and underscores",
+                        p.name
+                    )
+                }
+            );
             Ok(PartitionedBy {
                 name: p.name.clone(),
                 expression,
@@ -303,6 +315,51 @@ mod tests {
             Field::new("sales_volume", DataType::Int32, true),
         ]));
         DFSchema::try_from(schema).expect("schema created")
+    }
+
+    /// Regression: `partition_by_expressions` must reject partition *names* that
+    /// are not `[A-Za-z0-9_]` (they become path components / identifiers, so an
+    /// unsafe name like `../escape` is a path-traversal risk), and must reject
+    /// empty names, while accepting safe names.
+    #[tokio::test]
+    async fn test_partition_by_expressions_rejects_unsafe_name() -> Result<(), Error> {
+        let schema = create_test_schema();
+        let ctx = datafusion::prelude::SessionContext::new();
+
+        // Valid expression, but a path-unsafe partition name.
+        let unsafe_name = vec![spicepod::partitioning::PartitionedBy {
+            name: "../escape".to_string(),
+            expression: "region".to_string(),
+        }];
+        assert!(
+            matches!(
+                partition_by_expressions(&unsafe_name, &ctx, &schema),
+                Err(Error::InvalidExpression { .. })
+            ),
+            "path-unsafe partition name must be rejected"
+        );
+
+        // An empty name is also rejected.
+        let empty_name = vec![spicepod::partitioning::PartitionedBy {
+            name: String::new(),
+            expression: "region".to_string(),
+        }];
+        assert!(
+            matches!(
+                partition_by_expressions(&empty_name, &ctx, &schema),
+                Err(Error::InvalidExpression { .. })
+            ),
+            "empty partition name must be rejected"
+        );
+
+        // A safe alphanumeric/underscore name is accepted.
+        let safe_name = vec![spicepod::partitioning::PartitionedBy {
+            name: "region_bucket".to_string(),
+            expression: "region".to_string(),
+        }];
+        partition_by_expressions(&safe_name, &ctx, &schema)
+            .expect("safe partition name must be accepted");
+        Ok(())
     }
 
     #[tokio::test]

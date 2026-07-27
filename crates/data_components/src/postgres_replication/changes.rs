@@ -80,54 +80,6 @@ impl ChangeOp {
     }
 }
 
-/// Buffer collecting `DecodedChange`s within a single transaction.
-pub struct TransactionBuffer {
-    pub begin_lsn: u64,
-    pub changes: Vec<DecodedChange>,
-}
-
-impl TransactionBuffer {
-    #[must_use]
-    pub fn new(begin_lsn: u64) -> Self {
-        Self {
-            begin_lsn,
-            changes: Vec::new(),
-        }
-    }
-
-    pub fn push_insert(&mut self, _relation: &Relation, tuple: TupleData) {
-        self.changes.push(DecodedChange {
-            op: ChangeOp::Create,
-            row: tuple,
-        });
-    }
-
-    pub fn push_update(&mut self, relation: &Relation, old: Option<TupleData>, new: TupleData) {
-        push_update_change(&mut self.changes, relation, old, new);
-    }
-
-    pub fn push_delete(&mut self, _relation: &Relation, old: TupleData) {
-        self.changes.push(DecodedChange {
-            op: ChangeOp::Delete,
-            row: old,
-        });
-    }
-
-    /// Record a TRUNCATE for the relation. Row payload is empty — the
-    /// accelerator path applies it as an unconditional delete-all.
-    pub fn push_truncate(&mut self, _relation: &Relation) {
-        self.changes.push(DecodedChange {
-            op: ChangeOp::Truncate,
-            row: TupleData { columns: vec![] },
-        });
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.changes.is_empty()
-    }
-}
-
 /// Resolve `Value::Unchanged` (`TOAST`ed columns omitted from an UPDATE's new
 /// tuple) by substituting the value from the old tuple, when `REPLICA
 /// IDENTITY FULL` provides one — for an *unchanged* column, the old value IS
@@ -526,11 +478,17 @@ pub fn envelope_with_lsn(
     confirmed_flush: Arc<AtomicU64>,
     flush_to: u64,
     is_dataset_ready: bool,
+    dataset: String,
 ) -> ChangeEnvelope {
+    // Capture the batch's source-commit timestamp before it's moved into the
+    // envelope, so the committer can log end-to-end lag when it acks progress.
+    let source_commit_ts_ms = batch.source_commit_ts_ms();
     ChangeEnvelope::new(
         Box::new(LsnCommitter {
             confirmed_flush,
             flush_to,
+            dataset,
+            source_commit_ts_ms,
         }),
         batch,
         is_dataset_ready,
@@ -543,6 +501,11 @@ pub fn envelope_with_lsn(
 struct LsnCommitter {
     confirmed_flush: Arc<AtomicU64>,
     flush_to: u64,
+    /// Dataset name, for the committer-progress log line.
+    dataset: String,
+    /// Source-commit timestamp (ms since the Unix epoch) of the batch this
+    /// commit acks; `None` for snapshot-boundary batches.
+    source_commit_ts_ms: Option<i64>,
 }
 
 #[async_trait]
@@ -553,7 +516,7 @@ impl CommitChange for LsnCommitter {
         let mut current = self.confirmed_flush.load(Ordering::Relaxed);
         loop {
             if self.flush_to <= current {
-                return Ok(());
+                break;
             }
             match self.confirmed_flush.compare_exchange(
                 current,
@@ -561,10 +524,17 @@ impl CommitChange for LsnCommitter {
                 Ordering::Release,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return Ok(()),
+                Ok(_) => break,
                 Err(actual) => current = actual,
             }
         }
+        crate::cdc::log_committer_progress(
+            "postgres",
+            &self.dataset,
+            &format!("lsn={}", self.flush_to),
+            self.source_commit_ts_ms,
+        );
+        Ok(())
     }
 
     /// The Postgres logical replication slot retains WAL until `confirmed_flush`
@@ -1830,6 +1800,8 @@ mod tests {
         let committer = LsnCommitter {
             confirmed_flush: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             flush_to: 42,
+            dataset: "test".to_string(),
+            source_commit_ts_ms: None,
         };
         assert!(committer.supports_deferral());
     }
@@ -1982,6 +1954,8 @@ mod tests {
         let c1 = LsnCommitter {
             confirmed_flush: Arc::clone(&lsn),
             flush_to: 100,
+            dataset: "test".to_string(),
+            source_commit_ts_ms: None,
         };
         c1.commit().await.expect("commit");
         assert_eq!(lsn.load(std::sync::atomic::Ordering::Relaxed), 100);
@@ -1990,6 +1964,8 @@ mod tests {
         let c2 = LsnCommitter {
             confirmed_flush: Arc::clone(&lsn),
             flush_to: 50,
+            dataset: "test".to_string(),
+            source_commit_ts_ms: None,
         };
         c2.commit().await.expect("commit");
         assert_eq!(lsn.load(std::sync::atomic::Ordering::Relaxed), 100);

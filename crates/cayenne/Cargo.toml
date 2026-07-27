@@ -29,6 +29,10 @@ datafusion-common = { workspace = true }
 datafusion-datasource = { workspace = true }
 datafusion-execution = { workspace = true }
 datafusion-expr = { workspace = true }
+# `DecimalAverager`: the maintained decimal AVG serves DataFusion's own
+# sum/count -> decimal quotient, so parity with a base-table re-scan is
+# structural rather than a re-implementation kept in sync by hand.
+datafusion-functions-aggregate-common = { workspace = true }
 datafusion-physical-expr = { workspace = true }
 datafusion-physical-plan = { workspace = true }
 datafusion-pruning = { workspace = true }
@@ -40,6 +44,7 @@ object_store = { workspace = true }
 parking_lot = { workspace = true }
 roaring = { workspace = true }
 runtime-datafusion = { path = "../runtime-datafusion" }
+runtime-request-context = { path = "../runtime-request-context" }
 runtime-table-partition = { path = "../runtime-table-partition", optional = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
@@ -131,6 +136,10 @@ libc = "0.2"
 [[bench]]
 harness = false
 name = "zorder_clustering"
+
+[[bench]]
+harness = false
+name = "layout_amp_default_on"
 
 [[bench]]
 harness = false
@@ -398,6 +407,10 @@ name = "delta_encoding_sweep"
 [[bench]]
 harness = false
 name = "compaction_write_amplification"
+
+[[bench]]
+harness = false
+name = "p1_audit_coverage"
 
 [[bench]]
 harness = false

@@ -129,8 +129,8 @@ pub async fn create_tables(client: &Client) -> Result<()> {
                 w_city VARCHAR(20) NOT NULL,
                 w_state CHAR(2) NOT NULL,
                 w_zip CHAR(9) NOT NULL,
-                w_tax DOUBLE PRECISION NOT NULL,
-                w_ytd DOUBLE PRECISION NOT NULL,
+                w_tax NUMERIC(4,4) NOT NULL,
+                w_ytd NUMERIC(12,2) NOT NULL,
                 PRIMARY KEY (w_id)
             )",
         ),
@@ -145,8 +145,8 @@ pub async fn create_tables(client: &Client) -> Result<()> {
                 d_city VARCHAR(20) NOT NULL,
                 d_state CHAR(2) NOT NULL,
                 d_zip CHAR(9) NOT NULL,
-                d_tax DOUBLE PRECISION NOT NULL,
-                d_ytd DOUBLE PRECISION NOT NULL,
+                d_tax NUMERIC(4,4) NOT NULL,
+                d_ytd NUMERIC(12,2) NOT NULL,
                 d_next_o_id INT NOT NULL,
                 PRIMARY KEY (d_w_id, d_id)
             )",
@@ -168,9 +168,9 @@ pub async fn create_tables(client: &Client) -> Result<()> {
                 c_phone CHAR(16) NOT NULL,
                 c_since TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 c_credit CHAR(2) NOT NULL,
-                c_credit_lim DOUBLE PRECISION NOT NULL,
-                c_discount DOUBLE PRECISION NOT NULL,
-                c_balance DOUBLE PRECISION NOT NULL,
+                c_credit_lim NUMERIC(12,2) NOT NULL,
+                c_discount NUMERIC(4,4) NOT NULL,
+                c_balance NUMERIC(12,2) NOT NULL,
                 c_ytd_payment DOUBLE PRECISION NOT NULL,
                 c_payment_cnt INT NOT NULL,
                 c_delivery_cnt INT NOT NULL,
@@ -187,7 +187,7 @@ pub async fn create_tables(client: &Client) -> Result<()> {
                 h_d_id INT NOT NULL,
                 h_w_id INT NOT NULL,
                 h_date TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                h_amount DOUBLE PRECISION NOT NULL,
+                h_amount NUMERIC(6,2) NOT NULL,
                 h_data VARCHAR(24) NOT NULL
             )",
         ),
@@ -225,7 +225,7 @@ pub async fn create_tables(client: &Client) -> Result<()> {
                 ol_supply_w_id INT NOT NULL,
                 ol_delivery_d TIMESTAMP NULL DEFAULT NULL,
                 ol_quantity INT NOT NULL,
-                ol_amount DOUBLE PRECISION NOT NULL,
+                ol_amount NUMERIC(6,2) NOT NULL,
                 ol_dist_info CHAR(24) NOT NULL,
                 PRIMARY KEY (ol_w_id, ol_d_id, ol_o_id, ol_number)
             )",
@@ -259,7 +259,7 @@ pub async fn create_tables(client: &Client) -> Result<()> {
                 i_id INT NOT NULL,
                 i_im_id INT NOT NULL,
                 i_name VARCHAR(24) NOT NULL,
-                i_price DOUBLE PRECISION NOT NULL,
+                i_price NUMERIC(5,2) NOT NULL,
                 i_data VARCHAR(50) NOT NULL,
                 PRIMARY KEY (i_id)
             )",
@@ -292,7 +292,7 @@ pub async fn create_tables(client: &Client) -> Result<()> {
                 su_address VARCHAR(40) NOT NULL,
                 su_nationkey BIGINT NOT NULL,
                 su_phone VARCHAR(15) NOT NULL,
-                su_acctbal DOUBLE PRECISION NOT NULL,
+                su_acctbal NUMERIC(12,2) NOT NULL,
                 su_comment VARCHAR(101) NOT NULL,
                 PRIMARY KEY (su_suppkey)
             )",
@@ -313,7 +313,7 @@ pub async fn create_tables(client: &Client) -> Result<()> {
     // Add the _bench_ts column (with default) to all mutated TPC-C tables so the
     // seed rows are stamped by the column default. The BEFORE INSERT/UPDATE
     // triggers are created *after* the load (see `create_triggers`) so they do
-    // not fire per-row during the bulk seed/clone.
+    // not fire per-row during the bulk seed load.
     add_bench_ts_columns(client).await?;
 
     Ok(())
@@ -322,7 +322,7 @@ pub async fn create_tables(client: &Client) -> Result<()> {
 /// Create the 4 secondary indexes (matching go-tpc Postgres DDL).
 ///
 /// Called *after* the bulk load so the indexes are built once, in bulk, instead
-/// of being maintained incrementally on every seed/clone insert.
+/// of being maintained incrementally on every seed load insert.
 ///
 /// # Errors
 ///
@@ -414,7 +414,7 @@ async fn add_bench_ts_columns(client: &Client) -> Result<()> {
 
 /// Create the `_bench_ts` `BEFORE INSERT OR UPDATE` trigger on all mutated
 /// TPC-C tables. Called *after* the bulk load so the trigger does not fire
-/// per-row during the seed/clone — the seed rows are already stamped by the
+/// per-row during the seed load — the seed rows are already stamped by the
 /// column default (see [`add_bench_ts_columns`]).
 ///
 /// Uses `clock_timestamp()` (wall-clock time per statement) instead of `now()`

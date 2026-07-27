@@ -228,7 +228,12 @@ fn is_sqlite_lock_error(error: &tokio_rusqlite::Error<rusqlite::Error>) -> bool 
 ///
 /// In-memory databases have no backing file, so the pool skips parent-directory
 /// creation and uses the `MEMORY` rollback journal (WAL is unsupported).
-fn is_memory_db_path(db_path: &str) -> bool {
+///
+/// `pub(crate)` so [`crate::cayenne_catalog::CayenneCatalog::init`] applies the
+/// SAME guard as [`SqliteMetastore::open_connection`] — the two must agree on
+/// what counts as in-memory, or one path creates a stray directory the other
+/// skips (the memory-mode `file:` directory bug, #11922).
+pub(crate) fn is_memory_db_path(db_path: &str) -> bool {
     db_path.contains("vfs=memdb")
 }
 
@@ -629,6 +634,38 @@ impl SqliteMetastore {
         ) WITHOUT ROWID
     ";
 
+    /// Schema for the `cayenne_pending_write_back` table (durable federated
+    /// write-back, #11838).
+    ///
+    /// Tracks the primary keys that a durable-write-back table has committed to
+    /// the accelerator but not yet reconciled to the federated source. One row
+    /// per undelivered key; the delivery worker claims rows, reconciles the
+    /// key's current committed value to the source, then clears the row.
+    ///
+    /// `table_id` is the 16 raw UUID bytes (as in `cayenne_insert_record`);
+    /// `pk_bytes` is the `RowConverter` `OwnedRow` encoding of the full primary
+    /// key (bit-identical to the keyset/footprint `pk_digest` input) so the
+    /// worker can rebuild both the accelerator point-scan filter and the source
+    /// key. `sequence_number` is the table commit sequence that last dirtied the
+    /// key; the marker upsert is **monotone** (keeps `MAX`) and the worker's
+    /// compare-and-clear is `<= claimed_seq`, so a newer commit landing during
+    /// delivery leaves the marker above the claimed sequence and the stale clear
+    /// no-ops. `first_marked_at` is the oldest-undelivered timestamp (lag metric)
+    /// and is never overwritten on re-mark.
+    ///
+    /// Unlike `cayenne_insert_record`, this table is **never** cleared at
+    /// checkpoint/overwrite (that would drop acked-but-undelivered writes);
+    /// `drop_table` deletes its rows explicitly.
+    const PENDING_WRITE_BACK_TABLE_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS cayenne_pending_write_back (
+            table_id BLOB NOT NULL,
+            pk_bytes BLOB NOT NULL,
+            sequence_number BIGINT NOT NULL,
+            first_marked_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            PRIMARY KEY (table_id, pk_bytes)
+        ) WITHOUT ROWID
+    ";
+
     /// Schema for the `cayenne_snapshot_sequence` table.
     ///
     /// Tracks the sequence number for each snapshot. This enables Iceberg-style
@@ -927,12 +964,13 @@ impl MetastoreBackend for SqliteMetastore {
             .call(|conn| {
                 // Create tables in a transaction
                 conn.execute_batch(&format!(
-                    "{}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {};",
+                    "{}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {};",
                     Self::TABLE_TABLE_DDL,
                     Self::TABLE_NAME_UNIQUE_INDEX_DDL,
                     Self::DELETE_FILE_TABLE_DDL,
                     Self::PARTITION_TABLE_DDL,
                     Self::INSERT_RECORD_TABLE_DDL,
+                    Self::PENDING_WRITE_BACK_TABLE_DDL,
                     Self::SNAPSHOT_SEQUENCE_TABLE_DDL,
                     Self::TABLE_STATISTICS_DDL,
                     Self::SNAPSHOT_FILE_STATISTICS_TABLE_DDL,
@@ -1399,7 +1437,7 @@ impl MetastoreBackend for SqliteMetastore {
                         conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
 
                     if journal_mode.eq_ignore_ascii_case("wal") {
-                        tracing::info!("Truncating Cayenne catalog WAL log");
+                        tracing::debug!("Truncating Cayenne catalog WAL log");
                         // Truncate the WAL log to persist changes and reduce file size
                         // wal_checkpoint returns results (busy, log, checkpointed), so we use query_row
                         let _: (i32, i32, i32) =
@@ -1410,7 +1448,7 @@ impl MetastoreBackend for SqliteMetastore {
 
                     // Run optimize to improve query performance for future connections
                     // PRAGMA optimize may return rows indicating what was optimized
-                    tracing::info!("Running optimize on Cayenne catalog");
+                    tracing::debug!("Running optimize on Cayenne catalog");
                     let mut stmt = conn.prepare("PRAGMA optimize")?;
                     let mut rows = stmt.query([])?;
                     while rows.next()?.is_some() {} // Consume all results to ensure PRAGMA completes
@@ -1568,14 +1606,35 @@ impl Drop for SqliteTransaction {
             // tokio_rusqlite::Connection::call sends a closure to the bg
             // thread; it will execute even after this Drop returns.
             // We spawn a task to await the future properly.
-            tokio::spawn(async move {
+            let rollback = async move {
                 let _ = conn
                     .call(|conn| {
                         let _ = conn.execute_batch("ROLLBACK");
                         Ok::<_, rusqlite::Error>(())
                     })
                     .await;
-            });
+            };
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(rollback);
+            } else {
+                // No ambient Tokio runtime (dropped from a non-Tokio thread).
+                // `tokio_rusqlite::Connection::call` awaits the background
+                // connection thread over a Tokio channel, so drive the
+                // best-effort rollback on a small current-thread runtime instead
+                // of a bare `futures::executor::block_on` (mirrors the Turso
+                // metastore transaction Drop). Log if the runtime cannot be built.
+                std::thread::spawn(move || {
+                    match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => rt.block_on(rollback),
+                        Err(err) => tracing::error!(
+                            "Failed to build fallback Tokio runtime to auto-rollback SqliteTransaction on drop: {err}"
+                        ),
+                    }
+                });
+            }
         }
     }
 }

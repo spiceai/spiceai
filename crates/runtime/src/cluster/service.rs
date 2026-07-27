@@ -275,6 +275,18 @@ impl ClusterServiceImpl {
         super::partition::first_unready_accelerated_table(&app, self.datafusion.as_ref()).await
     }
 
+    /// Whether the app declares any accelerated, partitioned table. When it does
+    /// not, there is nothing for the scheduler to assign, so the
+    /// first-assignment gate in `allocate_initial_partitions` must be bypassed —
+    /// otherwise executors would block and retry for a full assignment interval
+    /// during startup with no assignment ever coming.
+    async fn has_partitioned_accelerated_tables(&self) -> bool {
+        let Some(app) = self.app.read().await.clone() else {
+            return false;
+        };
+        !super::partition::accelerated_tables(&app).is_empty()
+    }
+
     /// Returns the executor registry for use by other components.
     #[must_use]
     pub fn executor_registry(&self) -> Arc<ExecutorRegistry> {
@@ -675,8 +687,14 @@ impl ClusterService for ClusterServiceImpl {
         // way to backfill (CDC/Changes-mode accelerations only load partition data at
         // the initial snapshot). Wait for the first cycle — the executor retries this
         // RPC on `Unavailable` with backoff — so the returned share is the fair one.
+        //
+        // Only gate when there are accelerated partitioned tables to assign. With
+        // none, the scheduler never assigns anything, so blocking would just make
+        // executors retry for a full assignment interval during startup for no
+        // reason.
         if let Some(partition_service) = self.datafusion.partition_service.as_ref()
             && !partition_service.is_first_assignment_complete()
+            && self.has_partitioned_accelerated_tables().await
         {
             tracing::debug!(
                 executor = %executor_id,
@@ -704,8 +722,12 @@ impl ClusterService for ClusterServiceImpl {
         let mut table_partitions: HashMap<String, BytesArray> = HashMap::new();
 
         let partition_store = self.executor_registry().accelerations_partition_store();
-        let app_guard = self.app.read().await;
-        if let Some(app) = app_guard.as_ref() {
+        // Snapshot the `Arc<App>` out of the lock and release the guard before the
+        // loop — `partition_value_to_bytes` is awaited per partition below, and
+        // holding the async `RwLock` read guard across those awaits would block
+        // writers (and risk deadlock if an awaited path re-acquires the lock).
+        let app_snapshot = self.app.read().await.clone();
+        if let Some(app) = app_snapshot.as_ref() {
             // Partition assignment is driven solely by the scheduler's periodic
             // partition-assignment cycle, which fairly distributes partitions
             // across all connected executors and pushes them over the control

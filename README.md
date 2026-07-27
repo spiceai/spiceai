@@ -83,7 +83,7 @@ Add a sandboxed, analytics-ready replica alongside **PostgreSQL, MySQL, and Mong
 
 - **PostgreSQL (WAL), MySQL (binlog), and MongoDB (change streams)** — native replication with auto-managed replication state (slots, binlog positions, resume tokens) and bootstrapped initial snapshots. **No Debezium or Kafka required.**
 - **DynamoDB Streams** — two-tier acceleration that fans out from a central Spice layer to thousands of edge sidecars with sub-second propagation. Used in production for global control-plane sync. [Read the pattern →](https://spice.ai/blog/real-time-acceleration-with-dynamodb-streams)
-- **Debezium + Kafka** — available when you want it.
+- **Debezium** — Kafka consumer (`from: debezium:…`) or **push ingest without Kafka** (`from: cdc:…` + `POST /v1/datasets/{name}/cdc`, JSON/Avro).
 
 ### Cluster-Sidecar Architecture: localhost latency, cluster scale
 
@@ -232,7 +232,8 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `oracle`                           | Oracle                                | Alpha             | [Oracle ODPI-C][ODPIC]       |
 | `abfs`                             | Azure BlobFS                          | Alpha             | Parquet, CSV                 |
 | `clickhouse`                       | ClickHouse                            | Alpha             |                              |
-| `debezium`                         | Debezium CDC                          | Alpha             | Kafka + JSON                 |
+| `debezium`                         | Debezium CDC (Kafka consumer)         | Alpha             | Kafka + JSON                 |
+| `cdc`                              | Debezium push ingest (no Kafka)       | Alpha             | JSON + Avro HTTP             |
 | `elasticsearch`                    | Elasticsearch (BM25 + kNN + RRF)      | Alpha             |                              |
 | `gcs`, `gs`                        | [Google Cloud Storage][gcs]           | Alpha             | Parquet, CSV, JSON           |
 | `kafka`                            | Kafka                                 | Alpha             | Kafka + JSON                 |
@@ -262,7 +263,7 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 
 | Name       | Description                       | Status            | Engine Modes     |
 | ---------- | --------------------------------- | ----------------- | ---------------- |
-| `cayenne`  | [Spice Cayenne (Vortex)][cayenne] | Release Candidate | `file`           |
+| `cayenne`  | [Spice Cayenne (Vortex)][cayenne] | Stable            | `file`           |
 | `arrow`    | [In-Memory Arrow Records][arrow]  | Stable            | `memory`         |
 | `duckdb`   | Embedded [DuckDB][duckdb]         | Stable            | `memory`, `file` |
 | `postgres` | Attached [PostgreSQL][postgres]   | Release Candidate | N/A              |
@@ -320,6 +321,7 @@ Catalog Connectors connect to external catalog providers and make their tables a
 | `iceberg`       | Apache Iceberg          | Beta   | Parquet                      |
 | `ducklake`      | DuckLake                | Beta   | Parquet                      |
 | `glue`          | AWS Glue                | Alpha  | CSV, Parquet, Iceberg        |
+| `pg`            | PostgreSQL (with native WAL CDC catalog acceleration) | Alpha | PostgreSQL Wire Protocol |
 
 ## Supported Secret Stores
 

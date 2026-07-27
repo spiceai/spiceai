@@ -142,19 +142,54 @@ impl Embed {
         model: &dyn llms::embeddings::Embed,
         sentences: impl Iterator<Item = Option<&'a str>>,
     ) -> DataFusionResult<ColumnarValue> {
-        let mut builder =
-            ListBuilder::new(ListBuilder::new(PrimitiveBuilder::<Float32Type>::new()));
+        let (lower, _) = sentences.size_hint();
+        let mut is_valid = Vec::with_capacity(lower);
+        let mut texts = Vec::with_capacity(lower);
 
         for maybe_string in sentences {
-            let embedded = match maybe_string {
-                Some(s) => model
-                    .embed_sync(EmbeddingInput::String(s.to_string()))
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?,
-                None => vec![vec![]],
-            };
+            match maybe_string {
+                Some(s) => {
+                    is_valid.push(true);
+                    texts.push(s.to_owned());
+                }
+                None => is_valid.push(false),
+            }
+        }
 
-            builder.values().values().append_slice(&embedded[0]);
-            builder.values().append(!embedded[0].is_empty());
+        let embeddings = if texts.is_empty() {
+            Vec::new()
+        } else {
+            model
+                .embed_sync(EmbeddingInput::StringArray(texts))
+                .map_err(|e| DataFusionError::External(Box::new(e)))?
+        };
+
+        let non_null_count = is_valid.iter().filter(|&&v| v).count();
+        if embeddings.len() != non_null_count {
+            return Err(DataFusionError::Execution(format!(
+                "Embedding model returned {} vectors for {non_null_count} non-null inputs (contract violation)",
+                embeddings.len(),
+            )));
+        }
+
+        let vector_size = embeddings.first().map_or(0, Vec::len);
+        let mut builder = ListBuilder::with_capacity(
+            ListBuilder::with_capacity(
+                PrimitiveBuilder::<Float32Type>::with_capacity(vector_size * non_null_count),
+                is_valid.len(),
+            ),
+            1,
+        );
+
+        let mut emb_idx = 0;
+        for valid in is_valid {
+            if valid {
+                builder.values().values().append_slice(&embeddings[emb_idx]);
+                builder.values().append(true);
+                emb_idx += 1;
+            } else {
+                builder.values().append(false);
+            }
         }
 
         builder.append(true);

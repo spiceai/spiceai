@@ -56,6 +56,11 @@ use test_framework::queries::QuerySet;
 use tokio::time::sleep;
 use tonic::transport::Channel;
 
+/// Gated serializable transaction (`BEGIN … COMMIT`) regression tests + bench.
+/// Gated off Windows to match the other Cayenne provider-level tests.
+#[cfg(not(target_os = "windows"))]
+mod transaction;
+
 /// Append a single row to a Cayenne-accelerated table through the Runtime write path.
 ///
 /// This exercises the full Cayenne write pipeline:
@@ -2012,7 +2017,7 @@ fn make_datalake_nation_dataset(
             warm_max_bytes.to_string(),
         ),
         (
-            "cayenne_datalake_promotion_interval_ms".to_string(),
+            "cayenne_datalake_tiering_check_interval_ms".to_string(),
             "500".to_string(),
         ),
     ]);

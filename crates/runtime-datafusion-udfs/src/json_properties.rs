@@ -79,6 +79,7 @@ limitations under the License.
 //! depth / row / size limit emits an error-kind metric and yields zero or a
 //! truncated-but-valid batch — never a query-level error.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, LazyLock};
@@ -195,7 +196,7 @@ pub struct PropertyRow {
     pub parent_path: String,
     pub name: String,
     pub description: Option<String>,
-    pub type_name: String,
+    pub type_name: Cow<'static, str>,
     pub required: bool,
     pub format: Option<String>,
     pub enum_values: Option<Vec<String>>,
@@ -348,11 +349,21 @@ impl<'a> Walker<'a> {
         // schema's own children — any `$ref` back to this node would look
         // "fresh" to the next `collect_effective` call. Re-insert the ref
         // (if there was one) so the whole walk-chain sees it.
+        // Capture the local `$ref` once: insert into the cycle set and keep
+        // the owned string for later removal (avoids a second `to_owned`).
         let chain_ref: Option<String> = schema
             .get("$ref")
             .and_then(Value::as_str)
             .filter(|r| is_local_ref(r))
-            .and_then(|r| self.visited_refs.insert(r.to_owned()).then(|| r.to_owned()));
+            .and_then(|r| {
+                if self.visited_refs.contains(r) {
+                    None
+                } else {
+                    let owned = r.to_owned();
+                    self.visited_refs.insert(owned.clone());
+                    Some(owned)
+                }
+            });
 
         let required: HashSet<&str> = effective
             .iter()
@@ -408,10 +419,10 @@ impl<'a> Walker<'a> {
         let type_name = effective_specs
             .iter()
             .map(|s| compute_type(s))
-            .find(|t| t != "unknown")
-            .unwrap_or_else(|| "unknown".to_owned());
+            .find(|t| t.as_ref() != "unknown")
+            .unwrap_or(Cow::Borrowed("unknown"));
 
-        let is_container = matches!(type_name.as_str(), "object" | "array" | "map");
+        let is_container = matches!(type_name.as_ref(), "object" | "array" | "map");
         let emit_container_now = !is_container || self.opts.include_internal;
         if emit_container_now {
             self.emit_row(
@@ -420,7 +431,7 @@ impl<'a> Walker<'a> {
                 &path,
                 parent_path,
                 name,
-                &type_name,
+                Cow::clone(&type_name),
                 required,
             );
             if self.row_cap_hit {
@@ -433,7 +444,7 @@ impl<'a> Walker<'a> {
         // overlapping `properties` across allOf/oneOf/anyOf / $ref branches
         // are de-duplicated rather than emitted once per branch.
         let rows_before = self.rows.len();
-        match type_name.as_str() {
+        match type_name.as_ref() {
             "object" => {
                 self.walk_schema(spec, &path, depth + 1);
             }
@@ -485,9 +496,9 @@ impl<'a> Walker<'a> {
                         let ap_type = ap_effective
                             .iter()
                             .map(|s| compute_type(s))
-                            .find(|t| t != "unknown")
-                            .unwrap_or_else(|| "unknown".to_owned());
-                        if ap_type == "array" {
+                            .find(|t| t.as_ref() != "unknown")
+                            .unwrap_or(Cow::Borrowed("unknown"));
+                        if ap_type.as_ref() == "array" {
                             if let Some(items) = ap_effective
                                 .iter()
                                 .find_map(|s| s.get("items"))
@@ -515,7 +526,7 @@ impl<'a> Walker<'a> {
                 &path,
                 parent_path,
                 name,
-                &type_name,
+                type_name,
                 required,
             );
         }
@@ -532,7 +543,7 @@ impl<'a> Walker<'a> {
         path: &str,
         parent_path: &str,
         name: &str,
-        type_name: &str,
+        type_name: Cow<'static, str>,
         required: bool,
     ) {
         // `effective` contains the raw_spec when no $ref was followed, and only
@@ -565,7 +576,7 @@ impl<'a> Walker<'a> {
             parent_path: parent_path.to_owned(),
             name: name.to_owned(),
             description,
-            type_name: type_name.to_owned(),
+            type_name,
             required,
             format,
             enum_values,
@@ -668,13 +679,28 @@ fn is_local_ref(ref_str: &str) -> bool {
     ref_str.starts_with('#')
 }
 
+/// Map a schema type string onto a `'static` label when it matches a known
+/// JSON Schema primitive / container keyword.
+fn static_type_label(s: &str) -> Option<&'static str> {
+    match s {
+        "null" => Some("null"),
+        "boolean" => Some("boolean"),
+        "object" => Some("object"),
+        "array" => Some("array"),
+        "number" => Some("number"),
+        "integer" => Some("integer"),
+        "string" => Some("string"),
+        _ => None,
+    }
+}
+
 /// Classify a schema node into one of the emitted type labels.
-fn compute_type(spec: &Value) -> String {
+fn compute_type(spec: &Value) -> Cow<'static, str> {
     // External $ref → "ref"
     if let Some(ref_str) = spec.get("$ref").and_then(Value::as_str)
         && !is_local_ref(ref_str)
     {
-        return "ref".to_owned();
+        return Cow::Borrowed("ref");
     }
     // Explicit additionalProperties without own properties → map.
     let has_ap = spec
@@ -685,46 +711,47 @@ fn compute_type(spec: &Value) -> String {
     // `items` shouldn't silently flip the type.
     let has_props = spec.get("properties").is_some_and(Value::is_object);
     if has_ap && !has_props {
-        return "map".to_owned();
+        return Cow::Borrowed("map");
     }
     match spec.get("type") {
-        Some(Value::String(s)) => s.clone(),
+        Some(Value::String(s)) => {
+            static_type_label(s).map_or_else(|| Cow::Owned(s.clone()), Cow::Borrowed)
+        }
         Some(Value::Array(arr)) => {
             // Type unions with `"null"` express optional/nullable in JSON
             // Schema; the "real" type is the first non-null entry. Only fall
             // back to `"null"` (or `"unknown"`) when no other type is present.
-            let strs: Vec<&str> = arr.iter().filter_map(Value::as_str).collect();
-            strs.iter()
-                .find(|t| **t != "null")
-                .copied()
-                .or_else(|| strs.first().copied())
-                .unwrap_or("unknown")
-                .to_owned()
+            let chosen = arr
+                .iter()
+                .filter_map(Value::as_str)
+                .find(|&t| t != "null")
+                .or_else(|| arr.iter().find_map(Value::as_str))
+                .unwrap_or("unknown");
+            static_type_label(chosen).map_or_else(|| Cow::Owned(chosen.to_owned()), Cow::Borrowed)
         }
         _ => {
             if has_props {
-                "object".to_owned()
+                Cow::Borrowed("object")
             } else if spec
                 .get("items")
                 .is_some_and(|v| v.is_object() || v.is_array())
             {
-                "array".to_owned()
+                Cow::Borrowed("array")
             } else if let Some(first_enum) = spec
                 .get("enum")
                 .and_then(Value::as_array)
                 .and_then(|a| a.first())
             {
-                match first_enum {
+                Cow::Borrowed(match first_enum {
                     Value::String(_) => "string",
                     Value::Bool(_) => "boolean",
                     Value::Number(n) if n.is_i64() || n.is_u64() => "integer",
                     Value::Number(_) => "number",
                     Value::Null => "null",
                     _ => "unknown",
-                }
-                .to_owned()
+                })
             } else {
-                "unknown".to_owned()
+                Cow::Borrowed("unknown")
             }
         }
     }
@@ -1077,7 +1104,7 @@ fn build_property_arrays(rows: &[PropertyRow]) -> (Vec<ArrayRef>, usize) {
             Some(v) => description.append_value(v),
             None => description.append_null(),
         }
-        type_name.append_value(&row.type_name);
+        type_name.append_value(row.type_name.as_ref());
         required.append_value(row.required);
         match &row.format {
             Some(v) => format.append_value(v),

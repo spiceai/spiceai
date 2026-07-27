@@ -17,13 +17,16 @@ limitations under the License.
 //! Engine-agnostic numeric comparison shared by the HTAP correctness gates
 //! (`analytical` and `row_count`).
 //!
-//! Postgres (the source of truth) and Cayenne emit the same logical values with
-//! different physical Arrow encodings. These helpers compare *values* — not
-//! their string renderings — with a type-aware tolerance:
-//!   * integer / decimal columns (row counts, money sums): **exact**, zero
-//!     tolerance — a count or a cent that drifts at all is a real defect;
-//!   * floating-point columns: a small relative epsilon — the only place real
-//!     rounding occurs in this pipeline (FP/encoding error here is < 0.001%).
+//! The source engine (Postgres or `MySQL` — the source of truth) and Cayenne emit
+//! the same logical values with different physical Arrow encodings. These
+//! helpers compare *values* — not their string renderings — with a type-aware
+//! tolerance:
+//!   * integers and *exact-reproduction* decimals (row counts, money `SUM`/
+//!     `MIN`/`MAX`): **exact**, zero tolerance — a count or a cent that drifts at
+//!     all is a real defect;
+//!   * floating-point columns and `AVG`/division decimals: a small relative
+//!     epsilon — the only places real rounding occurs in this pipeline (FP /
+//!     encoding / decimal-division error here is < 0.001%).
 //!
 //! Cells are compared after casting to `f64`. That is exact for integers and
 //! decimals whose magnitude stays below 2^53 (~9.0e15), which holds for every
@@ -39,6 +42,13 @@ use arrow::datatypes::DataType;
 /// so a genuine sub-5% value drift is now caught instead of passing silently.
 pub const FLOAT_REL_TOLERANCE: f64 = 0.001;
 
+/// Decimal scale of TPC-C money columns (`NUMERIC(_,2)` — cents). Exact
+/// aggregates (`SUM`/`MIN`/`MAX`) preserve this scale, so they stay on the exact
+/// comparison path; only `AVG`/division inflates a decimal result beyond it.
+/// A decimal column whose scale exceeds this is therefore treated as an
+/// approximate (rounding-prone) aggregate. See [`approximate_columns`].
+pub const MONEY_SCALE: i8 = 2;
+
 /// Outcome of comparing the numeric columns of two row-aligned record batches.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct NumericDelta {
@@ -52,6 +62,13 @@ pub struct NumericDelta {
     /// Column / row / values of the worst *offending* cell, for the failure
     /// message. `None` when nothing exceeded tolerance.
     pub worst: Option<String>,
+    /// Row index (0-based) of the worst offending cell, so callers can print
+    /// the surrounding rows for context. `None` when nothing exceeded tolerance
+    /// (or the divergence was a whole-column cast failure with no single row).
+    pub worst_row: Option<usize>,
+    /// Column index of the worst offending cell, matching `worst_row`. `None`
+    /// under the same conditions.
+    pub worst_col: Option<usize>,
 }
 
 /// Whether a column's values are compared numerically by [`numeric_delta`]
@@ -84,12 +101,30 @@ fn is_float(dt: &DataType) -> bool {
     )
 }
 
+/// Decimal scale of a numeric type, or `None` for non-decimals.
+fn decimal_scale(dt: &DataType) -> Option<i8> {
+    match dt {
+        DataType::Decimal128(_, s) | DataType::Decimal256(_, s) => Some(*s),
+        _ => None,
+    }
+}
+
+/// Whether a column is numeric *and* exact — integers and decimals, never
+/// floats. `SUM` over such a column is bit-identical across engines (no
+/// order-dependent rounding), so the fingerprint gate can compare it with zero
+/// tolerance; a floating `SUM` legitimately drifts and must not be summed.
+#[must_use]
+pub fn is_exact_numeric(dt: &DataType) -> bool {
+    is_numeric(dt) && !is_float(dt)
+}
+
 /// Per-column float-ness of a batch's schema, for the `actual_source_floats`
 /// argument of [`numeric_delta`].
 ///
-/// The analytical gate casts Spice's output to the *source* (Postgres) schema
+/// The analytical gate casts Spice's output to the *source* engine's schema
 /// before comparison, which turns an `avg()` that Spice computed as `Float64`
-/// into the `Decimal128` the PG arrow connector returns for `NUMERIC`. Captured
+/// into the `Decimal128` the source arrow connector returns for
+/// `NUMERIC`/`DECIMAL`. Captured
 /// from the pre-alignment actual batch, this lets [`numeric_delta`] keep the
 /// relative float tolerance for those approximate columns instead of demoting
 /// them to the exact integer/decimal path. The fingerprint gate runs identical
@@ -102,6 +137,48 @@ pub fn float_columns(batch: &RecordBatch) -> Vec<bool> {
         .fields()
         .iter()
         .map(|f| is_float(f.data_type()))
+        .collect()
+}
+
+/// Analytical-gate generalization of [`float_columns`]: flags a column for
+/// relative float tolerance when either side is float, or the column is a
+/// decimal produced by `AVG`/division. Exact reproductions (`SUM`/`MIN`/`MAX`/
+/// `COUNT`) preserve the operand scale (money is [`MONEY_SCALE`] digits in
+/// TPC-C) and stay exact; `AVG`/division *inflate* the scale — `DataFusion` and
+/// `MySQL` to operand scale + 4, Postgres to ~13 — so their low digits
+/// legitimately differ per-engine and must not be compared bit-exactly.
+///
+/// We detect that inflation directly rather than assuming the two engines
+/// *disagree* on the inflated scale: a decimal column is approximate when the
+/// scales differ **or** the (common) scale exceeds [`MONEY_SCALE`]. The
+/// scales-differ arm alone was Postgres-specific — `MySQL`'s `AVG` scale
+/// (operand + 4 = 6 for `NUMERIC(_,2)`) coincides with `DataFusion`'s, so a
+/// same-scale `AVG` used to fall into the exact path and a benign last-digit
+/// rounding difference tripped `DIVERGE`.
+///
+/// Must run pre-alignment (alignment casts actual to the source scale, erasing
+/// the signal); columns match by position.
+#[must_use]
+pub fn approximate_columns(expected: &RecordBatch, actual: &RecordBatch) -> Vec<bool> {
+    let a_schema = actual.schema();
+    let a_fields = a_schema.fields();
+    expected
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let Some(a) = a_fields.get(i) else {
+                return is_float(e.data_type());
+            };
+            let (e_dt, a_dt) = (e.data_type(), a.data_type());
+            is_float(e_dt)
+                || is_float(a_dt)
+                || matches!(
+                    (decimal_scale(e_dt), decimal_scale(a_dt)),
+                    (Some(es), Some(a_s)) if es != a_s || es.max(a_s) > MONEY_SCALE
+                )
+        })
         .collect()
 }
 
@@ -129,18 +206,14 @@ fn cast_pair_to_f64(e_col: &dyn Array, a_col: &dyn Array) -> Option<(Float64Arra
 /// cross-engine text collation / timestamp precision make their MIN/MAX
 /// unreliable to compare directly.
 ///
-/// `actual_source_floats[i]` flags columns the actual engine produced as
-/// floating point *before* any schema alignment (see [`float_columns`]). A
-/// column is compared with the relative float tolerance when either side's
-/// compared type is float *or* its pre-alignment actual type was — so an
-/// `avg()` that Spice computed in `Float64` but the gate cast to the source's
-/// `Decimal128` keeps its tolerance, while money sums and counts (decimal /
-/// integer on both sides, and never float pre-alignment) stay exact.
+/// `approximate[i]` flags columns to compare with relative float tolerance
+/// instead of exactly: the fingerprint gate passes [`float_columns`], the
+/// analytical gate [`approximate_columns`]. Sums and counts stay exact.
 #[must_use]
 pub fn numeric_delta(
     expected: &RecordBatch,
     actual: &RecordBatch,
-    actual_source_floats: &[bool],
+    approximate: &[bool],
 ) -> NumericDelta {
     let mut out = NumericDelta::default();
     let mut worst_rel = 0.0_f64;
@@ -161,7 +234,7 @@ pub fn numeric_delta(
         }
         let float_col = is_float(e_col.data_type())
             || is_float(a_col.data_type())
-            || actual_source_floats.get(c).copied().unwrap_or(false);
+            || approximate.get(c).copied().unwrap_or(false);
         let col_name = field.name();
 
         // Both columns are numeric, so casting to f64 should always succeed.
@@ -209,6 +282,8 @@ pub fn numeric_delta(
                         "{col_name}[row {r}]: expected {ev}, actual {av} (rel {:.6}%)",
                         rel * 100.0
                     ));
+                    out.worst_row = Some(r);
+                    out.worst_col = Some(c);
                 }
             }
         }
@@ -258,6 +333,10 @@ mod tests {
         let d = numeric_delta(&e, &a, &float_columns(&a));
         assert!(d.exceeded, "any integer diff must exceed (exact tolerance)");
         assert!(d.worst.is_some());
+        // The offending cell's coordinates are surfaced so the gate can print
+        // the surrounding rows for context.
+        assert_eq!(d.worst_row, Some(0));
+        assert_eq!(d.worst_col, Some(0));
     }
 
     #[test]
@@ -338,6 +417,75 @@ mod tests {
                 Decimal128Array::from(raw).with_data_type(DataType::Decimal128(precision, scale)),
             ) as ArrayRef,
         )
+    }
+
+    #[test]
+    fn approximate_columns_flags_scale_mismatched_decimals() {
+        // avg(): both decimal but different scale (Postgres ~13, DataFusion 6) ->
+        // approximate. sum() (money, scale 2 both) and count (integer) stay
+        // exact; a genuinely float column is always approximate.
+        let expected = batch(vec![
+            decimal_col("avg_amount", vec![1_i128], 38, 13),
+            decimal_col("sum_amount", vec![1_i128], 38, 2),
+            int_col("cnt", vec![1]),
+            float_col("ratio", vec![1.0]),
+        ]);
+        let actual = batch(vec![
+            decimal_col("avg_amount", vec![1_i128], 38, 6),
+            decimal_col("sum_amount", vec![1_i128], 38, 2),
+            int_col("cnt", vec![1]),
+            float_col("ratio", vec![1.0]),
+        ]);
+        assert_eq!(
+            approximate_columns(&expected, &actual),
+            vec![true, false, false, true]
+        );
+    }
+
+    #[test]
+    fn approximate_columns_flags_same_scale_inflated_avg() {
+        // MySQL regression (chbench_q1 `avg_amount`): both the source and
+        // DataFusion produce AVG(NUMERIC(_,2)) at scale 6 (operand + 4), so the
+        // scales *match*. The old "scales differ" heuristic left the column on
+        // the exact path, and a 1-ULP rounding difference (959.717385 vs
+        // 959.717384) tripped DIVERGE. Scale 6 > MONEY_SCALE (2) must now flag it
+        // approximate, while the money SUM (scale 2) and count stay exact.
+        let expected = batch(vec![
+            decimal_col("avg_amount", vec![959_717_385_i128], 38, 6),
+            decimal_col("sum_amount", vec![7_i128], 38, 2),
+            int_col("count_order", vec![1]),
+        ]);
+        let actual = batch(vec![
+            decimal_col("avg_amount", vec![959_717_384_i128], 38, 6),
+            decimal_col("sum_amount", vec![7_i128], 38, 2),
+            int_col("count_order", vec![1]),
+        ]);
+        assert_eq!(
+            approximate_columns(&expected, &actual),
+            vec![true, false, false],
+            "same-scale inflated AVG must be approximate; SUM/COUNT stay exact"
+        );
+
+        // With that classification the 1-ULP avg difference is within the
+        // relative float tolerance and must NOT fail the gate.
+        let approx = approximate_columns(&expected, &actual);
+        let delta = numeric_delta(&expected, &actual, &approx);
+        assert!(
+            !delta.exceeded,
+            "same-scale AVG rounding must pass under relative tolerance: {:?}",
+            delta.worst
+        );
+        assert!(delta.max_rel_delta > 0.0 && delta.max_rel_delta < FLOAT_REL_TOLERANCE);
+
+        // But a genuine one-cent drift in the exact money SUM still fails, so the
+        // fix does not weaken the exactness guarantee that matters.
+        let bad_sum = batch(vec![
+            decimal_col("avg_amount", vec![959_717_385_i128], 38, 6),
+            decimal_col("sum_amount", vec![8_i128], 38, 2),
+            int_col("count_order", vec![1]),
+        ]);
+        let delta = numeric_delta(&expected, &bad_sum, &approx);
+        assert!(delta.exceeded, "a one-cent SUM drift must still DIVERGE");
     }
 
     #[test]
