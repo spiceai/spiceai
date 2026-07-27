@@ -162,6 +162,12 @@ impl Index for CompoundVectorIndex {
         compound_delete_by_keys(self.primary.as_ref(), self.secondary.as_ref(), keys).await
     }
 
+    fn write_complete_failure_is_fatal(&self) -> bool {
+        // Either half failing to finalize leaves this compound index stale.
+        self.primary.write_complete_failure_is_fatal()
+            || self.secondary.write_complete_failure_is_fatal()
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

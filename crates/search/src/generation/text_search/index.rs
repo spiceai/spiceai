@@ -120,6 +120,14 @@ impl Index for FullTextDatabaseIndex {
             .map_err(|e| DataFusionError::External(Box::new(e)))
     }
 
+    fn write_complete_failure_is_fatal(&self) -> bool {
+        // Documents are only searchable once the tantivy writer commits them, and
+        // staged-but-uncommitted documents are discarded. A finalize that fails to
+        // commit therefore drops the write's documents while the underlying rows are
+        // already visible, so the write must not report success.
+        true
+    }
+
     async fn on_write_start(&self) -> Result<(), DataFusionError> {
         // A CDC-fed index never defers: its change stream calls `compute_index`
         // outside this lifecycle, and the shared writer cannot commit one caller's
