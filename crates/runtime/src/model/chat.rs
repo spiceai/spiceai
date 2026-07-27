@@ -521,7 +521,9 @@ async fn databricks(
 /// Builds a chat model served by the Spice.ai Cloud Platform, or by another Spice runtime
 /// (a Spice-to-Spice connection). Both expose an `OpenAI`-compatible API under `/v1`.
 fn spiceai(model_id: Option<String>, params: &Parameters) -> Result<Arc<dyn Chat>, LlmError> {
-    let Some(model_id) = model_id else {
+    // Treat a blank id the same as a missing one: a client built with an empty model name fails
+    // later with a far less obvious error.
+    let Some(model_id) = model_id.filter(|id| !id.trim().is_empty()) else {
         return Err(LlmError::ModelNotProvided {
             model_source: "spiceai".to_string(),
         });
@@ -1040,6 +1042,21 @@ mod test {
             err,
             LlmError::ModelNotProvided { ref model_source } if model_source == "spiceai"
         ));
+    }
+
+    #[test]
+    fn spiceai_rejects_a_blank_model_id() {
+        let params = spiceai_params(&[("api_key", "test-key")]);
+
+        for blank in ["", "   "] {
+            let Err(err) = spiceai(Some(blank.to_string()), &params) else {
+                panic!("a blank model id should be rejected, got a client for {blank:?}");
+            };
+            assert!(matches!(
+                err,
+                LlmError::ModelNotProvided { ref model_source } if model_source == "spiceai"
+            ));
+        }
     }
 
     #[test]

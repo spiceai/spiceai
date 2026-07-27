@@ -111,11 +111,18 @@ impl ModelSource {
                     model
                 }
             }),
-            ModelSource::SpiceAI => SPICEAI_PREFIXES.iter().find_map(|p| {
-                from.strip_prefix(&format!("{p}:"))
-                    .or_else(|| from.strip_prefix(&format!("{p}/")))
-                    .map(std::string::ToString::to_string)
-            }),
+            // A bare prefix (`spice.ai:`, `spice.ai/`) carries no model id. Report that as absent
+            // rather than as an empty id, so the caller raises "no model provided" instead of
+            // dialing the endpoint with an empty model name.
+            ModelSource::SpiceAI => SPICEAI_PREFIXES
+                .iter()
+                .find_map(|p| {
+                    from.strip_prefix(&format!("{p}:"))
+                        .or_else(|| from.strip_prefix(&format!("{p}/")))
+                })
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(std::string::ToString::to_string),
             p => {
                 if let Some(stripped) = from.strip_prefix(&format!("{p}:")) {
                     Some(stripped.to_string())
@@ -605,5 +612,29 @@ mod tests {
             assert_eq!(model.get_source(), Some(ModelSource::SpiceAI));
             assert_eq!(model.get_model_id(), None, "unexpected model id for {from}");
         }
+    }
+
+    #[test]
+    fn spiceai_bare_prefix_reports_no_model_id() {
+        // A blank id would otherwise reach the client as an empty model name, turning a clear
+        // "no model provided" error into an opaque failure against the endpoint.
+        for from in [
+            "spice.ai:",
+            "spice.ai/",
+            "spiceai:",
+            "spiceai/",
+            "spice.ai:   ",
+            "spiceai/ ",
+        ] {
+            let model = Model::new(from, "test");
+            assert_eq!(model.get_source(), Some(ModelSource::SpiceAI));
+            assert_eq!(model.get_model_id(), None, "unexpected model id for {from}");
+        }
+    }
+
+    #[test]
+    fn spiceai_model_id_is_trimmed() {
+        let model = Model::new("spice.ai: openai/gpt-4o ", "test");
+        assert_eq!(model.get_model_id().as_deref(), Some("openai/gpt-4o"));
     }
 }

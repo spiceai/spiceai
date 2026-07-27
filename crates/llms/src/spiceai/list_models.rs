@@ -25,9 +25,11 @@ use crate::config::HostedModelConfig;
 use crate::provider::{ListModels, ListModelsError, ListModelsResult, get_required_param};
 use crate::spiceai::{api_base, is_cloud_platform};
 
-const PROVIDER_NAME: &str = "Spice Cloud";
+// Names the provider in credential/network errors. Endpoint-neutral: this lister targets the
+// Spice.ai Cloud Platform and self-hosted Spice runtimes alike.
+const PROVIDER_NAME: &str = "Spice";
 
-/// Spice Cloud model lister that fetches available models using the SDK.
+/// Model lister for a Spice endpoint — the Spice.ai Cloud Platform or another Spice runtime.
 pub struct SpiceAiModelLister {
     client: Client<HostedModelConfig>,
 }
@@ -66,7 +68,7 @@ impl SpiceAiModelLister {
         }
     }
 
-    /// Returns common Spice Cloud model names as a fallback.
+    /// Returns common Spice.ai Cloud Platform model names as a fallback.
     #[must_use]
     pub fn common_models() -> Vec<String> {
         vec![
