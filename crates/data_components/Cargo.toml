@@ -64,6 +64,13 @@ imap = { workspace = true, optional = true }
 indexmap.workspace = true
 logos.workspace = true
 mysql_async = { workspace = true, optional = true }
+# Binlog-file replay (mysql_replication::replay): the file-image reader
+# (EventStreamReader) is not re-exported by mysql_async. Version matches the
+# mysql_async pin so no extra compilation unit.
+mysql_common = { version = "0.35.5", default-features = false, features = ["binlog"], optional = true }
+# Fast row-image decode (mysql_replication::binlog::FastRowsDecoder): included-
+# column bitmaps in mysql_common's rows-event API are bitvec slices.
+bitvec = { version = "1", optional = true }
 mailparse = { workspace = true, optional = true }
 num_cpus = "1.16"
 object_store = { workspace = true }
@@ -155,6 +162,8 @@ kafka = ["dep:rdkafka"]
 mssql = ["dep:tiberius", "dep:tokio-util", "dep:bb8"]
 mysql = [
     "dep:mysql_async",
+    "dep:mysql_common",
+    "dep:bitvec",
     "datafusion-table-providers/mysql",
     "datafusion-table-providers/mysql-federation",
 ]
@@ -193,6 +202,10 @@ test_hadoop_catalog_docker = []
 arrow = { workspace = true, features = ["prettyprint"] }
 arrow-array = { workspace = true }
 aws-smithy-types = { workspace = true }
+# bench mysql_binlog_replay: the value-only decoder prototype needs
+# mysql_common internals (ParseBuf, BinlogValue ctx) and bitvec's BitSlice;
+# versions match the mysql_async-pinned build so no extra compilation.
+bitvec = "1"
 brotli = "8.0.2"
 chrono = { workspace = true }
 criterion = { version = "0.7", features = ["async_tokio", "html_reports"] }
@@ -201,6 +214,7 @@ flate2 = "1.1.5"
 iceberg-storage-opendal.workspace = true
 iceberg_test_utils = { workspace = true, features = ["tests"] }
 insta.workspace = true
+mysql_common = { version = "0.35.5", default-features = false, features = ["binlog"] }
 object_store = { workspace = true }
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync"] }
 tokio-stream = { workspace = true, features = ["net"] }
@@ -231,6 +245,11 @@ required-features = ["postgres"]
 harness = false
 name = "kafka_decode"
 required-features = ["bench", "kafka"]
+
+[[bench]]
+harness = false
+name = "mysql_binlog_replay"
+required-features = ["mysql"]
 
 [[bench]]
 harness = false

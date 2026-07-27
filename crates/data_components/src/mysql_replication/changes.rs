@@ -36,9 +36,9 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, IntervalUnit, SchemaRef};
 use mysql_async::binlog::events::{RowsEventData, TableMapEvent};
 
-use super::binlog::buffer_rows_event;
+use super::binlog::{FastRowsDecoder, buffer_rows_event, buffer_rows_event_fast};
 use super::metrics::MetricsCollector;
-use super::rows::{TransactionBuffer, build_change_batch};
+use super::rows::{TransactionBuffer, build_change_batch_cached, nullable_clone};
 use super::setup::TableLayout;
 use crate::cdc::{ChangeBatch, ChangeBatchError, ChangeRows};
 
@@ -54,12 +54,36 @@ pub(super) struct MemberLayout {
     pub(super) column_map: Vec<usize>,
     /// Source row-image indexes of the declared primary keys.
     pub(super) pk_source_indexes: Vec<usize>,
+    /// Dataset schema with every field nullable, derived once — the change
+    /// batch's `data` struct type (see `build_change_batch`).
+    pub(super) nullable_schema: SchemaRef,
+    /// The `op`/`primary_keys`/`data` wrapper schema over `nullable_schema`,
+    /// derived once and shared by every per-commit batch build.
+    pub(super) wrapper_schema: SchemaRef,
+}
+
+impl MemberLayout {
+    pub(super) fn new(
+        layout: TableLayout,
+        column_map: Vec<usize>,
+        pk_source_indexes: Vec<usize>,
+        dataset_schema: &SchemaRef,
+    ) -> Self {
+        let nullable_schema = nullable_clone(dataset_schema);
+        let wrapper_schema = Arc::new(crate::cdc::changes_schema(&nullable_schema));
+        Self {
+            layout,
+            column_map,
+            pk_source_indexes,
+            nullable_schema,
+            wrapper_schema,
+        }
+    }
 }
 
 /// Deferred [`ChangeRows`] for one member's rows within one committed source
 /// transaction. Carries owned wire payloads; the decode runs in [`Self::build`].
 pub(crate) struct MysqlChangeRows {
-    schema: SchemaRef,
     primary_keys: Vec<String>,
     /// Decode-time layout snapshot (see [`MemberLayout`]).
     layout: Arc<MemberLayout>,
@@ -81,7 +105,6 @@ pub(crate) struct MysqlChangeRows {
 
 impl MysqlChangeRows {
     pub(super) fn new(
-        schema: SchemaRef,
         primary_keys: Vec<String>,
         layout: Arc<MemberLayout>,
         tme: Arc<TableMapEvent<'static>>,
@@ -91,8 +114,11 @@ impl MysqlChangeRows {
     ) -> Self {
         // Both metadata figures are computed WITHOUT decoding, from the buffered
         // wire size (`rows_data()` is a byte-slice accessor, no row parse).
+        // `nullable_schema` differs from the dataset schema only in nullability,
+        // so the fixed-width sum is identical.
         let wire_bytes: usize = events.iter().map(|e| e.rows_data().len()).sum();
-        let per_row_fixed: usize = schema
+        let per_row_fixed: usize = layout
+            .nullable_schema
             .fields()
             .iter()
             .map(|f| arrow_fixed_width(f.data_type()))
@@ -107,7 +133,6 @@ impl MysqlChangeRows {
         // allocation), matching `PgChangeRows`.
         let byte_len = wire_bytes.max(row_hint.saturating_mul(per_row_fixed));
         Self {
-            schema,
             primary_keys,
             layout,
             tme,
@@ -146,34 +171,89 @@ impl ChangeRows for MysqlChangeRows {
     }
 
     fn build(self: Box<Self>) -> Result<ChangeBatch, ChangeBatchError> {
-        // Decode every buffered rows event into the transaction buffer using the
-        // SAME `buffer_rows_event` the per-dataset path uses (it records the
-        // per-row op metrics as it decodes), then build one Arrow batch.
-        let mut buffer = TransactionBuffer::new();
-        for event in &self.events {
-            buffer_rows_event(
-                event,
-                &self.tme,
-                &self.layout.layout,
-                &self.layout.pk_source_indexes,
-                &mut buffer,
-                &self.metrics,
-            )
-            .map_err(|e| ChangeBatchError::DeferredBuild {
-                message: e.to_string(),
-            })?;
-        }
-        build_change_batch(
-            &self.schema,
+        decode_events_to_batch(
             &self.primary_keys,
-            &self.layout.column_map,
-            &buffer.changes,
+            &self.layout,
+            &self.tme,
+            None,
+            &self.events,
+            self.source_commit_ts_ms,
+            &self.metrics,
         )
-        .map(|b| b.with_source_commit_ts_ms(self.source_commit_ts_ms))
         .map_err(|e| ChangeBatchError::DeferredBuild {
             message: e.to_string(),
         })
     }
+}
+
+/// Decode one commit's buffered rows events for one member into a
+/// [`ChangeBatch`] — the single decode+build used by BOTH the deferred path
+/// ([`MysqlChangeRows::build`], on the consumer) and the eager path (the pump's
+/// `deliver_commit`, which passes its route-cached decoder). The fast decoder
+/// hoists the per-row-image metadata rebuild out of the loop (~7× on CH-benCH
+/// row mixes); when it cannot be constructed for this table map — or
+/// `SPICE_MYSQL_WALK_DECODE` forces it for A/B measurement — decode falls back
+/// to the `buffer_rows_event` walk, which reports the condition through
+/// `mysql_common`'s own error path. Both paths record the per-row op metrics
+/// as they decode.
+pub(super) fn decode_events_to_batch(
+    primary_keys: &[String],
+    layout: &MemberLayout,
+    tme: &TableMapEvent<'static>,
+    cached_decoder: Option<&FastRowsDecoder>,
+    events: &[RowsEventData<'static>],
+    source_commit_ts_ms: Option<i64>,
+    metrics: &MetricsCollector,
+) -> super::Result<ChangeBatch> {
+    // Read the A/B hatch once per process — this runs per commit.
+    static FORCE_WALK: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("SPICE_MYSQL_WALK_DECODE").is_some());
+    // Pre-size from the event count: every rows event carries ≥1 row, and the
+    // buffer grows geometrically past the floor for multi-row events.
+    let mut buffer = TransactionBuffer::with_row_capacity(events.len());
+    let force_walk = *FORCE_WALK;
+    let built_decoder = (!force_walk && cached_decoder.is_none())
+        .then(|| FastRowsDecoder::try_new(tme).ok())
+        .flatten();
+    let decoder = if force_walk {
+        None
+    } else {
+        cached_decoder.or(built_decoder.as_ref())
+    };
+    match decoder {
+        Some(decoder) => {
+            for event in events {
+                buffer_rows_event_fast(
+                    event,
+                    decoder,
+                    &layout.layout,
+                    &layout.pk_source_indexes,
+                    &mut buffer,
+                    metrics,
+                )?;
+            }
+        }
+        None => {
+            for event in events {
+                buffer_rows_event(
+                    event,
+                    tme,
+                    &layout.layout,
+                    &layout.pk_source_indexes,
+                    &mut buffer,
+                    metrics,
+                )?;
+            }
+        }
+    }
+    build_change_batch_cached(
+        &layout.nullable_schema,
+        &layout.wrapper_schema,
+        primary_keys,
+        &layout.column_map,
+        &buffer.changes,
+    )
+    .map(|b| b.with_source_commit_ts_ms(source_commit_ts_ms))
 }
 
 /// Fixed per-value Arrow byte width for a data type, or 0 for variable-width

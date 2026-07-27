@@ -94,18 +94,18 @@ use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use futures::{StreamExt, stream};
 use mysql_async::Conn;
-use mysql_async::binlog::events::{EventData, RowsEventData, TableMapEvent};
+use mysql_async::binlog::events::{EventData, RotateEvent, RowsEventData, TableMapEvent};
 use rustc_hash::FxHashMap;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::binlog::{
-    AdoptedLayout, MIN_VALID_EVENT_POS, QueryKind, StatementKind, adopt_current_layout,
-    classify_query, classify_statement, commit_ts_ms, compute_pk_source_indexes,
-    log_transient_reconnect, open_binlog_stream, purged_position_error, readiness_heartbeat,
-    record_watermark,
+    AdoptedLayout, FastRowsDecoder, MIN_VALID_EVENT_POS, QueryKind, StatementKind,
+    adopt_current_layout, classify_query, classify_statement, commit_ts_ms,
+    compute_pk_source_indexes, log_transient_reconnect, open_binlog_stream,
+    purged_position_error, readiness_heartbeat, record_watermark,
 };
-use super::changes::{MemberLayout, MysqlChangeRows};
+use super::changes::{MemberLayout, MysqlChangeRows, decode_events_to_batch};
 use super::config::{BinlogPosition, ReplicationParams};
 use super::metrics::MetricsCollector;
 use super::rows::{build_change_batch, truncate_change};
@@ -844,11 +844,12 @@ async fn attach_member(
             dataset_name: dataset_name.clone(),
             schema: Arc::clone(&schema),
             primary_keys: primary_keys.clone(),
-            layout: Mutex::new(Arc::new(MemberLayout {
-                layout: layout.clone(),
-                column_map: column_map.clone(),
+            layout: Mutex::new(Arc::new(MemberLayout::new(
+                layout.clone(),
+                column_map.clone(),
                 pk_source_indexes,
-            })),
+                &schema,
+            ))),
             sender,
             metrics: Arc::clone(&metrics),
             ready_lag: params.ready_lag,
@@ -1251,6 +1252,15 @@ struct Route {
     slot: Arc<AckSlot>,
     tme: Arc<TableMapEvent<'static>>,
     layout: Arc<MemberLayout>,
+    /// Fast row-image decoder built once at route install and reused for every
+    /// commit routed here (eager pump-side decode). `None` when construction
+    /// failed for this table map — decode then defers to the consumer's walk.
+    decoder: Option<Arc<FastRowsDecoder>>,
+    /// Column count of the `TableMapEvent` this route was installed from —
+    /// the cheap identity check that lets the per-event `TableMap` handler skip
+    /// reinstalling an unchanged route (`MySQL` emits one `TableMap` per rows
+    /// event, so the install path is per-event hot).
+    tme_columns: u64,
 }
 
 /// Whether the source uses GTID auto-positioning (`gtid_mode = ON`) for this
@@ -1492,7 +1502,9 @@ async fn run_pump(source: Arc<SharedSource>) {
             };
 
             let header = event.header();
-            let event_end_pos = u64::from(header.log_pos());
+            // Offset within `current_file` this event advances the stream to. A
+            // real `ROTATE` rewrites both together (see [`rotate_target`]).
+            let mut event_end_pos = u64::from(header.log_pos());
             let event_timestamp = header.timestamp();
             let data = match event.read_data() {
                 Ok(data) => data,
@@ -1505,12 +1517,33 @@ async fn run_pump(source: Arc<SharedSource>) {
 
             match data {
                 Some(EventData::RotateEvent(rotate)) => {
-                    if !rotate.is_fake() {
-                        current_file = rotate.name().into_owned();
+                    // Take BOTH the file and the offset from the event: its
+                    // header offset belongs to the file being closed, so keeping
+                    // `event_end_pos` here would credit idle members a position
+                    // the newly opened file will not reach for a long time. See
+                    // [`rotate_target`].
+                    if let Some(target) = rotate_target(&rotate) {
+                        current_file = target.file;
+                        event_end_pos = target.pos;
                     }
                 }
                 Some(EventData::TableMapEvent(tme)) => {
                     let table_id = tme.table_id();
+                    // Route-identity fast path: MySQL emits one `TableMap` per
+                    // rows event, so this arm is per-event hot. A `table_id` is
+                    // stable for a table's lifetime within a connection (DDL
+                    // assigns a new id), so an installed route with the same id
+                    // AND column count is current — skip the member/slot/layout
+                    // locks, the name allocations, and the owned TME copy. The
+                    // STREAMING and liveness re-checks still run per rows event
+                    // in the `RowsEvent` arm and at delivery, and a member
+                    // rejoin always forces a reconnect (fresh routes), so a
+                    // cached route can never outlive its member generation.
+                    if let Some(route) = routes.get(&table_id)
+                        && route.tme_columns == tme.columns_count()
+                    {
+                        continue 'recv;
+                    }
                     let mkey: MemberKey = (
                         tme.database_name().to_string(),
                         tme.table_name().to_string(),
@@ -1558,11 +1591,12 @@ async fn run_pump(source: Arc<SharedSource>) {
                                 column_map,
                                 pk_source_indexes,
                             }) if layout.columns.len() as u64 == tme.columns_count() => {
-                                *lock(&member.layout) = Arc::new(MemberLayout {
+                                *lock(&member.layout) = Arc::new(MemberLayout::new(
                                     layout,
                                     column_map,
                                     pk_source_indexes,
-                                });
+                                    &member.schema,
+                                ));
                             }
                             outcome => {
                                 member.metrics.inc_schema_mismatch_error();
@@ -1586,7 +1620,12 @@ async fn run_pump(source: Arc<SharedSource>) {
                         let g = lock(&member.layout);
                         Arc::clone(&g)
                     };
+                    let tme_columns = tme.columns_count();
                     let tme = Arc::new(tme.into_owned());
+                    // Built once per install; every commit routed here reuses it
+                    // for the eager decode. Failure falls back to the deferred
+                    // consumer-side walk for this route.
+                    let decoder = FastRowsDecoder::try_new(&tme).ok().map(Arc::new);
                     routes.insert(
                         table_id,
                         Route {
@@ -1595,6 +1634,8 @@ async fn run_pump(source: Arc<SharedSource>) {
                             slot,
                             tme,
                             layout,
+                            decoder,
+                            tme_columns,
                         },
                     );
                 }
@@ -1756,11 +1797,32 @@ fn current_file_pos(file: &str) -> BinlogPosition {
     BinlogPosition::new(file.to_string(), 0)
 }
 
+/// Where a `ROTATE` event repositions the shared stream, or `None` for the fake
+/// rotate the server sends at the head of a dump (which opens no new file).
+///
+/// `ROTATE` is the one event whose header offset does **not** belong to the file
+/// it names: `log_pos` is the end of the event in the file being *closed*, while
+/// the payload names the file being *opened* and the offset to resume reading at
+/// (normally 4, just past the magic number). Pairing the new name with the
+/// closing file's offset yields a coordinate far beyond anything the new file
+/// holds — an idle member credited there has every later commit in that file
+/// suppressed by [`AckSlot::already_committed`], silently and for as long as the
+/// new file stays smaller than the old one (#12042).
+fn rotate_target(rotate: &RotateEvent<'_>) -> Option<BinlogPosition> {
+    (!rotate.is_fake()).then(|| BinlogPosition::new(rotate.name(), rotate.position()))
+}
+
 /// Deliver a committed transaction's buffered rows to their members, then
-/// credit idle streaming members up to the commit position. The pump does the
-/// O(1)-per-table work only (route lookup, watermark, transaction count, commit
-/// bookkeeping); the tuple decode + Arrow build are deferred into the
-/// per-dataset consumer via [`MysqlChangeRows`].
+/// credit idle streaming members up to the commit position.
+///
+/// Decode is EAGER by default (Postgres parity): the pump builds the Arrow
+/// [`ChangeBatch`] here with the route-cached [`FastRowsDecoder`], so consumers
+/// receive materialized envelopes (the apply loop's per-envelope
+/// `spawn_blocking` offload — measured ~300–500µs per ~10-row envelope under
+/// contention — never runs). A decode failure is member-fatal for that one
+/// member only, preserving the fault isolation the deferred path provided.
+/// `SPICE_MYSQL_DEFERRED_DECODE` restores the deferred consumer-side build
+/// (A/B measurement and emergency fallback).
 async fn deliver_commit(
     source: &Arc<SharedSource>,
     routes: &FxHashMap<u64, Route>,
@@ -1770,7 +1832,11 @@ async fn deliver_commit(
     shutdown_epoch: u64,
     gtid: Option<(uuid::Uuid, u64)>,
 ) {
+    // Read the A/B hatch once per process — this runs per commit.
+    static EAGER: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("SPICE_MYSQL_DEFERRED_DECODE").is_none());
     let commit_ts = commit_ts_ms(event_timestamp);
+    let eager = *EAGER;
     for (table_id, events) in txn {
         if events.is_empty() {
             continue;
@@ -1781,6 +1847,8 @@ async fn deliver_commit(
             slot,
             tme,
             layout,
+            decoder,
+            ..
         }) = routes.get(&table_id)
         else {
             continue;
@@ -1788,36 +1856,67 @@ async fn deliver_commit(
         if !slot.has(STREAMING) || slot.already_committed(commit_pos) {
             continue;
         }
-        // O(1), no decode: freshness watermark + transaction count. The per-row
-        // op counters are recorded off-pump in `MysqlChangeRows::build`.
+        // Freshness watermark + transaction count (no decode needed). The
+        // per-row op counters are recorded wherever the decode runs.
         record_watermark(&member.metrics, event_timestamp);
         member.metrics.inc_transaction();
         let is_ready = crate::cdc::source_commit_within_ready_lag(commit_ts, member.ready_lag);
-        // Hand the OWNED payload + immutable layout/columns snapshots downstream;
-        // the decode + build runs on the consumer, and a decode failure surfaces
-        // as a `StreamError` on this one dataset's stream.
-        let rows = MysqlChangeRows::new(
-            Arc::clone(&member.schema),
-            member.primary_keys.clone(),
-            Arc::clone(layout),
-            Arc::clone(tme),
-            events,
-            commit_ts,
-            Arc::clone(&member.metrics),
-        );
-        let envelope = ChangeEnvelope::new_from_rows(
-            Box::new(SharedPositionCommitter {
-                slot: Arc::clone(slot),
-                flush_to: commit_pos.clone(),
-                dataset: member.dataset_name.clone(),
-                source_commit_ts_ms: commit_ts,
-                gtids: gtid.into_iter().collect(),
-            }),
-            Box::new(rows),
-            is_ready,
-        );
+        let committer = Box::new(SharedPositionCommitter {
+            slot: Arc::clone(slot),
+            flush_to: commit_pos.clone(),
+            dataset: member.dataset_name.clone(),
+            source_commit_ts_ms: commit_ts,
+            gtids: gtid.into_iter().collect(),
+        });
+        let envelope = if eager {
+            match decode_events_to_batch(
+                &member.primary_keys,
+                layout,
+                tme,
+                decoder.as_deref(),
+                &events,
+                commit_ts,
+                &member.metrics,
+            ) {
+                Ok(batch) => ChangeEnvelope::new(committer, batch, is_ready),
+                Err(e) => {
+                    member.metrics.inc_decode_error();
+                    member_fatal(
+                        source,
+                        key,
+                        format!(
+                            "decoding a committed transaction for {}.{} failed: {e}",
+                            key.0, key.1
+                        ),
+                    )
+                    .await;
+                    continue;
+                }
+            }
+        } else {
+            // Deferred: hand the OWNED payload + immutable layout/columns
+            // snapshots downstream; the decode + build runs on the consumer,
+            // and a decode failure surfaces as a `StreamError` on this one
+            // dataset's stream.
+            let rows = MysqlChangeRows::new(
+                member.primary_keys.clone(),
+                Arc::clone(layout),
+                Arc::clone(tme),
+                events,
+                commit_ts,
+                Arc::clone(&member.metrics),
+            );
+            ChangeEnvelope::new_from_rows(committer, Box::new(rows), is_ready)
+        };
         slot.deliver(commit_pos);
-        match deliver_to_member(&member.sender, Ok(envelope), shutdown_epoch).await {
+        match deliver_to_member(
+            &member.sender,
+            Ok(envelope),
+            shutdown_epoch,
+            &member.dataset_name,
+        )
+        .await
+        {
             DeliverOutcome::Sent => {}
             DeliverOutcome::ReceiverGone => {
                 source.detach_member(key, "changes stream receiver dropped", true);
@@ -1901,7 +2000,14 @@ async fn handle_statement(
                     is_ready,
                 );
                 slot.deliver(&commit_pos);
-                match deliver_to_member(&member.sender, Ok(envelope), shutdown_epoch).await {
+                match deliver_to_member(
+                    &member.sender,
+                    Ok(envelope),
+                    shutdown_epoch,
+                    &member.dataset_name,
+                )
+                .await
+                {
                     DeliverOutcome::Sent => {}
                     DeliverOutcome::ReceiverGone => {
                         source.detach_member(&mkey, "changes stream receiver dropped", true);
@@ -1935,11 +2041,12 @@ async fn handle_statement(
                         column_map,
                         pk_source_indexes,
                     }) => {
-                        *lock(&member.layout) = Arc::new(MemberLayout {
+                        *lock(&member.layout) = Arc::new(MemberLayout::new(
                             layout,
                             column_map,
                             pk_source_indexes,
-                        });
+                            &member.schema,
+                        ));
                     }
                     Err(e) => {
                         member.metrics.inc_schema_mismatch_error();
@@ -1977,8 +2084,10 @@ async fn deliver_to_member(
     sender: &mpsc::Sender<std::result::Result<ChangeEnvelope, StreamError>>,
     envelope: std::result::Result<ChangeEnvelope, StreamError>,
     shutdown_epoch: u64,
+    dataset: &str,
 ) -> DeliverOutcome {
     let mut pending = envelope;
+    let mut stalled_for = Duration::ZERO;
     loop {
         match sender.send_timeout(pending, MEMBER_SEND_STALL_WARN).await {
             Ok(()) => return DeliverOutcome::Sent,
@@ -1987,7 +2096,8 @@ async fn deliver_to_member(
                 if crate::cdc::shutdown_epoch() != shutdown_epoch {
                     return DeliverOutcome::ShutdownAbandon;
                 }
-                tracing::warn!(stalled_for = ?MEMBER_SEND_STALL_WARN, "shared mysql binlog member sink is not draining; the pump is waiting to deliver committed changes");
+                stalled_for += MEMBER_SEND_STALL_WARN;
+                tracing::warn!(dataset = %dataset, stalled_for = ?stalled_for, "shared mysql binlog member sink is not draining; the pump is waiting to deliver committed changes");
                 pending = returned;
             }
         }
@@ -2604,6 +2714,7 @@ mod tests {
             &sender,
             Err(StreamError::External("x".to_string())),
             crate::cdc::shutdown_epoch(),
+            "test_dataset",
         )
         .await;
         assert!(matches!(outcome, DeliverOutcome::ReceiverGone));

@@ -35,6 +35,7 @@ pub mod changes;
 pub mod config;
 pub mod gtid;
 pub mod metrics;
+pub mod replay;
 pub mod resilience;
 pub mod rows;
 pub mod setup;

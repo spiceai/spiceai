@@ -129,6 +129,7 @@ REQUIRED_METRICS = [
 # Per-burst apply-loop stage timings (histograms; mean = _sum/_count).
 STAGE_HISTS = [
     ("recv_wait", DA + "cdc_source_recv_wait_ms", {}),
+    ("decode", DA + "cdc_apply_fixed_cost_ms", {"phase": "decode"}),
     ("coalesce", DA + "cdc_apply_fixed_cost_ms", {"phase": "coalesce"}),
     ("linger", DA + "cdc_linger_wait_ms", {}),
     ("write", DA + "cdc_apply_fixed_cost_ms", {"phase": "write"}),

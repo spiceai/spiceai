@@ -83,6 +83,13 @@ pub struct TransactionBuffer {
 
 impl TransactionBuffer {
     #[must_use]
+    pub fn with_row_capacity(rows: usize) -> Self {
+        Self {
+            changes: Vec::with_capacity(rows),
+        }
+    }
+
+    #[must_use]
     pub fn new() -> Self {
         Self {
             changes: Vec::new(),
@@ -236,16 +243,36 @@ pub fn build_change_batch(
     column_map: &[usize],
     changes: &[DecodedChange],
 ) -> Result<ChangeBatch> {
-    let num_rows = changes.len();
     let nullable_schema = nullable_clone(dataset_schema);
-    let wrapper_schema = changes_schema(&nullable_schema);
+    let wrapper_schema = Arc::new(changes_schema(&nullable_schema));
+    build_change_batch_cached(
+        &nullable_schema,
+        &wrapper_schema,
+        primary_keys,
+        column_map,
+        changes,
+    )
+}
+
+/// [`build_change_batch`] with the two derived schemas supplied by the caller.
+/// Both are pure functions of the dataset schema, so per-commit callers (the
+/// pump's eager decode, `MysqlChangeRows::build`) cache them in the member
+/// layout instead of re-deriving them for every transaction.
+pub(super) fn build_change_batch_cached(
+    nullable_schema: &SchemaRef,
+    wrapper_schema: &SchemaRef,
+    primary_keys: &[String],
+    column_map: &[usize],
+    changes: &[DecodedChange],
+) -> Result<ChangeBatch> {
+    let num_rows = changes.len();
 
     let mut op_builder = StringBuilder::with_capacity(num_rows, num_rows * 2);
     let mut pk_offsets = Vec::<i32>::with_capacity(num_rows + 1);
     pk_offsets.push(0);
     let mut pk_values: Vec<&str> = Vec::with_capacity(num_rows.saturating_mul(primary_keys.len()));
 
-    let mut data_builders: Vec<FieldBuilder> = dataset_schema
+    let mut data_builders: Vec<FieldBuilder> = nullable_schema
         .fields()
         .iter()
         .map(|f| FieldBuilder::new(f.data_type()))
@@ -291,7 +318,7 @@ pub fn build_change_batch(
     let data_struct = StructArray::new(nullable_schema.fields().clone(), data_columns, None);
 
     let record = RecordBatch::try_new(
-        Arc::new(wrapper_schema),
+        Arc::clone(wrapper_schema),
         vec![op_array, Arc::new(pk_list), Arc::new(data_struct)],
     )
     .map_err(|e| Error::SchemaMismatch {
