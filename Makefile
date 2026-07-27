@@ -105,10 +105,14 @@ nextest:
 # scope and profile as `nextest`, so its test binaries carry into that run.
 # Callers must filter out packages without a library target: `--lib` is a fatal
 # `no library targets found` on bin-only crates.
+# --no-tests=pass because a scoped selection legitimately covers crates with no
+# unit tests (29 workspace libraries have none). nextest exits 4 on "no tests to
+# run" by default, which would abort the sign-off for a branch that only touched
+# one of them; the full `nextest` run still gates the workspace.
 .PHONY: nextest-packages
 nextest-packages:
 	@test -n "$(strip $(PACKAGES))" || { echo 'nextest-packages requires PACKAGES="crate1 crate2"' >&2; exit 1; }
-	@cargo nextest run $(_LINT_PKG_FLAGS) --lib $(_FEATURES_FLAGS) $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
+	@cargo nextest run --no-tests=pass $(_LINT_PKG_FLAGS) --lib $(_FEATURES_FLAGS) $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
 
 # Also update .github/workflows/integration.yml with changes to this target
 .PHONY: test-integration
