@@ -12,8 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Support code for Cayenne **result-correctness** integration tests
-//! (inventory, fixtures, SQLLancer corpus, reports).
+//! Support code for **result-correctness** integration tests (inventory,
+//! fixtures, standalone engines, SQLLancer corpus, reports).
+//!
+//! Standalone engines (`standalone_engines`) are out-of-Spice oracles
+//! (`duckdb` / `rusqlite` / chDB). Spice accelerators under test are Cayenne
+//! here and DuckDB/SQLite accelerators in `runtime`’s `result_correctness` test.
 //!
 //! Not used by Criterion `vs_duckdb_*` / `vs_chdb_*` performance benches.
 //! See `tests/correctness/README.md`.
@@ -23,12 +27,26 @@
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::missing_panics_doc)]
 #![allow(clippy::missing_errors_doc)]
+#![allow(clippy::cast_possible_wrap)]
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::cast_sign_loss)]
+#![allow(clippy::cast_precision_loss)]
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::match_same_arms)]
+#![allow(clippy::too_many_lines)]
+#![allow(clippy::many_single_char_names)]
+#![allow(clippy::map_unwrap_or)]
+#![allow(clippy::unnested_or_patterns)]
+#![allow(clippy::needless_raw_string_hashes)]
 
 pub mod chbench_data;
 pub mod harness;
 pub mod inventory;
 pub mod report;
+pub mod sqlite_engine;
 pub mod sqllancer;
+pub mod ssb_data;
+pub mod standalone_engines;
 
 #[expect(unused_imports)] // re-exported for integration test crates
 pub use harness::{
@@ -529,6 +547,9 @@ pub fn suite_queries() -> Vec<(String, Query)> {
     }
     for q in get_chbench_test_queries(None) {
         out.push(("chbench".to_string(), q));
+    }
+    for q in ssb_data::ssb_queries() {
+        out.push(("ssb".to_string(), q));
     }
     // SpiceBench SF1 built-in scenario is TPC-H (see spiceai/spicebench README).
     for q in get_tpch_test_queries(None) {

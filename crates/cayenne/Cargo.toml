@@ -500,5 +500,19 @@ name = "result_correctness_vs_chdb_test"
 path = "tests/result_correctness_vs_chdb_test.rs"
 required-features = ["result-correctness-chdb"]
 
+# Result correctness vs SQLite (SSB + SQLLancer + micro). Always linked
+# (rusqlite is a cayenne dependency). Not a Criterion bench.
+[[test]]
+name = "result_correctness_vs_sqlite_test"
+path = "tests/result_correctness_vs_sqlite_test.rs"
+
+# Out-of-Spice oracle baseline: standalone DuckDB ↔ standalone SQLite (no
+# Cayenne / no Spice accelerators). Validates external engines agree before
+# accelerator-vs-oracle gates. Requires DuckDB feature for one side.
+[[test]]
+name = "result_correctness_standalone_engines_test"
+path = "tests/result_correctness_standalone_engines_test.rs"
+required-features = ["result-correctness-duckdb"]
+
 [lints]
 workspace = true

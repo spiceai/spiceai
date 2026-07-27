@@ -14,15 +14,15 @@
 
 //! # Result correctness (not performance)
 //!
-//! Asserts Cayenne and DuckDB return **equivalent query results** for the same
-//! SQL on identical data. This is separate from Criterion `vs_duckdb_*` benches
-//! and from `tools/testoperator/dispatch/perf-cayenne-vs-duckdb/` — those measure
-//! latency/throughput; this gate only checks content equality.
+//! Asserts **Spice Cayenne** and **standalone DuckDB** (out-of-Spice `duckdb`
+//! crate) return **equivalent query results** for the same SQL on identical data.
+//! Separate from Criterion `vs_duckdb_*` benches and from
+//! `tools/testoperator/dispatch/perf-cayenne-vs-duckdb/` (latency/throughput).
 //!
 //! Requires `--features result-correctness-duckdb` (not `duckdb-bench`).
 //! See `tests/correctness/README.md`.
 //!
-//! Suites: TPC-H SF1, TPC-DS SF1, ClickBench, CH-benCHmark SF1, SpiceBench
+//! Suites: TPC-H SF1, TPC-DS SF1, ClickBench, CH-benCHmark SF1, SSB, SpiceBench
 //! (TPC-H scenario) SF1, SQLLancer corpus, micro SQL shapes.
 //! Scale defaults SF1 (`CAYENNE_PARITY_*_SF`). ClickBench: `CLICKBENCH_HITS_PARQUET`
 //! or ranking-deterministic fixture + env-failure log under `CAYENNE_PARITY_SCRATCH`.
@@ -1166,6 +1166,59 @@ async fn chbench_sf1_load_mode_matrix_vs_duckdb() {
 
     // Harness assertion — tests fail in CI without human analysis of logs.
     assert_all_pass_or_excluded(&labeled, "CH-benCHmark load-mode matrix");
+}
+
+/// Star Schema Benchmark: classic Q1.1–Q4.3 on deterministic reduced-scale data.
+#[tokio::test(flavor = "multi_thread")]
+async fn ssb_full_result_parity_vs_duckdb() {
+    use support::ssb_data::{SSB_TABLES, ssb_queries, write_ssb_parquet};
+
+    let scratch = scratch_dir();
+    std::fs::create_dir_all(&scratch).ok();
+    let scale = env_f64("CAYENNE_PARITY_SSB_SCALE", 1.0) as i64;
+    eprintln!("SSB parity vs DuckDB at scale={scale}");
+
+    let ssb_dir = scratch.join(format!("ssb_scale{scale}"));
+    if !ssb_dir.join("lineorder.parquet").exists() {
+        write_ssb_parquet(&ssb_dir, scale);
+    }
+
+    let cayenne = load_cayenne_from_parquet(&ssb_dir, SSB_TABLES).await;
+    let (duck_temp, duck) = load_duckdb_from_parquet(&ssb_dir, SSB_TABLES);
+    let _keep = duck_temp;
+
+    let mut results = Vec::new();
+    for q in ssb_queries() {
+        let outcome =
+            run_pair_with_df_baseline("ssb", &q, &cayenne, &duck, None, Some(&ssb_dir)).await;
+        eprintln!("ssb/{} -> {outcome:?}", q.name);
+        results.push(RunResult {
+            suite: "ssb".into(),
+            name: q.name.to_string(),
+            engine_pair: "cayenne-duckdb",
+            outcome,
+        });
+    }
+
+    let log_path = scratch.join("cayenne_duckdb_ssb_parity.log");
+    let mut log = format!("SSB scale={scale}\n");
+    for r in &results {
+        log.push_str(&format!("{}: {:?}\n", r.name, r.outcome));
+    }
+    log.push_str(&summary_line(&results));
+    log.push('\n');
+    std::fs::write(&log_path, &log).expect("write ssb log");
+    eprintln!("{}", summary_line(&results));
+
+    let fails: Vec<_> = results
+        .iter()
+        .filter(|r| !r.outcome.is_pass_or_excluded())
+        .collect();
+    assert!(
+        fails.is_empty(),
+        "SSB full-result parity failures: {fails:#?}\nsee {}",
+        log_path.display()
+    );
 }
 
 /// SpiceBench SF1 built-in scenario is TPC-H — same data/SQL as TPC-H SF1 with

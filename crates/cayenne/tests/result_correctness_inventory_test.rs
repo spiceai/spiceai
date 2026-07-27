@@ -16,7 +16,7 @@
 //!
 //! Not a performance test. Does not link DuckDB or chDB. Proves:
 //! 1. The correctness inventory is complete vs suite SQL sources
-//!    (TPC-H/TPC-DS/ClickBench/CH-benCHmark/SpiceBench/SQLLancer/micro).
+//!    (TPC-H/TPC-DS/ClickBench/CH-benCHmark/SSB/SpiceBench/SQLLancer/micro).
 //! 2. Shipped `compare_query_result_batches` fails on value mismatches and
 //!    passes multiset-equal reordered results.
 //!
@@ -24,6 +24,8 @@
 
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::cloned_ref_to_slice_refs)]
 
 #[path = "correctness/support/mod.rs"]
 mod support;
@@ -70,6 +72,11 @@ fn inventory_is_complete_relative_to_suite_sources() {
         by_suite.get("chbench").map(Vec::len)
     );
     assert!(
+        by_suite.get("ssb").map_or(0, Vec::len) >= 13,
+        "SSB inventory too small: {:?}",
+        by_suite.get("ssb").map(Vec::len)
+    );
+    assert!(
         by_suite.get("spicebench").map_or(0, Vec::len) >= 28,
         "SpiceBench inventory too small: {:?}",
         by_suite.get("spicebench").map(Vec::len)
@@ -82,12 +89,13 @@ fn inventory_is_complete_relative_to_suite_sources() {
     let inv = build_inventory();
     eprintln!(
         "inventory complete: {} total entries \
-         (tpch={} tpcds={} clickbench={} chbench={} spicebench={} sqllancer={} micro={})",
+         (tpch={} tpcds={} clickbench={} chbench={} ssb={} spicebench={} sqllancer={} micro={})",
         inv.len(),
         by_suite["tpch"].len(),
         by_suite["tpcds"].len(),
         by_suite["clickbench"].len(),
         by_suite["chbench"].len(),
+        by_suite["ssb"].len(),
         by_suite["spicebench"].len(),
         by_suite["sqllancer"].len(),
         by_suite["micro"].len(),

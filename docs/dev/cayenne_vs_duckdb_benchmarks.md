@@ -6,12 +6,20 @@ Cayenne wins on every dimension that matters — ingestion, query, mutation,
 retention, throughput — and to catch regressions early.
 
 **Result correctness is a separate gate.** Full-content SQL result equality
-vs DuckDB/chDB (TPC-H/TPC-DS/ClickBench/CH-benCHmark/SpiceBench/SQLLancer)
-lives under `crates/cayenne/tests/correctness/` and is run with
-`cargo test -p cayenne --features result-correctness-duckdb|result-correctness-chdb`
-— not with `cargo bench` or the `duckdb-bench` / `chdb-bench` Criterion
-features. See `crates/cayenne/tests/correctness/README.md`. Do not treat
-those tests as perf regressions or fold them into this matrix.
+compares **standalone engines outside Spice** (`duckdb` / `rusqlite` / `chdb-rust`
+crates) with **Spice accelerators** (Cayenne, DuckDB accel, SQLite accel) on
+TPC-H/TPC-DS/ClickBench/CH-benCHmark/SSB/SpiceBench/SQLLancer/micro. Entry points:
+
+- `crates/cayenne/tests/correctness/` — inventory, standalone DuckDB↔SQLite
+  baseline, Cayenne↔standalone oracles
+- `crates/runtime/tests/result_correctness.rs` — Spice DuckDB/SQLite accelerators
+  ↔ standalone oracles
+
+Run with `cargo test -p cayenne --features result-correctness-duckdb|result-correctness-chdb`
+and `cargo test -p runtime --features duckdb,sqlite --test result_correctness`
+— not with `cargo bench` or Criterion features. See
+`crates/cayenne/tests/correctness/README.md`. Do not treat those tests as perf
+regressions or fold them into this matrix.
 
 The comparison has two layers:
 

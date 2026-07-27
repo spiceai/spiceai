@@ -14,8 +14,9 @@
 
 //! # Result correctness (not performance)
 //!
-//! Asserts Cayenne and chDB return **equivalent query results** for expressible
-//! inventory SQL on identical data. Separate from Criterion `vs_chdb_*` benches.
+//! Asserts **Spice Cayenne** and **standalone chDB** (out-of-Spice `chdb-rust`)
+//! return **equivalent query results** for expressible inventory SQL on identical
+//! data. Separate from Criterion `vs_chdb_*` benches.
 //! Requires `--features result-correctness-chdb` (not `chdb-bench`). Does **not**
 //! link DuckDB (engines cannot co-exist in one process).
 //!

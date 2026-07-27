@@ -15,10 +15,10 @@
 //! Machine-checkable coverage inventory for Cayenne query-result parity.
 //!
 //! Suites (all SF1 unless noted):
-//! - TPC-H, TPC-DS, ClickBench, CH-benCHmark, SpiceBench (TPC-H scenario),
+//! - TPC-H, TPC-DS, ClickBench, CH-benCHmark, SSB, SpiceBench (TPC-H scenario),
 //!   SQLLancer corpus, micro-bench shapes.
 //!
-//! Engines: Cayenne, DuckDB, chDB (pairwise — DuckDB and chDB cannot co-link).
+//! Engines: Cayenne, DuckDB, chDB, SQLite (pairwise — DuckDB and chDB cannot co-link).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -30,6 +30,7 @@ use test_framework::queries::{
 
 use super::micro_bench_queries;
 use super::sqllancer::sqllancer_queries;
+use super::ssb_data::ssb_queries;
 
 /// One inventory entry: suite query + per-engine status.
 #[derive(Debug, Clone)]
@@ -41,6 +42,8 @@ pub struct InventoryEntry {
     pub duckdb_exclusion: Option<&'static str>,
     /// `None` means expressible in chDB; `Some(reason)` means not compared vs chDB.
     pub chdb_exclusion: Option<&'static str>,
+    /// `None` means compared vs SQLite; `Some(reason)` is a justified exclusion.
+    pub sqlite_exclusion: Option<&'static str>,
 }
 
 /// Build the full inventory from suite sources + micro + SQLLancer.
@@ -58,6 +61,10 @@ pub fn build_inventory() -> Vec<InventoryEntry> {
                 "TPC-H multi-table SQL targets DataFusion/DuckDB dialect; \
                  chDB runs SQLLancer + micro on all three engines",
             ),
+            sqlite_exclusion: Some(
+                "TPC-H SQL uses DataFusion/DuckDB dialect (EXTRACT, INTERVAL, …); \
+                 SQLite lane covers SSB + SQLLancer + micro",
+            ),
         });
     }
 
@@ -71,6 +78,10 @@ pub fn build_inventory() -> Vec<InventoryEntry> {
                 "TPC-DS multi-table SQL targets DataFusion/DuckDB dialect; \
                  chDB runs SQLLancer + micro on all three engines",
             ),
+            sqlite_exclusion: Some(
+                "TPC-DS SQL targets DataFusion/DuckDB dialect; \
+                 SQLite lane covers SSB + SQLLancer + micro",
+            ),
         });
     }
 
@@ -82,6 +93,10 @@ pub fn build_inventory() -> Vec<InventoryEntry> {
             duckdb_exclusion: None,
             chdb_exclusion: Some(
                 "ClickBench full hits loaded in DuckDB lane; chDB runs SQLLancer + micro",
+            ),
+            sqlite_exclusion: Some(
+                "ClickBench hits schema/SQL surface is DataFusion-oriented; \
+                 SQLite lane covers SSB + SQLLancer + micro",
             ),
         });
     }
@@ -95,6 +110,23 @@ pub fn build_inventory() -> Vec<InventoryEntry> {
             chdb_exclusion: Some(
                 "CH-benCHmark multi-table TPC-C/H hybrid SQL targets DataFusion/DuckDB dialect",
             ),
+            sqlite_exclusion: Some(
+                "CH-benCHmark SQL uses mod()/dialect forms; SQLite lane covers SSB + SQLLancer + micro",
+            ),
+        });
+    }
+
+    for q in ssb_queries() {
+        entries.push(InventoryEntry {
+            suite: "ssb",
+            name: q.name.to_string(),
+            sql: q.sql.to_string(),
+            duckdb_exclusion: None,
+            chdb_exclusion: Some(
+                "SSB multi-table star-schema SQL is covered vs DuckDB and SQLite; \
+                 chDB runs SQLLancer + micro",
+            ),
+            sqlite_exclusion: None,
         });
     }
 
@@ -110,6 +142,9 @@ pub fn build_inventory() -> Vec<InventoryEntry> {
             chdb_exclusion: Some(
                 "SpiceBench SF1 scenario is TPC-H; chDB dialect exclusion same as TPC-H suite",
             ),
+            sqlite_exclusion: Some(
+                "SpiceBench SF1 is TPC-H dialect; SQLite lane covers SSB + SQLLancer + micro",
+            ),
         });
     }
 
@@ -120,6 +155,7 @@ pub fn build_inventory() -> Vec<InventoryEntry> {
             sql: q.sql.to_string(),
             duckdb_exclusion: None,
             chdb_exclusion: sqllancer_chdb_exclusion(&q),
+            sqlite_exclusion: sqllancer_sqlite_exclusion(&q),
         });
     }
 
@@ -130,6 +166,7 @@ pub fn build_inventory() -> Vec<InventoryEntry> {
             sql: q.sql.to_string(),
             duckdb_exclusion: None,
             chdb_exclusion: None,
+            sqlite_exclusion: None,
         });
     }
 
@@ -144,6 +181,23 @@ fn sqllancer_chdb_exclusion(q: &Query) -> Option<&'static str> {
             "chDB NULL/MIN three-valued logic differs from DataFusion on scalar subquery filter",
         ),
         _ => None,
+    }
+}
+
+fn sqllancer_sqlite_exclusion(q: &Query) -> Option<&'static str> {
+    // SQLite lacks several DataFusion/Postgres scalar functions / clauses.
+    let sql = q.sql.to_ascii_lowercase();
+    if sql.contains("regexp_match")
+        || sql.contains("date_trunc")
+        || sql.contains("make_date")
+        || sql.contains("arrow_cast")
+        || sql.contains("extract(")
+        || sql.contains("nulls last")
+        || sql.contains("nulls first")
+    {
+        Some("SQLLancer query uses DataFusion-only SQL not supported by SQLite")
+    } else {
+        None
     }
 }
 
@@ -201,6 +255,13 @@ pub fn assert_inventory_complete() {
         assert!(
             inv_names.contains(&("chbench", q.name.as_ref())),
             "inventory missing CH-benCHmark query {}",
+            q.name
+        );
+    }
+    for q in ssb_queries() {
+        assert!(
+            inv_names.contains(&("ssb", q.name.as_ref())),
+            "inventory missing SSB query {}",
             q.name
         );
     }

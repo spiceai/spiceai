@@ -37,11 +37,19 @@ pub fn write_coverage_report(path: &Path, results: &[RunResult]) -> std::io::Res
 
     let inventory = build_inventory();
     let mut md = String::new();
-    writeln!(md, "# Cayenne result-correctness coverage").ok();
+    writeln!(md, "# Result-correctness coverage").ok();
     writeln!(md).ok();
     writeln!(
         md,
         "> Correctness only — not a performance / Criterion benchmark report."
+    )
+    .ok();
+    writeln!(md).ok();
+    writeln!(
+        md,
+        "Engine roles: **standalone-*** = out-of-Spice oracle crates \
+         (`duckdb`, `rusqlite`, `chdb-rust`); **spice-*** = Spice accelerators \
+         (Cayenne, DuckDB accel, SQLite accel)."
     )
     .ok();
     writeln!(md).ok();
@@ -128,18 +136,23 @@ pub fn write_coverage_report(path: &Path, results: &[RunResult]) -> std::io::Res
     writeln!(md).ok();
     writeln!(
         md,
-        "| Suite | Query | DuckDB exclusion | chDB exclusion |"
+        "| Suite | Query | DuckDB exclusion | chDB exclusion | SQLite exclusion |"
     )
     .ok();
-    writeln!(md, "|-------|-------|------------------|----------------|").ok();
+    writeln!(
+        md,
+        "|-------|-------|------------------|----------------|------------------|"
+    )
+    .ok();
     for e in &inventory {
         writeln!(
             md,
-            "| {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} |",
             e.suite,
             e.name,
             e.duckdb_exclusion.unwrap_or(""),
             e.chdb_exclusion.unwrap_or(""),
+            e.sqlite_exclusion.unwrap_or(""),
         )
         .ok();
     }
