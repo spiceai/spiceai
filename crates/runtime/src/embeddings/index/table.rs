@@ -15,10 +15,13 @@ limitations under the License.
 */
 #![allow(clippy::too_many_arguments)]
 
+use crate::component::dataset::acceleration::ZeroResultsAction;
 use crate::model::EmbeddingModelStore;
 use crate::secrets::Secrets;
 use datafusion::datasource::TableProvider;
 use datafusion::{prelude::SessionContext, sql::TableReference};
+#[cfg(feature = "models")]
+use runtime_datafusion_udfs::embed::EMBED_UDF_NAME;
 use spicepod::vector::VectorStore;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -28,25 +31,28 @@ use spicepod::semantic::Column;
 #[cfg(feature = "duckdb")]
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
 
+#[cfg(feature = "elasticsearch")]
+use search::metadata::MetadataColumns;
 #[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
 use {
     crate::embeddings::construct_chunker,
     arrow_schema::{Schema, SchemaRef},
     chunking::ChunkingConfig,
     runtime_datafusion_index::{Index, IndexedTableProvider},
-    search::index::{SearchIndex, VectorScanTableProvider, chunking::ChunkedSearchIndex},
+    runtime_search::embeddings::warm_index::with_memory_warm_index,
+    search::index::{
+        SearchIndex, VectorIndex, VectorScanTableProvider, chunking::ChunkedSearchIndex,
+    },
     search::metadata::MetadataColumn,
     snafu::ResultExt,
     spicepod::component::embeddings::EmbeddingChunkConfig,
     spicepod::semantic::MetadataType,
 };
-
 #[cfg(feature = "s3_vectors")]
 use {
     datafusion::common::ToDFSchema as _,
     runtime_table_partition::expression::partition_by_expressions,
     search::generation::util::get_primary_keys,
-    search::index::{VectorIndex, s3_vectors::S3Vector},
 };
 
 pub(crate) async fn wrap_table_as_index(
@@ -58,6 +64,7 @@ pub(crate) async fn wrap_table_as_index(
     file_format: Option<&str>,
     inner_table_provider: Arc<dyn TableProvider>,
     vector_store: &VectorStore,
+    on_zero_results: &ZeroResultsAction,
 ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
     let schema = inner_table_provider.schema();
     for c in columns {
@@ -74,7 +81,7 @@ pub(crate) async fn wrap_table_as_index(
     #[cfg(not(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb")))]
     let _ = file_format;
     #[cfg(not(any(feature = "s3_vectors", feature = "elasticsearch")))]
-    let _ = secrets;
+    let _ = (secrets, on_zero_results);
     #[cfg(not(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb")))]
     let _ = (
         embedding_models,
@@ -96,12 +103,14 @@ pub(crate) async fn wrap_table_as_index(
                 file_format,
                 inner_table_provider,
                 vector_store,
+                on_zero_results,
             )
             .await
         }
         #[cfg(feature = "elasticsearch")]
         Some("elasticsearch" | "es") => {
             wrap_table_as_index_elasticsearch(
+                ctx,
                 embedding_models,
                 secrets,
                 tbl,
@@ -109,6 +118,7 @@ pub(crate) async fn wrap_table_as_index(
                 file_format,
                 inner_table_provider,
                 vector_store,
+                on_zero_results,
             )
             .await
         }
@@ -188,6 +198,7 @@ async fn wrap_table_as_index_s3(
     file_format: Option<&str>,
     inner_table_provider: Arc<dyn TableProvider + 'static>,
     vector_store: &VectorStore,
+    on_zero_results: &ZeroResultsAction,
 ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
     tracing::info!("S3 Vectors for table {tbl} initializing...");
     let start = std::time::Instant::now();
@@ -198,6 +209,12 @@ async fn wrap_table_as_index_s3(
     } else {
         tracing::debug!("[S3Vectors][table={tbl}] No partitioning");
     }
+
+    let Some(embed_udf) = ctx.state().scalar_functions().get(EMBED_UDF_NAME).cloned() else {
+        return Err(Box::from(format!(
+            "No scalar UDF '{EMBED_UDF_NAME}' found in context"
+        )));
+    };
 
     let embedding_columns: Vec<_> = columns
         .iter()
@@ -214,13 +231,14 @@ async fn wrap_table_as_index_s3(
             IndexedTableProvider::new(Arc::clone(&inner_table_provider))
         };
     for (column, config) in embedding_columns {
-        let (columns, index_schema) = if config.chunking.as_ref().is_some_and(|cfg| cfg.enabled) {
+        let chunking = config.chunking.as_ref().filter(|cfg| cfg.enabled);
+        let (columns, index_schema) = if chunking.is_some() {
             updated_chunked_search_index_format(&inner_table_provider, columns, &column)
         } else {
             (columns.to_vec(), inner_table_provider.schema())
         };
 
-        let vector_index = super::s3::try_from_table(
+        let mut s3_index = super::s3::try_from_table(
             tbl,
             column,
             config.clone(),
@@ -235,30 +253,47 @@ async fn wrap_table_as_index_s3(
         )
         .await?;
 
-        if let Some(ref chunking) = config.chunking
-            && chunking.enabled
-        {
+        if chunking.is_some() {
             tracing::debug!(
                 "[S3Vectors][table={tbl}] Chunking column {}",
-                vector_index.embedded_column
+                s3_index.embedded_column
             );
-            provider = construct_s3_chunked_vector_index(
+            s3_index.primary_key = ChunkedSearchIndex::augment_primary_key(s3_index.primary_key);
+        }
+
+        // The S3 index exposes its metadata columns in both its list and query plans,
+        // so the warm index mirrors them — a fallback read then serves the same columns
+        // a warm read does.
+
+        let metadata_columns = s3_index.metadata_columns.clone();
+        let embedder = Arc::clone(&s3_index.compute_query);
+        let metric = s3_index.table.distance_metric.clone();
+        let vector_index = with_memory_warm_index(
+            tbl,
+            Arc::new(s3_index) as Arc<dyn VectorIndex>,
+            metadata_columns,
+            embedder,
+            &embed_udf,
+            &config.model,
+            metric.as_str(),
+            on_zero_results,
+        );
+
+        if let Some(chunking) = chunking {
+            provider = construct_chunked_vector_index(
                 provider,
                 embedding_models,
                 chunking,
-                vector_index,
+                vector_index as Arc<dyn SearchIndex>,
                 config.model.as_str(),
                 file_format,
             )
             .await?;
         } else {
-            let idx = Arc::new(vector_index);
-            let vector_index = Arc::clone(&idx) as Arc<dyn VectorIndex>;
-
             provider.underlying = Arc::new(
                 VectorScanTableProvider::try_new(provider.underlying, &vector_index).boxed()?,
             ) as Arc<dyn TableProvider>;
-            provider = provider.add_index(Arc::clone(&idx) as Arc<dyn Index>);
+            provider = provider.add_index(vector_index as Arc<dyn Index>);
         }
     }
     tracing::info!(
@@ -268,12 +303,15 @@ async fn wrap_table_as_index_s3(
     Ok(Arc::new(provider))
 }
 
-#[cfg(feature = "s3_vectors")]
-async fn construct_s3_chunked_vector_index(
+/// Wrap `index` (whose primary key must already be augmented with the chunk key via
+/// [`ChunkedSearchIndex::augment_primary_key`]) in a [`ChunkedSearchIndex`] and attach
+/// it to `provider`.
+#[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
+async fn construct_chunked_vector_index(
     mut provider: IndexedTableProvider,
     embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
     chunking: &EmbeddingChunkConfig,
-    mut vector_index: S3Vector,
+    index: Arc<dyn SearchIndex>,
     model_name: &str,
     file_format: Option<&str>,
 ) -> Result<IndexedTableProvider, Box<dyn std::error::Error + Send + Sync>> {
@@ -290,13 +328,7 @@ async fn construct_s3_chunked_vector_index(
     .await
     .boxed()?;
 
-    vector_index.primary_key = ChunkedSearchIndex::augment_primary_key(vector_index.primary_key);
-
-    let idx = Arc::new(vector_index);
-    let chunked_idx = Arc::new(ChunkedSearchIndex::new(
-        idx as Arc<dyn SearchIndex>,
-        chunker,
-    ));
+    let chunked_idx = Arc::new(ChunkedSearchIndex::new(index, chunker));
 
     if let Some(vector_index) = Arc::clone(&chunked_idx).as_vector_index() {
         provider.underlying =
@@ -373,6 +405,7 @@ fn get_partition_expressions(
 
 #[cfg(feature = "elasticsearch")]
 async fn wrap_table_as_index_elasticsearch(
+    ctx: &Arc<SessionContext>,
     embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
     secrets: &Arc<RwLock<Secrets>>,
     tbl: &TableReference,
@@ -380,6 +413,7 @@ async fn wrap_table_as_index_elasticsearch(
     file_format: Option<&str>,
     inner_table_provider: Arc<dyn TableProvider + 'static>,
     vector_store: &VectorStore,
+    on_zero_results: &ZeroResultsAction,
 ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
     tracing::info!("Elasticsearch vector engine for table {tbl} initializing...");
     let start = std::time::Instant::now();
@@ -401,15 +435,20 @@ async fn wrap_table_as_index_elasticsearch(
         runtime_datafusion_index::IndexedTableProvider::new(Arc::clone(&inner_table_provider))
     };
 
-    for (column, config) in embedding_columns {
-        let (augmented_columns, index_schema) =
-            if config.chunking.as_ref().is_some_and(|cfg| cfg.enabled) {
-                updated_chunked_search_index_format(&inner_table_provider, columns, &column)
-            } else {
-                (columns.to_vec(), inner_table_provider.schema())
-            };
+    let Some(embed_udf) = ctx.state().scalar_functions().get(EMBED_UDF_NAME).cloned() else {
+        return Err(Box::from(format!(
+            "No scalar UDF '{EMBED_UDF_NAME}' found in context"
+        )));
+    };
 
-        let es_index = super::elasticsearch::try_from_table(
+    for (column, config) in embedding_columns {
+        let chunking = config.chunking.as_ref().filter(|cfg| cfg.enabled);
+        let (augmented_columns, index_schema) = match chunking {
+            Some(_) => updated_chunked_search_index_format(&inner_table_provider, columns, &column),
+            None => (columns.to_vec(), inner_table_provider.schema()),
+        };
+
+        let mut es_index = super::elasticsearch::try_from_table(
             tbl,
             column.clone(),
             config.clone(),
@@ -422,31 +461,48 @@ async fn wrap_table_as_index_elasticsearch(
         )
         .await?;
 
-        if let Some(ref chunking) = config.chunking
-            && chunking.enabled
-        {
+        provider = if let Some(chunking) = chunking {
             tracing::debug!(
                 "[Elasticsearch][table={tbl}] Chunking column {}",
                 es_index.embedded_column
             );
-            provider = construct_elasticsearch_chunked_vector_index(
+            // The Elasticsearch chunked query plan omits the chunk key column, so the
+            // fallback projection from a warm in-memory index onto Elasticsearch results
+            // cannot be built — serve reads from Elasticsearch directly.
+            tracing::debug!(
+                "Not adding an in-memory warm vector index for table {tbl}: chunking is enabled on the Elasticsearch vector engine."
+            );
+            es_index.primary_key = ChunkedSearchIndex::augment_primary_key(es_index.primary_key);
+
+            construct_chunked_vector_index(
                 provider,
                 embedding_models,
                 chunking,
-                es_index,
+                Arc::new(es_index) as Arc<dyn SearchIndex>,
                 config.model.as_str(),
                 file_format,
             )
-            .await?;
+            .await?
         } else {
-            let idx = Arc::new(es_index);
-            let vector_index = Arc::clone(&idx) as Arc<dyn search::index::VectorIndex>;
+            // Unlike S3 Vectors, the Elasticsearch list & query plans do not expose
+            // metadata columns, so the warm index must not store any — otherwise the
+            // fallback projection onto the Elasticsearch results cannot be built.
+            let vector_index = with_memory_warm_index(
+                tbl,
+                Arc::new(es_index.clone()) as Arc<dyn VectorIndex>,
+                MetadataColumns::none(),
+                Arc::clone(&es_index.compute_query),
+                &embed_udf,
+                &config.model,
+                es_index.similarity.as_str(),
+                on_zero_results,
+            );
+
             provider.underlying = Arc::new(
-                VectorScanTableProvider::try_new(provider.underlying, &vector_index)
-                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?,
+                VectorScanTableProvider::try_new(provider.underlying, &vector_index).boxed()?,
             ) as Arc<dyn TableProvider>;
-            provider = provider.add_index(Arc::clone(&idx) as Arc<dyn Index>);
-        }
+            provider.add_index(vector_index as Arc<dyn Index>)
+        };
     }
 
     tracing::info!(
@@ -454,43 +510,4 @@ async fn wrap_table_as_index_elasticsearch(
         start.elapsed()
     );
     Ok(Arc::new(provider))
-}
-
-#[cfg(feature = "elasticsearch")]
-async fn construct_elasticsearch_chunked_vector_index(
-    mut provider: IndexedTableProvider,
-    embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
-    chunking: &EmbeddingChunkConfig,
-    mut es_index: super::elasticsearch::ElasticsearchIndex,
-    model_name: &str,
-    file_format: Option<&str>,
-) -> Result<IndexedTableProvider, Box<dyn std::error::Error + Send + Sync>> {
-    let chunker = construct_chunker(
-        model_name,
-        &ChunkingConfig {
-            target_chunk_size: chunking.target_chunk_size,
-            overlap_size: chunking.overlap_size,
-            trim_whitespace: chunking.trim_whitespace,
-            file_format,
-        },
-        &Arc::clone(embedding_models),
-    )
-    .await
-    .boxed()?;
-
-    es_index.primary_key = ChunkedSearchIndex::augment_primary_key(es_index.primary_key);
-
-    let idx = Arc::new(es_index);
-    let chunked_idx = Arc::new(ChunkedSearchIndex::new(
-        idx as Arc<dyn SearchIndex>,
-        chunker,
-    ));
-
-    if let Some(vector_index) = Arc::clone(&chunked_idx).as_vector_index() {
-        provider.underlying = Arc::new(
-            VectorScanTableProvider::try_new(provider.underlying, &vector_index)
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?,
-        ) as Arc<dyn TableProvider>;
-    }
-    Ok(provider.add_index(Arc::clone(&chunked_idx) as Arc<dyn Index>))
 }
