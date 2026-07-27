@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Weak;
 
@@ -97,23 +98,28 @@ const MAX_COLUMN_NAME: &str = "max";
 const BUCKET_COUNTS_COLUMN_NAME: &str = "bucket_counts";
 const EXPLICIT_BOUNDS_COLUMN_NAME: &str = "explicit_bounds";
 
-/// Column names that carry metric values (as opposed to data-point attributes).
-/// These must never be treated as attributes when (re)building a metric's schema.
-const RESERVED_COLUMN_NAMES: &[&str] = &[
+/// Column names that carry values for a number (Gauge/Sum) data point, as opposed to
+/// data-point attributes. These must never be treated as attributes when (re)building such
+/// a metric's schema. The set is per data-point shape: a histogram's value-column names are
+/// ordinary dimensions on a Gauge or Sum, and excluding them there drops the dimension from
+/// the seeded attribute schema (see [`initialize_attribute_schema`]).
+const NUMBER_VALUE_COLUMN_NAMES: &[&str] = &[
     VALUE_COLUMN_NAME,
     TIME_UNIX_NANO_COLUMN_NAME,
     START_TIME_UNIX_NANO_COLUMN_NAME,
+];
+
+/// Column names that carry values for a histogram data point. See [`NUMBER_VALUE_COLUMN_NAMES`].
+const HISTOGRAM_VALUE_COLUMN_NAMES: &[&str] = &[
     COUNT_COLUMN_NAME,
     SUM_COLUMN_NAME,
     MIN_COLUMN_NAME,
     MAX_COLUMN_NAME,
     BUCKET_COUNTS_COLUMN_NAME,
     EXPLICIT_BOUNDS_COLUMN_NAME,
+    TIME_UNIX_NANO_COLUMN_NAME,
+    START_TIME_UNIX_NANO_COLUMN_NAME,
 ];
-
-fn is_reserved_column(name: &str) -> bool {
-    RESERVED_COLUMN_NAMES.contains(&name)
-}
 
 pub struct Service {
     datafusion: Arc<dyn QueryEngine>,
@@ -487,8 +493,12 @@ fn number_data_points_to_record_batch(
         return MetricWithNoDataPointsSnafu.fail();
     }
 
-    let (attribute_fields_map, attribute_columns_map) =
-        attributes_to_fields_and_columns(metric, attributes.as_slice(), existing_schema);
+    let (attribute_fields_map, attribute_columns_map) = attributes_to_fields_and_columns(
+        metric,
+        attributes.as_slice(),
+        existing_schema,
+        NUMBER_VALUE_COLUMN_NAMES,
+    );
     fields.extend(
         attribute_fields_map
             .into_iter()
@@ -592,8 +602,12 @@ fn histogram_data_points_to_record_batch(
         .collect();
     let mut columns: Vec<ArrayRef> = value_columns.into_iter().map(|(_, array)| array).collect();
 
-    let (attribute_fields_map, attribute_columns_map) =
-        attributes_to_fields_and_columns(metric, attributes.as_slice(), existing_schema);
+    let (attribute_fields_map, attribute_columns_map) = attributes_to_fields_and_columns(
+        metric,
+        attributes.as_slice(),
+        existing_schema,
+        HISTOGRAM_VALUE_COLUMN_NAMES,
+    );
     fields.extend(attribute_fields_map.into_iter().map(|(_, v)| v));
     columns.extend(
         attribute_columns_map
@@ -647,18 +661,31 @@ fn attributes_to_fields_and_columns(
     metric: &str,
     attributes: &[&[KeyValue]],
     existing_schema: Option<&Schema>,
+    value_columns: &[&str],
 ) -> (
     IndexMap<String, Arc<Field>>,
     IndexMap<String, Box<dyn ArrayBuilder>>,
 ) {
     let mut fields: IndexMap<String, Arc<Field>> = IndexMap::new();
     let mut columns: IndexMap<String, Box<dyn ArrayBuilder>> = IndexMap::new();
+    let mut warned_collisions: HashSet<&str> = HashSet::new();
 
-    initialize_attribute_schema(&mut fields, &mut columns, existing_schema);
+    initialize_attribute_schema(&mut fields, &mut columns, existing_schema, value_columns);
 
     for (i, inner_attributes) in attributes.iter().enumerate() {
         for attribute in *inner_attributes {
             let key_str = attribute.key.as_str();
+            // An attribute whose key is one of this metric's value columns cannot be
+            // represented alongside it: emitting it as an attribute would put two columns of
+            // that name, with different types, in the same batch.
+            if value_columns.contains(&key_str) {
+                if warned_collisions.insert(key_str) {
+                    tracing::warn!(
+                        "Metric {metric} has attribute {key_str} with the same name as one of its value columns, dropping the attribute"
+                    );
+                }
+                continue;
+            }
             if let Some(any_value) = &attribute.value {
                 if let Some(value) = &any_value.value {
                     match value {
@@ -763,12 +790,16 @@ fn initialize_attribute_schema(
     fields: &mut IndexMap<String, Arc<Field>>,
     columns: &mut IndexMap<String, Box<dyn ArrayBuilder>>,
     existing_schema: Option<&Schema>,
+    value_columns: &[&str],
 ) {
     if let Some(s) = existing_schema {
         for field in s.fields() {
-            // Skip value/time fields (and histogram value columns) because they are not
-            // attributes and are already handled by the value-column builders.
-            if is_reserved_column(field.name()) {
+            // Skip only this metric's own value/time columns: they are not attributes and are
+            // already handled by the value-column builders. Every other stored column is a
+            // dimension and must be seeded here so it keeps its position and gets a null
+            // backfill on a data point that omits it — including one named like another data
+            // point shape's value column, such as `count` on a Gauge.
+            if value_columns.contains(&field.name().as_str()) {
                 continue;
             }
 
@@ -1219,5 +1250,135 @@ mod tests {
             .map(|f| f.name().as_str())
             .collect();
         assert_eq!(widened_names, rebuilt_names);
+    }
+
+    fn field_names(schema: &Schema) -> Vec<&str> {
+        schema.fields().iter().map(|f| f.name().as_str()).collect()
+    }
+
+    /// A histogram value-column name is an ordinary dimension on a Gauge or Sum, so it must be
+    /// carried through the stored schema like any other: same position on every export, and
+    /// null-backfilled when a data point omits it. Otherwise the batch stops matching the
+    /// stored table and `write_data`'s exact-positional `verify_schema` rejects every export
+    /// after the first.
+    #[test]
+    fn gauge_dimension_named_like_a_histogram_column_round_trips() {
+        let first = Data::Gauge(opentelemetry_proto::tonic::metrics::v1::Gauge {
+            data_points: vec![number_data_point(
+                1.0,
+                vec![
+                    string_attribute("count", "5"),
+                    string_attribute("host", "a"),
+                ],
+            )],
+        });
+        let (first_result, _) = metric_data_to_record_batch("svc", &first, None);
+        let first_schema = first_result.expect("first batch builds").schema();
+        assert_eq!(
+            field_names(&first_schema),
+            vec![
+                VALUE_COLUMN_NAME,
+                TIME_UNIX_NANO_COLUMN_NAME,
+                START_TIME_UNIX_NANO_COLUMN_NAME,
+                "count",
+                "host"
+            ]
+        );
+
+        // Second export, same dimensions: the schema must be identical, not just equivalent.
+        let (second_result, _) = metric_data_to_record_batch("svc", &first, Some(&first_schema));
+        let second_batch = second_result.expect("second batch builds");
+        assert_eq!(
+            field_names(&second_batch.schema()),
+            field_names(&first_schema),
+            "column order must match the stored schema"
+        );
+        assert_eq!(
+            column(&second_batch, "count").as_string::<i32>().value(0),
+            "5"
+        );
+
+        // Third export omits the `count` dimension: it must survive as a null column.
+        let third = Data::Gauge(opentelemetry_proto::tonic::metrics::v1::Gauge {
+            data_points: vec![number_data_point(2.0, vec![string_attribute("host", "b")])],
+        });
+        let (third_result, _) = metric_data_to_record_batch("svc", &third, Some(&first_schema));
+        let third_batch = third_result.expect("third batch builds");
+        assert_eq!(
+            field_names(&third_batch.schema()),
+            field_names(&first_schema),
+            "a dimension missing from this export must stay in the schema"
+        );
+        assert!(
+            column(&third_batch, "count").as_string::<i32>().is_null(0),
+            "missing dimension should be null"
+        );
+    }
+
+    /// An attribute that really does collide with one of the metric's own value columns cannot
+    /// be represented next to it, so it is dropped rather than emitted as a second column of
+    /// the same name.
+    #[test]
+    fn histogram_attribute_colliding_with_a_value_column_is_dropped() {
+        let data = Data::Histogram(Histogram {
+            data_points: vec![histogram_data_point(
+                7,
+                Some(1.0),
+                None,
+                None,
+                vec![7],
+                vec![],
+                vec![
+                    string_attribute(COUNT_COLUMN_NAME, "not a count"),
+                    string_attribute("host", "a"),
+                ],
+            )],
+            aggregation_temporality: 0,
+        });
+
+        let (result, _) = metric_data_to_record_batch("latency", &data, None);
+        let batch = result.expect("record batch should build");
+
+        assert_eq!(
+            field_names(&batch.schema())
+                .iter()
+                .filter(|name| **name == COUNT_COLUMN_NAME)
+                .count(),
+            1,
+            "count must appear exactly once"
+        );
+        let counts = column(&batch, COUNT_COLUMN_NAME)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("count is the UInt64 value column, not the attribute");
+        assert_eq!(counts.values().to_vec(), vec![7u64]);
+        assert_eq!(column(&batch, "host").as_string::<i32>().value(0), "a");
+    }
+
+    #[test]
+    fn number_attribute_colliding_with_the_value_column_is_dropped() {
+        let data = Data::Gauge(opentelemetry_proto::tonic::metrics::v1::Gauge {
+            data_points: vec![number_data_point(
+                1.5,
+                vec![string_attribute(VALUE_COLUMN_NAME, "not a value")],
+            )],
+        });
+
+        let (result, _) = metric_data_to_record_batch("svc", &data, None);
+        let batch = result.expect("record batch should build");
+
+        assert_eq!(
+            field_names(&batch.schema()),
+            vec![
+                VALUE_COLUMN_NAME,
+                TIME_UNIX_NANO_COLUMN_NAME,
+                START_TIME_UNIX_NANO_COLUMN_NAME
+            ]
+        );
+        let values = column(&batch, VALUE_COLUMN_NAME)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("value keeps the metric's own type");
+        assert!((values.value(0) - 1.5).abs() < f64::EPSILON);
     }
 }
