@@ -843,3 +843,230 @@ async fn list_primary_only_never_reads_secondary() {
     assert_eq!(sources, vec!["primary".to_string()]);
     assert_eq!(ids, vec![9]);
 }
+
+/// Exercises the exact composition the runtime builds for `.vectors` datasets and views:
+/// a [`MemoryVectorIndex`] warm primary in front of a vector-engine index (stood in for by
+/// [`MockIndex`]), in [`CompoundReadMode::FallbackToSecondary`]. Writes go to both indexes;
+/// searches and lists are served from memory once it has been written to, and by the
+/// engine index while the in-memory index is still empty (e.g. after a restart).
+#[cfg(feature = "llms")]
+mod warm_memory {
+    use super::*;
+    use crate::SEARCH_SCORE_COLUMN_NAME;
+    use crate::index::memory::{MemoryDistanceMetric, MemoryVectorIndex};
+    use crate::metadata::MetadataColumns;
+    use arrow::array::{
+        FixedSizeListArray, Float32Array, Float32Builder, Float64Array, ListBuilder,
+    };
+    use datafusion::logical_expr::ColumnarValue;
+    use datafusion::scalar::ScalarValue;
+    use datafusion_expr::{Volatility, create_udf};
+    use llms::embeddings::{Embed, EmbeddingInput};
+
+    const DIM: i32 = 3;
+
+    /// Deterministic, model-free embedder: maps a string to a fixed vector derived from
+    /// its byte content.
+    #[derive(Debug)]
+    struct ByteEmbed;
+
+    fn byte_vector(text: &str) -> Vec<f32> {
+        let dim = usize::try_from(DIM).expect("DIM is positive");
+        let mut vector = vec![0.0_f32; dim];
+        for (i, b) in text.bytes().enumerate() {
+            vector[i % dim] += f32::from(b) / 255.0;
+        }
+        vector
+    }
+
+    #[async_trait]
+    impl Embed for ByteEmbed {
+        async fn embed(&self, input: EmbeddingInput) -> llms::embeddings::Result<Vec<Vec<f32>>> {
+            match input {
+                EmbeddingInput::String(s) => Ok(vec![byte_vector(&s)]),
+                EmbeddingInput::StringArray(v) => Ok(v.iter().map(|s| byte_vector(s)).collect()),
+                _ => Ok(vec![]),
+            }
+        }
+        fn size(&self) -> i32 {
+            DIM
+        }
+    }
+
+    /// A DataFusion UDF matching [`ByteEmbed`]/[`byte_vector`], for use as the query-time
+    /// `embed(text, model_name)` expression in [`crate::index::memory::MemoryVectorIndex`]'s
+    /// score plan. Unlike the write-time [`Embed`] trait, this is actually invoked whenever a
+    /// query is executed against a non-empty memory index, so it must produce real vectors
+    /// rather than a stub.
+    fn embed_udf() -> Arc<datafusion_expr::ScalarUDF> {
+        Arc::new(create_udf(
+            "embed",
+            vec![DataType::Utf8, DataType::Utf8],
+            DataType::List(Arc::new(Field::new_list_field(DataType::Float32, true))),
+            Volatility::Volatile,
+            Arc::new(|args: &[ColumnarValue]| {
+                let ColumnarValue::Scalar(ScalarValue::Utf8(Some(text))) = &args[0] else {
+                    return Err(DataFusionError::Execution(
+                        "test embed UDF expects a literal text argument".to_string(),
+                    ));
+                };
+                let mut builder = ListBuilder::new(Float32Builder::new());
+                builder.values().append_slice(&byte_vector(text));
+                builder.append(true);
+                Ok(ColumnarValue::Scalar(ScalarValue::List(Arc::new(
+                    builder.finish(),
+                ))))
+            }),
+        ))
+    }
+
+    fn memory_index() -> MemoryVectorIndex {
+        MemoryVectorIndex::try_new(
+            "content".to_string(),
+            vec![Field::new("id", DataType::Int64, false)],
+            MetadataColumns::none(),
+            Arc::new(ByteEmbed),
+            embed_udf(),
+            "model_name".to_string(),
+            MemoryDistanceMetric::Cosine,
+        )
+        .expect("valid memory index")
+    }
+
+    fn embedding_field() -> Field {
+        Field::new(
+            "content_embedding",
+            DataType::FixedSizeList(
+                Arc::new(Field::new_list_field(DataType::Float32, false)),
+                DIM,
+            ),
+            true,
+        )
+    }
+
+    fn embedding_array(rows: usize) -> Arc<FixedSizeListArray> {
+        let values = Float32Array::from(
+            (0..rows)
+                .flat_map(|_| [1.0_f32, 0.0, 0.0])
+                .collect::<Vec<_>>(),
+        );
+        Arc::new(
+            FixedSizeListArray::try_new(
+                Arc::new(Field::new_list_field(DataType::Float32, false)),
+                DIM,
+                Arc::new(values),
+                None,
+            )
+            .expect("valid fixed size list"),
+        )
+    }
+
+    /// A query-result batch shaped like the memory index's query plan: primary key +
+    /// embedding + score.
+    fn engine_query_batch(ids: &[i64]) -> RecordBatch {
+        let rows = ids.len();
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                embedding_field(),
+                Field::new(SEARCH_SCORE_COLUMN_NAME, DataType::Float64, true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(ids.to_vec())),
+                embedding_array(rows),
+                Arc::new(Float64Array::from(vec![0.5; rows])),
+            ],
+        )
+        .expect("valid engine query batch")
+    }
+
+    /// A list-result batch shaped like the memory index's list plan (its stored schema):
+    /// embedding + primary key.
+    fn engine_list_batch(ids: &[i64]) -> RecordBatch {
+        let rows = ids.len();
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                embedding_field(),
+                Field::new("id", DataType::Int64, false),
+            ])),
+            vec![
+                embedding_array(rows),
+                Arc::new(Int64Array::from(ids.to_vec())),
+            ],
+        )
+        .expect("valid engine list batch")
+    }
+
+    async fn collect_ids(plan: LogicalPlan) -> Vec<i64> {
+        let ctx = SessionContext::new();
+        let batches = ctx
+            .execute_logical_plan(plan)
+            .await
+            .expect("plan executes")
+            .collect()
+            .await
+            .expect("plan collects");
+        let mut ids = vec![];
+        for batch in &batches {
+            let id_col = batch
+                .column_by_name("id")
+                .expect("id column")
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("int64 ids");
+            for i in 0..batch.num_rows() {
+                ids.push(id_col.value(i));
+            }
+        }
+        ids.sort_unstable();
+        ids
+    }
+
+    fn warm_compound(secondary: MockIndex) -> CompoundVectorIndex {
+        CompoundVectorIndex::try_new(
+            Arc::new(memory_index()) as Arc<dyn VectorIndex>,
+            Arc::new(secondary) as Arc<dyn VectorIndex>,
+            CompoundReadMode::FallbackToSecondary,
+        )
+        .expect("memory index is compatible with the engine index")
+    }
+
+    #[tokio::test]
+    async fn query_served_by_engine_until_memory_is_written() {
+        let events = Arc::new(Mutex::new(vec![]));
+        let mut secondary = MockIndex::new("engine", &events);
+        secondary.dimension = Some(DIM);
+        secondary.query_batches = vec![engine_query_batch(&[99])];
+
+        let idx = warm_compound(secondary);
+
+        // Cold in-memory index: the engine serves the query.
+        let plan = idx.query_table_provider("q").expect("query plan builds");
+        assert_eq!(collect_ids(Arc::unwrap_or_clone(plan)).await, vec![99]);
+
+        // A write through the compound populates the in-memory index...
+        idx.write(input_batch(2)).await.expect("write succeeds");
+
+        // ...which then serves the query, without touching the engine.
+        let plan = idx.query_table_provider("q").expect("query plan builds");
+        assert_eq!(collect_ids(Arc::unwrap_or_clone(plan)).await, vec![0, 1]);
+    }
+
+    #[tokio::test]
+    async fn list_served_by_engine_until_memory_is_written() {
+        let events = Arc::new(Mutex::new(vec![]));
+        let mut secondary = MockIndex::new("engine", &events);
+        secondary.dimension = Some(DIM);
+        secondary.list_batches = vec![engine_list_batch(&[99])];
+
+        let idx = warm_compound(secondary);
+
+        let plan = idx.list_table_provider().expect("list plan builds");
+        assert_eq!(collect_ids(plan).await, vec![99]);
+
+        idx.write(input_batch(2)).await.expect("write succeeds");
+
+        let plan = idx.list_table_provider().expect("list plan builds");
+        assert_eq!(collect_ids(plan).await, vec![0, 1]);
+    }
+}
