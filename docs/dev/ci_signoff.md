@@ -58,9 +58,11 @@ make signoff          # targeted crate lint + tests → full lint + unit tests, 
 `make signoff` first diffs the branch against `trunk`. If that diff has no
 Rust-affecting files (`.rs`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain*`,
 `.cargo/*`), Rust lint/build/unit tests are skipped and the sign-off status is
-still posted (docs/YAML/script-only changes — and the **Attestation** check
-fast-tracks those PRs anyway, so you don't need to run this at all). Otherwise it
-maps changed files to workspace crates and runs, in order:
+still posted (docs/YAML/script-only changes — and for a branch in this
+repository **Attestation** fast-tracks the PR anyway, so you don't need to run
+this at all; the fast-track is same-repo only, so a docs-only PR from a fork
+still needs a maintainer sign-off). Otherwise it maps changed files to workspace
+crates and runs, in order:
 
 1. `make lint-rust PACKAGES="…" FEATURES="…"` — lint the crates you touched
 2. `make nextest-packages PACKAGES="…" FEATURES="…"` — their unit tests
