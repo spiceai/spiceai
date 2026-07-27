@@ -49,27 +49,14 @@ use crate::index::SearchIndex;
 pub static MEMORY_BUDGET_FOR_INDEX_WRITER: usize = 150 * 1024 * 1024;
 pub static INDEX_UNIQUE_FIELD_NAME: &str = "__spice.unique_field";
 
-/// The fraction of a tantivy segment's documents that may be superseded — deleted, but
-/// still physically present — before the segment is rewritten by a merge.
+/// The fraction of a tantivy segment's documents that may be superseded/deleted, but
+/// still physically present, before the segment is rewritten by a merge.
 ///
-/// This bounds a relevance-scoring error. tantivy derives BM25's collection size from
-/// each segment's `max_doc`, which counts superseded documents, so every term's inverse
-/// document frequency is computed against a collection that still contains rows the
-/// index has already replaced. A single-term query is scaled uniformly and keeps its
-/// order, but a multi-term query weights its terms by their individual IDFs, so the
-/// ranking itself can differ from the one the live rows imply.
+/// Tantivy BM25 collection size statistics includes these superseded documents. A merge
+/// is the only mechanism to expunge documents. The default, [`LogMergePolicy`], does
+/// not merge on deletions, only when the ratio of deleted to collected documents is above a threshold.
 ///
-/// A merge is the only thing that expunges those documents, and tantivy's default
-/// [`LogMergePolicy`] never merges on deletions alone: `del_docs_ratio_before_merge`
-/// defaults to `1.0`, a ratio no segment can exceed. Its own documentation calls that
-/// default "not a very sensible default". Left at `1.0`, a segment that has grown large
-/// enough to sit alone at its size level — where the policy's segment-count rule can
-/// never apply either — keeps its superseded documents forever. Because `update_index`
-/// writes every incoming primary key as a deletion followed by an insertion, a
-/// repeatedly refreshed index reaches exactly that state as a matter of course.
-///
-/// Capping the ratio bounds the over-count instead: once merges settle, the collection
-/// size exceeds the live document count by at most `1 / (1 - RATIO)`.
+/// [`MAX_SUPERSEDED_DOCS_RATIO_PER_SEGMENT`] is the ratio to use in [`LogMergePolicy`]/
 const MAX_SUPERSEDED_DOCS_RATIO_PER_SEGMENT: f32 = 0.25;
 
 /// The merge policy for the index writer, which differs from tantivy's default only in
@@ -81,13 +68,9 @@ fn index_merge_policy() -> LogMergePolicy {
     policy
 }
 
-/// Discard everything staged in the writer since the last commit.
+/// Perform a [`tantivy::IndexWriter::rollback`] and preserve the [`MergePolicy`] from `index_merge_policy`.
 ///
-/// [`tantivy::IndexWriter::rollback`] does not reset the existing writer, it replaces it
-/// with a freshly constructed one — and a fresh writer carries tantivy's default merge
-/// policy. Every rollback therefore has to reinstate [`index_merge_policy`], or the first
-/// rolled-back write window silently reverts the index to never expunging superseded
-/// documents.
+/// [`tantivy::IndexWriter::rollback`] overwrites any custom [`MergePolicy`] with the default.
 fn rollback_writer(writer: &mut tantivy::IndexWriter) -> Result<(), TantivyError> {
     writer.rollback()?;
     writer.set_merge_policy(Box::new(index_merge_policy()));
