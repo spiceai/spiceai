@@ -803,8 +803,16 @@ fn initialize_attribute_schema(
             // column the accelerator stored as `NOT NULL`) would make `RecordBatch::try_new`
             // reject the whole batch and drop the export. The field type must match the
             // builder's output (not the stored view/large type) so array and field agree.
+            // Clone the stored field (preserving its metadata) and adjust only the data type
+            // and nullability rather than rebuilding it from scratch.
             let name = field.name().clone();
-            let nullable_field = Arc::new(Field::new(&name, builder_type, true));
+            let nullable_field = Arc::new(
+                field
+                    .as_ref()
+                    .clone()
+                    .with_data_type(builder_type)
+                    .with_nullable(true),
+            );
             fields.insert(name.clone(), nullable_field);
             columns.insert(name, builder);
         }
