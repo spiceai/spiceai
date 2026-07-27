@@ -43,12 +43,28 @@ use super::{
 /// above the scan either way.
 const MAX_ID_SET_LEN: usize = 8 * 1024;
 
-/// The message attributes every scan asks for: the envelope backing the header
-/// columns, and the raw message backing `content`.
+/// The message attributes a scan asks the server for, given whether the table
+/// has a `content` column.
 ///
-/// The raw message is requested for every scan, including one whose table has no
-/// `content` column and therefore discards it — see #12045.
-const FETCH_QUERY: &str = "(ENVELOPE BODY.PEEK[HEADER] BODY.PEEK[])";
+/// `ENVELOPE` backs the nine header columns and is always needed. `BODY.PEEK[]`
+/// is the *entire* raw message — every MIME part, attachments included — and is
+/// read only to populate `content`, so a table without that column does not ask
+/// for it: transferring a mailbox's attachments only to discard them dominates
+/// scan cost (#12045).
+///
+/// `BODY.PEEK[HEADER]` is asked for in neither case. No column is built from
+/// `Fetch::header()`; the header columns come from `ENVELOPE`, and `content`
+/// comes from the raw message, which carries its own headers.
+///
+/// `.PEEK` keeps the server from setting `\Seen`, so a scan never mutates the
+/// mailbox.
+fn fetch_query(fetch_content: bool) -> &'static str {
+    if fetch_content {
+        "(ENVELOPE BODY.PEEK[])"
+    } else {
+        "(ENVELOPE)"
+    }
+}
 
 /// Which messages a scan asks the server for.
 #[derive(Debug, PartialEq, Eq)]
@@ -295,9 +311,10 @@ impl TableProvider for ImapTableProvider {
         // An empty mailbox, or no message matching the filters, means there is
         // nothing to ask for — and `1:0` is not a valid identifier set.
         if let Some(fetch) = fetch {
+            let query = fetch_query(self.fetch_content);
             let fetch_messages = match fetch {
-                FetchSet::Uid(uids) => session.uid_fetch(uids, FETCH_QUERY),
-                FetchSet::Sequence(sequence_set) => session.fetch(sequence_set, FETCH_QUERY),
+                FetchSet::Uid(uids) => session.uid_fetch(uids, query),
+                FetchSet::Sequence(sequence_set) => session.fetch(sequence_set, query),
             }
             .context(FetchMessagesSnafu)?;
 
@@ -581,5 +598,74 @@ mod tests {
             Some(FetchSet::Sequence("1:5".to_string()))
         );
         assert_eq!(full_fetch_set(42, Some(0)), None);
+    }
+
+    #[test]
+    fn fetch_query_asks_for_the_raw_message_only_to_fill_content() {
+        // Regression for #12045: `BODY.PEEK[]` is the whole message — every MIME
+        // part and attachment — and is read only to build `content`, so a table
+        // without that column must not ask the server for it at all.
+        assert_eq!(fetch_query(true), "(ENVELOPE BODY.PEEK[])");
+        assert_eq!(fetch_query(false), "(ENVELOPE)");
+    }
+
+    #[test]
+    fn fetch_query_matches_the_columns_the_schema_exposes() {
+        // The attribute list and the schema must stay in step: the raw message is
+        // asked for exactly when there is a `content` column to put it in. Adding
+        // a column that needs another attribute, or gating `content` differently,
+        // has to move both together.
+        for fetch_content in [false, true] {
+            let has_content_column = test_provider(fetch_content)
+                .schema()
+                .field_with_name("content")
+                .is_ok();
+            let asks_for_raw_message = fetch_query(fetch_content).contains("BODY.PEEK[]");
+
+            assert_eq!(
+                asks_for_raw_message, has_content_column,
+                "fetch_content={fetch_content}: asked for the raw message={asks_for_raw_message}, \
+                 but the schema exposes content={has_content_column}"
+            );
+        }
+    }
+
+    #[test]
+    fn fetch_query_never_asks_for_an_unread_attribute() {
+        // Nothing builds a column from `Fetch::header()`, so `BODY.PEEK[HEADER]`
+        // is pure transfer cost in either configuration — the header columns come
+        // from `ENVELOPE` and the raw message carries its own headers.
+        for fetch_content in [false, true] {
+            let query = fetch_query(fetch_content);
+
+            assert!(
+                !query.contains("BODY.PEEK[HEADER]"),
+                "fetch_content={fetch_content}: {query} asks for a header section no column reads"
+            );
+            assert!(
+                query.contains("ENVELOPE"),
+                "fetch_content={fetch_content}: {query} must ask for the envelope"
+            );
+        }
+    }
+
+    #[test]
+    fn fetch_query_is_a_valid_peeking_attribute_list() {
+        // A scan must not mutate the mailbox: every body section is peeked, so the
+        // server never sets `\Seen`. The list also has to stay parenthesized to be
+        // valid `FETCH` syntax.
+        for fetch_content in [false, true] {
+            let query = fetch_query(fetch_content);
+
+            assert!(
+                query.starts_with('(') && query.ends_with(')'),
+                "fetch_content={fetch_content}: {query} is not a parenthesized attribute list"
+            );
+            assert!(
+                !query.contains("BODY[") && !query.contains("RFC822"),
+                "fetch_content={fetch_content}: {query} fetches a body section without `.PEEK`, \
+                 which would flag messages as read"
+            );
+        }
     }
 }
