@@ -772,24 +772,39 @@ fn initialize_attribute_schema(
                 continue;
             }
 
-            // Only seed a field when we can also seed a matching column builder for it;
-            // an unsupported type would otherwise insert a field with no column and desync
-            // the `fields`/`columns` maps, failing `RecordBatch::try_new`.
-            let builder: Box<dyn ArrayBuilder> = match field.data_type() {
-                DataType::Utf8 => Box::new(StringBuilder::new()),
-                DataType::Boolean => Box::new(BooleanBuilder::new()),
-                DataType::Int64 => Box::new(Int64Builder::new()),
-                DataType::Float64 => Box::new(Float64Builder::new()),
-                DataType::Binary => Box::new(BinaryBuilder::new()),
+            // Seed a builder by the stored column's type *family*, matching how present
+            // attributes are appended (`append_attribute!` always builds `Utf8`/`Binary`).
+            // Accelerators store strings/bytes in view/large layouts (e.g. Cayenne stores
+            // `Utf8View`), so matching only the exact `Utf8`/`Binary` type would skip those
+            // columns and emit a narrower batch than the table — the write then fails with a
+            // field-count mismatch. `verify_schema` treats the utf8/binary families as
+            // equivalent, so seeding the canonical `Utf8`/`Binary` type writes back cleanly.
+            //
+            // Only seed a field when a matching column builder exists; inserting a field
+            // without a column would desync the `fields`/`columns` maps and fail
+            // `RecordBatch::try_new`.
+            let (builder, builder_type): (Box<dyn ArrayBuilder>, DataType) = match field
+                .data_type()
+            {
+                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+                    (Box::new(StringBuilder::new()), DataType::Utf8)
+                }
+                DataType::Boolean => (Box::new(BooleanBuilder::new()), DataType::Boolean),
+                DataType::Int64 => (Box::new(Int64Builder::new()), DataType::Int64),
+                DataType::Float64 => (Box::new(Float64Builder::new()), DataType::Float64),
+                DataType::Binary | DataType::LargeBinary | DataType::BinaryView => {
+                    (Box::new(BinaryBuilder::new()), DataType::Binary)
+                }
                 _ => continue,
             };
 
             // Force the seeded dimension column nullable: a data point that omits this
             // attribute is backfilled with NULL, so a non-nullable field (e.g. a source
             // column the accelerator stored as `NOT NULL`) would make `RecordBatch::try_new`
-            // reject the whole batch and drop the export.
+            // reject the whole batch and drop the export. The field type must match the
+            // builder's output (not the stored view/large type) so array and field agree.
             let name = field.name().clone();
-            let nullable_field = Arc::new(field.as_ref().clone().with_nullable(true));
+            let nullable_field = Arc::new(Field::new(&name, builder_type, true));
             fields.insert(name.clone(), nullable_field);
             columns.insert(name, builder);
         }
@@ -1291,5 +1306,58 @@ mod tests {
             batch.schema().field_with_name("weird").is_err(),
             "unsupported-type column must be skipped, not partially seeded"
         );
+    }
+
+    #[test]
+    fn seeded_view_type_dimensions_are_materialized_not_dropped() {
+        // Regression for the Cayenne field-count mismatch: accelerators store string/binary
+        // dimensions in view/large layouts (Cayenne uses `Utf8View`). Matching only the exact
+        // `Utf8`/`Binary` type skipped those columns, so a data point missing them produced a
+        // narrower batch than the stored table (e.g. 17 expected vs 14 received) and the write
+        // failed. Every stored dimension must be materialized, present-but-NULL when absent.
+        let existing = Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Float64, true),
+            Field::new(TIME_UNIX_NANO_COLUMN_NAME, DataType::UInt64, true),
+            Field::new(START_TIME_UNIX_NANO_COLUMN_NAME, DataType::UInt64, true),
+            Field::new("region", DataType::Utf8View, true),
+            Field::new("team", DataType::LargeUtf8, true),
+            Field::new("payload", DataType::BinaryView, true),
+        ]);
+
+        // Data point carries none of the view-typed dimensions.
+        let data = Data::Gauge(opentelemetry_proto::tonic::metrics::v1::Gauge {
+            data_points: vec![number_data_point(1.0, vec![])],
+        });
+
+        let (result, _) = metric_data_to_record_batch("query_active_count", &data, Some(&existing));
+        let batch = result.expect("batch must build with the view-typed dimensions materialized");
+
+        assert_eq!(
+            batch.num_columns(),
+            existing.fields().len(),
+            "every stored column must be present so the write matches the table width"
+        );
+
+        // View/large string columns are materialized as canonical `Utf8` (matching how present
+        // attributes are appended); `verify_schema` treats the utf8 family as equivalent.
+        for name in ["region", "team"] {
+            let field = batch
+                .schema()
+                .field_with_name(name)
+                .unwrap_or_else(|_| panic!("{name} must be carried over"))
+                .clone();
+            assert_eq!(field.data_type(), &DataType::Utf8, "{name} seeded as Utf8");
+            assert!(
+                column(&batch, name).as_string::<i32>().is_null(0),
+                "{name} omitted on the data point must be NULL"
+            );
+        }
+
+        let payload_field = batch
+            .schema()
+            .field_with_name("payload")
+            .expect("payload must be carried over")
+            .clone();
+        assert_eq!(payload_field.data_type(), &DataType::Binary);
     }
 }
