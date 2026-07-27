@@ -1253,7 +1253,10 @@ mod tests {
         );
 
         let region = column(&batch, "region").as_string::<i32>();
-        assert!(region.is_null(0), "omitted dimension must be NULL, not dropped");
+        assert!(
+            region.is_null(0),
+            "omitted dimension must be NULL, not dropped"
+        );
     }
 
     #[test]
@@ -1271,7 +1274,10 @@ mod tests {
         ]);
 
         let data = Data::Gauge(opentelemetry_proto::tonic::metrics::v1::Gauge {
-            data_points: vec![number_data_point(1.0, vec![string_attribute("region", "us")])],
+            data_points: vec![number_data_point(
+                1.0,
+                vec![string_attribute("region", "us")],
+            )],
         });
 
         let (result, _) = metric_data_to_record_batch("svc_requests", &data, Some(&existing));
