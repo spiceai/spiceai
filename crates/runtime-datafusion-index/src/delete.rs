@@ -43,6 +43,11 @@ use datafusion::physical_plan::collect;
 /// `scan`'s `filters` argument is only a pushdown *hint* — most providers report
 /// `Unsupported`/`Inexact` and rely on the query planner to add the actual `FilterExec` above the
 /// scan, which only happens by going through plan creation.
+///
+/// # Errors
+///
+/// Returns an error if the logical plan can't be built (e.g. an invalid filter or projection), or
+/// if physical plan creation or execution against `table` fails.
 pub async fn resolve_keys_matching_predicate(
     table: &Arc<dyn TableProvider>,
     session: &dyn Session,
@@ -85,6 +90,11 @@ pub async fn resolve_keys_matching_predicate(
 /// Returns `None` if `keys` has zero rows. Used to translate a batch of primary-key rows into a
 /// predicate a store can filter/query by, e.g. when a wrapper index (chunked, compound) needs to
 /// address a backing store's own data using a subset of that store's key columns.
+///
+/// # Errors
+///
+/// Returns an error if `keys` is missing one of `key_columns`, or if a key value can't be
+/// converted to a scalar literal.
 pub fn build_key_match_predicate(
     keys: &RecordBatch,
     key_columns: &[String],
