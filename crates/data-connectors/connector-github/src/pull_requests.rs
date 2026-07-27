@@ -339,12 +339,17 @@ impl GitHubTableArgs for PullRequestTableArgs {
                     nodes = self.get_requested_nodes()
                 )
             }
+            // `orderBy` must name an immutable field. A GitHub `after:` cursor is a value
+            // predicate on the sort key, so ordering by a mutable field (e.g. UPDATED_AT)
+            // lets a pull request touched on the source mid-scan jump ahead of the cursor,
+            // where no remaining page will return it — silently dropping the row from the
+            // scan. CREATED_AT ASC is GitHub's own default order for this connection.
             GitHubQueryMode::Auto => {
                 format!(
                     r#"
             {{
                 repository(owner: "{owner}", name: "{name}") {{
-                    pullRequests(first: {page_size}, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{
+                    pullRequests(first: {page_size}, orderBy: {{field: CREATED_AT, direction: ASC}}) {{
                         pageInfo {{
                             hasNextPage
                             endCursor
@@ -643,15 +648,32 @@ mod tests {
     }
 
     #[test]
-    fn auto_mode_query_orders_by_updated_at_desc() {
-        // Deterministic UPDATED_AT-descending order is the prerequisite for
-        // watermark-based early-exit pagination on append refreshes.
+    fn auto_mode_query_orders_by_created_at_asc() {
+        // Deterministic ordering on an immutable key: see
+        // `auto_mode_query_never_paginates_on_a_mutable_sort_key`.
         let a = args(PullRequestCommentType::None, 25);
         let params = a.get_graphql_values();
         let query = params.query.as_ref();
         assert!(
-            query.contains("orderBy: {field: UPDATED_AT, direction: DESC}"),
-            "auto-mode pull_requests query must order by UPDATED_AT DESC, got:\n{query}"
+            query.contains("orderBy: {field: CREATED_AT, direction: ASC}"),
+            "auto-mode pull_requests query must order by CREATED_AT ASC, got:\n{query}"
+        );
+    }
+
+    /// Regression test for #12067. A GitHub `after:` cursor is a value predicate on the
+    /// sort key, so a connection paginated on a mutable field silently drops any row
+    /// that is touched on the source mid-scan: the row's key moves ahead of the cursor
+    /// and no remaining page returns it. Only immutable sort keys are safe here.
+    #[test]
+    fn auto_mode_query_never_paginates_on_a_mutable_sort_key() {
+        let a = args(PullRequestCommentType::All, 25);
+        let params = a.get_graphql_values();
+        let query = params.query.as_ref();
+        // The GraphQL enum is upper-case (`UPDATED_AT`), so this cannot collide with the
+        // `updated_at: updatedAt` field alias the query also selects.
+        assert!(
+            !query.contains("UPDATED_AT"),
+            "auto-mode pull_requests query must not order by the mutable UPDATED_AT, got:\n{query}"
         );
     }
 }
