@@ -191,17 +191,24 @@ impl MistralLlama {
         tokenizer_config: Option<&Path>,
         generation_config: Option<&Path>,
     ) -> Box<dyn ModelPaths> {
-        Box::new(LocalModelPaths::new(
-            tokenizer.map(PathBuf::from).unwrap_or_default(),
-            config.map(PathBuf::from).unwrap_or_default(),
-            tokenizer_config.map(PathBuf::from).unwrap_or_default(),
-            model_weights.to_vec(),
-            AdapterPaths::None,
-            generation_config.map(PathBuf::from),
-            None,
-            None,
-            None,
-        ))
+        // NOTE: `LocalModelPaths::new` wraps its 3rd arg (`template_filename`) in `Some`,
+        // so passing an empty `PathBuf` (GGUF models carry no `tokenizer_config`) yields
+        // `Some("")`, which panics in mistral.rs `get_chat_template` (`.extension()` on an
+        // empty path -> "Template filename must be a file"). Construct the struct directly
+        // so `template_filename` is `None` when absent: GGUF models then fall back to the
+        // chat template embedded in the GGUF metadata. A present `tokenizer_config`
+        // (safetensors) is still used as the template source, preserving prior behavior.
+        Box::new(LocalModelPaths {
+            tokenizer_filename: tokenizer.map(PathBuf::from).unwrap_or_default(),
+            config_filename: config.map(PathBuf::from).unwrap_or_default(),
+            template_filename: tokenizer_config.map(PathBuf::from),
+            filenames: model_weights.to_vec(),
+            adapter_paths: AdapterPaths::None,
+            gen_conf: generation_config.map(PathBuf::from),
+            preprocessor_config: None,
+            processor_config: None,
+            chat_template_json_filename: None,
+        })
     }
 
     fn load_default_pipeline(
