@@ -234,6 +234,7 @@ mod tests {
     use arrow::util::pretty::pretty_format_batches;
     use datafusion::datasource::MemTable;
     use futures::TryStreamExt;
+    use runtime_datafusion_index::Index;
     use search::index::SearchIndex;
     use search::index::compound::CompoundReadMode;
 
