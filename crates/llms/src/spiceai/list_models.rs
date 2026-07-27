@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Model listing functionality for Spice Cloud provider.
+//! Model listing functionality for the Spice model provider.
 
 use async_openai::Client;
 use async_trait::async_trait;
@@ -23,9 +23,9 @@ use std::collections::HashMap;
 
 use crate::config::HostedModelConfig;
 use crate::provider::{ListModels, ListModelsError, ListModelsResult, get_required_param};
+use crate::spiceai::api_base;
 
 const PROVIDER_NAME: &str = "Spice Cloud";
-const DEFAULT_ENDPOINT: &str = "https://data.spiceai.io";
 
 /// Spice Cloud model lister that fetches available models using the SDK.
 pub struct SpiceAiModelLister {
@@ -39,29 +39,18 @@ impl SpiceAiModelLister {
     /// Optional parameter: `spiceai_endpoint` (defaults to <https://data.spiceai.io>)
     pub fn from_params(params: &HashMap<String, SecretString>) -> ListModelsResult<Self> {
         let api_key = get_required_param(params, "spiceai_api_key")?;
-        let endpoint = params.get("spiceai_endpoint").map_or_else(
-            || format!("{DEFAULT_ENDPOINT}/v1"),
-            |s| format!("{}/v1", s.expose_secret().trim_end_matches('/')),
-        );
+        let endpoint = params
+            .get("spiceai_endpoint")
+            .map(ExposeSecret::expose_secret);
 
-        let config =
-            HostedModelConfig::from_url(&endpoint).with_api_key(Some(api_key.expose_secret()));
-
-        Ok(Self {
-            client: Client::with_config(config),
-        })
+        Ok(Self::new(api_key, endpoint))
     }
 
     /// Creates a new model lister with explicit credentials.
     #[must_use]
     pub fn new(api_key: &SecretString, endpoint: Option<&str>) -> Self {
-        let base_url = endpoint.map_or_else(
-            || format!("{DEFAULT_ENDPOINT}/v1"),
-            |e| format!("{}/v1", e.trim_end_matches('/')),
-        );
-
-        let config =
-            HostedModelConfig::from_url(&base_url).with_api_key(Some(api_key.expose_secret()));
+        let config = HostedModelConfig::from_url(&api_base(endpoint))
+            .with_api_key(Some(api_key.expose_secret()));
 
         Self {
             client: Client::with_config(config),
