@@ -73,8 +73,13 @@ limitations under the License.
 //! not classify) is adopted only if the freshly-fetched source layout matches
 //! the event's column count ([`super::binlog::adopt_current_layout`]), else
 //! member-fatal; the count-match guard makes replaying pre-change row images
-//! self-fatal rather than mis-decoded. A durable pre-adopt/replay-boundary
-//! checkpoint machinery is intentionally *not* implemented in v1. Instead,
+//! self-fatal rather than mis-decoded. Because a fetched layout describes the
+//! source *now* rather than the event being decoded, every routed `TableMap` is
+//! additionally checked against the column types the event itself carries
+//! ([`super::binlog::layout_event_mismatch`]), which is what catches a
+//! same-column-count reorder adopted from ahead of the stream. A durable
+//! pre-adopt/replay-boundary checkpoint machinery is intentionally *not*
+//! implemented in v1. Instead,
 //! safety across a detach/rejoin is guaranteed structurally: every (re)subscribe
 //! re-resolves the start position from the member's own sidecar and re-checks
 //! its persisted layout fingerprint against the current source layout, so a
@@ -102,8 +107,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use super::binlog::{
     AdoptedLayout, FastRowsDecoder, MIN_VALID_EVENT_POS, QueryKind, StatementKind,
     adopt_current_layout, classify_query, classify_statement, commit_ts_ms,
-    compute_pk_source_indexes, log_transient_reconnect, open_binlog_stream,
-    purged_position_error, readiness_heartbeat, record_watermark,
+    compute_pk_source_indexes, layout_event_mismatch, log_transient_reconnect,
+    open_binlog_stream, purged_position_error, readiness_heartbeat, record_watermark,
 };
 use super::changes::{MemberLayout, MysqlChangeRows, decode_events_to_batch};
 use super::config::{BinlogPosition, ReplicationParams};
@@ -1533,14 +1538,24 @@ async fn run_pump(source: Arc<SharedSource>) {
                     // rows event, so this arm is per-event hot. A `table_id` is
                     // stable for a table's lifetime within a connection (DDL
                     // assigns a new id), so an installed route with the same id
-                    // AND column count is current — skip the member/slot/layout
-                    // locks, the name allocations, and the owned TME copy. The
+                    // whose cached TME carries the same per-column types is
+                    // current — skip the member/slot/layout locks, the name
+                    // allocations, and the owned TME copy. The type comparison
+                    // keeps this exactly as strict as `layout_event_mismatch`
+                    // on the install path below, so a same-count DDL that only
+                    // changes types cannot slip past verification. The
                     // STREAMING and liveness re-checks still run per rows event
                     // in the `RowsEvent` arm and at delivery, and a member
                     // rejoin always forces a reconnect (fresh routes), so a
                     // cached route can never outlive its member generation.
                     if let Some(route) = routes.get(&table_id)
                         && route.tme_columns == tme.columns_count()
+                        && usize::try_from(route.tme_columns).is_ok_and(|n| {
+                            (0..n).all(|ordinal| {
+                                route.tme.get_column_type(ordinal).ok().flatten()
+                                    == tme.get_column_type(ordinal).ok().flatten()
+                            })
+                        })
                     {
                         continue 'recv;
                     }
@@ -1620,6 +1635,24 @@ async fn run_pump(source: Arc<SharedSource>) {
                         let g = lock(&member.layout);
                         Arc::clone(&g)
                     };
+                    // Every decode is routed from here, so this is the one place
+                    // that can check the layout against the event describing the
+                    // row images it will decode. A layout adopted from
+                    // `information_schema` reflects the source *now*, which under
+                    // lag can be a later DDL than the events in flight (#11764);
+                    // fail this member closed rather than scramble its columns.
+                    // (The route-identity fast path above only reuses a route
+                    // whose cached TME carries these same column types, so a
+                    // skipped install never skips a mismatch this would catch.)
+                    if let Some(mismatch) = layout_event_mismatch(&layout.layout, &tme) {
+                        member.metrics.inc_schema_mismatch_error();
+                        routes.remove(&table_id);
+                        member_fatal(&source, &mkey, format!(
+                            "source table {}.{} does not match the shape of the changes being replicated: column {} (position {}) is `{}` in the table definition but the change events carry a different type there. This happens when the source applies more than one ALTER TABLE while replication is behind, so the table definition read for the first one already reflects the second. Let replication catch up before the next schema change, then re-bootstrap by setting `mysql_replication_invalid_checkpoint_behavior: restart`.",
+                            mkey.0, mkey.1, mismatch.column, mismatch.ordinal, mismatch.source_type
+                        )).await;
+                        continue 'recv;
+                    }
                     let tme_columns = tme.columns_count();
                     let tme = Arc::new(tme.into_owned());
                     // Built once per install; every commit routed here reuses it
@@ -2468,6 +2501,61 @@ mod tests {
             file_checkpoint_verdict(false),
             CheckpointVerdict::Unresumable(_)
         ));
+    }
+
+    /// A real `ROTATE` closing `binlog.000041` at ~1 GiB and opening
+    /// `binlog.000042`: the stream continues at offset 4 of the *new* file, not
+    /// at the *closed* file's end offset (which the event header carries).
+    #[test]
+    fn rotate_targets_the_new_files_resume_offset() {
+        let rotate = RotateEvent::new(4, &b"binlog.000042"[..]);
+        assert_eq!(
+            rotate_target(&rotate),
+            Some(pos("binlog.000042", 4)),
+            "a rotate must reposition to the offset its payload names"
+        );
+    }
+
+    #[test]
+    fn a_fake_rotate_does_not_reposition_the_stream() {
+        // The artificial rotate at the head of a dump opens no new file.
+        let rotate = RotateEvent::new(0, &b"binlog.000042"[..]);
+        assert_eq!(rotate_target(&rotate), None);
+    }
+
+    /// Regression test for #12042.
+    ///
+    /// The pump credits idle streaming members the coordinate each event
+    /// advances the stream to. When a `ROTATE` contributed the *closing* file's
+    /// end offset under the *opening* file's name, an idle member's committed
+    /// floor jumped ~1 GiB past the new file's real offsets and `deliver_commit`
+    /// then dropped every following transaction as `already_committed` — with no
+    /// error, no detach, and no backpressure warning, for the rest of the run.
+    #[test]
+    fn a_rotate_credit_does_not_suppress_the_new_files_commits() {
+        let ack = AckTable::default();
+        let member = key("tpcc", "warehouse");
+        // An idle member caught up to the end of the file about to be closed.
+        ack.register(&member, pos("binlog.000041", 1_073_741_800), false);
+        ack.promote_ready_members();
+
+        let rotate = RotateEvent::new(4, &b"binlog.000042"[..]);
+        let target = rotate_target(&rotate).expect("a real rotate repositions the stream");
+        ack.credit_idle(&target, None);
+
+        assert_eq!(
+            ack.committed(&member),
+            Some(pos("binlog.000042", 4)),
+            "the credit must land at the new file's start"
+        );
+
+        // The first transaction of the newly opened file must still be delivered.
+        let next_commit = pos("binlog.000042", 1_182);
+        let slot = ack.slot(&member).expect("registered member has a slot");
+        assert!(
+            !slot.already_committed(&next_commit),
+            "commit at {next_commit} was suppressed as already-applied, so its rows are lost"
+        );
     }
 
     #[test]

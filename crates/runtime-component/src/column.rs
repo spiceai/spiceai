@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use datafusion::sql::TableReference;
 use spicepod::semantic::{Column, FullTextSearchConfig, IndexStore};
 
-use crate::component::dataset::FullTextSearchDatasetConfig;
+use crate::dataset::FullTextSearchDatasetConfig;
 
 #[expect(clippy::type_complexity)] // From a two-part `.unzip()`.
 #[must_use]

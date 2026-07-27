@@ -29,7 +29,7 @@ use async_stream::try_stream;
 use data_components::cdc::{ChangesStream, InitialSnapshotMode, StreamError};
 use data_components::postgres_replication::{
     PgOutputFormat, ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams,
-    ReplicationStreamInput, SchemaEvolutionPolicy, config, start_replication_stream_with_policy,
+    ReplicationStreamInput, SchemaEvolutionPolicy, config, start_replication_stream,
 };
 use datafusion::sql::TableReference;
 use futures::StreamExt;
@@ -230,9 +230,10 @@ pub fn build_changes_stream(
             schema_name,
             table_name,
             metrics,
+            policy: schema_evolution_policy,
         };
 
-        let mut inner = start_replication_stream_with_policy(input, schema_evolution_policy);
+        let mut inner = start_replication_stream(input);
         while let Some(item) = inner.next().await {
             yield item?;
         }

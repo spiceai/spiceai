@@ -1698,9 +1698,13 @@ impl DataFusion {
                 // Same coordinated partition as the static install (one tested
                 // definition of the no-overcommit invariant), but from LIVE pool
                 // usage, and never above the static ceiling so it can't overcommit.
-                let dynamic =
-                    builder::coordinated_mem_tier_budget(total_memory, pool_used, compaction_used)
-                        .min(static_ceiling_bytes);
+                let dynamic = builder::coordinated_mem_tier_budget(
+                    total_memory,
+                    pool_used,
+                    compaction_used,
+                    crate::accelerator_memory_budget::duckdb_total_reservation_bytes(),
+                )
+                .min(static_ceiling_bytes);
                 cayenne::update_global_mem_tier_total(dynamic);
             }
         });
@@ -5645,30 +5649,32 @@ mod tests {
         async fn create_test_dataset(time_column: Option<String>) -> Dataset {
             let runtime = crate::Runtime::builder().build().await;
             Dataset {
-                from: "test".to_string(),
-                name: TableReference::bare("test_dataset"),
-                access: AccessMode::Read,
-                params: HashMap::new(),
-                metadata: HashMap::new(),
-                columns: vec![],
-                schema: None,
-                has_metadata_table: false,
-                replication: None,
-                time_column,
-                time_format: None,
-                time_partition_column: None,
-                time_partition_format: None,
-                acceleration: None,
-                embeddings: vec![],
+                spec: crate::component::dataset::DatasetSpec {
+                    from: "test".to_string(),
+                    name: TableReference::bare("test_dataset"),
+                    access: AccessMode::Read,
+                    params: HashMap::new(),
+                    metadata: HashMap::new(),
+                    columns: vec![],
+                    schema: None,
+                    has_metadata_table: false,
+                    replication: None,
+                    time_column,
+                    time_format: None,
+                    time_partition_column: None,
+                    time_partition_format: None,
+                    acceleration: None,
+                    embeddings: vec![],
+                    unsupported_type_action: None,
+                    ready_state: ReadyState::OnRegistration,
+                    metrics: Metrics::default(),
+                    vectors: None,
+                    full_text_search: None,
+                    check_availability: crate::component::dataset::CheckAvailability::Disabled,
+                    on_schema_change: crate::component::dataset::OnSchemaChange::default(),
+                },
                 app: Arc::new(app::App::default()),
-                unsupported_type_action: None,
-                ready_state: ReadyState::OnRegistration,
-                metrics: Metrics::default(),
                 runtime: Arc::new(runtime),
-                vectors: None,
-                full_text_search: None,
-                check_availability: crate::component::dataset::CheckAvailability::Disabled,
-                on_schema_change: crate::component::dataset::OnSchemaChange::default(),
             }
         }
 

@@ -751,7 +751,9 @@ impl BoundedShardedPkIndexBuilder {
     pub(crate) fn new(shard_count: usize, max_bytes: Option<usize>) -> Self {
         let n = shard_count.max(1);
         Self {
-            shards: (0..n).map(|_| CachedPkKeyset::with_capacity(1024)).collect(),
+            shards: (0..n)
+                .map(|_| CachedPkKeyset::with_capacity(1024))
+                .collect(),
             blooms: None,
             max_bytes,
         }
@@ -825,7 +827,10 @@ impl BoundedShardedPkIndexBuilder {
         }
         // Shard keysets are already routed by `shard_of_pk`, so shard i's keys
         // drain into bloom i directly. Each bloom gets an even split of the
-        // budget, mirroring `build_sharded_pk_index`'s previous conversion.
+        // budget; `with_byte_budget` floors every bloom at 64 bits, so a
+        // pathologically small split (under 8 bytes per shard) still allocates
+        // a usable filter, overshooting the budget by at most 8 bytes per
+        // shard rather than degrading to an always-positive zero-bit bloom.
         let n = self.shards.len();
         let mut blooms: Vec<PkBloom> = (0..n)
             .map(|_| PkBloom::with_byte_budget(max_bytes / n))
@@ -869,9 +874,15 @@ impl ShardedPkIndex {
     /// each key's `OwnedRow` bytes (§3.5). Bloom-path indices are built sharded at
     /// load time instead — a combined bloom can't be partitioned (its keys are
     /// unrecoverable), so per-shard blooms are constructed by routing keys to N
-    /// blooms during `load_existing_keyset` / `try_load_persisted_pk_index`.
+    /// blooms during `load_existing_pk_index` / `try_load_persisted_pk_index`.
     pub(crate) fn from_exact(keyset: CachedPkKeyset, n: usize) -> Self {
         let n = n.max(1);
+        // At n == 1 every key routes to shard 0, so wrap the keyset directly —
+        // re-inserting each entry would be an O(rows) pass for nothing (the
+        // persisted-checkpoint load on the serial path takes this branch).
+        if n == 1 {
+            return Self::Exact(vec![keyset].into_boxed_slice());
+        }
         let mut shards: Vec<CachedPkKeyset> =
             (0..n).map(|_| CachedPkKeyset::with_capacity(0)).collect();
         // The position-delete capture set is table-global; every shard needs the

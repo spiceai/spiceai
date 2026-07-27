@@ -348,6 +348,11 @@ impl CayenneCdcWrite {
     pub async fn finish(self) -> Result<u64> {
         if let Some(prepared_append) = self.prepared_append {
             let publish_start = Instant::now();
+            // The best-effort staging-WAL removal on the protected-snapshot path
+            // below can fail without failing the (already-durable) write. Track
+            // that so we can re-arm the recovery flags after `finish()` clears
+            // them (see the re-arm after `finish()` below).
+            let mut staging_wal_removal_failed = false;
             let superseded_rows = if let Some(prepared_on_conflict) = self.prepared_on_conflict {
                 // Authoritative superseded-row count, captured at validation time.
                 // Do NOT recompute from `deleted_pk_i64`/`deleted_row_keys`: for an
@@ -398,30 +403,36 @@ impl CayenneCdcWrite {
                 //    replacement files' staging WAL is durable BEFORE it. Nothing
                 //    here changes that.
                 //  * `apply_under_held_barrier` (below) makes the replacement files
-                //    durable AND removes the staging WAL. If it fails, the tombstone
-                //    is STILL durable `published = 0`, the in-memory activation has
-                //    NOT run, and the staging WAL is still present — so there is NO
-                //    durable state to compensate (unlike the pre-b1★ flip-before-move
-                //    ordering, which had to revert a premature `published = 1`). We
-                //    simply propagate the error; reopen re-drives the move via
+                //    durable, then we remove the staging WAL best-effort (the block
+                //    after it). If the MOVE fails, the tombstone is STILL durable
+                //    `published = 0`, the in-memory activation has NOT run, and the
+                //    staging WAL is still present — so there is NO durable state to
+                //    compensate (unlike the pre-b1★ flip-before-move ordering, which
+                //    had to revert a premature `published = 1`). We simply propagate
+                //    the error; reopen re-drives the move via
                 //    `ensure_no_incomplete_write` then activates the orphan tombstone
                 //    via `publish_orphan_inlined_deletes`. Applied exactly once.
-                //  * A crash AFTER the move (WAL gone, files durable) but BEFORE the
-                //    deferred durable flip lands: the tombstone is durable
-                //    `published = 0` with a durable replacement and NO WAL, so reopen's
-                //    unconditional orphan sweep flips it `published = 1`. Old inline
-                //    copy hidden, replacement visible, applied once. The in-memory
-                //    `inlined_locally_published` entry is lost on crash, which is
-                //    correct: it only ever advanced visibility PAST the durable flag,
-                //    so losing it cannot resurface a row (the orphan sweep republishes).
+                //  * A crash AFTER the move but BEFORE the deferred durable flip
+                //    lands — WAL either already removed here, or still present and
+                //    rolled forward + removed by the next recovery pass; both leave
+                //    files durable, WAL gone: the tombstone is durable
+                //    `published = 0` with a durable replacement and NO WAL, so
+                //    reopen's unconditional orphan sweep flips it `published = 1`.
+                //    Old inline copy hidden, replacement visible, applied once. The
+                //    in-memory `inlined_locally_published` entry is lost on crash,
+                //    which is correct: it only ever advanced visibility PAST the
+                //    durable flag, so losing it cannot resurface a row (the orphan
+                //    sweep republishes).
                 //  This is the SAME recovery mechanism that already makes "crash
                 //  before finish()" safe (correctness_audit.md §5 case 1); deferring
                 //  the flip merely widens that already-healed window by one batch.
                 // `publish_apply_move`: the staged-file MOVE into the snapshot dir
-                // (object-store / fs rename + parent-dir fsync) + staging-WAL
-                // removal + the list-files-cache delta-apply, all under the held
+                // (object-store / fs rename + parent-dir fsync), under the held
                 // fence. This is the real I/O of the publish — on EBS the dir
-                // fsync is a device flush.
+                // fsync is a device flush. For this protected-snapshot target the
+                // move is all `apply_under_held_barrier` does (the list-files-cache
+                // delta-apply and staging-WAL removal are `CurrentSnapshot`-only);
+                // the WAL is removed for this path in the block right after.
                 let apply_move_start = Instant::now();
                 prepared_append.apply_under_held_barrier().await?;
                 record_cayenne_write_phase(
@@ -429,6 +440,26 @@ impl CayenneCdcWrite {
                     "publish_apply_move",
                     apply_move_start,
                 );
+
+                // Remove this protected-snapshot append's staging WAL now that
+                // the move has made its replacement files durable in the target
+                // snapshot (`apply_under_held_barrier` removes the WAL only for
+                // `CurrentSnapshot` targets). Best-effort: the append is already
+                // durably committed (its `snapshot_sequence` is durable from Stage
+                // A), so a failed unlink must NOT fail the write — the leftover WAL
+                // is rolled forward idempotently by the next write's
+                // `ensure_no_incomplete_write`.
+                if let Err(error) = prepared_append.remove_committed_staging_wal().await {
+                    staging_wal_removal_failed = true;
+                    tracing::debug!(
+                        table = self.table.table_name(),
+                        target_snapshot = prepared_append.target_snapshot_id(),
+                        staging_wal_path = %prepared_append.staging_wal_path().display(),
+                        %error,
+                        "Best-effort removal of a committed CDC upsert's staging WAL failed; the next write's recovery will roll it forward"
+                    );
+                }
+
                 // `publish_deletion_apply`: the in-memory deletion-cache merge
                 // (`extend_max_conflicts` builds a new deletion index), the
                 // protected-snapshot RCU, the tombstone-delta enqueue (cycle-5
@@ -449,6 +480,25 @@ impl CayenneCdcWrite {
                 0
             };
             let rows = prepared_append.finish().await?;
+            if staging_wal_removal_failed {
+                // `finish()` -> `mark_inflight_complete()` just cleared
+                // `staging_wal_present`/`staging_may_have_files` (this was the last
+                // in-flight append). But the committed staging WAL is still on disk
+                // -- its unlink failed above -- and for S3-backed tables
+                // `ensure_no_incomplete_write()` fast-paths out when both flags are
+                // clear, so without this re-arm the orphaned `_wal.json` would go
+                // permanently undiscovered, reintroducing the steady-state WAL
+                // accumulation this change fixes. Re-set both flags so the next
+                // write/open re-runs recovery and idempotently rolls the leftover
+                // WAL forward. Over-setting is safe: worst case is one extra
+                // recovery probe that finds nothing to do.
+                self.table
+                    .staging_wal_present()
+                    .store(true, Ordering::Release);
+                self.table
+                    .staging_may_have_files()
+                    .store(true, Ordering::Release);
+            }
             record_cayenne_write_phase(self.table.table_name(), "publish", publish_start);
             let retention_requested = self.table.has_retention_delete_filters();
             if retention_requested {
@@ -6732,7 +6782,7 @@ impl CayenneTableProvider {
         *self.pk_keyset_cache.lock() = None;
         // The keyset is gone: while it is `None`, `transaction_has_conflict`
         // already takes the per-table fallback, and the next rebuild floor-stamps
-        // every key to the current high-water (`load_existing_keyset`) or returns
+        // every key to the current high-water (`load_existing_pk_index`) or returns
         // a Bloom (also per-table fallback). Either way the stale stamps that set
         // the degraded flag cannot survive, so clear it here. `Release` pairs with
         // the `Acquire` load in `transaction_has_conflict` (see the setter above).
@@ -7253,7 +7303,7 @@ impl CayenneTableProvider {
     /// `cayenne_cold_tier_file` manifest and store it in `cold_pk_existence`,
     /// returning how the keyset rebuild should treat the cold tier.
     ///
-    /// Called on every keyset cache MISS (the same point `load_existing_keyset`
+    /// Called on every keyset cache MISS (the same point `load_existing_pk_index`
     /// would run its cold scan), so the two stay coupled: NO object-store I/O —
     /// the per-file blooms come straight from the manifest rows.
     ///
@@ -7318,17 +7368,16 @@ impl CayenneTableProvider {
         Ok(ColdKeysetSource::Bloom)
     }
 
-    /// Cold-rebuild the PK existence index from durable state in ONE bounded
+    /// Rebuild the PK existence index from durable state in ONE bounded
     /// streaming pass: every scanned key routes straight to its shard
     /// ([`BoundedShardedPkIndexBuilder`]), and an upsert table whose exact
     /// keysets would exceed the byte budget degrades to bounded per-shard
     /// blooms mid-scan instead of materializing the over-budget keyset and
     /// re-sharding/discarding it afterwards (an O(table-rows) second pass +
-    /// unbounded allocation inside the CDC apply loop — on a large
+    /// unbounded allocation that ran inside the CDC apply loop — on a large
     /// freshly-snapshotted table it starved the stream for the whole run).
-    ///
     /// `shards == 1` serves the serial path; the caller unwraps the single
-    /// shard ([`Self::load_existing_pk_index_serial`]).
+    /// shard.
     ///
     /// `fold_cold`: `true` scans the cold store to fold cold-resident keys into
     /// the index (the exact path — `DoNothing`, or a cold file lacks a bloom);
@@ -7548,7 +7597,7 @@ impl CayenneTableProvider {
     /// Re-add the CURRENT un-checkpointed mem-tier keys to a freshly rebuilt keyset,
     /// so a cold rebuild does not drop keys that live ONLY in the RAM tier (a
     /// brand-new insert not yet checkpointed, or an updated key whose superseding
-    /// copy is still in RAM). The durable scan in [`Self::load_existing_keyset`] sees
+    /// copy is still in RAM). The durable scan in [`Self::load_existing_pk_index`] sees
     /// only checkpointed files; a rebuild forced by [`Self::clear_cached_pk_keyset`]
     /// (compaction / deletion-vector refresh) does NOT flush the mem-tier first, so
     /// without this fold the next UPDATE of a RAM-only key would false-negative in
@@ -7801,7 +7850,7 @@ impl CayenneTableProvider {
 
     /// Try to reconstruct the PK existence index from the persisted sidecar,
     /// skipping the full-table keyset scan. Returns `None` (→ caller falls back to
-    /// the full `load_existing_keyset`) unless the table is upsert-eligible, the
+    /// the full `load_existing_pk_index`) unless the table is upsert-eligible, the
     /// sidecar exists and validates, AND its checkpoint snapshot still equals the
     /// current snapshot (guaranteeing the bloom covers the full current snapshot —
     /// upsert tables only add data after a checkpoint, never rewriting the current
@@ -7843,7 +7892,7 @@ impl CayenneTableProvider {
         }
         // Capture the mem-tier shards, the protected set, and the current snapshot
         // id COHERENTLY under the listing fence — identical to the full rebuild in
-        // `load_existing_keyset`. A compaction/checkpoint landing between these
+        // `load_existing_pk_index`. A compaction/checkpoint landing between these
         // reads must not leave a live key in NEITHER the durable delta
         // (protected/inline, extended below) NOR the RAM mem-tier fold, which would
         // drop it from the bloom and false-negative the next update (over-count).
@@ -7896,7 +7945,7 @@ impl CayenneTableProvider {
         // Fold the un-checkpointed RAM mem-tier too: in `cdc_durability: memory` it
         // is post-checkpoint delta just like the protected/inline layers, and a
         // RAM-only key omitted here would false-negative its next update and leak
-        // the prior copy (durable over-count). Mirrors `load_existing_keyset`.
+        // the prior copy (durable over-count). Mirrors `load_existing_pk_index`.
         Self::fold_mem_tier_keys_into_bloom(&mem_snapshots, pk_indices, converter, &mut bloom)?;
         tracing::debug!(
             table = self.table_metadata.table_name.as_str(),
@@ -8016,7 +8065,9 @@ impl CayenneTableProvider {
                         }
                     }
                     PkDeletionStrategyWithCache::PositionBased { .. } => {
-                        unreachable!("PositionBased strategy should not reach load_existing_keyset")
+                        unreachable!(
+                            "PositionBased strategy should not reach load_existing_pk_index"
+                        )
                     }
                 };
 
@@ -8187,8 +8238,10 @@ impl CayenneTableProvider {
                 .await
             {
                 Ok(Some(index)) => index,
-                _ => self.load_existing_pk_index_serial(pk_indices, converter, fold_cold)
-                    .await?,
+                _ => {
+                    self.load_existing_pk_index_serial(pk_indices, converter, fold_cold)
+                        .await?
+                }
             }
         } else {
             self.load_existing_pk_index_serial(pk_indices, converter, fold_cold)
@@ -8308,16 +8361,13 @@ impl CayenneTableProvider {
         }))
     }
 
-    /// Build the per-shard PK existence index (§2.3c) by reusing the existing
-    /// single-index machinery, then routing keys to `n` shards by
-    /// [`shard_of_pk`] on each key's `OwnedRow` bytes (§3.5).
-    ///
-    /// - Exact path: build the single keyset exactly as the serial path does
-    ///   (cache reuse or full rebuild), then [`ShardedPkIndex::from_exact`].
-    /// - Bloom path: a combined bloom CANNOT be split (its keys are
-    ///   unrecoverable), so when an over-budget upsert table falls back to a
-    ///   bloom we build `n` per-shard blooms by routing each loaded key. At
-    ///   `n == 1` the single bloom wraps directly.
+    /// Build the per-shard PK existence index (§2.3c): reuse the per-shard
+    /// cache when present, else rebuild via [`Self::load_existing_pk_index`],
+    /// which routes every key to its shard ([`shard_of_pk`] on the key's
+    /// `OwnedRow` bytes, §3.5) in one bounded streaming pass. At `n == 1` a
+    /// persisted checkpoint index (exact keyset or bloom — a combined bloom
+    /// CANNOT be split, so it is only usable unsharded) wraps directly with
+    /// no re-shard pass.
     async fn build_sharded_pk_index(
         &self,
         pk_indices: &[usize],
@@ -38783,7 +38833,7 @@ mod tests {
     /// Regression (SF-100 tuned-memory local over-count, `order_line`/`stock` +73K
     /// DURABLE): the PK keyset is invalidated by compaction/refresh
     /// (`clear_cached_pk_keyset`), and the cold rebuild reconstructs it via
-    /// `load_existing_keyset` from DURABLE SNAPSHOT FILES ONLY. Without folding the
+    /// `load_existing_pk_index` from DURABLE SNAPSHOT FILES ONLY. Without folding the
     /// un-checkpointed MEM-TIER keys back in, an UPDATE of an omitted-but-live key
     /// finds it absent in `apply_on_conflict_to_batch`, records NO tombstone, and the
     /// prior copy stays live => `COUNT(*)` > distinct keys — durably (compaction can't
@@ -39882,6 +39932,250 @@ mod tests {
         );
     }
 
+    /// Count staging WALs (`_wal.json`) currently on disk under a table's data
+    /// directory. A protected-snapshot append leaves its WAL under
+    /// `<table>/<table_id>/_staging/<id>/_wal.json`; committed snapshots never
+    /// carry one. Used by the #12027 recovery test to assert that the append
+    /// leaves a recoverable WAL and that recovery clears it.
+    fn count_staging_wals(provider: &CayenneTableProvider) -> usize {
+        fn walk(dir: &std::path::Path, count: &mut usize) {
+            // A missing directory means no staging WALs live under it — a
+            // legitimate zero (e.g. the table dir before any staged write). Any
+            // OTHER read error must fail the test rather than silently undercount
+            // and let a real leftover WAL be misreported as 0.
+            let entries = match std::fs::read_dir(dir) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+                Err(e) => panic!(
+                    "count_staging_wals: read_dir({}) failed: {e}",
+                    dir.display()
+                ),
+            };
+            for entry in entries {
+                let entry = entry.expect("count_staging_wals: read staging directory entry");
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, count);
+                } else if path.file_name().and_then(|name| name.to_str())
+                    == Some(crate::provider::constants::STAGING_WAL_FILENAME)
+                {
+                    *count += 1;
+                }
+            }
+        }
+        let table_dir = std::path::Path::new(&provider.table_metadata.path)
+            .join(&provider.table_metadata.table_id);
+        let mut count = 0;
+        walk(&table_dir, &mut count);
+        count
+    }
+
+    /// Issue #12027 — invariant proof: the `staging_wal` incomplete-append
+    /// recovery path (`ensure_no_incomplete_write`) rolls a durably-committed
+    /// protected-snapshot append FORWARD exactly once and is idempotent, so it
+    /// can never double-publish (duplicate rows) or roll back a legitimately
+    /// committed append — no matter how many times it runs.
+    ///
+    /// This is the steady-state shape the issue observed under sustained CDC
+    /// write load: a CDC upsert stages a protected snapshot and makes its
+    /// `snapshot_sequence` durable in Stage A, but Stage B
+    /// (`apply_under_held_barrier`) intentionally does NOT remove the
+    /// protected-snapshot staging WAL, leaving it for a subsequent write's
+    /// pre-write gate to recover. We reproduce that leftover-WAL state by driving
+    /// Stage A and then DROPPING the write before Stage B finalize (the append is
+    /// already durably committed), then invoke recovery directly, twice, and
+    /// assert: recovery succeeds both times (the second is a no-op), the leftover
+    /// WAL is cleared, and after reopen the committed row is visible EXACTLY once.
+    #[tokio::test]
+    async fn issue_12027_recovery_rolls_committed_protected_snapshot_forward_exactly_once() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, catalog, _tmp) =
+            create_cdc_upsert_table("issue_12027_roll_forward", Arc::clone(&runtime_env)).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // Stage A durably reserves + commits the protected-snapshot sequence and
+        // writes the staging WAL, returning an append that is pending finalize.
+        let write = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[100])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("cdc upsert should prepare (Stage A committed)");
+        assert!(write.has_pending_finalize());
+        // Drop BEFORE Stage B finalize: mirrors a finalize that never got to clear
+        // the WAL. The snapshot sequence is already durable, so this append is
+        // COMMITTED and must be rolled FORWARD by recovery — never back.
+        drop(write);
+
+        // The manufactured steady state: exactly one committed-but-unfinalized
+        // protected-snapshot append whose staging WAL is still on disk and is no
+        // longer flagged in-flight (the drop cleared the registration).
+        assert_eq!(
+            count_staging_wals(&provider),
+            1,
+            "a committed-but-unfinalized protected-snapshot append must leave exactly one staging WAL"
+        );
+
+        // Recovery, run twice. The first rolls the append forward (idempotent
+        // move + WAL removal); the second must be a clean no-op. Neither may
+        // error, duplicate, or roll back.
+        provider
+            .recover_incomplete_writes()
+            .await
+            .expect("first recovery rolls the committed append forward");
+        provider
+            .recover_incomplete_writes()
+            .await
+            .expect("second recovery is an idempotent no-op");
+
+        assert_eq!(
+            count_staging_wals(&provider),
+            0,
+            "recovery must clear the leftover staging WAL after rolling forward"
+        );
+
+        // Reopen re-establishes the protected-snapshot overlay from the durable
+        // catalog; the committed row must be present EXACTLY once. A recovery bug
+        // that double-published would surface here as a duplicate `(1, 100)`; one
+        // that rolled the committed append back would surface as an empty table.
+        let reopened = CayenneTableProviderBuilder::new(Arc::clone(&catalog), runtime_env)
+            .open("issue_12027_roll_forward")
+            .await
+            .expect("reopen after recovery");
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &reopened, "issue_12027_roll_forward").await,
+            vec![(1, 100)],
+            "the committed upsert must be visible exactly once — recovery must \
+             neither double-publish nor roll back a durably-committed append"
+        );
+    }
+
+    /// Issue #12027 fix: a finalized single-table CDC upsert clears its own
+    /// protected-snapshot staging WAL, so steady-state writes do not accumulate
+    /// WALs for the next write's pre-gate to recover. `apply_under_held_barrier`
+    /// removes the WAL only for `CurrentSnapshot` targets; the protected-snapshot
+    /// (on-conflict) branch of `CayenneCdcWrite::finish` removes it explicitly.
+    /// Before the fix the conflicting second upsert left a WAL behind
+    /// (`count_staging_wals == 1`).
+    #[tokio::test]
+    async fn cdc_upsert_finish_removes_staging_wal() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, _tmp) =
+            create_cdc_upsert_table("cdc_upsert_finish_clears_wal", Arc::clone(&runtime_env)).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // First upsert into an empty table: no conflict, so it stages a
+        // current-snapshot append (whose WAL `apply_under_barrier` already
+        // removes inline).
+        provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[100])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("first upsert prepares")
+            .finish()
+            .await
+            .expect("first upsert finalizes");
+        assert_eq!(
+            count_staging_wals(&provider),
+            0,
+            "a finalized current-snapshot append must leave no staging WAL"
+        );
+
+        // Second upsert on the same key conflicts → protected-snapshot finalize,
+        // the path the fix clears. Before the fix this left one WAL behind.
+        provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[200])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("second upsert prepares")
+            .finish()
+            .await
+            .expect("second upsert finalizes");
+        assert_eq!(
+            count_staging_wals(&provider),
+            0,
+            "a finalized protected-snapshot upsert must clear its own staging WAL \
+             instead of leaving it for the next write to recover"
+        );
+
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "cdc_upsert_finish_clears_wal").await,
+            vec![(1, 200)],
+            "the latest upsert wins with no duplication"
+        );
+    }
+
+    /// Issue #12027 fix — crash-window safety: now that a conflicting upsert's
+    /// finalize removes its staging WAL itself, a reopen with no intervening
+    /// batch must still apply the upsert exactly once via the open-time
+    /// orphan-tombstone sweep. The inline tombstone is durable `published = 0`
+    /// and its DURABLE `published = 1` flip is deferred to the next batch's
+    /// Stage-A transaction — which never comes here — so with the staging WAL
+    /// already gone, `ensure_no_incomplete_write` finds nothing and
+    /// `publish_orphan_inlined_deletes` (which keys off `published = 0` + a
+    /// durable replacement, NOT the WAL) is what hides the superseded row.
+    #[tokio::test]
+    async fn cdc_upsert_finalize_without_wal_reopens_via_orphan_tombstone_sweep() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, catalog, _tmp) =
+            create_cdc_upsert_table("cdc_upsert_deferred_flip", Arc::clone(&runtime_env)).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // Seed key 1 = 100.
+        provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[100])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seed prepares")
+            .finish()
+            .await
+            .expect("seed finalizes");
+
+        // Upsert key 1 = 200: conflicts, so finalize writes an inline tombstone
+        // durable `published = 0`, moves the replacement files, and removes the
+        // staging WAL — but leaves the durable tombstone flip deferred.
+        provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[200])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("upsert prepares")
+            .finish()
+            .await
+            .expect("upsert finalizes");
+        assert_eq!(
+            count_staging_wals(&provider),
+            0,
+            "the conflicting upsert's finalize must clear its staging WAL"
+        );
+
+        // Reopen with no intervening batch: the deferred durable flip never
+        // landed and there is no WAL to recover, so the open-time orphan sweep
+        // alone must hide the old value.
+        let reopened = CayenneTableProviderBuilder::new(Arc::clone(&catalog), runtime_env)
+            .open("cdc_upsert_deferred_flip")
+            .await
+            .expect("reopen after WAL-less finalize");
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &reopened, "cdc_upsert_deferred_flip").await,
+            vec![(1, 200)],
+            "after reopen the upsert must apply exactly once (old value hidden, new \
+             visible) even though its staging WAL was already removed and the durable \
+             tombstone flip was still deferred — the orphan-tombstone sweep heals it"
+        );
+    }
+
     /// Lever L1 (metadata-only publish) end-to-end correctness. An upsert that
     /// supersedes existing rows publishes its re-insert via the per-commit
     /// `reinsert_sequence` column on the delete-file row — writing ZERO per-key
@@ -40879,7 +41173,7 @@ mod tests {
 
     /// Regression: the persisted-bloom fast path (`try_load_persisted_pk_index`)
     /// must fold the un-checkpointed RAM mem-tier, exactly like the full
-    /// `load_existing_keyset` rebuild does. A key written to the mem tier AFTER the
+    /// `load_existing_pk_index` rebuild does. A key written to the mem tier AFTER the
     /// last checkpoint lives ONLY in RAM — it is in neither the persisted sidecar
     /// bloom (which covers the checkpointed snapshot) nor the protected/inline
     /// delta. Without the `fold_mem_tier_keys_into_bloom` fold, a rebuild through
@@ -44246,7 +44540,7 @@ mod tests {
         );
 
         // Faithfulness check: a REAL `clear_cached_pk_keyset` rebuild goes through
-        // `load_existing_keyset`, which floor-stamps every key to the end-of-scan
+        // `load_existing_pk_index`, which floor-stamps every key to the end-of-scan
         // high-water (`stamp_all_sequences_min(sequence_high_water())`). Model that
         // by floor-stamping id=1 to the high-water (7). The same transaction then
         // correctly CONFLICTS via the per-key stamp (7 > begin 5) — the production
@@ -44265,7 +44559,7 @@ mod tests {
                 &empty_write_set,
                 current_high_water,
             ),
-            "a floor-stamped rebuild (the production clear->load_existing_keyset \
+            "a floor-stamped rebuild (the production clear->load_existing_pk_index \
              path) must still conflict the stage_seq=5 txn against high-water 7"
         );
     }
