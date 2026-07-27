@@ -28,13 +28,13 @@ pub enum AccessMode {
 impl AccessMode {
     /// Returns true if this access mode allows write operations (INSERT, UPDATE, DELETE).
     #[must_use]
-    pub(crate) fn allows_write(&self) -> bool {
+    pub fn allows_write(&self) -> bool {
         matches!(self, AccessMode::ReadWrite | AccessMode::ReadWriteCreate)
     }
 
     /// Returns true if this access mode allows DDL operations (CREATE TABLE, DROP TABLE, etc.).
     #[must_use]
-    pub(crate) fn allows_ddl(&self) -> bool {
+    pub fn allows_ddl(&self) -> bool {
         matches!(self, AccessMode::ReadWriteCreate)
     }
 }

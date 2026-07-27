@@ -118,7 +118,7 @@ pub enum ParseTypeError {
 /// Parse a user-supplied type string into an Arrow `DataType`.
 ///
 /// See the module-level docs for the full list of accepted forms.
-pub(crate) fn parse_declared_type(input: &str) -> Result<DataType, ParseTypeError> {
+pub fn parse_declared_type(input: &str) -> Result<DataType, ParseTypeError> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err(ParseTypeError::Unrecognized {

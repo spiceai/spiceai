@@ -22,7 +22,7 @@ use crate::dataset::FullTextSearchDatasetConfig;
 
 #[expect(clippy::type_complexity)] // From a two-part `.unzip()`.
 #[must_use]
-pub(crate) fn full_text_search_config(
+pub fn full_text_search_config(
     columns: &[Column],
     name: &TableReference,
 ) -> Option<FullTextSearchDatasetConfig> {
