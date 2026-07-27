@@ -53,6 +53,8 @@ struct MockIndex {
     write_output_rows: Option<usize>,
     fail_write: bool,
     fail_on_write_start: bool,
+    /// What this mock reports from `Index::write_complete_failure_is_fatal`.
+    write_complete_fatal: bool,
     events: Arc<Mutex<Vec<String>>>,
 }
 
@@ -69,6 +71,7 @@ impl MockIndex {
             write_output_rows: None,
             fail_write: false,
             fail_on_write_start: false,
+            write_complete_fatal: false,
             events: Arc::clone(events),
         }
     }
@@ -161,6 +164,10 @@ impl Index for MockIndex {
     async fn on_write_complete(&self) -> Result<(), DataFusionError> {
         self.record("on_write_complete");
         Ok(())
+    }
+
+    fn write_complete_failure_is_fatal(&self) -> bool {
+        self.write_complete_fatal
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -488,6 +495,64 @@ async fn lifecycle_hooks_forward_to_both_indexes() {
                 "missing {side}:{event} in {events:?}"
             );
         }
+    }
+}
+
+/// A compound index is stale if *either* half fails to finalize, so the fatality flag
+/// must be the union of both halves rather than the trait default (#12038).
+#[test]
+fn write_complete_fatality_is_the_union_of_both_search_halves() {
+    let events = Arc::new(Mutex::new(vec![]));
+
+    for (primary_fatal, secondary_fatal, expected) in [
+        (false, false, false),
+        (true, false, true),
+        (false, true, true),
+        (true, true, true),
+    ] {
+        let mut primary = MockIndex::new("primary", &events);
+        primary.write_complete_fatal = primary_fatal;
+        let mut secondary = MockIndex::new("secondary", &events);
+        secondary.write_complete_fatal = secondary_fatal;
+
+        let idx = compound(primary, secondary, CompoundReadMode::PrimaryOnly);
+        assert_eq!(
+            idx.write_complete_failure_is_fatal(),
+            expected,
+            "primary_fatal={primary_fatal}, secondary_fatal={secondary_fatal}"
+        );
+    }
+}
+
+#[test]
+fn write_complete_fatality_is_the_union_of_both_vector_halves() {
+    let events = Arc::new(Mutex::new(vec![]));
+
+    for (primary_fatal, secondary_fatal, expected) in [
+        (false, false, false),
+        (true, false, true),
+        (false, true, true),
+        (true, true, true),
+    ] {
+        let mut primary = MockIndex::new("primary", &events);
+        primary.dimension = Some(4);
+        primary.write_complete_fatal = primary_fatal;
+        let mut secondary = MockIndex::new("secondary", &events);
+        secondary.dimension = Some(4);
+        secondary.write_complete_fatal = secondary_fatal;
+
+        let idx = CompoundVectorIndex::try_new(
+            Arc::new(primary) as Arc<dyn VectorIndex>,
+            Arc::new(secondary) as Arc<dyn VectorIndex>,
+            CompoundReadMode::PrimaryOnly,
+        )
+        .expect("compatible vector indexes");
+
+        assert_eq!(
+            idx.write_complete_failure_is_fatal(),
+            expected,
+            "primary_fatal={primary_fatal}, secondary_fatal={secondary_fatal}"
+        );
     }
 }
 
