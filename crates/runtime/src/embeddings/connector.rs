@@ -349,24 +349,17 @@ impl DataConnector for EmbeddingConnector {
             };
 
             // Avoid reindexing full-text indexes.
-            let stream_indexes: Vec<_> = indexed_table
-                .get_all_indexes()
-                .into_iter()
-                .filter(|idx| {
-                    idx.as_any()
-                        .downcast_ref::<FullTextDatabaseIndex>()
-                        .is_none()
-                })
-                .collect();
-
-            // Tell the indexes this change stream writes to that writes reach them from
-            // outside the sink write lifecycle, so none of them batches work across a
-            // write window that these writes do not belong to.
-            for index in &stream_indexes {
-                index.on_cdc_attached();
-            }
-
-            let indexes = Indexes::new(stream_indexes);
+            let indexes = Indexes::new(
+                indexed_table
+                    .get_all_indexes()
+                    .into_iter()
+                    .filter(|idx| {
+                        idx.as_any()
+                            .downcast_ref::<FullTextDatabaseIndex>()
+                            .is_none()
+                    })
+                    .collect(),
+            );
 
             let stream = self
                 .inner_connector

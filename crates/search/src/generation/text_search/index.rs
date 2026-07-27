@@ -195,12 +195,6 @@ impl Index for FullTextDatabaseIndex {
             .context(TextSearchIndexingSnafu)
             .map_err(|e| DataFusionError::External(Box::new(e)))
     }
-
-    /// Permanently disable the deferred-commit window: a change-data-capture stream writes
-    /// to this index outside the sink write lifecycle (see the `cdc_attached` field).
-    fn on_cdc_attached(&self) {
-        self.cdc_attached.store(true, Ordering::Release);
-    }
 }
 
 impl FullTextDatabaseIndex {
@@ -405,6 +399,14 @@ impl FullTextDatabaseIndex {
     #[must_use]
     pub fn as_arc_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
         self
+    }
+
+    /// Record that a change-data-capture stream also writes to this index, which
+    /// permanently disables the deferred-commit window (see `cdc_attached`).
+    ///
+    /// Called when the change stream that includes this index is constructed.
+    pub fn mark_cdc_attached(&self) {
+        self.cdc_attached.store(true, Ordering::Release);
     }
 
     #[must_use]
@@ -1076,7 +1078,7 @@ mod tests {
         )
         .expect("Failed to create FullTextDatabaseIndex");
 
-        index.on_cdc_attached();
+        index.mark_cdc_attached();
 
         // Opening a window is a no-op for a CDC-fed index.
         index.on_write_start().await.expect("on_write_start failed");
@@ -1117,11 +1119,12 @@ mod tests {
         );
     }
 
-    /// A warm full-text tier is registered inside a
-    /// [`CompoundSearchIndex`](crate::index::compound::CompoundSearchIndex), so the change
-    /// stream only ever notifies the compound. The notification has to reach the tier that
-    /// owns the tantivy writer, or it keeps deferring and a failed write window discards the
-    /// change stream's documents for good.
+    /// A warm full-text tier can be registered inside a
+    /// [`CompoundSearchIndex`](crate::index::compound::CompoundSearchIndex) rather than
+    /// directly, with writes routed to it via [`SearchIndex::write`]. Once that tier is marked
+    /// CDC-attached, it must stop deferring commits regardless of whether writes reach it
+    /// directly or through the compound, or a failed write window discards the change
+    /// stream's documents for good.
     #[tokio::test]
     async fn test_cdc_attached_compound_primary_never_defers_commits() {
         use crate::index::compound::{CompoundReadMode, CompoundSearchIndex};
@@ -1147,7 +1150,7 @@ mod tests {
         )
         .expect("two full-text tiers over the same table are compatible");
 
-        compound.on_cdc_attached();
+        warm.mark_cdc_attached();
 
         // A sink-driven refresh opens a write window on both tiers.
         compound

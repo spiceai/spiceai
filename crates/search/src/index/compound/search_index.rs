@@ -61,6 +61,19 @@ impl CompoundSearchIndex {
             read_mode,
         })
     }
+
+    /// The tier reads and writes are served from first.
+    #[must_use]
+    pub fn primary(&self) -> &Arc<dyn SearchIndex> {
+        &self.primary
+    }
+
+    /// The tier reads fall back to (in [`CompoundReadMode::FallbackToSecondary`]) and every
+    /// write also reaches.
+    #[must_use]
+    pub fn secondary(&self) -> &Arc<dyn SearchIndex> {
+        &self.secondary
+    }
 }
 
 #[async_trait]
@@ -104,13 +117,6 @@ impl Index for CompoundSearchIndex {
             self.secondary.on_write_complete()
         );
         primary_result.and(secondary_result)
-    }
-
-    fn on_cdc_attached(&self) {
-        // Both tiers are written by the change stream that wraps this compound, so both
-        // have to know that writes arrive outside the sink write lifecycle.
-        self.primary.on_cdc_attached();
-        self.secondary.on_cdc_attached();
     }
 
     fn as_any(&self) -> &dyn Any {

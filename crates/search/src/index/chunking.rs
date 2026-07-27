@@ -99,10 +99,6 @@ impl Index for ChunkedSearchIndex {
         self.inner.on_write_complete().await
     }
 
-    fn on_cdc_attached(&self) {
-        self.inner.on_cdc_attached();
-    }
-
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -206,6 +202,12 @@ impl ChunkedSearchIndex {
             inner,
             chunker,
         }
+    }
+
+    /// The index this chunking wrapper writes chunked batches through to.
+    #[must_use]
+    pub fn inner(&self) -> &Arc<dyn SearchIndex> {
+        &self.inner
     }
 
     /// Build the intermediate "chunked" [`RecordBatch`] for a contiguous group of input rows
@@ -767,10 +769,6 @@ impl Index for ChunkedVectorIndex {
 
     async fn on_write_complete(&self) -> Result<(), DataFusionError> {
         self.inner.on_write_complete().await
-    }
-
-    fn on_cdc_attached(&self) {
-        self.inner.on_cdc_attached();
     }
 
     fn as_any(&self) -> &dyn Any {

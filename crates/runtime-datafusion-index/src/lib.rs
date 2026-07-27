@@ -78,16 +78,5 @@ pub trait Index: Debug + Send + Sync + 'static {
         Ok(())
     }
 
-    /// Called when a change-data-capture stream that writes to this index is constructed.
-    ///
-    /// A CDC stream drives [`Index::compute_index`] outside the [`TableSink`] write lifecycle,
-    /// so an implementation that batches or defers work across a write window has to know that
-    /// writes also arrive from outside it.
-    ///
-    /// Default is a no-op. An index that composes other indexes **must** forward this to each
-    /// of them: inheriting the default leaves the inner index believing every write is
-    /// lifecycle-driven.
-    fn on_cdc_attached(&self) {}
-
     fn as_any(&self) -> &dyn Any;
 }
