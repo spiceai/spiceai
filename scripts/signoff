@@ -515,6 +515,33 @@ print(",".join(features))
 ' "$packages" || return 0
 }
 
+# Narrow a package-qualified feature list (`pkg/feat,…`) to the given packages.
+# Cargo rejects a feature naming a package outside the `-p` selection outright
+# ("the package 'x' does not contain this feature: y/z"), so any caller that
+# builds a subset of the packages the features were resolved for has to filter
+# first. Prints the kept features, or nothing when none survive.
+features_for_packages() {
+  local features="$1" packages="$2"
+  [[ -n "${features//[$'\t\n\r ']/}" ]] || return 0
+  [[ -n "${packages//[$'\t\n\r ']/}" ]] || return 0
+
+  awk -v feats="$features" -v pkgs="$packages" 'BEGIN {
+    n = split(pkgs, selected, /[ \t\n]+/)
+    for (i = 1; i <= n; i++) if (selected[i] != "") keep[selected[i]] = 1
+
+    m = split(feats, entries, /,/)
+    out = ""
+    for (i = 1; i <= m; i++) {
+      slash = index(entries[i], "/")
+      if (slash == 0) continue
+      if (substr(entries[i], 1, slash - 1) in keep) {
+        out = (out == "" ? entries[i] : out "," entries[i])
+      }
+    }
+    print out
+  }'
+}
+
 # Filter a space-separated package list to those with a library target. The
 # unit-test gate is lib-only, and `--lib` is a fatal `no library targets found`
 # on bin-only crates (spice, testoperator, …). Prints the filtered list, or
@@ -627,6 +654,13 @@ run_targeted_tests() {
     append_step_summary "### Targeted unit tests"$'\n'"Skipped (no changed packages with a library target)."$'\n'
     return 0
   fi
+
+  # The features were resolved for the full changed set, which can name crates
+  # dropped just above. Naming a feature for a package outside the `-p`
+  # selection is a hard cargo error ("the package 'x' does not contain this
+  # feature: y/z"), so a branch touching a library crate and a bin-only one
+  # (runtime + testoperator) would fail the run outright.
+  features=$(features_for_packages "$features" "$test_packages")
 
   info "Targeted unit tests for changed packages: ${test_packages}"
   info "  (make nextest-packages PACKAGES=\"${test_packages}\")"
