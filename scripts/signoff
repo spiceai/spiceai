@@ -474,18 +474,28 @@ changed_workspace_packages() {
 # the targeted tests; the full run still covers them).
 packages_with_lib_targets() {
   local packages="$1"
-  local metadata
   [[ -n "${packages//[$'\t\n\r ']/}" ]] || return 0
   command -v python3 >/dev/null 2>&1 || return 0
 
-  metadata=$(cargo metadata --no-deps --format-version 1 2>/dev/null) || return 0
+  # Metadata streams in over stdin rather than an environment variable: this
+  # workspace's `cargo metadata` output is ~700 KB against a 1 MiB ARG_MAX on
+  # macOS, and that cap covers argv plus the whole environment of exec(). Once
+  # the workspace outgrows the remaining headroom, python3 would stop starting
+  # at all and the targeted tests would silently disappear. That forces
+  # `python3 -c` over the heredoc used elsewhere here, since stdin is now data.
+  # The package list stays in argv — it is a handful of crate names.
+  cargo metadata --no-deps --format-version 1 2>/dev/null | python3 -c '
+import json, sys
 
-  SIGNOFF_CANDIDATE_PACKAGES="$packages" PACKAGES_METADATA="$metadata" python3 <<'PY'
-import json, os
+try:
+    meta = json.load(sys.stdin)
+except ValueError:
+    # cargo metadata failed or produced nothing: print no packages, so the
+    # caller skips the targeted tests instead of showing a decode traceback.
+    raise SystemExit(0)
 
-meta = json.loads(os.environ["PACKAGES_METADATA"])
-candidates = set(os.environ["SIGNOFF_CANDIDATE_PACKAGES"].split())
-# A proc-macro crate's lib target is what `--lib` selects for it, so it counts.
+candidates = set(sys.argv[1].split())
+# A proc-macro crate lib target is what `--lib` selects for it, so it counts.
 LIB_KINDS = {"lib", "rlib", "proc-macro"}
 
 with_lib = sorted(
@@ -495,7 +505,7 @@ with_lib = sorted(
     and any(LIB_KINDS & set(t["kind"]) for t in p["targets"])
 )
 print(" ".join(with_lib))
-PY
+' "$packages" || return 0
 }
 
 # Append a short markdown section to the GitHub Actions job summary (no-op
