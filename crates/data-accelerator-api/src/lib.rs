@@ -18,13 +18,14 @@ limitations under the License.
 //!
 //! Holds the [`DataAccelerator`] trait, the accelerator registry
 //! ([`AcceleratorEngineRegistry`], the `register_data_accelerator!` self-registration
-//! slice), the accelerated-table creation flow ([`AcceleratorEngineRegistry::create_accelerator_table`]
-//! + [`AcceleratorExternalTableBuilder`]), and the shared table-provider seams
+//! slice), the accelerated-table creation flow
+//! ([`AcceleratorEngineRegistry::create_accelerator_table`] and
+//! [`AcceleratorExternalTableBuilder`]), and the shared table-provider seams
 //! ([`swappable`], [`upsert_dedup`]).
 //!
 //! It names nothing from the `runtime` orchestrator — the trait is abstracted behind
 //! [`runtime_acceleration::AccelerationSource`], and secrets/parameters/partitioning are
-//! passed in via below-runtime crates — so an accelerator engine (and the AcceleratedTable
+//! passed in via below-runtime crates — so an accelerator engine (and the `AcceleratedTable`
 //! machinery) can implement or consume the contract without depending on `runtime`.
 
 use ::arrow::datatypes::SchemaRef;
@@ -41,9 +42,9 @@ use datafusion_table_providers::util::{
     column_reference::ColumnReference, constraints::UpsertOptions, on_conflict::OnConflict,
 };
 use linkme::distributed_slice;
+use runtime_acceleration::Engine;
 use runtime_acceleration::acceleration::{self, Acceleration, IndexType, Mode};
 use runtime_acceleration::snapshot::AccelerationLayout;
-use runtime_acceleration::Engine;
 use runtime_parameters::ParameterSpec;
 use runtime_parameters::Parameters;
 use runtime_secrets::{ExposeSecret, ParamStr, Secrets};
@@ -183,6 +184,12 @@ pub enum FilePathError {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 impl AcceleratorEngineRegistry {
+    /// Builds the accelerator [`TableProvider`] for a dataset from its acceleration settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configured engine is unknown or unregistered, or if the
+    /// engine fails to create its external table.
     #[expect(clippy::too_many_arguments)]
     pub async fn create_accelerator_table(
         &self,
@@ -203,9 +210,7 @@ impl AcceleratorEngineRegistry {
         // compact encoding.
         let needs_dictionary_normalization = matches!(
             engine.to_unpartitioned(),
-            Engine::DuckDB
-                | Engine::Sqlite
-                | Engine::Turso
+            Engine::DuckDB | Engine::Sqlite | Engine::Turso
         );
         let schema = if needs_dictionary_normalization
             && arrow_tools::schema::has_dictionary_types(&schema)
@@ -455,6 +460,11 @@ pub trait DataAccelerator: Send + Sync {
 
     /// For file-based accelerators, return the file path
     /// For any other accelerator, return None
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the accelerator does not support file mode, or if the engine
+    /// cannot resolve a file path for the source.
     fn file_path(&self, _source: &dyn AccelerationSource) -> Result<String, FilePathError> {
         Err(FilePathError::FileModeUnsupported {})
     }
@@ -667,6 +677,12 @@ impl AcceleratorExternalTableBuilder {
         }
     }
 
+    /// Builds the `CREATE EXTERNAL TABLE` command from the accumulated builder state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the accumulated acceleration settings are invalid for the
+    /// selected engine.
     pub fn build(self) -> Result<CreateExternalTable> {
         self.validate()?;
 
@@ -741,6 +757,12 @@ impl AcceleratorExternalTableBuilder {
     }
 }
 
+/// Resolves the on-disk file path for a file-based acceleration source.
+///
+/// # Errors
+///
+/// Returns an error if acceleration is not enabled, the engine is unavailable, or the
+/// engine does not support file mode.
 pub async fn acceleration_file_path(
     source: &dyn AccelerationSource,
     registry: &AcceleratorEngineRegistry,
@@ -768,6 +790,10 @@ pub async fn acceleration_file_path(
 /// - Directory-based engines (Cayenne): `AccelerationLayout::cayenne`
 ///
 /// This is used for snapshots and size metrics.
+///
+/// # Errors
+///
+/// Returns an error if acceleration is not enabled or the engine is unavailable.
 pub async fn get_acceleration_layout(
     source: &dyn AccelerationSource,
     registry: &AcceleratorEngineRegistry,
@@ -784,6 +810,7 @@ pub async fn get_acceleration_layout(
     Ok(accelerator.acceleration_layout(source))
 }
 
+#[must_use]
 pub fn get_primary_keys_from_constraints(
     constraints: &Constraints,
     schema: &SchemaRef,
@@ -813,4 +840,3 @@ pub fn cayenne_pk_conflict_detection_none(acceleration_settings: &Acceleration) 
             .filter_map(|key| acceleration_settings.params.get(*key))
             .any(|value| value.eq_ignore_ascii_case("none"))
 }
-

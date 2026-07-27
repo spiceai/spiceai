@@ -194,4 +194,7 @@ impl DataAccelerator for PartitionedArrowAccelerator {
     }
 }
 
-data_accelerator_api::register_data_accelerator!(Engine::PartitionedArrow, PartitionedArrowAccelerator);
+data_accelerator_api::register_data_accelerator!(
+    Engine::PartitionedArrow,
+    PartitionedArrowAccelerator
+);
