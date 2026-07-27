@@ -16,7 +16,7 @@ limitations under the License.
 use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
 use datafusion::datasource::TableProvider;
-use runtime_datafusion_index::{Index, IndexedTableProvider};
+use runtime_datafusion_index::IndexedTableProvider;
 use search::generation::text_search::index::FullTextDatabaseIndex;
 use search::index::chunking::ChunkedSearchIndex;
 use search::index::compound::CompoundSearchIndex;
