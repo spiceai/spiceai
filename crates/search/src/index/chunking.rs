@@ -224,6 +224,12 @@ impl ChunkedSearchIndex {
         }
     }
 
+    /// The index this chunking wrapper writes chunked batches through to.
+    #[must_use]
+    pub fn inner(&self) -> &Arc<dyn SearchIndex> {
+        &self.inner
+    }
+
     /// Build the intermediate "chunked" [`RecordBatch`] for a contiguous group of input rows
     /// (`record[start..start+length]`). Non-search columns are repeated per chunk; the search
     /// column is replaced with the flattened chunk strings; `_spice.chunk_id` and the offset
