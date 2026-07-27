@@ -78,5 +78,19 @@ pub trait Index: Debug + Send + Sync + 'static {
         Ok(())
     }
 
+    /// Whether a failure in [`Index::on_write_complete`] must fail the write.
+    ///
+    /// Defaults to `false` (best-effort), matching indexes whose finalize step has
+    /// `IF NOT EXISTS` semantics and is simply redone on the next refresh. An index
+    /// that finalizes durable state the written data depends on returns `true`: for
+    /// those, a failed finalize leaves the index stale while the write reports
+    /// success, so the sink reports the write as failed instead.
+    ///
+    /// Wrapper implementations MUST forward this to the index they wrap — inheriting
+    /// the default silently downgrades a fatal inner index to best-effort.
+    fn write_complete_failure_is_fatal(&self) -> bool {
+        false
+    }
+
     fn as_any(&self) -> &dyn Any;
 }
