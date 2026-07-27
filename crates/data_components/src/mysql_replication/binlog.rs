@@ -289,6 +289,11 @@ pub(super) fn buffer_rows_event_fast(
     buffer: &mut TransactionBuffer,
     metrics: &MetricsCollector,
 ) -> Result<()> {
+    enum FastOp {
+        Insert,
+        Update,
+        Delete,
+    }
     if layout.columns.len() != decoder.cols.len() {
         return Err(Error::Decode {
             message: format!(
@@ -298,11 +303,6 @@ pub(super) fn buffer_rows_event_fast(
                 layout.columns.len()
             ),
         });
-    }
-    enum FastOp {
-        Insert,
-        Update,
-        Delete,
     }
     let op = match rows_data {
         RowsEventData::WriteRowsEvent(_) | RowsEventData::WriteRowsEventV1(_) => FastOp::Insert,
