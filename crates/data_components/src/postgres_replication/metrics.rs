@@ -99,6 +99,16 @@ pub struct MetricsCollector {
     /// this counter exports the subtracted amount so the waterfall can attribute
     /// it to apply back-pressure rather than lose it. Only set for shared slots.
     member_send_wait_micros_total: AtomicU64,
+    /// Envelopes the shared-slot pump is currently holding back for this member
+    /// because its channel is full. This is the depth of the decoupling that
+    /// keeps one lagging member from stalling its slot-mates, so it is the
+    /// signal for "this dataset is behind its peers on the slot" — the role
+    /// `member_send_stalled_seconds_total` used to play before a full channel
+    /// stopped meaning a stalled pump. A sustained non-zero value is a lagging
+    /// member; a value at the hold-back cap means the pump has gone back to
+    /// blocking (bounded memory), and `member_send_stalled_seconds_total` will
+    /// tick again. Only ever set for shared-slot datasets.
+    member_held_envelopes: AtomicU64,
 
     // Shared-slot membership liveness. `member_attached` is `1` while this
     // dataset is an attached member of its shared replication slot and `0` once
@@ -276,6 +286,11 @@ impl MetricsCollector {
     /// same amount from `reader_processing_micros_total` at the source, so that
     /// counter stays decode-only; this exports the subtracted wait for
     /// attribution.
+    /// Publish the pump's current hold-back depth for this member.
+    pub fn set_member_held_envelopes(&self, n: u64) {
+        self.member_held_envelopes.store(n, Ordering::Relaxed);
+    }
+
     pub fn add_member_send_wait_micros(&self, us: u64) {
         self.member_send_wait_micros_total
             .fetch_add(us, Ordering::Relaxed);
@@ -496,6 +511,11 @@ impl Metrics {
         self.collector
             .member_send_wait_micros_total
             .load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn member_held_envelopes(&self) -> u64 {
+        self.collector.member_held_envelopes.load(Ordering::Relaxed)
     }
 }
 

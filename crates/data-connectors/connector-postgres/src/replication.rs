@@ -442,6 +442,22 @@ const METRICS: &[MetricSpec] = &[
     )
     .unit("us")
     .auto_register(),
+    MetricSpec::new(
+        "replication_member_held_envelopes",
+        MetricType::ObservableGaugeU64,
+    )
+    .description(
+        "Committed-change envelopes the shared-slot pump is currently holding back for \
+         this dataset because its delivery channel is full. The pump keeps reading the \
+         replication connection and serving the slot's other members while this is \
+         non-zero, so this — not member_send_stalled_seconds_total — is the signal for \
+         'this dataset is behind its slot-mates'. A value pinned at the hold-back cap \
+         (4x the member channel capacity, summed across members) means the pump has \
+         reverted to blocking to bound memory, at which point \
+         member_send_stalled_seconds_total starts ticking again. Only reported for \
+         datasets on a shared (explicitly-named) slot.",
+    )
+    .auto_register(),
 ];
 
 #[derive(Debug, Clone)]
@@ -598,6 +614,11 @@ impl MetricsProvider for PostgresMetricsProvider {
             "replication_member_send_wait_micros_total" => {
                 Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
                     instrument.observe(m.member_send_wait_micros_total(), &attributes);
+                })))
+            }
+            "replication_member_held_envelopes" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.member_held_envelopes(), &attributes);
                 })))
             }
             _ => None,
