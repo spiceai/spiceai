@@ -38,6 +38,8 @@
 #                     statuses, "via remote" description, GitHub step summary
 #   SIGNOFF_DEBUG     Set to any value for verbose debug logging
 #   SIGNOFF_SKIP_TARGETED_LINT  Set to any value to skip the branch-scoped pre-lint
+#   SIGNOFF_SKIP_TARGETED_TESTS Set to any value to skip the branch-scoped unit
+#                     tests that run after the pre-lint
 #   SIGNOFF_SSH_HOSTS Space-separated hosts for make signoff-remote (default:
 #                     192.168.1.100 192.168.1.101). First host that answers SSH
 #                     and has a Git checkout at $HOME/dev/spice2 is used;
@@ -465,6 +467,37 @@ changed_workspace_packages() {
   echo "$packages" | tr '\n' ' ' | sed 's/[[:space:]]*$//'
 }
 
+# Filter a space-separated package list to those with a library target. The
+# unit-test gate is lib-only, and `--lib` is a fatal `no library targets found`
+# on bin-only crates (spice, testoperator, …). Prints the filtered list, or
+# nothing when none qualify or the metadata is unavailable (caller then skips
+# the targeted tests; the full run still covers them).
+packages_with_lib_targets() {
+  local packages="$1"
+  local metadata
+  [[ -n "${packages//[$'\t\n\r ']/}" ]] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+
+  metadata=$(cargo metadata --no-deps --format-version 1 2>/dev/null) || return 0
+
+  SIGNOFF_CANDIDATE_PACKAGES="$packages" PACKAGES_METADATA="$metadata" python3 <<'PY'
+import json, os
+
+meta = json.loads(os.environ["PACKAGES_METADATA"])
+candidates = set(os.environ["SIGNOFF_CANDIDATE_PACKAGES"].split())
+# A proc-macro crate's lib target is what `--lib` selects for it, so it counts.
+LIB_KINDS = {"lib", "rlib", "proc-macro"}
+
+with_lib = sorted(
+    p["name"]
+    for p in meta["packages"]
+    if p["name"] in candidates
+    and any(LIB_KINDS & set(t["kind"]) for t in p["targets"])
+)
+print(" ".join(with_lib))
+PY
+}
+
 # Append a short markdown section to the GitHub Actions job summary (no-op
 # outside Actions, or when the summary file isn't writable).
 append_step_summary() {
@@ -515,6 +548,36 @@ branch_has_rust_changes() {
   return 1
 }
 
+# Unit tests for the packages a branch touched, run before the full workspace
+# lint. A broken test in the crate you just edited is the likeliest failure, and
+# it would otherwise surface only after the longest step in the gate.
+# Bin-only packages are dropped (see packages_with_lib_targets); everything the
+# targeted run skips is still covered by the full `nextest` run later.
+run_targeted_tests() {
+  local packages="$1"
+  local test_packages
+
+  if [[ -n "${SIGNOFF_SKIP_TARGETED_TESTS:-}" ]]; then
+    info "SIGNOFF_SKIP_TARGETED_TESTS set — skipping targeted unit tests"
+    return 0
+  fi
+
+  test_packages=$(packages_with_lib_targets "$packages" || true)
+  if [[ -z "${test_packages//[$'\t\n\r ']/}" ]]; then
+    debug "no changed packages with a library target — skipping targeted unit tests"
+    append_step_summary "### Targeted unit tests"$'\n'"Skipped (no changed packages with a library target)."$'\n'
+    return 0
+  fi
+
+  info "Targeted unit tests for changed packages: ${test_packages}"
+  info "  (make nextest-packages PACKAGES=\"${test_packages}\")"
+  append_step_summary "### Targeted unit tests"$'\n'"Packages: \`${test_packages}\`"$'\n'
+  # Explicit `|| return` so failures short-circuit even when the caller has
+  # temporarily disabled `set -e` (see cmd_signoff).
+  make nextest-packages PACKAGES="$test_packages" || return $?
+  info "Targeted unit tests passed."
+}
+
 # Run the same fast checks the old PR build ran: lint + build + unit tests.
 # The heavier suite (release build, integration, e2e, ...) runs in the merge
 # queue, so it deliberately isn't part of the local sign-off.
@@ -522,8 +585,14 @@ branch_has_rust_changes() {
 # Fail-fast order:
 #   0. Skip all Rust work when the branch has no Rust-affecting files vs trunk
 #   1. Targeted lint on packages touched by the branch (fast feedback)
-#   2. Full workspace lint (the real gate)
-#   3. CLI build + unit tests
+#   2. Targeted unit tests for those packages (fast feedback)
+#   3. Full workspace lint (the real gate)
+#   4. CLI build + unit tests
+#
+# Steps 1-2 cover the crate you actually edited before step 3, the longest step,
+# so its likeliest failures surface in minutes instead of at the end. Both trade
+# one extra compile of those crates when everything passes; SIGNOFF_SKIP_TARGETED_LINT
+# and SIGNOFF_SKIP_TARGETED_TESTS opt out.
 #
 # Sets SIGNOFF_CHECK_SUMMARY (short phrase for the commit-status description).
 # Output streams straight to the terminal — call this bare, never `$(run_checks)`,
@@ -555,7 +624,9 @@ run_checks() {
     # complete feature set. Explicit `|| return` so failures short-circuit even
     # when the caller has temporarily disabled `set -e` (see cmd_signoff).
     make lint-rust PACKAGES="$packages" FEATURES= || return $?
-    info "Targeted pre-lint passed — running full workspace lint…"
+    info "Targeted pre-lint passed."
+    run_targeted_tests "$packages" || return $?
+    info "Running full workspace lint…"
   else
     info "No changed workspace packages detected (or targeted lint skipped) — running full workspace lint…"
     append_step_summary "### Targeted pre-lint"$'\n'"Skipped (no changed workspace packages, or unavailable base/diff)."$'\n'
@@ -566,8 +637,14 @@ run_checks() {
   # the full gate; empty values leave the Makefile on its workspace defaults.
   make lint-rust PACKAGES= FEATURES= || return $?
 
-  info "Building the CLI and running unit tests (make build-cli nextest)…"
-  make build-cli nextest || return $?
+  # build-cli-dev, not build-cli: the release CLI build shares no artifacts with
+  # the profile the lint and test passes just warmed, so it recompiles its whole
+  # graph (~590 crates, DataFusion and Arrow among them) to prove the binary
+  # links. The merge queue's required `Build (release profile)` job builds the
+  # CLI, spiced, and the release install for real, so release-only breakage is
+  # still caught before trunk.
+  info "Building the CLI and running unit tests (make build-cli-dev nextest)…"
+  make build-cli-dev nextest || return $?
 
   SIGNOFF_CHECK_SUMMARY="lint+test passed"
 }
@@ -1118,10 +1195,12 @@ Checks (when verify is on):
      rust-toolchain*, .cargo/*) → skip Rust lint/build/tests (still posts status)
   1. Targeted lint of crates touched by this branch vs trunk
      (make lint-rust PACKAGES="…") — fail-fast feedback
-  2. Full workspace lint (make lint-rust)
-  3. CLI build + unit tests (make build-cli nextest)
+  2. Targeted unit tests for those crates (make nextest-packages PACKAGES="…")
+  3. Full workspace lint (make lint-rust)
+  4. CLI build + unit tests (make build-cli-dev nextest)
 
-  Set SIGNOFF_SKIP_TARGETED_LINT=1 to skip step 1.
+  Set SIGNOFF_SKIP_TARGETED_LINT=1 to skip step 1, SIGNOFF_SKIP_TARGETED_TESTS=1
+  to skip step 2 (both trade an extra compile of those crates for early failure).
   Remote runs (.github/workflows/signoff.yml) set SIGNOFF_REMOTE_RUN and use
   the GitHub compare API when the clone is too shallow for merge-base.
 

@@ -10,7 +10,7 @@ build-cli:
 
 .PHONY: build-cli-dev
 build-cli-dev:
-	cargo build -p spice
+	cargo build $(CARGO_PROFILE) -p spice
 
 .PHONY: build-spiced
 build-spiced:
@@ -84,18 +84,31 @@ signoff-remote:
 test:
 	@cargo test --all --lib
 
+# Indent these with spaces, never a tab: this block follows the `test` recipe, so
+# a tab-indented line is parsed as another command in that recipe instead of an
+# assignment — which both breaks `make test` and silently empties the variable.
 ifdef RUST_PROFILE
     CARGO_PROFILE := --profile $(RUST_PROFILE)
-	NEXTEST_CARGO_PROFILE := --cargo-profile $(RUST_PROFILE)
+    NEXTEST_CARGO_PROFILE := --cargo-profile $(RUST_PROFILE)
 else
-	CARGO_PROFILE := --profile dev
-	NEXTEST_CARGO_PROFILE := --cargo-profile dev
+    CARGO_PROFILE := --profile dev
+    NEXTEST_CARGO_PROFILE := --cargo-profile dev
 endif
 
 .PHONY: nextest
 nextest:
 	@cargo nextest run --all --lib $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
 	@cargo nextest run -p cayenne --tests $(NEXTEST_CARGO_PROFILE)
+
+# Unit tests for named packages — the fail-fast pre-check scripts/signoff runs on
+# the crates a branch touched, before the full workspace gate. Same lib-only
+# scope and profile as `nextest`, so its test binaries carry into that run.
+# Callers must filter out packages without a library target: `--lib` is a fatal
+# `no library targets found` on bin-only crates.
+.PHONY: nextest-packages
+nextest-packages:
+	@test -n "$(strip $(PACKAGES))" || { echo 'nextest-packages requires PACKAGES="crate1 crate2"' >&2; exit 1; }
+	@cargo nextest run $(_LINT_PKG_FLAGS) --lib $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
 
 # Also update .github/workflows/integration.yml with changes to this target
 .PHONY: test-integration
