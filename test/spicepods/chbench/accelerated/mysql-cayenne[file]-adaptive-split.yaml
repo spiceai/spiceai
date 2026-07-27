@@ -87,6 +87,10 @@ datasets:
         # parallel within one apply on the memory-tier (changes) tables. Inert on the
         # full-refresh reference tables that share this anchor (not CDC memory mode).
         cayenne_cdc_mem_tier_shards: '4'
+        cdc_prefetch_buffer: '16384'
+        cdc_max_coalesced_envelopes: '16384'
+        cdc_max_coalesced_bytes: '536870912'
+        cdc_max_coalesce_age_ms: '2000'
         # Goal-driven SLOs are set globally under `runtime.params` (above) and
         # inherited by every dataset, so they are intentionally not repeated here.
         # (A dataset that needed a sharper target would override the relevant
