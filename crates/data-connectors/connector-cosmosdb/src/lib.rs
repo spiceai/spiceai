@@ -15,6 +15,9 @@ limitations under the License.
 */
 
 //! Azure Cosmos DB (`NoSQL` / Core SQL API) data connector.
+#![allow(clippy::missing_errors_doc)]
+
+pub mod cosmosdb;
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -23,13 +26,13 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
-use async_trait::async_trait;
-use data_components::cosmosdb::{
+use crate::cosmosdb::{
     BackoffMethod, CosmosDBCredential, CosmosDBTableProvider, CosmosResilienceConfig,
     DEFAULT_MAX_CONCURRENT_REQUESTS, DEFAULT_MAX_RETRIES, DEFAULT_QUERY,
     DEFAULT_SCHEMA_INFER_MAX_RECORDS, build_container_client,
     provider::CosmosDBTableProviderConfig,
 };
+use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use datafusion_table_providers::UnsupportedTypeAction as DFUnsupportedTypeAction;
 use opentelemetry::KeyValue;

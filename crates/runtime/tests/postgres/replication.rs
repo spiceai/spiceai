@@ -34,8 +34,8 @@ use arrow::array::AsArray;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use data_components::cdc::{ChangeEnvelope, ChangesStream};
 use data_components::postgres_replication::{
-    PgOutputFormat, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput, config,
-    start_replication_stream,
+    PgOutputFormat, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
+    SchemaEvolutionPolicy, config, start_replication_stream,
 };
 use futures::StreamExt;
 use secrecy::SecretString;
@@ -215,6 +215,7 @@ async fn bootstrap_then_stream_changes() -> Result<(), anyhow::Error> {
         schema_name: "public".into(),
         table_name: "repl_users".into(),
         metrics: ReplicationMetricsCollector::new(),
+        policy: SchemaEvolutionPolicy::Block,
     };
 
     let mut stream = start_replication_stream(input);
@@ -325,6 +326,7 @@ async fn bootstrap_then_stream_changes() -> Result<(), anyhow::Error> {
         schema_name: "public".into(),
         table_name: "repl_users".into(),
         metrics: ReplicationMetricsCollector::new(),
+        policy: SchemaEvolutionPolicy::Block,
     };
     let mut stream = start_replication_stream(input);
     let envelope = next_envelope(&mut stream, "forced resume snapshot").await?;
@@ -386,6 +388,7 @@ async fn large_value_and_burst_replicate_intact() -> Result<(), anyhow::Error> {
         schema_name: "public".into(),
         table_name: "repl_big".into(),
         metrics: ReplicationMetricsCollector::new(),
+        policy: SchemaEvolutionPolicy::Block,
     };
     let mut stream = start_replication_stream(input);
 
@@ -515,6 +518,7 @@ async fn two_replicas_have_independent_slots() -> Result<(), anyhow::Error> {
         schema_name: "public".into(),
         table_name: "repl_users".into(),
         metrics: ReplicationMetricsCollector::new(),
+        policy: SchemaEvolutionPolicy::Block,
     };
 
     let mut stream_a = start_replication_stream(build_input(params_a));
@@ -689,6 +693,7 @@ async fn run_wide_types_scenario(
         schema_name: "public".into(),
         table_name: table.clone(),
         metrics: ReplicationMetricsCollector::new(),
+        policy: SchemaEvolutionPolicy::Block,
     };
     let mut stream = start_replication_stream(input);
 
@@ -916,6 +921,7 @@ async fn resume_with_stale_backlog_is_not_ready_until_caught_up() -> Result<(), 
         schema_name: "public".into(),
         table_name: "repl_users".into(),
         metrics: ReplicationMetricsCollector::new(),
+        policy: SchemaEvolutionPolicy::Block,
     };
 
     // Cold bootstrap, then let the caught-up source reach Ready. Committing the

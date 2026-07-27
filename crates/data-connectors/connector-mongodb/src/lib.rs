@@ -24,6 +24,7 @@ limitations under the License.
 //! this crate, not the entire runtime.
 
 mod changes;
+pub mod stream;
 
 use async_trait::async_trait;
 use data_components::inferred_schema::{InferredIndex, InferredSchema, InferredSortColumn};

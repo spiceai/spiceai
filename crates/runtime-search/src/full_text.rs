@@ -52,12 +52,12 @@ pub async fn as_es_text_candidate_generations(
     df: Arc<dyn QueryEngine>,
     tbl: TableReference,
 ) -> Result<Vec<Arc<dyn CandidateGeneration>>, search::generation::Error> {
-    use crate::candidate::elasticsearch_text::ElasticsearchTextSearchCandidate;
+    use crate::candidate::udtf_text::UdtfTextSearchCandidate;
 
     let mut generators = vec![];
     for idx in indexes {
         for field in &idx.search_fields {
-            generators.push(Arc::new(ElasticsearchTextSearchCandidate::new(
+            generators.push(Arc::new(UdtfTextSearchCandidate::new(
                 field.clone(),
                 Arc::clone(&df),
                 tbl.clone(),
@@ -65,4 +65,25 @@ pub async fn as_es_text_candidate_generations(
         }
     }
     Ok(generators)
+}
+
+/// Constructs the [`CandidateGeneration`] for a compound (write-through) full-text index over a
+/// single `search_column`.
+///
+/// The candidate is index-opaque — its `search()` simply re-issues the `text_search()` UDTF —
+/// so the compound's warm/fallback query plan is executed by the UDTF's compound arm; here we
+/// only need the search field name. Single-column scope mirrors [`add_compound_fts_to_table`]
+/// (multi-column is tracked in <https://github.com/spiceai/spiceai/issues/11963>).
+#[cfg(feature = "elasticsearch")]
+pub async fn as_compound_text_candidate_generations(
+    search_column: String,
+    df: Arc<dyn QueryEngine>,
+    tbl: TableReference,
+) -> Result<Vec<Arc<dyn CandidateGeneration>>, search::generation::Error> {
+    use crate::candidate::udtf_text::UdtfTextSearchCandidate;
+
+    Ok(vec![
+        Arc::new(UdtfTextSearchCandidate::new(search_column, df, tbl))
+            as Arc<dyn CandidateGeneration>,
+    ])
 }

@@ -18,7 +18,8 @@ use app::App;
 use datafusion::sql::TableReference;
 use snafu::prelude::*;
 use spicepod::{component::view as spicepod_view, vector::VectorStore};
-use std::{collections::HashMap, fs, sync::Arc, time::Duration};
+use std::ops::{Deref, DerefMut};
+use std::{collections::HashMap, fs, sync::Arc};
 
 use crate::{Runtime, dataaccelerator::AccelerationSource};
 
@@ -31,31 +32,37 @@ use super::{
 };
 use spicepod::semantic::Column;
 
-/// [`View`] is the internal representation of the [`spicepod_view::View`] spicepod component.
+// Config-only spec lives in `runtime-component`; re-export for path
+// compatibility (`crate::component::view::ViewSpec`).
+pub use runtime_component::view::ViewSpec;
+
+/// `Arc<Runtime>`-bound wrapper over a [`ViewSpec`]. Derefs to the spec so
+/// `view.acceleration`, `view.columns`, `view.is_accelerated()`, etc. keep
+/// working unchanged.
 #[derive(Clone)]
 pub struct View {
-    pub(crate) name: TableReference,
-    pub(crate) sql: Arc<str>,
-    pub(crate) metadata: HashMap<String, String>,
-    pub(crate) columns: Vec<Column>,
-    pub(crate) acceleration: Option<acceleration::Acceleration>,
-    pub(crate) ready_state: ReadyState,
-    pub(crate) runtime: Arc<Runtime>,
-    pub(crate) vectors: Option<VectorStore>,
-    pub(crate) params: HashMap<String, String>,
-    app: Arc<App>,
+    pub spec: ViewSpec,
+    pub runtime: Arc<Runtime>,
+    pub app: Arc<App>,
+}
+
+impl Deref for View {
+    type Target = ViewSpec;
+
+    fn deref(&self) -> &Self::Target {
+        &self.spec
+    }
+}
+
+impl DerefMut for View {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.spec
+    }
 }
 
 impl PartialEq for View {
     fn eq(&self, other: &Self) -> bool {
-        self.name == other.name
-            && self.sql == other.sql
-            && self.metadata == other.metadata
-            && self.columns == other.columns
-            && self.acceleration == other.acceleration
-            && self.vectors == other.vectors
-            && self.params == other.params
-            && self.ready_state == other.ready_state
+        self.spec == other.spec
     }
 }
 
@@ -83,54 +90,7 @@ impl View {
     }
 
     #[must_use]
-    pub(crate) fn is_accelerated(&self) -> bool {
-        if let Some(acceleration) = &self.acceleration {
-            return acceleration.enabled;
-        }
-
-        false
-    }
-
-    #[must_use]
-    fn refresh_check_interval(&self) -> Option<Duration> {
-        if let Some(acceleration) = &self.acceleration {
-            return acceleration.refresh_check_interval;
-        }
-        None
-    }
-
-    #[must_use]
-    pub(crate) fn refresh_max_jitter(&self) -> Option<Duration> {
-        if let Some(acceleration) = &self.acceleration
-            && acceleration.refresh_jitter_enabled
-        {
-            // If `refresh_jitter_max` is not set, use 10% of `refresh_check_interval`.
-            return match acceleration.refresh_jitter_max {
-                Some(jitter) => Some(jitter),
-                None => self.refresh_check_interval().map(|i| i.mul_f64(0.1)),
-            };
-        }
-        None
-    }
-
-    #[must_use]
-    pub(crate) fn refresh_retry_enabled(&self) -> bool {
-        if let Some(acceleration) = &self.acceleration {
-            return acceleration.refresh_retry_enabled;
-        }
-        false
-    }
-
-    #[must_use]
-    pub(crate) fn refresh_retry_max_attempts(&self) -> Option<usize> {
-        if let Some(acceleration) = &self.acceleration {
-            return acceleration.refresh_retry_max_attempts;
-        }
-        None
-    }
-
-    #[must_use]
-    pub(crate) async fn is_accelerator_initialized(&self) -> bool {
+    pub async fn is_accelerator_initialized(&self) -> bool {
         if let Some(acceleration_settings) = &self.acceleration {
             let Some(accelerator) = self
                 .runtime
@@ -146,29 +106,17 @@ impl View {
 
         false
     }
-
-    #[must_use]
-    pub(crate) fn has_embeddings(&self) -> bool {
-        self.columns.iter().any(|c| !c.embeddings.is_empty())
-    }
-
-    #[must_use]
-    pub(crate) fn has_full_text_column(&self) -> bool {
-        self.columns
-            .iter()
-            .any(|c| c.full_text_search.as_ref().is_some_and(|cfg| cfg.enabled))
-    }
 }
 
 pub struct ViewBuilder {
-    pub(crate) name: TableReference,
-    sql: String,
-    metadata: HashMap<String, String>,
-    columns: Vec<Column>,
-    acceleration: Option<acceleration::Acceleration>,
-    ready_state: ReadyState,
-    vectors: Option<VectorStore>,
-    params: HashMap<String, String>,
+    pub name: TableReference,
+    pub sql: String,
+    pub metadata: HashMap<String, String>,
+    pub columns: Vec<Column>,
+    pub acceleration: Option<acceleration::Acceleration>,
+    pub ready_state: ReadyState,
+    pub vectors: Option<VectorStore>,
+    pub params: HashMap<String, String>,
 }
 
 impl TryFrom<spicepod_view::View> for ViewBuilder {
@@ -329,14 +277,16 @@ impl ViewBuilder {
     #[must_use]
     pub fn build_with(self, runtime: Arc<Runtime>, app: Arc<App>) -> View {
         View {
-            name: self.name,
-            sql: Arc::from(self.sql),
-            metadata: self.metadata,
-            columns: self.columns,
-            acceleration: self.acceleration,
-            ready_state: self.ready_state,
-            vectors: self.vectors,
-            params: self.params,
+            spec: ViewSpec {
+                name: self.name,
+                sql: Arc::from(self.sql),
+                metadata: self.metadata,
+                columns: self.columns,
+                acceleration: self.acceleration,
+                ready_state: self.ready_state,
+                vectors: self.vectors,
+                params: self.params,
+            },
             runtime,
             app,
         }

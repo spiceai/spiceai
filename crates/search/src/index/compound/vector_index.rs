@@ -150,6 +150,12 @@ impl Index for CompoundVectorIndex {
         primary_result.and(secondary_result)
     }
 
+    fn write_complete_failure_is_fatal(&self) -> bool {
+        // Either half failing to finalize leaves this compound index stale.
+        self.primary.write_complete_failure_is_fatal()
+            || self.secondary.write_complete_failure_is_fatal()
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

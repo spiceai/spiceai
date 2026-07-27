@@ -22,7 +22,7 @@ use super::metadata::{
     InlinedDelete, PartitionMetadata, PkConflictDetection, SnapshotFile, SnapshotFileStatistics,
     TableMetadata, TableStatistics,
 };
-use super::metastore::sqlite::SqliteMetastore;
+use super::metastore::sqlite::{SqliteMetastore, is_memory_db_path};
 #[cfg(feature = "turso")]
 use super::metastore::turso::TursoMetastore;
 use super::metastore::{
@@ -1752,48 +1752,58 @@ impl MetadataCatalog for CayenneCatalog {
     }
 
     async fn init(&self) -> CatalogResult<()> {
-        // Create database directory if it doesn't exist
+        // Create database directory if it doesn't exist.
+        //
+        // In-memory databases (Cayenne `mode: memory`, connection string
+        // `sqlite://file:/cayenne-mem-N?vfs=memdb`) have no backing file, so
+        // there is no parent directory to create — and `Path::parent()` of that
+        // path is the bare scheme component `file:`, so creating it would leave
+        // a stray, empty `file:` directory in the process working directory
+        // (#11922). Skip directory setup entirely for them, matching the guard
+        // in `SqliteMetastore::open_connection`.
         let db_path = self.db_path();
-        let db_dir =
-            Path::new(db_path)
-                .parent()
-                .ok_or_else(|| CatalogError::InvalidDatabasePath {
-                    path: db_path.to_string(),
-                })?;
+        if !is_memory_db_path(db_path) {
+            let db_dir =
+                Path::new(db_path)
+                    .parent()
+                    .ok_or_else(|| CatalogError::InvalidDatabasePath {
+                        path: db_path.to_string(),
+                    })?;
 
-        if !db_dir.exists() {
-            tokio::fs::create_dir_all(db_dir).await?;
+            if !db_dir.exists() {
+                tokio::fs::create_dir_all(db_dir).await?;
 
-            // Best-effort sync of the parent directory so the db_dir entry
-            // itself is durable on local FS before we proceed to create the
-            // catalog DB file and initialize its schema.
-            //
-            // We keep this best-effort (with warning on failure) rather than
-            // fatal because:
-            // - Catalog DB directory creation is a one-time initialization
-            //   event (not a hot write path).
-            // - It is immediately followed by DB file creation and schema
-            //   initialization, which provide strong content durability.
-            // - The parent directory is frequently a stable, operator-
-            //   managed volume root (e.g., K8s PersistentVolume) where
-            //   directory entry durability is already handled at a higher
-            //   level.
-            //
-            // This is still the right thing to do for consistency with the
-            // uniform durability contract used for all per-table mutable
-            // data paths, and it gives operators a clear warning if
-            // something unusual happens on a fresh deployment.
-            if let Some(parent) = db_dir.parent() {
-                let parent = parent.to_path_buf();
-                if let Err(e) = tokio::task::spawn_blocking(move || {
-                    std::fs::File::open(&parent).and_then(|f| f.sync_all())
-                })
-                .await
-                {
-                    tracing::warn!(
-                        "Failed to sync parent of catalog DB directory {} (subsequent DB writes will still be durable; directory entry may not survive crash): {e}",
-                        db_dir.display()
-                    );
+                // Best-effort sync of the parent directory so the db_dir entry
+                // itself is durable on local FS before we proceed to create the
+                // catalog DB file and initialize its schema.
+                //
+                // We keep this best-effort (with warning on failure) rather than
+                // fatal because:
+                // - Catalog DB directory creation is a one-time initialization
+                //   event (not a hot write path).
+                // - It is immediately followed by DB file creation and schema
+                //   initialization, which provide strong content durability.
+                // - The parent directory is frequently a stable, operator-
+                //   managed volume root (e.g., K8s PersistentVolume) where
+                //   directory entry durability is already handled at a higher
+                //   level.
+                //
+                // This is still the right thing to do for consistency with the
+                // uniform durability contract used for all per-table mutable
+                // data paths, and it gives operators a clear warning if
+                // something unusual happens on a fresh deployment.
+                if let Some(parent) = db_dir.parent() {
+                    let parent = parent.to_path_buf();
+                    if let Err(e) = tokio::task::spawn_blocking(move || {
+                        std::fs::File::open(&parent).and_then(|f| f.sync_all())
+                    })
+                    .await
+                    {
+                        tracing::warn!(
+                            "Failed to sync parent of catalog DB directory {} (subsequent DB writes will still be durable; directory entry may not survive crash): {e}",
+                            db_dir.display()
+                        );
+                    }
                 }
             }
         }

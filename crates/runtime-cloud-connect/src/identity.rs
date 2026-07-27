@@ -14,17 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Local persistence for the post-adoption runtime identity.
+//! Local persistence for the post-enrollment runtime identity.
 //!
 //! The identity file lives at `$SPICE_CONFIG_DIR/identity.json` with
 //! `0600` perms on Unix. On first boot the client generates a keypair
-//! (ECDSA P-256) and a PKCS#10 CSR *before* it says `Hello`, sends the
-//! CSR (and the public key) in the enrollment `Hello`, and receives a
-//! leaf certificate the control plane signed from that CSR in `Adopt`.
-//! The leaf, the matching private key, and the issuing-CA bundle are
-//! persisted here for later mTLS reconnects. Generating the key and
+//! (ECDSA P-256) and a PKCS#10 CSR, presents the adoption code + CSR to
+//! the **cloud enroll endpoint** over plain HTTPS (out-of-band, before
+//! any gRPC stream), and receives back the signed leaf certificate, the
+//! issuing-CA bundle, and the gateway address. The leaf, the matching
+//! private key, the CA bundle, and the gateway address are persisted
+//! here for the mTLS stream to the gateway. Generating the key and
 //! proving possession of it (via the CSR) *before* the cert is issued is
 //! what makes the issued cert genuinely bind the keypair used for mTLS.
+//!
+//! Renewals (~12h cadence against the cloud `/renew` endpoint) rotate the
+//! keypair: each renewal persists a fresh key + leaf over this file.
 //!
 //! The JSON layout is intentionally narrow — it is a private interface
 //! between the runtime and the local filesystem. Other Spice tooling
@@ -64,27 +68,36 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Persisted runtime identity. Treat as opaque outside this crate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Identity {
-    /// Server-assigned identifier (`inst_...`).
+    /// Cloud-assigned stable instance identifier (`instance_id` from the
+    /// enroll response, e.g. `inst_...`).
     pub identifier: String,
-    /// PEM-encoded X.509 leaf certificate the control plane signed from
-    /// the client's CSR and returned in `Adopt.identity_cert_pem`. On
-    /// every reconnect this leaf (with `private_key_pem`) is presented as
-    /// the TLS client certificate — it *is* the reconnect credential, so
-    /// the reconnect `Hello.credential` is empty.
+    /// PEM-encoded X.509 leaf certificate the cloud KMS CA signed from
+    /// the client's CSR (enroll response `identity_cert_pem`). On every
+    /// gateway connection this leaf (with `private_key_pem`) is presented
+    /// as the TLS client certificate — it *is* the credential, so the
+    /// `Hello.credential` is always empty.
     pub identity_cert_pem: String,
-    /// PEM-encoded PKCS#8 private key for the enrollment keypair. Kept
-    /// local (never sent); pairs with `identity_cert_pem` for mTLS.
+    /// PEM-encoded PKCS#8 private key for the current keypair. Kept
+    /// local (never sent); pairs with `identity_cert_pem` for mTLS and
+    /// signs the `/renew` proof-of-possession. Rotated on every renewal.
     pub private_key_pem: String,
-    /// PEM-encoded SPKI public key. Echoes back in `AdoptAck` so the
-    /// server can pin it.
+    /// PEM-encoded SPKI public key. The cloud pins it at enroll/renew.
     pub public_key_pem: String,
-    /// PEM-encoded issuing-CA chain returned in `Adopt.ca_bundle_pem`.
-    /// The client pins this to verify the control plane on mTLS
-    /// reconnects. Empty when the server did not supply one (the client
-    /// then falls back to public roots). Defaulted so identity files
-    /// written before this field existed still load.
+    /// PEM-encoded issuing-CA chain from the enroll response
+    /// (`ca_bundle_pem`). The client pins this to verify the gateway on
+    /// mTLS connections. Empty when the server did not supply one (the
+    /// client then falls back to public roots). Defaulted so identity
+    /// files written before this field existed still load.
     #[serde(default)]
     pub ca_bundle_pem: String,
+    /// Gateway `host:port` from the enroll response (`gateway_addr`) —
+    /// the address the mTLS `CloudConnect` stream connects to. Defaulted
+    /// so identity files written before this field existed still load;
+    /// an empty value means the identity predates the enroll-first flow
+    /// and cannot be used to reach the gateway (re-adopt with a fresh
+    /// code).
+    #[serde(default)]
+    pub gateway_addr: String,
     /// Unix timestamp (seconds) after which the identity cert is no
     /// longer accepted by the server. `0` means "unknown / unbounded".
     pub not_after_unix: u64,
@@ -187,9 +200,11 @@ impl IdentityStore {
     }
 
     /// Generate fresh enrollment material: an ECDSA P-256 keypair and a
-    /// PKCS#10 CSR for it, all PEM-encoded. Called at startup *before*
-    /// the first `Hello`, so the client can prove possession of its key
-    /// (the CSR) before the control plane issues the leaf certificate.
+    /// PKCS#10 CSR for it, all PEM-encoded. Called before the cloud
+    /// enroll request — and again before every renewal, since each
+    /// renewal rotates the keypair — so the client proves possession of
+    /// its key (the CSR self-signature) before the cloud CA issues the
+    /// leaf certificate.
     ///
     /// The CSR carries a stable common name and a `clientAuth` extended
     /// key usage so the issued leaf is directly usable as an mTLS client
@@ -228,8 +243,8 @@ impl IdentityStore {
 /// Freshly-generated enrollment material returned by
 /// [`IdentityStore::generate_enrollment`]: the client keypair (PEM) plus a
 /// PKCS#10 CSR built from it. The private key is retained locally and, on
-/// successful adoption, persisted into the [`Identity`] alongside the
-/// signed leaf; the CSR and public key are sent in the enrollment `Hello`.
+/// successful enroll/renew, persisted into the [`Identity`] alongside the
+/// signed leaf; the CSR is sent in the HTTP enroll (or renew) request.
 #[derive(Debug, Clone)]
 pub struct EnrollmentMaterial {
     pub(crate) private_key_pem: String,
@@ -375,6 +390,7 @@ mod tests {
                 .to_string(),
             ca_bundle_pem: "-----BEGIN CERTIFICATE-----\nMOCKCA\n-----END CERTIFICATE-----\n"
                 .to_string(),
+            gateway_addr: "gateway.test.spice.ai:7320".to_string(),
             not_after_unix: 0,
         }
     }
@@ -394,12 +410,13 @@ mod tests {
         assert_eq!(loaded.identity_cert_pem, identity.identity_cert_pem);
         assert_eq!(loaded.public_key_pem, identity.public_key_pem);
         assert_eq!(loaded.ca_bundle_pem, identity.ca_bundle_pem);
+        assert_eq!(loaded.gateway_addr, identity.gateway_addr);
     }
 
     #[test]
     fn load_tolerates_identity_without_ca_bundle() {
-        // Identity files written before `ca_bundle_pem` existed must still
-        // load (the field is `#[serde(default)]`).
+        // Identity files written before `ca_bundle_pem` / `gateway_addr`
+        // existed must still load (the fields are `#[serde(default)]`).
         let dir = tempfile::tempdir().expect("create tempdir");
         let path = dir.path().join("identity.json");
         let legacy = r#"{
@@ -415,6 +432,7 @@ mod tests {
             .expect("present");
         assert_eq!(loaded.identifier, "inst_legacy");
         assert!(loaded.ca_bundle_pem.is_empty());
+        assert!(loaded.gateway_addr.is_empty());
     }
 
     #[test]

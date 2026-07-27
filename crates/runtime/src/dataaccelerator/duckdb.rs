@@ -84,7 +84,7 @@ pub(crate) mod settings;
 /// Creates a [`DuckDBTableProviderFactory`] with standard Spice settings (dialect, timezone,
 /// index scan tuning, function deny-list). All `DuckDB` accelerator consumers should use this
 /// to avoid divergent configurations.
-fn create_factory() -> DuckDBTableProviderFactory {
+pub(crate) fn create_factory() -> DuckDBTableProviderFactory {
     DuckDBTableProviderFactory::new(AccessMode::ReadWrite)
         .with_dialect(new_duckdb_dialect())
         // Install the DuckDB-aware function deny-list so Spice-only UDFs the
@@ -106,10 +106,10 @@ fn create_factory() -> DuckDBTableProviderFactory {
         )
 }
 
-const DEFAULT_CONNECTION_POOL_SIZE: u32 = 10;
-const DEFAULT_EBS_CONNECTION_POOL_SIZE: u32 = 4;
-const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
-const SPICE_OPT_DUCKDB_AGG_PUSHDOWN_KEY: &str =
+pub(crate) const DEFAULT_CONNECTION_POOL_SIZE: u32 = 10;
+pub(crate) const DEFAULT_EBS_CONNECTION_POOL_SIZE: u32 = 4;
+pub(crate) const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
+pub(crate) const SPICE_OPT_DUCKDB_AGG_PUSHDOWN_KEY: &str =
     "spice.optimizer.duckdb_aggregate_pushdown";
 
 use super::upsert_dedup;
@@ -163,19 +163,19 @@ pub struct DuckDBAccelerator {
 
 impl DuckDBAccelerator {
     #[must_use]
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             duckdb_factory: create_factory(),
         }
     }
 
     /// Returns the `DuckDB` file path that would be used for a file-based `DuckDB` accelerator from this dataset
-    pub(crate) fn duckdb_file_path(&self, source: &dyn AccelerationSource) -> Result<String> {
+    pub fn duckdb_file_path(&self, source: &dyn AccelerationSource) -> Result<String> {
         duckdb_file_path(&self.duckdb_factory, source, "accelerated_duckdb")
     }
 
     /// Returns an existing `DuckDB` connection pool for the given dataset, or creates a new one if it doesn't exist.
-    pub(crate) async fn get_shared_pool(
+    pub async fn get_shared_pool(
         &self,
         source: &dyn AccelerationSource,
     ) -> Result<DuckDbConnectionPool> {
@@ -278,7 +278,7 @@ impl DuckDBAccelerator {
         instance_usage
     }
 
-    fn spicepod_dataset_duckdb_file_path(
+    pub(crate) fn spicepod_dataset_duckdb_file_path(
         &self,
         dataset: &spicepod::component::dataset::Dataset,
     ) -> Option<String> {
@@ -303,7 +303,51 @@ impl DuckDBAccelerator {
             .ok()
     }
 
-    fn default_connection_pool_size(storage: ResolvedAccelerationStorage) -> u32 {
+    /// Whether another initialized dataset sharing `source`'s `DuckDB` instance (same
+    /// resolved file path, or the shared in-memory instance) set an explicit
+    /// `duckdb_memory_limit`.
+    ///
+    /// `DuckDB`'s `memory_limit` is per-instance (the last dataset created wins), so
+    /// the coordinated auto-cap must NOT be injected for an un-limited dataset on such
+    /// an instance — doing so would clobber the sibling's explicit value. The planner
+    /// separately flags these mixed instances with a warning.
+    async fn instance_has_explicit_limit_sibling(&self, source: &dyn AccelerationSource) -> bool {
+        let Some(accel) = source.acceleration() else {
+            return false;
+        };
+        let self_is_memory = matches!(accel.mode, Mode::Memory);
+        let self_path = if self_is_memory {
+            None
+        } else {
+            self.file_path(source).ok()
+        };
+        source
+            .initialized_sources()
+            .await
+            .into_iter()
+            .filter(|other| other.name() != source.name())
+            .any(|other| {
+                let Some(other_accel) = other.acceleration() else {
+                    return false;
+                };
+                if other_accel.engine != Engine::DuckDB {
+                    return false;
+                }
+                let other_is_memory = matches!(other_accel.mode, Mode::Memory);
+                let same_instance = if self_is_memory {
+                    other_is_memory
+                } else {
+                    // Memory-mode datasets live on the shared in-memory instance, but
+                    // `file_path` still resolves a path for them — without this guard a
+                    // memory-mode sibling could match a file instance's path and
+                    // wrongly suppress that instance's coordinated cap.
+                    !other_is_memory && self.file_path(other.as_ref()).ok() == self_path
+                };
+                same_instance && other_accel.params.contains_key("duckdb_memory_limit")
+            })
+    }
+
+    pub(crate) fn default_connection_pool_size(storage: ResolvedAccelerationStorage) -> u32 {
         match storage {
             ResolvedAccelerationStorage::Ebs => DEFAULT_EBS_CONNECTION_POOL_SIZE,
             ResolvedAccelerationStorage::LocalSsd
@@ -312,14 +356,14 @@ impl DuckDBAccelerator {
         }
     }
 
-    fn get_pool_min_idle(storage: ResolvedAccelerationStorage, max_size: u32) -> u32 {
+    pub(crate) fn get_pool_min_idle(storage: ResolvedAccelerationStorage, max_size: u32) -> u32 {
         Self::default_connection_pool_size(storage).min(max_size)
     }
 
     /// Storage-profile-specific `DuckDB` pragmas applied to every connection in
     /// the pool. These tune `DuckDB`'s I/O behavior to match the underlying
     /// medium's latency and durability profile.
-    fn storage_setup_queries(
+    pub(crate) fn storage_setup_queries(
         storage: ResolvedAccelerationStorage,
     ) -> &'static [&'static str] {
         match storage {
@@ -365,7 +409,7 @@ impl DuckDBAccelerator {
 /// * `duckdb_factory` - The `DuckDB` table provider factory used to generate the file path
 /// * `source` - The acceleration source (dataset or view) containing acceleration configuration
 /// * `default_db_name` - Default database file name to use if the `duckdb_file` parameter is not specified
-fn duckdb_file_path(
+pub fn duckdb_file_path(
     duckdb_factory: &DuckDBTableProviderFactory,
     source: &dyn AccelerationSource,
     default_db_name: &str,
@@ -696,6 +740,31 @@ impl DataAccelerator for DuckDBAccelerator {
 
             Some(make_on_refresh_write_handler(dataset_name, config))
         });
+
+        // Coordinated auto memory limit: when the operator did not set
+        // `duckdb_memory_limit` on this dataset, apply the runtime-computed
+        // per-instance cap (see `accelerator_memory_budget`) so this DuckDB
+        // instance's ceiling — DuckDB's own default is ~80% of host RAM — plus the
+        // query pool and the other DuckDB instances can't over-commit the memory
+        // available to this process (the cgroup limit in a container, which is what
+        // the coordinated budget is computed from).
+        // Here `memory_limit` is the prefix-stripped `duckdb_memory_limit`; an
+        // explicit value on THIS dataset always wins (the guard skips a present key).
+        // Also skip when another dataset sharing this DuckDB instance set an explicit
+        // limit: memory_limit is per-instance (last dataset created wins), so
+        // auto-capping an un-limited sibling there would clobber the explicit value.
+        if !cmd.options.contains_key("memory_limit")
+            && let Some(auto_limit) =
+                crate::accelerator_memory_budget::duckdb_auto_memory_limit_option()
+        {
+            let has_explicit_sibling = match source {
+                Some(src) => self.instance_has_explicit_limit_sibling(src).await,
+                None => false,
+            };
+            if !has_explicit_sibling {
+                cmd.options.insert("memory_limit".to_string(), auto_limit);
+            }
+        }
 
         Ok(create_table_provider(&self.duckdb_factory, &cmd, write_completion_handler).await?)
     }

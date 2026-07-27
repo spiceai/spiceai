@@ -198,6 +198,41 @@ impl GtidSet {
         }
         out
     }
+
+    /// Whether `self` is a subset of `other`: every transaction in `self` is
+    /// also in `other`.
+    ///
+    /// This is the GTID analog of "is the persisted binlog file still present
+    /// on the source": a resume checkpoint's executed set must be a subset of
+    /// the source's current `@@gtid_executed`. When it is not — a `RESET
+    /// MASTER`, a rebuilt server with a fresh `server_uuid`, or a different
+    /// source entirely — the source no longer contains the checkpoint's
+    /// transactions, so resuming from it would position `COM_BINLOG_DUMP_GTID`
+    /// from a set the server cannot honor and silently stream against a
+    /// diverged history. The empty set is a subset of anything (`gtid_mode =
+    /// ON` with no transactions applied is always resumable).
+    #[must_use]
+    pub fn is_subset_of(&self, other: &Self) -> bool {
+        self.intervals.iter().all(|(uuid, ranges)| {
+            if ranges.is_empty() {
+                return true;
+            }
+            let Some(other_ranges) = other.intervals.get(uuid) else {
+                return false;
+            };
+            // Both sides are sorted, coalesced, disjoint inclusive ranges, so a
+            // single forward sweep suffices: each `self` interval must fall
+            // entirely within one `other` interval. `j` only advances (both
+            // ascending), so cover-checking is linear.
+            let mut j = 0usize;
+            ranges.iter().all(|&(start, end)| {
+                while j < other_ranges.len() && other_ranges[j].1 < start {
+                    j += 1;
+                }
+                j < other_ranges.len() && other_ranges[j].0 <= start && end <= other_ranges[j].1
+            })
+        })
+    }
 }
 
 impl std::fmt::Display for GtidSet {
@@ -325,6 +360,63 @@ mod tests {
         // Disjoint UUIDs share nothing.
         let other = GtidSet::parse(&format!("{U2}:1-10")).expect("parse other");
         assert!(a.intersect(&other).is_empty());
+    }
+
+    #[test]
+    fn subset_of_covers_reset_and_divergence() {
+        let checkpoint = GtidSet::parse(&format!("{U1}:1-100")).expect("parse checkpoint");
+
+        // Normal restart: the source has advanced past the checkpoint.
+        let advanced = GtidSet::parse(&format!("{U1}:1-150")).expect("parse advanced");
+        assert!(
+            checkpoint.is_subset_of(&advanced),
+            "a checkpoint the source has kept and grown past is resumable"
+        );
+
+        // Exact match resumes (subset is reflexive).
+        assert!(checkpoint.is_subset_of(&checkpoint));
+
+        // RESET MASTER / rebuilt server: the source's executed set is under a
+        // brand-new server_uuid, so the checkpoint's UUID is absent entirely.
+        let reset = GtidSet::parse(&format!("{U2}:1-3")).expect("parse reset");
+        assert!(
+            !checkpoint.is_subset_of(&reset),
+            "a source whose executed set no longer contains the checkpoint UUID is not resumable"
+        );
+
+        // Divergence / restore-from-older-backup: same UUID, but the source has
+        // fewer transactions than the checkpoint claims were applied.
+        let rolled_back = GtidSet::parse(&format!("{U1}:1-50")).expect("parse rolled_back");
+        assert!(
+            !checkpoint.is_subset_of(&rolled_back),
+            "a source missing transactions the checkpoint already applied is not resumable"
+        );
+
+        // A hole inside the covered range is not a subset either.
+        let holed = GtidSet::parse(&format!("{U1}:1-40:60-150")).expect("parse holed");
+        assert!(
+            !checkpoint.is_subset_of(&holed),
+            "a gap inside the source's set breaks coverage of the checkpoint range"
+        );
+    }
+
+    #[test]
+    fn empty_subset_of_anything_and_multi_uuid() {
+        let empty = GtidSet::new();
+        let any = GtidSet::parse(&format!("{U1}:1-10")).expect("parse");
+        // gtid_mode = ON with zero applied transactions is always resumable.
+        assert!(empty.is_subset_of(&any));
+        assert!(empty.is_subset_of(&empty));
+        // A non-empty set is never a subset of the empty set.
+        assert!(!any.is_subset_of(&empty));
+
+        // Every UUID block must be covered: one missing block fails the whole
+        // check even when the other is present.
+        let two = GtidSet::parse(&format!("{U1}:1-5,{U2}:1-5")).expect("parse two");
+        let only_one = GtidSet::parse(&format!("{U1}:1-9")).expect("parse only_one");
+        assert!(!two.is_subset_of(&only_one));
+        let both = GtidSet::parse(&format!("{U1}:1-9,{U2}:1-9")).expect("parse both");
+        assert!(two.is_subset_of(&both));
     }
 
     #[test]

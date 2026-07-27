@@ -859,7 +859,7 @@ impl Query {
         }
 
         // Get the schema from the logical plan
-        let schema = Arc::new(plan.schema().as_arrow().clone());
+        let schema = Arc::clone(plan.schema().inner());
 
         let input_tables = get_logical_plan_input_tables(&plan);
         if input_tables
@@ -1444,8 +1444,10 @@ impl Query {
                         }
                     };
 
-                    let mut execution_session = session.clone();
-                    if let Some(batch_size) =
+                    // Only clone SessionState when adaptive Flight batch sizing
+                    // rebuilds the physical plan; otherwise TaskContext can borrow
+                    // the existing session.
+                    let task_ctx = if let Some(batch_size) =
                         Self::adaptive_flight_batch_size(&session, &request_context, &physical_plan)
                     {
                         Self::ensure_not_cancelled(
@@ -1468,11 +1470,12 @@ impl Query {
                                 )
                             }
                         };
-                        execution_session = adaptive_session;
-                    }
+                        Arc::new(TaskContext::from(&adaptive_session))
+                    } else {
+                        Arc::new(TaskContext::from(&session))
+                    };
 
                     Self::ensure_not_cancelled(&query_cancel_token, &query_id_str, &timeout_state)?;
-                    let task_ctx = Arc::new(TaskContext::from(&execution_session));
 
                     let stream = match execute_stream_preserving_output_order(
                         Arc::clone(&physical_plan),

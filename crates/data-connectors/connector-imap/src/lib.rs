@@ -14,11 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use async_trait::async_trait;
-use data_components::imap::{
+// The imap provider module is exported (as it was in data_components) so its public
+// provider API stays reachable and its public items are treated as exported API by
+// clippy's avoid-breaking-exported-api. missing_errors_doc mirrors data_components.
+#![allow(clippy::missing_errors_doc)]
+
+pub mod imap;
+
+use crate::imap::{
     ImapTableProvider,
     session::{ImapAuthMode, ImapAuthModeParameter, ImapSSLMode, ImapSession},
 };
+use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use regex::Regex;
 use runtime::component::dataset::Dataset;

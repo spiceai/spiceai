@@ -399,6 +399,9 @@ fn is_delete_all(filters: &[Expr]) -> bool {
 pub(crate) struct PkKeysetInvalidatingDeletionSink {
     pub(crate) table: CayenneTableProvider,
     pub(crate) inner: Arc<dyn DeletionSink>,
+    /// The delete request's filters, needed to recognize a delete-all so the
+    /// mem-tier can be purged alongside the inner sink's file-side work.
+    pub(crate) filters: Vec<Expr>,
 }
 
 #[async_trait]
@@ -424,7 +427,34 @@ impl DeletionSink for PkKeysetInvalidatingDeletionSink {
         // below resets the flag and rebuilds exact; an upsert table keeps the
         // stale-superset keyset and stays degraded until its next rebuild.
         self.table.mark_pk_keyset_occ_degraded();
-        let deleted = self.inner.delete_from(context).await?;
+        let mut deleted = self.inner.delete_from(context).await?;
+
+        // Delete-all (TRUNCATE / `DELETE … WHERE TRUE`): the inner sink records
+        // `(file, file-local position)` deletes, and rows resident in the
+        // in-memory tier live in no file — so nothing tombstones them and they
+        // stay visible. A table with no primary key reaches this sink for every
+        // delete (`pk_deletion_strategy` is `PositionBased` exactly then), and in
+        // `mode: memory` the mem-tier is the permanent store, so without this the
+        // table can never be emptied. Mirrors `InlineAwareDeletionSink` below,
+        // which covers the key-based arm. Skipped for filtered deletes, whose
+        // predicate cannot be evaluated against the tier here.
+        //
+        // `purge_mem_tier_all` requires the table `write_lock`, which the inner
+        // sink takes and releases internally, so acquire it here rather than
+        // nesting. Purge before the `deleted > 0` bookkeeping below: on a table
+        // whose rows are *only* in the mem-tier the inner count is 0, and the
+        // cached scan statistics still need invalidating once the purge changes
+        // the visible row count.
+        if is_delete_all(&self.filters) {
+            let _guard = self.table.write_lock.lock().await;
+            let purged = self
+                .table
+                .purge_mem_tier_all()
+                .await
+                .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
+            deleted = deleted.saturating_add(purged);
+        }
+
         if deleted > 0 {
             // Keyset clear-on-delete avoidance (cycle-4 incremental lever).
             //

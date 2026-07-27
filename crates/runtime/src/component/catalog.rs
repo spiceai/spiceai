@@ -18,10 +18,17 @@ use app::App;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use snafu::prelude::*;
 use spicepod::{component::catalog as spicepod_catalog, param::Params};
+use std::ops::{Deref, DerefMut};
 use std::{collections::HashMap, sync::Arc};
 
-use super::{find_first_delimiter, validate_identifier};
-use crate::{Runtime, component::access::AccessMode};
+use crate::Runtime;
+use crate::component::access::AccessMode;
+
+// Config-only spec + config types live in `runtime-component`; re-export for
+// path compatibility (`crate::component::catalog::CatalogSpec`, etc.).
+pub use runtime_component::catalog::{
+    CatalogAcceleration, CatalogAccelerationEngine, CatalogRefreshMode, CatalogSpec,
+};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -34,71 +41,29 @@ pub enum Error {
     },
 }
 
-pub(crate) type Result<T> = std::result::Result<T, Error>;
+pub type Result<T> = std::result::Result<T, Error>;
 
-/// Acceleration configuration for an entire [`Catalog`]. See
-/// [`spicepod_catalog::CatalogAcceleration`] for the user-facing schema this
-/// mirrors.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CatalogAcceleration {
-    engine: CatalogAccelerationEngine,
-    refresh_mode: CatalogRefreshMode,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CatalogAccelerationEngine {
-    #[default]
-    Cayenne,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CatalogRefreshMode {
-    Changes,
-}
-
-impl From<spicepod_catalog::CatalogAccelerationEngine> for CatalogAccelerationEngine {
-    fn from(engine: spicepod_catalog::CatalogAccelerationEngine) -> Self {
-        match engine {
-            spicepod_catalog::CatalogAccelerationEngine::Cayenne => {
-                CatalogAccelerationEngine::Cayenne
-            }
-        }
-    }
-}
-
-impl From<spicepod_catalog::CatalogRefreshMode> for CatalogRefreshMode {
-    fn from(refresh_mode: spicepod_catalog::CatalogRefreshMode) -> Self {
-        match refresh_mode {
-            spicepod_catalog::CatalogRefreshMode::Changes => CatalogRefreshMode::Changes,
-        }
-    }
-}
-
-impl From<spicepod_catalog::CatalogAcceleration> for CatalogAcceleration {
-    fn from(acceleration: spicepod_catalog::CatalogAcceleration) -> Self {
-        CatalogAcceleration {
-            engine: acceleration.engine.into(),
-            refresh_mode: acceleration.refresh_mode.into(),
-        }
-    }
-}
-
+/// `Arc<Runtime>`-bound wrapper over a [`CatalogSpec`]. Derefs to the spec so
+/// `catalog.provider`, `catalog.acceleration`, etc. keep working unchanged.
 #[derive(Clone)]
 pub struct Catalog {
-    pub(crate) provider: String,
-    pub(crate) catalog_id: Option<String>,
-    pub(crate) from: String,
-    pub(crate) name: String,
-    pub(crate) access: AccessMode,
-    pub(crate) orig_include: Vec<String>,
-    pub(crate) include: Option<GlobSet>,
-    orig_exclude: Vec<String>,
-    pub(crate) exclude: Option<GlobSet>,
-    pub(crate) params: HashMap<String, String>,
-    pub(crate) dataset_params: HashMap<String, String>,
-    pub(crate) acceleration: Option<CatalogAcceleration>,
-    pub(crate) app: Arc<App>,
-    runtime: Arc<Runtime>,
+    pub spec: CatalogSpec,
+    pub app: Arc<App>,
+    pub runtime: Arc<Runtime>,
+}
+
+impl Deref for Catalog {
+    type Target = CatalogSpec;
+
+    fn deref(&self) -> &Self::Target {
+        &self.spec
+    }
+}
+
+impl DerefMut for Catalog {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.spec
+    }
 }
 
 impl std::fmt::Debug for Catalog {
@@ -123,99 +88,37 @@ impl std::fmt::Debug for Catalog {
 
 impl PartialEq for Catalog {
     fn eq(&self, other: &Self) -> bool {
-        self.from == other.from
-            && self.name == other.name
-            && self.access == other.access
-            && self.orig_include == other.orig_include
-            && self.orig_exclude == other.orig_exclude
-            && self.params == other.params
-            && self.dataset_params == other.dataset_params
-            && self.acceleration == other.acceleration
+        self.spec == other.spec
     }
 }
 
 impl Catalog {
     #[must_use]
-    pub(crate) fn app(&self) -> Arc<App> {
+    pub fn app(&self) -> Arc<App> {
         Arc::clone(&self.app)
     }
 
     #[must_use]
-    pub(crate) fn runtime(&self) -> Arc<Runtime> {
+    pub fn runtime(&self) -> Arc<Runtime> {
         Arc::clone(&self.runtime)
-    }
-
-    /// Returns the catalog provider - the first part of the `from` field before the first '://', ':', or '/'.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use runtime::component::catalog::Catalog;
-    ///
-    /// let catalog = Catalog::new("foo:bar", "bar");
-    ///
-    /// assert_eq!(catalog.provider, "foo".to_string());
-    /// ```
-    ///
-    /// ```
-    /// use runtime::component::catalog::Catalog;
-    ///
-    /// let catalog = Catalog::new("foo", "bar");
-    ///
-    /// assert_eq!(catalog.provider, "foo".to_string());
-    /// ```
-    #[must_use]
-    fn provider(from: &str) -> &str {
-        match find_first_delimiter(from) {
-            Some((0, _)) | None => from,
-            Some((pos, _)) => &from[..pos],
-        }
-    }
-
-    /// Returns the catalog id - the second part of the `from` field after the first `:`.
-    /// This is optional and will return the default catalog from the provider if not set.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use runtime::component::catalog::Catalog;
-    ///
-    /// let catalog = Catalog::new("foo:bar", "bar");
-    ///
-    /// assert_eq!(catalog.catalog_id, Some("bar".to_string()));
-    /// ```
-    ///
-    /// ```
-    /// use runtime::component::catalog::Catalog;
-    ///
-    /// let catalog = Catalog::new("foo", "bar");
-    ///
-    /// assert_eq!(catalog.catalog_id, None);
-    /// ```
-    #[must_use]
-    fn catalog_id(from: &str) -> Option<&str> {
-        match find_first_delimiter(from) {
-            Some((pos, len)) => Some(&from[pos + len..]),
-            None => None,
-        }
     }
 }
 
 pub struct CatalogBuilder {
-    provider: String,
-    catalog_id: Option<String>,
-    from: String,
-    pub(crate) name: String,
-    access: AccessMode,
+    pub provider: String,
+    pub catalog_id: Option<String>,
+    pub from: String,
+    pub name: String,
+    pub access: AccessMode,
     orig_include: Vec<String>,
-    include: Option<GlobSet>,
+    pub include: Option<GlobSet>,
     orig_exclude: Vec<String>,
-    exclude: Option<GlobSet>,
-    params: HashMap<String, String>,
-    dataset_params: HashMap<String, String>,
-    acceleration: Option<CatalogAcceleration>,
-    app: Option<Arc<App>>,
-    runtime: Option<Arc<Runtime>>,
+    pub exclude: Option<GlobSet>,
+    pub params: HashMap<String, String>,
+    pub dataset_params: HashMap<String, String>,
+    pub acceleration: Option<CatalogAcceleration>,
+    pub app: Option<Arc<App>>,
+    pub runtime: Option<Arc<Runtime>>,
 }
 
 #[expect(clippy::result_large_err)]
@@ -241,13 +144,13 @@ impl TryFrom<spicepod_catalog::Catalog> for CatalogBuilder {
     type Error = crate::Error;
 
     fn try_from(catalog: spicepod_catalog::Catalog) -> std::result::Result<Self, Self::Error> {
-        let provider = Catalog::provider(&catalog.from);
-        let catalog_id = Catalog::catalog_id(&catalog.from).map(String::from);
+        let provider = CatalogSpec::provider(&catalog.from);
+        let catalog_id = CatalogSpec::catalog_id(&catalog.from).map(String::from);
 
         let include = compile_globset(&catalog.include)?;
         let exclude = compile_globset(&catalog.exclude)?;
 
-        validate_identifier(&catalog.name).context(crate::ComponentSnafu)?;
+        crate::component::validate_identifier(&catalog.name).context(crate::ComponentSnafu)?;
 
         if catalog
             .name
@@ -310,8 +213,8 @@ impl TryFrom<spicepod_catalog::Catalog> for CatalogBuilder {
 
 impl CatalogBuilder {
     #[expect(clippy::result_large_err)]
-    pub(crate) fn try_new(from: String, name: &str) -> std::result::Result<Self, crate::Error> {
-        validate_identifier(name).context(crate::ComponentSnafu)?;
+    pub fn try_new(from: String, name: &str) -> std::result::Result<Self, crate::Error> {
+        crate::component::validate_identifier(name).context(crate::ComponentSnafu)?;
 
         if name.eq_ignore_ascii_case(crate::datafusion::SPICE_DEFAULT_CATALOG) {
             return Err(crate::Error::ComponentError {
@@ -321,8 +224,8 @@ impl CatalogBuilder {
             });
         }
 
-        let provider = Catalog::provider(from.as_str());
-        let catalog_id = Catalog::catalog_id(from.as_str()).map(String::from);
+        let provider = CatalogSpec::provider(from.as_str());
+        let catalog_id = CatalogSpec::catalog_id(from.as_str()).map(String::from);
 
         Ok(CatalogBuilder {
             provider: provider.to_string(),
@@ -343,18 +246,18 @@ impl CatalogBuilder {
     }
 
     #[must_use]
-    pub(crate) fn with_app(mut self, app: Arc<App>) -> Self {
+    pub fn with_app(mut self, app: Arc<App>) -> Self {
         self.app = Some(app);
         self
     }
 
     #[must_use]
-    pub(crate) fn with_runtime(mut self, runtime: Arc<Runtime>) -> Self {
+    pub fn with_runtime(mut self, runtime: Arc<Runtime>) -> Self {
         self.runtime = Some(runtime);
         self
     }
 
-    pub(crate) fn build(self) -> Result<Catalog> {
+    pub fn build(self) -> Result<Catalog> {
         let app = self.app.ok_or(Error::UnableToBuildCatalog {
             catalog: self.name.clone(),
             missing_component: "app".to_string(),
@@ -365,18 +268,20 @@ impl CatalogBuilder {
         })?;
 
         let catalog = Catalog {
-            provider: self.provider,
-            catalog_id: self.catalog_id,
-            from: self.from,
-            name: self.name,
-            access: self.access,
-            orig_include: self.orig_include,
-            include: self.include,
-            orig_exclude: self.orig_exclude,
-            exclude: self.exclude,
-            params: self.params,
-            dataset_params: self.dataset_params,
-            acceleration: self.acceleration,
+            spec: CatalogSpec {
+                provider: self.provider,
+                catalog_id: self.catalog_id,
+                from: self.from,
+                name: self.name,
+                access: self.access,
+                orig_include: self.orig_include,
+                include: self.include,
+                orig_exclude: self.orig_exclude,
+                exclude: self.exclude,
+                params: self.params,
+                dataset_params: self.dataset_params,
+                acceleration: self.acceleration,
+            },
             app,
             runtime,
         };

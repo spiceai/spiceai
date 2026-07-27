@@ -70,61 +70,13 @@ pub enum ChangeOp {
 
 impl ChangeOp {
     #[must_use]
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Create => "c",
             Self::Update => "u",
             Self::Delete => "d",
             Self::Truncate => "t",
         }
-    }
-}
-
-/// Buffer collecting `DecodedChange`s within a single transaction.
-pub(crate) struct TransactionBuffer {
-    begin_lsn: u64,
-    pub(crate) changes: Vec<DecodedChange>,
-}
-
-impl TransactionBuffer {
-    #[must_use]
-    pub(crate) fn new(begin_lsn: u64) -> Self {
-        Self {
-            begin_lsn,
-            changes: Vec::new(),
-        }
-    }
-
-    pub(crate) fn push_insert(&mut self, _relation: &Relation, tuple: TupleData) {
-        self.changes.push(DecodedChange {
-            op: ChangeOp::Create,
-            row: tuple,
-        });
-    }
-
-    pub(crate) fn push_update(&mut self, relation: &Relation, old: Option<TupleData>, new: TupleData) {
-        push_update_change(&mut self.changes, relation, old, new);
-    }
-
-    pub(crate) fn push_delete(&mut self, _relation: &Relation, old: TupleData) {
-        self.changes.push(DecodedChange {
-            op: ChangeOp::Delete,
-            row: old,
-        });
-    }
-
-    /// Record a TRUNCATE for the relation. Row payload is empty — the
-    /// accelerator path applies it as an unconditional delete-all.
-    pub(crate) fn push_truncate(&mut self, _relation: &Relation) {
-        self.changes.push(DecodedChange {
-            op: ChangeOp::Truncate,
-            row: TupleData { columns: vec![] },
-        });
-    }
-
-    #[must_use]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.changes.is_empty()
     }
 }
 
@@ -142,7 +94,7 @@ impl TransactionBuffer {
 /// actionable REPLICA-IDENTITY-FULL hint, instead of silently overwriting the
 /// accelerator's value with NULL.
 #[must_use]
-fn merge_unchanged_toast(mut new: TupleData, old: Option<&TupleData>) -> TupleData {
+pub fn merge_unchanged_toast(mut new: TupleData, old: Option<&TupleData>) -> TupleData {
     let Some(old) = old else {
         return new;
     };
@@ -163,7 +115,7 @@ fn merge_unchanged_toast(mut new: TupleData, old: Option<&TupleData>) -> TupleDa
 /// old key tuple plus the new row. Accelerators apply `ChangeOp::Update` as an
 /// upsert keyed by the new primary key, so a primary-key change must also emit a
 /// delete for the old key; otherwise the old accelerated row is orphaned.
-fn push_update_change(
+pub fn push_update_change(
     changes: &mut Vec<DecodedChange>,
     relation: &Relation,
     old: Option<TupleData>,
@@ -381,7 +333,7 @@ pub struct PgChangeRows {
 
 impl PgChangeRows {
     #[must_use]
-    pub(crate) fn new(
+    pub fn new(
         schema: SchemaRef,
         relation: Relation,
         raw: Vec<bytes::Bytes>,
@@ -521,7 +473,7 @@ pub(super) fn nullable_clone_for_bootstrap(schema: &SchemaRef) -> SchemaRef {
 /// Wrap a batch into a `ChangeEnvelope` whose `commit()` advances the
 /// shared confirmed-flush LSN atomic.
 #[must_use]
-pub(crate) fn envelope_with_lsn(
+pub fn envelope_with_lsn(
     batch: ChangeBatch,
     confirmed_flush: Arc<AtomicU64>,
     flush_to: u64,

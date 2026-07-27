@@ -53,6 +53,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+mod connection;
 mod replication;
 
 #[derive(Debug, Snafu)]
@@ -97,9 +98,12 @@ const POSTGRES_DOCS: &str = "https://spiceai.org/docs/components/data-connectors
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("connection_string")
         .description(
-            "Full libpq-style connection string. Overrides other connection params if set.",
+            "Full libpq-style connection string (key=value or postgres:// URI). Overrides other connection params if set.",
         )
-        .examples(&["host=db.example.com port=5432 dbname=app user=ro sslmode=require"])
+        .examples(&[
+            "host=db.example.com port=5432 dbname=app user=ro sslmode=require",
+            "postgresql://ro@db.example.com:5432/app?sslmode=require",
+        ])
         .help_link(POSTGRES_DOCS)
         .secret(),
     ParameterSpec::component("user")
@@ -157,6 +161,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     // --- Logical replication (WAL streaming) ---
     ParameterSpec::component("replication_slot").description(
         "Name of the Postgres replication slot to create/reuse for this dataset. \
+         Must match [a-z0-9_]{1,63} (lowercase letters, digits, underscores only) and \
+         must not be the reserved name `pg_conflict_detection`. \
          Defaults to `spice_<dataset>_<dataset-hash>_<instance-hash>`. Datasets on the \
          same connection that name the same slot SHARE it: one replication connection, \
          one publication, with decoded changes routed per table. Each Spice replica \

@@ -228,7 +228,12 @@ fn is_sqlite_lock_error(error: &tokio_rusqlite::Error<rusqlite::Error>) -> bool 
 ///
 /// In-memory databases have no backing file, so the pool skips parent-directory
 /// creation and uses the `MEMORY` rollback journal (WAL is unsupported).
-fn is_memory_db_path(db_path: &str) -> bool {
+///
+/// `pub(crate)` so [`crate::cayenne_catalog::CayenneCatalog::init`] applies the
+/// SAME guard as [`SqliteMetastore::open_connection`] — the two must agree on
+/// what counts as in-memory, or one path creates a stray directory the other
+/// skips (the memory-mode `file:` directory bug, #11922).
+pub(crate) fn is_memory_db_path(db_path: &str) -> bool {
     db_path.contains("vfs=memdb")
 }
 

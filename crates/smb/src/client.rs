@@ -357,7 +357,7 @@ impl SmbClient {
 
         update_preauth_hash(&mut preauth_hash, &packet[4..]);
 
-        let (resp_hdr, _resp_body, resp_raw) = self.send_recv_raw(&mut packet).await?;
+        let (resp_hdr, _resp_body, mut resp_raw) = self.send_recv_raw(&mut packet).await?;
         if NtStatus::from_u32(resp_hdr.status).is_error() {
             tracing::warn!(target: "smb", "auth failed: 0x{:08X}", resp_hdr.status);
             return Err(io::Error::new(
@@ -366,17 +366,29 @@ impl SmbClient {
             ));
         }
 
-        // Per [MS-SMB2] §3.2.5.3.1, the client must update the preauth
-        // integrity hash with the final SESSION_SETUP response (the one
-        // returning STATUS_SUCCESS) before deriving the SMB 3.1.1 signing
-        // key. Skipping this would derive the key from an incomplete
-        // transcript, so the very first signed request after auth would
-        // fail against servers that validate the full preauth chain
-        // (Samba 4.21+, Windows Server 2025).
-        update_preauth_hash(&mut preauth_hash, &resp_raw);
-
+        // Per [MS-SMB2] §3.2.5.5.3, the preauth integrity hash used for key
+        // derivation ends with the final SESSION_SETUP *request*; the
+        // STATUS_SUCCESS response is excluded. Only intermediate responses
+        // (STATUS_MORE_PROCESSING_REQUIRED) are hashed. The server signs the
+        // final response with the derived signing key, so the key cannot
+        // depend on that response's own bytes. Hashing it here derives a key
+        // that disagrees with the server's and every subsequent signed
+        // exchange fails verification.
         let signing_key = auth::derive_signing_key(&session_base_key, &preauth_hash);
         tracing::debug!(target: "smb", "authenticated, signing key derived");
+
+        // The server signs the final SESSION_SETUP response with the key it
+        // just derived. When the response is marked signed, verify it before
+        // trusting the session — a mismatch means the two sides disagree on
+        // the key or the auth-completing response was tampered with in
+        // transit ([MS-SMB2] §3.2.5.5.3).
+        if resp_hdr.flags & SMB2_FLAGS_SIGNED != 0 && !verify_signature(&mut resp_raw, &signing_key)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "final SESSION_SETUP response signature verification failed",
+            ));
+        }
 
         self.session_id = resp_hdr.session_id;
         let transact = neg_resp.max_transact_size;
@@ -1606,4 +1618,358 @@ fn parse_compound_response(msg: &[u8]) -> Vec<(Header, Vec<u8>)> {
     }
 
     results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    const STATUS_MORE_PROCESSING_REQUIRED: u32 = 0xC000_0016;
+    const SMB2_FLAGS_RESPONSE: u32 = 0x0000_0001;
+    const TEST_USERNAME: &str = "spicetester";
+    const TEST_PASSWORD: &str = "s3cret-pw!";
+    const TEST_DOMAIN: &str = "WORKGROUP";
+    const TEST_SESSION_ID: u64 = 0x0102_0304_0506_0708;
+    const TEST_TREE_ID: u32 = 99;
+
+    /// How the mock server deviates (or not) from a well-behaved server.
+    #[derive(Clone, Copy)]
+    enum TreeConnectBehavior {
+        /// Sign every response with the spec-derived key (well-behaved server).
+        SignCorrectly,
+        /// Sign the TREE_CONNECT response, then flip a bit in its signature.
+        CorruptSignature,
+        /// Send the TREE_CONNECT response without the SIGNED flag or signature.
+        OmitSignature,
+        /// Corrupt the signature on the final (STATUS_SUCCESS) SESSION_SETUP
+        /// response and stop — the client must abort before TREE_CONNECT.
+        CorruptFinalSetupSignature,
+    }
+
+    async fn read_frame(stream: &mut TcpStream) -> Vec<u8> {
+        let mut len_buf = [0u8; 4];
+        stream
+            .read_exact(&mut len_buf)
+            .await
+            .expect("mock server: read frame length");
+        let len = u32::from_be_bytes(len_buf) as usize;
+        let mut msg = vec![0u8; len];
+        stream
+            .read_exact(&mut msg)
+            .await
+            .expect("mock server: read frame body");
+        msg
+    }
+
+    async fn write_frame(stream: &mut TcpStream, msg: &[u8]) {
+        let len = u32::try_from(msg.len()).expect("mock server: frame fits in u32");
+        stream
+            .write_all(&len.to_be_bytes())
+            .await
+            .expect("mock server: write frame length");
+        stream
+            .write_all(msg)
+            .await
+            .expect("mock server: write frame body");
+        stream.flush().await.expect("mock server: flush");
+    }
+
+    /// Build a response message (SMB2 header + body, no NetBIOS prefix).
+    /// Echoes the request's command and message id, as a real server does.
+    fn build_response(req: &Header, status: u32, session_id: u64, body: &[u8]) -> Vec<u8> {
+        let mut hdr = req.clone();
+        hdr.status = status;
+        hdr.flags = SMB2_FLAGS_RESPONSE;
+        hdr.session_id = session_id;
+        hdr.tree_id = TEST_TREE_ID;
+        let mut buf = BytesMut::with_capacity(SMB2_HEADER_SIZE + body.len());
+        hdr.encode(&mut buf);
+        buf.put_slice(body);
+        buf.to_vec()
+    }
+
+    /// Minimal SMB 3.1.1 NEGOTIATE response body (fields the client reads).
+    fn negotiate_response_body() -> Vec<u8> {
+        let mut body = vec![0u8; 64];
+        body[0] = 65; // StructureSize
+        body[2] = 0x01; // SecurityMode: signing enabled
+        body[4..6].copy_from_slice(&DIALECT_SMB3_1_1.to_le_bytes());
+        body[28..32].copy_from_slice(&65536u32.to_le_bytes()); // MaxTransactSize
+        body[32..36].copy_from_slice(&65536u32.to_le_bytes()); // MaxReadSize
+        body[36..40].copy_from_slice(&65536u32.to_le_bytes()); // MaxWriteSize
+        body
+    }
+
+    /// Raw NTLM CHALLENGE (Type 2) message with a minimal target info.
+    fn ntlm_challenge_message(server_challenge: [u8; 8]) -> Vec<u8> {
+        // UNICODE | REQUEST_TARGET | NTLM | EXTENDED_SESSIONSECURITY | TARGET_INFO
+        let flags: u32 = 0x0088_0205;
+        let target_info = [0u8; 4]; // single MsvAvEOL AvPair
+        let ti_offset = 56u32; // right after the 8-byte Version field
+        let mut msg = Vec::with_capacity(60);
+        msg.extend_from_slice(b"NTLMSSP\0");
+        msg.extend_from_slice(&2u32.to_le_bytes()); // MessageType
+        msg.extend_from_slice(&[0u8; 8]); // TargetNameFields (empty)
+        msg.extend_from_slice(&flags.to_le_bytes());
+        msg.extend_from_slice(&server_challenge);
+        msg.extend_from_slice(&[0u8; 8]); // Reserved
+        let ti_len = u16::try_from(target_info.len()).expect("test fixture");
+        msg.extend_from_slice(&ti_len.to_le_bytes());
+        msg.extend_from_slice(&ti_len.to_le_bytes());
+        msg.extend_from_slice(&ti_offset.to_le_bytes());
+        msg.extend_from_slice(&[0u8; 8]); // Version
+        msg.extend_from_slice(&target_info);
+        msg
+    }
+
+    /// SESSION_SETUP response body carrying `blob` as the security buffer.
+    fn session_setup_response_body(blob: &[u8]) -> Vec<u8> {
+        let mut body = Vec::with_capacity(8 + blob.len());
+        body.extend_from_slice(&9u16.to_le_bytes()); // StructureSize
+        body.extend_from_slice(&0u16.to_le_bytes()); // SessionFlags
+        // SecurityBufferOffset is from the start of the SMB2 header.
+        let offset = u16::try_from(SMB2_HEADER_SIZE + 8).expect("test fixture");
+        body.extend_from_slice(&offset.to_le_bytes());
+        let blob_len = u16::try_from(blob.len()).expect("test fixture");
+        body.extend_from_slice(&blob_len.to_le_bytes());
+        body.extend_from_slice(blob);
+        body
+    }
+
+    /// Extract the NTLMSSP security blob from a SESSION_SETUP request message.
+    fn session_setup_security_blob(msg: &[u8]) -> &[u8] {
+        let body = &msg[SMB2_HEADER_SIZE..];
+        let offset = u16::from_le_bytes([body[12], body[13]]) as usize;
+        let len = u16::from_le_bytes([body[14], body[15]]) as usize;
+        &msg[offset..offset + len]
+    }
+
+    /// Recompute the NTLMv2 session base key the way a real server does:
+    /// from the stored credentials plus the NTProofStr sent by the client.
+    fn server_session_base_key(auth_blob: &[u8]) -> [u8; 16] {
+        let ntlmssp = auth::unwrap_spnego(auth_blob);
+        // NtChallengeResponseFields live at offset 20 (Len u16, MaxLen u16, Offset u32).
+        let nt_offset =
+            u32::from_le_bytes(ntlmssp[24..28].try_into().expect("test fixture")) as usize;
+        let mut nt_proof = [0u8; 16];
+        nt_proof.copy_from_slice(&ntlmssp[nt_offset..nt_offset + 16]);
+
+        let password_utf16: Vec<u8> = TEST_PASSWORD
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let nt_hash = crypto::md4(&password_utf16);
+        let user_domain = format!("{}{}", TEST_USERNAME.to_uppercase(), TEST_DOMAIN);
+        let ud_utf16: Vec<u8> = user_domain
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let ntlmv2_hash = crypto::hmac_md5(&nt_hash, &ud_utf16);
+        crypto::hmac_md5(&ntlmv2_hash, &nt_proof)
+    }
+
+    /// Drive a spec-compliant SMB 3.1.1 negotiate + NTLM session setup +
+    /// TREE_CONNECT exchange. Maintains the preauth integrity hash exactly as
+    /// [MS-SMB2] prescribes for a server: negotiate request/response and
+    /// session-setup messages are hashed, but the final SESSION_SETUP
+    /// response (STATUS_SUCCESS) is *not* — it is itself signed with the
+    /// derived key, so the key cannot depend on it.
+    ///
+    /// Returns whether the client's signed TREE_CONNECT request verified
+    /// under the spec-derived signing key.
+    async fn run_mock_server(listener: TcpListener, behavior: TreeConnectBehavior) -> bool {
+        let (mut stream, _) = listener.accept().await.expect("mock server: accept");
+        let mut preauth = [0u8; 64];
+
+        // ── NEGOTIATE ──
+        let req = read_frame(&mut stream).await;
+        let req_hdr = Header::decode(&req).expect("mock server: negotiate header");
+        assert_eq!(req_hdr.command, Command::Negotiate as u16);
+        update_preauth_hash(&mut preauth, &req);
+        let resp = build_response(&req_hdr, 0, 0, &negotiate_response_body());
+        update_preauth_hash(&mut preauth, &resp);
+        write_frame(&mut stream, &resp).await;
+
+        // ── SESSION_SETUP #1 (NTLM NEGOTIATE → CHALLENGE) ──
+        let req = read_frame(&mut stream).await;
+        let req_hdr = Header::decode(&req).expect("mock server: session setup 1 header");
+        assert_eq!(req_hdr.command, Command::SessionSetup as u16);
+        update_preauth_hash(&mut preauth, &req);
+        let challenge = ntlm_challenge_message(*b"SrvChal8");
+        let resp = build_response(
+            &req_hdr,
+            STATUS_MORE_PROCESSING_REQUIRED,
+            TEST_SESSION_ID,
+            &session_setup_response_body(&challenge),
+        );
+        update_preauth_hash(&mut preauth, &resp);
+        write_frame(&mut stream, &resp).await;
+
+        // ── SESSION_SETUP #2 (NTLM AUTH → SUCCESS) ──
+        let req = read_frame(&mut stream).await;
+        let req_hdr = Header::decode(&req).expect("mock server: session setup 2 header");
+        assert_eq!(req_hdr.command, Command::SessionSetup as u16);
+        update_preauth_hash(&mut preauth, &req);
+
+        // Key derivation happens HERE: the transcript ends with the final
+        // session-setup request. The success response below is excluded.
+        let session_base_key = server_session_base_key(session_setup_security_blob(&req));
+        let signing_key = auth::derive_signing_key(&session_base_key, &preauth);
+
+        let mut resp = build_response(
+            &req_hdr,
+            0,
+            TEST_SESSION_ID,
+            &session_setup_response_body(&[]),
+        );
+        // A real server signs the final session-setup response with the key
+        // it just derived — proof that the key cannot include this response.
+        sign_message(&mut resp, &signing_key);
+        if matches!(behavior, TreeConnectBehavior::CorruptFinalSetupSignature) {
+            resp[48] ^= 0xFF; // flip bits in the first signature byte
+            write_frame(&mut stream, &resp).await;
+            // The client rejects this response and never sends TREE_CONNECT.
+            return false;
+        }
+        write_frame(&mut stream, &resp).await;
+
+        // ── TREE_CONNECT (first signed request/response exchange) ──
+        let mut req = read_frame(&mut stream).await;
+        let req_hdr = Header::decode(&req).expect("mock server: tree connect header");
+        assert_eq!(req_hdr.command, Command::TreeConnect as u16);
+        let client_signed = req_hdr.flags & SMB2_FLAGS_SIGNED != 0;
+        let client_sig_ok = client_signed && verify_signature(&mut req, &signing_key);
+
+        let mut tree_body = vec![0u8; 16];
+        tree_body[0] = 16; // StructureSize
+        tree_body[2] = 1; // ShareType: disk
+        let mut resp = build_response(&req_hdr, 0, TEST_SESSION_ID, &tree_body);
+        match behavior {
+            // CorruptFinalSetupSignature returned above, before TREE_CONNECT.
+            TreeConnectBehavior::SignCorrectly
+            | TreeConnectBehavior::CorruptFinalSetupSignature => {
+                sign_message(&mut resp, &signing_key);
+            }
+            TreeConnectBehavior::CorruptSignature => {
+                sign_message(&mut resp, &signing_key);
+                resp[48] ^= 0xFF; // flip bits in the first signature byte
+            }
+            TreeConnectBehavior::OmitSignature => {}
+        }
+        write_frame(&mut stream, &resp).await;
+
+        client_sig_ok
+    }
+
+    async fn connect_client(port: u16) -> io::Result<Arc<SmbClient>> {
+        SmbClient::connect(SmbConfig {
+            server: "127.0.0.1".to_string(),
+            port,
+            username: TEST_USERNAME.to_string(),
+            password: TEST_PASSWORD.to_string(),
+            domain: TEST_DOMAIN.to_string(),
+            workstation: "TESTWS".to_string(),
+            max_io_size: 0,
+            read_timeout: Some(Duration::from_secs(5)),
+        })
+        .await
+    }
+
+    /// Run the full handshake plus one TREE_CONNECT against the mock server.
+    /// Returns the tree-connect result and whether the client's signed
+    /// TREE_CONNECT request verified under the spec-derived signing key.
+    async fn tree_connect_against(behavior: TreeConnectBehavior) -> (io::Result<u32>, bool) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let port = listener.local_addr().expect("mock server addr").port();
+        let server = tokio::spawn(run_mock_server(listener, behavior));
+
+        let client = connect_client(port)
+            .await
+            .expect("negotiate + NTLM session setup should succeed");
+        let result = client.tree_connect("data").await;
+        let client_sig_ok = server.await.expect("mock server task");
+        (result, client_sig_ok)
+    }
+
+    /// Regression test for #11148: the signing key must be derived from a
+    /// preauth integrity hash that ends with the final SESSION_SETUP
+    /// *request*. Hashing the final (STATUS_SUCCESS) response too — as the
+    /// original port of this client did — derives a key that disagrees with
+    /// every spec-compliant server (Samba, Windows), and the first signed
+    /// exchange after auth fails with "signature verification failed".
+    #[tokio::test]
+    async fn signing_key_matches_spec_compliant_server() {
+        let (result, client_sig_ok) =
+            tree_connect_against(TreeConnectBehavior::SignCorrectly).await;
+        let tree_id =
+            result.expect("signed TREE_CONNECT should verify against a spec-compliant server");
+        assert_eq!(tree_id, TEST_TREE_ID);
+        assert!(
+            client_sig_ok,
+            "client's signed TREE_CONNECT request must verify under the spec-derived signing key"
+        );
+    }
+
+    /// Negative control: a tampered response signature must be rejected —
+    /// proves the positive test above cannot pass vacuously (i.e. the client
+    /// really does verify response signatures with its derived key).
+    #[tokio::test]
+    async fn tampered_response_signature_is_rejected() {
+        let (result, client_sig_ok) =
+            tree_connect_against(TreeConnectBehavior::CorruptSignature).await;
+        let err = result.expect_err("tampered response signature must be rejected");
+        assert!(
+            err.to_string().contains("signature verification failed"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            client_sig_ok,
+            "client request signature should still verify"
+        );
+    }
+
+    /// Negative control: the final (STATUS_SUCCESS) SESSION_SETUP response is
+    /// signed by the server with the freshly derived key; a tampered
+    /// signature there must abort the session before any operation runs.
+    #[tokio::test]
+    async fn tampered_final_session_setup_signature_is_rejected() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let port = listener.local_addr().expect("mock server addr").port();
+        let server = tokio::spawn(run_mock_server(
+            listener,
+            TreeConnectBehavior::CorruptFinalSetupSignature,
+        ));
+
+        let Err(err) = connect_client(port).await else {
+            panic!("tampered final SESSION_SETUP signature must abort the session")
+        };
+        assert!(
+            err.to_string()
+                .contains("final SESSION_SETUP response signature verification failed"),
+            "unexpected error: {err}"
+        );
+        let _ = server.await.expect("mock server task");
+    }
+
+    /// Negative control: once signing is established, an unsigned response
+    /// must be rejected.
+    #[tokio::test]
+    async fn unsigned_response_after_auth_is_rejected() {
+        let (result, client_sig_ok) =
+            tree_connect_against(TreeConnectBehavior::OmitSignature).await;
+        let err = result.expect_err("unsigned response after signing established must be rejected");
+        assert!(
+            err.to_string().contains("missing signature"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            client_sig_ok,
+            "client request signature should still verify"
+        );
+    }
 }

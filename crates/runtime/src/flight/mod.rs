@@ -898,9 +898,10 @@ pub(crate) async fn start(
         .layer(BasicAuthLayer::new(session_aware_auth))
         .into_inner();
 
-    // Create the OpenTelemetry MetricsService
+    // Create the OpenTelemetry MetricsService. Pass a weak runtime handle so ingest can
+    // evolve an accelerated metric table's schema in place when new dimensions arrive.
     let query_engine: Arc<dyn runtime_query_engine::query_engine::QueryEngine> = rt.datafusion();
-    let otel_service = create_metrics_service(query_engine);
+    let otel_service = create_metrics_service(query_engine, Some(Arc::downgrade(&rt)));
 
     // Get job executor if available (cluster mode)
     let job_executor = rt.job_executor();

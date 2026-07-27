@@ -400,6 +400,13 @@ pub(crate) struct DataFusionBuilder {
     /// set by the Runtime builder. When it exceeds the base host/10 headroom, the
     /// query-memory default is reduced by the excess. 0 = none / not Cayenne CDC.
     cayenne_cdc_reservation_bytes: u64,
+    /// Coordinated query-pool ceiling (bytes) when `DuckDB` file accelerators are
+    /// present, computed by the Runtime builder's cgroup-aware budget so the query
+    /// pool + each `DuckDB` instance's own `memory_limit` can't over-commit the
+    /// memory available to this process (the cgroup limit in a container).
+    /// Applied as a `min`-cap on the DEFAULT query pool only (an explicit
+    /// `runtime.query.memory_limit` still wins). `None` = no `DuckDB` coordination.
+    duckdb_query_pool_cap: Option<u64>,
     cayenne_optimizer_rules: CayenneOptimizerRules,
     /// Arbitrary additional analyzer rules.
     additional_analyzer_rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>,
@@ -460,6 +467,7 @@ impl DataFusionBuilder {
             cayenne_footer_cache_mb: None,
             compaction_memory_fraction: None,
             cayenne_cdc_reservation_bytes: 0,
+            duckdb_query_pool_cap: None,
             cayenne_optimizer_rules: CayenneOptimizerRules::default(),
             additional_analyzer_rules: vec![],
             executor_registry: None,
@@ -621,6 +629,19 @@ impl DataFusionBuilder {
         self
     }
 
+    /// Coordinated query-pool ceiling (bytes) when `DuckDB` file accelerators are
+    /// present. Reduces ONLY the default query pool (via a `min`-cap in
+    /// [`effective_query_memory_limit`]) so the query pool + each `DuckDB` instance's
+    /// own `memory_limit` can't over-commit the memory available to this process
+    /// (the cgroup limit in a container). Set by the Runtime builder;
+    /// `None` disables the reduction and an explicit `runtime.query.memory_limit`
+    /// always wins.
+    #[must_use]
+    pub fn duckdb_query_pool_cap(mut self, cap: Option<u64>) -> Self {
+        self.duckdb_query_pool_cap = cap;
+        self
+    }
+
     /// Carve a dedicated compaction memory pool of `fraction` of the query
     /// memory limit. Set by the Runtime builder only when Cayenne acceleration
     /// is configured and dedicated thread pools are enabled.
@@ -706,6 +727,7 @@ impl DataFusionBuilder {
             self.memory_limit,
             cayenne_active,
             self.cayenne_cdc_reservation_bytes,
+            self.duckdb_query_pool_cap,
         );
         let compaction_memory_bytes = compaction_memory_fraction.map(|fraction| {
             #[expect(
@@ -742,23 +764,40 @@ impl DataFusionBuilder {
 
         // After the compaction carve, `effective_memory_limit` is the query memory
         // pool size. Coordinate the off-pool Cayenne in-memory CDC tier budget
-        // against it (and the carved compaction pool) so the three never sum past
-        // host RAM. `set_compaction_runtime` installs `mem_tier_budget_bytes`
-        // instead of the old, isolation-sized `get_total_memory() / 4`.
+        // against it, the carved compaction pool, AND any external accelerator
+        // reservation (e.g. co-resident DuckDB instance ceilings) so they never sum
+        // past the memory available to this process — get_total_memory() is
+        // cgroup-aware, so in a container that is the cgroup limit, not host RAM.
+        // `set_compaction_runtime` installs `mem_tier_budget_bytes` instead of the
+        // old, isolation-sized `get_total_memory() / 4`.
         let query_memory_pool_bytes = effective_memory_limit;
         let mem_tier_budget_bytes = cayenne_active.then(|| {
             let total_memory = crate::resource_monitor::get_total_memory();
+            let external_reservation_bytes =
+                crate::accelerator_memory_budget::duckdb_total_reservation_bytes();
             let budget = coordinated_mem_tier_budget(
                 total_memory,
                 query_memory_pool_bytes,
                 compaction_memory_bytes.unwrap_or(0),
+                external_reservation_bytes,
             );
-            if self.memory_limit.is_some() && budget <= total_memory / MEM_TIER_FLOOR_FRACTION {
+            // The tier floor (available/32) can exceed the coordinated remainder when the
+            // query pool + compaction + external (DuckDB) reservations leave too
+            // little room; the clamp then installs `floor > remainder`, a deliberate
+            // small over-commit so a nonzero global cap always exists (memory mode
+            // then leans on per-table caps + spill). Warn whenever that binds —
+            // whether from an explicit runtime.query.memory_limit OR from a large
+            // co-resident DuckDB accelerator reservation (which can now trigger it
+            // even when runtime.query.memory_limit is unset).
+            if budget <= total_memory / MEM_TIER_FLOOR_FRACTION
+                && (self.memory_limit.is_some() || external_reservation_bytes > 0)
+            {
                 tracing::warn!(
                     query_memory_pool_bytes,
                     total_memory,
+                    external_reservation_bytes,
                     mem_tier_budget_bytes = budget,
-                    "Cayenne in-memory CDC ingestion has limited memory on this host because runtime.query.memory_limit reserves most of it for queries, so ingestion will spill to disk more often. Consider lowering runtime.query.memory_limit to give in-memory CDC more room."
+                    "Cayenne in-memory CDC ingestion has limited memory available: the query pool, compaction pool, and co-resident DuckDB accelerator reservations leave little room for in-memory CDC, so ingestion spills to disk more often and combined memory ceilings may slightly exceed the memory available to this process (the cgroup limit when running in a container). Consider lowering runtime.query.memory_limit or per-dataset duckdb_memory_limit to give in-memory CDC more room."
                 );
             }
             budget
@@ -1184,6 +1223,7 @@ impl DataFusionBuilder {
             ddl_extension_store,
             datafusion_ref,
             caching,
+            schema_evolve_locks: TokioRwLock::new(HashMap::new()),
             pending_sink_tables: TokioRwLock::new(Vec::new()),
             deferred_tables: TokioRwLock::new(HashMap::new()),
             deferred_catalogs: TokioRwLock::new(HashMap::new()),
@@ -1505,50 +1545,72 @@ const CAYENNE_QUERY_MEMORY_PERCENT: u64 = 70;
 /// memory mode leans on the per-table caps + spill/durable backstops.
 const CAYENNE_QUERY_MEMORY_FLOOR_PERCENT: u64 = 50;
 
-fn effective_query_memory_limit(
+pub(crate) fn effective_query_memory_limit(
     memory_limit: Option<u64>,
     cayenne_active: bool,
     cdc_reservation_bytes: u64,
+    duckdb_query_pool_cap: Option<u64>,
 ) -> u64 {
     memory_limit.unwrap_or_else(|| {
         let total_memory = crate::resource_monitor::get_total_memory();
-        if !cayenne_active {
+        let default_limit = if cayenne_active {
+            // Cayenne CDC active. Base is CAYENNE_QUERY_MEMORY_PERCENT of host, leaving
+            // room for the off-pool in-memory tier (clamped to <= host/5 by
+            // `coordinated_mem_tier_budget`) plus a host/10 headroom for the off-pool
+            // per-table CDC caches + OS overhead — a 70 / 20 / 10 = 100% partition. The
+            // per-table caches (keyset/segment/coalesce/inline) live OUTSIDE the query
+            // pool and scale with table count; they are assumed to fit the host/10
+            // headroom. When the estimated reservation EXCEEDS that headroom, carve the
+            // excess out of the query pool so the freed query bytes cover the excess
+            // caches and `query_pool + compaction + tier + caches + headroom` stays
+            // within host. Floored at CAYENNE_QUERY_MEMORY_FLOOR_PERCENT so a very
+            // cache-heavy config never starves queries (past the floor the tier
+            // install-time check warns).
+            let base = total_memory.saturating_mul(CAYENNE_QUERY_MEMORY_PERCENT) / 100;
+            let base_headroom = total_memory / MEM_TIER_HEADROOM_FRACTION;
+            let reservation_excess = cdc_reservation_bytes.saturating_sub(base_headroom);
+            let floor = total_memory.saturating_mul(CAYENNE_QUERY_MEMORY_FLOOR_PERCENT) / 100;
+            let default_limit = base.saturating_sub(reservation_excess).max(floor);
+
+            tracing::debug!(
+                cayenne_active,
+                cdc_reservation_bytes,
+                reservation_excess,
+                "No query memory limit specified; Cayenne CDC base {CAYENNE_QUERY_MEMORY_PERCENT}% of total, reduced by the per-table CDC reservation above the host/10 headroom to: {}",
+                util::human_readable_bytes(default_limit as usize)
+            );
+
+            default_limit
+        } else {
             let default_limit = total_memory.saturating_mul(DEFAULT_QUERY_MEMORY_PERCENT) / 100;
             tracing::debug!(
                 cayenne_active,
                 "No query memory limit specified, defaulting to {DEFAULT_QUERY_MEMORY_PERCENT}% of total memory: {}",
                 util::human_readable_bytes(default_limit as usize)
             );
-            return default_limit;
+            default_limit
+        };
+
+        // Coordinated DuckDB cap: when DuckDB file accelerators are present the
+        // Runtime builder computes a reduced query-pool ceiling (see
+        // `accelerator_memory_budget`) that leaves room for each DuckDB instance's
+        // own `memory_limit`, so the query pool + DuckDB ceilings can't over-commit
+        // host RAM. It only ever LOWERS the default (an explicit
+        // `runtime.query.memory_limit` short-circuits above and is never reduced).
+        match duckdb_query_pool_cap {
+            Some(cap) => {
+                let capped = default_limit.min(cap);
+                if capped < default_limit {
+                    tracing::debug!(
+                        default_query_memory_bytes = default_limit,
+                        coordinated_query_memory_bytes = capped,
+                        "Query memory pool reduced below its default by the coordinated DuckDB accelerator budget, leaving room for each DuckDB instance's own memory_limit."
+                    );
+                }
+                capped
+            }
+            None => default_limit,
         }
-
-        // Cayenne CDC active. Base is CAYENNE_QUERY_MEMORY_PERCENT of host, leaving
-        // room for the off-pool in-memory tier (clamped to <= host/5 by
-        // `coordinated_mem_tier_budget`) plus a host/10 headroom for the off-pool
-        // per-table CDC caches + OS overhead — a 70 / 20 / 10 = 100% partition. The
-        // per-table caches (keyset/segment/coalesce/inline) live OUTSIDE the query
-        // pool and scale with table count; they are assumed to fit the host/10
-        // headroom. When the estimated reservation EXCEEDS that headroom, carve the
-        // excess out of the query pool so the freed query bytes cover the excess
-        // caches and `query_pool + compaction + tier + caches + headroom` stays
-        // within host. Floored at CAYENNE_QUERY_MEMORY_FLOOR_PERCENT so a very
-        // cache-heavy config never starves queries (past the floor the tier
-        // install-time check warns).
-        let base = total_memory.saturating_mul(CAYENNE_QUERY_MEMORY_PERCENT) / 100;
-        let base_headroom = total_memory / MEM_TIER_HEADROOM_FRACTION;
-        let reservation_excess = cdc_reservation_bytes.saturating_sub(base_headroom);
-        let floor = total_memory.saturating_mul(CAYENNE_QUERY_MEMORY_FLOOR_PERCENT) / 100;
-        let default_limit = base.saturating_sub(reservation_excess).max(floor);
-
-        tracing::debug!(
-            cayenne_active,
-            cdc_reservation_bytes,
-            reservation_excess,
-            "No query memory limit specified; Cayenne CDC base {CAYENNE_QUERY_MEMORY_PERCENT}% of total, reduced by the per-table CDC reservation above the host/10 headroom to: {}",
-            util::human_readable_bytes(default_limit as usize)
-        );
-
-        default_limit
     })
 }
 
@@ -1568,12 +1630,14 @@ const MEM_TIER_HEADROOM_FRACTION: u64 = 10;
 /// exactly. 1/4 = 25%, a modest bump above the 20% base ceiling — the fraction must
 /// stay SMALLER than `MEM_TIER_CEILING_FRACTION` so the float sits ABOVE the base.
 const MEM_TIER_FLOAT_CEILING_FRACTION: u64 = 4;
-/// Floor (1/N of host) so a global aggregate cap is ALWAYS installed — a tier
-/// budget of 0 disables the global cap entirely (per-table caps then sum unbounded
-/// across a fleet: the original no-global-cap OOM). Binds only when an operator
-/// pins an explicit, greedy `runtime.query.memory_limit` that leaves no
-/// coordinated room; memory mode then leans on the per-table caps + spill/durable
-/// backstops, and the caller warns.
+/// Lower clamp (1/N of host) that keeps a healthy deployment's tier off the ground,
+/// and the threshold below which [`coordinated_mem_tier_budget`] stops clamping up
+/// and yields to the coordinated remainder instead. When an operator pins an
+/// explicit, greedy `runtime.query.memory_limit` that leaves less than this floor,
+/// the budget follows the remainder down — but never to 0, because a 0 budget
+/// disables the global aggregate cap entirely (per-table caps then sum unbounded
+/// across a fleet: the original no-global-cap OOM). Memory mode then leans on the
+/// per-table caps + spill/durable backstops, and the caller warns.
 pub(crate) const MEM_TIER_FLOOR_FRACTION: u64 = 32;
 
 /// Coordinated aggregate byte budget for the off-pool Cayenne in-memory CDC tier.
@@ -1581,48 +1645,72 @@ pub(crate) const MEM_TIER_FLOOR_FRACTION: u64 = 32;
 /// The query pool, carved compaction pool, and this tier are otherwise each
 /// derived from total RAM IN ISOLATION (`builder.rs` query pool, compaction carve,
 /// and `mod.rs` `get_total_memory()/4`) and sum to >100% of host. Sizing the tier
-/// as the host RAM left AFTER the query pool, the compaction pool, and a headroom
-/// reserve is the missing cross-subsystem coordination. For the coordinated
-/// default inputs — a query pool sized to leave room (see
-/// [`effective_query_memory_limit`]) — it yields
-/// `query_pool + compaction + tier + headroom ≤ host`. The result is clamped to
-/// `[host/32, host/5]`: the `host/5` ceiling keeps the tier ≤ 1/5 of host when the
-/// pools are small, and the `host/32` floor guarantees a nonzero global aggregate
-/// cap is ALWAYS installed (a 0 budget would disable the cap — the original
-/// no-global-cap OOM).
+/// as the host RAM left AFTER the query pool, the compaction pool, any memory
+/// reserved outside both by another subsystem (`external_reservation_bytes` — today
+/// a co-resident `DuckDB` accelerator's ceiling), and a headroom reserve is the missing
+/// cross-subsystem coordination. For the coordinated default inputs — a query pool
+/// sized to leave room (see [`effective_query_memory_limit`]) — it yields
+/// `query_pool + compaction + external + tier + headroom ≤ host`. While that
+/// remainder reaches the `host/32` floor the result is clamped to `[host/32, host/5]`:
+/// the `host/5` ceiling keeps the tier ≤ 1/5 of host when the pools are small.
 ///
-/// PRECONDITION: the `≤ host` guarantee holds only while the inputs leave at least
-/// `floor + headroom` of room. An oversized explicit `runtime.query.memory_limit`
-/// makes the `host/32` floor win over the strict budget; the caller
-/// ([`DataFusionBuilder::build`]) detects that and warns, and memory mode then
-/// leans on the per-table caps + spill/durable backstops.
+/// A greedy explicit `runtime.query.memory_limit`, or a large external reservation,
+/// can leave a remainder BELOW the floor. The tier then yields to the remainder rather
+/// than clamping up to a floor that would overcommit the host — down to a 1-byte
+/// refuse-all gate, since a 0 budget would uninstall the global aggregate cap entirely
+/// (see [`MEM_TIER_FLOOR_FRACTION`]). So the inequality above holds exactly, except for
+/// that one reserved byte when the remainder is 0; every real append then refuses and
+/// CDC spills to the durable backstops. The caller ([`DataFusionBuilder::build`])
+/// detects the squeezed budget and warns.
 pub(crate) fn coordinated_mem_tier_budget(
     total_memory: u64,
     query_pool_bytes: u64,
     compaction_pool_bytes: u64,
+    external_reservation_bytes: u64,
 ) -> u64 {
     let headroom = total_memory / MEM_TIER_HEADROOM_FRACTION;
     let base_ceiling = total_memory / MEM_TIER_CEILING_FRACTION;
     let floor = (total_memory / MEM_TIER_FLOOR_FRACTION).min(base_ceiling);
+    // Memory reserved OUTSIDE the query and compaction pools by other subsystems —
+    // today a co-resident DuckDB accelerator's aggregate ceiling (see
+    // `accelerator_memory_budget`), and any future external consumer — carved from
+    // the same host RAM by the coordinated budget. Subtract it here so the tier,
+    // and especially its query-light float below, can't reclaim room already
+    // reserved elsewhere. `0` when nothing external is reserved.
     let remainder = total_memory
         .saturating_sub(query_pool_bytes)
         .saturating_sub(compaction_pool_bytes)
+        .saturating_sub(external_reservation_bytes)
         .saturating_sub(headroom);
     // Floating ceiling for query-light deployments: when the query + compaction
     // pools are sized well below the default partition (an operator who set a low
     // `runtime.query.memory_limit`), let the tier reclaim part of the freed RAM
     // above the base host/5 cap — up to `host / MEM_TIER_FLOAT_CEILING_FRACTION` —
     // but only the room left beyond a DOUBLED headroom reserve, so the off-pool
-    // caches/memtables the single headroom covers keep their slack. Raising only the
-    // ceiling never lifts the result above `remainder` (the ceiling caps from above,
-    // and `remainder` is computed with the single headroom), so the floating ceiling
-    // preserves the #11449 no-overcommit invariant `query_pool + compaction + tier +
-    // headroom <= host` for ANY ceiling — subject to the same `remainder >= floor`
-    // PRECONDITION above: when the floor wins (`remainder < floor`) the clamp returns
-    // `floor > remainder` and the caller warns instead.
+    // caches/memtables the single headroom covers keep their slack. `float_room`
+    // subtracts the external reservation just like `remainder`, so the float can
+    // never reclaim externally-reserved RAM. Raising only the ceiling never lifts
+    // the result above `remainder` (the ceiling caps from above, and `remainder` is
+    // computed with the single headroom), so the floating ceiling preserves the
+    // #11449 no-overcommit invariant `query_pool + compaction + external + tier +
+    // headroom <= host` for ANY ceiling.
+    //
+    // Honesty under a tight explicit `runtime.query.memory_limit`: when the remainder
+    // is below the floor, yield to the remainder instead of clamping up to a floor
+    // that would make `query + compaction + tier + headroom > host`. A refuse-all
+    // budget is the honest envelope there — mem-tier leans on the per-table caps +
+    // spill/durable backstops — and it must stay nonzero to keep the global cap
+    // installed, so the single reserved byte below is the one deliberate exception
+    // to the `<= host` invariant above.
+    if remainder < floor {
+        // Nonzero refuse-all gate: 1 byte means every real append refuses and
+        // CDC spills/falls back, without uninstalling the budget.
+        return remainder.max(1);
+    }
     let float_room = total_memory
         .saturating_sub(query_pool_bytes)
         .saturating_sub(compaction_pool_bytes)
+        .saturating_sub(external_reservation_bytes)
         .saturating_sub(2 * headroom);
     let ceiling = base_ceiling.max(float_room.min(total_memory / MEM_TIER_FLOAT_CEILING_FRACTION));
     remainder.clamp(floor, ceiling)
@@ -1871,15 +1959,23 @@ mod tests {
     #[test]
     fn effective_query_memory_limit_honors_explicit_value() {
         assert_eq!(
-            effective_query_memory_limit(Some(123 << 30), true, 0),
+            effective_query_memory_limit(Some(123 << 30), true, 0, None),
             123 << 30
         );
         assert_eq!(
-            effective_query_memory_limit(Some(123 << 30), false, 0),
+            effective_query_memory_limit(Some(123 << 30), false, 0, None),
             123 << 30
         );
         // A nonzero CDC reservation never overrides an explicit limit.
-        assert_eq!(effective_query_memory_limit(Some(7), true, 1 << 30), 7);
+        assert_eq!(
+            effective_query_memory_limit(Some(7), true, 1 << 30, None),
+            7
+        );
+        // Nor does a DuckDB query-pool cap override an explicit limit.
+        assert_eq!(
+            effective_query_memory_limit(Some(123 << 30), false, 0, Some(1 << 30)),
+            123 << 30
+        );
     }
 
     /// Cayenne active, no explicit limit: a per-table CDC reservation at/under the
@@ -1895,25 +1991,42 @@ mod tests {
         let floor = total.saturating_mul(CAYENNE_QUERY_MEMORY_FLOOR_PERCENT) / 100;
 
         // Reservation within the base headroom -> no reduction, stays at base 70%.
-        assert_eq!(effective_query_memory_limit(None, true, 0), base);
-        assert_eq!(effective_query_memory_limit(None, true, headroom), base);
+        assert_eq!(effective_query_memory_limit(None, true, 0, None), base);
+        assert_eq!(
+            effective_query_memory_limit(None, true, headroom, None),
+            base
+        );
 
         // Reservation above the headroom -> reduced by exactly the excess.
         let excess = headroom / 2;
         assert_eq!(
-            effective_query_memory_limit(None, true, headroom + excess),
+            effective_query_memory_limit(None, true, headroom + excess, None),
             base - excess
         );
 
         // A reservation larger than the whole host floors the pool, never 0.
-        let floored = effective_query_memory_limit(None, true, total.saturating_mul(2));
+        let floored = effective_query_memory_limit(None, true, total.saturating_mul(2), None);
         assert_eq!(floored, floor);
         assert!(floored > 0);
 
         // The reservation never affects the non-Cayenne default.
         assert_eq!(
-            effective_query_memory_limit(None, false, total),
+            effective_query_memory_limit(None, false, total, None),
             total.saturating_mul(DEFAULT_QUERY_MEMORY_PERCENT) / 100
+        );
+
+        // A DuckDB query-pool cap lowers (never raises) the default query pool.
+        let non_cayenne_default = total.saturating_mul(DEFAULT_QUERY_MEMORY_PERCENT) / 100;
+        let half = non_cayenne_default / 2;
+        assert_eq!(
+            effective_query_memory_limit(None, false, 0, Some(half)),
+            half,
+            "a smaller cap reduces the default"
+        );
+        assert_eq!(
+            effective_query_memory_limit(None, false, 0, Some(non_cayenne_default * 2)),
+            non_cayenne_default,
+            "a larger cap never raises the default"
         );
     }
 
@@ -1958,7 +2071,7 @@ mod tests {
                 let pre_carve = total.saturating_mul(CAYENNE_QUERY_MEMORY_PERCENT) / 100;
                 let compaction = pre_carve.saturating_mul(compaction_pct) / 100;
                 let query_pool = pre_carve.saturating_sub(compaction);
-                let tier = coordinated_mem_tier_budget(total, query_pool, compaction);
+                let tier = coordinated_mem_tier_budget(total, query_pool, compaction, 0);
                 let headroom = total / MEM_TIER_HEADROOM_FRACTION;
                 let sum = query_pool + compaction + tier + headroom;
                 assert!(
@@ -1969,11 +2082,12 @@ mod tests {
         }
     }
 
-    /// The tier budget is always clamped to `[host/32, host/MEM_TIER_FLOAT_CEILING]`:
-    /// never 0 (a 0 budget disables the global aggregate cap, the original
-    /// no-global-cap OOM) and never above the float ceiling even when the pools are
-    /// tiny. The float (host/4) only engages on a query-light deployment and never
-    /// breaks the no-overcommit invariant.
+    /// While the coordinated remainder reaches the floor, the tier budget stays inside
+    /// `[host/32, host/MEM_TIER_FLOAT_CEILING]` — never above the float ceiling even
+    /// when the pools are tiny, and the float (host/4) only engages on a query-light
+    /// deployment without breaking the no-overcommit invariant. A greedy pool drives
+    /// the remainder under the floor and the budget follows it down, but never to 0 (a
+    /// 0 budget disables the global aggregate cap, the original no-global-cap OOM).
     #[test]
     fn coordinated_tier_budget_stays_within_clamp() {
         for gib in [16_u64, 64, 256, 1024] {
@@ -1984,7 +2098,7 @@ mod tests {
 
             // A tiny query pool (query-light) → the tier floats up to the raised
             // ceiling to use the spare RAM, never above it.
-            let big = coordinated_mem_tier_budget(total, total / 100, 0);
+            let big = coordinated_mem_tier_budget(total, total / 100, 0, 0);
             assert_eq!(
                 big, float_ceiling,
                 "a query-light deployment floats the tier to the raised ceiling"
@@ -1997,21 +2111,62 @@ mod tests {
             );
 
             // A moderate query pool at the default 70% partition stays at/under the
-            // BASE ceiling (the float only helps when the pool is sized down).
+            // BASE ceiling (the float only helps when the pool is sized down) and
+            // at/above the floor (remainder still allows the lower clamp).
             let pre_carve = total.saturating_mul(CAYENNE_QUERY_MEMORY_PERCENT) / 100;
-            let moderate = coordinated_mem_tier_budget(total, pre_carve, 0);
+            let moderate = coordinated_mem_tier_budget(total, pre_carve, 0, 0);
             assert!(
                 moderate <= base_ceiling,
                 "the default partition does not float above the base ceiling"
             );
+            assert!(
+                moderate >= floor,
+                "when remainder allows, the tier budget stays at/above the floor"
+            );
 
-            // A greedy pool that consumes all of host → tier floored, never 0.
-            let small = coordinated_mem_tier_budget(total, total, 0);
+            // A greedy pool that consumes all of host → tier yields to the
+            // remainder (honest, no forced overcommit). Remainder is 0 after
+            // headroom, but we still install a 1-byte always-refuse gate so the
+            // global cap is never disabled (try_reserve fails → spill). The
+            // meaningful claim here is the refuse-all gate, not "no host
+            // overcommit" via the floor — the pool already consumes `total`.
+            let small = coordinated_mem_tier_budget(total, total, 0, 0);
             assert_eq!(
-                small, floor,
-                "a greedy pool floors the tier (still a nonzero cap)"
+                small, 1,
+                "a greedy pool installs a 1-byte refuse-all gate rather than the host/32 floor"
             );
             assert!(small > 0, "the global aggregate cap must never be disabled");
+            assert!(
+                small < floor,
+                "a greedy pool yields BELOW the floor rather than clamping up to it (floor={floor}, small={small})"
+            );
+        }
+    }
+
+    /// A non-zero external (`DuckDB`) reservation is subtracted from BOTH the tier
+    /// remainder and its query-light float, so the tier can only shrink — it can't
+    /// reclaim externally-reserved memory — and `query + external + tier + headroom`
+    /// never exceeds host RAM.
+    #[test]
+    fn coordinated_tier_budget_reserves_external_bytes() {
+        for gib in [16_u64, 64, 256, 1024] {
+            let total = gib << 30;
+            let headroom = total / MEM_TIER_HEADROOM_FRACTION;
+            let query_pool = total / 10; // query-light: the tier would otherwise float up
+            let external = total / 2; // a sizeable co-resident DuckDB reservation
+
+            let with_ext = coordinated_mem_tier_budget(total, query_pool, 0, external);
+            let no_ext = coordinated_mem_tier_budget(total, query_pool, 0, 0);
+
+            assert!(
+                with_ext <= no_ext,
+                "gib={gib}: an external reservation must never grow the tier"
+            );
+            let sum = query_pool + external + with_ext + headroom;
+            assert!(
+                sum <= total,
+                "gib={gib}: overcommit — query={query_pool} external={external} tier={with_ext} headroom={headroom} sum={sum} > total={total}"
+            );
         }
     }
 

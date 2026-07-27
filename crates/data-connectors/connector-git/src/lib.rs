@@ -15,11 +15,15 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
-use async_trait::async_trait;
-use data_components::git::{
+// Exported (as it was in data_components) so its public API items are treated as
+// exported API by clippy's avoid-breaking-exported-api, matching the original crate.
+pub mod git;
+
+use crate::git::{
     BackoffMethod, DEFAULT_MAX_CONCURRENT_REQUESTS, DEFAULT_MAX_FILE_BYTES, DEFAULT_MAX_FILES,
     DEFAULT_MAX_RETRIES, GitCredentials, GitResilienceConfig, GitTableConfig, GitTableProvider,
 };
+use async_trait::async_trait;
 use data_components::rate_limit::RateLimiter;
 use datafusion::datasource::TableProvider;
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -222,7 +226,7 @@ impl Git {
             .and_then(|v| v.parse::<bool>().ok())
             .unwrap_or(true);
 
-        let key = data_components::git::sanitize_repo_url(repo_url);
+        let key = crate::git::sanitize_repo_url(repo_url);
         let semaphore = shared_semaphore(&key, max_concurrent_requests);
         let disabled = shared_disabled_flag(&key);
 
@@ -252,7 +256,7 @@ impl Git {
 
         tracing::debug!(
             "Connecting to Git repository: {} (reference: {:?})",
-            data_components::git::sanitize_repo_url(&repo_url),
+            crate::git::sanitize_repo_url(&repo_url),
             reference
         );
 

@@ -28,14 +28,20 @@ use crate::make_spice_data_sub_directory;
 
 use search::generation::text_search::index::FullTextDatabaseIndex;
 
-/// Adds a [`FullTextDatabaseIndex`] to a [`TableProvider`].
+/// Builds (but does not register) a [`FullTextDatabaseIndex`] over `inner_table_provider`.
+///
+/// `store_fields_override` replaces the store-fields set derived from the columns' vector
+/// metadata: the compound warm-tier caller passes `Some(&[])` so the index's query schema is
+/// exactly `[primary key…, _score]` (matching the Elasticsearch secondary tier); the
+/// plain full-text caller passes `None` to keep the metadata-derived set.
 ///
 /// Expects at least one [`Column`] to have a full text search column configured.
-pub(crate) fn add_full_text_search_to_table(
+pub(crate) fn build_full_text_database_index(
     inner_table_provider: Arc<dyn TableProvider>,
     columns: &[Column],
     tbl: &TableReference,
-) -> Result<IndexedTableProvider, Box<dyn std::error::Error + Send + Sync>> {
+    store_fields_override: Option<&[String]>,
+) -> Result<FullTextDatabaseIndex, Box<dyn std::error::Error + Send + Sync>> {
     let schema = inner_table_provider.schema();
     for c in columns {
         if schema.column_with_name(&c.name).is_none() {
@@ -74,33 +80,63 @@ pub(crate) fn add_full_text_search_to_table(
         None
     };
 
-    let store_fields = columns
-        .iter()
-        .filter_map(|c| {
-            if c.as_vector_metadata() == Some(MetadataType::NonFilterable) {
-                return Some(c.name.clone());
-            }
-            None
-        })
-        .collect::<Vec<_>>();
+    // `derived_store_fields` outlives the borrow below only when no override is supplied.
+    let derived_store_fields;
+    let store_fields: &[String] = if let Some(store_fields) = store_fields_override {
+        store_fields
+    } else {
+        derived_store_fields = columns
+            .iter()
+            .filter_map(|c| {
+                if c.as_vector_metadata() == Some(MetadataType::NonFilterable) {
+                    Some(c.name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        derived_store_fields.as_slice()
+    };
 
-    let index = FullTextDatabaseIndex::try_new(
-        Arc::clone(&inner_table_provider),
+    FullTextDatabaseIndex::try_new(
+        inner_table_provider,
         search_fields,
         Some(primary_key),
         directory,
-        &store_fields,
+        store_fields,
     )
-    .boxed()?;
+    .boxed()
+}
 
-    let tbl: IndexedTableProvider =
+/// Registers `index` on `inner_table_provider`, reusing the existing [`IndexedTableProvider`]
+/// chain when one is already present so multiple indexes compose onto a single provider.
+fn register_index(
+    inner_table_provider: &Arc<dyn TableProvider>,
+    index: Arc<dyn Index + Send + Sync>,
+) -> IndexedTableProvider {
+    let provider =
         if let Some(idx_tbl) = inner_table_provider.downcast_ref::<IndexedTableProvider>() {
             idx_tbl.clone()
         } else {
-            IndexedTableProvider::new(inner_table_provider)
+            IndexedTableProvider::new(Arc::clone(inner_table_provider))
         };
+    provider.add_index(index)
+}
 
-    Ok(tbl.add_index(Arc::new(index) as Arc<dyn Index + Send + Sync>))
+/// Adds a [`FullTextDatabaseIndex`] to a [`TableProvider`].
+///
+/// Expects at least one [`Column`] to have a full text search column configured.
+pub(crate) fn add_full_text_search_to_table(
+    inner_table_provider: &Arc<dyn TableProvider>,
+    columns: &[Column],
+    tbl: &TableReference,
+) -> Result<IndexedTableProvider, Box<dyn std::error::Error + Send + Sync>> {
+    let index =
+        build_full_text_database_index(Arc::clone(inner_table_provider), columns, tbl, None)?;
+    Ok(register_index(
+        inner_table_provider,
+        Arc::new(index) as Arc<dyn Index + Send + Sync>,
+    ))
 }
 
 /// Adds a single [`ElasticsearchTextIndex`] to a [`TableProvider`] covering all FTS-enabled columns.
@@ -121,18 +157,113 @@ pub(crate) async fn add_elasticsearch_fts_to_table(
     tbl: &datafusion::sql::TableReference,
     fts_params: &runtime_search::store_params::elasticsearch::ElasticsearchFtsConfig,
 ) -> Result<IndexedTableProvider, Box<dyn std::error::Error + Send + Sync>> {
-    use runtime_datafusion_index::Index;
     let index =
         build_elasticsearch_text_index(Arc::clone(&inner_table_provider), columns, tbl, fts_params)
             .await?;
-    let mut provider: IndexedTableProvider =
-        if let Some(idx_tbl) = inner_table_provider.downcast_ref::<IndexedTableProvider>() {
-            idx_tbl.clone()
-        } else {
-            IndexedTableProvider::new(Arc::clone(&inner_table_provider))
-        };
-    provider = provider.add_index(index as Arc<dyn Index + Send + Sync>);
-    Ok(provider)
+    Ok(register_index(
+        &inner_table_provider,
+        index as Arc<dyn Index + Send + Sync>,
+    ))
+}
+
+/// Adds a compound (write-through + fallback) full-text search index to `inner_table_provider`:
+/// a warm local Tantivy tier in front of the external Elasticsearch tier.
+///
+/// Writes fan out to both tiers; reads serve from the warm Tantivy index, falling back to
+/// Elasticsearch on empty results only when `on_zero_results` is
+/// [`ZeroResultsAction::UseSource`] (mirrors the accelerator→source fallback setting). Only the
+/// compound index is registered, so discovery resolves to it ahead of the concrete indexes.
+///
+/// Scope and graceful degradation:
+///  - **Multi-column full-text search** is out of scope: one [`CompoundSearchIndex`] keys on a
+///    single search column, and building one per field would multiply write-through work. Such
+///    datasets register the Elasticsearch index alone (today's behavior, no warm tier, no
+///    regression). Tracked in <https://github.com/spiceai/spiceai/issues/11963>.
+///  - The Elasticsearch tier is the user-configured store, so failing to build it is fatal.
+///  - Building or composing the warm Tantivy tier must **never** fail dataset load: on error the
+///    Elasticsearch index is registered alone and a warning is logged (mirrors the vector warm
+///    index). A common cause is a primary key whose type Elasticsearch normalizes (e.g.
+///    `LargeUtf8` → `Utf8`), which trips the compound compatibility check.
+#[cfg(feature = "elasticsearch")]
+pub(crate) async fn add_compound_fts_to_table(
+    inner_table_provider: Arc<dyn TableProvider>,
+    columns: &[spicepod::semantic::Column],
+    tbl: &datafusion::sql::TableReference,
+    fts_params: &runtime_search::store_params::elasticsearch::ElasticsearchFtsConfig,
+    on_zero_results: &crate::component::dataset::acceleration::ZeroResultsAction,
+) -> Result<IndexedTableProvider, Box<dyn std::error::Error + Send + Sync>> {
+    use crate::component::dataset::acceleration::ZeroResultsAction;
+    use search::index::SearchIndex;
+    use search::index::compound::{CompoundReadMode, CompoundSearchIndex};
+
+    // Multi-column full-text search through the compound is out of scope (#11963): a single
+    // compound keys on one search column, and one compound per field would multiply the
+    // write-through work. Keep the Elasticsearch-only behavior for these datasets.
+    let search_field_count = full_text_search_config(columns, tbl)
+        .map(|config| config.search_fields.len())
+        .unwrap_or_default();
+    if search_field_count > 1 {
+        tracing::info!(
+            "Dataset {tbl} is configured with {search_field_count} full-text search columns; the write-through warm index is single-column only, so full-text searches are served by Elasticsearch directly. Multi-column warm indexing is tracked in https://github.com/spiceai/spiceai/issues/11963."
+        );
+        return add_elasticsearch_fts_to_table(inner_table_provider, columns, tbl, fts_params)
+            .await;
+    }
+
+    // The Elasticsearch tier is the user-configured store; a failure here is a configuration error.
+    let es_index =
+        build_elasticsearch_text_index(Arc::clone(&inner_table_provider), columns, tbl, fts_params)
+            .await?;
+
+    // Warm Tantivy tier over the raw base provider with `store_fields = []`, so its query schema
+    // is exactly `[primary key…, _score]` — the same column set the Elasticsearch tier
+    // emits, which is what the compound's empty-result fallback requires.
+    let warm_index = match build_full_text_database_index(
+        Arc::clone(&inner_table_provider),
+        columns,
+        tbl,
+        Some(&[] as &[String]),
+    ) {
+        Ok(index) => index,
+        Err(source) => {
+            tracing::warn!(
+                "Not adding a warm full-text search index for dataset {tbl}: {source}. Full-text searches will be served by Elasticsearch directly."
+            );
+            return Ok(register_index(
+                &inner_table_provider,
+                es_index as Arc<dyn Index + Send + Sync>,
+            ));
+        }
+    };
+
+    // Mirrors the accelerator→source `on_zero_results` setting: only fall back to the
+    // Elasticsearch secondary on an empty warm-tier result when the dataset opted in.
+    let read_mode = match on_zero_results {
+        ZeroResultsAction::ReturnEmpty => CompoundReadMode::PrimaryOnly,
+        ZeroResultsAction::UseSource => CompoundReadMode::FallbackToSecondary,
+    };
+
+    let compound = match CompoundSearchIndex::try_new(
+        Arc::new(warm_index) as Arc<dyn SearchIndex>,
+        Arc::clone(&es_index) as Arc<dyn SearchIndex>,
+        read_mode,
+    ) {
+        Ok(compound) => compound,
+        Err(source) => {
+            tracing::warn!(
+                "Not adding a warm full-text search index for dataset {tbl}: {source}. Full-text searches will be served by Elasticsearch directly."
+            );
+            return Ok(register_index(
+                &inner_table_provider,
+                es_index as Arc<dyn Index + Send + Sync>,
+            ));
+        }
+    };
+
+    Ok(register_index(
+        &inner_table_provider,
+        Arc::new(compound) as Arc<dyn Index + Send + Sync>,
+    ))
 }
 
 /// Builds (but does not register) an [`ElasticsearchTextIndex`] for all FTS-enabled columns.
@@ -351,6 +482,57 @@ mod tests {
             err.to_string()
                 .contains("row_id column 'missing_id' does not exist in the dataset schema"),
             "unexpected error: {err}"
+        );
+    }
+
+    /// The warm Tantivy tier of the compound is built with `store_fields = []` so its query
+    /// schema is exactly `[primary key…, _score]` — the same column set the Elasticsearch tier
+    /// emits. This is the one non-obvious correctness constraint that lets the compound's
+    /// empty-result fallback project one tier's plan onto the other; guard it directly.
+    #[tokio::test]
+    async fn empty_store_fields_expose_only_primary_key_and_score() {
+        use search::index::SearchIndex;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("body", DataType::Utf8, true),
+        ]));
+        let table =
+            Arc::new(MemTable::try_new(schema, vec![vec![]]).expect("mem table should be created"))
+                as Arc<dyn TableProvider>;
+        let columns = vec![
+            Column::new("body")
+                .with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id")),
+        ];
+        let table_ref = datafusion::sql::TableReference::parse_str("docs");
+
+        let index =
+            build_full_text_database_index(table, &columns, &table_ref, Some(&[] as &[String]))
+                .expect("warm index builds");
+
+        let plan = index
+            .query_table_provider("hello")
+            .expect("query plan builds");
+        let field_names: Vec<String> = plan
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+
+        assert!(
+            field_names.iter().any(|f| f == "id"),
+            "the primary key must be exposed: {field_names:?}"
+        );
+        assert!(
+            field_names
+                .iter()
+                .any(|f| f == search::SEARCH_SCORE_COLUMN_NAME),
+            "the score column must be exposed: {field_names:?}"
+        );
+        assert!(
+            !field_names.iter().any(|f| f == "body"),
+            "an empty store_fields set must not expose the searched content column: {field_names:?}"
         );
     }
 }
