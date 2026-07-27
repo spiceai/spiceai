@@ -43,7 +43,7 @@ const NTLMSSP_NEGOTIATE_VERSION: u32 = 0x0200_0000;
 
 /// Build the NTLMSSP Negotiate (Type 1) message.
 #[must_use]
-pub fn build_negotiate_message() -> Bytes {
+pub(crate) fn build_negotiate_message() -> Bytes {
     let mut buf = BytesMut::with_capacity(40);
     buf.put_slice(NTLMSSP_SIGNATURE);
     buf.put_u32_le(NTLMSSP_NEGOTIATE);
@@ -73,14 +73,14 @@ fn put_ntlm_version(buf: &mut BytesMut) {
 
 #[derive(Debug)]
 pub struct ChallengeMessage {
-    pub server_challenge: [u8; 8],
-    pub negotiate_flags: u32,
-    pub target_info: Vec<u8>,
+    server_challenge: [u8; 8],
+    negotiate_flags: u32,
+    target_info: Vec<u8>,
 }
 
 /// Parse an NTLMSSP Challenge (Type 2) message.
 #[must_use]
-pub fn parse_challenge_message(data: &[u8]) -> Option<ChallengeMessage> {
+pub(crate) fn parse_challenge_message(data: &[u8]) -> Option<ChallengeMessage> {
     if data.len() < 32 || &data[0..8] != NTLMSSP_SIGNATURE {
         return None;
     }
@@ -129,7 +129,7 @@ fn ntlmv2_hash(username: &str, password: &str, domain: &str) -> [u8; 16] {
 /// Build the NTLMSSP Authenticate (Type 3) message.
 /// Returns `(message_bytes, session_base_key)`.
 #[must_use]
-pub fn build_authenticate_message(
+pub(crate) fn build_authenticate_message(
     challenge: &ChallengeMessage,
     username: &str,
     password: &str,
@@ -228,7 +228,7 @@ pub fn build_authenticate_message(
 
 /// Derive the SMB 3.1.1 signing key using SP800-108 Counter Mode KDF.
 #[must_use]
-pub fn derive_signing_key(session_key: &[u8; 16], preauth_hash: &[u8; 64]) -> [u8; 16] {
+pub(crate) fn derive_signing_key(session_key: &[u8; 16], preauth_hash: &[u8; 64]) -> [u8; 16] {
     let label = b"SMBSigningKey\0";
 
     let mut input = Vec::with_capacity(4 + label.len() + 1 + 64 + 4);
@@ -283,7 +283,7 @@ fn generate_client_challenge() -> [u8; 8] {
 /// Extract an NTLMSSP token from a GSS-API / SPNEGO wrapper if present,
 /// or return the data as-is if it's already raw NTLMSSP.
 #[must_use]
-pub fn unwrap_spnego(data: &[u8]) -> &[u8] {
+pub(crate) fn unwrap_spnego(data: &[u8]) -> &[u8] {
     data.windows(8)
         .position(|w| w == NTLMSSP_SIGNATURE)
         .map_or(data, |pos| &data[pos..])
@@ -292,7 +292,7 @@ pub fn unwrap_spnego(data: &[u8]) -> &[u8] {
 /// Wrap an NTLMSSP token in a minimal SPNEGO `NegTokenInit` for the first
 /// message.
 #[must_use]
-pub fn wrap_spnego_negotiate(ntlmssp: &[u8]) -> Vec<u8> {
+pub(crate) fn wrap_spnego_negotiate(ntlmssp: &[u8]) -> Vec<u8> {
     let oid_spnego: &[u8] = &[0x06, 0x06, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x02];
     let oid_ntlmssp: &[u8] = &[
         0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a,
@@ -318,7 +318,7 @@ pub fn wrap_spnego_negotiate(ntlmssp: &[u8]) -> Vec<u8> {
 
 /// Wrap an NTLMSSP auth token in SPNEGO `NegTokenResp`.
 #[must_use]
-pub fn wrap_spnego_auth(ntlmssp: &[u8]) -> Vec<u8> {
+pub(crate) fn wrap_spnego_auth(ntlmssp: &[u8]) -> Vec<u8> {
     let octet_string = der_wrap(0x04, ntlmssp);
     let resp_token = der_wrap(0xa2, &octet_string);
     let seq = der_wrap(0x30, &resp_token);

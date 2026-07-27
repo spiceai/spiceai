@@ -67,7 +67,7 @@ impl std::fmt::Debug for EmbeddingConnector {
 }
 
 impl EmbeddingConnector {
-    pub fn new(
+    pub(crate) fn new(
         inner_connector: Arc<dyn DataConnector>,
         embedding_models: Arc<RwLock<EmbeddingModelStore>>,
         secrets: Arc<RwLock<Secrets>>,
@@ -81,7 +81,7 @@ impl EmbeddingConnector {
 
     /// Wrap an existing [`TableProvider`] with a [`EmbeddingTable`] provider. If no embeddings
     /// are needed for the [`Dataset`], it is not unnecessarily nested.
-    pub(crate) async fn wrap_table(
+    async fn wrap_table(
         &self,
         inner_table_provider: Arc<dyn TableProvider>,
         dataset: &Dataset,
@@ -590,7 +590,7 @@ fn duckdb_embedding_columns(dataset: &Dataset) -> Vec<(String, ColumnLevelEmbedd
 }
 
 #[cfg(feature = "duckdb")]
-pub(crate) fn duckdb_vector_store_for_view(view: &View) -> Option<VectorStore> {
+fn duckdb_vector_store_for_view(view: &View) -> Option<VectorStore> {
     if let Some(vector_engine) = &view.vectors
         && vector_engine.enabled
         && vector_engine.engine.as_deref() == Some("duckdb")
@@ -612,7 +612,7 @@ pub(crate) fn duckdb_vector_store_for_view(view: &View) -> Option<VectorStore> {
 }
 
 #[cfg(feature = "duckdb")]
-pub(crate) fn duckdb_embedding_columns_from_view(
+fn duckdb_embedding_columns_from_view(
     view: &View,
 ) -> Vec<(String, ColumnLevelEmbeddingConfig)> {
     let mut embedding_columns = Vec::new();

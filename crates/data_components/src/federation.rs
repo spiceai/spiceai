@@ -48,7 +48,7 @@ pub struct DenyFunctionsSqlExecutor<T: 'static, P: 'static> {
 
 impl<T: 'static, P: 'static> DenyFunctionsSqlExecutor<T, P> {
     #[must_use]
-    pub fn new(inner: Arc<SqlTable<T, P>>, function_support: Option<FunctionSupport>) -> Self {
+    fn new(inner: Arc<SqlTable<T, P>>, function_support: Option<FunctionSupport>) -> Self {
         Self {
             inner,
             function_support,

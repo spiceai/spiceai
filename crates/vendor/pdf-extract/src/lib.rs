@@ -1562,10 +1562,10 @@ fn show_text(
 
 #[derive(Debug, Clone, Copy)]
 pub struct MediaBox {
-    pub llx: f64,
-    pub lly: f64,
-    pub urx: f64,
-    pub ury: f64,
+    llx: f64,
+    lly: f64,
+    urx: f64,
+    ury: f64,
 }
 
 fn apply_state(doc: &Document, gs: &mut GraphicsState, state: &Dictionary) {
@@ -1614,7 +1614,7 @@ pub enum PathOp {
 
 #[derive(Debug)]
 pub struct Path {
-    pub ops: Vec<PathOp>,
+    ops: Vec<PathOp>,
 }
 
 impl Path {

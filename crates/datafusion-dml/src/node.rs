@@ -39,7 +39,7 @@ pub enum DmlNodeOp {
 }
 
 impl DmlNodeOp {
-    pub(crate) fn kind_label(&self) -> &'static str {
+    fn kind_label(&self) -> &'static str {
         match self {
             Self::Delete(_) => "Delete",
             Self::Update(_) => "Update",
@@ -48,7 +48,7 @@ impl DmlNodeOp {
         }
     }
 
-    pub(crate) fn target_table_name(&self) -> String {
+    fn target_table_name(&self) -> String {
         match self {
             Self::Delete(p) => p.table_name.to_string(),
             Self::Update(p) => p.table_name.to_string(),
@@ -67,7 +67,7 @@ pub struct DmlExtensionNode {
     /// DML operation and its full parameters.
     pub op: DmlNodeOp,
     /// Handler that will convert this node to a physical plan.
-    pub handler: Arc<dyn CatalogDmlHandler>,
+    pub(crate) handler: Arc<dyn CatalogDmlHandler>,
     inputs: Vec<Arc<LogicalPlan>>,
     output_schema: DFSchemaRef,
 }

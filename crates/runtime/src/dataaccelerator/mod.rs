@@ -64,7 +64,7 @@ pub mod upsert_dedup;
 
 pub use runtime_acceleration::BootstrapStatus;
 pub(crate) use snapshots::validate_snapshot_paths;
-pub use snapshots::{CayenneSnapshotValidationError, validate_cayenne_snapshot_consistency};
+pub(crate) use snapshots::{CayenneSnapshotValidationError, validate_cayenne_snapshot_consistency};
 pub use types::{AccelerationSource, AcceleratorEngineRegistry};
 
 #[derive(Clone, Copy)]
@@ -562,7 +562,7 @@ pub type ReloadProviderFactory = Arc<
      (DuckDB, SQLite, Cayenne, or Turso)."
 ))]
 pub struct SnapshotReloadUnsupported {
-    pub engine: &'static str,
+    engine: &'static str,
 }
 
 /// Error returned by the default [`DataAccelerator::evolve_table_schema`]
@@ -573,10 +573,10 @@ pub struct SnapshotReloadUnsupported {
      The acceleration must be recreated to apply the new schema."
 ))]
 pub struct SchemaEvolutionUnsupported {
-    pub engine: &'static str,
+    engine: &'static str,
 }
 
-pub struct AcceleratorExternalTableBuilder {
+struct AcceleratorExternalTableBuilder {
     table_name: TableReference,
     schema: SchemaRef,
     engine: Engine,
@@ -590,7 +590,7 @@ pub struct AcceleratorExternalTableBuilder {
 
 impl AcceleratorExternalTableBuilder {
     #[must_use]
-    pub fn new(table_name: TableReference, schema: SchemaRef, engine: Engine) -> Self {
+    fn new(table_name: TableReference, schema: SchemaRef, engine: Engine) -> Self {
         Self {
             table_name,
             schema,
@@ -605,37 +605,37 @@ impl AcceleratorExternalTableBuilder {
     }
 
     #[must_use]
-    pub fn indexes(mut self, indexes: HashMap<ColumnReference, IndexType>) -> Self {
+    fn indexes(mut self, indexes: HashMap<ColumnReference, IndexType>) -> Self {
         self.indexes = indexes;
         self
     }
 
     #[must_use]
-    pub fn on_conflict(mut self, on_conflict: OnConflict) -> Self {
+    fn on_conflict(mut self, on_conflict: OnConflict) -> Self {
         self.on_conflict = Some(on_conflict);
         self
     }
 
     #[must_use]
-    pub fn mode(mut self, mode: Mode) -> Self {
+    fn mode(mut self, mode: Mode) -> Self {
         self.mode = mode;
         self
     }
 
     #[must_use]
-    pub fn options(mut self, options: Parameters) -> Self {
+    fn options(mut self, options: Parameters) -> Self {
         self.options = Some(options);
         self
     }
 
     #[must_use]
-    pub fn constraints(mut self, constraints: Constraints) -> Self {
+    fn constraints(mut self, constraints: Constraints) -> Self {
         self.constraints = Some(constraints);
         self
     }
 
     #[must_use]
-    pub fn upsert_options(mut self, upsert_options: UpsertOptions) -> Self {
+    fn upsert_options(mut self, upsert_options: UpsertOptions) -> Self {
         self.upsert_options = upsert_options;
         self
     }
@@ -657,7 +657,7 @@ impl AcceleratorExternalTableBuilder {
         }
     }
 
-    pub fn build(self) -> Result<CreateExternalTable> {
+    fn build(self) -> Result<CreateExternalTable> {
         self.validate()?;
 
         let mut options: HashMap<String, String> = self
@@ -731,7 +731,7 @@ impl AcceleratorExternalTableBuilder {
     }
 }
 
-pub async fn acceleration_file_path(
+pub(crate) async fn acceleration_file_path(
     source: &dyn AccelerationSource,
     registry: &AcceleratorEngineRegistry,
 ) -> Result<PathBuf, FilePathError> {
@@ -758,7 +758,7 @@ pub async fn acceleration_file_path(
 /// - Directory-based engines (Cayenne): `AccelerationLayout::cayenne`
 ///
 /// This is used for snapshots and size metrics.
-pub async fn get_acceleration_layout(
+pub(crate) async fn get_acceleration_layout(
     source: &dyn AccelerationSource,
     registry: &AcceleratorEngineRegistry,
 ) -> Result<AccelerationLayout, FilePathError> {

@@ -30,12 +30,12 @@ use crate::SEARCH_SCORE_COLUMN_NAME;
 use super::hnsw::DuckDBHnswOptions;
 
 /// CTE name used for the inner nearest-neighbor subquery.
-pub(super) const CTE_NAME: &str = "__spice_nn";
+const CTE_NAME: &str = "__spice_nn";
 /// Alias for the pre-computed distance value inside the CTE.
-pub(super) const CTE_DISTANCE_ALIAS: &str = "__spice_dist";
+const CTE_DISTANCE_ALIAS: &str = "__spice_dist";
 
-pub(super) const DEFAULT_DUCKDB_VECTOR_SEARCH_LIMIT: usize = 1000;
-pub(super) const EMPTY_PROJECTION_ROW_COLUMN: &str = "__spice_empty_projection_row";
+const DEFAULT_DUCKDB_VECTOR_SEARCH_LIMIT: usize = 1000;
+const EMPTY_PROJECTION_ROW_COLUMN: &str = "__spice_empty_projection_row";
 
 /// Build vector search SQL for DuckDB.
 ///

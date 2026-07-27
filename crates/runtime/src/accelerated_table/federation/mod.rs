@@ -59,7 +59,7 @@ impl AcceleratedTable {
     }
 
     #[must_use]
-    pub fn table_provider(self: Arc<Self>) -> Arc<dyn TableProvider> {
+    pub(crate) fn table_provider(self: Arc<Self>) -> Arc<dyn TableProvider> {
         match Arc::clone(&self).create_federated_table_source() {
             Some(table_source) => Arc::new(FederatedTableProviderAdaptor::new_with_provider(
                 table_source,

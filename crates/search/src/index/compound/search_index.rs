@@ -49,7 +49,7 @@ impl CompoundSearchIndex {
     /// # Errors
     ///
     /// Returns an [`Error`] describing the first incompatibility found.
-    pub fn try_new(
+    pub(crate) fn try_new(
         primary: Arc<dyn SearchIndex>,
         secondary: Arc<dyn SearchIndex>,
         read_mode: CompoundReadMode,

@@ -157,7 +157,7 @@ pub enum SqlBuildError {
     InputSchemaMismatch { details: String },
 }
 
-pub type Result<T, E = SqlBuildError> = std::result::Result<T, E>;
+pub(crate) type Result<T, E = SqlBuildError> = std::result::Result<T, E>;
 
 /// Build a [`ScalarUDF`] from a [`Function`] declaration whose `from: sql`
 /// body has been extracted by the caller.
@@ -168,7 +168,7 @@ pub type Result<T, E = SqlBuildError> = std::result::Result<T, E>;
 /// unsupported, `signature.returns` is missing, the body cannot be
 /// parsed or lowered to a physical expression, or the body's computed
 /// return type is not coercible to the declared return type.
-pub fn build_scalar_udf(decl: &Function, body: &str) -> Result<Arc<ScalarUDF>> {
+pub(crate) fn build_scalar_udf(decl: &Function, body: &str) -> Result<Arc<ScalarUDF>> {
     if !decl.signature.tables.is_empty() {
         return build_scalar_table_arg_udf(decl, body);
     }
@@ -393,7 +393,7 @@ impl ScalarUDFImpl for SqlScalarUdf {
 /// Returns [`SqlBuildError`] when the return schema is missing or invalid, any
 /// argument type is invalid, or the query cannot be planned against a typed
 /// `args` table.
-pub async fn build_table_udtf(decl: &Function, body: &str) -> Result<Arc<dyn TableFunctionImpl>> {
+pub(crate) async fn build_table_udtf(decl: &Function, body: &str) -> Result<Arc<dyn TableFunctionImpl>> {
     let arg_schema = function_arg_schema(&decl.signature.args)?;
     let table_args = table_arg_specs(&decl.signature.tables)?;
     let output_schema = table_return_schema(decl)?;

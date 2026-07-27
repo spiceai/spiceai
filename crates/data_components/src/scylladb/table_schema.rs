@@ -37,7 +37,7 @@ pub enum Error {
     TableNotFound { keyspace: String, table: String },
 }
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Encapsulates `ScyllaDB` table schema with partition and clustering key information.
 ///
@@ -57,7 +57,7 @@ pub struct ScyllaDBTableSchema {
 impl ScyllaDBTableSchema {
     /// Creates a new `ScyllaDBTableSchema` with the given key columns.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         keyspace: impl Into<Arc<str>>,
         table: impl Into<Arc<str>>,
         partition_keys: Vec<String>,
@@ -84,7 +84,7 @@ impl ScyllaDBTableSchema {
     /// # Returns
     ///
     /// A `ScyllaDBTableSchema` with partition and clustering key information.
-    pub async fn fetch(session: &Session, keyspace: &str, table: &str) -> Result<Self, Error> {
+    pub(crate) async fn fetch(session: &Session, keyspace: &str, table: &str) -> Result<Self, Error> {
         // Escape single quotes to prevent CQL injection
         let escaped_keyspace = keyspace.replace('\'', "''");
         let escaped_table = table.replace('\'', "''");
@@ -151,25 +151,25 @@ impl ScyllaDBTableSchema {
 
     /// Returns the keyspace name.
     #[must_use]
-    pub fn keyspace(&self) -> &str {
+    fn keyspace(&self) -> &str {
         &self.keyspace
     }
 
     /// Returns the table name.
     #[must_use]
-    pub fn table(&self) -> &str {
+    fn table(&self) -> &str {
         &self.table
     }
 
     /// Returns the partition key columns in order.
     #[must_use]
-    pub fn partition_keys(&self) -> &[String] {
+    fn partition_keys(&self) -> &[String] {
         &self.partition_keys
     }
 
     /// Returns the clustering key columns in order.
     #[must_use]
-    pub fn clustering_keys(&self) -> &[String] {
+    fn clustering_keys(&self) -> &[String] {
         &self.clustering_keys
     }
 
@@ -178,13 +178,13 @@ impl ScyllaDBTableSchema {
     /// For composite partition keys, this returns only the first column.
     /// Use `partition_keys()` to get all partition key columns.
     #[must_use]
-    pub fn partition_key(&self) -> Option<&str> {
+    fn partition_key(&self) -> Option<&str> {
         self.partition_keys.first().map(String::as_str)
     }
 
     /// Returns the first clustering key column, if any.
     #[must_use]
-    pub fn clustering_key(&self) -> Option<&str> {
+    fn clustering_key(&self) -> Option<&str> {
         self.clustering_keys.first().map(String::as_str)
     }
 
@@ -202,7 +202,7 @@ impl ScyllaDBTableSchema {
     /// This implementation only pushes down filters on the first partition key column
     /// (for simplicity) and optionally the first clustering key column.
     #[must_use]
-    pub fn supports_filters_pushdown(&self, filters: &[&Expr]) -> Vec<TableProviderFilterPushDown> {
+    pub(crate) fn supports_filters_pushdown(&self, filters: &[&Expr]) -> Vec<TableProviderFilterPushDown> {
         let partition_key = self.partition_key();
         let clustering_key = self.clustering_key();
 
@@ -241,7 +241,7 @@ impl ScyllaDBTableSchema {
     /// partition key equality filter is found, otherwise returns `None` and all
     /// filters in the other list.
     #[must_use]
-    pub fn separate_key_filters(
+    pub(crate) fn separate_key_filters(
         &self,
         filters: &[Expr],
     ) -> (Option<(Expr, Option<Expr>)>, Vec<Expr>) {

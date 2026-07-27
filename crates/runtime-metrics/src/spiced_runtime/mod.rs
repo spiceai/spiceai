@@ -16,7 +16,7 @@ limitations under the License.
 
 use super::{Counter, LazyLock, Meter, global};
 
-pub static RUNTIME_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("runtime"));
+static RUNTIME_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("runtime"));
 
 pub static FLIGHT_SERVER_START: LazyLock<Counter<u64>> = LazyLock::new(|| {
     RUNTIME_METER

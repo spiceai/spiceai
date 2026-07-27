@@ -29,10 +29,10 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 /// Maximum number of items per `BatchWriteItem` request (`DynamoDB` limit).
-pub(crate) const DYNAMODB_BATCH_WRITE_MAX: usize = 25;
+const DYNAMODB_BATCH_WRITE_MAX: usize = 25;
 
 /// Default number of concurrent `BatchWriteItem` requests.
-pub const DEFAULT_WRITE_PARALLELISM: usize = 5;
+pub(crate) const DEFAULT_WRITE_PARALLELISM: usize = 5;
 
 /// Maximum number of retries for unprocessed items.
 const MAX_UNPROCESSED_RETRIES: usize = 8;

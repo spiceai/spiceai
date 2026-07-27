@@ -78,7 +78,7 @@ pub enum Error {
     AuthenticationError,
 }
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// `ScyllaDB` data connector.
 #[derive(Debug)]
@@ -92,12 +92,12 @@ pub struct ScyllaDbFactory {}
 
 impl ScyllaDbFactory {
     #[must_use]
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {}
     }
 
     #[must_use]
-    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+    fn new_arc() -> Arc<dyn DataConnectorFactory> {
         Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
     }
 }

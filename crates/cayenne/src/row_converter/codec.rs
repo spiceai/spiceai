@@ -164,7 +164,7 @@ pub(crate) enum LengthTracker {
 }
 
 impl LengthTracker {
-    pub(crate) fn new(num_rows: usize) -> Self {
+    fn new(num_rows: usize) -> Self {
         Self::Fixed {
             length: 0,
             num_rows,
@@ -200,7 +200,7 @@ impl LengthTracker {
 
     /// Initialize `offsets` (shifted down by one row) from the tracked lengths, returning the
     /// total encoded byte length.
-    pub(crate) fn extend_offsets(&self, initial_offset: usize, offsets: &mut Vec<usize>) -> usize {
+    fn extend_offsets(&self, initial_offset: usize, offsets: &mut Vec<usize>) -> usize {
         match self {
             LengthTracker::Fixed { length, num_rows } => {
                 offsets.extend((0..*num_rows).map(|i| initial_offset + i * length));

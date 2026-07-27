@@ -45,9 +45,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
-pub const PREFIX: &str = "adbc";
+pub(crate) const PREFIX: &str = "adbc";
 
-pub const PARAMETERS: &[ParameterSpec] = &[
+pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("driver")
         .description("The ADBC driver name (e.g., 'duckdb', 'sqlite', 'postgres', 'snowflake')")
         .required(),
@@ -142,7 +142,7 @@ pub struct AdbcCatalog {
 
 impl AdbcCatalog {
     #[must_use]
-    pub fn new_connector(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
+    pub(crate) fn new_connector(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
         Arc::new(Self { params })
     }
 }

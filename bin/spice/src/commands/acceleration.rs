@@ -62,7 +62,7 @@ pub enum AccelerationCommand {
 #[derive(Args, Debug)]
 pub struct SnapshotsArgs {
     /// The dataset name
-    pub dataset: String,
+    dataset: String,
 
     /// Output format
     #[arg(long, short = 'o', default_value = "table")]
@@ -70,17 +70,17 @@ pub struct SnapshotsArgs {
 
     /// Maximum number of snapshots to return (most recent first)
     #[arg(long, default_value = "10")]
-    pub limit: usize,
+    limit: usize,
 }
 
 /// Arguments for the snapshot subcommand.
 #[derive(Args, Debug)]
 pub struct SnapshotArgs {
     /// The dataset name
-    pub dataset: String,
+    dataset: String,
 
     /// The snapshot ID
-    pub snapshot_id: u64,
+    snapshot_id: u64,
 
     /// Output format
     #[arg(long, short = 'o', default_value = "table")]
@@ -91,10 +91,10 @@ pub struct SnapshotArgs {
 #[derive(Args, Debug)]
 pub struct SetSnapshotArgs {
     /// The dataset name
-    pub dataset: String,
+    dataset: String,
 
     /// The snapshot ID to set as current
-    pub snapshot_id: u64,
+    snapshot_id: u64,
 
     /// Output format
     #[arg(long, short = 'o', default_value = "table")]
@@ -104,27 +104,27 @@ pub struct SetSnapshotArgs {
 /// Snapshot information from the API.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct SnapshotInfo {
-    pub snapshot_id: u64,
-    pub timestamp_ms: i64,
-    pub location: String,
-    pub checksum: String,
-    pub checksum_algorithm: String,
-    pub size_bytes: u64,
-    pub engine: Option<String>,
-    pub row_count: Option<u64>,
-    pub is_current: bool,
-    pub status: String,
+    snapshot_id: u64,
+    timestamp_ms: i64,
+    location: String,
+    checksum: String,
+    checksum_algorithm: String,
+    size_bytes: u64,
+    engine: Option<String>,
+    row_count: Option<u64>,
+    is_current: bool,
+    status: String,
 }
 
 /// Snapshot summary from the API.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct SnapshotSummary {
-    pub dataset_name: String,
-    pub location: String,
-    pub last_updated_ms: i64,
-    pub engine: Option<String>,
-    pub current_snapshot_id: Option<u64>,
-    pub snapshots: Vec<SnapshotInfo>,
+    dataset_name: String,
+    location: String,
+    last_updated_ms: i64,
+    engine: Option<String>,
+    current_snapshot_id: Option<u64>,
+    snapshots: Vec<SnapshotInfo>,
 }
 
 /// Request to set the current snapshot.

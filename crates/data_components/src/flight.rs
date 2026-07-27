@@ -207,7 +207,7 @@ impl std::fmt::Debug for FlightTable {
 }
 
 impl FlightTable {
-    pub async fn create(
+    async fn create(
         name: &'static str,
         client: FlightClient,
         table_reference: impl Into<RemoteTableRef>,
@@ -260,7 +260,7 @@ impl FlightTable {
 
     /// Install the federation function deny-list (see [`FunctionSupport`]).
     #[must_use]
-    pub fn with_function_support(mut self, function_support: Option<FunctionSupport>) -> Self {
+    fn with_function_support(mut self, function_support: Option<FunctionSupport>) -> Self {
         self.function_support = function_support;
         self
     }

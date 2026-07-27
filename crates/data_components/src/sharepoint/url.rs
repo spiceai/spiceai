@@ -36,7 +36,7 @@ use object_store::path::Path;
 use snafu::Snafu;
 use url::Url;
 
-pub const SHAREPOINT_SCHEME: &str = "sharepoint";
+const SHAREPOINT_SCHEME: &str = "sharepoint";
 
 /// Identifies a SharePoint drive target resolvable via an ID only (or the
 /// `me` shortcut). Distinct from [`crate::sharepoint::client::PublicDrivePtr`]

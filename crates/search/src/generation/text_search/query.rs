@@ -33,14 +33,14 @@ use datafusion::{
 /// [`RecordBatch`] results will be ordered by the relevancy score.
 #[derive(Debug)]
 pub struct FullTextSearchQuery {
-    pub index: Arc<FullTextSearchFieldIndex>,
-    pub query: String,
+    pub(crate) index: Arc<FullTextSearchFieldIndex>,
+    pub(crate) query: String,
 
     /// If Some(N), will only retrieve `N` results from the index. If filters are provided that are
     /// unsupported by the index (i.e. via its[`TableProvider::supports_filters_pushdown`] ), then
     ///  `< N` will be returned in the overall SQL query.
     /// If a `limit` is provided such that `limit` < `pre_limit`, `limit` will be used.
-    pub pre_limit: Option<usize>,
+    pub(crate) pre_limit: Option<usize>,
 }
 
 impl FullTextSearchQuery {

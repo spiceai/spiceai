@@ -65,7 +65,7 @@ use crate::SecretStore;
 /// Kubernetes and JWT require `hashicorp_vault_role` and a JWT (Kubernetes can also
 /// read it from `hashicorp_vault_kubernetes_token_path`, defaulting to the in-cluster
 /// service-account token).
-pub const PARAMETERS: &[ParameterSpec] = &[
+pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("hashicorp_vault_address")
         .description(
             "Vault server URL, e.g. `https://vault.example.com:8200`. \
@@ -325,22 +325,22 @@ impl AuthMethod {
 /// manual impl below redacts them.
 #[derive(Clone)]
 pub struct HashicorpVaultConfig {
-    pub path: String,
-    pub address: String,
-    pub namespace: Option<String>,
-    pub mount: String,
-    pub kv_version: KvVersion,
-    pub auth_method: AuthMethod,
-    pub auth_mount: Option<String>,
-    pub token: Option<SecretString>,
-    pub role_id: Option<String>,
-    pub secret_id: Option<SecretString>,
-    pub role: Option<String>,
-    pub jwt: Option<SecretString>,
-    pub kubernetes_token_path: Option<String>,
-    pub ca_cert: Option<String>,
-    pub tls_skip_verify: bool,
-    pub request_timeout: Duration,
+    pub(crate) path: String,
+    pub(crate) address: String,
+    pub(crate) namespace: Option<String>,
+    pub(crate) mount: String,
+    pub(crate) kv_version: KvVersion,
+    pub(crate) auth_method: AuthMethod,
+    auth_mount: Option<String>,
+    pub(crate) token: Option<SecretString>,
+    pub(crate) role_id: Option<String>,
+    pub(crate) secret_id: Option<SecretString>,
+    role: Option<String>,
+    jwt: Option<SecretString>,
+    kubernetes_token_path: Option<String>,
+    ca_cert: Option<String>,
+    tls_skip_verify: bool,
+    request_timeout: Duration,
 }
 
 impl std::fmt::Debug for HashicorpVaultConfig {

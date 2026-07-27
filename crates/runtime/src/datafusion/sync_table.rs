@@ -42,7 +42,7 @@ use runtime_datafusion::schema_provider::SpiceSchemaProvider;
 
 /// A [`SchemaProvider`] whose tables are cached and can therefore be resolved
 /// synchronously (no async, no catalog I/O).
-pub(crate) trait SyncTableProvider {
+trait SyncTableProvider {
     /// Look up a table by name from the provider's in-memory cache.
     fn sync_table(&self, name: &str) -> Option<Arc<dyn TableProvider>>;
 }

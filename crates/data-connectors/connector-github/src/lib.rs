@@ -153,7 +153,7 @@ impl std::fmt::Debug for Github {
     }
 }
 
-pub struct GitHubTableGraphQLParams {
+pub(crate) struct GitHubTableGraphQLParams {
     /// The GraphQL query string
     query: Arc<str>,
 
@@ -167,7 +167,7 @@ pub struct GitHubTableGraphQLParams {
 
 impl GitHubTableGraphQLParams {
     #[must_use]
-    pub fn new(
+    fn new(
         query: Arc<str>,
         json_pointer: Option<&'static str>,
         unnest_behavior: UnnestBehavior,
@@ -182,7 +182,7 @@ impl GitHubTableGraphQLParams {
     }
 }
 
-pub trait GitHubTableArgs: Send + Sync {
+pub(crate) trait GitHubTableArgs: Send + Sync {
     fn get_graphql_values(&self) -> GitHubTableGraphQLParams;
     fn get_component(&self) -> ConnectorComponent;
 }
@@ -365,7 +365,7 @@ impl Github {
         }
     }
 
-    pub(crate) async fn create_graphql_client(
+    async fn create_graphql_client(
         &self,
         tbl: &Arc<dyn GitHubTableArgs>,
     ) -> std::result::Result<GraphQLClient, Box<dyn std::error::Error + Send + Sync>> {
@@ -545,7 +545,7 @@ impl Github {
         )
     }
 
-    pub(crate) fn create_rest_client(
+    fn create_rest_client(
         &self,
     ) -> std::result::Result<GithubRestClient, Box<dyn std::error::Error + Send + Sync>> {
         let token = self
@@ -731,12 +731,12 @@ pub struct GithubFactory {}
 
 impl GithubFactory {
     #[must_use]
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {}
     }
 
     #[must_use]
-    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+    fn new_arc() -> Arc<dyn DataConnectorFactory> {
         Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
     }
 }
@@ -1390,7 +1390,7 @@ impl DataConnector for Github {
     }
 }
 
-pub fn parse_globs(
+fn parse_globs(
     component: &ConnectorComponent,
     input: &str,
 ) -> DataConnectorResult<Arc<GlobSet>> {

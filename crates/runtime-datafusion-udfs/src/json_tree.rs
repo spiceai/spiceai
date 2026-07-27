@@ -116,9 +116,9 @@ fn record_error(kind: &'static str) {
 
 #[derive(Debug, Clone)]
 pub struct JsonTreeOptions {
-    pub max_depth: usize,
-    pub max_rows: usize,
-    pub max_bytes: usize,
+    max_depth: usize,
+    max_rows: usize,
+    max_bytes: usize,
 }
 
 impl Default for JsonTreeOptions {
@@ -163,25 +163,25 @@ static ROW_LIST_TYPE: LazyLock<DataType> = LazyLock::new(|| {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeRow {
-    pub key: Option<String>,
-    pub value: Option<String>,
-    pub type_name: &'static str,
-    pub atom: Option<String>,
-    pub id: i64,
-    pub parent: Option<i64>,
-    pub fullkey: String,
-    pub path: Option<String>,
+    key: Option<String>,
+    value: Option<String>,
+    type_name: &'static str,
+    atom: Option<String>,
+    id: i64,
+    parent: Option<i64>,
+    fullkey: String,
+    path: Option<String>,
 }
 
 // -------- Public entry points --------
 
 #[must_use]
-pub fn json_tree(input: &str) -> Vec<TreeRow> {
+fn json_tree(input: &str) -> Vec<TreeRow> {
     json_tree_with_options(input, &JsonTreeOptions::default())
 }
 
 #[must_use]
-pub fn json_tree_with_options(input: &str, opts: &JsonTreeOptions) -> Vec<TreeRow> {
+fn json_tree_with_options(input: &str, opts: &JsonTreeOptions) -> Vec<TreeRow> {
     INVOCATIONS.add(1, &[]);
 
     if input.len() > opts.max_bytes {

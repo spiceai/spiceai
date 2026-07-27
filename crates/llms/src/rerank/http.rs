@@ -69,7 +69,7 @@ pub(crate) struct CohereLikeResult {
 /// Use this for BYO [`HttpReranker`] endpoints, which may be quirky. Native
 /// providers (Cohere, Voyage, Jina) should use [`scores_from_results_strict`]
 /// so a partial/invalid provider response fails fast.
-pub(crate) fn scores_from_results(results: &[CohereLikeResult], expected: usize) -> Vec<f32> {
+fn scores_from_results(results: &[CohereLikeResult], expected: usize) -> Vec<f32> {
     let mut out = vec![0.0_f32; expected];
     for entry in results {
         if entry.index < expected {

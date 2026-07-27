@@ -35,7 +35,7 @@ use hash_index::hash_key_128;
 /// fast, well-distributed non-cryptographic hash (the threat here is accidental
 /// bit-rot / a bad object-store round-trip, not an adversary) that is already a
 /// Cayenne dependency via `hash_index`, so it adds no new crate.
-pub(crate) const DIGEST_ALGORITHM: &str = "xxh3-128";
+const DIGEST_ALGORITHM: &str = "xxh3-128";
 
 /// Compute the integrity digest of `bytes`, formatted as
 /// `"xxh3-128:<32-lowercase-hex>"`.

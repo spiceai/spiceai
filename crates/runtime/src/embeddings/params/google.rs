@@ -23,8 +23,8 @@ use secrecy::SecretString;
 pub struct GoogleEmbeddingParams {
     /// The Google API key.
     #[param(autoload_secret)]
-    pub api_key: SecretString,
+    pub(crate) api_key: SecretString,
     /// The number of dimensions for the embedding output.
     #[param(runtime)]
-    pub dimensions: Option<u32>,
+    pub(crate) dimensions: Option<u32>,
 }

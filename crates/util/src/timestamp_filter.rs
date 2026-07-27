@@ -196,7 +196,7 @@ impl TimestampFilterConvert {
 ///
 /// Returns a string like `2024-01-25T20:43:41.000000000`.
 #[must_use]
-pub fn nanos_to_iso8601_string(nanos: u128) -> String {
+fn nanos_to_iso8601_string(nanos: u128) -> String {
     let format_max_timestamp = || {
         tracing::warn!(
             "Timestamp value {nanos}ns exceeds chrono range; saturating ISO 8601 filter literal to the maximum representable UTC timestamp"

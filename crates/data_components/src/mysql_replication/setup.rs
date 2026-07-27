@@ -42,26 +42,26 @@ use snafu::prelude::*;
 /// [`TableLayout::columns`] is the binlog row-image index.
 #[derive(Clone, Debug)]
 pub struct SourceColumn {
-    pub name: String,
+    pub(crate) name: String,
     /// Raw `information_schema.COLUMNS.COLUMN_TYPE` (e.g. `int`,
     /// `varchar(255)`, `enum('a','b')`). Captured so a checkpoint can detect
     /// source-only layout changes (reorder / retype) that leave the dataset
     /// Arrow schema unchanged.
-    pub column_type: String,
+    pub(crate) column_type: String,
     /// For `ENUM` columns: the 1-based variant labels. Binlog row images
     /// carry only the variant *index*.
-    pub enum_variants: Option<Arc<[String]>>,
+    pub(crate) enum_variants: Option<Arc<[String]>>,
     /// For `SET` columns: the member labels. Binlog row images carry only a
     /// member *bitmask*.
-    pub set_variants: Option<Arc<[String]>>,
+    pub(crate) set_variants: Option<Arc<[String]>>,
     /// Part of the source table's PRIMARY KEY.
-    pub is_primary_key: bool,
+    pub(crate) is_primary_key: bool,
 }
 
 /// The positional column layout of the source table.
 #[derive(Clone, Debug)]
 pub struct TableLayout {
-    pub columns: Vec<SourceColumn>,
+    pub(crate) columns: Vec<SourceColumn>,
 }
 
 impl TableLayout {
@@ -71,7 +71,7 @@ impl TableLayout {
     /// (where pgoutput omits GENERATED columns) `MySQL` row images carry every
     /// table column, so an unmapped field means the dataset schema has
     /// drifted from the source table.
-    pub fn column_map(
+    pub(crate) fn column_map(
         &self,
         dataset_schema: &SchemaRef,
         database: &str,
@@ -114,7 +114,7 @@ impl TableLayout {
     /// Format (one line per ordinal, `\n`-joined):
     /// `{ordinal}\t{name}\t{column_type}\t{PRI|}\n`
     #[must_use]
-    pub fn fingerprint(&self) -> String {
+    pub(crate) fn fingerprint(&self) -> String {
         let mut out = String::with_capacity(self.columns.len().saturating_mul(48));
         for (ordinal, col) in self.columns.iter().enumerate() {
             use std::fmt::Write as _;
@@ -131,13 +131,13 @@ impl TableLayout {
 }
 
 /// Open a plain (non-binlog) connection for setup/snapshot queries.
-pub async fn connect(params: &ReplicationParams) -> Result<Conn> {
+pub(crate) async fn connect(params: &ReplicationParams) -> Result<Conn> {
     Conn::new(params.opts.clone()).await.context(ConnectSnafu)
 }
 
 /// Validate that the source server is configured for row-based binlog
 /// replication. Each failure carries the exact server setting to change.
-pub async fn validate_server(conn: &mut Conn) -> Result<()> {
+pub(crate) async fn validate_server(conn: &mut Conn) -> Result<()> {
     let settings: Option<(i64, String, String)> = conn
         .query_first("SELECT @@log_bin, @@binlog_format, @@binlog_row_image")
         .await
@@ -261,7 +261,7 @@ pub async fn fetch_table_layout(
 ///
 /// Uses `SHOW BINARY LOG STATUS` (`MySQL` 8.2+; the only form on 8.4+) and
 /// falls back to `SHOW MASTER STATUS` on older servers.
-pub async fn fetch_head_position(conn: &mut Conn) -> Result<BinlogPosition> {
+pub(crate) async fn fetch_head_position(conn: &mut Conn) -> Result<BinlogPosition> {
     let row = match conn.query_first::<Row, _>("SHOW BINARY LOG STATUS").await {
         Ok(row) => row,
         Err(e) if is_unknown_statement(&e) => conn
@@ -304,7 +304,7 @@ pub async fn fetch_head_position(conn: &mut Conn) -> Result<BinlogPosition> {
 /// auto-positioning; `OFF` and the transitional `ON_PERMISSIVE`/`OFF_PERMISSIVE`
 /// states (a mixed topology can still emit anonymous transactions, which GTID
 /// auto-positioning cannot resume from) mean file+offset.
-pub async fn detect_gtid_mode(conn: &mut Conn) -> Result<Option<String>> {
+pub(crate) async fn detect_gtid_mode(conn: &mut Conn) -> Result<Option<String>> {
     match conn
         .query_first::<Option<String>, _>("SELECT @@GLOBAL.gtid_mode")
         .await
@@ -322,7 +322,7 @@ pub async fn detect_gtid_mode(conn: &mut Conn) -> Result<Option<String>> {
 /// Whether an observed [`detect_gtid_mode`] value enables GTID auto-positioning
 /// (exactly `ON`). `None` (GTIDs unsupported) is not on.
 #[must_use]
-pub fn gtid_mode_is_on(observed: Option<&str>) -> bool {
+pub(crate) fn gtid_mode_is_on(observed: Option<&str>) -> bool {
     matches!(observed, Some(mode) if mode.eq_ignore_ascii_case("ON"))
 }
 
@@ -334,7 +334,7 @@ pub fn gtid_mode_is_on(observed: Option<&str>) -> bool {
 ///
 /// The returned set is empty when the server reports no executed GTIDs (a
 /// freshly-reset GTID-enabled server), which is a valid starting point.
-pub async fn fetch_head_and_gtid(conn: &mut Conn) -> Result<(BinlogPosition, GtidSet)> {
+pub(crate) async fn fetch_head_and_gtid(conn: &mut Conn) -> Result<(BinlogPosition, GtidSet)> {
     let row = match conn.query_first::<Row, _>("SHOW BINARY LOG STATUS").await {
         Ok(row) => row,
         Err(e) if is_unknown_statement(&e) => conn
@@ -374,7 +374,7 @@ pub async fn fetch_head_and_gtid(conn: &mut Conn) -> Result<(BinlogPosition, Gti
 /// source-attested time: a binlog HEARTBEAT event carries no usable clock, so
 /// lag-based readiness on a quiet source reads the source's own clock here
 /// rather than a local `now()`.
-pub async fn fetch_source_now_ms(conn: &mut Conn) -> Result<i64> {
+pub(crate) async fn fetch_source_now_ms(conn: &mut Conn) -> Result<i64> {
     let ms: Option<i64> = conn
         .query_first("SELECT CAST(ROUND(UNIX_TIMESTAMP(NOW(3)) * 1000) AS SIGNED)")
         .await
@@ -413,7 +413,7 @@ pub async fn fetch_approx_row_count(
 
 /// Whether `file` is still present in the server's binary log index.
 /// A resumable persisted position requires its file to still exist.
-pub async fn binlog_file_exists(conn: &mut Conn, file: &str) -> Result<bool> {
+pub(crate) async fn binlog_file_exists(conn: &mut Conn, file: &str) -> Result<bool> {
     let rows: Vec<Row> = conn
         .query("SHOW BINARY LOGS")
         .await

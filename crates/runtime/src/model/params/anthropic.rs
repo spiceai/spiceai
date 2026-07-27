@@ -31,7 +31,7 @@ pub const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
 
 const ANTHROPIC_PARAM_LEN: usize = 4;
 
-pub(crate) const ANTHROPIC_PARAMETERS: [ParameterSpec; ANTHROPIC_PARAM_LEN] = [
+const ANTHROPIC_PARAMETERS: [ParameterSpec; ANTHROPIC_PARAM_LEN] = [
     ParameterSpec::runtime("endpoint").description("The Anthropic API base endpoint."),
     ParameterSpec::component("api_key").description("The Anthropic API key."),
     ParameterSpec::component("auth_token").description("The Anthropic Auth Token."),

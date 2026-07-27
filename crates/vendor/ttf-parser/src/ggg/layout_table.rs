@@ -17,11 +17,11 @@ pub struct LayoutTable<'a> {
     /// A list of all supported features.
     pub features: FeatureList<'a>,
     /// A list of all lookups.
-    pub lookups: LookupList<'a>,
+    lookups: LookupList<'a>,
     /// Used to substitute an alternate set of lookup tables
     /// to use for any given feature under specified conditions.
     #[cfg(feature = "variable-fonts")]
-    pub variations: Option<FeatureVariations<'a>>,
+    variations: Option<FeatureVariations<'a>>,
 }
 
 impl<'a> LayoutTable<'a> {
@@ -111,7 +111,7 @@ impl<'a, T: RecordListItem<'a>> RecordList<'a, T> {
     }
 
     /// Returns a number of items in the RecordList.
-    pub fn len(&self) -> u16 {
+    fn len(&self) -> u16 {
         self.records.len()
     }
 
@@ -121,7 +121,7 @@ impl<'a, T: RecordListItem<'a>> RecordList<'a, T> {
     }
 
     /// Returns RecordList value by index.
-    pub fn get(&self, index: u16) -> Option<T> {
+    fn get(&self, index: u16) -> Option<T> {
         let record = self.records.get(index)?;
         self.data
             .get(record.offset.to_usize()..)
@@ -212,7 +212,7 @@ pub struct Script<'a> {
     /// Script tag.
     pub tag: Tag,
     /// Default language.
-    pub default_language: Option<LanguageSystem<'a>>,
+    default_language: Option<LanguageSystem<'a>>,
     /// List of supported languages, excluding the default one. Listed alphabetically.
     pub languages: LanguageSystemList<'a>,
 }
@@ -242,9 +242,9 @@ pub struct LanguageSystem<'a> {
     /// Language tag.
     pub tag: Tag,
     /// Index of a feature required for this language system.
-    pub required_feature: Option<FeatureIndex>,
+    required_feature: Option<FeatureIndex>,
     /// Array of indices into the FeatureList, in arbitrary order.
-    pub feature_indices: LazyArray16<'a, FeatureIndex>,
+    feature_indices: LazyArray16<'a, FeatureIndex>,
 }
 
 impl<'a> RecordListItem<'a> for LanguageSystem<'a> {
@@ -270,7 +270,7 @@ impl<'a> RecordListItem<'a> for LanguageSystem<'a> {
 #[derive(Clone, Copy, Debug)]
 pub struct Feature<'a> {
     pub tag: Tag,
-    pub lookup_indices: LazyArray16<'a, LookupIndex>,
+    lookup_indices: LazyArray16<'a, LookupIndex>,
 }
 
 impl<'a> RecordListItem<'a> for Feature<'a> {

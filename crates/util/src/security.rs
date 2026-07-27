@@ -74,7 +74,7 @@ pub const MAX_SAFE_JSON_DEPTH: usize = 32;
 /// assert_eq!(sanitize_filename("subdir/model.bin").unwrap(), "model.bin");
 /// ```
 #[must_use = "sanitized filename must be used to prevent path traversal vulnerabilities"]
-pub fn sanitize_filename(input: &str) -> Result<String, String> {
+fn sanitize_filename(input: &str) -> Result<String, String> {
     Path::new(input)
         .file_name()
         .and_then(std::ffi::OsStr::to_str)
@@ -122,7 +122,7 @@ pub fn sanitize_filename(input: &str) -> Result<String, String> {
 /// let empty = b"";
 /// assert!(validate_non_empty_bytes(empty, "config.json").is_err());
 /// ```
-pub fn validate_non_empty_bytes(bytes: &[u8], context: &str) -> Result<(), String> {
+fn validate_non_empty_bytes(bytes: &[u8], context: &str) -> Result<(), String> {
     if bytes.is_empty() {
         Err(format!("Downloaded file {context} is empty"))
     } else {

@@ -35,7 +35,7 @@ pub struct VortexMetricsFinder(Vec<MetricsSet>);
 
 impl VortexMetricsFinder {
     /// Find all metrics for `VortexExec` nodes.
-    pub fn find_all(plan: &dyn ExecutionPlan) -> Vec<MetricsSet> {
+    fn find_all(plan: &dyn ExecutionPlan) -> Vec<MetricsSet> {
         let mut finder = Self::default();
         match accept(plan, &mut finder) {
             Ok(()) => finder.0,

@@ -37,7 +37,7 @@ pub type RelationId = u32;
 /// before deciding whether to fully decode or defer. See the message-format
 /// reference in the module docs.
 #[must_use]
-pub fn message_type(data: &[u8]) -> Option<u8> {
+pub(crate) fn message_type(data: &[u8]) -> Option<u8> {
     data.first().copied()
 }
 
@@ -49,7 +49,7 @@ pub fn message_type(data: &[u8]) -> Option<u8> {
 /// Truncate (`[nrel][flags][relids…]`), Begin, and Commit place other fields at
 /// that offset, so callers MUST check [`message_type`] first.
 #[must_use]
-pub fn relation_id(data: &[u8]) -> Option<RelationId> {
+pub(crate) fn relation_id(data: &[u8]) -> Option<RelationId> {
     let bytes: [u8; 4] = data.get(1..5)?.try_into().ok()?;
     Some(u32::from_be_bytes(bytes))
 }
@@ -93,26 +93,26 @@ pub enum DecodedMessage {
 /// re-sent if the schema changes.
 #[derive(Debug, Clone)]
 pub struct Relation {
-    pub relation_id: RelationId,
-    pub namespace: String,
-    pub name: String,
-    pub replica_identity: u8,
-    pub columns: Vec<Column>,
+    pub(crate) relation_id: RelationId,
+    pub(crate) namespace: String,
+    pub(crate) name: String,
+    pub(crate) replica_identity: u8,
+    pub(crate) columns: Vec<Column>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Column {
-    pub is_key: bool,
-    pub name: String,
-    pub type_oid: u32,
-    pub type_modifier: i32,
+    pub(crate) is_key: bool,
+    pub(crate) name: String,
+    pub(crate) type_oid: u32,
+    pub(crate) type_modifier: i32,
 }
 
 /// A single row's column values. `None` means NULL, `Some(Value::Unchanged)`
 /// means the column was unchanged TOAST.
 #[derive(Debug, Clone)]
 pub struct TupleData {
-    pub columns: Vec<Option<Value>>,
+    pub(crate) columns: Vec<Option<Value>>,
 }
 
 /// A single column value, carried as a zero-copy [`Bytes`] slice of the
@@ -151,12 +151,12 @@ impl Decoder {
 
     /// Look up a previously-seen relation by id.
     #[must_use]
-    pub fn relation(&self, id: RelationId) -> Option<&Relation> {
+    pub(crate) fn relation(&self, id: RelationId) -> Option<&Relation> {
         self.relations.get(&id)
     }
 
     /// Iterate over cached relations (insertion order not preserved).
-    pub fn relation_iter(&self) -> impl Iterator<Item = &Relation> {
+    pub(crate) fn relation_iter(&self) -> impl Iterator<Item = &Relation> {
         self.relations.values()
     }
 
@@ -164,7 +164,7 @@ impl Decoder {
     /// keys after the original relation message has been validated against the
     /// source replica identity. This keeps the per-change hot path borrowed and
     /// avoids cloning the whole relation for every row.
-    pub fn apply_declared_primary_keys(&mut self, id: RelationId, declared_pks: &[String]) {
+    pub(crate) fn apply_declared_primary_keys(&mut self, id: RelationId, declared_pks: &[String]) {
         if declared_pks.is_empty() {
             return;
         }

@@ -45,7 +45,7 @@ Docs: https://spiceai.org/docs"#
 )]
 pub struct AddArgs {
     /// Spicepod path (e.g. `spiceai/quickstart`, `./local/path`, or `spiceai/quickstart@v1.0`).
-    pub pod_path: String,
+    pub(crate) pod_path: String,
 }
 
 /// Execute the add command.
@@ -62,7 +62,7 @@ pub async fn execute(ctx: &RuntimeContext, args: AddArgs) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if the Spicepod cannot be fetched or added.
-pub async fn execute_add_or_connect(
+pub(crate) async fn execute_add_or_connect(
     ctx: &RuntimeContext,
     args: AddArgs,
     connect: bool,

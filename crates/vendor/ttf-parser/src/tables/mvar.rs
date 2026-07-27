@@ -36,7 +36,7 @@ pub struct Table<'a> {
 
 impl<'a> Table<'a> {
     /// Parses a table from raw data.
-    pub fn parse(data: &'a [u8]) -> Option<Self> {
+    pub(crate) fn parse(data: &'a [u8]) -> Option<Self> {
         let mut s = Stream::new(data);
 
         let version = s.read::<u32>()?;
@@ -67,7 +67,7 @@ impl<'a> Table<'a> {
     }
 
     /// Returns a metric offset by tag.
-    pub fn metric_offset(&self, tag: Tag, coordinates: &[NormalizedCoordinate]) -> Option<f32> {
+    pub(crate) fn metric_offset(&self, tag: Tag, coordinates: &[NormalizedCoordinate]) -> Option<f32> {
         let (_, record) = self.records.binary_search_by(|r| r.value_tag.cmp(&tag))?;
         self.variation_store.parse_delta(
             record.delta_set_outer_index,

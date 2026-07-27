@@ -22,7 +22,7 @@ use crate::TokenProvider;
 
 #[derive(Default, Clone)]
 pub struct TokenProviderRegistry {
-    pub token_provider_registry: Arc<RwLock<HashMap<String, Arc<dyn TokenProvider>>>>,
+    token_provider_registry: Arc<RwLock<HashMap<String, Arc<dyn TokenProvider>>>>,
 }
 
 impl TokenProviderRegistry {

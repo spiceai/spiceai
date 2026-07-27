@@ -63,7 +63,7 @@ pub struct DistributedConfig {
 impl DistributedConfig {
     /// Number of nodes participating (the tensor-parallel world size).
     #[must_use]
-    pub fn world_size(&self) -> usize {
+    fn world_size(&self) -> usize {
         self.nodes.len()
     }
 

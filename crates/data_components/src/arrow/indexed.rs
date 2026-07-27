@@ -53,19 +53,19 @@ use crate::index_maintenance::IndexMaintenanceProvider;
 #[derive(Debug, Clone)]
 pub struct SecondaryIndex {
     /// The name of the index (typically the column name(s) joined).
-    pub name: String,
+    name: String,
     /// Column names that form the index key.
-    pub columns: Vec<String>,
+    columns: Vec<String>,
     /// Whether this index enforces uniqueness.
-    pub unique: bool,
+    unique: bool,
     /// The hash index itself.
-    pub index: Arc<HashIndex>,
+    index: Arc<HashIndex>,
 }
 
 impl SecondaryIndex {
     /// Creates a new secondary index.
     #[must_use]
-    pub fn new(name: String, columns: Vec<String>, unique: bool, index: Arc<HashIndex>) -> Self {
+    pub(crate) fn new(name: String, columns: Vec<String>, unique: bool, index: Arc<HashIndex>) -> Self {
         Self {
             name,
             columns,
@@ -137,7 +137,7 @@ impl IndexedMemTable {
     /// * `primary_key_columns` - Columns that form the primary key
     /// * `parallelism` - Number of parallel threads (e.g., from `DataFusion`'s
     ///   `target_partitions`). If `None`, defaults to the number of CPUs.
-    pub fn try_new(
+    pub(crate) fn try_new(
         schema: SchemaRef,
         partitions: Vec<Vec<RecordBatch>>,
         primary_key_columns: Vec<String>,
@@ -149,7 +149,7 @@ impl IndexedMemTable {
     ///
     /// See [`try_new`] for details. This variant allows specifying the
     /// parallelism value used to calculate the index threshold.
-    pub fn try_new_with_parallelism(
+    fn try_new_with_parallelism(
         schema: SchemaRef,
         partitions: Vec<Vec<RecordBatch>>,
         primary_key_columns: Vec<String>,
@@ -201,7 +201,7 @@ impl IndexedMemTable {
 
     /// Returns true if the index may be stale relative to the underlying data.
     #[must_use]
-    pub fn is_dirty(&self) -> bool {
+    fn is_dirty(&self) -> bool {
         self.dirty.load(Ordering::Acquire)
     }
 
@@ -228,27 +228,27 @@ impl IndexedMemTable {
 
     /// Returns the secondary indexes.
     #[must_use]
-    pub fn secondary_indexes(&self) -> &[SecondaryIndex] {
+    fn secondary_indexes(&self) -> &[SecondaryIndex] {
         &self.secondary_indexes
     }
 
     /// Adds a secondary index to the table.
     #[must_use]
-    pub fn with_secondary_index(mut self, index: SecondaryIndex) -> Self {
+    fn with_secondary_index(mut self, index: SecondaryIndex) -> Self {
         self.secondary_indexes.push(index);
         self
     }
 
     /// Adds multiple secondary indexes to the table.
     #[must_use]
-    pub fn with_secondary_indexes(mut self, indexes: Vec<SecondaryIndex>) -> Self {
+    pub(crate) fn with_secondary_indexes(mut self, indexes: Vec<SecondaryIndex>) -> Self {
         self.secondary_indexes.extend(indexes);
         self
     }
 
     /// Returns the hash index if available.
     #[must_use]
-    pub fn index(&self) -> Option<&Arc<HashIndex>> {
+    fn index(&self) -> Option<&Arc<HashIndex>> {
         self.index.as_ref()
     }
 
@@ -270,7 +270,7 @@ impl IndexedMemTable {
     ///
     /// For data-critical queries, prefer using SQL queries via `scan()`,
     /// which verifies actual key values after hash lookup.
-    pub async fn get_by_key<K: std::hash::Hash>(&self, key: &K) -> Result<Option<RecordBatch>> {
+    async fn get_by_key<K: std::hash::Hash>(&self, key: &K) -> Result<Option<RecordBatch>> {
         let index = match &self.index {
             Some(idx) => idx,
             None => {
@@ -326,7 +326,7 @@ impl IndexedMemTable {
     ///
     /// For data-critical queries, prefer using SQL queries via `scan()`,
     /// which verifies actual key values after hash lookup.
-    pub async fn get_batch_by_keys<K: std::hash::Hash>(
+    async fn get_batch_by_keys<K: std::hash::Hash>(
         &self,
         keys: &[K],
     ) -> Result<Vec<RecordBatch>> {
@@ -355,7 +355,7 @@ impl IndexedMemTable {
     /// Rebuilds the hash index from current data.
     ///
     /// This should be called after modifications that invalidate the index.
-    pub async fn rebuild_index(&self) -> Result<()> {
+    async fn rebuild_index(&self) -> Result<()> {
         let partitions = self.read_all_partitions().await;
 
         // Rebuild primary key index
@@ -468,14 +468,14 @@ impl IndexedMemTable {
 
     /// Configures `on_conflict` behavior.
     #[must_use]
-    pub fn with_on_conflict(mut self, on_conflict: OnConflict) -> Self {
+    pub(crate) fn with_on_conflict(mut self, on_conflict: OnConflict) -> Self {
         self.inner = self.inner.with_on_conflict(on_conflict);
         self
     }
 
     /// Configures sort columns.
     #[must_use]
-    pub fn with_sort_columns(mut self, sort_columns: Vec<String>) -> Self {
+    pub(crate) fn with_sort_columns(mut self, sort_columns: Vec<String>) -> Self {
         self.inner = self.inner.with_sort_columns(sort_columns);
         self
     }
@@ -485,7 +485,7 @@ impl IndexedMemTable {
     /// Note: `Unique` constraints are filtered out because `IndexedMemTable` handles
     /// uniqueness through secondary indexes. The underlying `MemTable` doesn't support
     /// `Unique` constraints, so we only pass through `PrimaryKey` constraints.
-    pub async fn try_with_constraints(mut self, constraints: Constraints) -> Result<Self> {
+    pub(crate) async fn try_with_constraints(mut self, constraints: Constraints) -> Result<Self> {
         // Filter out Unique constraints - IndexedMemTable handles uniqueness via secondary indexes.
         // The underlying MemTable doesn't support Unique constraints.
         let filtered_constraints: Vec<Constraint> = constraints

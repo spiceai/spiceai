@@ -28,12 +28,12 @@ pub struct JobExecutorContextExtension {
 
 impl JobExecutorContextExtension {
     #[must_use]
-    pub fn new(executor: Arc<JobExecutor>) -> Self {
+    pub(crate) fn new(executor: Arc<JobExecutor>) -> Self {
         Self { executor }
     }
 
     #[must_use]
-    pub fn executor(&self) -> Arc<JobExecutor> {
+    fn executor(&self) -> Arc<JobExecutor> {
         Arc::clone(&self.executor)
     }
 }
@@ -47,7 +47,7 @@ impl Extension for JobExecutorContextExtension {
 /// Gets the job executor from the current request context.
 ///
 /// Returns `None` if async jobs are not enabled (not in cluster mode).
-pub fn get_job_executor(context: &Arc<RequestContext>) -> Option<Arc<JobExecutor>> {
+pub(crate) fn get_job_executor(context: &Arc<RequestContext>) -> Option<Arc<JobExecutor>> {
     context
         .extension::<JobExecutorContextExtension>()
         .map(|ext| ext.executor())

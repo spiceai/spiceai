@@ -247,7 +247,7 @@ impl MetricCollector<SearchScoreMetric, SearchRunMetric> for SpiceTest<Completed
 }
 
 pub struct SearchScoreMetric {
-    pub score: f64,
+    score: f64,
 }
 impl ExtendedMetrics for SearchScoreMetric {
     fn fields() -> Vec<Field> {
@@ -269,15 +269,15 @@ impl ExtendedMetrics for SearchScoreMetric {
 }
 impl SearchScoreMetric {
     #[must_use]
-    pub fn new(score: f64) -> Self {
+    fn new(score: f64) -> Self {
         Self { score }
     }
 }
 
 pub struct SearchRunMetric {
-    pub rps: f64,
-    pub p95_latency_ms: f64,
-    pub score: f64,
+    rps: f64,
+    p95_latency_ms: f64,
+    score: f64,
 }
 impl ExtendedMetrics for SearchRunMetric {
     fn fields() -> Vec<Field> {

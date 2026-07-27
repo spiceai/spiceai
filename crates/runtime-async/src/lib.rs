@@ -103,7 +103,7 @@ impl Default for ManagedTokioRuntimeBuilder {
 impl ManagedTokioRuntimeBuilder {
     /// Create a new builder with default settings.
     #[must_use]
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             low_priority: false,
             thread_name: None,
@@ -182,7 +182,7 @@ impl ManagedTokioRuntimeBuilder {
 /// # Errors
 ///
 /// Returns [`Error::TaskExecution`] if the task is cancelled or panics before producing a result.
-pub async fn spawn_task_and_collect_results<F>(fut: F, tokio_handle: &Handle) -> Result<F::Output>
+async fn spawn_task_and_collect_results<F>(fut: F, tokio_handle: &Handle) -> Result<F::Output>
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,

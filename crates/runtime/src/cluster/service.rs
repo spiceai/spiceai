@@ -103,7 +103,7 @@ pub struct ExecutorControlStreamRegistry {
 impl ExecutorControlStreamRegistry {
     /// Creates a new empty executor stream registry.
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             streams: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -113,7 +113,7 @@ impl ExecutorControlStreamRegistry {
     ///
     /// This notifies executors that new work may be available, causing them
     /// to immediately poll for tasks rather than waiting for the next poll interval.
-    pub fn broadcast_poll_now(&self, reason: &str) {
+    pub(crate) fn broadcast_poll_now(&self, reason: &str) {
         let streams = self.streams.read();
         if streams.is_empty() {
             return;
@@ -141,7 +141,7 @@ impl ExecutorControlStreamRegistry {
     ///
     /// Returns `true` when the message is accepted into the outbound channel.
     #[must_use]
-    pub fn send_cancel_tasks(&self, executor_id: &str, tasks: Vec<TaskCancelInfo>) -> bool {
+    pub(crate) fn send_cancel_tasks(&self, executor_id: &str, tasks: Vec<TaskCancelInfo>) -> bool {
         let streams = self.streams.read();
         let Some(handle) = streams.get(executor_id) else {
             return false;
@@ -155,7 +155,7 @@ impl ExecutorControlStreamRegistry {
     }
 
     /// Registers an executor stream for receiving control messages.
-    pub(crate) fn register(&self, executor_id: &str, tx: mpsc::Sender<SchedulerControlMessage>) {
+    fn register(&self, executor_id: &str, tx: mpsc::Sender<SchedulerControlMessage>) {
         let mut streams = self.streams.write();
         streams.insert(executor_id.to_string(), ExecutorStreamHandle { tx });
         tracing::debug!(
@@ -165,7 +165,7 @@ impl ExecutorControlStreamRegistry {
     }
 
     /// Unregisters an executor stream.
-    pub(crate) fn unregister(&self, executor_id: &str) {
+    fn unregister(&self, executor_id: &str) {
         let mut streams = self.streams.write();
         if streams.remove(executor_id).is_some() {
             tracing::debug!(
@@ -195,7 +195,7 @@ impl ClusterServiceImpl {
     /// Creates a new cluster service implementation.
     #[must_use]
     #[expect(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         app: Arc<TokioRwLock<Option<Arc<App>>>>,
         secrets: Arc<TokioRwLock<Secrets>>,
         advertise_address: String,
@@ -224,7 +224,7 @@ impl ClusterServiceImpl {
     /// broadcasting `PollNow` notifications.
     #[must_use]
     #[expect(clippy::too_many_arguments)]
-    pub fn with_executor_streams(
+    pub(crate) fn with_executor_streams(
         app: Arc<TokioRwLock<Option<Arc<App>>>>,
         secrets: Arc<TokioRwLock<Secrets>>,
         advertise_address: String,
@@ -289,7 +289,7 @@ impl ClusterServiceImpl {
 
     /// Returns the executor registry for use by other components.
     #[must_use]
-    pub fn executor_registry(&self) -> Arc<ExecutorRegistry> {
+    fn executor_registry(&self) -> Arc<ExecutorRegistry> {
         Arc::clone(&self.executor_registry)
     }
 }
@@ -1052,7 +1052,7 @@ async fn handle_partitions_loaded(
 ///
 /// `table` must be the canonical (fully resolved) reference — the same form
 /// `handle_partitions_loaded` uses as the tracker key.
-pub(crate) async fn evaluate_table_readiness(datafusion: &DataFusion, table: &TableReference) {
+async fn evaluate_table_readiness(datafusion: &DataFusion, table: &TableReference) {
     let Some(tracker) = datafusion.partition_load_tracker.as_ref() else {
         return;
     };

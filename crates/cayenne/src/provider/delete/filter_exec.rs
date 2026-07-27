@@ -206,7 +206,7 @@ pub(crate) fn is_pk_visible_i64(
 /// implementation the `get_batch` equivalence tests check against.
 #[cfg(test)]
 #[inline]
-pub(crate) fn is_pk_visible_row_key(
+fn is_pk_visible_row_key(
     key: &[u8],
     tombstones: &KeyDeletionIndex,
     insert_record_handling: InsertRecordHandling,

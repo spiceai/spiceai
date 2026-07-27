@@ -540,7 +540,7 @@ pub(crate) async fn post(
     }
 }
 
-pub(crate) async fn handle_nsql_query(
+async fn handle_nsql_query(
     rt: Arc<Runtime>,
     context: Arc<RequestContext>,
     llms: Arc<RwLock<LLMChatCompletionsModelStore>>,

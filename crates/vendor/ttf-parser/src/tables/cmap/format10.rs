@@ -6,14 +6,14 @@ use crate::GlyphId;
 #[derive(Clone, Copy, Debug)]
 pub struct Subtable10<'a> {
     /// First character code covered.
-    pub first_code_point: u32,
+    first_code_point: u32,
     /// Array of glyph indices for the character codes covered.
-    pub glyphs: LazyArray32<'a, GlyphId>,
+    glyphs: LazyArray32<'a, GlyphId>,
 }
 
 impl<'a> Subtable10<'a> {
     /// Parses a subtable from raw data.
-    pub fn parse(data: &'a [u8]) -> Option<Self> {
+    pub(crate) fn parse(data: &'a [u8]) -> Option<Self> {
         let mut s = Stream::new(data);
         s.skip::<u16>(); // format
         s.skip::<u16>(); // reserved
@@ -29,7 +29,7 @@ impl<'a> Subtable10<'a> {
     }
 
     /// Returns a glyph index for a code point.
-    pub fn glyph_index(&self, code_point: u32) -> Option<GlyphId> {
+    pub(crate) fn glyph_index(&self, code_point: u32) -> Option<GlyphId> {
         let idx = code_point.checked_sub(self.first_code_point)?;
         self.glyphs.get(idx)
     }

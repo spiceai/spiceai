@@ -280,7 +280,7 @@ impl RelationSchemaTracker {
 /// Aligned with `datafusion-table-providers`' `pg_data_type_to_arrow_type` so
 /// stream-time adoption and restart-time (provider-inferred) classification
 /// agree on the evolved type — a mismatch would re-classify on restart.
-pub(crate) fn map_pg_oid_to_arrow(type_oid: u32, type_modifier: i32) -> Option<DataType> {
+fn map_pg_oid_to_arrow(type_oid: u32, type_modifier: i32) -> Option<DataType> {
     Some(match type_oid {
         16 => DataType::Boolean,
         // "char" (single byte) maps to Int8, matching the provider.

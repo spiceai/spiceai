@@ -40,11 +40,11 @@ See more at: https://spiceai.org/docs/"#,
 pub struct UpgradeArgs {
     /// Version to upgrade to (e.g., v1.8.3)
     #[arg(name = "target_version")]
-    pub version: Option<String>,
+    version: Option<String>,
 
     /// Force upgrade even if already at the target version
     #[arg(short, long)]
-    pub force: bool,
+    force: bool,
 }
 
 /// Execute the upgrade command.

@@ -114,11 +114,11 @@ impl<'a> FromSlice<'a> for ChainedSequenceRuleSet<'a> {
 #[derive(Clone, Copy, Debug)]
 pub struct ChainedSequenceRule<'a> {
     /// Contains either glyph IDs or glyph Classes.
-    pub backtrack: LazyArray16<'a, u16>,
-    pub input: LazyArray16<'a, u16>,
+    backtrack: LazyArray16<'a, u16>,
+    input: LazyArray16<'a, u16>,
     /// Contains either glyph IDs or glyph Classes.
-    pub lookahead: LazyArray16<'a, u16>,
-    pub lookups: LazyArray16<'a, SequenceLookupRecord>,
+    lookahead: LazyArray16<'a, u16>,
+    lookups: LazyArray16<'a, SequenceLookupRecord>,
 }
 
 impl<'a> FromSlice<'a> for ChainedSequenceRule<'a> {

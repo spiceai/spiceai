@@ -81,7 +81,7 @@ pub fn distance(a: &str, b: &str) -> usize {
 /// ```
 #[expect(clippy::cast_precision_loss)]
 #[must_use]
-pub fn similarity(a: &str, b: &str) -> f64 {
+fn similarity(a: &str, b: &str) -> f64 {
     let max_len = a.chars().count().max(b.chars().count());
     if max_len == 0 {
         return 1.0;

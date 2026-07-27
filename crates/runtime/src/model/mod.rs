@@ -62,26 +62,26 @@ impl Default for LlmRuntimeStores {
 
 impl LlmRuntimeStores {
     #[must_use]
-    pub fn completion_llms(&self) -> Arc<RwLock<LLMChatCompletionsModelStore>> {
+    pub(crate) fn completion_llms(&self) -> Arc<RwLock<LLMChatCompletionsModelStore>> {
         Arc::clone(&self.completion_llms)
     }
 
     #[must_use]
-    pub fn responses_llms(&self) -> Arc<RwLock<LLMResponsesModelStore>> {
+    pub(crate) fn responses_llms(&self) -> Arc<RwLock<LLMResponsesModelStore>> {
         Arc::clone(&self.responses_llms)
     }
 
     #[must_use]
-    pub fn rate_controllers(
+    pub(crate) fn rate_controllers(
         &self,
     ) -> Arc<RwLock<HashMap<String, Arc<runtime_rate_control::RateController>>>> {
         Arc::clone(&self.rate_controllers)
     }
 
     #[must_use]
-    pub fn responses_api_support(&self) -> Arc<RwLock<HashMap<String, ResponsesApiSupport>>> {
+    pub(crate) fn responses_api_support(&self) -> Arc<RwLock<HashMap<String, ResponsesApiSupport>>> {
         Arc::clone(&self.responses_api_support)
     }
 }
 
-pub static ENABLE_MODEL_SUPPORT_MESSAGE: &str = "To enable model support, either: \n  1) `spice install ai` \n  2) Build spiced binary with flag `--features models`.";
+pub(crate) static ENABLE_MODEL_SUPPORT_MESSAGE: &str = "To enable model support, either: \n  1) `spice install ai` \n  2) Build spiced binary with flag `--features models`.";

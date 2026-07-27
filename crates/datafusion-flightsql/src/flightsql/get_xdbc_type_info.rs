@@ -57,7 +57,7 @@ pub(crate) fn do_get(
     Ok(Response::new(Box::pin(stream)))
 }
 
-pub(crate) fn get_xdbc_type_info_data() -> &'static XdbcTypeInfoData {
+fn get_xdbc_type_info_data() -> &'static XdbcTypeInfoData {
     static INSTANCE: std::sync::LazyLock<XdbcTypeInfoData> = std::sync::LazyLock::new(|| {
         let mut builder = XdbcTypeInfoDataBuilder::new();
 

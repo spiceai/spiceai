@@ -54,7 +54,7 @@ impl Debug for SpiceLogicalCodec {
 
 impl SpiceLogicalCodec {
     #[must_use]
-    pub fn new_with_runtime(runtime: Arc<Runtime>) -> Arc<dyn LogicalExtensionCodec> {
+    pub(crate) fn new_with_runtime(runtime: Arc<Runtime>) -> Arc<dyn LogicalExtensionCodec> {
         Arc::new(Self {
             inner: Arc::new(BallistaLogicalExtensionCodec::default()),
             runtime: Some(runtime),
@@ -62,7 +62,7 @@ impl SpiceLogicalCodec {
     }
 
     #[must_use]
-    pub fn new_codec() -> Arc<dyn LogicalExtensionCodec> {
+    pub(crate) fn new_codec() -> Arc<dyn LogicalExtensionCodec> {
         Arc::new(Self {
             inner: Arc::new(BallistaLogicalExtensionCodec::default()),
             runtime: None,

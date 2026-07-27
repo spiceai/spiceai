@@ -50,10 +50,10 @@ use crate::cdc::{ChangeBatch, changes_schema};
 /// snapshot/truncate paths).
 #[derive(Debug, Clone)]
 pub struct DecodedChange {
-    pub op: ChangeOp,
+    pub(crate) op: ChangeOp,
     /// Full row image in source column order ([`super::setup::TableLayout`]
     /// order). Empty for [`ChangeOp::Truncate`].
-    pub row: Vec<Value>,
+    pub(crate) row: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,7 +66,7 @@ pub enum ChangeOp {
 
 impl ChangeOp {
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    fn as_str(self) -> &'static str {
         match self {
             Self::Create => "c",
             Self::Update => "u",
@@ -78,18 +78,18 @@ impl ChangeOp {
 
 /// Buffer collecting changes within a single source transaction.
 pub struct TransactionBuffer {
-    pub changes: Vec<DecodedChange>,
+    pub(crate) changes: Vec<DecodedChange>,
 }
 
 impl TransactionBuffer {
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             changes: Vec::new(),
         }
     }
 
-    pub fn push_insert(&mut self, row: Vec<Value>) {
+    pub(crate) fn push_insert(&mut self, row: Vec<Value>) {
         self.changes.push(DecodedChange {
             op: ChangeOp::Create,
             row,
@@ -101,7 +101,7 @@ impl TransactionBuffer {
     /// Accelerators apply [`ChangeOp::Update`] as an upsert keyed by the new
     /// primary key, so a primary-key change must also emit a delete for the
     /// old key; otherwise the old accelerated row is orphaned.
-    pub fn push_update(&mut self, pk_source_indexes: &[usize], old: Vec<Value>, new: Vec<Value>) {
+    pub(crate) fn push_update(&mut self, pk_source_indexes: &[usize], old: Vec<Value>, new: Vec<Value>) {
         let key_changed = pk_source_indexes
             .iter()
             .any(|idx| old.get(*idx) != new.get(*idx));
@@ -117,7 +117,7 @@ impl TransactionBuffer {
         });
     }
 
-    pub fn push_delete(&mut self, old: Vec<Value>) {
+    pub(crate) fn push_delete(&mut self, old: Vec<Value>) {
         self.changes.push(DecodedChange {
             op: ChangeOp::Delete,
             row: old,
@@ -133,7 +133,7 @@ impl TransactionBuffer {
 /// A synthesized TRUNCATE change. Row payload is empty — the accelerator
 /// path applies it as an unconditional delete-all.
 #[must_use]
-pub fn truncate_change() -> DecodedChange {
+pub(crate) fn truncate_change() -> DecodedChange {
     DecodedChange {
         op: ChangeOp::Truncate,
         row: Vec::new(),
@@ -158,7 +158,7 @@ impl Default for TransactionBuffer {
 ///     `BinlogValue → Value` conversion itself).
 ///
 /// Everything else passes through unchanged.
-pub fn normalize_binlog_value(column: &SourceColumn, value: BinlogValue<'_>) -> Result<Value> {
+pub(crate) fn normalize_binlog_value(column: &SourceColumn, value: BinlogValue<'_>) -> Result<Value> {
     if let Some(variants) = &column.enum_variants
         && let BinlogValue::Value(Value::Int(index)) = &value
     {
@@ -230,7 +230,7 @@ pub fn normalize_binlog_value(column: &SourceColumn, value: BinlogValue<'_>) -> 
 /// other CDC sources (see `postgres_replication::changes::build_change_batch`
 /// for the full rationale) — zero-date coercion and TRUNCATE rows produce
 /// nulls in otherwise non-null columns, and downstream casts re-tighten.
-pub fn build_change_batch(
+pub(crate) fn build_change_batch(
     dataset_schema: &SchemaRef,
     primary_keys: &[String],
     column_map: &[usize],
@@ -305,7 +305,7 @@ pub fn build_change_batch(
 
 /// Return a clone of `schema` where every field is marked nullable. See the
 /// note on [`build_change_batch`].
-pub(super) fn nullable_clone(schema: &SchemaRef) -> SchemaRef {
+fn nullable_clone(schema: &SchemaRef) -> SchemaRef {
     let fields: Vec<Field> = schema
         .fields()
         .iter()
@@ -320,7 +320,7 @@ pub(super) fn nullable_clone(schema: &SchemaRef) -> SchemaRef {
 /// Type coverage matches what `datafusion-table-providers`' `MySQL` provider
 /// exposes via `read_provider()` — the dataset's Arrow schema flows through
 /// that path, so mismatches here would fail `StructArray` validation.
-pub(super) enum FieldBuilder {
+enum FieldBuilder {
     Utf8(StringBuilder),
     LargeUtf8(LargeStringBuilder),
     Binary(BinaryBuilder),
@@ -355,7 +355,7 @@ pub(super) enum FieldBuilder {
 }
 
 impl FieldBuilder {
-    pub(super) fn new(data_type: &DataType) -> Result<Self> {
+    fn new(data_type: &DataType) -> Result<Self> {
         Ok(match data_type {
             DataType::Utf8 => Self::Utf8(StringBuilder::new()),
             DataType::LargeUtf8 => Self::LargeUtf8(LargeStringBuilder::new()),
@@ -421,7 +421,7 @@ impl FieldBuilder {
         })
     }
 
-    pub(super) fn append(&mut self, value: &Value) -> Result<()> {
+    fn append(&mut self, value: &Value) -> Result<()> {
         if matches!(value, Value::NULL) {
             self.append_null();
             return Ok(());
@@ -490,7 +490,7 @@ impl FieldBuilder {
         Ok(())
     }
 
-    pub(super) fn append_null(&mut self) {
+    fn append_null(&mut self) {
         match self {
             Self::Utf8(b) => b.append_null(),
             Self::LargeUtf8(b) => b.append_null(),
@@ -519,7 +519,7 @@ impl FieldBuilder {
         }
     }
 
-    pub(super) fn finish(self) -> ArrayRef {
+    fn finish(self) -> ArrayRef {
         match self {
             Self::Utf8(mut b) => Arc::new(b.finish()),
             Self::LargeUtf8(mut b) => Arc::new(b.finish()),

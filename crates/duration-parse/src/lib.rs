@@ -66,7 +66,7 @@ pub enum ParseError {
 impl ParseError {
     /// Creates an `InvalidInput` error with the given message.
     #[must_use]
-    pub fn invalid_input(message: impl Into<String>) -> Self {
+    fn invalid_input(message: impl Into<String>) -> Self {
         Self::InvalidInput {
             message: message.into(),
         }
@@ -470,7 +470,7 @@ const MAX_EXPONENT_MAGNITUDE: i32 = 20;
 /// assert_eq!(format_duration(Duration::ZERO), "0s");
 /// ```
 #[must_use]
-pub fn format_duration(duration: Duration) -> String {
+fn format_duration(duration: Duration) -> String {
     if duration.is_zero() {
         return "0s".to_string();
     }
@@ -544,7 +544,7 @@ pub fn format_duration(duration: Duration) -> String {
 /// assert_eq!(duration, std::time::Duration::from_secs(30));
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DurationArg(pub Duration);
+pub struct DurationArg(Duration);
 
 impl FromStr for DurationArg {
     type Err = ParseError;

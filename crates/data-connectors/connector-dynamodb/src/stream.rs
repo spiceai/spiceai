@@ -86,7 +86,7 @@ impl From<StreamError> for data_components::cdc::StreamError {
 /// # Errors
 ///
 /// Returns [`StreamError`] if the change record batch can't be constructed.
-pub fn record_batch_to_change_batch(
+pub(crate) fn record_batch_to_change_batch(
     batch: RecordBatch,
     table_schema: &Arc<Schema>,
     primary_keys: &[String],
@@ -133,7 +133,7 @@ pub fn record_batch_to_change_batch(
 /// # Errors
 ///
 /// Returns [`StreamError`] if the change batch can't be built.
-pub fn truncate_change_batch(
+pub(crate) fn truncate_change_batch(
     table_schema: &Arc<Schema>,
     primary_keys: &[String],
 ) -> Result<ChangeBatch, StreamError> {
@@ -197,7 +197,7 @@ fn get_primary_keys_array(primary_keys: &[String], row_count: usize) -> ListArra
 /// # Errors
 ///
 /// Returns [`StreamError`] if a record can't be decoded or the batch can't be built.
-pub fn process_batch(
+pub(crate) fn process_batch(
     batch: DynamoDBStreamBatch,
     table_schema: &Arc<Schema>,
     primary_keys: &[String],

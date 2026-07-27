@@ -60,7 +60,7 @@ where
         + Sync
         + 'static,
 {
-    pub fn new(input_exec: Arc<dyn ExecutionPlan>, name: &'static str, exec: F) -> Self {
+    pub(crate) fn new(input_exec: Arc<dyn ExecutionPlan>, name: &'static str, exec: F) -> Self {
         Self {
             input_exec,
             name,
@@ -72,14 +72,14 @@ where
 
     /// Override default input partitioning [`Distribution::UnspecifiedDistribution`].
     #[must_use]
-    pub fn with_input_partitioning(mut self, dist: Distribution) -> Self {
+    pub(crate) fn with_input_partitioning(mut self, dist: Distribution) -> Self {
         self.required_input_distribution = dist;
         self
     }
 
     /// Set a custom display formatter for this execution plan
     #[must_use]
-    pub fn with_display_fmt_fn<FF>(mut self, display_fmt_fn: FF) -> Self
+    pub(crate) fn with_display_fmt_fn<FF>(mut self, display_fmt_fn: FF) -> Self
     where
         FF: Fn(DisplayFormatType, &mut fmt::Formatter) -> fmt::Result + Send + Sync + 'static,
     {

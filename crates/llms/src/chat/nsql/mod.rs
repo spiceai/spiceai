@@ -28,8 +28,8 @@ pub struct QueryGenerationContext {
 }
 
 pub struct FailedAttempt {
-    pub attempted_query: String,
-    pub error_message: String,
+    attempted_query: String,
+    error_message: String,
 }
 
 impl FailedAttempt {
@@ -59,7 +59,7 @@ pub trait SqlGeneration: Sync + Send {
 
 /// Default system prompt for SQL code generation.
 #[must_use]
-pub fn create_prompt(query: &str, ctx: &QueryGenerationContext) -> String {
+pub(crate) fn create_prompt(query: &str, ctx: &QueryGenerationContext) -> String {
     let mut prompt = format!(
         r#"Task: Write a SQL query to answer this question: _\"{query}\"_. Instruction: Return only valid SQL code, nothing additional, don't wrap it in ```. Columns with capitals must be quoted. For tables with schemas and catalogs '"catalog"."schema"."table"' not '"catalog.schema.table"'."#
     );

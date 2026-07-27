@@ -54,7 +54,7 @@ impl BedrockModelLister {
 
     /// Creates a new model lister with explicit configuration.
     #[must_use]
-    pub fn new(region: Option<String>) -> Self {
+    fn new(region: Option<String>) -> Self {
         Self {
             region: region.unwrap_or_else(|| DEFAULT_REGION.to_string()),
         }
@@ -62,7 +62,7 @@ impl BedrockModelLister {
 
     /// Returns the configured AWS region.
     #[must_use]
-    pub fn region(&self) -> &str {
+    fn region(&self) -> &str {
         &self.region
     }
 
@@ -71,7 +71,7 @@ impl BedrockModelLister {
     /// This list includes commonly used models available through AWS Bedrock.
     /// Model availability varies by region.
     #[must_use]
-    pub fn known_models() -> Vec<String> {
+    fn known_models() -> Vec<String> {
         vec![
             // Anthropic Claude models
             "anthropic.claude-3-5-sonnet-20240620-v1:0".to_string(),

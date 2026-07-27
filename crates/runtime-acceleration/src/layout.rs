@@ -82,7 +82,7 @@ impl AccelerationLayout {
 
     /// Creates a directory-based layout with custom directories.
     #[must_use]
-    pub fn directories(dirs: Vec<(PathBuf, String)>) -> Self {
+    fn directories(dirs: Vec<(PathBuf, String)>) -> Self {
         Self::Directories { dirs }
     }
 

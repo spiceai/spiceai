@@ -19,5 +19,5 @@ limitations under the License.
 pub mod iceberg_scan_exec;
 pub mod udtf_exec;
 
-pub use iceberg_scan_exec::{IcebergScanExec, session_is_distributed};
-pub use udtf_exec::UdtfExec;
+pub(crate) use iceberg_scan_exec::{IcebergScanExec, session_is_distributed};
+pub(crate) use udtf_exec::UdtfExec;

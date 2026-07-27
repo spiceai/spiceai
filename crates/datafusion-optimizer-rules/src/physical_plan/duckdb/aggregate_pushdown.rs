@@ -35,7 +35,7 @@ pub struct DuckDBAggregatePushdownMarkerExec {
 }
 
 impl DuckDBAggregatePushdownMarkerExec {
-    pub fn new(logical_plan: LogicalPlan, input: Arc<dyn ExecutionPlan>) -> Arc<Self> {
+    pub(crate) fn new(logical_plan: LogicalPlan, input: Arc<dyn ExecutionPlan>) -> Arc<Self> {
         Arc::new(DuckDBAggregatePushdownMarkerExec {
             logical_plan,
             input,

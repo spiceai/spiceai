@@ -23,14 +23,14 @@ use crate::{
     embeddings::{Error as EmbedError, Result as EmbedResult},
 };
 
-pub const NOVA_MULTIMODAL_EMBED_V2: &str = "amazon.nova-2-multimodal-embeddings-v1:0";
+pub(crate) const NOVA_MULTIMODAL_EMBED_V2: &str = "amazon.nova-2-multimodal-embeddings-v1:0";
 
 #[derive(Debug)]
 pub struct NovaConfig {
-    pub model_name: String,
-    pub dimensions: u32,
-    pub embedding_purpose: NovaEmbeddingPurpose,
-    pub truncation_mode: NovaTruncationMode,
+    pub(crate) model_name: String,
+    pub(crate) dimensions: u32,
+    pub(crate) embedding_purpose: NovaEmbeddingPurpose,
+    pub(crate) truncation_mode: NovaTruncationMode,
 }
 
 impl BedrockEmbeddingConfig<NovaEmbedRequest, NovaEmbedResponse> for NovaConfig {
@@ -126,7 +126,7 @@ pub enum NovaTruncationMode {
 
 impl NovaTruncationMode {
     #[must_use]
-    pub fn all() -> Vec<NovaTruncationMode> {
+    fn all() -> Vec<NovaTruncationMode> {
         vec![Self::Start, Self::End, Self::None]
     }
 }
@@ -161,44 +161,44 @@ pub enum NovaTaskType {
 #[serde(rename_all = "camelCase")]
 pub struct NovaEmbedRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub schema_version: Option<String>,
-    pub task_type: NovaTaskType,
-    pub single_embedding_params: NovaSingleEmbeddingParams,
+    schema_version: Option<String>,
+    task_type: NovaTaskType,
+    single_embedding_params: NovaSingleEmbeddingParams,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NovaSingleEmbeddingParams {
-    pub embedding_purpose: NovaEmbeddingPurpose,
+    embedding_purpose: NovaEmbeddingPurpose,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub embedding_dimension: Option<u32>,
+    embedding_dimension: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<NovaTextInput>,
+    text: Option<NovaTextInput>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub image: Option<NovaImageInput>,
+    image: Option<NovaImageInput>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub audio: Option<NovaAudioInput>,
+    audio: Option<NovaAudioInput>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub video: Option<NovaVideoInput>,
+    video: Option<NovaVideoInput>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NovaTextInput {
-    pub truncation_mode: NovaTruncationMode,
+    truncation_mode: NovaTruncationMode,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub value: Option<String>,
+    value: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<NovaSourceObject>,
+    source: Option<NovaSourceObject>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NovaImageInput {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub detail_level: Option<NovaImageDetailLevel>,
-    pub format: NovaImageFormat,
-    pub source: NovaSourceObject,
+    detail_level: Option<NovaImageDetailLevel>,
+    format: NovaImageFormat,
+    source: NovaSourceObject,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,8 +220,8 @@ pub enum NovaImageFormat {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NovaAudioInput {
-    pub format: NovaAudioFormat,
-    pub source: NovaSourceObject,
+    format: NovaAudioFormat,
+    source: NovaSourceObject,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -235,9 +235,9 @@ pub enum NovaAudioFormat {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NovaVideoInput {
-    pub format: NovaVideoFormat,
-    pub source: NovaSourceObject,
-    pub embedding_mode: NovaVideoEmbeddingMode,
+    format: NovaVideoFormat,
+    source: NovaSourceObject,
+    embedding_mode: NovaVideoEmbeddingMode,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -265,23 +265,23 @@ pub enum NovaVideoEmbeddingMode {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NovaSourceObject {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub s3_uri: Option<String>,
+    s3_uri: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub bytes: Option<Vec<u8>>,
+    bytes: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NovaEmbedResponse {
-    pub embeddings: Vec<NovaEmbeddingResult>,
+    embeddings: Vec<NovaEmbeddingResult>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NovaEmbeddingResult {
-    pub embedding_type: NovaEmbeddingType,
-    pub embedding: Vec<f32>,
+    embedding_type: NovaEmbeddingType,
+    embedding: Vec<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub truncated_char_length: Option<i32>,
+    truncated_char_length: Option<i32>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

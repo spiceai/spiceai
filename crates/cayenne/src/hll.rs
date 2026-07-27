@@ -59,7 +59,7 @@ pub struct HyperLogLog {
 impl HyperLogLog {
     /// Create an empty sketch at the default [`PRECISION`].
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::with_precision(PRECISION)
     }
 
@@ -86,7 +86,7 @@ impl HyperLogLog {
         clippy::cast_possible_truncation,
         reason = "idx < 2^precision and rank <= 64 - precision + 1 are both small and in range"
     )]
-    pub fn add_hash(&mut self, hash: u64) {
+    fn add_hash(&mut self, hash: u64) {
         let p = u32::from(self.precision);
         let idx = (hash >> (64 - p)) as usize;
         // Place the remaining (64 - p) bits at the top so leading_zeros counts
@@ -100,7 +100,7 @@ impl HyperLogLog {
 
     /// Add a raw integer value (sign-extended to `i128` so all integer widths
     /// share one stable hashing path).
-    pub fn add_i128(&mut self, value: i128) {
+    pub(crate) fn add_i128(&mut self, value: i128) {
         // Explicit byte hashing (not `Hash`) so the mapping is stable across
         // runs and builds — the sketch is persisted and merged over time.
         // One-shot XXH3 (not the streaming hasher) since every value is a
@@ -114,14 +114,14 @@ impl HyperLogLog {
     /// Add a raw byte value (e.g. a UTF-8 string or binary key). Uses the same
     /// stable, explicit byte hashing as [`add_i128`](Self::add_i128) so the
     /// mapping is consistent across runs and builds for the persisted sketch.
-    pub fn add_bytes(&mut self, value: &[u8]) {
+    pub(crate) fn add_bytes(&mut self, value: &[u8]) {
         let hash = hash_index::hash_key_bytes_oneshot(value);
         self.add_hash(hash);
     }
 
     /// Merge another sketch into this one (register-wise max). No-op on a
     /// precision mismatch (treated as incompatible rather than panicking).
-    pub fn merge(&mut self, other: &Self) {
+    pub(crate) fn merge(&mut self, other: &Self) {
         if self.precision != other.precision || self.registers.len() != other.registers.len() {
             tracing::warn!(
                 "HyperLogLog::merge: precision/size mismatch ({}/{} vs {}/{}); skipping",
@@ -147,7 +147,7 @@ impl HyperLogLog {
         clippy::cast_sign_loss,
         reason = "register/zero counts <= 2^18 are exact in f64; the estimate is rounded and clamped >= 0 before the u64 cast"
     )]
-    pub fn estimate(&self) -> u64 {
+    fn estimate(&self) -> u64 {
         let m = self.m();
         let m_f = m as f64;
 
@@ -203,7 +203,7 @@ pub struct NdvSketches {
 impl NdvSketches {
     /// Create an empty container with no per-column sketches.
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
@@ -214,14 +214,14 @@ impl NdvSketches {
     }
 
     /// Get (creating if absent) the sketch for `column_index`.
-    pub fn entry(&mut self, column_index: u32) -> &mut HyperLogLog {
+    pub(crate) fn entry(&mut self, column_index: u32) -> &mut HyperLogLog {
         self.columns.entry(column_index).or_default()
     }
 
     /// The estimated distinct count for `column_index`, if a sketch exists and is
     /// non-empty.
     #[must_use]
-    pub fn estimate(&self, column_index: u32) -> Option<u64> {
+    pub(crate) fn estimate(&self, column_index: u32) -> Option<u64> {
         let hll = self.columns.get(&column_index)?;
         if hll.is_empty() {
             return None;
@@ -230,7 +230,7 @@ impl NdvSketches {
     }
 
     /// Merge `other` into `self` (per-column register-wise max; union of columns).
-    pub fn merge(&mut self, other: &Self) {
+    fn merge(&mut self, other: &Self) {
         for (idx, hll) in &other.columns {
             self.columns
                 .entry(*idx)
@@ -244,7 +244,7 @@ impl NdvSketches {
     /// Empty (all-zero) columns are dropped; an all-empty set returns `None` so
     /// callers can store SQL `NULL`.
     #[must_use]
-    pub fn serialize(&self) -> Option<Vec<u8>> {
+    pub(crate) fn serialize(&self) -> Option<Vec<u8>> {
         // Non-empty columns only (don't persist all-zero registers).
         let mut cols: Vec<(&u32, &HyperLogLog)> =
             self.columns.iter().filter(|(_, h)| !h.is_empty()).collect();
@@ -306,7 +306,7 @@ impl NdvSketches {
     /// Deserialize a blob produced by [`Self::serialize`]. Returns `None` on a
     /// version mismatch or malformed input (callers fall back to no NDV).
     #[must_use]
-    pub fn deserialize(bytes: &[u8]) -> Option<Self> {
+    pub(crate) fn deserialize(bytes: &[u8]) -> Option<Self> {
         let (precision, columns) = Self::parse_columns(bytes)?;
         let columns = columns
             .map(|(idx, registers)| {
@@ -341,7 +341,7 @@ impl NdvSketches {
     /// guard); a column not yet in the accumulator is adopted as-is (a union with
     /// the empty sketch is the sketch itself). Nothing is inserted for a
     /// would-be-skipped column.
-    pub fn merge_serialized(&mut self, existing_blob: &[u8]) {
+    pub(crate) fn merge_serialized(&mut self, existing_blob: &[u8]) {
         let Some((precision, columns)) = Self::parse_columns(existing_blob) else {
             return;
         };

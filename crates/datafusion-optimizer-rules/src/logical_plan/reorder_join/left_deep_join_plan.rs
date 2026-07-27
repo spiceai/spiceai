@@ -33,7 +33,7 @@ use super::{
 };
 
 /// Outcome of [`optimal_left_deep_join_plan`]
-pub enum ReorderOutcome {
+pub(crate) enum ReorderOutcome {
     /// The reorder ran to completion. The inner [`Transformed`] says whether the
     /// plan actually changed: `yes` = a new join order was applied, `no` = the
     /// enumeration reproduced the input (already optimal or no reorderable island).
@@ -92,7 +92,7 @@ pub enum ReorderOutcome {
 ///
 /// A [`ReorderOutcome`] reporting whether the plan was reordered, rejected by a
 /// safety check, or hit an internal error — always carrying a usable plan.
-pub fn optimal_left_deep_join_plan(
+pub(crate) fn optimal_left_deep_join_plan(
     plan: LogicalPlan,
     cost_estimator: &dyn JoinCostEstimator,
 ) -> ReorderOutcome {
@@ -303,7 +303,7 @@ fn plan_columns_resolve(plan: &LogicalPlan) -> bool {
 ///
 /// Returns an error if no valid precedence graph can be built, or if precedence
 /// tree denormalization or reconstruction fails.
-pub fn query_graph_to_optimal_left_deep_join_plan(
+fn query_graph_to_optimal_left_deep_join_plan(
     query_graph: &JoinGraph,
     cost_estimator: &dyn JoinCostEstimator,
 ) -> Result<LogicalPlan> {
@@ -410,7 +410,7 @@ impl Debug for PrecedenceTreeNode<'_> {
 
 impl<'graph> PrecedenceTreeNode<'graph> {
     /// Creates a precedence tree from a query graph.
-    pub(crate) fn from_query_graph(
+    fn from_query_graph(
         graph: &'graph JoinGraph,
         root_id: NodeId,
         cost_estimator: &dyn JoinCostEstimator,
@@ -656,7 +656,7 @@ impl<'graph> PrecedenceTreeNode<'graph> {
     }
 
     /// Converts the precedence tree chain into a `DataFusion` `LogicalPlan`.
-    pub(crate) fn into_logical_plan(self, query_graph: &JoinGraph) -> Result<LogicalPlan> {
+    fn into_logical_plan(self, query_graph: &JoinGraph) -> Result<LogicalPlan> {
         // Flatten the precedence chain into an ordered list of node ids.
         let mut chain: Vec<NodeId> = Vec::new();
         let mut cursor = &self;

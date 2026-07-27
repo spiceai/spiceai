@@ -39,9 +39,9 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub static COMPONENTS_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("component"));
+static COMPONENTS_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("component"));
 
-pub static REGISTERED_COUNT: LazyLock<UpDownCounter<i64>> = LazyLock::new(|| {
+static REGISTERED_COUNT: LazyLock<UpDownCounter<i64>> = LazyLock::new(|| {
     COMPONENTS_METER
         .i64_up_down_counter("component_metric_registered_count")
         .with_description("Number of currently registered component metrics.")

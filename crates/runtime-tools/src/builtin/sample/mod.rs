@@ -59,7 +59,7 @@ pub enum SampleTableMethod {
 
 impl SampleTableMethod {
     #[must_use]
-    pub fn name(&self) -> &str {
+    fn name(&self) -> &str {
         match self {
             SampleTableMethod::DistinctColumns => "sample_distinct_columns",
             SampleTableMethod::RandomSample => "random_sample",
@@ -68,7 +68,7 @@ impl SampleTableMethod {
     }
 
     #[must_use]
-    pub fn description(&self) -> &str {
+    fn description(&self) -> &str {
         match self {
             SampleTableMethod::DistinctColumns => {
                 "Return up to `limit` rows from `dataset` chosen to surface distinct values per column. Use this to quickly understand the value distribution and cardinality of columns without running a full SQL query. Specify `cols` to restrict to particular columns; otherwise all columns are sampled. Returns a JSON array of rows."
@@ -83,7 +83,7 @@ impl SampleTableMethod {
     }
 
     /// For the given method, attempt to parse the arguments into the appropriate [`SampleTableParams`].
-    pub fn parse_args(&self, args: &str) -> Result<SampleTableParams, serde_json::Error> {
+    fn parse_args(&self, args: &str) -> Result<SampleTableParams, serde_json::Error> {
         match self {
             SampleTableMethod::DistinctColumns => Ok(SampleTableParams::DistinctColumns(
                 serde_json::from_str(args)?,

@@ -62,7 +62,7 @@ pub enum Error {
 
 impl Error {
     #[must_use]
-    pub fn is_user_error(&self) -> bool {
+    pub(crate) fn is_user_error(&self) -> bool {
         matches!(self, Error::NoPrimaryKey)
     }
 }

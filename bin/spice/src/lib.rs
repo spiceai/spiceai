@@ -28,10 +28,10 @@ pub mod commands;
 pub mod context;
 pub mod error;
 pub mod github;
-pub mod manifest;
+pub(crate) mod manifest;
 pub mod output;
 pub mod registry;
 
 pub use context::RuntimeContext;
 pub use error::{Error, Result};
-pub use output::TableRow;
+pub(crate) use output::TableRow;

@@ -42,7 +42,7 @@ pub struct TaskEmbed {
 }
 
 impl TaskEmbed {
-    pub async fn new(name: &str, inner: Arc<dyn Embed>) -> EmbedResult<Self> {
+    pub(crate) async fn new(name: &str, inner: Arc<dyn Embed>) -> EmbedResult<Self> {
         let size = get_or_infer_size(&inner).await?;
         Ok(Self {
             name: name.to_string(),
@@ -242,7 +242,7 @@ fn add_request_labels_to_span(req: &CreateEmbeddingRequest, span: &Span) {
 }
 
 #[must_use]
-pub fn to_truncated_string(input: &EmbeddingInput) -> String {
+fn to_truncated_string(input: &EmbeddingInput) -> String {
     match input {
         EmbeddingInput::String(s) => serde_json::to_string(&s).unwrap_or_default(),
         EmbeddingInput::StringArray(arr) => format_array(arr),

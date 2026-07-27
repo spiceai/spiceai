@@ -9,7 +9,7 @@ use crate::NormalizedCoordinate;
 pub(crate) struct ItemVariationStore<'a> {
     data: &'a [u8],
     data_offsets: LazyArray16<'a, u32>,
-    pub regions: VariationRegionList<'a>,
+    pub(crate) regions: VariationRegionList<'a>,
 }
 
 impl<'a> Default for ItemVariationStore<'a> {
@@ -28,7 +28,7 @@ impl<'a> Default for ItemVariationStore<'a> {
 
 impl<'a> ItemVariationStore<'a> {
     #[inline]
-    pub fn parse(mut s: Stream) -> Option<ItemVariationStore> {
+    pub(crate) fn parse(mut s: Stream) -> Option<ItemVariationStore> {
         let data = s.tail()?;
 
         let mut regions_s = s.clone();
@@ -60,7 +60,7 @@ impl<'a> ItemVariationStore<'a> {
         })
     }
 
-    pub fn region_indices(&self, index: u16) -> Option<LazyArray16<'_, u16>> {
+    pub(crate) fn region_indices(&self, index: u16) -> Option<LazyArray16<'_, u16>> {
         // Offsets in bytes from the start of the item variation store
         // to each item variation data subtable.
         let offset = self.data_offsets.get(index)?;
@@ -71,7 +71,7 @@ impl<'a> ItemVariationStore<'a> {
         s.read_array16::<u16>(count)
     }
 
-    pub fn parse_delta(
+    pub(crate) fn parse_delta(
         &self,
         outer_index: u16,
         inner_index: u16,
@@ -167,7 +167,7 @@ struct RegionAxisCoordinatesRecord {
 
 impl RegionAxisCoordinatesRecord {
     #[inline]
-    pub fn evaluate_axis(&self, coord: i16) -> f32 {
+    fn evaluate_axis(&self, coord: i16) -> f32 {
         let start = self.start_coord;
         let peak = self.peak_coord;
         let end = self.end_coord;

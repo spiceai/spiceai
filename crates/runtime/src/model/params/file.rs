@@ -29,7 +29,7 @@ pub const PARAMETERS: &[ParameterSpec] =
 
 const FILE_PARAM_LEN: usize = 5;
 
-pub(crate) const FILE_PARAMETERS: [ParameterSpec; FILE_PARAM_LEN] = [
+const FILE_PARAMETERS: [ParameterSpec; FILE_PARAM_LEN] = [
     ParameterSpec::runtime("chat_template").description(
         "Customizes the transformation of OpenAI chat messages into a character stream for the model.",
     ),

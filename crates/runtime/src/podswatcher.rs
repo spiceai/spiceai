@@ -43,7 +43,7 @@ impl PodsWatcher {
         }
     }
 
-    pub async fn watch(&mut self) -> notify::Result<Receiver<PathBuf>> {
+    pub(crate) async fn watch(&mut self) -> notify::Result<Receiver<PathBuf>> {
         let root_path = self.root_path.clone();
         let runtime_handle = Handle::current();
 

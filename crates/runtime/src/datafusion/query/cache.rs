@@ -460,7 +460,7 @@ impl Query {
         .with_raw_key(Some(raw_key)))
     }
 
-    pub(super) fn should_cache_results(
+    fn should_cache_results(
         df: &DataFusion,
         plan: &LogicalPlan,
         cache_status: CacheStatus,

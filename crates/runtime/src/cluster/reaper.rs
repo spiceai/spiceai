@@ -52,8 +52,8 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Outcome of one reaper tick.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReaperOutcome {
-    pub evicted: Vec<SchedulerId>,
-    pub skipped: Vec<SchedulerId>,
+    pub(crate) evicted: Vec<SchedulerId>,
+    pub(crate) skipped: Vec<SchedulerId>,
 }
 
 #[derive(Debug)]
@@ -64,7 +64,7 @@ pub struct Reaper {
 
 impl Reaper {
     #[must_use]
-    pub fn new(cluster: Arc<ClusterStateStore>, heartbeats: Arc<SchedulerHeartbeatStore>) -> Self {
+    pub(crate) fn new(cluster: Arc<ClusterStateStore>, heartbeats: Arc<SchedulerHeartbeatStore>) -> Self {
         Self {
             cluster,
             heartbeats,
@@ -74,7 +74,7 @@ impl Reaper {
     /// Run a single reap pass. Returns the set of scheduler ids that
     /// were evicted from `cluster.json` and any candidates that were
     /// skipped because of an `instance_id` mismatch (likely takeover).
-    pub async fn tick(&self, now_ms: u64) -> Result<ReaperOutcome> {
+    pub(crate) async fn tick(&self, now_ms: u64) -> Result<ReaperOutcome> {
         let snapshot = self
             .cluster
             .read()

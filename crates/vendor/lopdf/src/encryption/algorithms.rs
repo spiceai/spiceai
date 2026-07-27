@@ -1199,7 +1199,7 @@ impl PasswordAlgorithm {
     }
 
     /// Sanitize the password.
-    pub fn sanitize_password(&self, password: &str) -> Result<Vec<u8>, DecryptionError> {
+    pub(crate) fn sanitize_password(&self, password: &str) -> Result<Vec<u8>, DecryptionError> {
         match self.revision {
             2..=4 => self.sanitize_password_r4(password),
             5..=6 => self.sanitize_password_r6(password),
@@ -1208,7 +1208,7 @@ impl PasswordAlgorithm {
     }
 
     /// Compute the file encryption key used to encrypt/decrypt the document.
-    pub fn compute_file_encryption_key<P>(
+    pub(crate) fn compute_file_encryption_key<P>(
         &self,
         doc: &Document,
         password: P,
@@ -1224,7 +1224,7 @@ impl PasswordAlgorithm {
     }
 
     /// Authenticate the owner password.
-    pub fn authenticate_user_password<U>(
+    pub(crate) fn authenticate_user_password<U>(
         &self,
         doc: &Document,
         user_password: U,
@@ -1240,7 +1240,7 @@ impl PasswordAlgorithm {
     }
 
     /// Authenticate the owner password.
-    pub fn authenticate_owner_password<O>(
+    pub(crate) fn authenticate_owner_password<O>(
         &self,
         doc: &Document,
         owner_password: O,

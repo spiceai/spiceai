@@ -67,7 +67,7 @@ static CURRENT_INLIST_MEMORY_BYTES: AtomicUsize = AtomicUsize::new(0);
 // concurrency; individual accumulators still keep their own local cap.
 
 #[must_use]
-pub fn maximum_shared_inlist_memory_bytes() -> usize {
+fn maximum_shared_inlist_memory_bytes() -> usize {
     match MAXIMUM_SHARED_INLIST_MEMORY_BYTES.load(AtomicOrdering::Relaxed) {
         UNCONFIGURED_SHARED_INLIST_MEMORY_BYTES => DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES,
         limit => limit,
@@ -272,7 +272,7 @@ impl CollectLeftAccumulator for ExactLeftAccumulator {
 impl ExactLeftAccumulator {
     /// Creates an accumulator with a custom local in-list memory limit.
     #[must_use]
-    pub fn new_with_memory_limit(
+    fn new_with_memory_limit(
         expr: Arc<dyn PhysicalExpr>,
         max_inlist_memory_size: usize,
     ) -> Self {

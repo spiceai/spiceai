@@ -10,9 +10,9 @@ use crate::NormalizedCoordinate;
 #[derive(Clone, Copy, Debug)]
 pub struct AxisValueMap {
     /// A normalized coordinate value obtained using default normalization.
-    pub from_coordinate: i16,
+    from_coordinate: i16,
     /// The modified, normalized coordinate value.
-    pub to_coordinate: i16,
+    to_coordinate: i16,
 }
 
 impl FromData for AxisValueMap {
@@ -91,12 +91,12 @@ impl<'a> Iterator for SegmentMapsIter<'a> {
 pub struct Table<'a> {
     /// The segment maps array — one segment map for each axis
     /// in the order of axes specified in the `fvar` table.
-    pub segment_maps: SegmentMaps<'a>,
+    segment_maps: SegmentMaps<'a>,
 }
 
 impl<'a> Table<'a> {
     /// Parses a table from raw data.
-    pub fn parse(data: &'a [u8]) -> Option<Self> {
+    pub(crate) fn parse(data: &'a [u8]) -> Option<Self> {
         let mut s = Stream::new(data);
 
         let version = s.read::<u32>()?;
@@ -115,7 +115,7 @@ impl<'a> Table<'a> {
     }
 
     /// Maps a single coordinate
-    pub fn map_coordinate(
+    pub(crate) fn map_coordinate(
         &self,
         coordinates: &mut [NormalizedCoordinate],
         coordinate_index: usize,

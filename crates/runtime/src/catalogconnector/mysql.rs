@@ -29,9 +29,9 @@ use datafusion_table_providers::sql::db_connection_pool::mysqlpool::MySQLConnect
 use std::any::Any;
 use std::sync::Arc;
 
-pub const PREFIX: &str = "mysql";
+pub(crate) const PREFIX: &str = "mysql";
 
-pub const PARAMETERS: &[ParameterSpec] = &[
+pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("connection_string")
         .secret()
         .description("The MySQL connection string."),
@@ -57,7 +57,7 @@ pub struct MySQLCatalog {
 
 impl MySQLCatalog {
     #[must_use]
-    pub fn new_connector(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
+    pub(crate) fn new_connector(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
         Arc::new(Self { params })
     }
 }

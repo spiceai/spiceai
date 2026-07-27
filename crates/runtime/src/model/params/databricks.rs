@@ -31,7 +31,7 @@ pub const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
 
 const DATABRICKS_PARAM_LEN: usize = 4;
 
-pub(crate) const DATABRICKS_PARAMETERS: [ParameterSpec; DATABRICKS_PARAM_LEN] = [
+const DATABRICKS_PARAMETERS: [ParameterSpec; DATABRICKS_PARAM_LEN] = [
     ParameterSpec::component("endpoint").description(
         "The Databricks workspace endpoint, e.g., dbc-a12cd3e4-56f7.cloud.databricks.com.",
     ),

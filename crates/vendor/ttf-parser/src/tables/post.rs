@@ -320,18 +320,18 @@ impl<'a> Iterator for Names<'a> {
 #[derive(Clone, Copy, Debug)]
 pub struct Table<'a> {
     /// Italic angle in counter-clockwise degrees from the vertical.
-    pub italic_angle: f32,
+    pub(crate) italic_angle: f32,
     /// Underline metrics.
-    pub underline_metrics: LineMetrics,
+    pub(crate) underline_metrics: LineMetrics,
     /// Flag that indicates that the font is monospaced.
-    pub is_monospaced: bool,
+    pub(crate) is_monospaced: bool,
     glyph_indexes: LazyArray16<'a, u16>,
     names_data: &'a [u8],
 }
 
 impl<'a> Table<'a> {
     /// Parses a table from raw data.
-    pub fn parse(data: &'a [u8]) -> Option<Self> {
+    pub(crate) fn parse(data: &'a [u8]) -> Option<Self> {
         // Do not check the exact length, because some fonts include
         // padding in table's length in table records, which is incorrect.
         if data.len() < 32 {
@@ -378,7 +378,7 @@ impl<'a> Table<'a> {
 
     /// Returns a glyph name by ID.
     #[cfg(feature = "glyph-names")]
-    pub fn glyph_name(&self, glyph_id: GlyphId) -> Option<&'a str> {
+    pub(crate) fn glyph_name(&self, glyph_id: GlyphId) -> Option<&'a str> {
         let mut index = self.glyph_indexes.get(glyph_id.0)?;
 
         // 'If the name index is between 0 and 257, treat the name index
@@ -414,7 +414,7 @@ impl<'a> Table<'a> {
     /// Returns an iterator over glyph names.
     ///
     /// Default/predefined names are not included. Just the one in the font file.
-    pub fn names(&self) -> Names<'a> {
+    fn names(&self) -> Names<'a> {
         Names {
             data: self.names_data,
             offset: 0,

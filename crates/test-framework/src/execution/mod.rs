@@ -96,12 +96,12 @@ use crate::queries::Query;
 #[derive(Debug)]
 pub struct ExecutionResult {
     /// Time taken to execute the query
-    pub duration: Duration,
+    pub(crate) duration: Duration,
     /// Number of rows returned
-    pub row_count: usize,
+    pub(crate) row_count: usize,
     /// Actual record batches (optional, for validation/snapshots)
     /// Some executors (like HTTP) may not provide this
-    pub batches: Option<Vec<RecordBatch>>,
+    pub(crate) batches: Option<Vec<RecordBatch>>,
 }
 
 /// Trait for executing queries against different backends

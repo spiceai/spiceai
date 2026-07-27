@@ -109,33 +109,33 @@ pub struct ColumnSchema {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobSchema {
     /// Number of columns
-    pub column_count: usize,
+    pub(crate) column_count: usize,
     /// Column definitions
-    pub columns: Vec<ColumnSchema>,
+    pub(crate) columns: Vec<ColumnSchema>,
 }
 
 /// Manifest describing the complete result set.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobResultManifest {
     /// Data format (always `ARROW_IPC` for now)
-    pub format: String,
+    pub(crate) format: String,
     /// Result schema
-    pub schema: JobSchema,
+    pub(crate) schema: JobSchema,
     /// Total number of rows across all chunks
-    pub total_row_count: usize,
+    pub(crate) total_row_count: usize,
     /// Total number of chunks
-    pub total_chunk_count: usize,
+    pub(crate) total_chunk_count: usize,
     /// Total size in bytes (approximate)
-    pub total_byte_count: usize,
+    pub(crate) total_byte_count: usize,
 }
 
 /// Result information for a completed job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobResult {
     /// The result manifest with schema and counts
-    pub manifest: JobResultManifest,
+    pub(crate) manifest: JobResultManifest,
     /// List of chunk indices available
-    pub chunk_indices: Vec<usize>,
+    pub(crate) chunk_indices: Vec<usize>,
     /// Cumulative starting row offset of each chunk, aligned with `chunk_indices`.
     ///
     /// Chunks are flushed once a row threshold is reached but are built by appending
@@ -146,62 +146,62 @@ pub struct JobResult {
     /// Defaults to empty for results persisted before this field existed; readers must
     /// fall back gracefully when an offset is absent.
     #[serde(default)]
-    pub chunk_row_offsets: Vec<usize>,
+    pub(crate) chunk_row_offsets: Vec<usize>,
 }
 
 /// Complete state of a job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobState {
     /// Schema version for forward compatibility
-    pub schema_version: u32,
+    schema_version: u32,
     /// Unique job identifier
     pub job_id: String,
     /// Current status
     pub status: JobStatus,
     /// The SQL statement being executed
-    pub sql: String,
+    pub(crate) sql: String,
     /// Query parameters if any
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub parameters: Option<serde_json::Value>,
+    pub(crate) parameters: Option<serde_json::Value>,
     /// Node that is scheduling this job
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub scheduler_node: Option<String>,
+    pub(crate) scheduler_node: Option<String>,
     /// Error details if status is Failed
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<JobError>,
+    pub(crate) error: Option<JobError>,
     /// Result information if status is Succeeded
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub result: Option<JobResult>,
+    pub(crate) result: Option<JobResult>,
     /// When the job was created (Unix timestamp ms)
-    pub created_at_ms: u64,
+    pub(crate) created_at_ms: u64,
     /// When execution started (Unix timestamp ms)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub started_at_ms: Option<u64>,
+    pub(crate) started_at_ms: Option<u64>,
     /// When execution completed (Unix timestamp ms)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub completed_at_ms: Option<u64>,
+    pub(crate) completed_at_ms: Option<u64>,
     /// When results will expire (Unix timestamp ms)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub expires_at_ms: Option<u64>,
+    pub(crate) expires_at_ms: Option<u64>,
     /// Optional timeout for the job in seconds
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout_seconds: Option<u64>,
+    pub(crate) timeout_seconds: Option<u64>,
     /// Optional maximum size of results for the job in bytes
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub maximum_size: Option<u64>,
+    pub(crate) maximum_size: Option<u64>,
     /// Whether this job must execute only read-only SQL operations.
     #[serde(default)]
-    pub read_only: bool,
+    pub(crate) read_only: bool,
     /// Object store version for conditional writes (e-tag tracking).
     /// This is not serialized - it's set after reading from object store.
     #[serde(skip)]
-    pub version: Option<UpdateVersion>,
+    pub(crate) version: Option<UpdateVersion>,
 }
 
 impl JobState {
     /// Creates a new pending job state.
     #[must_use]
-    pub fn new_pending(job_id: String, sql: String, parameters: Option<serde_json::Value>) -> Self {
+    pub(crate) fn new_pending(job_id: String, sql: String, parameters: Option<serde_json::Value>) -> Self {
         let now_ms = now_ms_or_zero();
         Self {
             schema_version: JOB_SCHEMA_VERSION,
@@ -224,14 +224,14 @@ impl JobState {
     }
 
     /// Transitions job to running state.
-    pub fn set_running(&mut self, executor_node: String) {
+    pub(crate) fn set_running(&mut self, executor_node: String) {
         self.status = JobStatus::Running;
         self.scheduler_node = Some(executor_node);
         self.started_at_ms = Some(now_ms_or_zero());
     }
 
     /// Transitions job to succeeded state with results.
-    pub fn set_succeeded(&mut self, result: JobResult, result_ttl: Duration) {
+    pub(crate) fn set_succeeded(&mut self, result: JobResult, result_ttl: Duration) {
         let now = now_ms_or_zero();
         self.status = JobStatus::Succeeded;
         self.result = Some(result);
@@ -244,21 +244,21 @@ impl JobState {
     }
 
     /// Transitions job to failed state with error.
-    pub fn set_failed(&mut self, error: JobError) {
+    pub(crate) fn set_failed(&mut self, error: JobError) {
         self.status = JobStatus::Failed;
         self.error = Some(error);
         self.completed_at_ms = Some(now_ms_or_zero());
     }
 
     /// Transitions job to cancelled state.
-    pub fn set_cancelled(&mut self) {
+    pub(crate) fn set_cancelled(&mut self) {
         self.status = JobStatus::Cancelled;
         self.completed_at_ms = Some(now_ms_or_zero());
     }
 
     /// Checks if the job has expired.
     #[must_use]
-    pub fn is_expired(&self) -> bool {
+    pub(crate) fn is_expired(&self) -> bool {
         if let Some(expires_at) = self.expires_at_ms {
             now_ms_or_zero() >= expires_at
         } else {

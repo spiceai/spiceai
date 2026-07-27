@@ -39,7 +39,7 @@ pub struct DatabricksDialect {}
 
 impl DatabricksDialect {
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {}
     }
 }

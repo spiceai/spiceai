@@ -336,7 +336,7 @@ impl ExecutionPlan for ObjectStoreTextExec {
 }
 
 impl ObjectStoreTextExec {
-    pub(crate) fn new(
+    fn new(
         projected_schema: SchemaRef,
         object_metas: Vec<ObjectMeta>,
         ctx: ObjectStoreContext,
@@ -359,7 +359,7 @@ impl ObjectStoreTextExec {
     }
 }
 
-pub(crate) fn to_sendable_stream(
+fn to_sendable_stream(
     ctx: ObjectStoreContext,
     formatter: Option<Arc<dyn DocumentParser>>,
     object_metas: Arc<Vec<ObjectMeta>>,

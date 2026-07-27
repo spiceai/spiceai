@@ -25,16 +25,16 @@ use std::path::{Path, PathBuf};
 use yaml::{Mapping, Value};
 
 /// Canonical Spicepod manifest filename written by the CLI.
-pub const SPICEPOD_YAML: &str = "spicepod.yaml";
+const SPICEPOD_YAML: &str = "spicepod.yaml";
 /// Alternate Spicepod manifest filename accepted by CLI commands.
-pub const SPICEPOD_YML: &str = "spicepod.yml";
+pub(crate) const SPICEPOD_YML: &str = "spicepod.yml";
 
 const SPICEPOD_FILENAMES: [&str; 2] = [SPICEPOD_YAML, SPICEPOD_YML];
 const SCHEMA_DIRECTIVE: &str = "# yaml-language-server: $schema=https://raw.githubusercontent.com/spiceai/spiceai/trunk/.schema/spicepod.schema.json";
 
 /// Returns the first existing root Spicepod manifest path, preferring `spicepod.yaml` over `spicepod.yml`.
 #[must_use]
-pub fn existing_spicepod_path(base_dir: &Path) -> Option<PathBuf> {
+pub(crate) fn existing_spicepod_path(base_dir: &Path) -> Option<PathBuf> {
     SPICEPOD_FILENAMES
         .iter()
         .map(|filename| base_dir.join(filename))
@@ -43,18 +43,18 @@ pub fn existing_spicepod_path(base_dir: &Path) -> Option<PathBuf> {
 
 /// Returns the default manifest path for new Spice apps.
 #[must_use]
-pub fn default_spicepod_path(base_dir: &Path) -> PathBuf {
+pub(crate) fn default_spicepod_path(base_dir: &Path) -> PathBuf {
     base_dir.join(SPICEPOD_YAML)
 }
 
 /// Builds the default Spicepod YAML content for a new app.
 #[must_use]
-pub fn create_spicepod_yaml(name: &str) -> String {
+pub(crate) fn create_spicepod_yaml(name: &str) -> String {
     format!("{SCHEMA_DIRECTIVE}\nversion: v2\nkind: Spicepod\nname: {name}\n")
 }
 
 /// Reads a Spicepod manifest as YAML while validating its root header.
-pub fn read_spicepod_value(path: &Path) -> Result<Value> {
+pub(crate) fn read_spicepod_value(path: &Path) -> Result<Value> {
     let content = std::fs::read_to_string(path).context(ConfigIoSnafu {
         operation: "read",
         path: path.to_path_buf(),
@@ -70,7 +70,7 @@ pub fn read_spicepod_value(path: &Path) -> Result<Value> {
 }
 
 /// Loads an existing root manifest, or returns a new default manifest value and path.
-pub fn load_or_create_spicepod_value(
+pub(crate) fn load_or_create_spicepod_value(
     base_dir: &Path,
     name: &str,
 ) -> Result<(PathBuf, Value, bool)> {
@@ -89,7 +89,7 @@ pub fn load_or_create_spicepod_value(
 }
 
 /// Validates and writes a Spicepod manifest value to disk.
-pub fn write_spicepod_value(path: &Path, value: &Value) -> Result<()> {
+pub(crate) fn write_spicepod_value(path: &Path, value: &Value) -> Result<()> {
     validate_spicepod_value(value, path)?;
 
     let mut updated_yaml =
@@ -156,7 +156,7 @@ fn ensure_parent_dir(path: &Path) -> Result<()> {
 ///
 /// On non-Unix platforms this falls back to the standard library write path;
 /// callers must not assume owner-only ACL hardening there.
-pub fn write_secure_file(path: &Path, contents: &[u8]) -> Result<()> {
+pub(crate) fn write_secure_file(path: &Path, contents: &[u8]) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -198,7 +198,7 @@ pub fn write_secure_file(path: &Path, contents: &[u8]) -> Result<()> {
 }
 
 /// Ensures a YAML sequence field contains a string item, returning whether it changed the value.
-pub fn ensure_string_sequence_item(value: &mut Value, field: &str, item: &str) -> Result<bool> {
+pub(crate) fn ensure_string_sequence_item(value: &mut Value, field: &str, item: &str) -> Result<bool> {
     let sequence = ensure_sequence_field(value, field)?;
 
     if sequence
@@ -213,7 +213,7 @@ pub fn ensure_string_sequence_item(value: &mut Value, field: &str, item: &str) -
 }
 
 /// Ensures a component reference sequence contains a `ref` entry, returning whether it changed the value.
-pub fn ensure_component_reference(value: &mut Value, field: &str, reference: &str) -> Result<bool> {
+pub(crate) fn ensure_component_reference(value: &mut Value, field: &str, reference: &str) -> Result<bool> {
     let sequence = ensure_sequence_field(value, field)?;
 
     if sequence.iter().any(|entry| {
@@ -236,7 +236,7 @@ pub fn ensure_component_reference(value: &mut Value, field: &str, reference: &st
 
 /// Formats a path as a portable Spicepod reference using `/` separators.
 #[must_use]
-pub fn path_to_spicepod_ref(path: &Path) -> String {
+pub(crate) fn path_to_spicepod_ref(path: &Path) -> String {
     path.to_string_lossy()
         .replace(std::path::MAIN_SEPARATOR, "/")
 }

@@ -20,7 +20,7 @@ limitations under the License.
 pub const HTTP_BASE_URL: &str = "http://localhost:8090";
 
 /// Default Flight SQL endpoint for spiced runtime
-pub const FLIGHT_URL: &str = "http://localhost:50051";
+pub(crate) const FLIGHT_URL: &str = "http://localhost:50051";
 
 /// Default metrics endpoint for spiced runtime (when --metrics is enabled)
 pub const METRICS_URL: &str = "http://localhost:9090/metrics";
@@ -35,7 +35,7 @@ pub const READY_ENDPOINT: &str = "/v1/ready";
 pub const SQL_ENDPOINT: &str = "/v1/sql";
 
 /// Search endpoint path (relative to `HTTP_BASE_URL`)
-pub const SEARCH_ENDPOINT: &str = "/v1/search";
+pub(crate) const SEARCH_ENDPOINT: &str = "/v1/search";
 
 /// Async queries endpoint path for distributed query mode (relative to `HTTP_BASE_URL`)
 pub const QUERIES_ENDPOINT: &str = "/v1/queries";

@@ -51,19 +51,19 @@ use crate::cdc::{ChangeBatch, ChangeEnvelope, StreamError, changes_schema};
 /// Input for [`snapshot_stream`]. Grouped into a struct to keep the function
 /// signature below clippy's `too_many_arguments` threshold and to make the
 /// callers easier to read.
-pub struct SnapshotInput {
-    pub params: ReplicationParams,
-    pub schema_name: String,
-    pub table_name: String,
-    pub dataset_schema: SchemaRef,
-    pub primary_keys: Vec<String>,
-    pub dataset_name: String,
-    pub metrics: Arc<ReplicationMetricsCollector>,
+pub(crate) struct SnapshotInput {
+    pub(crate) params: ReplicationParams,
+    pub(crate) schema_name: String,
+    pub(crate) table_name: String,
+    pub(crate) dataset_schema: SchemaRef,
+    pub(crate) primary_keys: Vec<String>,
+    pub(crate) dataset_name: String,
+    pub(crate) metrics: Arc<ReplicationMetricsCollector>,
 }
 
 /// Build a `ChangesStream`-compatible stream that emits all rows of the source
 /// table as op="c" change envelopes.
-pub fn snapshot_stream(
+pub(crate) fn snapshot_stream(
     input: SnapshotInput,
 ) -> Result<impl Stream<Item = std::result::Result<ChangeEnvelope, StreamError>> + Send + use<>> {
     let SnapshotInput {

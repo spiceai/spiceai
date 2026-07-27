@@ -107,7 +107,7 @@ pub enum Error {
     InvalidMaxPutBytes { value: String },
 }
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Top-level SharePoint connector. Owns a shared [`GraphClient`] and dispatches
 /// `from:` URLs to either the legacy [`SharepointTableProvider`] or a
@@ -666,7 +666,7 @@ impl SharepointFactory {
     }
 
     #[must_use]
-    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+    fn new_arc() -> Arc<dyn DataConnectorFactory> {
         Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
     }
 }

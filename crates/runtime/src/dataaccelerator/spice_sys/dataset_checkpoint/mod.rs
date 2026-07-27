@@ -137,7 +137,7 @@ impl DatasetCheckpoint {
     }
 
     #[must_use]
-    pub fn with_snapshot_behavior(self, snapshot_behavior: SnapshotBehavior) -> Self {
+    pub(crate) fn with_snapshot_behavior(self, snapshot_behavior: SnapshotBehavior) -> Self {
         Self {
             dataset_name: self.dataset_name,
             acceleration_connection: self.acceleration_connection,
@@ -146,7 +146,7 @@ impl DatasetCheckpoint {
     }
 
     #[must_use]
-    pub fn to_arc(self) -> Arc<dyn DatasetCheckpointer> {
+    pub(crate) fn to_arc(self) -> Arc<dyn DatasetCheckpointer> {
         Arc::new(self)
     }
 
@@ -323,7 +323,7 @@ impl DatasetCheckpoint {
             reason = "async only when an async accelerator backend is compiled in; DuckDB helpers are synchronous"
         )
     )]
-    pub async fn checkpoint(&self, schema: &SchemaRef, refresh_sql: Option<&str>) -> Result<()> {
+    pub(crate) async fn checkpoint(&self, schema: &SchemaRef, refresh_sql: Option<&str>) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => {
@@ -362,7 +362,7 @@ impl DatasetCheckpoint {
             reason = "async only when an async accelerator backend is compiled in; DuckDB helpers are synchronous"
         )
     )]
-    pub async fn get_schema(&self) -> Result<Option<SchemaRef>> {
+    pub(crate) async fn get_schema(&self) -> Result<Option<SchemaRef>> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.get_schema_duckdb(pool),
@@ -391,7 +391,7 @@ impl DatasetCheckpoint {
             reason = "async only when an async accelerator backend is compiled in; DuckDB helpers are synchronous"
         )
     )]
-    pub async fn get_refresh_sql(&self) -> Result<Option<String>> {
+    pub(crate) async fn get_refresh_sql(&self) -> Result<Option<String>> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.get_refresh_sql_duckdb(pool),
@@ -421,7 +421,7 @@ impl DatasetCheckpoint {
             reason = "async only when an async accelerator backend is compiled in; DuckDB helpers are synchronous"
         )
     )]
-    pub async fn delete(&self) -> Result<()> {
+    pub(crate) async fn delete(&self) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.delete_duckdb(pool),

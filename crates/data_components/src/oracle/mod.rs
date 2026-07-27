@@ -126,7 +126,7 @@ impl OracleTableProvider {
         })
     }
 
-    pub async fn get_schema(
+    async fn get_schema(
         conn: Arc<OracleConnectionPool>,
         table: &TableReference,
     ) -> Result<SchemaRef> {

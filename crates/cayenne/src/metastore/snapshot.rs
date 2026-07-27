@@ -54,10 +54,10 @@ use super::{
 use crate::catalog::{CatalogError, CatalogResult};
 
 /// Current slice format version. Incremented on incompatible format changes.
-pub const SLICE_FORMAT_VERSION: u32 = 1;
+const SLICE_FORMAT_VERSION: u32 = 1;
 
 /// Engine identifier embedded in slices to detect cross-engine misuse.
-pub const SLICE_ENGINE: &str = "cayenne";
+const SLICE_ENGINE: &str = "cayenne";
 
 /// JSON-friendly mirror of [`MetastoreValue`]. Blobs are base64-encoded so the
 /// document remains valid UTF-8 JSON.
@@ -99,7 +99,7 @@ impl SliceValue {
     /// # Errors
     ///
     /// Returns an error if a `Blob` variant contains invalid base64.
-    pub fn into_metastore_value(self) -> CatalogResult<MetastoreValue> {
+    fn into_metastore_value(self) -> CatalogResult<MetastoreValue> {
         Ok(match self {
             SliceValue::Integer(i) => MetastoreValue::Integer(i),
             SliceValue::Text(s) => MetastoreValue::Text(s),
@@ -125,16 +125,16 @@ pub type SliceRow = Vec<SliceValue>;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatasetMetastoreSlice {
     /// Slice format version. Must equal [`SLICE_FORMAT_VERSION`] for this build.
-    pub format_version: u32,
+    format_version: u32,
     /// Engine identifier; must equal [`SLICE_ENGINE`] (`"cayenne"`).
-    pub engine: String,
+    engine: String,
     /// Logical dataset name (matches `cayenne_table.table_name`).
     pub dataset_name: String,
     /// Wall-clock timestamp (milliseconds since epoch) when the slice was exported.
-    pub exported_at_ms: i64,
+    exported_at_ms: i64,
     /// Map of metastore table name -> rows. Each row is positional;
     /// column order must match the corresponding [`EXPECTED_TABLES`] entry.
-    pub tables: BTreeMap<String, Vec<SliceRow>>,
+    pub(crate) tables: BTreeMap<String, Vec<SliceRow>>,
 }
 
 impl DatasetMetastoreSlice {
@@ -264,7 +264,7 @@ async fn lookup_table_id(
 ///
 /// Returns an error if the dataset does not exist, or if any underlying
 /// metastore query fails.
-pub async fn export_dataset(
+pub(crate) async fn export_dataset(
     metastore: &impl MetastoreBackend,
     dataset_name: &str,
     data_dir_anchor: &Path,
@@ -366,7 +366,7 @@ pub async fn export_dataset(
 /// # Errors
 ///
 /// Returns an error if any DML fails or the slice is internally inconsistent.
-pub async fn import_dataset(
+pub(crate) async fn import_dataset(
     metastore: &impl MetastoreBackend,
     slice: &DatasetMetastoreSlice,
     data_dir_anchor: &Path,

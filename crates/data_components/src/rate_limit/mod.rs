@@ -176,7 +176,7 @@ pub fn retry_after_time(headers: &HeaderMap, now: SystemTime) -> Option<SystemTi
 }
 
 #[must_use]
-pub fn retry_after_duration(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
+pub(crate) fn retry_after_duration(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
     let retry_after = retry_after_millis_duration(headers).or_else(|| {
         headers
             .get(RETRY_AFTER)
@@ -191,7 +191,7 @@ pub fn retry_after_duration(headers: &HeaderMap, now: SystemTime) -> Option<Dura
 }
 
 #[must_use]
-pub fn retry_after_duration_from_value(value: &str, now: SystemTime) -> Option<Duration> {
+pub(crate) fn retry_after_duration_from_value(value: &str, now: SystemTime) -> Option<Duration> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return None;

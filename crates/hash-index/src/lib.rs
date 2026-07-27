@@ -55,7 +55,7 @@ mod sbbf;
 mod tests;
 
 pub use bloom::{BatchBloomFilter, BloomFilter};
-pub use extract::{
+pub(crate) use extract::{
     KeyExtractor, PrimitiveKeyExtractor, RowConverterKeyExtractor, Utf8KeyExtractor,
 };
 pub use index::{

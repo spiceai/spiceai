@@ -38,19 +38,19 @@ See more at: https://spiceai.org/docs/"#
 pub struct RefreshArgs {
     /// The dataset name to refresh
     #[arg(required = true)]
-    pub dataset: String,
+    dataset: String,
 
     /// SQL query to filter the data to refresh
     #[arg(long)]
-    pub refresh_sql: Option<String>,
+    refresh_sql: Option<String>,
 
     /// Refresh mode: 'full' or 'append'
     #[arg(long)]
-    pub refresh_mode: Option<String>,
+    refresh_mode: Option<String>,
 
     /// Maximum jitter for the refresh operation (e.g. '1m')
     #[arg(long)]
-    pub refresh_jitter_max: Option<String>,
+    refresh_jitter_max: Option<String>,
 
     /// Output format
     #[arg(long, short = 'o', default_value = "table")]

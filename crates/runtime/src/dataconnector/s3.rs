@@ -145,9 +145,9 @@ impl S3Factory {
     }
 }
 
-pub const S3_DOCS: &str = "https://spiceai.org/docs/components/data-connectors/s3";
+const S3_DOCS: &str = "https://spiceai.org/docs/components/data-connectors/s3";
 
-pub static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
+pub(crate) static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
     let mut all_parameters = Vec::new();
     all_parameters.extend_from_slice(&[
             ParameterSpec::component("region")

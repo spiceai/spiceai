@@ -43,7 +43,7 @@ pub struct OtelExecutorMetricsCollector {
 impl OtelExecutorMetricsCollector {
     /// Creates a new `OtelExecutorMetricsCollector` with the given node ID.
     #[must_use]
-    pub fn new(node_id: String) -> Self {
+    pub(crate) fn new(node_id: String) -> Self {
         Self { node_id }
     }
 }
@@ -185,13 +185,13 @@ pub struct OtelShuffleReadMetricsCallback {
 impl OtelShuffleReadMetricsCallback {
     /// Creates a new `OtelShuffleReadMetricsCallback` with the given node ID.
     #[must_use]
-    pub fn new(node_id: String) -> Self {
+    fn new(node_id: String) -> Self {
         Self { node_id }
     }
 
     /// Creates a new callback wrapped in an Arc for use with session config.
     #[must_use]
-    pub fn new_arc(node_id: String) -> Arc<dyn ShuffleReadMetricsCallback> {
+    pub(crate) fn new_arc(node_id: String) -> Arc<dyn ShuffleReadMetricsCallback> {
         Arc::new(Self::new(node_id))
     }
 }
@@ -281,7 +281,7 @@ pub struct OtelSchedulerMetricsCollector {
 impl OtelSchedulerMetricsCollector {
     /// Creates a new `OtelSchedulerMetricsCollector` with the given node ID.
     #[must_use]
-    pub fn new(node_id: String) -> Self {
+    pub(crate) fn new(node_id: String) -> Self {
         Self { node_id }
     }
 }

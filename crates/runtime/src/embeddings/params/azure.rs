@@ -23,15 +23,15 @@ use secrecy::SecretString;
 pub struct AzureEmbeddingParams {
     /// The Azure `OpenAI` resource endpoint, e.g., <https://resource-name.openai.azure.com>.
     #[param(runtime)]
-    pub endpoint: Option<String>,
+    pub(crate) endpoint: Option<String>,
     /// The API version used for the Azure `OpenAI` service.
-    pub api_version: Option<String>,
+    pub(crate) api_version: Option<String>,
     /// The name of the model deployment.
-    pub deployment_name: Option<String>,
+    pub(crate) deployment_name: Option<String>,
     /// The Azure `OpenAI` API key.
     #[param(autoload_secret)]
-    pub api_key: Option<SecretString>,
+    pub(crate) api_key: Option<SecretString>,
     /// The Azure Entra token for authentication.
     #[param(autoload_secret)]
-    pub entra_token: Option<SecretString>,
+    pub(crate) entra_token: Option<SecretString>,
 }

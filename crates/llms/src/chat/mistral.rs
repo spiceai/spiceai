@@ -84,7 +84,7 @@ fn to_openai_response(
 }
 
 impl MistralLlama {
-    pub async fn from(
+    pub(crate) async fn from(
         model_weights: &[PathBuf],
         config: Option<&Path>,
         tokenizer: Option<&Path>,
@@ -382,7 +382,7 @@ impl MistralLlama {
         }
     }
 
-    pub async fn from_hf(
+    pub(crate) async fn from_hf(
         model_id: &str,
         arch: Option<&str>,
         hf_token_literal: Option<&SecretString>,

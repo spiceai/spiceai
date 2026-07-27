@@ -91,7 +91,7 @@ pub struct Subtable14<'a> {
 
 impl<'a> Subtable14<'a> {
     /// Parses a subtable from raw data.
-    pub fn parse(data: &'a [u8]) -> Option<Self> {
+    pub(crate) fn parse(data: &'a [u8]) -> Option<Self> {
         let mut s = Stream::new(data);
         s.skip::<u16>(); // format
         s.skip::<u32>(); // length

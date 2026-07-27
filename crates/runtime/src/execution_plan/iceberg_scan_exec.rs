@@ -125,7 +125,7 @@ impl IcebergScanExec {
     /// `IcebergTableScan`) the provider produced, carrying the scan arguments the
     /// codec needs to serialize a recipe.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         table_ref: TableReference,
         inner: Arc<dyn ExecutionPlan>,
         projection: Option<Vec<usize>>,
@@ -151,7 +151,7 @@ impl IcebergScanExec {
     /// be the concrete Iceberg provider (e.g. `cluster.inner()`), not the cluster
     /// wrapper, so replaying its `scan()` yields the bare scan without re-wrapping.
     #[must_use]
-    pub fn new_deferred(
+    pub(crate) fn new_deferred(
         table_ref: TableReference,
         provider: Arc<dyn TableProvider>,
         projection: Option<Vec<usize>>,
@@ -182,25 +182,25 @@ impl IcebergScanExec {
 
     /// The `DataFusion` reference of the registered Iceberg table.
     #[must_use]
-    pub fn table_ref(&self) -> &TableReference {
+    pub(crate) fn table_ref(&self) -> &TableReference {
         &self.table_ref
     }
 
     /// The scan's column projection.
     #[must_use]
-    pub fn projection(&self) -> Option<&Vec<usize>> {
+    pub(crate) fn projection(&self) -> Option<&Vec<usize>> {
         self.projection.as_ref()
     }
 
     /// The scan's pushed-down filters.
     #[must_use]
-    pub fn filters(&self) -> &[Expr] {
+    pub(crate) fn filters(&self) -> &[Expr] {
         &self.filters
     }
 
     /// The scan's row limit.
     #[must_use]
-    pub fn limit(&self) -> Option<usize> {
+    pub(crate) fn limit(&self) -> Option<usize> {
         self.limit
     }
 
@@ -212,7 +212,7 @@ impl IcebergScanExec {
     /// deferred node (its provider already carries the pin) or if the wrapped plan
     /// isn't an `IcebergTableScan`.
     #[must_use]
-    pub fn snapshot_id(&self) -> Option<i64> {
+    pub(crate) fn snapshot_id(&self) -> Option<i64> {
         match &self.source {
             ScanSource::Planned(inner) => inner.downcast_ref::<IcebergTableScan>().and_then(|s| {
                 s.snapshot_id()

@@ -69,17 +69,17 @@ const STREAM_BATCH_SIZE: usize = 1024;
 /// Configuration for a single Cosmos DB dataset.
 #[derive(Debug, Clone)]
 pub struct CosmosDBTableProviderConfig {
-    pub database: String,
-    pub container: String,
+    database: String,
+    container: String,
     /// Cosmos SQL query to execute. Defaults to `SELECT * FROM c`.
-    pub query: String,
+    query: String,
     /// Number of documents sampled when inferring the schema.
-    pub schema_infer_max_records: usize,
+    schema_infer_max_records: usize,
     /// How to handle columns whose type Cosmos DB cannot represent (e.g.
     /// all-null samples that Arrow's JSON inference returns as
     /// [`DataType::Null`]). Defaults to [`UnsupportedTypeAction::Warn`].
-    pub unsupported_type_action: UnsupportedTypeAction,
-    pub resilience: CosmosResilienceConfig,
+    unsupported_type_action: UnsupportedTypeAction,
+    resilience: CosmosResilienceConfig,
 }
 
 impl CosmosDBTableProviderConfig {

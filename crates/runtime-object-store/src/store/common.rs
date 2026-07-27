@@ -26,7 +26,7 @@ use object_store::{GetRange, ListResult, ObjectMeta, path::Path};
 
 /// Create a generic object store error for a given store type.
 #[inline]
-pub fn generic_error<T: Into<Box<dyn std::error::Error + Sync + Send>>>(
+pub(crate) fn generic_error<T: Into<Box<dyn std::error::Error + Sync + Send>>>(
     store: &'static str,
     error: T,
 ) -> object_store::Error {
@@ -40,19 +40,19 @@ pub fn generic_error<T: Into<Box<dyn std::error::Error + Sync + Send>>>(
 #[derive(Debug, Clone)]
 pub struct DirEntry {
     /// The name of the file or directory (not the full path).
-    pub name: String,
+    pub(crate) name: String,
     /// Whether this entry is a directory.
-    pub is_dir: bool,
+    pub(crate) is_dir: bool,
     /// File size in bytes (0 for directories).
-    pub size: u64,
+    pub(crate) size: u64,
     /// Last modification time.
-    pub last_modified: DateTime<Utc>,
+    last_modified: DateTime<Utc>,
 }
 
 impl DirEntry {
     /// Create a new file entry.
     #[must_use]
-    pub fn file(name: String, size: u64, last_modified: DateTime<Utc>) -> Self {
+    pub(crate) fn file(name: String, size: u64, last_modified: DateTime<Utc>) -> Self {
         Self {
             name,
             is_dir: false,
@@ -63,7 +63,7 @@ impl DirEntry {
 
     /// Create a new directory entry.
     #[must_use]
-    pub fn directory(name: String) -> Self {
+    pub(crate) fn directory(name: String) -> Self {
         Self {
             name,
             is_dir: true,
@@ -76,7 +76,7 @@ impl DirEntry {
 /// Build the full path for a directory entry given its parent path.
 #[inline]
 #[must_use]
-pub fn build_full_path(parent: &str, name: &str) -> String {
+fn build_full_path(parent: &str, name: &str) -> String {
     if parent.is_empty() {
         name.to_string()
     } else {
@@ -87,7 +87,7 @@ pub fn build_full_path(parent: &str, name: &str) -> String {
 /// Convert a `DirEntry` to an `ObjectMeta` for files.
 #[inline]
 #[must_use]
-pub fn entry_to_object_meta(full_path: String, entry: &DirEntry) -> ObjectMeta {
+fn entry_to_object_meta(full_path: String, entry: &DirEntry) -> ObjectMeta {
     ObjectMeta {
         location: Path::from(full_path),
         size: entry.size,
@@ -100,7 +100,7 @@ pub fn entry_to_object_meta(full_path: String, entry: &DirEntry) -> ObjectMeta {
 /// Check if a directory entry name should be skipped (. or ..).
 #[inline]
 #[must_use]
-pub fn should_skip_entry(name: &str) -> bool {
+pub(crate) fn should_skip_entry(name: &str) -> bool {
     name == "." || name == ".."
 }
 
@@ -108,7 +108,7 @@ pub fn should_skip_entry(name: &str) -> bool {
 /// and directories to add to the traversal queue.
 ///
 /// Returns a tuple of (files, directories).
-pub fn process_directory_entries(
+pub(crate) fn process_directory_entries(
     parent_path: &str,
     entries: impl IntoIterator<Item = DirEntry>,
 ) -> (Vec<ObjectMeta>, Vec<String>) {
@@ -134,7 +134,7 @@ pub fn process_directory_entries(
 
 /// Process directory entries for a shallow listing (`list_with_delimiter`).
 /// Returns a `ListResult` with objects (files) and `common_prefixes` (directories).
-pub fn process_directory_entries_shallow(
+pub(crate) fn process_directory_entries_shallow(
     prefix: &str,
     entries: impl IntoIterator<Item = DirEntry>,
 ) -> ListResult {
@@ -174,7 +174,7 @@ pub fn process_directory_entries_shallow(
 /// - `Offset(n)`: Read from byte `n` to end of file
 /// - `Suffix(n)`: Read the last `n` bytes of the file
 #[must_use]
-pub fn resolve_range(range: Option<&GetRange>, file_size: u64) -> (u64, u64, u64) {
+pub(crate) fn resolve_range(range: Option<&GetRange>, file_size: u64) -> (u64, u64, u64) {
     match range {
         Some(GetRange::Bounded(r)) => {
             let end = r.end.min(file_size);
@@ -196,13 +196,13 @@ pub fn resolve_range(range: Option<&GetRange>, file_size: u64) -> (u64, u64, u64
 /// Build a byte `Range` from resolved start and end offsets.
 #[inline]
 #[must_use]
-pub fn build_byte_range(start: u64, end: u64) -> Range<u64> {
+pub(crate) fn build_byte_range(start: u64, end: u64) -> Range<u64> {
     Range { start, end }
 }
 
 /// Create an `ObjectMeta` from basic file information.
 #[must_use]
-pub fn build_object_meta(location: Path, size: u64, last_modified: DateTime<Utc>) -> ObjectMeta {
+pub(crate) fn build_object_meta(location: Path, size: u64, last_modified: DateTime<Utc>) -> ObjectMeta {
     ObjectMeta {
         location,
         size,

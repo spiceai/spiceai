@@ -464,7 +464,7 @@ fn _direct_object(depth: usize) -> impl Fn(ParserInput) -> NomResult<Object> {
     }
 }
 
-pub fn direct_object(input: ParserInput) -> Option<Object> {
+pub(crate) fn direct_object(input: ParserInput) -> Option<Object> {
     strip_nom(_direct_object(crate::reader::MAX_NESTING_DEPTH)(input))
 }
 
@@ -483,7 +483,7 @@ fn object<'a>(
     .parse(input)
 }
 
-pub fn indirect_object(
+pub(crate) fn indirect_object(
     input: ParserInput,
     offset: usize,
     expected_id: Option<ObjectId>,
@@ -532,7 +532,7 @@ fn _indirect_object<'a>(
     Ok((object_id, object))
 }
 
-pub fn header(input: ParserInput, strict: bool) -> Option<String> {
+pub(crate) fn header(input: ParserInput, strict: bool) -> Option<String> {
     // Parse version digits (e.g. "1.7") separately from any trailing bytes
     // before the newline.  Some PDF generators (e.g. ImageMill) place binary
     // marker bytes on the header line which would fail UTF-8 validation.
@@ -556,7 +556,7 @@ pub fn header(input: ParserInput, strict: bool) -> Option<String> {
     Some(version)
 }
 
-pub fn binary_mark(input: ParserInput) -> Option<Vec<u8>> {
+pub(crate) fn binary_mark(input: ParserInput) -> Option<Vec<u8>> {
     strip_nom(
         map_res(
             delimited(
@@ -612,7 +612,7 @@ fn trailer(input: ParserInput) -> NomResult<Dictionary> {
     delimited(pair(tag(&b"trailer"[..]), space), dictionary, space).parse(input)
 }
 
-pub fn xref_and_trailer(input: ParserInput, reader: &Reader) -> crate::Result<(Xref, Dictionary)> {
+pub(crate) fn xref_and_trailer(input: ParserInput, reader: &Reader) -> crate::Result<(Xref, Dictionary)> {
     let xref_trailer = map(pair(xref, trailer), |(mut xref, trailer)| {
         xref.size = trailer
             .get(b"Size")
@@ -642,7 +642,7 @@ pub fn xref_and_trailer(input: ParserInput, reader: &Reader) -> crate::Result<(X
     .map_err(|_| error::ParseError::InvalidTrailer)?
 }
 
-pub fn xref_start(input: ParserInput) -> Option<i64> {
+pub(crate) fn xref_start(input: ParserInput) -> Option<i64> {
     strip_nom(
         delimited(
             pair(tag(&b"startxref"[..]), preceded(opt(tag(&b" "[..])), eol)),
@@ -816,11 +816,11 @@ fn _content(input: ParserInput) -> NomResult<Content<Vec<Operation>>> {
     .parse(input)
 }
 
-pub fn content(input: ParserInput) -> Option<Content<Vec<Operation>>> {
+pub(crate) fn content(input: ParserInput) -> Option<Content<Vec<Operation>>> {
     strip_nom(_content.parse(input))
 }
 
-pub fn content_strict(input: ParserInput) -> Result<Content<Vec<Operation>>, error::ParseError> {
+pub(crate) fn content_strict(input: ParserInput) -> Result<Content<Vec<Operation>>, error::ParseError> {
     let (rest, content) = _content
         .parse(input)
         .map_err(|_| error::ParseError::InvalidContentStream)?;

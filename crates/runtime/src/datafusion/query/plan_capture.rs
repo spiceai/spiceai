@@ -50,7 +50,7 @@ pub struct PlanCaptureConfig {
 
 impl PlanCaptureConfig {
     #[must_use]
-    pub fn analyze_enabled(&self) -> bool {
+    pub(crate) fn analyze_enabled(&self) -> bool {
         matches!(self.captured_plan, TaskHistoryCapturedPlan::ExplainAnalyze)
     }
 }
@@ -70,7 +70,7 @@ pub(crate) fn logical_plan_is_explain(plan: &LogicalPlan) -> bool {
 /// failure is treated as non-explain: the background EXPLAIN re-plan either
 /// succeeds or fails harmlessly.
 #[must_use]
-pub fn sql_is_explain(sql: &str) -> bool {
+fn sql_is_explain(sql: &str) -> bool {
     let Ok(statements) = DFParser::parse_sql_with_dialect(sql, &PostgreSqlDialect {}) else {
         return false;
     };
@@ -107,7 +107,7 @@ pub(crate) fn plan_capture_eligible(elapsed_ms: f64, config: &PlanCaptureConfig)
 /// Whether the exporter should spawn a background EXPLAIN re-plan for this
 /// retained `sql_query` span. Shared with the `Explain` (non-analyze) path.
 #[must_use]
-pub fn should_capture_explain_plan(
+pub(crate) fn should_capture_explain_plan(
     task: &str,
     input: &str,
     execution_duration_ms: f64,

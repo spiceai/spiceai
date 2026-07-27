@@ -108,7 +108,7 @@ impl FromData for StringId {
     }
 }
 
-pub trait IsEven {
+pub(crate) trait IsEven {
     fn is_even(&self) -> bool;
     fn is_odd(&self) -> bool;
 }
@@ -127,7 +127,7 @@ impl IsEven for usize {
 
 #[cfg(feature = "std")]
 #[inline]
-pub fn f32_abs(n: f32) -> f32 {
+pub(crate) fn f32_abs(n: f32) -> f32 {
     n.abs()
 }
 
@@ -142,7 +142,7 @@ pub fn f32_abs(n: f32) -> f32 {
 }
 
 #[inline]
-pub fn conv_subroutine_index(index: f32, bias: u16) -> Result<u32, CFFError> {
+pub(crate) fn conv_subroutine_index(index: f32, bias: u16) -> Result<u32, CFFError> {
     conv_subroutine_index_impl(index, bias).ok_or(CFFError::InvalidSubroutineIndex)
 }
 
@@ -157,7 +157,7 @@ fn conv_subroutine_index_impl(index: f32, bias: u16) -> Option<u32> {
 
 // Adobe Technical Note #5176, Chapter 16 "Local / Global Subrs INDEXes"
 #[inline]
-pub fn calc_subroutine_bias(len: u32) -> u16 {
+pub(crate) fn calc_subroutine_bias(len: u32) -> u16 {
     if len < 1240 {
         107
     } else if len < 33900 {

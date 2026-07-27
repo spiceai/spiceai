@@ -134,7 +134,7 @@ pub struct CayenneSnapshotEngine {
 }
 
 impl CayenneSnapshotEngine {
-    pub fn new(
+    pub(crate) fn new(
         catalog: Arc<dyn MetadataCatalog>,
         dataset_name: impl Into<String>,
         data_dir_anchor: PathBuf,

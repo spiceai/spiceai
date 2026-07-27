@@ -6,8 +6,8 @@ use crate::GlyphId;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) struct BitmapFormat {
-    pub metrics: MetricsFormat,
-    pub data: BitmapDataFormat,
+    pub(crate) metrics: MetricsFormat,
+    pub(crate) data: BitmapDataFormat,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -26,18 +26,18 @@ pub(crate) enum BitmapDataFormat {
 
 #[derive(Clone, Copy, Default, Debug)]
 pub(crate) struct Metrics {
-    pub x: i8,
-    pub y: i8,
-    pub width: u8,
-    pub height: u8,
+    pub(crate) x: i8,
+    pub(crate) y: i8,
+    pub(crate) width: u8,
+    pub(crate) height: u8,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Location {
-    pub format: BitmapFormat,
-    pub offset: usize,
-    pub metrics: Metrics,
-    pub ppem: u16,
+    pub(crate) format: BitmapFormat,
+    pub(crate) offset: usize,
+    pub(crate) metrics: Metrics,
+    pub(crate) ppem: u16,
 }
 
 #[derive(Clone, Copy)]
@@ -160,7 +160,7 @@ pub struct Table<'a> {
 
 impl<'a> Table<'a> {
     /// Parses a table from raw data.
-    pub fn parse(data: &'a [u8]) -> Option<Self> {
+    pub(crate) fn parse(data: &'a [u8]) -> Option<Self> {
         Some(Self { data })
     }
 

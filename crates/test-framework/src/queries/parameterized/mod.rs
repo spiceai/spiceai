@@ -31,7 +31,7 @@ pub enum ParameterValue {
 
 impl ParameterValue {
     #[must_use]
-    pub fn dtype(&self) -> DataType {
+    pub(crate) fn dtype(&self) -> DataType {
         match self {
             ParameterValue::String(_) => DataType::Utf8,
             ParameterValue::Number(_) => DataType::Int64,
@@ -40,7 +40,7 @@ impl ParameterValue {
     }
 
     #[must_use]
-    pub fn array(&self) -> Arc<dyn arrow::array::Array> {
+    pub(crate) fn array(&self) -> Arc<dyn arrow::array::Array> {
         match self {
             ParameterValue::String(value) => {
                 Arc::new(arrow::array::StringArray::from(vec![value.as_ref()]))
@@ -57,7 +57,7 @@ impl ParameterValue {
     /// Converts the parameter value to a SQL literal string for use in queries
     /// that don't support parameterized queries (e.g., HTTP endpoints).
     #[must_use]
-    pub fn to_sql_literal(&self) -> String {
+    pub(crate) fn to_sql_literal(&self) -> String {
         match self {
             ParameterValue::String(s) => format!("'{}'", s.replace('\'', "''")),
             ParameterValue::Number(n) => n.to_string(),
@@ -69,7 +69,7 @@ impl ParameterValue {
 /// Defines parameters for TPC-H queries. Values are extracted from the original TPC-H queries,
 /// with their values replaced with $1 parameters in the `/parameterized/` TPC-H files.
 #[must_use]
-pub fn add_tpch_parameters(queries: Vec<Query>) -> Vec<Query> {
+pub(crate) fn add_tpch_parameters(queries: Vec<Query>) -> Vec<Query> {
     queries
         .into_iter()
         .map(|q| {

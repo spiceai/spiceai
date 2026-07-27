@@ -95,7 +95,7 @@ impl ODBCPool {
     }
 
     #[must_use]
-    pub fn odbc_environment(&self) -> &'static Environment {
+    pub(crate) fn odbc_environment(&self) -> &'static Environment {
         self.pool
     }
 }

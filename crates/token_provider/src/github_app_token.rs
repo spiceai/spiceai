@@ -218,8 +218,8 @@ impl GitHubAppTokenProvider {
 
 #[derive(Clone)]
 pub struct GitHubToken {
-    pub token: SecretString,
-    pub expires_at: DateTime<Utc>,
+    token: SecretString,
+    expires_at: DateTime<Utc>,
 }
 
 impl fmt::Debug for GitHubToken {
@@ -233,7 +233,7 @@ impl fmt::Debug for GitHubToken {
 impl GitHubToken {
     #[expect(clippy::cast_sign_loss)]
     #[must_use]
-    pub fn next_wait(&self) -> Duration {
+    fn next_wait(&self) -> Duration {
         // Clamp seconds-until-expiry to a non-negative value before casting to u64;
         // an already-expired (or near-expired) token yields a negative value that would
         // otherwise wrap to a huge sleep. Subtract the refresh buffer with saturating

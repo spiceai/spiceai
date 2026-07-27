@@ -22,14 +22,14 @@ limitations under the License.
 //! Entry point: [`start_replication_stream`]. Compiled as part of the
 //! `postgres` feature on this crate — no separate feature flag.
 
-pub mod bootstrap;
+pub(crate) mod bootstrap;
 pub mod changes;
-pub mod client;
+pub(crate) mod client;
 pub mod config;
 pub mod metrics;
 pub mod pgoutput;
 pub mod resilience;
-pub mod schema_evolution;
+pub(crate) mod schema_evolution;
 pub mod shared;
 pub mod slot;
 
@@ -53,7 +53,7 @@ pub use slot::{SlotInfo, SlotSetupOutcome};
 /// string "db error", hiding the actual `PostgreSQL` server message. This helper
 /// surfaces the severity + message (and detail, if present) from the underlying
 /// `DbError` so that log lines contain actionable text.
-pub(crate) fn pg_error_detail(e: &tokio_postgres::Error) -> String {
+fn pg_error_detail(e: &tokio_postgres::Error) -> String {
     if let Some(db) = e.as_db_error() {
         let mut msg = format!("{}: {}", db.severity(), db.message());
         if let Some(detail) = db.detail() {
@@ -361,6 +361,6 @@ fn stream_error(err: &Error) -> StreamError {
     clippy::needless_pass_by_value,
     reason = "used as a function pointer in map_err; taking by reference would require a closure at every call site"
 )]
-pub(crate) fn err_to_stream(err: Error) -> StreamError {
+fn err_to_stream(err: Error) -> StreamError {
     stream_error(&err)
 }

@@ -3,8 +3,8 @@ mod differences;
 mod glyphnames;
 mod mappings;
 
-pub use self::differences::Differences;
-pub use self::glyphnames::Glyph;
+pub(crate) use self::differences::Differences;
+pub(crate) use self::glyphnames::Glyph;
 pub use self::mappings::*;
 use crate::Error;
 use crate::Result;
@@ -13,7 +13,7 @@ use cmap::ToUnicodeCMap;
 use encoding_rs::UTF_16BE;
 use log::debug;
 
-pub fn bytes_to_string(encoding: &CodedCharacterSet, bytes: &[u8], out: &mut String) -> Result<()> {
+pub(crate) fn bytes_to_string(encoding: &CodedCharacterSet, bytes: &[u8], out: &mut String) -> Result<()> {
     for b in bytes {
         let Some(g) = encoding.get(*b as usize).copied().flatten() else {
             continue;
@@ -27,13 +27,13 @@ pub fn bytes_to_string(encoding: &CodedCharacterSet, bytes: &[u8], out: &mut Str
     Ok(())
 }
 
-pub fn string_to_bytes(encoding: &CodedCharacterSet, text: &str) -> Vec<u8> {
+pub(crate) fn string_to_bytes(encoding: &CodedCharacterSet, text: &str) -> Vec<u8> {
     let mut out = Vec::new();
     write_to_bytes(encoding, text, &mut out);
     out
 }
 
-pub fn write_to_bytes(encoding: &CodedCharacterSet, text: &str, out: &mut Vec<u8>) {
+fn write_to_bytes(encoding: &CodedCharacterSet, text: &str, out: &mut Vec<u8>) {
     for c in text.encode_utf16() {
         let g = Glyph::from_utf16_code_unit(c);
 
@@ -68,13 +68,13 @@ impl std::fmt::Debug for Encoding<'_> {
 }
 
 impl Encoding<'_> {
-    pub fn bytes_to_string(&self, bytes: &[u8]) -> Result<String> {
+    pub(crate) fn bytes_to_string(&self, bytes: &[u8]) -> Result<String> {
         let mut out = String::new();
         self.write_to_string(bytes, &mut out)?;
         Ok(out)
     }
 
-    pub fn write_to_string(&self, bytes: &[u8], out: &mut String) -> Result<()> {
+    pub(crate) fn write_to_string(&self, bytes: &[u8], out: &mut String) -> Result<()> {
         match self {
             Self::OneByteEncoding(map) => {
                 bytes_to_string(map, bytes, out)?;
@@ -130,13 +130,13 @@ impl Encoding<'_> {
         }
     }
 
-    pub fn string_to_bytes(&self, text: &str) -> Vec<u8> {
+    pub(crate) fn string_to_bytes(&self, text: &str) -> Vec<u8> {
         let mut bytes = Vec::new();
         self.write_to_bytes(text, &mut bytes);
         bytes
     }
 
-    pub fn write_to_bytes(&self, text: &str, out: &mut Vec<u8>) {
+    fn write_to_bytes(&self, text: &str, out: &mut Vec<u8>) {
         match self {
             Self::OneByteEncoding(map) => write_to_bytes(map, text, out),
             Self::SimpleEncoding(b"UniGB-UCS2-H") | Self::SimpleEncoding(b"UniGB-UTF16-H") => {

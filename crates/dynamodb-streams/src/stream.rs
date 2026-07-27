@@ -265,7 +265,7 @@ fn combine_shard_batches(poll_results: &[ShardPollResult]) -> DynamoDBStreamBatc
 
 #[derive(Debug)]
 pub struct DynamodbStream {
-    pub receiver: mpsc::Receiver<DynamoDBStreamBatch>,
+    pub(crate) receiver: mpsc::Receiver<DynamoDBStreamBatch>,
 }
 
 impl Stream for DynamodbStream {

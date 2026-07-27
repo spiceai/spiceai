@@ -1,7 +1,7 @@
 use super::glyphnames::Glyph;
 
 pub type CodedCharacterSet = [Option<Glyph>; 256];
-pub const MAC_ROMAN_ENCODING: CodedCharacterSet = [
+pub(crate) const MAC_ROMAN_ENCODING: CodedCharacterSet = [
     None,
     None,
     None,
@@ -260,7 +260,7 @@ pub const MAC_ROMAN_ENCODING: CodedCharacterSet = [
     Some(Glyph::caron),
 ];
 
-pub const MAC_EXPERT_ENCODING: CodedCharacterSet = [
+pub(crate) const MAC_EXPERT_ENCODING: CodedCharacterSet = [
     None,
     None,
     None,
@@ -519,7 +519,7 @@ pub const MAC_EXPERT_ENCODING: CodedCharacterSet = [
     None,
 ];
 
-pub const WIN_ANSI_ENCODING: CodedCharacterSet = [
+pub(crate) const WIN_ANSI_ENCODING: CodedCharacterSet = [
     None,
     None,
     None,
@@ -778,7 +778,7 @@ pub const WIN_ANSI_ENCODING: CodedCharacterSet = [
     Some(Glyph::ydieresis),
 ];
 
-pub const STANDARD_ENCODING: CodedCharacterSet = [
+pub(crate) const STANDARD_ENCODING: CodedCharacterSet = [
     None,
     None,
     None,

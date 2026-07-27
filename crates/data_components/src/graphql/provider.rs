@@ -353,7 +353,7 @@ impl GraphQLTableProviderExec {
     }
 
     #[must_use]
-    pub fn with_transform_fn(mut self, transform_fn: Option<TransformFn>) -> Self {
+    fn with_transform_fn(mut self, transform_fn: Option<TransformFn>) -> Self {
         self.transform_fn = transform_fn;
         self
     }

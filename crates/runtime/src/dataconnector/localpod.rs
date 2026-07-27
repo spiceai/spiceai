@@ -31,7 +31,7 @@ use crate::{component::dataset::Dataset, parameters::ParameterSpec};
 
 use super::{ConnectorComponent, ConnectorParams, DataConnectorFactory};
 
-pub const LOCALPOD_DATACONNECTOR: &str = "localpod";
+pub(crate) const LOCALPOD_DATACONNECTOR: &str = "localpod";
 
 #[derive(Default, Debug, Copy, Clone)]
 pub struct LocalPodFactory {}
@@ -83,7 +83,7 @@ pub struct LocalPodConnector {
 
 impl LocalPodConnector {
     #[must_use]
-    pub fn new(datafusion: Arc<DataFusion>) -> Self {
+    pub(crate) fn new(datafusion: Arc<DataFusion>) -> Self {
         Self { datafusion }
     }
 }

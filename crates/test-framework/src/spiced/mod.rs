@@ -40,7 +40,7 @@ use crate::{
 pub struct SpicedVersion(String);
 impl SpicedVersion {
     #[must_use]
-    pub fn new(version: String) -> Self {
+    fn new(version: String) -> Self {
         Self(version)
     }
 }

@@ -17,12 +17,12 @@ pub struct Table<'a> {
 
 impl<'a> Table<'a> {
     /// Parses a table from raw data.
-    pub fn parse(locations: cblc::Table<'a>, data: &'a [u8]) -> Option<Self> {
+    pub(crate) fn parse(locations: cblc::Table<'a>, data: &'a [u8]) -> Option<Self> {
         Some(Self { locations, data })
     }
 
     /// Returns a raster image for the glyph.
-    pub fn get(&self, glyph_id: GlyphId, pixels_per_em: u16) -> Option<RasterGlyphImage<'a>> {
+    pub(crate) fn get(&self, glyph_id: GlyphId, pixels_per_em: u16) -> Option<RasterGlyphImage<'a>> {
         let location = self.locations.get(glyph_id, pixels_per_em)?;
         let mut s = Stream::new_at(self.data, location.offset)?;
         let metrics = match location.format.metrics {

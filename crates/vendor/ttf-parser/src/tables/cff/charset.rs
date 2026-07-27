@@ -81,7 +81,7 @@ pub(crate) enum Charset<'a> {
 }
 
 impl Charset<'_> {
-    pub fn sid_to_gid(&self, sid: StringId) -> Option<GlyphId> {
+    pub(crate) fn sid_to_gid(&self, sid: StringId) -> Option<GlyphId> {
         if sid.0 == 0 {
             return Some(GlyphId(0));
         }
@@ -128,7 +128,7 @@ impl Charset<'_> {
     }
 
     #[cfg(feature = "glyph-names")]
-    pub fn gid_to_sid(&self, gid: GlyphId) -> Option<StringId> {
+    pub(crate) fn gid_to_sid(&self, gid: GlyphId) -> Option<StringId> {
         match self {
             Charset::ISOAdobe => {
                 if gid.0 <= 228 {

@@ -59,9 +59,9 @@ fn parse_unsupported_type_action(
     }
 }
 
-pub const PREFIX: &str = "pg";
+pub(crate) const PREFIX: &str = "pg";
 
-pub const PARAMETERS: &[ParameterSpec] = &[
+pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("connection_string")
         .secret()
         .description("The PostgreSQL connection string."),
@@ -88,7 +88,7 @@ pub struct PostgresCatalog {
 
 impl PostgresCatalog {
     #[must_use]
-    pub fn new_connector(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
+    pub(crate) fn new_connector(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
         Arc::new(Self { params })
     }
 }

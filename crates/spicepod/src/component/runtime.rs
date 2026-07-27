@@ -29,7 +29,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 const TASK_HISTORY_RETENTION_MINIMUM: u64 = 60; // 1 minute
-pub const DEFAULT_FLIGHT_ADAPTIVE_BATCH_SIZE_MAX: usize = 131_072;
+const DEFAULT_FLIGHT_ADAPTIVE_BATCH_SIZE_MAX: usize = 131_072;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -471,7 +471,7 @@ pub struct TelemetryConfig {
 /// still fit the `OpenTelemetry` 255-character instrument name limit
 /// (`prefix` + base metric name ≤ 255), so 128 leaves ≥127 characters of
 /// headroom for the base name.
-pub const METRIC_PREFIX_MAX_LEN: usize = 128;
+const METRIC_PREFIX_MAX_LEN: usize = 128;
 
 /// Non-alphanumeric characters allowed in `OpenTelemetry` instrument names
 /// (and therefore in `metric_prefix`). Matches the `OTel` Metrics API ABNF and
@@ -643,16 +643,16 @@ pub struct TaskHistory {
     pub enabled: bool,
     #[serde(default = "default_none")]
     #[cfg_attr(feature = "schemars", schemars(with = "String"))]
-    pub captured_output: Arc<str>,
+    captured_output: Arc<str>,
     #[serde(default = "default_truncated")]
     #[cfg_attr(feature = "schemars", schemars(with = "TaskHistoryCapturedContext"))]
     pub captured_context: Arc<str>,
     #[serde(default = "default_retention_period")]
     #[cfg_attr(feature = "schemars", schemars(with = "String"))]
-    pub retention_period: Arc<str>,
+    retention_period: Arc<str>,
     #[serde(default = "default_retention_check_interval")]
     #[cfg_attr(feature = "schemars", schemars(with = "String"))]
-    pub retention_check_interval: Arc<str>,
+    retention_check_interval: Arc<str>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
     pub min_sql_duration: Option<Arc<str>>,
@@ -1193,7 +1193,7 @@ pub fn default_partition_discovery_timeout() -> String {
 }
 
 #[must_use]
-pub fn default_rate_control_refresh_interval() -> String {
+fn default_rate_control_refresh_interval() -> String {
     "30s".to_string()
 }
 
@@ -1204,62 +1204,62 @@ pub fn default_rate_control_refresh_interval() -> String {
 pub struct RuntimeDeserializer {
     #[serde(default)]
     #[deprecated(since = "2.0.0", note = "Use `runtime.caching.sql_results` instead.")]
-    pub results_cache: Option<ResultsCache>,
+    results_cache: Option<ResultsCache>,
     #[serde(default)]
-    pub caching: Option<Caching>,
+    caching: Option<Caching>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub dataset_load_parallelism: Option<usize>,
+    dataset_load_parallelism: Option<usize>,
     /// If set, the runtime will configure all endpoints to use TLS
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tls: Option<TlsConfig>,
+    tls: Option<TlsConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tracing: Option<TracingConfig>,
+    tracing: Option<TracingConfig>,
     #[serde(default, skip_serializing_if = "is_default")]
-    pub telemetry: TelemetryConfig,
+    telemetry: TelemetryConfig,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     #[serde(default)]
-    pub params: HashMap<String, String>,
+    params: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "is_default")]
-    pub task_history: TaskHistory,
+    task_history: TaskHistory,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth: Option<Auth>,
+    auth: Option<Auth>,
     #[serde(default, skip_serializing_if = "is_default")]
-    pub cors: CorsConfig,
+    cors: CorsConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub flight: Option<Flight>,
+    flight: Option<Flight>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub mcp: Option<McpConfig>,
+    mcp: Option<McpConfig>,
     /// Configures where the runtime will store temporary files needed for operations like
     /// spilling to disk for queries & accelerations that are larger than memory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[deprecated(since = "1.8.1", note = "Use `runtime.query.temp_directory` instead.")]
-    pub temp_directory: Option<String>,
+    temp_directory: Option<String>,
     /// Specifies the runtime memory limit. When configured, will spill to disk
     /// for supported queries larger than memory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[deprecated(since = "1.8.1", note = "Use `runtime.query.memory_limit` instead.")]
-    pub memory_limit: Option<String>,
+    memory_limit: Option<String>,
     /// Configures how long the runtime waits for connections to be gracefully drained
     /// and components to shut down cleanly during runtime termination
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub shutdown_timeout: Option<String>,
+    shutdown_timeout: Option<String>,
     /// Controls when the runtime is considered ready for the `/v1/ready` endpoint.
     #[serde(default, skip_serializing_if = "is_default")]
-    pub ready_state: RuntimeReadyState,
+    ready_state: RuntimeReadyState,
     /// Configures log level for the runtime. Can be overriden if flags or environment variables
     /// are set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_level: Option<OutputLevel>,
+    output_level: Option<OutputLevel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub query: Option<Query>,
+    query: Option<Query>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub metrics: Option<Metrics>,
+    metrics: Option<Metrics>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scheduler: Option<Scheduler>,
+    scheduler: Option<Scheduler>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_rate_control: Option<SourceRateControl>,
+    source_rate_control: Option<SourceRateControl>,
     #[serde(default, skip_serializing_if = "is_default")]
-    pub functions: Functions,
+    functions: Functions,
 }
 
 #[expect(deprecated)]

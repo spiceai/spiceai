@@ -63,7 +63,7 @@ pub enum Error {
     SchemaNotEmpty { schema_name: String },
 }
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// A catalog provider for `DuckLake` that discovers schemas and tables
 /// using a dedicated `DuckDB` instance with the `ducklake` extension.
@@ -449,7 +449,7 @@ impl DuckLakeSchemaProvider {
         clippy::too_many_arguments,
         reason = "schema provider requires all these configuration parameters"
     )]
-    pub fn new(
+    fn new(
         pool: Arc<DuckDbConnectionPool>,
         duckdb_factory: Arc<DuckDBTableFactory>,
         catalog_name: String,

@@ -84,9 +84,9 @@ mod common_tests {
     use crate::VortexFormatFactory;
     use crate::VortexTableOptions;
 
-    pub struct TestSessionContext {
-        pub store: Arc<dyn ObjectStore>,
-        pub session: SessionContext,
+    pub(crate) struct TestSessionContext {
+        pub(crate) store: Arc<dyn ObjectStore>,
+        pub(crate) session: SessionContext,
     }
 
     impl Default for TestSessionContext {
@@ -97,7 +97,7 @@ mod common_tests {
 
     impl TestSessionContext {
         /// Create a new test session context with the given projection pushdown setting.
-        pub fn new(projection_pushdown: bool) -> Self {
+        pub(crate) fn new(projection_pushdown: bool) -> Self {
             let store = Arc::new(InMemory::new());
             let opts = VortexTableOptions {
                 projection_pushdown: ProjectionPushdown::from_bool(projection_pushdown),

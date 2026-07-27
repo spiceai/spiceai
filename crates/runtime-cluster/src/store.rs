@@ -74,9 +74,9 @@ pub enum CopyAssignmentsResult {
 /// batched [`PartitionStore::apply_assignments`] API.
 #[derive(Debug, Clone)]
 pub struct AssignmentRequest {
-    pub table: TableReference,
-    pub partition_value: PartitionValue,
-    pub executor_id: String,
+    table: TableReference,
+    partition_value: PartitionValue,
+    executor_id: String,
 }
 
 /// Partition metadata store bound to one [`PartitionScope`] of the
@@ -97,7 +97,7 @@ pub type CatalogPartitions = PartitionStore;
 
 impl PartitionStore {
     #[must_use]
-    pub fn new(cluster: Arc<ClusterStateStore>, scope: PartitionScope) -> Self {
+    fn new(cluster: Arc<ClusterStateStore>, scope: PartitionScope) -> Self {
         Self { cluster, scope }
     }
 
@@ -202,7 +202,7 @@ impl PartitionStore {
     /// # Errors
     ///
     /// Returns an error if the cluster state mutation fails or encounters a concurrent modification.
-    pub async fn set_unassigned_partitions(
+    async fn set_unassigned_partitions(
         &self,
         table: &TableReference,
         partition_values: Vec<HashMap<String, Option<String>>>,
@@ -253,7 +253,7 @@ impl PartitionStore {
     /// # Errors
     ///
     /// Returns an error if the partition or table metadata is not found, or if the mutation fails.
-    pub async fn assign_partition(
+    pub(crate) async fn assign_partition(
         &self,
         table: &TableReference,
         partition_value: &PartitionValue,
@@ -285,7 +285,7 @@ impl PartitionStore {
     /// # Errors
     ///
     /// Returns an error if any table metadata is not found or if the cluster state mutation fails.
-    pub async fn apply_assignments(&self, assignments: &[AssignmentRequest]) -> Result<()> {
+    async fn apply_assignments(&self, assignments: &[AssignmentRequest]) -> Result<()> {
         let mut not_found: Option<(String, String)> = None;
         self.apply_assignments_inner(assignments, &mut not_found)
             .await
@@ -386,7 +386,7 @@ impl PartitionStore {
     /// # Errors
     ///
     /// Returns an error if the cluster state mutation fails (see [`Self::apply_assignments`]).
-    pub async fn add_and_assign_partitions(
+    pub(crate) async fn add_and_assign_partitions(
         &self,
         table: &TableReference,
         assignments: &[(&PartitionValue, &str)],
@@ -412,7 +412,7 @@ impl PartitionStore {
     /// # Errors
     ///
     /// Returns an error if the cluster state mutation fails.
-    pub async fn write_metadata(
+    pub(crate) async fn write_metadata(
         &self,
         table: &TableReference,
         metadata: TablePartitionMetadata,

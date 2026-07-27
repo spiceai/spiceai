@@ -110,7 +110,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("wallet"),
 ];
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Oracle data connector.
 #[derive(Debug)]
@@ -201,7 +201,7 @@ impl Oracle {
     ///
     /// Returns an error if the wallet directory cannot be created, the certificate cannot be
     /// decoded from base64, or the certificate file cannot be written.
-    pub fn save_wallet_cert_once(cert_base64_str: &str, wallet_path: &str) -> Result<()> {
+    fn save_wallet_cert_once(cert_base64_str: &str, wallet_path: &str) -> Result<()> {
         let mutex = WALLET_INIT.get_or_init(|| Mutex::new(None));
         let mut guard = mutex
             .lock()
@@ -263,7 +263,7 @@ impl OracleFactory {
     }
 
     #[must_use]
-    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+    fn new_arc() -> Arc<dyn DataConnectorFactory> {
         Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
     }
 }

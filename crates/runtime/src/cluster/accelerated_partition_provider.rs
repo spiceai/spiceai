@@ -37,7 +37,7 @@ pub struct AcceleratedPartitionProvider(Arc<ExecutorRegistry>);
 
 impl AcceleratedPartitionProvider {
     #[must_use]
-    pub fn from_registry(registry: Arc<ExecutorRegistry>) -> Self {
+    pub(crate) fn from_registry(registry: Arc<ExecutorRegistry>) -> Self {
         Self(registry)
     }
 }

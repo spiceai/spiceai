@@ -31,7 +31,7 @@ pub struct TextSearchCandidate {
 }
 
 impl TextSearchCandidate {
-    pub fn new(
+    pub(crate) fn new(
         inner: Arc<FullTextSearchFieldIndex>,
         df: Arc<dyn QueryEngine>,
         tbl: TableReference,

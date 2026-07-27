@@ -27,13 +27,13 @@ use token_provider::{StaticTokenProvider, TokenProvider};
 /// and allows you to set the base URL and add arbitrary default headers.
 #[derive(Clone, Debug)]
 pub struct HostedModelConfig {
-    pub auth: Option<GenericAuthMechanism>,
-    pub base_url: String,
-    pub default_headers: HeaderMap,
+    auth: Option<GenericAuthMechanism>,
+    base_url: String,
+    default_headers: HeaderMap,
 }
 
 impl HostedModelConfig {
-    pub fn from_url(url: &str) -> Self {
+    pub(crate) fn from_url(url: &str) -> Self {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         Self {
@@ -45,7 +45,7 @@ impl HostedModelConfig {
 
     /// Set the API key for authentication.
     #[must_use]
-    pub fn with_api_key<S: Into<String>>(mut self, api_key: Option<S>) -> Self {
+    pub(crate) fn with_api_key<S: Into<String>>(mut self, api_key: Option<S>) -> Self {
         if let Some(key) = api_key {
             self.auth = Some(GenericAuthMechanism::from_api_key(key));
         }
@@ -62,20 +62,20 @@ impl HostedModelConfig {
     }
 
     #[must_use]
-    pub fn with_auth(mut self, auth: GenericAuthMechanism) -> Self {
+    pub(crate) fn with_auth(mut self, auth: GenericAuthMechanism) -> Self {
         self.auth = Some(auth);
         self
     }
 
     /// Add (or override) a default header.
     #[must_use]
-    pub fn with_header(mut self, key: &'static str, value: &'static str) -> Self {
+    pub(crate) fn with_header(mut self, key: &'static str, value: &'static str) -> Self {
         self = self.with_header_value(key, HeaderValue::from_static(value));
         self
     }
 
     #[must_use]
-    pub fn with_header_value(mut self, key: &'static str, value: HeaderValue) -> Self {
+    pub(crate) fn with_header_value(mut self, key: &'static str, value: HeaderValue) -> Self {
         self.default_headers
             .insert(HeaderName::from_static(key), value);
         self
@@ -95,7 +95,7 @@ impl GenericAuthMechanism {
             SecretString::new(api_key.into().into()),
         )))
     }
-    pub fn from_api_key_provider(provider: Arc<dyn TokenProvider>) -> Self {
+    fn from_api_key_provider(provider: Arc<dyn TokenProvider>) -> Self {
         Self::ApiKey(provider)
     }
 
@@ -104,7 +104,7 @@ impl GenericAuthMechanism {
             SecretString::from(bearer_token.into()),
         )))
     }
-    pub fn from_bearer_token_provider(provider: Arc<dyn TokenProvider>) -> Self {
+    pub(crate) fn from_bearer_token_provider(provider: Arc<dyn TokenProvider>) -> Self {
         Self::BearerToken(provider)
     }
 }

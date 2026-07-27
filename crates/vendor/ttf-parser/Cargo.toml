@@ -55,6 +55,7 @@ gvar-alloc = ["std"]
 
 [dev-dependencies]
 base64 = { workspace = true }
+bencher = "0.1"
 pico-args = "0.5"
 tiny-skia-path = "0.12"
 xmlwriter = "0.1"

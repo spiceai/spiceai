@@ -40,8 +40,8 @@ use datafusion::{
     prelude::SessionContext,
 };
 
-pub const OBJ_DESCRIPTION_UDF_NAME: &str = "obj_description";
-pub const COL_DESCRIPTION_UDF_NAME: &str = "col_description";
+pub(crate) const OBJ_DESCRIPTION_UDF_NAME: &str = "obj_description";
+pub(crate) const COL_DESCRIPTION_UDF_NAME: &str = "col_description";
 
 static NEXT_COMMENT_UDF_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -166,7 +166,7 @@ struct CommentLookupCache {
     table_by_oid: HashMap<u32, Option<TableKey>>,
 }
 
-pub fn register_postgres_comment_udfs(ctx: &SessionContext) {
+pub(crate) fn register_postgres_comment_udfs(ctx: &SessionContext) {
     let lookup = CommentLookup::new(ctx);
     ctx.register_udf(ObjDescription::new(lookup.clone()).into_scalar_udf());
     ctx.register_udf(ColDescription::new(lookup).into_scalar_udf());

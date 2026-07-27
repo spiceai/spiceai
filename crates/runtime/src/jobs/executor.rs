@@ -135,7 +135,7 @@ impl JobExecutor {
     /// Re-drives an existing job whose owning scheduler was lost, resuming its
     /// distributed execution on this scheduler. No-op if this scheduler is
     /// already driving the job locally.
-    pub async fn resume(&self, job_id: &str) {
+    pub(crate) async fn resume(&self, job_id: &str) {
         let cancel_token = CancellationToken::new();
         {
             let mut active = self.active_jobs.write().await;
@@ -182,7 +182,7 @@ impl JobExecutor {
     }
 
     /// Requests cancellation of a running job.
-    pub async fn cancel(&self, job_id: &str) -> Result<JobState> {
+    pub(crate) async fn cancel(&self, job_id: &str) -> Result<JobState> {
         // Signal cancellation to the running task
         let active = self.active_jobs.read().await;
         if let Some(info) = active.get(job_id) {
@@ -222,7 +222,7 @@ impl JobExecutor {
     }
 
     /// Lists all jobs, optionally filtered by status.
-    pub async fn list_jobs(&self, status_filter: Option<JobStatus>) -> Result<Vec<JobState>> {
+    pub(crate) async fn list_jobs(&self, status_filter: Option<JobStatus>) -> Result<Vec<JobState>> {
         self.job_store.list_jobs(status_filter).await
     }
 

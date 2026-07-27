@@ -37,7 +37,7 @@ pub struct KeyringSecretStore {}
 /// Parameters accepted by the `keyring` secret store. The keyring store has
 /// no configurable parameters today; the empty list is kept here so the
 /// validation pipeline can still reject typos.
-pub const PARAMETERS: &[runtime_parameter_spec::ParameterSpec] = &[];
+pub(crate) const PARAMETERS: &[runtime_parameter_spec::ParameterSpec] = &[];
 
 impl Default for KeyringSecretStore {
     fn default() -> Self {
@@ -47,7 +47,7 @@ impl Default for KeyringSecretStore {
 
 impl KeyringSecretStore {
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {}
     }
 }

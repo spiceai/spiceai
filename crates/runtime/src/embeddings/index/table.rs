@@ -49,7 +49,7 @@ use {
     search::index::{VectorIndex, s3_vectors::S3Vector},
 };
 
-pub async fn wrap_table_as_index(
+pub(crate) async fn wrap_table_as_index(
     ctx: &Arc<SessionContext>,
     embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
     secrets: &Arc<RwLock<Secrets>>,

@@ -140,7 +140,7 @@ impl PartitionedIndexName {
         .join(PARTS_SEPARATOR)
     }
 
-    pub fn from_index_name(index_name: &str) -> Result<Self, Error> {
+    fn from_index_name(index_name: &str) -> Result<Self, Error> {
         let parts: Vec<&str> = index_name.split(PARTS_SEPARATOR).collect();
         let num_parts = parts.len();
         ensure!(num_parts == 4, IncorrectNumPartsInNameSnafu { num_parts });
@@ -156,7 +156,7 @@ impl PartitionedIndexName {
     //
     // Does not delineate between an invalid `index_name` and one that is not apart of the partition.
     #[must_use]
-    pub fn check_index_name_belongs(
+    fn check_index_name_belongs(
         index_name: &str,
         base_index_name: &str,
         column_name: &str,
@@ -173,7 +173,7 @@ impl PartitionedIndexName {
 
     /// Determines if the partitions come from the same dataset
     #[must_use]
-    pub fn belongs_with(
+    fn belongs_with(
         &self,
         index_name: &str,
         column_name: &str,
@@ -198,7 +198,7 @@ impl PartitionedIndexName {
     }
 }
 
-pub async fn all_indexes_in_partition(
+pub(crate) async fn all_indexes_in_partition(
     table: &S3VectorsTable,
     column_name: &str,
     partition_by: &[Expr],
@@ -532,7 +532,7 @@ mod tests {
 
     impl Bucket {
         #[must_use]
-        pub fn new() -> Self {
+        fn new() -> Self {
             Self {
                 signature: Signature::any(2, Volatility::Immutable),
             }

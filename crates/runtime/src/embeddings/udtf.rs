@@ -118,7 +118,7 @@ const VECTOR_SEARCH_MAX_QUERIES: usize = 32;
 /// `VariadicAny` signature. The `UserDefined` signature type allows us to:
 /// 1. Accept any types (like `VariadicAny`)
 /// 2. Support named parameters via `with_parameter_names()`
-pub static VECTOR_SEARCH_SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
+static VECTOR_SEARCH_SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
     // Parameter names that can be passed as named arguments.
     // These are passthrough parameters used by RRF and other table functions.
     let param_names = vec![
@@ -198,7 +198,7 @@ impl std::hash::Hash for VectorSearchTableFunc {
     }
 }
 
-pub fn parse_limit_scalar(scalar: &ScalarValue) -> Result<u64, DataFusionError> {
+fn parse_limit_scalar(scalar: &ScalarValue) -> Result<u64, DataFusionError> {
     match scalar {
         ScalarValue::Int64(Some(limit)) => u64::try_from(*limit).map_err(|_| {
             DataFusionError::Plan(format!(
@@ -219,7 +219,7 @@ pub fn parse_limit_scalar(scalar: &ScalarValue) -> Result<u64, DataFusionError> 
 
 impl VectorSearchTableFunc {
     #[must_use]
-    pub fn new(df: Weak<DataFusion>, explicit_pks: HashMap<TableReference, Vec<String>>) -> Self {
+    pub(crate) fn new(df: Weak<DataFusion>, explicit_pks: HashMap<TableReference, Vec<String>>) -> Self {
         let ptr = df.as_ptr().addr() as u64;
         Self {
             df,
@@ -676,7 +676,7 @@ pub struct VectorSearchUDTFProvider {
 impl VectorSearchUDTFProvider {
     /// Returns the arguments used to create this provider.
     #[must_use]
-    pub fn args(&self) -> &VectorSearchTableFuncArgs {
+    pub(crate) fn args(&self) -> &VectorSearchTableFuncArgs {
         &self.args
     }
 

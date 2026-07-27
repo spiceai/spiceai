@@ -47,33 +47,33 @@ pub struct Location {
 impl Location {
     /// Create a new location.
     #[must_use]
-    pub fn new(line: usize, column: usize) -> Self {
+    fn new(line: usize, column: usize) -> Self {
         Self { line, column }
     }
 
     /// Get the line number (1-indexed).
     #[must_use]
-    pub fn line(&self) -> usize {
+    fn line(&self) -> usize {
         self.line
     }
 
     /// Get the column number (1-indexed).
     #[must_use]
-    pub fn column(&self) -> usize {
+    fn column(&self) -> usize {
         self.column
     }
 }
 
 impl Error {
     #[cfg(test)]
-    pub(crate) fn parse(msg: impl Into<String>) -> Self {
+    fn parse(msg: impl Into<String>) -> Self {
         Self {
             kind: ErrorKind::Parse(msg.into()),
             location: None,
         }
     }
 
-    pub(crate) fn parse_with_location(msg: impl Into<String>, location: Location) -> Self {
+    fn parse_with_location(msg: impl Into<String>, location: Location) -> Self {
         Self {
             kind: ErrorKind::Parse(msg.into()),
             location: Some(location),
@@ -94,14 +94,14 @@ impl Error {
         }
     }
 
-    pub(crate) fn io(err: std::io::Error) -> Self {
+    fn io(err: std::io::Error) -> Self {
         Self {
             kind: ErrorKind::Io(err),
             location: None,
         }
     }
 
-    pub(crate) fn custom(msg: impl Into<String>) -> Self {
+    fn custom(msg: impl Into<String>) -> Self {
         Self {
             kind: ErrorKind::Custom(msg.into()),
             location: None,

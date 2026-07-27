@@ -42,7 +42,7 @@ pub mod encoding;
 pub mod key;
 pub mod result;
 
-pub use backend::CacheBackend;
+pub(crate) use backend::CacheBackend;
 pub use backend::CacheBackendBuilder;
 pub use backend::MokaBackend;
 
@@ -131,8 +131,8 @@ impl AsTableRefs for LogicalPlan {
 /// `SPICE_DEFAULT_SCHEMA`. They are duplicated here because the `cache` crate
 /// cannot depend on `runtime-datafusion` without forming a dependency cycle
 /// (`runtime-datafusion -> search -> datafusion-optimizer-rules -> cache`).
-pub const SPICE_DEFAULT_CATALOG: &str = "spice";
-pub const SPICE_DEFAULT_SCHEMA: &str = "public";
+const SPICE_DEFAULT_CATALOG: &str = "spice";
+const SPICE_DEFAULT_SCHEMA: &str = "public";
 
 /// Returns `true` if `target` refers to the same physical table as any reference
 /// in `stored`, after resolving both sides to fully-qualified
@@ -147,7 +147,7 @@ pub const SPICE_DEFAULT_SCHEMA: &str = "public";
 /// until TTL expiry. Resolving both sides first makes the comparison robust to
 /// qualification differences.
 #[must_use]
-pub fn resolved_table_match<S: std::hash::BuildHasher>(
+fn resolved_table_match<S: std::hash::BuildHasher>(
     stored: &HashSet<TableReference, S>,
     target: &TableReference,
 ) -> bool {
@@ -529,12 +529,12 @@ impl QueryResultsCacheProvider {
     /// # Errors
     ///
     /// Will return `Err` if method fails to invalidate cache for the table provided
-    pub fn invalidate_for_table(&self, table_name: TableReference) -> Result<()> {
+    fn invalidate_for_table(&self, table_name: TableReference) -> Result<()> {
         self.cache.invalidate_for_table(table_name)
     }
 
     #[must_use]
-    pub fn max_size(&self) -> u64 {
+    fn max_size(&self) -> u64 {
         self.cache_max_size
     }
 
@@ -549,7 +549,7 @@ impl QueryResultsCacheProvider {
     }
 
     #[must_use]
-    pub async fn item_count(&self) -> u64 {
+    async fn item_count(&self) -> u64 {
         self.cache.item_count().await
     }
 
@@ -589,7 +589,7 @@ impl QueryResultsCacheProvider {
     }
 
     #[must_use]
-    pub fn encoding_name(&self) -> &'static str {
+    fn encoding_name(&self) -> &'static str {
         use spicepod::component::caching::Encoding;
         match self.encoding {
             Encoding::None => "none",

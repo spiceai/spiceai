@@ -32,7 +32,7 @@ pub struct TaskHistoryMetrics {
     pub llm_input_tokens: u64,
     pub llm_output_tokens: u64,
     /// The last SQL query generated as a candidate answer (after an AI completion).
-    pub generated_sql: String,
+    generated_sql: String,
     /// All SQL queries that followed an `ai_completion` task (candidate answers).
     pub attempted_sql: Vec<String>,
 }

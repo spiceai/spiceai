@@ -25,15 +25,15 @@ use super::Query;
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct ScenarioQueryDefinition {
     /// Unique name for the query
-    pub name: String,
+    name: String,
 
     /// SQL query to execute
-    pub sql: String,
+    sql: String,
 
     /// Optional expected results for validation
     /// Can be specified as a path to a CSV file or inline data
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub expected_results: Option<ExpectedResults>,
+    expected_results: Option<ExpectedResults>,
 }
 
 /// Expected results for query validation
@@ -58,10 +58,10 @@ pub enum ExpectedResults {
 pub struct ScenarioQuerySet {
     /// Optional name for the query set
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
+    pub(crate) name: Option<String>,
 
     /// List of queries in this set
-    pub queries: Vec<ScenarioQueryDefinition>,
+    queries: Vec<ScenarioQueryDefinition>,
 }
 
 impl ScenarioQuerySet {
@@ -83,7 +83,7 @@ impl ScenarioQuerySet {
 
     /// Get expected results for validation (as `RecordBatches`)
     /// Returns a map of query name to expected results
-    pub fn get_expected_results(
+    pub(crate) fn get_expected_results(
         &self,
         base_path: Option<&Path>,
     ) -> anyhow::Result<HashMap<Arc<str>, Vec<RecordBatch>>> {

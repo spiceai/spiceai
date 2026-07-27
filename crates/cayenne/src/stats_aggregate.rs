@@ -233,7 +233,7 @@ fn is_numeric_widening_cast(source: &DataType, target: &DataType) -> bool {
 ///
 /// Returns an error only if building the Arrow batch from otherwise-valid
 /// scalars fails.
-pub fn stats_aggregate_batch(
+pub(crate) fn stats_aggregate_batch(
     query_aggregate: &AggregateExec,
     output_aggregate: &AggregateExec,
     input_stats: &Statistics,

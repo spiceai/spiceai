@@ -80,18 +80,18 @@ pub struct ConnectArgs {
     /// argument (`target`) is inspected to decide between adoption flow
     /// and legacy pod-add behavior.
     #[command(subcommand)]
-    pub command: Option<ConnectCommand>,
+    command: Option<ConnectCommand>,
 
     /// First positional argument: either a Spice Cloud adoption code
     /// (`SPICE-ADOPT-...`) or a Spicepod path (`<org>/<pod>`).
     #[arg(value_name = "TARGET")]
-    pub target: Option<String>,
+    target: Option<String>,
 
     /// Override the Spice Cloud Connect endpoint. Defaults to
     /// `https://cloud.spice.ai`. Also configurable via
     /// `SPICE_CLOUD_ENDPOINT`.
     #[arg(long, value_name = "URL")]
-    pub endpoint: Option<String>,
+    endpoint: Option<String>,
 }
 
 /// Cloud-connect subcommands.

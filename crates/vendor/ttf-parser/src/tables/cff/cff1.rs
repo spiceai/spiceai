@@ -33,69 +33,69 @@ const TWO_BYTE_OPERATOR_MARK: u8 = 12;
 
 /// Enumerates some operators defined in the Adobe Technical Note #5177.
 mod operator {
-    pub const HORIZONTAL_STEM: u8 = 1;
-    pub const VERTICAL_STEM: u8 = 3;
-    pub const VERTICAL_MOVE_TO: u8 = 4;
-    pub const LINE_TO: u8 = 5;
-    pub const HORIZONTAL_LINE_TO: u8 = 6;
-    pub const VERTICAL_LINE_TO: u8 = 7;
-    pub const CURVE_TO: u8 = 8;
-    pub const CALL_LOCAL_SUBROUTINE: u8 = 10;
-    pub const RETURN: u8 = 11;
-    pub const ENDCHAR: u8 = 14;
-    pub const HORIZONTAL_STEM_HINT_MASK: u8 = 18;
-    pub const HINT_MASK: u8 = 19;
-    pub const COUNTER_MASK: u8 = 20;
-    pub const MOVE_TO: u8 = 21;
-    pub const HORIZONTAL_MOVE_TO: u8 = 22;
-    pub const VERTICAL_STEM_HINT_MASK: u8 = 23;
-    pub const CURVE_LINE: u8 = 24;
-    pub const LINE_CURVE: u8 = 25;
-    pub const VV_CURVE_TO: u8 = 26;
-    pub const HH_CURVE_TO: u8 = 27;
-    pub const SHORT_INT: u8 = 28;
-    pub const CALL_GLOBAL_SUBROUTINE: u8 = 29;
-    pub const VH_CURVE_TO: u8 = 30;
-    pub const HV_CURVE_TO: u8 = 31;
-    pub const HFLEX: u8 = 34;
-    pub const FLEX: u8 = 35;
-    pub const HFLEX1: u8 = 36;
-    pub const FLEX1: u8 = 37;
-    pub const FIXED_16_16: u8 = 255;
+    pub(crate) const HORIZONTAL_STEM: u8 = 1;
+    pub(crate) const VERTICAL_STEM: u8 = 3;
+    pub(crate) const VERTICAL_MOVE_TO: u8 = 4;
+    pub(crate) const LINE_TO: u8 = 5;
+    pub(crate) const HORIZONTAL_LINE_TO: u8 = 6;
+    pub(crate) const VERTICAL_LINE_TO: u8 = 7;
+    pub(crate) const CURVE_TO: u8 = 8;
+    pub(crate) const CALL_LOCAL_SUBROUTINE: u8 = 10;
+    pub(crate) const RETURN: u8 = 11;
+    pub(crate) const ENDCHAR: u8 = 14;
+    pub(crate) const HORIZONTAL_STEM_HINT_MASK: u8 = 18;
+    pub(crate) const HINT_MASK: u8 = 19;
+    pub(crate) const COUNTER_MASK: u8 = 20;
+    pub(crate) const MOVE_TO: u8 = 21;
+    pub(crate) const HORIZONTAL_MOVE_TO: u8 = 22;
+    pub(crate) const VERTICAL_STEM_HINT_MASK: u8 = 23;
+    pub(crate) const CURVE_LINE: u8 = 24;
+    pub(crate) const LINE_CURVE: u8 = 25;
+    pub(crate) const VV_CURVE_TO: u8 = 26;
+    pub(crate) const HH_CURVE_TO: u8 = 27;
+    pub(crate) const SHORT_INT: u8 = 28;
+    pub(crate) const CALL_GLOBAL_SUBROUTINE: u8 = 29;
+    pub(crate) const VH_CURVE_TO: u8 = 30;
+    pub(crate) const HV_CURVE_TO: u8 = 31;
+    pub(crate) const HFLEX: u8 = 34;
+    pub(crate) const FLEX: u8 = 35;
+    pub(crate) const HFLEX1: u8 = 36;
+    pub(crate) const FLEX1: u8 = 37;
+    pub(crate) const FIXED_16_16: u8 = 255;
 }
 
 /// Enumerates some operators defined in the Adobe Technical Note #5176,
 /// Table 9 Top DICT Operator Entries
 mod top_dict_operator {
-    pub const CHARSET_OFFSET: u16 = 15;
-    pub const ENCODING_OFFSET: u16 = 16;
-    pub const CHAR_STRINGS_OFFSET: u16 = 17;
-    pub const PRIVATE_DICT_SIZE_AND_OFFSET: u16 = 18;
-    pub const FONT_MATRIX: u16 = 1207;
-    pub const ROS: u16 = 1230;
-    pub const FD_ARRAY: u16 = 1236;
-    pub const FD_SELECT: u16 = 1237;
+    pub(crate) const CHARSET_OFFSET: u16 = 15;
+    pub(crate) const ENCODING_OFFSET: u16 = 16;
+    pub(crate) const CHAR_STRINGS_OFFSET: u16 = 17;
+    pub(crate) const PRIVATE_DICT_SIZE_AND_OFFSET: u16 = 18;
+    pub(crate) const FONT_MATRIX: u16 = 1207;
+    pub(crate) const ROS: u16 = 1230;
+    pub(crate) const FD_ARRAY: u16 = 1236;
+    pub(crate) const FD_SELECT: u16 = 1237;
 }
 
 /// Enumerates some operators defined in the Adobe Technical Note #5176,
 /// Table 23 Private DICT Operators
 mod private_dict_operator {
-    pub const LOCAL_SUBROUTINES_OFFSET: u16 = 19;
-    pub const DEFAULT_WIDTH: u16 = 20;
-    pub const NOMINAL_WIDTH: u16 = 21;
+    pub(crate) const LOCAL_SUBROUTINES_OFFSET: u16 = 19;
+    pub(crate) const DEFAULT_WIDTH: u16 = 20;
+    pub(crate) const NOMINAL_WIDTH: u16 = 21;
 }
 
 /// Enumerates Charset IDs defined in the Adobe Technical Note #5176, Table 22
 mod charset_id {
-    pub const ISO_ADOBE: usize = 0;
-    pub const EXPERT: usize = 1;
-    pub const EXPERT_SUBSET: usize = 2;
+    pub(crate) const ISO_ADOBE: usize = 0;
+    pub(crate) const EXPERT: usize = 1;
+    pub(crate) const EXPERT_SUBSET: usize = 2;
 }
 
 /// Enumerates Charset IDs defined in the Adobe Technical Note #5176, Table 16
 mod encoding_id {
-    pub const STANDARD: usize = 0;
-    pub const EXPERT: usize = 1;
+    pub(crate) const STANDARD: usize = 0;
+    pub(crate) const EXPERT: usize = 1;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -124,12 +124,12 @@ pub(crate) struct CIDMetadata<'a> {
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Matrix {
-    pub sx: f32,
-    pub ky: f32,
-    pub kx: f32,
-    pub sy: f32,
-    pub tx: f32,
-    pub ty: f32,
+    pub(crate) sx: f32,
+    pub(crate) ky: f32,
+    pub(crate) kx: f32,
+    pub(crate) sy: f32,
+    pub(crate) tx: f32,
+    pub(crate) ty: f32,
 }
 
 impl Default for Matrix {
@@ -971,7 +971,7 @@ impl<'a> Table<'a> {
 
     /// Returns a font transformation matrix.
     #[inline]
-    pub fn matrix(&self) -> Matrix {
+    fn matrix(&self) -> Matrix {
         self.matrix
     }
 
@@ -1051,7 +1051,7 @@ impl<'a> Table<'a> {
 
     /// Returns a glyph name.
     #[cfg(feature = "glyph-names")]
-    pub fn glyph_name(&self, glyph_id: GlyphId) -> Option<&'a str> {
+    pub(crate) fn glyph_name(&self, glyph_id: GlyphId) -> Option<&'a str> {
         match self.kind {
             FontKind::SID(_) => {
                 let sid = self.charset.gid_to_sid(glyph_id)?;

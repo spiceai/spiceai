@@ -28,7 +28,7 @@ pub const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
 
 const XAI_PARAM_LEN: usize = 2;
 
-pub(crate) const XAI_PARAMETERS: [ParameterSpec; XAI_PARAM_LEN] = [
+const XAI_PARAMETERS: [ParameterSpec; XAI_PARAM_LEN] = [
     ParameterSpec::component("api_key").description("The xAI API key."),
     ParameterSpec::component("usage_tier")
         .description("xAI usage tier (0-4). Used for rate limit defaults."),

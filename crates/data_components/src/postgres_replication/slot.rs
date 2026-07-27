@@ -31,17 +31,17 @@ use super::{
 /// Info about a slot after `setup_slot_and_publication` returns.
 #[derive(Clone, Debug)]
 pub struct SlotInfo {
-    pub slot_name: String,
-    pub publication_name: String,
-    pub consistent_lsn: u64,
-    pub snapshot_name: Option<String>,
-    pub created_fresh: bool,
+    pub(crate) slot_name: String,
+    pub(crate) publication_name: String,
+    pub(crate) consistent_lsn: u64,
+    snapshot_name: Option<String>,
+    pub(crate) created_fresh: bool,
     /// `GENERATED` columns of the source table. Postgres does not publish
     /// generated columns over logical replication (they are absent from
     /// pgoutput `Relation` messages), so the WAL path must tolerate their
     /// absence — the initial snapshot still captures their values, but
     /// replicated changes apply them as NULL.
-    pub generated_columns: Vec<String>,
+    pub(crate) generated_columns: Vec<String>,
 }
 
 pub type SlotSetupOutcome = SlotInfo;
@@ -59,7 +59,7 @@ pub type SlotSetupOutcome = SlotInfo;
 /// from the same LSN Postgres already knows about. If the catalog hasn't
 /// initialized the LSN yet (NULL on brand-new slots, rare race) we fall back
 /// to 0 — pgwire-replication treats that as "server decides".
-pub async fn setup_slot_and_publication(
+pub(crate) async fn setup_slot_and_publication(
     params: &ReplicationParams,
     schema_name: &str,
     table_name: &str,
@@ -80,15 +80,15 @@ pub async fn setup_slot_and_publication(
 /// Setup outcome for one member table of a *shared* replication slot.
 #[derive(Clone, Debug)]
 pub struct SharedMemberSetup {
-    pub slot: SlotInfo,
+    pub(crate) slot: SlotInfo,
     /// Whether this call newly added the member's table to the shared
     /// publication (or created the publication with it). When `true`, the
     /// member's table has no WAL history on this slot before now and needs an
     /// initial snapshot.
-    pub table_added: bool,
+    pub(crate) table_added: bool,
     /// `GENERATED` columns of this member's table — see
     /// [`SlotInfo::generated_columns`].
-    pub generated_columns: Vec<String>,
+    pub(crate) generated_columns: Vec<String>,
 }
 
 /// Idempotent setup for one member of a shared slot: validates the table's
@@ -99,7 +99,7 @@ pub struct SharedMemberSetup {
 /// owned by the member — `created_fresh` describes the slot itself, and the
 /// caller combines it with `table_added` to decide whether this member needs
 /// a snapshot.
-pub async fn setup_shared_member(
+pub(crate) async fn setup_shared_member(
     params: &ReplicationParams,
     schema_name: &str,
     table_name: &str,
@@ -524,7 +524,7 @@ async fn ensure_publish_via_partition_root(
 /// resuming over an accelerator that is missing base rows.
 ///
 /// "Already absent" outcomes (publication or membership gone) are success.
-pub async fn remove_table_from_publication(
+pub(crate) async fn remove_table_from_publication(
     params: &ReplicationParams,
     schema_name: &str,
     table_name: &str,
@@ -655,7 +655,7 @@ async fn create_logical_slot(
 /// Errors on malformed input rather than defaulting to 0, because 0 is also
 /// the "server decides" sentinel downstream — silently coercing invalid input
 /// would change the replication start position.
-pub fn parse_lsn(s: &str) -> Result<u64> {
+fn parse_lsn(s: &str) -> Result<u64> {
     let (hi_str, lo_str) = s
         .split_once('/')
         .ok_or_else(|| super::Error::InvalidLsn { lsn: s.to_string() })?;
@@ -674,7 +674,7 @@ fn parse_lsn_or_zero(s: &str) -> u64 {
 }
 
 #[must_use]
-pub fn format_lsn(lsn: u64) -> String {
+fn format_lsn(lsn: u64) -> String {
     // Postgres LSN strings are intentionally "high32/low32" in hex, so truncating
     // the low 32 bits is exactly what we want here.
     #[expect(

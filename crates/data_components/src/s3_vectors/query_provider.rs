@@ -57,7 +57,7 @@ pub use s3_vectors::QUERY_VECTORS_MAX_TOPK as S3_VECTOR_MAX_TOPK;
 pub use s3_vectors::QUERY_VECTORS_PAGE_SIZE as S3_VECTOR_PAGE_SIZE;
 
 /// Maximum number of keys per `GetVectors` API call. <https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-limitations.html>
-pub static GET_VECTORS_MAX_KEYS: usize = 100;
+static GET_VECTORS_MAX_KEYS: usize = 100;
 
 /// An S3 Vector index that implements [`TableProvider`] as a `QueryVector` API operation for a given query vector.
 #[derive(Debug)]

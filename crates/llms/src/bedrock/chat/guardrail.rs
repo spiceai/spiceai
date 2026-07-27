@@ -110,7 +110,7 @@ pub enum GuardrailError {
     UnknownTrace { variant: String },
 }
 
-pub fn validate_guardrail_identifier(
+fn validate_guardrail_identifier(
     s: impl Into<String>,
 ) -> Result<GuardrailIdentifier, GuardrailError> {
     let value = s.into();
@@ -144,7 +144,7 @@ impl std::fmt::Display for GuardrailVersion {
     }
 }
 
-pub fn validate_guardrail_version(
+fn validate_guardrail_version(
     s: impl Into<String>,
 ) -> Result<GuardrailVersion, GuardrailError> {
     let value = s.into();

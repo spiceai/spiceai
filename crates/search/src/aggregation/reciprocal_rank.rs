@@ -54,7 +54,7 @@ const USIZE_TO_F64_CHUNK_BASE: f64 = 65_536.0;
 const USIZE_TO_F64_CHUNK_MASK: usize = (1usize << USIZE_TO_F64_CHUNK_BITS) - 1;
 
 #[must_use]
-pub fn reciprocal_rank_score(rank: usize, k: f64) -> f64 {
+fn reciprocal_rank_score(rank: usize, k: f64) -> f64 {
     1.0 / (usize_to_f64(rank) + k)
 }
 

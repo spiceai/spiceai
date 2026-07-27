@@ -52,7 +52,7 @@ use uuid::Uuid;
 
 use std::error::Error;
 
-pub mod federation;
+pub(crate) mod federation;
 
 /// Rebuildable Spark Connect session factory.
 ///
@@ -197,7 +197,7 @@ impl SparkConnect {
         Self::from_connection_with_rate_controller(connection, None).await
     }
 
-    pub async fn from_connection_with_rate_controller(
+    pub(crate) async fn from_connection_with_rate_controller(
         connection: &str,
         rate_controller: Option<Arc<RateController>>,
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
@@ -223,7 +223,7 @@ impl SparkConnect {
 
     /// Updates the auth token on both the live session and the rebuild factory,
     /// so a rotated token survives a subsequent reconnect.
-    pub async fn set_token(&self, token: &str) {
+    pub(crate) async fn set_token(&self, token: &str) {
         self.inner.factory.set_token(token).await;
         let session = self.inner.session.read().await;
         session.set_token(Some(token));
@@ -280,7 +280,7 @@ impl SparkConnect {
     ///
     /// Only read operations are issued through this connector, so retrying after
     /// a reconnect is safe and does not risk duplicating side effects.
-    pub(crate) async fn with_session_retry<F, Fut, T>(&self, op: F) -> Result<T, SparkError>
+    async fn with_session_retry<F, Fut, T>(&self, op: F) -> Result<T, SparkError>
     where
         F: Fn(Arc<SparkSession>) -> Fut,
         Fut: Future<Output = Result<T, SparkError>>,
@@ -656,7 +656,7 @@ fn map_error_to_datafusion_err(e: SparkError) -> datafusion::error::DataFusionEr
     datafusion::error::DataFusionError::External(Box::new(e))
 }
 
-pub(super) async fn acquire_rate_controller_permit(
+async fn acquire_rate_controller_permit(
     rate_controller: Option<&Arc<RateController>>,
 ) -> Result<Option<runtime_rate_control::Permit>, Box<dyn Error + Send + Sync>> {
     let Some(rate_controller) = rate_controller else {

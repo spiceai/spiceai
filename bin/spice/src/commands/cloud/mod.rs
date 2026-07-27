@@ -28,8 +28,8 @@ use dialoguer::{Input, Password, Select, theme::ColorfulTheme};
 use snafu::ResultExt;
 use std::{fmt, io::IsTerminal};
 
-pub use client::{CloudClient, is_device_authorization_denied_error, parse_org_app};
-pub use config::{CloudLink, get_linked_app, load_cloud_link, remove_cloud_link, save_cloud_link};
+pub(crate) use client::{CloudClient, is_device_authorization_denied_error, parse_org_app};
+pub(crate) use config::{CloudLink, get_linked_app, load_cloud_link, remove_cloud_link, save_cloud_link};
 use spice_cloud_client::{
     endpoints::{data_region_name, normalize_data_region},
     types::{AppKind, IngestionMetrics, PodMetrics, UpdateChannel},
@@ -208,7 +208,7 @@ pub struct PatLoginArgs {
         value_name = "TOKEN",
         help_heading = "PAT Login Options"
     )]
-    pub token: Option<String>,
+    token: Option<String>,
 }
 
 impl fmt::Debug for PatLoginArgs {
@@ -255,22 +255,22 @@ impl fmt::Debug for ApiLoginArgs {
 #[derive(Args, Debug)]
 pub struct LinkArgs {
     /// App name in org/app format
-    pub app: String,
+    app: String,
 }
 
 #[derive(Args, Debug)]
 pub struct DeploymentsArgs {
     /// App name in org/app format (uses linked app if not specified)
     #[arg(long)]
-    pub app: Option<String>,
+    app: Option<String>,
 
     /// Maximum number of deployments to show
     #[arg(long, default_value = "10")]
-    pub limit: usize,
+    limit: usize,
 
     /// Filter by deployment status
     #[arg(long)]
-    pub status: Option<String>,
+    status: Option<String>,
 
     /// Output format
     #[arg(long, short = 'o', default_value = "table")]
@@ -281,7 +281,7 @@ pub struct DeploymentsArgs {
 pub struct ImagesArgs {
     /// Filter by channel (stable, beta, etc.)
     #[arg(long)]
-    pub channel: Option<String>,
+    channel: Option<String>,
 
     /// Output format
     #[arg(long, short = 'o', default_value = "table")]
@@ -292,19 +292,19 @@ pub struct ImagesArgs {
 pub struct LogsArgs {
     /// App name in org/app format (uses linked app if not specified)
     #[arg(long)]
-    pub app: Option<String>,
+    app: Option<String>,
 
     /// Deployment ID (uses latest if not specified)
     #[arg(long)]
-    pub deployment: Option<i64>,
+    deployment: Option<i64>,
 
     /// Maximum number of log entries to show
     #[arg(long, default_value = "100")]
-    pub limit: usize,
+    limit: usize,
 
     /// Follow logs in real-time
     #[arg(short, long)]
-    pub follow: bool,
+    follow: bool,
 
     /// Output format
     #[arg(long, short = 'o', default_value = "table")]
@@ -315,19 +315,19 @@ pub struct LogsArgs {
 pub struct DeployArgs {
     /// App name in org/app format (uses linked app if not specified)
     #[arg(long)]
-    pub app: Option<String>,
+    app: Option<String>,
 
     /// Container image tag to deploy
     #[arg(long)]
-    pub image: Option<String>,
+    image: Option<String>,
 
     /// Number of replicas
     #[arg(long)]
-    pub replicas: Option<i32>,
+    replicas: Option<i32>,
 
     /// Enable debug mode
     #[arg(long)]
-    pub debug: bool,
+    debug: bool,
 
     /// Output format
     #[arg(long, short = 'o', default_value = "table")]
@@ -338,7 +338,7 @@ pub struct DeployArgs {
 pub struct InspectArgs {
     /// App name in org/app format (uses linked app if not specified)
     #[arg(long)]
-    pub app: Option<String>,
+    app: Option<String>,
 
     /// Output format
     #[arg(long, short = 'o', default_value = "table")]
@@ -349,11 +349,11 @@ pub struct InspectArgs {
 pub struct ApiKeysArgs {
     /// App name in org/app format (uses linked app if not specified)
     #[arg(long)]
-    pub app: Option<String>,
+    app: Option<String>,
 
     /// Regenerate API key (1 or 2)
     #[arg(long)]
-    pub regenerate: Option<u8>,
+    regenerate: Option<u8>,
 
     /// Output format
     #[arg(long, short = 'o', default_value = "table")]
@@ -364,11 +364,11 @@ pub struct ApiKeysArgs {
 pub struct MetricsArgs {
     /// App name in org/app format (uses linked app if not specified)
     #[arg(long)]
-    pub app: Option<String>,
+    app: Option<String>,
 
     /// Window for counter metrics (e.g. 1m, 5m, 1h). Parsed as a duration.
     #[arg(long, value_parser = parse_window)]
-    pub window: Option<String>,
+    window: Option<String>,
 
     /// Output format
     #[arg(long, short = 'o', default_value = "table")]
@@ -399,7 +399,7 @@ pub enum SecretsCommands {
 pub struct SecretsListArgs {
     /// App name in org/app format (uses linked app if not specified)
     #[arg(long)]
-    pub app: Option<String>,
+    app: Option<String>,
 
     /// Output format
     #[arg(long, short = 'o', default_value = "table")]
@@ -410,13 +410,13 @@ pub struct SecretsListArgs {
 pub struct SecretsSetArgs {
     /// App name in org/app format (uses linked app if not specified)
     #[arg(long)]
-    pub app: Option<String>,
+    app: Option<String>,
 
     /// Secret name
-    pub name: String,
+    name: String,
 
     /// Secret value
-    pub value: String,
+    value: String,
 
     /// Output format
     #[arg(long, short = 'o', default_value = "table")]
@@ -427,10 +427,10 @@ pub struct SecretsSetArgs {
 pub struct SecretsGetArgs {
     /// App name in org/app format (uses linked app if not specified)
     #[arg(long)]
-    pub app: Option<String>,
+    app: Option<String>,
 
     /// Secret name
-    pub name: String,
+    name: String,
 
     /// Output format
     #[arg(long, short = 'o', default_value = "table")]
@@ -441,10 +441,10 @@ pub struct SecretsGetArgs {
 pub struct SecretsDeleteArgs {
     /// App name in org/app format (uses linked app if not specified)
     #[arg(long)]
-    pub app: Option<String>,
+    app: Option<String>,
 
     /// Secret name
-    pub name: String,
+    name: String,
 
     /// Output format
     #[arg(long, short = 'o', default_value = "table")]
@@ -467,59 +467,59 @@ pub enum CreateCommands {
 #[derive(Args, Debug)]
 pub struct CreateAppArgs {
     /// App name
-    pub name: String,
+    name: String,
 
     /// Deployment region (e.g. us-east-1-prod-aws-data)
     #[arg(long, value_parser = parse_create_app_region)]
-    pub region: String,
+    region: String,
 
     /// App kind (set or cluster)
     #[arg(long, value_parser = clap::value_parser!(AppKind), default_value = "set")]
-    pub kind: AppKind,
+    kind: AppKind,
 
     /// App description
     #[arg(long)]
-    pub description: Option<String>,
+    description: Option<String>,
 
     /// App visibility (public or private)
     #[arg(long, default_value = "private")]
-    pub visibility: String,
+    visibility: String,
 
     /// Number of scheduler replicas
     #[arg(long)]
-    pub replicas: Option<i32>,
+    replicas: Option<i32>,
 
     /// Scheduler CPU limit in vCPUs (e.g. 4)
     #[arg(long)]
-    pub cpu: Option<i32>,
+    cpu: Option<i32>,
 
     /// Scheduler memory limit (e.g. 16Gi, 16GiB)
     #[arg(long)]
-    pub memory: Option<bytes::NumBytes>,
+    memory: Option<bytes::NumBytes>,
 
     /// Block storage size in GB
     #[arg(long)]
-    pub storage_size_gb: Option<f64>,
+    storage_size_gb: Option<f64>,
 
     /// Number of executor replicas
     #[arg(long)]
-    pub executor_replicas: Option<i32>,
+    executor_replicas: Option<i32>,
 
     /// Executor CPU limit in vCPUs (e.g. 8)
     #[arg(long)]
-    pub executor_cpu: Option<i32>,
+    executor_cpu: Option<i32>,
 
     /// Executor memory limit (e.g. 32Gi, 32GiB)
     #[arg(long)]
-    pub executor_memory: Option<bytes::NumBytes>,
+    executor_memory: Option<bytes::NumBytes>,
 
     /// Path to a spicepod.yaml file
     #[arg(long)]
-    pub spicepod: Option<String>,
+    spicepod: Option<String>,
 
     /// Update channel (stable, preview, nightly, internal)
     #[arg(long, value_parser = clap::value_parser!(UpdateChannel))]
-    pub channel: Option<UpdateChannel>,
+    channel: Option<UpdateChannel>,
 
     /// Output format
     #[arg(long, short = 'o', default_value = "table")]
@@ -530,19 +530,19 @@ pub struct CreateAppArgs {
 pub struct CreateDeploymentArgs {
     /// App name in org/app format (uses linked app if not specified)
     #[arg(long)]
-    pub app: Option<String>,
+    app: Option<String>,
 
     /// Container image tag
     #[arg(long)]
-    pub image: Option<String>,
+    image: Option<String>,
 
     /// Number of replicas
     #[arg(long)]
-    pub replicas: Option<i32>,
+    replicas: Option<i32>,
 
     /// Enable debug mode
     #[arg(long)]
-    pub debug: bool,
+    debug: bool,
 
     /// Output format
     #[arg(long, short = 'o', default_value = "table")]
@@ -562,7 +562,7 @@ pub enum GetCommands {
 #[derive(Args, Debug)]
 pub struct GetAppArgs {
     /// App name in org/app format
-    pub app: String,
+    app: String,
 
     /// Output format
     #[arg(long, short = 'o', default_value = "table")]
@@ -583,59 +583,59 @@ pub enum UpdateCommands {
 pub struct UpdateAppArgs {
     /// App name in org/app format (uses linked app if not specified)
     #[arg(long)]
-    pub app: Option<String>,
+    app: Option<String>,
 
     /// New description
     #[arg(long)]
-    pub description: Option<String>,
+    description: Option<String>,
 
     /// New visibility (public or private)
     #[arg(long)]
-    pub visibility: Option<String>,
+    visibility: Option<String>,
 
     /// Number of scheduler replicas
     #[arg(long)]
-    pub replicas: Option<i32>,
+    replicas: Option<i32>,
 
     /// Container image tag
     #[arg(long)]
-    pub image: Option<String>,
+    image: Option<String>,
 
     /// Deployment region
     #[arg(long)]
-    pub region: Option<String>,
+    region: Option<String>,
 
     /// Scheduler CPU limit in vCPUs (e.g. 4)
     #[arg(long)]
-    pub cpu: Option<i32>,
+    cpu: Option<i32>,
 
     /// Scheduler memory limit (e.g. 16Gi, 16GiB)
     #[arg(long)]
-    pub memory: Option<bytes::NumBytes>,
+    memory: Option<bytes::NumBytes>,
 
     /// Block storage size in GB
     #[arg(long)]
-    pub storage_size_gb: Option<f64>,
+    storage_size_gb: Option<f64>,
 
     /// Number of executor replicas
     #[arg(long)]
-    pub executor_replicas: Option<i32>,
+    executor_replicas: Option<i32>,
 
     /// Executor CPU limit in vCPUs (e.g. 8)
     #[arg(long)]
-    pub executor_cpu: Option<i32>,
+    executor_cpu: Option<i32>,
 
     /// Executor memory limit (e.g. 32Gi, 32GiB)
     #[arg(long)]
-    pub executor_memory: Option<bytes::NumBytes>,
+    executor_memory: Option<bytes::NumBytes>,
 
     /// Path to a spicepod.yaml file
     #[arg(long)]
-    pub spicepod: Option<String>,
+    spicepod: Option<String>,
 
     /// Update channel (stable, preview, nightly, internal)
     #[arg(long, value_parser = clap::value_parser!(UpdateChannel))]
-    pub channel: Option<UpdateChannel>,
+    channel: Option<UpdateChannel>,
 
     /// Output format
     #[arg(long, short = 'o', default_value = "table")]
@@ -655,11 +655,11 @@ pub enum DeleteCommands {
 #[derive(Args, Debug)]
 pub struct DeleteAppArgs {
     /// App name in org/app format
-    pub app: String,
+    app: String,
 
     /// Skip confirmation prompt
     #[arg(long, short)]
-    pub yes: bool,
+    yes: bool,
 
     /// Output format
     #[arg(long, short = 'o', default_value = "table")]

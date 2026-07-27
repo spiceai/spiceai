@@ -69,10 +69,10 @@ use crate::{DateTime, S3Vectors};
 pub struct MockData {
     pub indexes: HashMap<String, Vec<aws_sdk_s3vectors::types::IndexSummary>>,
     pub vectors: HashMap<String, Vec<ListOutputVector>>,
-    pub vector_counts: HashMap<String, usize>, // Track number of vectors per index
-    pub quota_limits: HashMap<String, usize>,  // Configurable quota limits per index
-    pub list_indexes_calls: HashMap<String, usize>, // bucket -> call count
-    pub create_index_calls: usize,
+    vector_counts: HashMap<String, usize>, // Track number of vectors per index
+    quota_limits: HashMap<String, usize>,  // Configurable quota limits per index
+    list_indexes_calls: HashMap<String, usize>, // bucket -> call count
+    create_index_calls: usize,
 }
 
 #[derive(Debug, Clone, Default)]

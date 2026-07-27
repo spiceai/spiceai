@@ -46,7 +46,7 @@ pub enum ResponsesApiSupport {
 
 impl ResponsesApiSupport {
     #[must_use]
-    pub fn supports_responses_api(&self) -> bool {
+    pub(crate) fn supports_responses_api(&self) -> bool {
         matches!(self, ResponsesApiSupport::Supported)
     }
 }

@@ -110,7 +110,7 @@ impl DatasetTableProvider {
     /// to the catalog and used for SQL planning until the real provider
     /// takes over.
     #[must_use]
-    pub fn new(name: TableReference, schema: SchemaRef, init: DatasetInitialization) -> Self {
+    pub(crate) fn new(name: TableReference, schema: SchemaRef, init: DatasetInitialization) -> Self {
         Self {
             name,
             schema,
@@ -127,7 +127,7 @@ impl DatasetTableProvider {
 
     /// At-most-once initialization. Concurrent callers wait for the
     /// in-flight call and observe its result.
-    pub async fn ensure_ready(&self) -> Result<Arc<DatasetReady>, Arc<InitError>> {
+    pub(crate) async fn ensure_ready(&self) -> Result<Arc<DatasetReady>, Arc<InitError>> {
         let result = self.ready.get_or_init(|| self.initialize_ready()).await;
         result.clone()
     }

@@ -32,13 +32,13 @@ pub mod class {
 #[derive(Clone, Copy, Debug)]
 pub struct GenericStateEntry<T: FromData> {
     /// A new state.
-    pub new_state: u16,
+    new_state: u16,
     /// Entry flags.
-    pub flags: u16,
+    flags: u16,
     /// Additional data.
     ///
     /// Use `()` if no data expected.
-    pub extra: T,
+    extra: T,
 }
 
 impl<T: FromData> FromData for GenericStateEntry<T> {
@@ -238,7 +238,7 @@ impl<'a, T: FromData> ExtendedStateTable<'a, T> {
     /// Parses an Extended State Table from a stream.
     ///
     /// `number_of_glyphs` is from the `maxp` table.
-    pub fn parse(number_of_glyphs: NonZeroU16, s: &mut Stream<'a>) -> Option<Self> {
+    pub(crate) fn parse(number_of_glyphs: NonZeroU16, s: &mut Stream<'a>) -> Option<Self> {
         let data = s.tail()?;
 
         let number_of_classes = s.read::<u32>()?;

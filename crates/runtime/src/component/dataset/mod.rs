@@ -41,9 +41,9 @@ pub mod acceleration;
 pub mod builder;
 pub mod declared_schema;
 pub mod declared_type;
-pub mod metadata;
+pub(crate) mod metadata;
 pub mod replication;
-pub mod schema_inference;
+pub(crate) mod schema_inference;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -348,7 +348,7 @@ pub struct Dataset {
     pub name: TableReference,
     pub access: AccessMode,
     pub params: HashMap<String, String>,
-    pub metadata: HashMap<String, String>,
+    pub(crate) metadata: HashMap<String, String>,
     pub columns: Vec<Column>,
     /// Arrow schema derived from `columns[].type` declarations. `None` when no
     /// column carries an explicit type. Connectors merge this with their inferred
@@ -356,21 +356,21 @@ pub struct Dataset {
     pub schema: Option<SchemaRef>,
     pub has_metadata_table: bool,
     pub replication: Option<replication::Replication>,
-    pub time_column: Option<String>,
-    pub time_format: Option<TimeFormat>,
-    pub time_partition_column: Option<String>,
-    pub time_partition_format: Option<TimeFormat>,
+    pub(crate) time_column: Option<String>,
+    pub(crate) time_format: Option<TimeFormat>,
+    pub(crate) time_partition_column: Option<String>,
+    pub(crate) time_partition_format: Option<TimeFormat>,
     pub acceleration: Option<acceleration::Acceleration>,
-    pub embeddings: Vec<ColumnEmbeddingConfig>,
-    pub app: Arc<App>,
-    pub unsupported_type_action: Option<UnsupportedTypeAction>,
+    pub(crate) embeddings: Vec<ColumnEmbeddingConfig>,
+    pub(crate) app: Arc<App>,
+    pub(crate) unsupported_type_action: Option<UnsupportedTypeAction>,
     pub on_schema_change: OnSchemaChange,
-    pub ready_state: ReadyState,
-    pub metrics: Metrics,
+    pub(crate) ready_state: ReadyState,
+    pub(crate) metrics: Metrics,
     pub runtime: Arc<Runtime>,
-    pub vectors: Option<VectorStore>,
-    pub full_text_search: Option<spicepod::fts::FtsStore>,
-    pub check_availability: CheckAvailability,
+    pub(crate) vectors: Option<VectorStore>,
+    full_text_search: Option<spicepod::fts::FtsStore>,
+    pub(crate) check_availability: CheckAvailability,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -431,17 +431,17 @@ impl PartialEq for Dataset {
 
 impl Dataset {
     #[must_use]
-    pub fn app(&self) -> Arc<App> {
+    pub(crate) fn app(&self) -> Arc<App> {
         Arc::clone(&self.app)
     }
 
     #[must_use]
-    pub fn runtime(&self) -> Arc<Runtime> {
+    pub(crate) fn runtime(&self) -> Arc<Runtime> {
         Arc::clone(&self.runtime)
     }
 
     #[must_use]
-    pub fn with_params(mut self, params: HashMap<String, String>) -> Self {
+    pub(crate) fn with_params(mut self, params: HashMap<String, String>) -> Self {
         self.params = params;
         self
     }
@@ -464,7 +464,7 @@ impl Dataset {
 
     /// Returns the dataset source - the first part of the `from` field before the first '://', ':', or '/'
     #[must_use]
-    pub fn source(&self) -> &str {
+    pub(crate) fn source(&self) -> &str {
         if self.from == "sink" || self.from.is_empty() {
             return "sink";
         }
@@ -535,7 +535,7 @@ impl Dataset {
     }
 
     #[must_use]
-    pub fn refresh_check_interval(&self) -> Option<Duration> {
+    pub(crate) fn refresh_check_interval(&self) -> Option<Duration> {
         if let Some(acceleration) = &self.acceleration {
             return acceleration.refresh_check_interval;
         }
@@ -551,7 +551,7 @@ impl Dataset {
     }
 
     #[must_use]
-    pub fn refresh_max_jitter(&self) -> Option<Duration> {
+    pub(crate) fn refresh_max_jitter(&self) -> Option<Duration> {
         if let Some(acceleration) = &self.acceleration
             && acceleration.refresh_jitter_enabled
         {
@@ -564,7 +564,7 @@ impl Dataset {
         None
     }
 
-    pub fn retention_check_interval(&self) -> Option<Duration> {
+    pub(crate) fn retention_check_interval(&self) -> Option<Duration> {
         if let Some(acceleration) = &self.acceleration
             && let Some(retention_check_interval) = &acceleration.retention_check_interval
         {
@@ -581,7 +581,7 @@ impl Dataset {
         None
     }
 
-    pub fn retention_period(&self) -> Option<Duration> {
+    pub(crate) fn retention_period(&self) -> Option<Duration> {
         if let Some(acceleration) = &self.acceleration
             && let Some(retention_period) = &acceleration.retention_period
         {
@@ -599,7 +599,7 @@ impl Dataset {
     }
 
     #[must_use]
-    pub fn retention_sql(&self) -> Option<String> {
+    pub(crate) fn retention_sql(&self) -> Option<String> {
         if let Some(acceleration) = &self.acceleration {
             return acceleration.retention_sql.clone();
         }
@@ -617,7 +617,7 @@ impl Dataset {
     }
 
     #[must_use]
-    pub fn refresh_data_window(&self) -> Option<Duration> {
+    pub(crate) fn refresh_data_window(&self) -> Option<Duration> {
         if let Some(acceleration) = &self.acceleration
             && let Some(refresh_data_window) = &acceleration.refresh_data_window
         {
@@ -635,7 +635,7 @@ impl Dataset {
     }
 
     #[must_use]
-    pub fn refresh_retry_enabled(&self) -> bool {
+    pub(crate) fn refresh_retry_enabled(&self) -> bool {
         if let Some(acceleration) = &self.acceleration {
             return acceleration.refresh_retry_enabled;
         }
@@ -643,7 +643,7 @@ impl Dataset {
     }
 
     #[must_use]
-    pub fn refresh_retry_max_attempts(&self) -> Option<usize> {
+    pub(crate) fn refresh_retry_max_attempts(&self) -> Option<usize> {
         if let Some(acceleration) = &self.acceleration {
             return acceleration.refresh_retry_max_attempts;
         }
@@ -651,7 +651,7 @@ impl Dataset {
     }
 
     #[must_use]
-    pub fn access(&self) -> AccessMode {
+    pub(crate) fn access(&self) -> AccessMode {
         self.access
     }
 
@@ -684,7 +684,7 @@ impl Dataset {
     }
 
     #[must_use]
-    pub async fn is_accelerator_initialized(&self) -> bool {
+    pub(crate) async fn is_accelerator_initialized(&self) -> bool {
         if let Some(acceleration_settings) = &self.acceleration {
             let Some(accelerator) = self
                 .runtime()
@@ -707,7 +707,7 @@ impl Dataset {
     ///
     /// If the parameter is set but is not valid, logs a warning and returns `default_value`.
     #[must_use]
-    pub fn get_param<T>(&self, param: &str, default_value: T) -> T
+    pub(crate) fn get_param<T>(&self, param: &str, default_value: T) -> T
     where
         T: Display + FromStr,
     {
@@ -727,12 +727,12 @@ impl Dataset {
     }
 
     #[must_use]
-    pub fn has_embeddings(&self) -> bool {
+    pub(crate) fn has_embeddings(&self) -> bool {
         !self.embeddings.is_empty() || self.columns.iter().any(|c| !c.embeddings.is_empty())
     }
 
     #[must_use]
-    pub fn has_full_text_column(&self) -> bool {
+    pub(crate) fn has_full_text_column(&self) -> bool {
         self.columns
             .iter()
             .any(|c| c.full_text_search.as_ref().is_some_and(|cfg| cfg.enabled))
@@ -785,11 +785,11 @@ impl Dataset {
 }
 
 /// Summarizes all full-text search configuration for a given [`Dataset`] (compared to the column-level [`FullTextSearchConfig`]).
-pub struct FullTextSearchDatasetConfig {
-    pub index_store: IndexStore,
-    pub index_path: Option<String>,
-    pub search_fields: Vec<String>,
-    pub primary_key: Vec<String>,
+pub(crate) struct FullTextSearchDatasetConfig {
+    pub(crate) index_store: IndexStore,
+    pub(crate) index_path: Option<String>,
+    pub(crate) search_fields: Vec<String>,
+    pub(crate) primary_key: Vec<String>,
 }
 
 impl AccelerationSource for Dataset {

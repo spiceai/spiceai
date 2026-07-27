@@ -28,7 +28,7 @@ limitations under the License.
 pub mod client;
 pub mod provider;
 pub mod resilience;
-pub mod schema;
+pub(crate) mod schema;
 
 use snafu::Snafu;
 

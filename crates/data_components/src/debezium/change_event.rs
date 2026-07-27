@@ -24,8 +24,8 @@ use serde::{Deserialize, Serialize};
 /// A representation of a Debezium Change Event Key.
 #[derive(Serialize, Deserialize)]
 pub struct ChangeEventKey {
-    pub schema: Schema,
-    pub payload: serde_json::Value,
+    schema: Schema,
+    payload: serde_json::Value,
 }
 
 impl ChangeEventKey {
@@ -76,8 +76,8 @@ impl ChangeEventKey {
 #[derive(Serialize, Deserialize)]
 pub struct ChangeEvent {
     #[serde(default)]
-    pub schema: Option<Schema>,
-    pub payload: Payload,
+    pub(crate) schema: Option<Schema>,
+    pub(crate) payload: Payload,
 }
 
 impl ChangeEvent {
@@ -92,7 +92,7 @@ impl ChangeEvent {
     /// payload carries `op` at the root. Treating the message as an envelope only
     /// when the root has no `op` avoids mis-detecting a schemaless event that
     /// happens to have a column literally named `payload`.
-    pub fn from_json_value(value: serde_json::Value) -> Result<Self, serde_json::Error> {
+    pub(crate) fn from_json_value(value: serde_json::Value) -> Result<Self, serde_json::Error> {
         if value.get("op").is_none() && value.get("payload").is_some() {
             return serde_json::from_value(value);
         }
@@ -138,7 +138,7 @@ pub enum Op {
 
 impl Op {
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Op::Create => "c",
             Op::Update => "u",
@@ -158,16 +158,16 @@ impl Display for Op {
 
 #[derive(Serialize, Deserialize)]
 pub struct Payload {
-    pub before: Option<serde_json::Value>,
+    pub(crate) before: Option<serde_json::Value>,
     /// Present for create/update/read; typically `null` for deletes.
     #[serde(default)]
-    pub after: serde_json::Value,
+    pub(crate) after: serde_json::Value,
     #[serde(default)]
-    pub source: Source,
-    pub op: Op,
+    pub(crate) source: Source,
+    pub(crate) op: Op,
     #[serde(default)]
-    pub ts_ms: i64,
-    pub transaction: Option<serde_json::Value>,
+    pub(crate) ts_ms: i64,
+    pub(crate) transaction: Option<serde_json::Value>,
 }
 
 /// Debezium `source` block. Fields vary by connector (Postgres uses `db`+`table`,
@@ -176,43 +176,43 @@ pub struct Payload {
 #[derive(Default, Serialize, Deserialize)]
 pub struct Source {
     #[serde(default)]
-    pub version: String,
+    version: String,
     #[serde(default)]
-    pub connector: String,
+    connector: String,
     #[serde(default)]
-    pub name: String,
+    name: String,
     #[serde(default)]
-    pub ts_ms: i64,
+    pub(crate) ts_ms: i64,
     #[serde(default)]
-    pub snapshot: String,
+    snapshot: String,
     #[serde(default)]
-    pub db: String,
+    db: String,
     #[serde(default)]
-    pub table: String,
+    table: String,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct Schema {
     #[serde(rename = "type")]
-    pub schema_type: String,
+    schema_type: String,
     #[serde(default)]
-    pub fields: Vec<Field>,
+    fields: Vec<Field>,
     #[serde(default)]
-    pub optional: bool,
+    optional: bool,
     #[serde(default)]
-    pub name: String,
+    name: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Field {
     #[serde(rename = "type")]
-    pub field_type: String,
-    pub fields: Option<Vec<Field>>,
+    pub(crate) field_type: String,
+    fields: Option<Vec<Field>>,
     #[serde(default)]
-    pub optional: bool,
-    pub name: Option<String>,
-    pub field: Option<String>,
-    pub version: Option<i64>,
-    pub parameters: Option<HashMap<String, String>>,
-    pub items: Option<Box<Field>>,
+    pub(crate) optional: bool,
+    pub(crate) name: Option<String>,
+    pub(crate) field: Option<String>,
+    version: Option<i64>,
+    pub(crate) parameters: Option<HashMap<String, String>>,
+    pub(crate) items: Option<Box<Field>>,
 }

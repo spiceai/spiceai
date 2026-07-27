@@ -186,7 +186,7 @@ impl fmt::Debug for IcebergCreateSchemaExec {
 
 impl IcebergCreateSchemaExec {
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         catalog: Arc<dyn Catalog>,
         namespace: NamespaceIdent,
         if_not_exists: bool,
@@ -349,7 +349,7 @@ impl fmt::Debug for IcebergCreateTableExec {
 impl IcebergCreateTableExec {
     #[must_use]
     #[expect(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         catalog: Arc<dyn Catalog>,
         namespace: NamespaceIdent,
         table_name: String,
@@ -1181,7 +1181,7 @@ impl fmt::Debug for IcebergDropTableExec {
 impl IcebergDropTableExec {
     #[must_use]
     #[expect(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         catalog: Arc<dyn Catalog>,
         namespace: NamespaceIdent,
         table_name: String,

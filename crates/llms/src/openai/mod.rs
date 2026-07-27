@@ -34,8 +34,8 @@ pub use list_models::OpenAiModelLister;
 
 pub const MAX_COMPLETION_TOKENS: u16 = 1024_u16; // Avoid accidentally using infinite tokens. Should think about this more.
 
-pub(crate) const GPT_4O_MINI: &str = "gpt-4o-mini";
-pub(crate) const TEXT_EMBED_3_SMALL: &str = "text-embedding-3-small";
+const GPT_4O_MINI: &str = "gpt-4o-mini";
+const TEXT_EMBED_3_SMALL: &str = "text-embedding-3-small";
 
 pub const DEFAULT_LLM_MODEL: &str = GPT_4O_MINI;
 pub const DEFAULT_EMBEDDING_MODEL: &str = TEXT_EMBED_3_SMALL;

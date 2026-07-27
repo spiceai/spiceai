@@ -135,7 +135,7 @@ pub struct ImapSession {
 
 impl ImapSession {
     #[must_use]
-    pub fn mailbox(&self) -> Arc<str> {
+    pub(crate) fn mailbox(&self) -> Arc<str> {
         Arc::clone(&self.mailbox)
     }
 
@@ -156,7 +156,7 @@ impl ImapSession {
         self
     }
 
-    pub fn connect(&self) -> Result<Session<Box<dyn ImapConnection>>, super::Error> {
+    pub(crate) fn connect(&self) -> Result<Session<Box<dyn ImapConnection>>, super::Error> {
         let client = imap::ClientBuilder::new(Arc::clone(&self.host), self.port)
             .mode(self.ssl_mode.into())
             .connect()

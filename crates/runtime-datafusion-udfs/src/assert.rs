@@ -33,11 +33,11 @@ use datafusion::logical_expr::{
 };
 use datafusion::scalar::ScalarValue;
 
-pub static ASSERT_SCALAR_UDF_NAME: &str = "assert";
+static ASSERT_SCALAR_UDF_NAME: &str = "assert";
 
 /// Prefix on the error message of every `assert()` failure, so callers can recognize a gate
 /// abort without relying on the (shared) `ErrorCode`.
-pub static ASSERT_FAILED_MARKER: &str = "assertion failed:";
+static ASSERT_FAILED_MARKER: &str = "assertion failed:";
 
 #[derive(Debug, Hash, Eq, PartialEq)]
 pub struct Assert {

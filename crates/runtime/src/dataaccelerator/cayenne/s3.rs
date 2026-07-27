@@ -783,13 +783,13 @@ pub(crate) const S3_PARAMETERS: [ParameterSpec; S3_PARAMS_LEN] = [
 /// S3 Express One Zone buckets have the naming convention: `{base-name}--{zone-id}--x-s3`
 /// Example: `s3://mybucket--usw2-az1--x-s3/prefix/`
 #[must_use]
-pub fn is_s3_express_path(path: &str) -> bool {
+pub(crate) fn is_s3_express_path(path: &str) -> bool {
     path.starts_with("s3://") && path.contains("--x-s3")
 }
 
 /// Validates that the path is either a local path or an S3 Express One Zone path.
 /// Standard S3 paths are not supported.
-pub fn validate_file_path(path: &str) -> Result<()> {
+pub(crate) fn validate_file_path(path: &str) -> Result<()> {
     if path.starts_with("s3://") && !is_s3_express_path(path) {
         return Err(Error::StandardS3NotSupported {
             path: path.to_string(),
@@ -803,7 +803,7 @@ pub fn validate_file_path(path: &str) -> Result<()> {
 /// This returns true if either:
 /// - `cayenne_file_path` is set to an S3 Express path, or
 /// - `cayenne_s3_zone_ids` is set (which means we'll auto-generate S3 Express paths)
-pub fn is_s3_express_data_path(source: &dyn AccelerationSource) -> bool {
+pub(crate) fn is_s3_express_data_path(source: &dyn AccelerationSource) -> bool {
     source.acceleration().is_some_and(|a| {
         // Check for explicit S3 Express path
         if a.params
@@ -820,7 +820,7 @@ pub fn is_s3_express_data_path(source: &dyn AccelerationSource) -> bool {
 /// Returns true if multi-zone S3 Express One Zone storage is configured.
 ///
 /// Multi-zone is enabled when `cayenne_s3_zone_ids` contains multiple zone IDs.
-pub fn is_multi_zone_s3_express(source: &dyn AccelerationSource) -> bool {
+pub(crate) fn is_multi_zone_s3_express(source: &dyn AccelerationSource) -> bool {
     source.acceleration().is_some_and(|a| {
         a.params
             .get("cayenne_s3_zone_ids")
@@ -833,7 +833,7 @@ pub fn is_multi_zone_s3_express(source: &dyn AccelerationSource) -> bool {
 /// Parses the `cayenne_s3_zone_ids` parameter as a comma-separated list of zone IDs.
 /// Normalizes entries (trim + lowercase) and deduplicates, preserving first-seen order.
 /// Returns an empty vector if the parameter is not set.
-pub fn get_s3_zone_ids(source: &dyn AccelerationSource) -> Result<Vec<String>> {
+pub(crate) fn get_s3_zone_ids(source: &dyn AccelerationSource) -> Result<Vec<String>> {
     source
         .acceleration()
         .and_then(|a| a.params.get("cayenne_s3_zone_ids"))
@@ -874,7 +874,7 @@ pub fn get_s3_zone_ids(source: &dyn AccelerationSource) -> Result<Vec<String>> {
 /// S3 Express One Zone bucket names have the format: `{base-name}--{zone-id}--x-s3`
 /// Example: `mybucket--usw2-az1--x-s3` returns `Some("usw2-az1")`
 #[must_use]
-pub fn extract_zone_id_from_bucket(bucket_name: &str) -> Option<&str> {
+fn extract_zone_id_from_bucket(bucket_name: &str) -> Option<&str> {
     // Find the last occurrence of "--x-s3"
     let suffix_start = bucket_name.rfind("--x-s3")?;
     let before_suffix = &bucket_name[..suffix_start];
@@ -969,7 +969,7 @@ pub fn generate_bucket_name(app_name: &str, dataset_name: &str, zone_id: &str) -
 ///
 /// Returns `Ok(true)` if a new bucket was created, `Ok(false)` if the bucket already existed.
 /// Returns `Err` if the bucket creation or verification fails.
-pub async fn create_s3_express_bucket_if_needed(
+pub(crate) async fn create_s3_express_bucket_if_needed(
     bucket_name: &str,
     zone_id: &str,
     region: &str,
@@ -1184,7 +1184,7 @@ pub async fn create_s3_express_bucket_if_needed(
 /// - `timeout`: Client timeout (defaults to 120s if None)
 /// - `unsigned_payload`: Whether to skip payload signing (defaults to true if None)
 #[expect(clippy::too_many_arguments)]
-pub async fn build_s3_object_store_for_validation(
+async fn build_s3_object_store_for_validation(
     bucket_name: &str,
     zone_id: &str,
     region: &str,
@@ -1281,7 +1281,7 @@ pub async fn build_s3_object_store_for_validation(
     clippy::type_complexity,
     reason = "Return type represents distinct S3 configuration fields"
 )]
-pub fn get_s3_bucket_info(
+pub(crate) fn get_s3_bucket_info(
     source: &dyn AccelerationSource,
     data_path: &str,
 ) -> Result<(
@@ -1365,7 +1365,7 @@ pub fn get_s3_bucket_info(
 /// Zone IDs follow the pattern: `{region-code}-az{n}` (e.g., `usw2-az1`, `use1-az4`)
 /// We need to map the abbreviated region code to the full AWS region name.
 #[must_use]
-pub fn derive_region_from_zone(zone_id: &str) -> Option<String> {
+pub(crate) fn derive_region_from_zone(zone_id: &str) -> Option<String> {
     // Extract the region prefix from zone ID (e.g., "usw2" from "usw2-az1")
     let region_prefix = zone_id.split("-az").next()?;
 
@@ -1478,7 +1478,7 @@ async fn resolve_s3_params_with_prefix(
 /// Unlike [`build_s3_object_store`] (warm tier, S3 Express One Zone only), this
 /// targets general S3 endpoints: path-style requests by default, no
 /// zone/Express options. Returns `None` when `location` is not `s3://`.
-pub async fn build_datalake_object_store(
+pub(crate) async fn build_datalake_object_store(
     source: &dyn AccelerationSource,
     location: &str,
 ) -> Result<Option<cayenne::metadata::ObjectStoreConfig>> {
@@ -1608,7 +1608,7 @@ pub async fn build_datalake_object_store(
 /// background promotion), then best-effort DELETE it (failure only warns —
 /// `DeleteObject` is deliberately optional so minimal-permission deployments
 /// work; a leftover probe marker is harmless).
-pub async fn validate_datalake_store_access(
+pub(crate) async fn validate_datalake_store_access(
     config: &cayenne::metadata::ObjectStoreConfig,
     dataset_name: &str,
 ) -> Result<()> {
@@ -1771,7 +1771,7 @@ async fn build_single_s3_store_for_path(
 /// Build an S3 object store for S3 Express One Zone storage.
 ///
 /// Returns `None` if the path is not an S3 path, or an error if S3 configuration is invalid.
-pub async fn build_s3_object_store(
+pub(crate) async fn build_s3_object_store(
     source: &dyn AccelerationSource,
     data_path: String,
 ) -> Result<Option<cayenne::metadata::ObjectStoreConfig>> {
@@ -1845,7 +1845,7 @@ pub async fn build_s3_object_store(
 /// This walks the error chain and inspects both structured error sources (when available) and
 /// a last-resort string check. This keeps the string matching centralized instead of duplicating
 /// it at each call site.
-pub fn is_auth_error(error: &(dyn std::error::Error + 'static)) -> bool {
+fn is_auth_error(error: &(dyn std::error::Error + 'static)) -> bool {
     let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(err) = current {
         // If the object store wrapped another error (e.g., AWS SDK), inspect the source chain

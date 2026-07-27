@@ -597,7 +597,7 @@ pub struct MetadataParam {
 // 2. AWS Bedrock: anthropic.claude-3-5-sonnet-20241022-v2:0
 // 3. GCP Vertex AI: claude-3-5-sonnet-v2@20241022
 // Based on available models from https://docs.claude.com/en/docs/about-claude/models/overview, as of 2025-09-28.
-pub(crate) static ANTHROPIC_REGEX: &str = r"(?x) # Enable verbose mode
+static ANTHROPIC_REGEX: &str = r"(?x) # Enable verbose mode
     (?:anthropic\.)?                              # Optional 'anthropic.' prefix for AWS
     claude-                                       # Required 'claude-' prefix
     (?:instant-)?                                 # Optional 'instant-' for legacy

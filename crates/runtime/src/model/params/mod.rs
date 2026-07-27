@@ -34,7 +34,7 @@ const DEPRECATED_MESSAGE: &str = "The `openai_<param>` language model overrides 
 ///
 /// This function is used by the schema generator to collect all model parameters.
 #[must_use]
-pub fn get_params_spec(source: &ModelSource) -> Option<&'static [ParameterSpec]> {
+pub(crate) fn get_params_spec(source: &ModelSource) -> Option<&'static [ParameterSpec]> {
     match source {
         ModelSource::OpenAi => Some(openai::PARAMETERS),
         ModelSource::Azure => Some(azure::PARAMETERS),
@@ -49,12 +49,12 @@ pub fn get_params_spec(source: &ModelSource) -> Option<&'static [ParameterSpec]>
     }
 }
 
-pub const PARAM_LEN: usize = 51;
-pub const PARAM_WITH_DEPRE_LEN: usize = 52;
+pub(crate) const PARAM_LEN: usize = 51;
+pub(crate) const PARAM_WITH_DEPRE_LEN: usize = 52;
 
 // Model parameters that are used for openai model provider. Those parameters are supported by other (non-openai) models as well.
 // OpenAI model is prefixed with `openai_`, use separate PARAMETERS constant to avoid confusion with other model providers.
-pub const COMMON_MODEL_PARAMETERS: [ParameterSpec; PARAM_LEN] = [
+pub(crate) const COMMON_MODEL_PARAMETERS: [ParameterSpec; PARAM_LEN] = [
     // Common parameters for all models
     ParameterSpec::runtime("tools")
         .description("Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery without data sampling tools, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery."),
@@ -117,7 +117,7 @@ pub const COMMON_MODEL_PARAMETERS: [ParameterSpec; PARAM_LEN] = [
 ];
 
 // Common model parameters that are used for all model providers except openai.
-pub const COMMON_MODEL_PARAMETERS_WITH_DEPRECATED: [ParameterSpec; PARAM_WITH_DEPRE_LEN] = [
+pub(crate) const COMMON_MODEL_PARAMETERS_WITH_DEPRECATED: [ParameterSpec; PARAM_WITH_DEPRE_LEN] = [
     // Common parameters for all models
     ParameterSpec::runtime("tools")
         .description("Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery without data sampling tools, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery."),

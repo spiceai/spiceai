@@ -83,13 +83,13 @@ impl PlanningFailure {
 }
 
 /// Record the number of executors selected for a successfully planned query.
-pub fn record_query_executor_count(node_id: &str, executors: u64) {
+pub(crate) fn record_query_executor_count(node_id: &str, executors: u64) {
     let labels = [KeyValue::new("node_id", node_id.to_string())];
     QUERY_EXECUTOR_COUNT.record(executors, &labels);
 }
 
 /// Record a query-planning failure with the given error type.
-pub fn record_query_planning_failure(node_id: &str, failure: PlanningFailure) {
+pub(crate) fn record_query_planning_failure(node_id: &str, failure: PlanningFailure) {
     let labels = [
         KeyValue::new("node_id", node_id.to_string()),
         KeyValue::new("error_type", failure.as_str()),
@@ -206,7 +206,7 @@ impl PartitionStateOperation {
 }
 
 /// Set the partition count for a dataset, split by `assigned`/`unassigned`.
-pub fn set_scheduler_partitions_count(
+pub(crate) fn set_scheduler_partitions_count(
     node_id: &str,
     dataset: &str,
     assigned: u64,
@@ -228,7 +228,7 @@ pub fn set_scheduler_partitions_count(
 }
 
 /// Record a partition assignment attempt to a specific executor.
-pub fn record_partition_assignment(node_id: &str, executor: &str, status: AssignmentStatus) {
+pub(crate) fn record_partition_assignment(node_id: &str, executor: &str, status: AssignmentStatus) {
     let labels = [
         KeyValue::new("node_id", node_id.to_string()),
         KeyValue::new("executor", executor.to_string()),
@@ -238,7 +238,7 @@ pub fn record_partition_assignment(node_id: &str, executor: &str, status: Assign
 }
 
 /// Record partition discovery duration against the source for a dataset.
-pub fn record_partition_discovery_duration(node_id: &str, dataset: &str, duration_ms: f64) {
+pub(crate) fn record_partition_discovery_duration(node_id: &str, dataset: &str, duration_ms: f64) {
     let labels = [
         KeyValue::new("node_id", node_id.to_string()),
         KeyValue::new("dataset", dataset.to_string()),
@@ -247,7 +247,7 @@ pub fn record_partition_discovery_duration(node_id: &str, dataset: &str, duratio
 }
 
 /// Record a partition state operation (add / remove / reassign).
-pub fn record_partition_state_operation(node_id: &str, op: PartitionStateOperation, count: u64) {
+pub(crate) fn record_partition_state_operation(node_id: &str, op: PartitionStateOperation, count: u64) {
     if count == 0 {
         return;
     }
@@ -259,7 +259,7 @@ pub fn record_partition_state_operation(node_id: &str, op: PartitionStateOperati
 }
 
 /// Record a partitioned-write forward to an executor.
-pub fn record_partitioned_write_forward(node_id: &str, executor: &str, status: WriteForwardStatus) {
+pub(crate) fn record_partitioned_write_forward(node_id: &str, executor: &str, status: WriteForwardStatus) {
     let labels = [
         KeyValue::new("node_id", node_id.to_string()),
         KeyValue::new("executor", executor.to_string()),
@@ -336,7 +336,7 @@ static EXECUTOR_SCHEDULER_CONNECTION_RETRIES: LazyLock<Counter<u64>> = LazyLock:
 });
 
 /// Set the scheduler→executor active-connection gauge for one executor (0 or 1).
-pub fn set_scheduler_executor_active_connection(node_id: &str, executor: &str, active: bool) {
+pub(crate) fn set_scheduler_executor_active_connection(node_id: &str, executor: &str, active: bool) {
     let labels = [
         KeyValue::new("node_id", node_id.to_string()),
         KeyValue::new("executor", executor.to_string()),
@@ -345,7 +345,7 @@ pub fn set_scheduler_executor_active_connection(node_id: &str, executor: &str, a
 }
 
 /// Increment the scheduler→executor reconnection counter.
-pub fn record_scheduler_executor_connection_retry(node_id: &str, executor: &str) {
+pub(crate) fn record_scheduler_executor_connection_retry(node_id: &str, executor: &str) {
     let labels = [
         KeyValue::new("node_id", node_id.to_string()),
         KeyValue::new("executor", executor.to_string()),

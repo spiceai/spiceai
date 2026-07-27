@@ -180,7 +180,7 @@ impl From<f32> for NormalizedCoordinate {
 impl NormalizedCoordinate {
     /// Returns the coordinate value as f2.14.
     #[inline]
-    pub fn get(self) -> i16 {
+    fn get(self) -> i16 {
         self.0
     }
 }
@@ -247,7 +247,7 @@ impl Tag {
 
     /// Returns tag as 4-element byte array.
     #[inline]
-    pub const fn to_bytes(self) -> [u8; 4] {
+    const fn to_bytes(self) -> [u8; 4] {
         [
             (self.0 >> 24 & 0xff) as u8,
             (self.0 >> 16 & 0xff) as u8,
@@ -258,7 +258,7 @@ impl Tag {
 
     /// Returns tag as 4-element byte array.
     #[inline]
-    pub const fn to_chars(self) -> [char; 4] {
+    const fn to_chars(self) -> [char; 4] {
         [
             (self.0 >> 24 & 0xff) as u8 as char,
             (self.0 >> 16 & 0xff) as u8 as char,
@@ -318,10 +318,10 @@ impl FromData for Tag {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct LineMetrics {
     /// Line position.
-    pub position: i16,
+    position: i16,
 
     /// Line thickness.
-    pub thickness: i16,
+    thickness: i16,
 }
 
 /// A rectangle.
@@ -432,7 +432,7 @@ pub struct Transform {
 impl Transform {
     /// Creates a new transform with the specified components.
     #[inline]
-    pub fn new(a: f32, b: f32, c: f32, d: f32, e: f32, f: f32) -> Self {
+    fn new(a: f32, b: f32, c: f32, d: f32, e: f32, f: f32) -> Self {
         Transform { a, b, c, d, e, f }
     }
 
@@ -528,9 +528,9 @@ impl core::fmt::Debug for Transform {
 #[derive(Clone, Copy, Debug)]
 pub struct PointF {
     /// The X-axis coordinate.
-    pub x: f32,
+    x: f32,
     /// The Y-axis coordinate.
-    pub y: f32,
+    y: f32,
 }
 
 /// Phantom points.
@@ -539,13 +539,13 @@ pub struct PointF {
 #[derive(Clone, Copy, Debug)]
 pub struct PhantomPoints {
     /// Left side bearing point.
-    pub left: PointF,
+    left: PointF,
     /// Right side bearing point.
-    pub right: PointF,
+    right: PointF,
     /// Top side bearing point.
-    pub top: PointF,
+    top: PointF,
     /// Bottom side bearing point.
-    pub bottom: PointF,
+    bottom: PointF,
 }
 
 /// A RGBA color in the sRGB color space.
@@ -570,7 +570,7 @@ impl RgbaColor {
         }
     }
 
-    pub(crate) fn apply_alpha(&mut self, alpha: f32) {
+    fn apply_alpha(&mut self, alpha: f32) {
         self.alpha = (((f32::from(self.alpha) / 255.0) * alpha) * 255.0) as u8;
     }
 }
@@ -704,11 +704,11 @@ pub struct RasterGlyphImage<'a> {
 #[derive(Clone, Copy, Debug)]
 #[allow(missing_docs)]
 pub struct TableRecord {
-    pub tag: Tag,
+    tag: Tag,
     #[allow(dead_code)]
     pub check_sum: u32,
-    pub offset: u32,
-    pub length: u32,
+    offset: u32,
+    length: u32,
 }
 
 impl FromData for TableRecord {
@@ -811,9 +811,9 @@ impl std::error::Error for FaceParsingError {}
 #[derive(Clone, Copy)]
 pub struct RawFace<'a> {
     /// The input font file data.
-    pub data: &'a [u8],
+    data: &'a [u8],
     /// An array of table records.
-    pub table_records: LazyArray16<'a, TableRecord>,
+    table_records: LazyArray16<'a, TableRecord>,
 }
 
 impl<'a> RawFace<'a> {
@@ -836,7 +836,7 @@ impl<'a> RawFace<'a> {
     /// Set to 0 if unsure.
     ///
     /// While we do reuse [`FaceParsingError`], `No*Table` errors will not be throws.
-    pub fn parse(data: &'a [u8], index: u32) -> Result<Self, FaceParsingError> {
+    fn parse(data: &'a [u8], index: u32) -> Result<Self, FaceParsingError> {
         // https://docs.microsoft.com/en-us/typography/opentype/spec/otff#organization-of-an-opentype-font
 
         let mut s = Stream::new(data);
@@ -919,109 +919,109 @@ impl core::fmt::Debug for RawFace<'_> {
 pub struct RawFaceTables<'a> {
     // Mandatory tables.
     /// Font Header, global information about the font, version number, creation and modification dates, revision number, and basic typographic data.
-    pub head: &'a [u8],
+    head: &'a [u8],
     /// Horizontal Header, information needed to layout fonts whose characters are written horizontally.
-    pub hhea: &'a [u8],
+    hhea: &'a [u8],
     /// Maximum Profile, establishes the memory requirements for a font.
-    pub maxp: &'a [u8],
+    maxp: &'a [u8],
 
     /// Bitmap data table
-    pub bdat: Option<&'a [u8]>,
+    bdat: Option<&'a [u8]>,
     /// Bitmap Location, availability of bitmaps at requested point sizes.
-    pub bloc: Option<&'a [u8]>,
+    bloc: Option<&'a [u8]>,
     /// Color Bitmap Data, used to embed color bitmap glyph data.
-    pub cbdt: Option<&'a [u8]>,
+    cbdt: Option<&'a [u8]>,
     /// Color Bitmap Location, provides locators for embedded color bitmaps.
-    pub cblc: Option<&'a [u8]>,
+    cblc: Option<&'a [u8]>,
     /// Compact Font Format 1
-    pub cff: Option<&'a [u8]>,
+    cff: Option<&'a [u8]>,
     /// Character to Glyph Mapping, maps character codes to glyph indices.
-    pub cmap: Option<&'a [u8]>,
+    cmap: Option<&'a [u8]>,
     /// Color, adds support for multi-colored glyphs.
-    pub colr: Option<&'a [u8]>,
+    colr: Option<&'a [u8]>,
     /// Color Palette, a set of one or more color palettes.
-    pub cpal: Option<&'a [u8]>,
+    cpal: Option<&'a [u8]>,
     /// Embedded Bitmap Data, embed monochrome or grayscale bitmap glyph data.
-    pub ebdt: Option<&'a [u8]>,
+    ebdt: Option<&'a [u8]>,
     /// Embedded Bitmap Location, provides embedded bitmap locators.
-    pub eblc: Option<&'a [u8]>,
+    eblc: Option<&'a [u8]>,
     /// Glyph Outline, data that defines the appearance of the glyphs.
-    pub glyf: Option<&'a [u8]>,
+    glyf: Option<&'a [u8]>,
     /// Horizontal Metrics, metric information for the horizontal layout each of the glyphs.
-    pub hmtx: Option<&'a [u8]>,
+    hmtx: Option<&'a [u8]>,
     /// Kern, values that adjust the intercharacter spacing for glyphs.
-    pub kern: Option<&'a [u8]>,
+    kern: Option<&'a [u8]>,
     /// Glyph Data Location, stores the offsets to the locations of the glyphs.
-    pub loca: Option<&'a [u8]>,
+    loca: Option<&'a [u8]>,
     /// Font Names, human-readable names for features and settings, copyright, font names, style names, and other information.
-    pub name: Option<&'a [u8]>,
+    name: Option<&'a [u8]>,
     /// OS/2 Compatibility, a set of metrics that are required by Windows.
-    pub os2: Option<&'a [u8]>,
+    os2: Option<&'a [u8]>,
     /// Glyph Name and PostScript Font, information needed to use a TrueType font on a PostScript printer.
-    pub post: Option<&'a [u8]>,
+    post: Option<&'a [u8]>,
     /// Extended Bitmaps, provides access to bitmap data in a standard graphics format (such as PNG, JPEG, TIFF).
-    pub sbix: Option<&'a [u8]>,
+    sbix: Option<&'a [u8]>,
     /// Style Attributes, describes design attributes that distinguish font-style variants within a font family.
-    pub stat: Option<&'a [u8]>,
+    stat: Option<&'a [u8]>,
     /// Scalable Vector Graphics, contains SVG descriptions for some or all of the glyphs in the font.
-    pub svg: Option<&'a [u8]>,
+    svg: Option<&'a [u8]>,
     /// Vertical Header, information needed for vertical fonts.
-    pub vhea: Option<&'a [u8]>,
+    vhea: Option<&'a [u8]>,
     /// Vertical Metrics, specifies the vertical spacing for each glyph in an AAT vertical font.
-    pub vmtx: Option<&'a [u8]>,
+    vmtx: Option<&'a [u8]>,
     /// Vertical Origin, the y coordinate of a glyph’s vertical origin, this can only be used in CFF or CFF2 fonts.
-    pub vorg: Option<&'a [u8]>,
+    vorg: Option<&'a [u8]>,
 
     /// Glyph Definition, provides various glyph properties used in OpenType Layout processing.
     #[cfg(feature = "opentype-layout")]
-    pub gdef: Option<&'a [u8]>,
+    gdef: Option<&'a [u8]>,
     /// Glyph Positioning, precise control over glyph placement for sophisticated text layout in each supported script.
     #[cfg(feature = "opentype-layout")]
-    pub gpos: Option<&'a [u8]>,
+    gpos: Option<&'a [u8]>,
     /// Glyph Substitution, provides data for substitution of glyphs for appropriate rendering of different scripts.
     #[cfg(feature = "opentype-layout")]
-    pub gsub: Option<&'a [u8]>,
+    gsub: Option<&'a [u8]>,
     /// Mathematical Typesetting, font-specific information necessary for math formula layout.
     #[cfg(feature = "opentype-layout")]
-    pub math: Option<&'a [u8]>,
+    math: Option<&'a [u8]>,
 
     /// Anchor Point Table, defines anchor points.
     #[cfg(feature = "apple-layout")]
-    pub ankr: Option<&'a [u8]>,
+    ankr: Option<&'a [u8]>,
     /// Feature Name Table, font's text features.
     #[cfg(feature = "apple-layout")]
-    pub feat: Option<&'a [u8]>,
+    feat: Option<&'a [u8]>,
     /// Kerx, extended kerning table.
     #[cfg(feature = "apple-layout")]
-    pub kerx: Option<&'a [u8]>,
+    kerx: Option<&'a [u8]>,
     /// Extended Glyph Metamorphosis, specifies a set of transformations that can apply to the glyphs of your font.
     #[cfg(feature = "apple-layout")]
-    pub morx: Option<&'a [u8]>,
+    morx: Option<&'a [u8]>,
     /// Tracking, allows AAT fonts to adjust to normal interglyph spacing.
     #[cfg(feature = "apple-layout")]
-    pub trak: Option<&'a [u8]>,
+    trak: Option<&'a [u8]>,
 
     /// Axis Variation Table, allows the font to modify the mapping between axis values and these normalized values.
     #[cfg(feature = "variable-fonts")]
-    pub avar: Option<&'a [u8]>,
+    avar: Option<&'a [u8]>,
     /// Compact Font Format 2
     #[cfg(feature = "variable-fonts")]
-    pub cff2: Option<&'a [u8]>,
+    cff2: Option<&'a [u8]>,
     /// Font Variations Table, global information of which variation axes are included in the font.
     #[cfg(feature = "variable-fonts")]
-    pub fvar: Option<&'a [u8]>,
+    fvar: Option<&'a [u8]>,
     /// Glyph Variations Table, includes all of the data required for stylizing the glyphs.
     #[cfg(feature = "variable-fonts")]
-    pub gvar: Option<&'a [u8]>,
+    gvar: Option<&'a [u8]>,
     /// Horizontal Metrics Variations Table, used in variable fonts to provide glyph variations for horizontal glyph metrics values.
     #[cfg(feature = "variable-fonts")]
-    pub hvar: Option<&'a [u8]>,
+    hvar: Option<&'a [u8]>,
     /// Metrics Variations Table, used in variable fonts to provide glyph variations for font-wide metric values found in other font tables.
     #[cfg(feature = "variable-fonts")]
-    pub mvar: Option<&'a [u8]>,
+    mvar: Option<&'a [u8]>,
     /// Vertical Metrics Variations Table, used in variable fonts to provide glyph variations for vertical glyph metric values.
     #[cfg(feature = "variable-fonts")]
-    pub vvar: Option<&'a [u8]>,
+    vvar: Option<&'a [u8]>,
 }
 
 /// Parsed face tables.
@@ -1036,63 +1036,63 @@ pub struct RawFaceTables<'a> {
 #[derive(Clone)]
 pub struct FaceTables<'a> {
     // Mandatory tables.
-    pub head: head::Table,
-    pub hhea: hhea::Table,
-    pub maxp: maxp::Table,
+    head: head::Table,
+    hhea: hhea::Table,
+    maxp: maxp::Table,
 
-    pub bdat: Option<cbdt::Table<'a>>,
-    pub cbdt: Option<cbdt::Table<'a>>,
-    pub cff: Option<cff::Table<'a>>,
-    pub cmap: Option<cmap::Table<'a>>,
+    bdat: Option<cbdt::Table<'a>>,
+    cbdt: Option<cbdt::Table<'a>>,
+    cff: Option<cff::Table<'a>>,
+    cmap: Option<cmap::Table<'a>>,
     pub colr: Option<colr::Table<'a>>,
-    pub ebdt: Option<cbdt::Table<'a>>,
-    pub glyf: Option<glyf::Table<'a>>,
-    pub hmtx: Option<hmtx::Table<'a>>,
-    pub kern: Option<kern::Table<'a>>,
-    pub name: Option<name::Table<'a>>,
-    pub os2: Option<os2::Table<'a>>,
-    pub post: Option<post::Table<'a>>,
-    pub sbix: Option<sbix::Table<'a>>,
+    ebdt: Option<cbdt::Table<'a>>,
+    glyf: Option<glyf::Table<'a>>,
+    hmtx: Option<hmtx::Table<'a>>,
+    kern: Option<kern::Table<'a>>,
+    name: Option<name::Table<'a>>,
+    os2: Option<os2::Table<'a>>,
+    post: Option<post::Table<'a>>,
+    sbix: Option<sbix::Table<'a>>,
     pub stat: Option<stat::Table<'a>>,
-    pub svg: Option<svg::Table<'a>>,
-    pub vhea: Option<vhea::Table>,
-    pub vmtx: Option<hmtx::Table<'a>>,
-    pub vorg: Option<vorg::Table<'a>>,
+    svg: Option<svg::Table<'a>>,
+    vhea: Option<vhea::Table>,
+    vmtx: Option<hmtx::Table<'a>>,
+    vorg: Option<vorg::Table<'a>>,
 
     #[cfg(feature = "opentype-layout")]
-    pub gdef: Option<gdef::Table<'a>>,
+    gdef: Option<gdef::Table<'a>>,
     #[cfg(feature = "opentype-layout")]
     pub gpos: Option<opentype_layout::LayoutTable<'a>>,
     #[cfg(feature = "opentype-layout")]
     pub gsub: Option<opentype_layout::LayoutTable<'a>>,
     #[cfg(feature = "opentype-layout")]
-    pub math: Option<math::Table<'a>>,
+    math: Option<math::Table<'a>>,
 
     #[cfg(feature = "apple-layout")]
-    pub ankr: Option<ankr::Table<'a>>,
+    ankr: Option<ankr::Table<'a>>,
     #[cfg(feature = "apple-layout")]
-    pub feat: Option<feat::Table<'a>>,
+    feat: Option<feat::Table<'a>>,
     #[cfg(feature = "apple-layout")]
-    pub kerx: Option<kerx::Table<'a>>,
+    kerx: Option<kerx::Table<'a>>,
     #[cfg(feature = "apple-layout")]
-    pub morx: Option<morx::Table<'a>>,
+    morx: Option<morx::Table<'a>>,
     #[cfg(feature = "apple-layout")]
-    pub trak: Option<trak::Table<'a>>,
+    trak: Option<trak::Table<'a>>,
 
     #[cfg(feature = "variable-fonts")]
-    pub avar: Option<avar::Table<'a>>,
+    avar: Option<avar::Table<'a>>,
     #[cfg(feature = "variable-fonts")]
-    pub cff2: Option<cff2::Table<'a>>,
+    cff2: Option<cff2::Table<'a>>,
     #[cfg(feature = "variable-fonts")]
-    pub fvar: Option<fvar::Table<'a>>,
+    fvar: Option<fvar::Table<'a>>,
     #[cfg(feature = "variable-fonts")]
-    pub gvar: Option<gvar::Table<'a>>,
+    gvar: Option<gvar::Table<'a>>,
     #[cfg(feature = "variable-fonts")]
-    pub hvar: Option<hvar::Table<'a>>,
+    hvar: Option<hvar::Table<'a>>,
     #[cfg(feature = "variable-fonts")]
-    pub mvar: Option<mvar::Table<'a>>,
+    mvar: Option<mvar::Table<'a>>,
     #[cfg(feature = "variable-fonts")]
-    pub vvar: Option<vvar::Table<'a>>,
+    vvar: Option<vvar::Table<'a>>,
 }
 
 /// A font face.
@@ -1475,7 +1475,7 @@ impl<'a> Face<'a> {
 
     /// Returns face style.
     #[inline]
-    pub fn style(&self) -> Style {
+    fn style(&self) -> Style {
         self.tables.os2.map(|os2| os2.style()).unwrap_or_default()
     }
 
@@ -2396,7 +2396,7 @@ impl<'a> Face<'a> {
     ///
     /// Available only for variable fonts with the `gvar` table.
     #[cfg(feature = "variable-fonts")]
-    pub fn glyph_phantom_points(&self, glyph_id: GlyphId) -> Option<PhantomPoints> {
+    fn glyph_phantom_points(&self, glyph_id: GlyphId) -> Option<PhantomPoints> {
         let glyf = self.tables.glyf?;
         let gvar = self.tables.gvar?;
         gvar.phantom_points(glyf, self.coords(), glyph_id)

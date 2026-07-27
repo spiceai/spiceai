@@ -74,7 +74,7 @@ fn get_container_memory_limit() -> Option<u64> {
 /// This function is used internally by `ResourceMonitor` and by `DataFusion`
 /// to set default memory limits.
 #[must_use]
-pub fn get_total_memory() -> u64 {
+pub(crate) fn get_total_memory() -> u64 {
     let mut system = System::new();
     system.refresh_memory();
 
@@ -88,7 +88,7 @@ impl ResourceMonitor {
     /// Automatically detects if running in a container and uses container memory
     /// limits instead of host system memory.
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let pid = Pid::from_u32(std::process::id());
         let mut system = System::new();
         system.refresh_memory();
@@ -125,7 +125,7 @@ impl ResourceMonitor {
     /// # Performance
     /// This method performs blocking I/O operations (process info refresh). When calling from
     /// async contexts, wrap in `tokio::task::spawn_blocking` to avoid blocking the async runtime.
-    pub fn check_memory_usage(&self, context: &str) {
+    pub(crate) fn check_memory_usage(&self, context: &str) {
         const THRESHOLDS: &[u8] = &[70, 80, 90, 95, 99];
 
         let mut inner = self.inner.write();

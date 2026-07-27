@@ -114,7 +114,7 @@ impl SmbPool {
     /// Returns the index even if all slots are poisoned — callers should
     /// invoke [`Self::reconnect`] to recover before using the connection.
     #[must_use]
-    pub fn next_index(&self) -> usize {
+    pub(crate) fn next_index(&self) -> usize {
         let n = self.slots.len();
         let start = self.next.fetch_add(1, Ordering::Relaxed);
         for i in 0..n {
@@ -130,7 +130,7 @@ impl SmbPool {
     /// currently-installed `Arc<SmbClient>` (the slot may have been swapped
     /// in by a prior `reconnect`).
     #[must_use]
-    pub fn client(&self, idx: usize) -> Arc<SmbClient> {
+    pub(crate) fn client(&self, idx: usize) -> Arc<SmbClient> {
         Arc::clone(
             &self.slots[idx]
                 .lock()
@@ -146,7 +146,7 @@ impl SmbPool {
 
     /// Number of connections in the pool.
     #[must_use]
-    pub fn size(&self) -> usize {
+    pub(crate) fn size(&self) -> usize {
         self.slots.len()
     }
 
@@ -157,7 +157,7 @@ impl SmbPool {
     /// Concurrent reconnects to the same slot will each establish a new
     /// connection; callers should serialize per-slot reconnects (see
     /// `ShareSession::pick` for an example using a per-slot async lock).
-    pub async fn reconnect(&self, idx: usize) -> io::Result<Arc<SmbClient>> {
+    pub(crate) async fn reconnect(&self, idx: usize) -> io::Result<Arc<SmbClient>> {
         let new_client = SmbClient::connect(self.config.clone()).await?;
         {
             let mut slot = self.slots[idx]

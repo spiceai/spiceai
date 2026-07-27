@@ -209,7 +209,7 @@ pub fn valid_keywords(keywords: &[String]) -> Result<Vec<String>, Error> {
         .collect::<Result<Vec<String>, _>>()
 }
 
-pub fn validate_keyword_to_ilike(k: &str, target_column: &str) -> Result<Expr, Error> {
+fn validate_keyword_to_ilike(k: &str, target_column: &str) -> Result<Expr, Error> {
     let lower = k.to_lowercase();
     let pattern = format!("%{lower}%");
     let expression = format!("{target_column} ILIKE '{pattern}'");

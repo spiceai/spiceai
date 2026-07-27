@@ -224,7 +224,7 @@ impl ClusterConfig {
     }
 
     #[must_use]
-    pub fn node_port(&self) -> u16 {
+    pub(crate) fn node_port(&self) -> u16 {
         self.node_bind_address.port()
     }
 }

@@ -46,7 +46,7 @@ impl DocumentParserFactory for PptxParserFactory {
 pub struct PptxParser {}
 impl PptxParser {
     #[must_use]
-    pub fn new(_parser_options: &HashMap<String, String>) -> Self {
+    fn new(_parser_options: &HashMap<String, String>) -> Self {
         PptxParser::default()
     }
 }

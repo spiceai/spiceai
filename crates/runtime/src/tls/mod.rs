@@ -109,17 +109,17 @@ pub struct TlsConfig {
     /// handshakes (presented certs are verified). Shared by
     /// reference; the contained `ResolvesServerCert` is the swap
     /// point for rotated certs.
-    pub flight_server_config: Arc<ServerConfig>,
+    pub(crate) flight_server_config: Arc<ServerConfig>,
 
     /// rustls config used by the HTTP and metrics listeners. Under
     /// `client_auth_mode: required` and `request` this admits
     /// no-cert handshakes. Identical to [`Self::flight_server_config`]
     /// when `client_auth_mode` is unset.
-    pub http_server_config: Arc<ServerConfig>,
+    pub(crate) http_server_config: Arc<ServerConfig>,
 
     /// Whether the HTTP route layer should reject non-probe requests
     /// that arrived without a verified client cert.
-    pub client_auth: ClientAuthEnforcement,
+    pub(crate) client_auth: ClientAuthEnforcement,
 
     /// Resolver kept around so callers can introspect / force a reload from
     /// tests. Production callers do not need to touch this directly.
@@ -230,7 +230,7 @@ impl TlsConfig {
     /// every change re-reads the whole bundle and the resulting
     /// `WebPkiClientVerifier` is atomically swapped under the live
     /// `ServerConfig` without rebuilding it.
-    pub fn try_new_from_paths_with_client_auth(
+    fn try_new_from_paths_with_client_auth(
         cert_path: PathBuf,
         key_path: PathBuf,
         client_ca_path: Option<PathBuf>,
@@ -389,7 +389,7 @@ impl TlsConfig {
     /// Subject CN of the currently-loaded leaf cert, for the startup log
     /// line. Reads the live (post-reload) chain.
     #[must_use]
-    pub fn subject_name(&self) -> Option<String> {
+    pub(crate) fn subject_name(&self) -> Option<String> {
         let chain = self.resolver.current_cert_chain();
         let leaf = chain.first()?;
         let x509 = X509Certificate::from_der(leaf.as_ref()).ok()?;

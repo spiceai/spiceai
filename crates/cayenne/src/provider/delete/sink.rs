@@ -175,7 +175,7 @@ impl PreparedDeletionPublish {
     /// (not verified live rows), so returning a real count would require the
     /// table scan that path deliberately skips. The CDC caller discards the count.
     #[must_use]
-    pub(crate) fn with_sentinel_count(mut self) -> Self {
+    fn with_sentinel_count(mut self) -> Self {
         self.deleted_count = 0;
         self
     }

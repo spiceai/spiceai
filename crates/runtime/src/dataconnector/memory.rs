@@ -37,7 +37,7 @@ use super::{
 pub struct MemoryConnector {}
 
 impl MemoryConnector {
-    pub(crate) fn schema_from_path(path: &str) -> Option<SchemaRef> {
+    fn schema_from_path(path: &str) -> Option<SchemaRef> {
         match path {
             "store" => Some(Arc::clone(&MEMORY_TABLE_SCHEMA)),
             _ => None,

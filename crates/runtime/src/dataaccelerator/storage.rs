@@ -38,7 +38,7 @@ impl Display for ResolvedAccelerationStorage {
 }
 
 #[must_use]
-pub(crate) fn resolve_acceleration_storage(
+fn resolve_acceleration_storage(
     configured_storage: StorageProfile,
     path: &Path,
 ) -> ResolvedAccelerationStorage {

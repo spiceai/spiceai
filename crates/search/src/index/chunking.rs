@@ -44,7 +44,7 @@ const INNER_WRITE_TARGET_CHUNKS: usize = 8192;
 
 /// Additional metadata field to store in underlying search index. This is only used when the
 /// underlying index has [`SearchIndex::search_column`] in [`SearchIndex::metadata_columns`].
-pub static CHUNKED_INDEX_FULL_SEARCH_FIELD: &str = "_spice.search_field";
+static CHUNKED_INDEX_FULL_SEARCH_FIELD: &str = "_spice.search_field";
 
 /// A [`SearchIndex`] that chunks the [`SearchIndex::search_column`] before each [`SearchIndex::write`].
 ///

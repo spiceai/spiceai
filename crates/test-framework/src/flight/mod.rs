@@ -63,7 +63,7 @@ pub async fn put_batches(
     Ok(client.publish(dataset_path, batches).await?)
 }
 
-pub struct PreparedStatementParamColumn {
+pub(crate) struct PreparedStatementParamColumn {
     name: String,
     dtype: arrow::datatypes::DataType,
     nullable: bool,
@@ -71,7 +71,7 @@ pub struct PreparedStatementParamColumn {
 }
 
 impl PreparedStatementParamColumn {
-    pub fn new(
+    pub(crate) fn new(
         name: String,
         dtype: arrow::datatypes::DataType,
         nullable: bool,
@@ -104,7 +104,7 @@ impl PreparedStatementParamColumn {
 ///   )
 /// ])?;
 /// ```
-pub fn create_param_batch(
+pub(crate) fn create_param_batch(
     params: Vec<PreparedStatementParamColumn>,
 ) -> Result<RecordBatch, anyhow::Error> {
     let (fields, columns): (Vec<FieldRef>, Vec<ArrayRef>) = params

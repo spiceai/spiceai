@@ -73,15 +73,15 @@ pub enum Part {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Blob {
-    pub mime_type: String,
-    pub data: String,
+    mime_type: String,
+    data: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileData {
-    pub mime_type: String,
-    pub file_uri: String,
+    mime_type: String,
+    file_uri: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -234,8 +234,8 @@ pub struct CachedContent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SafetySetting {
-    pub category: HarmCategory,
-    pub threshold: HarmBlockThreshold,
+    category: HarmCategory,
+    threshold: HarmBlockThreshold,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -273,19 +273,19 @@ pub struct Candidate {
     pub finish_reason: Option<FinishReason>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub safety_ratings: Option<Vec<SafetyRating>>,
+    safety_ratings: Option<Vec<SafetyRating>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub citation_metadata: Option<CitationMetadata>,
+    citation_metadata: Option<CitationMetadata>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub token_count: Option<i32>,
+    token_count: Option<i32>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub index: Option<i32>,
+    index: Option<i32>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub avg_logprobs: Option<f64>,
+    avg_logprobs: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -302,10 +302,10 @@ pub enum FinishReason {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SafetyRating {
-    pub category: HarmCategory,
-    pub probability: HarmProbability,
+    category: HarmCategory,
+    probability: HarmProbability,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub blocked: Option<bool>,
+    blocked: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -322,23 +322,23 @@ pub enum HarmProbability {
 #[serde(rename_all = "camelCase")]
 pub struct CitationMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub citation_sources: Option<Vec<CitationSource>>,
+    citation_sources: Option<Vec<CitationSource>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CitationSource {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub start_index: Option<i32>,
+    start_index: Option<i32>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub end_index: Option<i32>,
+    end_index: Option<i32>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub uri: Option<String>,
+    uri: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub license: Option<String>,
+    license: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -353,7 +353,7 @@ pub struct UsageMetadata {
     pub candidates_token_count: Option<u32>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_use_prompt_token_count: Option<u32>,
+    tool_use_prompt_token_count: Option<u32>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thoughts_token_count: Option<u32>,
@@ -364,13 +364,13 @@ pub struct UsageMetadata {
     pub prompt_tokens_details: Option<Vec<TokenCountDetails>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_tokens_details: Option<Vec<TokenCountDetails>>,
+    cache_tokens_details: Option<Vec<TokenCountDetails>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub candidates_tokens_details: Option<Vec<TokenCountDetails>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_use_prompt_tokens_details: Option<Vec<TokenCountDetails>>,
+    tool_use_prompt_tokens_details: Option<Vec<TokenCountDetails>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

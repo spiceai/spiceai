@@ -245,7 +245,7 @@ pub(super) fn value_to_document(value: serde_json::Value) -> Document {
     }
 }
 
-pub(super) fn document_to_value(doc: Document) -> serde_json::Value {
+fn document_to_value(doc: Document) -> serde_json::Value {
     match doc {
         Document::Object(map) => serde_json::Value::Object(
             map.into_iter()

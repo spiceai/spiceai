@@ -77,7 +77,7 @@ use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
 use std::rc::Rc;
 
-pub use sys::{AUTH, nfs_stat_64, statvfs, timeval};
+pub(crate) use sys::{AUTH, nfs_stat_64, statvfs, timeval};
 
 /// Error type for NFS operations.
 #[derive(Debug, Snafu)]
@@ -189,25 +189,25 @@ impl EntryType {
 /// Information about a directory entry.
 #[derive(Debug, Clone)]
 pub struct DirEntry {
-    pub path: PathBuf,
-    pub inode: u64,
-    pub d_type: EntryType,
-    pub mode: Mode,
-    pub size: u64,
-    pub atime: sys::timeval,
-    pub mtime: sys::timeval,
-    pub ctime: sys::timeval,
-    pub uid: u32,
-    pub gid: u32,
-    pub nlink: u32,
-    pub dev: u64,
-    pub rdev: u64,
-    pub blksize: u64,
-    pub blocks: u64,
-    pub used: u64,
-    pub atime_nsec: u32,
-    pub mtime_nsec: u32,
-    pub ctime_nsec: u32,
+    path: PathBuf,
+    inode: u64,
+    d_type: EntryType,
+    mode: Mode,
+    size: u64,
+    atime: sys::timeval,
+    mtime: sys::timeval,
+    ctime: sys::timeval,
+    uid: u32,
+    gid: u32,
+    nlink: u32,
+    dev: u64,
+    rdev: u64,
+    blksize: u64,
+    blocks: u64,
+    used: u64,
+    atime_nsec: u32,
+    mtime_nsec: u32,
+    ctime_nsec: u32,
 }
 
 /// Handle to an open NFS directory for iteration.

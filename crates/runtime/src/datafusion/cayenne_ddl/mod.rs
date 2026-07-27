@@ -42,19 +42,19 @@ use crate::catalogconnector::PartitionAwareCatalog;
 
 /// Returns `true` if `provider` is Cayenne-backed, peeling the transparent
 /// `RefreshingCatalogProvider` and `ComposedCatalogProvider` wrappers.
-pub fn is_cayenne_catalog(provider: &dyn CatalogProvider) -> bool {
+pub(crate) fn is_cayenne_catalog(provider: &dyn CatalogProvider) -> bool {
     get_cayenne_provider(provider).is_some()
 }
 
 /// Extract the [`CayenneCatalogProvider`] reference, peeling the transparent
 /// catalog wrappers. Delegates to the wrapper-aware helper in the `cayenne`
 /// crate so the peeling logic lives in one place.
-pub fn get_cayenne_provider(provider: &dyn CatalogProvider) -> Option<&CayenneCatalogProvider> {
+pub(crate) fn get_cayenne_provider(provider: &dyn CatalogProvider) -> Option<&CayenneCatalogProvider> {
     cayenne::ddl::get_cayenne_provider(provider)
 }
 
 /// Return a [`PartitionAwareCatalog`] reference if the provider is Cayenne-backed.
-pub fn as_partition_aware(provider: &dyn CatalogProvider) -> Option<&dyn PartitionAwareCatalog> {
+pub(crate) fn as_partition_aware(provider: &dyn CatalogProvider) -> Option<&dyn PartitionAwareCatalog> {
     let cayenne_catalog = get_cayenne_provider(provider)?;
     Some(cayenne_catalog as &dyn PartitionAwareCatalog)
 }

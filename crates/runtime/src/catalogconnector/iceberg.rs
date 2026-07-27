@@ -118,7 +118,7 @@ pub enum Error {
     UnableToBuildCatalogClient { source: reqwest::Error },
 }
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Clone)]
 pub struct IcebergCatalog {
@@ -127,7 +127,7 @@ pub struct IcebergCatalog {
 
 impl IcebergCatalog {
     #[must_use]
-    pub fn new_connector(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
+    pub(crate) fn new_connector(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
         Arc::new(Self {
             params: params.parameters,
         })
@@ -200,7 +200,7 @@ impl IcebergCatalog {
     }
 }
 
-pub const ICEBERG_PARAM_LEN: usize = 24;
+pub(crate) const ICEBERG_PARAM_LEN: usize = 24;
 pub const PARAMETERS: [ParameterSpec; ICEBERG_PARAM_LEN] = [
     ParameterSpec::component("token")
         .secret()
@@ -510,7 +510,7 @@ pub(crate) async fn verify_s3_endpoint(endpoint: &str) -> Result<()> {
 ///   Namespace { name: "spiceai_sandbox", properties: {} }
 /// )
 /// ```
-pub fn parse_catalog_url(
+fn parse_catalog_url(
     url: &str,
 ) -> Result<(String, HashMap<String, String>, Option<Namespace>)> {
     let (base_uri, props, path_info) = parse_iceberg_url(url)?;
@@ -662,7 +662,7 @@ fn parse_iceberg_url(url: &str) -> Result<(String, HashMap<String, String>, Iceb
 ///   "my_table"
 /// )
 /// ```
-pub fn parse_table_url(url: &str) -> Result<(String, HashMap<String, String>, Namespace, String)> {
+pub(crate) fn parse_table_url(url: &str) -> Result<(String, HashMap<String, String>, Namespace, String)> {
     let (base_uri, props, path_info) = parse_iceberg_url(url)?;
 
     match path_info {
@@ -689,7 +689,7 @@ fn default_storage_factory_from_props(props: &HashMap<String, String>) -> Arc<dy
 }
 
 /// Builds an `IcebergRestCatalog` from a base URI and properties.
-pub async fn get_rest_catalog(
+pub(crate) async fn get_rest_catalog(
     base_uri: String,
     mut props: HashMap<String, String, std::hash::RandomState>,
     storage_factory: Option<Arc<dyn StorageFactory>>,
@@ -729,7 +729,7 @@ fn get_warehouse(url: &Url) -> Option<String> {
     None
 }
 
-pub fn parse_hadoop_table_url(
+pub(crate) fn parse_hadoop_table_url(
     url: &str,
     warehouse_uri: Option<&str>,
 ) -> Result<(String, Namespace, String)> {

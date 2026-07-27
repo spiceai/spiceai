@@ -201,7 +201,7 @@ impl SnapshotEngine for DefaultSnapshotEngine {
 
 /// Creates a snapshot engine for the given acceleration engine.
 #[must_use]
-pub fn create_snapshot_engine(
+pub(crate) fn create_snapshot_engine(
     engine: &AccelerationEngine,
     #[cfg(feature = "duckdb")] compaction_enabled: bool,
     #[cfg(not(feature = "duckdb"))] _compaction_enabled: bool,

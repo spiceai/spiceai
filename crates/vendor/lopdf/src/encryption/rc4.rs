@@ -1,11 +1,11 @@
 // This module exists because the rust-crypto module is really old and not maintained.
 // Fortunately the RC4 algorithm is very simple to implement.
-pub struct Rc4 {
+pub(crate) struct Rc4 {
     initial_state: [u8; 256],
 }
 
 impl Rc4 {
-    pub fn new<Key: AsRef<[u8]>>(key: Key) -> Self {
+    pub(crate) fn new<Key: AsRef<[u8]>>(key: Key) -> Self {
         let key = key.as_ref();
         assert!(!key.is_empty() && key.len() <= 256);
 
@@ -27,7 +27,7 @@ impl Rc4 {
 
     /// Encrypts/decrypts `input` into `output`.  The shorter of `input` and `output`
     ///  determine how many bytes are written into `output`.
-    pub fn apply_keystream<'i, 'o, Input, Output>(&self, input: Input, output: Output)
+    fn apply_keystream<'i, 'o, Input, Output>(&self, input: Input, output: Output)
     where
         Input: Iterator<Item = &'i u8>,
         Output: Iterator<Item = &'o mut u8>,
@@ -46,7 +46,7 @@ impl Rc4 {
 
     /// Allocates a new Vec<u8> of the same length as `input` and decrypts
     ///  `input` into it.
-    pub fn decrypt<Input>(&self, input: Input) -> Vec<u8>
+    pub(crate) fn decrypt<Input>(&self, input: Input) -> Vec<u8>
     where
         Input: AsRef<[u8]>,
     {
@@ -58,7 +58,7 @@ impl Rc4 {
 
     /// Allocates a new Vec<u8> of the same length as `input` and encrypts
     ///  `input` into it.
-    pub fn encrypt<Input>(&self, input: Input) -> Vec<u8>
+    pub(crate) fn encrypt<Input>(&self, input: Input) -> Vec<u8>
     where
         Input: AsRef<[u8]>,
     {

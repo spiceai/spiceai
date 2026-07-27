@@ -61,14 +61,14 @@ pub struct CreateTableStatementExtension {
 /// the extensions when rewriting the DDL plan.
 #[derive(Debug, Clone, Default)]
 pub struct DdlExtensionStore {
-    pub extensions: HashMap<ResolvedTableReference, CreateTableStatementExtension>,
+    extensions: HashMap<ResolvedTableReference, CreateTableStatementExtension>,
     default_schema: String,
     default_catalog: String,
 }
 
 impl DdlExtensionStore {
     #[must_use]
-    pub fn new(default_catalog: String, default_schema: String) -> Self {
+    fn new(default_catalog: String, default_schema: String) -> Self {
         Self {
             default_catalog,
             default_schema,

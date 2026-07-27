@@ -158,7 +158,7 @@ pub(crate) fn set_table_admission_reserve(table: &str, demand: usize) {
 /// live held-count is also emitted by `reconcile_held`'s debug log.
 #[cfg(test)]
 #[must_use]
-pub(crate) fn query_admission_reserved() -> usize {
+fn query_admission_reserved() -> usize {
     GLOBAL_QUERY_ADMISSION
         .lock()
         .as_ref()

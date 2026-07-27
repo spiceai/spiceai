@@ -88,7 +88,7 @@ impl ArrayBuilder for StructBuilder {
 
 impl StructBuilder {
     /// Creates a new `StructBuilder`
-    pub fn new(fields: impl Into<Fields>, field_builders: Vec<Box<dyn ArrayBuilder>>) -> Self {
+    fn new(fields: impl Into<Fields>, field_builders: Vec<Box<dyn ArrayBuilder>>) -> Self {
         Self {
             field_builders,
             fields: fields.into(),
@@ -168,7 +168,7 @@ impl StructBuilder {
 
     /// Builds the `StructArray` without resetting the builder.
     #[must_use]
-    pub fn finish_cloned(&self) -> StructArray {
+    fn finish_cloned(&self) -> StructArray {
         self.validate_content();
 
         if self.fields.is_empty() {

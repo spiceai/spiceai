@@ -56,7 +56,7 @@ impl<S: TestCompleted> SpiceTest<S> {
 }
 
 impl<S: TestState> SpiceTest<S> {
-    pub fn get_spiced(&self) -> Result<&SpicedInstance> {
+    fn get_spiced(&self) -> Result<&SpicedInstance> {
         self.spiced_instance
             .as_ref()
             .context("Spiced instance should be present")

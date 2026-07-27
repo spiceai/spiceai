@@ -88,7 +88,7 @@ pub struct DynamoDBTableProvider {
     unnest_depth: Option<usize>,
     config_partitions: Option<usize>,
     table_total_item_count: Option<i64>,
-    pub ready_lag: Duration,
+    pub(crate) ready_lag: Duration,
     projection: Option<SchemaProjection>,
     write_parallelism: usize,
     streams_enabled: bool,
@@ -115,7 +115,7 @@ impl DynamoDBTableProvider {
     ///
     /// Returns an error if the table cannot be accessed or metadata cannot be fetched.
     #[expect(clippy::too_many_arguments)]
-    pub async fn try_new(
+    pub(crate) async fn try_new(
         sdk_config: SdkConfig,
         table_name: Arc<str>,
         unnest_depth: Option<usize>,
@@ -300,7 +300,7 @@ impl DynamoDBTableProvider {
 
     /// Returns `true` if `DynamoDB` Streams is enabled on the underlying table.
     #[must_use]
-    pub fn streams_enabled(&self) -> bool {
+    pub(crate) fn streams_enabled(&self) -> bool {
         self.streams_enabled
     }
 
@@ -489,7 +489,7 @@ impl DynamoDBTableProvider {
     /// # Errors
     ///
     /// Returns an error if the `DynamoDB` stream can't be initialized.
-    pub async fn latest_global_checkpoint(&self) -> Result<Checkpoint> {
+    pub(crate) async fn latest_global_checkpoint(&self) -> Result<Checkpoint> {
         self.streams_client
             .latest_global_checkpoint()
             .await
@@ -501,7 +501,7 @@ impl DynamoDBTableProvider {
     /// # Errors
     ///
     /// Returns an error if the stream can't be initialized from the checkpoint.
-    pub async fn stream_from_checkpoint(
+    pub(crate) async fn stream_from_checkpoint(
         &self,
         checkpoint: Checkpoint,
     ) -> Result<
@@ -546,7 +546,7 @@ impl DynamoDBTableProvider {
     /// Returns an error if:
     /// - Logical plan construction fails
     /// - Stream execution fails
-    pub async fn bootstrap_stream(
+    async fn bootstrap_stream(
         self: Arc<Self>,
     ) -> Result<BoxStream<'static, Result<ChangeBatch, data_components::cdc::StreamError>>> {
         let schema = Arc::clone(self.table_schema.schema());
@@ -605,7 +605,7 @@ impl DynamoDBTableProvider {
     /// is surfaced as the stream's first element (like the per-batch scan errors),
     /// so the accelerator fails the changes stream visibly rather than skipping the
     /// truncate.
-    pub async fn overwrite_bootstrap_stream(
+    pub(crate) async fn overwrite_bootstrap_stream(
         self: Arc<Self>,
     ) -> Result<BoxStream<'static, Result<ChangeBatch, data_components::cdc::StreamError>>> {
         // A truncate-build failure flows as the stream's first element (like the
@@ -808,7 +808,7 @@ pub struct DynamoDBTableProviderExec {
 
 impl DynamoDBTableProviderExec {
     #[must_use]
-    pub fn new(
+    fn new(
         client: Arc<DbClient>,
         request_plan: DynamoDBRequestPlan,
         unnest_depth: Option<usize>,
@@ -1019,7 +1019,7 @@ fn build_stream_from_plan(
     }
 }
 
-pub fn to_execution_error(
+fn to_execution_error(
     e: impl Into<Box<dyn std::error::Error + Send + Sync>>,
 ) -> DataFusionError {
     DataFusionError::Execution(format!("{}", e.into()))

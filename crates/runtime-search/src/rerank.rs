@@ -71,8 +71,8 @@ use tracing::Instrument;
 use crate::rrf::{RRF_FUSED_SCORE_COLUMN_NAME, RRF_UDF_NAME};
 use crate::udtf::{TEXT_SEARCH_UDTF_NAME, VECTOR_SEARCH_UDTF_NAME, table_ref_from_column_expr};
 
-pub const SPICE_DEFAULT_CATALOG: &str = "spice";
-pub const SPICE_DEFAULT_SCHEMA: &str = "public";
+const SPICE_DEFAULT_CATALOG: &str = "spice";
+const SPICE_DEFAULT_SCHEMA: &str = "public";
 
 pub type ChatModelStore = HashMap<String, Arc<dyn Chat>>;
 
@@ -80,7 +80,7 @@ pub static RERANK_UDTF_NAME: &str = "rerank";
 
 /// Signature accepts a variadic positional input plus named arguments.
 /// Parameter names are declared so `DataFusion` v51+ named-arg syntax works.
-pub static RERANK_SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
+static RERANK_SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
     let param_names = vec![
         "input".to_string(),
         "model".to_string(),
@@ -147,7 +147,7 @@ static RERANK_DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| Document
 /// `_fused_score` so downstream callers can tell which stage produced which
 /// score. The reranker output drops the upstream score columns and keeps only
 /// `rerank_score` — the fresh relevance judgement is what matters.
-pub const RERANK_SCORE_COLUMN: &str = "rerank_score";
+const RERANK_SCORE_COLUMN: &str = "rerank_score";
 
 /// Upper bound on the number of candidate rows a single `rerank()` invocation
 /// will score. Guards the bare-table path (`FROM rerank(tbl, ...)`) against
@@ -164,19 +164,19 @@ pub struct RerankTableFuncArgs {
     /// The input provider expression (either a nested search UDTF call or a
     /// table reference). Resolution happens lazily in `TableFunctionImpl::call`
     /// so parse errors surface independently of table-existence errors.
-    pub input: RerankInput,
+    input: RerankInput,
     /// Reranker model name. Optional when exactly one model is registered.
-    pub model: Option<String>,
+    model: Option<String>,
     /// Column containing the text to score. Required.
-    pub document: String,
+    document: String,
     /// Query string. Auto-propagated from a nested search UDTF if omitted.
-    pub query: Option<String>,
+    query: Option<String>,
     /// Max rows to return.
-    pub limit: Option<usize>,
+    limit: Option<usize>,
     /// LLM strategy when using an LLM-as-reranker (ignored by native rerankers).
-    pub strategy: Option<LlmStrategy>,
+    strategy: Option<LlmStrategy>,
     /// Optional override of the built-in prompt template for LLM rerankers.
-    pub prompt_template: Option<String>,
+    prompt_template: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -312,7 +312,7 @@ fn parse_limit_scalar(scalar: &ScalarValue) -> DataFusionResult<usize> {
 }
 
 impl RerankTableFuncArgs {
-    pub fn from_udtf_args(args: &[Expr]) -> DataFusionResult<Self> {
+    fn from_udtf_args(args: &[Expr]) -> DataFusionResult<Self> {
         let mut named: HashMap<&str, &Expr> = HashMap::new();
         let mut positional: Vec<&Expr> = Vec::with_capacity(args.len());
         for a in args {

@@ -346,7 +346,7 @@ pub enum MaintainAggregates {
 
 impl MaintainAggregates {
     #[must_use]
-    pub const fn is_enabled(self) -> bool {
+    const fn is_enabled(self) -> bool {
         matches!(self, Self::Enabled)
     }
 }
@@ -356,7 +356,7 @@ impl MaintainAggregates {
 #[serde(deny_unknown_fields)]
 pub struct MaintainedAggregatesConfig {
     #[serde(default, alias = "enabled")]
-    pub mode: MaintainAggregates,
+    mode: MaintainAggregates,
 
     #[serde(
         default,
@@ -364,7 +364,7 @@ pub struct MaintainedAggregatesConfig {
         alias = "specs",
         skip_serializing_if = "Vec::is_empty"
     )]
-    pub views: Vec<MaintainedAggregate>,
+    views: Vec<MaintainedAggregate>,
 }
 
 impl Default for MaintainedAggregatesConfig {
@@ -437,12 +437,12 @@ impl MaintainedAggregates {
     }
 
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.as_slice().is_empty()
     }
 
     #[must_use]
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.as_slice().len()
     }
 
@@ -451,7 +451,7 @@ impl MaintainedAggregates {
     }
 
     #[must_use]
-    pub fn is_default(&self) -> bool {
+    fn is_default(&self) -> bool {
         match self {
             Self::List(aggregates) => aggregates.is_empty(),
             Self::Config(config) => !config.mode.is_enabled() && config.views.is_empty(),

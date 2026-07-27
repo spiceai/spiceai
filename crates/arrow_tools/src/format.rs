@@ -32,7 +32,7 @@ static MARKDOWN_TABLE_SEPARATOR_ROW: [&str; 5] = ["---"; 5];
 /// Operations to apply to [`ArrayRef`] or [`RecordBatch`] data so as to prepare it for display.
 ///
 /// Note: Operations do not preserve all original data, and as such, should be used for human display purposes only.
-pub enum FormatOperation {
+pub(crate) enum FormatOperation {
     /// Truncate strings to be no larger than a given length. This includesnested strings (i.e.
     /// UTF8 elements within lists and structs).
     TruncateUtf8Length(usize),
@@ -867,7 +867,7 @@ pub fn table_schemas_to_markdown_table(table_schemas: Vec<(String, Schema)>) -> 
 /// # Errors
 ///
 /// Returns a `std::fmt::Error` if writing to the output fails.
-pub fn pretty_print_schema(
+fn pretty_print_schema(
     schema: &Arc<Schema>,
     output: &mut impl std::fmt::Write,
 ) -> std::fmt::Result {
@@ -1678,7 +1678,7 @@ Cras venenatis euismod malesuada.",
         }
     }
 
-    pub fn write_to_json_value(
+    fn write_to_json_value(
         data: ArrayRef,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         let rb = RecordBatch::try_new(

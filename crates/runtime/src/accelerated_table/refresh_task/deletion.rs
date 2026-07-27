@@ -22,7 +22,7 @@ use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::col;
 
 #[cfg(test)]
-pub fn build_batch_delete_expr<F, G>(
+fn build_batch_delete_expr<F, G>(
     row_indices: &[usize],
     get_primary_keys: F,
     get_row_data: G,

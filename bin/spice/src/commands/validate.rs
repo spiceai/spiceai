@@ -49,7 +49,7 @@ Examples:
 pub struct ValidateArgs {
     /// Path to a spicepod.yaml/spicepod.yml file, or a directory containing one. Defaults to ".".
     #[arg(default_value = ".")]
-    pub path: PathBuf,
+    path: PathBuf,
 }
 
 pub async fn execute(args: &ValidateArgs) -> Result<()> {

@@ -179,18 +179,18 @@ use crate::delete::{DeletionExec, DeletionSink};
 ///
 /// The integer-based approach is recommended for performance and simplicity in
 /// acceleration workloads where timestamps are primarily used for filtering and sorting.
-pub mod timestamp_conversion {
+pub(crate) mod timestamp_conversion {
     /// Milliseconds per second (1,000)
-    pub const MILLIS_PER_SECOND: i64 = 1_000;
+    pub(crate) const MILLIS_PER_SECOND: i64 = 1_000;
 
     /// Microseconds per millisecond (1,000)
-    pub const MICROS_PER_MILLI: i64 = 1_000;
+    pub(crate) const MICROS_PER_MILLI: i64 = 1_000;
 
     /// Nanoseconds per millisecond (1,000,000)
-    pub const NANOS_PER_MILLI: i64 = 1_000_000;
+    pub(crate) const NANOS_PER_MILLI: i64 = 1_000_000;
 
     /// Nanoseconds per second (1,000,000,000)
-    pub const NANOS_PER_SECOND: i64 = 1_000_000_000;
+    pub(crate) const NANOS_PER_SECOND: i64 = 1_000_000_000;
 
     /// Microseconds per second (1,000,000)
     pub const MICROS_PER_SECOND: i64 = 1_000_000;
@@ -436,13 +436,13 @@ impl TursoConnectionPool {
 
     /// Returns the database path
     #[must_use]
-    pub fn db_path(&self) -> &str {
+    fn db_path(&self) -> &str {
         &self.db_path
     }
 
     /// Returns the timestamp format used for this connection pool
     #[must_use]
-    pub fn timestamp_format(&self) -> TimestampFormat {
+    fn timestamp_format(&self) -> TimestampFormat {
         self.timestamp_format
     }
 
@@ -472,7 +472,7 @@ pub struct TursoTableProvider {
     schema: SchemaRef,
     table_name: String,
     pool: Arc<TursoConnectionPool>,
-    pub(crate) function_support: Option<FunctionSupport>,
+    function_support: Option<FunctionSupport>,
 }
 
 impl TursoTableProvider {
@@ -534,7 +534,7 @@ impl TursoTableProvider {
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation
     )]
-    pub fn values_to_record_batch(
+    fn values_to_record_batch(
         rows: &[Vec<TursoValue>],
         schema: &SchemaRef,
     ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
@@ -1156,7 +1156,7 @@ impl TursoTableProvider {
     /// Read-side conversions intentionally fall back to NULL to keep queries available in the
     /// face of schema/type drift, so this is detection-only: it never alters the batch.
     #[must_use]
-    pub(crate) fn count_conversion_failures(
+    fn count_conversion_failures(
         rows: &[Vec<TursoValue>],
         batch: &RecordBatch,
     ) -> Vec<usize> {
@@ -1514,7 +1514,7 @@ impl TursoExec {
     /// * `filters` - Filter expressions to push down
     /// * `limit` - Optional row limit
     #[must_use]
-    pub fn new(
+    fn new(
         schema: SchemaRef,
         table_name: String,
         pool: Arc<TursoConnectionPool>,
@@ -1684,7 +1684,7 @@ pub struct TursoDeletionSink {
 impl TursoDeletionSink {
     /// Creates a new deletion sink
     #[must_use]
-    pub fn new(pool: Arc<TursoConnectionPool>, table_name: String, filters: &[Expr]) -> Self {
+    fn new(pool: Arc<TursoConnectionPool>, table_name: String, filters: &[Expr]) -> Self {
         Self {
             pool,
             table_name,
@@ -1752,7 +1752,7 @@ impl DisplayAs for TursoDataSink {
 impl TursoDataSink {
     /// Creates a new data sink for INSERT operations
     #[must_use]
-    pub fn new(
+    fn new(
         pool: Arc<TursoConnectionPool>,
         table_name: String,
         schema: SchemaRef,

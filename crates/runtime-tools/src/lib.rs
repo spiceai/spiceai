@@ -22,4 +22,4 @@ pub mod mcp;
 pub mod memory;
 pub mod options;
 pub mod tooling;
-pub mod utils;
+pub(crate) mod utils;

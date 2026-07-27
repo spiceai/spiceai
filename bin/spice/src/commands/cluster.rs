@@ -61,7 +61,7 @@ Docs: https://spiceai.org/docs"#
 )]
 pub struct ClusterArgs {
     #[command(subcommand)]
-    pub command: ClusterCommands,
+    command: ClusterCommands,
 }
 
 /// Cluster subcommands.
@@ -75,7 +75,7 @@ pub enum ClusterCommands {
 #[derive(Args, Debug)]
 pub struct TlsArgs {
     #[command(subcommand)]
-    pub command: TlsCommands,
+    command: TlsCommands,
 }
 
 /// TLS subcommands.

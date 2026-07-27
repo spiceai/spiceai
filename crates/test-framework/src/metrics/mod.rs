@@ -64,8 +64,8 @@ impl Display for QueryStatus {
 pub struct QueryMetric<T: ExtendedMetrics> {
     pub query_name: Arc<str>,
     pub query_status: QueryStatus,
-    pub started_at: usize,
-    pub finished_at: usize,
+    started_at: usize,
+    finished_at: usize,
     pub min_duration_ms: u64,
     pub max_duration_ms: u64,
     pub iterations: usize,
@@ -77,7 +77,7 @@ pub struct QueryMetric<T: ExtendedMetrics> {
 }
 
 impl<T: ExtendedMetrics> QueryMetric<T> {
-    pub fn new_from_durations(
+    pub(crate) fn new_from_durations(
         name: Arc<str>,
         durations: &Vec<Duration>,
         query_status: QueryStatus,
@@ -107,7 +107,7 @@ impl<T: ExtendedMetrics> QueryMetric<T> {
     }
 
     #[must_use]
-    pub fn failed_with_status(mut self, query_status: QueryStatus) -> Self {
+    fn failed_with_status(mut self, query_status: QueryStatus) -> Self {
         if matches!(query_status, QueryStatus::Failed(_)) {
             self.query_status = query_status;
         } else {
@@ -118,7 +118,7 @@ impl<T: ExtendedMetrics> QueryMetric<T> {
     }
 
     #[must_use]
-    pub fn new(name: Arc<str>) -> Self {
+    fn new(name: Arc<str>) -> Self {
         Self {
             query_name: name,
             query_status: QueryStatus::Passed,
@@ -136,7 +136,7 @@ impl<T: ExtendedMetrics> QueryMetric<T> {
     }
 
     #[must_use]
-    pub fn with_extended_metrics(mut self, extended_metrics: T) -> Self {
+    pub(crate) fn with_extended_metrics(mut self, extended_metrics: T) -> Self {
         self.extended_metrics = Some(extended_metrics);
         self
     }
@@ -353,17 +353,17 @@ impl StatisticsCollector<BTreeMap<String, Duration>, BTreeMap<String, Vec<Durati
 ///
 /// For example, the throughput test uses ``NoExtendedMetrics`` for the individual queries, but ``ThroughputMetrics`` for the test run
 pub struct QueryMetrics<T: ExtendedMetrics, R: ExtendedMetrics> {
-    pub run_id: Uuid,
-    pub run_name: String,
+    run_id: Uuid,
+    run_name: String,
     pub spiced_version: String,
     pub commit_sha: String,
     pub branch_name: String,
-    pub test_type: TestType,
+    test_type: TestType,
     pub started_at: usize,
     pub finished_at: usize,
     pub metrics: Vec<QueryMetric<T>>,
     pub run_metric: Option<R>,
-    pub memory_usage: Option<f64>,
+    memory_usage: Option<f64>,
 }
 
 // Macro to help extract values from metric vecs
@@ -439,7 +439,7 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
     }
 
     #[must_use]
-    pub fn run_schema() -> SchemaRef {
+    fn run_schema() -> SchemaRef {
         let extended_fields = R::fields();
 
         let mut base_fields = vec![
@@ -464,7 +464,7 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
     /// Records do not need the values from the main run, because they contain a reference to the run ID to retrieve them
     /// Runs are 1:N with records
     #[must_use]
-    pub fn records_schema() -> SchemaRef {
+    fn records_schema() -> SchemaRef {
         let extended_fields = T::fields();
 
         let mut base_fields = vec![
@@ -490,7 +490,7 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
         Arc::new(Schema::new(base_fields))
     }
 
-    pub fn build_extended_metrics<'a, M>(
+    fn build_extended_metrics<'a, M>(
         &self,
         metrics_iter: impl Iterator<Item = Option<&'a M>>,
     ) -> Result<BTreeMap<String, Builder>>
@@ -640,7 +640,7 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
 
     /// Builds record batches for the test run
     /// The record batch is a single row, representing the run as a whole - which can pass or fail separately from individual queries
-    pub fn build_run(&self, status: &QueryStatus) -> Result<Vec<RecordBatch>> {
+    fn build_run(&self, status: &QueryStatus) -> Result<Vec<RecordBatch>> {
         let run_id = vec![self.run_id.to_string()];
         let spiced_version = vec![self.spiced_version.clone()];
         let run_name = vec![self.run_name.clone()];
@@ -798,7 +798,7 @@ impl ExtendedMetrics for NoExtendedMetrics {
 }
 
 pub struct DatasetMetrics {
-    pub name: String,
+    name: String,
 }
 
 impl ExtendedMetrics for DatasetMetrics {
@@ -822,13 +822,13 @@ impl ExtendedMetrics for DatasetMetrics {
 
 impl DatasetMetrics {
     #[must_use]
-    pub fn new(name: String) -> Self {
+    pub(crate) fn new(name: String) -> Self {
         Self { name }
     }
 }
 
 pub struct ThroughputMetrics {
-    pub throughput: f64,
+    throughput: f64,
 }
 impl ExtendedMetrics for ThroughputMetrics {
     fn fields() -> Vec<Field> {
@@ -858,7 +858,7 @@ impl ThroughputMetrics {
     }
 }
 
-pub fn system_time_to_unix_epoch_ms(time: SystemTime) -> Result<usize> {
+pub(crate) fn system_time_to_unix_epoch_ms(time: SystemTime) -> Result<usize> {
     let duration = time
         .duration_since(UNIX_EPOCH)
         .map_err(|_| anyhow::anyhow!("Time went backwards"))?;

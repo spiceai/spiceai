@@ -70,22 +70,22 @@ pub enum UdtfSource {
 /// if required by filters or additional columns in the projection.
 #[derive(Clone)]
 pub struct SearchQueryProvider {
-    pub search_index_query: Arc<LogicalPlan>,
-    pub table_provider: Arc<dyn TableProvider>,
-    pub search_column: String,
-    pub primary_key: Vec<String>,
-    pub constraints: Option<Constraints>,
-    pub pre_limit: Option<usize>,
+    search_index_query: Arc<LogicalPlan>,
+    table_provider: Arc<dyn TableProvider>,
+    search_column: String,
+    primary_key: Vec<String>,
+    constraints: Option<Constraints>,
+    pre_limit: Option<usize>,
     /// When `false`, the [`SEARCH_SCORE_COLUMN_NAME`] column is projected out of
     /// both the advertised schema and the scan result. When `true` (default),
     /// the score column is exposed so callers can order/inspect results.
-    pub include_score: bool,
+    include_score: bool,
     /// Optional callback invoked before a table scan is performed.
     ///
     /// This callback can be used to perform custom actions (such as logging, metrics, or side effects)
     /// immediately before the provider executes a scan operation. The callback is asynchronous and
     /// will be awaited before the scan proceeds. If `None`, no callback is invoked.
-    pub scan_callback: Option<Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>>,
+    scan_callback: Option<Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>>,
     /// Tracks the original UDTF invocation for distributed serialization.
     ///
     /// This is set when the provider is created via a UDTF like `text_search()` or `vector_search()`.
@@ -107,7 +107,7 @@ impl std::fmt::Debug for SearchQueryProvider {
 }
 
 impl SearchQueryProvider {
-    pub fn new(
+    fn new(
         search_index_query: Arc<LogicalPlan>,
         table_provider: Arc<dyn TableProvider>,
         search_column: String,
@@ -366,7 +366,7 @@ impl SearchQueryProvider {
             .map(|(i, _)| i)
     }
 
-    pub fn add_match_column(
+    fn add_match_column(
         &self,
         projection: Option<&Vec<usize>>,
         input: LogicalPlanBuilder,

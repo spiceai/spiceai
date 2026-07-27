@@ -84,7 +84,7 @@ pub(crate) mod settings;
 /// Creates a [`DuckDBTableProviderFactory`] with standard Spice settings (dialect, timezone,
 /// index scan tuning, function deny-list). All `DuckDB` accelerator consumers should use this
 /// to avoid divergent configurations.
-pub(crate) fn create_factory() -> DuckDBTableProviderFactory {
+fn create_factory() -> DuckDBTableProviderFactory {
     DuckDBTableProviderFactory::new(AccessMode::ReadWrite)
         .with_dialect(new_duckdb_dialect())
         // Install the DuckDB-aware function deny-list so Spice-only UDFs the
@@ -106,10 +106,10 @@ pub(crate) fn create_factory() -> DuckDBTableProviderFactory {
         )
 }
 
-pub(crate) const DEFAULT_CONNECTION_POOL_SIZE: u32 = 10;
-pub(crate) const DEFAULT_EBS_CONNECTION_POOL_SIZE: u32 = 4;
-pub(crate) const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
-pub(crate) const SPICE_OPT_DUCKDB_AGG_PUSHDOWN_KEY: &str =
+const DEFAULT_CONNECTION_POOL_SIZE: u32 = 10;
+const DEFAULT_EBS_CONNECTION_POOL_SIZE: u32 = 4;
+const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
+const SPICE_OPT_DUCKDB_AGG_PUSHDOWN_KEY: &str =
     "spice.optimizer.duckdb_aggregate_pushdown";
 
 use super::upsert_dedup;
@@ -163,19 +163,19 @@ pub struct DuckDBAccelerator {
 
 impl DuckDBAccelerator {
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             duckdb_factory: create_factory(),
         }
     }
 
     /// Returns the `DuckDB` file path that would be used for a file-based `DuckDB` accelerator from this dataset
-    pub fn duckdb_file_path(&self, source: &dyn AccelerationSource) -> Result<String> {
+    pub(crate) fn duckdb_file_path(&self, source: &dyn AccelerationSource) -> Result<String> {
         duckdb_file_path(&self.duckdb_factory, source, "accelerated_duckdb")
     }
 
     /// Returns an existing `DuckDB` connection pool for the given dataset, or creates a new one if it doesn't exist.
-    pub async fn get_shared_pool(
+    pub(crate) async fn get_shared_pool(
         &self,
         source: &dyn AccelerationSource,
     ) -> Result<DuckDbConnectionPool> {
@@ -303,7 +303,7 @@ impl DuckDBAccelerator {
             .ok()
     }
 
-    pub(crate) fn default_connection_pool_size(storage: ResolvedAccelerationStorage) -> u32 {
+    fn default_connection_pool_size(storage: ResolvedAccelerationStorage) -> u32 {
         match storage {
             ResolvedAccelerationStorage::Ebs => DEFAULT_EBS_CONNECTION_POOL_SIZE,
             ResolvedAccelerationStorage::LocalSsd
@@ -312,14 +312,14 @@ impl DuckDBAccelerator {
         }
     }
 
-    pub(crate) fn get_pool_min_idle(storage: ResolvedAccelerationStorage, max_size: u32) -> u32 {
+    fn get_pool_min_idle(storage: ResolvedAccelerationStorage, max_size: u32) -> u32 {
         Self::default_connection_pool_size(storage).min(max_size)
     }
 
     /// Storage-profile-specific `DuckDB` pragmas applied to every connection in
     /// the pool. These tune `DuckDB`'s I/O behavior to match the underlying
     /// medium's latency and durability profile.
-    pub(crate) fn storage_setup_queries(
+    fn storage_setup_queries(
         storage: ResolvedAccelerationStorage,
     ) -> &'static [&'static str] {
         match storage {
@@ -365,7 +365,7 @@ impl DuckDBAccelerator {
 /// * `duckdb_factory` - The `DuckDB` table provider factory used to generate the file path
 /// * `source` - The acceleration source (dataset or view) containing acceleration configuration
 /// * `default_db_name` - Default database file name to use if the `duckdb_file` parameter is not specified
-pub fn duckdb_file_path(
+fn duckdb_file_path(
     duckdb_factory: &DuckDBTableProviderFactory,
     source: &dyn AccelerationSource,
     default_db_name: &str,

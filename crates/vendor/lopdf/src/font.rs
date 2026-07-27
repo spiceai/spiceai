@@ -5,7 +5,7 @@
 pub struct FontData {
     /// (Required) The PostScript name of the font. This should be the same as the value of BaseFont in the font or
     /// CIDFont dictionary that refers to this font descriptor.
-    pub font_name: String,
+    pub(crate) font_name: String,
     /// (Required) A collection of flags defining various characteristics of the font.
     pub flags: i64,
     /// (Required, except for Type 3 fonts) A rectangle (see Section 3.8.4, “Rectangles”), expressed in the glyph

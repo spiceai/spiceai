@@ -27,11 +27,11 @@ use snafu::Snafu;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-pub use local_file::LocalFileRegistry;
-pub use spicerack::SpicerackRegistry;
+pub(crate) use local_file::LocalFileRegistry;
+pub(crate) use spicerack::SpicerackRegistry;
 
 /// Result type for registry operations.
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Errors that can occur during registry operations.
 #[derive(Debug, Snafu)]
@@ -95,7 +95,7 @@ pub enum Error {
 ///
 /// The path to the downloaded/copied Spicepod directory.
 #[expect(clippy::implicit_hasher, reason = "HashMap is sufficient for this API")]
-pub async fn get_pod(
+pub(crate) async fn get_pod(
     pod_path: &str,
     pods_dir: &Path,
     headers: &HashMap<String, String>,

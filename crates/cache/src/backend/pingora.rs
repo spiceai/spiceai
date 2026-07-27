@@ -83,7 +83,7 @@ where
 
     /// Creates a new Pingora backend with explicit capacity and TTL.
     #[must_use]
-    pub fn with_params(max_capacity: u64, ttl: std::time::Duration) -> Self {
+    pub(crate) fn with_params(max_capacity: u64, ttl: std::time::Duration) -> Self {
         let total_capacity = usize::try_from(max_capacity).unwrap_or(usize::MAX);
         let capacity_per_shard = (total_capacity / NUM_KEY_SHARDS).max(16);
         let cache = Arc::new(Lru::with_capacity(total_capacity, capacity_per_shard));

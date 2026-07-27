@@ -20,7 +20,7 @@ use tonic::Status;
 use tonic::service::Interceptor;
 
 #[must_use]
-pub fn make_interceptor(
+pub(crate) fn make_interceptor(
     auth_verifier: Option<Arc<dyn GrpcAuth + Send + Sync>>,
 ) -> impl Interceptor + Send + Sync + Clone {
     move |mut req: tonic::Request<()>| {

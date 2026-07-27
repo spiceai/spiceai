@@ -53,7 +53,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 ///
 /// # Errors
 /// Returns [`Error::Overflow`] if the rescaling would overflow `i128`.
-pub fn rescale_i128(unscaled: i128, src_scale: i8, dst_scale: i8) -> Result<i128> {
+fn rescale_i128(unscaled: i128, src_scale: i8, dst_scale: i8) -> Result<i128> {
     use std::cmp::Ordering::{Equal, Greater, Less};
     match src_scale.cmp(&dst_scale) {
         Equal => Ok(unscaled),
@@ -112,7 +112,7 @@ fn decode_base64_decimal(s: &str) -> Result<i128> {
 ///
 /// # Errors
 /// Returns [`Error::Invalid`] for unparseable input or [`Error::Overflow`] on scaling overflow.
-pub fn parse_number_to_decimal(n: &serde_json::Number, target_scale: i8) -> Result<i128> {
+fn parse_number_to_decimal(n: &serde_json::Number, target_scale: i8) -> Result<i128> {
     let s = n.to_string();
 
     if s.bytes().any(|b| b == b'e' || b == b'E') {

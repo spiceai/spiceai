@@ -167,11 +167,11 @@ static ROW_LIST_TYPE: LazyLock<DataType> = LazyLock::new(|| {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JsonRow {
-    pub path: String,
-    pub parent_path: String,
-    pub key: String,
-    pub value: Option<String>,
-    pub type_name: &'static str,
+    path: String,
+    parent_path: String,
+    key: String,
+    value: Option<String>,
+    type_name: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,14 +192,14 @@ impl PathStyle {
 
 #[derive(Debug, Clone)]
 pub struct FlattenOptions {
-    pub max_depth: usize,
-    pub max_rows: usize,
-    pub max_bytes: usize,
-    pub path_style: PathStyle,
-    pub include_internal: bool,
+    max_depth: usize,
+    max_rows: usize,
+    max_bytes: usize,
+    path_style: PathStyle,
+    include_internal: bool,
     /// When `true`, arrays collapse to a single wildcard segment instead of
     /// per-index paths. Matches `JSONPath` storage conventions.
-    pub array_wildcard: bool,
+    array_wildcard: bool,
 }
 
 impl Default for FlattenOptions {
@@ -219,7 +219,7 @@ impl Default for FlattenOptions {
 
 /// Walk with default options.
 #[must_use]
-pub fn flatten(input: &str) -> Vec<JsonRow> {
+fn flatten(input: &str) -> Vec<JsonRow> {
     flatten_with_options(input, &FlattenOptions::default())
 }
 
@@ -228,7 +228,7 @@ pub fn flatten(input: &str) -> Vec<JsonRow> {
 /// an empty / truncated `Vec` for malformed input or caps being hit, emitting
 /// the corresponding metric.
 #[must_use]
-pub fn flatten_with_options(input: &str, opts: &FlattenOptions) -> Vec<JsonRow> {
+fn flatten_with_options(input: &str, opts: &FlattenOptions) -> Vec<JsonRow> {
     INVOCATIONS.add(1, &[]);
 
     if input.len() > opts.max_bytes {

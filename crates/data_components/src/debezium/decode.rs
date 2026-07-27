@@ -93,7 +93,7 @@ impl CdcFormat {
 ///
 /// Non-row ops (`m` message) are filtered out. Tombstones (empty body lines)
 /// are skipped.
-pub fn parse_json_change_events(body: &[u8]) -> Result<Vec<ChangeEvent>> {
+fn parse_json_change_events(body: &[u8]) -> Result<Vec<ChangeEvent>> {
     if body.iter().all(u8::is_ascii_whitespace) {
         return EmptyBodySnafu.fail();
     }
@@ -150,7 +150,7 @@ fn filter_row_events(events: Vec<ChangeEvent>) -> Vec<ChangeEvent> {
 }
 
 /// Convert parsed Debezium change events into a single [`ChangeBatch`].
-pub fn change_events_to_batch(
+pub(crate) fn change_events_to_batch(
     table_schema: &SchemaRef,
     primary_keys: &[String],
     events: &[ChangeEvent],

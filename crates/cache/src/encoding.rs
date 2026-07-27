@@ -78,7 +78,7 @@ impl ZstdEncoder {
     /// Create a new Zstd encoder with the specified compression level.
     /// Level 0 uses the default (currently 3), levels 1-22 are valid (higher = better compression, slower).
     #[must_use]
-    pub fn new(compression_level: i32) -> Self {
+    fn new(compression_level: i32) -> Self {
         Self { compression_level }
     }
 }
@@ -151,7 +151,7 @@ impl Encoder for ZstdEncoder {
 
 /// Create an encoder based on the encoding configuration.
 #[must_use]
-pub fn get_encoder(encoding: Encoding) -> Option<Arc<dyn Encoder>> {
+pub(crate) fn get_encoder(encoding: Encoding) -> Option<Arc<dyn Encoder>> {
     match encoding {
         Encoding::None => None,
         Encoding::Zstd => Some(Arc::new(ZstdEncoder::default())),

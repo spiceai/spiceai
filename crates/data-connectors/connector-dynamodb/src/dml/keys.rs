@@ -417,7 +417,7 @@ fn extract_keys_from_struct_eq(
     Ok(())
 }
 
-pub(crate) fn extract_key_pair_from_struct_func(
+fn extract_key_pair_from_struct_func(
     func: &datafusion::logical_expr::expr::ScalarFunction,
     pk_idx: usize,
     sk_idx: Option<usize>,

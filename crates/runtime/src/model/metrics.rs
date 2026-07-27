@@ -29,17 +29,17 @@ use opentelemetry::{
 
 static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("llms"));
 
-pub(crate) static LLM_REQUESTS: LazyLock<Counter<u64>> =
+static LLM_REQUESTS: LazyLock<Counter<u64>> =
     LazyLock::new(|| METER.u64_counter("llm_requests").build());
 
-pub(crate) static FAILURES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+static FAILURES: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("llm_failures")
         .with_description("Number of embedding failures.")
         .build()
 });
 
-pub(crate) static LLM_INTERNAL_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+static LLM_INTERNAL_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
     METER
         .f64_histogram("llm_internal_request_duration_ms")
         .with_unit("ms")
@@ -47,14 +47,14 @@ pub(crate) static LLM_INTERNAL_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock:
         .build()
 });
 
-pub(crate) static LLM_PROMPT_TOKENS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+static LLM_PROMPT_TOKENS: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("llm_prompt_tokens_total")
         .with_description("Total prompt (input) tokens consumed by LLM requests.")
         .build()
 });
 
-pub(crate) static LLM_COMPLETION_TOKENS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+static LLM_COMPLETION_TOKENS: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("llm_completion_tokens_total")
         .with_description("Total completion (output) tokens produced by LLM requests.")

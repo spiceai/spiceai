@@ -51,7 +51,7 @@ enum ToolUtilsError {
 ///
 /// Useful for constructing [`Vec<ChatCompletionRequestMessage>`], simulating a model already
 /// having requested specific tools.
-pub async fn create_tool_use_messages(
+async fn create_tool_use_messages(
     tool: &dyn SpiceModelTool,
     id: &str,
     params: &impl serde::Serialize,
@@ -90,14 +90,14 @@ pub async fn create_tool_use_messages(
     ])
 }
 
-pub fn tool_call_error_response(tool_name: &str, error: impl std::fmt::Display) -> Value {
+pub(crate) fn tool_call_error_response(tool_name: &str, error: impl std::fmt::Display) -> Value {
     Value::String(format!(
         "Failed to call the tool {tool_name}. An error occurred: {error}"
     ))
 }
 
 /// Construct a [`serde_json::Value`] from a [`JsonSchema`] type.
-pub fn parameters<T: JsonSchema + Serialize>() -> Option<Value> {
+pub(crate) fn parameters<T: JsonSchema + Serialize>() -> Option<Value> {
     match serde_json::to_value(schema_for!(T)) {
         Ok(v) => Some(v),
         Err(e) => {
@@ -110,7 +110,7 @@ pub fn parameters<T: JsonSchema + Serialize>() -> Option<Value> {
 /// Create a [`ResolvedTableAwareAllowlist`] from a list of dataset patterns.
 ///
 /// Returns `Ok(None)` if the list is empty.
-pub fn create_table_allowlist(
+pub(crate) fn create_table_allowlist(
     datasets: &[String],
 ) -> Result<Option<ResolvedTableAwareAllowlist>, Box<dyn std::error::Error + Send + Sync>> {
     if datasets.is_empty() {
@@ -129,7 +129,7 @@ pub async fn get_tools(rt: Arc<Runtime>, opts: &SpiceToolsOptions) -> Vec<Arc<dy
 }
 
 #[must_use]
-pub async fn get_tools_with_allowlist(
+pub(crate) async fn get_tools_with_allowlist(
     rt: Arc<Runtime>,
     opts: &SpiceToolsOptions,
     table_allowlist: Option<ResolvedTableAwareAllowlist>,

@@ -87,7 +87,7 @@ pub struct MongoSys {
         )),
         expect(dead_code)
     )]
-    pub dataset_name: String,
+    dataset_name: String,
     acceleration_connection: AccelerationConnection,
 }
 

@@ -6,7 +6,7 @@ use crate::GlyphId;
 #[derive(Clone, Copy, Debug)]
 pub struct Subtable0<'a> {
     /// Just a list of 256 8bit glyph IDs.
-    pub glyph_ids: &'a [u8],
+    glyph_ids: &'a [u8],
 }
 
 impl<'a> Subtable0<'a> {

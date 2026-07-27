@@ -38,14 +38,14 @@ pub struct NumBytes(u64);
 
 impl NumBytes {
     /// Create a `NumBytes` from a raw byte count.
-    pub fn from_bytes(bytes: u64) -> Self {
+    pub(crate) fn from_bytes(bytes: u64) -> Self {
         Self(bytes)
     }
 
     /// Parse a human-readable byte string (e.g. `"16Gi"`, `"1.5GiB"`, `"16GB"`, or raw bytes like `"512"`).
     ///
     /// Accepted suffixes (case-insensitive): `Gi`, `GiB`, `Mi`, `MiB`, `Ki`, `KiB`, `G`, `GB`, `M`, `MB`, `K`, `KB`, `B`, or no suffix for bytes.
-    pub fn parse(s: &str) -> Result<Self> {
+    pub(crate) fn parse(s: &str) -> Result<Self> {
         let s = s.trim();
         let suffix_start = s
             .find(|c: char| !c.is_ascii_digit() && c != '.')
@@ -93,7 +93,7 @@ impl NumBytes {
     }
 
     /// Return the raw byte count.
-    pub fn as_bytes(self) -> u64 {
+    fn as_bytes(self) -> u64 {
         self.0
     }
 
@@ -101,7 +101,7 @@ impl NumBytes {
     ///
     /// This is the format expected by the Spice Cloud API for memory/storage fields. Decimal
     /// inputs such as `16GB` are normalized to the equivalent binary `Ki`/`Mi`/`Gi` form.
-    pub fn to_resource_string(self) -> String {
+    pub(crate) fn to_resource_string(self) -> String {
         self.to_parse_string()
     }
 
@@ -223,7 +223,7 @@ impl fmt::Display for NumBytes {
 /// Format a floating-point byte count for display.
 ///
 /// Used for metrics counters that may be fractional (e.g. disk I/O accumulated values).
-pub fn format_bytes_f64(bytes: f64) -> String {
+pub(crate) fn format_bytes_f64(bytes: f64) -> String {
     const KIB_F: f64 = 1024.0;
     const MIB_F: f64 = KIB_F * 1024.0;
     const GIB_F: f64 = MIB_F * 1024.0;

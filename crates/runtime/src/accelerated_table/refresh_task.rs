@@ -313,19 +313,19 @@ impl RefreshTaskBuilder {
 
     /// Sets the `disable_federation` flag
     #[must_use]
-    pub fn with_disable_federation(mut self, disable: bool) -> RefreshTaskBuilder {
+    pub(crate) fn with_disable_federation(mut self, disable: bool) -> RefreshTaskBuilder {
         self.disable_federation = disable;
         self
     }
 
     #[must_use]
-    pub fn with_semaphore(mut self, semaphore: Arc<Semaphore>) -> RefreshTaskBuilder {
+    pub(crate) fn with_semaphore(mut self, semaphore: Arc<Semaphore>) -> RefreshTaskBuilder {
         self.semaphore = Some(semaphore);
         self
     }
 
     #[must_use]
-    pub fn with_metrics(mut self, metrics: Option<Metrics>) -> RefreshTaskBuilder {
+    pub(crate) fn with_metrics(mut self, metrics: Option<Metrics>) -> RefreshTaskBuilder {
         self.metrics = metrics;
         self
     }
@@ -337,7 +337,7 @@ impl RefreshTaskBuilder {
     }
 
     #[must_use]
-    pub fn with_resource_monitor(
+    pub(crate) fn with_resource_monitor(
         mut self,
         monitor: crate::resource_monitor::ResourceMonitor,
     ) -> RefreshTaskBuilder {
@@ -346,7 +346,7 @@ impl RefreshTaskBuilder {
     }
 
     #[must_use]
-    pub fn with_on_stream_batch_process_callback(
+    pub(crate) fn with_on_stream_batch_process_callback(
         mut self,
         callback: Option<StreamBatchProcessCallback>,
     ) -> RefreshTaskBuilder {
@@ -355,13 +355,13 @@ impl RefreshTaskBuilder {
     }
 
     #[must_use]
-    pub fn with_last_updated_at(mut self, last_updated_at: Arc<AtomicI64>) -> RefreshTaskBuilder {
+    pub(crate) fn with_last_updated_at(mut self, last_updated_at: Arc<AtomicI64>) -> RefreshTaskBuilder {
         self.last_updated_at = last_updated_at;
         self
     }
 
     #[must_use]
-    pub fn with_initial_load_completed(
+    pub(crate) fn with_initial_load_completed(
         mut self,
         initial_load_completed: Arc<AtomicBool>,
     ) -> RefreshTaskBuilder {
@@ -371,14 +371,14 @@ impl RefreshTaskBuilder {
 
     /// Set whether the acceleration uses S3 Express One Zone storage.
     #[must_use]
-    pub fn with_s3_express_acceleration(mut self, is_s3_express: bool) -> RefreshTaskBuilder {
+    pub(crate) fn with_s3_express_acceleration(mut self, is_s3_express: bool) -> RefreshTaskBuilder {
         self.is_s3_express_acceleration = is_s3_express;
         self
     }
 
     /// Provide the snapshot-refresh state required for `RefreshMode::Snapshot`.
     #[must_use]
-    pub fn with_snapshot_refresh_state(
+    pub(crate) fn with_snapshot_refresh_state(
         mut self,
         state: Option<crate::accelerated_table::snapshots::SnapshotRefreshState>,
     ) -> RefreshTaskBuilder {
@@ -479,7 +479,7 @@ pub(crate) struct DatasetMetricLabels {
 }
 
 impl DatasetMetricLabels {
-    pub(crate) fn new(dataset_name: &TableReference) -> Self {
+    fn new(dataset_name: &TableReference) -> Self {
         let name: Arc<str> = Arc::from(dataset_name.to_string());
         Self {
             dataset_only: [KeyValue::new("dataset", name)],
@@ -487,7 +487,7 @@ impl DatasetMetricLabels {
     }
 
     /// The dataset-only label set — a zero-allocation slice reuse.
-    pub(crate) fn dataset(&self) -> &[KeyValue] {
+    fn dataset(&self) -> &[KeyValue] {
         &self.dataset_only
     }
 
@@ -495,7 +495,7 @@ impl DatasetMetricLabels {
     /// cached dataset `KeyValue` is an `Arc` refcount bump and the static second
     /// label allocates nothing, so only the two-element stack array is produced —
     /// no string copy.
-    pub(crate) fn tagged(&self, key: &'static str, value: &'static str) -> [KeyValue; 2] {
+    fn tagged(&self, key: &'static str, value: &'static str) -> [KeyValue; 2] {
         [self.dataset_only[0].clone(), KeyValue::new(key, value)]
     }
 }
@@ -531,7 +531,7 @@ pub struct RefreshTask {
     /// Cached generic CDC append plan. Cayenne's native CDC path bypasses this.
     cdc_insert_plan_cache: Arc<Mutex<Option<changes::CdcInsertPlanCache>>>,
     /// Per-dataset `cdc_*` parameter overrides drawn from `dataset.acceleration.params`.
-    pub(crate) cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
+    cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
 }
 
 impl std::fmt::Debug for RefreshTask {
@@ -576,7 +576,7 @@ impl RefreshTask {
     }
 
     /// Subscribes a new acceleration table provider to the existing `AccelerationSink` managed by this `RefreshTask`.
-    pub async fn add_synchronized_table(&self, synchronized_table: SynchronizedTable) {
+    pub(crate) async fn add_synchronized_table(&self, synchronized_table: SynchronizedTable) {
         self.sink
             .write()
             .await
@@ -1092,7 +1092,7 @@ impl RefreshTask {
         Ok(())
     }
 
-    pub async fn get_full_or_incremental_append_update(
+    async fn get_full_or_incremental_append_update(
         &self,
         refresh: &Refresh,
         overwrite_timestamp_in_nano: Option<u128>,

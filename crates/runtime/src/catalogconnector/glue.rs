@@ -35,7 +35,7 @@ mod provider;
 
 use provider::GlueCatalogProvider;
 
-pub static PREFIX: &str = "glue";
+pub(crate) static PREFIX: &str = "glue";
 
 static VALIDATORS: LazyLock<
     Vec<Box<dyn Validator<Error = parameters::aws::Error> + Send + Sync + 'static>>,
@@ -51,7 +51,7 @@ pub struct GlueCatalog {
 
 impl GlueCatalog {
     #[must_use]
-    pub fn new_connector(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
+    pub(crate) fn new_connector(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
         Arc::new(Self { params })
     }
 }

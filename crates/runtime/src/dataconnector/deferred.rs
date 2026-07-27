@@ -35,7 +35,7 @@ pub struct DeferredConnector {
 }
 
 impl DeferredConnector {
-    pub fn new(inner: Arc<dyn DataConnector>) -> Self {
+    pub(crate) fn new(inner: Arc<dyn DataConnector>) -> Self {
         Self {
             inner,
             schema: Arc::new(Schema::new(vec![Field::new(
@@ -47,7 +47,7 @@ impl DeferredConnector {
     }
 
     #[must_use]
-    pub fn source(&self) -> Arc<dyn DataConnector> {
+    pub(crate) fn source(&self) -> Arc<dyn DataConnector> {
         Arc::clone(&self.inner)
     }
 }

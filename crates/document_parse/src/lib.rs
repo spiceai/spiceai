@@ -78,7 +78,7 @@ pub async fn get_parser_factory(ext: &str) -> Option<Arc<dyn DocumentParserFacto
     registry.get(ext.strip_prefix('.').unwrap_or(ext)).cloned()
 }
 
-pub async fn register_parser_factory(
+async fn register_parser_factory(
     name: &str,
     connector_factory: Arc<dyn DocumentParserFactory>,
 ) {

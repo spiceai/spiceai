@@ -34,7 +34,7 @@ pub struct Anthropic {
 }
 
 static ANTHROPIC_API_BASE: &str = "https://api.anthropic.com/v1";
-pub static DEFAULT_ANTHROPIC_MODEL: &str = "claude-3-5-sonnet-latest";
+static DEFAULT_ANTHROPIC_MODEL: &str = "claude-3-5-sonnet-latest";
 static ANTHROPIC_API_VERSION: &str = "2023-06-01";
 
 impl Anthropic {

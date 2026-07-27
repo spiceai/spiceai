@@ -109,7 +109,7 @@ impl TableSchemaTool {
         self
     }
 
-    pub async fn get_schema(
+    async fn get_schema(
         &self,
         req: &TableSchemaToolParams,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {

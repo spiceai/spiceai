@@ -77,7 +77,7 @@ impl PartialEq for SnapshotBehavior {
 
 impl SnapshotBehavior {
     #[must_use]
-    pub fn disabled() -> Self {
+    pub(crate) fn disabled() -> Self {
         SnapshotBehavior::Disabled
     }
 

@@ -63,7 +63,7 @@ pub struct View {
 
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(rename = "dependsOn", default)]
-    pub depends_on: Vec<String>,
+    depends_on: Vec<String>,
 }
 
 impl Nameable for View {

@@ -78,7 +78,7 @@ pub(crate) async fn do_get(
 /// This returns metadata about supported data types in a format
 /// compatible with ODBC/JDBC drivers.
 #[expect(clippy::too_many_lines)]
-pub(crate) fn get_xdbc_type_info_data() -> &'static XdbcTypeInfoData {
+fn get_xdbc_type_info_data() -> &'static XdbcTypeInfoData {
     static INSTANCE: std::sync::LazyLock<XdbcTypeInfoData> = std::sync::LazyLock::new(|| {
         let mut builder = XdbcTypeInfoDataBuilder::new();
 

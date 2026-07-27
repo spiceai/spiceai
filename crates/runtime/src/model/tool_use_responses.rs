@@ -84,7 +84,7 @@ pub struct ToolUsingResponses {
 
 impl ToolUsingResponses {
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         inner_responses: Arc<dyn Responses>,
         openai_tools: Vec<OpenAIResponsesTools>,
         tools: Vec<Arc<dyn SpiceModelTool>>,
@@ -115,7 +115,7 @@ impl ToolUsingResponses {
     }
 
     #[must_use]
-    pub fn runtime_tools(&self) -> Vec<ToolDefinition> {
+    fn runtime_tools(&self) -> Vec<ToolDefinition> {
         self.tools
             .iter()
             .map(|t| {

@@ -7,6 +7,6 @@ use r2d2::PooledConnection;
 pub mod aggregate_pushdown;
 pub mod intermediate_index_cte;
 
-pub type ConcreteDuckSqlExec =
+pub(crate) type ConcreteDuckSqlExec =
     DuckSqlExec<PooledConnection<DuckdbConnectionManager>, DuckDBParameter>;
-pub static PARSER_DIALECT: sqlparser::dialect::DuckDbDialect = sqlparser::dialect::DuckDbDialect {};
+pub(crate) static PARSER_DIALECT: sqlparser::dialect::DuckDbDialect = sqlparser::dialect::DuckDbDialect {};

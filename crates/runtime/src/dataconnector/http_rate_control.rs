@@ -125,16 +125,16 @@ pub fn global_registry() -> Arc<HttpRateControlRegistry> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HttpRateControlConfig {
-    pub max_concurrent_requests: Option<usize>,
-    pub requests_per_second: Option<NonZeroU32>,
-    pub requests_per_minute: Option<NonZeroU32>,
-    pub jitter_min: Duration,
-    pub jitter_max: Duration,
+    pub(crate) max_concurrent_requests: Option<usize>,
+    pub(crate) requests_per_second: Option<NonZeroU32>,
+    pub(crate) requests_per_minute: Option<NonZeroU32>,
+    pub(crate) jitter_min: Duration,
+    pub(crate) jitter_max: Duration,
 }
 
 impl HttpRateControlConfig {
     #[must_use]
-    pub fn is_enabled(&self) -> bool {
+    pub(crate) fn is_enabled(&self) -> bool {
         self.max_concurrent_requests.is_some()
             || self.requests_per_second.is_some()
             || self.requests_per_minute.is_some()
@@ -556,7 +556,7 @@ pub fn resolve_config<S: BuildHasher>(
     )
 }
 
-pub fn resolve_config_for_component<S: BuildHasher>(
+pub(crate) fn resolve_config_for_component<S: BuildHasher>(
     params: &Parameters,
     runtime_params: Option<&HashMap<String, String, S>>,
     connector_component: &ConnectorComponent,
@@ -722,7 +722,7 @@ impl HttpRateControlRegistry {
         )
     }
 
-    pub fn claim_metrics_owner(&self, base_url: &Url, owner: &str) -> bool {
+    fn claim_metrics_owner(&self, base_url: &Url, owner: &str) -> bool {
         let key = rate_control_key(base_url);
         let Ok(mut metric_owners) = self.metric_owners.write() else {
             return false;
@@ -770,7 +770,7 @@ impl HttpRateControlRegistry {
         .await
     }
 
-    pub async fn reserve_shared_rate_controller_for_component(
+    async fn reserve_shared_rate_controller_for_component(
         self: Arc<Self>,
         base_url: &Url,
         config: &HttpRateControlConfig,
@@ -853,7 +853,7 @@ impl HttpRateControlRegistry {
         .await
     }
 
-    pub async fn shared_rate_controller_for_component(
+    pub(crate) async fn shared_rate_controller_for_component(
         &self,
         base_url: &Url,
         config: &HttpRateControlConfig,
@@ -1211,7 +1211,7 @@ fn runtime_or_dataset_param_name<S: BuildHasher>(
 }
 
 #[must_use]
-pub fn rate_control_key(base_url: &Url) -> String {
+fn rate_control_key(base_url: &Url) -> String {
     let scheme = base_url.scheme();
     let host = base_url.host_str().unwrap_or_default().to_ascii_lowercase();
     match base_url.port_or_known_default() {

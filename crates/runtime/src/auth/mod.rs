@@ -30,8 +30,8 @@ pub mod no_auth;
 #[derive(Clone)]
 pub struct EndpointAuth {
     pub http_auth: Option<Arc<dyn HttpAuth + Send + Sync>>,
-    pub flight_basic_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
-    pub grpc_auth: Option<Arc<dyn GrpcAuth + Send + Sync>>,
+    pub(crate) flight_basic_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
+    grpc_auth: Option<Arc<dyn GrpcAuth + Send + Sync>>,
     /// Where the request's auth principal originates. Computed once
     /// at startup by the binary entrypoint from the combination of
     /// `runtime.auth` and `runtime.tls.client_auth`. Threaded into
@@ -42,7 +42,7 @@ pub struct EndpointAuth {
     /// Defaults to [`IdentitySource::Anonymous`] so existing tests
     /// and callers that don't set it explicitly preserve today's
     /// behavior.
-    pub identity_source: IdentitySource,
+    pub(crate) identity_source: IdentitySource,
 }
 
 impl EndpointAuth {

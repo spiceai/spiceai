@@ -686,7 +686,7 @@ impl GithubRestClient {
     #[expect(clippy::too_many_arguments)]
     #[expect(clippy::missing_panics_doc)]
     #[expect(clippy::expect_used)]
-    pub async fn fetch_files(
+    async fn fetch_files(
         &self,
         owner: &str,
         repo: &str,
@@ -1660,7 +1660,7 @@ impl GithubRestClient {
         Ok(Box::pin(stream_adapter))
     }
 
-    pub async fn fetch_workflow_run_logs(
+    async fn fetch_workflow_run_logs(
         &self,
         owner: &str,
         repo: &str,
@@ -2026,41 +2026,41 @@ struct GitCommitAuthor {
 
 #[derive(Debug, Deserialize)]
 pub struct WorkflowsResponse {
-    pub total_count: i64,
-    pub workflows: Vec<Workflow>,
+    total_count: i64,
+    workflows: Vec<Workflow>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct Workflow {
-    pub id: i64,
-    pub name: String,
-    pub path: String,
-    pub state: String,
-    pub created_at: String,
-    pub updated_at: String,
-    pub badge_url: String,
+    id: i64,
+    name: String,
+    path: String,
+    state: String,
+    created_at: String,
+    updated_at: String,
+    badge_url: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct WorkflowRunsResponse {
-    pub total_count: i64,
-    pub workflow_runs: Vec<WorkflowRun>,
+    total_count: i64,
+    workflow_runs: Vec<WorkflowRun>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct WorkflowRun {
-    pub id: i64,
-    pub name: Option<String>,
-    pub head_branch: Option<String>,
-    pub head_sha: String,
-    pub run_number: i64,
-    pub display_title: String,
-    pub event: String,
-    pub status: Option<String>,
-    pub conclusion: Option<String>,
-    pub workflow_id: i64,
-    pub run_started_at: Option<String>,
-    pub jobs_url: String,
+    id: i64,
+    name: Option<String>,
+    head_branch: Option<String>,
+    head_sha: String,
+    run_number: i64,
+    display_title: String,
+    event: String,
+    status: Option<String>,
+    conclusion: Option<String>,
+    workflow_id: i64,
+    run_started_at: Option<String>,
+    jobs_url: String,
 }
 
 // For GitHub, first checks if an explicit rate limit error was returned, then checks the headers

@@ -31,31 +31,31 @@ use crate::dataconnector::iceberg_cluster::IcebergClusterTableProvider;
 use data_components::iceberg::delete::IcebergDeletionProvider;
 
 /// Inner-provider accessor for [`FederatedTableProviderAdaptor`].
-pub const FEDERATED_ADAPTOR_INNER: InnerProviderFn = |tbl| {
+const FEDERATED_ADAPTOR_INNER: InnerProviderFn = |tbl| {
     tbl.downcast_ref::<FederatedTableProviderAdaptor>()
         .and_then(|adaptor| adaptor.table_provider.as_ref())
 };
 
 /// Inner-provider accessor for [`MetadataEnrichedTableProvider`].
-pub const METADATA_ENRICHED_INNER: InnerProviderFn = |tbl| {
+const METADATA_ENRICHED_INNER: InnerProviderFn = |tbl| {
     tbl.downcast_ref::<MetadataEnrichedTableProvider>()
         .map(MetadataEnrichedTableProvider::get_inner_ref)
 };
 
 /// Inner-provider accessor for [`IcebergClusterTableProvider`].
-pub const ICEBERG_CLUSTER_INNER: InnerProviderFn = |tbl| {
+const ICEBERG_CLUSTER_INNER: InnerProviderFn = |tbl| {
     tbl.downcast_ref::<IcebergClusterTableProvider>()
         .map(IcebergClusterTableProvider::inner)
 };
 
 /// Inner-provider accessor for [`IcebergDeletionProvider`].
-pub const ICEBERG_DELETION_INNER: InnerProviderFn = |tbl| {
+const ICEBERG_DELETION_INNER: InnerProviderFn = |tbl| {
     tbl.downcast_ref::<IcebergDeletionProvider>()
         .map(IcebergDeletionProvider::inner)
 };
 
 /// Inner-provider accessor for [`EmbeddingTable`].
-pub const EMBEDDING_INNER: InnerProviderFn = |tbl| {
+const EMBEDDING_INNER: InnerProviderFn = |tbl| {
     tbl.downcast_ref::<EmbeddingTable>()
         .map(EmbeddingTable::get_underlying_ref)
 };
@@ -63,7 +63,7 @@ pub const EMBEDDING_INNER: InnerProviderFn = |tbl| {
 /// Inner-provider accessor for [`AcceleratedTable`]. Resolves to the federated
 /// provider only if it is available synchronously (a deferred provider that is
 /// not yet ready yields `None`).
-pub const ACCELERATED_INNER: InnerProviderFn = |tbl| {
+const ACCELERATED_INNER: InnerProviderFn = |tbl| {
     tbl.downcast_ref::<AcceleratedTable>()
         .and_then(|accelerated| {
             accelerated
@@ -74,7 +74,7 @@ pub const ACCELERATED_INNER: InnerProviderFn = |tbl| {
 
 /// The full set of runtime wrapper layers understood by
 /// [`find_concrete_table_provider`].
-pub const DEFAULT_INNER_FNS: &[InnerProviderFn] = &[
+const DEFAULT_INNER_FNS: &[InnerProviderFn] = &[
     INDEXED_INNER,
     FEDERATED_ADAPTOR_INNER,
     METADATA_ENRICHED_INNER,
@@ -88,13 +88,13 @@ pub const DEFAULT_INNER_FNS: &[InnerProviderFn] = &[
 /// [`impl TableProvider`], unwrapping all known runtime wrapper layers
 /// (including `AcceleratedTable`). See [`find_concrete_table_provider_with`]
 /// to restrict which layers are peeled.
-pub fn find_concrete_table_provider<T: TableProvider + 'static>(
+pub(crate) fn find_concrete_table_provider<T: TableProvider + 'static>(
     tbl: &Arc<dyn TableProvider>,
 ) -> Option<&T> {
     find_concrete_table_provider_with::<T>(tbl, DEFAULT_INNER_FNS)
 }
 
-pub fn find_index_in_table_provider<T: Index + 'static>(
+pub(crate) fn find_index_in_table_provider<T: Index + 'static>(
     tbl: &Arc<dyn TableProvider>,
 ) -> Option<(Vec<&T>, Arc<dyn TableProvider>)> {
     if let Some(accelerated_table) = find_concrete_table_provider::<AcceleratedTable>(tbl)

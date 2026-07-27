@@ -139,7 +139,7 @@ const REGIONS: &[(i64, &str)] = &[
 /// both loaders so the load statement's column list always matches what was
 /// generated here. `_bench_ts` is deliberately absent — seed rows are
 /// stamped by the column default (see `schema`/`schema_mysql`), not set here.
-pub const TABLE_COLUMNS: &[(&str, &str)] = &[
+const TABLE_COLUMNS: &[(&str, &str)] = &[
     ("item", "i_id, i_im_id, i_name, i_price, i_data"),
     ("nation", "n_nationkey, n_name, n_regionkey, n_comment"),
     ("region", "r_regionkey, r_name, r_comment"),
@@ -182,10 +182,10 @@ pub const TABLE_COLUMNS: &[(&str, &str)] = &[
 /// belongs to (multiple shards may share a table — load every shard into
 /// it), `path` is the file on disk, `columns` is the exact column list for
 /// the load statement (see [`TABLE_COLUMNS`]).
-pub struct GeneratedShard {
-    pub table: &'static str,
-    pub path: PathBuf,
-    pub columns: &'static str,
+pub(crate) struct GeneratedShard {
+    pub(crate) table: &'static str,
+    pub(crate) path: PathBuf,
+    pub(crate) columns: &'static str,
 }
 
 struct CsvString<'a>(&'a str);
@@ -514,7 +514,7 @@ fn generate_warehouse_range(
 /// # Errors
 ///
 /// Returns [`Error::Io`] if any CSV file cannot be created or written.
-pub fn generate(dir: &Path, warehouses: usize, seed: Option<u64>) -> Result<Vec<GeneratedShard>> {
+pub(crate) fn generate(dir: &Path, warehouses: usize, seed: Option<u64>) -> Result<Vec<GeneratedShard>> {
     let base_seed = seed.unwrap_or_else(|| rand::rng().random());
     let mut rng = StdRng::seed_from_u64(base_seed);
     let mut shards: Vec<GeneratedShard> = Vec::new();

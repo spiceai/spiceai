@@ -27,7 +27,7 @@ use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter, UpDownCounter};
 use opentelemetry::{KeyValue, global};
 use telemetry::DURATION_MS_HISTOGRAM_BUCKETS;
 
-pub static CLUSTER_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("cluster"));
+static CLUSTER_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("cluster"));
 
 // =============================================================================
 // Node Status Metrics (shared)
@@ -35,7 +35,7 @@ pub static CLUSTER_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("clus
 
 /// Node status gauge: 0=Unknown, 1=Healthy, 2=Unhealthy, 3=Draining
 /// Labels: `node_id`, role (scheduler|executor)
-pub static NODE_STATUS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+static NODE_STATUS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     CLUSTER_METER
         .u64_gauge("node_status")
         .with_description(
@@ -46,7 +46,7 @@ pub static NODE_STATUS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
 
 /// Number of active executors registered with the scheduler.
 /// Labels: `node_id`
-pub static SCHEDULER_ACTIVE_EXECUTORS_COUNT: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+static SCHEDULER_ACTIVE_EXECUTORS_COUNT: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     CLUSTER_METER
         .u64_gauge("scheduler_active_executors_count")
         .with_description("Number of active executors registered with the scheduler.")
@@ -55,7 +55,7 @@ pub static SCHEDULER_ACTIVE_EXECUTORS_COUNT: LazyLock<Gauge<u64>> = LazyLock::ne
 
 /// Number of scheduler instances (for HA configurations).
 /// Labels: `node_id`
-pub static SCHEDULER_COUNT: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+static SCHEDULER_COUNT: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     CLUSTER_METER
         .u64_gauge("scheduler_count")
         .with_description("Number of scheduler instances in the cluster.")
@@ -88,7 +88,7 @@ pub static NODE_TASKS_ACTIVE: LazyLock<UpDownCounter<i64>> = LazyLock::new(|| {
 
 /// Task execution duration in milliseconds (executor only).
 /// Labels: `node_id`
-pub static EXECUTOR_TASK_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+static EXECUTOR_TASK_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
     CLUSTER_METER
         .f64_histogram("executor_task_duration_ms")
         .with_description("Task execution duration in milliseconds.")
@@ -99,7 +99,7 @@ pub static EXECUTOR_TASK_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|
 
 /// Total number of task failures.
 /// Labels: `node_id`, role, `error_type`
-pub static NODE_TASK_FAILURES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+static NODE_TASK_FAILURES: LazyLock<Counter<u64>> = LazyLock::new(|| {
     CLUSTER_METER
         .u64_counter("node_task_failures")
         .with_description("Total number of task failures.")
@@ -109,7 +109,7 @@ pub static NODE_TASK_FAILURES: LazyLock<Counter<u64>> = LazyLock::new(|| {
 
 /// Total number of task retries.
 /// Labels: `node_id`, role
-pub static NODE_TASK_RETRIES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+static NODE_TASK_RETRIES: LazyLock<Counter<u64>> = LazyLock::new(|| {
     CLUSTER_METER
         .u64_counter("node_task_retries")
         .with_description("Total number of task retries.")
@@ -119,7 +119,7 @@ pub static NODE_TASK_RETRIES: LazyLock<Counter<u64>> = LazyLock::new(|| {
 
 /// Number of tasks waiting to be scheduled.
 /// Labels: `node_id`
-pub static SCHEDULER_TASK_QUEUE_DEPTH: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+static SCHEDULER_TASK_QUEUE_DEPTH: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     CLUSTER_METER
         .u64_gauge("scheduler_task_queue_depth")
         .with_description("Number of tasks waiting to be scheduled.")
@@ -144,7 +144,7 @@ pub static SCHEDULER_TASK_SCHEDULING_LATENCY_MS: LazyLock<Histogram<f64>> = Lazy
 
 /// Total number of stages processed.
 /// Labels: `node_id`, status (completed|failed|cancelled)
-pub static SCHEDULER_STAGES_TOTAL: LazyLock<Counter<u64>> = LazyLock::new(|| {
+static SCHEDULER_STAGES_TOTAL: LazyLock<Counter<u64>> = LazyLock::new(|| {
     CLUSTER_METER
         .u64_counter("scheduler_stages_total")
         .with_description("Total number of stages processed by the scheduler.")
@@ -154,7 +154,7 @@ pub static SCHEDULER_STAGES_TOTAL: LazyLock<Counter<u64>> = LazyLock::new(|| {
 
 /// Stage execution duration in milliseconds.
 /// Labels: `node_id`
-pub static SCHEDULER_STAGE_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+static SCHEDULER_STAGE_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
     CLUSTER_METER
         .f64_histogram("scheduler_stage_duration_ms")
         .with_description("Stage execution duration in milliseconds.")
@@ -165,7 +165,7 @@ pub static SCHEDULER_STAGE_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new
 
 /// Total number of stage failures.
 /// Labels: `node_id`, `error_type`
-pub static SCHEDULER_STAGE_FAILURES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+static SCHEDULER_STAGE_FAILURES: LazyLock<Counter<u64>> = LazyLock::new(|| {
     CLUSTER_METER
         .u64_counter("scheduler_stage_failures")
         .with_description("Total number of stage failures.")
@@ -175,7 +175,7 @@ pub static SCHEDULER_STAGE_FAILURES: LazyLock<Counter<u64>> = LazyLock::new(|| {
 
 /// Total number of stage retries.
 /// Labels: `node_id`
-pub static SCHEDULER_STAGE_RETRIES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+static SCHEDULER_STAGE_RETRIES: LazyLock<Counter<u64>> = LazyLock::new(|| {
     CLUSTER_METER
         .u64_counter("scheduler_stage_retries")
         .with_description("Total number of stage retries.")
@@ -232,7 +232,7 @@ pub static EXECUTOR_TASK_FAILURES: LazyLock<Counter<u64>> = LazyLock::new(|| {
 
 /// Available memory on the executor in bytes.
 /// Labels: `node_id`
-pub static EXECUTOR_MEMORY_AVAILABLE_BYTES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+static EXECUTOR_MEMORY_AVAILABLE_BYTES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     CLUSTER_METER
         .u64_gauge("executor_memory_available_bytes")
         .with_description("Available memory on the executor in bytes.")
@@ -242,7 +242,7 @@ pub static EXECUTOR_MEMORY_AVAILABLE_BYTES: LazyLock<Gauge<u64>> = LazyLock::new
 
 /// Maximum concurrent task slots on the executor.
 /// Labels: `node_id`
-pub static EXECUTOR_TASK_SLOTS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+static EXECUTOR_TASK_SLOTS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     CLUSTER_METER
         .u64_gauge("executor_task_slots")
         .with_description("Maximum concurrent task slots on the executor.")
@@ -256,7 +256,7 @@ pub static EXECUTOR_TASK_SLOTS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
 
 /// Total bytes written during shuffle operations by executors.
 /// Labels: `node_id`
-pub static EXECUTOR_SHUFFLE_WRITE_BYTES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+static EXECUTOR_SHUFFLE_WRITE_BYTES: LazyLock<Counter<u64>> = LazyLock::new(|| {
     CLUSTER_METER
         .u64_counter("executor_shuffle_write_bytes")
         .with_description("Total bytes written during shuffle operations.")
@@ -266,7 +266,7 @@ pub static EXECUTOR_SHUFFLE_WRITE_BYTES: LazyLock<Counter<u64>> = LazyLock::new(
 
 /// Total rows written during shuffle operations by executors.
 /// Labels: `node_id`
-pub static EXECUTOR_SHUFFLE_WRITE_ROWS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+static EXECUTOR_SHUFFLE_WRITE_ROWS: LazyLock<Counter<u64>> = LazyLock::new(|| {
     CLUSTER_METER
         .u64_counter("executor_shuffle_write_rows")
         .with_description("Total rows written during shuffle operations.")
@@ -276,7 +276,7 @@ pub static EXECUTOR_SHUFFLE_WRITE_ROWS: LazyLock<Counter<u64>> = LazyLock::new(|
 
 /// Duration of shuffle write operations in milliseconds.
 /// Labels: `node_id`
-pub static EXECUTOR_SHUFFLE_WRITE_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+static EXECUTOR_SHUFFLE_WRITE_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
     CLUSTER_METER
         .f64_histogram("executor_shuffle_write_duration_ms")
         .with_description("Duration of shuffle write operations in milliseconds.")
@@ -294,7 +294,7 @@ pub static EXECUTOR_SHUFFLE_WRITE_DURATION_MS: LazyLock<Histogram<f64>> = LazyLo
 
 /// Total bytes read from local shuffle files (same executor that wrote them).
 /// Labels: `node_id`
-pub static EXECUTOR_SHUFFLE_READ_LOCAL_BYTES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+static EXECUTOR_SHUFFLE_READ_LOCAL_BYTES: LazyLock<Counter<u64>> = LazyLock::new(|| {
     CLUSTER_METER
         .u64_counter("executor_shuffle_read_local_bytes")
         .with_description("Total bytes read from local shuffle files (same executor).")
@@ -304,7 +304,7 @@ pub static EXECUTOR_SHUFFLE_READ_LOCAL_BYTES: LazyLock<Counter<u64>> = LazyLock:
 
 /// Total rows read from local shuffle files (same executor that wrote them).
 /// Labels: `node_id`
-pub static EXECUTOR_SHUFFLE_READ_LOCAL_ROWS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+static EXECUTOR_SHUFFLE_READ_LOCAL_ROWS: LazyLock<Counter<u64>> = LazyLock::new(|| {
     CLUSTER_METER
         .u64_counter("executor_shuffle_read_local_rows")
         .with_description("Total rows read from local shuffle files (same executor).")
@@ -314,7 +314,7 @@ pub static EXECUTOR_SHUFFLE_READ_LOCAL_ROWS: LazyLock<Counter<u64>> = LazyLock::
 
 /// Count of local shuffle read operations.
 /// Labels: `node_id`
-pub static EXECUTOR_SHUFFLE_READ_LOCAL_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {
+static EXECUTOR_SHUFFLE_READ_LOCAL_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {
     CLUSTER_METER
         .u64_counter("executor_shuffle_read_local_count")
         .with_description("Count of local shuffle read operations.")
@@ -324,7 +324,7 @@ pub static EXECUTOR_SHUFFLE_READ_LOCAL_COUNT: LazyLock<Counter<u64>> = LazyLock:
 
 /// Duration of local shuffle read operations in milliseconds.
 /// Labels: `node_id`
-pub static EXECUTOR_SHUFFLE_READ_LOCAL_DURATION_MS: LazyLock<Histogram<f64>> =
+static EXECUTOR_SHUFFLE_READ_LOCAL_DURATION_MS: LazyLock<Histogram<f64>> =
     LazyLock::new(|| {
         CLUSTER_METER
             .f64_histogram("executor_shuffle_read_local_duration_ms")
@@ -336,7 +336,7 @@ pub static EXECUTOR_SHUFFLE_READ_LOCAL_DURATION_MS: LazyLock<Histogram<f64>> =
 
 /// Total bytes read from remote shuffle files (fetched from another executor).
 /// Labels: `node_id`
-pub static EXECUTOR_SHUFFLE_READ_REMOTE_BYTES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+static EXECUTOR_SHUFFLE_READ_REMOTE_BYTES: LazyLock<Counter<u64>> = LazyLock::new(|| {
     CLUSTER_METER
         .u64_counter("executor_shuffle_read_remote_bytes")
         .with_description("Total bytes fetched from remote shuffle files (other executors).")
@@ -346,7 +346,7 @@ pub static EXECUTOR_SHUFFLE_READ_REMOTE_BYTES: LazyLock<Counter<u64>> = LazyLock
 
 /// Total rows read from remote shuffle files (fetched from another executor).
 /// Labels: `node_id`
-pub static EXECUTOR_SHUFFLE_READ_REMOTE_ROWS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+static EXECUTOR_SHUFFLE_READ_REMOTE_ROWS: LazyLock<Counter<u64>> = LazyLock::new(|| {
     CLUSTER_METER
         .u64_counter("executor_shuffle_read_remote_rows")
         .with_description("Total rows fetched from remote shuffle files (other executors).")
@@ -356,7 +356,7 @@ pub static EXECUTOR_SHUFFLE_READ_REMOTE_ROWS: LazyLock<Counter<u64>> = LazyLock:
 
 /// Count of remote shuffle read operations.
 /// Labels: `node_id`
-pub static EXECUTOR_SHUFFLE_READ_REMOTE_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {
+static EXECUTOR_SHUFFLE_READ_REMOTE_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {
     CLUSTER_METER
         .u64_counter("executor_shuffle_read_remote_count")
         .with_description("Count of remote shuffle read operations.")
@@ -366,7 +366,7 @@ pub static EXECUTOR_SHUFFLE_READ_REMOTE_COUNT: LazyLock<Counter<u64>> = LazyLock
 
 /// Duration histogram for remote shuffle read operations (network fetch time).
 /// Labels: `node_id`
-pub static EXECUTOR_SHUFFLE_READ_REMOTE_DURATION_MS: LazyLock<Histogram<f64>> =
+static EXECUTOR_SHUFFLE_READ_REMOTE_DURATION_MS: LazyLock<Histogram<f64>> =
     LazyLock::new(|| {
         CLUSTER_METER
             .f64_histogram("executor_shuffle_read_remote_duration_ms")
@@ -383,7 +383,7 @@ pub static EXECUTOR_SHUFFLE_READ_REMOTE_DURATION_MS: LazyLock<Histogram<f64>> =
 
 /// Total bytes fetched by the scheduler when collecting final query results.
 /// Labels: `node_id`
-pub static SCHEDULER_RESULT_FETCH_BYTES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+static SCHEDULER_RESULT_FETCH_BYTES: LazyLock<Counter<u64>> = LazyLock::new(|| {
     CLUSTER_METER
         .u64_counter("scheduler_result_fetch_bytes")
         .with_description("Total bytes fetched when collecting final query results from executors.")
@@ -393,7 +393,7 @@ pub static SCHEDULER_RESULT_FETCH_BYTES: LazyLock<Counter<u64>> = LazyLock::new(
 
 /// Total rows fetched by the scheduler when collecting final query results.
 /// Labels: `node_id`
-pub static SCHEDULER_RESULT_FETCH_ROWS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+static SCHEDULER_RESULT_FETCH_ROWS: LazyLock<Counter<u64>> = LazyLock::new(|| {
     CLUSTER_METER
         .u64_counter("scheduler_result_fetch_rows")
         .with_description("Total rows fetched when collecting final query results from executors.")
@@ -403,7 +403,7 @@ pub static SCHEDULER_RESULT_FETCH_ROWS: LazyLock<Counter<u64>> = LazyLock::new(|
 
 /// Count of result fetch operations by the scheduler.
 /// Labels: `node_id`
-pub static SCHEDULER_RESULT_FETCH_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {
+static SCHEDULER_RESULT_FETCH_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {
     CLUSTER_METER
         .u64_counter("scheduler_result_fetch_count")
         .with_description("Count of result fetch operations from executors.")
@@ -413,7 +413,7 @@ pub static SCHEDULER_RESULT_FETCH_COUNT: LazyLock<Counter<u64>> = LazyLock::new(
 
 /// Duration of result fetch operations in milliseconds.
 /// Labels: `node_id`
-pub static SCHEDULER_RESULT_FETCH_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+static SCHEDULER_RESULT_FETCH_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
     CLUSTER_METER
         .f64_histogram("scheduler_result_fetch_duration_ms")
         .with_description("Duration of result fetch operations in milliseconds.")
@@ -428,7 +428,7 @@ pub static SCHEDULER_RESULT_FETCH_DURATION_MS: LazyLock<Histogram<f64>> = LazyLo
 
 /// Number of jobs waiting in the scheduler queue.
 /// Labels: `node_id`
-pub static SCHEDULER_JOB_QUEUE_DEPTH: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+static SCHEDULER_JOB_QUEUE_DEPTH: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     CLUSTER_METER
         .u64_gauge("scheduler_job_queue_depth")
         .with_description("Number of jobs waiting in the scheduler queue.")
@@ -438,7 +438,7 @@ pub static SCHEDULER_JOB_QUEUE_DEPTH: LazyLock<Gauge<u64>> = LazyLock::new(|| {
 
 /// Time spent planning a query in milliseconds.
 /// Labels: `node_id`
-pub static SCHEDULER_PLANNING_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+static SCHEDULER_PLANNING_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
     CLUSTER_METER
         .f64_histogram("scheduler_planning_duration_ms")
         .with_description("Time spent planning a query in milliseconds.")
@@ -449,7 +449,7 @@ pub static SCHEDULER_PLANNING_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::
 
 /// Total number of task-to-executor assignments.
 /// Labels: `node_id`
-pub static SCHEDULER_EXECUTOR_ASSIGNMENTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+static SCHEDULER_EXECUTOR_ASSIGNMENTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
     CLUSTER_METER
         .u64_counter("scheduler_executor_assignments")
         .with_description("Total number of task-to-executor assignments made by the scheduler.")

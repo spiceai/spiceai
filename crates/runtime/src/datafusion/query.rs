@@ -622,7 +622,7 @@ impl Query {
     /// Resumes a distributed query whose owning scheduler was lost, driving the
     /// recovered execution graph to completion on this scheduler and returning a
     /// handle to its results. `job_id` must match the original submission.
-    pub async fn resume_distributed(self, job_id: &str) -> Result<QueryHandle> {
+    pub(crate) async fn resume_distributed(self, job_id: &str) -> Result<QueryHandle> {
         let request_context = RequestContext::current(AsyncMarker::new().await);
 
         let span = tracing::span!(
@@ -1616,7 +1616,7 @@ impl Query {
         }
     }
 
-    pub fn from_logical_plan(df: &Arc<DataFusion>, plan: LogicalPlan) -> Self {
+    pub(crate) fn from_logical_plan(df: &Arc<DataFusion>, plan: LogicalPlan) -> Self {
         Self {
             df: Arc::clone(df),
             sql: QueryMethod::Plan(Box::new(plan)),
@@ -1633,7 +1633,7 @@ impl Query {
         format!("{}", self.sql)
     }
 
-    pub fn finish_with_error(
+    fn finish_with_error(
         self,
         request_context: &RequestContext,
         error_message: String,
@@ -1645,7 +1645,7 @@ impl Query {
     }
 
     /// Return the schema for the data and (possibly) the parameters of a [`Query`].
-    pub async fn get_schema(self) -> Result<(Schema, Option<Schema>), DataFusionError> {
+    pub(crate) async fn get_schema(self) -> Result<(Schema, Option<Schema>), DataFusionError> {
         let request_context = RequestContext::current(AsyncMarker::new().await);
 
         // Check if there's a Flight SQL session-specific context for session isolation
@@ -1853,7 +1853,7 @@ pub struct QueryActiveGuard {
 }
 
 impl QueryActiveGuard {
-    pub fn new(request_context: Arc<RequestContext>) -> Self {
+    fn new(request_context: Arc<RequestContext>) -> Self {
         let dimensions = request_context.to_protocol_dimensions();
 
         let active = request_context.entered_top_level_query();
@@ -2004,7 +2004,7 @@ where
 /// Returns true if `err` represents a query cancellation produced by
 /// [`attach_cancellation_to_stream`].
 #[must_use]
-pub fn is_cancellation_error(err: &DataFusionError) -> bool {
+pub(crate) fn is_cancellation_error(err: &DataFusionError) -> bool {
     let DataFusionError::External(source) = err else {
         return false;
     };
@@ -2016,7 +2016,7 @@ pub fn is_cancellation_error(err: &DataFusionError) -> bool {
 /// Returns true if `err` represents a query cancelled by the
 /// `runtime.query.timeout` timer, produced by [`attach_cancellation_to_stream`].
 #[must_use]
-pub fn is_timeout_error(err: &DataFusionError) -> bool {
+pub(crate) fn is_timeout_error(err: &DataFusionError) -> bool {
     let DataFusionError::External(source) = err else {
         return false;
     };
@@ -2177,7 +2177,7 @@ fn strip_root_order_preserving_repartition(
     Ok(plan)
 }
 
-pub fn write_to_json_string(
+pub(crate) fn write_to_json_string(
     data: &[RecordBatch],
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     if data.iter().any(record_batch_has_union_columns) {

@@ -84,7 +84,7 @@ impl ObjectStoreContext {
     }
 }
 
-pub(crate) fn get_prefix(url: &Url) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+fn get_prefix(url: &Url) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
     match url.scheme() {
         "ftp" | "sftp" => Ok(PathBuf::from(url.path())),
         _ => {
@@ -95,7 +95,7 @@ pub(crate) fn get_prefix(url: &Url) -> Result<PathBuf, Box<dyn std::error::Error
     }
 }
 
-pub(crate) fn parse_prefix_and_regex(
+fn parse_prefix_and_regex(
     url: &Url,
     extension: Option<String>,
 ) -> Result<(String, Option<String>), Box<dyn std::error::Error + Send + Sync>> {

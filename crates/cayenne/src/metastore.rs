@@ -46,7 +46,7 @@ use async_trait::async_trait;
 ///   of every upserted row. The gate below turns that latent silent-row-loss into
 ///   a loud [`CatalogError::IncompatibleSchemaVersion`] on any future downgrade to
 ///   a build whose max supported version is lower than the stamped one (#11291).
-pub const CAYENNE_METASTORE_SCHEMA_VERSION: i64 = 1;
+const CAYENNE_METASTORE_SCHEMA_VERSION: i64 = 1;
 
 /// Guard against opening a metastore that was written by a **newer** Spice build
 /// than this one supports.
@@ -66,7 +66,7 @@ pub const CAYENNE_METASTORE_SCHEMA_VERSION: i64 = 1;
 ///
 /// Returns [`CatalogError::IncompatibleSchemaVersion`] if `stored_version` is
 /// greater than [`CAYENNE_METASTORE_SCHEMA_VERSION`].
-pub fn ensure_supported_schema_version(stored_version: i64) -> CatalogResult<()> {
+fn ensure_supported_schema_version(stored_version: i64) -> CatalogResult<()> {
     if stored_version > CAYENNE_METASTORE_SCHEMA_VERSION {
         return Err(CatalogError::IncompatibleSchemaVersion {
             found: stored_version,
@@ -85,16 +85,16 @@ pub fn ensure_supported_schema_version(stored_version: i64) -> CatalogResult<()>
 #[derive(Debug, Clone)]
 pub struct ExpectedTable {
     /// The table name (e.g., `"cayenne_table"`).
-    pub name: &'static str,
+    name: &'static str,
     /// The ordered list of expected column names.
-    pub columns: &'static [&'static str],
+    columns: &'static [&'static str],
 }
 
 /// Expected schema definitions for all Cayenne metadata tables.
 ///
 /// These must be kept in sync with the DDL constants in `sqlite.rs` and `turso.rs`.
 /// When the schema changes, update both the DDL constants **and** these definitions.
-pub const EXPECTED_TABLES: &[ExpectedTable] = &[
+pub(crate) const EXPECTED_TABLES: &[ExpectedTable] = &[
     ExpectedTable {
         name: "cayenne_table",
         columns: &[
@@ -316,7 +316,7 @@ pub fn table_id_to_key_bytes(table_id: &str) -> Vec<u8> {
 ///
 /// Returns [`CatalogError::SchemaMismatch`] when the existing schema does not
 /// match the expected schema.
-pub async fn validate_existing_schema<F, Fut>(actual_columns_fn: F) -> CatalogResult<()>
+async fn validate_existing_schema<F, Fut>(actual_columns_fn: F) -> CatalogResult<()>
 where
     F: Fn(&'static str) -> Fut,
     Fut: std::future::Future<Output = CatalogResult<Vec<String>>>,

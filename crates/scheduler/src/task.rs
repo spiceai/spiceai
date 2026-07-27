@@ -29,9 +29,9 @@ pub trait ScheduledTask: Send + Sync {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaskRequest {
-    pub cancel_running: bool,
-    pub clear_queue: bool,
-    pub created_at: Instant,
+    pub(crate) cancel_running: bool,
+    pub(crate) clear_queue: bool,
+    pub(crate) created_at: Instant,
 }
 
 impl Default for TaskRequest {
@@ -42,7 +42,7 @@ impl Default for TaskRequest {
 
 impl TaskRequest {
     #[must_use]
-    pub fn new() -> Self {
+    fn new() -> Self {
         let now = Instant::now();
         Self {
             cancel_running: false,
@@ -52,13 +52,13 @@ impl TaskRequest {
     }
 
     #[must_use]
-    pub fn cancels_running(mut self) -> Self {
+    pub(crate) fn cancels_running(mut self) -> Self {
         self.cancel_running = true;
         self
     }
 
     #[must_use]
-    pub fn clears_queue(mut self) -> Self {
+    pub(crate) fn clears_queue(mut self) -> Self {
         self.clear_queue = true;
         self
     }

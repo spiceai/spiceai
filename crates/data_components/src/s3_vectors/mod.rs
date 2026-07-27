@@ -169,7 +169,7 @@ impl S3VectorIdentifier {
 
     /// Gets the bucket name for this identifier, if available.
     #[must_use]
-    pub fn bucket_name(&self) -> Option<&str> {
+    fn bucket_name(&self) -> Option<&str> {
         match self {
             Self::Index { bucket_name, .. } => Some(bucket_name),
             Self::IndexArn(_) => None,
@@ -178,7 +178,7 @@ impl S3VectorIdentifier {
 }
 
 /// Lists index names with the given prefix in the specified bucket.
-pub async fn list_index_names(
+pub(crate) async fn list_index_names(
     client: &Arc<dyn S3Vectors + Send + Sync>,
     bucket_name: &str,
     prefix: &str,

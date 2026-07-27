@@ -48,7 +48,7 @@ use tonic::async_trait;
 pub const CONNECTOR_NAME: &str = "kafka";
 
 /// Default max records to scan to infer the schema.
-pub const DEFAULT_SCHEMA_INFER_MAX_RECORD: usize = 1;
+const DEFAULT_SCHEMA_INFER_MAX_RECORD: usize = 1;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -74,7 +74,7 @@ pub struct Kafka {
 
 impl Kafka {
     #[expect(clippy::needless_pass_by_value)]
-    pub fn new(params: Parameters) -> Result<Self> {
+    fn new(params: Parameters) -> Result<Self> {
         let kafka_config = KafkaConfig {
             brokers: params
                 .get("bootstrap_servers")
@@ -209,7 +209,7 @@ impl KafkaFactory {
     }
 
     #[must_use]
-    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+    fn new_arc() -> Arc<dyn DataConnectorFactory> {
         Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
     }
 }
@@ -541,7 +541,7 @@ pub(crate) struct SidecarOffsetCommitHook<T> {
 }
 
 impl<T> SidecarOffsetCommitHook<T> {
-    pub(crate) fn new(store: Arc<T>) -> Self {
+    fn new(store: Arc<T>) -> Self {
         Self { store }
     }
 }
@@ -671,7 +671,7 @@ pub(crate) struct KafkaMetricsProvider {
 }
 
 impl KafkaMetricsProvider {
-    pub(crate) fn new(metrics: Arc<KafkaMetrics>) -> Self {
+    fn new(metrics: Arc<KafkaMetrics>) -> Self {
         Self { metrics }
     }
 }

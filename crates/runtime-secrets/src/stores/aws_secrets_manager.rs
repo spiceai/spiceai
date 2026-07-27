@@ -69,7 +69,7 @@ use crate::SecretStore;
 /// components with a consistent vocabulary. When `region` is omitted, the
 /// AWS SDK falls back to the standard credential-provider chain
 /// (`AWS_REGION` / `AWS_DEFAULT_REGION` / IMDS).
-pub const PARAMETERS: &[ParameterSpec] = &[
+pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("region")
         .description(
             "AWS region the Secrets Manager secret lives in. When omitted, the SDK \
@@ -113,12 +113,12 @@ pub const PARAMETERS: &[ParameterSpec] = &[
 /// would surface them via any `{:?}` print (panic dumps, log calls, etc.).
 #[derive(Clone)]
 pub struct AwsSecretsManagerConfig {
-    pub secret_name: String,
-    pub region: Option<String>,
-    pub endpoint_url: Option<String>,
-    pub access_key_id: Option<String>,
-    pub secret_access_key: Option<SecretString>,
-    pub session_token: Option<SecretString>,
+    pub(crate) secret_name: String,
+    pub(crate) region: Option<String>,
+    pub(crate) endpoint_url: Option<String>,
+    pub(crate) access_key_id: Option<String>,
+    pub(crate) secret_access_key: Option<SecretString>,
+    pub(crate) session_token: Option<SecretString>,
 }
 
 impl std::fmt::Debug for AwsSecretsManagerConfig {
@@ -144,7 +144,7 @@ impl AwsSecretsManagerConfig {
     /// Builds an [`AwsSecretsManagerConfig`] from the parsed selector and a
     /// validated parameter map.
     #[must_use]
-    pub fn from_params(secret_name: String, params: &HashMap<String, String>) -> Self {
+    pub(crate) fn from_params(secret_name: String, params: &HashMap<String, String>) -> Self {
         Self {
             secret_name,
             region: params.get("region").cloned(),
@@ -328,7 +328,7 @@ impl AwsSecretsManager {
     ///
     /// Returns [`Error::EmptySecretName`] if the configured secret name is
     /// empty or whitespace-only.
-    pub fn from_config(config: AwsSecretsManagerConfig) -> Result<Self> {
+    pub(crate) fn from_config(config: AwsSecretsManagerConfig) -> Result<Self> {
         let trimmed = config.secret_name.trim();
         if trimmed.is_empty() {
             return EmptySecretNameSnafu.fail();
@@ -722,7 +722,7 @@ impl SecretStore for AwsSecretsManager {
 /// # Errors
 ///
 /// Returns an error if the input is not valid JSON or is not a JSON object.
-pub fn parse_json_to_hashmap(json_str: &str) -> Result<HashMap<String, SecretString>> {
+fn parse_json_to_hashmap(json_str: &str) -> Result<HashMap<String, SecretString>> {
     let parsed: serde_json::Value =
         serde_json::from_str(json_str).context(UnableToParseJsonSnafu)?;
     let root = parsed.as_object().context(InvalidJsonFormatSnafu)?;

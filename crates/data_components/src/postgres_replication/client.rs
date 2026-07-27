@@ -37,30 +37,30 @@ use super::{
 };
 use crate::cdc::{ChangeEnvelope, ChangesStream, StreamError};
 
-pub struct WalStreamInput {
-    pub params: ReplicationParams,
-    pub slot_name: String,
-    pub publication_name: String,
-    pub start_lsn: u64,
-    pub schema: SchemaRef,
-    pub primary_keys: Vec<String>,
+pub(crate) struct WalStreamInput {
+    pub(crate) params: ReplicationParams,
+    pub(crate) slot_name: String,
+    pub(crate) publication_name: String,
+    pub(crate) start_lsn: u64,
+    pub(crate) schema: SchemaRef,
+    pub(crate) primary_keys: Vec<String>,
     /// `GENERATED` columns of the source table — absent from pgoutput
     /// `Relation` messages by Postgres design; tolerated during schema
     /// validation and applied as NULL.
-    pub generated_columns: Vec<String>,
-    pub dataset_name: String,
+    pub(crate) generated_columns: Vec<String>,
+    pub(crate) dataset_name: String,
     /// Dataset `on_schema_change` policy. With anything other than `Block`,
     /// pgoutput `Relation` messages are reconciled against the working schema
     /// (widening adopted, breaking changes surfaced as actionable errors).
-    pub schema_evolution_policy: SchemaEvolutionPolicy,
+    pub(crate) schema_evolution_policy: SchemaEvolutionPolicy,
     /// Lag-based readiness threshold. Each committed transaction's envelope is
     /// marked `is_dataset_ready` when its source commit time is within this of
     /// now, and a caught-up keepalive emits a heartbeat carrying the same
     /// verdict. The dataset therefore becomes Ready only once the stream has
     /// caught up to the source head — never merely because bootstrap finished.
-    pub ready_lag: Duration,
-    pub confirmed_flush: Arc<AtomicU64>,
-    pub metrics: Arc<ReplicationMetricsCollector>,
+    pub(crate) ready_lag: Duration,
+    pub(crate) confirmed_flush: Arc<AtomicU64>,
+    pub(crate) metrics: Arc<ReplicationMetricsCollector>,
 }
 
 /// Establish the replication connection and return a `ChangesStream`.
@@ -69,7 +69,7 @@ pub struct WalStreamInput {
 /// are handled internally by reconnecting with exponential backoff. Only
 /// *fatal* errors (authentication failure, slot dropped, schema mismatch) are
 /// surfaced to the caller.
-pub async fn start_wal_stream(input: WalStreamInput) -> Result<ChangesStream> {
+pub(crate) async fn start_wal_stream(input: WalStreamInput) -> Result<ChangesStream> {
     // Do one upfront connection attempt so startup errors (bad host, auth
     // failure, slot missing) surface immediately instead of being swallowed
     // by the reconnect loop. If it succeeds we hand the client to the stream;

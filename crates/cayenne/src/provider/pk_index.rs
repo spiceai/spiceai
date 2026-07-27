@@ -231,7 +231,7 @@ impl CachedPkKeyset {
     /// `pk_digest(&key)`), overwriting an existing entry's location. Lets the
     /// per-apply recording paths reuse the digest already stored in a
     /// [`PkDigestSet`] instead of re-hashing.
-    pub(crate) fn insert_with_digest(
+    fn insert_with_digest(
         &mut self,
         digest: u128,
         key: OwnedRow,
@@ -376,7 +376,7 @@ impl CachedPkKeyset {
     }
 
     /// Consume the keyset into `(key, location)` pairs (the shard split).
-    pub(crate) fn into_entries(self) -> impl Iterator<Item = (OwnedRow, RowLocation)> {
+    fn into_entries(self) -> impl Iterator<Item = (OwnedRow, RowLocation)> {
         self.keys
             .into_values()
             .map(|entry| (entry.row, entry.location))
@@ -436,7 +436,7 @@ fn pk_bloom_hash(bytes: &[u8], seed: u64) -> u64 {
 /// - Only valid for upsert. `DoNothing` needs an exact answer (a false positive
 ///   would wrongly drop a genuinely new row), so those tables keep the exact path.
 pub(crate) struct PkBloom {
-    pub(crate) bits: Vec<u64>,
+    bits: Vec<u64>,
     /// `num_bits - 1`; `num_bits` is a power of two so indexing masks instead of mods.
     pub(crate) bit_mask: u64,
     /// Keys inserted (observability + false-positive-rate estimation).
@@ -460,7 +460,7 @@ impl PkBloom {
     }
 
     /// Allocate with the largest power-of-two bit count `<= target_bits` (min 64).
-    pub(crate) fn with_num_bits_pow2(target_bits: usize) -> Self {
+    fn with_num_bits_pow2(target_bits: usize) -> Self {
         let num_bits: usize = 1usize << target_bits.max(64).ilog2();
         let words = (num_bits / 64).max(1);
         Self {
@@ -472,7 +472,7 @@ impl PkBloom {
 
     /// Serialize as `bit_mask(8) | inserted_keys(8) | num_words(8) | words(8·W)`,
     /// little-endian.
-    pub(crate) fn serialize_into(&self, out: &mut Vec<u8>) {
+    fn serialize_into(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.bit_mask.to_le_bytes());
         out.extend_from_slice(
             &u64::try_from(self.inserted_keys)
@@ -519,7 +519,7 @@ impl PkBloom {
         ))
     }
 
-    pub(crate) fn probe_bits(key: &[u8]) -> impl Iterator<Item = u64> {
+    fn probe_bits(key: &[u8]) -> impl Iterator<Item = u64> {
         let h1 = pk_bloom_hash(key, 0x517c_c1b7_2722_0a95);
         // Force odd so successive probes stride across the whole bit space.
         let h2 = pk_bloom_hash(key, 0x9e37_79b9_7f4a_7c15) | 1;

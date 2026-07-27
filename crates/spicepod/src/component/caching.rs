@@ -198,19 +198,19 @@ impl Default for SQLResultsCacheConfig {
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct ResultsCache {
     #[serde(default = "default_true")]
-    pub enabled: bool,
-    pub cache_max_size: Option<String>,
-    pub item_ttl: Option<String>,
+    enabled: bool,
+    cache_max_size: Option<String>,
+    item_ttl: Option<String>,
     #[serde(default, alias = "eviction_policy")]
-    pub caching_policy: CachingPolicy,
+    caching_policy: CachingPolicy,
     #[serde(default)]
-    pub cache_key_type: CacheKeyType,
+    cache_key_type: CacheKeyType,
     #[serde(default)]
-    pub hashing_algorithm: HashingAlgorithm,
+    hashing_algorithm: HashingAlgorithm,
     #[serde(default)]
-    pub engine: CacheEngine,
+    engine: CacheEngine,
     /// Maximum stale-while-revalidate duration to add to the cache TTL.
-    pub max_stale_while_revalidate: Option<String>,
+    max_stale_while_revalidate: Option<String>,
 }
 
 impl Default for ResultsCache {

@@ -18,7 +18,7 @@ limitations under the License.
 
 mod table;
 
-pub use table::{TableOutput, TableRow, write_table};
+pub(crate) use table::{TableOutput, TableRow, write_table};
 
 use crate::error::{InvalidResponseSnafu, Result};
 use serde::Serialize;
@@ -35,7 +35,7 @@ pub enum OutputFormat {
 }
 
 /// Serialize `data` to pretty-printed JSON and print to stdout.
-pub fn write_json<T: Serialize>(data: &T) -> Result<()> {
+pub(crate) fn write_json<T: Serialize>(data: &T) -> Result<()> {
     let json = serde_json::to_string_pretty(data).map_err(|e| {
         InvalidResponseSnafu {
             message: format!("Failed to serialize to JSON: {e}"),

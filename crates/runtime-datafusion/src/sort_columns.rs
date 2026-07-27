@@ -44,7 +44,7 @@ pub struct SortColumn {
 
 impl SortColumn {
     #[must_use]
-    pub fn new(column: String, direction: SortDirection) -> Self {
+    fn new(column: String, direction: SortDirection) -> Self {
         Self {
             column,
             direction,

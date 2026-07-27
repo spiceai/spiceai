@@ -70,7 +70,7 @@ impl SpiceAiModelLister {
 
     /// Returns common Spice Cloud model names as a fallback.
     #[must_use]
-    pub fn common_models() -> Vec<String> {
+    fn common_models() -> Vec<String> {
         vec![
             "openai/gpt-4o".to_string(),
             "openai/gpt-4o-mini".to_string(),

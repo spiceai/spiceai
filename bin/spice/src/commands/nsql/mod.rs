@@ -49,10 +49,10 @@ Docs: https://spiceai.org/docs"#
 pub struct NsqlArgs {
     /// Model id to use for text-to-SQL (must be registered in `spicepod.yaml`).
     #[arg(long, short)]
-    pub model: Option<String>,
+    model: Option<String>,
 
     #[command(subcommand)]
-    pub command: Option<NsqlCommands>,
+    command: Option<NsqlCommands>,
 }
 
 /// NSQL subcommands.

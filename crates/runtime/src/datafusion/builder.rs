@@ -366,7 +366,7 @@ impl Default for CayenneOptimizerRules {
     }
 }
 
-pub struct DataFusionBuilder {
+pub(crate) struct DataFusionBuilder {
     config: SessionConfig,
     status: Arc<status::RuntimeStatus>,
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
@@ -422,7 +422,7 @@ impl DataFusionBuilder {
     ///
     /// Panics if a managed Tokio runtime cannot be created. This indicates a bug in the runtime initialization.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         status: Arc<status::RuntimeStatus>,
         accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
         io_runtime: Handle,
@@ -469,61 +469,61 @@ impl DataFusionBuilder {
     }
 
     #[must_use]
-    pub fn with_task_history(mut self, task_history: bool) -> Self {
+    pub(crate) fn with_task_history(mut self, task_history: bool) -> Self {
         self.task_history_enabled = task_history;
         self
     }
 
     #[must_use]
-    pub fn with_caching(mut self, caching: Arc<Caching>) -> Self {
+    pub(crate) fn with_caching(mut self, caching: Arc<Caching>) -> Self {
         self.caching = Some(caching);
         self
     }
 
     #[must_use]
-    pub fn with_cluster_config(mut self, config: ResolvedClusterConfig) -> Self {
+    pub(crate) fn with_cluster_config(mut self, config: ResolvedClusterConfig) -> Self {
         self.cluster_config = Some(Arc::new(config));
         self
     }
 
     #[must_use]
-    pub fn memory_limit(mut self, memory_limit: Option<u64>) -> Self {
+    pub(crate) fn memory_limit(mut self, memory_limit: Option<u64>) -> Self {
         self.memory_limit = memory_limit;
         self
     }
 
     #[must_use]
-    pub fn target_partitions(mut self, target_partitions: Option<usize>) -> Self {
+    pub(crate) fn target_partitions(mut self, target_partitions: Option<usize>) -> Self {
         self.target_partitions = target_partitions;
         self
     }
 
     #[must_use]
-    pub fn prefer_hash_join(mut self, prefer_hash_join: Option<bool>) -> Self {
+    pub(crate) fn prefer_hash_join(mut self, prefer_hash_join: Option<bool>) -> Self {
         self.prefer_hash_join = prefer_hash_join;
         self
     }
 
     #[must_use]
-    pub fn eager_aggregation(mut self, eager_aggregation: Option<bool>) -> Self {
+    pub(crate) fn eager_aggregation(mut self, eager_aggregation: Option<bool>) -> Self {
         self.eager_aggregation = eager_aggregation;
         self
     }
 
     #[must_use]
-    pub fn eager_aggregation_min_reduction_factor(mut self, factor: Option<usize>) -> Self {
+    pub(crate) fn eager_aggregation_min_reduction_factor(mut self, factor: Option<usize>) -> Self {
         self.eager_aggregation_min_reduction_factor = factor;
         self
     }
 
     #[must_use]
-    pub fn eager_aggregation_max_pushed_groups(mut self, cap: Option<usize>) -> Self {
+    pub(crate) fn eager_aggregation_max_pushed_groups(mut self, cap: Option<usize>) -> Self {
         self.eager_aggregation_max_pushed_groups = cap;
         self
     }
 
     #[must_use]
-    pub fn spill_compression(mut self, spill_compression: Option<SpiceSpillCompression>) -> Self {
+    pub(crate) fn spill_compression(mut self, spill_compression: Option<SpiceSpillCompression>) -> Self {
         self.spill_compression = match spill_compression {
             Some(SpiceSpillCompression::Zstd) => Some(SpillCompression::Zstd),
             Some(SpiceSpillCompression::Lz4Frame) => Some(SpillCompression::Lz4Frame),
@@ -534,13 +534,13 @@ impl DataFusionBuilder {
     }
 
     #[must_use]
-    pub fn temp_directory(mut self, temp_directory: Option<String>) -> Self {
+    pub(crate) fn temp_directory(mut self, temp_directory: Option<String>) -> Self {
         self.temp_directory = temp_directory;
         self
     }
 
     #[must_use]
-    pub fn max_parallel_accelerated_refreshes(
+    pub(crate) fn max_parallel_accelerated_refreshes(
         mut self,
         max_parallel_accelerated_refreshes: usize,
     ) -> Self {
@@ -555,20 +555,20 @@ impl DataFusionBuilder {
     /// behavior); `Some(n)` installs a semaphore of `n` permits (clamped to at
     /// least 1).
     #[must_use]
-    pub fn max_concurrent_queries(mut self, max_concurrent_queries: Option<usize>) -> Self {
+    pub(crate) fn max_concurrent_queries(mut self, max_concurrent_queries: Option<usize>) -> Self {
         self.query_admission_semaphore =
             max_concurrent_queries.map(|n| Arc::new(Semaphore::new(n.max(1))));
         self
     }
 
     #[must_use]
-    pub fn with_metrics(mut self, metrics: Option<Metrics>) -> Self {
+    pub(crate) fn with_metrics(mut self, metrics: Option<Metrics>) -> Self {
         self.metrics = metrics;
         self
     }
 
     #[must_use]
-    pub fn with_resource_monitor(
+    pub(crate) fn with_resource_monitor(
         mut self,
         monitor: crate::resource_monitor::ResourceMonitor,
     ) -> Self {
@@ -588,25 +588,25 @@ impl DataFusionBuilder {
     ///     url_tables: enabled
     /// ```
     #[must_use]
-    pub fn with_url_tables(mut self, enabled: bool) -> Self {
+    pub(crate) fn with_url_tables(mut self, enabled: bool) -> Self {
         self.url_tables_enabled = enabled;
         self
     }
 
     #[must_use]
-    pub fn cayenne_sort_merge_min_rows(mut self, min_rows: Option<usize>) -> Self {
+    pub(crate) fn cayenne_sort_merge_min_rows(mut self, min_rows: Option<usize>) -> Self {
         self.cayenne_sort_merge_min_rows = min_rows;
         self
     }
 
     #[must_use]
-    pub fn cayenne_sort_merge_memory_pool_fraction(mut self, fraction: Option<f64>) -> Self {
+    pub(crate) fn cayenne_sort_merge_memory_pool_fraction(mut self, fraction: Option<f64>) -> Self {
         self.cayenne_sort_merge_memory_pool_fraction = fraction;
         self
     }
 
     #[must_use]
-    pub fn cayenne_footer_cache_mb(mut self, footer_cache_mb: Option<usize>) -> Self {
+    pub(crate) fn cayenne_footer_cache_mb(mut self, footer_cache_mb: Option<usize>) -> Self {
         self.cayenne_footer_cache_mb = footer_cache_mb;
         self
     }
@@ -616,7 +616,7 @@ impl DataFusionBuilder {
     /// Used to reduce the query-memory default when it exceeds the base host/10
     /// headroom. Set by the Runtime builder; `0` disables the reduction.
     #[must_use]
-    pub fn cayenne_cdc_reservation_bytes(mut self, bytes: u64) -> Self {
+    pub(crate) fn cayenne_cdc_reservation_bytes(mut self, bytes: u64) -> Self {
         self.cayenne_cdc_reservation_bytes = bytes;
         self
     }
@@ -625,7 +625,7 @@ impl DataFusionBuilder {
     /// memory limit. Set by the Runtime builder only when Cayenne acceleration
     /// is configured and dedicated thread pools are enabled.
     #[must_use]
-    pub fn compaction_memory_fraction(mut self, fraction: Option<f64>) -> Self {
+    pub(crate) fn compaction_memory_fraction(mut self, fraction: Option<f64>) -> Self {
         self.compaction_memory_fraction = fraction;
         self
     }
@@ -638,7 +638,7 @@ impl DataFusionBuilder {
     /// control over individual logical rules, use the
     /// `runtime.params.cayenne_optimizer_rules` config path instead.
     #[must_use]
-    pub fn cayenne_filter_propagation_enabled(mut self, enabled: bool) -> Self {
+    fn cayenne_filter_propagation_enabled(mut self, enabled: bool) -> Self {
         self.cayenne_optimizer_rules.set_filter_propagation(enabled);
         self.cayenne_optimizer_rules.set_inlist_to_range(enabled);
         self
@@ -659,14 +659,14 @@ impl DataFusionBuilder {
 
     /// Sets the executor registry for distributed write forwarding (scheduler mode only).
     #[must_use]
-    pub fn with_executor_registry(mut self, registry: Arc<ExecutorRegistry>) -> Self {
+    pub(crate) fn with_executor_registry(mut self, registry: Arc<ExecutorRegistry>) -> Self {
         self.executor_registry = Some(registry);
         self
     }
 
     /// Sets the partition service for discovery and assignment of partitions (scheduler mode only).
     #[must_use]
-    pub fn with_partition_service(mut self, service: Arc<PartitionService>) -> Self {
+    pub(crate) fn with_partition_service(mut self, service: Arc<PartitionService>) -> Self {
         self.partition_service = Some(service);
         self
     }
@@ -674,7 +674,7 @@ impl DataFusionBuilder {
     /// Sets the partition load tracker used to aggregate executor
     /// `PartitionsLoaded` acks (scheduler mode only).
     #[must_use]
-    pub fn with_partition_load_tracker(
+    pub(crate) fn with_partition_load_tracker(
         mut self,
         tracker: Arc<runtime_cluster::PartitionLoadTracker>,
     ) -> Self {
@@ -688,7 +688,7 @@ impl DataFusionBuilder {
     ///
     /// Panics if the `DataFusion` instance cannot be built due to errors in registering functions or schemas.
     #[must_use]
-    pub fn build(self) -> DataFusion {
+    pub(crate) fn build(self) -> DataFusion {
         let mut config = self.config;
         // Request a dedicated compaction memory budget when a fraction is
         // configured (Cayenne acceleration + dedicated thread pools). Its presence
@@ -1438,7 +1438,7 @@ impl AnalyzerRulesBuilder {
     }
 
     #[must_use]
-    pub fn include_federation(mut self, include: bool) -> Self {
+    pub(crate) fn include_federation(mut self, include: bool) -> Self {
         self.include_federation = include;
         self
     }
@@ -1805,7 +1805,7 @@ fn build_compaction_runtime_env(
     }
 }
 
-pub(crate) fn default_extension_planners(
+fn default_extension_planners(
     _executor_registry: Option<Arc<ExecutorRegistry>>,
     _io_runtime: tokio::runtime::Handle,
 ) -> Vec<Arc<dyn ExtensionPlanner + Send + Sync>> {

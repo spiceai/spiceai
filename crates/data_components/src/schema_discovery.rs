@@ -90,13 +90,13 @@ pub enum SchemaDiscoveryWarning {
 /// Outcome of parallel schema discovery.
 #[derive(Debug)]
 pub struct SchemaDiscoveryResult {
-    pub schema: SchemaRef,
-    pub warnings: Vec<SchemaDiscoveryWarning>,
+    pub(crate) schema: SchemaRef,
+    warnings: Vec<SchemaDiscoveryWarning>,
 }
 
 impl SchemaDiscoveryResult {
     /// Logs all warnings using `tracing::warn`.
-    pub fn log_warnings(&self, table: impl std::fmt::Display) {
+    pub(crate) fn log_warnings(&self, table: impl std::fmt::Display) {
         for warning in &self.warnings {
             match warning {
                 SchemaDiscoveryWarning::MetadataFallback { reason, nuance } => {
@@ -126,7 +126,7 @@ impl SchemaDiscoveryResult {
 /// | *           | *           | Ok             | use metadata schema |
 /// | *           | Ok          | Failed/Denied  | warn + use direct schema |
 /// | *           | Failed      | Failed         | propagate error |
-pub async fn discover_schema(
+pub(crate) async fn discover_schema(
     table_name: &str,
     metadata_probe: impl Future<Output = SchemaProbeResult> + Send,
     direct_probe: impl Future<Output = SchemaProbeResult> + Send,

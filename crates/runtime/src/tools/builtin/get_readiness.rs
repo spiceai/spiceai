@@ -30,7 +30,7 @@ pub struct GetReadinessTool {
 
 impl GetReadinessTool {
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         status: Arc<status::RuntimeStatus>,
         name: Option<&str>,
         description: Option<&str>,

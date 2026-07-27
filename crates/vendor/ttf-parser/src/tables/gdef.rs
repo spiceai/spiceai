@@ -33,7 +33,7 @@ pub struct Table<'a> {
 
 impl<'a> Table<'a> {
     /// Parses a table from raw data.
-    pub fn parse(data: &'a [u8]) -> Option<Self> {
+    pub(crate) fn parse(data: &'a [u8]) -> Option<Self> {
         let mut s = Stream::new(data);
         let version = s.read::<u32>()?;
         if !(version == 0x00010000 || version == 0x00010002 || version == 0x00010003) {

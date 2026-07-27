@@ -137,7 +137,7 @@ impl App {
 
 #[derive(Debug, Deserialize)]
 pub struct AppsResponse {
-    pub apps: Vec<App>,
+    pub(crate) apps: Vec<App>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -152,19 +152,19 @@ pub struct AppExecutor {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppConfig {
-    pub spicepod: Option<serde_json::Value>,
-    pub registry: Option<String>,
-    pub image: Option<String>,
-    pub image_tag: Option<String>,
-    pub update_channel: Option<String>,
-    pub replicas: Option<i32>,
-    pub resources: Option<AppResources>,
-    pub executor: Option<AppExecutor>,
-    pub region: Option<String>,
-    pub node_group: Option<String>,
-    pub storage_size_gb: Option<f64>,
+    spicepod: Option<serde_json::Value>,
+    registry: Option<String>,
+    image: Option<String>,
+    image_tag: Option<String>,
+    update_channel: Option<String>,
+    replicas: Option<i32>,
+    resources: Option<AppResources>,
+    executor: Option<AppExecutor>,
+    region: Option<String>,
+    node_group: Option<String>,
+    storage_size_gb: Option<f64>,
     /// Deprecated: Use `storage_size_gb` instead.
-    pub storage_claim_size_gb: Option<f64>,
+    storage_claim_size_gb: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -254,23 +254,23 @@ pub struct Deployment {
     #[serde(default)]
     pub status: String,
     pub created_at: Option<String>,
-    pub updated_at: Option<String>,
-    pub started_at: Option<String>,
-    pub finished_at: Option<String>,
-    pub image: Option<String>,
+    updated_at: Option<String>,
+    started_at: Option<String>,
+    finished_at: Option<String>,
+    image: Option<String>,
     pub image_tag: Option<String>,
     pub replicas: Option<i32>,
-    pub branch: Option<String>,
-    pub commit_sha: Option<String>,
-    pub commit_message: Option<String>,
+    branch: Option<String>,
+    commit_sha: Option<String>,
+    commit_message: Option<String>,
     pub error_message: Option<String>,
-    pub creation_source: Option<String>,
-    pub created_by: Option<serde_json::Value>,
+    creation_source: Option<String>,
+    created_by: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct DeploymentsResponse {
-    pub deployments: Vec<Deployment>,
+    pub(crate) deployments: Vec<Deployment>,
 }
 
 #[derive(Debug, Serialize)]
@@ -326,7 +326,7 @@ pub struct RegionsResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContainerImage {
-    pub name: Option<String>,
+    name: Option<String>,
     pub tag: String,
     pub channel: Option<String>,
 }
@@ -343,22 +343,22 @@ pub struct ContainerImagesResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Secret {
-    pub id: Option<i64>,
+    id: Option<i64>,
     pub name: String,
     pub value: Option<String>,
-    pub created_at: Option<String>,
+    created_at: Option<String>,
     pub updated_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct SecretsResponse {
-    pub secrets: Vec<Secret>,
+    pub(crate) secrets: Vec<Secret>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct SetSecretRequest {
-    pub name: String,
-    pub value: String,
+    pub(crate) name: String,
+    pub(crate) value: String,
 }
 
 // ============================================================================
@@ -370,7 +370,7 @@ pub struct LogEntry {
     pub timestamp: Option<String>,
     pub level: Option<String>,
     pub message: String,
-    pub source: Option<String>,
+    source: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -392,12 +392,12 @@ pub struct ApiKeysResponse {
 pub struct RegenerateApiKeyResponse {
     pub api_key: Option<String>,
     pub api_key_2: Option<String>,
-    pub regenerated_key: Option<u8>,
+    regenerated_key: Option<u8>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct RegenerateApiKeyRequest {
-    pub key_number: u8,
+    pub(crate) key_number: u8,
 }
 
 // ============================================================================
@@ -450,15 +450,15 @@ pub struct AuthExchangeResponse {
 // exchangeable for an access token, so treat it like a secret.
 #[derive(Serialize)]
 pub struct AuthExchangeRequest<'a> {
-    pub code: &'a str,
+    pub(crate) code: &'a str,
 }
 
 // Debug is intentionally not derived: client_secret must not appear in logs or error output.
 #[derive(Serialize)]
 pub struct OAuthTokenRequest<'a> {
-    pub client_id: &'a str,
-    pub client_secret: &'a str,
-    pub grant_type: &'static str,
+    pub(crate) client_id: &'a str,
+    pub(crate) client_secret: &'a str,
+    pub(crate) grant_type: &'static str,
 }
 
 // Debug is intentionally not derived: access_token must not appear in logs or error output.
@@ -484,24 +484,24 @@ pub struct AuthContext {
 #[derive(Deserialize)]
 pub struct AuthContextRaw {
     #[serde(default)]
-    pub username: String,
+    pub(crate) username: String,
     #[serde(default)]
-    pub email: String,
+    pub(crate) email: String,
     #[serde(default)]
-    pub org: Option<AuthContextOrg>,
+    pub(crate) org: Option<AuthContextOrg>,
     #[serde(default)]
-    pub app: Option<AuthContextApp>,
+    pub(crate) app: Option<AuthContextApp>,
 }
 
 #[derive(Deserialize)]
 pub struct AuthContextOrg {
-    pub name: Option<String>,
+    pub(crate) name: Option<String>,
 }
 
 #[derive(Deserialize)]
 pub struct AuthContextApp {
-    pub name: Option<String>,
-    pub api_key: Option<String>,
+    pub(crate) name: Option<String>,
+    pub(crate) api_key: Option<String>,
 }
 
 impl From<AuthContextRaw> for AuthContext {

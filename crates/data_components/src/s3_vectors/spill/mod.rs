@@ -30,15 +30,15 @@ use crate::s3_vectors::{S3VectorIdentifier, S3VectorsTable, list_index_names};
 const SPILL_SEPARATOR: &str = "-";
 
 /// Maximum sequence number for spill indexes (00-99).
-pub const MAX_SPILL_SEQUENCE: u8 = 99;
+const MAX_SPILL_SEQUENCE: u8 = 99;
 
 /// Represents a spill index with its base name and sequence number.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpillIndex {
     /// The base index name (without spill suffix).
-    pub base_name: String,
+    base_name: String,
     /// The spill sequence number (0-99).
-    pub sequence: u8,
+    sequence: u8,
 }
 
 #[derive(Debug, PartialEq, Snafu)]
@@ -71,7 +71,7 @@ impl SpillIndex {
     }
 
     /// Parses a spill index name into its components.
-    pub fn parse(index_name: &str) -> Result<Option<Self>> {
+    fn parse(index_name: &str) -> Result<Option<Self>> {
         let parts: Vec<&str> = index_name.split(SPILL_SEPARATOR).collect();
 
         if parts.len() < 2 {
@@ -127,7 +127,7 @@ impl SpillIndex {
 
     /// Gets all index names (main + spills) that belong to a virtual index.
     #[must_use]
-    pub fn get_all_indexes_for_virtual_index(
+    fn get_all_indexes_for_virtual_index(
         virtual_index_name: &str,
         all_indexes: &[String],
     ) -> Vec<String> {
@@ -169,7 +169,7 @@ pub async fn get_last_spill_index_for_virtual_index(
 
 /// Returns the current index identifier, accounting for spilling.
 #[must_use]
-pub fn current_index(idx: &S3VectorIdentifier, spill_index: &Arc<AtomicU8>) -> S3VectorIdentifier {
+pub(crate) fn current_index(idx: &S3VectorIdentifier, spill_index: &Arc<AtomicU8>) -> S3VectorIdentifier {
     let spill_num = spill_index.load(Ordering::SeqCst);
     if spill_num == 0 {
         idx.clone()
@@ -191,7 +191,7 @@ pub fn current_index(idx: &S3VectorIdentifier, spill_index: &Arc<AtomicU8>) -> S
 ///
 /// # Errors
 /// Returns an error if there is no next index
-pub fn next_index(
+pub(crate) fn next_index(
     idx: &S3VectorIdentifier,
     spill_index: &Arc<AtomicU8>,
 ) -> Result<S3VectorIdentifier, super::Error> {

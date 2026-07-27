@@ -1,6 +1,6 @@
 use crate::parser::{FromData, NumFrom, Stream, U24};
 
-pub trait IndexSize: FromData {
+pub(crate) trait IndexSize: FromData {
     fn to_u32(self) -> u32;
 }
 
@@ -17,7 +17,7 @@ impl IndexSize for u32 {
 }
 
 #[inline]
-pub fn parse_index<'a, T: IndexSize>(s: &mut Stream<'a>) -> Option<Index<'a>> {
+pub(crate) fn parse_index<'a, T: IndexSize>(s: &mut Stream<'a>) -> Option<Index<'a>> {
     let count = s.read::<T>()?;
     parse_index_impl(count.to_u32(), s)
 }
@@ -46,7 +46,7 @@ fn parse_index_impl<'a>(count: u32, s: &mut Stream<'a>) -> Option<Index<'a>> {
 }
 
 #[inline]
-pub fn skip_index<T: IndexSize>(s: &mut Stream) -> Option<()> {
+pub(crate) fn skip_index<T: IndexSize>(s: &mut Stream) -> Option<()> {
     let count = s.read::<T>()?;
     skip_index_impl(count.to_u32(), s)
 }
@@ -73,12 +73,12 @@ fn skip_index_impl(count: u32, s: &mut Stream) -> Option<()> {
 
 #[derive(Clone, Copy, Debug)]
 pub struct VarOffsets<'a> {
-    pub data: &'a [u8],
-    pub offset_size: OffsetSize,
+    data: &'a [u8],
+    offset_size: OffsetSize,
 }
 
 impl<'a> VarOffsets<'a> {
-    pub fn get(&self, index: u32) -> Option<u32> {
+    fn get(&self, index: u32) -> Option<u32> {
         if index >= self.len() {
             return None;
         }
@@ -98,7 +98,7 @@ impl<'a> VarOffsets<'a> {
     }
 
     #[inline]
-    pub fn last(&self) -> Option<u32> {
+    fn last(&self) -> Option<u32> {
         if !self.is_empty() {
             self.get(self.len() - 1)
         } else {
@@ -107,20 +107,20 @@ impl<'a> VarOffsets<'a> {
     }
 
     #[inline]
-    pub fn len(&self) -> u32 {
+    fn len(&self) -> u32 {
         self.data.len() as u32 / self.offset_size as u32
     }
 
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.len() == 0
     }
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct Index<'a> {
-    pub data: &'a [u8],
-    pub offsets: VarOffsets<'a>,
+    data: &'a [u8],
+    offsets: VarOffsets<'a>,
 }
 
 impl<'a> Default for Index<'a> {
@@ -151,12 +151,12 @@ impl<'a> IntoIterator for Index<'a> {
 
 impl<'a> Index<'a> {
     #[inline]
-    pub fn len(&self) -> u32 {
+    pub(crate) fn len(&self) -> u32 {
         // Last offset points to the byte after the `Object data`. We should skip it.
         self.offsets.len().saturating_sub(1)
     }
 
-    pub fn get(&self, index: u32) -> Option<&'a [u8]> {
+    pub(crate) fn get(&self, index: u32) -> Option<&'a [u8]> {
         let next_index = index.checked_add(1)?; // make sure we do not overflow
         let start = usize::num_from(self.offsets.get(index)?);
         let end = usize::num_from(self.offsets.get(next_index)?);
@@ -194,11 +194,11 @@ pub enum OffsetSize {
 
 impl OffsetSize {
     #[inline]
-    pub fn to_u32(self) -> u32 {
+    fn to_u32(self) -> u32 {
         self as u32
     }
     #[inline]
-    pub fn to_usize(self) -> usize {
+    fn to_usize(self) -> usize {
         self as usize
     }
 }

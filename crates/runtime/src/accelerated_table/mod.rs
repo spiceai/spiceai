@@ -63,7 +63,7 @@ use tokio::sync::{Mutex, Notify, RwLock, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 
 pub mod caching;
-pub mod federation;
+pub(crate) mod federation;
 pub mod refresh;
 pub mod refresh_task;
 mod refresh_task_runner;
@@ -390,7 +390,7 @@ pub struct Builder {
 }
 
 impl Builder {
-    pub fn new(
+    fn new(
         runtime_status: Arc<status::RuntimeStatus>,
         dataset_name: TableReference,
         federated: Arc<FederatedTable>,
@@ -444,17 +444,17 @@ impl Builder {
     /// Override the schema reported by the resulting [`AcceleratedTable`] to
     /// query planners. Used by caching mode to hide the internal namespace
     /// storage column from users.
-    pub fn user_facing_schema(&mut self, schema: SchemaRef) -> &mut Self {
+    pub(crate) fn user_facing_schema(&mut self, schema: SchemaRef) -> &mut Self {
         self.user_facing_schema = Some(schema);
         self
     }
 
-    pub fn cluster_role(&mut self, role: Option<ClusterRole>) -> &mut Self {
+    pub(crate) fn cluster_role(&mut self, role: Option<ClusterRole>) -> &mut Self {
         self.cluster_role = role;
         self
     }
 
-    pub fn acceleration_layout(
+    pub(crate) fn acceleration_layout(
         &mut self,
         layout: runtime_acceleration::snapshot::AccelerationLayout,
     ) -> &mut Self {
@@ -467,34 +467,34 @@ impl Builder {
         self
     }
 
-    pub fn zero_results_action(&mut self, zero_results_action: ZeroResultsAction) -> &mut Self {
+    pub(crate) fn zero_results_action(&mut self, zero_results_action: ZeroResultsAction) -> &mut Self {
         self.zero_results_action = zero_results_action;
         self
     }
 
-    pub fn refresh_on_startup(&mut self, refresh_on_startup: RefreshOnStartup) -> &mut Self {
+    pub(crate) fn refresh_on_startup(&mut self, refresh_on_startup: RefreshOnStartup) -> &mut Self {
         self.refresh_on_startup = refresh_on_startup;
         self
     }
 
-    pub fn ready_state(&mut self, ready_state: ReadyState) -> &mut Self {
+    pub(crate) fn ready_state(&mut self, ready_state: ReadyState) -> &mut Self {
         self.ready_state = ready_state;
         self
     }
 
-    pub fn caching(&mut self, caching: Option<Arc<Caching>>) -> &mut Self {
+    pub(crate) fn caching(&mut self, caching: Option<Arc<Caching>>) -> &mut Self {
         self.caching = caching;
         self
     }
 
-    pub fn disable_federation(&mut self) -> &mut Self {
+    pub(crate) fn disable_federation(&mut self) -> &mut Self {
         self.disable_federation = true;
         self
     }
 
     /// Returns a clone of the accelerator `Arc`.
     #[must_use]
-    pub fn get_accelerator(&self) -> Arc<dyn TableProvider> {
+    pub(crate) fn get_accelerator(&self) -> Arc<dyn TableProvider> {
         Arc::clone(&self.accelerator)
     }
 
@@ -502,13 +502,13 @@ impl Builder {
     ///
     /// This must be called **before** [`build`](Self::build) so that the
     /// refresher (created during build) receives the updated provider.
-    pub fn set_accelerator(&mut self, accelerator: Arc<dyn TableProvider>) {
+    pub(crate) fn set_accelerator(&mut self, accelerator: Arc<dyn TableProvider>) {
         self.accelerator = accelerator;
     }
 
     /// Set to only write to the accelerator (not replicate to federated source).
     /// This is used when `on_conflict` is configured - writes go only to the accelerator.
-    pub fn write_to_accelerator_only(&mut self) -> &mut Self {
+    pub(crate) fn write_to_accelerator_only(&mut self) -> &mut Self {
         self.write_to_accelerator_only = true;
         self
     }
@@ -517,24 +517,24 @@ impl Builder {
     /// and the local Cayenne accelerator using staged append/commit/rollback semantics.
     /// Reserved for the Iceberg federated catalog cache path — not driven by the
     /// user-facing `write_mode: write_through` setting.
-    pub fn dual_write(&mut self) -> &mut Self {
+    pub(crate) fn dual_write(&mut self) -> &mut Self {
         self.dual_write = true;
         self
     }
 
     /// Enable write-back mode: writes commit to the local accelerator first,
     /// then asynchronously persist to the federated source.
-    pub fn write_back(&mut self) -> &mut Self {
+    pub(crate) fn write_back(&mut self) -> &mut Self {
         self.write_back = true;
         self
     }
 
-    pub fn refresh_semaphore(&mut self, refresh_semaphore: Arc<Semaphore>) -> &mut Self {
+    pub(crate) fn refresh_semaphore(&mut self, refresh_semaphore: Arc<Semaphore>) -> &mut Self {
         self.refresh_semaphore = Some(refresh_semaphore);
         self
     }
 
-    pub fn metrics(&mut self, metrics: Metrics) -> &mut Self {
+    pub(crate) fn metrics(&mut self, metrics: Metrics) -> &mut Self {
         self.metrics = Some(metrics);
         self
     }
@@ -544,12 +544,12 @@ impl Builder {
         self
     }
 
-    pub fn cdc_apply_runtime(&mut self, runtime: Option<Handle>) -> &mut Self {
+    pub(crate) fn cdc_apply_runtime(&mut self, runtime: Option<Handle>) -> &mut Self {
         self.cdc_apply_runtime = runtime;
         self
     }
 
-    pub fn with_resource_monitor(
+    pub(crate) fn with_resource_monitor(
         &mut self,
         monitor: crate::resource_monitor::ResourceMonitor,
     ) -> &mut Self {
@@ -558,13 +558,13 @@ impl Builder {
     }
 
     /// Set the changes stream for the accelerated table
-    pub fn changes_stream(&mut self, changes_stream: ChangesStream) -> &mut Self {
+    pub(crate) fn changes_stream(&mut self, changes_stream: ChangesStream) -> &mut Self {
         self.changes_stream = Some(changes_stream);
         self
     }
 
     /// Set the append stream for the accelerated table
-    pub fn append_stream(&mut self, append_stream: ChangesStream) -> &mut Self {
+    pub(crate) fn append_stream(&mut self, append_stream: ChangesStream) -> &mut Self {
         self.append_stream = Some(append_stream);
         self
     }
@@ -576,7 +576,7 @@ impl Builder {
     }
 
     /// Set the checkpointer for the accelerated table
-    pub fn checkpointer_opt(
+    pub(crate) fn checkpointer_opt(
         &mut self,
         checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     ) -> &mut Self {
@@ -594,7 +594,7 @@ impl Builder {
     ///
     /// Handling append/changes mode should be possible, but requires more care to ensure
     /// that delta updates are applied correctly after the initial table scan.
-    pub async fn synchronize_with(
+    pub(crate) async fn synchronize_with(
         &mut self,
         existing_accelerated_table: &AcceleratedTable,
     ) -> AcceleratedTableBuilderResult<&mut Self> {
@@ -623,13 +623,13 @@ impl Builder {
     /// Tell the accelerated table that an initial load has already been completed, via a previous dataset checkpoint.
     ///
     /// This will allow the table to be marked as ready immediately.
-    pub fn initial_load_complete(&mut self, initial_load_complete: bool) -> &mut Self {
+    pub(crate) fn initial_load_complete(&mut self, initial_load_complete: bool) -> &mut Self {
         self.initial_load_complete = initial_load_complete;
         self
     }
 
     /// Configure whether snapshots are taken of the accelerated table after refreshes.
-    pub fn snapshot_creation_config(
+    pub(crate) fn snapshot_creation_config(
         &mut self,
         snapshot_config: Option<SnapshotCreationConfig>,
     ) -> &mut Self {
@@ -639,7 +639,7 @@ impl Builder {
 
     /// Configure per-dataset state for `RefreshMode::Snapshot`. Required when
     /// the refresh mode is Snapshot.
-    pub fn snapshot_refresh_state(
+    pub(crate) fn snapshot_refresh_state(
         &mut self,
         state: Option<snapshots::SnapshotRefreshState>,
     ) -> &mut Self {
@@ -648,13 +648,13 @@ impl Builder {
     }
 
     /// Set the TTL for cache mode
-    pub fn caching_ttl(&mut self, ttl: Option<Duration>) -> &mut Self {
+    pub(crate) fn caching_ttl(&mut self, ttl: Option<Duration>) -> &mut Self {
         self.caching_ttl = ttl;
         self
     }
 
     /// Set the stale-while-revalidate duration for cache mode
-    pub fn caching_stale_while_revalidate_ttl(
+    pub(crate) fn caching_stale_while_revalidate_ttl(
         &mut self,
         stale_while_revalidate: Option<Duration>,
     ) -> &mut Self {
@@ -663,26 +663,26 @@ impl Builder {
     }
 
     /// Set whether to serve expired data on upstream error in cache mode
-    pub fn caching_stale_if_error(&mut self, enabled: bool) -> &mut Self {
+    pub(crate) fn caching_stale_if_error(&mut self, enabled: bool) -> &mut Self {
         self.caching_stale_if_error = enabled;
         self
     }
 
     /// Set whether the dataset was bootstrapped from a snapshot.
-    pub fn bootstrap_status(&mut self, bootstrap_status: BootstrapStatus) -> &mut Self {
+    pub(crate) fn bootstrap_status(&mut self, bootstrap_status: BootstrapStatus) -> &mut Self {
         self.bootstrap_status = bootstrap_status;
         self
     }
 
     /// Set whether the acceleration uses S3 Express One Zone storage.
-    pub fn s3_express_acceleration(&mut self, is_s3_express: bool) -> &mut Self {
+    pub(crate) fn s3_express_acceleration(&mut self, is_s3_express: bool) -> &mut Self {
         self.is_s3_express_acceleration = is_s3_express;
         self
     }
 
     /// Mutex to protect concurrent access to the accelerator during insert/update/delete/cache/snapshot operations
     /// Shared with `DataConnector`, `Refresher` and `CachingAccelerationScanExec`.
-    pub fn accelerator_write_mutex(
+    pub(crate) fn accelerator_write_mutex(
         &mut self,
         accelerator_write_mutex: Arc<Mutex<()>>,
     ) -> &mut Self {
@@ -693,7 +693,7 @@ impl Builder {
     /// Provide per-dataset `cdc_*` parameter overrides drawn from
     /// `dataset.acceleration.params`. These layer on top of the runtime-global
     /// CDC config only for this dataset's changes stream;
-    pub fn cdc_param_overrides(
+    pub(crate) fn cdc_param_overrides(
         &mut self,
         overrides: Option<Arc<HashMap<String, String>>>,
     ) -> &mut Self {
@@ -1178,7 +1178,7 @@ impl AcceleratedTable {
     }
 
     /// Periodically emits the `dataset_acceleration_size_bytes` metric for file-based accelerators.
-    pub(crate) async fn start_size_metrics_task(
+    async fn start_size_metrics_task(
         dataset_name: TableReference,
         layout: runtime_acceleration::snapshot::AccelerationLayout,
     ) {
@@ -1193,7 +1193,7 @@ impl AcceleratedTable {
     }
 
     #[must_use]
-    pub fn refresher(&self) -> Arc<refresh::Refresher> {
+    pub(crate) fn refresher(&self) -> Arc<refresh::Refresher> {
         Arc::clone(&self.refresher)
     }
 
@@ -1203,14 +1203,14 @@ impl AcceleratedTable {
     }
 
     #[must_use]
-    pub fn refresh_trigger(&self) -> Option<&mpsc::Sender<Option<RefreshOverrides>>> {
+    pub(crate) fn refresh_trigger(&self) -> Option<&mpsc::Sender<Option<RefreshOverrides>>> {
         match &self.synchronized_with {
             Some(_) => None,
             None => self.refresh_trigger.as_ref(),
         }
     }
 
-    pub async fn trigger_refresh(&self, overrides: Option<RefreshOverrides>) -> Result<()> {
+    pub(crate) async fn trigger_refresh(&self, overrides: Option<RefreshOverrides>) -> Result<()> {
         if let Some(refresh_trigger) = self.refresh_trigger() {
             refresh_trigger
                 .send(overrides)
@@ -1235,12 +1235,12 @@ impl AcceleratedTable {
     }
 
     #[must_use]
-    pub fn get_federated_table_ref(&self) -> &Arc<FederatedTable> {
+    pub(crate) fn get_federated_table_ref(&self) -> &Arc<FederatedTable> {
         &self.federated
     }
 
     #[must_use]
-    pub fn is_dual_write(&self) -> bool {
+    pub(crate) fn is_dual_write(&self) -> bool {
         self.write_mode.is_dual_write()
     }
 
@@ -1293,11 +1293,11 @@ impl AcceleratedTable {
 
     /// Get the list of synchronized child accelerators for caching mode.
     #[must_use]
-    pub fn synchronized_children(&self) -> Arc<RwLock<Vec<Arc<dyn TableProvider>>>> {
+    fn synchronized_children(&self) -> Arc<RwLock<Vec<Arc<dyn TableProvider>>>> {
         Arc::clone(&self.synchronized_children)
     }
 
-    pub async fn update_refresh_sql(&self, mut refresh_sql: refresh::RefreshSQL) -> Result<()> {
+    pub(crate) async fn update_refresh_sql(&self, mut refresh_sql: refresh::RefreshSQL) -> Result<()> {
         let dataset_name = &self.dataset_name;
 
         let mut refresh = self.refresh_params.write().await;
@@ -1328,7 +1328,7 @@ impl AcceleratedTable {
     /// `None` (not partition-scoped, retrieve everything), `Some(filters)` (the
     /// assigned partitions), or `Some(empty)` (no partitions assigned — load no
     /// rows).
-    pub async fn update_partition_filters(
+    pub(crate) async fn update_partition_filters(
         &self,
         filters: Option<Vec<datafusion_expr::Expr>>,
     ) -> Result<()> {
@@ -1381,7 +1381,7 @@ impl AcceleratedTable {
     /// Sets an `AtomicI64` timestamp to the current time in milliseconds.
     /// Used by both `AcceleratedTable` instance methods and the caching background task.
     #[expect(clippy::cast_possible_truncation)]
-    pub(crate) fn set_timestamp_to_now(last_updated_at: &AtomicI64) {
+    fn set_timestamp_to_now(last_updated_at: &AtomicI64) {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -2025,7 +2025,7 @@ pub struct RetentionBuilder {
 
 impl RetentionBuilder {
     #[must_use]
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             time_column: None,
             time_format: None,
@@ -2051,7 +2051,7 @@ impl RetentionBuilder {
     }
 
     #[must_use]
-    pub fn time_partition_column<S: Into<String>>(
+    pub(crate) fn time_partition_column<S: Into<String>>(
         mut self,
         time_partition_column: Option<S>,
     ) -> Self {
@@ -2060,13 +2060,13 @@ impl RetentionBuilder {
     }
 
     #[must_use]
-    pub fn time_partition_format(mut self, time_partition_format: Option<TimeFormat>) -> Self {
+    pub(crate) fn time_partition_format(mut self, time_partition_format: Option<TimeFormat>) -> Self {
         self.time_partition_format = time_partition_format;
         self
     }
 
     #[must_use]
-    pub fn delete_expr(mut self, delete_expr: Option<Expr>) -> Self {
+    pub(crate) fn delete_expr(mut self, delete_expr: Option<Expr>) -> Self {
         self.delete_expr = delete_expr;
         self
     }
@@ -2144,8 +2144,8 @@ impl Default for RetentionBuilder {
 }
 
 pub struct Retention {
-    pub(crate) filters: Vec<DataRetentionFilter>,
-    pub(crate) check_interval: Duration,
+    filters: Vec<DataRetentionFilter>,
+    check_interval: Duration,
 }
 
 impl Retention {

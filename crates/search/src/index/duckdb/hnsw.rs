@@ -39,7 +39,7 @@ impl Default for DuckDBHnswOptions {
 
 impl DuckDBHnswOptions {
     #[must_use]
-    pub fn index_name_for(table_name: &str, embedding_column: &str) -> String {
+    pub(crate) fn index_name_for(table_name: &str, embedding_column: &str) -> String {
         let mut raw = format!("__spice_vss_{table_name}_{embedding_column}");
         raw.retain(|c| c.is_ascii_alphanumeric() || c == '_');
         if raw.is_empty() {
@@ -50,7 +50,7 @@ impl DuckDBHnswOptions {
     }
 
     #[must_use]
-    pub fn create_index_sql(
+    pub(crate) fn create_index_sql(
         &self,
         table_name: &str,
         embedding_column: &str,

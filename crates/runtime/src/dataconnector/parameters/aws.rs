@@ -26,7 +26,7 @@ use tonic::async_trait;
 use super::{ConnectorParams, Validator};
 
 // https://docs.aws.amazon.com/general/latest/gr/rande.html
-pub const AWS_REGIONS: [&str; 32] = [
+const AWS_REGIONS: [&str; 32] = [
     "us-east-1",
     "us-east-2",
     "us-west-1",
@@ -224,7 +224,7 @@ impl Validator for AuthValidator {
 /// Initiate a [`ConfigLoader`] with AWS credentials as we'd expect them to be defined in [`Parameters`] (for a given `provider_name`).
 ///
 /// Return [`ConfigLoader`] to allow further customisation.
-pub async fn initiate_config_with_credentials(
+pub(crate) async fn initiate_config_with_credentials(
     provider_name: &'static str,
     region_name: &'static str,
     key_name: &'static str,

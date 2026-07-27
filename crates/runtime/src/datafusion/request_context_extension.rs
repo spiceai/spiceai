@@ -25,12 +25,12 @@ pub struct DataFusionContextExtension {
 
 impl DataFusionContextExtension {
     #[must_use]
-    pub fn new(df: Arc<DataFusion>) -> Self {
+    pub(crate) fn new(df: Arc<DataFusion>) -> Self {
         Self { df }
     }
 
     #[must_use]
-    pub fn datafusion(&self) -> Arc<DataFusion> {
+    pub(crate) fn datafusion(&self) -> Arc<DataFusion> {
         Arc::clone(&self.df)
     }
 }
@@ -38,7 +38,7 @@ impl DataFusionContextExtension {
 /// # Panics
 ///
 /// Panics if the datafusion extension is not found in the request context.
-pub fn get_current_datafusion(context: &Arc<RequestContext>) -> Arc<DataFusion> {
+pub(crate) fn get_current_datafusion(context: &Arc<RequestContext>) -> Arc<DataFusion> {
     if let Some(df) = context.extension::<DataFusionContextExtension>() {
         df.datafusion()
     } else {

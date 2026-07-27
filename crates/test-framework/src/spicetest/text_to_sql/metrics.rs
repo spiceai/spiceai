@@ -33,10 +33,10 @@ use serde_json::Value;
 #[derive(Debug, Clone)]
 pub struct TextToSqlMetric {
     pub question: String,
-    pub generated_sql: String,
-    pub expected_sql: String,
-    pub sample_data_enabled: bool,
-    pub return_sql: bool,
+    pub(crate) generated_sql: String,
+    pub(crate) expected_sql: String,
+    sample_data_enabled: bool,
+    return_sql: bool,
     pub is_error: bool,
 
     // Non-functional metrics
@@ -199,7 +199,7 @@ impl ExtendedMetrics for TextToSqlMetric {
 
 impl TextToSqlMetric {
     #[expect(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         question: String,
         generated_sql: &str,
         expected_sql: &str,
@@ -263,10 +263,10 @@ pub struct TextToSqlRunMetric {
     pub mean_llm_input_tokens: f64,
     pub mean_llm_output_tokens: f64,
 
-    pub exact_logical_plan_match_rate: f64,
-    pub mean_correct_tables: f64,
-    pub mean_correct_table_projections: f64,
-    pub mean_correct_output_schema: f64,
+    exact_logical_plan_match_rate: f64,
+    mean_correct_tables: f64,
+    mean_correct_table_projections: f64,
+    mean_correct_output_schema: f64,
 }
 
 impl ExtendedMetrics for TextToSqlRunMetric {
@@ -373,7 +373,7 @@ impl ExtendedMetrics for TextToSqlRunMetric {
 impl TextToSqlRunMetric {
     #[must_use]
     #[expect(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         p95_latency_ms: f64,
         median_latency_ms: f64,
         exact_match_rate: f64,

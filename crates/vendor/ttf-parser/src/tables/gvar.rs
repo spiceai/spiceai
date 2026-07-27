@@ -479,7 +479,7 @@ mod packed_points {
     impl<'a> PackedPointsIter<'a> {
         // The first Option::None indicates a parsing error.
         // The second Option::None indicates "no points".
-        pub fn new<'b>(s: &'b mut Stream<'a>) -> Option<Option<Self>> {
+        pub(crate) fn new<'b>(s: &'b mut Stream<'a>) -> Option<Option<Self>> {
             // The total amount of points can be set as one or two bytes
             // depending on the first bit.
             let b1 = s.read::<u8>()?;
@@ -592,13 +592,13 @@ mod packed_points {
 
     impl<'a> SetPointsIter<'a> {
         #[inline]
-        pub fn new(mut iter: PackedPointsIter<'a>) -> Self {
+        pub(crate) fn new(mut iter: PackedPointsIter<'a>) -> Self {
             let unref_count = iter.next().unwrap_or(0);
             SetPointsIter { iter, unref_count }
         }
 
         #[inline]
-        pub fn restart(self) -> Self {
+        pub(crate) fn restart(self) -> Self {
             let mut iter = self.iter.clone();
             iter.offset = 0;
             iter.state = State::Control;
@@ -992,7 +992,7 @@ mod packed_deltas {
     // so it has to be as small as possible.
     // Therefore we cannot use `Stream` and other abstractions.
     #[derive(Clone, Copy, Default)]
-    pub struct PackedDeltasIter<'a> {
+    pub(crate) struct PackedDeltasIter<'a> {
         data: &'a [u8],
         x_run: RunState,
         y_run: RunState,
@@ -1007,7 +1007,7 @@ mod packed_deltas {
 
     impl<'a> PackedDeltasIter<'a> {
         /// `count` indicates a number of delta pairs.
-        pub fn new(scalar: f32, count: u16, data: &'a [u8]) -> Self {
+        pub(crate) fn new(scalar: f32, count: u16, data: &'a [u8]) -> Self {
             debug_assert!(core::mem::size_of::<PackedDeltasIter>() <= 32);
 
             let mut iter = PackedDeltasIter {
@@ -1033,12 +1033,12 @@ mod packed_deltas {
         }
 
         #[inline]
-        pub fn restart(self) -> Self {
+        pub(crate) fn restart(self) -> Self {
             PackedDeltasIter::new(self.scalar, self.total_count, self.data)
         }
 
         #[inline]
-        pub fn next(&mut self) -> Option<(f32, f32)> {
+        pub(crate) fn next(&mut self) -> Option<(f32, f32)> {
             let x = self.x_run.next(self.data, self.scalar)?;
             let y = self.y_run.next(self.data, self.scalar)?;
             Some((x, y))
@@ -1648,7 +1648,7 @@ pub struct Table<'a> {
 
 impl<'a> Table<'a> {
     /// Parses a table from raw data.
-    pub fn parse(data: &'a [u8]) -> Option<Self> {
+    pub(crate) fn parse(data: &'a [u8]) -> Option<Self> {
         let mut s = Stream::new(data);
         let version = s.read::<u32>()?;
         if version != 0x00010000 {
@@ -1736,7 +1736,7 @@ impl<'a> Table<'a> {
     }
 
     /// Outlines a glyph.
-    pub fn outline(
+    pub(crate) fn outline(
         &self,
         glyf_table: glyf::Table,
         coordinates: &[NormalizedCoordinate],

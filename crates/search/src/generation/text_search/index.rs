@@ -44,17 +44,17 @@ use crate::index::SearchIndex;
 /// The heap budget for the [`tantivy::IndexWriter`] (150 MiB).
 /// A larger budget reduces the number of segment flushes and subsequent merges,
 /// significantly improving bulk-indexing throughput.
-pub static MEMORY_BUDGET_FOR_INDEX_WRITER: usize = 150 * 1024 * 1024;
-pub static INDEX_UNIQUE_FIELD_NAME: &str = "__spice.unique_field";
+static MEMORY_BUDGET_FOR_INDEX_WRITER: usize = 150 * 1024 * 1024;
+static INDEX_UNIQUE_FIELD_NAME: &str = "__spice.unique_field";
 
 #[derive(Clone)]
 pub struct FullTextDatabaseIndex {
     pub search_fields: Vec<String>,
-    pub primary_key: Vec<String>,
-    pub base_table: Arc<dyn TableProvider>,
+    primary_key: Vec<String>,
+    base_table: Arc<dyn TableProvider>,
 
-    pub writer: Arc<Mutex<tantivy::IndexWriter>>,
-    pub reader: tantivy::IndexReader,
+    writer: Arc<Mutex<tantivy::IndexWriter>>,
+    reader: tantivy::IndexReader,
 }
 
 impl std::fmt::Debug for FullTextDatabaseIndex {
@@ -281,7 +281,7 @@ impl FullTextDatabaseIndex {
     }
 
     #[must_use]
-    pub fn underlying_table(&self) -> Arc<dyn TableProvider> {
+    fn underlying_table(&self) -> Arc<dyn TableProvider> {
         Arc::clone(&self.base_table)
     }
 

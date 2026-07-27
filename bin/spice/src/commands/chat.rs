@@ -67,15 +67,15 @@ pub struct ChatArgs {
 
     /// Sampling temperature (0.0 = deterministic, higher = more random).
     #[arg(long)]
-    pub temperature: Option<f32>,
+    temperature: Option<f32>,
 
     /// Override the runtime HTTP endpoint (e.g. `http://localhost:8090`).
     #[arg(long)]
-    pub endpoint: Option<String>,
+    endpoint: Option<String>,
 
     /// Custom HTTP headers in `Key:Value` form (repeatable).
     #[arg(long = "headers", value_name = "KEY:VALUE")]
-    pub custom_headers: Vec<String>,
+    custom_headers: Vec<String>,
 
     /// Output format for one-shot responses
     #[arg(long, short = 'o', default_value = "table")]

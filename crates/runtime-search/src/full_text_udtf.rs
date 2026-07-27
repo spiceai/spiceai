@@ -57,8 +57,8 @@ use crate::udtf::{
 use runtime_query_engine::query_engine::QueryEngine;
 use runtime_request_context::{AsyncMarker, RequestContext};
 
-pub const SPICE_DEFAULT_CATALOG: &str = "spice";
-pub const SPICE_DEFAULT_SCHEMA: &str = "public";
+const SPICE_DEFAULT_CATALOG: &str = "spice";
+const SPICE_DEFAULT_SCHEMA: &str = "public";
 
 /// Creates a `UserDefined` signature that allows named parameters (like `rank_weight => X`)
 /// to pass through for RRF (Reciprocal Rank Fusion) operations.
@@ -67,7 +67,7 @@ pub const SPICE_DEFAULT_SCHEMA: &str = "public";
 /// `VariadicAny` signature. The `UserDefined` signature type allows us to:
 /// 1. Accept any types (like `VariadicAny`)
 /// 2. Support named parameters via `with_parameter_names()`
-pub static TEXT_SEARCH_SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
+static TEXT_SEARCH_SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
     // Parameter names that can be passed as named arguments.
     // These are passthrough parameters used by RRF and other table functions.
     let param_names = vec![

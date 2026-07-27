@@ -12,9 +12,9 @@ pub struct SvgDocument<'a> {
     /// Can be stored as a string or as a gzip compressed data, aka SVGZ.
     pub data: &'a [u8],
     /// The first glyph ID for the range covered by this record.
-    pub start_glyph_id: GlyphId,
+    start_glyph_id: GlyphId,
     /// The last glyph ID, *inclusive*, for the range covered by this record.
-    pub end_glyph_id: GlyphId,
+    end_glyph_id: GlyphId,
 }
 
 impl SvgDocument<'_> {
@@ -66,7 +66,7 @@ impl<'a> SvgDocumentsList<'a> {
     ///
     /// `index` is not a GlyphId. You should use [`find()`](SvgDocumentsList::find) instead.
     #[inline]
-    pub fn get(&self, index: u16) -> Option<SvgDocument<'a>> {
+    fn get(&self, index: u16) -> Option<SvgDocument<'a>> {
         let record = self.records.get(index)?;
         let offset = record.svg_doc_offset?.to_usize();
         self.data
@@ -80,7 +80,7 @@ impl<'a> SvgDocumentsList<'a> {
 
     /// Returns a SVG document data by glyph ID.
     #[inline]
-    pub fn find(&self, glyph_id: GlyphId) -> Option<SvgDocument<'a>> {
+    pub(crate) fn find(&self, glyph_id: GlyphId) -> Option<SvgDocument<'a>> {
         let index = self
             .records
             .into_iter()
@@ -89,7 +89,7 @@ impl<'a> SvgDocumentsList<'a> {
     }
 
     /// Returns the number of SVG documents in the list.
-    pub fn len(&self) -> u16 {
+    fn len(&self) -> u16 {
         self.records.len()
     }
 
@@ -149,12 +149,12 @@ impl<'a> Iterator for SvgDocumentsListIter<'a> {
 #[derive(Clone, Copy, Debug)]
 pub struct Table<'a> {
     /// A list of SVG documents.
-    pub documents: SvgDocumentsList<'a>,
+    pub(crate) documents: SvgDocumentsList<'a>,
 }
 
 impl<'a> Table<'a> {
     /// Parses a table from raw data.
-    pub fn parse(data: &'a [u8]) -> Option<Self> {
+    pub(crate) fn parse(data: &'a [u8]) -> Option<Self> {
         let mut s = Stream::new(data);
         s.skip::<u16>(); // version
         let doc_list_offset = s.read::<Option<Offset32>>()??;

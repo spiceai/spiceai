@@ -88,16 +88,16 @@ pub enum IdentitySource {
 pub struct ChannelIdentity {
     /// The X.509 Subject DN, e.g. `CN=client-1`. Empty string when
     /// the cert leaf has no Subject (degenerate setup).
-    pub identity: String,
+    identity: String,
     /// The X.509 Subject DN. Mirrors [`Self::identity`] today; kept
     /// as a separate field so the audit / task-history surface can
     /// rely on a stable "raw subject" slot independent of any
     /// future identity-promotion logic.
-    pub subject_dn: String,
+    subject_dn: String,
     /// SHA-256 of the leaf cert DER. Useful for audit ("which exact
     /// cert was used?") and as a last-resort cache namespace
     /// fallback.
-    pub cert_fingerprint: [u8; 32],
+    cert_fingerprint: [u8; 32],
 }
 
 /// The mTLS-as-identity auth principal. Set on the request's
@@ -112,15 +112,15 @@ pub struct MtlsPrincipal {
     /// The X.509 Subject DN (e.g. `CN=client-1`). Used for
     /// [`AuthPrincipal::username`] and as the basis for
     /// [`AuthPrincipal::stable_id`].
-    pub identity: String,
+    identity: String,
     /// X.509 Subject DN. Used for `stable_id` when `identity` is a
     /// fingerprint fallback. Empty string for cert-Subject-less
     /// leaves.
-    pub subject_dn: String,
+    subject_dn: String,
     /// SHA-256 of the leaf cert DER. Used for `stable_id` only as a
     /// last resort (cert with no Subject — a degenerate operator
     /// setup).
-    pub cert_fingerprint: [u8; 32],
+    cert_fingerprint: [u8; 32],
 }
 
 /// Always-`read_write` ACL group set returned by [`MtlsPrincipal`].

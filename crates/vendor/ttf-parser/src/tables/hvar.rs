@@ -19,7 +19,7 @@ pub struct Table<'a> {
 
 impl<'a> Table<'a> {
     /// Parses a table from raw data.
-    pub fn parse(data: &'a [u8]) -> Option<Self> {
+    pub(crate) fn parse(data: &'a [u8]) -> Option<Self> {
         let mut s = Stream::new(data);
 
         let version = s.read::<u32>()?;
@@ -42,7 +42,7 @@ impl<'a> Table<'a> {
 
     /// Returns the advance width offset for a glyph.
     #[inline]
-    pub fn advance_offset(
+    pub(crate) fn advance_offset(
         &self,
         glyph_id: GlyphId,
         coordinates: &[NormalizedCoordinate],
@@ -63,7 +63,7 @@ impl<'a> Table<'a> {
 
     /// Returns the left side bearing offset for a glyph.
     #[inline]
-    pub fn left_side_bearing_offset(
+    pub(crate) fn left_side_bearing_offset(
         &self,
         glyph_id: GlyphId,
         coordinates: &[NormalizedCoordinate],

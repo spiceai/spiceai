@@ -2,9 +2,9 @@ use super::{Encoding, Glyph, Result};
 use indexmap::IndexMap;
 
 pub struct Differences<'a> {
-    pub base: Box<Encoding<'a>>,
-    pub map: IndexMap<u8, Glyph>,
-    pub inverse: IndexMap<Glyph, u8>,
+    pub(crate) base: Box<Encoding<'a>>,
+    pub(crate) map: IndexMap<u8, Glyph>,
+    pub(crate) inverse: IndexMap<Glyph, u8>,
 }
 
 impl Differences<'_> {

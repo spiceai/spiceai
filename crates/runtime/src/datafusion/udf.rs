@@ -71,7 +71,7 @@ use util::in_tracing_context_async;
 ///
 /// These UDFs only need a [`SessionContext`] and can be registered on any
 /// context, including isolated ones like the refresh-task context.
-pub fn register_core_scalar_udfs(ctx: &SessionContext) {
+pub(crate) fn register_core_scalar_udfs(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDFAlias::new(Arc::new(RandomFunc::default()), "rand").into());
     ctx.register_udf(Bucket::new().into());
     ctx.register_udf(CosineDistance::new().into());
@@ -85,7 +85,7 @@ pub fn register_core_scalar_udfs(ctx: &SessionContext) {
     register_postgres_comment_udfs(ctx);
 }
 
-pub async fn register_udfs(runtime: &crate::Runtime) {
+pub(crate) async fn register_udfs(runtime: &crate::Runtime) {
     let ctx = &runtime.df.ctx;
     register_core_scalar_udfs(ctx);
 
@@ -329,7 +329,7 @@ async fn maybe_register_function_as_tool(runtime: &crate::Runtime, decl: &Functi
 /// add its name to the federation deny-list in one call. Used by the
 /// tool→SQL bridge so the tool-registration path doesn't need to know
 /// about the deny-list as an implementation detail.
-pub fn register_async_user_udf(ctx: &SessionContext, udf: &ScalarUDF, name: &str) -> bool {
+pub(crate) fn register_async_user_udf(ctx: &SessionContext, udf: &ScalarUDF, name: &str) -> bool {
     if let Some(existing_name) = registered_scalar_udf_name(ctx, name) {
         tracing::warn!(name = %name, existing_name = %existing_name, "Skipping async user UDF registration because a scalar UDF with this name is already registered; rename the function to avoid changing query semantics");
         return false;
@@ -346,7 +346,7 @@ pub fn register_async_user_udf(ctx: &SessionContext, udf: &ScalarUDF, name: &str
 
 /// Return the exact registered scalar UDF name that collides with `name`, if any.
 #[must_use]
-pub fn registered_scalar_udf_name(ctx: &SessionContext, name: &str) -> Option<String> {
+fn registered_scalar_udf_name(ctx: &SessionContext, name: &str) -> Option<String> {
     ctx.udfs()
         .into_iter()
         .find(|registered_name| registered_name.eq_ignore_ascii_case(name))
@@ -354,7 +354,7 @@ pub fn registered_scalar_udf_name(ctx: &SessionContext, name: &str) -> Option<St
 
 /// Return the exact registered table-function name that collides with `name`, if any.
 #[must_use]
-pub fn registered_table_udf_name(ctx: &SessionContext, name: &str) -> Option<String> {
+fn registered_table_udf_name(ctx: &SessionContext, name: &str) -> Option<String> {
     ctx.state()
         .table_functions()
         .keys()
@@ -425,7 +425,7 @@ fn info_from_decl(decl: &Function) -> UserFunctionInfo {
 
 /// Rebuild + re-register user functions against `new_app`, removing any
 /// that are no longer declared. Called on spicepod hot-reload.
-pub async fn apply_function_diff(
+pub(crate) async fn apply_function_diff(
     runtime: &crate::Runtime,
     current_app: &Arc<app::App>,
     new_app: &Arc<app::App>,
@@ -618,11 +618,11 @@ static CODE_EXECUTING_FUNCTION_NAMES: LazyLock<RwLock<Vec<String>>> =
 /// through the `list_udfs()` UDTF and the `/v1/functions` HTTP endpoint.
 #[derive(Clone, Debug)]
 pub struct UserFunctionInfo {
-    pub name: String,
-    pub kind: String,
-    pub volatility: String,
-    pub from: String,
-    pub description: Option<String>,
+    pub(crate) name: String,
+    pub(crate) kind: String,
+    pub(crate) volatility: String,
+    pub(crate) from: String,
+    pub(crate) description: Option<String>,
 }
 
 /// Registry of user-function metadata keyed by name. Kept in sync with
@@ -632,7 +632,7 @@ static USER_FUNCTION_INFO: LazyLock<RwLock<Vec<UserFunctionInfo>>> =
 
 /// Snapshot the current user-function metadata, ordered by registration.
 #[must_use]
-pub fn user_function_infos() -> Vec<UserFunctionInfo> {
+pub(crate) fn user_function_infos() -> Vec<UserFunctionInfo> {
     USER_FUNCTION_INFO.read().clone()
 }
 
@@ -677,7 +677,7 @@ fn rebuild_deny_lists(user: &[String]) {
 }
 
 /// Add a user function name to the federation deny-list. Idempotent.
-pub fn add_user_function_to_deny_list(name: &str) {
+fn add_user_function_to_deny_list(name: &str) {
     add_user_functions_to_deny_list(std::iter::once(name.to_string()));
 }
 
@@ -721,7 +721,7 @@ fn remove_user_functions_from_deny_list(names: &[String]) {
 }
 
 /// Add a function name to the read-write API key requirement set. Idempotent.
-pub fn add_code_executing_function(name: &str) {
+pub(crate) fn add_code_executing_function(name: &str) {
     let mut guard = CODE_EXECUTING_FUNCTION_NAMES.write();
     if !guard.iter().any(|n| n == name) {
         guard.push(name.to_string());
@@ -729,7 +729,7 @@ pub fn add_code_executing_function(name: &str) {
 }
 
 /// Remove a function name from the read-write API key requirement set.
-pub fn remove_code_executing_function(name: &str) {
+pub(crate) fn remove_code_executing_function(name: &str) {
     CODE_EXECUTING_FUNCTION_NAMES
         .write()
         .retain(|function_name| function_name != name);
@@ -737,7 +737,7 @@ pub fn remove_code_executing_function(name: &str) {
 
 /// Returns true when a function requires a read-write API key to execute.
 #[must_use]
-pub fn is_code_executing_function(name: &str) -> bool {
+pub(crate) fn is_code_executing_function(name: &str) -> bool {
     CODE_EXECUTING_FUNCTION_NAMES
         .read()
         .iter()
@@ -767,7 +767,7 @@ pub fn deny_spice_specific_functions() -> Arc<FunctionSupport> {
 ///
 /// Returns the cached default list when `native` is empty.
 #[must_use]
-pub fn deny_spice_specific_functions_excluding(native: &[&str]) -> Arc<FunctionSupport> {
+fn deny_spice_specific_functions_excluding(native: &[&str]) -> Arc<FunctionSupport> {
     if native.is_empty() {
         return deny_spice_specific_functions();
     }
@@ -786,7 +786,7 @@ pub fn deny_spice_specific_functions_excluding(native: &[&str]) -> Arc<FunctionS
 /// [`crate::datafusion::dialect::duckdb_native_function_names`] so it tracks the
 /// dialect automatically.
 #[must_use]
-pub fn deny_spice_functions_for_duckdb() -> Arc<FunctionSupport> {
+fn deny_spice_functions_for_duckdb() -> Arc<FunctionSupport> {
     deny_spice_specific_functions_excluding(
         &crate::datafusion::dialect::duckdb_native_function_names(),
     )

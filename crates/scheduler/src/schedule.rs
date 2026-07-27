@@ -59,7 +59,7 @@ impl Schedule {
     }
 
     /// Executes the components defined by this schedule.
-    pub(crate) fn execute(self: &Arc<Self>, notifier: Arc<Notify>) -> RunningTask {
+    fn execute(self: &Arc<Self>, notifier: Arc<Notify>) -> RunningTask {
         let task = Arc::clone(&self.task);
         let handle = tokio::spawn(async move {
             if (task.execute().await).is_err() {

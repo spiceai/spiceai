@@ -23,13 +23,13 @@ limitations under the License.
 //! - **`OrderStatus`** (4%): Read-only — look up latest order for a customer.
 //! - **`StockLevel`** (4%): Read-only — count low-stock items in recent orders.
 
-pub mod delivery;
-pub mod mysql;
-pub mod new_order;
-pub mod order_status;
-pub mod payment;
+mod delivery;
+pub(crate) mod mysql;
+mod new_order;
+mod order_status;
+mod payment;
 pub mod prepared;
-pub mod stock_level;
+mod stock_level;
 
 use std::fmt;
 
@@ -37,7 +37,7 @@ use ::rand::{Rng, RngExt};
 use tokio_postgres::Client;
 
 use crate::Result;
-pub use prepared::PreparedStatements;
+pub(crate) use prepared::PreparedStatements;
 
 /// The five TPC-C transaction types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -63,7 +63,7 @@ impl fmt::Display for TxnType {
 
 /// Standard TPC-C transaction mix weights (must sum to 100).
 /// Index order: `NewOrder`, Payment, Delivery, `OrderStatus`, `StockLevel`.
-pub const DEFAULT_MIX: [u32; 5] = [45, 43, 4, 4, 4];
+pub(crate) const DEFAULT_MIX: [u32; 5] = [45, 43, 4, 4, 4];
 
 /// All transaction types in mix-weight index order.
 const TXN_TYPES: [TxnType; 5] = [
@@ -75,7 +75,7 @@ const TXN_TYPES: [TxnType; 5] = [
 ];
 
 /// Select a random transaction type according to the given mix weights.
-pub fn pick_txn_type(rng: &mut impl Rng, mix: &[u32; 5]) -> TxnType {
+pub(crate) fn pick_txn_type(rng: &mut impl Rng, mix: &[u32; 5]) -> TxnType {
     let total: u32 = mix.iter().sum();
     let roll = rng.random_range(0..total);
     let mut cumulative = 0;
@@ -99,20 +99,20 @@ pub fn pick_txn_type(rng: &mut impl Rng, mix: &[u32; 5]) -> TxnType {
 #[derive(Debug, Clone, Copy)]
 pub struct TerminalAssignment {
     /// Home warehouse ID (1-based).
-    pub home_w_id: i32,
+    home_w_id: i32,
     /// Lower district ID (inclusive, 1-based).
-    pub district_lo: i32,
+    district_lo: i32,
     /// Upper district ID (inclusive, 1-based).
-    pub district_hi: i32,
+    district_hi: i32,
     /// Total number of warehouses (for remote warehouse selection).
-    pub num_warehouses: i32,
+    num_warehouses: i32,
 }
 
 impl TerminalAssignment {
     /// Compute assignments for all terminals, distributing evenly across
     /// warehouses and districts (like `BenchBase`'s `createTerminals`).
     #[must_use]
-    pub fn compute(num_terminals: usize, num_warehouses: i32) -> Vec<Self> {
+    pub(crate) fn compute(num_terminals: usize, num_warehouses: i32) -> Vec<Self> {
         let nw = usize::try_from(num_warehouses.max(1)).unwrap_or(1);
         let mut assignments = Vec::with_capacity(num_terminals);
 
@@ -156,7 +156,7 @@ impl TerminalAssignment {
 /// # Errors
 ///
 /// Returns an error if the transaction fails.
-pub async fn execute(
+pub(crate) async fn execute(
     client: &mut Client,
     rng: &mut impl Rng,
     txn_type: TxnType,

@@ -89,7 +89,7 @@ impl RuntimeStatus {
         })
     }
 
-    pub fn set_ready_state(&self, ready_state: RuntimeReadyState) {
+    pub(crate) fn set_ready_state(&self, ready_state: RuntimeReadyState) {
         let mut configured_ready_state = self
             .ready_state
             .write()
@@ -98,7 +98,7 @@ impl RuntimeStatus {
     }
 
     #[must_use]
-    pub fn is_shutdown(&self) -> bool {
+    pub(crate) fn is_shutdown(&self) -> bool {
         self.is_shutdown.load(Ordering::SeqCst)
     }
 
@@ -137,7 +137,7 @@ impl RuntimeStatus {
         }
     }
 
-    pub fn update_catalog(&self, catalog_name: impl Into<String>, status: ComponentStatus) {
+    pub(crate) fn update_catalog(&self, catalog_name: impl Into<String>, status: ComponentStatus) {
         let catalog_name = catalog_name.into();
         let metric_value = status.discriminant();
         self.update_component_status(&format!("catalog:{catalog_name}"), status);
@@ -160,28 +160,28 @@ impl RuntimeStatus {
         runtime_metrics::models::STATUS.record(metric_value, &[KeyValue::new("model", model_name)]);
     }
 
-    pub fn update_tool(&self, tool_name: &str, status: ComponentStatus) {
+    pub(crate) fn update_tool(&self, tool_name: &str, status: ComponentStatus) {
         let tool_name = tool_name.to_string();
         let metric_value = status.discriminant();
         self.update_component_status(&format!("tool:{tool_name}"), status);
         runtime_metrics::tools::STATUS.record(metric_value, &[KeyValue::new("tool", tool_name)]);
     }
 
-    pub fn update_tool_catalog(&self, catalog_name: &str, status: ComponentStatus) {
+    pub(crate) fn update_tool_catalog(&self, catalog_name: &str, status: ComponentStatus) {
         let name = catalog_name.to_string();
         let metric_value = status.discriminant();
         self.update_component_status(&format!("tool_catalog:{name}"), status);
         runtime_metrics::tools::STATUS.record(metric_value, &[KeyValue::new("tool_catalog", name)]);
     }
 
-    pub fn update_llm(&self, model_name: &str, status: ComponentStatus) {
+    fn update_llm(&self, model_name: &str, status: ComponentStatus) {
         let model_name = model_name.to_string();
         let metric_value = status.discriminant();
         self.update_component_status(&format!("llm:{model_name}"), status);
         runtime_metrics::llms::STATUS.record(metric_value, &[KeyValue::new("model", model_name)]);
     }
 
-    pub fn update_embedding(&self, model_name: &str, status: ComponentStatus) {
+    pub(crate) fn update_embedding(&self, model_name: &str, status: ComponentStatus) {
         let model_name = model_name.to_string();
         let metric_value = status.discriminant();
         self.update_component_status(&format!("embedding:{model_name}"), status);
@@ -189,14 +189,14 @@ impl RuntimeStatus {
             .record(metric_value, &[KeyValue::new("model", model_name)]);
     }
 
-    pub fn update_reranker(&self, model_name: &str, status: ComponentStatus) {
+    pub(crate) fn update_reranker(&self, model_name: &str, status: ComponentStatus) {
         let model_name = model_name.to_string();
         let metric_value = status.discriminant();
         self.update_component_status(&format!("reranker:{model_name}"), status);
         runtime_metrics::rerankers::STATUS
             .record(metric_value, &[KeyValue::new("model", model_name)]);
     }
-    pub fn update_view(&self, view_name: &TableReference, status: ComponentStatus) {
+    pub(crate) fn update_view(&self, view_name: &TableReference, status: ComponentStatus) {
         let view_name = view_name.to_string();
         let metric_value = status.discriminant();
         self.update_component_status(&format!("view:{view_name}"), status);
@@ -204,7 +204,7 @@ impl RuntimeStatus {
     }
 
     /// Update the status of a worker
-    pub fn update_worker(&self, name: &str, status: ComponentStatus) {
+    pub(crate) fn update_worker(&self, name: &str, status: ComponentStatus) {
         let worker_name = name.to_string();
         let metric_value = status.discriminant();
         self.update_component_status(&format!("worker:{worker_name}"), status);
@@ -213,7 +213,7 @@ impl RuntimeStatus {
     }
 
     /// Update the status of a cluster node
-    pub fn update_cluster(&self, node_name: &str, status: ComponentStatus) {
+    pub(crate) fn update_cluster(&self, node_name: &str, status: ComponentStatus) {
         let cluster_node_name = node_name.to_string();
 
         // Record cluster node status metric
@@ -294,7 +294,7 @@ impl RuntimeStatus {
 
     /// Returns the status of all registered components.
     #[must_use]
-    pub fn get_all_statuses(&self) -> HashMap<String, ComponentStatus> {
+    pub(crate) fn get_all_statuses(&self) -> HashMap<String, ComponentStatus> {
         let statuses = match self.statuses.read() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -309,7 +309,7 @@ impl RuntimeStatus {
     ///
     /// Keys are the `model_name`, not the format from [`RuntimeStatus::get_all_statuses`] (i.e. `model:<model_name>`).
     #[must_use]
-    pub fn get_model_statuses(&self) -> HashMap<String, ComponentStatus> {
+    pub(crate) fn get_model_statuses(&self) -> HashMap<String, ComponentStatus> {
         self.get_statuses_of_prefix("model:")
     }
 
@@ -333,7 +333,7 @@ impl RuntimeStatus {
 
     /// Returns the status of all registered workers.
     #[must_use]
-    pub fn get_worker_statuses(&self) -> HashMap<String, ComponentStatus> {
+    pub(crate) fn get_worker_statuses(&self) -> HashMap<String, ComponentStatus> {
         self.get_statuses_of_prefix("worker:")
     }
 
@@ -357,7 +357,7 @@ impl RuntimeStatus {
     }
 
     /// Sets the runtime to the shutting down state.
-    pub fn mark_shutdown(&self) {
+    pub(crate) fn mark_shutdown(&self) {
         self.is_shutdown.store(true, Ordering::SeqCst);
         self.shutdown_token.cancel();
     }
@@ -372,7 +372,7 @@ impl RuntimeStatus {
     /// Use `token.cancelled()` in `tokio::select!` to make async operations
     /// (e.g. backoff sleeps) immediately interruptible on shutdown.
     #[must_use]
-    pub fn shutdown_token(&self) -> CancellationToken {
+    pub(crate) fn shutdown_token(&self) -> CancellationToken {
         self.shutdown_token.child_token()
     }
 
@@ -450,7 +450,7 @@ impl RuntimeStatus {
     }
 
     /// Waits for a dataset to become ready.
-    pub async fn wait_for_dataset_ready(&self, dataset: &TableReference) {
+    pub(crate) async fn wait_for_dataset_ready(&self, dataset: &TableReference) {
         let component_name = format!("dataset:{dataset}");
         self.wait_for_component_ready(&component_name).await;
     }
@@ -460,7 +460,7 @@ impl RuntimeStatus {
     /// provider to exist, not for the dataset to be fully loaded — e.g.
     /// scheduler-side partition discovery, where waiting for `Ready`
     /// would deadlock because `Ready` is gated on executor data loads.
-    pub async fn wait_for_dataset_registered(&self, dataset: &TableReference) {
+    pub(crate) async fn wait_for_dataset_registered(&self, dataset: &TableReference) {
         let component_name = format!("dataset:{dataset}");
         self.wait_for_component_registered(&component_name).await;
     }
@@ -523,7 +523,7 @@ impl RuntimeStatus {
     ///
     /// This polls the `is_ready()` status at a regular interval until the runtime is ready.
     /// If the runtime is already ready, this returns immediately.
-    pub async fn wait_for_ready(&self) {
+    pub(crate) async fn wait_for_ready(&self) {
         const POLL_INTERVAL: Duration = Duration::from_millis(100);
         loop {
             if self.is_ready() {

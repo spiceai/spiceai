@@ -22,13 +22,13 @@ use secrecy::SecretString;
 #[params(prefix = "databricks")]
 pub struct DatabricksEmbeddingParams {
     /// The Databricks workspace endpoint, e.g., dbc-a12cd3e4-56f7.cloud.databricks.com.
-    pub endpoint: String,
+    pub(crate) endpoint: String,
     /// The Databricks API token.
     #[param(autoload_secret)]
-    pub token: Option<SecretString>,
+    pub(crate) token: Option<SecretString>,
     /// The Databricks Service Principal Client ID. Cannot be used with `databricks_token`.
-    pub client_id: Option<String>,
+    pub(crate) client_id: Option<String>,
     /// The Databricks Service Principal Client Secret. Cannot be used with `databricks_token`.
     #[param(autoload_secret)]
-    pub client_secret: Option<SecretString>,
+    pub(crate) client_secret: Option<SecretString>,
 }

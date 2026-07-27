@@ -1,4 +1,4 @@
-pub const STANDARD_NAMES: &[&str] = &[
+pub(crate) const STANDARD_NAMES: &[&str] = &[
     ".notdef",
     "space",
     "exclam",

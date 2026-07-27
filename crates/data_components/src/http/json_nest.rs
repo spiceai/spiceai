@@ -57,7 +57,7 @@ pub enum Error {
     JsonSerialize { source: serde_json::Error },
 }
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Configuration for decomposing a JSON response row into a set of
 /// user-declared static columns plus a single catch-all JSON column.
@@ -129,7 +129,7 @@ impl HttpJsonNesting {
 /// Decomposed representation of a single HTTP JSON response row.
 ///
 /// Keys are column names. `None` values represent SQL `NULL`.
-pub type DecomposedRow = HashMap<String, Option<String>>;
+pub(crate) type DecomposedRow = HashMap<String, Option<String>>;
 
 /// Decompose a single JSON row string according to the nesting
 /// configuration. See [`HttpJsonNesting`] for the semantics.
@@ -152,7 +152,7 @@ pub type DecomposedRow = HashMap<String, Option<String>>;
 /// <https://github.com/spiceai/spiceai/issues/11155>.
 ///
 /// [`HttpExec::parse_content`]: super::provider::HttpExec
-pub fn decompose_json_row(json_row: &str, nesting: &HttpJsonNesting) -> Result<DecomposedRow> {
+pub(crate) fn decompose_json_row(json_row: &str, nesting: &HttpJsonNesting) -> Result<DecomposedRow> {
     let mut out: DecomposedRow = HashMap::new();
     let Ok(mut value) = serde_json::from_str::<serde_json::Value>(json_row) else {
         // Not valid JSON: preserve the raw row instead of failing the

@@ -90,7 +90,7 @@ pub struct Git {
 
 impl Git {
     #[must_use]
-    pub fn new(params: Parameters) -> Self {
+    fn new(params: Parameters) -> Self {
         Self {
             params,
             metrics: Arc::new(GitMetrics::default()),
@@ -370,7 +370,7 @@ impl GitFactory {
     }
 
     #[must_use]
-    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+    fn new_arc() -> Arc<dyn DataConnectorFactory> {
         Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
     }
 }
@@ -515,7 +515,7 @@ impl MetricsProvider for GitMetricsProvider {
     }
 }
 
-pub fn parse_globs(
+fn parse_globs(
     component: &ConnectorComponent,
     input: &str,
 ) -> Result<Arc<GlobSet>, Box<dyn std::error::Error + Send + Sync>> {

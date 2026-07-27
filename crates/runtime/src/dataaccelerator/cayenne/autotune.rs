@@ -470,7 +470,7 @@ pub(crate) enum InferredMetadata {
 
 impl InferredMetadata {
     #[must_use]
-    pub(crate) fn from_schema(inferred: &InferredSchema) -> Self {
+    fn from_schema(inferred: &InferredSchema) -> Self {
         if inferred.is_empty() {
             Self::Absent
         } else {
@@ -491,7 +491,7 @@ impl WorkloadProfile {
     /// schema was inferred), so it is gated to test builds.
     #[cfg(test)]
     #[must_use]
-    pub fn hardware_only(small_write: bool) -> Self {
+    pub(crate) fn hardware_only(small_write: bool) -> Self {
         Self {
             small_write,
             ..Self::default()

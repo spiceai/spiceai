@@ -26,13 +26,13 @@ pub use util::{download_hf_file, link_files_into_tmp_dir};
 /// Important fields from a model's `config.json`
 #[derive(Debug, Deserialize)]
 pub struct ModelConfig {
-    pub hidden_size: i32,
-    pub architectures: Vec<String>,
-    pub model_type: String,
+    hidden_size: i32,
+    architectures: Vec<String>,
+    model_type: String,
     #[serde(alias = "n_positions")]
-    pub max_position_embeddings: usize,
+    max_position_embeddings: usize,
     #[serde(default)]
-    pub pad_token_id: usize,
-    pub id2label: Option<HashMap<String, String>>,
-    pub label2id: Option<HashMap<String, usize>>,
+    pad_token_id: usize,
+    id2label: Option<HashMap<String, String>>,
+    label2id: Option<HashMap<String, usize>>,
 }

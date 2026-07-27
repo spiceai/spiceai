@@ -1,4 +1,4 @@
-pub const MAC_ROMAN_ENCODING: [Option<&str>; 256] = [
+pub(crate) const MAC_ROMAN_ENCODING: [Option<&str>; 256] = [
     None,
     None,
     None,
@@ -257,7 +257,7 @@ pub const MAC_ROMAN_ENCODING: [Option<&str>; 256] = [
     Some("caron"),
 ];
 
-pub const MAC_EXPERT_ENCODING: [Option<&str>; 256] = [
+pub(crate) const MAC_EXPERT_ENCODING: [Option<&str>; 256] = [
     None,
     None,
     None,
@@ -516,7 +516,7 @@ pub const MAC_EXPERT_ENCODING: [Option<&str>; 256] = [
     None,
 ];
 
-pub const WIN_ANSI_ENCODING: [Option<&str>; 256] = [
+pub(crate) const WIN_ANSI_ENCODING: [Option<&str>; 256] = [
     None,
     None,
     None,

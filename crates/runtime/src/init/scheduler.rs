@@ -50,7 +50,7 @@ const WORKER_SCHEDULER_NAME: &str = "worker_scheduler";
 pub(crate) type ScheduleRegistry = RwLock<HashMap<Arc<str>, Arc<Scheduler<Running>>>>;
 
 impl Runtime {
-    pub async fn create_worker_schedule(self: Arc<Self>, worker: Arc<dyn Worker>) -> Result<()> {
+    pub(crate) async fn create_worker_schedule(self: Arc<Self>, worker: Arc<dyn Worker>) -> Result<()> {
         let Some(worker_parameters) = worker.schedule_parameters() else {
             tracing::debug!(
                 "Worker '{}' has no schedule parameters, skipping schedule creation",
@@ -135,7 +135,7 @@ impl Runtime {
         Ok(())
     }
 
-    pub async fn remove_worker_schedule(self: Arc<Self>, worker_name: Arc<str>) -> Result<()> {
+    pub(crate) async fn remove_worker_schedule(self: Arc<Self>, worker_name: Arc<str>) -> Result<()> {
         let scheduler_lock = Arc::clone(&self.schedulers);
         let schedulers = scheduler_lock.read().await;
 
@@ -166,7 +166,7 @@ impl Runtime {
         Ok(())
     }
 
-    pub async fn remove_dataset_or_view_schedule(
+    pub(crate) async fn remove_dataset_or_view_schedule(
         self: Arc<Self>,
         ds_name: &TableReference,
     ) -> Result<()> {
@@ -201,7 +201,7 @@ impl Runtime {
         Ok(())
     }
 
-    pub async fn create_dataset_or_view_schedule(
+    pub(crate) async fn create_dataset_or_view_schedule(
         self: Arc<Self>,
         component: impl Into<ScheduleDataComponent>,
     ) -> Result<()> {

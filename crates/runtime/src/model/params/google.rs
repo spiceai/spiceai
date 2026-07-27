@@ -29,5 +29,5 @@ pub const PARAMETERS: &[ParameterSpec] =
 
 const GOOGLE_PARAM_LEN: usize = 1;
 
-pub(crate) const GOOGLE_PARAMETERS: [ParameterSpec; GOOGLE_PARAM_LEN] =
+const GOOGLE_PARAMETERS: [ParameterSpec; GOOGLE_PARAM_LEN] =
     [ParameterSpec::component("api_key").description("The Google Generative AI API key.")];

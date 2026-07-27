@@ -121,7 +121,7 @@ impl SqliteAccelerator {
     }
 
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         // Initialize the decimal extension for SQLite
         //
         // SAFETY: This is safe because sqlite3_decimal_init is a valid function pointer.
@@ -144,7 +144,7 @@ impl SqliteAccelerator {
     }
 
     /// Returns the `Sqlite` file path that would be used for a file-based `Sqlite` accelerator from this dataset
-    pub fn sqlite_file_path(&self, source: &dyn AccelerationSource) -> Result<String> {
+    pub(crate) fn sqlite_file_path(&self, source: &dyn AccelerationSource) -> Result<String> {
         if !source.is_file_accelerated() {
             Err(Error::InvalidConfiguration {
                 detail: Arc::from("Dataset is not file accelerated"),
@@ -165,7 +165,7 @@ impl SqliteAccelerator {
     }
 
     /// Returns the `Sqlite` `busy_timeout` param that would be used for setting the `busy_timeout` in `Sqlite` accelerator for this dataset, default to 5000 milliseconds
-    pub fn sqlite_busy_timeout(&self, source: &dyn AccelerationSource) -> Result<Duration> {
+    fn sqlite_busy_timeout(&self, source: &dyn AccelerationSource) -> Result<Duration> {
         if let Some(acceleration) = source.acceleration() {
             let acceleration_params = acceleration.params.clone();
             return self
@@ -216,7 +216,7 @@ impl SqliteAccelerator {
     }
 
     /// Returns an existing `SQLite` connection pool for the given dataset, or creates a new one if it doesn't exist.
-    pub async fn get_shared_pool(
+    pub(crate) async fn get_shared_pool(
         &self,
         source: &dyn AccelerationSource,
     ) -> Result<SqliteConnectionPool> {

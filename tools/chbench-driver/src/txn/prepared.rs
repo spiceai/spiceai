@@ -25,30 +25,30 @@ use crate::Result;
 
 /// Prepared statements for the `NewOrder` transaction.
 pub struct NewOrderStmts {
-    pub select_customer_warehouse: Statement,
-    pub select_district: Statement,
-    pub update_district: Statement,
-    pub insert_oorder: Statement,
-    pub insert_new_order: Statement,
-    pub select_item: Statement,
+    pub(crate) select_customer_warehouse: Statement,
+    pub(crate) select_district: Statement,
+    pub(crate) update_district: Statement,
+    pub(crate) insert_oorder: Statement,
+    pub(crate) insert_new_order: Statement,
+    pub(crate) select_item: Statement,
     /// One prepared statement per district (`s_dist_01` through `s_dist_10`).
-    pub select_stock: [Statement; 10],
-    pub update_stock: Statement,
-    pub insert_order_line: Statement,
+    pub(crate) select_stock: [Statement; 10],
+    update_stock: Statement,
+    insert_order_line: Statement,
 }
 
 /// Prepared statements for the Payment transaction.
 pub struct PaymentStmts {
-    pub update_warehouse: Statement,
-    pub select_warehouse: Statement,
-    pub update_district: Statement,
-    pub select_district: Statement,
-    pub select_customer_by_last: Statement,
-    pub select_customer_for_update: Statement,
-    pub select_customer_data: Statement,
-    pub update_customer_with_data: Statement,
-    pub update_customer: Statement,
-    pub insert_history: Statement,
+    pub(crate) update_warehouse: Statement,
+    pub(crate) select_warehouse: Statement,
+    pub(crate) update_district: Statement,
+    pub(crate) select_district: Statement,
+    pub(crate) select_customer_by_last: Statement,
+    pub(crate) select_customer_for_update: Statement,
+    pub(crate) select_customer_data: Statement,
+    pub(crate) update_customer_with_data: Statement,
+    pub(crate) update_customer: Statement,
+    pub(crate) insert_history: Statement,
 }
 
 /// All prepared statements for the OLTP terminal, grouped by transaction type.
@@ -56,8 +56,8 @@ pub struct PaymentStmts {
 /// Created once per connection via [`PreparedStatements::prepare`], then reused
 /// across all transaction invocations for that terminal.
 pub struct PreparedStatements {
-    pub new_order: NewOrderStmts,
-    pub payment: PaymentStmts,
+    pub(crate) new_order: NewOrderStmts,
+    pub(crate) payment: PaymentStmts,
 }
 
 impl PreparedStatements {
@@ -66,7 +66,7 @@ impl PreparedStatements {
     /// # Errors
     ///
     /// Returns an error if any statement fails to prepare (e.g., schema mismatch).
-    pub async fn prepare(client: &Client) -> Result<Self> {
+    pub(crate) async fn prepare(client: &Client) -> Result<Self> {
         let new_order = Self::prepare_new_order(client).await?;
         let payment = Self::prepare_payment(client).await?;
         Ok(Self { new_order, payment })

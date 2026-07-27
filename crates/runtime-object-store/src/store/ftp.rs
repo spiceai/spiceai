@@ -263,7 +263,7 @@ impl FTPObjectStore {
     /// Create a new FTP object store with lazy connection pooling.
     /// The connection pool is initialized on first use.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         user: String,
         password: String,
         host: String,

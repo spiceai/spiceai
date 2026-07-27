@@ -172,7 +172,7 @@ pub struct DeltaTable {
 }
 
 impl DeltaTable {
-    pub fn from(
+    pub(crate) fn from(
         table_location: String,
         options: HashMap<String, SecretString>,
         io_runtime: &Handle,
@@ -275,7 +275,7 @@ impl DeltaTable {
     ///
     /// Used by Unity Catalog credential vending, where the store
     /// authenticates with vended, refresh-aware credentials.
-    pub fn from_object_store(
+    pub(crate) fn from_object_store(
         table_location: String,
         object_store: Arc<dyn object_store::ObjectStore>,
     ) -> Result<Self> {
@@ -329,7 +329,7 @@ impl DeltaTable {
     }
 
     #[must_use]
-    pub fn with_table_parquet_options(mut self, opts: TableParquetOptions) -> Self {
+    pub(crate) fn with_table_parquet_options(mut self, opts: TableParquetOptions) -> Self {
         self.table_parquet_options = opts;
         self
     }

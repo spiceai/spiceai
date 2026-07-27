@@ -133,7 +133,7 @@ impl PartialOrd for CacheInvalidationNode {
     }
 }
 impl CacheInvalidationNode {
-    pub(crate) fn new(input: LogicalPlan, table: TableReference, caching: Weak<Caching>) -> Self {
+    fn new(input: LogicalPlan, table: TableReference, caching: Weak<Caching>) -> Self {
         Self {
             input,
             table,

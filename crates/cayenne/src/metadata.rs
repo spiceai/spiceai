@@ -29,13 +29,13 @@ pub const DEFAULT_INLINE_MAX_BUFFER_BYTES: usize = 4 * 1_048_576;
 /// Default maximum rows to keep inline before flushing to Vortex.
 pub const DEFAULT_INLINE_FLUSH_MAX_ROWS: i64 = 10_000;
 /// Default maximum inline entries before flushing to Vortex.
-pub const DEFAULT_INLINE_FLUSH_MAX_SEGMENTS: i64 = 64;
+pub(crate) const DEFAULT_INLINE_FLUSH_MAX_SEGMENTS: i64 = 64;
 /// Default maximum serialized IPC bytes to keep inline before flushing to Vortex.
-pub const DEFAULT_INLINE_FLUSH_MAX_BYTES: i64 = 8 * 1_048_576;
+pub(crate) const DEFAULT_INLINE_FLUSH_MAX_BYTES: i64 = 8 * 1_048_576;
 /// Default maximum age of buffered streaming-append data before the sink cuts
 /// the segment and publishes it (bounds ingest-to-queryable latency for
 /// long-lived insert streams).
-pub const DEFAULT_STREAM_PUBLISH_INTERVAL_MS: u64 = 10_000;
+const DEFAULT_STREAM_PUBLISH_INTERVAL_MS: u64 = 10_000;
 
 /// Metadata about a table in the catalog.
 #[derive(Debug, Clone)]
@@ -47,7 +47,7 @@ pub struct TableMetadata {
     /// Path to the table's data directory
     pub path: String,
     /// Whether the path is relative to the catalog base
-    pub path_is_relative: bool,
+    pub(crate) path_is_relative: bool,
     /// Arrow schema for this table
     pub schema: SchemaRef,
     /// Primary key columns (for deletion vector support)
@@ -60,7 +60,7 @@ pub struct TableMetadata {
     /// Partition column name (if this is a partitioned table)
     pub partition_column: Option<String>,
     /// Vortex encoding configuration for this table
-    pub vortex_config: VortexConfig,
+    pub(crate) vortex_config: VortexConfig,
     /// Current sequence number for ordering operations (Iceberg-style).
     ///
     /// Monotonically increasing counter used to order deletes and inserts.
@@ -71,7 +71,7 @@ pub struct TableMetadata {
     /// This enables upsert semantics: if a PK is deleted and then re-inserted,
     /// the new insert has a higher sequence than the delete, so the delete
     /// doesn't apply to the new data.
-    pub current_sequence_number: i64,
+    pub(crate) current_sequence_number: i64,
 }
 
 impl TableMetadata {
@@ -95,7 +95,7 @@ impl TableMetadata {
     /// new id), so it is derived on demand and never persisted. The warm tier is
     /// intentionally left keyed by the bare `table_id`.
     #[must_use]
-    pub fn datalake_dir_segment(&self) -> String {
+    pub(crate) fn datalake_dir_segment(&self) -> String {
         let slug = Self::sanitize_name_slug(&self.table_name);
         if slug.is_empty() {
             self.table_id.clone()
@@ -134,7 +134,7 @@ impl TableMetadata {
     /// [`Self::datalake_dir_segment`]. Keeps the full segment well under the
     /// 255-byte path-component limit on common filesystems even with a 36-char
     /// UUID and a separator appended.
-    pub const DATALAKE_SLUG_MAX_LEN: usize = 64;
+    const DATALAKE_SLUG_MAX_LEN: usize = 64;
 }
 
 /// Represents a data file containing table rows.
@@ -146,30 +146,30 @@ impl TableMetadata {
 #[derive(Debug, Clone)]
 pub struct DataFile {
     /// Unique identifier for this data file
-    pub data_file_id: i64,
+    data_file_id: i64,
     /// Table this file belongs to (`UUIDv7`)
-    pub table_id: String,
+    table_id: String,
     /// Partition this file belongs to (None for non-partitioned tables)
-    pub partition_id: Option<String>,
+    partition_id: Option<String>,
     /// Ordering of this file within the table
-    pub file_order: i64,
+    file_order: i64,
     /// Path to the directory containing the `ListingTable`'s Vortex files
     /// This is the "virtual file" - a directory managed by a Vortex `ListingTable`
-    pub path: String,
+    path: String,
     /// Whether the path is relative to the table's base path
-    pub path_is_relative: bool,
+    path_is_relative: bool,
     /// File format (always "vortex" for Cayenne)
-    pub file_format: String,
+    file_format: String,
     /// Number of records in this virtual file (cached from `ListingTable` stats)
-    pub record_count: i64,
+    record_count: i64,
     /// Total size of all Vortex files in the `ListingTable` directory
-    pub file_size_bytes: i64,
+    file_size_bytes: i64,
     /// Starting row ID for this file (for row ID assignment)
-    pub row_id_start: i64,
+    row_id_start: i64,
     /// Sequence number when this data file was written.
     /// Used for ordering deletions: a deletion only applies to data files with
     /// `sequence_number` <= the delete file's `sequence_number`.
-    pub sequence_number: i64,
+    sequence_number: i64,
 }
 
 /// The type of deletion vector: position-based or key-based.
@@ -238,7 +238,7 @@ pub struct PartitionMetadata {
     /// Unique identifier for this partition (`UUIDv7`)
     pub partition_id: String,
     /// Table this partition belongs to (`UUIDv7`)
-    pub table_id: String,
+    pub(crate) table_id: String,
     /// Names of the partition columns (ordered).
     /// For a single partition column, this is a single-element vector.
     /// For composite partitions like `partition_by: [year, month]`, this contains
@@ -250,9 +250,9 @@ pub struct PartitionMetadata {
     /// e.g., `["2025", "10"]` for year=2025, month=10.
     pub partition_values: Vec<String>,
     /// Path to the partition's data directory
-    pub path: String,
+    pub(crate) path: String,
     /// Whether the path is relative to the table's base path
-    pub path_is_relative: bool,
+    pub(crate) path_is_relative: bool,
     /// Total number of records in this partition
     pub record_count: i64,
     /// Total size of data files in this partition (bytes)
@@ -383,12 +383,12 @@ pub enum DeltaEncoding {
 }
 
 /// Maximum supported [`DeltaEncoding`] level.
-pub const DELTA_ENCODING_MAX_LEVEL: u8 = 10;
+pub(crate) const DELTA_ENCODING_MAX_LEVEL: u8 = 10;
 
 /// First level that maps to the full default `BtrBlocks` cascade (levels
 /// `7..=10` are all "full" today). Shared with
 /// `provider::delta_encoding::FULL_LEVEL` so the two can't drift.
-pub const DELTA_ENCODING_FULL_LEVEL: u8 = 7;
+pub(crate) const DELTA_ENCODING_FULL_LEVEL: u8 = 7;
 
 impl std::fmt::Display for DeltaEncoding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -547,7 +547,7 @@ impl DeletionMode {
     /// meaning with a PK; a PK-less table can only do position-based deletion, so
     /// `Key` there resolves to `Position`.
     #[must_use]
-    pub const fn resolved(self, has_primary_key: bool) -> Self {
+    pub(crate) const fn resolved(self, has_primary_key: bool) -> Self {
         match self {
             // `Key` is only honored when there is a key to record.
             Self::Key if has_primary_key => Self::Key,
@@ -560,7 +560,7 @@ impl DeletionMode {
     /// Whether this mode (already resolved via [`Self::resolved`]) records and
     /// applies deletions as per-file row positions.
     #[must_use]
-    pub const fn is_position(self) -> bool {
+    pub(crate) const fn is_position(self) -> bool {
         matches!(self, Self::Position)
     }
 }
@@ -701,7 +701,7 @@ impl StorageClass {
     /// toward larger inline-flush (fewer, bigger files; fewer metastore commits).
     /// `LocalSsd`/`Tmpfs` are fast and get no bias.
     #[must_use]
-    pub fn is_slow_tier(self) -> bool {
+    pub(crate) fn is_slow_tier(self) -> bool {
         matches!(self, Self::Ebs | Self::Unknown)
     }
 
@@ -709,7 +709,7 @@ impl StorageClass {
     /// `2` `Tmpfs`, `3` `Unknown`. Lets dashboards see the storage tier the tuner
     /// detected without emitting a high-cardinality string label.
     #[must_use]
-    pub fn metric_code(self) -> u64 {
+    pub(crate) fn metric_code(self) -> u64 {
         match self {
             Self::LocalSsd => 0,
             Self::Ebs => 1,
@@ -1163,7 +1163,7 @@ impl VortexConfig {
     /// derived as `cold_target_file_size_mb * 16`. The single derivation rule
     /// for standalone and runtime paths — never returns 0.
     #[must_use]
-    pub fn cold_clustering_run_size_bytes(&self) -> usize {
+    pub(crate) fn cold_clustering_run_size_bytes(&self) -> usize {
         self.cold_clustering_run_size_mb
             .unwrap_or_else(|| self.cold_target_file_size_mb.saturating_mul(16))
             .max(1)
@@ -1199,7 +1199,7 @@ impl SchemaEvolutionMode {
 
     /// Whether `plan` falls within this mode's evolution set.
     #[must_use]
-    pub fn allows(&self, plan: &arrow_tools::schema_evolution::WideningPlan) -> bool {
+    pub(crate) fn allows(&self, plan: &arrow_tools::schema_evolution::WideningPlan) -> bool {
         match self {
             SchemaEvolutionMode::Disabled => false,
             SchemaEvolutionMode::AddColumnsOnly => plan.is_additive_only(),
@@ -1823,18 +1823,18 @@ pub struct CreateTableOptions {
 #[derive(Debug, Clone)]
 pub struct SnapshotFileStatistics {
     /// Table this stats entry belongs to (`UUIDv7`)
-    pub table_id: String,
+    pub(crate) table_id: String,
     /// Snapshot directory the file was listed from (`UUIDv7`)
-    pub snapshot_id: String,
+    pub(crate) snapshot_id: String,
     /// Object-store path of the `.vortex` file (as returned by listing)
-    pub file_path: String,
+    pub(crate) file_path: String,
     /// Cached `ObjectMeta::size` at the time stats were captured
-    pub file_size_bytes: i64,
+    pub(crate) file_size_bytes: i64,
     /// Row count from the file footer when stats were captured
-    pub num_rows: i64,
+    pub(crate) num_rows: i64,
     /// Serialized Vortex `FileStatistics` flatbuffer bytes (per-column min, max,
     /// and null count)
-    pub statistics_blob: Vec<u8>,
+    pub(crate) statistics_blob: Vec<u8>,
 }
 
 /// One row of the authoritative per-snapshot data-file manifest
@@ -1848,19 +1848,19 @@ pub struct SnapshotFileStatistics {
 #[derive(Debug, Clone)]
 pub struct SnapshotFile {
     /// Table this manifest entry belongs to (`UUIDv7`).
-    pub table_id: String,
+    pub(crate) table_id: String,
     /// Snapshot this file is a member of (`UUIDv7`).
     pub snapshot_id: String,
     /// Object-store path of the `.vortex` data file (as returned by listing).
     pub file_path: String,
     /// Live row count in the file.
-    pub row_count: i64,
+    pub(crate) row_count: i64,
     /// `ObjectMeta::size` of the file in bytes.
-    pub file_size_bytes: i64,
+    pub(crate) file_size_bytes: i64,
     /// Inclusive minimum commit sequence of the rows in this file.
-    pub min_sequence: i64,
+    pub(crate) min_sequence: i64,
     /// Inclusive maximum commit sequence of the rows in this file.
-    pub max_sequence: i64,
+    pub(crate) max_sequence: i64,
     /// Optional end-to-end integrity digest of the file's bytes, self-describing
     /// as `"<algorithm>:<lowercase-hex>"` (e.g. `"xxh3-128:1a2b…"`). `None` when
     /// integrity checksums were disabled at flush (or for rows written before
@@ -1892,17 +1892,17 @@ pub struct SnapshotFile {
 #[derive(Debug, Clone)]
 pub struct ColdTierFile {
     /// Table this cold file belongs to (`UUIDv7`).
-    pub table_id: String,
+    pub(crate) table_id: String,
     /// Absolute object-store URL of the `.vortex` data file on the cold store.
     pub file_url: String,
     /// Live row count in the file (post-merge, single-version-per-key).
     pub row_count: i64,
     /// `ObjectMeta::size` of the file in bytes.
-    pub file_size_bytes: i64,
+    pub(crate) file_size_bytes: i64,
     /// Inclusive minimum commit sequence of the rows in this file.
-    pub min_sequence: i64,
+    pub(crate) min_sequence: i64,
     /// Inclusive maximum commit sequence of the rows in this file.
-    pub max_sequence: i64,
+    pub(crate) max_sequence: i64,
     /// Serialized Vortex `FileStatistics` flatbuffer (per-column min/max/null/
     /// sum). Always populated at promotion (copied from the written footer) so
     /// listing-time pruning never falls back to a full scan.
@@ -1913,7 +1913,7 @@ pub struct ColdTierFile {
     /// `None` (non-upsert table, over the per-file cap, or a legacy row) makes
     /// the rebuild fall back to the exact cold scan. Never consulted for
     /// `DoNothing` (a false positive would wrongly drop a new row).
-    pub pk_bloom: Option<Vec<u8>>,
+    pub(crate) pk_bloom: Option<Vec<u8>>,
 }
 
 /// Table-level statistics stored as a serialized Vortex [`FileStatistics`] blob.

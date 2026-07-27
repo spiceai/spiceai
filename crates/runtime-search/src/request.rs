@@ -48,12 +48,12 @@ pub struct SearchRequestBaseJson {
 
     /// An SQL filter predicate to apply. Format: 'WHERE `where_cond`'.
     #[serde(rename = "where", default)]
-    pub where_cond: Option<String>,
+    where_cond: Option<String>,
 
     /// Additional columns to return from the dataset. If the column is a primary key, it will be
     ///  returned within the response under `.primary_key`, not `.data`.
     #[serde(default)]
-    pub additional_columns: Vec<String>,
+    additional_columns: Vec<String>,
 }
 
 /// HTTP request schema is separate from AI requests, so that keywords can be supplied as an optional field for HTTP calls.
@@ -68,14 +68,14 @@ pub struct SearchRequestHTTPJson {
 
     // A list of optional keywords, to pre-filter on the embedding column in SQL before performing the vector search.
     #[serde(default)]
-    pub keywords: Option<Vec<String>>,
+    keywords: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
 #[expect(clippy::doc_markdown)]
 pub struct SearchRequest {
     /// The text to search documents for similarity
-    pub text: String,
+    pub(crate) text: String,
 
     /// The datasets to search for similarity. If None, search across all datasets. For available datasets, use the 'list_datasets' tool and ensure `can_search_documents==true`.
     pub datasets: Option<Vec<String>>,
@@ -84,13 +84,13 @@ pub struct SearchRequest {
     pub limit: usize,
 
     /// An SQL filter predicate to apply. Format: 'WHERE <where_cond>'.
-    pub where_cond: Option<Expr>,
+    pub(crate) where_cond: Option<Expr>,
 
     /// Additional columns to return from the dataset.
-    pub additional_columns: Vec<Column>,
+    pub(crate) additional_columns: Vec<Column>,
 
     /// Keywords to perform a lexical search and pre-filter the embedding column.
-    pub keywords: Vec<String>,
+    pub(crate) keywords: Vec<String>,
 }
 
 impl TryFrom<SearchRequestHTTPJson> for SearchRequest {
@@ -180,7 +180,7 @@ impl SearchRequest {
     /// [`where_cond`] should already be sanitized. For raw WHERE conditions,
     /// use [`TryFrom<SearchRequestJson>`].
     #[must_use]
-    pub fn new(
+    fn new(
         text: String,
         datasets: Option<Vec<String>>,
         limit: usize,
@@ -198,7 +198,7 @@ impl SearchRequest {
         }
     }
 
-    pub fn parse_where_cond(where_cond: String) -> Result<Expr> {
+    fn parse_where_cond(where_cond: String) -> Result<Expr> {
         let parser = Parser::new(&PostgreSqlDialect {});
         let mut parser =
             parser
@@ -226,7 +226,7 @@ impl SearchRequest {
         Ok(expr)
     }
 
-    pub fn parse_additional_columns(additional_columns: &[String]) -> Result<Vec<Column>> {
+    fn parse_additional_columns(additional_columns: &[String]) -> Result<Vec<Column>> {
         additional_columns
             .iter()
             .map(|c| {

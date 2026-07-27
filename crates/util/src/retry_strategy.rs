@@ -62,7 +62,7 @@ pub struct RetryBackoff {
     pub randomization_factor: f64,
     pub max_retries: Option<usize>,
     pub max_duration: Option<Duration>,
-    pub base_interval: Duration,
+    base_interval: Duration,
 }
 
 impl Default for RetryBackoff {

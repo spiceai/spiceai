@@ -114,7 +114,7 @@ impl FilterColumnObservations {
     /// Hit count for a column (0 if never observed). Test helper.
     #[cfg(test)]
     #[must_use]
-    pub(crate) fn hits(&self, column: &str) -> u64 {
+    fn hits(&self, column: &str) -> u64 {
         self.state.lock().get(column).copied().unwrap_or(0)
     }
 }

@@ -151,7 +151,7 @@ impl CayennePartitionedInsertStrategy {
     /// coordinator to write top-level WAL files at
     /// `<table_root>/_partitioned_wal/`.
     #[must_use]
-    pub fn new(catalog: Arc<CayenneCatalog>, table_root: PathBuf) -> Self {
+    pub(crate) fn new(catalog: Arc<CayenneCatalog>, table_root: PathBuf) -> Self {
         Self {
             catalog,
             coordinator_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -166,7 +166,7 @@ impl CayennePartitionedInsertStrategy {
     /// set, every pointer must either equal its recorded target (committed) or
     /// differ (not committed). A mixed set is impossible under an atomic
     /// catalog transaction and is rejected rather than guessed at.
-    pub async fn recover_partitioned_wals(
+    pub(crate) async fn recover_partitioned_wals(
         &self,
         providers: &[Arc<dyn datafusion::catalog::TableProvider>],
     ) -> Result<(), DataFusionError> {

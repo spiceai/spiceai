@@ -46,7 +46,7 @@ use tokenizers::Tokenizer;
 
 use super::{Openai, default_rate_controller};
 
-pub(crate) const TEXT_EMBED_3_SMALL: &str = "text-embedding-3-small";
+const TEXT_EMBED_3_SMALL: &str = "text-embedding-3-small";
 
 pub const DEFAULT_EMBEDDING_MODEL: &str = TEXT_EMBED_3_SMALL;
 
@@ -59,8 +59,8 @@ fn default_retry_strategy() -> FibonacciBackoff {
 /// For non-OpenAI models, a [`Tokenizer`] can be provided to correctly size
 /// chunks (instead of the default `OpenAI` BPE tokenizer).
 pub struct OpenaiEmbed<C: Config + Clone> {
-    pub inner: Openai<C>,
-    pub chunk_sizer: Option<Arc<dyn ChunkSizer + Send + Sync>>,
+    inner: Openai<C>,
+    chunk_sizer: Option<Arc<dyn ChunkSizer + Send + Sync>>,
     // Retry strategy for transient or throttling errors
     retry_strategy: FibonacciBackoff,
 

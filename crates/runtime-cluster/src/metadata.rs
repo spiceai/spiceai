@@ -76,12 +76,12 @@ pub struct PartitionMetadata {
     pub assigned_executors: Vec<String>,
     /// Timestamp when partition was last assigned
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_assigned_at: Option<u128>,
+    pub(crate) last_assigned_at: Option<u128>,
 }
 
 impl PartitionMetadata {
     #[must_use]
-    pub fn new(partition_value: HashMap<String, Option<String>>) -> Self {
+    pub(crate) fn new(partition_value: HashMap<String, Option<String>>) -> Self {
         Self {
             partition_value,
             assigned_executors: Vec::new(),
@@ -99,7 +99,7 @@ impl PartitionMetadata {
         !self.assigned_executors.is_empty()
     }
 
-    pub fn assign_to(&mut self, executor_id: String, timestamp: u128) {
+    pub(crate) fn assign_to(&mut self, executor_id: String, timestamp: u128) {
         if !self.assigned_executors.contains(&executor_id) {
             self.assigned_executors.push(executor_id);
         }
@@ -151,13 +151,13 @@ pub async fn partition_value_to_bytes(
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TablePartitionMetadata {
     /// Fully qualified table name (always normalized via [`normalized_table_name`]).
-    pub table_name: String,
+    pub(crate) table_name: String,
     /// All partitions for this table
     pub partitions: Vec<PartitionMetadata>,
     /// Schema version for migration compatibility
-    pub schema_version: u32,
+    pub(crate) schema_version: u32,
     /// Last updated timestamp (milliseconds since UNIX epoch)
-    pub updated_at: u128,
+    pub(crate) updated_at: u128,
     /// The SQL expression strings for partition-by expressions (e.g. `["bucket(3, c_nationkey)"]`).
     /// Stored so that auto-generated labels like `"expr0"` can be resolved back to the
     /// original SQL expression for query routing.
@@ -166,7 +166,7 @@ pub struct TablePartitionMetadata {
 
 impl TablePartitionMetadata {
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         table: &TableReference,
         updated_at: u128,
         partition_expressions: Vec<String>,
@@ -180,12 +180,12 @@ impl TablePartitionMetadata {
         }
     }
 
-    pub fn add_partition(&mut self, partition: PartitionMetadata) {
+    pub(crate) fn add_partition(&mut self, partition: PartitionMetadata) {
         self.partitions.push(partition);
     }
 
     #[must_use]
-    pub fn unassigned_partitions(&self) -> Vec<&PartitionMetadata> {
+    pub(crate) fn unassigned_partitions(&self) -> Vec<&PartitionMetadata> {
         self.partitions
             .iter()
             .filter(|p| !p.is_assigned())
@@ -198,7 +198,7 @@ impl TablePartitionMetadata {
     ///
     /// Returns an error if the table schema cannot be converted to a `DataFusion` schema
     /// or if a partition expression cannot be parsed.
-    pub fn all_executor_partitions(
+    pub(crate) fn all_executor_partitions(
         &self,
         ctx: &Arc<SessionContext>,
         table_schema: &Arc<Schema>,

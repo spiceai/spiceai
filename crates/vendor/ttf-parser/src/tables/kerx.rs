@@ -21,7 +21,7 @@ const HEADER_SIZE: usize = 12;
 #[derive(Clone, Copy, Debug)]
 pub struct Subtable0<'a> {
     /// A list of kerning pairs.
-    pub pairs: LazyArray32<'a, KerningPair>,
+    pairs: LazyArray32<'a, KerningPair>,
 }
 
 impl<'a> Subtable0<'a> {
@@ -48,7 +48,7 @@ impl<'a> Subtable0<'a> {
 #[derive(Clone, Copy, Debug)]
 pub struct EntryData {
     /// An action index.
-    pub action_index: u16,
+    action_index: u16,
 }
 
 impl FromData for EntryData {
@@ -69,7 +69,7 @@ impl FromData for EntryData {
 #[derive(Clone)]
 pub struct Subtable1<'a> {
     /// A state table.
-    pub state_table: aat::ExtendedStateTable<'a, EntryData>,
+    state_table: aat::ExtendedStateTable<'a, EntryData>,
     actions_data: &'a [u8],
 }
 
@@ -190,9 +190,9 @@ impl core::fmt::Debug for AnchorPoints<'_> {
 #[derive(Clone)]
 pub struct Subtable4<'a> {
     /// A state table.
-    pub state_table: aat::ExtendedStateTable<'a, EntryData>,
+    state_table: aat::ExtendedStateTable<'a, EntryData>,
     /// Anchor points.
-    pub anchor_points: AnchorPoints<'a>,
+    anchor_points: AnchorPoints<'a>,
 }
 
 impl<'a> Subtable4<'a> {
@@ -319,21 +319,21 @@ pub enum Format<'a> {
 #[derive(Clone, Debug)]
 pub struct Subtable<'a> {
     /// Indicates that subtable is for horizontal text.
-    pub horizontal: bool,
+    horizontal: bool,
     /// Indicates that subtable is variable.
-    pub variable: bool,
+    variable: bool,
     /// Indicates that subtable has a cross-stream values.
-    pub has_cross_stream: bool,
+    has_cross_stream: bool,
     /// Indicates that subtable uses a state machine.
     ///
     /// In this case `glyphs_kerning()` will return `None`.
-    pub has_state_machine: bool,
+    has_state_machine: bool,
     /// The tuple count.
     ///
     /// This value is only used with variation fonts and should be 0 for all other fonts.
-    pub tuple_count: u32,
+    tuple_count: u32,
     /// Subtable format.
-    pub format: Format<'a>,
+    format: Format<'a>,
 }
 
 impl<'a> Subtable<'a> {
@@ -358,9 +358,9 @@ struct Coverage(u8);
 #[rustfmt::skip]
 impl Coverage {
     // TODO: use hex
-    #[inline] pub fn is_horizontal(self) -> bool { self.0 & (1 << 7) == 0 }
-    #[inline] pub fn has_cross_stream(self) -> bool { self.0 & (1 << 6) != 0 }
-    #[inline] pub fn is_variable(self) -> bool { self.0 & (1 << 5) != 0 }
+    #[inline] fn is_horizontal(self) -> bool { self.0 & (1 << 7) == 0 }
+    #[inline] fn has_cross_stream(self) -> bool { self.0 & (1 << 6) != 0 }
+    #[inline] fn is_variable(self) -> bool { self.0 & (1 << 5) != 0 }
 }
 
 /// A list of extended kerning subtables.
@@ -466,14 +466,14 @@ impl<'a> Iterator for SubtablesIter<'a> {
 #[derive(Clone, Copy, Debug)]
 pub struct Table<'a> {
     /// A list of subtables.
-    pub subtables: Subtables<'a>,
+    subtables: Subtables<'a>,
 }
 
 impl<'a> Table<'a> {
     /// Parses a table from raw data.
     ///
     /// `number_of_glyphs` is from the `maxp` table.
-    pub fn parse(number_of_glyphs: NonZeroU16, data: &'a [u8]) -> Option<Self> {
+    pub(crate) fn parse(number_of_glyphs: NonZeroU16, data: &'a [u8]) -> Option<Self> {
         let mut s = Stream::new(data);
         s.skip::<u16>(); // version
         s.skip::<u16>(); // padding

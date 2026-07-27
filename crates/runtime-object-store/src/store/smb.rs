@@ -181,7 +181,7 @@ impl SMBObjectStore {
     /// Create a new SMB object store with lazy connection setup.
     /// `port` defaults to 445 when `None`.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         server: String,
         port: Option<u16>,
         share: String,

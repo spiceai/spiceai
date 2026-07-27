@@ -1,4 +1,4 @@
-pub fn zapfdigbats_names_to_unicode(name: &str) -> Option<u16> {
+pub(crate) fn zapfdigbats_names_to_unicode(name: &str) -> Option<u16> {
     let names = [
         ("a1", 0x2701),
         ("a10", 0x2721),

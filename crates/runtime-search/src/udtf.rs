@@ -63,7 +63,7 @@ pub fn table_ref_from_column_expr(c: &Column) -> TableReference {
 /// Convert a [`TableReference`] into the [`Column`] encoding used by UDTFs
 /// that accept a table name as an expression argument.
 #[must_use]
-pub fn to_column_expr(tbl: &TableReference) -> Column {
+fn to_column_expr(tbl: &TableReference) -> Column {
     match tbl {
         TableReference::Bare { table } => Column::new_unqualified(table.to_string()),
         TableReference::Partial { schema, table } => Column::new(
@@ -267,7 +267,7 @@ pub enum EmbeddingInputMode {
 
 impl EmbeddingInputMode {
     #[must_use]
-    pub fn is_list_multi(&self) -> bool {
+    pub(crate) fn is_list_multi(&self) -> bool {
         matches!(self, Self::ListMulti { .. })
     }
 }
@@ -319,7 +319,7 @@ pub fn closest_column(target: &str, candidates: &[String]) -> Option<String> {
 ///
 /// Returns an error if `scalar` is not a non-negative integer value (or a
 /// string that parses to one).
-pub fn parse_limit_scalar(scalar: &ScalarValue) -> DataFusionResult<u64> {
+pub(crate) fn parse_limit_scalar(scalar: &ScalarValue) -> DataFusionResult<u64> {
     match scalar {
         ScalarValue::Int64(Some(limit)) => u64::try_from(*limit).map_err(|_| {
             DataFusionError::Plan(format!(
@@ -391,7 +391,7 @@ impl TextSearchTableFuncArgs {
     /// - A requested column is not indexed for text search.
     /// - No column is provided and multiple indexed columns exist.
     /// - The table has no indexed text-search columns.
-    pub fn column(&self, search_fields: &[String]) -> DataFusionResult<String> {
+    pub(crate) fn column(&self, search_fields: &[String]) -> DataFusionResult<String> {
         if let Some(col) = &self.column {
             if !search_fields.contains(col) {
                 return Err(DataFusionError::Plan(format!(

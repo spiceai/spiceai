@@ -314,13 +314,13 @@ struct GitTreeNode {
 
 static SPICE_USER_AGENT: &str = "spice";
 
-pub struct GithubRestClient {
+struct GithubRestClient {
     client: reqwest::Client,
     token: Option<String>,
 }
 
 impl GithubRestClient {
-    pub fn new(token: Option<&str>) -> reqwest::Result<Self> {
+    fn new(token: Option<&str>) -> reqwest::Result<Self> {
         let client = reqwest::Client::builder()
             .user_agent(util::spiceai_user_agent())
             .connect_timeout(Duration::from_secs(10))

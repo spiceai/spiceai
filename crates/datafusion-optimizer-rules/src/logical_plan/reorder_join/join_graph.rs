@@ -107,16 +107,16 @@ fn restore_schema_order(plan: LogicalPlan, schema: &DFSchemaRef) -> Result<Logic
     )?))
 }
 
-pub type NodeId = usize;
+pub(crate) type NodeId = usize;
 
-pub struct Node {
-    pub plan: Arc<LogicalPlan>,
-    pub(crate) connections: Vec<EdgeId>,
+pub(crate) struct Node {
+    pub(crate) plan: Arc<LogicalPlan>,
+    connections: Vec<EdgeId>,
 }
 
 impl Node {
     #[must_use]
-    pub fn connections(&self) -> &[EdgeId] {
+    pub(crate) fn connections(&self) -> &[EdgeId] {
         &self.connections
     }
 
@@ -132,7 +132,7 @@ impl Node {
     }
 
     #[must_use]
-    pub fn neighbours(&self, node_id: NodeId, join_graph: &JoinGraph) -> Vec<NodeId> {
+    pub(crate) fn neighbours(&self, node_id: NodeId, join_graph: &JoinGraph) -> Vec<NodeId> {
         self.connections
             .iter()
             .filter_map(|edge_id| join_graph.get_edge(*edge_id))
@@ -142,7 +142,7 @@ impl Node {
     }
 }
 
-pub type EdgeId = usize;
+pub(crate) type EdgeId = usize;
 
 /// An edge connecting two nodes in the join graph, carrying the equi-join
 /// keys (`on`) between them.
@@ -156,15 +156,15 @@ pub type EdgeId = usize;
 /// joins are normalized to the `Left` variants at extraction time, so the
 /// interior only ever sees this orientation; `into_logical_plan` relies on it
 /// to orient the rebuilt `Join`.
-pub struct Edge {
-    pub nodes: [NodeId; 2],
-    pub on: Vec<(Expr, Expr)>,
-    pub join_type: JoinType,
-    pub null_equality: NullEquality,
+pub(crate) struct Edge {
+    pub(crate) nodes: [NodeId; 2],
+    pub(crate) on: Vec<(Expr, Expr)>,
+    pub(crate) join_type: JoinType,
+    pub(crate) null_equality: NullEquality,
 }
 
-pub struct JoinGraph {
-    pub(crate) nodes: VecMap<Node>,
+pub(crate) struct JoinGraph {
+    nodes: VecMap<Node>,
     edges: VecMap<Edge>,
     /// Non-equi predicates hoisted out of decomposed `Join.filter` clauses
     /// and out of `LogicalPlan::Filter` nodes that sit between joins.
@@ -185,7 +185,7 @@ impl JoinGraph {
     ///
     /// Returns an error if the plan contains no join, or if a join predicate
     /// cannot be mapped onto exactly two relations during flattening.
-    pub fn try_from_logical_plan(
+    pub(crate) fn try_from_logical_plan(
         value: LogicalPlan,
         cost_estimator: &dyn JoinCostEstimator,
     ) -> Result<(JoinGraph, Vec<LogicalPlan>), DataFusionError> {
@@ -302,7 +302,7 @@ impl JoinGraph {
         tracing::trace!("{dump}");
     }
 
-    pub(crate) fn new() -> Self {
+    fn new() -> Self {
         Self {
             nodes: VecMap::new(),
             edges: VecMap::new(),
@@ -311,7 +311,7 @@ impl JoinGraph {
         }
     }
     #[must_use]
-    pub fn filters(&self) -> &[Expr] {
+    pub(crate) fn filters(&self) -> &[Expr] {
         &self.filters
     }
 
@@ -360,7 +360,7 @@ impl JoinGraph {
         visited.len() == total
     }
 
-    pub(crate) fn add_filter(&mut self, expr: Expr) {
+    fn add_filter(&mut self, expr: Expr) {
         self.filters.push(expr);
     }
 
@@ -457,7 +457,7 @@ impl JoinGraph {
         }
     }
 
-    pub(crate) fn add_node(&mut self, node_data: Arc<LogicalPlan>) -> NodeId {
+    fn add_node(&mut self, node_data: Arc<LogicalPlan>) -> NodeId {
         self.nodes.insert(Node {
             plan: node_data,
             connections: Vec::new(),
@@ -548,7 +548,7 @@ impl JoinGraph {
         }
     }
 
-    pub fn remove_edge(&mut self, edge_id: EdgeId) -> Option<Edge> {
+    fn remove_edge(&mut self, edge_id: EdgeId) -> Option<Edge> {
         if let Some(edge) = self.edges.remove(edge_id) {
             // Remove the edge from both nodes' connections
             for node_id in edge.nodes {
@@ -663,7 +663,7 @@ impl JoinGraph {
     /// unchanged — only estimates and scan selectivity improve. The derived
     /// `Filter` also materializes in the reconstructed plan, pruning the
     /// dimension at scan time.
-    pub(crate) fn derive_implied_single_table_filters(&mut self) {
+    fn derive_implied_single_table_filters(&mut self) {
         use std::collections::HashMap;
 
         // node_id -> predicates to AND onto that node's plan.
@@ -744,7 +744,7 @@ impl JoinGraph {
     /// existing key edges imply the original equality transitively — so only the
     /// join order changes. Removing a pendant's single edge isolates it before
     /// re-attaching, keeping the graph acyclic.
-    pub(crate) fn rewire_pendants_to_selective_equivalent(&mut self) {
+    fn rewire_pendants_to_selective_equivalent(&mut self) {
         struct Rewire {
             old_edge: EdgeId,
             pendant: NodeId,
@@ -903,7 +903,7 @@ fn transitive_class(pairs: &[(Column, Column)], seed: &Column) -> Vec<Column> {
 /// # Errors
 ///
 /// Returns an error if the plan doesn't contain any joins.
-pub(crate) fn extract_join_subtree(plan: LogicalPlan) -> Result<(LogicalPlan, Vec<LogicalPlan>)> {
+fn extract_join_subtree(plan: LogicalPlan) -> Result<(LogicalPlan, Vec<LogicalPlan>)> {
     let mut wrappers = Vec::new();
     let mut current = plan;
     let original_display = current.display().to_string();
@@ -958,7 +958,7 @@ pub(crate) fn extract_join_subtree(plan: LogicalPlan) -> Result<(LogicalPlan, Ve
 /// # Errors
 ///
 /// Returns an error if reconstructing any wrapper operator fails.
-pub fn reconstruct_plan(join_plan: LogicalPlan, wrappers: Vec<LogicalPlan>) -> Result<LogicalPlan> {
+pub(crate) fn reconstruct_plan(join_plan: LogicalPlan, wrappers: Vec<LogicalPlan>) -> Result<LogicalPlan> {
     let mut current = join_plan;
 
     // Apply wrappers in reverse order (from innermost to outermost)
@@ -1249,33 +1249,33 @@ fn flatten_joins_recursive(
 pub(crate) struct VecMap<V>(Vec<Option<V>>);
 
 impl<V> VecMap<V> {
-    pub(crate) fn new() -> Self {
+    fn new() -> Self {
         Self(Vec::new())
     }
 
-    pub(crate) fn insert(&mut self, value: V) -> usize {
+    fn insert(&mut self, value: V) -> usize {
         let idx = self.0.len();
         self.0.push(Some(value));
         idx
     }
 
-    pub(crate) fn get(&self, key: usize) -> Option<&V> {
+    fn get(&self, key: usize) -> Option<&V> {
         self.0.get(key)?.as_ref()
     }
 
-    pub(crate) fn get_mut(&mut self, key: usize) -> Option<&mut V> {
+    fn get_mut(&mut self, key: usize) -> Option<&mut V> {
         self.0.get_mut(key)?.as_mut()
     }
 
-    pub(crate) fn remove(&mut self, key: usize) -> Option<V> {
+    fn remove(&mut self, key: usize) -> Option<V> {
         self.0.get_mut(key)?.take()
     }
 
-    pub(crate) fn contains_key(&self, key: usize) -> bool {
+    fn contains_key(&self, key: usize) -> bool {
         self.0.get(key).and_then(|v| v.as_ref()).is_some()
     }
 
-    pub(crate) fn iter(&self) -> impl Iterator<Item = (usize, &V)> {
+    fn iter(&self) -> impl Iterator<Item = (usize, &V)> {
         self.0
             .iter()
             .enumerate()

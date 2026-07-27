@@ -46,8 +46,8 @@ pub use document::Document;
 pub use object::{Dictionary, Object, ObjectId, Stream, StringFormat};
 
 pub use bookmarks::Bookmark;
-pub use common_data_structures::{decode_text_string, text_string};
-pub use destinations::Destination;
+pub(crate) use common_data_structures::{decode_text_string, text_string};
+pub(crate) use destinations::Destination;
 pub use encodings::{Encoding, encode_utf8, encode_utf16_be};
 pub use encryption::{EncryptionState, EncryptionVersion, Permissions};
 pub use error::{Error, Result};
@@ -57,9 +57,9 @@ pub use object_stream::{ObjectStream, ObjectStreamBuilder, ObjectStreamConfig};
 pub use outlines::Outline;
 pub use reader::{PdfMetadata, Reader};
 pub use save_options::{SaveOptions, SaveOptionsBuilder};
-pub use toc::Toc;
+pub(crate) use toc::Toc;
 
-pub use parser_aux::substr;
+pub(crate) use parser_aux::substr;
 pub use parser_aux::substring;
 
 pub use font::FontData;

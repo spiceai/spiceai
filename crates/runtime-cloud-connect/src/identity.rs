@@ -175,7 +175,7 @@ impl IdentityStore {
     /// # Errors
     ///
     /// Returns an error if the file exists but cannot be removed.
-    pub async fn clear_async(path: &Path) -> Result<()> {
+    pub(crate) async fn clear_async(path: &Path) -> Result<()> {
         match tokio::fs::remove_file(path).await {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -199,7 +199,7 @@ impl IdentityStore {
     ///
     /// Returns [`Error::Enrollment`] if key generation or CSR
     /// serialization fails.
-    pub fn generate_enrollment() -> Result<EnrollmentMaterial> {
+    pub(crate) fn generate_enrollment() -> Result<EnrollmentMaterial> {
         let key_pair = KeyPair::generate().context(EnrollmentSnafu)?;
         let private_key_pem = key_pair.serialize_pem();
         let public_key_pem = key_pair.public_key_pem();
@@ -232,9 +232,9 @@ impl IdentityStore {
 /// signed leaf; the CSR and public key are sent in the enrollment `Hello`.
 #[derive(Debug, Clone)]
 pub struct EnrollmentMaterial {
-    pub private_key_pem: String,
-    pub public_key_pem: String,
-    pub csr_pem: String,
+    pub(crate) private_key_pem: String,
+    pub(crate) public_key_pem: String,
+    pub(crate) csr_pem: String,
 }
 
 #[cfg(unix)]

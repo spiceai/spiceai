@@ -29,7 +29,7 @@ use crate::value::{Mapping, Number, Value};
 ///
 /// Returns an error if a `u64` value exceeds `i64::MAX` and cannot be represented
 /// in YAML's integer format.
-pub(crate) fn value_to_yaml(value: &Value) -> Result<Yaml> {
+fn value_to_yaml(value: &Value) -> Result<Yaml> {
     Ok(match value {
         Value::Null => Yaml::Null,
         Value::Bool(b) => Yaml::Boolean(*b),

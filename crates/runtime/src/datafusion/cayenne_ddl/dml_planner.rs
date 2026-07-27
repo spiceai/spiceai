@@ -119,7 +119,7 @@ pub struct DistributedCayenneDmlHandler {
 
 impl DistributedCayenneDmlHandler {
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         executor_registry: Arc<ExecutorRegistry>,
         io_runtime: Option<tokio::runtime::Handle>,
     ) -> Self {

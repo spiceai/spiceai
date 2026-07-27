@@ -201,9 +201,9 @@ impl From<FieldOperation> for Document {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LogicalOperation {
     #[serde(rename = "$and", skip_serializing_if = "Option::is_none")]
-    pub and: Option<Vec<FilterExpression>>,
+    pub(crate) and: Option<Vec<FilterExpression>>,
     #[serde(rename = "$or", skip_serializing_if = "Option::is_none")]
-    pub or: Option<Vec<FilterExpression>>,
+    pub(crate) or: Option<Vec<FilterExpression>>,
 }
 
 impl From<LogicalOperation> for Map<String, Value> {
@@ -281,7 +281,7 @@ impl FromStr for Operator {
 }
 impl Operator {
     #[must_use]
-    pub fn as_str(&self) -> &'static str {
+    pub(crate) fn as_str(&self) -> &'static str {
         match self {
             Operator::Eq => "$eq",
             Operator::Ne => "$ne",
@@ -422,7 +422,7 @@ fn format_value_with_depth(value: &Value, depth: usize) -> String {
 }
 
 impl MetadataFilter {
-    pub fn from_json(json: &str) -> Result<Self> {
+    pub(crate) fn from_json(json: &str) -> Result<Self> {
         let value: Value = serde_json::from_str(json).context(JsonParsingSnafu)?;
         Self::from_value(&value)
     }
@@ -468,11 +468,11 @@ impl MetadataFilter {
         }
     }
 
-    pub fn to_json(&self) -> Result<String> {
+    pub(crate) fn to_json(&self) -> Result<String> {
         serde_json::to_string(self).context(JsonParsingSnafu)
     }
 
-    pub fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         match self {
             MetadataFilter::Simple(map) => {
                 for (field, value) in map {
@@ -756,7 +756,7 @@ pub fn document_to_json_map(document: Document) -> Result<Map<String, Value>> {
 /// # Errors
 ///
 /// Returns an error if the document nesting exceeds `MAX_RECURSION_DEPTH`.
-pub fn document_to_json_value(document: Document) -> Result<Value> {
+fn document_to_json_value(document: Document) -> Result<Value> {
     document_to_json_value_with_depth(document, 0)
 }
 
@@ -792,7 +792,7 @@ fn document_to_json_value_with_depth(document: Document, depth: usize) -> Result
 }
 
 #[must_use]
-pub fn aws_number_to_json_number(num: aws_smithy_types::Number) -> Option<serde_json::Number> {
+fn aws_number_to_json_number(num: aws_smithy_types::Number) -> Option<serde_json::Number> {
     match num {
         aws_smithy_types::Number::PosInt(pos_int) => Some(serde_json::Number::from(pos_int)),
         aws_smithy_types::Number::NegInt(neg_int) => Some(serde_json::Number::from(neg_int)),
@@ -802,7 +802,7 @@ pub fn aws_number_to_json_number(num: aws_smithy_types::Number) -> Option<serde_
 
 #[must_use]
 #[expect(clippy::needless_pass_by_value)]
-pub fn json_number_to_aws_number(num: serde_json::Number) -> Option<aws_smithy_types::Number> {
+fn json_number_to_aws_number(num: serde_json::Number) -> Option<aws_smithy_types::Number> {
     if num.is_i64() {
         let i = num.as_i64()?;
         if i >= 0 {

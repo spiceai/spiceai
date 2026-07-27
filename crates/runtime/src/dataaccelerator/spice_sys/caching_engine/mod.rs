@@ -20,7 +20,7 @@ use crate::{component::dataset::Dataset, dataaccelerator::spice_sys::OpenOption}
 #[cfg(feature = "duckdb")]
 mod duckdb;
 
-pub struct CachingEngineSys {
+pub(crate) struct CachingEngineSys {
     #[cfg_attr(not(feature = "duckdb"), expect(dead_code))]
     dataset_name: String,
     #[cfg_attr(not(feature = "duckdb"), expect(dead_code))]
@@ -28,7 +28,7 @@ pub struct CachingEngineSys {
 }
 
 impl CachingEngineSys {
-    pub async fn try_new(dataset: &Dataset, open_option: OpenOption) -> Result<Self> {
+    pub(crate) async fn try_new(dataset: &Dataset, open_option: OpenOption) -> Result<Self> {
         let registry = dataset.runtime.accelerator_engine_registry();
         Ok(Self {
             dataset_name: dataset.name.to_string(),
@@ -37,7 +37,7 @@ impl CachingEngineSys {
         })
     }
 
-    pub fn update_fetched_at(&self) -> Result<()> {
+    pub(crate) fn update_fetched_at(&self) -> Result<()> {
         #[cfg(feature = "duckdb")]
         {
             match &self.acceleration_connection {

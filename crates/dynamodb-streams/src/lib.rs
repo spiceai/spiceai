@@ -107,7 +107,7 @@ fn is_throttling_error_code(code: Option<&str>) -> bool {
 }
 
 impl Error {
-    pub fn from_describe_table(err: SdkError<DescribeTableError>) -> Self {
+    fn from_describe_table(err: SdkError<DescribeTableError>) -> Self {
         match err {
             SdkError::TimeoutError(_) => Error::Timeout,
             SdkError::DispatchFailure(_) => Error::ConnectionFailure,
@@ -126,7 +126,7 @@ impl Error {
         }
     }
 
-    pub fn from_describe_stream(err: SdkError<DescribeStreamError>) -> Self {
+    fn from_describe_stream(err: SdkError<DescribeStreamError>) -> Self {
         match err {
             SdkError::TimeoutError(_) => Error::Timeout,
             SdkError::DispatchFailure(_) => Error::ConnectionFailure,
@@ -145,7 +145,7 @@ impl Error {
         }
     }
 
-    pub fn from_get_records(err: SdkError<GetRecordsError>) -> Self {
+    fn from_get_records(err: SdkError<GetRecordsError>) -> Self {
         match err {
             SdkError::TimeoutError(_) => Error::Timeout,
             SdkError::DispatchFailure(_) => Error::ConnectionFailure,
@@ -166,7 +166,7 @@ impl Error {
         }
     }
 
-    pub fn from_get_shard_iterator(err: SdkError<GetShardIteratorError>) -> Self {
+    fn from_get_shard_iterator(err: SdkError<GetShardIteratorError>) -> Self {
         match err {
             SdkError::TimeoutError(_) => Error::Timeout,
             SdkError::DispatchFailure(_) => Error::ConnectionFailure,

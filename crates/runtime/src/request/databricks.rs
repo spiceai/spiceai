@@ -68,7 +68,7 @@ impl DatabricksAuthExtension {
     }
 
     #[must_use]
-    pub fn add_from_headers(
+    pub(crate) fn add_from_headers(
         self,
         mut bldr: RequestContextBuilder,
         headers: &HeaderMap,
@@ -81,7 +81,7 @@ impl DatabricksAuthExtension {
     }
 
     #[must_use]
-    pub fn from_headers(
+    pub(crate) fn from_headers(
         app: &Option<Arc<App>>,
         df: &Option<Arc<DataFusion>>,
         headers: &HeaderMap,
@@ -117,11 +117,11 @@ impl DatabricksAuthExtension {
     }
 
     #[must_use]
-    pub fn get_token(&self, client_id: &str) -> Option<SecretString> {
+    pub(crate) fn get_token(&self, client_id: &str) -> Option<SecretString> {
         self.tokens.get(client_id).cloned()
     }
 
-    pub async fn load_u2m_components(&self) {
+    async fn load_u2m_components(&self) {
         if let (Some(app), Some(df)) = (self.app.clone(), self.df.clone()) {
             let client_ids = self.tokens.keys().cloned().collect::<Vec<_>>();
 

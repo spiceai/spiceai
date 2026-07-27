@@ -68,23 +68,23 @@ const DEFAULT_OU: &str = "test-framework";
 #[derive(Debug, Clone)]
 pub struct PkiConfig {
     /// Path to the directory containing all PKI files.
-    pub pki_dir: PathBuf,
+    pki_dir: PathBuf,
     /// Path to the CA certificate file.
     pub ca_cert_path: PathBuf,
     /// Path to the CA private key file.
-    pub ca_key_path: PathBuf,
+    ca_key_path: PathBuf,
 }
 
 impl PkiConfig {
     /// Get the path where a client certificate would be stored.
     #[must_use]
-    pub fn client_cert_path(&self, client_name: &str) -> PathBuf {
+    fn client_cert_path(&self, client_name: &str) -> PathBuf {
         self.pki_dir.join(format!("{client_name}.crt"))
     }
 
     /// Get the path where a client private key would be stored.
     #[must_use]
-    pub fn client_key_path(&self, client_name: &str) -> PathBuf {
+    fn client_key_path(&self, client_name: &str) -> PathBuf {
         self.pki_dir.join(format!("{client_name}.key"))
     }
 
@@ -159,7 +159,7 @@ impl PkiConfig {
     /// - CA certificate or key cannot be read
     /// - Certificate generation fails
     /// - File I/O fails
-    pub fn create_client_cert_with_hosts(
+    fn create_client_cert_with_hosts(
         &self,
         client_name: &str,
         additional_hosts: &[&str],
@@ -255,7 +255,7 @@ pub struct ClientCertConfig {
     /// Path to the client private key file.
     pub key_path: PathBuf,
     /// The Common Name (CN) of the client certificate.
-    pub common_name: String,
+    common_name: String,
 }
 
 /// Initialize a test PKI infrastructure in the specified directory.
@@ -322,7 +322,7 @@ pub fn init_pki(output_dir: &Path) -> anyhow::Result<PkiConfig> {
 /// - Directory creation fails
 /// - Certificate generation fails
 /// - File I/O fails
-pub fn init_pki_with_ou(output_dir: &Path, organizational_unit: &str) -> anyhow::Result<PkiConfig> {
+fn init_pki_with_ou(output_dir: &Path, organizational_unit: &str) -> anyhow::Result<PkiConfig> {
     // Create PKI directory
     fs::create_dir_all(output_dir)?;
 

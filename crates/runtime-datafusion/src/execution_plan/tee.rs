@@ -37,7 +37,7 @@ pub struct TeeExec {
 
 impl TeeExec {
     /// Create a new `TeeExec`.
-    pub fn new(input: Arc<dyn ExecutionPlan>, n: usize) -> Self {
+    fn new(input: Arc<dyn ExecutionPlan>, n: usize) -> Self {
         let eq_properties = input.equivalence_properties().clone();
         let emission_type = input.pipeline_behavior();
         let boundedness = input.boundedness();

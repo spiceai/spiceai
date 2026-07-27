@@ -18,7 +18,7 @@ use opentelemetry::{
     metrics::{Counter, Gauge, Histogram, Meter},
 };
 
-pub const DURATION_MS_HISTOGRAM_BUCKETS: [f64; 15] = [
+const DURATION_MS_HISTOGRAM_BUCKETS: [f64; 15] = [
     0.0, 100.0, 250.0, 500.0, 750.0, 1000.0, 2500.0, 5000.0, 7500.0, 10000.0, 25000.0, 50000.0,
     100_000.0, 250_000.0, 500_000.0,
 ];
@@ -129,7 +129,7 @@ pub fn record_snapshot_failure(dataset: &str) {
     SNAPSHOT_FAILURE_COUNT.add(1, &labels);
 }
 
-pub fn record_write_metrics(
+pub(crate) fn record_write_metrics(
     dataset: &str,
     timestamp_secs: i64,
     duration_ms: f64,
@@ -160,7 +160,7 @@ pub fn record_write_metrics(
     SNAPSHOT_WRITE_CHECKSUM.record(1.0, &checksum_labels);
 }
 
-pub fn record_snapshot_skipped(dataset: &str) {
+pub(crate) fn record_snapshot_skipped(dataset: &str) {
     let labels = [dataset_label(dataset)];
     telemetry::record_snapshot_skipped(&labels);
     SNAPSHOT_SKIPPED_COUNT.add(1, &labels);

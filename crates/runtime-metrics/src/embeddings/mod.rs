@@ -16,7 +16,7 @@ limitations under the License.
 
 use super::{Counter, Gauge, LazyLock, Meter, UpDownCounter, global};
 
-pub static EMBEDDINGS_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("embeddings"));
+static EMBEDDINGS_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("embeddings"));
 
 pub static LOAD_ERROR: LazyLock<Counter<u64>> = LazyLock::new(|| {
     EMBEDDINGS_METER

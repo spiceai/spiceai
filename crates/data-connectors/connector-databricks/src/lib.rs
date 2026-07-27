@@ -122,7 +122,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 const DATABRICKS_DOCS: &str = "https://spiceai.org/docs/components/data-connectors/databricks";
 
-pub const PARAMETERS: &[ParameterSpec] = &[
+const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("endpoint")
         .required()
         .secret()
@@ -264,7 +264,7 @@ impl Databricks {
     ///
     /// Returns an error if required parameters are missing or invalid,
     /// or if the connection to Databricks fails.
-    pub async fn new(
+    async fn new(
         params: Parameters,
         io_runtime: Handle,
         token_provider_registry: Arc<TokenProviderRegistry>,
@@ -475,7 +475,7 @@ impl Databricks {
     /// # Errors
     ///
     /// Returns an error if token provider creation fails.
-    pub async fn get_token_provider(
+    async fn get_token_provider(
         endpoint: &str,
         auth_credentials: AuthCredentials<'_>,
         token_provider_registry: Arc<TokenProviderRegistry>,
@@ -502,7 +502,7 @@ impl Databricks {
     /// # Errors
     ///
     /// Returns an error if the authentication configuration is invalid.
-    pub fn build_auth_credentials(params: &Parameters) -> Result<AuthCredentials<'_>> {
+    fn build_auth_credentials(params: &Parameters) -> Result<AuthCredentials<'_>> {
         let token = params.get("token").ok();
         let client_id = params.get("client_id").expose().ok();
         let client_secret = params.get("client_secret").ok();
@@ -620,7 +620,7 @@ impl Databricks {
     /// # Errors
     ///
     /// Returns an error if token provider registration fails.
-    pub async fn get_m2m_token_provider(
+    async fn get_m2m_token_provider(
         endpoint: &str,
         client_id: &str,
         client_secret: &SecretString,
@@ -646,7 +646,7 @@ impl Databricks {
     /// # Errors
     ///
     /// Returns an error if token provider registration fails.
-    pub async fn get_u2m_token_provider(
+    async fn get_u2m_token_provider(
         endpoint: &str,
         client_id: &str,
         token_provider_registry: &Arc<TokenProviderRegistry>,
@@ -843,7 +843,7 @@ impl DatabricksFactory {
     }
 
     #[must_use]
-    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+    fn new_arc() -> Arc<dyn DataConnectorFactory> {
         Arc::new(Self) as Arc<dyn DataConnectorFactory>
     }
 }

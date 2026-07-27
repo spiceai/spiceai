@@ -134,7 +134,7 @@ pub enum UserFunctionError {
     },
 }
 
-pub type Result<T, E = UserFunctionError> = std::result::Result<T, E>;
+type Result<T, E = UserFunctionError> = std::result::Result<T, E>;
 
 #[must_use]
 pub fn supported_schemes() -> &'static str {
@@ -168,7 +168,7 @@ fn split_scheme(from: &str) -> (String, &str) {
 /// Returns [`UserFunctionError`] when the `from:` scheme is unsupported,
 /// the SQL body is missing for a SQL function, or the tier-specific factory
 /// (`sql` / `remote`) returns a build error.
-pub async fn build_function(decl: &Function) -> Result<BuiltFunction> {
+async fn build_function(decl: &Function) -> Result<BuiltFunction> {
     let (scheme, _tail) = split_scheme(&decl.from);
 
     match scheme.as_str() {

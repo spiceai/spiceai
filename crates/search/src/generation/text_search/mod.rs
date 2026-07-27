@@ -53,10 +53,10 @@ use super::{
 
 /// Maximum number of results in a single full-text search request, before any pagination.
 /// This size is designated for latency performance on the underlying index.
-pub static DEFAULT_BATCH_SIZE: usize = 100;
+static DEFAULT_BATCH_SIZE: usize = 100;
 
 /// Maximum number of results to return for a given full-text search.
-pub static DEFAULT_LIMIT_MAXIMUM: usize = 1000;
+pub(crate) static DEFAULT_LIMIT_MAXIMUM: usize = 1000;
 
 pub mod exec;
 pub mod index;
@@ -183,7 +183,7 @@ pub struct FullTextSearchFieldIndex {
     reader: tantivy::Searcher,
 
     pub field: String,
-    pub primary_key: Vec<String>,
+    primary_key: Vec<String>,
 
     /// Cached names of stored fields in the underlying index (for O(1) membership checks).
     stored_columns: HashSet<String>,
@@ -195,7 +195,7 @@ pub struct FullTextSearchFieldIndex {
 }
 
 impl FullTextSearchFieldIndex {
-    pub fn try_new(
+    fn try_new(
         index_search: Searcher,
         field: String,
         primary_key: Vec<String>,
@@ -261,18 +261,18 @@ impl FullTextSearchFieldIndex {
     /// Add type hints for all fields in [`SchemaRef`].
     ///
     /// Fields in `schema` but not in the underlying [`FullTextSearchIndex::idx`] are added.
-    pub fn add_type_hints(&mut self, schema: &SchemaRef) {
+    fn add_type_hints(&mut self, schema: &SchemaRef) {
         for f in schema.fields() {
             self.add_type_hint(f.name(), Arc::clone(f));
         }
     }
 
-    pub fn add_type_hint(&mut self, name: impl Into<String>, field: impl Into<Arc<Field>>) {
+    fn add_type_hint(&mut self, name: impl Into<String>, field: impl Into<Arc<Field>>) {
         self.type_hints.insert(name.into(), field.into());
     }
 
     #[must_use]
-    pub fn get_type_hint(&self, name: &str) -> Option<&FieldRef> {
+    fn get_type_hint(&self, name: &str) -> Option<&FieldRef> {
         self.type_hints.get(name)
     }
 
@@ -296,7 +296,7 @@ impl FullTextSearchFieldIndex {
         )
     }
 
-    pub async fn search(
+    async fn search(
         &self,
         query: String,
         opt_filters: &[&Expr],
@@ -557,7 +557,7 @@ fn make_stream(
 }
 
 #[must_use]
-pub fn tantivy_to_arrow_type(t: &FieldType) -> Option<arrow::datatypes::DataType> {
+fn tantivy_to_arrow_type(t: &FieldType) -> Option<arrow::datatypes::DataType> {
     match t {
         FieldType::Str(_) => Some(arrow::datatypes::DataType::Utf8),
         FieldType::I64(_) => Some(arrow::datatypes::DataType::Int64),

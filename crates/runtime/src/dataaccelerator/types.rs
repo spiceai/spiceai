@@ -30,12 +30,12 @@ pub use runtime_acceleration::AccelerationSource;
 
 #[derive(Default, Clone)]
 pub struct AcceleratorEngineRegistry {
-    pub accelerator_engine_registry: Arc<RwLock<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+    accelerator_engine_registry: Arc<RwLock<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
 }
 
 impl AcceleratorEngineRegistry {
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             accelerator_engine_registry: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -74,7 +74,7 @@ impl AcceleratorEngineRegistry {
         }
     }
 
-    pub async fn unregister_all(&self) {
+    pub(crate) async fn unregister_all(&self) {
         let mut registry = self.accelerator_engine_registry.write().await;
         // Shutdown each accelerator before clearing the registry
         for (engine, accelerator) in registry.drain() {

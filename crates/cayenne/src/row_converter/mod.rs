@@ -75,11 +75,11 @@ pub enum RowFormatVersion {
 
 impl RowFormatVersion {
     /// The version used for all newly-encoded data.
-    pub const CURRENT: Self = Self::V1;
+    const CURRENT: Self = Self::V1;
 
     /// A stable integer identifier, suitable for persisting alongside encoded bytes.
     #[must_use]
-    pub const fn id(self) -> u16 {
+    const fn id(self) -> u16 {
         match self {
             Self::V1 => 1,
         }
@@ -87,7 +87,7 @@ impl RowFormatVersion {
 
     /// The version for a previously-persisted [`id`](Self::id), or `None` if unknown.
     #[must_use]
-    pub const fn from_id(id: u16) -> Option<Self> {
+    const fn from_id(id: u16) -> Option<Self> {
         match id {
             1 => Some(Self::V1),
             _ => None,
@@ -98,8 +98,8 @@ impl RowFormatVersion {
 /// Configures the data type and sort order of one column of the row encoding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SortField {
-    pub(crate) options: SortOptions,
-    pub(crate) data_type: DataType,
+    options: SortOptions,
+    data_type: DataType,
 }
 
 impl SortField {
@@ -111,7 +111,7 @@ impl SortField {
 
     /// Create a field for `data_type` with explicit [`SortOptions`].
     #[must_use]
-    pub fn new_with_options(data_type: DataType, options: SortOptions) -> Self {
+    fn new_with_options(data_type: DataType, options: SortOptions) -> Self {
         Self { options, data_type }
     }
 }
@@ -141,7 +141,7 @@ impl RowConverter {
     /// # Errors
     /// Returns [`ArrowError::NotYetImplemented`] if any field's data type is not supported by
     /// that version.
-    pub fn with_version(
+    fn with_version(
         version: RowFormatVersion,
         fields: Vec<SortField>,
     ) -> Result<Self, ArrowError> {
@@ -152,7 +152,7 @@ impl RowConverter {
 
     /// The format version of this converter.
     #[must_use]
-    pub fn version(&self) -> RowFormatVersion {
+    fn version(&self) -> RowFormatVersion {
         match self {
             Self::Version1(_) => RowFormatVersion::V1,
         }
@@ -178,7 +178,7 @@ impl RowConverter {
     ///
     /// # Errors
     /// Returns an error if the row bytes are malformed for this converter's schema.
-    pub fn convert_rows<'a>(
+    pub(crate) fn convert_rows<'a>(
         &self,
         rows: impl IntoIterator<Item = Row<'a>>,
     ) -> Result<Vec<ArrayRef>, ArrowError> {

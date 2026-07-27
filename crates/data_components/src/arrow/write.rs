@@ -101,9 +101,9 @@ pub struct MemTable {
     column_defaults: HashMap<String, Expr>,
     /// Optional pre-known sort order(s). Must be `SortExpr`s.
     /// inserting data into this table removes the order
-    pub sort_order: Arc<Mutex<Vec<Vec<Expr>>>>,
+    sort_order: Arc<Mutex<Vec<Vec<Expr>>>>,
 
-    pub on_conflict: Option<OnConflict>,
+    on_conflict: Option<OnConflict>,
 
     /// Optional columns to sort by during insert operations.
     /// When specified, data is sorted before being written to improve
@@ -147,13 +147,13 @@ impl MemTable {
     }
 
     #[must_use]
-    pub fn with_sort_columns(mut self, sort_columns: Vec<String>) -> Self {
+    pub(crate) fn with_sort_columns(mut self, sort_columns: Vec<String>) -> Self {
         self.sort_columns = sort_columns;
         self
     }
 
     #[must_use]
-    pub fn with_on_conflict(mut self, on_conflict: OnConflict) -> Self {
+    pub(crate) fn with_on_conflict(mut self, on_conflict: OnConflict) -> Self {
         if !matches!(on_conflict, OnConflict::Upsert(_)) {
             tracing::warn!(
                 "In-memory tables only support Upsert on_conflict, but got: {on_conflict:?}. Setting will be ignored."
@@ -165,7 +165,7 @@ impl MemTable {
         self
     }
 
-    pub async fn try_with_constraints(mut self, constraints: Constraints) -> Result<Self> {
+    pub(crate) async fn try_with_constraints(mut self, constraints: Constraints) -> Result<Self> {
         self.ensure_batches_satisfy_constraints(&constraints)
             .await?;
         self.constraints = constraints;
@@ -666,7 +666,7 @@ impl MemSink {
 ///
 /// # Visibility
 /// This function is public for benchmarking purposes.
-pub(crate) fn check_and_filter_non_null_unique_primary_keys<S: std::hash::BuildHasher + Default>(
+fn check_and_filter_non_null_unique_primary_keys<S: std::hash::BuildHasher + Default>(
     pks: &[Option<String>],
     existing_pks: Option<&HashSet<String, S>>,
 ) -> Result<HashSet<String, S>> {
@@ -693,7 +693,7 @@ pub(crate) fn check_and_filter_non_null_unique_primary_keys<S: std::hash::BuildH
 ///
 /// # Visibility
 /// This function is public for benchmarking purposes.
-pub(crate) fn check_and_filter_unique_constraint<S: std::hash::BuildHasher + Default>(
+fn check_and_filter_unique_constraint<S: std::hash::BuildHasher + Default>(
     ids: &[&str],
     existing_ids: Option<&HashSet<String, S>>,
 ) -> Result<HashSet<String, S>> {
@@ -823,7 +823,7 @@ fn i64_to_key_string(n: i64) -> String {
 ///
 /// # Visibility
 /// This function is public for benchmarking purposes.
-pub(crate) fn extract_primary_keys_str(
+fn extract_primary_keys_str(
     batch: &RecordBatch,
     pk_indices_ordered: &[usize],
 ) -> Result<Vec<Option<String>>> {
@@ -1081,7 +1081,7 @@ fn constraint_identifiers(rb: &[&RecordBatch], constraint_idx: &[usize]) -> Resu
 ///
 /// # Visibility
 /// This function is public for benchmarking purposes.
-pub(crate) fn filter_existing<S: std::hash::BuildHasher>(
+fn filter_existing<S: std::hash::BuildHasher>(
     existing_batches: &mut Vec<RecordBatch>,
     overwriting_primary_keys: &HashSet<String, S>,
     pk_indices_ordered: &[usize],

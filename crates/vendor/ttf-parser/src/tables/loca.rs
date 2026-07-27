@@ -22,7 +22,7 @@ impl<'a> Table<'a> {
     ///
     /// - `number_of_glyphs` is from the `maxp` table.
     /// - `format` is from the `head` table.
-    pub fn parse(
+    pub(crate) fn parse(
         number_of_glyphs: NonZeroU16,
         format: IndexToLocationFormat,
         data: &'a [u8],
@@ -59,7 +59,7 @@ impl<'a> Table<'a> {
 
     /// Returns the number of offsets.
     #[inline]
-    pub fn len(&self) -> u16 {
+    fn len(&self) -> u16 {
         match self {
             Table::Short(ref array) => array.len(),
             Table::Long(ref array) => array.len(),
@@ -73,7 +73,7 @@ impl<'a> Table<'a> {
 
     /// Returns glyph's range in the `glyf` table.
     #[inline]
-    pub fn glyph_range(&self, glyph_id: GlyphId) -> Option<Range<usize>> {
+    pub(crate) fn glyph_range(&self, glyph_id: GlyphId) -> Option<Range<usize>> {
         let glyph_id = glyph_id.0;
         if glyph_id == u16::MAX {
             return None;

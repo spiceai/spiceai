@@ -221,7 +221,7 @@ impl OptimizerRule for DuckDBAggregateLogicalPushdown {
 
 #[derive(Debug, Eq, PartialEq, Hash)]
 pub struct DuckDBAggregatePushdownNode {
-    pub input_plan: LogicalPlan,
+    pub(crate) input_plan: LogicalPlan,
 }
 
 impl PartialOrd for DuckDBAggregatePushdownNode {
@@ -232,7 +232,7 @@ impl PartialOrd for DuckDBAggregatePushdownNode {
 
 impl DuckDBAggregatePushdownNode {
     #[must_use]
-    pub fn new(input: LogicalPlan) -> Arc<Self> {
+    fn new(input: LogicalPlan) -> Arc<Self> {
         Arc::new(Self { input_plan: input })
     }
 }

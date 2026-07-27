@@ -9,16 +9,16 @@ const FLOAT_STACK_LEN: usize = 64;
 const END_OF_FLOAT_FLAG: u8 = 0xf;
 
 #[derive(Clone, Copy, Debug)]
-pub struct Operator(pub u16);
+pub(crate) struct Operator(u16);
 
 impl Operator {
     #[inline]
-    pub fn get(self) -> u16 {
+    pub(crate) fn get(self) -> u16 {
         self.0
     }
 }
 
-pub struct DictionaryParser<'a> {
+pub(crate) struct DictionaryParser<'a> {
     data: &'a [u8],
     // The current offset.
     offset: usize,
@@ -37,7 +37,7 @@ pub struct DictionaryParser<'a> {
 
 impl<'a> DictionaryParser<'a> {
     #[inline]
-    pub fn new(data: &'a [u8], operands_buffer: &'a mut [f64]) -> Self {
+    pub(crate) fn new(data: &'a [u8], operands_buffer: &'a mut [f64]) -> Self {
         DictionaryParser {
             data,
             offset: 0,
@@ -48,7 +48,7 @@ impl<'a> DictionaryParser<'a> {
     }
 
     #[inline(never)]
-    pub fn parse_next(&mut self) -> Option<Operator> {
+    pub(crate) fn parse_next(&mut self) -> Option<Operator> {
         let mut s = Stream::new_at(self.data, self.offset)?;
         self.operands_offset = self.offset;
         while !s.at_end() {
@@ -84,7 +84,7 @@ impl<'a> DictionaryParser<'a> {
     ///
     /// We still have to "skip" operands during operators search (see `skip_number()`),
     /// but it's still faster that a naive method.
-    pub fn parse_operands(&mut self) -> Option<()> {
+    pub(crate) fn parse_operands(&mut self) -> Option<()> {
         let mut s = Stream::new_at(self.data, self.operands_offset)?;
         self.operands_len = 0;
         while !s.at_end() {
@@ -107,18 +107,18 @@ impl<'a> DictionaryParser<'a> {
     }
 
     #[inline]
-    pub fn operands(&self) -> &[f64] {
+    pub(crate) fn operands(&self) -> &[f64] {
         &self.operands[..usize::from(self.operands_len)]
     }
 
     #[inline]
-    pub fn parse_number(&mut self) -> Option<f64> {
+    pub(crate) fn parse_number(&mut self) -> Option<f64> {
         self.parse_operands()?;
         self.operands().get(0).cloned()
     }
 
     #[inline]
-    pub fn parse_offset(&mut self) -> Option<usize> {
+    pub(crate) fn parse_offset(&mut self) -> Option<usize> {
         self.parse_operands()?;
         let operands = self.operands();
         if operands.len() == 1 {
@@ -129,7 +129,7 @@ impl<'a> DictionaryParser<'a> {
     }
 
     #[inline]
-    pub fn parse_range(&mut self) -> Option<Range<usize>> {
+    pub(crate) fn parse_range(&mut self) -> Option<Range<usize>> {
         self.parse_operands()?;
         let operands = self.operands();
         if operands.len() == 2 {
@@ -145,7 +145,7 @@ impl<'a> DictionaryParser<'a> {
 
 // One-byte CFF DICT Operators according to the
 // Adobe Technical Note #5176, Appendix H CFF DICT Encoding.
-pub fn is_dict_one_byte_op(b: u8) -> bool {
+fn is_dict_one_byte_op(b: u8) -> bool {
     match b {
         0..=27 => true,
         28..=30 => false,  // numbers
@@ -156,7 +156,7 @@ pub fn is_dict_one_byte_op(b: u8) -> bool {
 }
 
 // Adobe Technical Note #5177, Table 3 Operand Encoding
-pub fn parse_number(b0: u8, s: &mut Stream) -> Option<f64> {
+fn parse_number(b0: u8, s: &mut Stream) -> Option<f64> {
     match b0 {
         28 => {
             let n = i32::from(s.read::<i16>()?);
@@ -253,7 +253,7 @@ fn parse_float_nibble(nibble: u8, mut idx: usize, data: &mut [u8]) -> Option<usi
 }
 
 // Just like `parse_number`, but doesn't actually parses the data.
-pub fn skip_number(b0: u8, s: &mut Stream) -> Option<()> {
+fn skip_number(b0: u8, s: &mut Stream) -> Option<()> {
     match b0 {
         28 => s.skip::<u16>(),
         29 => s.skip::<u32>(),

@@ -25,7 +25,7 @@ pub enum DuckDBDistanceMetric {
 
 impl DuckDBDistanceMetric {
     #[must_use]
-    pub fn duckdb_hnsw_metric(self) -> &'static str {
+    pub(crate) fn duckdb_hnsw_metric(self) -> &'static str {
         match self {
             Self::Cosine => "cosine",
             Self::L2 => "l2sq",

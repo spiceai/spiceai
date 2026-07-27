@@ -31,7 +31,7 @@ use std::any::Any;
 use std::sync::Arc;
 use tiberius::{Config, EncryptionLevel};
 
-pub const PREFIX: &str = "mssql";
+pub(crate) const PREFIX: &str = "mssql";
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -48,7 +48,7 @@ pub enum Error {
     InvalidParameterValue { parameter: String },
 }
 
-pub const PARAMETERS: &[ParameterSpec] = &[
+pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("connection_string")
         .secret()
         .description("The MSSQL connection string."),
@@ -77,7 +77,7 @@ pub struct MssqlCatalog {
 
 impl MssqlCatalog {
     #[must_use]
-    pub fn new_connector(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
+    pub(crate) fn new_connector(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
         Arc::new(Self { params })
     }
 

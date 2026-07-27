@@ -53,7 +53,7 @@ fn check_target(target: Target) -> bool {
 
 /// Returns `true` when colored output should be emitted for the given stream.
 #[must_use]
-pub fn colors_enabled_for(target: Target) -> bool {
+fn colors_enabled_for(target: Target) -> bool {
     let cell = match target {
         Target::Stdout => &STDOUT_COLORS,
         Target::Stderr => &STDERR_COLORS,

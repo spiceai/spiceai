@@ -92,7 +92,7 @@ pub enum Error {
 
 impl Error {
     /// Returns `true` for configuration errors that will not resolve with retries.
-    pub fn is_configuration_error(&self) -> bool {
+    pub(crate) fn is_configuration_error(&self) -> bool {
         matches!(
             self,
             Error::InvalidConfiguration { .. } | Error::InvalidConfigurationNoSource { .. }
@@ -138,7 +138,7 @@ pub(crate) static CATALOG_CONNECTOR_FACTORY_REGISTRY: LazyLock<
 /// # Returns
 ///
 /// `None` if the connector for `name` is not registered, otherwise a `Result` containing the result of calling the constructor to create a `CatalogConnector`.
-pub async fn create_new_connector(
+pub(crate) async fn create_new_connector(
     name: &str,
     params: ConnectorParams,
 ) -> Option<Arc<dyn CatalogConnector>> {
@@ -152,7 +152,7 @@ pub async fn create_new_connector(
 }
 
 /// Names of every registered catalog connector, for "did you mean?" suggestions.
-pub async fn registered_catalog_names() -> Vec<String> {
+pub(crate) async fn registered_catalog_names() -> Vec<String> {
     let guard = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
     let mut names: Vec<String> = guard.keys().cloned().collect();
     names.sort();
@@ -161,7 +161,7 @@ pub async fn registered_catalog_names() -> Vec<String> {
 
 /// Closest-match suggestion for an unknown catalog connector name. Reuses the
 /// same scoring/threshold helper as data connectors so behaviour is consistent.
-pub async fn suggest_catalog_connector(name: &str) -> Option<String> {
+pub(crate) async fn suggest_catalog_connector(name: &str) -> Option<String> {
     util::levenshtein::closest_match(name, &registered_catalog_names().await)
 }
 
@@ -296,7 +296,7 @@ pub async fn register_all() {
     );
 }
 
-pub async fn unregister_all() {
+pub(crate) async fn unregister_all() {
     let mut registry = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
     registry.clear();
 }
@@ -371,7 +371,7 @@ pub trait PartitionAwareCatalog: Send + Sync {
     ) -> Result<Option<String>>;
 }
 
-pub async fn get_catalog_provider(
+pub(crate) async fn get_catalog_provider(
     connector: Arc<dyn CatalogConnector>,
     runtime: Arc<Runtime>,
     catalog: &Catalog,

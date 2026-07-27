@@ -680,7 +680,7 @@ impl SharedSource {
 /// per-dataset lazy contract — setup runs on first poll, errors surface through
 /// the stream.
 #[must_use]
-pub fn subscribe(input: ReplicationStreamInput) -> ChangesStream {
+pub(crate) fn subscribe(input: ReplicationStreamInput) -> ChangesStream {
     Box::pin(
         stream::once(async move { subscribe_inner(input).await }).flat_map(|result| match result {
             Ok(stream) => stream,

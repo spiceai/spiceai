@@ -68,11 +68,11 @@ pub struct PartitionedWal {
     pub commit_id: String,
     /// Absolute path of the partitioned-table root, captured for diagnostic
     /// purposes (the file's own location is the authoritative root).
-    pub table_root: String,
+    table_root: String,
     /// Every partition participating in this commit.
     pub partitions: Vec<PartitionedWalEntry>,
     /// ISO-8601 timestamp when the WAL was written.
-    pub created_at: String,
+    created_at: String,
 }
 
 /// A single partition's reference inside a [`PartitionedWal`].

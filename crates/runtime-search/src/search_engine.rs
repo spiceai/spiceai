@@ -25,8 +25,8 @@ use crate::candidate::vector_udtf::VectorUDTFGeneration;
 use crate::error::{DataFusionSnafu, Error, FormattingSnafu, Result, SearchPipelineSnafu};
 use crate::table_provider_explorer::TableProviderExplorer;
 
-pub const SPICE_DEFAULT_CATALOG: &str = "spice";
-pub const SPICE_DEFAULT_SCHEMA: &str = "public";
+const SPICE_DEFAULT_CATALOG: &str = "spice";
+const SPICE_DEFAULT_SCHEMA: &str = "public";
 use arrow::array::RecordBatch;
 use async_stream::stream;
 use cache::key::{CacheKey, RawCacheKey, SearchKey};
@@ -68,7 +68,7 @@ use crate::types::VectorSearchResult;
 
 /// A Component that can perform search operations.
 pub struct SearchEngine<E: TableProviderExplorer> {
-    pub df: Arc<dyn QueryEngine>,
+    df: Arc<dyn QueryEngine>,
 
     explicit_primary_keys: HashMap<TableReference, Vec<String>>,
 
@@ -272,7 +272,7 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
     }
 
     // Prepare an individual [`impl search::CandidateGeneration`] (specifically a [`VectorGeneration`]) based on the [`TableReference`].
-    pub async fn vector_search_generator(
+    async fn vector_search_generator(
         &self,
         tbl: &TableReference,
         embedding_column: &str,
@@ -449,7 +449,7 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
         })
     }
 
-    pub async fn search(&self, req: &SearchRequest) -> Result<VectorSearchResult> {
+    async fn search(&self, req: &SearchRequest) -> Result<VectorSearchResult> {
         let SearchRequest {
             text: query,
             datasets: data_source_opt,

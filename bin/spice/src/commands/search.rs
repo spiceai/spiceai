@@ -47,23 +47,23 @@ Docs: https://spiceai.org/docs"#
 pub struct SearchArgs {
     /// Maximum number of results to return per query.
     #[arg(long, short, default_value = "10")]
-    pub limit: u32,
+    limit: u32,
 
     /// Whether to use the runtime results cache (`cache` or `no-cache`).
     #[arg(long, default_value = "cache", value_parser = ["cache", "no-cache"])]
-    pub cache_control: String,
+    cache_control: String,
 
     /// Embedding model id to use (defaults to the dataset's configured embedding).
     #[arg(long)]
-    pub model: Option<String>,
+    model: Option<String>,
 
     /// Override the runtime HTTP endpoint (e.g. `http://localhost:8090`).
     #[arg(long)]
-    pub endpoint: Option<String>,
+    endpoint: Option<String>,
 
     /// Custom HTTP headers in `Key:Value` form (repeatable).
     #[arg(long = "headers", value_name = "KEY:VALUE")]
-    pub custom_headers: Vec<String>,
+    custom_headers: Vec<String>,
 
     /// Output format.
     #[arg(long, short = 'o', default_value = "table")]

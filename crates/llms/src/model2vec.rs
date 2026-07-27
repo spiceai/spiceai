@@ -34,7 +34,7 @@ use util::home_dir::home_dir;
 /// `Model2Vec` is a technique that distills embeddings from
 /// transformer models into static word embeddings.
 pub struct Model2Vec {
-    pub name: String,
+    name: String,
     // `Arc` so the model can be shared into `spawn_blocking` to run the
     // (CPU-bound, synchronous) forward pass off the async runtime thread.
     model: Arc<StaticModel>,

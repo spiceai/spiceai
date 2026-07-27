@@ -10,9 +10,9 @@ use crate::GlyphId;
 #[derive(Clone, Copy, Debug)]
 pub struct Metrics {
     /// Width/Height advance for `hmtx`/`vmtx`.
-    pub advance: u16,
+    advance: u16,
     /// Left/Top side bearing for `hmtx`/`vmtx`.
-    pub side_bearing: i16,
+    side_bearing: i16,
 }
 
 impl FromData for Metrics {
@@ -35,11 +35,11 @@ impl FromData for Metrics {
 #[derive(Clone, Copy, Debug)]
 pub struct Table<'a> {
     /// A list of metrics indexed by glyph ID.
-    pub metrics: LazyArray16<'a, Metrics>,
+    metrics: LazyArray16<'a, Metrics>,
     /// Side bearings for glyph IDs greater than or equal to the number of `metrics` values.
-    pub bearings: LazyArray16<'a, i16>,
+    bearings: LazyArray16<'a, i16>,
     /// Sum of long metrics + bearings.
-    pub number_of_metrics: u16,
+    number_of_metrics: u16,
 }
 
 impl<'a> Table<'a> {

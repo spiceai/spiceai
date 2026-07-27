@@ -36,19 +36,19 @@ pub enum ReplicationCopyData {
 impl ReplicationCopyData {
     /// Returns true if this is an `XLogData` message
     #[inline]
-    pub fn is_xlog_data(&self) -> bool {
+    fn is_xlog_data(&self) -> bool {
         matches!(self, ReplicationCopyData::XLogData { .. })
     }
 
     /// Returns true if this is a `KeepAlive` message
     #[inline]
-    pub fn is_keepalive(&self) -> bool {
+    fn is_keepalive(&self) -> bool {
         matches!(self, ReplicationCopyData::KeepAlive { .. })
     }
 
     /// Returns true if this is a `KeepAlive` that requests a reply
     #[inline]
-    pub fn requires_reply(&self) -> bool {
+    fn requires_reply(&self) -> bool {
         matches!(
             self,
             ReplicationCopyData::KeepAlive {

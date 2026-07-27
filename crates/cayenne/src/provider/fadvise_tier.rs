@@ -115,7 +115,7 @@ pub(crate) fn flush_and_evict(path: &std::path::Path) -> io::Result<()> {
     clippy::unnecessary_wraps,
     reason = "signature must match the fallible Linux variant so callers are platform-agnostic"
 )]
-pub(crate) fn flush_and_evict(_path: &std::path::Path) -> std::io::Result<()> {
+fn flush_and_evict(_path: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -188,7 +188,7 @@ pub(crate) fn drop_clean(path: &std::path::Path) -> io::Result<()> {
     clippy::unnecessary_wraps,
     reason = "signature must match the fallible Linux variant so callers are platform-agnostic"
 )]
-pub(crate) fn drop_clean(_path: &std::path::Path) -> std::io::Result<()> {
+fn drop_clean(_path: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 

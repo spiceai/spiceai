@@ -140,7 +140,7 @@ pub struct ReloadableServerCerts {
 impl ReloadableServerCerts {
     /// Build from in-memory PEM. Used for inline / `${secrets:...}`-sourced
     /// material that cannot rotate at runtime.
-    pub fn from_pem(
+    fn from_pem(
         cert_pem: &[u8],
         key_pem: &[u8],
         scope: ReloadScope,
@@ -153,7 +153,7 @@ impl ReloadableServerCerts {
     /// The verifier is held under the same `ArcSwap` machinery as the
     /// hot-reload path uses, but — since this constructor takes inline
     /// bytes — it never gets rebuilt for the lifetime of the process.
-    pub fn from_pem_with_client_auth(
+    pub(crate) fn from_pem_with_client_auth(
         cert_pem: &[u8],
         key_pem: &[u8],
         client_ca_pem: Option<&[u8]>,
@@ -202,7 +202,7 @@ impl ReloadableServerCerts {
     /// (separately) the new client verifier. Cert+key and verifier are
     /// independent swaps so reads on one cannot block reads on the
     /// other; the dispatcher thread is the only writer.
-    pub fn from_paths_with_client_auth(
+    pub(crate) fn from_paths_with_client_auth(
         cert_path: PathBuf,
         key_path: PathBuf,
         client_ca_path: Option<PathBuf>,
@@ -266,7 +266,7 @@ impl ReloadableServerCerts {
     /// a parse failure on one keeps the previous version in place
     /// without affecting the others. Errors keep the old material in
     /// place rather than taking the server down on a bad rotation.
-    pub fn reload_now(&self) {
+    pub(crate) fn reload_now(&self) {
         // ---- server cert + key ----
         if let (Some(cert_path), Some(key_path)) = (&self.cert_path, &self.key_path) {
             let cert_pem = match fs::read(cert_path) {
@@ -380,7 +380,7 @@ impl ReloadableServerCerts {
     /// `None` when the resolver was built without client-cert auth
     /// (the caller should wire `with_no_client_auth()` instead).
     #[must_use]
-    pub fn client_verifier(&self) -> Option<Arc<dyn ClientCertVerifier>> {
+    pub(crate) fn client_verifier(&self) -> Option<Arc<dyn ClientCertVerifier>> {
         Some(shim_for(self.verifier_swap.as_ref()?))
     }
 
@@ -394,7 +394,7 @@ impl ReloadableServerCerts {
     ///
     /// `None` mirrors [`Self::client_verifier`].
     #[must_use]
-    pub fn client_verifier_lax(&self) -> Option<Arc<dyn ClientCertVerifier>> {
+    pub(crate) fn client_verifier_lax(&self) -> Option<Arc<dyn ClientCertVerifier>> {
         Some(shim_for(self.verifier_swap_lax.as_ref()?))
     }
 }
@@ -513,7 +513,7 @@ impl ReloadableServerCerts {
     /// Snapshot of the currently-loaded leaf + chain. Used for startup
     /// logging (`TlsConfig::subject_name`).
     #[must_use]
-    pub fn current_cert_chain(&self) -> Vec<CertificateDer<'static>> {
+    pub(crate) fn current_cert_chain(&self) -> Vec<CertificateDer<'static>> {
         self.inner.load().cert.clone()
     }
 }
@@ -541,7 +541,7 @@ enum WatchOp {
 impl CertWatcher {
     /// Spawn the watcher loop. The loop owns the OS-level watcher and a
     /// debounce table. Returns a handle that can be cloned cheaply via `Arc`.
-    pub fn spawn() -> Result<Self, ReloadError> {
+    pub(crate) fn spawn() -> Result<Self, ReloadError> {
         type ReloadCallback = Box<dyn Fn(&Path) + Send + Sync>;
         let (tx, mut rx) = mpsc::unbounded_channel::<WatchOp>();
         let event_tx = tx.clone();
@@ -682,7 +682,7 @@ impl CertWatcher {
     /// directory, so misconfiguration (missing dir, no permissions) is
     /// surfaced as a `ReloadError::Watcher` at the call site rather than
     /// silently disabling rotation.
-    pub fn register<F>(&self, paths: Vec<PathBuf>, callback: F) -> Result<(), ReloadError>
+    pub(crate) fn register<F>(&self, paths: Vec<PathBuf>, callback: F) -> Result<(), ReloadError>
     where
         F: Fn(&Path) + Send + Sync + 'static,
     {
@@ -716,7 +716,7 @@ impl CertWatcher {
     /// the rotation has actually landed should observe the
     /// `tls_reload_total{result="ok"}` counter (or the
     /// `reload_count_for_tests` helper in tests).
-    pub fn trigger_reload_all(&self) -> Result<(), ReloadError> {
+    pub(crate) fn trigger_reload_all(&self) -> Result<(), ReloadError> {
         self.tx
             .send(WatchOp::TriggerReloadAll)
             .map_err(|_| ReloadError::WatcherClosed)
@@ -941,7 +941,7 @@ pub fn reload_count_for_tests(scope: ReloadScope, result: &'static str) -> u64 {
 /// Increment the reload metric for the given (scope, result). Used by
 /// out-of-module reload paths (e.g. cluster outbound `ClientTlsConfig`
 /// rebuild) so all reload activity is observed under one metric.
-pub fn record_reload_metric(scope: ReloadScope, result: &'static str) {
+pub(crate) fn record_reload_metric(scope: ReloadScope, result: &'static str) {
     metrics().reload(scope, result);
 }
 

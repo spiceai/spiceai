@@ -621,7 +621,7 @@ fn find_top_level_as(s: &str) -> Option<usize> {
 /// the original expression. The substituted expression is then converted
 /// recursively *without* substitutions, because its own column references
 /// target the scan schema directly.
-pub(super) fn physical_expr_to_sql(
+fn physical_expr_to_sql(
     expr: &Arc<dyn PhysicalExpr>,
     column_substitutions: &[Arc<dyn PhysicalExpr>],
 ) -> Option<String> {

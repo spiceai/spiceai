@@ -154,16 +154,16 @@ impl Default for Style {
 #[derive(Clone, Copy, Eq, PartialEq, Debug, Hash)]
 pub struct ScriptMetrics {
     /// Horizontal face size.
-    pub x_size: i16,
+    pub(crate) x_size: i16,
 
     /// Vertical face size.
-    pub y_size: i16,
+    pub(crate) y_size: i16,
 
     /// X offset.
-    pub x_offset: i16,
+    pub(crate) x_offset: i16,
 
     /// Y offset.
-    pub y_offset: i16,
+    pub(crate) y_offset: i16,
 }
 
 // https://docs.microsoft.com/en-us/typography/opentype/spec/os2#fsselection
@@ -363,13 +363,13 @@ fn char_range_index(c: char) -> i8 {
 #[derive(Clone, Copy)]
 pub struct Table<'a> {
     /// Table version.
-    pub version: u8,
+    version: u8,
     data: &'a [u8],
 }
 
 impl<'a> Table<'a> {
     /// Parses a table from raw data.
-    pub fn parse(data: &'a [u8]) -> Option<Self> {
+    pub(crate) fn parse(data: &'a [u8]) -> Option<Self> {
         let mut s = Stream::new(data);
         let version = s.read::<u16>()?;
 
@@ -397,13 +397,13 @@ impl<'a> Table<'a> {
 
     /// Returns weight class.
     #[inline]
-    pub fn weight(&self) -> Weight {
+    pub(crate) fn weight(&self) -> Weight {
         Weight::from(Stream::read_at::<u16>(self.data, WEIGHT_CLASS_OFFSET).unwrap_or(0))
     }
 
     /// Returns face width.
     #[inline]
-    pub fn width(&self) -> Width {
+    pub(crate) fn width(&self) -> Width {
         match Stream::read_at::<u16>(self.data, WIDTH_CLASS_OFFSET).unwrap_or(0) {
             1 => Width::UltraCondensed,
             2 => Width::ExtraCondensed,
@@ -422,7 +422,7 @@ impl<'a> Table<'a> {
     ///
     /// Returns `None` in case of a malformed value.
     #[inline]
-    pub fn permissions(&self) -> Option<Permissions> {
+    pub(crate) fn permissions(&self) -> Option<Permissions> {
         let n = Stream::read_at::<u16>(self.data, TYPE_OFFSET).unwrap_or(0);
         if self.version <= 2 {
             // Version 2 and prior, applications are allowed to take
@@ -480,7 +480,7 @@ impl<'a> Table<'a> {
 
     /// Returns subscript metrics.
     #[inline]
-    pub fn subscript_metrics(&self) -> ScriptMetrics {
+    pub(crate) fn subscript_metrics(&self) -> ScriptMetrics {
         let mut s = Stream::new_at(self.data, Y_SUBSCRIPT_X_SIZE_OFFSET).unwrap_or_default();
         ScriptMetrics {
             x_size: s.read::<i16>().unwrap_or(0),
@@ -492,7 +492,7 @@ impl<'a> Table<'a> {
 
     /// Returns superscript metrics.
     #[inline]
-    pub fn superscript_metrics(&self) -> ScriptMetrics {
+    pub(crate) fn superscript_metrics(&self) -> ScriptMetrics {
         let mut s = Stream::new_at(self.data, Y_SUPERSCRIPT_X_SIZE_OFFSET).unwrap_or_default();
         ScriptMetrics {
             x_size: s.read::<i16>().unwrap_or(0),
@@ -504,7 +504,7 @@ impl<'a> Table<'a> {
 
     /// Returns strikeout metrics.
     #[inline]
-    pub fn strikeout_metrics(&self) -> LineMetrics {
+    pub(crate) fn strikeout_metrics(&self) -> LineMetrics {
         LineMetrics {
             thickness: Stream::read_at::<i16>(self.data, Y_STRIKEOUT_SIZE_OFFSET).unwrap_or(0),
             position: Stream::read_at::<i16>(self.data, Y_STRIKEOUT_POSITION_OFFSET).unwrap_or(0),
@@ -528,7 +528,7 @@ impl<'a> Table<'a> {
     }
 
     /// Returns style.
-    pub fn style(&self) -> Style {
+    pub(crate) fn style(&self) -> Style {
         let flags = SelectionFlags(self.fs_selection());
         if flags.italic() {
             Style::Italic
@@ -543,13 +543,13 @@ impl<'a> Table<'a> {
     ///
     /// Do not confuse with [`Weight::Bold`].
     #[inline]
-    pub fn is_bold(&self) -> bool {
+    pub(crate) fn is_bold(&self) -> bool {
         SelectionFlags(self.fs_selection()).bold()
     }
 
     /// Checks if typographic metrics should be used.
     #[inline]
-    pub fn use_typographic_metrics(&self) -> bool {
+    pub(crate) fn use_typographic_metrics(&self) -> bool {
         if self.version < 4 {
             false
         } else {
@@ -559,31 +559,31 @@ impl<'a> Table<'a> {
 
     /// Returns typographic ascender.
     #[inline]
-    pub fn typographic_ascender(&self) -> i16 {
+    pub(crate) fn typographic_ascender(&self) -> i16 {
         Stream::read_at::<i16>(self.data, TYPO_ASCENDER_OFFSET).unwrap_or(0)
     }
 
     /// Returns typographic descender.
     #[inline]
-    pub fn typographic_descender(&self) -> i16 {
+    pub(crate) fn typographic_descender(&self) -> i16 {
         Stream::read_at::<i16>(self.data, TYPO_DESCENDER_OFFSET).unwrap_or(0)
     }
 
     /// Returns typographic line gap.
     #[inline]
-    pub fn typographic_line_gap(&self) -> i16 {
+    pub(crate) fn typographic_line_gap(&self) -> i16 {
         Stream::read_at::<i16>(self.data, TYPO_LINE_GAP_OFFSET).unwrap_or(0)
     }
 
     /// Returns Windows ascender.
     #[inline]
-    pub fn windows_ascender(&self) -> i16 {
+    pub(crate) fn windows_ascender(&self) -> i16 {
         Stream::read_at::<i16>(self.data, WIN_ASCENT).unwrap_or(0)
     }
 
     /// Returns Windows descender.
     #[inline]
-    pub fn windows_descender(&self) -> i16 {
+    pub(crate) fn windows_descender(&self) -> i16 {
         // Should be negated.
         -Stream::read_at::<i16>(self.data, WIN_DESCENT).unwrap_or(0)
     }
@@ -592,7 +592,7 @@ impl<'a> Table<'a> {
     ///
     /// Returns `None` version is < 2.
     #[inline]
-    pub fn x_height(&self) -> Option<i16> {
+    pub(crate) fn x_height(&self) -> Option<i16> {
         if self.version < 2 {
             None
         } else {
@@ -604,7 +604,7 @@ impl<'a> Table<'a> {
     ///
     /// Returns `None` version is < 2.
     #[inline]
-    pub fn capital_height(&self) -> Option<i16> {
+    pub(crate) fn capital_height(&self) -> Option<i16> {
         if self.version < 2 {
             None
         } else {

@@ -23,7 +23,7 @@ pub struct Document {
 
     /// The binary mark important for PDF A/2,3 tells various software tools to classify
     /// the file as containing 8-bit binary that should be preserved during processing
-    pub binary_mark: Vec<u8>,
+    pub(crate) binary_mark: Vec<u8>,
 
     /// The trailer gives the location of the cross-reference table and of certain special objects.
     pub trailer: Dictionary,
@@ -38,20 +38,20 @@ pub struct Document {
     pub max_id: u32,
 
     /// Current maximum object id within Bookmarks.
-    pub max_bookmark_id: u32,
+    pub(crate) max_bookmark_id: u32,
 
     /// The bookmarks in the document. Render at the very end of document after renumbering objects.
-    pub bookmarks: Vec<u32>,
+    pub(crate) bookmarks: Vec<u32>,
 
     /// used to locate a stored Bookmark so children can be appended to it via its id. Otherwise we
     /// need to do recursive lookups and returns on the bookmarks internal layout Vec
-    pub bookmark_table: HashMap<u32, Bookmark>,
+    pub(crate) bookmark_table: HashMap<u32, Bookmark>,
 
     /// The byte the cross-reference table starts at.
     /// This value is only set during reading, but not when writing the file.
     /// It is used to support incremental updates in PDFs.
     /// Default value is `0`.
-    pub xref_start: usize,
+    pub(crate) xref_start: usize,
 
     /// The encryption state stores the parameters that were used to decrypt this document if the
     /// document has been decrypted.
@@ -77,7 +77,7 @@ impl Document {
     }
 
     /// Create a new PDF document that is an incremental update to a previous document.
-    pub fn new_from_prev(prev: &Document) -> Self {
+    pub(crate) fn new_from_prev(prev: &Document) -> Self {
         let mut new_trailer = prev.trailer.clone();
         new_trailer.set("Prev", Object::Integer(prev.xref_start as i64));
         Self {
@@ -141,7 +141,7 @@ impl Document {
     /// The object id will be None if the object was not a
     /// reference. Otherwise, it will be the last object id in the
     /// reference chain.
-    pub fn dereference<'a>(
+    pub(crate) fn dereference<'a>(
         &'a self,
         mut object: &'a Object,
     ) -> Result<(Option<ObjectId>, &'a Object)> {
@@ -228,7 +228,7 @@ impl Document {
     }
 
     /// Traverse objects from trailer recursively, return all referenced object IDs.
-    pub fn traverse_objects<A: Fn(&mut Object)>(&mut self, action: A) -> Vec<ObjectId> {
+    pub(crate) fn traverse_objects<A: Fn(&mut Object)>(&mut self, action: A) -> Vec<ObjectId> {
         fn traverse_array<A: Fn(&mut Object)>(
             array: &mut [Object],
             action: &A,
@@ -276,7 +276,7 @@ impl Document {
     }
 
     /// Return dictionary with encryption information
-    pub fn get_encrypted(&self) -> Result<&Dictionary> {
+    pub(crate) fn get_encrypted(&self) -> Result<&Dictionary> {
         self.trailer
             .get(b"Encrypt")
             .and_then(Object::as_reference)
@@ -326,7 +326,7 @@ impl Document {
     }
 
     /// Authenticate the provided owner/user password as bytes without sanitization
-    pub fn authenticate_raw_password<P>(&self, password: P) -> Result<()>
+    fn authenticate_raw_password<P>(&self, password: P) -> Result<()>
     where
         P: AsRef<[u8]>,
     {
@@ -370,7 +370,7 @@ impl Document {
     }
 
     /// Authenticate the provided owner/user password
-    pub fn authenticate_password(&self, password: &str) -> Result<()> {
+    pub(crate) fn authenticate_password(&self, password: &str) -> Result<()> {
         if !self.is_encrypted() {
             return Err(Error::NotEncrypted);
         }
@@ -385,7 +385,7 @@ impl Document {
     }
 
     /// Returns a `BTreeMap` of the crypt filters available in the PDF document if any.
-    pub fn get_crypt_filters(&self) -> BTreeMap<Vec<u8>, Arc<dyn CryptFilter>> {
+    pub(crate) fn get_crypt_filters(&self) -> BTreeMap<Vec<u8>, Arc<dyn CryptFilter>> {
         let mut crypt_filters = BTreeMap::new();
 
         if let Ok(filters) = self
@@ -467,7 +467,7 @@ impl Document {
 
     /// Replaces all encrypted Strings and Streams with their decrypted contents with the password
     /// provided directly as bytes without sanitization
-    pub fn decrypt_raw<P>(&mut self, password: P) -> Result<()>
+    fn decrypt_raw<P>(&mut self, password: P) -> Result<()>
     where
         P: AsRef<[u8]>,
     {
@@ -558,7 +558,7 @@ impl Document {
     }
 
     /// Get content stream object ids of a page.
-    pub fn get_page_contents(&self, page_id: ObjectId) -> Vec<ObjectId> {
+    fn get_page_contents(&self, page_id: ObjectId) -> Vec<ObjectId> {
         let mut streams = vec![];
         if let Ok(page) = self.get_dictionary(page_id) {
             let mut nb_deref = 0;
@@ -631,7 +631,7 @@ impl Document {
     }
 
     /// Get resources used by a page.
-    pub fn get_page_resources(
+    fn get_page_resources(
         &self,
         page_id: ObjectId,
     ) -> Result<(Option<&Dictionary>, Vec<ObjectId>)> {
@@ -665,7 +665,7 @@ impl Document {
     }
 
     /// Get fonts used by a page.
-    pub fn get_page_fonts(&self, page_id: ObjectId) -> Result<BTreeMap<Vec<u8>, &Dictionary>> {
+    pub(crate) fn get_page_fonts(&self, page_id: ObjectId) -> Result<BTreeMap<Vec<u8>, &Dictionary>> {
         fn collect_fonts_from_resources<'a>(
             resources: &'a Dictionary,
             fonts: &mut BTreeMap<Vec<u8>, &'a Dictionary>,
@@ -798,12 +798,12 @@ impl Document {
         Ok(images)
     }
 
-    pub fn decode_text(encoding: &Encoding, bytes: &[u8]) -> Result<String> {
+    pub(crate) fn decode_text(encoding: &Encoding, bytes: &[u8]) -> Result<String> {
         debug!("Decoding text with {encoding:#?}");
         encoding.bytes_to_string(bytes)
     }
 
-    pub fn encode_text(encoding: &Encoding, text: &str) -> Vec<u8> {
+    pub(crate) fn encode_text(encoding: &Encoding, text: &str) -> Vec<u8> {
         encoding.string_to_bytes(text)
     }
 }

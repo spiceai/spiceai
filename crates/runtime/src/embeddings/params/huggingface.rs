@@ -25,11 +25,11 @@ use super::Pooling;
 pub struct HuggingFaceEmbeddingParams {
     /// The Hugging Face access token.
     #[param(runtime, autoload_secret)]
-    pub hf_token: Option<SecretString>,
+    pub(crate) hf_token: Option<SecretString>,
     /// The pooling strategy for the embedding model.
     #[param(runtime)]
-    pub pooling: Option<Pooling>,
+    pub(crate) pooling: Option<Pooling>,
     /// The maximum sequence length for the embedding model.
     #[param(runtime)]
-    pub max_seq_length: Option<usize>,
+    pub(crate) max_seq_length: Option<usize>,
 }

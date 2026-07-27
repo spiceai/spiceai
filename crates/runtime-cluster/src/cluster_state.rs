@@ -45,7 +45,7 @@ use crate::metadata::TablePartitionMetadata;
 
 /// Current schema version for `cluster.json`. Bump if the on-disk shape
 /// changes; readers reject unknown versions.
-pub const CLUSTER_STATE_SCHEMA_VERSION: u32 = 1;
+const CLUSTER_STATE_SCHEMA_VERSION: u32 = 1;
 
 /// Maximum number of conditional-write attempts for [`ClusterStateStore::mutate`].
 /// Bumped from the 5 used per-table in the old layout because the document is
@@ -60,9 +60,9 @@ pub type NormalizedTableName = String;
 /// The full distributed cluster state, persisted as a single OCC document.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClusterState {
-    pub schema_version: u32,
-    pub created_at_ms: u64,
-    pub updated_at_ms: u64,
+    schema_version: u32,
+    created_at_ms: u64,
+    updated_at_ms: u64,
 
     /// All currently registered schedulers (heartbeats live in a separate
     /// per-scheduler file).
@@ -71,11 +71,11 @@ pub struct ClusterState {
 
     /// Partition metadata for accelerated tables.
     #[serde(default)]
-    pub accelerations: HashMap<NormalizedTableName, TablePartitionMetadata>,
+    accelerations: HashMap<NormalizedTableName, TablePartitionMetadata>,
 
     /// Partition metadata for catalog/federated tables.
     #[serde(default)]
-    pub catalog: HashMap<NormalizedTableName, TablePartitionMetadata>,
+    catalog: HashMap<NormalizedTableName, TablePartitionMetadata>,
 }
 
 impl ClusterState {
@@ -137,7 +137,7 @@ impl PartitionScope {
     }
 
     #[expect(dead_code, reason = "useful for diagnostics; kept for symmetry")]
-    pub(crate) fn as_str(self) -> &'static str {
+    fn as_str(self) -> &'static str {
         match self {
             PartitionScope::Acceleration => "acceleration",
             PartitionScope::Catalog => "catalog",
@@ -307,7 +307,7 @@ impl ClusterStateStore {
     /// Returns the in-memory snapshot if any has been observed so far.
     /// Cheap (Arc clone) and IO-free.
     #[must_use]
-    pub fn read_cached(&self) -> Option<Arc<ClusterState>> {
+    pub(crate) fn read_cached(&self) -> Option<Arc<ClusterState>> {
         self.cache.read().as_ref().map(|c| Arc::clone(&c.value))
     }
 

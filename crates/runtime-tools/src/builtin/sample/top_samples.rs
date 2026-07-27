@@ -69,12 +69,12 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct TopSamplesParams {
     #[serde(rename = "dataset")]
     /// The SQL dataset to sample data from.
-    pub tbl: String,
+    pub(crate) tbl: String,
     /// The number of rows, each with distinct values per column, to sample.
-    pub limit: usize,
+    limit: usize,
 
     /// How to order the samples before retrieving the top N.
-    pub order_by: String,
+    order_by: String,
 }
 
 impl Display for TopSamplesParams {

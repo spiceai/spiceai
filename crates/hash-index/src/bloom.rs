@@ -62,7 +62,7 @@ impl BloomFilter {
     ///
     /// Uses default parameters (10 bits/item, 7 hash functions) for ~0.82% FPR.
     #[must_use]
-    pub fn new(expected_items: usize) -> Self {
+    pub(crate) fn new(expected_items: usize) -> Self {
         Self::with_params(expected_items, DEFAULT_BITS_PER_ITEM, DEFAULT_NUM_HASHES)
     }
 
@@ -73,7 +73,7 @@ impl BloomFilter {
     /// - `bits_per_item`: Number of bits per item (higher = lower FPR, more memory)
     /// - `num_hashes`: Number of hash functions (optimal ≈ 0.693 × `bits_per_item`)
     #[must_use]
-    pub fn with_params(expected_items: usize, bits_per_item: usize, num_hashes: usize) -> Self {
+    fn with_params(expected_items: usize, bits_per_item: usize, num_hashes: usize) -> Self {
         let num_bits = (expected_items * bits_per_item).max(64);
         // Round up to next multiple of 64 for block alignment
         let num_bits = (num_bits + 63) & !63;
@@ -90,7 +90,7 @@ impl BloomFilter {
     ///
     /// This is useful as a placeholder; it will always return `true` from `might_contain`.
     #[must_use]
-    pub const fn empty() -> Self {
+    pub(crate) const fn empty() -> Self {
         Self {
             bits: Vec::new(),
             num_hashes: 0,
@@ -100,19 +100,19 @@ impl BloomFilter {
 
     /// Returns true if the bloom filter is empty (has no capacity).
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.bits.is_empty()
     }
 
     /// Returns the number of bits in the bloom filter.
     #[must_use]
-    pub fn num_bits(&self) -> usize {
+    pub(crate) fn num_bits(&self) -> usize {
         self.num_bits
     }
 
     /// Returns the estimated memory usage in bytes.
     #[must_use]
-    pub fn memory_usage(&self) -> usize {
+    pub(crate) fn memory_usage(&self) -> usize {
         self.bits.len() * 8
     }
 
@@ -120,13 +120,13 @@ impl BloomFilter {
     ///
     /// Alias for `memory_usage` for consistency with other components.
     #[must_use]
-    pub fn memory_usage_bytes(&self) -> usize {
+    pub(crate) fn memory_usage_bytes(&self) -> usize {
         self.memory_usage()
     }
 
     /// Inserts a hash into the bloom filter.
     #[inline]
-    pub fn insert(&mut self, hash: u64) {
+    pub(crate) fn insert(&mut self, hash: u64) {
         if self.bits.is_empty() {
             return;
         }
@@ -145,7 +145,7 @@ impl BloomFilter {
     /// Returns `true` if the item might be in the set (possible false positive).
     #[inline]
     #[must_use]
-    pub fn might_contain(&self, hash: u64) -> bool {
+    pub(crate) fn might_contain(&self, hash: u64) -> bool {
         if self.bits.is_empty() {
             // Empty bloom filter - always return true to fall through to hash table
             return true;
@@ -164,7 +164,7 @@ impl BloomFilter {
     }
 
     /// Clears all bits in the bloom filter.
-    pub fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.bits.fill(0);
     }
 
@@ -197,14 +197,14 @@ pub struct BatchBloomFilter {
 impl BatchBloomFilter {
     /// Creates a new batch bloom filter.
     #[must_use]
-    pub fn new(expected_items: usize) -> Self {
+    fn new(expected_items: usize) -> Self {
         Self {
             inner: BloomFilter::new(expected_items),
         }
     }
 
     /// Inserts multiple hashes into the bloom filter.
-    pub fn insert_batch(&mut self, hashes: &[u64]) {
+    fn insert_batch(&mut self, hashes: &[u64]) {
         for &hash in hashes {
             self.inner.insert(hash);
         }
@@ -214,7 +214,7 @@ impl BatchBloomFilter {
     ///
     /// Returns a vector of booleans indicating which hashes might be present.
     #[must_use]
-    pub fn might_contain_batch(&self, hashes: &[u64]) -> Vec<bool> {
+    fn might_contain_batch(&self, hashes: &[u64]) -> Vec<bool> {
         hashes
             .iter()
             .map(|&h| self.inner.might_contain(h))
@@ -225,7 +225,7 @@ impl BatchBloomFilter {
     ///
     /// This is useful for batch lookups where you want to skip definitely-missing keys.
     #[must_use]
-    pub fn filter_candidates(&self, hashes: &[u64]) -> Vec<u64> {
+    fn filter_candidates(&self, hashes: &[u64]) -> Vec<u64> {
         hashes
             .iter()
             .copied()
@@ -235,12 +235,12 @@ impl BatchBloomFilter {
 
     /// Provides access to the underlying bloom filter.
     #[must_use]
-    pub fn inner(&self) -> &BloomFilter {
+    pub(crate) fn inner(&self) -> &BloomFilter {
         &self.inner
     }
 
     /// Provides mutable access to the underlying bloom filter.
-    pub fn inner_mut(&mut self) -> &mut BloomFilter {
+    pub(crate) fn inner_mut(&mut self) -> &mut BloomFilter {
         &mut self.inner
     }
 }

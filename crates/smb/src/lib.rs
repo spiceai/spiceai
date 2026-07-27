@@ -43,7 +43,7 @@ limitations under the License.
 
 pub mod auth;
 pub mod client;
-pub mod crypto;
+pub(crate) mod crypto;
 pub mod ops;
 pub mod pool;
 pub mod protocol;

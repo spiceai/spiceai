@@ -117,7 +117,7 @@ impl FlightSqlService {
     /// Returns the per-session context if the request carries a known session
     /// ID (via `x-session-id` or `Authorization: Bearer <id>`), otherwise
     /// falls back to the base context.
-    pub(crate) fn session_ctx(
+    fn session_ctx(
         &self,
         metadata: &tonic::metadata::MetadataMap,
     ) -> Arc<SessionContext> {
@@ -224,7 +224,7 @@ impl FlightSqlService {
     ///
     /// Applies `expand_views_schema` so that the advertised schema matches
     /// what `sql_to_flight_stream` will actually produce.
-    pub(crate) async fn get_arrow_schema(
+    async fn get_arrow_schema(
         ctx: &Arc<SessionContext>,
         sql: &str,
     ) -> Result<Schema, Status> {
@@ -234,7 +234,7 @@ impl FlightSqlService {
     }
 
     /// Serialize an Arrow `Schema` to IPC bytes suitable for a `FlightInfo`.
-    pub(crate) fn serialize_schema(schema: &Schema) -> Result<Bytes, Status> {
+    fn serialize_schema(schema: &Schema) -> Result<Bytes, Status> {
         let message: IpcMessage = SchemaAsIpc::new(schema, &IpcWriteOptions::default())
             .try_into()
             .map_err(to_tonic_err)?;
@@ -242,7 +242,7 @@ impl FlightSqlService {
     }
 
     /// Execute `sql` against `ctx` and encode the result as a Flight data stream.
-    pub(crate) async fn sql_to_flight_stream(
+    async fn sql_to_flight_stream(
         ctx: Arc<SessionContext>,
         sql: &str,
         parameters: Option<ParamValues>,

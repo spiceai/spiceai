@@ -38,7 +38,7 @@ use util::topological_ordering::{
 /// Represents a validated view with its parsed dependencies
 pub(crate) struct ValidatedView {
     pub(crate) view: Arc<View>,
-    pub(crate) dependencies: Vec<TableReference>,
+    dependencies: Vec<TableReference>,
 }
 
 /// Extract view dependencies from SQL and return them in topological order.

@@ -133,12 +133,12 @@ static TPCH_ANSWERS: LazyLock<BTreeMap<Arc<str>, Vec<RecordBatch>>> = LazyLock::
 });
 
 #[must_use]
-pub(crate) fn has_static_tpch_answer(query: &Query) -> bool {
+fn has_static_tpch_answer(query: &Query) -> bool {
     TPCH_ANSWERS.contains_key(&query.name)
 }
 
 #[must_use]
-pub(crate) fn should_validate_with_static_tpch_answer(query: &Query, scale_factor: f64) -> bool {
+fn should_validate_with_static_tpch_answer(query: &Query, scale_factor: f64) -> bool {
     (scale_factor - 1.0).abs() < f64::EPSILON && has_static_tpch_answer(query)
 }
 
@@ -267,7 +267,7 @@ macro_rules! downcast_and_stringify_ts {
 /// - If the function fails to downcast the array to the expected type (e.g., if the array's type is
 ///   mismatched), it will return an error.
 /// - If the array's data type is not supported for conversion, `None` is returned.
-pub fn array_value_to_string(array: &dyn Array, index: usize) -> Result<Option<String>> {
+fn array_value_to_string(array: &dyn Array, index: usize) -> Result<Option<String>> {
     if array.len() <= index {
         return Err(anyhow!("Index out of bounds: {index} >= {}", array.len()));
     }
@@ -433,7 +433,7 @@ pub fn array_value_to_string(array: &dyn Array, index: usize) -> Result<Option<S
     }
 }
 
-pub fn validate_batches_as_strings(
+fn validate_batches_as_strings(
     expected: &RecordBatch,
     actual: &RecordBatch,
 ) -> Result<QueryValidationResult> {
@@ -514,7 +514,7 @@ pub fn validate_batches_as_strings(
     Ok(QueryValidationResult::Pass)
 }
 
-pub fn validate_tpch_query(
+fn validate_tpch_query(
     query: &Query,
     batches: &[RecordBatch],
 ) -> Result<QueryValidationResult> {
@@ -583,7 +583,7 @@ pub fn validate_tpch_query(
     validate_batches_as_strings(&expected_batches, &actual_batches)
 }
 
-pub fn validate_tpch_query_at_scale(
+pub(crate) fn validate_tpch_query_at_scale(
     query: &Query,
     batches: &[RecordBatch],
     scale_factor: f64,

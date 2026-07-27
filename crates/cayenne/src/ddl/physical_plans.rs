@@ -106,7 +106,7 @@ impl fmt::Debug for CayenneCreateTableExec {
 impl CayenneCreateTableExec {
     /// Construct a new single-node  execution plan.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         params: CreateTableParams,
         catalog_list: Arc<dyn CatalogProviderList>,
         runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
@@ -226,7 +226,7 @@ impl fmt::Debug for CayenneDropTableExec {
 impl CayenneDropTableExec {
     /// Construct a new single-node  execution plan.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         table_name: String,
         if_exists: bool,
         df_catalog_name: String,
@@ -341,7 +341,7 @@ impl fmt::Debug for CayenneCreateSchemaExec {
 impl CayenneCreateSchemaExec {
     /// Construct a new  execution plan.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         schema_name: String,
         if_not_exists: bool,
         df_catalog_name: String,
@@ -453,7 +453,7 @@ pub struct CayenneMergeExec {
 impl CayenneMergeExec {
     /// Construct a new local execution plan.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         join_plan: Arc<dyn ExecutionPlan>,
         target_provider: Arc<dyn TableProvider>,
         session_state: SessionState,

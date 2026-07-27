@@ -68,7 +68,7 @@ pub enum Error {
     MapPayload { message: String },
 }
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+type Result<T, E = Error> = std::result::Result<T, E>;
 
 type SchemaCacheKey = (String, u32);
 type SchemaCache = HashMap<SchemaCacheKey, Arc<AvroSchema>>;
@@ -121,7 +121,7 @@ pub struct AvroDecodeOptions {
 ///
 /// Async because resolving a Confluent wire-format schema id may fetch from
 /// the Schema Registry; cached schemas resolve without I/O.
-pub async fn parse_avro_change_events(
+async fn parse_avro_change_events(
     body: &[u8],
     options: &AvroDecodeOptions,
 ) -> Result<Vec<ChangeEvent>> {

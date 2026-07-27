@@ -70,7 +70,7 @@ pub enum Error {
     InvalidParameterValue { parameter: String },
 }
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+type Result<T, E = Error> = std::result::Result<T, E>;
 
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("connection_string").secret(),
@@ -185,7 +185,7 @@ impl SqlServerFactory {
     }
 
     #[must_use]
-    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+    fn new_arc() -> Arc<dyn DataConnectorFactory> {
         Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
     }
 }

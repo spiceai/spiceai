@@ -62,13 +62,13 @@ pub struct UpdateAppParams<'a> {
 
 impl CloudClient {
     /// Create a new authenticated cloud client.
-    pub fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         let token = get_auth_token()?;
         Self::with_token(token)
     }
 
     /// Create a new authenticated cloud client with an explicit bearer token.
-    pub fn with_token(token: impl Into<String>) -> Result<Self> {
+    pub(crate) fn with_token(token: impl Into<String>) -> Result<Self> {
         Ok(Self {
             inner: InnerCloudClient::new(&get_base_url())
                 .map_err(into_cli)?
@@ -77,24 +77,24 @@ impl CloudClient {
     }
 
     /// Create a new unauthenticated cloud client (for the login flow).
-    pub fn new_unauthenticated() -> Result<Self> {
+    pub(crate) fn new_unauthenticated() -> Result<Self> {
         Ok(Self {
             inner: InnerCloudClient::new(&get_base_url()).map_err(into_cli)?,
         })
     }
 
     /// Get the auth URL for the login flow.
-    pub fn get_auth_url(&self, auth_code: &str) -> String {
+    pub(crate) fn get_auth_url(&self, auth_code: &str) -> String {
         self.inner.get_auth_url(auth_code)
     }
 
     /// Exchange an auth code for an access token.
-    pub async fn exchange_code(&self, auth_code: &str) -> Result<Option<AuthExchangeResponse>> {
+    pub(crate) async fn exchange_code(&self, auth_code: &str) -> Result<Option<AuthExchangeResponse>> {
         self.inner.exchange_code(auth_code).await.map_err(into_cli)
     }
 
     /// Exchange `OAuth2` client credentials for an access token.
-    pub async fn exchange_client_credentials(
+    pub(crate) async fn exchange_client_credentials(
         &self,
         client_id: &str,
         client_secret: &str,
@@ -119,7 +119,7 @@ impl CloudClient {
     }
 
     /// Get the auth context for the current user.
-    pub async fn get_auth_context(&self) -> Result<AuthContext> {
+    pub(crate) async fn get_auth_context(&self) -> Result<AuthContext> {
         self.inner.get_auth_context().await.map_err(into_cli)
     }
 
@@ -127,7 +127,7 @@ impl CloudClient {
     ///
     /// Service-account tokens cannot access the auth-context endpoint; those
     /// `Unauthorized` failures are treated as absent user context.
-    pub async fn optional_user_auth_context(&self) -> Result<Option<AuthContext>> {
+    pub(crate) async fn optional_user_auth_context(&self) -> Result<Option<AuthContext>> {
         match self.get_auth_context().await {
             Ok(ctx) => Ok(Some(ctx)),
             Err(err) if is_unauthorized_auth_context_error(&err) => Ok(None),
@@ -139,7 +139,7 @@ impl CloudClient {
     // Apps
     // ========================================================================
 
-    pub async fn get_app_metrics(
+    pub(crate) async fn get_app_metrics(
         &self,
         app_id: i64,
         window: Option<&str>,
@@ -150,11 +150,11 @@ impl CloudClient {
             .map_err(into_cli)
     }
 
-    pub async fn list_apps(&self) -> Result<Vec<App>> {
+    pub(crate) async fn list_apps(&self) -> Result<Vec<App>> {
         self.inner.list_apps().await.map_err(into_cli)
     }
 
-    pub async fn get_app(&self, org_app: &str) -> Result<App> {
+    pub(crate) async fn get_app(&self, org_app: &str) -> Result<App> {
         let (org, name) = parse_org_app(org_app);
 
         if org.is_empty() {
@@ -173,12 +173,12 @@ impl CloudClient {
         self.get_app_by_id(app_id).await
     }
 
-    pub async fn get_app_by_id(&self, app_id: i64) -> Result<App> {
+    async fn get_app_by_id(&self, app_id: i64) -> Result<App> {
         self.inner.get_app_by_id(app_id).await.map_err(into_cli)
     }
 
     #[expect(clippy::too_many_arguments)]
-    pub async fn create_app(
+    pub(crate) async fn create_app(
         &self,
         name: &str,
         region: &str,
@@ -210,7 +210,7 @@ impl CloudClient {
         self.inner.create_app(&request).await.map_err(into_cli)
     }
 
-    pub async fn update_app(&self, org_app: &str, params: UpdateAppParams<'_>) -> Result<App> {
+    pub(crate) async fn update_app(&self, org_app: &str, params: UpdateAppParams<'_>) -> Result<App> {
         let app = self.get_app(org_app).await?;
         let resources = build_resources(params.cpu, params.memory);
         // Create and update both send storage size at the app level. The executor field remains
@@ -239,7 +239,7 @@ impl CloudClient {
             .map_err(into_cli)
     }
 
-    pub async fn delete_app(&self, org_app: &str) -> Result<()> {
+    pub(crate) async fn delete_app(&self, org_app: &str) -> Result<()> {
         let app = self.get_app(org_app).await?;
         self.inner.delete_app(app.id).await.map_err(into_cli)
     }
@@ -248,7 +248,7 @@ impl CloudClient {
     // Deployments
     // ========================================================================
 
-    pub async fn list_deployments(
+    pub(crate) async fn list_deployments(
         &self,
         org_app: &str,
         limit: usize,
@@ -261,7 +261,7 @@ impl CloudClient {
             .map_err(into_cli)
     }
 
-    pub async fn get_latest_deployment(&self, org_app: &str) -> Result<Deployment> {
+    pub(crate) async fn get_latest_deployment(&self, org_app: &str) -> Result<Deployment> {
         let deployments = self.list_deployments(org_app, 1, None).await?;
         deployments
             .into_iter()
@@ -271,7 +271,7 @@ impl CloudClient {
             })
     }
 
-    pub async fn create_deployment(
+    pub(crate) async fn create_deployment(
         &self,
         org_app: &str,
         image_tag: Option<&str>,
@@ -295,7 +295,7 @@ impl CloudClient {
             .map_err(into_cli)
     }
 
-    pub async fn get_deployment_logs(
+    pub(crate) async fn get_deployment_logs(
         &self,
         org_app: &str,
         deployment_id: i64,
@@ -313,11 +313,11 @@ impl CloudClient {
     // Regions & Images
     // ========================================================================
 
-    pub async fn list_regions(&self, env: Option<&str>) -> Result<RegionsResponse> {
+    pub(crate) async fn list_regions(&self, env: Option<&str>) -> Result<RegionsResponse> {
         self.inner.list_regions(env).await.map_err(into_cli)
     }
 
-    pub async fn list_container_images(
+    pub(crate) async fn list_container_images(
         &self,
         channel: Option<&str>,
     ) -> Result<ContainerImagesResponse> {
@@ -331,17 +331,17 @@ impl CloudClient {
     // Secrets
     // ========================================================================
 
-    pub async fn list_secrets(&self, org_app: &str) -> Result<Vec<Secret>> {
+    pub(crate) async fn list_secrets(&self, org_app: &str) -> Result<Vec<Secret>> {
         let app = self.get_app(org_app).await?;
         self.inner.list_secrets(app.id).await.map_err(into_cli)
     }
 
-    pub async fn get_secret(&self, org_app: &str, name: &str) -> Result<Secret> {
+    pub(crate) async fn get_secret(&self, org_app: &str, name: &str) -> Result<Secret> {
         let app = self.get_app(org_app).await?;
         self.inner.get_secret(app.id, name).await.map_err(into_cli)
     }
 
-    pub async fn set_secret(&self, org_app: &str, name: &str, value: &str) -> Result<Secret> {
+    pub(crate) async fn set_secret(&self, org_app: &str, name: &str, value: &str) -> Result<Secret> {
         let app = self.get_app(org_app).await?;
         self.inner
             .set_secret(app.id, name, value)
@@ -349,7 +349,7 @@ impl CloudClient {
             .map_err(into_cli)
     }
 
-    pub async fn delete_secret(&self, org_app: &str, name: &str) -> Result<()> {
+    pub(crate) async fn delete_secret(&self, org_app: &str, name: &str) -> Result<()> {
         let app = self.get_app(org_app).await?;
         self.inner
             .delete_secret(app.id, name)
@@ -361,12 +361,12 @@ impl CloudClient {
     // API Keys
     // ========================================================================
 
-    pub async fn get_api_keys(&self, org_app: &str) -> Result<ApiKeysResponse> {
+    pub(crate) async fn get_api_keys(&self, org_app: &str) -> Result<ApiKeysResponse> {
         let app = self.get_app(org_app).await?;
         self.inner.get_api_keys(app.id).await.map_err(into_cli)
     }
 
-    pub async fn regenerate_api_key(
+    pub(crate) async fn regenerate_api_key(
         &self,
         org_app: &str,
         key_number: u8,

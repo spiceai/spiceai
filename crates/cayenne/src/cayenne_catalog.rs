@@ -111,7 +111,7 @@ pub(crate) enum MetastoreImpl {
 
 impl MetastoreImpl {
     /// Helper to query a single row from metastore, working with both `SQLite` and Turso
-    pub(crate) async fn query_row_helper<F, T>(
+    async fn query_row_helper<F, T>(
         &self,
         params: QueryRowParams<'_>,
         f: F,
@@ -128,7 +128,7 @@ impl MetastoreImpl {
     }
 
     /// Helper to execute a statement on metastore, working with both `SQLite` and Turso
-    pub(crate) async fn execute_helper(&self, params: ExecuteParams<'_>) -> CatalogResult<()> {
+    async fn execute_helper(&self, params: ExecuteParams<'_>) -> CatalogResult<()> {
         match self {
             MetastoreImpl::Sqlite(m) => m.execute(params).await,
             #[cfg(feature = "turso")]
@@ -137,7 +137,7 @@ impl MetastoreImpl {
     }
 
     /// Helper to execute a transactional batch on metastore, working with both `SQLite` and Turso
-    pub(crate) async fn execute_transaction_batch_helper(&self, sql: &str) -> CatalogResult<()> {
+    async fn execute_transaction_batch_helper(&self, sql: &str) -> CatalogResult<()> {
         match self {
             MetastoreImpl::Sqlite(m) => m.execute_transaction_batch(sql).await,
             #[cfg(feature = "turso")]
@@ -146,7 +146,7 @@ impl MetastoreImpl {
     }
 
     /// Helper to query multiple rows from metastore, working with both `SQLite` and Turso
-    pub(crate) async fn query_helper<F, T>(
+    async fn query_helper<F, T>(
         &self,
         params: QueryParams<'_>,
         f: F,
@@ -163,7 +163,7 @@ impl MetastoreImpl {
     }
 
     /// Shutdown the metastore, performing any necessary cleanup.
-    pub(crate) async fn shutdown(&self) -> CatalogResult<()> {
+    async fn shutdown(&self) -> CatalogResult<()> {
         match self {
             MetastoreImpl::Sqlite(m) => m.shutdown().await,
             #[cfg(feature = "turso")]
@@ -172,7 +172,7 @@ impl MetastoreImpl {
     }
 
     /// Run a non-blocking WAL checkpoint off the hot path (cycle-5 TASK 2b).
-    pub(crate) async fn checkpoint_wal(&self) -> CatalogResult<()> {
+    async fn checkpoint_wal(&self) -> CatalogResult<()> {
         match self {
             MetastoreImpl::Sqlite(m) => m.checkpoint_wal().await,
             #[cfg(feature = "turso")]
@@ -185,7 +185,7 @@ impl MetastoreImpl {
     /// Each backend sends the appropriate BEGIN statement (e.g. `BEGIN TRANSACTION`
     /// for `SQLite`, `BEGIN CONCURRENT` for Turso). The returned transaction object
     /// holds exclusive access to the connection.
-    pub(crate) async fn begin_transaction(
+    async fn begin_transaction(
         &self,
     ) -> CatalogResult<Box<dyn super::metastore::MetastoreTransaction>> {
         match self {
@@ -270,7 +270,7 @@ impl CayenneCatalog {
     ///
     /// Returns [`CatalogError`] if the catalog cannot be opened or if the
     /// maintenance pragma statements fail to execute.
-    pub async fn shutdown(&self) -> CatalogResult<()> {
+    async fn shutdown(&self) -> CatalogResult<()> {
         self.metastore.shutdown().await
     }
 
@@ -694,7 +694,7 @@ impl CayenneCatalog {
     /// valid UUID (they are interpolated into the batch SQL).
     /// Returns [`CatalogError::FailedToSetCurrentSnapshot`] if the `execute_batch`
     /// call against the borrowed transaction fails.
-    pub async fn commit_compaction_fenced_in_txn(
+    async fn commit_compaction_fenced_in_txn(
         &self,
         txn: &mut dyn MetastoreTransaction,
         table_id: &str,
@@ -770,7 +770,7 @@ impl CayenneCatalog {
     ///
     /// Returns [`CatalogError::InvalidOperationNoSource`] if any UUID is
     /// malformed, or propagates the metastore error if a statement fails.
-    pub async fn swap_protected_snapshots_in_txn(
+    async fn swap_protected_snapshots_in_txn(
         &self,
         txn: &mut dyn MetastoreTransaction,
         table_id: &str,

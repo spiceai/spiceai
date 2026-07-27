@@ -62,7 +62,7 @@ use data_components::flightsql::{FlightSQLTable, FlightSqlClient};
 use crate::datafusion::DataFusion;
 
 /// UDTF name for `executor_table`.
-pub const EXECUTOR_TABLE_UDTF_NAME: &str = "executor_table";
+pub(crate) const EXECUTOR_TABLE_UDTF_NAME: &str = "executor_table";
 
 const MAX_FLIGHT_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
 
@@ -79,7 +79,7 @@ impl std::fmt::Debug for ExecutorTableFunc {
 
 impl ExecutorTableFunc {
     #[must_use]
-    pub fn new(df: Weak<DataFusion>) -> Self {
+    pub(crate) fn new(df: Weak<DataFusion>) -> Self {
         Self { df }
     }
 }

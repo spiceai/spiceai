@@ -16,7 +16,7 @@ limitations under the License.
 
 use super::{Counter, Gauge, LazyLock, Meter, UpDownCounter, global};
 
-pub static RERANKERS_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("rerankers"));
+static RERANKERS_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("rerankers"));
 
 pub static LOAD_ERROR: LazyLock<Counter<u64>> = LazyLock::new(|| {
     RERANKERS_METER

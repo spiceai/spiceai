@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// Spinner animation frames.
-pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Model information from the models endpoint.
 #[derive(Deserialize)]
@@ -204,7 +204,7 @@ pub async fn validate_model(
 /// # Errors
 ///
 /// Returns an error if no models are configured or user selection fails.
-pub async fn select_model(
+async fn select_model(
     client: &reqwest::Client,
     http_endpoint: &str,
     headers: &[(String, String)],

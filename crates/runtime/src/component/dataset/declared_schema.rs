@@ -50,7 +50,7 @@ pub enum DeclaredSchemaError {
 ///
 /// `nullable` defaults to `true` when not specified — Arrow's standard
 /// "unknown nullability is nullable" convention.
-pub fn declared_schema_for(dataset: &Dataset) -> Result<Option<SchemaRef>, DeclaredSchemaError> {
+pub(crate) fn declared_schema_for(dataset: &Dataset) -> Result<Option<SchemaRef>, DeclaredSchemaError> {
     if dataset.columns.is_empty() {
         return Ok(None);
     }

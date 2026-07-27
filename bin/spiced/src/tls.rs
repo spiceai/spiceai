@@ -28,7 +28,7 @@ use crate::{Args, ClientAuthMode};
 
 /// Message shown when mTLS is configured but the `client_tls` cargo feature is
 /// not compiled into this build of Spice.
-pub(crate) const MTLS_ENTERPRISE_ONLY_MESSAGE: &str = "mTLS (client certificate authentication) is included in the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai/docs/enterprise";
+const MTLS_ENTERPRISE_ONLY_MESSAGE: &str = "mTLS (client certificate authentication) is included in the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai/docs/enterprise";
 
 #[cfg(feature = "client_tls")]
 const CLIENT_TLS_ENABLED: bool = true;

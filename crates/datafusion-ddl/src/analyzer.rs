@@ -60,9 +60,9 @@ use crate::{
 /// planner has no catalog knowledge of its own.
 pub struct DdlExtensionNode {
     /// The DDL operation and its full parameters.
-    pub op: DdlNodeOp,
+    op: DdlNodeOp,
     /// The handler that will convert this node to a physical plan.
-    pub handler: Arc<dyn CatalogDdlHandler>,
+    handler: Arc<dyn CatalogDdlHandler>,
     output_schema: DFSchemaRef,
 }
 

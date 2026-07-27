@@ -234,13 +234,13 @@ impl CayenneCatalogProvider {
 
     /// Returns the base data path on local disk.
     #[must_use]
-    pub fn data_base_path(&self) -> &str {
+    pub(crate) fn data_base_path(&self) -> &str {
         &self.data_base_path
     }
 
     /// Returns the Vortex configuration.
     #[must_use]
-    pub fn vortex_config(&self) -> &VortexConfig {
+    pub(crate) fn vortex_config(&self) -> &VortexConfig {
         &self.vortex_config
     }
 
@@ -452,7 +452,7 @@ impl CayenneSchemaProvider {
     /// # Errors
     ///
     /// Returns an error if any table fails to load from the catalog.
-    pub async fn try_new(
+    async fn try_new(
         catalog: Arc<dyn MetadataCatalog>,
         namespace: &str,
         full_table_names: &[String],

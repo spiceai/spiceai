@@ -41,7 +41,7 @@ pub struct SchedulerRPCSecretStore {
 
 impl SchedulerRPCSecretStore {
     #[must_use]
-    pub fn new(expander: Arc<dyn ClusterSecretExpander>, executor_id: String) -> Self {
+    pub(crate) fn new(expander: Arc<dyn ClusterSecretExpander>, executor_id: String) -> Self {
         Self {
             executor_id,
             expander,

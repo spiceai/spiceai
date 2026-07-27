@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 pub mod connector;
-pub mod table;
+pub(crate) mod table;
 
 #[cfg(feature = "elasticsearch")]
 pub mod elasticsearch;

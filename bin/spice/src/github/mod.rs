@@ -36,20 +36,20 @@ const RUNTIME_REPO: &str = "spiceai";
 pub struct GitHubClient {
     client: Client,
     token: Option<String>,
-    pub owner: String,
-    pub repo: String,
+    owner: String,
+    repo: String,
 }
 
 impl GitHubClient {
     /// Create a new GitHub client for the spiceai/spiceai repository.
     #[must_use]
-    pub fn new_runtime_client() -> Self {
+    pub(crate) fn new_runtime_client() -> Self {
         Self::new(RUNTIME_OWNER, RUNTIME_REPO)
     }
 
     /// Create a new GitHub client for a specific repository.
     #[must_use]
-    pub fn new(owner: &str, repo: &str) -> Self {
+    fn new(owner: &str, repo: &str) -> Self {
         // Check for GitHub token in environment
         let token = std::env::var("GH_TOKEN")
             .or_else(|_| std::env::var("GITHUB_TOKEN"))
@@ -76,7 +76,7 @@ impl GitHubClient {
     }
 
     /// Make a GET request to the GitHub API.
-    pub async fn get<T: DeserializeOwned>(&self, url: &str) -> Result<T, GitHubError> {
+    async fn get<T: DeserializeOwned>(&self, url: &str) -> Result<T, GitHubError> {
         let mut request = self
             .client
             .get(url)
@@ -110,7 +110,7 @@ impl GitHubClient {
     }
 
     /// Download a file with progress tracking.
-    pub async fn download_with_progress<F>(
+    async fn download_with_progress<F>(
         &self,
         url: &str,
         mut on_progress: F,
@@ -162,7 +162,7 @@ impl GitHubClient {
 
     /// Get the releases API URL.
     #[must_use]
-    pub fn releases_url(&self) -> String {
+    fn releases_url(&self) -> String {
         format!(
             "{GITHUB_API_BASE}/repos/{}/{}/releases",
             self.owner, self.repo
@@ -171,7 +171,7 @@ impl GitHubClient {
 
     /// Get the latest release API URL.
     #[must_use]
-    pub fn latest_release_url(&self) -> String {
+    fn latest_release_url(&self) -> String {
         format!("{}/latest", self.releases_url())
     }
 }

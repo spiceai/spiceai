@@ -80,7 +80,7 @@ pub struct InflightGuard {
 }
 
 impl InflightGuard {
-    pub fn enter(counter: Arc<AtomicU64>) -> Self {
+    pub(crate) fn enter(counter: Arc<AtomicU64>) -> Self {
         counter.fetch_add(1, Ordering::Relaxed);
         Self { counter }
     }
@@ -154,7 +154,7 @@ impl std::error::Error for ResilienceError {
 
 /// Classify an SDK error as permanent (authn/authz/not-found) vs. transient.
 #[must_use]
-pub fn is_permanent_error(err: &azure_core::Error) -> bool {
+pub(crate) fn is_permanent_error(err: &azure_core::Error) -> bool {
     matches!(err.http_status().map(u16::from), Some(401 | 403 | 404))
 }
 
@@ -162,7 +162,7 @@ pub fn is_permanent_error(err: &azure_core::Error) -> bool {
 /// if any. Honors both the standard `Retry-After` (seconds) and the
 /// Cosmos-specific `x-ms-retry-after-ms` header.
 #[must_use]
-pub fn retry_after_from_error(err: &azure_core::Error) -> Option<Duration> {
+fn retry_after_from_error(err: &azure_core::Error) -> Option<Duration> {
     if let ErrorKind::HttpResponse {
         raw_response: Some(response),
         ..
@@ -190,7 +190,7 @@ fn retry_after_from_headers(headers: &Headers) -> Option<Duration> {
 /// Compute the backoff delay for the given attempt under the configured
 /// method, capped at [`RETRY_MAX_BACKOFF`].
 #[must_use]
-pub fn backoff_delay(method: BackoffMethod, attempt: u32) -> Duration {
+fn backoff_delay(method: BackoffMethod, attempt: u32) -> Duration {
     let factor_u64: u64 = match method {
         BackoffMethod::Exponential => 2u64.saturating_pow(attempt),
         BackoffMethod::Fibonacci => {
@@ -221,7 +221,7 @@ pub fn backoff_delay(method: BackoffMethod, attempt: u32) -> Duration {
 /// Returns [`ResilienceError::Disabled`] if the shared disabled flag is set,
 /// or [`ResilienceError::Request`] once retries are exhausted or on a
 /// permanent error.
-pub async fn run_with_resilience<T, F, Fut>(
+pub(crate) async fn run_with_resilience<T, F, Fut>(
     config: &CosmosResilienceConfig,
     endpoint: &str,
     operation: F,

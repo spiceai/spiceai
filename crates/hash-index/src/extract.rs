@@ -88,7 +88,7 @@ impl<T: PrimitiveKey> PrimitiveKeyExtractor<T> {
     /// # Errors
     ///
     /// Returns an error if the column is not found or has an unsupported type.
-    pub fn new(batch: &RecordBatch, column: &str) -> Result<Self> {
+    fn new(batch: &RecordBatch, column: &str) -> Result<Self> {
         let col_idx = batch
             .schema()
             .index_of(column)
@@ -272,7 +272,7 @@ impl Utf8KeyExtractor {
     /// # Errors
     ///
     /// Returns an error if the column is not found or has an unsupported type.
-    pub fn new(batch: &RecordBatch, column: &str) -> Result<Self> {
+    fn new(batch: &RecordBatch, column: &str) -> Result<Self> {
         let col_idx = batch
             .schema()
             .index_of(column)
@@ -288,7 +288,7 @@ impl Utf8KeyExtractor {
     /// # Errors
     ///
     /// Returns an error if the array type is not supported.
-    pub fn from_array(array: &ArrayRef) -> Result<Self> {
+    fn from_array(array: &ArrayRef) -> Result<Self> {
         if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
             return Ok(Self {
                 array: StringKeys::Utf8(arr.clone()),
@@ -486,7 +486,7 @@ impl RowConverterKeyExtractor {
     /// # Errors
     ///
     /// Returns an error if any column is not found or has an unsupported type.
-    pub fn new(batch: &RecordBatch, columns: &[String]) -> Result<Self> {
+    fn new(batch: &RecordBatch, columns: &[String]) -> Result<Self> {
         let schema = batch.schema();
         let sort_fields: Vec<SortField> = columns
             .iter()

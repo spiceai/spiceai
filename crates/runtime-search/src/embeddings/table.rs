@@ -239,7 +239,7 @@ impl EmbeddingTable {
 
     /// When creating a new [`EmbeddingTable`], the provided columns (in `embed_columns`) must be checked to see if they are already in the base table.
     /// Constructing the [`EmbeddingColumnConfig`] for each column is different depending on whether the column is in the base table or not.
-    pub async fn try_new(
+    async fn try_new(
         base_table: Arc<dyn TableProvider>,
         embed_columns: HashMap<String, ColumnEmbeddingConfig>,
         embedding_models: Arc<RwLock<EmbeddingModelStore>>,
@@ -534,7 +534,7 @@ impl EmbeddingTable {
 
     /// Get the names of the columns that are augmented with embeddings.
     #[must_use]
-    pub fn get_embedding_columns(&self) -> Vec<String> {
+    pub(crate) fn get_embedding_columns(&self) -> Vec<String> {
         self.embedded_columns.keys().cloned().collect()
     }
 

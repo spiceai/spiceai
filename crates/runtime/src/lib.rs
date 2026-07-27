@@ -145,7 +145,7 @@ mod udtfs;
 mod view;
 mod worker;
 
-pub type PartitionAssignments =
+type PartitionAssignments =
     HashMap<ResolvedTableReference, Vec<::datafusion::logical_expr::Expr>>;
 pub type SharedPartitionAssignments = Arc<RwLock<PartitionAssignments>>;
 
@@ -520,7 +520,7 @@ const CAYENNE_COMPACTION_SHUTDOWN_TIMEOUT: Duration = Duration::from_mins(2);
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Clone, Copy)]
-pub struct LogErrors(pub bool);
+pub struct LogErrors(pub(crate) bool);
 
 #[derive(Clone)]
 #[expect(clippy::struct_field_names)]
@@ -614,12 +614,12 @@ impl Runtime {
     }
 
     #[must_use]
-    pub fn config(&self) -> Arc<Config> {
+    fn config(&self) -> Arc<Config> {
         Arc::clone(&self.config)
     }
 
     #[must_use]
-    pub fn flight_write_rate_limit_enabled(&self) -> bool {
+    fn flight_write_rate_limit_enabled(&self) -> bool {
         self.rate_limits.flight_write_enabled()
     }
 
@@ -629,7 +629,7 @@ impl Runtime {
     }
 
     #[must_use]
-    pub fn secrets_weak(&self) -> Weak<RwLock<secrets::Secrets>> {
+    fn secrets_weak(&self) -> Weak<RwLock<secrets::Secrets>> {
         Arc::downgrade(&self.secrets)
     }
 
@@ -639,21 +639,21 @@ impl Runtime {
     }
 
     #[must_use]
-    pub fn embeds(&self) -> Arc<RwLock<EmbeddingModelStore>> {
+    fn embeds(&self) -> Arc<RwLock<EmbeddingModelStore>> {
         Arc::clone(&self.embeds)
     }
 
     #[must_use]
-    pub fn completion_llms(&self) -> Arc<RwLock<LLMChatCompletionsModelStore>> {
+    fn completion_llms(&self) -> Arc<RwLock<LLMChatCompletionsModelStore>> {
         self.llm_runtime_stores.completion_llms()
     }
 
     #[must_use]
-    pub fn rerankers(&self) -> Arc<RwLock<RerankerModelStore>> {
+    fn rerankers(&self) -> Arc<RwLock<RerankerModelStore>> {
         Arc::clone(&self.rerankers)
     }
 
-    pub async fn responses_api_support_for_model(
+    async fn responses_api_support_for_model(
         &self,
         model_name: &str,
     ) -> Option<crate::model::ResponsesApiSupport> {
@@ -665,7 +665,7 @@ impl Runtime {
             .cloned()
     }
 
-    pub async fn responses_supported_model_names(&self) -> HashSet<String> {
+    async fn responses_supported_model_names(&self) -> HashSet<String> {
         self.llm_runtime_stores
             .responses_api_support()
             .read()
@@ -676,14 +676,14 @@ impl Runtime {
     }
 
     #[must_use]
-    pub fn model_rate_controllers(
+    fn model_rate_controllers(
         &self,
     ) -> Arc<RwLock<HashMap<String, Arc<runtime_rate_control::RateController>>>> {
         self.llm_runtime_stores.rate_controllers()
     }
 
     #[must_use]
-    pub fn responses_llms(&self) -> Arc<RwLock<LLMResponsesModelStore>> {
+    fn responses_llms(&self) -> Arc<RwLock<LLMResponsesModelStore>> {
         self.llm_runtime_stores.responses_llms()
     }
 
@@ -705,7 +705,7 @@ impl Runtime {
     }
 
     #[must_use]
-    pub fn tool_factories(&self) -> Arc<Mutex<HashMap<String, ToolFactory>>> {
+    fn tool_factories(&self) -> Arc<Mutex<HashMap<String, ToolFactory>>> {
         Arc::clone(&self.tool_factories)
     }
 
@@ -738,7 +738,7 @@ impl Runtime {
     }
 
     #[must_use]
-    pub fn partition_assignments(&self) -> Option<Arc<RwLock<PartitionAssignments>>> {
+    fn partition_assignments(&self) -> Option<Arc<RwLock<PartitionAssignments>>> {
         match self.distributed.as_ref() {
             Some(DistributedNode::Executor {
                 partition_assignments,
@@ -752,7 +752,7 @@ impl Runtime {
     /// `PartitionsLoaded` and other unsolicited messages back to schedulers.
     /// Only available when this runtime is running as a cluster executor.
     #[must_use]
-    pub fn executor_outbound_broadcaster(
+    fn executor_outbound_broadcaster(
         &self,
     ) -> Option<crate::cluster::ExecutorOutboundBroadcaster> {
         match self.distributed.as_ref() {
@@ -764,7 +764,7 @@ impl Runtime {
         }
     }
 
-    pub async fn set_partition_assignments(&self, assignments: PartitionAssignments) {
+    async fn set_partition_assignments(&self, assignments: PartitionAssignments) {
         if let Some(DistributedNode::Executor {
             partition_assignments,
             ..
@@ -811,7 +811,7 @@ impl Runtime {
         }
     }
 
-    pub async fn update_partition_assignments(
+    async fn update_partition_assignments(
         &self,
         new_partitions: HashMap<String, Vec<Vec<u8>>>,
         removed_partitions: HashMap<String, Vec<Vec<u8>>>,
@@ -901,7 +901,7 @@ impl Runtime {
         Ok(())
     }
 
-    pub(crate) async fn update_partition_refresh_sql(
+    async fn update_partition_refresh_sql(
         &self,
         table: ResolvedTableReference,
         assignments: &PartitionAssignments,
@@ -987,7 +987,7 @@ impl Runtime {
     /// expired entries are reclaimed even on caches with no `get`/`insert`
     /// traffic. Returns immediately when no cache is configured; otherwise loops
     /// until the task is cancelled at shutdown.
-    pub(crate) async fn run_cache_maintenance(self: Arc<Self>) -> Result<()> {
+    async fn run_cache_maintenance(self: Arc<Self>) -> Result<()> {
         let caching = self.datafusion().caching();
         if caching.results.is_none()
             && caching.plans.is_none()
@@ -1011,7 +1011,7 @@ impl Runtime {
     /// in-memory stats would reflect only the first snapshot (or nothing if the
     /// table had no data at initial-load time). A periodic rebroadcast keeps the
     /// coordinator's join-sizing statistics fresh as the executor's local data grows.
-    pub(crate) async fn run_executor_statistics_reporter(self: Arc<Self>) {
+    async fn run_executor_statistics_reporter(self: Arc<Self>) {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(45));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // The statistics source (`local_executor_table_statistics`) reads the
@@ -1113,7 +1113,7 @@ impl Runtime {
 
     /// Returns the cluster state store (scheduler only).
     #[must_use]
-    pub fn cluster_state(&self) -> Option<Arc<ClusterStateStore>> {
+    fn cluster_state(&self) -> Option<Arc<ClusterStateStore>> {
         match self.distributed.as_ref() {
             Some(DistributedNode::Scheduler { cluster_state, .. }) => {
                 Some(Arc::clone(cluster_state))
@@ -1124,7 +1124,7 @@ impl Runtime {
 
     /// Returns the scheduler heartbeat store (scheduler only).
     #[must_use]
-    pub fn scheduler_heartbeats(&self) -> Option<Arc<SchedulerHeartbeatStore>> {
+    fn scheduler_heartbeats(&self) -> Option<Arc<SchedulerHeartbeatStore>> {
         match self.distributed.as_ref() {
             Some(DistributedNode::Scheduler { heartbeats, .. }) => Some(Arc::clone(heartbeats)),
             _ => None,
@@ -1137,7 +1137,7 @@ impl Runtime {
     /// - `GetMetrics` RPC to return local metrics to peer schedulers
     /// - Executors responding to metrics requests from schedulers via control stream
     #[must_use]
-    pub fn metrics_reader(&self) -> Option<&metrics_reader::MetricsReader> {
+    fn metrics_reader(&self) -> Option<&metrics_reader::MetricsReader> {
         self.metrics_reader.as_ref()
     }
 
@@ -1166,7 +1166,7 @@ impl Runtime {
     }
 
     /// Sets the job executor for async SQL queries.
-    pub async fn set_job_executor(&self, executor: Arc<jobs::JobExecutor>) {
+    async fn set_job_executor(&self, executor: Arc<jobs::JobExecutor>) {
         match self.distributed.as_ref() {
             Some(DistributedNode::Scheduler { job_executor, .. }) => {
                 let mut guard = job_executor.write().await;
@@ -1556,7 +1556,7 @@ impl Runtime {
     }
 
     /// Updates all of the component statuses to `Initializing`.
-    pub async fn set_components_initializing(self: Arc<Self>) {
+    async fn set_components_initializing(self: Arc<Self>) {
         let Some(app) = self.read_app().await else {
             return;
         };
@@ -1862,7 +1862,7 @@ impl Runtime {
     }
 
     /// Spawns and registers a runtime task with optional cancellation support.
-    pub(crate) async fn start_runtime_task<F>(
+    async fn start_runtime_task<F>(
         self: &Arc<Self>,
         component_name: &str,
         cancellation_token: Option<CancellationToken>,
@@ -1917,7 +1917,7 @@ impl Runtime {
         }
     }
 
-    pub async fn get_tool(self: &Arc<Self>, tool_name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+    async fn get_tool(self: &Arc<Self>, tool_name: &str) -> Option<Arc<dyn SpiceModelTool>> {
         let tools = self.tools.read().await;
         if let Some((catalog_name, name)) = decode_tool_name(tool_name)
             && let Some(Tooling::Catalog { tools: catalog, .. }) = tools.get(&catalog_name)

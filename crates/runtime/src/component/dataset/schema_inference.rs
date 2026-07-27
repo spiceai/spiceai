@@ -58,7 +58,7 @@ use super::acceleration::{Acceleration, Engine, IndexType, OnConflictBehavior, R
 /// the first load (see `constraints_applicable` below). Columns absent from
 /// `effective_schema` (e.g. projected away by `refresh_sql`) are skipped so we
 /// never produce a constraint the accelerator would reject.
-pub fn apply_inferred_schema(
+pub(crate) fn apply_inferred_schema(
     acceleration: &mut Acceleration,
     inferred: &InferredSchema,
     effective_schema: &SchemaRef,

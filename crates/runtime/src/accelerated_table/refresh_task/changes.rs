@@ -931,7 +931,7 @@ pub(crate) fn extract_cdc_param_overrides(
 
 /// Overlay per-dataset `cdc_*` params on top of an already-resolved global [`CdcConfig`].
 #[must_use]
-pub(crate) fn cdc_config_overlay(
+fn cdc_config_overlay(
     base: CdcConfig,
     dataset_params: &std::collections::HashMap<String, String>,
 ) -> CdcConfig {
@@ -3297,7 +3297,7 @@ fn spawn_ordered_commit_task(
 }
 
 #[cfg(test)]
-pub(crate) fn get_primary_key_value(
+fn get_primary_key_value(
     data: &RecordBatch,
     key: &str,
 ) -> crate::accelerated_table::Result<(String, Expr)> {
@@ -3305,7 +3305,7 @@ pub(crate) fn get_primary_key_value(
 }
 
 #[cfg(test)]
-pub(crate) fn get_primary_key_value_at_row(
+fn get_primary_key_value_at_row(
     data: &RecordBatch,
     row: usize,
     key: &str,

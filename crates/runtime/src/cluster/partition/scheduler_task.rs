@@ -43,14 +43,14 @@ pub enum Error {
     },
 }
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Background task responsible for managing the assignment of accelerated table partitions to executors. Responsible for
 /// 1. Discovering new partition values from tables that are accelerated (by querying the underlying source).
 /// 2. Adding new partitions to the partition metadata (initially unassigned).
 /// 3. Removing partitions that no longer exist in the source and notifying executors to unload them.
 /// 4. Assigning unassigned partitions to executors.
-pub struct PartitionAssignmentTask {
+pub(crate) struct PartitionAssignmentTask {
     df: Arc<DataFusion>,
     status: Arc<RuntimeStatus>,
 
@@ -62,7 +62,7 @@ pub struct PartitionAssignmentTask {
 }
 
 impl PartitionAssignmentTask {
-    pub fn new(
+    pub(crate) fn new(
         df: Arc<DataFusion>,
         status: Arc<RuntimeStatus>,
         interval: Duration,
@@ -76,7 +76,7 @@ impl PartitionAssignmentTask {
         }
     }
 
-    pub async fn run(self) -> Result<()> {
+    pub(crate) async fn run(self) -> Result<()> {
         tracing::debug!("Starting {CLUSTER_PARTITION_ASSIGNMENT_TASK} in background");
 
         // Seed partition metadata for tables that don't have it yet.

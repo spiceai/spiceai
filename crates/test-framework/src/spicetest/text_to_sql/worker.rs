@@ -34,12 +34,12 @@ use crate::spicetest::text_to_sql::{
 
 #[derive(Debug, Clone)]
 pub struct TextToSqlRequest {
-    pub id: String,
-    pub question: String,
-    pub expected_sql: String,
-    pub model: String,
-    pub sample_data_enabled: bool,
-    pub return_sql: bool,
+    id: String,
+    question: String,
+    expected_sql: String,
+    model: String,
+    sample_data_enabled: bool,
+    return_sql: bool,
 }
 
 impl TextToSqlRequest {
@@ -75,7 +75,7 @@ impl TextToSqlRequest {
 
 #[derive(Debug, Clone, Default)]
 pub struct TextToSqlConfig {
-    pub requests: Vec<TextToSqlRequest>,
+    pub(crate) requests: Vec<TextToSqlRequest>,
 }
 
 impl TextToSqlConfig {

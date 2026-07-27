@@ -496,7 +496,7 @@ mod tests {
 
     impl StreamState {
         #[must_use]
-        pub fn new(_stream_arn: String) -> Self {
+        fn new(_stream_arn: String) -> Self {
             Self {
                 active: HashMap::new(),
                 blocked: HashMap::new(),

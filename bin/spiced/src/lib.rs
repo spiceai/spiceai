@@ -137,7 +137,7 @@ mod tls;
 /// block at the top of this module, so `runtime::dataconnector::register_all()` registers them
 /// at startup. Only these alias/legacy names, which map a second string to the same factory,
 /// need an explicit registration here.
-pub async fn register_external_connectors() {
+async fn register_external_connectors() {
     use runtime::dataconnector::register_connector_factory;
 
     // Connectors self-register into the linkme slice (`register_data_connector!`) and are
@@ -251,7 +251,7 @@ impl ClientAuthMode {
     }
 
     #[must_use]
-    pub fn from_spicepod(value: SpicepodClientAuthMode) -> Self {
+    fn from_spicepod(value: SpicepodClientAuthMode) -> Self {
         match value {
             SpicepodClientAuthMode::None => ClientAuthMode::None,
             SpicepodClientAuthMode::Request => ClientAuthMode::Request,
@@ -267,7 +267,7 @@ impl ClientAuthMode {
 pub struct Args {
     /// Enable Prometheus metrics. (disabled by default)
     #[arg(long, value_name = "BIND_ADDRESS", help_heading = "Metrics")]
-    pub metrics: Option<SocketAddr>,
+    metrics: Option<SocketAddr>,
 
     /// Deprecated OpenTelemetry bind address (no effect).
     #[arg(
@@ -276,7 +276,7 @@ pub struct Args {
         default_value = "127.0.0.1:50052",
         action
     )]
-    pub open_telemetry_bind_address: SocketAddr,
+    open_telemetry_bind_address: SocketAddr,
 
     /// Print the version and exit.
     #[arg(long)]
@@ -284,7 +284,7 @@ pub struct Args {
 
     /// All runtime related arguments
     #[clap(flatten)]
-    pub runtime: RuntimeConfig,
+    runtime: RuntimeConfig,
 
     /// Starts a SQL REPL to interactively query against the runtime's Flight endpoint.
     #[arg(long, help_heading = "SQL REPL")]
@@ -295,23 +295,23 @@ pub struct Args {
 
     /// Enable TLS for the runtime.
     #[arg(long, default_value_t = false, action = ArgAction::Set)]
-    pub tls_enabled: bool,
+    tls_enabled: bool,
 
     /// The TLS PEM-encoded certificate.
     #[arg(long, value_name = "-----BEGIN CERTIFICATE-----...")]
-    pub tls_certificate: Option<String>,
+    tls_certificate: Option<String>,
 
     /// Path to the TLS PEM-encoded certificate file.
     #[arg(long, value_name = "cert.pem")]
-    pub tls_certificate_file: Option<String>,
+    tls_certificate_file: Option<String>,
 
     /// The TLS PEM-encoded private key.
     #[arg(long, value_name = "-----BEGIN PRIVATE KEY-----...")]
-    pub tls_key: Option<String>,
+    tls_key: Option<String>,
 
     /// Path to the TLS PEM-encoded private key file.
     #[arg(long, value_name = "key.pem")]
-    pub tls_key_file: Option<String>,
+    tls_key_file: Option<String>,
 
     /// Path to a PEM-encoded CA bundle used to verify client certificates
     /// when `--tls-client-auth-mode request` or `required` (or the
@@ -319,13 +319,13 @@ pub struct Args {
     /// Eligible for hot-reload via the same watcher that picks up
     /// server cert / key rotations.
     #[arg(long, value_name = "client-ca.pem")]
-    pub tls_client_auth_ca_file: Option<String>,
+    tls_client_auth_ca_file: Option<String>,
 
     /// Inline PEM-encoded CA bundle used to verify client certificates.
     /// Mutually exclusive with `--tls-client-auth-ca-file`. Inline material
     /// is not hot-reloaded.
     #[arg(long, value_name = "-----BEGIN CERTIFICATE-----...")]
-    pub tls_client_auth_ca: Option<String>,
+    tls_client_auth_ca: Option<String>,
 
     /// How the runtime treats client certificates on the public TLS
     /// endpoints. `none` disables client-cert authentication (default).
@@ -334,33 +334,33 @@ pub struct Args {
     /// `required` enables strict mTLS — the server demands a valid
     /// cert signed by `--tls-client-auth-ca` / `--tls-client-auth-ca-file`.
     #[arg(long, value_enum)]
-    pub tls_client_auth_mode: Option<ClientAuthMode>,
+    tls_client_auth_mode: Option<ClientAuthMode>,
 
     /// Enable anonymous telemetry collection. In Open Source builds that include anonymous telemetry,
     /// `false` is ignored; build without the `anonymous_telemetry` feature to remove anonymous usage telemetry.
     #[arg(long)]
-    pub telemetry_enabled: Option<bool>,
+    telemetry_enabled: Option<bool>,
 
     /// Enable pods watcher (disabled by default).
     #[arg(long, default_value_t = false, action = ArgAction::SetTrue)]
-    pub pods_watcher_enabled: bool,
+    pods_watcher_enabled: bool,
 
     #[arg(short, long, action = ArgAction::Count)]
-    pub verbose: u8,
+    verbose: u8,
 
     /// Enable very verbose logging. In conjunction with `verbose` can be set via -vv or --very-verbose.
     #[arg(long)]
-    pub very_verbose: bool,
+    very_verbose: bool,
 
     /// Path to the Spicepod directory or file. Supports local paths and remote URLs (i.e. `s3://my_bucket/spicepod.yaml`)
     ///
     /// When specified, the behavior to automatically reload changes to the Spicepod is disabled.
     #[arg(value_name = "PATH")]
-    pub spicepod: Option<PathBuf>,
+    spicepod: Option<PathBuf>,
 
     /// Overrides for the runtime configuration (--set-runtime key1.subkey=value1)
     #[arg(long, action = ArgAction::Append, value_parser = parse_set_string)]
-    pub set_runtime: Vec<(String, String)>,
+    set_runtime: Vec<(String, String)>,
 
     #[arg(skip)]
     pub open_telemetry_deprecated: bool,

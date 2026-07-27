@@ -137,13 +137,13 @@ pub struct CayenneContext {
 /// raise the param on memory-rich hosts so high-cardinality tables keep their
 /// keyset resident instead of rebuilding it from a full-table scan every CDC
 /// batch.
-pub(crate) const DEFAULT_PK_KEYSET_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
+const DEFAULT_PK_KEYSET_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
 
 /// Hard ceiling on the configurable PK keyset cache budget. The budget doubles as
 /// the bloom allocation size (`PkBloom::with_byte_budget`), so an out-of-range or
 /// typo'd `cayenne_pk_keyset_cache_mb` must not be able to request a
 /// near-`usize::MAX` allocation. Matches the auto-default's 8 GiB ceiling.
-pub(crate) const PK_KEYSET_CACHE_MAX_CONFIGURABLE_BYTES: usize = 8 * 1024 * 1024 * 1024;
+const PK_KEYSET_CACHE_MAX_CONFIGURABLE_BYTES: usize = 8 * 1024 * 1024 * 1024;
 
 impl CayenneContext {
     /// Create a new Cayenne context from configuration.
@@ -325,14 +325,14 @@ impl CayenneContext {
     /// global encode budget — parking there deadlocks the demux
     /// (spiceai/spiceai#11818).
     #[must_use]
-    pub fn is_coupled_writer(&self) -> bool {
+    pub(crate) fn is_coupled_writer(&self) -> bool {
         self.coupled_writer
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Encoding effort configured for delta writes (`cayenne_delta_encoding`).
     #[must_use]
-    pub fn delta_encoding(&self) -> DeltaEncoding {
+    pub(crate) fn delta_encoding(&self) -> DeltaEncoding {
         self.config.delta_encoding
     }
 
@@ -397,7 +397,7 @@ impl CayenneContext {
     ///
     /// The format uses the shared runtime cache for file metadata.
     #[must_use]
-    pub fn file_format(&self) -> &Arc<VortexFormat> {
+    pub(crate) fn file_format(&self) -> &Arc<VortexFormat> {
         &self.vortex_format
     }
 
@@ -415,7 +415,7 @@ impl CayenneContext {
 
     /// Get the target file size in bytes for chunking data files.
     #[must_use]
-    pub fn target_file_size_bytes(&self) -> usize {
+    pub(crate) fn target_file_size_bytes(&self) -> usize {
         // The live actuator value: seeded from the configured (tier-aware) size
         // and grown by the adaptive controller for query goals (bounded by the
         // static config). `<= 0` keeps size-rolling disabled.
@@ -424,20 +424,20 @@ impl CayenneContext {
 
     /// Get the sort columns if configured.
     #[must_use]
-    pub fn sort_columns(&self) -> &[String] {
+    pub(crate) fn sort_columns(&self) -> &[String] {
         &self.config.sort_columns
     }
 
     /// Check if sorting is enabled.
     #[must_use]
-    pub fn has_sort_columns(&self) -> bool {
+    pub(crate) fn has_sort_columns(&self) -> bool {
         !self.config.sort_columns.is_empty()
     }
 
     /// Get the configured intra-write shard-key columns. Empty = derive the
     /// shard key from the primary key (the historical behavior).
     #[must_use]
-    pub fn shard_key_columns(&self) -> &[String] {
+    pub(crate) fn shard_key_columns(&self) -> &[String] {
         &self.config.shard_key_columns
     }
 
@@ -457,7 +457,7 @@ impl CayenneContext {
     /// dynamic-tunable). `0` in the live actuator means "unset" (use the session
     /// default), mirroring `config.write_concurrency == None`.
     #[must_use]
-    pub fn write_concurrency(&self) -> Option<usize> {
+    pub(crate) fn write_concurrency(&self) -> Option<usize> {
         let wc = self.live_actuators.write_concurrency();
         (wc != 0).then(|| wc.max(1))
     }

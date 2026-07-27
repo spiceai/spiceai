@@ -185,13 +185,13 @@ macro_rules! remove_chbench_query {
 pub struct Query {
     pub name: Arc<str>,
     pub sql: Arc<str>,
-    pub overridden: bool,
-    pub parameters: Option<Vec<ParameterValue>>,
+    pub(crate) overridden: bool,
+    pub(crate) parameters: Option<Vec<ParameterValue>>,
 }
 
 impl Query {
     #[must_use]
-    pub fn new(name: Arc<str>, sql: Arc<str>, overridden: bool) -> Self {
+    fn new(name: Arc<str>, sql: Arc<str>, overridden: bool) -> Self {
         Self {
             name,
             sql,
@@ -201,7 +201,7 @@ impl Query {
     }
 
     #[must_use]
-    pub fn get_parameters_batch(&self) -> Option<anyhow::Result<RecordBatch>> {
+    pub(crate) fn get_parameters_batch(&self) -> Option<anyhow::Result<RecordBatch>> {
         self.parameters.as_ref().map(|params| {
             let columns: Vec<_> = params
                 .iter()
@@ -264,7 +264,7 @@ impl Query {
     /// Returns an error if:
     /// - The SQL query cannot be parsed
     /// - The query contains multiple statements (only single statements are supported)
-    pub fn rewrite_with_reference_schema(&self, reference_schema: &str) -> anyhow::Result<Self> {
+    pub(crate) fn rewrite_with_reference_schema(&self, reference_schema: &str) -> anyhow::Result<Self> {
         use datafusion::sql::sqlparser::ast::{
             Ident, ObjectNamePart, TableAlias, TableFactor, VisitMut, VisitorMut,
         };
@@ -443,8 +443,8 @@ pub enum QuerySet {
 
 #[derive(Debug, Clone, Copy)]
 pub struct TableWithTimeColumn {
-    pub name: &'static str,
-    pub column: &'static str,
+    pub(crate) name: &'static str,
+    pub(crate) column: &'static str,
 }
 
 impl From<&(&'static str, &'static str)> for TableWithTimeColumn {
@@ -567,7 +567,7 @@ impl QuerySet {
     }
 
     #[must_use]
-    pub fn append_time_columns(&self) -> Vec<TableWithTimeColumn> {
+    pub(crate) fn append_time_columns(&self) -> Vec<TableWithTimeColumn> {
         match self {
             QuerySet::Tpch | QuerySet::ParameterizedTpch => [
                 ("customer", "c_created_at"),
@@ -641,7 +641,7 @@ impl QuerySet {
 
     /// Returns query names that should be skipped for row count validation.
     #[must_use]
-    pub fn get_row_count_validation_skip_queries(
+    pub(crate) fn get_row_count_validation_skip_queries(
         &self,
         overrides: Option<QueryOverrides>,
         scale_factor: f64,
@@ -1192,7 +1192,7 @@ pub fn get_tpch_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
 }
 
 #[must_use]
-pub fn get_tpcds_test_queries(
+fn get_tpcds_test_queries(
     overrides: Option<QueryOverrides>,
     scale_factor: Option<f64>,
 ) -> Vec<Query> {
@@ -1300,7 +1300,7 @@ pub fn get_tpcds_test_queries(
 }
 
 #[must_use]
-pub fn get_clickbench_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
+fn get_clickbench_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
     let mut queries = generate_clickbench_queries!(
         1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
         26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43

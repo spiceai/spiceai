@@ -78,31 +78,31 @@ pub enum CatalogMode {
 }
 
 /// Context for the statement planner, carrying catalog and cluster information.
-pub struct PlannerContext {
+pub(crate) struct PlannerContext {
     /// The catalog mode determines whether statement-level interception is active.
-    pub catalog_mode: CatalogMode,
+    pub(crate) catalog_mode: CatalogMode,
 
     /// The cluster role, if any. When `Some(ClusterRole::Scheduler)`, Cayenne
     /// DML is rewritten into generic extension nodes backed by the distributed
     /// Cayenne DML handler.
-    pub cluster_role: Option<ClusterRole>,
+    pub(crate) cluster_role: Option<ClusterRole>,
 
     /// Shared store for DDL extensions extracted from `CREATE TABLE` statements.
     /// Populated by the planner, consumed by the analyzer rules.
-    pub ddl_extension_store: SharedDdlExtensionStore,
+    pub(crate) ddl_extension_store: SharedDdlExtensionStore,
 
     /// Executor registry, if running in a distributed cluster.
     /// Used by `CREATE TABLE ... LIKE` to resolve auto-generated partition
     /// labels (e.g. `expr0`) back to the original SQL expression.
-    pub executor_registry: Option<Arc<crate::cluster::ExecutorRegistry>>,
+    pub(crate) executor_registry: Option<Arc<crate::cluster::ExecutorRegistry>>,
 
     /// IO runtime handle used by the distributed Cayenne DML handler.
-    pub io_runtime: Handle,
+    pub(crate) io_runtime: Handle,
 
     /// DDL handler for `CREATE TABLE ... LIKE`.
     /// Used to produce a [`datafusion_ddl::DdlExtensionNode`] for the LIKE path,
     /// bypassing the standard analyzer rule.
-    pub ddl_handler: Option<Arc<dyn datafusion_ddl::CatalogDdlHandler>>,
+    pub(crate) ddl_handler: Option<Arc<dyn datafusion_ddl::CatalogDdlHandler>>,
 }
 
 impl PlannerContext {
@@ -143,7 +143,7 @@ pub async fn create_logical_plan(
     create_logical_plan_from_statement(sql, statement, session, ctx).await
 }
 
-pub async fn create_logical_plan_from_statement(
+pub(crate) async fn create_logical_plan_from_statement(
     sql: &str,
     statement: Statement,
     session: &SessionState,

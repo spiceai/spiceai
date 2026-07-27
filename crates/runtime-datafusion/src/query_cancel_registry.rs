@@ -145,7 +145,7 @@ impl QueryCancelRegistry {
 
     /// Returns the number of active queries.
     #[must_use]
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.entries.len()
     }
 

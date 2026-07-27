@@ -85,7 +85,7 @@ pub mod mysql_binlog;
 #[cfg(any(feature = "kafka", feature = "debezium"))]
 mod offsets;
 
-pub mod caching_engine;
+pub(crate) mod caching_engine;
 
 enum AccelerationConnection {
     #[cfg(feature = "duckdb")]
@@ -234,7 +234,7 @@ pub enum OpenOption {
     feature = "postgres-accel",
     feature = "turso"
 ))]
-pub async fn checkpoint_store(
+pub(crate) async fn checkpoint_store(
     dataset: &crate::component::dataset::Dataset,
     table_name: &'static str,
 ) -> Option<Arc<dyn BlobCheckpointStore>> {

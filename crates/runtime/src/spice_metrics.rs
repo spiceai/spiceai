@@ -92,7 +92,7 @@ impl otel_arrow::ArrowExporter for SpiceMetricsExporter {
     }
 }
 
-pub async fn register_metrics_table(
+pub(crate) async fn register_metrics_table(
     datafusion: &Arc<DataFusion>,
     runtime: Arc<Runtime>,
 ) -> Result<(), Error> {

@@ -67,7 +67,7 @@ pub struct SmbConfig {
 
 impl SmbConfig {
     #[must_use]
-    pub fn share_path(&self, share: &str) -> String {
+    fn share_path(&self, share: &str) -> String {
         format!(r"\\{}\{}", self.server, share)
     }
 }
@@ -95,7 +95,7 @@ pub struct SmbClient {
 
 impl SmbClient {
     /// Connect to the SMB server and authenticate.
-    pub async fn connect(config: SmbConfig) -> io::Result<Arc<Self>> {
+    pub(crate) async fn connect(config: SmbConfig) -> io::Result<Arc<Self>> {
         let addr = format!("{}:{}", config.server, config.port);
         let stream = match TcpStream::connect(&addr).await {
             Ok(s) => {
@@ -134,7 +134,7 @@ impl SmbClient {
 
     /// Whether this connection has been poisoned by a timeout.
     #[must_use]
-    pub fn is_poisoned(&self) -> bool {
+    pub(crate) fn is_poisoned(&self) -> bool {
         self.poisoned.load(Ordering::Relaxed)
     }
 
@@ -394,7 +394,7 @@ impl SmbClient {
     }
 
     /// Connect to a share (Tree Connect).
-    pub async fn tree_connect(&self, share: &str) -> io::Result<u32> {
+    pub(crate) async fn tree_connect(&self, share: &str) -> io::Result<u32> {
         let path = self.config.share_path(share);
         let msg_id = self.next_message_id();
         let mut hdr = Header::new(Command::TreeConnect, msg_id);
@@ -431,7 +431,7 @@ impl SmbClient {
     }
 
     /// Open a file or directory.
-    pub async fn create(
+    pub(crate) async fn create(
         &self,
         tree_id: u32,
         path: &str,
@@ -469,7 +469,7 @@ impl SmbClient {
     }
 
     /// Close a file handle.
-    pub async fn close(&self, tree_id: u32, file_id: &[u8; 16]) -> io::Result<()> {
+    pub(crate) async fn close(&self, tree_id: u32, file_id: &[u8; 16]) -> io::Result<()> {
         self.close_inner(tree_id, file_id, false).await.map(|_| ())
     }
 
@@ -477,7 +477,7 @@ impl SmbClient {
     /// honors the request, the returned `CloseResponse` carries the final
     /// `last_write_time` and `file_size`, saving a follow-up `head_object`
     /// round trip.
-    pub async fn close_with_attrs(
+    pub(crate) async fn close_with_attrs(
         &self,
         tree_id: u32,
         file_id: &[u8; 16],
@@ -517,7 +517,7 @@ impl SmbClient {
     }
 
     /// Read from an open file.
-    pub async fn read(
+    pub(crate) async fn read(
         &self,
         tree_id: u32,
         file_id: &[u8; 16],
@@ -556,7 +556,7 @@ impl SmbClient {
     ///
     /// Holds the stream lock for the entire batch, eliminating per-request
     /// round-trip latency. Returns chunks in offset order. Stops early on EOF.
-    pub async fn pipelined_read(
+    pub(crate) async fn pipelined_read(
         &self,
         tree_id: u32,
         file_id: &[u8; 16],
@@ -695,7 +695,7 @@ impl SmbClient {
     }
 
     /// Write to an open file.
-    pub async fn write(
+    pub(crate) async fn write(
         &self,
         tree_id: u32,
         file_id: &[u8; 16],
@@ -760,7 +760,7 @@ impl SmbClient {
 
     /// Pipelined write: send `chunks` write requests in a batch, then receive
     /// all responses. Returns total bytes written.
-    pub async fn pipelined_write(
+    pub(crate) async fn pipelined_write(
         &self,
         tree_id: u32,
         file_id: &[u8; 16],
@@ -899,7 +899,7 @@ impl SmbClient {
     }
 
     /// Rename a file using `SET_INFO` with `FileRenameInformation`.
-    pub async fn rename(
+    pub(crate) async fn rename(
         &self,
         tree_id: u32,
         file_id: &[u8; 16],
@@ -931,7 +931,7 @@ impl SmbClient {
     }
 
     /// List directory contents.
-    pub async fn query_directory(
+    pub(crate) async fn query_directory(
         &self,
         tree_id: u32,
         file_id: &[u8; 16],
@@ -1108,7 +1108,7 @@ impl SmbClient {
     }
 
     /// Compound Create + Close (1 round trip).
-    pub async fn create_close(
+    pub(crate) async fn create_close(
         &self,
         tree_id: u32,
         path: &str,
@@ -1257,7 +1257,7 @@ impl SmbClient {
     }
 
     /// Compound Create + Write + Close (1 round trip). For small-file writes.
-    pub async fn create_write_close(
+    pub(crate) async fn create_write_close(
         &self,
         tree_id: u32,
         path: &str,
@@ -1349,7 +1349,7 @@ impl SmbClient {
     }
 
     /// Compound batch of Create+Close pairs for directory creation (1 round trip).
-    pub async fn ensure_dirs(&self, tree_id: u32, dirs: &[String]) -> io::Result<()> {
+    pub(crate) async fn ensure_dirs(&self, tree_id: u32, dirs: &[String]) -> io::Result<()> {
         if dirs.is_empty() {
             return Ok(());
         }

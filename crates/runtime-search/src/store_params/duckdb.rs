@@ -25,18 +25,18 @@ use spicepod::vector::VectorStore;
 pub struct DuckDbVectorParams {
     /// Vector similarity metric for `DuckDB` VSS. One of: cosine | l2 | `inner_product`.
     #[param(alias = "metric")]
-    pub distance_metric: Option<DuckDBDistanceMetric>,
+    distance_metric: Option<DuckDBDistanceMetric>,
     /// `DuckDB` VSS HNSW graph parameter m (links per node).
-    pub hnsw_m: Option<u32>,
+    hnsw_m: Option<u32>,
     /// `DuckDB` VSS HNSW build parameter `ef_construction`.
-    pub hnsw_ef_construction: Option<u32>,
+    hnsw_ef_construction: Option<u32>,
     /// `DuckDB` VSS query-time `ef_search` setting.
-    pub hnsw_ef_search: Option<u32>,
+    hnsw_ef_search: Option<u32>,
     /// Not yet supported for the `DuckDB` vector engine.
-    pub partition_by: Option<String>,
+    partition_by: Option<String>,
     /// Not supported for the `DuckDB` vector engine.
     #[param(parse_with = crate::store_params::parse_bool)]
-    pub spill_writes: Option<bool>,
+    spill_writes: Option<bool>,
 }
 
 impl DuckDbVectorParams {

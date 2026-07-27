@@ -7,13 +7,13 @@ pub struct Glyph(u16);
 impl Glyph {
     /// Construct a glyph from a UTF-16 code unit.
     #[inline]
-    pub fn from_utf16_code_unit(c: u16) -> Self {
+    pub(crate) fn from_utf16_code_unit(c: u16) -> Self {
         Self(c)
     }
 
     /// Returns the UTF-16 code unit associated with this glyph.
     #[inline]
-    pub fn utf16_code_unit(&self) -> u16 {
+    pub(crate) fn utf16_code_unit(&self) -> u16 {
         self.0
     }
 }

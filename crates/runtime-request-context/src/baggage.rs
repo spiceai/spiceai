@@ -20,7 +20,7 @@ use std::iter;
 
 use percent_encoding::percent_decode_str;
 
-pub static BAGGAGE_HEADER: &str = "baggage";
+static BAGGAGE_HEADER: &str = "baggage";
 
 /// Extract baggage from the headers, which is a comma-separated list of key-value pairs
 /// with optional metadata. Spice will ignore the metadata and only use the key-value pairs.
@@ -34,7 +34,7 @@ pub static BAGGAGE_HEADER: &str = "baggage";
 ///
 /// [W3C Baggage]: https://w3c.github.io/baggage
 #[must_use]
-pub fn from_headers(headers: &HeaderMap) -> BaggageIterator<'_> {
+pub(crate) fn from_headers(headers: &HeaderMap) -> BaggageIterator<'_> {
     let Some(baggage) = headers.get(BAGGAGE_HEADER) else {
         return BaggageIterator::Empty(iter::empty());
     };

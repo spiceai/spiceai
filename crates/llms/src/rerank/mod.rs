@@ -158,7 +158,7 @@ impl LlmStrategy {
 
 /// Default listwise prompt template. `{query}` and `{documents}` are replaced
 /// at call time. The model is asked for strict JSON so we can parse it.
-pub const DEFAULT_LISTWISE_PROMPT: &str = "You are a relevance reranker. Given a query and a numbered list of documents, rank the documents by how well they answer the query. For each document, return a JSON object with `id` (the 1-based index) and `score` (a relevance score from 0.0 to 1.0 where 1.0 is maximally relevant). Return ONLY a JSON array of these objects, with no surrounding prose. Include an entry for every document in the input.
+const DEFAULT_LISTWISE_PROMPT: &str = "You are a relevance reranker. Given a query and a numbered list of documents, rank the documents by how well they answer the query. For each document, return a JSON object with `id` (the 1-based index) and `score` (a relevance score from 0.0 to 1.0 where 1.0 is maximally relevant). Return ONLY a JSON array of these objects, with no surrounding prose. Include an entry for every document in the input.
 
 Query: {query}
 
@@ -169,7 +169,7 @@ Response (JSON array only):";
 
 /// Default pointwise prompt template. `{query}` and `{document}` are replaced
 /// at call time for each document.
-pub const DEFAULT_POINTWISE_PROMPT: &str = r#"Score how relevant the following document is to the query, on a scale of 0.0 (irrelevant) to 1.0 (maximally relevant). Return ONLY a JSON object of the form {"score": <number>}, with no surrounding prose.
+const DEFAULT_POINTWISE_PROMPT: &str = r#"Score how relevant the following document is to the query, on a scale of 0.0 (irrelevant) to 1.0 (maximally relevant). Return ONLY a JSON object of the form {"score": <number>}, with no surrounding prose.
 
 Query: {query}
 

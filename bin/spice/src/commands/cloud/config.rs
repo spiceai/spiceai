@@ -28,19 +28,19 @@ const CLOUD_CONFIG_FILE: &str = "cloud.json";
 /// Cloud link configuration for a Spice Cloud app.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudLink {
-    pub org: String,
-    pub app: String,
+    pub(crate) org: String,
+    pub(crate) app: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub app_id: Option<i64>,
+    pub(crate) app_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub region: Option<String>,
+    pub(crate) region: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub linked_at: Option<String>,
+    pub(crate) linked_at: Option<String>,
 }
 
 impl CloudLink {
     /// Get the full app name in org/app format.
-    pub fn full_name(&self) -> String {
+    pub(crate) fn full_name(&self) -> String {
         if self.org.is_empty() {
             self.app.clone()
         } else {

@@ -36,13 +36,13 @@ use std::time::Duration;
 /// Defaults picked to tolerate short network blips (≤ a minute of Postgres
 /// unavailability) without being user-visibly disruptive, while giving up on
 /// anything longer so an operator can intervene.
-pub const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(500);
-pub const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(30);
+const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(500);
+const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// Maximum time we'll keep retrying a single setup/bootstrap attempt before
 /// giving up. The WAL stream uses the same attempts budget per *reconnect*
 /// but reconnects indefinitely once it has been healthy once — the stream is
 /// meant to run forever.
-pub const DEFAULT_SETUP_MAX_ELAPSED: Duration = Duration::from_mins(2);
+pub(crate) const DEFAULT_SETUP_MAX_ELAPSED: Duration = Duration::from_mins(2);
 
 /// Exponential backoff with full jitter (±20%).
 #[derive(Debug)]
@@ -54,7 +54,7 @@ pub struct Backoff {
 
 impl Backoff {
     #[must_use]
-    pub fn new(initial: Duration, max: Duration) -> Self {
+    fn new(initial: Duration, max: Duration) -> Self {
         Self {
             current: initial,
             max,
@@ -63,26 +63,26 @@ impl Backoff {
     }
 
     #[must_use]
-    pub fn default_for_stream() -> Self {
+    pub(crate) fn default_for_stream() -> Self {
         Self::new(DEFAULT_INITIAL_BACKOFF, DEFAULT_MAX_BACKOFF)
     }
 
     /// Sleep for the current delay, then double it (capped at `max`). The
     /// actual delay is randomised ±20% so N replicas reconnecting after a
     /// network split don't synchronise into a thundering herd.
-    pub async fn wait(&mut self) {
+    pub(crate) async fn wait(&mut self) {
         let jittered = jitter(self.current);
         tokio::time::sleep(jittered).await;
         let next = self.current.saturating_mul(2);
         self.current = if next > self.max { self.max } else { next };
     }
 
-    pub fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.current = self.initial;
     }
 
     #[must_use]
-    pub fn current(&self) -> Duration {
+    pub(crate) fn current(&self) -> Duration {
         self.current
     }
 }
@@ -123,13 +123,13 @@ fn jitter(d: Duration) -> Duration {
 /// that looks like an IO / connection / EOF error is transient; authentication,
 /// protocol, slot-not-found, or decoding errors are fatal.
 #[must_use]
-pub fn is_transient_pgwire(err: &pgwire_replication::PgWireError) -> bool {
+pub(crate) fn is_transient_pgwire(err: &pgwire_replication::PgWireError) -> bool {
     is_transient_by_display(&err.to_string())
 }
 
 /// Same classifier for tokio-postgres (used by setup + bootstrap).
 #[must_use]
-pub fn is_transient_pg(err: &tokio_postgres::Error) -> bool {
+pub(crate) fn is_transient_pg(err: &tokio_postgres::Error) -> bool {
     if err.is_closed() {
         return true;
     }
@@ -190,7 +190,7 @@ fn is_transient_by_display(msg: &str) -> bool {
 /// Run `op` with exponential backoff, retrying any error for which `classify`
 /// returns true, up to `max_elapsed`. Returns the first success or the most
 /// recent error once the budget is exhausted.
-pub async fn retry_async<T, E, F, Fut, C>(
+pub(crate) async fn retry_async<T, E, F, Fut, C>(
     label: &str,
     max_elapsed: Duration,
     mut classify: C,

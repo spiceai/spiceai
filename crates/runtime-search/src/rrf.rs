@@ -85,8 +85,8 @@ const RRF_ROW_ID_COLUMN_NAME: &str = "__spice_rrf_row_id";
 /// rank-fusion has a wider pool of candidates to combine. The post-fuse
 /// `.limit(0, Some(l))` still caps the final result to exactly `l` rows. This
 /// trades a small amount of extra index work for materially better recall.
-pub const RRF_CANDIDATE_POOL_FACTOR: usize = 4;
-pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| {
+const RRF_CANDIDATE_POOL_FACTOR: usize = 4;
+static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| {
     Documentation {
     doc_section: DocSection::default(),
     description: "Merge several search queries by re-ranking them into a single result set considering each result set's orders, rank weights (if requested), and recency (if requested).".to_string(),
@@ -112,7 +112,7 @@ pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| {
 }
 });
 
-pub static SIGNATURE: LazyLock<Signature> =
+static SIGNATURE: LazyLock<Signature> =
     LazyLock::new(|| Signature::variadic_any(Volatility::Stable));
 
 macro_rules! extract_scalar_base {
@@ -582,7 +582,7 @@ impl Debug for ReciprocalRankFusion {
 }
 
 pub struct ReciprocalRankFusion {
-    pub session_context: Arc<SessionContext>,
+    session_context: Arc<SessionContext>,
     // store a pointer to use for Hash/Eq since UDTF impls require this trait bound but we cannot feasibly make `SessionContext` implement them.
     session_ptr: u64,
     /// Output schema, derived once in `call()` by building the fused `DataFrame`.
@@ -645,7 +645,7 @@ impl ReciprocalRankFusion {
 
     /// Sets the RRF source for distributed serialization.
     #[must_use]
-    pub fn with_rrf_source(mut self, source: SerializableRrfArgs) -> Self {
+    fn with_rrf_source(mut self, source: SerializableRrfArgs) -> Self {
         self.rrf_source = Some(source);
         self
     }

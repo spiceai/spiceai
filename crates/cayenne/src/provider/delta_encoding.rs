@@ -123,7 +123,7 @@ pub(crate) enum WriteClass {
 /// Level used for every [`WriteClass::Maintenance`] write: the full default
 /// `BtrBlocks` cascade. Aliases the metadata constant so the config default
 /// and the mapping boundary can't drift apart.
-pub(crate) const FULL_LEVEL: u8 = DELTA_ENCODING_FULL_LEVEL;
+const FULL_LEVEL: u8 = DELTA_ENCODING_FULL_LEVEL;
 
 /// Level chosen by `auto` for every delta write: string `Zstd` only. A single
 /// entropy-coding pass over the string residual captures most of the
@@ -137,7 +137,7 @@ pub(crate) const FULL_LEVEL: u8 = DELTA_ENCODING_FULL_LEVEL;
 /// this path; the full cascade is reserved for the durable
 /// [`WriteClass::Maintenance`] artifacts whose encoding quality pays for scan
 /// throughput.
-pub(crate) const AUTO_LIGHT_LEVEL: u8 = 2;
+const AUTO_LIGHT_LEVEL: u8 = 2;
 
 /// Resolve the effective encoding level for one snapshot write.
 ///

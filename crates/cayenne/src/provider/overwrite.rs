@@ -92,7 +92,7 @@ impl PreparedOverwrite {
 
     /// The table id whose catalog pointer this overwrite will flip.
     #[must_use]
-    pub fn table_id(&self) -> &str {
+    fn table_id(&self) -> &str {
         self.table.table_id()
     }
 

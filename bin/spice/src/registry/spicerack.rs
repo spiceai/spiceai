@@ -40,7 +40,7 @@ fn get_spicerack_base_url() -> String {
 pub struct SpicerackRegistry;
 
 impl SpicerackRegistry {
-    pub async fn get_pod(
+    pub(crate) async fn get_pod(
         &self,
         pod_full_path: &str,
         pods_dir: &Path,

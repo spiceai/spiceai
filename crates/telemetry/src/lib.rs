@@ -47,7 +47,7 @@ pub const DURATION_MS_HISTOGRAM_BUCKETS: [f64; 15] = [
 // Spans a single small inline write (~1 KiB) through a coalesced burst at the
 // default 128 MiB coalesce budget up to a multi-hundred-MiB WAL backlog, so both
 // the hot-path burst shape and a stalled-checkpoint WAL stay on-scale.
-pub const BYTES_HISTOGRAM_BUCKETS: [f64; 16] = [
+pub(crate) const BYTES_HISTOGRAM_BUCKETS: [f64; 16] = [
     1024.0,
     4096.0,
     16384.0,
@@ -93,7 +93,7 @@ pub fn track_query_count(dimensions: &[KeyValue]) {
 
 /// Register the query counter instrument so it appears in the initial export
 /// without recording a phantom count.
-pub fn register_query_counter(dimensions: &[KeyValue]) {
+fn register_query_counter(dimensions: &[KeyValue]) {
     let Some(m) = meter::METER.get() else { return };
     QUERY_COUNT
         .get_or_init(|| {

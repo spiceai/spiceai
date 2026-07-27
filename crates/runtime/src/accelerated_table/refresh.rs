@@ -111,7 +111,7 @@ impl RefreshSQL {
     /// Reconstruct the user SQL from parts: `SELECT {columns} FROM {table} WHERE {user_filters} LIMIT {limit}`.
     /// This does NOT include partition filters — those are applied as `DataFrame` filters.
     #[must_use]
-    pub fn to_sql(&self) -> String {
+    pub(crate) fn to_sql(&self) -> String {
         let columns_str = match &self.columns {
             RefreshSQLColumns::All => "*".to_string(),
             RefreshSQLColumns::Named(idents) => idents
@@ -146,7 +146,7 @@ impl RefreshSQL {
     /// [`Self::extend_effective_partition_filters`], which resolves the
     /// empty-`Some` case to a `false` predicate.
     #[must_use]
-    pub fn partition_filters(&self) -> Option<&[datafusion_expr::Expr]> {
+    pub(crate) fn partition_filters(&self) -> Option<&[datafusion_expr::Expr]> {
         self.partition_filters.as_deref()
     }
 
@@ -154,7 +154,7 @@ impl RefreshSQL {
     /// or `Some(filters)` for the assigned partitions — where an empty `Vec`
     /// means this executor owns no partition of the table and should load no
     /// rows (see [`Self::extend_effective_partition_filters`]).
-    pub fn set_partition_filters(&mut self, filters: Option<Vec<datafusion_expr::Expr>>) {
+    pub(crate) fn set_partition_filters(&mut self, filters: Option<Vec<datafusion_expr::Expr>>) {
         self.partition_filters = filters;
     }
 
@@ -165,7 +165,7 @@ impl RefreshSQL {
     /// - `Some(filters)` (non-empty) → the assigned partitions' predicate.
     /// - `Some(empty)` → a single `false` predicate, so an executor with no
     ///   assigned partition loads no rows instead of the whole table.
-    pub fn extend_effective_partition_filters(&self, out: &mut Vec<datafusion_expr::Expr>) {
+    pub(crate) fn extend_effective_partition_filters(&self, out: &mut Vec<datafusion_expr::Expr>) {
         match &self.partition_filters {
             None => {}
             Some(filters) if filters.is_empty() => out.push(datafusion_expr::lit(false)),
@@ -176,7 +176,7 @@ impl RefreshSQL {
     /// For logging/status display. Shows the user SQL and annotates the
     /// partition-filter state.
     #[must_use]
-    pub fn display_sql(&self) -> String {
+    pub(crate) fn display_sql(&self) -> String {
         let base = self.to_sql();
         match &self.partition_filters {
             None => base,
@@ -195,7 +195,7 @@ impl RefreshSQL {
 
     /// Returns the columns selection.
     #[must_use]
-    pub fn columns(&self) -> &RefreshSQLColumns {
+    pub(crate) fn columns(&self) -> &RefreshSQLColumns {
         &self.columns
     }
 }
@@ -225,8 +225,8 @@ pub struct Refresh {
     pub(crate) time_format: Option<TimeFormat>,
     pub(crate) time_partition_column: Option<String>,
     pub(crate) time_partition_format: Option<TimeFormat>,
-    pub(crate) check_interval: Option<Duration>,
-    pub(crate) max_jitter: Option<Duration>,
+    check_interval: Option<Duration>,
+    max_jitter: Option<Duration>,
     pub(crate) sql: Option<RefreshSQL>,
     /// Raw SQL string from an override request, not yet parsed.
     /// When set, this should be parsed into a `RefreshSQL` before use.
@@ -307,13 +307,13 @@ impl Refresh {
     }
 
     #[must_use]
-    pub fn time_partition_column(mut self, time_partition_column: String) -> Self {
+    pub(crate) fn time_partition_column(mut self, time_partition_column: String) -> Self {
         self.time_partition_column = Some(time_partition_column);
         self
     }
 
     #[must_use]
-    pub fn time_partition_format(mut self, time_partition_format: TimeFormat) -> Self {
+    pub(crate) fn time_partition_format(mut self, time_partition_format: TimeFormat) -> Self {
         self.time_partition_format = Some(time_partition_format);
         self
     }
@@ -325,7 +325,7 @@ impl Refresh {
     }
 
     #[must_use]
-    pub fn max_jitter(mut self, max_jitter: Duration) -> Self {
+    pub(crate) fn max_jitter(mut self, max_jitter: Duration) -> Self {
         self.max_jitter = Some(max_jitter);
         self
     }
@@ -338,7 +338,7 @@ impl Refresh {
 
     /// Get the display SQL string for logging/status purposes.
     #[must_use]
-    pub fn display_sql(&self) -> Option<String> {
+    pub(crate) fn display_sql(&self) -> Option<String> {
         self.sql.as_ref().map(RefreshSQL::display_sql)
     }
 
@@ -349,19 +349,19 @@ impl Refresh {
     }
 
     #[must_use]
-    pub fn append_overlap(mut self, append_overlap: Duration) -> Self {
+    pub(crate) fn append_overlap(mut self, append_overlap: Duration) -> Self {
         self.append_overlap = Some(append_overlap);
         self
     }
 
     #[must_use]
-    pub fn caching_ttl(mut self, caching_ttl: Duration) -> Self {
+    pub(crate) fn caching_ttl(mut self, caching_ttl: Duration) -> Self {
         self.caching_ttl = Some(caching_ttl);
         self
     }
 
     #[must_use]
-    pub fn with_retry(mut self, enabled: bool, max_attempts: Option<usize>) -> Self {
+    pub(crate) fn with_retry(mut self, enabled: bool, max_attempts: Option<usize>) -> Self {
         self.retry_enabled = enabled;
         self.retry_max_attempts = max_attempts;
         self
@@ -374,7 +374,7 @@ impl Refresh {
     /// `crate::datafusion::refresh_sql::parse_refresh_sql` before use
     /// (this requires table name and schema context).
     #[must_use]
-    pub fn with_overrides(mut self, overrides: &RefreshOverrides) -> Self {
+    pub(crate) fn with_overrides(mut self, overrides: &RefreshOverrides) -> Self {
         if let Some(sql_str) = &overrides.sql {
             self.override_sql_raw = Some(sql_str.clone());
         }
@@ -430,7 +430,7 @@ impl Refresh {
     }
 
     /// Determine the next refresh when Spice starts based on the refresh mode and the last checkpoint.
-    pub(crate) async fn startup_next_refresh(
+    async fn startup_next_refresh(
         &self,
         refresh_on_startup: RefreshOnStartup,
         last_checkpoint: Option<Arc<dyn DatasetCheckpointer>>,
@@ -653,7 +653,7 @@ impl Default for Refresh {
     }
 }
 
-pub enum AccelerationRefreshMode {
+pub(crate) enum AccelerationRefreshMode {
     Disabled,
     Full(Receiver<Option<RefreshOverrides>>),
     Append(Receiver<Option<RefreshOverrides>>),
@@ -721,7 +721,7 @@ impl std::fmt::Debug for Refresher {
 
 impl Refresher {
     #[expect(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         runtime_status: Arc<status::RuntimeStatus>,
         dataset_name: TableReference,
         federated: Arc<FederatedTable>,
@@ -765,12 +765,12 @@ impl Refresher {
         }
     }
 
-    pub fn caching(&mut self, caching: &Option<Arc<Caching>>) -> &mut Self {
+    pub(crate) fn caching(&mut self, caching: &Option<Arc<Caching>>) -> &mut Self {
         self.caching = caching.as_ref().map(Arc::downgrade);
         self
     }
 
-    pub fn checkpointer(
+    pub(crate) fn checkpointer(
         &mut self,
         checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     ) -> &mut Self {
@@ -778,44 +778,44 @@ impl Refresher {
         self
     }
 
-    pub fn refresh_on_startup(&mut self, refresh_on_startup: RefreshOnStartup) -> &mut Self {
+    pub(crate) fn refresh_on_startup(&mut self, refresh_on_startup: RefreshOnStartup) -> &mut Self {
         self.refresh_on_startup = refresh_on_startup;
         self
     }
 
     /// Synchronize further refreshes with an existing accelerated table after the initial load completes
-    pub fn synchronize_with(&mut self, synchronized_table: SynchronizedTable) -> &mut Self {
+    pub(crate) fn synchronize_with(&mut self, synchronized_table: SynchronizedTable) -> &mut Self {
         self.synchronize_with = Some(synchronized_table);
         self
     }
 
     /// Disable refresh queries federation for this refresher
-    pub fn disable_federation(&mut self, disable: bool) -> &mut Self {
+    pub(crate) fn disable_federation(&mut self, disable: bool) -> &mut Self {
         self.disable_federation = disable;
         self
     }
 
-    pub fn semaphore(&mut self, semaphore: Arc<Semaphore>) -> &mut Self {
+    pub(crate) fn semaphore(&mut self, semaphore: Arc<Semaphore>) -> &mut Self {
         self.semaphore = Some(semaphore);
         self
     }
 
-    pub fn with_last_updated_at(&mut self, last_updated_at: Arc<AtomicI64>) -> &mut Self {
+    pub(crate) fn with_last_updated_at(&mut self, last_updated_at: Arc<AtomicI64>) -> &mut Self {
         self.last_updated_at = last_updated_at;
         self
     }
 
-    pub fn with_completion_notifier(&mut self, on_complete_notification: Arc<Notify>) -> &mut Self {
+    pub(crate) fn with_completion_notifier(&mut self, on_complete_notification: Arc<Notify>) -> &mut Self {
         self.on_complete_notification = Some(on_complete_notification);
         self
     }
 
-    pub fn with_metrics(&mut self, metrics: Option<Metrics>) -> &mut Self {
+    pub(crate) fn with_metrics(&mut self, metrics: Option<Metrics>) -> &mut Self {
         self.metrics = metrics;
         self
     }
 
-    pub fn with_snapshot_creation_config(
+    pub(crate) fn with_snapshot_creation_config(
         &mut self,
         snapshot_config: Option<SnapshotCreationConfig>,
     ) -> &mut Self {
@@ -825,7 +825,7 @@ impl Refresher {
 
     /// Configure per-dataset state for `RefreshMode::Snapshot`. Required when
     /// the refresh mode is Snapshot.
-    pub fn with_snapshot_refresh_state(
+    pub(crate) fn with_snapshot_refresh_state(
         &mut self,
         state: Option<crate::accelerated_table::snapshots::SnapshotRefreshState>,
     ) -> &mut Self {
@@ -834,27 +834,27 @@ impl Refresher {
     }
 
     /// Set the bootstrap status from dataset initialization.
-    pub fn set_bootstrap_status(&mut self, bootstrap_status: BootstrapStatus) -> &mut Self {
+    pub(crate) fn set_bootstrap_status(&mut self, bootstrap_status: BootstrapStatus) -> &mut Self {
         self.bootstrap_status = bootstrap_status;
         self
     }
 
     #[must_use]
-    pub fn on_complete_notification(&self) -> Option<Arc<Notify>> {
+    pub(crate) fn on_complete_notification(&self) -> Option<Arc<Notify>> {
         self.on_complete_notification.clone()
     }
 
-    pub fn set_initial_load_completed(&self, initial_load_completed: bool) {
+    pub(crate) fn set_initial_load_completed(&self, initial_load_completed: bool) {
         self.initial_load_completed
             .store(initial_load_completed, Ordering::Relaxed);
     }
 
     #[must_use]
-    pub fn initial_load_completed(&self) -> bool {
+    pub(crate) fn initial_load_completed(&self) -> bool {
         self.initial_load_completed.load(Ordering::Relaxed)
     }
 
-    pub fn with_resource_monitor(
+    pub(crate) fn with_resource_monitor(
         &mut self,
         monitor: crate::resource_monitor::ResourceMonitor,
     ) -> &mut Self {
@@ -863,14 +863,14 @@ impl Refresher {
     }
 
     /// Set whether the acceleration uses S3 Express One Zone storage.
-    pub fn with_s3_express_acceleration(&mut self, is_s3_express: bool) -> &mut Self {
+    pub(crate) fn with_s3_express_acceleration(&mut self, is_s3_express: bool) -> &mut Self {
         self.is_s3_express_acceleration = is_s3_express;
         self
     }
 
     /// Provide per-dataset `cdc_*` parameter overrides drawn from
     /// `dataset.acceleration.params`.
-    pub fn with_cdc_param_overrides(
+    pub(crate) fn with_cdc_param_overrides(
         &mut self,
         overrides: Option<Arc<HashMap<String, String>>>,
     ) -> &mut Self {
@@ -893,7 +893,7 @@ impl Refresher {
         }
     }
 
-    pub async fn start(
+    pub(crate) async fn start(
         &mut self,
         acceleration_refresh_mode: AccelerationRefreshMode,
     ) -> super::Result<Option<tokio::task::JoinHandle<()>>> {
@@ -1248,7 +1248,7 @@ impl Refresher {
     /// # Panics
     ///
     /// Panics if this function is called on an accelerated table that is not configured with a full refresh mode
-    pub async fn add_synchronized_table(&self, synchronized_table: SynchronizedTable) {
+    async fn add_synchronized_table(&self, synchronized_table: SynchronizedTable) {
         if !matches!(self.refresh.read().await.mode, RefreshMode::Full) {
             unreachable!(
                 "Only tables configured with a full refresh mode can subscribe to new table providers - this is an implementation bug"

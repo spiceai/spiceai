@@ -39,7 +39,7 @@ use telemetry::reader::InitialReader;
 
 const ENDPOINT_CONST: &str = "https://telemetry.spiceai.io";
 
-pub static ENDPOINT: LazyLock<Arc<str>> = LazyLock::new(|| {
+static ENDPOINT: LazyLock<Arc<str>> = LazyLock::new(|| {
     std::env::var("SPICEAI_TELEMETRY_ENDPOINT")
         .unwrap_or_else(|_| ENDPOINT_CONST.into())
         .into()
@@ -54,7 +54,7 @@ pub static ENDPOINT: LazyLock<Arc<str>> = LazyLock::new(|| {
 ///
 /// When metrics are disabled and `METER` is never initialized, all
 /// metric operations fall through to noop via the `meter()` helper.
-pub static METER: OnceLock<Meter> = OnceLock::new();
+static METER: OnceLock<Meter> = OnceLock::new();
 
 /// Shared noop meter used when `METER` has not been initialized.
 /// This avoids allocating a new `NoopMeterProvider` on every `meter()` call.

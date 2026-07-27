@@ -255,7 +255,7 @@ where
 /// Returns an error if writing the tar archive fails (I/O error on `writer`,
 /// missing source directory, or any of the recursive walks/append calls
 /// against `dirs` or `extras` fail).
-pub async fn archive_directories_with_plan<W>(
+async fn archive_directories_with_plan<W>(
     dirs: &[(PathBuf, String)],
     writer: W,
     skip_relative_paths: &[PathBuf],
@@ -360,7 +360,7 @@ where
 /// # Errors
 /// Returns an error when the destination file or any archive input cannot be
 /// read or written.
-pub async fn archive_directories_to_file_with_plan(
+pub(crate) async fn archive_directories_to_file_with_plan(
     dirs: &[(PathBuf, String)],
     destination: &Path,
     skip_relative_paths: &[PathBuf],
@@ -444,17 +444,17 @@ pub struct ExtractOptions {
     /// This is useful for Cayenne snapshots where multiple datasets share a metadata
     /// directory - the first dataset's snapshot extracts the metadata, and subsequent
     /// datasets skip the metadata files because they already exist.
-    pub skip_if_exists: bool,
+    skip_if_exists: bool,
 
     /// If true, verify checksums of existing files when `skip_if_exists` is enabled.
     /// If a file exists but its checksum doesn't match the expected value in the archive,
     /// an error is returned to indicate data corruption.
-    pub verify_existing_checksums: bool,
+    verify_existing_checksums: bool,
 
     /// Expected checksums for files, keyed by their archive path.
     /// If provided and `verify_existing_checksums` is true, existing files are verified
     /// against these checksums.
-    pub expected_checksums: Option<HashMap<String, String>>,
+    expected_checksums: Option<HashMap<String, String>>,
 
     /// Mapping from archive prefixes to target directories.
     /// When set, archive entries starting with a prefix will be extracted to the
@@ -463,7 +463,7 @@ pub struct ExtractOptions {
     /// For example, if the mapping contains `("data/", "/spice/data/my_table")`,
     /// an archive entry `data/file.parquet` will be extracted to
     /// `/spice/data/my_table/file.parquet` instead of `{target_dir}/data/file.parquet`.
-    pub prefix_mappings: Option<Vec<(String, PathBuf)>>,
+    pub(crate) prefix_mappings: Option<Vec<(String, PathBuf)>>,
 }
 
 impl ExtractOptions {
@@ -471,7 +471,7 @@ impl ExtractOptions {
     /// This is the recommended option for Cayenne snapshot extraction where data
     /// integrity is critical.
     #[must_use]
-    pub fn skip_existing() -> Self {
+    pub(crate) fn skip_existing() -> Self {
         Self {
             skip_if_exists: true,
             verify_existing_checksums: true,
@@ -483,7 +483,7 @@ impl ExtractOptions {
     /// Creates options with `skip_if_exists` enabled but checksum verification disabled.
     /// Use with caution - this trades off safety for performance.
     #[must_use]
-    pub fn skip_existing_no_verify() -> Self {
+    fn skip_existing_no_verify() -> Self {
         Self {
             skip_if_exists: true,
             verify_existing_checksums: false,
@@ -532,7 +532,7 @@ where
 /// - Files cannot be extracted
 /// - The target directory cannot be created
 /// - Checksum verification fails (if enabled)
-pub async fn extract_archive_with_options<R>(
+async fn extract_archive_with_options<R>(
     reader: R,
     target_dir: &Path,
     options: ExtractOptions,
@@ -596,7 +596,7 @@ where
 ///
 /// # Errors
 /// Returns an error if the archive cannot be opened, validated, or extracted.
-pub async fn extract_archive_file_with_options(
+pub(crate) async fn extract_archive_file_with_options(
     archive_path: &Path,
     target_dir: &Path,
     options: ExtractOptions,

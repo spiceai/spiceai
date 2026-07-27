@@ -59,7 +59,7 @@ pub struct Databricks {
 
 impl Databricks {
     #[must_use]
-    pub fn new_connector(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
+    pub(crate) fn new_connector(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
         let component_initialization = match build_auth_credentials(&params.parameters) {
             Ok(AuthCredentials::U2M(_)) => ComponentInitialization::OnTrigger,
             _ => ComponentInitialization::default(),

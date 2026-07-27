@@ -21,7 +21,7 @@ use tokio_postgres::Client;
 use crate::Result;
 
 /// All table names in creation order (respects implicit FK dependencies).
-pub const ALL_TABLES: &[&str] = &[
+pub(crate) const ALL_TABLES: &[&str] = &[
     "warehouse",
     "district",
     "item",
@@ -41,7 +41,7 @@ pub const ALL_TABLES: &[&str] = &[
 /// # Errors
 ///
 /// Returns an error if querying or dropping replication artifacts fails.
-pub async fn drop_replication_artifacts(client: &Client) -> Result<()> {
+async fn drop_replication_artifacts(client: &Client) -> Result<()> {
     // Drop replication slots named spice_*
     let slot_rows = client
         .query(
@@ -94,7 +94,7 @@ pub async fn drop_replication_artifacts(client: &Client) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if any table cannot be dropped.
-pub async fn drop_tables(client: &Client) -> Result<()> {
+pub(crate) async fn drop_tables(client: &Client) -> Result<()> {
     drop_replication_artifacts(client).await?;
     println!("  dropping {} tables", ALL_TABLES.len());
     for table in ALL_TABLES.iter().rev() {
@@ -117,7 +117,7 @@ pub async fn drop_tables(client: &Client) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if any table or `_bench_ts` column cannot be created.
-pub async fn create_tables(client: &Client) -> Result<()> {
+pub(crate) async fn create_tables(client: &Client) -> Result<()> {
     let ddl_statements: &[(&str, &str)] = &[
         (
             "warehouse",
@@ -327,7 +327,7 @@ pub async fn create_tables(client: &Client) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if any index cannot be created.
-pub async fn create_indexes(client: &Client) -> Result<()> {
+pub(crate) async fn create_indexes(client: &Client) -> Result<()> {
     let indexes: &[(&str, &str)] = &[
         (
             "idx_customer",
@@ -377,7 +377,7 @@ const MUTATED_TABLES: &[&str] = &[
 /// All mutated TPC-C tables that are accelerated/replicated by Spice.
 /// Excludes static reference tables (`item`, `nation`, `region`, `supplier`)
 /// and `history` (no primary key, not supported for CDC replication).
-pub const STALENESS_PROBE_TABLES: &[&str] = &[
+pub(crate) const STALENESS_PROBE_TABLES: &[&str] = &[
     "customer",
     "district",
     "new_order",
@@ -423,7 +423,7 @@ async fn add_bench_ts_columns(client: &Client) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if the trigger function or any trigger cannot be created.
-pub async fn create_triggers(client: &Client) -> Result<()> {
+pub(crate) async fn create_triggers(client: &Client) -> Result<()> {
     // Create the shared trigger function once.
     client
         .execute(

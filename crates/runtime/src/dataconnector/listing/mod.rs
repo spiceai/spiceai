@@ -78,9 +78,9 @@ pub const LISTING_TABLE_PARAMETERS: &[ParameterSpec] = &[
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ParsedFileExtension {
-    pub(crate) file_extension: String,
+    file_extension: String,
     pub(crate) format_extension: Option<String>,
-    pub(crate) compression: Option<FileCompressionType>,
+    compression: Option<FileCompressionType>,
 }
 
 pub(crate) fn parse_file_extension_param(value: &str) -> Option<ParsedFileExtension> {

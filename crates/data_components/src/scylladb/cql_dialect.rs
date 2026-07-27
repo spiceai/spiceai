@@ -46,7 +46,7 @@ pub struct CqlDialect {}
 
 impl CqlDialect {
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {}
     }
 }

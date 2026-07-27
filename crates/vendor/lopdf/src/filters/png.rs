@@ -46,7 +46,7 @@ fn paeth_predict(left: u8, above: u8, upperleft: u8) -> u8 {
     }
 }
 
-pub fn decode_row(filter: FilterType, bpp: usize, previous: &[u8], current: &mut [u8]) {
+fn decode_row(filter: FilterType, bpp: usize, previous: &[u8], current: &mut [u8]) {
     use self::FilterType::*;
     let len = current.len();
     let bpp = bpp.min(len);
@@ -89,7 +89,7 @@ pub fn decode_row(filter: FilterType, bpp: usize, previous: &[u8], current: &mut
     }
 }
 
-pub fn decode_frame(
+pub(crate) fn decode_frame(
     content: &[u8],
     bytes_per_pixel: usize,
     pixels_per_row: usize,

@@ -146,28 +146,28 @@ pub mod iceberg_ddl;
 pub mod job_executor_context_extension;
 pub use runtime_datafusion::managed_runtime;
 pub use runtime_datafusion::param_utils;
-pub mod pg_catalog;
+pub(crate) mod pg_catalog;
 #[cfg(not(windows))]
 pub mod planner;
 pub mod refresh_sql;
 pub mod request_context_extension;
 pub mod retention_sql;
-pub mod schema;
+pub(crate) mod schema;
 pub mod secrets_context_extension;
 pub mod table;
 pub use runtime_datafusion::sort_columns;
 pub(crate) mod sql_validator;
-pub(crate) mod sync_table;
+mod sync_table;
 pub mod tool_udf;
 pub mod udf;
 pub mod udtf;
 
 pub use runtime_datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 
-pub const SPICE_RUNTIME_SCHEMA: &str = "runtime";
-pub const SPICE_EVAL_SCHEMA: &str = "eval";
-pub const SPICE_METADATA_SCHEMA: &str = "metadata";
-pub const SPICE_SCP_SCHEMA: &str = "scp";
+pub(crate) const SPICE_RUNTIME_SCHEMA: &str = "runtime";
+const SPICE_EVAL_SCHEMA: &str = "eval";
+pub(crate) const SPICE_METADATA_SCHEMA: &str = "metadata";
+pub(crate) const SPICE_SCP_SCHEMA: &str = "scp";
 
 const MAX_STREAMING_BROADCAST_BATCHES: usize = 128;
 const MAX_STREAMING_BROADCAST_ROWS: usize = 1_000_000;
@@ -627,7 +627,7 @@ const DEFAULT_SNAPSHOT_CREATION_BATCHES: i64 = 100;
 /// snapshot is picked up promptly without aggressive object-store load.
 const DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL: Duration = Duration::from_mins(1);
 
-pub enum Table {
+pub(crate) enum Table {
     Accelerated {
         source: Arc<dyn DataConnector>,
         federated_read_table: FederatedTable,
@@ -741,7 +741,7 @@ pub struct DataFusion {
     /// folds derived from them) track publishes instead of a fixed interval.
     write_stats_notify: tokio::sync::Notify,
 
-    pub(crate) accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
+    accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     // Controls the parallelism of accelerated table refreshes
     acceleration_refresh_semaphore: Option<Arc<Semaphore>>,
     // Bounds concurrently-executing query plans — ordinary queries + DDL/DML +
@@ -785,13 +785,13 @@ pub struct DataFusion {
     metrics: Option<Metrics>,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
 
-    pub temp_directory: Option<String>,
+    temp_directory: Option<String>,
     pub cluster_config: Arc<ResolvedClusterConfig>,
     pub scheduler_server: RwLock<Option<Arc<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>>>>,
     pub executor: RwLock<Option<Arc<Executor>>>,
     /// Registry of connected executor control streams for `PollNow` broadcasts.
     /// Only used in scheduler mode.
-    pub executor_stream_registry: RwLock<Option<ExecutorControlStreamRegistry>>,
+    executor_stream_registry: RwLock<Option<ExecutorControlStreamRegistry>>,
     /// Partition service for discovering/assigning partitions (scheduler mode only).
     pub(crate) partition_service: Option<Arc<PartitionService>>,
     /// Tracks executor `PartitionsLoaded` acks so dataset readiness on the
@@ -799,7 +799,7 @@ pub struct DataFusion {
     /// in scheduler mode.
     pub(crate) partition_load_tracker: Option<Arc<runtime_cluster::PartitionLoadTracker>>,
     #[cfg(not(windows))]
-    pub(crate) cayenne_ddl_handler: Option<Arc<dyn datafusion_ddl::CatalogDdlHandler>>,
+    cayenne_ddl_handler: Option<Arc<dyn datafusion_ddl::CatalogDdlHandler>>,
 }
 
 impl std::fmt::Debug for DataFusion {
@@ -816,7 +816,7 @@ impl std::fmt::Debug for DataFusion {
 
 impl DataFusion {
     #[must_use]
-    pub fn builder(
+    pub(crate) fn builder(
         status: Arc<status::RuntimeStatus>,
         accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
         io_runtime: Handle,
@@ -830,12 +830,12 @@ impl DataFusion {
     }
 
     #[must_use]
-    pub fn caching(&self) -> Arc<Caching> {
+    pub(crate) fn caching(&self) -> Arc<Caching> {
         Arc::clone(&self.caching)
     }
 
     #[must_use]
-    pub fn data_update_broadcaster(&self) -> DataUpdateBroadcaster {
+    pub(crate) fn data_update_broadcaster(&self) -> DataUpdateBroadcaster {
         self.data_update_broadcaster.clone()
     }
 
@@ -931,12 +931,12 @@ impl DataFusion {
     /// The query-admission semaphore when `runtime.query.max_concurrent_queries`
     /// is set; `None` means unbounded (no admission gating). Mirrors
     /// `acceleration_refresh_semaphore` for the read/query side.
-    pub(crate) fn query_admission_semaphore(&self) -> Option<Arc<Semaphore>> {
+    fn query_admission_semaphore(&self) -> Option<Arc<Semaphore>> {
         self.query_admission_semaphore.clone()
     }
 
     #[must_use]
-    pub fn query_cancel_registry(&self) -> Arc<QueryCancelRegistry> {
+    pub(crate) fn query_cancel_registry(&self) -> Arc<QueryCancelRegistry> {
         Arc::clone(&self.query_cancel_registry)
     }
 
@@ -951,7 +951,7 @@ impl DataFusion {
     }
 
     #[must_use]
-    pub(crate) fn plan_capture_config(&self) -> Option<&query::plan_capture::PlanCaptureConfig> {
+    fn plan_capture_config(&self) -> Option<&query::plan_capture::PlanCaptureConfig> {
         self.plan_capture.get()
     }
 
@@ -975,7 +975,7 @@ impl DataFusion {
     /// This method may return `None` if the table is registered from a catalog provider that doesn't support synchronous table access.
     /// All tables registered in the default catalog (i.e. `spice`) are available synchronously.
     /// Catalog implementations that use `SpiceSchemaProvider` objects are also available synchronously.
-    pub fn get_table_sync(
+    pub(crate) fn get_table_sync(
         &self,
         table_reference: &TableReference,
     ) -> Option<Arc<dyn TableProvider>> {
@@ -1017,7 +1017,7 @@ impl DataFusion {
         Ok(())
     }
 
-    pub async fn register_catalog(
+    pub(crate) async fn register_catalog(
         &self,
         name: &str,
         access: &AccessMode,
@@ -1082,7 +1082,7 @@ impl DataFusion {
     }
 
     // Returns a Notify if the table supports notifying the runtime when the table is ready.
-    pub async fn register_table(
+    pub(crate) async fn register_table(
         &self,
         dataset: Arc<Dataset>,
         table: Table,
@@ -1174,7 +1174,7 @@ impl DataFusion {
     }
 
     #[must_use]
-    pub fn is_writable(&self, table_reference: &TableReference) -> bool {
+    pub(crate) fn is_writable(&self, table_reference: &TableReference) -> bool {
         if let Ok(writers) = self.data_writers.read() {
             writers.iter().any(|s| s.resolved_eq(table_reference))
         } else {
@@ -1183,7 +1183,7 @@ impl DataFusion {
     }
 
     #[must_use]
-    pub fn is_catalog_writable(&self, catalog_name: &str) -> bool {
+    fn is_catalog_writable(&self, catalog_name: &str) -> bool {
         if let Ok(writable_catalogs) = self.writable_catalogs.read() {
             writable_catalogs.contains(catalog_name)
         } else {
@@ -1194,12 +1194,12 @@ impl DataFusion {
     /// Check if a table reference belongs to a writable catalog.
     /// Handles both explicit catalog names and bare names (defaults to `SPICE_DEFAULT_CATALOG`).
     #[must_use]
-    pub fn is_path_catalog_writable(&self, table_reference: &TableReference) -> bool {
+    pub(crate) fn is_path_catalog_writable(&self, table_reference: &TableReference) -> bool {
         let catalog = table_reference.catalog().unwrap_or(SPICE_DEFAULT_CATALOG);
         self.is_catalog_writable(catalog)
     }
 
-    pub fn mark_catalog_writable(&self, catalog_name: &str) -> Result<()> {
+    fn mark_catalog_writable(&self, catalog_name: &str) -> Result<()> {
         tracing::warn!(
             "Access mode 'read_write' is enabled for catalog {catalog_name}. This feature is currently in preview."
         );
@@ -1212,7 +1212,7 @@ impl DataFusion {
 
     /// Returns true if the catalog allows DDL operations (CREATE TABLE, DROP TABLE, etc.).
     #[must_use]
-    pub fn is_catalog_ddl_enabled(&self, catalog_name: &str) -> bool {
+    fn is_catalog_ddl_enabled(&self, catalog_name: &str) -> bool {
         if let Ok(ddl_catalogs) = self.ddl_enabled_catalogs.read() {
             ddl_catalogs.contains(catalog_name)
         } else {
@@ -1221,7 +1221,7 @@ impl DataFusion {
     }
 
     /// Marks a catalog as DDL-enabled, allowing CREATE TABLE, DROP TABLE, etc. operations.
-    pub fn mark_catalog_ddl_enabled(&self, catalog_name: &str) -> Result<()> {
+    fn mark_catalog_ddl_enabled(&self, catalog_name: &str) -> Result<()> {
         tracing::warn!(
             "Access mode 'read_write_create' is enabled for catalog {catalog_name}. DDL operations are allowed. This feature is currently in preview."
         );
@@ -1256,11 +1256,11 @@ impl DataFusion {
 
     /// Populate the shared weak self-reference. Must be called once after
     /// wrapping `DataFusion` in `Arc`.
-    pub fn set_self_ref(self: &Arc<Self>) {
+    pub(crate) fn set_self_ref(self: &Arc<Self>) {
         let _ = self.datafusion_ref.set(Arc::downgrade(self));
     }
 
-    pub fn mark_dataset_writable(&self, dataset_name: &TableReference) -> Result<()> {
+    pub(crate) fn mark_dataset_writable(&self, dataset_name: &TableReference) -> Result<()> {
         tracing::warn!(
             "Access mode 'read_write' is enabled for dataset {dataset_name}. This feature is currently in preview."
         );
@@ -1301,7 +1301,7 @@ impl DataFusion {
 
     /// Returns `true` if the given table reference resolves to a Cayenne-backed catalog.
     #[must_use]
-    pub fn is_cayenne_catalog(&self, table_reference: &TableReference) -> bool {
+    fn is_cayenne_catalog(&self, table_reference: &TableReference) -> bool {
         let catalog_name = table_reference.catalog().unwrap_or(SPICE_DEFAULT_CATALOG);
 
         #[cfg(not(windows))]
@@ -1331,7 +1331,7 @@ impl DataFusion {
     /// When the catalog returns an auto-generated label like `"expr0"` (used for function
     /// partition expressions such as `bucket(3, c_nationkey)`), the original SQL expression
     /// string is resolved from [`TablePartitionMetadata`] stored in the partition manager.
-    pub async fn get_table_partition_expr(
+    pub(crate) async fn get_table_partition_expr(
         &self,
         table_reference: &TableReference,
     ) -> Result<Option<String>, DataFusionError> {
@@ -1349,7 +1349,7 @@ impl DataFusion {
     ///
     /// This is used by `DistributedCayenneInsertExec` which is constructed from the
     /// extension planner and only has access to the session context.
-    pub async fn get_table_partition_expr_from_ctx(
+    async fn get_table_partition_expr_from_ctx(
         ctx: &datafusion::prelude::SessionContext,
         executor_registry: &ExecutorRegistry,
         table_reference: &TableReference,
@@ -1730,7 +1730,7 @@ impl DataFusion {
         self.resolve_pending_initializations(&table_refs).await
     }
 
-    pub async fn load_deferred_dataset(&self, table_reference: TableReference) -> Result<()> {
+    pub(crate) async fn load_deferred_dataset(&self, table_reference: TableReference) -> Result<()> {
         let deferred_tables = self.deferred_tables.read().await;
         if let Some(deferred_registration) = deferred_tables.get(&table_reference.to_string()) {
             let read_provider = deferred_registration
@@ -1763,7 +1763,7 @@ impl DataFusion {
     /// initialization registry. The lazy `DatasetInitialization` is
     /// consumed at most once on first reference via the resolver hook
     /// in `create_logical_plan`.
-    pub async fn register_deferred_dataset(
+    pub(crate) async fn register_deferred_dataset(
         &self,
         dataset: Arc<Dataset>,
         init: crate::init::dataset_initialization::DatasetInitialization,
@@ -1817,7 +1817,7 @@ impl DataFusion {
     /// success, removes it from the pending registry and decrements
     /// the counter, then swaps the real provider into the catalog via
     /// `replace_table`.
-    pub async fn resolve_pending_initializations(
+    async fn resolve_pending_initializations(
         &self,
         table_refs: &[TableReference],
     ) -> std::result::Result<(), DataFusionError> {
@@ -1909,7 +1909,7 @@ impl DataFusion {
 
     /// Replace the table provider registered under `name` with
     /// `provider`. Used by the deferred dataset initialization swap.
-    pub fn replace_table(
+    fn replace_table(
         &self,
         name: &TableReference,
         provider: Arc<dyn TableProvider>,
@@ -1949,7 +1949,7 @@ impl DataFusion {
     /// placeholder with a real provider (e.g. via `register_table`
     /// inside `register_loaded_dataset`), so deregistering would
     /// remove the freshly-registered real provider.
-    pub async fn complete_pending_initialization(&self, name: &TableReference) {
+    pub(crate) async fn complete_pending_initialization(&self, name: &TableReference) {
         let mut pending = self.pending_initializations.write().await;
         if pending.remove(name).is_some() {
             self.pending_initializations_count
@@ -1957,7 +1957,7 @@ impl DataFusion {
         }
     }
 
-    pub async fn load_deferred_catalog(&self, name: &str, access: &AccessMode) -> Result<()> {
+    pub(crate) async fn load_deferred_catalog(&self, name: &str, access: &AccessMode) -> Result<()> {
         let deferred_catalogs = self.deferred_catalogs.read().await;
         if let Some(catalog) = deferred_catalogs.get(name) {
             if let Ok(provider) = catalog.get_catalog_provider().await {
@@ -2146,11 +2146,11 @@ impl DataFusion {
     }
 
     /// Resolves when a streaming write has completed since the previous call.
-    pub async fn write_completed_notified(&self) {
+    pub(crate) async fn write_completed_notified(&self) {
         self.write_stats_notify.notified().await;
     }
 
-    pub async fn write_streaming_data(
+    pub(crate) async fn write_streaming_data(
         &self,
         table_reference: &TableReference,
         streaming_update: StreamingDataUpdate,
@@ -2281,7 +2281,7 @@ impl DataFusion {
         Ok(())
     }
 
-    pub async fn get_arrow_schema(&self, dataset: impl Into<TableReference>) -> Result<Schema> {
+    pub(crate) async fn get_arrow_schema(&self, dataset: impl Into<TableReference>) -> Result<Schema> {
         let table_reference = dataset.into();
         let table_provider = self.get_table_provider(&table_reference).await?;
         Ok(table_provider.schema().as_ref().clone())
@@ -2303,7 +2303,7 @@ impl DataFusion {
         self.ctx.catalog(catalog).is_some()
     }
 
-    pub async fn remove_view(&self, view_name: &TableReference) -> Result<()> {
+    pub(crate) async fn remove_view(&self, view_name: &TableReference) -> Result<()> {
         if !self.ctx.table_exist(view_name.clone()).unwrap_or(false) {
             return Ok(());
         }
@@ -2322,7 +2322,7 @@ impl DataFusion {
         Ok(())
     }
 
-    pub async fn remove_table(&self, dataset_name: &TableReference) -> Result<()> {
+    pub(crate) async fn remove_table(&self, dataset_name: &TableReference) -> Result<()> {
         if !self.ctx.table_exist(dataset_name.clone()).unwrap_or(false) {
             return Ok(());
         }
@@ -2348,7 +2348,7 @@ impl DataFusion {
         Ok(())
     }
 
-    pub async fn create_accelerated_table(
+    pub(crate) async fn create_accelerated_table(
         &self,
         dataset: &Dataset,
         source: Arc<dyn DataConnector>,
@@ -3389,7 +3389,7 @@ impl DataFusion {
     /// - The parent and child acceleration modes don't match (both must be Full or both must be Caching).
     ///
     /// It is safe to fallback to the existing acceleration behavior, but the refreshes won't be synchronized.
-    pub async fn attempt_to_synchronize_accelerated_table(
+    async fn attempt_to_synchronize_accelerated_table(
         &self,
         accelerated_table_builder: &mut accelerated_table::Builder,
         dataset: &Dataset,
@@ -3453,23 +3453,23 @@ impl DataFusion {
         );
     }
 
-    pub fn results_cache_provider(&self) -> Option<Arc<QueryResultsCacheProvider>> {
+    pub(crate) fn results_cache_provider(&self) -> Option<Arc<QueryResultsCacheProvider>> {
         self.caching.results.clone()
     }
 
-    pub fn plans_cache_provider(
+    pub(crate) fn plans_cache_provider(
         &self,
     ) -> Option<Arc<dyn TabledCacheProvider<LogicalPlan> + Send + Sync>> {
         self.caching.plans.clone()
     }
 
-    pub fn embeddings_cache_provider(
+    pub(crate) fn embeddings_cache_provider(
         &self,
     ) -> Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>> {
         self.caching.embeddings.clone()
     }
 
-    pub fn search_cache_provider(
+    pub(crate) fn search_cache_provider(
         &self,
     ) -> Option<Arc<dyn TabledCacheProvider<CachedSearchResult> + Send + Sync>> {
         self.caching.search.clone()
@@ -3693,7 +3693,7 @@ impl DataFusion {
     /// `filters` carries the `RefreshSQL` three-state partition-filter semantics:
     /// `None` (not partition-scoped), `Some(filters)` (assigned partitions), or
     /// `Some(empty)` (no partitions assigned — load no rows).
-    pub async fn update_partition_filters(
+    pub(crate) async fn update_partition_filters(
         &self,
         dataset_name: TableReference,
         filters: Option<Vec<datafusion_expr::Expr>>,
@@ -3959,7 +3959,7 @@ impl DataFusion {
         Ok(register_task)
     }
 
-    pub async fn create_accelerated_view(
+    async fn create_accelerated_view(
         self: &Arc<Self>,
         view: &View,
         view_table: Arc<dyn TableProvider>,
@@ -4128,7 +4128,7 @@ impl DataFusion {
     ///  - `spice.runtime`
     ///  - `spice.metadata`
     ///  - `spice.eval`
-    pub fn get_user_table_names(&self) -> Vec<TableReference> {
+    pub(crate) fn get_user_table_names(&self) -> Vec<TableReference> {
         self.ctx
             .catalog_names()
             .iter()
@@ -4171,7 +4171,7 @@ impl DataFusion {
             .collect_vec()
     }
 
-    pub fn get_public_table_names(&self) -> Result<Vec<String>> {
+    fn get_public_table_names(&self) -> Result<Vec<String>> {
         Ok(self
             .ctx
             .catalog(SPICE_DEFAULT_CATALOG)
@@ -4191,7 +4191,7 @@ impl DataFusion {
 
     /// Performs `DataFusion` cleanup during shutdown.
     /// Currently cancels active queries and cleans up accelerated tables.
-    pub async fn shutdown(&self) {
+    pub(crate) async fn shutdown(&self) {
         // Don't block self.accelerated_tables as it needs to be modified during table removal
         // and will be cleaned up authomatically by removing accelerated tables.
         tracing::debug!("Datafusion shutdown started");
@@ -4216,7 +4216,7 @@ impl DataFusion {
     }
 
     /// Create or get a logical plan from the query
-    pub(crate) async fn get_or_create_logical_plan(
+    async fn get_or_create_logical_plan(
         &self,
         session: &SessionState,
         cache_key_opt: Option<&RawCacheKey>,
@@ -4324,7 +4324,7 @@ impl DataFusion {
         }
     }
 
-    pub fn bind_scheduler_server(
+    pub(crate) fn bind_scheduler_server(
         &self,
         server: Arc<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>>,
     ) -> Result<()> {
@@ -4336,7 +4336,7 @@ impl DataFusion {
         Ok(())
     }
 
-    pub fn bind_executor_stream_registry(
+    pub(crate) fn bind_executor_stream_registry(
         &self,
         registry: ExecutorControlStreamRegistry,
     ) -> Result<()> {
@@ -4352,7 +4352,7 @@ impl DataFusion {
     ///
     /// Returns `None` if no registry is bound or if the read lock cannot be acquired.
     #[must_use]
-    pub fn executor_stream_registry(&self) -> Option<ExecutorControlStreamRegistry> {
+    pub(crate) fn executor_stream_registry(&self) -> Option<ExecutorControlStreamRegistry> {
         self.executor_stream_registry.read().ok()?.clone()
     }
 
@@ -4363,7 +4363,7 @@ impl DataFusion {
             .map(|ps| &ps.executor_registry)
     }
 
-    pub fn bind_executor(&self, executor: Arc<Executor>) -> Result<()> {
+    pub(crate) fn bind_executor(&self, executor: Arc<Executor>) -> Result<()> {
         let mut executor_handle = self
             .executor
             .try_write()
@@ -4375,7 +4375,7 @@ impl DataFusion {
     /// Parse a given [`Expr`] from a SQL string.
     ///
     /// The entire `expr` must only contain expressions from the provided [`TableReference`], which itself should be a registered table (i.e. [`DataFusion::register_table`]).
-    pub async fn try_parse_expr(
+    async fn try_parse_expr(
         &self,
         tbl: &TableReference,
         expr: &str,
@@ -4661,7 +4661,7 @@ fn partition_expr_from_table_provider(table_provider: &Arc<dyn TableProvider>) -
 }
 
 #[must_use]
-pub fn is_spice_internal_dataset(dataset: &TableReference) -> bool {
+pub(crate) fn is_spice_internal_dataset(dataset: &TableReference) -> bool {
     match (dataset.catalog(), dataset.schema()) {
         (Some(catalog), Some(schema)) => is_spice_internal_schema(catalog, schema),
         (None, Some(schema)) => is_spice_internal_schema(SPICE_DEFAULT_CATALOG, schema),
@@ -4676,7 +4676,7 @@ fn resolve_table_reference(table: TableReference) -> ResolvedTableReference {
 }
 
 #[must_use]
-pub fn is_spice_internal_schema(catalog: &str, schema: &str) -> bool {
+pub(crate) fn is_spice_internal_schema(catalog: &str, schema: &str) -> bool {
     catalog == SPICE_DEFAULT_CATALOG
         && (schema == SPICE_RUNTIME_SCHEMA
             || schema == SPICE_METADATA_SCHEMA

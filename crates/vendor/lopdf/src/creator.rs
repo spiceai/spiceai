@@ -23,7 +23,7 @@ impl Document {
         id
     }
 
-    pub fn set_object<T: Into<Object>>(&mut self, id: ObjectId, object: T) {
+    pub(crate) fn set_object<T: Into<Object>>(&mut self, id: ObjectId, object: T) {
         self.objects.insert(id, object.into());
     }
 
@@ -62,7 +62,7 @@ impl Document {
     /// Get the page's resource dictionary.
     ///
     /// Get Object that has the key "Resources".
-    pub fn get_or_create_resources(&mut self, page_id: ObjectId) -> Result<&mut Object> {
+    fn get_or_create_resources(&mut self, page_id: ObjectId) -> Result<&mut Object> {
         let resources_id = {
             let page = self.get_object(page_id).and_then(Object::as_dict)?;
             if page.has(b"Resources") {
@@ -84,7 +84,7 @@ impl Document {
     /// Add XObject to a page.
     ///
     /// Get Object that has the key `Resources -> XObject`.
-    pub fn add_xobject<N: Into<Vec<u8>>>(
+    pub(crate) fn add_xobject<N: Into<Vec<u8>>>(
         &mut self,
         page_id: ObjectId,
         xobject_name: N,
@@ -168,7 +168,7 @@ impl Document {
     ///     },
     /// });
     /// ```
-    pub fn add_font(&mut self, font_data: FontData) -> Result<ObjectId> {
+    fn add_font(&mut self, font_data: FontData) -> Result<ObjectId> {
         // Create embedded font stream
         let font_stream = Stream::new(
             dictionary! {
@@ -212,7 +212,7 @@ impl Document {
 }
 
 #[cfg(test)]
-pub mod tests {
+pub(crate) mod tests {
     use std::path::PathBuf;
 
     use crate::content::*;
@@ -224,16 +224,16 @@ pub mod tests {
     }
 
     #[cfg(feature = "time")]
-    pub fn get_timestamp() -> Object {
+    fn get_timestamp() -> Object {
         time::OffsetDateTime::now_utc().into()
     }
 
     /// Create and return a document for testing
-    pub fn create_document() -> Document {
+    pub(crate) fn create_document() -> Document {
         create_document_with_texts(&["Hello World!"])
     }
 
-    pub fn create_document_with_texts(texts_for_pages: &[&str]) -> Document {
+    pub(crate) fn create_document_with_texts(texts_for_pages: &[&str]) -> Document {
         let mut doc = Document::with_version("1.5");
         let info_id = doc.add_object(dictionary! {
             "Title" => Object::string_literal("Create PDF document example"),
@@ -300,7 +300,7 @@ pub mod tests {
     /// caller-supplied list of operations (wrapped in `BT`/`ET` if not
     /// already). Used by tests that need to exercise specific
     /// content-stream operators not produced by `create_document_with_texts`.
-    pub fn create_document_with_operations(operations: Vec<Operation>) -> Document {
+    pub(crate) fn create_document_with_operations(operations: Vec<Operation>) -> Document {
         let mut doc = Document::with_version("1.5");
         let info_id = doc.add_object(dictionary! {
             "Title" => Object::string_literal("Create PDF document example"),
@@ -351,7 +351,7 @@ pub mod tests {
     }
 
     /// Save a document
-    pub fn save_document(file_path: &PathBuf, doc: &mut Document) {
+    pub(crate) fn save_document(file_path: &PathBuf, doc: &mut Document) {
         let res = doc.save(file_path);
 
         assert!(match res {

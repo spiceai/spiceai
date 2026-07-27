@@ -192,15 +192,15 @@ static ROW_LIST_TYPE: LazyLock<DataType> = LazyLock::new(|| {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PropertyRow {
-    pub path: String,
-    pub parent_path: String,
-    pub name: String,
-    pub description: Option<String>,
-    pub type_name: Cow<'static, str>,
-    pub required: bool,
-    pub format: Option<String>,
-    pub enum_values: Option<Vec<String>>,
-    pub metadata: Option<String>,
+    path: String,
+    parent_path: String,
+    name: String,
+    description: Option<String>,
+    type_name: Cow<'static, str>,
+    required: bool,
+    format: Option<String>,
+    enum_values: Option<Vec<String>>,
+    metadata: Option<String>,
 }
 
 /// Dialect tag carried through options. Currently only affects the metric
@@ -284,7 +284,7 @@ impl Default for FlattenOptions {
 
 /// Walk with default options. See [`flatten_with_options`] for configurable caps.
 #[must_use]
-pub fn flatten(input: &str) -> Vec<PropertyRow> {
+fn flatten(input: &str) -> Vec<PropertyRow> {
     flatten_with_options(input, &FlattenOptions::default())
 }
 

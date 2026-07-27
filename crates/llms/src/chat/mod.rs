@@ -198,7 +198,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Attempts to string match a model error to a known error type.
 /// Returns None if no match is found.
 #[must_use]
-pub fn try_map_boxed_error(e: &(dyn std::error::Error + Send + Sync)) -> Option<Error> {
+fn try_map_boxed_error(e: &(dyn std::error::Error + Send + Sync)) -> Option<Error> {
     let err_string = e.to_string().to_ascii_lowercase();
     if err_string.contains("expected file with extension")
         && WEIGHTS_EXTENSIONS
@@ -242,7 +242,7 @@ pub fn try_map_boxed_error_to_box(
 /// Convert a structured [`ChatCompletionRequestMessage`] to a basic string. Useful for basic
 /// [`Chat::run`] but reduces optional configuration provided by callers.
 #[must_use]
-pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
+fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
     match message {
         ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
             content, ..
@@ -353,7 +353,7 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
 /// Convert a structured [`ChatCompletionRequestMessage`] to the mistral.rs compatible [`RequestMessage`] type.
 #[cfg(feature = "local_llm")]
 #[must_use]
-pub fn message_to_mistral(
+pub(crate) fn message_to_mistral(
     message: &ChatCompletionRequestMessage,
 ) -> IndexMap<String, MessageContent> {
     use async_openai::types::chat::{

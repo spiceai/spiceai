@@ -44,11 +44,11 @@ pub enum Paint<'a> {
 #[derive(Clone, Copy, Debug)]
 struct ClipRecord {
     /// The first glyph ID for the range covered by this record.
-    pub start_glyph_id: GlyphId,
+    start_glyph_id: GlyphId,
     /// The last glyph ID, *inclusive*, for the range covered by this record.
-    pub end_glyph_id: GlyphId,
+    end_glyph_id: GlyphId,
     /// The offset to the clip box.
-    pub clip_box_offset: Offset24,
+    clip_box_offset: Offset24,
 }
 
 impl FromData for ClipRecord {
@@ -66,7 +66,7 @@ impl FromData for ClipRecord {
 
 impl ClipRecord {
     /// Returns the glyphs range.
-    pub fn glyphs_range(&self) -> core::ops::RangeInclusive<GlyphId> {
+    fn glyphs_range(&self) -> core::ops::RangeInclusive<GlyphId> {
         self.start_glyph_id..=self.end_glyph_id
     }
 }
@@ -80,7 +80,7 @@ struct ClipList<'a> {
 }
 
 impl<'a> ClipList<'a> {
-    pub fn get(
+    fn get(
         &self,
         index: u32,
         #[cfg(feature = "variable-fonts")] variation_data: &VariationData,
@@ -116,7 +116,7 @@ impl<'a> ClipList<'a> {
 
     /// Returns a ClipBox by glyph ID.
     #[inline]
-    pub fn find(
+    fn find(
         &self,
         glyph_id: GlyphId,
         #[cfg(feature = "variable-fonts")] variation_data: &VariationData,
@@ -857,7 +857,7 @@ impl<'a> Table<'a> {
     }
 
     /// Returns the clip box for a glyph.
-    pub fn clip_box(
+    fn clip_box(
         &self,
         glyph_id: GlyphId,
         #[cfg(feature = "variable-fonts")] coords: &[NormalizedCoordinate],
@@ -1840,12 +1840,12 @@ struct RecursionStack {
 
 impl RecursionStack {
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     #[inline]
-    pub fn push(&mut self, offset: usize) -> Result<(), ()> {
+    fn push(&mut self, offset: usize) -> Result<(), ()> {
         if self.len == self.stack.len() {
             Err(())
         } else {
@@ -1856,7 +1856,7 @@ impl RecursionStack {
     }
 
     #[inline]
-    pub fn contains(&self, offset: usize) -> bool {
+    fn contains(&self, offset: usize) -> bool {
         if let Some(offsets) = self.stack.get(..self.len) {
             return offsets.contains(&offset);
         }
@@ -1865,7 +1865,7 @@ impl RecursionStack {
     }
 
     #[inline]
-    pub fn pop(&mut self) {
+    fn pop(&mut self) {
         debug_assert!(!self.is_empty());
         self.len -= 1;
     }

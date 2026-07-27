@@ -28,10 +28,10 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 /// Timeout for model list API calls
-pub const API_TIMEOUT: Duration = Duration::from_secs(10);
+const API_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Maximum number of models to display in hints
-pub const MAX_MODELS_TO_DISPLAY: usize = 10;
+const MAX_MODELS_TO_DISPLAY: usize = 10;
 
 /// Errors that can occur when listing models from a provider.
 #[derive(Debug, Snafu)]
@@ -91,7 +91,7 @@ pub trait ListModels: Send + Sync {
 
 /// Formats a list of models into a user-friendly hint string.
 #[must_use]
-pub fn format_models_hint(models: &[String], provider_name: &str) -> String {
+fn format_models_hint(models: &[String], provider_name: &str) -> String {
     if models.is_empty() {
         return String::new();
     }
@@ -117,7 +117,7 @@ pub fn format_models_hint(models: &[String], provider_name: &str) -> String {
 
 /// Creates an HTTP client with standard timeout and TLS settings.
 #[must_use]
-pub fn create_http_client() -> Option<reqwest::Client> {
+pub(crate) fn create_http_client() -> Option<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(util::spiceai_user_agent())
         .connect_timeout(std::time::Duration::from_secs(10))
@@ -129,7 +129,7 @@ pub fn create_http_client() -> Option<reqwest::Client> {
 
 /// Maps HTTP status codes to appropriate `ListModelsError` variants.
 #[must_use]
-pub fn map_status_to_error(status: StatusCode, provider: &str) -> ListModelsError {
+pub(crate) fn map_status_to_error(status: StatusCode, provider: &str) -> ListModelsError {
     match status {
         StatusCode::TOO_MANY_REQUESTS => ListModelsError::RateLimited {
             provider: provider.to_string(),
@@ -153,7 +153,7 @@ pub fn map_status_to_error(status: StatusCode, provider: &str) -> ListModelsErro
 ///
 /// Returns `ListModelsError::MissingParameter` if the key is not found.
 #[expect(clippy::implicit_hasher)]
-pub fn get_required_param<'a>(
+pub(crate) fn get_required_param<'a>(
     params: &'a HashMap<String, SecretString>,
     key: &str,
 ) -> ListModelsResult<&'a SecretString> {

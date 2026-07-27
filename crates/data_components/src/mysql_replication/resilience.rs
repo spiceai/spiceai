@@ -24,19 +24,19 @@ use util::retry_strategy::{Backoff as _, BackoffMethod, RetryBackoff, RetryBacko
 
 /// Defaults picked to tolerate short network blips without being
 /// user-visibly disruptive; the stream reconnects indefinitely.
-pub const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(500);
-pub const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(30);
+const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(500);
+const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Jittered exponential backoff for the reconnect loop, with the next delay
 /// peekable before sleeping so reconnect log lines can report it.
-pub struct StreamBackoff {
+pub(crate) struct StreamBackoff {
     inner: RetryBackoff,
     pending: Option<Duration>,
 }
 
 impl StreamBackoff {
     #[must_use]
-    pub fn default_for_stream() -> Self {
+    pub(crate) fn default_for_stream() -> Self {
         Self {
             inner: RetryBackoffBuilder::new()
                 .method(BackoffMethod::Exponential)
@@ -50,7 +50,7 @@ impl StreamBackoff {
 
     /// The delay the next [`Self::wait`] will sleep for. Idempotent until
     /// that wait happens.
-    pub fn next_delay(&mut self) -> Duration {
+    pub(crate) fn next_delay(&mut self) -> Duration {
         if self.pending.is_none() {
             // `None` only occurs when a max-retries budget is exhausted,
             // which this strategy doesn't set.
@@ -59,13 +59,13 @@ impl StreamBackoff {
         self.pending.unwrap_or(DEFAULT_MAX_BACKOFF)
     }
 
-    pub async fn wait(&mut self) {
+    pub(crate) async fn wait(&mut self) {
         let delay = self.next_delay();
         tokio::time::sleep(delay).await;
         self.pending = None;
     }
 
-    pub fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.inner.reset();
         self.pending = None;
     }
@@ -75,7 +75,7 @@ impl StreamBackoff {
 /// longer has (`ER_SOURCE_FATAL_ERROR_READING_BINLOG` — raised when binary
 /// logs were purged past the requested position). Fatal, with a dedicated
 /// recovery path (`invalid_position_behavior`).
-pub const ER_SOURCE_FATAL_ERROR_READING_BINLOG: u16 = 1236;
+const ER_SOURCE_FATAL_ERROR_READING_BINLOG: u16 = 1236;
 
 /// Classify a `mysql_async::Error` as transient (worth reconnecting) or
 /// fatal (propagate to the user).
@@ -84,7 +84,7 @@ pub const ER_SOURCE_FATAL_ERROR_READING_BINLOG: u16 = 1236;
 /// purged binlog) except a small set of connection-lifecycle codes emitted
 /// around server restarts and connection churn.
 #[must_use]
-pub fn is_transient_mysql(err: &mysql_async::Error) -> bool {
+pub(crate) fn is_transient_mysql(err: &mysql_async::Error) -> bool {
     match err {
         mysql_async::Error::Io(_) => true,
         mysql_async::Error::Server(server) => {
@@ -128,7 +128,7 @@ fn is_transient_by_display(msg: &str) -> bool {
 /// binary logs). Gets the dedicated `invalid_position_behavior` handling
 /// rather than the generic fatal path.
 #[must_use]
-pub fn is_purged_position_error(err: &mysql_async::Error) -> bool {
+pub(crate) fn is_purged_position_error(err: &mysql_async::Error) -> bool {
     matches!(
         err,
         mysql_async::Error::Server(s) if s.code == ER_SOURCE_FATAL_ERROR_READING_BINLOG

@@ -12,9 +12,9 @@ use crate::GlyphId;
 #[derive(Clone, Copy, Debug)]
 pub struct MathValue<'a> {
     /// The X or Y value in font design units.
-    pub value: i16,
+    value: i16,
     /// Device corrections for this value.
-    pub device: Option<Device<'a>>,
+    device: Option<Device<'a>>,
 }
 
 impl<'a> MathValue<'a> {
@@ -638,13 +638,13 @@ impl KernInfoRecord {
 #[derive(Clone, Debug)]
 pub struct KernInfo<'a> {
     /// The kerning data for the top-right corner.
-    pub top_right: Option<Kern<'a>>,
+    top_right: Option<Kern<'a>>,
     /// The kerning data for the top-left corner.
-    pub top_left: Option<Kern<'a>>,
+    top_left: Option<Kern<'a>>,
     /// The kerning data for the bottom-right corner.
-    pub bottom_right: Option<Kern<'a>>,
+    bottom_right: Option<Kern<'a>>,
     /// The kerning data for the bottom-left corner.
-    pub bottom_left: Option<Kern<'a>>,
+    bottom_left: Option<Kern<'a>>,
 }
 
 /// A [Math Kern Info Table](https://docs.microsoft.com/en-us/typography/opentype/spec/math#mathkerninfo-table).
@@ -688,13 +688,13 @@ impl core::fmt::Debug for KernInfos<'_> {
 #[derive(Clone, Copy, Debug)]
 pub struct GlyphInfo<'a> {
     /// Per-glyph italics correction values.
-    pub italic_corrections: Option<MathValues<'a>>,
+    italic_corrections: Option<MathValues<'a>>,
     /// Per-glyph horizontal positions for attaching mathematical accents.
-    pub top_accent_attachments: Option<MathValues<'a>>,
+    top_accent_attachments: Option<MathValues<'a>>,
     /// Glyphs which are _extended shapes_.
-    pub extended_shapes: Option<Coverage<'a>>,
+    extended_shapes: Option<Coverage<'a>>,
     /// Per-glyph information for mathematical kerning.
-    pub kern_infos: Option<KernInfos<'a>>,
+    kern_infos: Option<KernInfos<'a>>,
 }
 
 impl<'a> FromSlice<'a> for GlyphInfo<'a> {
@@ -711,7 +711,7 @@ impl<'a> FromSlice<'a> for GlyphInfo<'a> {
 
 /// Glyph part flags.
 #[derive(Clone, Copy, Debug)]
-pub struct PartFlags(pub u16);
+pub struct PartFlags(u16);
 
 #[allow(missing_docs)]
 impl PartFlags {
@@ -733,15 +733,15 @@ impl FromData for PartFlags {
 #[derive(Clone, Copy, Debug)]
 pub struct GlyphPart {
     /// Glyph ID for the part.
-    pub glyph_id: GlyphId,
+    glyph_id: GlyphId,
     /// Lengths of the connectors on the start of the glyph, in font design units.
-    pub start_connector_length: u16,
+    start_connector_length: u16,
     /// Lengths of the connectors on the end of the glyph, in font design units.
-    pub end_connector_length: u16,
+    end_connector_length: u16,
     /// The full advance of the part, in font design units.
-    pub full_advance: u16,
+    full_advance: u16,
     /// Part flags.
-    pub part_flags: PartFlags,
+    part_flags: PartFlags,
 }
 
 impl FromData for GlyphPart {
@@ -763,9 +763,9 @@ impl FromData for GlyphPart {
 #[derive(Clone, Copy, Debug)]
 pub struct GlyphAssembly<'a> {
     /// The italics correction of the assembled glyph.
-    pub italics_correction: MathValue<'a>,
+    italics_correction: MathValue<'a>,
     /// Parts the assembly is composed of.
-    pub parts: LazyArray16<'a, GlyphPart>,
+    parts: LazyArray16<'a, GlyphPart>,
 }
 
 impl<'a> FromSlice<'a> for GlyphAssembly<'a> {
@@ -785,9 +785,9 @@ impl<'a> FromSlice<'a> for GlyphAssembly<'a> {
 #[derive(Clone, Copy, Debug)]
 pub struct GlyphVariant {
     /// The ID of the variant glyph.
-    pub variant_glyph: GlyphId,
+    variant_glyph: GlyphId,
     /// Advance width/height, in design units, of the variant glyph.
-    pub advance_measurement: u16,
+    advance_measurement: u16,
 }
 
 impl FromData for GlyphVariant {
@@ -807,9 +807,9 @@ impl FromData for GlyphVariant {
 #[derive(Clone, Copy, Debug)]
 pub struct GlyphConstruction<'a> {
     /// A general recipe on how to construct a variant with large advance width/height.
-    pub assembly: Option<GlyphAssembly<'a>>,
+    assembly: Option<GlyphAssembly<'a>>,
     /// Prepared variants of the glyph with varying advances.
-    pub variants: LazyArray16<'a, GlyphVariant>,
+    variants: LazyArray16<'a, GlyphVariant>,
 }
 
 impl<'a> FromSlice<'a> for GlyphConstruction<'a> {
@@ -864,11 +864,11 @@ impl core::fmt::Debug for GlyphConstructions<'_> {
 #[derive(Clone, Copy, Debug)]
 pub struct Variants<'a> {
     /// Minimum overlap of connecting glyphs during glyph construction, in design units.
-    pub min_connector_overlap: u16,
+    min_connector_overlap: u16,
     /// Constructions for shapes growing in the vertical direction.
-    pub vertical_constructions: GlyphConstructions<'a>,
+    vertical_constructions: GlyphConstructions<'a>,
     /// Constructions for shapes growing in the horizontal direction.
-    pub horizontal_constructions: GlyphConstructions<'a>,
+    horizontal_constructions: GlyphConstructions<'a>,
 }
 
 impl<'a> FromSlice<'a> for Variants<'a> {
@@ -901,16 +901,16 @@ impl<'a> FromSlice<'a> for Variants<'a> {
 #[derive(Clone, Copy, Debug)]
 pub struct Table<'a> {
     /// Math positioning constants.
-    pub constants: Option<Constants<'a>>,
+    constants: Option<Constants<'a>>,
     /// Per-glyph positioning information.
-    pub glyph_info: Option<GlyphInfo<'a>>,
+    glyph_info: Option<GlyphInfo<'a>>,
     /// Variants and assembly recipes for growable glyphs.
-    pub variants: Option<Variants<'a>>,
+    variants: Option<Variants<'a>>,
 }
 
 impl<'a> Table<'a> {
     /// Parses a table from raw data.
-    pub fn parse(data: &'a [u8]) -> Option<Self> {
+    pub(crate) fn parse(data: &'a [u8]) -> Option<Self> {
         let mut s = Stream::new(data);
         let major_version = s.read::<u16>()? as u8;
         s.skip::<u16>(); // minor version

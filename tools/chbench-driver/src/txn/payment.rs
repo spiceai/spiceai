@@ -33,7 +33,7 @@ use crate::rand as tpcc_rand;
 /// # Errors
 ///
 /// Returns an error if any database operation fails.
-pub async fn run(
+pub(crate) async fn run(
     client: &mut Client,
     rng: &mut impl Rng,
     assignment: &TerminalAssignment,

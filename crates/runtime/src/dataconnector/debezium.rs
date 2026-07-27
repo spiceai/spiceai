@@ -75,7 +75,7 @@ pub enum Error {
     RefreshSql { source: refresh_sql::Error },
 }
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug)]
 pub struct Debezium {
@@ -86,7 +86,7 @@ pub struct Debezium {
 
 impl Debezium {
     #[expect(clippy::needless_pass_by_value)]
-    pub fn new(params: Parameters) -> Result<Self> {
+    fn new(params: Parameters) -> Result<Self> {
         let transport = params.get("transport").expose().ok().unwrap_or("kafka");
 
         let message_format = params.get("message_format").expose().ok().unwrap_or("json");

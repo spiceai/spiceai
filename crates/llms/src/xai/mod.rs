@@ -52,9 +52,9 @@ static DEFAULT_MODEL: &str = "grok-4.3";
 
 /// [`Xai`] is a chat model for xAI models. xAI is nearly `OpenAI` compatible.
 pub struct Xai {
-    pub model: String, // Xai model
-    pub client: Client<OpenAIConfig>,
-    pub rate_controller: Arc<RateController>,
+    model: String, // Xai model
+    client: Client<OpenAIConfig>,
+    rate_controller: Arc<RateController>,
 }
 
 impl Xai {

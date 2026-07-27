@@ -38,7 +38,7 @@ use crate::chat::Result;
 /// Returns an error if the system time cannot be determined or if the timestamp
 /// conversion fails.
 #[expect(clippy::cast_possible_truncation)]
-pub fn create_stream_response(
+pub(crate) fn create_stream_response(
     id: &str,
     model: &str,
     choices: Vec<ChatChoiceStream>,
@@ -69,7 +69,7 @@ pub fn create_stream_response(
 ///
 /// This function is currently infallible and wrapped in `Ok()`, but returns a `Result`
 /// for API consistency with other streaming utility functions.
-pub fn create_stream_response_with_timestamp(
+pub(crate) fn create_stream_response_with_timestamp(
     id: &str,
     model: &str,
     choices: Vec<ChatChoiceStream>,
@@ -92,7 +92,7 @@ pub fn create_stream_response_with_timestamp(
 
 /// Creates a chat choice for streaming with optional content
 #[must_use]
-pub fn create_stream_choice(
+fn create_stream_choice(
     index: u32,
     content: Option<String>,
     role: Option<Role>,
@@ -114,7 +114,7 @@ pub fn create_stream_choice(
 }
 
 /// Generates a unique stream ID with the format `{model_id}-{random_suffix}`
-pub fn generate_stream_id(model_id: &str) -> String {
+pub(crate) fn generate_stream_id(model_id: &str) -> String {
     let random_suffix: String = rng()
         .sample_iter(&Alphanumeric)
         .take(10)
@@ -125,7 +125,7 @@ pub fn generate_stream_id(model_id: &str) -> String {
 
 /// Converts a basic string stream to an `OpenAI` compatible chat completion stream
 #[must_use]
-pub fn string_stream_to_chat_stream(
+pub(crate) fn string_stream_to_chat_stream(
     model_id: String,
     mut stream: Pin<Box<dyn Stream<Item = Result<Option<String>>> + Send>>,
 ) -> Pin<Box<dyn Stream<Item = Result<CreateChatCompletionStreamResponse, OpenAIError>> + Send>> {

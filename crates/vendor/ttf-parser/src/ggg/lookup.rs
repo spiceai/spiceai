@@ -9,11 +9,11 @@ pub type LookupList<'a> = LazyOffsetArray16<'a, Lookup<'a>>;
 #[derive(Clone, Copy, Debug)]
 pub struct Lookup<'a> {
     /// Lookup qualifiers.
-    pub flags: LookupFlags,
+    flags: LookupFlags,
     /// Available subtables.
-    pub subtables: LookupSubtables<'a>,
+    subtables: LookupSubtables<'a>,
     /// Index into GDEF mark glyph sets structure.
-    pub mark_filtering_set: Option<u16>,
+    mark_filtering_set: Option<u16>,
 }
 
 impl<'a> FromSlice<'a> for Lookup<'a> {
@@ -66,7 +66,7 @@ impl core::fmt::Debug for LookupSubtables<'_> {
 impl<'a> LookupSubtables<'a> {
     /// Returns a number of items in the LookupSubtables.
     #[inline]
-    pub fn len(&self) -> u16 {
+    fn len(&self) -> u16 {
         self.offsets.len()
     }
 
@@ -82,7 +82,7 @@ impl<'a> LookupSubtables<'a> {
     /// or [`SubstitutionSubtable`](crate::gsub::SubstitutionSubtable).
     ///
     /// Technically, we can enforce it at compile time, but it makes code too convoluted.
-    pub fn get<T: LookupSubtable<'a>>(&self, index: u16) -> Option<T> {
+    fn get<T: LookupSubtable<'a>>(&self, index: u16) -> Option<T> {
         let offset = self.offsets.get(index)?.to_usize();
         let data = self.data.get(offset..)?;
         T::parse(data, self.kind)
@@ -125,7 +125,7 @@ impl<'a, T: LookupSubtable<'a>> Iterator for LookupSubtablesIter<'a, T> {
 /// Lookup table flags.
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug)]
-pub struct LookupFlags(pub u16);
+pub struct LookupFlags(u16);
 
 #[rustfmt::skip]
 #[allow(missing_docs)]
@@ -135,7 +135,7 @@ impl LookupFlags {
     #[inline] pub fn ignore_ligatures(self) -> bool { self.0 & 0x0004 != 0 }
     #[inline] pub fn ignore_marks(self) -> bool { self.0 & 0x0008 != 0 }
     #[inline] pub fn ignore_flags(self) -> bool { self.0 & 0x000E != 0 }
-    #[inline] pub fn use_mark_filtering_set(self) -> bool { self.0 & 0x0010 != 0 }
+    #[inline] fn use_mark_filtering_set(self) -> bool { self.0 & 0x0010 != 0 }
     #[inline] pub fn mark_attachment_type(self) -> u8 { ((self.0 & 0xFF00) >> 8) as u8 }
 }
 

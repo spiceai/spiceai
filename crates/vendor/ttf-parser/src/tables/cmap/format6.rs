@@ -8,14 +8,14 @@ use crate::GlyphId;
 #[derive(Clone, Copy, Debug)]
 pub struct Subtable6<'a> {
     /// First character code of subrange.
-    pub first_code_point: u16,
+    first_code_point: u16,
     /// Array of glyph indexes for character codes in the range.
-    pub glyphs: LazyArray16<'a, GlyphId>,
+    glyphs: LazyArray16<'a, GlyphId>,
 }
 
 impl<'a> Subtable6<'a> {
     /// Parses a subtable from raw data.
-    pub fn parse(data: &'a [u8]) -> Option<Self> {
+    pub(crate) fn parse(data: &'a [u8]) -> Option<Self> {
         let mut s = Stream::new(data);
         s.skip::<u16>(); // format
         s.skip::<u16>(); // length
@@ -32,7 +32,7 @@ impl<'a> Subtable6<'a> {
     /// Returns a glyph index for a code point.
     ///
     /// Returns `None` when `code_point` is larger than `u16`.
-    pub fn glyph_index(&self, code_point: u32) -> Option<GlyphId> {
+    pub(crate) fn glyph_index(&self, code_point: u32) -> Option<GlyphId> {
         // This subtable supports code points only in a u16 range.
         let code_point = u16::try_from(code_point).ok()?;
         let idx = code_point.checked_sub(self.first_code_point)?;

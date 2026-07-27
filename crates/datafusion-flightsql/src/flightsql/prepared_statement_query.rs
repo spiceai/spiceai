@@ -203,7 +203,7 @@ pub(crate) struct PreparedStatement {
     pub(super) query: String,
     pub(super) parameters: Vec<u8>,
     /// Arrow IPC bytes of the bound parameter schema (set during `DoPut`).
-    pub(super) parameter_schema: Option<Vec<u8>>,
+    parameter_schema: Option<Vec<u8>>,
 }
 
 // ── DoAction: CreatePreparedStatement ────────────────────────────────────────

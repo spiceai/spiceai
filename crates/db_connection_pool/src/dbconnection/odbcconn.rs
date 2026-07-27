@@ -67,7 +67,7 @@ impl<T: InputParameter + Sync + Send + DynClone> ODBCSyncParameter for T {
 dyn_clone::clone_trait_object!(ODBCSyncParameter);
 
 pub type ODBCParameter = Box<dyn ODBCSyncParameter>;
-pub type ODBCDbConnection<'a> = dyn DbConnection<Connection<'a>, ODBCParameter>;
+pub(crate) type ODBCDbConnection<'a> = dyn DbConnection<Connection<'a>, ODBCParameter>;
 pub type ODBCDbConnectionPool<'a> =
     dyn DbConnectionPool<Connection<'a>, ODBCParameter> + Sync + Send;
 
@@ -94,8 +94,8 @@ pub enum Error {
 }
 
 pub struct ODBCConnection<'a> {
-    pub conn: Arc<Mutex<Connection<'a>>>,
-    pub params: Arc<HashMap<String, SecretString>>,
+    pub(crate) conn: Arc<Mutex<Connection<'a>>>,
+    pub(crate) params: Arc<HashMap<String, SecretString>>,
 }
 
 impl<'a> DbConnection<Connection<'a>, ODBCParameter> for ODBCConnection<'a>

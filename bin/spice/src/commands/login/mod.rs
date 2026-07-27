@@ -24,7 +24,7 @@ use crate::error::Result;
 use crate::manifest;
 use clap::{Args, Subcommand};
 
-pub use auth_config::{merge_auth_config, store_keychain};
+pub(crate) use auth_config::{merge_auth_config, store_keychain};
 
 /// Credential storage backend for `spice login`.
 #[derive(Debug, Clone, Default, clap::ValueEnum)]
@@ -74,14 +74,14 @@ Docs: https://spiceai.org/docs"#
 pub struct LoginArgs {
     /// API key for direct authentication (skips the OAuth/browser flow).
     #[arg(short = 'k', long)]
-    pub key: Option<String>,
+    key: Option<String>,
 
     /// Where to store the resulting credentials.
     #[arg(long, short = 'o', default_value = "env")]
-    pub output: LoginOutput,
+    output: LoginOutput,
 
     #[command(subcommand)]
-    pub command: Option<LoginCommands>,
+    command: Option<LoginCommands>,
 }
 
 /// Login subcommands for different providers.

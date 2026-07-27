@@ -45,11 +45,11 @@ EXAMPLES
 pub struct CompletionsArgs {
     /// The shell to generate completions for (detected from `$SHELL` if omitted).
     #[arg(value_enum)]
-    pub shell: Option<Shell>,
+    shell: Option<Shell>,
 
     /// Print completions to stdout instead of writing to a file.
     #[arg(long)]
-    pub stdout: bool,
+    stdout: bool,
 }
 
 /// Generate shell completions, writing to the appropriate file by default.

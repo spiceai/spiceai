@@ -48,9 +48,9 @@ use super::util::{
 
 #[derive(Debug)]
 pub struct TeiEmbed {
-    pub infer: Infer,
-    pub model_size: i32,     // Used for `size` method.
-    pub tok: Arc<Tokenizer>, // Used for `chunker` method.
+    infer: Infer,
+    model_size: i32,     // Used for `size` method.
+    tok: Arc<Tokenizer>, // Used for `chunker` method.
 
     // Shared embeddings cache
     cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
@@ -134,7 +134,7 @@ impl TeiEmbed {
     }
 
     /// Instantiates a text-embedding-inference service with model, tokenizer, config, etc files in a single directory.
-    pub async fn from_dir(
+    async fn from_dir(
         root: &Path,
         pooling_overwrite: Option<Pool>,
         max_seq_length_overwrite: Option<usize>,
@@ -227,7 +227,7 @@ impl TeiEmbed {
         self
     }
 
-    pub(crate) async fn embed_futures(
+    async fn embed_futures(
         &self,
         inputs: Vec<EncodingInput>,
     ) -> std::result::Result<Vec<PooledEmbeddingsInferResponse>, TextEmbeddingsError> {

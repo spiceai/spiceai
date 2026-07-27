@@ -45,7 +45,7 @@ pub struct TpcExtension {
 
 impl TpcExtension {
     #[must_use]
-    pub fn new(manifest: ExtensionManifest) -> Self {
+    fn new(manifest: ExtensionManifest) -> Self {
         TpcExtension { manifest }
     }
 }

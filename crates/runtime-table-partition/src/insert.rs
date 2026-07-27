@@ -77,7 +77,7 @@ pub struct PartitionerExec {
 }
 
 impl PartitionerExec {
-    pub(crate) fn new(
+    fn new(
         input: Arc<dyn ExecutionPlan>,
         partition_by: Vec<PartitionedBy>,
         creator: Arc<dyn PartitionCreator>,

@@ -23,7 +23,7 @@ pub mod codec;
 pub mod datafusion_scheduler_ext;
 
 #[must_use]
-pub fn datafusion_and_cluster_physical_optimizers()
+pub(crate) fn datafusion_and_cluster_physical_optimizers()
 -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     let mut rules = PhysicalOptimizer::new().rules;
     rules.extend(cluster_physical_optimizers());

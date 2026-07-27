@@ -77,7 +77,7 @@ pub struct ScyllaDbConnection {
 
 impl ScyllaDbConnection {
     #[must_use]
-    pub fn new(session: Arc<Session>, keyspace: Arc<str>) -> Self {
+    pub(crate) fn new(session: Arc<Session>, keyspace: Arc<str>) -> Self {
         Self { session, keyspace }
     }
 }

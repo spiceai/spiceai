@@ -28,7 +28,7 @@ pub struct OracleConnectionPool {
 }
 
 impl OracleConnectionPool {
-    pub async fn get(&self) -> super::Result<bb8::PooledConnection<'_, OracleConnectionManager>> {
+    pub(crate) async fn get(&self) -> super::Result<bb8::PooledConnection<'_, OracleConnectionManager>> {
         let conn = self
             .pool
             .get()
@@ -41,7 +41,7 @@ impl OracleConnectionPool {
     /// internal `Arc`-clone of the pool) so it can be moved into
     /// `tokio::task::spawn_blocking` to run synchronous OCI calls off the async
     /// runtime thread.
-    pub async fn get_owned(
+    pub(crate) async fn get_owned(
         &self,
     ) -> super::Result<bb8::PooledConnection<'static, OracleConnectionManager>> {
         self.pool
@@ -53,7 +53,7 @@ impl OracleConnectionPool {
 
 #[derive(Debug)]
 pub struct SetTimezoneCustomizer {
-    pub timezone: String,
+    timezone: String,
 }
 
 #[async_trait::async_trait]

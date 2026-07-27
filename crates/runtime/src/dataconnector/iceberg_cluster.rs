@@ -66,7 +66,7 @@ impl IcebergClusterTableProvider {
     /// Wraps `inner` with the reference used to resolve it for distributed
     /// execution.
     #[must_use]
-    pub fn new(table_ref: TableReference, inner: Arc<dyn TableProvider>) -> Self {
+    pub(crate) fn new(table_ref: TableReference, inner: Arc<dyn TableProvider>) -> Self {
         Self { table_ref, inner }
     }
 
@@ -74,7 +74,7 @@ impl IcebergClusterTableProvider {
     /// `IcebergDeletionProvider` around one). Exposed so wrapper-peeling helpers
     /// can see through this layer to the concrete Iceberg provider.
     #[must_use]
-    pub fn inner(&self) -> &Arc<dyn TableProvider> {
+    pub(crate) fn inner(&self) -> &Arc<dyn TableProvider> {
         &self.inner
     }
 }

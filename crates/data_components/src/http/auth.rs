@@ -319,7 +319,7 @@ impl OAuth2Auth {
     /// accidentally log or otherwise exfiltrate the access token via this API.
     #[cfg(test)]
     #[must_use]
-    pub(crate) fn current_header_value(&self) -> HeaderValue {
+    fn current_header_value(&self) -> HeaderValue {
         self.rx.borrow().clone()
     }
 }

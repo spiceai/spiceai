@@ -4,7 +4,7 @@ use aes::cipher::block_padding::{Error as PaddingError, Padding};
 ///
 /// PKCS#5 is described in [RFC 2898](https://tools.ietf.org/html/rfc2898).
 #[derive(Clone, Copy, Debug)]
-pub struct Pkcs5;
+pub(crate) struct Pkcs5;
 
 impl Pkcs5 {
     #[inline]

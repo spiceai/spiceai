@@ -99,7 +99,7 @@ impl JobStore {
 
     /// Sets the chunk size.
     #[must_use]
-    pub fn with_chunk_size(mut self, size: usize) -> Self {
+    fn with_chunk_size(mut self, size: usize) -> Self {
         self.chunk_size = size;
         self
     }
@@ -109,7 +109,7 @@ impl JobStore {
     /// Returns a Databricks-style formatted ID like "01ABC-DEF-456-7890AB".
     /// Uses `UUIDv7` which contains a millisecond timestamp plus random bits.
     #[must_use]
-    pub fn generate_job_id() -> String {
+    fn generate_job_id() -> String {
         // Format: 01ABC-DEF-456-7890AB style (Databricks-like)
         // UUIDv7 hex structure (32 chars):
         //   0-11:  48-bit ms timestamp
@@ -132,7 +132,7 @@ impl JobStore {
     }
 
     /// Creates a new pending job and stores it.
-    pub async fn create_job(
+    pub(crate) async fn create_job(
         &self,
         request: SubmitQueryRequest,
         read_only: bool,
@@ -147,7 +147,7 @@ impl JobStore {
     }
 
     /// Gets the current state of a job.
-    pub async fn get_job(&self, job_id: &str) -> Result<JobState> {
+    pub(crate) async fn get_job(&self, job_id: &str) -> Result<JobState> {
         let path = self.job_state_path(job_id);
         let result = self.store.get(&path).await.map_err(|e| match e {
             ObjectStoreError::NotFound { .. } => super::error::Error::JobNotFound {
@@ -179,12 +179,12 @@ impl JobStore {
     }
 
     /// Updates the job state with conditional write for consistency.
-    pub async fn update_job(&self, state: &mut JobState) -> Result<()> {
+    async fn update_job(&self, state: &mut JobState) -> Result<()> {
         self.write_job_state(state).await
     }
 
     /// Marks a job as running.
-    pub async fn set_job_running(&self, job_id: &str) -> Result<JobState> {
+    pub(crate) async fn set_job_running(&self, job_id: &str) -> Result<JobState> {
         let mut state = self.get_job(job_id).await?;
         state.set_running(self.node_id.clone());
         self.write_job_state(&mut state).await?;
@@ -197,7 +197,7 @@ impl JobStore {
     /// background task updated the state between our read and write). On retry,
     /// re-reads the state and returns early if the job already reached a terminal
     /// state.
-    pub async fn cancel_job(&self, job_id: &str) -> Result<JobState> {
+    pub(crate) async fn cancel_job(&self, job_id: &str) -> Result<JobState> {
         use util::fibonacci_backoff::FibonacciBackoffBuilder;
 
         let mut backoff = FibonacciBackoffBuilder::new().max_retries(Some(3)).build();
@@ -241,7 +241,7 @@ impl JobStore {
     /// the configured `chunk_size` row threshold is reached.
     ///
     /// Returns the job result manifest.
-    pub async fn write_result_chunks_from_stream(
+    pub(crate) async fn write_result_chunks_from_stream(
         &self,
         job_id: &str,
         mut stream: SendableRecordBatchStream,
@@ -455,7 +455,7 @@ impl JobStore {
     }
 
     /// Reads a result chunk from the object store.
-    pub async fn read_chunk(&self, job_id: &str, chunk_index: usize) -> Result<Vec<RecordBatch>> {
+    pub(crate) async fn read_chunk(&self, job_id: &str, chunk_index: usize) -> Result<Vec<RecordBatch>> {
         let path = self.chunk_path(job_id, chunk_index);
 
         let result = self.store.get(&path).await.map_err(|e| match e {
@@ -479,7 +479,7 @@ impl JobStore {
     }
 
     /// Marks a job as succeeded with the given results.
-    pub async fn complete_job(&self, job_id: &str, result: JobResult) -> Result<JobState> {
+    pub(crate) async fn complete_job(&self, job_id: &str, result: JobResult) -> Result<JobState> {
         let mut state = self.get_job(job_id).await?;
         state.set_succeeded(result, self.result_ttl);
         self.write_job_state(&mut state).await?;
@@ -487,7 +487,7 @@ impl JobStore {
     }
 
     /// Marks a job as failed with the given error.
-    pub async fn fail_job(
+    pub(crate) async fn fail_job(
         &self,
         job_id: &str,
         error_code: JobErrorCode,
@@ -553,7 +553,7 @@ impl JobStore {
     /// Lists all jobs, optionally filtered by status.
     ///
     /// Returns an error if any job state file fails to be read or deserialized.
-    pub async fn list_jobs(&self, status_filter: Option<JobStatus>) -> Result<Vec<JobState>> {
+    pub(crate) async fn list_jobs(&self, status_filter: Option<JobStatus>) -> Result<Vec<JobState>> {
         let jobs_prefix = self.jobs_prefix();
         let mut stream = self.store.list(Some(&jobs_prefix));
         let mut jobs = Vec::new();

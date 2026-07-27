@@ -90,7 +90,7 @@ pub enum S3VectorTableResult {
 
 impl S3VectorTableResult {
     #[must_use]
-    pub fn table(self) -> Option<S3VectorsTable> {
+    fn table(self) -> Option<S3VectorsTable> {
         match self {
             S3VectorTableResult::Table(table) => Some(table),
             _ => None,
@@ -100,7 +100,7 @@ impl S3VectorTableResult {
 
 impl S3VectorsTable {
     // Returns an [`S3VectorTableResult`] if the [`S3VectorIdentifier`] does not exist. Use [`Self::try_create_new_identifier`].
-    pub async fn try_new_table(
+    async fn try_new_table(
         id: S3VectorIdentifier,
         client: Arc<dyn S3Vectors + Send + Sync>,
         dimension: i64,
@@ -139,7 +139,7 @@ impl S3VectorsTable {
     }
 
     #[must_use]
-    pub fn with_new_id(mut self, id: S3VectorIdentifier) -> Self {
+    pub(crate) fn with_new_id(mut self, id: S3VectorIdentifier) -> Self {
         self.idx = Arc::new(id);
         self
     }
@@ -374,7 +374,7 @@ impl S3VectorsTable {
         }
     }
 
-    pub(crate) fn is_filterable_column(&self, column: &str) -> bool {
+    fn is_filterable_column(&self, column: &str) -> bool {
         let Ok(f) = self.schema.field_with_name(column) else {
             return false;
         };
@@ -619,7 +619,7 @@ pub(super) fn loosen_vector_schema(s: &SchemaRef) -> (SchemaRef, HashMap<String,
     (Arc::new(Schema::new(fields)), sizes)
 }
 
-pub(super) fn make_fixed_sizes(
+fn make_fixed_sizes(
     mut rb: RecordBatch,
     vector_sizes: &HashMap<String, DataType>,
 ) -> Result<RecordBatch, ArrowError> {

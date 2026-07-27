@@ -60,13 +60,13 @@ impl IcebergDataConnectorFactory {
 }
 
 const HADOOP_PARAM_LEN: usize = 1;
-pub(crate) const HADOOP_PARAMETERS: [ParameterSpec; HADOOP_PARAM_LEN] = [
+const HADOOP_PARAMETERS: [ParameterSpec; HADOOP_PARAM_LEN] = [
     // Hadoop options
     ParameterSpec::runtime("metadata_path")
         .description("The path including scheme to the metadata file for the Hadoop table. Must specify a path to a `.json` file. For example, `s3a://my-bucket/warehouse/namespace/table/metadata/v1.metadata.json`")
 ];
 
-pub(crate) const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
+const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     HADOOP_PARAM_LEN,
     ICEBERG_PARAM_LEN,

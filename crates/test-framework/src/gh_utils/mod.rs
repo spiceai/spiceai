@@ -22,10 +22,10 @@ use tonic::transport::Uri;
 
 /// Represents a GitHub workflow to be dispatched
 pub struct GitHubWorkflow {
-    pub org: String,
-    pub repo: String,
-    pub workflow_file: String,
-    pub r#ref: String,
+    org: String,
+    repo: String,
+    workflow_file: String,
+    r#ref: String,
 }
 
 impl GitHubWorkflow {

@@ -27,9 +27,9 @@ const BACKOFF_INTERVALS_MS: [u64; 14] = [
 #[derive(Debug, Clone)]
 pub struct FibonacciBackoff {
     num_retries: usize,
-    pub randomization_factor: f64,
-    pub max_retries: Option<usize>,
-    pub max_duration: Option<Duration>,
+    randomization_factor: f64,
+    max_retries: Option<usize>,
+    max_duration: Option<Duration>,
 }
 
 impl Default for FibonacciBackoff {

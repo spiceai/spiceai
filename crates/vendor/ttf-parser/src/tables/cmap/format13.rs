@@ -15,7 +15,7 @@ pub struct Subtable13<'a> {
 
 impl<'a> Subtable13<'a> {
     /// Parses a subtable from raw data.
-    pub fn parse(data: &'a [u8]) -> Option<Self> {
+    pub(crate) fn parse(data: &'a [u8]) -> Option<Self> {
         let mut s = Stream::new(data);
         s.skip::<u16>(); // format
         s.skip::<u16>(); // reserved
@@ -27,7 +27,7 @@ impl<'a> Subtable13<'a> {
     }
 
     /// Returns a glyph index for a code point.
-    pub fn glyph_index(&self, code_point: u32) -> Option<GlyphId> {
+    pub(crate) fn glyph_index(&self, code_point: u32) -> Option<GlyphId> {
         for group in self.groups {
             let start_char_code = group.start_char_code;
             if code_point >= start_char_code && code_point <= group.end_char_code {

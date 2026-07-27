@@ -153,7 +153,7 @@ impl CayenneAccelerationExec {
     /// Creates a new `CayenneAccelerationExec` carrying maintained aggregate
     /// state captured at the table scan visibility epoch.
     #[must_use]
-    pub fn new_with_maintained_aggregates(
+    pub(crate) fn new_with_maintained_aggregates(
         inner: Arc<dyn ExecutionPlan>,
         maintained_aggregates: Arc<MaintainedAggregateRegistry>,
         maintained_aggregate_epoch: u64,
@@ -494,7 +494,7 @@ pub(crate) fn plan_has_pushed_filter(plan: &Arc<dyn ExecutionPlan>) -> bool {
 /// Distinct from [`plan_has_pushed_filter`], which is intentionally shallow because
 /// the deletion-filter exec's delete-aware `num_rows` math must NOT see a filtered
 /// (subset) count as a whole-table count.
-pub(crate) fn plan_has_pushed_filter_deep(plan: &Arc<dyn ExecutionPlan>) -> bool {
+fn plan_has_pushed_filter_deep(plan: &Arc<dyn ExecutionPlan>) -> bool {
     if let Some(data_source_exec) = plan.downcast_ref::<DataSourceExec>() {
         return data_source_exec
             .data_source()

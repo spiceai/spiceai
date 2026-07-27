@@ -52,18 +52,18 @@ pub struct GtidSet {
 
 impl GtidSet {
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.intervals.values().all(Vec::is_empty)
     }
 
     /// Number of distinct source UUIDs in the set.
     #[must_use]
-    pub fn uuid_count(&self) -> usize {
+    fn uuid_count(&self) -> usize {
         self.intervals.values().filter(|v| !v.is_empty()).count()
     }
 
@@ -75,7 +75,7 @@ impl GtidSet {
     /// the empty set. Any malformed block is a hard error rather than silent
     /// partial data (a truncated set would under-report applied transactions
     /// and re-stream — or, worse, over-report and skip — on resume).
-    pub fn parse(raw: &str) -> Result<Self, String> {
+    pub(crate) fn parse(raw: &str) -> Result<Self, String> {
         let mut set = Self::new();
         for block in raw.split(',') {
             let block = block.trim();
@@ -110,7 +110,7 @@ impl GtidSet {
     }
 
     /// Fold a single committed transaction's GTID into the set.
-    pub fn add(&mut self, uuid: Uuid, gno: u64) {
+    pub(crate) fn add(&mut self, uuid: Uuid, gno: u64) {
         self.add_interval(uuid, gno, gno);
     }
 
@@ -136,7 +136,7 @@ impl GtidSet {
     /// server never issues such values) is a hard error: dropping it would
     /// silently under-report the applied set and make the source re-stream
     /// already-applied transactions on resume. Fail loudly instead.
-    pub fn to_sids(&self) -> Result<Vec<Sid<'static>>, String> {
+    pub(crate) fn to_sids(&self) -> Result<Vec<Sid<'static>>, String> {
         self.intervals
             .iter()
             .filter(|(_, ranges)| !ranges.is_empty())
@@ -167,7 +167,7 @@ impl GtidSet {
     /// file+offset across members. A UUID present in only one set, or ranges
     /// that do not overlap, contribute nothing.
     #[must_use]
-    pub fn intersect(&self, other: &Self) -> Self {
+    pub(crate) fn intersect(&self, other: &Self) -> Self {
         let mut out = Self::new();
         for (uuid, a_ranges) in &self.intervals {
             let Some(b_ranges) = other.intervals.get(uuid) else {

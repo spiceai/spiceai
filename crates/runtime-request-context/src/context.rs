@@ -391,13 +391,13 @@ impl RequestContext {
 
     /// Returns `true` if cancellation has been requested for this request.
     #[must_use]
-    pub fn is_cancelled(&self) -> bool {
+    fn is_cancelled(&self) -> bool {
         self.cancellation_token.is_cancelled()
     }
 
     /// Cancels this request's cancellation token, signalling all cooperating
     /// operations to stop. This is used by the administrative cancel paths.
-    pub fn cancel(&self) {
+    fn cancel(&self) {
         self.cancellation_token.cancel();
     }
 
@@ -555,7 +555,7 @@ impl RequestContextBuilder {
     }
 
     #[must_use]
-    pub fn with_authorization_header(mut self, authorization_header: Option<String>) -> Self {
+    fn with_authorization_header(mut self, authorization_header: Option<String>) -> Self {
         self.authorization_header = authorization_header;
         self
     }
@@ -578,7 +578,7 @@ impl RequestContextBuilder {
     /// (for example, a scheduler-side request token derived from an executor-side
     /// token so that cancellation cascades).
     #[must_use]
-    pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
+    fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
         self.cancellation_token = Some(token);
         self
     }

@@ -277,7 +277,7 @@ fn parse_maintained_aggregate_filter(
 
 /// Transform schema according to `unsupported_type_action` policy.
 /// Delegates to `cayenne::transform_schema_for_vortex`.
-pub(crate) fn transform_schema_for_vortex(
+fn transform_schema_for_vortex(
     schema: &arrow::datatypes::Schema,
     unsupported_type_action: UnsupportedTypeAction,
 ) -> Result<arrow::datatypes::Schema> {
@@ -766,12 +766,12 @@ static CAYENNE_ACCELERATOR_INSTANCE_COUNTER: std::sync::atomic::AtomicU64 =
 
 impl CayenneAccelerator {
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::with_footer_cache_mb(None)
     }
 
     #[must_use]
-    pub fn with_footer_cache_mb(footer_cache_mb: Option<usize>) -> Self {
+    pub(crate) fn with_footer_cache_mb(footer_cache_mb: Option<usize>) -> Self {
         let permits = std::thread::available_parallelism()
             .map_or(1, std::num::NonZeroUsize::get)
             .max(1);
@@ -801,7 +801,7 @@ impl CayenneAccelerator {
     /// 1. `cayenne_file_path` - Custom path (local or S3 Express One Zone)
     /// 2. Auto-generated S3 Express path if `cayenne_s3_zone_ids` is specified (uses first zone)
     /// 3. Default: `spice_data_base_path()/{dataset_name}/`
-    pub fn cayenne_data_dir(&self, source: &dyn AccelerationSource) -> Result<String> {
+    fn cayenne_data_dir(&self, source: &dyn AccelerationSource) -> Result<String> {
         if !source.is_file_accelerated() {
             return Err(Error::InvalidConfiguration {
                 detail: Arc::from("Dataset is not file accelerated"),
@@ -3499,7 +3499,7 @@ impl std::fmt::Debug for CayennePartitionCreator {
 
 impl CayennePartitionCreator {
     #[expect(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    fn new(
         table_name: String,
         base_path: PathBuf,
         partition_by: Vec<PartitionedBy>,

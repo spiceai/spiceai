@@ -346,7 +346,7 @@ impl std::fmt::Debug for AcceleratedCatalogProvider {
 
 impl AcceleratedCatalogProvider {
     #[must_use]
-    pub fn new(catalog: &Catalog, pool: Arc<PostgresConnectionPool>) -> Self {
+    pub(crate) fn new(catalog: &Catalog, pool: Arc<PostgresConnectionPool>) -> Self {
         let slot_name = default_slot_name(&catalog.name);
 
         // Seed from the catalog's connection params, then let `dataset_params`

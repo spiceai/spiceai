@@ -127,7 +127,7 @@ impl<'a> Row<'a> {
     /// The bytes MUST come from the same converter configuration that encoded
     /// them; `convert_rows` returns an error on malformed input.
     #[must_use]
-    pub fn from_encoded(data: &'a [u8]) -> Self {
+    pub(crate) fn from_encoded(data: &'a [u8]) -> Self {
         Self { data }
     }
 
@@ -194,7 +194,7 @@ pub struct OwnedRow {
 impl OwnedRow {
     /// Borrow this owned row as a [`Row`].
     #[must_use]
-    pub fn row(&self) -> Row<'_> {
+    pub(crate) fn row(&self) -> Row<'_> {
         Row { data: &self.data }
     }
 }

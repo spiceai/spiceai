@@ -62,7 +62,7 @@ pub fn begin_shutdown() {
 /// The current shutdown epoch. Long-running CDC sources capture this at
 /// stream start and stop once it changes.
 #[must_use]
-pub fn shutdown_epoch() -> u64 {
+pub(crate) fn shutdown_epoch() -> u64 {
     CDC_SHUTDOWN_EPOCH.load(std::sync::atomic::Ordering::Acquire)
 }
 
@@ -462,7 +462,7 @@ impl ChangeEnvelope {
     /// path free of per-row Arrow-typing cost; the build then runs on the
     /// per-dataset consumer. `rows` must own its inputs.
     #[must_use]
-    pub fn new_from_rows(
+    pub(crate) fn new_from_rows(
         change_committer: Box<dyn CommitChange + Send + Sync>,
         rows: Box<dyn ChangeRows>,
         is_dataset_ready: bool,
@@ -477,14 +477,14 @@ impl ChangeEnvelope {
     /// Whether there are zero output rows, exactly, without forcing a build.
     /// See [`ChangeRows::is_empty`].
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.change_batch.is_empty()
     }
 
     /// Upper-bound output-row count without forcing a build, for sizing/metrics.
     /// See [`ChangeRows::num_rows_hint`].
     #[must_use]
-    pub fn num_rows_hint(&self) -> usize {
+    fn num_rows_hint(&self) -> usize {
         self.change_batch.num_rows_hint()
     }
 
@@ -612,7 +612,7 @@ pub fn system_time_to_unix_ms(t: SystemTime) -> Option<i64> {
 /// Current wall-clock time as milliseconds since the Unix epoch, or `None` if the
 /// clock is unavailable.
 #[must_use]
-pub fn now_unix_ms() -> Option<i64> {
+fn now_unix_ms() -> Option<i64> {
     system_time_to_unix_ms(SystemTime::now())
 }
 
@@ -621,7 +621,7 @@ pub fn now_unix_ms() -> Option<i64> {
 /// the clock is unavailable. Shared by the `spice_cdc::*` log lines and the lag
 /// gauge so every CDC connector computes lag identically.
 #[must_use]
-pub fn replication_lag_ms(source_commit_ts_ms: Option<i64>) -> Option<i64> {
+pub(crate) fn replication_lag_ms(source_commit_ts_ms: Option<i64>) -> Option<i64> {
     match (now_unix_ms(), source_commit_ts_ms) {
         (Some(now), Some(ts)) => Some(now.saturating_sub(ts).max(0)),
         _ => None,
@@ -661,7 +661,7 @@ pub fn log_committer_progress(
 /// The batch has zero rows and a no-op committer — idle progress is
 /// acknowledged through the connector's own keepalive/position handling, not
 /// through this envelope's committer.
-pub fn build_heartbeat_envelope(
+pub(crate) fn build_heartbeat_envelope(
     schema: &SchemaRef,
     source_commit_ts_ms: Option<i64>,
     is_dataset_ready: bool,
@@ -736,7 +736,7 @@ pub fn build_ready_signal_envelope(schema: &SchemaRef) -> Result<ChangeEnvelope,
 /// `is_dataset_ready` with it (mirroring `DynamoDB`'s poll-cycle lag gate), and a
 /// [`build_heartbeat_envelope`] on an idle source carries the same verdict.
 #[must_use]
-pub fn source_commit_within_ready_lag(
+pub(crate) fn source_commit_within_ready_lag(
     source_commit_ts_ms: Option<i64>,
     ready_lag: Duration,
 ) -> bool {
@@ -865,7 +865,7 @@ impl ChangeBatch {
     /// not yet received/applied and corrupts the progress-rate ladder. It also correctly
     /// excludes empty-transaction envelopes from the data frontier.
     #[must_use]
-    pub fn is_heartbeat(&self) -> bool {
+    fn is_heartbeat(&self) -> bool {
         self.record.num_rows() == 0
     }
 

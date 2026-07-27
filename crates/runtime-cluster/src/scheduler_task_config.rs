@@ -32,13 +32,13 @@ pub struct PartitionAssignmentConfig {
     pub interval: Duration,
 
     /// Maximum partitions to assign per interval
-    pub max_assignments_per_interval: usize,
+    pub(crate) max_assignments_per_interval: usize,
 
     /// Maximum partitions per executor (soft limit)
-    pub max_partitions_per_executor: usize,
+    pub(crate) max_partitions_per_executor: usize,
 
     /// How long to wait for partition discovery before timing out
-    pub discovery_timeout: Duration,
+    pub(crate) discovery_timeout: Duration,
 }
 
 #[derive(Debug, Snafu)]

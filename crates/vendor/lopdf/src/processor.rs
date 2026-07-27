@@ -163,7 +163,7 @@ impl Document {
         }
     }
 
-    pub fn renumber_bookmarks(&mut self, old: &ObjectId, new: &ObjectId) {
+    fn renumber_bookmarks(&mut self, old: &ObjectId, new: &ObjectId) {
         if !self.bookmarks.is_empty() {
             self.update_bookmark_pages(&self.bookmarks.clone(), old, new);
         }
@@ -270,7 +270,7 @@ impl Document {
         self.max_id = new_id - 1;
     }
 
-    pub fn change_content_stream(&mut self, stream_id: ObjectId, content: Vec<u8>) {
+    fn change_content_stream(&mut self, stream_id: ObjectId, content: Vec<u8>) {
         if let Some(Object::Stream(stream)) = self.objects.get_mut(&stream_id) {
             stream.set_plain_content(content);
             // Ignore any compression error.
@@ -278,7 +278,7 @@ impl Document {
         }
     }
 
-    pub fn change_page_content(&mut self, page_id: ObjectId, content: Vec<u8>) -> Result<()> {
+    pub(crate) fn change_page_content(&mut self, page_id: ObjectId, content: Vec<u8>) -> Result<()> {
         let contents = self
             .get_dictionary(page_id)
             .and_then(|page| page.get(b"Contents"))?;

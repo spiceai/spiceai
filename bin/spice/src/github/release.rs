@@ -25,28 +25,28 @@ use tar::Archive;
 /// A GitHub release.
 #[derive(Debug, Deserialize)]
 pub struct RepoRelease {
-    pub url: String,
-    pub html_url: String,
-    pub assets_url: String,
-    pub tag_name: String,
-    pub name: Option<String>,
-    pub draft: bool,
-    pub prerelease: bool,
-    pub created_at: String,
-    pub published_at: Option<String>,
-    pub assets: Vec<ReleaseAsset>,
+    url: String,
+    html_url: String,
+    assets_url: String,
+    pub(crate) tag_name: String,
+    name: Option<String>,
+    draft: bool,
+    prerelease: bool,
+    created_at: String,
+    published_at: Option<String>,
+    assets: Vec<ReleaseAsset>,
 }
 
 impl RepoRelease {
     /// Check if the release has a specific asset.
     #[must_use]
-    pub fn has_asset(&self, name: &str) -> bool {
+    fn has_asset(&self, name: &str) -> bool {
         self.assets.iter().any(|a| a.name == name)
     }
 
     /// Get a specific asset by name.
     #[must_use]
-    pub fn get_asset(&self, name: &str) -> Option<&ReleaseAsset> {
+    fn get_asset(&self, name: &str) -> Option<&ReleaseAsset> {
         self.assets.iter().find(|a| a.name == name)
     }
 }
@@ -54,13 +54,13 @@ impl RepoRelease {
 /// A GitHub release asset.
 #[derive(Debug, Deserialize)]
 pub struct ReleaseAsset {
-    pub url: String,
-    pub id: u64,
-    pub name: String,
-    pub content_type: String,
-    pub size: u64,
-    pub download_count: u64,
-    pub browser_download_url: String,
+    url: String,
+    id: u64,
+    name: String,
+    content_type: String,
+    size: u64,
+    download_count: u64,
+    browser_download_url: String,
 }
 
 /// Get the latest release from GitHub.
@@ -312,7 +312,7 @@ pub enum SystemType {
 
 impl SystemType {
     /// Get the OS type for the current platform.
-    pub fn this_pc() -> SystemType {
+    pub(crate) fn this_pc() -> SystemType {
         let arch = Arch(get_rust_arch().to_string());
         match std::env::consts::OS {
             "linux" => SystemType::Linux(arch),
@@ -368,7 +368,7 @@ impl SystemType {
     /// # Arguments
     /// * `flavor` - The flavor to install: "default" (auto-detect), or "cuda" (explicit CUDA)
     /// * `target_version` - The release tag (e.g. "v2.0.0-rc.1") to determine naming strategy
-    pub fn runtime_asset_names(&self, flavor: &str, target_version: &str) -> Vec<String> {
+    pub(crate) fn runtime_asset_names(&self, flavor: &str, target_version: &str) -> Vec<String> {
         let mut names = Vec::new();
 
         // Determine the accelerator based on flavor
@@ -424,7 +424,7 @@ impl SystemType {
     }
 
     /// Get the CLI asset name for the current platform.
-    pub fn cli_asset_name(&self) -> String {
+    pub(crate) fn cli_asset_name(&self) -> String {
         format!(
             "{prefix}_{os}_{arch}.tar.gz",
             prefix = self.cli_asset_prefix(),

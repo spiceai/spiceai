@@ -15,7 +15,7 @@ pub(crate) type CodeLen = u8;
 pub(crate) type SourceRangeMapping = ((SourceCode, SourceCode, CodeLen), ArrayOfTargetStrings);
 pub(crate) type SourceCharMapping = ((SourceCode, CodeLen), Vec<u16>);
 #[derive(Debug, PartialEq)]
-pub enum CMapSection {
+pub(crate) enum CMapSection {
     CsRange(Vec<(SourceCode, SourceCode, CodeLen)>),
     BfChar(Vec<SourceCharMapping>),
     BfRange(Vec<SourceRangeMapping>),

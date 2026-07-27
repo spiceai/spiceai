@@ -37,17 +37,17 @@ pub struct Reranker {
     pub from: String,
     pub name: String,
 
-    pub description: Option<String>,
+    description: Option<String>,
 
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub params: HashMap<String, Value>,
 
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(rename = "dependsOn", default)]
-    pub depends_on: Vec<String>,
+    depends_on: Vec<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub metrics: Option<Metrics>,
+    metrics: Option<Metrics>,
 }
 
 impl Nameable for Reranker {
@@ -67,7 +67,7 @@ impl WithDependsOn<Reranker> for Reranker {
 
 impl Reranker {
     #[must_use]
-    pub fn new(from: impl Into<String>, name: impl Into<String>) -> Self {
+    fn new(from: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
             from: from.into(),
             name: name.into(),

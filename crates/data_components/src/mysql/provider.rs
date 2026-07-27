@@ -45,7 +45,7 @@ pub enum Error {
     QueryFailed { source: mysql_async::Error },
 }
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// System schemas to exclude from discovery.
 const SYSTEM_SCHEMAS: &[&str] = &["information_schema", "mysql", "performance_schema", "sys"];
@@ -195,7 +195,7 @@ impl std::fmt::Debug for MySQLSchemaProvider {
 
 impl MySQLSchemaProvider {
     #[must_use]
-    pub fn new(
+    fn new(
         pool: mysql_async::Pool,
         schema_name: String,
         table_creator: Arc<dyn Read>,

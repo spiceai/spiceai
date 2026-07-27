@@ -35,7 +35,7 @@ pub enum PartitionedBySchema {
     Named(std::collections::HashMap<String, String>),
 }
 
-pub fn deserialize_partition_by<'de, D>(deserializer: D) -> Result<Vec<PartitionedBy>, D::Error>
+pub(crate) fn deserialize_partition_by<'de, D>(deserializer: D) -> Result<Vec<PartitionedBy>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -89,7 +89,7 @@ where
     Ok(result)
 }
 
-pub fn serialize_partition_by<S>(
+pub(crate) fn serialize_partition_by<S>(
     partition_by: &[PartitionedBy],
     serializer: S,
 ) -> Result<S::Ok, S::Error>
@@ -122,13 +122,13 @@ mod tests {
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     #[cfg_attr(feature = "schemars", derive(JsonSchema))]
     #[serde(deny_unknown_fields)]
-    pub struct Test {
+    pub(crate) struct Test {
         #[serde(
             default,
             skip_serializing_if = "Vec::is_empty",
             deserialize_with = "deserialize_partition_by"
         )]
-        pub partition_by: Vec<PartitionedBy>,
+        partition_by: Vec<PartitionedBy>,
     }
     #[test]
     fn deserialize_partition_by_unnamed() -> Result<(), yaml::Error> {

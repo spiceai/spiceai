@@ -25,7 +25,7 @@ pub struct SecretsContextExtension {
 
 impl SecretsContextExtension {
     #[must_use]
-    pub fn new(secrets: Arc<RwLock<secrets::Secrets>>) -> Self {
+    pub(crate) fn new(secrets: Arc<RwLock<secrets::Secrets>>) -> Self {
         Self { secrets }
     }
 

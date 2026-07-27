@@ -86,17 +86,17 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Represents a file entry in a Git repository with version information
 #[derive(Debug, Clone)]
 pub struct GitFileEntry {
-    pub name: String,
-    pub path: String,
-    pub size: i64,
-    pub sha: String,
-    pub mode: String,
-    pub tree_sha: String,
-    pub commit_sha: Option<String>,
-    pub version: Option<String>,
-    pub created_at: Option<i64>,
-    pub updated_at: Option<i64>,
-    pub content: Option<String>,
+    name: String,
+    path: String,
+    size: i64,
+    sha: String,
+    mode: String,
+    tree_sha: String,
+    commit_sha: Option<String>,
+    version: Option<String>,
+    created_at: Option<i64>,
+    updated_at: Option<i64>,
+    content: Option<String>,
 }
 
 pub const DEFAULT_MAX_FILES: usize = 5_000;
@@ -243,7 +243,7 @@ impl std::fmt::Debug for GitCredentials {
 
 impl GitCredentials {
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.username.is_none()
             && self.password.is_none()
             && self.token.is_none()
@@ -501,7 +501,7 @@ impl GitClient {
         clippy::too_many_arguments,
         reason = "credentials and resilience config would otherwise clutter every call site; keeping one builder for clarity"
     )]
-    pub fn new(
+    fn new(
         repo_url: &str,
         reference: Option<&str>,
         rate_limiter: Arc<dyn RateLimiter>,
@@ -860,7 +860,7 @@ impl GitClient {
     }
 
     /// Fetch files from the repository
-    pub async fn fetch_files(
+    async fn fetch_files(
         &self,
         limit: Option<usize>,
         include: Option<Arc<GlobSet>>,

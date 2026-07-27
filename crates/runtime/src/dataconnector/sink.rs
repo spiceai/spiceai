@@ -46,7 +46,7 @@ pub struct SinkConnector {
 
 impl SinkConnector {
     #[must_use]
-    pub fn new(schema: SchemaRef) -> Self {
+    pub(crate) fn new(schema: SchemaRef) -> Self {
         Self {
             schema,
             table_constraints: Constraints::new_unverified(vec![]),
@@ -54,7 +54,7 @@ impl SinkConnector {
     }
 
     #[must_use]
-    pub fn with_primary_key(mut self, primary_key: &[String]) -> Self {
+    pub(crate) fn with_primary_key(mut self, primary_key: &[String]) -> Self {
         let primary_key_idxs = primary_key
             .iter()
             .filter_map(|p| self.schema.column_with_name(p.as_str()))

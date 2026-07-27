@@ -60,7 +60,7 @@ impl ToolFactory {
 }
 
 #[must_use]
-pub fn default_catalog_names<'a>() -> Vec<&'a str> {
+pub(crate) fn default_catalog_names<'a>() -> Vec<&'a str> {
     vec![MemoryToolCatalog::name(), BuiltinToolCatalog::name()]
 }
 
@@ -76,7 +76,7 @@ impl From<Arc<dyn IndividualToolFactory>> for ToolFactory {
     }
 }
 
-pub async fn register_all_factories(rt: Arc<Runtime>) {
+pub(crate) async fn register_all_factories(rt: Arc<Runtime>) {
     let tool_factories = rt.tool_factories();
     let mut registry = tool_factories.lock().await;
     registry.insert(
@@ -102,7 +102,7 @@ pub async fn register_all_factories(rt: Arc<Runtime>) {
     );
 }
 
-pub async fn unregister_all_factories(rt: &Runtime) {
+pub(crate) async fn unregister_all_factories(rt: &Runtime) {
     let tool_factories = rt.tool_factories();
     let mut registry = tool_factories.lock().await;
     registry.clear();
@@ -113,7 +113,7 @@ pub async fn unregister_all_factories(rt: &Runtime) {
 
 /// Get all catalogs available by default in the spice runtime.
 #[must_use]
-pub fn default_available_catalogs(rt: &Arc<Runtime>) -> Vec<Arc<dyn SpiceToolCatalog>> {
+pub(crate) fn default_available_catalogs(rt: &Arc<Runtime>) -> Vec<Arc<dyn SpiceToolCatalog>> {
     vec![
         Arc::new(BuiltinToolCatalog::new(
             rt.datafusion() as Arc<dyn QueryEngine>,
@@ -130,7 +130,7 @@ pub fn default_available_catalogs(rt: &Arc<Runtime>) -> Vec<Arc<dyn SpiceToolCat
 
 /// Forge creates `Tooling` from a `Tool` component. It uses the `from` field to determine if it should create a [`SpiceToolCatalog`] or a [`SpiceModelTool`].
 #[expect(clippy::implicit_hasher)]
-pub async fn forge(
+pub(crate) async fn forge(
     component: &Tool,
     secrets: HashMap<String, SecretString>,
     rt: Arc<Runtime>,

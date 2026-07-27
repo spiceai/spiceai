@@ -30,7 +30,7 @@ use secrecy::{ExposeSecret, SecretString, zeroize::Zeroizing};
 use snafu::{ResultExt, Snafu};
 
 /// Parameters accepted by the `kubernetes` secret store.
-pub const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::runtime("namespace")
+pub(crate) const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::runtime("namespace")
     .description(
         "Kubernetes namespace containing the secret. Defaults to the namespace of the \
          current pod (read from the service-account mount).",
@@ -40,15 +40,15 @@ pub const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::runtime("namespace")
 /// Resolved configuration for the `kubernetes` secret store.
 #[derive(Debug, Clone)]
 pub struct KubernetesConfig {
-    pub secret_name: String,
-    pub namespace: Option<String>,
+    pub(crate) secret_name: String,
+    pub(crate) namespace: Option<String>,
 }
 
 impl KubernetesConfig {
     /// Builds a [`KubernetesConfig`] from the parsed selector and a
     /// validated parameter map.
     #[must_use]
-    pub fn from_params(secret_name: String, params: &HashMap<String, String>) -> Self {
+    pub(crate) fn from_params(secret_name: String, params: &HashMap<String, String>) -> Self {
         Self {
             secret_name,
             namespace: params.get("namespace").cloned(),
@@ -90,7 +90,7 @@ pub enum StoreError {
     UnableToGetSecret { source: Error },
 }
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
 
 const KUBERNETES_ACCOUNT_PATH: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
 const KUBERNETES_API_SERVER: &str = "https://kubernetes.default.svc";
@@ -242,7 +242,7 @@ pub struct KubernetesSecretStore {
 
 impl KubernetesSecretStore {
     #[must_use]
-    pub fn new(secret_name: String, namespace_override: Option<String>) -> Self {
+    pub(crate) fn new(secret_name: String, namespace_override: Option<String>) -> Self {
         Self {
             secret_name,
             kubernetes_client: KubernetesClient::new(namespace_override),
@@ -254,7 +254,7 @@ impl KubernetesSecretStore {
     /// # Errors
     ///
     /// Returns an error if unable to read Kubernetes credentials.
-    pub async fn init(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    pub(crate) async fn init(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if let Err(err) = self.kubernetes_client.init().await {
             return Err(Box::new(StoreError::UnableToInitKubernetesClient {
                 source: err,

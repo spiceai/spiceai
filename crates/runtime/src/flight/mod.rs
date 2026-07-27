@@ -102,7 +102,7 @@ pub struct Service {
 impl Service {
     /// Creates a new Flight service using the shared data update broadcaster.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         basic_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
         data_update_broadcaster: DataUpdateBroadcaster,
     ) -> Self {
@@ -115,7 +115,7 @@ impl Service {
 
     /// Returns a clone of the session store.
     #[must_use]
-    pub fn session_store(&self) -> SessionStore {
+    pub(crate) fn session_store(&self) -> SessionStore {
         self.session_store.clone()
     }
 }
@@ -293,7 +293,7 @@ impl Service {
         ))
     }
 
-    pub(crate) fn ipc_write_options_for_context(
+    fn ipc_write_options_for_context(
         context: &RequestContext,
     ) -> Result<IpcWriteOptions, Status> {
         let ipc_compression = context
@@ -619,7 +619,7 @@ pub(crate) fn is_auth_read_only(context: &RequestContext) -> bool {
 /// - `Ok(Some(plan))` — principal is read-only, SQL is safe (plan reusable, params bound)
 /// - `Ok(None)`       — principal has write access; no plan was parsed
 /// - `Err(_)`         — principal is read-only and SQL contains a write operation
-pub(crate) async fn check_read_only_sql(
+async fn check_read_only_sql(
     context: &RequestContext,
     datafusion: &Arc<DataFusion>,
     sql: &str,
@@ -843,7 +843,7 @@ pub(crate) fn is_address_in_use_error(err: &tonic::transport::Error) -> bool {
 /// # Panics
 /// If running in clustered mode, will panic unless TLS is configured or user manually overrides
 /// this safety check, as RPC will transmit sensitive information to executors.
-pub async fn start(
+pub(crate) async fn start(
     bind_address: std::net::SocketAddr,
     app: Option<Arc<App>>,
     rt: Arc<Runtime>,
@@ -995,7 +995,7 @@ pub(crate) fn configure_flight_server_transport(server: Server) -> Server {
 }
 
 pub struct RateLimits {
-    pub flight_write_limit: Quota,
+    pub(crate) flight_write_limit: Quota,
     /// Whether write rate limiting is enabled. When `false`, the rate limiter
     /// layer is still present but the check function always succeeds.
     flight_write_enabled: AtomicBool,
@@ -1005,7 +1005,7 @@ pub struct RateLimits {
     /// even when their data requests are rate-limited. Because this throttles all
     /// `/metrics` callers, lowering it to protect the expensive cluster fan-out
     /// will also throttle ordinary local Prometheus scrapes.
-    pub metrics_endpoint_limit: Quota,
+    pub(crate) metrics_endpoint_limit: Quota,
 }
 
 impl RateLimits {
@@ -1033,11 +1033,11 @@ impl RateLimits {
     }
 
     #[must_use]
-    pub fn flight_write_enabled(&self) -> bool {
+    pub(crate) fn flight_write_enabled(&self) -> bool {
         self.flight_write_enabled.load(Ordering::Acquire)
     }
 
-    pub fn set_flight_write_enabled(&self, enabled: bool) {
+    pub(crate) fn set_flight_write_enabled(&self, enabled: bool) {
         self.flight_write_enabled.store(enabled, Ordering::Release);
     }
 }

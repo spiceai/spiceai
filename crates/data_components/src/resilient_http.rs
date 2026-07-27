@@ -29,17 +29,17 @@ const DEFAULT_HTTP_TCP_KEEPALIVE: Duration = Duration::from_mins(1);
 const DEFAULT_HTTP_POOL_MAX_IDLE_PER_HOST: usize = 16;
 const DEFAULT_HTTP_RETRIES: usize = 3;
 const MAX_HTTP_BACKOFF: Duration = Duration::from_mins(5);
-pub const SUPPORTED_ACCEPT_ENCODINGS: &str = "zstd, br, gzip, deflate";
+const SUPPORTED_ACCEPT_ENCODINGS: &str = "zstd, br, gzip, deflate";
 
 /// Groups the optional retry, concurrency, and observability knobs accepted by
 /// the `send_request_with_retry*` family of helpers.
 #[derive(Default)]
 pub struct RetryConfig<'a> {
-    pub concurrency_limit: Option<&'a Semaphore>,
-    pub max_retries: Option<usize>,
-    pub backoff_method: Option<BackoffMethod>,
-    pub retry_counter: Option<&'a AtomicU64>,
-    pub inflight_counter: Option<&'a AtomicU64>,
+    pub(crate) concurrency_limit: Option<&'a Semaphore>,
+    pub(crate) max_retries: Option<usize>,
+    pub(crate) backoff_method: Option<BackoffMethod>,
+    pub(crate) retry_counter: Option<&'a AtomicU64>,
+    pub(crate) inflight_counter: Option<&'a AtomicU64>,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -66,7 +66,7 @@ where
     .await
 }
 
-pub async fn send_request_with_retry_and_concurrency_limit<F>(
+pub(crate) async fn send_request_with_retry_and_concurrency_limit<F>(
     service_name: &str,
     operation_name: &str,
     build_request: F,
@@ -200,7 +200,7 @@ where
     }
 }
 
-pub fn enable_supported_compression(builder: ClientBuilder) -> ClientBuilder {
+fn enable_supported_compression(builder: ClientBuilder) -> ClientBuilder {
     builder.gzip(true).brotli(true).zstd(true).deflate(true)
 }
 
@@ -323,7 +323,7 @@ fn bounded_retry_delay(
 
 /// Marker appended to a sanitized body when it was truncated. Defined here so
 /// the content budget in [`sanitize_error_body`] can reserve room for it.
-pub const TRUNCATED_BODY_MARKER: &str = "…<truncated>";
+const TRUNCATED_BODY_MARKER: &str = "…<truncated>";
 
 /// Stream chunks from an HTTP error response, stopping as soon as we have
 /// enough bytes to fill `max_bytes` after sanitization. Prevents a
@@ -332,7 +332,7 @@ pub const TRUNCATED_BODY_MARKER: &str = "…<truncated>";
 /// message. The returned string is already passed through
 /// [`sanitize_error_body`] and is capped at `max_bytes` bytes *including*
 /// the truncation marker.
-pub async fn read_bounded_error_body(mut response: Response, max_bytes: usize) -> String {
+pub(crate) async fn read_bounded_error_body(mut response: Response, max_bytes: usize) -> String {
     // Cap the raw read at a small multiple of the sanitized cap to allow for
     // UTF-8 completion and whitespace expansion, while still bounding memory.
     let read_cap_bytes = max_bytes.saturating_mul(2);
@@ -365,7 +365,7 @@ pub async fn read_bounded_error_body(mut response: Response, max_bytes: usize) -
 /// the marker (a degenerate cap), we fill up to `max_bytes` bytes of
 /// sanitized content with no marker, matching the documented upper bound.
 #[must_use]
-pub fn sanitize_error_body(body: &str, max_bytes: usize) -> String {
+fn sanitize_error_body(body: &str, max_bytes: usize) -> String {
     // If the cap can accommodate the marker, reserve room for it so a truncated
     // result still fits inside `max_bytes`. If it can't, we skip the marker and
     // let the content itself fill `max_bytes` — otherwise small caps would yield

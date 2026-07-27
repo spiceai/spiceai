@@ -21,13 +21,13 @@ use crate::{
     bedrock::embed::BedrockEmbeddingConfig,
     embeddings::{FailedToExtractEmbeddingsSnafu, Result as EmbedResult},
 };
-pub const TITAN_TEXT_EMBED_V2: &str = "amazon.titan-embed-text-v2:0";
+pub(crate) const TITAN_TEXT_EMBED_V2: &str = "amazon.titan-embed-text-v2:0";
 
 #[derive(Debug)]
 pub struct TitanConfig {
-    pub model_name: String,
-    pub normalize: bool,
-    pub dimensions: u32,
+    pub(crate) model_name: String,
+    pub(crate) normalize: bool,
+    pub(crate) dimensions: u32,
 }
 const MAX_TITAN_INPUT_LENGTH: usize = 8192;
 
@@ -80,20 +80,20 @@ impl BedrockEmbeddingConfig<TitanEmbedRequest, TitanEmbedResponse> for TitanConf
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TitanEmbedRequest {
     #[serde(rename = "inputText")]
-    pub input_text: String,
+    input_text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub normalize: Option<bool>,
+    normalize: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub dimensions: Option<u32>,
+    dimensions: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "embeddingTypes")]
-    pub embedding_types: Option<Vec<String>>,
+    embedding_types: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TitanEmbedResponse {
-    pub embedding: Vec<f32>,
+    embedding: Vec<f32>,
     #[serde(rename = "inputTextTokenCount")]
-    pub input_text_token_count: u32,
+    input_text_token_count: u32,
     #[serde(skip_serializing_if = "Option::is_none", rename = "embeddingsByType")]
-    pub embeddings_by_type: Option<serde_json::Value>,
+    embeddings_by_type: Option<serde_json::Value>,
 }

@@ -41,7 +41,7 @@ pub struct McpToolWrapper {
 }
 
 impl McpToolWrapper {
-    pub fn new(client: Arc<RwLock<McpClient>>, spec: Tool, server_name: String) -> Self {
+    pub(crate) fn new(client: Arc<RwLock<McpClient>>, spec: Tool, server_name: String) -> Self {
         Self {
             client,
             spec,
@@ -50,7 +50,7 @@ impl McpToolWrapper {
     }
 
     #[must_use]
-    pub fn internal_name(&self) -> Cow<'static, str> {
+    fn internal_name(&self) -> Cow<'static, str> {
         self.spec.name.clone()
     }
 }

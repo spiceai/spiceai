@@ -16,7 +16,7 @@ limitations under the License.
 
 use super::{Counter, Gauge, LazyLock, Meter, UpDownCounter, global};
 
-pub static TOOLS_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("tool"));
+static TOOLS_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("tool"));
 
 pub static COUNT: LazyLock<UpDownCounter<i64>> = LazyLock::new(|| {
     TOOLS_METER

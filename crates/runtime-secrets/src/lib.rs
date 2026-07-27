@@ -89,11 +89,11 @@ pub type AnyErrorResult<T> = std::result::Result<T, Box<dyn std::error::Error + 
 /// current build (e.g. `keyring` is only present with the
 /// `keyring-secret-store` feature).
 #[must_use]
-pub fn known_secret_stores() -> Vec<&'static str> {
+fn known_secret_stores() -> Vec<&'static str> {
     store_registry().iter().map(|r| r.name).collect()
 }
 
-pub const SECRETS: &str = "secrets";
+const SECRETS: &str = "secrets";
 
 #[async_trait]
 pub trait SecretStore: Send + Sync {
@@ -551,7 +551,7 @@ pub fn iter_secret_references(content: &str) -> impl Iterator<Item = SecretRefer
 /// assert_eq!(refs.get("DB_USER"), Some(&"env".to_string()));
 /// ```
 #[must_use]
-pub fn extract_secret_references(content: &str) -> std::collections::HashMap<String, String> {
+fn extract_secret_references(content: &str) -> std::collections::HashMap<String, String> {
     iter_secret_references(content)
         .map(|r| (r.key, r.store))
         .collect()
@@ -934,7 +934,7 @@ mod tests {
     /// runtime thread and clippy flags it as `await_holding_lock`.
     static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
-    pub(super) async fn lock_env() -> MutexGuard<'static, ()> {
+    async fn lock_env() -> MutexGuard<'static, ()> {
         ENV_LOCK.lock().await
     }
 

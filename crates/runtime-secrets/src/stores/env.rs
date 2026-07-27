@@ -26,20 +26,20 @@ use crate::SecretStore;
 const ENV_SECRET_PREFIX: &str = "SPICE_";
 
 /// Parameters accepted by the `env` secret store.
-pub const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::runtime("file_path")
+pub(crate) const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::runtime("file_path")
     .description("Path to a `.env` file to load secrets from. Defaults to `.env`.")
     .examples(&[".env", "/etc/spice/secrets.env"])];
 
 /// Resolved configuration for the `env` secret store.
 #[derive(Debug, Clone, Default)]
 pub struct EnvConfig {
-    pub file_path: Option<String>,
+    pub(crate) file_path: Option<String>,
 }
 
 impl EnvConfig {
     /// Builds an [`EnvConfig`] from a validated parameter map.
     #[must_use]
-    pub fn from_params(params: &HashMap<String, String>) -> Self {
+    pub(crate) fn from_params(params: &HashMap<String, String>) -> Self {
         Self {
             file_path: params.get("file_path").cloned(),
         }
@@ -58,18 +58,18 @@ impl Default for EnvSecretStoreBuilder {
 
 impl EnvSecretStoreBuilder {
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { path: None }
     }
 
     #[must_use]
-    pub fn with_path(mut self, path: PathBuf) -> Self {
+    pub(crate) fn with_path(mut self, path: PathBuf) -> Self {
         self.path = Some(path);
         self
     }
 
     #[must_use]
-    pub fn build(self) -> EnvSecretStore {
+    pub(crate) fn build(self) -> EnvSecretStore {
         let env = EnvSecretStore { path: self.path };
         env.load();
         env

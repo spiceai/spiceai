@@ -30,7 +30,7 @@ use std::fmt::{Debug, Write};
 use std::sync::{Arc, LazyLock};
 
 pub static DIGEST_UDF_NAME: &str = "digest_many";
-pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| {
+static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| {
     Documentation {
     doc_section: DocSection::default(),
     description: "Emits a digest with the chosen function atop multiple columns of varying types by hashing their string representations".to_string(),
@@ -51,7 +51,7 @@ pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| {
 }
 });
 
-pub static SIGNATURE: LazyLock<Signature> =
+static SIGNATURE: LazyLock<Signature> =
     LazyLock::new(|| Signature::one_of(vec![TypeSignature::VariadicAny], Volatility::Stable));
 
 pub static INSTANCE: LazyLock<ScalarUDF> = LazyLock::new(|| DigestMany::default().into());

@@ -290,7 +290,7 @@ pub(crate) async fn get_tool_registry_tool(
     }
 }
 
-pub(crate) async fn resolve_tool_registry_embedding_model(
+async fn resolve_tool_registry_embedding_model(
     rt: Arc<Runtime>,
     model_name: Option<&str>,
 ) -> Result<Arc<dyn Embed>, Box<dyn std::error::Error + Send + Sync>> {

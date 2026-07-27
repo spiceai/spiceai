@@ -35,7 +35,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
-pub const PREFIX: &str = "oracle";
+pub(crate) const PREFIX: &str = "oracle";
 const DEFAULT_WALLET_PATH: &str = ".oracle";
 
 #[derive(Debug, Snafu)]
@@ -62,7 +62,7 @@ pub enum Error {
     },
 }
 
-pub const PARAMETERS: &[ParameterSpec] = &[
+pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("connection_string")
         .secret()
         .description("The Oracle connection string."),
@@ -92,7 +92,7 @@ pub struct OracleCatalog {
 
 impl OracleCatalog {
     #[must_use]
-    pub fn new_connector(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
+    pub(crate) fn new_connector(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
         Arc::new(Self { params })
     }
 

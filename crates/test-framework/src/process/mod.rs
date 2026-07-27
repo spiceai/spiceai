@@ -34,7 +34,7 @@ pub struct Process {
 
 impl Process {
     #[must_use]
-    pub fn new(pid: Pid) -> Self {
+    pub(crate) fn new(pid: Pid) -> Self {
         Self { pid }
     }
 
@@ -69,7 +69,7 @@ impl Process {
     }
 
     /// Returns the memory usage in bytes for the process
-    pub fn memory_usage(pid: Pid) -> Result<u64> {
+    fn memory_usage(pid: Pid) -> Result<u64> {
         let mut system = System::new();
         system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
 

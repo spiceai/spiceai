@@ -57,7 +57,7 @@ impl MetadataColumns {
         Self(vec![])
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &MetadataColumn> {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &MetadataColumn> {
         self.0.iter()
     }
 }
@@ -78,7 +78,7 @@ impl From<Vec<MetadataColumn>> for MetadataColumns {
 
 impl MetadataColumns {
     #[must_use]
-    pub fn filterable(&self) -> Vec<FieldRef> {
+    fn filterable(&self) -> Vec<FieldRef> {
         self.0
             .iter()
             .filter_map(|c| match c {
@@ -89,7 +89,7 @@ impl MetadataColumns {
     }
 
     #[must_use]
-    pub fn non_filterable(&self) -> Vec<FieldRef> {
+    fn non_filterable(&self) -> Vec<FieldRef> {
         self.0
             .iter()
             .filter_map(|c| match c {
@@ -113,7 +113,7 @@ impl MetadataColumns {
     }
 
     #[must_use]
-    pub fn all_names(&self) -> Vec<String> {
+    pub(crate) fn all_names(&self) -> Vec<String> {
         self.non_filterable()
             .iter()
             .map(|f| f.name().clone())

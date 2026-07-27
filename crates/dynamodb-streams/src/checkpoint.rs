@@ -28,10 +28,10 @@ use std::time::SystemTime;
 /// Exclusive (`After`) checkpoint is returned as part of `StreamResult`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ShardCheckpoint {
-    pub sequence_number: String,
-    pub parent_id: Option<String>, // Root shards don't have parents
-    pub updated_at: SystemTime,
-    pub position: CheckpointPosition,
+    pub(crate) sequence_number: String,
+    pub(crate) parent_id: Option<String>, // Root shards don't have parents
+    pub(crate) updated_at: SystemTime,
+    pub(crate) position: CheckpointPosition,
 }
 
 /// Determines whether to resume processing at or after a sequence number.
@@ -58,7 +58,7 @@ impl Checkpoint {
     /// Returns shards that have no children in this checkpoint (leaf nodes in the lineage tree).
     /// These are the active shards to resume from, as their parents are already exhausted.
     #[must_use]
-    pub fn leaf_shards(&self) -> Vec<(&String, &ShardCheckpoint)> {
+    pub(crate) fn leaf_shards(&self) -> Vec<(&String, &ShardCheckpoint)> {
         let parent_ids: HashSet<&str> = self
             .shards
             .values()

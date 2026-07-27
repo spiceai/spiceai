@@ -23,10 +23,10 @@ use datafusion::sql::sqlparser::ast::{
 };
 use itertools::Itertools;
 
-pub(crate) const REGEXP_LIKE_NAME: &str = "regexp_matches";
-pub(crate) const REGEXP_MATCH_NAME: &str = "regexp_extract";
-pub(crate) const REGEXP_REPLACE_NAME: &str = "regexp_replace";
-pub(crate) const REGEXP_COUNT_NAME: &str = "regexp_extract_all";
+const REGEXP_LIKE_NAME: &str = "regexp_matches";
+const REGEXP_MATCH_NAME: &str = "regexp_extract";
+const REGEXP_REPLACE_NAME: &str = "regexp_replace";
+const REGEXP_COUNT_NAME: &str = "regexp_extract_all";
 
 /// Shared conversion for Spice vector UDFs that have a native `DuckDB` ARRAY
 /// equivalent taking two equal-length `FLOAT[N]` operands (e.g.

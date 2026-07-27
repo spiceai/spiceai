@@ -187,7 +187,7 @@ impl UnityCatalogSchemaProvider {
     /// # Errors
     ///
     /// Returns an error if the schema cannot be created.
-    pub async fn try_new(
+    async fn try_new(
         client: Arc<UnityCatalog>,
         schema: &UCSchema,
         table_creator: Arc<dyn UCTableProviderFactory>,
@@ -304,7 +304,7 @@ impl UnityCatalogSchemaProvider {
         })
     }
 
-    pub async fn refresh(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn refresh(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let previous_table_names = self.table_names();
         let current_tables = self
             .client

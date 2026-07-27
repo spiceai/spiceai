@@ -95,12 +95,12 @@ pub enum ToolUdfBuildError {
     UnsupportedReturnType { tool: String, arrow_type: String },
 }
 
-pub type Result<T, E = ToolUdfBuildError> = std::result::Result<T, E>;
+pub(crate) type Result<T, E = ToolUdfBuildError> = std::result::Result<T, E>;
 
 /// Build a [`ScalarUDF`] (async-backed) that dispatches to `tool` for
 /// each row. The tool's receiver name and signature drive the resulting
 /// UDF's identity and typing.
-pub fn build_scalar_udf(
+pub(crate) fn build_scalar_udf(
     tool: Arc<dyn SpiceModelTool>,
     tool_name: &str,
     yaml_sig: &YamlSignature,

@@ -274,7 +274,7 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
         Some((cte, cte_filters))
     }
 
-    pub(crate) fn rewrite_statement(
+    fn rewrite_statement(
         statement: &Statement,
         indexes: &[(ColumnReference, IndexType)],
     ) -> Option<Statement> {

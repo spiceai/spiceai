@@ -56,7 +56,7 @@ impl<Resp> Clone for CorrelatedResponses<Resp> {
 
 impl<Resp> CorrelatedResponses<Resp> {
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             pending: Arc::new(DashMap::new()),
         }
@@ -66,7 +66,7 @@ impl<Resp> CorrelatedResponses<Resp> {
     /// Prefer [`send_correlated`] for the common case; this is exposed for callers
     /// that need to interleave the register/send steps.
     #[must_use]
-    pub fn register(&self, id: String) -> oneshot::Receiver<Resp> {
+    fn register(&self, id: String) -> oneshot::Receiver<Resp> {
         let (tx, rx) = oneshot::channel();
         self.pending.insert(id, tx);
         rx
@@ -74,7 +74,7 @@ impl<Resp> CorrelatedResponses<Resp> {
 
     /// Drops the pending entry without delivering. Used to clean up on send
     /// failure or timeout.
-    pub fn remove(&self, id: &str) {
+    fn remove(&self, id: &str) {
         self.pending.remove(id);
     }
 
@@ -88,12 +88,12 @@ impl<Resp> CorrelatedResponses<Resp> {
     }
 
     #[must_use]
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.pending.len()
     }
 
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.pending.is_empty()
     }
 }
@@ -135,7 +135,7 @@ pub enum CorrelationError {
 /// - [`CorrelationError::Cancelled`] if the pending entry is removed (e.g.
 ///   via [`CorrelatedResponses::remove`]) or the registry is dropped
 ///   before delivery.
-pub async fn send_correlated<Req, Resp>(
+pub(crate) async fn send_correlated<Req, Resp>(
     request_tx: &mpsc::Sender<Req>,
     pending: &CorrelatedResponses<Resp>,
     build_req: impl FnOnce(String) -> Req,

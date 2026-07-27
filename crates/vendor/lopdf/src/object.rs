@@ -30,7 +30,7 @@ pub struct Stream {
     /// Font streams may not be compressed, for example
     pub allows_compression: bool,
     /// Stream data's position in PDF file.
-    pub start_position: Option<usize>,
+    pub(crate) start_position: Option<usize>,
 }
 
 /// Basic PDF object types defined in an enum.
@@ -142,7 +142,7 @@ impl Object {
         matches!(*self, Object::Null)
     }
 
-    pub fn as_bool(&self) -> Result<bool> {
+    pub(crate) fn as_bool(&self) -> Result<bool> {
         match self {
             Object::Boolean(value) => Ok(*value),
             _ => Err(Error::ObjectType {
@@ -195,7 +195,7 @@ impl Object {
         }
     }
 
-    pub fn as_str(&self) -> Result<&[u8]> {
+    pub(crate) fn as_str(&self) -> Result<&[u8]> {
         match self {
             Object::String(string, _) => Ok(string),
             _ => Err(Error::ObjectType {
@@ -275,7 +275,7 @@ impl Object {
         }
     }
 
-    pub fn as_stream_mut(&mut self) -> Result<&mut Stream> {
+    pub(crate) fn as_stream_mut(&mut self) -> Result<&mut Stream> {
         match self {
             Object::Stream(stream) => Ok(stream),
             _ => Err(Error::ObjectType {
@@ -297,7 +297,7 @@ impl Object {
         }
     }
 
-    pub fn enum_variant(&self) -> &'static str {
+    pub(crate) fn enum_variant(&self) -> &'static str {
         match self {
             Object::Null => "Null",
             Object::Boolean(_) => "Boolean",
@@ -396,7 +396,7 @@ impl Dictionary {
         self.get(b"Type").and_then(|s| s.as_name()).ok() == Some(type_name)
     }
 
-    pub fn get_type(&self) -> Result<&[u8]> {
+    pub(crate) fn get_type(&self) -> Result<&[u8]> {
         self.get(b"Type")
             .and_then(Object::as_name)
             .or_else(|_| self.get(b"Linearized").and(Ok(b"Linearized")))
@@ -406,11 +406,11 @@ impl Dictionary {
         self.0.iter()
     }
 
-    pub fn iter_mut(&'_ mut self) -> indexmap::map::IterMut<'_, Vec<u8>, Object> {
+    pub(crate) fn iter_mut(&'_ mut self) -> indexmap::map::IterMut<'_, Vec<u8>, Object> {
         self.0.iter_mut()
     }
 
-    pub fn get_font_encoding<'a>(&'a self, doc: &'a Document) -> Result<Encoding<'a>> {
+    pub(crate) fn get_font_encoding<'a>(&'a self, doc: &'a Document) -> Result<Encoding<'a>> {
         if !self.has_type(b"Font") {
             return Err(Error::DictType {
                 expected: "Font",
@@ -743,7 +743,7 @@ impl Stream {
         }
     }
 
-    pub fn with_position(dict: Dictionary, position: usize) -> Stream {
+    pub(crate) fn with_position(dict: Dictionary, position: usize) -> Stream {
         Stream {
             dict,
             content: vec![],
@@ -780,14 +780,14 @@ impl Stream {
         self.dict.set("Length", self.content.len() as i64);
     }
 
-    pub fn set_plain_content(&mut self, content: Vec<u8>) {
+    pub(crate) fn set_plain_content(&mut self, content: Vec<u8>) {
         self.dict.remove(b"DecodeParms");
         self.dict.remove(b"Filter");
         self.dict.set("Length", content.len() as i64);
         self.content = content;
     }
 
-    pub fn get_plain_content(&self) -> Result<Vec<u8>> {
+    fn get_plain_content(&self) -> Result<Vec<u8>> {
         match self.filters() {
             Ok(vec) if !vec.is_empty() => self.decompressed_content(),
             _ => Ok(self.content.clone()),
@@ -982,7 +982,7 @@ impl Stream {
         }
     }
 
-    pub fn decompress(&mut self) -> Result<()> {
+    pub(crate) fn decompress(&mut self) -> Result<()> {
         let data = self.decompressed_content()?;
         self.dict.remove(b"DecodeParms");
         self.dict.remove(b"Filter");
@@ -990,7 +990,7 @@ impl Stream {
         Ok(())
     }
 
-    pub fn is_compressed(&self) -> bool {
+    pub(crate) fn is_compressed(&self) -> bool {
         self.dict.get(b"Filter").is_ok()
     }
 }

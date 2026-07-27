@@ -88,7 +88,7 @@ impl std::fmt::Debug for FederatedTaskHistoryTable {
 impl FederatedTaskHistoryTable {
     /// Creates a new federated task history table.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         schema: SchemaRef,
         local_table: Arc<dyn TableProvider>,
         scheduler_peers: Arc<RwLock<SchedulerPeers>>,

@@ -50,7 +50,7 @@ impl CookieStore {
     }
 
     #[must_use]
-    pub fn cookie_header_value(&self) -> Option<HeaderValue> {
+    fn cookie_header_value(&self) -> Option<HeaderValue> {
         let cookies = self.cookies.read();
         if cookies.is_empty() {
             return None;
@@ -69,7 +69,7 @@ impl CookieStore {
         HeaderValue::from_str(&header).ok()
     }
 
-    pub fn update_from_headers(&self, headers: &HeaderMap) {
+    fn update_from_headers(&self, headers: &HeaderMap) {
         let mut cookies = self.cookies.write();
         for value in headers.get_all(SET_COOKIE) {
             if let Ok(value) = value.to_str()

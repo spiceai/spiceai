@@ -472,18 +472,18 @@ impl TryInto<IncrementalDocument> for &[u8] {
 }
 
 pub struct Reader<'a> {
-    pub buffer: &'a [u8],
-    pub document: Document,
-    pub encryption_state: Option<EncryptionState>,
-    pub raw_objects: BTreeMap<ObjectId, Vec<u8>>, // Store raw bytes for encrypted objects
-    pub password: Option<String>,                 // Password for encrypted PDFs
-    pub strict: bool,                             // Reject non-conforming PDFs when true
+    buffer: &'a [u8],
+    document: Document,
+    encryption_state: Option<EncryptionState>,
+    raw_objects: BTreeMap<ObjectId, Vec<u8>>, // Store raw bytes for encrypted objects
+    password: Option<String>,                 // Password for encrypted PDFs
+    strict: bool,                             // Reject non-conforming PDFs when true
 }
 
 /// Maximum allowed embedding of literal strings.
-pub const MAX_BRACKET: usize = 100;
+pub(crate) const MAX_BRACKET: usize = 100;
 
-pub const MAX_NESTING_DEPTH: usize = 100;
+pub(crate) const MAX_NESTING_DEPTH: usize = 100;
 
 /// PDF metadata extracted without loading the entire document.
 /// This is useful for quickly getting basic information about large PDFs.
@@ -573,7 +573,7 @@ impl Reader<'_> {
     /// This is much faster for large PDFs when you only need basic information.
     ///
     /// For encrypted PDFs, use `Document::load_metadata_with_password()` instead.
-    pub fn read_metadata(mut self) -> Result<PdfMetadata> {
+    fn read_metadata(mut self) -> Result<PdfMetadata> {
         let offset = self
             .buffer
             .windows(5)
@@ -815,7 +815,7 @@ impl Reader<'_> {
     }
 
     /// Read whole document.
-    pub fn read(mut self, filter_func: Option<FilterFunc>) -> Result<Document> {
+    fn read(mut self, filter_func: Option<FilterFunc>) -> Result<Document> {
         let offset = self
             .buffer
             .windows(5)
@@ -1202,7 +1202,7 @@ impl Reader<'_> {
             .ok_or(Error::MissingXrefEntry)
     }
 
-    pub fn get_object(&self, id: ObjectId, already_seen: &mut HashSet<ObjectId>) -> Result<Object> {
+    pub(crate) fn get_object(&self, id: ObjectId, already_seen: &mut HashSet<ObjectId>) -> Result<Object> {
         if already_seen.contains(&id) {
             warn!(
                 "reference cycle detected resolving object {} {}",

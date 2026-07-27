@@ -65,7 +65,7 @@ impl CachedQueryResult {
     /// The `schema` parameter must be provided explicitly to ensure the correct
     /// schema is preserved even when `batches` is empty (e.g., 0-row query results).
     #[must_use]
-    pub fn new_raw(
+    fn new_raw(
         batches: Vec<RecordBatch>,
         schema: SchemaRef,
         input_tables: Arc<HashSet<TableReference>>,
@@ -82,7 +82,7 @@ impl CachedQueryResult {
 
     /// Create a new cached query result with encoded data.
     #[must_use]
-    pub fn new(
+    fn new(
         encoded_data: Bytes,
         schema: Arc<Schema>,
         input_tables: Arc<HashSet<TableReference>>,
@@ -163,7 +163,7 @@ impl CachedQueryResult {
     /// Returns the accurate deep memory size of this cache entry.
     /// Includes array data, `RecordBatch` overhead, and schema size.
     #[must_use]
-    pub fn memory_size(&self) -> u64 {
+    fn memory_size(&self) -> u64 {
         let mut size = std::mem::size_of::<Self>() as u64;
 
         match &self.data {

@@ -29,13 +29,13 @@ limitations under the License.
 //! Entry point: [`start_replication_stream`]. Compiled as part of the
 //! `mysql` feature on this crate — no separate feature flag.
 
-pub mod binlog;
-pub mod bootstrap;
+pub(crate) mod binlog;
+pub(crate) mod bootstrap;
 pub mod changes;
 pub mod config;
 pub mod gtid;
 pub mod metrics;
-pub mod resilience;
+pub(crate) mod resilience;
 pub mod rows;
 pub mod setup;
 pub mod shared;
@@ -203,7 +203,7 @@ pub struct PersistedPosition {
 }
 
 /// Version tag for [`CheckpointMeta`] serialized into `schema_json`.
-pub const CHECKPOINT_META_VERSION: u32 = 2;
+const CHECKPOINT_META_VERSION: u32 = 2;
 
 /// Versioned checkpoint sidecar payload stored in `schema_json`.
 ///
@@ -212,16 +212,16 @@ pub const CHECKPOINT_META_VERSION: u32 = 2;
 /// fingerprint. Resume refuses to continue when either diverges.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct CheckpointMeta {
-    pub version: u32,
+    version: u32,
     /// Serialized dataset Arrow schema (same bytes `MySqlBinlogSys::serialize_schema` produces).
-    pub dataset_schema_json: String,
+    dataset_schema_json: String,
     /// [`setup::TableLayout::fingerprint`] of the source table at checkpoint time.
-    pub source_layout_fingerprint: String,
+    source_layout_fingerprint: String,
 }
 
 impl CheckpointMeta {
     #[must_use]
-    pub fn new(dataset_schema_json: String, source_layout_fingerprint: String) -> Self {
+    fn new(dataset_schema_json: String, source_layout_fingerprint: String) -> Self {
         Self {
             version: CHECKPOINT_META_VERSION,
             dataset_schema_json,
@@ -230,7 +230,7 @@ impl CheckpointMeta {
     }
 
     /// Serialize for the `schema_json` sidecar column.
-    pub fn to_schema_json(&self) -> Result<String, serde_json::Error> {
+    fn to_schema_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(self)
     }
 
@@ -241,7 +241,7 @@ impl CheckpointMeta {
     ///   no usable `version`) → `Ok(None)` (caller must treat as unknown
     ///   layout and refuse unsafe resume)
     /// - corrupt / empty / non-schema JSON → `Err`
-    pub fn parse(schema_json: &str) -> Result<Option<Self>, String> {
+    fn parse(schema_json: &str) -> Result<Option<Self>, String> {
         let value: serde_json::Value =
             serde_json::from_str(schema_json).map_err(|e| e.to_string())?;
         if value
@@ -348,7 +348,7 @@ impl std::fmt::Display for ResumeDrift {
 /// match. Any other outcome is [`ResumeDrift`] — the caller must error or
 /// rebootstrap rather than decode historical row images with the current
 /// layout (which would silently scramble columns on a reorder/retype).
-pub fn check_resume_compatibility(
+pub(crate) fn check_resume_compatibility(
     persisted_schema_json: Option<&str>,
     current_dataset_schema_json: Option<&str>,
     current_layout_fingerprint: &str,

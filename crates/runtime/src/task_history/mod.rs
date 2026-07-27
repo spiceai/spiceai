@@ -42,10 +42,10 @@ use crate::accelerated_table::{AcceleratedTable, Retention};
 pub mod federated;
 pub mod otel_exporter;
 
-pub const DEFAULT_TASK_HISTORY_TABLE: &str = "task_history";
+pub(crate) const DEFAULT_TASK_HISTORY_TABLE: &str = "task_history";
 /// Internal table name for the local (non-federated) task history table.
 /// Used by cluster RPC handlers to query local data without triggering federated fan-out.
-pub const LOCAL_TASK_HISTORY_TABLE: &str = "local_task_history";
+pub(crate) const LOCAL_TASK_HISTORY_TABLE: &str = "local_task_history";
 pub const DEFAULT_TASK_HISTORY_RETENTION_PERIOD_SECS: u64 = 8 * 60 * 60; // 8 hours
 pub const DEFAULT_TASK_HISTORY_RETENTION_CHECK_INTERVAL_SECS: u64 = 15 * 60; // 15 minutes
 
@@ -88,7 +88,7 @@ pub struct TaskSpan {
 }
 
 impl TaskSpan {
-    pub async fn instantiate_table(
+    pub(crate) async fn instantiate_table(
         status: Arc<status::RuntimeStatus>,
         retention_period_secs: u64,
         retention_check_interval_secs: u64,
@@ -183,7 +183,7 @@ impl TaskSpan {
         Schema::new(fields)
     }
 
-    pub async fn write(df: Arc<dyn QueryEngine>, spans: Vec<TaskSpan>) -> Result<(), Error> {
+    async fn write(df: Arc<dyn QueryEngine>, spans: Vec<TaskSpan>) -> Result<(), Error> {
         let overrides: Vec<_> = spans
             .iter()
             .filter_map(|s| {
@@ -375,7 +375,7 @@ impl TaskSpan {
     }
 }
 
-pub(crate) fn downcast_builder<T: ArrayBuilder>(
+fn downcast_builder<T: ArrayBuilder>(
     builder: &mut dyn ArrayBuilder,
 ) -> Result<&mut T, Error> {
     builder

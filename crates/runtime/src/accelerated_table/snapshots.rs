@@ -92,13 +92,13 @@ impl SnapshotRefreshState {
 
 #[derive(Debug, Clone)]
 pub struct SnapshotCreationConfig {
-    pub manager: Arc<SnapshotManager>,
-    pub create_trigger: SnapshotCreateTrigger,
+    pub(crate) manager: Arc<SnapshotManager>,
+    pub(crate) create_trigger: SnapshotCreateTrigger,
 }
 
 impl SnapshotCreationConfig {
     #[must_use]
-    pub fn new(manager: Arc<SnapshotManager>, create_trigger: SnapshotCreateTrigger) -> Self {
+    pub(crate) fn new(manager: Arc<SnapshotManager>, create_trigger: SnapshotCreateTrigger) -> Self {
         Self {
             manager,
             create_trigger,

@@ -263,7 +263,7 @@ impl Default for TursoAccelerator {
 
 impl TursoAccelerator {
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             pools: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
@@ -319,7 +319,7 @@ impl TursoAccelerator {
     /// # Note
     ///
     /// This function will never return `":memory:"` when called with file mode.
-    pub fn turso_file_path(&self, source: &dyn AccelerationSource) -> Result<String> {
+    pub(crate) fn turso_file_path(&self, source: &dyn AccelerationSource) -> Result<String> {
         // Check acceleration mode first
         if !source.is_file_accelerated() {
             // Memory mode: always use in-memory database
@@ -355,7 +355,7 @@ impl TursoAccelerator {
     }
 
     /// Returns the shared connection pool for a `Turso` database
-    pub async fn get_shared_pool(
+    pub(crate) async fn get_shared_pool(
         &self,
         source: &dyn AccelerationSource,
     ) -> Result<Arc<TursoConnectionPool>> {

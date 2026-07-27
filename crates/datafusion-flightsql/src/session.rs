@@ -58,7 +58,7 @@ impl std::fmt::Debug for SessionStore {
 
 impl SessionStore {
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let ttl = Duration::from_secs(SESSION_TTL_SECS);
         Self {
             sessions: Cache::builder()
@@ -77,7 +77,7 @@ impl SessionStore {
     /// If `api_key` is provided it is stored for later validation via
     /// [`validate_session`].
     #[must_use]
-    pub fn create_session(
+    pub(crate) fn create_session(
         &self,
         base_ctx: &SessionContext,
         api_key: Option<&str>,
@@ -103,7 +103,7 @@ impl SessionStore {
 
     /// Return the API key associated with a valid session, or `None`.
     #[must_use]
-    pub fn validate_session(&self, session_id: &str) -> Option<String> {
+    pub(crate) fn validate_session(&self, session_id: &str) -> Option<String> {
         if self.sessions.get(session_id).is_some() {
             self.session_principals.get(session_id)
         } else {
@@ -113,14 +113,14 @@ impl SessionStore {
 
     /// Look up a session by ID; returns `None` if expired or unknown.
     #[must_use]
-    pub fn get_session(&self, session_id: &str) -> Option<Arc<SessionContext>> {
+    fn get_session(&self, session_id: &str) -> Option<Arc<SessionContext>> {
         self.sessions.get(session_id)
     }
 
     /// Look up the session context from gRPC request metadata, returning `None`
     /// when no recognisable session ID header is present.
     #[must_use]
-    pub fn get_session_from_metadata(&self, metadata: &MetadataMap) -> Option<Arc<SessionContext>> {
+    pub(crate) fn get_session_from_metadata(&self, metadata: &MetadataMap) -> Option<Arc<SessionContext>> {
         let session_id = extract_session_id(metadata)?;
         self.get_session(&session_id)
     }
@@ -171,7 +171,7 @@ impl SessionStore {
 
     /// Remove a session; returns `true` if it existed.
     #[must_use]
-    pub fn remove_session(&self, session_id: &str) -> bool {
+    fn remove_session(&self, session_id: &str) -> bool {
         let removed = self.sessions.remove(session_id).is_some();
         self.sessions.run_pending_tasks();
         removed
@@ -179,7 +179,7 @@ impl SessionStore {
 
     /// Number of active sessions.
     #[must_use]
-    pub fn session_count(&self) -> usize {
+    fn session_count(&self) -> usize {
         usize::try_from(self.sessions.entry_count()).unwrap_or(0)
     }
 }

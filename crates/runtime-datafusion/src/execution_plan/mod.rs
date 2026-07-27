@@ -111,7 +111,7 @@ pub fn wrap_with_filter(
 }
 
 /// Filters an input `ExecutionPlan` using the filters in `TableScanParams`.
-pub(crate) fn filter_plan(
+fn filter_plan(
     input: Arc<dyn ExecutionPlan>,
     scan_params: &TableScanParams,
 ) -> Result<Arc<dyn ExecutionPlan>> {

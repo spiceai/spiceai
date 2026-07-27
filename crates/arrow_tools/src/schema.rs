@@ -232,7 +232,7 @@ pub fn set_computed_columns_meta<S: ::std::hash::BuildHasher>(
     }
 }
 
-pub fn set_computed_columns_meta_for_base_column(
+fn set_computed_columns_meta_for_base_column(
     schema: &mut Schema,
     base_column: &str,
     computed_columns: &[String],

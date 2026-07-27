@@ -395,7 +395,7 @@ impl DatabricksSqlWarehouse {
     }
 
     /// Creates a new Databricks SQL Warehouse instance with explicit configuration.
-    pub fn with_config(
+    fn with_config(
         endpoint: &str,
         sql_warehouse_id: &str,
         token_provider: Arc<dyn TokenProvider>,
@@ -410,7 +410,7 @@ impl DatabricksSqlWarehouse {
     /// When `shared_semaphore` is `Some`, the instance uses the provided semaphore
     /// for concurrency limiting instead of creating its own. This ensures a global
     /// concurrency limit across all datasets that share the same semaphore.
-    pub fn with_config_and_semaphore(
+    fn with_config_and_semaphore(
         endpoint: &str,
         sql_warehouse_id: &str,
         token_provider: Arc<dyn TokenProvider>,
@@ -429,7 +429,7 @@ impl DatabricksSqlWarehouse {
 
     /// Creates a new Databricks SQL Warehouse instance with explicit configuration,
     /// a shared concurrency semaphore, and a dataset permissions checker.
-    pub fn with_config_semaphore_and_permissions(
+    fn with_config_semaphore_and_permissions(
         endpoint: &str,
         sql_warehouse_id: &str,
         token_provider: Arc<dyn TokenProvider>,

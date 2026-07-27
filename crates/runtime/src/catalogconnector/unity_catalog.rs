@@ -47,7 +47,7 @@ pub struct UnityCatalog {
 
 impl UnityCatalog {
     #[must_use]
-    pub fn new_connector(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
+    pub(crate) fn new_connector(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
         Arc::new(Self {
             params: params.parameters,
         })

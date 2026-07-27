@@ -9,9 +9,9 @@ use crate::{
 #[derive(Clone, Copy, Debug)]
 pub struct AxisValue {
     /// Zero-based index into [`Table::axes`].
-    pub axis_index: u16,
+    axis_index: u16,
     /// Numeric value for this axis.
-    pub value: Fixed,
+    value: Fixed,
 }
 
 impl FromData for AxisValue {
@@ -88,9 +88,9 @@ pub struct AxisRecord {
     /// Axis tag.
     pub tag: Tag,
     /// The name ID for entries in the 'name' table that provide a display string for this axis.
-    pub name_id: u16,
+    name_id: u16,
     /// Sort order for e.g. composing font family or face names.
-    pub ordering: u16,
+    ordering: u16,
 }
 
 impl FromData for AxisRecord {
@@ -114,10 +114,10 @@ pub struct AxisValueFlags(u16);
 #[rustfmt::skip]
 impl AxisValueFlags {
     /// If set, this value also applies to older versions of this font.
-    #[inline] pub fn older_sibling_attribute(self) -> bool { self.0 & (1 << 0) != 0 }
+    #[inline] fn older_sibling_attribute(self) -> bool { self.0 & (1 << 0) != 0 }
 
     /// If set, this value is the normal (a.k.a. "regular") value for the font family.
-    #[inline] pub fn elidable(self) -> bool { self.0 & (1 << 1) != 0 }
+    #[inline] fn elidable(self) -> bool { self.0 & (1 << 1) != 0 }
 }
 
 impl core::fmt::Debug for AxisValueFlags {
@@ -139,13 +139,13 @@ impl core::fmt::Debug for AxisValueFlags {
 #[derive(Clone, Copy, Debug)]
 pub struct AxisValueSubtableFormat1 {
     /// Zero-based index into [`Table::axes`].
-    pub axis_index: u16,
+    axis_index: u16,
     /// Flags for [`AxisValueSubtable`].
-    pub flags: AxisValueFlags,
+    flags: AxisValueFlags,
     /// The name ID of the display string.
-    pub value_name_id: u16,
+    value_name_id: u16,
     /// Numeric value for this record.
-    pub value: Fixed,
+    value: Fixed,
 }
 
 impl FromData for AxisValueSubtableFormat1 {
@@ -167,17 +167,17 @@ impl FromData for AxisValueSubtableFormat1 {
 #[derive(Clone, Copy, Debug)]
 pub struct AxisValueSubtableFormat2 {
     /// Zero-based index into [`Table::axes`].
-    pub axis_index: u16,
+    axis_index: u16,
     /// Flags for [`AxisValueSubtable`].
-    pub flags: AxisValueFlags,
+    flags: AxisValueFlags,
     /// The name ID of the display string.
-    pub value_name_id: u16,
+    value_name_id: u16,
     /// Nominal numeric value for this record.
-    pub nominal_value: Fixed,
+    nominal_value: Fixed,
     /// The minimum value for this record.
-    pub range_min_value: Fixed,
+    range_min_value: Fixed,
     /// The maximum value for this record.
-    pub range_max_value: Fixed,
+    range_max_value: Fixed,
 }
 
 impl FromData for AxisValueSubtableFormat2 {
@@ -201,15 +201,15 @@ impl FromData for AxisValueSubtableFormat2 {
 #[derive(Clone, Copy, Debug)]
 pub struct AxisValueSubtableFormat3 {
     /// Zero-based index into [`Table::axes`].
-    pub axis_index: u16,
+    axis_index: u16,
     /// Flags for [`AxisValueSubtable`].
-    pub flags: AxisValueFlags,
+    flags: AxisValueFlags,
     /// The name ID of the display string.
-    pub value_name_id: u16,
+    value_name_id: u16,
     /// Numeric value for this record.
-    pub value: Fixed,
+    value: Fixed,
     /// Numeric value for a style-linked mapping.
-    pub linked_value: Fixed,
+    linked_value: Fixed,
 }
 
 impl FromData for AxisValueSubtableFormat3 {
@@ -232,11 +232,11 @@ impl FromData for AxisValueSubtableFormat3 {
 #[derive(Clone, Copy, Debug)]
 pub struct AxisValueSubtableFormat4<'a> {
     /// Flags for [`AxisValueSubtable`].
-    pub flags: AxisValueFlags,
+    flags: AxisValueFlags,
     /// The name ID of the display string.
-    pub value_name_id: u16,
+    value_name_id: u16,
     /// List of axis-value pairings.
-    pub values: LazyArray16<'a, AxisValue>,
+    values: LazyArray16<'a, AxisValue>,
 }
 
 impl<'a> AxisValueSubtableFormat4<'a> {
@@ -343,7 +343,7 @@ pub struct Table<'a> {
     /// List of axes
     pub axes: LazyArray16<'a, AxisRecord>,
     /// Fallback name when everything can be elided.
-    pub fallback_name_id: Option<u16>,
+    fallback_name_id: Option<u16>,
     version: u32,
     data: &'a [u8],
     value_lookup_start: Offset32,
@@ -352,7 +352,7 @@ pub struct Table<'a> {
 
 impl<'a> Table<'a> {
     /// Parses a table from raw data.
-    pub fn parse(data: &'a [u8]) -> Option<Self> {
+    pub(crate) fn parse(data: &'a [u8]) -> Option<Self> {
         let mut s = Stream::new(data);
         let version = s.read::<u32>()?;
 
@@ -395,7 +395,7 @@ impl<'a> Table<'a> {
     }
 
     /// Returns an iterator over the collection of axis value tables.
-    pub fn subtables(&self) -> AxisValueSubtables<'a> {
+    fn subtables(&self) -> AxisValueSubtables<'a> {
         AxisValueSubtables {
             data: Stream::new(self.data),
             start: self.value_lookup_start,

@@ -52,7 +52,7 @@ pub(crate) struct ArrowPartitionCreator {
 }
 
 impl ArrowPartitionCreator {
-    pub(crate) fn new(cmd: CreateExternalTable, partition_by: Vec<PartitionedBy>) -> Self {
+    fn new(cmd: CreateExternalTable, partition_by: Vec<PartitionedBy>) -> Self {
         Self {
             cmd,
             arrow_factory: ArrowFactory::new(),

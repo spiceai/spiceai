@@ -58,7 +58,7 @@ pub fn format_batches_with_types(batches: &[RecordBatch]) -> Result<String, Arro
 /// # Errors
 ///
 /// Returns an error if any cell value cannot be formatted.
-pub fn format_batches_expanded(batches: &[RecordBatch]) -> Result<String, ArrowError> {
+pub(crate) fn format_batches_expanded(batches: &[RecordBatch]) -> Result<String, ArrowError> {
     if batches.is_empty() {
         return Ok(String::new());
     }
@@ -291,7 +291,7 @@ fn build_type_row(widths: &[usize], schema: &SchemaRef) -> String {
 ///
 /// This produces shorter, more readable type names similar to `DuckDB`'s format.
 #[must_use]
-pub fn format_data_type(data_type: &DataType) -> String {
+fn format_data_type(data_type: &DataType) -> String {
     match data_type {
         DataType::Null => "null".to_string(),
         DataType::Boolean => "boolean".to_string(),

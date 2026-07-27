@@ -115,7 +115,7 @@ impl PreparedOnConflictDeletionPublish {
     }
 
     /// Return the exact deletion-vector paths owned by abort cleanup.
-    pub fn cleanup_paths(&self) -> Vec<std::path::PathBuf> {
+    fn cleanup_paths(&self) -> Vec<std::path::PathBuf> {
         self.durable_payload
             .as_ref()
             .map_or_else(Vec::new, |payload| {
@@ -139,7 +139,7 @@ impl PreparedOnConflictDeletionPublish {
     /// read. The top-level WAL remains authoritative for restart recovery, so
     /// deleting staged vectors would be unsafe, but counters and deferred flips
     /// owned by this process must still be restored before the value is dropped.
-    pub fn retain_files_for_wal_recovery(&mut self) {
+    pub(crate) fn retain_files_for_wal_recovery(&mut self) {
         if let Some(payload) = self.durable_payload.as_mut() {
             self.table.restore_aborted_inline_tombstone_bookkeeping(
                 &mut self.pending_inline_tombstone_owned,
@@ -236,16 +236,16 @@ pub(crate) struct TombstoneDelta {
     /// unique and never reset, so an `InlinedCache` records the highest delta it
     /// has applied (`tombstone_delta_seq`) and the delta path applies exactly the
     /// deltas with `seq > base.tombstone_delta_seq`.
-    pub(crate) seq: u64,
+    seq: u64,
     /// The tombstone's `delete_sequence`. An entry's row is removed iff its PK is
     /// in this delta AND the entry `sequence_number <= delete_sequence` (mirrors
     /// `filter_inlined_batch_for_deletions`: keep iff `data_sequence > delete_sequence`).
-    pub(crate) delete_sequence: i64,
+    delete_sequence: i64,
     /// Deleted Int64 PKs (for `Int64Pk` tables). Empty for composite-key tables.
-    pub(crate) int64_pk: Vec<i64>,
+    int64_pk: Vec<i64>,
     /// Deleted encoded row-keys (for `RowConverterBased` tables). Empty for
     /// `Int64Pk` tables.
-    pub(crate) row_keys: Vec<Box<[u8]>>,
+    row_keys: Vec<Box<[u8]>>,
 }
 
 impl TombstoneDelta {
@@ -387,7 +387,7 @@ pub(crate) struct InlineAwareDeletionSink {
 /// `true` when the delete targets every row — an empty filter list, or every
 /// filter being the always-true literal `true` (a TRUNCATE / `DELETE … WHERE
 /// TRUE`, which the CDC truncate path emits as `vec![lit(true)]`).
-pub(crate) fn is_delete_all(filters: &[Expr]) -> bool {
+fn is_delete_all(filters: &[Expr]) -> bool {
     filters.iter().all(|filter| {
         matches!(
             filter,
@@ -1126,21 +1126,21 @@ pub(crate) struct OnConflictContext<'a> {
 }
 
 pub(crate) struct OnConflictValidationStream {
-    pub(crate) table: CayenneTableProvider,
-    pub(crate) inner: SendableRecordBatchStream,
+    table: CayenneTableProvider,
+    inner: SendableRecordBatchStream,
     schema: SchemaRef,
-    pub(crate) pk_indices: Vec<usize>,
-    pub(crate) converter: RowConverter,
-    pub(crate) on_conflict: OnConflict,
-    pub(crate) upsert_options: UpsertOptions,
+    pk_indices: Vec<usize>,
+    converter: RowConverter,
+    on_conflict: OnConflict,
+    upsert_options: UpsertOptions,
     existing_keys: Option<CachedPkIndex>,
-    pub(crate) incoming_keys: PkDigestSet,
-    pub(crate) kept_keys: PkDigestSet,
-    pub(crate) delete_specs: HashMap<Arc<str>, Vec<u64>>,
-    pub(crate) deleted_pk_i64: Vec<i64>,
-    pub(crate) deleted_row_keys: Vec<Box<[u8]>>,
-    pub(crate) deleted_inlined_pk_i64: Vec<i64>,
-    pub(crate) deleted_inlined_row_keys: Vec<Box<[u8]>>,
+    incoming_keys: PkDigestSet,
+    kept_keys: PkDigestSet,
+    delete_specs: HashMap<Arc<str>, Vec<u64>>,
+    deleted_pk_i64: Vec<i64>,
+    deleted_row_keys: Vec<Box<[u8]>>,
+    deleted_inlined_pk_i64: Vec<i64>,
+    deleted_inlined_row_keys: Vec<Box<[u8]>>,
     reinserted_over_tombstone: usize,
     post_validation: Arc<ParkingMutex<Option<PostValidationState>>>,
     /// Whether the validation keyset is stored back into the table's shared PK

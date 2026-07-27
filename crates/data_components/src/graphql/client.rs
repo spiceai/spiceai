@@ -117,12 +117,12 @@ pub struct UnnestParameters {
 #[serde(rename_all = "camelCase")]
 pub struct PageInfo {
     #[serde(default)]
-    pub has_next_page: bool,
+    has_next_page: bool,
 
     #[serde(default)]
-    pub has_previous_page: bool,
-    pub start_cursor: Option<String>,
-    pub end_cursor: Option<String>,
+    has_previous_page: bool,
+    start_cursor: Option<String>,
+    end_cursor: Option<String>,
 }
 
 impl PageInfo {
@@ -306,7 +306,7 @@ impl Display for FieldArgument {
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct PaginationParameters {
     resource_name: String,
-    pub pagination_argument: PaginationArgument,
+    pagination_argument: PaginationArgument,
     other_arguments: Vec<FieldArgument>,
     page_info_path: Option<String>,
 }
@@ -801,7 +801,7 @@ impl GraphQLQuery {
     /// that a single page never requests more than `page_size_override` rows.
     /// Unlike `limit`, it does not bound the total number of rows returned
     /// across all pages; cursor-driven pagination still continues normally.
-    pub fn to_string_with_page_size(
+    fn to_string_with_page_size(
         &self,
         limit: Option<usize>,
         cursor: Option<String>,
@@ -819,7 +819,7 @@ impl GraphQLQuery {
     }
 
     #[must_use]
-    pub fn limit_reached(&self, limit: Option<usize>, record_count: usize) -> bool {
+    fn limit_reached(&self, limit: Option<usize>, record_count: usize) -> bool {
         if let Some(limit) = limit {
             record_count >= limit
         } else {
@@ -855,7 +855,7 @@ pub(crate) struct GraphQLQueryResult {
 
 impl GraphQLClient {
     #[expect(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         client: reqwest::Client,
         endpoint: Url,
         json_pointer: Option<&str>,

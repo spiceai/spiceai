@@ -88,7 +88,7 @@ pub struct ReorderJoinRule {
 }
 
 impl ReorderJoinRule {
-    pub fn new(estimator: Arc<dyn JoinCostEstimator + Send + Sync>) -> Self {
+    fn new(estimator: Arc<dyn JoinCostEstimator + Send + Sync>) -> Self {
         Self { estimator }
     }
 }

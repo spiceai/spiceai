@@ -93,13 +93,13 @@ pub enum ProjectionPushdown {
 impl ProjectionPushdown {
     /// Returns whether this mode enables safe projection-expression pushdown.
     #[must_use]
-    pub fn enabled(self) -> bool {
+    pub(crate) fn enabled(self) -> bool {
         matches!(self, Self::On | Self::Auto)
     }
 
     /// Converts a legacy boolean projection-pushdown setting into the enum mode.
     #[must_use]
-    pub fn from_bool(enabled: bool) -> Self {
+    pub(crate) fn from_bool(enabled: bool) -> Self {
         if enabled { Self::On } else { Self::Off }
     }
 }
@@ -354,7 +354,7 @@ impl VortexFormatFactory {
     /// let factory = VortexFormatFactory::new().with_options(VortexTableOptions::default());
     /// ```
     #[must_use]
-    pub fn with_options(mut self, options: VortexTableOptions) -> Self {
+    pub(crate) fn with_options(mut self, options: VortexTableOptions) -> Self {
         self.options = Some(options);
         self
     }
@@ -389,7 +389,7 @@ impl FileFormatFactory for VortexFormatFactory {
 impl VortexFormat {
     /// Create a new instance with default options.
     #[must_use]
-    pub fn new(session: VortexSession) -> Self {
+    fn new(session: VortexSession) -> Self {
         Self::new_with_options(session, VortexTableOptions::default())
     }
 

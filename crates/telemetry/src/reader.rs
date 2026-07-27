@@ -37,7 +37,7 @@ impl Default for InitialReader {
 
 impl InitialReader {
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             reader: Arc::new(ManualReader::builder().build()),
         }

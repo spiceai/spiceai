@@ -19,8 +19,8 @@ use datafusion::sql::TableReference;
 use itertools::Itertools;
 use tools::SpiceModelTool;
 
-pub const SPICE_DEFAULT_CATALOG: &str = "spice";
-pub const SPICE_DEFAULT_SCHEMA: &str = "public";
+const SPICE_DEFAULT_CATALOG: &str = "spice";
+const SPICE_DEFAULT_SCHEMA: &str = "public";
 use runtime_query_engine::allowlist::ResolvedTableAwareAllowlist;
 use runtime_query_engine::query_engine::QueryEngine;
 use serde::{Deserialize, Serialize};
@@ -105,7 +105,7 @@ impl SpiceModelTool for ListDatasetsTool {
 }
 
 /// Return all datasets available in the runtime, with the properties visible to LLMs.
-pub async fn get_dataset_elements(
+pub(crate) async fn get_dataset_elements(
     df: Arc<dyn QueryEngine>,
     app: Arc<RwLock<Option<Arc<App>>>>,
     opt_include: Option<&ResolvedTableAwareAllowlist>,
@@ -119,7 +119,7 @@ pub async fn get_dataset_elements(
     tables
 }
 
-pub async fn get_table_elements(
+async fn get_table_elements(
     app: Arc<RwLock<Option<Arc<App>>>>,
     opt_include: Option<&ResolvedTableAwareAllowlist>,
 ) -> Vec<ListDatasetElement> {
@@ -143,7 +143,7 @@ pub async fn get_table_elements(
         .collect_vec()
 }
 
-pub async fn get_catalog_elements(
+async fn get_catalog_elements(
     df: Arc<dyn QueryEngine>,
     app: Arc<RwLock<Option<Arc<App>>>>,
     opt_include: Option<&ResolvedTableAwareAllowlist>,
@@ -185,7 +185,7 @@ pub async fn get_catalog_elements(
         .collect()
 }
 
-pub async fn get_view_elements(
+async fn get_view_elements(
     app: Arc<RwLock<Option<Arc<App>>>>,
     opt_include: Option<&ResolvedTableAwareAllowlist>,
 ) -> Vec<ListDatasetElement> {
@@ -212,10 +212,10 @@ pub async fn get_view_elements(
 /// Details about each dataset outputted by the [`ListDatasetsTool`] tool.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ListDatasetElement {
-    pub table: String,
-    pub can_search_documents: bool,
-    pub description: Option<String>,
-    pub metadata: HashMap<String, Value>,
+    pub(crate) table: String,
+    can_search_documents: bool,
+    description: Option<String>,
+    metadata: HashMap<String, Value>,
 }
 
 impl ListDatasetElement {

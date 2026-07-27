@@ -36,7 +36,7 @@ pub struct OltpReport {
     /// Abort rate (0.0..1.0).
     pub abort_rate: f64,
     /// Wall-clock duration of the OLTP run.
-    pub duration: Duration,
+    duration: Duration,
 }
 
 /// Accumulates metrics during an OLTP run.
@@ -55,7 +55,7 @@ impl Default for OltpMetrics {
 
 impl OltpMetrics {
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             start: Instant::now(),
             new_order_committed: 0,
@@ -65,7 +65,7 @@ impl OltpMetrics {
     }
 
     /// Record a successful transaction.
-    pub fn record_success(&mut self, txn_type: TxnType) {
+    pub(crate) fn record_success(&mut self, txn_type: TxnType) {
         if txn_type == TxnType::NewOrder {
             self.new_order_committed += 1;
         }
@@ -73,12 +73,12 @@ impl OltpMetrics {
     }
 
     /// Record a failed/aborted transaction.
-    pub fn record_abort(&mut self) {
+    pub(crate) fn record_abort(&mut self) {
         self.aborted += 1;
     }
 
     /// Merge another terminal's metrics into this one.
-    pub fn merge(&mut self, other: &Self) {
+    pub(crate) fn merge(&mut self, other: &Self) {
         self.new_order_committed += other.new_order_committed;
         self.committed += other.committed;
         self.aborted += other.aborted;
@@ -86,7 +86,7 @@ impl OltpMetrics {
 
     /// Finalize and produce the report.
     #[must_use]
-    pub fn finish(self) -> OltpReport {
+    pub(crate) fn finish(self) -> OltpReport {
         let duration = self.start.elapsed();
         let minutes = duration.as_secs_f64() / 60.0;
 

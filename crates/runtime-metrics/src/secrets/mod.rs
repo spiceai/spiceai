@@ -16,7 +16,7 @@ limitations under the License.
 
 use super::{Histogram, LazyLock, Meter, global};
 
-pub static SECRETS_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("secrets_store"));
+static SECRETS_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("secrets_store"));
 
 pub static STORES_LOAD_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
     SECRETS_METER

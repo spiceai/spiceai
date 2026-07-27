@@ -145,7 +145,7 @@ impl InMemTombstones {
     /// owns a disjoint key set, so the per-key `max` here only ever takes the
     /// single present value (no real cross-shard collision can occur), yielding
     /// the exact whole-tier tombstone map the single-tier path produced.
-    pub(crate) fn merge_from(&mut self, other: &InMemTombstones) {
+    fn merge_from(&mut self, other: &InMemTombstones) {
         for (&pk, &seq) in &other.int64_pk {
             let next = self.int64_pk.get(&pk).map_or(seq, |&cur| cur.max(seq));
             self.int64_pk.insert(pk, next);
@@ -164,7 +164,7 @@ impl InMemTombstones {
     /// [`Self::merge_from`] is exact. O(seg-keys · log self), structurally
     /// sharing `self`'s untouched nodes (the same persistent-map cost
     /// `merge_from` has).
-    pub(crate) fn merge_segment(&mut self, seg: &SegmentTombstones) {
+    fn merge_segment(&mut self, seg: &SegmentTombstones) {
         let seq = seg.delete_sequence;
         for &pk in seg.int64_pk.keys() {
             let next = self.int64_pk.get(&pk).map_or(seq, |&cur| cur.max(seq));
@@ -314,11 +314,11 @@ pub(crate) struct MemSegment {
     pub(crate) tombstones: SegmentTombstones,
     /// This segment's measured byte cost (`get_array_memory_size`), for budget
     /// release accounting on a partial clear.
-    pub(crate) bytes: u64,
+    bytes: u64,
     /// This segment's row count.
-    pub(crate) rows: u64,
+    rows: u64,
     /// Rows this segment's upsert superseded (carried, not recomputed).
-    pub(crate) superseded: u64,
+    superseded: u64,
     /// The SHARED, per-APPLY slot-ack epoch this segment belongs to — the single
     /// epoch axis across all N shards (§3.4 Fix 1). One CDC apply fans into N
     /// shard appends; every one of them stamps the SAME `source_position`, so the
@@ -326,7 +326,7 @@ pub(crate) struct MemSegment {
     /// quantity (the runtime's slot deferral keys on it). `None` at N==1 (the
     /// single-shard path keeps using `MemTier::epoch` as the slot-ack currency, so
     /// behavior is byte-identical) and for the position-based / non-sharded append.
-    pub(crate) source_position: Option<u64>,
+    source_position: Option<u64>,
 }
 
 /// The in-memory CDC tier for one table. Immutable once constructed: every
@@ -352,7 +352,7 @@ pub(crate) struct MemTier {
     pub(crate) rows: u64,
     /// Authoritative superseded-row count carried across appends (NOT recomputed
     /// from `tombstones`, which would double-count the two `Int64Pk` encodings).
-    pub(crate) superseded: u64,
+    superseded: u64,
     /// Monotonic mem-tier epoch. Each append advances the live tier; a checkpoint
     /// flushes every segment up to and including the snapshotted epoch and fires
     /// [`SlotAdvancer::on_checkpoint_durable`] with that epoch only after the
@@ -362,7 +362,7 @@ pub(crate) struct MemTier {
     /// Wall-clock instant the OLDEST un-checkpointed segment was appended, used
     /// by the age cap to bound the crash-replay window for cold tables. `None`
     /// when the tier is empty.
-    pub(crate) oldest_append: Option<Instant>,
+    oldest_append: Option<Instant>,
     /// Monotonic CONTENT version: bumped on every construction that changes the
     /// tier's contents (append AND the post-checkpoint retain), unlike `epoch`
     /// which is preserved across a clear. Cache keys that must distinguish "same
@@ -386,7 +386,7 @@ pub(crate) struct MemTier {
 impl MemTier {
     /// An empty tier at epoch 0 (the provider's initial state in every mode;
     /// only ever appended to when `cdc_durability: memory`).
-    pub(crate) fn empty() -> Self {
+    fn empty() -> Self {
         Self {
             segments: Arc::new(Vec::new()),
             tombstones: InMemTombstones::default(),
@@ -593,7 +593,7 @@ impl MemTier {
     /// to shadow into the durable inline corpus before the slot may advance past
     /// them. Empty immediately after a seal (or on an empty tier).
     #[must_use]
-    pub(crate) fn unsealed_segments(&self) -> &[MemSegment] {
+    fn unsealed_segments(&self) -> &[MemSegment] {
         // `sealed_segments <= segments.len()` is a construction invariant, but a
         // capture/append race could in principle observe a stale pair; clamp so a
         // slice-out-of-bounds can never occur.

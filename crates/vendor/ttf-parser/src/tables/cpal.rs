@@ -45,7 +45,7 @@ impl<'a> Table<'a> {
     }
 
     /// Returns the number of palettes.
-    pub fn palettes(&self) -> NonZeroU16 {
+    pub(crate) fn palettes(&self) -> NonZeroU16 {
         // Already checked during parsing.
         NonZeroU16::new(self.color_indices.len()).unwrap()
     }

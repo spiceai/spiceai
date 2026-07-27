@@ -91,7 +91,7 @@ pub type SharedDataFusionRef = Arc<OnceLock<Weak<DataFusion>>>;
 
 /// Create a new, empty [`SharedDataFusionRef`].
 #[must_use]
-pub fn new_shared_datafusion_ref() -> SharedDataFusionRef {
+pub(crate) fn new_shared_datafusion_ref() -> SharedDataFusionRef {
     Arc::new(OnceLock::new())
 }
 
@@ -102,7 +102,7 @@ pub fn new_shared_datafusion_ref() -> SharedDataFusionRef {
 /// `DataFusion` 54 removed `CatalogProvider::as_any`, which these wrappers used to
 /// delegate to their inner provider so that `downcast_ref::<IcebergCatalogProvider>()`
 /// transparently saw through them. The wrappers must now be peeled explicitly.
-pub fn iceberg_provider_ref(provider: &dyn CatalogProvider) -> Option<&IcebergCatalogProvider> {
+fn iceberg_provider_ref(provider: &dyn CatalogProvider) -> Option<&IcebergCatalogProvider> {
     if let Some(iceberg) = provider.downcast_ref::<IcebergCatalogProvider>() {
         return Some(iceberg);
     }
@@ -117,7 +117,7 @@ pub fn iceberg_provider_ref(provider: &dyn CatalogProvider) -> Option<&IcebergCa
 
 /// Try to extract the Iceberg catalog from a `CatalogProvider`, peeling the
 /// runtime's transparent catalog wrappers (see [`iceberg_provider_ref`]).
-pub fn composed_catalog_to_iceberg(
+pub(crate) fn composed_catalog_to_iceberg(
     provider: &dyn CatalogProvider,
 ) -> Option<Arc<dyn iceberg::Catalog>> {
     iceberg_provider_ref(provider).map(|p| Arc::clone(p.catalog()))

@@ -53,11 +53,11 @@ type HmacSha256 = Hmac<Sha256>;
 #[derive(Debug, Clone)]
 pub struct ScramClient {
     /// Base64-encoded client nonce (18 random bytes)
-    pub client_nonce_b64: String,
+    client_nonce_b64: String,
     /// Client-first-message-bare (without channel binding prefix)
-    pub client_first_bare: String,
+    client_first_bare: String,
     /// Complete client-first-message to send to server
-    pub client_first: String,
+    pub(crate) client_first: String,
 }
 
 #[cfg(feature = "scram")]
@@ -67,7 +67,7 @@ impl ScramClient {
     /// # Arguments
     /// * `username` - `PostgreSQL` username (will be SASL-escaped)
     #[must_use]
-    pub fn new(username: &str) -> ScramClient {
+    pub(crate) fn new(username: &str) -> ScramClient {
         let mut nonce = [0u8; 18];
         rand::rng().fill_bytes(&mut nonce);
         let nonce_b64 = B64.encode(nonce);
@@ -85,7 +85,7 @@ impl ScramClient {
 
     /// Create a SCRAM client with a specific nonce (for testing).
     #[cfg(test)]
-    pub(crate) fn with_nonce(username: &str, nonce_b64: &str) -> ScramClient {
+    fn with_nonce(username: &str, nonce_b64: &str) -> ScramClient {
         let user = sasl_escape_username(username);
         let client_first_bare = format!("n={user},r={nonce_b64}");
         let client_first = format!("n,,{client_first_bare}");
@@ -106,7 +106,7 @@ impl ScramClient {
     ///
     /// # Errors
     /// Returns error if any required field is missing or malformed.
-    pub fn parse_server_first(server_first: &str) -> Result<(String, String, u32)> {
+    fn parse_server_first(server_first: &str) -> Result<(String, String, u32)> {
         let mut r = None;
         let mut s = None;
         let mut i = None;
@@ -147,7 +147,7 @@ impl ScramClient {
     /// # Errors
     /// - Nonce doesn't start with client nonce (possible MITM)
     /// - Invalid base64 in salt
-    pub fn client_final(
+    pub(crate) fn client_final(
         &self,
         password: &str,
         server_first: &str,
@@ -202,7 +202,7 @@ impl ScramClient {
     /// - Missing server signature
     /// - Invalid base64
     /// - Signature mismatch (server doesn't know password)
-    pub fn verify_server_final(
+    pub(crate) fn verify_server_final(
         server_final: &str,
         salted_password: &[u8],
         auth_message: &str,

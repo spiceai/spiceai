@@ -63,9 +63,9 @@ pub struct KerningPair {
     ///
     /// In the kern table spec, a kerning pair is stored as two u16,
     /// but we are using one u32, so we can binary search it directly.
-    pub pair: u32,
+    pub(crate) pair: u32,
     /// Kerning value.
-    pub value: i16,
+    pub(crate) value: i16,
 }
 
 impl KerningPair {
@@ -112,17 +112,17 @@ pub enum Format<'a> {
 #[derive(Clone, Debug)]
 pub struct Subtable<'a> {
     /// Indicates that subtable is for horizontal text.
-    pub horizontal: bool,
+    horizontal: bool,
     /// Indicates that subtable is variable.
-    pub variable: bool,
+    variable: bool,
     /// Indicates that subtable has a cross-stream values.
-    pub has_cross_stream: bool,
+    has_cross_stream: bool,
     /// Indicates that subtable uses a state machine.
     ///
     /// In this case `glyphs_kerning()` will return `None`.
-    pub has_state_machine: bool,
+    has_state_machine: bool,
     /// Subtable format.
-    pub format: Format<'a>,
+    format: Format<'a>,
 }
 
 impl<'a> Subtable<'a> {
@@ -298,12 +298,12 @@ impl<'a> Iterator for SubtablesIter<'a> {
 #[derive(Clone, Copy, Debug)]
 pub struct Subtable0<'a> {
     /// A list of kerning pairs.
-    pub pairs: LazyArray16<'a, KerningPair>,
+    pairs: LazyArray16<'a, KerningPair>,
 }
 
 impl<'a> Subtable0<'a> {
     /// Parses a subtable from raw data.
-    pub fn parse(data: &'a [u8]) -> Option<Self> {
+    fn parse(data: &'a [u8]) -> Option<Self> {
         let mut s = Stream::new(data);
         let number_of_pairs = s.read::<u16>()?;
         s.advance(6); // search_range (u16) + entry_selector (u16) + range_shift (u16)
@@ -333,7 +333,7 @@ pub struct Subtable2<'a> {
 
 impl<'a> Subtable2<'a> {
     /// Parses a subtable from raw data.
-    pub fn parse(header_len: u8, data: &'a [u8]) -> Option<Self> {
+    fn parse(header_len: u8, data: &'a [u8]) -> Option<Self> {
         Some(Self { header_len, data })
     }
 
@@ -390,7 +390,7 @@ pub struct Subtable3<'a> {
 
 impl<'a> Subtable3<'a> {
     /// Parses a subtable from raw data.
-    pub fn parse(data: &'a [u8]) -> Option<Self> {
+    fn parse(data: &'a [u8]) -> Option<Self> {
         Some(Self { data })
     }
 
@@ -429,12 +429,12 @@ impl<'a> Subtable3<'a> {
 #[derive(Clone, Copy, Debug)]
 pub struct Table<'a> {
     /// A list of subtables.
-    pub subtables: Subtables<'a>,
+    subtables: Subtables<'a>,
 }
 
 impl<'a> Table<'a> {
     /// Parses a table from raw data.
-    pub fn parse(data: &'a [u8]) -> Option<Self> {
+    pub(crate) fn parse(data: &'a [u8]) -> Option<Self> {
         // The `kern` table has two variants: OpenType and Apple.
         // And they both have different headers.
         // There are no robust way to distinguish them, so we have to guess.

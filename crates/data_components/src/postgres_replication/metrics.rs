@@ -126,7 +126,7 @@ impl MetricsCollector {
     }
 
     /// Record which replication slot this member belongs to (shared-slot grouping).
-    pub fn set_slot_name(&self, slot: String) {
+    pub(crate) fn set_slot_name(&self, slot: String) {
         // Recover through poisoning so an unrelated panic can't leave the `slot` label
         // permanently unset (which would break shared-slot grouping in the analysis).
         let mut guard = self
@@ -136,26 +136,26 @@ impl MetricsCollector {
         *guard = Some(slot);
     }
 
-    pub fn inc_insert(&self) {
+    pub(crate) fn inc_insert(&self) {
         self.wal_inserts_total.fetch_add(1, Ordering::Relaxed);
     }
-    pub fn inc_update(&self) {
+    pub(crate) fn inc_update(&self) {
         self.wal_updates_total.fetch_add(1, Ordering::Relaxed);
     }
-    pub fn inc_delete(&self) {
+    pub(crate) fn inc_delete(&self) {
         self.wal_deletes_total.fetch_add(1, Ordering::Relaxed);
     }
-    pub fn inc_truncate(&self) {
+    pub(crate) fn inc_truncate(&self) {
         self.wal_truncates_total.fetch_add(1, Ordering::Relaxed);
     }
-    pub fn inc_transaction(&self) {
+    pub(crate) fn inc_transaction(&self) {
         self.wal_transactions_total.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn add_bootstrap_rows(&self, n: u64) {
+    pub(crate) fn add_bootstrap_rows(&self, n: u64) {
         self.bootstrap_rows_total.fetch_add(n, Ordering::Relaxed);
     }
-    pub fn mark_bootstrap_complete(&self) {
+    pub(crate) fn mark_bootstrap_complete(&self) {
         self.bootstrap_complete.store(1, Ordering::Relaxed);
     }
 
@@ -174,7 +174,7 @@ impl MetricsCollector {
     /// (schema inference surfaced no row count for the source). `Some(0)` is a
     /// known-empty source table — deliberately distinct from `None`.
     #[must_use]
-    pub fn bootstrap_rows_expected(&self) -> Option<u64> {
+    pub(crate) fn bootstrap_rows_expected(&self) -> Option<u64> {
         // Acquire pairs with the Release store in `set_bootstrap_rows_expected()` so the
         // value load below never observes a stale default once the flag reads `true`.
         if self.bootstrap_rows_expected_known.load(Ordering::Acquire) {
@@ -187,7 +187,7 @@ impl MetricsCollector {
     /// unknown. A known-empty source table (`Some(0)`) reports `Some(100)` — the
     /// snapshot is trivially complete. Clamped to 100 since the estimate is approximate.
     #[must_use]
-    pub fn bootstrap_progress_percent(&self) -> Option<u64> {
+    pub(crate) fn bootstrap_progress_percent(&self) -> Option<u64> {
         let expected = self.bootstrap_rows_expected()?;
         if expected == 0 {
             return Some(100);
@@ -247,27 +247,27 @@ impl MetricsCollector {
         }
     }
 
-    pub fn inc_schema_evolution(&self) {
+    pub(crate) fn inc_schema_evolution(&self) {
         self.schema_evolutions_total.fetch_add(1, Ordering::Relaxed);
     }
-    pub fn inc_schema_evolution_rejected(&self) {
+    pub(crate) fn inc_schema_evolution_rejected(&self) {
         self.schema_evolution_rejections_total
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn inc_decode_error(&self) {
+    pub(crate) fn inc_decode_error(&self) {
         self.wal_decode_errors_total.fetch_add(1, Ordering::Relaxed);
     }
-    pub fn inc_schema_mismatch_error(&self) {
+    pub(crate) fn inc_schema_mismatch_error(&self) {
         self.schema_mismatch_errors_total
             .fetch_add(1, Ordering::Relaxed);
     }
-    pub fn inc_recv_error(&self) {
+    pub(crate) fn inc_recv_error(&self) {
         self.replication_recv_errors_total
             .fetch_add(1, Ordering::Relaxed);
     }
     /// Add to the cumulative member-send-stalled seconds counter (shared slot).
-    pub fn add_send_stalled(&self, secs: u64) {
+    pub(crate) fn add_send_stalled(&self, secs: u64) {
         self.member_send_stalled_seconds_total
             .fetch_add(secs, Ordering::Relaxed);
     }
@@ -276,16 +276,16 @@ impl MetricsCollector {
     /// same amount from `reader_processing_micros_total` at the source, so that
     /// counter stays decode-only; this exports the subtracted wait for
     /// attribution.
-    pub fn add_member_send_wait_micros(&self, us: u64) {
+    pub(crate) fn add_member_send_wait_micros(&self, us: u64) {
         self.member_send_wait_micros_total
             .fetch_add(us, Ordering::Relaxed);
     }
-    pub fn inc_reconnect(&self) {
+    pub(crate) fn inc_reconnect(&self) {
         self.replication_reconnects_total
             .fetch_add(1, Ordering::Relaxed);
     }
     /// Add elapsed disconnected time (ms) for a completed reconnect (drop → resume).
-    pub fn add_disconnected_ms(&self, ms: u64) {
+    pub(crate) fn add_disconnected_ms(&self, ms: u64) {
         self.replication_disconnected_ms_total
             .fetch_add(ms, Ordering::Relaxed);
     }
@@ -294,7 +294,7 @@ impl MetricsCollector {
     /// (fresh join or in-process rejoin). Also flips the "known" flag so the
     /// metric begins reporting — a dataset on a dedicated (non-shared) slot never
     /// calls this, so its series stays absent rather than a misleading `0`.
-    pub fn mark_member_attached(&self) {
+    pub(crate) fn mark_member_attached(&self) {
         self.member_attached.store(1, Ordering::Relaxed);
         // Release pairs with the Acquire load in `member_attached()` so a reader
         // that observes `known == true` also sees the value store above.
@@ -304,7 +304,7 @@ impl MetricsCollector {
     /// Mark this dataset as DETACHED from its shared replication slot: its ack
     /// floor is now frozen and pins WAL retention for the whole slot until it
     /// rejoins or spiced restarts (#11644).
-    pub fn mark_member_detached(&self) {
+    pub(crate) fn mark_member_detached(&self) {
         self.member_attached.store(0, Ordering::Relaxed);
         self.member_attached_known.store(true, Ordering::Release);
     }
@@ -361,7 +361,7 @@ impl Metrics {
     }
     /// Bootstrap progress percent (0–100), or `None` when the expected total is unknown.
     #[must_use]
-    pub fn bootstrap_progress_percent(&self) -> Option<u64> {
+    fn bootstrap_progress_percent(&self) -> Option<u64> {
         self.collector.bootstrap_progress_percent()
     }
 
@@ -415,13 +415,13 @@ impl Metrics {
     }
 
     #[must_use]
-    pub fn schema_evolutions_total(&self) -> u64 {
+    fn schema_evolutions_total(&self) -> u64 {
         self.collector
             .schema_evolutions_total
             .load(Ordering::Relaxed)
     }
     #[must_use]
-    pub fn schema_evolution_rejections_total(&self) -> u64 {
+    fn schema_evolution_rejections_total(&self) -> u64 {
         self.collector
             .schema_evolution_rejections_total
             .load(Ordering::Relaxed)

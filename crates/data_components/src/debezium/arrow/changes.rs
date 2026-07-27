@@ -60,7 +60,7 @@ pub fn to_change_batch(
     Ok(change_batch)
 }
 
-pub fn vector_to_change_batch(
+pub(crate) fn vector_to_change_batch(
     table_schema: &SchemaRef,
     primary_key: &[String],
     changes: &[&ChangeEvent],

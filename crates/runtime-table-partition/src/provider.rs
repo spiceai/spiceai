@@ -58,7 +58,7 @@ use crate::{
     insert::{DefaultInsertStrategy, InsertStrategy, PartitionContext},
 };
 
-pub mod pruning;
+pub(crate) mod pruning;
 
 #[derive(Debug, Snafu)]
 pub enum Error {

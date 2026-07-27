@@ -179,7 +179,7 @@ impl TombstoneEntry {
     /// Highest insert (upsert re-insertion) sequence recorded for this key, if any.
     #[inline]
     #[must_use]
-    pub fn insert_sequence(&self) -> Option<i64> {
+    fn insert_sequence(&self) -> Option<i64> {
         (self.insert_seq != SEQUENCE_ABSENT).then_some(self.insert_seq)
     }
 }
@@ -885,7 +885,7 @@ impl DeletionIndex {
     /// `pk -> insert_sequence` maps (the catalog load path persists the two
     /// sides separately).
     #[must_use]
-    pub fn from_maps(deleted: HashMap<i64, i64>, insert_records: HashMap<i64, i64>) -> Self {
+    pub(crate) fn from_maps(deleted: HashMap<i64, i64>, insert_records: HashMap<i64, i64>) -> Self {
         Self {
             core: LayeredRuns::from_iters(deleted.into_iter(), insert_records.into_iter(), |pk| {
                 hash_key_i64(*pk)
@@ -908,19 +908,19 @@ impl DeletionIndex {
 
     /// Whether the index has no entries at all.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.core.entry_count == 0
     }
 
     /// Number of keys with a recorded deletion.
     #[must_use]
-    pub fn delete_len(&self) -> usize {
+    pub(crate) fn delete_len(&self) -> usize {
         self.core.delete_count
     }
 
     /// Number of keys with a recorded insert (upsert re-insertion).
     #[must_use]
-    pub fn insert_len(&self) -> usize {
+    pub(crate) fn insert_len(&self) -> usize {
         self.core.insert_count
     }
 
@@ -928,7 +928,7 @@ impl DeletionIndex {
     /// filter entirely when this is `false` (insert-only entries never affect
     /// visibility).
     #[must_use]
-    pub fn has_deletions(&self) -> bool {
+    pub(crate) fn has_deletions(&self) -> bool {
         self.core.delete_count > 0
     }
 
@@ -938,7 +938,7 @@ impl DeletionIndex {
     /// overhead. Shared structure retained by older reader-pinned generations
     /// is intentionally not charged to the latest snapshot again.
     #[must_use]
-    pub fn approx_bytes(&self) -> usize {
+    pub(crate) fn approx_bytes(&self) -> usize {
         const APPROX_I64_BASE_ENTRY_BYTES: usize = 32;
         const APPROX_I64_DELTA_ENTRY_BYTES: usize = 80;
         self.core
@@ -965,7 +965,7 @@ impl DeletionIndex {
     /// `CayenneTableProvider::branch_int64_pk_range` and the
     /// `Int64PkDeletionFilterStream` per-batch fast path.
     #[must_use]
-    pub fn deleted_key_range(&self) -> Option<(i64, i64)> {
+    pub(crate) fn deleted_key_range(&self) -> Option<(i64, i64)> {
         Some((self.core.min_deleted_key?, self.core.max_deleted_key?))
     }
 
@@ -974,7 +974,7 @@ impl DeletionIndex {
     /// [`get`](Self::get) is required to confirm).
     #[inline]
     #[must_use]
-    pub fn might_contain(&self, pk: i64) -> bool {
+    fn might_contain(&self, pk: i64) -> bool {
         self.core.bloom.might_contain(hash_key_i64(pk))
     }
 
@@ -1139,7 +1139,7 @@ impl DeletionIndex {
     /// `insert_sequence`, each merged with per-key max. One pass over the map
     /// replaces the previous two-index double extend.
     #[must_use]
-    pub fn extend_max_conflicts(
+    pub(crate) fn extend_max_conflicts(
         &self,
         keys: impl IntoIterator<Item = i64>,
         delete_sequence: i64,
@@ -1166,7 +1166,7 @@ impl DeletionIndex {
     /// rebuilds the bloom once per group — the compounding cost called out on
     /// [`Self::extend_max_deletes`].
     #[must_use]
-    pub fn extend_max(
+    pub(crate) fn extend_max(
         &self,
         pure: impl IntoIterator<Item = (i64, i64)>,
         conflicts: impl IntoIterator<Item = (i64, i64, i64)>,
@@ -1191,7 +1191,7 @@ impl DeletionIndex {
     /// counters/ranges are recomputed over the survivors. See
     /// [`LayeredRuns::prune_deletes_at_or_below`] for the per-entry semantics.
     #[must_use]
-    pub fn prune_deletes_at_or_below(&self, cutoff: i64) -> Self {
+    pub(crate) fn prune_deletes_at_or_below(&self, cutoff: i64) -> Self {
         Self {
             core: self
                 .core
@@ -1271,7 +1271,7 @@ impl KeyDeletionIndex {
     /// `pk_bytes -> insert_sequence` maps (the catalog load path persists the
     /// two sides separately).
     #[must_use]
-    pub fn from_maps(
+    pub(crate) fn from_maps(
         deleted: HashMap<Box<[u8]>, i64>,
         insert_records: HashMap<Box<[u8]>, i64>,
     ) -> Self {
@@ -1297,26 +1297,26 @@ impl KeyDeletionIndex {
     /// Total number of fused entries (keys with a deletion, an insert record,
     /// or both).
     #[must_use]
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.core.entry_count
     }
 
     /// Number of keys with a recorded deletion.
     #[must_use]
-    pub fn delete_len(&self) -> usize {
+    pub(crate) fn delete_len(&self) -> usize {
         self.core.delete_count
     }
 
     /// Number of keys with a recorded insert (upsert re-insertion).
     #[must_use]
-    pub fn insert_len(&self) -> usize {
+    pub(crate) fn insert_len(&self) -> usize {
         self.core.insert_count
     }
 
     /// Whether any key has a recorded deletion. See
     /// [`DeletionIndex::has_deletions`].
     #[must_use]
-    pub fn has_deletions(&self) -> bool {
+    pub(crate) fn has_deletions(&self) -> bool {
         self.core.delete_count > 0
     }
 
@@ -1328,7 +1328,7 @@ impl KeyDeletionIndex {
     /// retained by older reader-pinned generations is intentionally not
     /// charged to the latest snapshot again.
     #[must_use]
-    pub fn approx_bytes(&self) -> usize {
+    pub(crate) fn approx_bytes(&self) -> usize {
         const APPROX_KEY_BASE_ENTRY_BYTES: usize = 40;
         const APPROX_KEY_DELTA_ENTRY_BYTES: usize = 88;
         self.core
@@ -1343,7 +1343,7 @@ impl KeyDeletionIndex {
 
     /// Highest **delete** sequence number in this index, if any.
     #[must_use]
-    pub fn max_sequence_number(&self) -> Option<i64> {
+    pub(crate) fn max_sequence_number(&self) -> Option<i64> {
         self.core.max_sequence_number
     }
 
@@ -1383,7 +1383,7 @@ impl KeyDeletionIndex {
     /// all runs (main scan), byte-identical to [`get`](Self::get).
     #[inline]
     #[must_use]
-    pub fn get_with_min_seq(&self, key: &[u8], min_delete_seq: Option<i64>) -> Option<Tombstone> {
+    pub(crate) fn get_with_min_seq(&self, key: &[u8], min_delete_seq: Option<i64>) -> Option<Tombstone> {
         let key_hash = hash_key_128(key);
         let bloom_hash = bloom_half(key_hash);
         // Global bloom is a safe superset over every run's deletion keys, so a
@@ -1532,7 +1532,7 @@ impl KeyDeletionIndex {
     /// deletes (`(key, delete_seq)`) and upsert conflicts
     /// (`(key, delete_seq, insert_seq)`) in a SINGLE pass / one bloom rebuild.
     #[must_use]
-    pub fn extend_max<K: AsRef<[u8]>>(
+    pub(crate) fn extend_max<K: AsRef<[u8]>>(
         &self,
         pure: impl IntoIterator<Item = (K, i64)>,
         conflicts: impl IntoIterator<Item = (K, i64, i64)>,
@@ -1554,7 +1554,7 @@ impl KeyDeletionIndex {
     /// Build a new index with every **deletion** at or below `cutoff` removed;
     /// see [`DeletionIndex::prune_deletes_at_or_below`].
     #[must_use]
-    pub fn prune_deletes_at_or_below(&self, cutoff: i64) -> Self {
+    pub(crate) fn prune_deletes_at_or_below(&self, cutoff: i64) -> Self {
         Self {
             core: self
                 .core

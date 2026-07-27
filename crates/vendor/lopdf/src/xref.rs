@@ -12,7 +12,7 @@ pub struct Xref {
     pub entries: BTreeMap<u32, XrefEntry>,
 
     /// Total number of entries (including free entries), equal to the highest object number plus 1.
-    pub size: u32,
+    pub(crate) size: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -33,12 +33,12 @@ pub enum XrefEntry {
 
 #[derive(Debug, Clone)]
 pub struct XrefSection {
-    pub starting_id: u32,
-    pub entries: Vec<XrefEntry>,
+    pub(crate) starting_id: u32,
+    pub(crate) entries: Vec<XrefEntry>,
 }
 
 impl Xref {
-    pub fn new(size: u32, xref_type: XrefType) -> Xref {
+    pub(crate) fn new(size: u32, xref_type: XrefType) -> Xref {
         Xref {
             cross_reference_type: xref_type,
             entries: BTreeMap::new(),
@@ -50,14 +50,14 @@ impl Xref {
         self.entries.get(&id)
     }
 
-    pub fn insert(&mut self, id: u32, entry: XrefEntry) {
+    pub(crate) fn insert(&mut self, id: u32, entry: XrefEntry) {
         self.entries.insert(id, entry);
         self.size = self.size.max(id.saturating_add(1));
     }
 
     /// Combine Xref entries. Only add them if they do not exists already.
     /// Do not replace existing entries.
-    pub fn merge(&mut self, xref: Xref) {
+    pub(crate) fn merge(&mut self, xref: Xref) {
         for (id, entry) in xref.entries {
             self.entries.entry(id).or_insert(entry);
         }
@@ -67,7 +67,7 @@ impl Xref {
         self.entries.clear()
     }
 
-    pub fn max_id(&self) -> u32 {
+    pub(crate) fn max_id(&self) -> u32 {
         match self.entries.keys().max() {
             Some(&id) => id,
             None => 0,
@@ -113,7 +113,7 @@ impl XrefEntry {
     }
 
     /// Write Entry in Cross Reference Table.
-    pub fn write_xref_entry(&self, file: &mut dyn Write) -> Result<()> {
+    fn write_xref_entry(&self, file: &mut dyn Write) -> Result<()> {
         match self {
             XrefEntry::Normal { offset, generation } => {
                 writeln!(file, "{offset:>010} {generation:>05} n ")?;
@@ -136,27 +136,27 @@ impl XrefEntry {
 }
 
 impl XrefSection {
-    pub fn new(starting_id: u32) -> Self {
+    pub(crate) fn new(starting_id: u32) -> Self {
         XrefSection {
             starting_id,
             entries: Vec::new(),
         }
     }
 
-    pub fn add_entry(&mut self, entry: XrefEntry) {
+    pub(crate) fn add_entry(&mut self, entry: XrefEntry) {
         self.entries.push(entry);
     }
 
-    pub fn add_unusable_free_entry(&mut self) {
+    pub(crate) fn add_unusable_free_entry(&mut self) {
         self.add_entry(XrefEntry::UnusableFree);
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
     /// Write Section in Cross Reference Table.
-    pub fn write_xref_section(&self, file: &mut dyn Write) -> Result<()> {
+    pub(crate) fn write_xref_section(&self, file: &mut dyn Write) -> Result<()> {
         if !self.is_empty() {
             // Write section range
             writeln!(file, "{} {}", self.starting_id, self.entries.len())?;
@@ -169,7 +169,7 @@ impl XrefSection {
     }
 }
 
-pub use crate::parser_aux::decode_xref_stream;
+pub(crate) use crate::parser_aux::decode_xref_stream;
 
 /// Encode a field value as big-endian bytes with specified width
 fn encode_field(value: u64, width: usize, output: &mut Vec<u8>) {

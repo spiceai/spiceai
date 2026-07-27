@@ -40,7 +40,7 @@ const COSMOS_SYSTEM_FIELDS: &[&str] = &["_rid", "_self", "_etag", "_attachments"
 /// Strip Cosmos DB-internal system fields from a top-level JSON object. Any
 /// non-object value is returned unchanged.
 #[must_use]
-pub fn strip_system_fields(value: Value) -> Value {
+pub(crate) fn strip_system_fields(value: Value) -> Value {
     match value {
         Value::Object(mut map) => {
             for field in COSMOS_SYSTEM_FIELDS {
@@ -61,7 +61,7 @@ pub fn strip_system_fields(value: Value) -> Value {
 ///
 /// # Errors
 /// Returns an error if Arrow's JSON schema inference fails.
-pub fn infer_schema(samples: &[Value]) -> Result<SchemaRef, Error> {
+pub(crate) fn infer_schema(samples: &[Value]) -> Result<SchemaRef, Error> {
     if samples.is_empty() {
         return Ok(Arc::new(Schema::empty()));
     }

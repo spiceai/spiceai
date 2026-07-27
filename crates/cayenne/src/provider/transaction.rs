@@ -61,16 +61,16 @@ use crate::CayenneCatalog;
 pub struct TxnTable {
     /// Per-table begin sequence high-water (allocators are per-table, so the
     /// token is meaningless across tables).
-    pub token: TransactionWriteToken,
+    token: TransactionWriteToken,
     /// The table's provider (locks, catalog, per-key index) for validation and,
     /// for written tables, the fenced publish.
-    pub provider: CayenneTableProvider,
+    provider: CayenneTableProvider,
     /// Digests of primary keys this transaction read from the table.
-    pub footprint: HashSet<u128>,
+    footprint: HashSet<u128>,
     /// A read without a bounded PK predicate — forces per-table OCC fallback.
-    pub footprint_incomplete: bool,
+    footprint_incomplete: bool,
     /// The staged write handle, present iff the transaction wrote this table.
-    pub stage: Option<CayenneStagedUpsert>,
+    stage: Option<CayenneStagedUpsert>,
 }
 
 struct TxnInner {
@@ -146,7 +146,7 @@ impl CayenneTransaction {
 
     /// Record primary-key digests a statement read from `table_id` (from the
     /// scan's pushed-down PK predicate) into that table's footprint.
-    pub fn record_read_keys(&self, table_id: &str, digests: impl IntoIterator<Item = u128>) {
+    pub(crate) fn record_read_keys(&self, table_id: &str, digests: impl IntoIterator<Item = u128>) {
         if let Ok(mut tables) = self.0.tables.lock()
             && let Some(t) = tables.get_mut(table_id)
         {
@@ -156,7 +156,7 @@ impl CayenneTransaction {
 
     /// Mark `table_id`'s read footprint incomplete (an unbounded read) — commit
     /// falls back to the conservative per-table OCC check for that table.
-    pub fn mark_footprint_incomplete(&self, table_id: &str) {
+    pub(crate) fn mark_footprint_incomplete(&self, table_id: &str) {
         if let Ok(mut tables) = self.0.tables.lock()
             && let Some(t) = tables.get_mut(table_id)
         {
@@ -166,13 +166,13 @@ impl CayenneTransaction {
 
     /// Flag that a Cayenne table outside the participant set was read — the
     /// transaction is fail-closed and aborts at commit.
-    pub fn mark_unregistered_read(&self) {
+    pub(crate) fn mark_unregistered_read(&self) {
         self.0.unregistered_read.store(true, Ordering::Relaxed);
     }
 
     /// Whether a non-participant Cayenne table was read (fail-closed abort).
     #[must_use]
-    pub fn has_unregistered_read(&self) -> bool {
+    fn has_unregistered_read(&self) -> bool {
         self.0.unregistered_read.load(Ordering::Relaxed)
     }
 
@@ -180,7 +180,7 @@ impl CayenneTransaction {
     /// `None` if the table is not a participant or already staged (v1 allows one
     /// write per table); the write path treats `None` as fail-closed.
     #[must_use]
-    pub fn take_token(&self, table_id: &str) -> Option<TransactionWriteToken> {
+    pub(crate) fn take_token(&self, table_id: &str) -> Option<TransactionWriteToken> {
         let tables = self.0.tables.lock().ok()?;
         let t = tables.get(table_id)?;
         if t.stage.is_some() {
@@ -201,7 +201,7 @@ impl CayenneTransaction {
     /// Take all participants (consuming the map) in canonical `table_id` order
     /// for the commit protocol.
     #[must_use]
-    pub fn take_all(&self) -> Vec<TxnTable> {
+    fn take_all(&self) -> Vec<TxnTable> {
         self.0
             .tables
             .lock()
@@ -489,9 +489,9 @@ async fn rollback_prepared(prepared: Vec<PreparedTxnCommit>) {
 #[derive(Debug, Default)]
 pub struct TransactionCommit {
     /// Total rows published across all written tables.
-    pub row_count: u64,
+    row_count: u64,
     /// The `table_id`s whose staged writes were published.
-    pub written_tables: Vec<String>,
+    written_tables: Vec<String>,
 }
 
 impl TransactionCommit {

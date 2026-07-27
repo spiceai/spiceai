@@ -35,18 +35,18 @@ pub struct ModelContextExtension {
 
 impl ModelContextExtension {
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             used_tools: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     #[must_use]
-    pub fn tools_used(&self) -> usize {
+    fn tools_used(&self) -> usize {
         self.used_tools.load(Ordering::SeqCst)
     }
 
-    pub fn add_tools_used(&self, value: usize) {
+    fn add_tools_used(&self, value: usize) {
         self.used_tools.fetch_add(value, Ordering::SeqCst);
     }
 }

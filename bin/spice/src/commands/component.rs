@@ -200,7 +200,7 @@ EXAMPLES
 Docs: https://spiceai.org/docs";
 
 /// Long help text for `spice extension`.
-pub const EXTENSION_LONG_ABOUT: &str = r"Add or configure entries under the `extensions:` section of `spicepod.yaml`.
+const EXTENSION_LONG_ABOUT: &str = r"Add or configure entries under the `extensions:` section of `spicepod.yaml`.
 
 USAGE
   spice extension add <name>       [body flags]   # add a new extension entry; fails if it exists
@@ -220,7 +220,7 @@ EXAMPLES
 Docs: https://spiceai.org/docs";
 
 /// Long help text for `spice metadata`.
-pub const METADATA_LONG_ABOUT: &str = r"Add, update, or set entries under the `metadata:` section of `spicepod.yaml`.
+const METADATA_LONG_ABOUT: &str = r"Add, update, or set entries under the `metadata:` section of `spicepod.yaml`.
 
 USAGE
   spice metadata add KEY=VALUE [KEY=VALUE ...]    # add entries; fails if a key already exists
@@ -245,7 +245,7 @@ Docs: https://spiceai.org/docs";
 )]
 pub struct ComponentArgs {
     #[command(subcommand)]
-    pub command: ComponentCommand,
+    command: ComponentCommand,
 }
 
 #[derive(Subcommand, Debug)]
@@ -260,24 +260,24 @@ pub enum ComponentCommand {
 #[derive(Args, Debug, Default)]
 pub struct ComponentAddArgs {
     /// Component name for inline definitions
-    pub name: Option<String>,
+    name: Option<String>,
 
     #[command(flatten)]
-    pub options: CommonComponentOptions,
+    options: CommonComponentOptions,
 }
 
 #[derive(Args, Debug, Default)]
 pub struct ComponentConfigureArgs {
     /// Component name to create or update
-    pub name: Option<String>,
+    name: Option<String>,
 
     #[command(flatten)]
-    pub options: CommonComponentOptions,
+    options: CommonComponentOptions,
 }
 
 impl ComponentConfigureArgs {
     #[must_use]
-    pub fn has_manifest_edits(&self) -> bool {
+    pub(crate) fn has_manifest_edits(&self) -> bool {
         self.name.is_some() || self.options.has_component_body()
     }
 }
@@ -286,71 +286,71 @@ impl ComponentConfigureArgs {
 pub struct CommonComponentOptions {
     /// Path to the Spicepod manifest to edit
     #[arg(long, value_hint = ValueHint::FilePath)]
-    pub manifest: Option<PathBuf>,
+    manifest: Option<PathBuf>,
 
     /// Source URI/provider for inline components
     #[arg(long = "from", value_name = "SOURCE")]
-    pub from: Option<String>,
+    from: Option<String>,
 
     /// Add a component reference instead of an inline definition
     #[arg(long = "ref", value_name = "PATH")]
-    pub reference: Option<String>,
+    reference: Option<String>,
 
     /// Read the inline component body from a YAML or JSON file
     #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
-    pub file: Option<PathBuf>,
+    file: Option<PathBuf>,
 
     /// Read the inline component body from stdin
     #[arg(long)]
-    pub stdin: bool,
+    stdin: bool,
 
     /// Component description
     #[arg(long, value_name = "TEXT")]
-    pub description: Option<String>,
+    description: Option<String>,
 
     /// Inline SQL for views, workers, or SQL functions
     #[arg(long, value_name = "SQL")]
-    pub sql: Option<String>,
+    sql: Option<String>,
 
     /// SQL file reference for views
     #[arg(long = "sql-ref", value_name = "PATH")]
-    pub sql_ref: Option<String>,
+    sql_ref: Option<String>,
 
     /// Cron expression for workers
     #[arg(long, value_name = "CRON")]
-    pub cron: Option<String>,
+    cron: Option<String>,
 
     /// Inline function body
     #[arg(long, value_name = "BODY")]
-    pub body: Option<String>,
+    body: Option<String>,
 
     /// Function body file reference
     #[arg(long = "body-ref", value_name = "PATH")]
-    pub body_ref: Option<String>,
+    body_ref: Option<String>,
 
     /// Set a schema field using a dotted path. Values are strings unless prefixed with yaml: or string:.
     #[arg(long = "set", value_name = "PATH=VALUE")]
-    pub set: Vec<String>,
+    set: Vec<String>,
 
     /// Set a params entry
     #[arg(long = "param", value_name = "KEY=VALUE")]
-    pub params: Vec<String>,
+    params: Vec<String>,
 
     /// Set an env entry
     #[arg(long = "env", value_name = "KEY=VALUE")]
-    pub env: Vec<String>,
+    env: Vec<String>,
 
     /// Add a dependsOn entry
     #[arg(long = "depends-on", value_name = "NAME")]
-    pub depends_on: Vec<String>,
+    depends_on: Vec<String>,
 
     /// Set enabled: true
     #[arg(long, conflicts_with = "disable")]
-    pub enable: bool,
+    enable: bool,
 
     /// Set enabled: false
     #[arg(long)]
-    pub disable: bool,
+    disable: bool,
 }
 
 impl CommonComponentOptions {
@@ -399,7 +399,7 @@ impl CommonComponentOptions {
 )]
 pub struct SingletonArgs {
     #[command(subcommand)]
-    pub command: SingletonCommand,
+    command: SingletonCommand,
 }
 
 #[derive(Subcommand, Debug)]
@@ -412,39 +412,39 @@ pub enum SingletonCommand {
 pub struct SingletonConfigureArgs {
     /// Path to the Spicepod manifest to edit
     #[arg(long, value_hint = ValueHint::FilePath)]
-    pub manifest: Option<PathBuf>,
+    manifest: Option<PathBuf>,
 
     /// Read the section body from a YAML or JSON file
     #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
-    pub file: Option<PathBuf>,
+    file: Option<PathBuf>,
 
     /// Read the section body from stdin
     #[arg(long)]
-    pub stdin: bool,
+    stdin: bool,
 
     /// Set a schema field using a dotted path. Values are strings unless prefixed with yaml:.
     #[arg(long = "set", value_name = "PATH=VALUE")]
-    pub set: Vec<String>,
+    set: Vec<String>,
 
     /// Set a params entry
     #[arg(long = "param", value_name = "KEY=VALUE")]
-    pub params: Vec<String>,
+    params: Vec<String>,
 
     /// Set enabled: true
     #[arg(long, conflicts_with = "disable")]
-    pub enable: bool,
+    enable: bool,
 
     /// Set enabled: false
     #[arg(long)]
-    pub disable: bool,
+    disable: bool,
 
     /// Management API key
     #[arg(long = "api-key", value_name = "KEY")]
-    pub api_key: Option<String>,
+    api_key: Option<String>,
 
     /// Snapshot object store location
     #[arg(long, value_name = "URI")]
-    pub location: Option<String>,
+    location: Option<String>,
 }
 
 impl SingletonConfigureArgs {
@@ -467,7 +467,7 @@ impl SingletonConfigureArgs {
 )]
 pub struct ExtensionArgs {
     #[command(subcommand)]
-    pub command: ExtensionCommand,
+    command: ExtensionCommand,
 }
 
 #[derive(Subcommand, Debug)]
@@ -482,35 +482,35 @@ pub enum ExtensionCommand {
 #[derive(Args, Debug, Default)]
 pub struct ExtensionEditArgs {
     /// Extension name
-    pub name: String,
+    name: String,
 
     /// Path to the Spicepod manifest to edit
     #[arg(long, value_hint = ValueHint::FilePath)]
-    pub manifest: Option<PathBuf>,
+    manifest: Option<PathBuf>,
 
     /// Read the extension body from a YAML or JSON file
     #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
-    pub file: Option<PathBuf>,
+    file: Option<PathBuf>,
 
     /// Read the extension body from stdin
     #[arg(long)]
-    pub stdin: bool,
+    stdin: bool,
 
     /// Set a schema field using a dotted path. Values are strings unless prefixed with yaml:.
     #[arg(long = "set", value_name = "PATH=VALUE")]
-    pub set: Vec<String>,
+    set: Vec<String>,
 
     /// Set an extension params entry
     #[arg(long = "param", value_name = "KEY=VALUE")]
-    pub params: Vec<String>,
+    params: Vec<String>,
 
     /// Set enabled: true
     #[arg(long, conflicts_with = "disable")]
-    pub enable: bool,
+    enable: bool,
 
     /// Set enabled: false
     #[arg(long)]
-    pub disable: bool,
+    disable: bool,
 }
 
 #[derive(Args, Debug)]
@@ -520,7 +520,7 @@ pub struct ExtensionEditArgs {
 )]
 pub struct MetadataArgs {
     #[command(subcommand)]
-    pub command: MetadataCommand,
+    command: MetadataCommand,
 }
 
 #[derive(Subcommand, Debug)]
@@ -539,28 +539,28 @@ pub enum MetadataCommand {
 pub struct MetadataEditArgs {
     /// Metadata entries as KEY=VALUE. Values are stored as strings unless prefixed with yaml: or string:.
     #[arg(value_name = "KEY=VALUE")]
-    pub entries: Vec<String>,
+    entries: Vec<String>,
 
     /// Path to the Spicepod manifest to edit
     #[arg(long, value_hint = ValueHint::FilePath)]
-    pub manifest: Option<PathBuf>,
+    manifest: Option<PathBuf>,
 
     /// Set metadata entries as KEY=VALUE. Values are stored as strings unless prefixed with yaml: or string:.
     #[arg(long = "set", value_name = "KEY=VALUE")]
-    pub set: Vec<String>,
+    set: Vec<String>,
 }
 
 #[derive(Args, Debug)]
 pub struct MetadataSetArgs {
     /// Metadata key
-    pub key: String,
+    key: String,
 
     /// Metadata value. Stored as a string unless prefixed with yaml: or string:.
-    pub value: String,
+    value: String,
 
     /// Path to the Spicepod manifest to edit
     #[arg(long, value_hint = ValueHint::FilePath)]
-    pub manifest: Option<PathBuf>,
+    manifest: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -576,7 +576,7 @@ pub fn execute_component(section: ComponentSection, args: &ComponentArgs) -> Res
     }
 }
 
-pub fn add_component(section: ComponentSection, args: &ComponentAddArgs) -> Result<()> {
+pub(crate) fn add_component(section: ComponentSection, args: &ComponentAddArgs) -> Result<()> {
     let (manifest_path, mut spicepod, created) = load_manifest(args.options.manifest.as_deref())?;
     let before = spicepod.clone();
     mutate_component(
@@ -589,7 +589,7 @@ pub fn add_component(section: ComponentSection, args: &ComponentAddArgs) -> Resu
     write_if_changed(&manifest_path, &spicepod, &before, created)
 }
 
-pub fn configure_component(section: ComponentSection, args: &ComponentConfigureArgs) -> Result<()> {
+pub(crate) fn configure_component(section: ComponentSection, args: &ComponentConfigureArgs) -> Result<()> {
     let (manifest_path, mut spicepod, created) = load_manifest(args.options.manifest.as_deref())?;
     let before = spicepod.clone();
     mutate_component(

@@ -5,21 +5,21 @@ use crate::error::{PgWireError, Result};
 /// Parsed `PostgreSQL` error/notice response fields
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ErrorFields {
-    pub severity: Option<String>,
-    pub code: Option<String>, // SQLSTATE
-    pub message: Option<String>,
-    pub detail: Option<String>,
-    pub hint: Option<String>,
-    pub position: Option<String>,
-    pub where_: Option<String>,
-    pub schema: Option<String>,
-    pub table: Option<String>,
-    pub column: Option<String>,
-    pub data_type: Option<String>,
-    pub constraint: Option<String>,
-    pub file: Option<String>,
-    pub line: Option<String>,
-    pub routine: Option<String>,
+    severity: Option<String>,
+    code: Option<String>, // SQLSTATE
+    message: Option<String>,
+    detail: Option<String>,
+    hint: Option<String>,
+    position: Option<String>,
+    where_: Option<String>,
+    schema: Option<String>,
+    table: Option<String>,
+    column: Option<String>,
+    data_type: Option<String>,
+    constraint: Option<String>,
+    file: Option<String>,
+    line: Option<String>,
+    routine: Option<String>,
 }
 
 impl ErrorFields {
@@ -66,7 +66,7 @@ impl ErrorFields {
 
     /// Format as a human-readable error string
     #[must_use]
-    pub fn to_error_string(&self) -> String {
+    fn to_error_string(&self) -> String {
         match (&self.message, &self.code) {
             (Some(m), Some(c)) => format!("{m} (SQLSTATE {c})"),
             (Some(m), None) => m.clone(),
@@ -108,13 +108,13 @@ pub fn parse_auth_request(payload: &[u8]) -> Result<(i32, &[u8])> {
 }
 
 /// Authentication type constants
-pub mod auth {
-    pub const OK: i32 = 0;
-    pub const CLEARTEXT_PASSWORD: i32 = 3;
-    pub const MD5_PASSWORD: i32 = 5;
-    pub const SASL: i32 = 10;
-    pub const SASL_CONTINUE: i32 = 11;
-    pub const SASL_FINAL: i32 = 12;
+mod auth {
+    pub(crate) const OK: i32 = 0;
+    pub(crate) const CLEARTEXT_PASSWORD: i32 = 3;
+    pub(crate) const MD5_PASSWORD: i32 = 5;
+    pub(crate) const SASL: i32 = 10;
+    pub(crate) const SASL_CONTINUE: i32 = 11;
+    pub(crate) const SASL_FINAL: i32 = 12;
 }
 
 #[cfg(test)]

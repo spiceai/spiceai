@@ -57,7 +57,7 @@ pub struct ComponentReference {
 
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(rename = "dependsOn", alias = "datasets", default)]
-    pub depends_on: Vec<String>,
+    depends_on: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -127,9 +127,9 @@ pub enum Error {
     InvalidComponentReference { path: PathBuf },
 }
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub async fn resolve_component_references<ComponentType>(
+pub(crate) async fn resolve_component_references<ComponentType>(
     fs: &(impl reader::ReadableYaml + Send + Sync),
     base_path: impl Into<PathBuf>,
     items: &[ComponentOrReference<ComponentType>],

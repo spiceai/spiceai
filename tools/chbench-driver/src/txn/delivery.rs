@@ -30,7 +30,7 @@ use crate::Result;
 /// # Errors
 ///
 /// Returns an error if any database operation fails.
-pub async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Result<()> {
+pub(crate) async fn run(client: &mut Client, rng: &mut impl Rng, warehouses: i32) -> Result<()> {
     let w_id = rng.random_range(1..=warehouses);
     let o_carrier_id = rng.random_range(1..=10);
 

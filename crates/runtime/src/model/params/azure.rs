@@ -29,7 +29,7 @@ pub const PARAMETERS: &[ParameterSpec] =
 
 const AZURE_PARAM_LEN: usize = 7;
 
-pub(crate) const AZURE_PARAMETERS: [ParameterSpec; AZURE_PARAM_LEN] = [
+const AZURE_PARAMETERS: [ParameterSpec; AZURE_PARAM_LEN] = [
     ParameterSpec::runtime("endpoint").description(
         "The Azure OpenAI resource endpoint, e.g., https://resource-name.openai.azure.com.",
     ),

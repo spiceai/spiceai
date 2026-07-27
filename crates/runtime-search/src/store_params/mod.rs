@@ -36,7 +36,7 @@ pub mod s3;
 /// # Errors
 ///
 /// Returns an error when the value is none of the accepted forms.
-pub fn parse_bool(raw: &str) -> Result<bool, String> {
+fn parse_bool(raw: &str) -> Result<bool, String> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "true" | "1" | "yes" => Ok(true),
         "false" | "0" | "no" => Ok(false),

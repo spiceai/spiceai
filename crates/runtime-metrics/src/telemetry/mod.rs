@@ -19,7 +19,7 @@ use std::time::Duration;
 use super::{Counter, Histogram, LazyLock, Meter, UpDownCounter, global};
 use opentelemetry::KeyValue;
 
-pub static TELEMETRY_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("telemetry"));
+static TELEMETRY_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("telemetry"));
 
 static QUERY_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {
     TELEMETRY_METER

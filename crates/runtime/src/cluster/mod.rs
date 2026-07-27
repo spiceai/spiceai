@@ -604,16 +604,16 @@ pub(crate) mod shared_job_state;
 use crate::cluster::partition::service::PartitionService;
 pub use accelerated_partition_provider::AcceleratedPartitionProvider;
 pub use cluster_state::{ClusterStateStore, SchedulerEntry};
-pub use control_stream_client::ControlStreamManager;
+pub(crate) use control_stream_client::ControlStreamManager;
 pub use heartbeat::{CLOCK_SKEW_TOLERANCE_MS, SchedulerHeartbeat, SchedulerHeartbeatStore};
 pub use partition::{PartitionMetadata, PartitionStore, TablePartitionMetadata};
-pub use reaper::{Reaper, ReaperOutcome};
+pub(crate) use reaper::{Reaper, ReaperOutcome};
 pub use runtime_cluster::ExecutorOutboundBroadcaster;
 use runtime_cluster::store::{AccelerationsPartitions, CatalogPartitions};
 pub use runtime_cluster::{ExecutorRegistry, FederatedPartitionProvider, TablePartitions};
 pub use scheduler_registry::SchedulerPeers;
-pub use scheduler_registry::start_scheduler_registry;
-pub use servers::{start_executor_flight_server, start_internal_cluster_server};
+pub(crate) use scheduler_registry::start_scheduler_registry;
+pub(crate) use servers::{start_executor_flight_server, start_internal_cluster_server};
 #[cfg(not(windows))]
 pub(crate) use service::discover_cayenne_tables;
 pub use service::{ClusterServiceImpl, ExecutorControlStreamRegistry};
@@ -947,7 +947,7 @@ impl ResolvedClusterConfig {
 
     /// Returns the cluster role.
     #[must_use]
-    pub fn role(&self) -> Option<&ClusterRole> {
+    pub(crate) fn role(&self) -> Option<&ClusterRole> {
         self.config.role.as_ref()
     }
 
@@ -989,7 +989,7 @@ impl ResolvedClusterConfig {
     /// Returns the scheduler URL (for executors).
     /// The scheme is inferred from TLS configuration if omitted in the original input.
     #[must_use]
-    pub fn scheduler_address(&self) -> Option<&Url> {
+    fn scheduler_address(&self) -> Option<&Url> {
         self.scheduler_address_url.as_ref()
     }
 
@@ -998,7 +998,7 @@ impl ResolvedClusterConfig {
     /// This is constructed from the advertise address during initialization.
     /// Returns `None` if advertise address was not configured.
     #[must_use]
-    pub fn scheduler_url_string(&self) -> Option<&str> {
+    fn scheduler_url_string(&self) -> Option<&str> {
         self.scheduler_url.as_deref()
     }
 
@@ -1010,26 +1010,26 @@ impl ResolvedClusterConfig {
 
     /// Returns the cluster TLS config if configured.
     #[must_use]
-    pub fn tls_config(&self) -> Option<&ClusterTlsConfig> {
+    pub(crate) fn tls_config(&self) -> Option<&ClusterTlsConfig> {
         self.tls_config.as_ref()
     }
 
     /// Returns whether cluster mTLS is enabled.
     #[must_use]
-    pub fn tls_enabled(&self) -> bool {
+    fn tls_enabled(&self) -> bool {
         self.tls_config.is_some()
     }
 
     /// Returns whether this node allows insecure cluster communication.
     #[must_use]
-    pub fn allow_insecure_connections(&self) -> bool {
+    fn allow_insecure_connections(&self) -> bool {
         self.config.allow_insecure_connections
     }
 
     /// Returns a fresh `ClientTlsConfig` snapshot for connecting to other
     /// cluster nodes. Reflects on-disk rotation each call.
     #[must_use]
-    pub fn client_tls_config(&self) -> Option<ClientTlsConfig> {
+    pub(crate) fn client_tls_config(&self) -> Option<ClientTlsConfig> {
         self.tls_config
             .as_ref()
             .map(ClusterTlsConfig::client_tls_config)
@@ -1038,14 +1038,14 @@ impl ResolvedClusterConfig {
     /// Reloadable rustls server config for accepting inbound mTLS
     /// connections (h2 ALPN). `None` if cluster mTLS is disabled.
     #[must_use]
-    pub fn cluster_server_config(&self) -> Option<Arc<rustls::ServerConfig>> {
+    fn cluster_server_config(&self) -> Option<Arc<rustls::ServerConfig>> {
         self.tls_config
             .as_ref()
             .map(ClusterTlsConfig::server_config)
     }
 
     /// Get the node's advertise address for node identification
-    pub fn node_id(&self) -> String {
+    pub(crate) fn node_id(&self) -> String {
         self.scheduler_url_string()
             .or_else(|| self.node_advertise_address())
             .map_or_else(|| self.node_bind_address().to_string(), str::to_string)
@@ -1061,7 +1061,7 @@ impl ResolvedClusterConfig {
     /// bind time, the configured port here may diverge from the actually
     /// bound port. That edge case is not corrected by this helper.
     #[must_use]
-    pub fn metrics_node_id(&self) -> String {
+    pub(crate) fn metrics_node_id(&self) -> String {
         let port = self.node_bind_address().port();
         if let Some(host) = self.node_advertise_address() {
             return format!("{host}:{port}");
@@ -1071,7 +1071,7 @@ impl ResolvedClusterConfig {
 }
 
 /// Creates & binds a Ballista scheduler to the Runtime handle, then updates status
-pub async fn initialize_cluster_scheduler(rt: &Arc<Runtime>) -> crate::Result<()> {
+async fn initialize_cluster_scheduler(rt: &Arc<Runtime>) -> crate::Result<()> {
     let (scheduler, executor_stream_registry) = create_scheduler_server(rt).await?;
 
     rt.df
@@ -1243,7 +1243,7 @@ pub(crate) async fn initialize_cluster_scheduler_future(
 
 /// Creates a Ballista executor, binds it to the `Runtime` handle, and returns its configured
 /// work loop as a future
-pub async fn initialize_cluster_executor(
+pub(crate) async fn initialize_cluster_executor(
     rt: Arc<Runtime>,
     shutdown_token: CancellationToken,
 ) -> crate::Result<impl Future<Output = crate::Result<()>>> {
@@ -2301,7 +2301,7 @@ pub struct ClusterSecretExpanderImpl {
 
 impl ClusterSecretExpanderImpl {
     #[must_use]
-    pub fn new(client: ClusterServiceClient<Channel>) -> Self {
+    fn new(client: ClusterServiceClient<Channel>) -> Self {
         Self { client }
     }
 }

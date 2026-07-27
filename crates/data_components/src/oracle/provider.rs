@@ -52,7 +52,7 @@ pub enum Error {
     TaskJoin { source: tokio::task::JoinError },
 }
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// System schemas (owners) to exclude from discovery.
 const SYSTEM_SCHEMAS: &[&str] = &[
@@ -222,7 +222,7 @@ impl std::fmt::Debug for OracleSchemaProvider {
 
 impl OracleSchemaProvider {
     #[must_use]
-    pub fn new(
+    fn new(
         pool: Arc<OracleConnectionPool>,
         schema_name: String,
         include: Option<Arc<GlobSet>>,

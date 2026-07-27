@@ -25,9 +25,9 @@ use std::sync::Arc;
 #[expect(clippy::doc_link_with_quotes)]
 pub struct FieldPath {
     /// The field names along the path (e.g., ["person", "name"])
-    pub field_names: Vec<String>,
+    field_names: Vec<String>,
     /// The field indices along the path (e.g., [1, 0] for second field, first nested field)
-    pub field_indices: Vec<usize>,
+    field_indices: Vec<usize>,
 }
 
 /// Maps a flattened field name back to its path in the original nested schema.
@@ -54,7 +54,7 @@ pub struct FieldPath {
 /// assert_eq!(path.field_indices, vec![0, 0]);
 /// ```
 #[must_use]
-pub fn map_flattened_to_original(
+fn map_flattened_to_original(
     flattened_field_name: &str,
     original_schema: &Schema,
     separator: &str,
@@ -129,7 +129,7 @@ pub fn unnest_struct_schema(schema: &Schema, separator: &str) -> Schema {
 /// * `flattened_schema` - The flattened schema
 /// * `separator` - The separator used for flattening (e.g., ".")
 #[must_use]
-pub fn nest_struct_schema(flattened_schema: &Schema, separator: &str) -> Schema {
+pub(crate) fn nest_struct_schema(flattened_schema: &Schema, separator: &str) -> Schema {
     // Build a tree structure from the flattened paths
     let mut tree = FieldTree::new();
 
@@ -169,7 +169,7 @@ pub fn nest_struct_schema(flattened_schema: &Schema, separator: &str) -> Schema 
 /// assert_eq!(col_index, 1); // The "person" struct is at index 1
 /// ```
 #[must_use]
-pub fn find_col_index(
+fn find_col_index(
     flattened_field: &Field,
     nested_schema: &Schema,
     separator: &str,
@@ -255,7 +255,7 @@ fn flatten_json(
 /// // Result: [person{name, age, email}, status] - complete original fields
 /// ```
 #[must_use]
-pub fn project_nested_schema(
+pub(crate) fn project_nested_schema(
     filtered_flattened_schema: &Schema,
     original_nested_schema: &Schema,
     separator: &str,
@@ -498,7 +498,7 @@ impl FieldTree {
 /// // Result: RecordBatch with columns [person.name_data, status_data]
 /// ```
 #[must_use]
-pub fn extract_flattened_from_nested(
+pub(crate) fn extract_flattened_from_nested(
     nested_batch: &RecordBatch,
     filtered_flattened_schema: &Schema,
     separator: &str,

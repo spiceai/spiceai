@@ -26,7 +26,7 @@ use datafusion_federation::FederatedPlanNode;
 /// If `plan` is a `FederatedPlanNode` whose inner plan contains functions that
 /// are unsupported according to `function_support`, unwrap it back to the inner
 /// plan so it is executed locally rather than being sent to the remote.
-pub fn unfederate_plan_with_unsupported_functions(
+pub(crate) fn unfederate_plan_with_unsupported_functions(
     plan: LogicalPlan,
     function_support: &FunctionSupport,
 ) -> Result<LogicalPlan> {

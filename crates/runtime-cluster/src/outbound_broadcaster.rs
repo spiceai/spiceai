@@ -67,7 +67,7 @@ struct ExecutorOutboundBroadcasterInner {
 
 impl ExecutorOutboundBroadcaster {
     #[must_use]
-    pub fn new(executor_id: String) -> Self {
+    fn new(executor_id: String) -> Self {
         Self {
             inner: Arc::new(ExecutorOutboundBroadcasterInner {
                 streams: RwLock::new(HashMap::new()),

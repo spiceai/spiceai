@@ -170,7 +170,7 @@ impl DeletionVectorWriteSpec {
     /// code uses the `_sorted` variant.
     #[cfg(test)]
     #[must_use]
-    pub fn new_position_based(file_path: String, row_ids: Vec<u64>) -> Self {
+    fn new_position_based(file_path: String, row_ids: Vec<u64>) -> Self {
         Self {
             identifiers: DeletionIdentifier::PositionBased {
                 file_path,

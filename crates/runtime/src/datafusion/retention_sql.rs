@@ -34,11 +34,11 @@ use runtime_object_store::registry::default_runtime_env;
 
 #[derive(Clone, Debug)]
 pub struct ParsedRetentionSql {
-    pub delete_expr: Expr,
-    pub delete_statement: Delete,
+    pub(crate) delete_expr: Expr,
+    pub(crate) delete_statement: Delete,
 }
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -93,7 +93,7 @@ pub enum Error {
     },
 }
 
-pub fn parse_retention_sql(
+pub(crate) fn parse_retention_sql(
     expected_table: &TableReference,
     retention_sql: &str,
     schema: Arc<Schema>,

@@ -13,8 +13,8 @@ macro_rules! concrete {
 /// A generalized `TreeNodeVisitor` that collects values from the provided fns during traversal
 #[expect(clippy::type_complexity)]
 pub struct SearchVisitor<T> {
-    pub values: Vec<T>,
-    pub limit: Option<usize>,
+    values: Vec<T>,
+    limit: Option<usize>,
     f_up: Option<Box<dyn FnMut(&Arc<dyn ExecutionPlan>) -> Option<T> + 'static>>,
     f_down: Option<Box<dyn FnMut(&Arc<dyn ExecutionPlan>) -> Option<T> + 'static>>,
 }
@@ -61,7 +61,7 @@ impl SearchVisitor<()> {
 
     /// # Errors
     /// Returns an error if the plan visitor encounters an error during traversal
-    pub fn first_concrete_down<C: ExecutionPlan + 'static>(
+    pub(crate) fn first_concrete_down<C: ExecutionPlan + 'static>(
         plan: &Arc<dyn ExecutionPlan>,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         SearchVisitor::default()
@@ -100,7 +100,7 @@ impl<T: 'static> SearchVisitor<T> {
     }
 
     #[must_use]
-    pub fn down(
+    fn down(
         mut self,
         func: impl FnMut(&Arc<dyn ExecutionPlan>) -> Option<T> + 'static,
     ) -> Self {
@@ -109,7 +109,7 @@ impl<T: 'static> SearchVisitor<T> {
     }
 
     #[must_use]
-    pub fn limit(mut self, limit: usize) -> Self {
+    fn limit(mut self, limit: usize) -> Self {
         self.limit = Some(limit);
         self
     }
@@ -125,7 +125,7 @@ impl<T: 'static> SearchVisitor<T> {
 
     /// # Errors
     /// Returns an error if the plan visitor encounters an error during traversal
-    pub fn find_first(self, plan: &Arc<dyn ExecutionPlan>) -> Result<Option<T>> {
+    fn find_first(self, plan: &Arc<dyn ExecutionPlan>) -> Result<Option<T>> {
         let mut with_limit = self.limit(1);
         plan.visit(&mut with_limit)?;
         Ok(with_limit.values.into_iter().next())

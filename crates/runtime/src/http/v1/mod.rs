@@ -100,7 +100,7 @@ pub enum Format {
     Csv,
 }
 
-pub(crate) fn principal_has_write_access(principal: &AuthPrincipalRef) -> bool {
+fn principal_has_write_access(principal: &AuthPrincipalRef) -> bool {
     principal
         .groups()
         .iter()
@@ -183,7 +183,7 @@ impl ResponseMetadata {
 }
 
 /// Gets all possible media types from a `Accept` header without allocating.
-pub(crate) fn accept_header_types(accept: &TypedHeader<Accept>) -> impl Iterator<Item = &str> + '_ {
+fn accept_header_types(accept: &TypedHeader<Accept>) -> impl Iterator<Item = &str> + '_ {
     accept.0.media_types().map(AsRef::<str>::as_ref)
 }
 
@@ -631,7 +631,7 @@ fn attach_cache_headers(
 
 /// Append `field` to the `Vary` response header, preserving any prior
 /// value(s). RFC 7231 §7.1.4 allows comma-separated field lists.
-pub(super) fn append_vary(headers: &mut HeaderMap, field: &'static str) {
+fn append_vary(headers: &mut HeaderMap, field: &'static str) {
     use http::header::VARY;
     if let Some(existing) = headers.get(VARY)
         && let Ok(existing_str) = existing.to_str()

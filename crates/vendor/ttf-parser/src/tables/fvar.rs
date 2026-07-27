@@ -16,8 +16,8 @@ pub struct VariationAxis {
     pub def_value: f32,
     pub max_value: f32,
     /// An axis name in the `name` table.
-    pub name_id: u16,
-    pub hidden: bool,
+    name_id: u16,
+    hidden: bool,
 }
 
 impl FromData for VariationAxis {
@@ -67,12 +67,12 @@ impl VariationAxis {
 #[derive(Clone, Copy, Debug)]
 pub struct Table<'a> {
     /// A list of variation axes.
-    pub axes: LazyArray16<'a, VariationAxis>,
+    pub(crate) axes: LazyArray16<'a, VariationAxis>,
 }
 
 impl<'a> Table<'a> {
     /// Parses a table from raw data.
-    pub fn parse(data: &'a [u8]) -> Option<Self> {
+    pub(crate) fn parse(data: &'a [u8]) -> Option<Self> {
         let mut s = Stream::new(data);
         let version = s.read::<u32>()?;
         if version != 0x00010000 {

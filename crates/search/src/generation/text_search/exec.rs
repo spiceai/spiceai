@@ -32,15 +32,15 @@ use super::FullTextSearchFieldIndex;
 
 /// Executes a search on a [`FullTextSearchFieldIndex`] with a given query.
 pub struct FullTextSearchExec {
-    pub(super) index: Arc<FullTextSearchFieldIndex>,
-    pub(super) query: String,
+    index: Arc<FullTextSearchFieldIndex>,
+    query: String,
     filters: Vec<LogicalExpr>,
     limit: usize,
     plan_properties: Arc<PlanProperties>,
 }
 
 impl FullTextSearchExec {
-    pub fn try_new(
+    pub(crate) fn try_new(
         index: &Arc<FullTextSearchFieldIndex>,
         query: String,
         schema: SchemaRef,

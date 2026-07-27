@@ -213,7 +213,7 @@ impl CayenneStagedAppend {
     /// # Errors
     ///
     /// Returns an error if writing the WAL file fails.
-    pub async fn write_wal(&self) -> Result<()> {
+    async fn write_wal(&self) -> Result<()> {
         if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
             self.table
                 .write_staging_wal_for(&self.staging_snapshot_id)
@@ -234,7 +234,7 @@ impl CayenneStagedAppend {
     /// # Errors
     ///
     /// Returns an error if moving the staged files fails.
-    pub async fn move_staged_files(&self) -> Result<()> {
+    async fn move_staged_files(&self) -> Result<()> {
         if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
             self.table
                 .move_staged_files_to_current_snapshot(&self.staging_snapshot_id)
@@ -251,7 +251,7 @@ impl CayenneStagedAppend {
     /// # Errors
     ///
     /// Returns an error if removing the WAL file fails.
-    pub async fn remove_wal(&self) -> Result<()> {
+    async fn remove_wal(&self) -> Result<()> {
         self.table
             .remove_staging_wal_for(&self.staging_snapshot_id)
             .await
@@ -269,7 +269,7 @@ impl CayenneStagedAppend {
     ///
     /// Returns an error if any fallible step in the finalize sequence (write WAL, move files,
     /// or remove WAL) fails.
-    pub async fn finalize_staged_write(&self) -> Result<()> {
+    pub(crate) async fn finalize_staged_write(&self) -> Result<()> {
         use super::table::record_cayenne_write_phase;
 
         // Carve the single `publish` phase into its four cost centers so the
@@ -498,11 +498,11 @@ impl PreparedStagedAppend {
         self.ivm_feed_batches = batches;
     }
 
-    pub(crate) fn set_prepared_on_conflict(&mut self, prepared: PreparedOnConflictDeletionPublish) {
+    fn set_prepared_on_conflict(&mut self, prepared: PreparedOnConflictDeletionPublish) {
         self.prepared_on_conflict = Some(prepared);
     }
 
-    pub(crate) fn set_validated_file_keys(&mut self, keys: super::pk_index::PkDigestSet) {
+    fn set_validated_file_keys(&mut self, keys: super::pk_index::PkDigestSet) {
         self.validated_file_keys = Some(keys);
     }
 
@@ -1380,7 +1380,7 @@ impl CayenneTableProvider {
     ///
     /// The WAL file is placed at `{table_path}/{table_id}/_staging/<id>/_wal.json`
     /// (local FS) or at the corresponding S3 key.
-    pub(crate) async fn write_staging_wal_for(&self, staging_snapshot_id: &str) -> Result<()> {
+    async fn write_staging_wal_for(&self, staging_snapshot_id: &str) -> Result<()> {
         let current_snapshot = self.get_current_snapshot_id();
 
         self.write_staging_wal_for_target(
@@ -1391,7 +1391,7 @@ impl CayenneTableProvider {
         .await
     }
 
-    pub(crate) async fn write_staging_wal_for_target(
+    async fn write_staging_wal_for_target(
         &self,
         staging_snapshot_id: &str,
         target_snapshot: &str,
@@ -1602,7 +1602,7 @@ impl CayenneTableProvider {
     /// This signals that all staged files have been moved successfully. If this
     /// removal fails, the commit is not reported as complete: callers must retain
     /// the recovery intent and surface the failure.
-    pub(crate) async fn remove_staging_wal_for(&self, staging_snapshot_id: &str) -> Result<()> {
+    async fn remove_staging_wal_for(&self, staging_snapshot_id: &str) -> Result<()> {
         if self.table_path().starts_with("s3://") {
             let config = self.require_object_store()?;
             if let Some(staging_prefix) = self.snapshot_object_store_prefix(staging_snapshot_id)? {

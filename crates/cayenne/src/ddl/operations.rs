@@ -51,7 +51,7 @@ use crate::{CayenneTableProviderBuilder, MetadataCatalog};
 #[derive(Debug)]
 pub struct CreateTableOutcome {
     /// Human-readable result message returned as the DDL result batch.
-    pub message: String,
+    pub(crate) message: String,
 }
 
 /// Outcome of a `DROP TABLE` operation.
@@ -460,7 +460,7 @@ async fn build_partitioned_provider(
 ///
 /// Column expressions use the column name; non-column expressions fall back to `"expr0"`.
 #[must_use]
-pub fn partition_label_for_expr(partition_expr: &Expr) -> String {
+fn partition_label_for_expr(partition_expr: &Expr) -> String {
     let candidate = match partition_expr {
         Expr::Column(col) => col.name.as_str(),
         _ => "expr0",

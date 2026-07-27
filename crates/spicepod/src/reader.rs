@@ -110,7 +110,7 @@ pub struct ObjectStoreFilesystem {
 
 #[cfg(feature = "object-store")]
 impl ObjectStoreFilesystem {
-    pub fn new(store: Arc<DynObjectStore>) -> Self {
+    pub(crate) fn new(store: Arc<DynObjectStore>) -> Self {
         Self { store }
     }
 }

@@ -49,7 +49,7 @@ const _: () = assert!(DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS > 0);
 
 /// Base delay in milliseconds used by [`retry_backoff_delay`] for
 /// Fibonacci backoff between concurrent write retries.
-pub const DEFAULT_CONCURRENT_RETRY_BASE_DELAY_MS: u64 = 10;
+const DEFAULT_CONCURRENT_RETRY_BASE_DELAY_MS: u64 = 10;
 
 /// Fibonacci backoff delay for retry `attempt` (1-based), with equal jitter
 /// applied via [`apply_equal_jitter`].

@@ -34,16 +34,16 @@ use spicepod::semantic::Column;
 /// [`View`] is the internal representation of the [`spicepod_view::View`] spicepod component.
 #[derive(Clone)]
 pub struct View {
-    pub name: TableReference,
-    pub sql: Arc<str>,
-    pub metadata: HashMap<String, String>,
-    pub columns: Vec<Column>,
-    pub acceleration: Option<acceleration::Acceleration>,
-    pub ready_state: ReadyState,
-    pub runtime: Arc<Runtime>,
-    pub vectors: Option<VectorStore>,
-    pub params: HashMap<String, String>,
-    pub app: Arc<App>,
+    pub(crate) name: TableReference,
+    pub(crate) sql: Arc<str>,
+    pub(crate) metadata: HashMap<String, String>,
+    pub(crate) columns: Vec<Column>,
+    pub(crate) acceleration: Option<acceleration::Acceleration>,
+    pub(crate) ready_state: ReadyState,
+    pub(crate) runtime: Arc<Runtime>,
+    pub(crate) vectors: Option<VectorStore>,
+    pub(crate) params: HashMap<String, String>,
+    app: Arc<App>,
 }
 
 impl PartialEq for View {
@@ -83,7 +83,7 @@ impl View {
     }
 
     #[must_use]
-    pub fn is_accelerated(&self) -> bool {
+    pub(crate) fn is_accelerated(&self) -> bool {
         if let Some(acceleration) = &self.acceleration {
             return acceleration.enabled;
         }
@@ -92,7 +92,7 @@ impl View {
     }
 
     #[must_use]
-    pub fn refresh_check_interval(&self) -> Option<Duration> {
+    fn refresh_check_interval(&self) -> Option<Duration> {
         if let Some(acceleration) = &self.acceleration {
             return acceleration.refresh_check_interval;
         }
@@ -100,7 +100,7 @@ impl View {
     }
 
     #[must_use]
-    pub fn refresh_max_jitter(&self) -> Option<Duration> {
+    pub(crate) fn refresh_max_jitter(&self) -> Option<Duration> {
         if let Some(acceleration) = &self.acceleration
             && acceleration.refresh_jitter_enabled
         {
@@ -114,7 +114,7 @@ impl View {
     }
 
     #[must_use]
-    pub fn refresh_retry_enabled(&self) -> bool {
+    pub(crate) fn refresh_retry_enabled(&self) -> bool {
         if let Some(acceleration) = &self.acceleration {
             return acceleration.refresh_retry_enabled;
         }
@@ -122,7 +122,7 @@ impl View {
     }
 
     #[must_use]
-    pub fn refresh_retry_max_attempts(&self) -> Option<usize> {
+    pub(crate) fn refresh_retry_max_attempts(&self) -> Option<usize> {
         if let Some(acceleration) = &self.acceleration {
             return acceleration.refresh_retry_max_attempts;
         }
@@ -130,7 +130,7 @@ impl View {
     }
 
     #[must_use]
-    pub async fn is_accelerator_initialized(&self) -> bool {
+    pub(crate) async fn is_accelerator_initialized(&self) -> bool {
         if let Some(acceleration_settings) = &self.acceleration {
             let Some(accelerator) = self
                 .runtime
@@ -148,12 +148,12 @@ impl View {
     }
 
     #[must_use]
-    pub fn has_embeddings(&self) -> bool {
+    pub(crate) fn has_embeddings(&self) -> bool {
         self.columns.iter().any(|c| !c.embeddings.is_empty())
     }
 
     #[must_use]
-    pub fn has_full_text_column(&self) -> bool {
+    pub(crate) fn has_full_text_column(&self) -> bool {
         self.columns
             .iter()
             .any(|c| c.full_text_search.as_ref().is_some_and(|cfg| cfg.enabled))
@@ -161,14 +161,14 @@ impl View {
 }
 
 pub struct ViewBuilder {
-    pub name: TableReference,
-    pub sql: String,
-    pub metadata: HashMap<String, String>,
-    pub columns: Vec<Column>,
-    pub acceleration: Option<acceleration::Acceleration>,
-    pub ready_state: ReadyState,
-    pub vectors: Option<VectorStore>,
-    pub params: HashMap<String, String>,
+    pub(crate) name: TableReference,
+    sql: String,
+    metadata: HashMap<String, String>,
+    columns: Vec<Column>,
+    acceleration: Option<acceleration::Acceleration>,
+    ready_state: ReadyState,
+    vectors: Option<VectorStore>,
+    params: HashMap<String, String>,
 }
 
 impl TryFrom<spicepod_view::View> for ViewBuilder {

@@ -22,9 +22,9 @@ use std::{
 
 use http::{HeaderMap, header::USER_AGENT};
 
-pub static RUNTIME_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub static RUNTIME_NAME: &str = "spiced";
-pub static RUNTIME_SYSTEM: LazyLock<Arc<str>> =
+pub(crate) static RUNTIME_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub(crate) static RUNTIME_NAME: &str = "spiced";
+pub(crate) static RUNTIME_SYSTEM: LazyLock<Arc<str>> =
     LazyLock::new(|| Arc::from(get_runtime_os_string()));
 
 /// `UserAgent` represents the client making a request to Spice and the platform Spice is running on.
@@ -52,22 +52,22 @@ impl Deref for Raw {
 
 #[derive(Debug, Eq, PartialEq, Clone)]
 pub struct Parsed {
-    pub client_name: Arc<str>,
-    pub client_version: Arc<str>,
-    pub client_system: Option<Arc<str>>,
-    pub raw_user_agent: Arc<str>,
+    pub(crate) client_name: Arc<str>,
+    pub(crate) client_version: Arc<str>,
+    pub(crate) client_system: Option<Arc<str>>,
+    raw_user_agent: Arc<str>,
 }
 
 #[derive(Debug, Eq, PartialEq, Clone)]
 pub struct Platform {
-    pub name: Arc<str>,
-    pub version: Arc<str>,
-    pub system: Option<Arc<str>>,
+    name: Arc<str>,
+    version: Arc<str>,
+    system: Option<Arc<str>>,
 }
 
 impl UserAgent {
     #[must_use]
-    pub fn from_headers(headers: &HeaderMap) -> Self {
+    pub(crate) fn from_headers(headers: &HeaderMap) -> Self {
         let Some(user_agent) = headers.get(USER_AGENT) else {
             return Self::Absent;
         };

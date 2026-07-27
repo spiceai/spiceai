@@ -37,11 +37,11 @@ use futures::StreamExt;
 use std::{collections::HashMap, fmt, sync::Arc};
 
 pub struct DynamoDBInsertSink {
-    pub db_client: Arc<DbClient>,
-    pub table_name: String,
-    pub schema: SchemaRef,
-    pub time_format: Arc<String>,
-    pub parallelism: usize,
+    pub(crate) db_client: Arc<DbClient>,
+    pub(crate) table_name: String,
+    pub(crate) schema: SchemaRef,
+    pub(crate) time_format: Arc<String>,
+    pub(crate) parallelism: usize,
 }
 
 impl std::fmt::Debug for DynamoDBInsertSink {

@@ -24,15 +24,15 @@ use secrecy::SecretString;
 pub struct OpenAiEmbeddingParams {
     /// The `OpenAI` API base endpoint.
     #[param(runtime, default = "https://api.openai.com/v1")]
-    pub endpoint: String,
+    pub(crate) endpoint: String,
     /// The `OpenAI` API key.
     #[param(autoload_secret)]
-    pub api_key: Option<SecretString>,
+    pub(crate) api_key: Option<SecretString>,
     /// The `OpenAI` organization ID.
-    pub org_id: Option<String>,
+    pub(crate) org_id: Option<String>,
     /// The `OpenAI` project ID.
-    pub project_id: Option<String>,
+    pub(crate) project_id: Option<String>,
     /// The current usage tier for the `OpenAI` account: 'free', 'tier1'-'tier5'.
     #[param(default = "tier1")]
-    pub usage_tier: UsageTier,
+    pub(crate) usage_tier: UsageTier,
 }

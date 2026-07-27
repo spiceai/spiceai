@@ -315,7 +315,7 @@ impl CayenneCdcWrite {
     /// those hold the SAME deletions in two encodings (summing double-counts) and
     /// neither sees `position_deletions`.
     #[must_use]
-    pub fn delete_rows(&self) -> u64 {
+    fn delete_rows(&self) -> u64 {
         self.prepared_on_conflict
             .as_ref()
             .map_or(0, |p| u64::try_from(p.superseded).unwrap_or(u64::MAX))
@@ -494,16 +494,16 @@ pub(crate) const INLINE_MAX_ROWS: usize = crate::metadata::DEFAULT_INLINE_MAX_RO
 
 /// Maximum rows to keep inline before flushing to Vortex.
 #[cfg(test)]
-pub(crate) const INLINE_FLUSH_MAX_ROWS: i64 = crate::metadata::DEFAULT_INLINE_FLUSH_MAX_ROWS;
+const INLINE_FLUSH_MAX_ROWS: i64 = crate::metadata::DEFAULT_INLINE_FLUSH_MAX_ROWS;
 
 /// Maximum inline entries before flushing to Vortex.
 #[cfg(test)]
-pub(crate) const INLINE_FLUSH_MAX_SEGMENTS: i64 =
+const INLINE_FLUSH_MAX_SEGMENTS: i64 =
     crate::metadata::DEFAULT_INLINE_FLUSH_MAX_SEGMENTS;
 
 /// Maximum serialized IPC bytes to keep inline before flushing to Vortex.
 #[cfg(test)]
-pub(crate) const INLINE_FLUSH_MAX_BYTES: i64 = crate::metadata::DEFAULT_INLINE_FLUSH_MAX_BYTES;
+const INLINE_FLUSH_MAX_BYTES: i64 = crate::metadata::DEFAULT_INLINE_FLUSH_MAX_BYTES;
 
 /// Maximum in-memory byte budget while buffering the inline fast-path stream.
 ///
@@ -537,7 +537,7 @@ impl InlineMemtablePressure {
 
 #[must_use]
 #[cfg(test)]
-pub(crate) fn inline_memtable_pressure(stats: InlinedDataStats) -> Option<InlineMemtablePressure> {
+fn inline_memtable_pressure(stats: InlinedDataStats) -> Option<InlineMemtablePressure> {
     inline_memtable_pressure_with_thresholds(
         stats,
         INLINE_FLUSH_MAX_ROWS,
@@ -845,9 +845,9 @@ struct CachedTableStatistics {
 /// independent (the const has no correctness ceiling, per the paragraph above),
 /// so testing it at 1024 fully covers the production 262144 path.
 #[cfg(not(test))]
-pub(crate) const SEQ_RESERVE_BLOCK: i64 = 262_144;
+const SEQ_RESERVE_BLOCK: i64 = 262_144;
 #[cfg(test)]
-pub(crate) const SEQ_RESERVE_BLOCK: i64 = 1024;
+const SEQ_RESERVE_BLOCK: i64 = 1024;
 
 /// In-memory sequence allocator (lever B2). Hands out monotonic per-table
 /// sequence numbers WITHOUT acquiring the metastore writer on the hot path.
@@ -2025,7 +2025,7 @@ impl MemTierCheckpointGuards {
 }
 
 /// Outcome of a best-effort [`CayenneTableProvider::try_checkpoint_mem_tier`].
-pub(crate) enum CheckpointAttempt {
+enum CheckpointAttempt {
     /// A checkpoint ran; value is rows flushed (0 = nothing to flush, but the slot
     /// advancer was still handled).
     Completed(u64),
@@ -2054,7 +2054,7 @@ pub(crate) enum CheckpointAttempt {
 /// write path on the dedicated compaction runtime, so the threshold only trades
 /// sweep frequency against lingering disk — never ingest latency, which is why it
 /// is a fixed constant rather than a tunable knob.
-pub(crate) const ORPHANED_DV_CLEANUP_MIN_FILES: usize = 20;
+const ORPHANED_DV_CLEANUP_MIN_FILES: usize = 20;
 
 /// Fraction of the (process-wide) query memory pool a single table's key-deletion
 /// index may occupy before the seq-prefix bake becomes a MANDATORY OOM backstop —
@@ -2266,7 +2266,7 @@ impl CayenneTableProvider {
     }
     /// Returns the name of this table.
     #[must_use]
-    pub fn table_name(&self) -> &str {
+    pub(crate) fn table_name(&self) -> &str {
         &self.table_metadata.table_name
     }
 
@@ -2285,7 +2285,7 @@ impl CayenneTableProvider {
     /// schema, which the write/CDC/stats/keyset paths keep using with the
     /// original `Utf8`/`Binary` types. Recomputed on demand so it tracks live
     /// schema evolution; cheap (top-level field remap) and not on a per-row path.
-    pub(crate) fn read_schema(&self) -> SchemaRef {
+    fn read_schema(&self) -> SchemaRef {
         if self.context.force_view_read_schema() {
             viewify_read_schema(&self.table_schema())
         } else {
@@ -2530,7 +2530,7 @@ impl CayenneTableProvider {
     /// Callers must hold `write_lock`: it blocks new Stage-A commits, so the
     /// pending set can only shrink, while Stage-B needs only the visibility
     /// lock + listing fence and therefore completes under the held lock.
-    pub(crate) async fn drain_inflight_staged_writes(&self, timeout: Duration) -> bool {
+    async fn drain_inflight_staged_writes(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         while self.has_inflight_staging_appends()
             || self.pending_inline_tombstones.load(Ordering::Acquire) > 0
@@ -2677,7 +2677,7 @@ impl CayenneTableProvider {
     /// files / insert records with `sequence_number <= cutoff` and only the
     /// `folded` protected snapshots — preserving deletes/upserts that committed
     /// after the rewrite captured its cutoff (the concurrent key-delete path).
-    pub(crate) async fn commit_snapshot_rewrite(
+    async fn commit_snapshot_rewrite(
         &self,
         new_snapshot_id: &str,
         fence: Option<&(i64, std::collections::HashSet<String>)>,
@@ -3334,7 +3334,7 @@ impl CayenneTableProvider {
     /// blocks the caller. Local filesystem only: S3 memory-mode dirs currently
     /// stay until a rotation-anchored cleanup covers them (a bounded leak;
     /// this path's correctness contract is the priority).
-    pub(crate) fn sweep_retired_snapshot_dirs(&self) {
+    fn sweep_retired_snapshot_dirs(&self) {
         if self.table_metadata.path.starts_with("s3://") {
             return;
         }
@@ -3943,7 +3943,7 @@ impl CayenneTableProvider {
     // doc links above); the live CDC pipeline now uses the per-snapshot
     // `clear_orphan_staging_dirs` / `clear_staging_snapshot_dir` variants.
     #[expect(dead_code)]
-    pub(crate) async fn clear_staging_dir(&self) -> Result<()> {
+    async fn clear_staging_dir(&self) -> Result<()> {
         // Fast path: if a previous append completed cleanly (or this is the
         // first write after open and no orphan files were present), staging is
         // known empty. Skipping the recursive delete / S3 List+DeletePrefix
@@ -5470,7 +5470,7 @@ impl CayenneTableProvider {
 
     /// The configured CDC durability mode for this table.
     #[must_use]
-    pub fn cdc_durability(&self) -> crate::metadata::CdcDurability {
+    fn cdc_durability(&self) -> crate::metadata::CdcDurability {
         self.table_metadata.vortex_config.cdc_durability
     }
 
@@ -5561,7 +5561,7 @@ impl CayenneTableProvider {
 
     /// The per-table mem-tier checkpoint lock, for the write path to serialize
     /// spills (only one checkpoint in flight at a time — the OOM-safety guard).
-    pub(crate) fn mem_checkpoint_lock_for_writer(&self) -> Arc<tokio::sync::Mutex<()>> {
+    fn mem_checkpoint_lock_for_writer(&self) -> Arc<tokio::sync::Mutex<()>> {
         Arc::clone(&self.mem_checkpoint_lock)
     }
 
@@ -11402,7 +11402,7 @@ impl CayenneTableProvider {
     /// writes the durable deletion vectors and commits them to the catalog so
     /// that the deletions survive a restart; it does not touch the in-memory
     /// cache, so its ordering relative to the cache publish is irrelevant.
-    pub(crate) async fn persist_file_deletions_after_inlined_insert(
+    async fn persist_file_deletions_after_inlined_insert(
         &self,
         deleted_pk_i64: &[i64],
         deleted_row_keys: &[Box<[u8]>],
@@ -12300,7 +12300,7 @@ impl CayenneTableProvider {
         Ok(())
     }
 
-    pub(crate) fn schedule_post_write_compaction(&self) {
+    fn schedule_post_write_compaction(&self) {
         let cfg = self.context.compaction_picker_config();
         let maintenance_trigger = self.protected_snapshot_maintenance_trigger();
         if self.new_files_since_last_compaction.load(Ordering::Relaxed) < cfg.trigger_files
@@ -17463,7 +17463,7 @@ impl CayenneTableProvider {
     /// against concurrent inserts / listing refreshes for the duration of the
     /// scan — same exclusion guarantee the inline-retention path used to
     /// provide, just held inside the sink rather than the writer.
-    pub(crate) async fn apply_retention_filters(&self) -> CatalogResult<u64> {
+    async fn apply_retention_filters(&self) -> CatalogResult<u64> {
         use data_components::delete::DeletionSink;
 
         if self.retention_filters.is_empty() {
@@ -17650,7 +17650,7 @@ impl CayenneTableProvider {
     /// A compaction that ran CONCURRENTLY with writers (the key-delete
     /// full-rewrite path) must NOT use this — it must carry forward post-cutoff
     /// mutations via [`Self::prune_deletion_caches_after_full_rewrite`] instead.
-    pub(crate) fn clear_all_deletion_caches(&self) {
+    fn clear_all_deletion_caches(&self) {
         // Clear caches based on the current strategy.
         // ArcSwap stores publish a fresh empty snapshot atomically; readers see either
         // the old or new state and never block.
@@ -17713,7 +17713,7 @@ impl CayenneTableProvider {
     /// Position deletions are untouched: this path is only taken for key-delete
     /// tables (position-delete tables hold `write_lock` across the whole rewrite
     /// and use [`Self::clear_all_deletion_caches`] instead).
-    pub(crate) fn prune_deletion_caches_after_full_rewrite(
+    fn prune_deletion_caches_after_full_rewrite(
         &self,
         cutoff: i64,
         folded_protected_ids: &std::collections::HashSet<String>,
@@ -17811,7 +17811,7 @@ impl CayenneTableProvider {
     /// will call it in production is built out; it is not part of the documented
     /// public surface.
     #[doc(hidden)]
-    pub fn prune_deletion_index_at_or_below(&self, cutoff: i64) {
+    fn prune_deletion_index_at_or_below(&self, cutoff: i64) {
         match &self.pk_deletion_strategy {
             PkDeletionStrategyWithCache::Int64Pk {
                 deletion_snapshot, ..
@@ -17867,7 +17867,7 @@ impl CayenneTableProvider {
     /// STRUCTURAL: the underlying corpus was wiped/replaced wholesale, so the
     /// next miss must full-rebuild — the append-only delta path (which assumes
     /// the cached entries are still a valid base) would be unsound.
-    pub(crate) fn invalidate_inlined_cache(&self) {
+    fn invalidate_inlined_cache(&self) {
         self.inlined_row_count.store(0, Ordering::Relaxed);
         // The durable corpus was wiped atomically with the catalog operation
         // that triggered this invalidation.
@@ -17912,7 +17912,7 @@ impl CayenneTableProvider {
     /// This must be called after `commit_compaction` to keep the in-memory snapshot ID
     /// in sync with the catalog.
     ///
-    pub(crate) fn update_current_snapshot_id(&self, new_snapshot_id: &str) {
+    fn update_current_snapshot_id(&self, new_snapshot_id: &str) {
         // [sound output_ordering] Any snapshot-id change invalidates the
         // sorted-snapshot attestation. The sorted compaction rewrite re-sets it
         // AFTER calling this; every other id change (overwrite, restore, catalog
@@ -18080,7 +18080,7 @@ impl CayenneTableProvider {
     /// # Errors
     ///
     /// Returns an error if the listing table cannot be refreshed.
-    pub(crate) async fn refresh_listing_table(&self) -> Result<()> {
+    async fn refresh_listing_table(&self) -> Result<()> {
         // Acquire the listing fence for the duration of the swap. Single-partition
         // path; the cross-partition append coordinator (issue #10125 step 6)
         // uses `refresh_listing_table_under_held_fence` instead so it can hold
@@ -18110,7 +18110,7 @@ impl CayenneTableProvider {
     /// # Errors
     ///
     /// Returns an error if the listing table cannot be reconstructed.
-    pub(crate) async fn refresh_listing_table_under_held_fence(&self) -> Result<()> {
+    async fn refresh_listing_table_under_held_fence(&self) -> Result<()> {
         // [sound output_ordering] A listing refresh re-lists the current snapshot
         // because its file set changed (a checkpoint/append wrote files), which
         // may have added UNSORTED files — invalidate the sorted attestation. The
@@ -18369,7 +18369,7 @@ impl CayenneTableProvider {
     /// Used by the cross-partition append coordinator (#10125 step 6) so it
     /// can hold fences across every participating partition for the duration
     /// of one barrier window.
-    pub async fn lock_listing_fence_write_owned(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+    pub(crate) async fn lock_listing_fence_write_owned(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
         Arc::clone(&self.listing_fence).write_owned().await
     }
 
@@ -18433,7 +18433,7 @@ impl CayenneTableProvider {
     ///
     /// Best-effort: logs a warning and continues if stats persistence fails,
     /// since stats are an optimization and not critical for correctness.
-    pub(crate) async fn persist_table_stats(
+    async fn persist_table_stats(
         &self,
         accumulator: &ColumnStatsAccumulator,
         num_rows_update: RowCountUpdate,
@@ -18464,7 +18464,7 @@ impl CayenneTableProvider {
     /// than merging) resets any superset drift accumulated incrementally — e.g.
     /// min/max widened by since-deleted rows, or an NDV sketch inflated by
     /// superseded keys — back to the live set, and `Set`s the live count.
-    pub(crate) async fn replace_table_stats_after_rewrite(
+    async fn replace_table_stats_after_rewrite(
         &self,
         accumulator: &ColumnStatsAccumulator,
     ) {
@@ -18744,7 +18744,7 @@ impl CayenneTableProvider {
     }
 
     #[must_use]
-    pub(crate) fn cached_inlined_row_count(&self) -> i64 {
+    fn cached_inlined_row_count(&self) -> i64 {
         self.inlined_row_count.load(Ordering::Relaxed)
     }
 
@@ -18767,7 +18767,7 @@ impl CayenneTableProvider {
     /// testing the delta-vs-full provenance invariant.
     #[cfg(test)]
     #[must_use]
-    pub(crate) fn inlined_structural_epoch(&self) -> u64 {
+    fn inlined_structural_epoch(&self) -> u64 {
         self.inlined_structural_epoch.load(Ordering::Relaxed)
     }
 
@@ -18775,7 +18775,7 @@ impl CayenneTableProvider {
     /// cached inline view. Exposed for testing the incremental delta boundary.
     #[cfg(test)]
     #[must_use]
-    pub(crate) fn cached_inlined_materialized_through_sequence(&self) -> i64 {
+    fn cached_inlined_materialized_through_sequence(&self) -> i64 {
         self.inlined_cache.load().materialized_through_sequence
     }
 
@@ -18816,7 +18816,7 @@ impl CayenneTableProvider {
     /// decoded batches in `inlined_cache`. Concurrent misses are safe: each
     /// produces identical results for the same generation, and the last
     /// `ArcSwap::store` wins without corrupting data.
-    pub(crate) async fn read_inlined_batches(&self) -> Result<Vec<RecordBatch>> {
+    async fn read_inlined_batches(&self) -> Result<Vec<RecordBatch>> {
         if let Some(batches) = self.try_read_inlined_batches_cached() {
             return Ok(batches);
         }
@@ -20615,7 +20615,7 @@ impl CayenneTableProvider {
     /// in parallel. The shared monotonic allocator keeps one flat sequence domain,
     /// so the merge-on-read filter + durable encoder are unchanged (§2.3d).
     #[expect(clippy::too_many_arguments)]
-    pub(crate) async fn append_to_shard(
+    async fn append_to_shard(
         &self,
         shard_id: usize,
         batches: Vec<RecordBatch>,
@@ -22437,7 +22437,7 @@ impl CayenneTableProvider {
         partitions
     }
 
-    pub(crate) async fn insert_to_new_snapshot_with_sequence(
+    async fn insert_to_new_snapshot_with_sequence(
         &self,
         stream: SendableRecordBatchStream,
         sequence_number: i64,
@@ -22732,7 +22732,7 @@ impl CayenneTableProvider {
 
     /// Flush the inline level-0 memtable when accumulated entries would make reads or
     /// rewrites too expensive.
-    pub(crate) async fn checkpoint_inlined_data_if_memtable_pressure_exceeded(&self) -> Result<()> {
+    async fn checkpoint_inlined_data_if_memtable_pressure_exceeded(&self) -> Result<()> {
         // Defer while any staged inline-conflict tombstone is unpublished
         // (Option D). A checkpoint flushes inline data to a file WITHOUT applying
         // an inert (`published = false`) tombstone — the read filter skips it —
@@ -24937,7 +24937,7 @@ impl CayenneTableProvider {
 ///
 /// Only top-level fields are mapped. Returns the input schema unchanged (same
 /// `Arc`) when it has no `Utf8` columns, so all-scalar tables pay nothing.
-pub(crate) fn viewify_read_schema(schema: &SchemaRef) -> SchemaRef {
+fn viewify_read_schema(schema: &SchemaRef) -> SchemaRef {
     fn view_type(dt: &DataType) -> Option<DataType> {
         match dt {
             // Only Utf8 (the i32-offset string type) is the q21 overflow case and
@@ -26459,7 +26459,7 @@ impl CayenneTableProvider {
 
     /// Returns `true` if this table uses the `PositionBased` deletion strategy.
     #[must_use]
-    pub fn is_position_based(&self) -> bool {
+    pub(crate) fn is_position_based(&self) -> bool {
         self.pk_deletion_strategy.is_position_based()
     }
 
@@ -28864,7 +28864,7 @@ mod tests {
     /// A `TableProviderFactory` implementation to create new instances of `CayenneTableProvider`.
     // Not used outside of tests until https://github.com/spiceai/spiceai/issues/8534 is resolved
     #[derive(Debug)]
-    pub struct CayenneTableProviderFactory {}
+    pub(crate) struct CayenneTableProviderFactory {}
 
     #[async_trait]
     impl TableProviderFactory for CayenneTableProviderFactory {

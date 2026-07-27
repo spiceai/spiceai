@@ -70,7 +70,7 @@ impl Error {
     /// caller should retry (e.g. executor not yet ready). Returns false for
     /// permanent failures (e.g. executor unregistered).
     #[must_use]
-    pub fn is_retryable(&self) -> bool {
+    pub(crate) fn is_retryable(&self) -> bool {
         matches!(self, Error::AckTimeout { .. } | Error::AckFailed { .. })
     }
 }
@@ -93,7 +93,7 @@ pub struct ExecutorConnection {
 impl ExecutorConnection {
     /// Creates a new executor connection.
     #[must_use]
-    pub fn new(request_tx: mpsc::Sender<SchedulerControlMessage>) -> Self {
+    fn new(request_tx: mpsc::Sender<SchedulerControlMessage>) -> Self {
         Self {
             request_tx,
             pending_metrics: CorrelatedResponses::new(),
@@ -104,7 +104,7 @@ impl ExecutorConnection {
     /// Returns a cheap clone of the pending-metrics registry. Used by the
     /// control-stream inbound handler to deliver `MetricsResponse` messages.
     #[must_use]
-    pub fn pending_metrics(&self) -> CorrelatedResponses<MetricsResponse> {
+    fn pending_metrics(&self) -> CorrelatedResponses<MetricsResponse> {
         self.pending_metrics.clone()
     }
 
@@ -112,7 +112,7 @@ impl ExecutorConnection {
     /// control-stream inbound handler to deliver `Ack` messages, and by
     /// notify-with-ack call sites to await delivery confirmation.
     #[must_use]
-    pub fn pending_acks(&self) -> CorrelatedResponses<Ack> {
+    fn pending_acks(&self) -> CorrelatedResponses<Ack> {
         self.pending_acks.clone()
     }
 
@@ -199,9 +199,9 @@ impl DdlLog {
 #[derive(Debug, Clone)]
 pub struct ExecutorTableStatistics {
     /// `num_rows` + positional per-column `min`/`max`/`null_count` for the executor's slice.
-    pub statistics: Statistics,
+    statistics: Statistics,
     /// Column names aligned positionally with `statistics.column_statistics`.
-    pub column_names: Vec<String>,
+    column_names: Vec<String>,
 }
 
 impl ExecutorTableStatistics {
@@ -211,7 +211,7 @@ impl ExecutorTableStatistics {
     /// This lets the coordinator's planner estimate join/aggregate cardinalities
     /// from the executor's column min/max even when the leaf scan is projected.
     #[must_use]
-    pub fn projected_onto(&self, leaf_schema: &SchemaRef) -> Statistics {
+    fn projected_onto(&self, leaf_schema: &SchemaRef) -> Statistics {
         use datafusion::common::ColumnStatistics;
         let by_name: HashMap<&str, &ColumnStatistics> = self
             .column_names
@@ -350,7 +350,7 @@ impl ExecutorRegistry {
     /// query-planning time; the small clone avoids holding the lock across
     /// planning.
     #[must_use]
-    pub fn executor_statistics_snapshot(
+    fn executor_statistics_snapshot(
         &self,
         table: &TableReference,
     ) -> HashMap<String, ExecutorTableStatistics> {
@@ -363,7 +363,7 @@ impl ExecutorRegistry {
 
     /// Returns the scheduler's `node_id` if one was provided at construction.
     #[must_use]
-    pub fn node_id(&self) -> Option<&str> {
+    pub(crate) fn node_id(&self) -> Option<&str> {
         self.node_id.as_deref()
     }
 
@@ -551,7 +551,7 @@ impl ExecutorRegistry {
     /// - [`Error::SendFailed`] if delivery to the control stream channel fails.
     /// - [`Error::AckTimeout`] if no ack arrives within `timeout`.
     /// - [`Error::AckFailed`] if the executor reports an application error.
-    pub async fn send_command_with_ack(
+    pub(crate) async fn send_command_with_ack(
         &self,
         executor_id: &str,
         build_command: impl FnOnce(String) -> SchedulerControlMessage + Send,
@@ -730,7 +730,7 @@ fn ready_executors<'a>(
         .collect()
 }
 
-pub(crate) fn flight_sql_table_provider(
+fn flight_sql_table_provider(
     executor_id: &str,
     client: FlightSqlClient,
     table: &TableReference,
@@ -755,7 +755,7 @@ pub(crate) fn flight_sql_table_provider(
 /// Uses the given [`PartitionStore`] to look up partition metadata, checks readiness (both an
 /// active connection and a `FlightSQL` client) via the `executors` map, selects a minimal
 /// executor set, and returns `(FlightSQL provider, partition values)` pairs.
-pub(crate) fn get_partitions_from_store(
+fn get_partitions_from_store(
     partition_store: &PartitionStore,
     executors: &HashMap<String, (&ExecutorConnection, &FlightSqlClient)>,
     table: &TableReference,

@@ -65,7 +65,7 @@ use snafu::prelude::*;
 
 #[derive(Debug)]
 pub struct SpiceJsonOptions {
-    pub compression: CompressionTypeVariant,
+    compression: CompressionTypeVariant,
     pub schema_infer_max_rec: Option<usize>,
     pub format: Format,
     /// If set, flatten nested structs with the given separator
@@ -77,7 +77,7 @@ pub struct SpiceJsonOptions {
     pub json_pointer: Option<String>,
     /// When `true`, include Socrata `meta_data` columns (sid, id, position, etc.)
     /// in the schema for SODA format responses. Disabled by default.
-    pub soda_metadata: bool,
+    soda_metadata: bool,
 }
 
 #[derive(Debug, Snafu)]
@@ -460,7 +460,7 @@ pub struct SpiceJsonDecoder {
 
 impl SpiceJsonDecoder {
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         decoder: json::reader::Decoder,
         array_to_ndjson: bool,
         unnest_struct: Option<String>,

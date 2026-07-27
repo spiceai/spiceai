@@ -51,11 +51,11 @@ use util::human_readable_bytes;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HardwareInfo {
     /// Number of logical CPUs (vCPUs) available.
-    pub vcpu_count: usize,
+    pub(crate) vcpu_count: usize,
     /// Number of GPUs detected.
-    pub gpu_count: usize,
+    pub(crate) gpu_count: usize,
     /// Total memory available in bytes.
-    pub total_memory_bytes: u64,
+    pub(crate) total_memory_bytes: u64,
 }
 
 impl Default for HardwareInfo {

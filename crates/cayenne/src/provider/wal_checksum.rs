@@ -58,10 +58,10 @@ use hash_index::hash_key_bytes;
 /// Magic prefix identifying a checksum-framed staging-WAL record. Chosen to be
 /// invalid JSON (a bare `{`/whitespace can never start with these bytes) so
 /// framed and legacy records are unambiguously distinguishable.
-pub(crate) const MAGIC: [u8; 8] = *b"CAYWALv1";
+const MAGIC: [u8; 8] = *b"CAYWALv1";
 
 /// Framing format version. Bumped only on an incompatible envelope change.
-pub(crate) const FORMAT_VERSION: u8 = 1;
+const FORMAT_VERSION: u8 = 1;
 
 /// Envelope header length: magic(8) + version(1) + `payload_len`(8) + checksum(8).
 const HEADER_LEN: usize = MAGIC.len() + 1 + 8 + 8;

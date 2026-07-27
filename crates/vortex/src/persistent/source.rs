@@ -51,16 +51,16 @@ use crate::persistent::reader::VortexReaderFactory;
 /// [`DataSourceExec`]: datafusion_datasource::source::DataSourceExec
 #[derive(Clone)]
 pub struct VortexSource {
-    pub(crate) session: VortexSession,
-    pub(crate) table_schema: TableSchema,
-    pub(crate) projection: ProjectionExprs,
+    session: VortexSession,
+    table_schema: TableSchema,
+    projection: ProjectionExprs,
     /// Combined predicate expression containing all filters from `DataFusion` query planning.
     /// Used with `FilePruner` to skip files based on statistics and partition values.
-    pub(crate) full_predicate: Option<PhysicalExprRef>,
+    full_predicate: Option<PhysicalExprRef>,
     /// Subset of predicates that can be pushed down into Vortex scan operations.
     /// These are expressions that Vortex can efficiently evaluate during scanning.
-    pub(crate) vortex_predicate: Option<PhysicalExprRef>,
-    pub(crate) batch_size: Option<usize>,
+    vortex_predicate: Option<PhysicalExprRef>,
+    batch_size: Option<usize>,
     df_metrics: ExecutionPlanMetricsSet,
     /// Shared layout readers, the source only lives as long as one scan.
     ///
@@ -69,7 +69,7 @@ pub struct VortexSource {
     /// Shared full-file natural split ranges keyed by path.
     natural_split_ranges: Arc<DashMap<Path, Arc<[Range<u64>]>>>,
     expression_convertor: Arc<dyn ExpressionConvertor>,
-    pub(crate) vortex_reader_factory: Option<Arc<dyn VortexReaderFactory>>,
+    vortex_reader_factory: Option<Arc<dyn VortexReaderFactory>>,
     vx_metrics_registry: Arc<dyn MetricsRegistry>,
     file_metadata_cache: Option<Arc<dyn FileMetadataCache>>,
     segment_cache: Option<Arc<SharedSegmentCache>>,
@@ -90,7 +90,7 @@ impl VortexSource {
     ///
     /// Can be configured using the provided methods.
     #[must_use]
-    pub fn new(table_schema: TableSchema, session: VortexSession) -> Self {
+    pub(crate) fn new(table_schema: TableSchema, session: VortexSession) -> Self {
         let full_schema = table_schema.table_schema();
         let indices = (0..full_schema.fields().len()).collect::<Vec<_>>();
         let projection = ProjectionExprs::from_indices(&indices, full_schema);
@@ -118,7 +118,7 @@ impl VortexSource {
 
     /// Set projection-expression pushdown behavior for the underlying Vortex scan.
     #[must_use]
-    pub fn with_projection_pushdown(mut self, mode: ProjectionPushdown) -> Self {
+    pub(crate) fn with_projection_pushdown(mut self, mode: ProjectionPushdown) -> Self {
         self.options.projection_pushdown = mode;
         self
     }
@@ -147,13 +147,13 @@ impl VortexSource {
 
     /// Returns the [`MetricsRegistry`] attached to this source.
     #[must_use]
-    pub fn metrics_registry(&self) -> &Arc<dyn MetricsRegistry> {
+    pub(crate) fn metrics_registry(&self) -> &Arc<dyn MetricsRegistry> {
         &self.vx_metrics_registry
     }
 
     /// Override the file metadata cache
     #[must_use]
-    pub fn with_file_metadata_cache(
+    pub(crate) fn with_file_metadata_cache(
         mut self,
         file_metadata_cache: Arc<dyn FileMetadataCache>,
     ) -> Self {
@@ -169,7 +169,7 @@ impl VortexSource {
 
     /// Set the underlying scan concurrency mode. This limit is used per Vortex scan operation.
     #[must_use]
-    pub fn with_scan_concurrency(mut self, scan_concurrency: ScanConcurrency) -> Self {
+    pub(crate) fn with_scan_concurrency(mut self, scan_concurrency: ScanConcurrency) -> Self {
         self.options.scan_concurrency = scan_concurrency;
         self
     }

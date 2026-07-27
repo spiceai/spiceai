@@ -32,7 +32,7 @@ pub use runtime_proto::{
 use runtime_proto::udtf_args::Args;
 
 /// Extension trait for `UdtfArgs` to provide convenient construction.
-pub trait UdtfArgsExt {
+pub(crate) trait UdtfArgsExt {
     /// Create a `ListUdfs` variant.
     fn list_udfs() -> UdtfArgs;
 

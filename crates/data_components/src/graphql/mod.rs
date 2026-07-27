@@ -30,7 +30,7 @@ pub mod provider;
 pub mod rate_limit;
 
 /// Maximum number of retry attempts for a single page fetch during pagination.
-pub const PAGE_RETRY_MAX_ATTEMPTS: u32 = 5;
+pub(crate) const PAGE_RETRY_MAX_ATTEMPTS: u32 = 5;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -150,7 +150,7 @@ pub fn is_retriable_error(error: &Error) -> bool {
 /// Returns `true` if the error is a gateway error (502 Bad Gateway or 504 Gateway Timeout)
 /// that may benefit from closing the current connection and establishing a fresh one.
 #[must_use]
-pub fn is_gateway_error(error: &Error) -> bool {
+pub(crate) fn is_gateway_error(error: &Error) -> bool {
     let status = match error {
         Error::InvalidReqwestStatus { status, .. } | Error::JsonDecodeError { status, .. } => {
             Some(*status)

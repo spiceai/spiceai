@@ -80,7 +80,7 @@ use crate::SecretStore;
 /// the default chain: implicit IMDS/federated-token probing has noisy
 /// failure modes (timeouts, misleading errors) that make misconfiguration
 /// hard to diagnose when the user actually meant the CLI path.
-pub const PARAMETERS: &[ParameterSpec] = &[
+pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("auth_method")
         .description(
             "Authentication method used to obtain tokens for Key Vault. `default` \
@@ -222,7 +222,7 @@ impl AzureKeyVaultConfig {
     /// trimmed so downstream code sees the same canonical form users see
     /// when they copy-paste values.
     #[must_use]
-    pub fn from_params(vault: String, params: &HashMap<String, String>) -> Self {
+    pub(crate) fn from_params(vault: String, params: &HashMap<String, String>) -> Self {
         fn non_empty(s: Option<&String>) -> Option<String> {
             let trimmed = s.map(|v| v.trim())?;
             if trimmed.is_empty() {
@@ -375,7 +375,7 @@ impl AzureKeyVault {
     ///
     /// # Errors
     /// Returns [`Error::EmptyVaultName`] if `vault` is empty or whitespace.
-    pub fn new(vault: &str) -> Result<Self> {
+    fn new(vault: &str) -> Result<Self> {
         Self::from_config(AzureKeyVaultConfig {
             vault: vault.to_string(),
             auth_method: AuthMethod::Default,

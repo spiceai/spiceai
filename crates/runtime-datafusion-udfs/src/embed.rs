@@ -34,7 +34,7 @@ use std::sync::{Arc, LazyLock};
 use tokio::sync::RwLock;
 
 pub static EMBED_UDF_NAME: &str = "embed";
-pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| Documentation {
+static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| Documentation {
     doc_section: DocSection::default(),
     description: "Generates embeddings for text using a specified embedding model".to_string(),
     syntax_example: "embed(text, model_name)".to_string(),
@@ -50,7 +50,7 @@ pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| Documentati
     related_udfs: None,
 });
 
-pub static SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
+static SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
     Signature::one_of(
         // In order of least likely to auto-coerce, via logical_expr docs for OneOf:
         // > Coercion is attempted to match the signatures in order,

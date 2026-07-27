@@ -73,7 +73,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Will return `Err` if:
 ///     - `rustls_native_certs` could not load native certificates.
 ///     - It couldn't convert the PEMs to a string.
-pub fn system_tls_certificate() -> Result<tonic::transport::Certificate> {
+fn system_tls_certificate() -> Result<tonic::transport::Certificate> {
     // Load root certificates found in the platform's native certificate store.
     let cert_result = rustls_native_certs::load_native_certs();
     if !cert_result.errors.is_empty() {
@@ -104,7 +104,7 @@ pub fn system_tls_certificate() -> Result<tonic::transport::Certificate> {
 /// Will return `Err` if:
 ///     - The file does not exist.
 ///     - The file could not be read.
-pub async fn load_ca_certificate_from_file(path: &Path) -> Result<tonic::transport::Certificate> {
+async fn load_ca_certificate_from_file(path: &Path) -> Result<tonic::transport::Certificate> {
     if !path.exists() {
         return Err(Error::CaCertificateFileNotFound {
             path: path.display().to_string(),
@@ -204,7 +204,7 @@ impl ClientTlsOptions {
     /// Convenience constructor that mirrors the legacy
     /// [`new_tls_flight_channel`] entry point.
     #[must_use]
-    pub fn ca_only(ca_certificate_path: Option<PathBuf>) -> Self {
+    pub(crate) fn ca_only(ca_certificate_path: Option<PathBuf>) -> Self {
         Self {
             ca_certificate_path,
             client_identity: None,

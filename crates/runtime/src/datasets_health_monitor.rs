@@ -90,7 +90,7 @@ impl Debug for DatasetAvailabilityInfo {
 }
 
 impl DatasetAvailabilityInfo {
-    pub fn new(name: String, table_provider: Arc<dyn TableProvider>) -> Self {
+    fn new(name: String, table_provider: Arc<dyn TableProvider>) -> Self {
         Self {
             name,
             table_provider,
@@ -121,7 +121,7 @@ impl DatasetsHealthMonitor {
     }
 
     #[must_use]
-    pub fn with_task_history_enabled(mut self, is_enabled: bool) -> Self {
+    pub(crate) fn with_task_history_enabled(mut self, is_enabled: bool) -> Self {
         self.is_task_history_enabled = is_enabled;
         self
     }
@@ -168,7 +168,7 @@ impl DatasetsHealthMonitor {
         Ok(())
     }
 
-    pub async fn deregister_dataset(&self, dataset_name: &String) {
+    pub(crate) async fn deregister_dataset(&self, dataset_name: &String) {
         tracing::debug!("Removing dataset {dataset_name} from periodic availability check");
         let mut monitored_datasets = self.monitored_datasets.lock().await;
         monitored_datasets.remove(dataset_name);
@@ -190,7 +190,7 @@ impl DatasetsHealthMonitor {
     }
 
     // returns a list of dataset names that had successful queries against them in the last 10 minutes
-    pub async fn get_recently_accessed_datasets(
+    async fn get_recently_accessed_datasets(
         df: Arc<DataFusion>,
     ) -> Result<Arc<HashSet<String>>> {
         let query = format!(
@@ -242,7 +242,7 @@ AND labels.error_code IS NULL"
         Ok(Arc::new(datasets_with_recent_activity_set))
     }
 
-    pub fn start(&self) {
+    pub(crate) fn start(&self) {
         tracing::debug!("Starting datasets availability monitoring");
         let monitored_datasets = Arc::clone(&self.monitored_datasets);
         let df = Arc::clone(&self.df);

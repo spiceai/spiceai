@@ -57,7 +57,7 @@ pub struct Match {
     dataset: String,
 
     #[serde(skip_serializing_if = "HashMap::is_empty")]
-    pub metadata: HashMap<String, serde_json::Value>,
+    metadata: HashMap<String, serde_json::Value>,
 }
 
 impl Match {
@@ -147,7 +147,7 @@ pub async fn to_matches_sorted(result: VectorSearchResult, limit: usize) -> Resu
 }
 
 /// Consumes [`AggregationResult`] and converts all results to [`Match`] format.
-pub async fn to_matches(
+async fn to_matches(
     tbl: &TableReference,
     mut result: AggregationResult,
 ) -> std::result::Result<Vec<Match>, SearchError> {

@@ -307,14 +307,14 @@ impl ReplicaIdentityMode {
 /// key order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplicaIdentity {
-    pub mode: ReplicaIdentityMode,
+    mode: ReplicaIdentityMode,
     /// Primary-key columns in key order; empty when the table has no primary key.
-    pub primary_key: Vec<String>,
+    primary_key: Vec<String>,
     /// The `REPLICA IDENTITY USING INDEX` index's columns in key order. Empty
     /// when the table is not in `USING INDEX` mode, or the nominated index is
     /// unusable as an upsert key (e.g. an expression index -- `PostgreSQL`
     /// disallows those as replica identities, so this is a defensive guard).
-    pub identity_index: Vec<String>,
+    identity_index: Vec<String>,
 }
 
 /// Fold the per-index-column rows returned by [`replica_identity`]'s query into

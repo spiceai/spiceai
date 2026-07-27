@@ -143,7 +143,7 @@ pub struct VendedTableCredentials {
 
 impl VendedTableCredentials {
     #[must_use]
-    pub fn new(client: Arc<UnityCatalog>, table_id: String, operation: TableOperation) -> Self {
+    fn new(client: Arc<UnityCatalog>, table_id: String, operation: TableOperation) -> Self {
         Self {
             client,
             table_id,
@@ -154,7 +154,7 @@ impl VendedTableCredentials {
 
     /// Returns valid vended credentials, re-vending from Unity Catalog if the
     /// cached ones are missing or close to expiry.
-    pub async fn get(&self) -> Result<TemporaryTableCredentials> {
+    async fn get(&self) -> Result<TemporaryTableCredentials> {
         let now_ms = now_millis();
         {
             let cached = self.cached.read().await;
@@ -332,7 +332,7 @@ fn parse_sas_token(sas: &str) -> Vec<(String, String)> {
 /// The vending response carries no AWS region, so for S3 the region is taken
 /// from `aws_region`, then the `AWS_REGION`/`AWS_DEFAULT_REGION` environment
 /// variables, then resolved from the bucket itself.
-pub async fn vended_object_store(
+async fn vended_object_store(
     table_url: &Url,
     credentials: Arc<VendedTableCredentials>,
     aws_region: Option<String>,

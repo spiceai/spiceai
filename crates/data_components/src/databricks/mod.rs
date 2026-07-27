@@ -20,7 +20,7 @@ pub mod dialect;
 pub mod spark_connect;
 pub mod sql_warehouse;
 
-pub use dialect::DatabricksDialect;
+pub(crate) use dialect::DatabricksDialect;
 
 use std::sync::LazyLock;
 

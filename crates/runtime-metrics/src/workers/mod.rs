@@ -16,7 +16,7 @@ limitations under the License.
 
 use super::{Gauge, Histogram, LazyLock, Meter, UpDownCounter, global};
 
-pub static WORKERS_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("worker"));
+static WORKERS_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("worker"));
 
 pub static COUNT: LazyLock<UpDownCounter<i64>> = LazyLock::new(|| {
     WORKERS_METER

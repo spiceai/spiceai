@@ -54,7 +54,7 @@ impl Default for EndCondition {
 
 impl EndCondition {
     #[must_use]
-    pub fn is_met(&self, start: &Instant, query_set_count: usize) -> bool {
+    fn is_met(&self, start: &Instant, query_set_count: usize) -> bool {
         match self {
             EndCondition::Duration(duration) => start.elapsed() >= *duration,
             EndCondition::QuerySetCompleted(count) => query_set_count >= *count,
@@ -443,12 +443,12 @@ impl SpiceTest<Completed> {
     }
 
     #[must_use]
-    pub fn get_cumulative_query_duration(&self) -> Duration {
+    fn get_cumulative_query_duration(&self) -> Duration {
         self.state.query_durations.values().flatten().copied().sum()
     }
 
     #[must_use]
-    pub fn get_test_duration(&self) -> Duration {
+    fn get_test_duration(&self) -> Duration {
         self.state.test_duration
     }
 

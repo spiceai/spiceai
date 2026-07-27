@@ -27,13 +27,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub struct DynamoDBDeletionSink {
-    pub db_client: Arc<DbClient>,
-    pub table_name: String,
-    pub partition_key: String,
-    pub sort_key: Option<String>,
-    pub time_format: Arc<String>,
-    pub filters: Vec<Expr>,
-    pub parallelism: usize,
+    pub(crate) db_client: Arc<DbClient>,
+    pub(crate) table_name: String,
+    pub(crate) partition_key: String,
+    pub(crate) sort_key: Option<String>,
+    pub(crate) time_format: Arc<String>,
+    pub(crate) filters: Vec<Expr>,
+    pub(crate) parallelism: usize,
 }
 
 #[async_trait]

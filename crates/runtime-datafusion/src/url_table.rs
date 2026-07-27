@@ -461,7 +461,7 @@ pub struct DynamicUrlSchemaProvider {
 
 impl DynamicUrlSchemaProvider {
     /// Create a new `DynamicUrlSchemaProvider`.
-    pub fn new(inner: Arc<dyn SchemaProvider>, factory: Arc<SpiceUrlTableFactory>) -> Self {
+    fn new(inner: Arc<dyn SchemaProvider>, factory: Arc<SpiceUrlTableFactory>) -> Self {
         Self { inner, factory }
     }
 }
@@ -516,7 +516,7 @@ pub struct DynamicUrlCatalogProvider {
 
 impl DynamicUrlCatalogProvider {
     /// Create a new `DynamicUrlCatalogProvider`.
-    pub fn new(inner: Arc<dyn CatalogProvider>, factory: Arc<SpiceUrlTableFactory>) -> Self {
+    fn new(inner: Arc<dyn CatalogProvider>, factory: Arc<SpiceUrlTableFactory>) -> Self {
         Self { inner, factory }
     }
 }

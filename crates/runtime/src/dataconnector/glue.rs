@@ -107,7 +107,7 @@ pub struct GlueDataConnector {
 
 impl GlueDataConnector {
     #[must_use]
-    pub fn new(params: Parameters, tokio_io_runtime: tokio::runtime::Handle) -> Self {
+    pub(crate) fn new(params: Parameters, tokio_io_runtime: tokio::runtime::Handle) -> Self {
         Self {
             params,
             tokio_io_runtime,

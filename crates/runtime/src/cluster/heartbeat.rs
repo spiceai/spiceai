@@ -85,20 +85,20 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// On-disk heartbeat record.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SchedulerHeartbeat {
-    pub scheduler_id: SchedulerId,
+    scheduler_id: SchedulerId,
     /// Must match the `instance_id` of the corresponding entry in
     /// `cluster.json`. Mismatched heartbeats are filtered out as
     /// orphans by [`SchedulerHeartbeatStore::list_alive`].
-    pub instance_id: Uuid,
-    pub last_heartbeat_ms: u64,
-    pub ttl_ms: u64,
+    pub(crate) instance_id: Uuid,
+    last_heartbeat_ms: u64,
+    ttl_ms: u64,
 }
 
 impl SchedulerHeartbeat {
     /// Returns true if this heartbeat is older than its TTL plus the
     /// configured clock-skew tolerance.
     #[must_use]
-    pub fn is_stale(&self, now_ms: u64) -> bool {
+    pub(crate) fn is_stale(&self, now_ms: u64) -> bool {
         now_ms.saturating_sub(self.last_heartbeat_ms)
             > self.ttl_ms.saturating_add(CLOCK_SKEW_TOLERANCE_MS)
     }
@@ -119,7 +119,7 @@ pub struct SchedulerHeartbeatStore {
 
 impl SchedulerHeartbeatStore {
     #[must_use]
-    pub fn new(store: Arc<dyn ObjectStore>, base_prefix: &str) -> Self {
+    pub(crate) fn new(store: Arc<dyn ObjectStore>, base_prefix: &str) -> Self {
         let trimmed = base_prefix.trim_end_matches('/');
         let prefix = if trimmed.is_empty() {
             "heartbeats/".to_string()
@@ -131,12 +131,12 @@ impl SchedulerHeartbeatStore {
 
     /// Returns the full path for a given scheduler id.
     #[must_use]
-    pub fn path_for(&self, scheduler_id: &str) -> Path {
+    fn path_for(&self, scheduler_id: &str) -> Path {
         Path::from(format!("{}{}.json", self.prefix, scheduler_id))
     }
 
     /// Writes (or overwrites) the heartbeat for a scheduler.
-    pub async fn heartbeat(
+    pub(crate) async fn heartbeat(
         &self,
         scheduler_id: &str,
         instance_id: Uuid,
@@ -190,7 +190,7 @@ impl SchedulerHeartbeatStore {
     }
 
     /// Reads the heartbeat for a scheduler, if any.
-    pub async fn read(&self, scheduler_id: &str) -> Result<Option<SchedulerHeartbeat>> {
+    pub(crate) async fn read(&self, scheduler_id: &str) -> Result<Option<SchedulerHeartbeat>> {
         let path = self.path_for(scheduler_id);
         match self.store.get(&path).await {
             Ok(result) => {
@@ -211,7 +211,7 @@ impl SchedulerHeartbeatStore {
     }
 
     /// Best-effort delete; missing files are tolerated.
-    pub async fn delete(&self, scheduler_id: &str) -> Result<()> {
+    pub(crate) async fn delete(&self, scheduler_id: &str) -> Result<()> {
         let path = self.path_for(scheduler_id);
         match self.store.delete(&path).await {
             Ok(()) | Err(ObjectStoreError::NotFound { .. }) => Ok(()),
@@ -224,7 +224,7 @@ impl SchedulerHeartbeatStore {
 
     /// Lists every heartbeat present in the store. Always performs a
     /// fresh `list` + `get`; never reads from a cache.
-    pub async fn list_all(&self) -> Result<HashMap<SchedulerId, SchedulerHeartbeat>> {
+    pub(crate) async fn list_all(&self) -> Result<HashMap<SchedulerId, SchedulerHeartbeat>> {
         let prefix_path = Path::from(self.prefix.trim_end_matches('/'));
         let mut stream = self.store.list(Some(&prefix_path));
         let mut paths = Vec::new();
@@ -281,7 +281,7 @@ impl SchedulerHeartbeatStore {
 
     /// Returns the heartbeats that are (a) registered in `cluster_state`,
     /// (b) carry the matching `instance_id`, and (c) are not stale.
-    pub async fn list_alive(
+    pub(crate) async fn list_alive(
         &self,
         now_ms: u64,
         cluster_state: &ClusterState,

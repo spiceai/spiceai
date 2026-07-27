@@ -55,7 +55,7 @@ use util::expr::combine_exprs_balanced;
 /// triggering a new revalidation to avoid duplicate upstream requests during the SWR window.
 pub type InFlightRevalidations = Arc<Mutex<HashSet<String>>>;
 
-pub const CACHE_REFRESHED_AT_COLUMN: &str = "_fetched_at";
+pub(crate) const CACHE_REFRESHED_AT_COLUMN: &str = "_fetched_at";
 
 /// Reserved column name added to caching-mode accelerator storage to scope
 /// cached rows by [`runtime_request_context::CacheNamespace`]. The column is
@@ -66,13 +66,13 @@ pub const CACHE_REFRESHED_AT_COLUMN: &str = "_fetched_at";
 /// `"system"`, or `"apikey:<sha256[..16]>"`). Comparing rows by this column
 /// is what enforces cross-principal isolation inside the caching
 /// accelerator.
-pub const CACHE_NAMESPACE_COLUMN: &str = "__spice_cache_namespace";
+pub(crate) const CACHE_NAMESPACE_COLUMN: &str = "__spice_cache_namespace";
 
 /// Returns true if `name` collides with a column reserved by the caching
 /// accelerator. Used by dataset configuration validation so a user-defined
 /// column never silently overwrites internal cache state.
 #[must_use]
-pub fn is_reserved_caching_column(name: &str) -> bool {
+pub(crate) fn is_reserved_caching_column(name: &str) -> bool {
     name.eq_ignore_ascii_case(CACHE_NAMESPACE_COLUMN)
 }
 
@@ -84,7 +84,7 @@ pub fn is_reserved_caching_column(name: &str) -> bool {
 /// every persisted row carries its originating namespace tag, which is
 /// what `__spice_cache_namespace = $current_ns` filtering keys off of on
 /// read.
-pub fn stamp_namespace_column(
+fn stamp_namespace_column(
     batch: RecordBatch,
     namespace_id: &str,
 ) -> DataFusionResult<RecordBatch> {
@@ -110,7 +110,7 @@ pub fn stamp_namespace_column(
 /// Pushed into the accelerator alongside user filters so cached rows
 /// belonging to other principals are not visible to this request.
 #[must_use]
-pub fn namespace_filter_expr(namespace_id: &str) -> Expr {
+pub(crate) fn namespace_filter_expr(namespace_id: &str) -> Expr {
     col(CACHE_NAMESPACE_COLUMN).eq(lit(namespace_id))
 }
 
@@ -123,7 +123,7 @@ pub fn namespace_filter_expr(namespace_id: &str) -> Expr {
 /// Returns an error if the source schema already defines a column whose
 /// name collides with [`CACHE_NAMESPACE_COLUMN`] — that name is reserved
 /// for the runtime and a collision would silently corrupt cached rows.
-pub fn extend_schema_with_cache_namespace(
+pub(crate) fn extend_schema_with_cache_namespace(
     dataset_name: &str,
     schema: &arrow::datatypes::Schema,
 ) -> DataFusionResult<arrow::datatypes::Schema> {
@@ -173,34 +173,34 @@ const CACHE_WRITE_FLUSH_INTERVAL_MS: u64 = 500;
 #[derive(Debug)]
 pub struct CacheWriteRequest {
     /// Batches to write to the accelerator
-    pub batches: Vec<RecordBatch>,
+    batches: Vec<RecordBatch>,
     /// Filter expressions to identify the cache key (for upsert operations)
-    pub filters: Vec<Expr>,
+    filters: Vec<Expr>,
     /// If true, this is an upsert (expired data exists), otherwise insert (new data)
-    pub is_upsert: bool,
+    is_upsert: bool,
     /// Cache key computed from filters, used to track in-flight writes
-    pub cache_key: String,
+    cache_key: String,
     /// Stable storage id of the originating namespace (see
     /// [`runtime_request_context::CacheNamespace::storage_id`]). Stamped into
     /// `__spice_cache_namespace` on every row at flush time and added to the
     /// upsert filter set so concurrent writers in different namespaces never
     /// overwrite each other's rows for the same `(request_path, query, body)`
     /// key.
-    pub namespace_id: Arc<str>,
+    namespace_id: Arc<str>,
 }
 
 /// Sender half of the cache write channel
 pub type CacheWriteSender = mpsc::Sender<CacheWriteRequest>;
 
 /// Receiver half of the cache write channel
-pub type CacheWriteReceiver = mpsc::Receiver<CacheWriteRequest>;
+pub(crate) type CacheWriteReceiver = mpsc::Receiver<CacheWriteRequest>;
 
 /// Creates a new cache write channel with the configured capacity.
 ///
 /// Returns the sender (for `CachingAccelerationScanExec` to send writes) and
 /// the receiver (for the consumer task to process batched writes).
 #[must_use]
-pub fn create_cache_write_channel() -> (CacheWriteSender, CacheWriteReceiver) {
+pub(crate) fn create_cache_write_channel() -> (CacheWriteSender, CacheWriteReceiver) {
     mpsc::channel(CACHE_WRITE_CHANNEL_CAPACITY)
 }
 
@@ -208,7 +208,7 @@ pub fn create_cache_write_channel() -> (CacheWriteSender, CacheWriteReceiver) {
 ///
 /// Removes cache keys from `in_flight_revalidations` after writes complete.
 /// Updates `last_updated_at` after successful writes to support `snapshots_creation_policy: on_change`.
-pub fn spawn_batched_cache_write_task(
+pub(crate) fn spawn_batched_cache_write_task(
     mut rx: CacheWriteReceiver,
     accelerator: Arc<dyn TableProvider>,
     dataset_name: String,
@@ -578,7 +578,7 @@ fn as_timestamp_nanosecond_array(array: &ArrayRef) -> DataFusionResult<ArrayRef>
 }
 
 /// Helper functions for cache refresh operations
-pub struct CacheRefreshHelper;
+pub(crate) struct CacheRefreshHelper;
 
 impl CacheRefreshHelper {
     /// Refresh ALL stale rows in the cache by querying the accelerator for rows with old `fetched_at` timestamps,
@@ -586,7 +586,7 @@ impl CacheRefreshHelper {
     /// This is specifically designed for HTTP connector caching mode and is used by the periodic refresh task.
     ///
     /// For single-entry refresh (e.g., SWR pattern), use `refresh_entry` instead.
-    pub async fn refresh_all_stale_rows(
+    pub(crate) async fn refresh_all_stale_rows(
         federated: Arc<dyn TableProvider>,
         accelerator: Arc<dyn TableProvider>,
         dataset_name: &str,
@@ -702,7 +702,7 @@ impl CacheRefreshHelper {
     /// should be refreshed, not all stale entries.
     ///
     /// Writes are queued through the batched write channel to reduce accelerator overhead.
-    pub async fn refresh_entry(
+    async fn refresh_entry(
         federated: Arc<dyn TableProvider>,
         dataset_name: &str,
         filters: &[Expr],
@@ -1298,7 +1298,7 @@ impl CacheRefreshHelper {
     ///
     /// # Returns
     /// Returns the number of rows copied, or an error if the operation fails.
-    pub async fn initialize_child_from_parent(
+    pub(crate) async fn initialize_child_from_parent(
         parent_accelerator: &Arc<dyn TableProvider>,
         child_accelerator: &Arc<dyn TableProvider>,
         dataset_name: &str,
@@ -1710,7 +1710,7 @@ pub struct CachingAccelerationScanExec {
 
 impl CachingAccelerationScanExec {
     #[expect(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         input: Arc<dyn ExecutionPlan>,
         max_age: Option<Duration>,
         stale_while_revalidate: Option<Duration>,

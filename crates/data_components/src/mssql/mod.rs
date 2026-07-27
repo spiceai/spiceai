@@ -107,7 +107,7 @@ impl SqlServerTableProvider {
         })
     }
 
-    pub async fn get_schema(
+    async fn get_schema(
         conn: Arc<SqlServerConnectionPool>,
         table: &TableReference,
     ) -> Result<SchemaRef> {

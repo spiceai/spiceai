@@ -20,17 +20,17 @@ limitations under the License.
 /// and runs a TPC-C OLTP workload with configurable terminals.
 pub mod config;
 pub mod csv_gen;
-pub mod loader;
-pub mod loader_mysql;
+mod loader;
+mod loader_mysql;
 pub mod metrics;
-pub mod rand;
-pub mod schema;
-pub mod schema_mysql;
+pub(crate) mod rand;
+mod schema;
+mod schema_mysql;
 pub mod txn;
 
 pub use config::{ChBenchConfig, MysqlSourceConfig, PostgresSourceConfig};
 pub use metrics::OltpReport;
-pub use txn::TxnType;
+pub(crate) use txn::TxnType;
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
@@ -116,7 +116,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Tasks are polled concurrently via `select_all`, so a failure in *any* task is
 /// noticed as soon as it completes — the abort is not delayed behind an earlier
 /// still-running task.
-pub(crate) async fn join_loader_tasks(
+async fn join_loader_tasks(
     handles: Vec<tokio::task::JoinHandle<Result<()>>>,
     what: &str,
 ) -> Result<()> {
@@ -516,7 +516,7 @@ async fn run_terminal(
 /// Pin a `MySQL` session's time zone to UTC so `NOW(3)`/`_bench_ts` writes and
 /// reads line up with how the Spice CDC path interprets timestamps (which pins
 /// the replication session to UTC).
-pub(crate) async fn set_mysql_utc(conn: &mut mysql_async::Conn) -> Result<()> {
+async fn set_mysql_utc(conn: &mut mysql_async::Conn) -> Result<()> {
     conn.query_drop("SET time_zone = '+00:00'")
         .await
         .map_err(|source| Error::MySql {

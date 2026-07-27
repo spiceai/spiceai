@@ -434,7 +434,7 @@ impl MaintainedAggregateExec {
     /// # Errors
     ///
     /// Returns an error if the in-memory execution plan cannot be built.
-    pub fn try_new(batch: RecordBatch) -> DataFusionResult<Self> {
+    pub(crate) fn try_new(batch: RecordBatch) -> DataFusionResult<Self> {
         let schema = batch.schema();
         let inner = MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None)?;
         Ok(Self { inner })
@@ -577,7 +577,7 @@ impl MaintainedAggregateRegistry {
     /// retract-old-then-insert path in [`Self::apply_insert_batches`] for
     /// updates) rather than falling back to a full rebuild via [`Self::mark_stale`].
     #[must_use]
-    pub fn supports_retraction(&self) -> bool {
+    pub(crate) fn supports_retraction(&self) -> bool {
         self.has_pk_index
     }
 
@@ -585,7 +585,7 @@ impl MaintainedAggregateRegistry {
     /// retained state immediately. When called from a `Tokio` runtime, destruction
     /// of the detached maps runs on the blocking pool so a large stale view does
     /// not stall an async visibility fence.
-    pub fn mark_stale(&self, epoch: u64) {
+    pub(crate) fn mark_stale(&self, epoch: u64) {
         let retired = {
             let mut state = self.state.write();
             state.epoch = epoch;
@@ -730,7 +730,7 @@ impl MaintainedAggregateRegistry {
     /// # Errors
     ///
     /// Returns an error if a matching maintained view cannot be materialized.
-    pub fn batch_for_aggregate(
+    pub(crate) fn batch_for_aggregate(
         &self,
         aggregate: &AggregateExec,
         scan_epoch: u64,
@@ -748,7 +748,7 @@ impl MaintainedAggregateRegistry {
     /// # Errors
     ///
     /// Returns an error if a matching maintained view cannot be materialized.
-    pub fn batch_for_aggregate_with_output(
+    pub(crate) fn batch_for_aggregate_with_output(
         &self,
         query_aggregate: &AggregateExec,
         output_aggregate: &AggregateExec,

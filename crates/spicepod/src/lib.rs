@@ -244,7 +244,7 @@ impl Spicepod {
     }
 
     #[cfg(feature = "object-store")]
-    pub async fn load_from_object_store(url: url::Url) -> Result<Self> {
+    async fn load_from_object_store(url: url::Url) -> Result<Self> {
         let (store, path) = match (url.scheme(), url.path()) {
             ("s3", path) => {
                 let store = aws_sdk_credential_bridge::from_s3_url(&url, None)
@@ -421,7 +421,7 @@ impl Spicepod {
         Self::load_definition_from(&reader::StdFileSystem, path).await
     }
 
-    pub async fn load_definition_from(
+    async fn load_definition_from(
         fs: &(impl reader::ReadableYaml + Send + Sync),
         path: impl Into<PathBuf>,
     ) -> Result<SpicepodDefinition> {

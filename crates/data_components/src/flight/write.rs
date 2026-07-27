@@ -49,7 +49,7 @@ pub struct FlightTableWriter {
 }
 
 impl FlightTableWriter {
-    pub fn create(
+    pub(crate) fn create(
         read_provider: Arc<dyn TableProvider>,
         table_reference: TableReference,
         flight_client: FlightClient,

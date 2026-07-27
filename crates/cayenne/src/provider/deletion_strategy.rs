@@ -95,7 +95,7 @@ impl PositionDeletionVector {
     }
 
     #[must_use]
-    pub(crate) fn approx_bytes(&self) -> usize {
+    fn approx_bytes(&self) -> usize {
         // The resident state keeps both the original u32 bitmap and the u64
         // access-plan treemap built from it. Serialized size is a compact,
         // container-aware estimate that tracks bitmap growth without walking

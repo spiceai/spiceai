@@ -115,7 +115,7 @@ impl Number {
         clippy::cast_sign_loss,
         reason = "explicit conversion with bounds checking"
     )]
-    pub fn as_u64(&self) -> Option<u64> {
+    fn as_u64(&self) -> Option<u64> {
         match self {
             Number::PosInt(n) => Some(*n),
             Number::NegInt(n) => (*n).try_into().ok(),
@@ -136,7 +136,7 @@ impl Number {
         clippy::cast_possible_truncation,
         reason = "explicit conversion with bounds checking"
     )]
-    pub fn as_i64(&self) -> Option<i64> {
+    fn as_i64(&self) -> Option<i64> {
         match self {
             Number::PosInt(n) => (*n).try_into().ok(),
             Number::NegInt(n) => Some(*n),
@@ -153,7 +153,7 @@ impl Number {
     /// Returns the number as f64.
     #[must_use]
     #[expect(clippy::cast_precision_loss, reason = "intentional conversion to f64")]
-    pub fn as_f64(&self) -> f64 {
+    fn as_f64(&self) -> f64 {
         match self {
             Number::PosInt(n) => *n as f64,
             Number::NegInt(n) => *n as f64,
@@ -220,19 +220,19 @@ impl std::hash::Hash for Value {
 impl Value {
     /// Returns true if the value is null.
     #[must_use]
-    pub fn is_null(&self) -> bool {
+    pub(crate) fn is_null(&self) -> bool {
         matches!(self, Value::Null)
     }
 
     /// Returns true if the value is a boolean.
     #[must_use]
-    pub fn is_bool(&self) -> bool {
+    fn is_bool(&self) -> bool {
         matches!(self, Value::Bool(_))
     }
 
     /// Returns true if the value is a number.
     #[must_use]
-    pub fn is_number(&self) -> bool {
+    fn is_number(&self) -> bool {
         matches!(self, Value::Number(_))
     }
 
@@ -244,7 +244,7 @@ impl Value {
 
     /// Returns true if the value is a sequence.
     #[must_use]
-    pub fn is_sequence(&self) -> bool {
+    pub(crate) fn is_sequence(&self) -> bool {
         matches!(self, Value::Sequence(_))
     }
 
@@ -265,7 +265,7 @@ impl Value {
 
     /// If the value is a number, returns it. Otherwise returns None.
     #[must_use]
-    pub fn as_number(&self) -> Option<&Number> {
+    fn as_number(&self) -> Option<&Number> {
         match self {
             Value::Number(n) => Some(n),
             _ => None,
@@ -274,19 +274,19 @@ impl Value {
 
     /// If the value is a u64, returns it. Otherwise returns None.
     #[must_use]
-    pub fn as_u64(&self) -> Option<u64> {
+    pub(crate) fn as_u64(&self) -> Option<u64> {
         self.as_number().and_then(Number::as_u64)
     }
 
     /// If the value is representable as i64, returns it. Otherwise returns None.
     #[must_use]
-    pub fn as_i64(&self) -> Option<i64> {
+    pub(crate) fn as_i64(&self) -> Option<i64> {
         self.as_number().and_then(Number::as_i64)
     }
 
     /// If the value is a number, returns it as f64. Otherwise returns None.
     #[must_use]
-    pub fn as_f64(&self) -> Option<f64> {
+    pub(crate) fn as_f64(&self) -> Option<f64> {
         self.as_number().map(Number::as_f64)
     }
 
@@ -344,7 +344,7 @@ impl Value {
 
     /// Mutably index into a YAML sequence or mapping.
     #[must_use]
-    pub fn get_mut<I: Index>(&mut self, index: I) -> Option<&mut Value> {
+    fn get_mut<I: Index>(&mut self, index: I) -> Option<&mut Value> {
         index.index_into_mut(self)
     }
 }

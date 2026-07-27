@@ -28,7 +28,7 @@ pub mod provider;
 
 pub static SEARCH_SCORE_COLUMN_NAME: &str = "_score";
 pub static SEARCH_VALUE_COLUMN_NAME: &str = "_value";
-pub static SEARCH_MATCH_COLUMN_NAME: &str = "_match";
+pub(crate) static SEARCH_MATCH_COLUMN_NAME: &str = "_match";
 
 pub async fn collect_batches(
     mut stream: SendableRecordBatchStream,
@@ -51,6 +51,6 @@ pub struct VectorSearchGenerationTableResult {
 
 /// The results of a single [`CandidateGeneration::search`].
 pub struct VectorSearchGenerationResult {
-    pub data: SendableRecordBatchStream,
-    pub derived_from: String,
+    data: SendableRecordBatchStream,
+    derived_from: String,
 }

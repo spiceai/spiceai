@@ -23,20 +23,20 @@ use secrecy::SecretString;
 pub struct Model2VecEmbeddingParams {
     /// The Hugging Face access token.
     #[param(runtime, autoload_secret)]
-    pub hf_token: Option<SecretString>,
+    pub(crate) hf_token: Option<SecretString>,
     /// The subfolder within the Hugging Face repo containing the model.
     #[param(runtime)]
-    pub subfolder: Option<String>,
+    pub(crate) subfolder: Option<String>,
     /// Whether to normalize the embedding output.
     #[param(runtime)]
-    pub normalize: Option<bool>,
+    pub(crate) normalize: Option<bool>,
     /// The number of threads to use for parallel inference.
     #[param(runtime)]
-    pub parallelism: Option<usize>,
+    pub(crate) parallelism: Option<usize>,
     /// The maximum token length for embedding input.
     #[param(runtime)]
-    pub embed_max_token_length: Option<usize>,
+    pub(crate) embed_max_token_length: Option<usize>,
     /// The custom batch size for embedding inference.
     #[param(runtime)]
-    pub embed_custom_batch_size: Option<usize>,
+    pub(crate) embed_custom_batch_size: Option<usize>,
 }

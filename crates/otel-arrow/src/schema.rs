@@ -159,7 +159,7 @@ pub(crate) fn attribute_list_field() -> Field {
     )
 }
 
-pub(crate) fn attributes_list_type() -> DataType {
+fn attributes_list_type() -> DataType {
     DataType::List(Arc::new(attribute_list_field()))
 }
 
@@ -170,7 +170,7 @@ pub(crate) fn number_fields() -> Vec<Field> {
     ]
 }
 
-pub(crate) fn number_data_type() -> DataType {
+fn number_data_type() -> DataType {
     DataType::Struct(number_fields().into())
 }
 
@@ -193,7 +193,7 @@ pub(crate) fn histogram_data_fields() -> Vec<Field> {
     ]
 }
 
-pub(crate) fn histogram_data_type() -> DataType {
+fn histogram_data_type() -> DataType {
     DataType::Struct(histogram_data_fields().into())
 }
 
@@ -206,7 +206,7 @@ pub enum MetricType {
 
 impl MetricType {
     #[must_use]
-    pub fn to_u8(self) -> u8 {
+    pub(crate) fn to_u8(self) -> u8 {
         self as u8
     }
 
@@ -246,7 +246,7 @@ pub enum AttributeValueType {
 
 impl AttributeValueType {
     #[must_use]
-    pub fn to_u8(self) -> u8 {
+    pub(crate) fn to_u8(self) -> u8 {
         self as u8
     }
 

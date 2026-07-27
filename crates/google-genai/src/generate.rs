@@ -32,22 +32,22 @@ use tokio_stream::StreamExt;
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GenerateContentRequest {
-    pub contents: Vec<Content>,
+    contents: Vec<Content>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Vec<Tool>>,
+    tools: Option<Vec<Tool>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_config: Option<ToolConfig>,
+    tool_config: Option<ToolConfig>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub safety_settings: Option<Vec<SafetySetting>>,
+    safety_settings: Option<Vec<SafetySetting>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub generation_config: Option<GenerationConfig>,
+    generation_config: Option<GenerationConfig>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub system_instruction: Option<Content>,
+    system_instruction: Option<Content>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached_content: Option<CachedContent>,
@@ -113,7 +113,7 @@ pub struct GenerateContentResponse {
     pub usage_metadata: Option<UsageMetadata>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub prompt_feedback: Option<PromptFeedback>,
+    prompt_feedback: Option<PromptFeedback>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_version: Option<String>,
@@ -126,10 +126,10 @@ pub struct GenerateContentResponse {
 #[serde(rename_all = "camelCase")]
 pub struct PromptFeedback {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub block_reason: Option<String>,
+    block_reason: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub safety_ratings: Option<Vec<crate::types::SafetyRating>>,
+    safety_ratings: Option<Vec<crate::types::SafetyRating>>,
 }
 
 impl Client {

@@ -58,7 +58,7 @@ pub struct TableOutput {
 
 impl TableOutput {
     /// Create a new table with the given column headers.
-    pub fn new(headers: Vec<&str>) -> Self {
+    pub(crate) fn new(headers: Vec<&str>) -> Self {
         Self {
             headers: headers.into_iter().map(String::from).collect(),
             rows: Vec::new(),
@@ -66,12 +66,12 @@ impl TableOutput {
     }
 
     /// Add a row to the table.
-    pub fn add_row(&mut self, values: Vec<String>) {
+    pub(crate) fn add_row(&mut self, values: Vec<String>) {
         self.rows.push(values);
     }
 
     /// Print the table to stdout.
-    pub fn print(&self) {
+    pub(crate) fn print(&self) {
         println!("{self}");
     }
 

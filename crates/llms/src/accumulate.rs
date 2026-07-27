@@ -175,7 +175,7 @@ fn update_chat_choice(acc: &mut ChatChoice, update: &ChatChoiceStream) {
 }
 
 #[cfg(test)]
-pub mod tests {
+pub(crate) mod tests {
 
     use async_openai::error::OpenAIError;
     use serde_json::json;
@@ -184,7 +184,7 @@ pub mod tests {
 
     #[expect(clippy::missing_panics_doc)]
     #[tokio::test]
-    pub async fn test_accumulate() {
+    async fn test_accumulate() {
         let parts = vec![
             "{\"id\":\"chatcmpl-Ap1hqCfgxosk7rTVtDHee6aFff0wd\",\"choices\":[{\"index\":0,\"delta\":{\"content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"call_AGU5KhGhzAsH14iFbZcvHNzx\",\"type\":\"function\",\"function\":{\"name\":\"get_current_weather\",\"arguments\":\"\"}}],\"role\":\"assistant\",\"refusal\":null},\"finish_reason\":null,\"logprobs\":null}],\"created\":1736724650,\"model\":\"not_needed\",\"service_tier\":\"default\",\"system_fingerprint\":\"fp_72ed7ab54c\",\"object\":\"chat.completion.chunk\"}",
             "{\"id\":\"chatcmpl-Ap1hqCfgxosk7rTVtDHee6aFff0wd\",\"choices\":[{\"index\":0,\"delta\":{\"content\":null,\"tool_calls\":[{\"index\":0,\"id\":null,\"type\":null,\"function\":{\"name\":null,\"arguments\":\"{\\\"\"}}],\"refusal\":null},\"finish_reason\":null,\"logprobs\":null}],\"created\":1736724650,\"model\":\"not_needed\",\"service_tier\":\"default\",\"system_fingerprint\":\"fp_72ed7ab54c\",\"object\":\"chat.completion.chunk\"}",

@@ -44,7 +44,7 @@ impl DocumentParserFactory for XlsxParserFactory {
 pub struct XlsxParser {}
 impl XlsxParser {
     #[must_use]
-    pub fn new(_parser_options: &HashMap<String, String>) -> Self {
+    fn new(_parser_options: &HashMap<String, String>) -> Self {
         XlsxParser::default()
     }
 }

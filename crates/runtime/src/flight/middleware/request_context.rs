@@ -52,7 +52,7 @@ pub struct RequestContextLayer {
 
 impl RequestContextLayer {
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         app: Option<Arc<App>>,
         df: Arc<DataFusion>,
         session_store: SessionStore,
@@ -69,7 +69,7 @@ impl RequestContextLayer {
 
     /// Sets the job executor for async query operations (cluster mode only).
     #[must_use]
-    pub fn with_job_executor(mut self, executor: Option<Arc<JobExecutor>>) -> Self {
+    pub(crate) fn with_job_executor(mut self, executor: Option<Arc<JobExecutor>>) -> Self {
         self.job_executor = executor;
         self
     }

@@ -72,7 +72,7 @@ pub enum Error {
     AssertionEncoding { source: base64::DecodeError },
 }
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Clone)]
 pub struct SamlBearerConfig {
@@ -93,7 +93,7 @@ pub struct SamlBearerConfig {
 }
 
 /// A SAML bearer flow, plus a cached access token.
-pub struct SamlBearerFlow {
+pub(crate) struct SamlBearerFlow {
     config: SamlBearerConfig,
     http: Client,
     cache: Arc<RwLock<Option<AcquiredToken>>>,
@@ -105,13 +105,13 @@ pub struct SamlBearerFlow {
 
 #[derive(Debug, Clone)]
 pub struct AcquiredToken {
-    pub access_token: SecretString,
-    pub expires_at: Instant,
+    pub(crate) access_token: SecretString,
+    expires_at: Instant,
 }
 
 impl AcquiredToken {
     #[must_use]
-    pub fn is_fresh(&self) -> bool {
+    fn is_fresh(&self) -> bool {
         Instant::now() + EXPIRY_GRACE < self.expires_at
     }
 }
@@ -131,7 +131,7 @@ struct TokenError {
 
 impl SamlBearerFlow {
     #[must_use]
-    pub fn new(config: SamlBearerConfig) -> Self {
+    pub(crate) fn new(config: SamlBearerConfig) -> Self {
         Self {
             config,
             http: Client::new(),
@@ -143,7 +143,7 @@ impl SamlBearerFlow {
     /// Return a valid access token, re-exchanging the assertion if the cached
     /// one is missing or stale. Callers that just want a one-shot exchange
     /// without caching can call [`Self::exchange_once`].
-    pub async fn acquire_token(&self) -> Result<AcquiredToken> {
+    pub(crate) async fn acquire_token(&self) -> Result<AcquiredToken> {
         // Fast path: read lock only — most calls hit a fresh cached token.
         {
             let cached = self.cache.read().await;
@@ -175,7 +175,7 @@ impl SamlBearerFlow {
     }
 
     /// Perform the SAML → OAuth2 token exchange once, bypassing the cache.
-    pub async fn exchange_once(&self) -> Result<AcquiredToken> {
+    async fn exchange_once(&self) -> Result<AcquiredToken> {
         validate_assertion_encoding(self.config.assertion.expose_secret())?;
 
         let base = self

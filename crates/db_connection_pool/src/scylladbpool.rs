@@ -25,7 +25,7 @@ use snafu::Snafu;
 
 use crate::dbconnection::scylladbconn::ScyllaDbConnection;
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {

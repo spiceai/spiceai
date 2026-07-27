@@ -63,7 +63,7 @@ impl UpsertDedupTableProvider {
     /// * `upsert_options` - Options controlling deduplication behavior
     /// * `constraints` - Constraints for deduplication (e.g., primary key)
     #[must_use]
-    pub fn new(
+    fn new(
         inner: Arc<dyn TableProvider>,
         upsert_options: UpsertOptions,
         constraints: Constraints,
@@ -82,7 +82,7 @@ impl UpsertDedupTableProvider {
 
     /// Returns a reference to the inner table provider.
     #[must_use]
-    pub fn inner(&self) -> &Arc<dyn TableProvider> {
+    pub(crate) fn inner(&self) -> &Arc<dyn TableProvider> {
         &self.inner
     }
 }
@@ -348,7 +348,7 @@ impl ExecutionPlan for UpsertDedupExec {
 
 /// Extracts `UpsertOptions` from the command options.
 #[must_use]
-pub fn extract_upsert_options<S: std::hash::BuildHasher>(
+fn extract_upsert_options<S: std::hash::BuildHasher>(
     options: &std::collections::HashMap<String, String, S>,
 ) -> UpsertOptions {
     let remove_duplicates = options
@@ -368,7 +368,7 @@ pub fn extract_upsert_options<S: std::hash::BuildHasher>(
 ///
 /// Returns the original provider if deduplication is not needed.
 #[must_use]
-pub fn wrap_with_upsert_dedup_if_needed<T: TableProvider + 'static, S: std::hash::BuildHasher>(
+pub(crate) fn wrap_with_upsert_dedup_if_needed<T: TableProvider + 'static, S: std::hash::BuildHasher>(
     provider: Arc<T>,
     options: &std::collections::HashMap<String, String, S>,
     constraints: Constraints,

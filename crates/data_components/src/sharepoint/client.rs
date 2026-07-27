@@ -86,7 +86,7 @@ pub enum DriveItemPtr {
 /// - `"sharepoint:drive:Documents/path:/Documents"`
 /// - `"sharepoint:site:contoso.sharepoint.com/root"`
 /// - `"sharepoint:user:48d31887-5fad-4d73-a9f5-3c356e68a038/path:/documents/reports"`
-pub fn parse_from(from: &str) -> Result<(PublicDrivePtr, DriveItemPtr), Error> {
+fn parse_from(from: &str) -> Result<(PublicDrivePtr, DriveItemPtr), Error> {
     let (drive, item) = from
         .trim_start_matches("sharepoint:")
         .split_once('/')
@@ -348,7 +348,7 @@ impl SharepointClient {
     }
 
     /// Returns the underlying content of a drive item.
-    pub(crate) async fn get_drive_item_content(
+    async fn get_drive_item_content(
         &self,
         item_id: &str,
     ) -> Result<Bytes, GraphFailure> {

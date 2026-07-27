@@ -104,7 +104,7 @@ pub(crate) async fn init_management(
 /// Implements runtime management and observability for Spice instances running
 /// outside of the Spice Cloud Platform, enabling monitoring and troubleshooting capabilities
 /// across on-premises and cluster environments.
-pub(crate) struct Management {
+struct Management {
     runtime: Arc<Runtime>,
     api_key: SecretString,
     params: HashMap<String, SecretString>,

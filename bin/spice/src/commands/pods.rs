@@ -43,11 +43,11 @@ pub struct PodsArgs {
 /// Spicepod status information from the runtime API.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct SpicepodStatus {
-    pub version: Option<String>,
-    pub name: Option<String>,
-    pub datasets_count: Option<i32>,
-    pub models_count: Option<i32>,
-    pub dependencies_count: Option<i32>,
+    version: Option<String>,
+    name: Option<String>,
+    datasets_count: Option<i32>,
+    models_count: Option<i32>,
+    dependencies_count: Option<i32>,
 }
 
 impl TableRow for SpicepodStatus {

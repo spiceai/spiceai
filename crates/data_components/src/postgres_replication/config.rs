@@ -214,19 +214,19 @@ impl SslMode {
 
     /// Whether this mode requires any TLS negotiation at all.
     #[must_use]
-    pub fn requires_tls(self) -> bool {
+    fn requires_tls(self) -> bool {
         !matches!(self, Self::Disable)
     }
 
     /// Whether this mode verifies the server certificate chain.
     #[must_use]
-    pub fn verifies_certificate(self) -> bool {
+    fn verifies_certificate(self) -> bool {
         matches!(self, Self::VerifyCa | Self::VerifyFull)
     }
 
     /// Whether this mode verifies the server hostname against the cert.
     #[must_use]
-    pub fn verifies_hostname(self) -> bool {
+    fn verifies_hostname(self) -> bool {
         matches!(self, Self::VerifyFull)
     }
 }
@@ -401,13 +401,13 @@ mod hostname {
 impl ReplicationParams {
     /// Build a tokio-postgres config for setup queries (not replication).
     #[must_use]
-    pub fn setup_pg_config(&self) -> tokio_postgres::Config {
+    pub(crate) fn setup_pg_config(&self) -> tokio_postgres::Config {
         self.pg_config(&format!("spice-replication-setup/{}", self.slot_name))
     }
 
     /// Build a tokio-postgres config with a custom `application_name`.
     #[must_use]
-    pub fn pg_config(&self, application_name: &str) -> tokio_postgres::Config {
+    pub(crate) fn pg_config(&self, application_name: &str) -> tokio_postgres::Config {
         let mut cfg = tokio_postgres::Config::new();
         cfg.host(&self.host)
             .port(self.port)
@@ -434,7 +434,7 @@ impl ReplicationParams {
     /// - `VerifyCa` → verify chain against the configured `sslrootcert` (or
     ///   system roots if none provided); hostname verification DISABLED
     /// - `VerifyFull` → verify chain AND hostname (strictest)
-    pub async fn native_tls_connector(
+    pub(crate) async fn native_tls_connector(
         &self,
     ) -> std::result::Result<Option<postgres_native_tls::MakeTlsConnector>, TlsConfigError> {
         if !self.sslmode.requires_tls() {

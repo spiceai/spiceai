@@ -63,7 +63,7 @@ impl QueryBuilder {
     /// Prefer this over [`Self::new`] when the caller already holds an
     /// `Arc<str>` (for example after decoding an HTTP body) so the SQL is not
     /// copied again.
-    pub fn new_arc(sql: Arc<str>, df: Arc<DataFusion>) -> Self {
+    pub(crate) fn new_arc(sql: Arc<str>, df: Arc<DataFusion>) -> Self {
         Self {
             df,
             method: SqlOrPlan::Sql(sql),
@@ -84,7 +84,7 @@ impl QueryBuilder {
     ///
     /// Use this when the plan has already been parsed externally (e.g. for
     /// read-only auth validation) to avoid re-parsing.
-    pub fn from_plan(plan: LogicalPlan, sql: impl Into<Arc<str>>, df: Arc<DataFusion>) -> Self {
+    pub(crate) fn from_plan(plan: LogicalPlan, sql: impl Into<Arc<str>>, df: Arc<DataFusion>) -> Self {
         Self {
             df,
             method: SqlOrPlan::Plan(Box::new(plan), sql.into()),
@@ -98,19 +98,19 @@ impl QueryBuilder {
     }
 
     #[must_use]
-    pub fn allow_tables(mut self, allowed_tables: ResolvedTableAwareAllowlist) -> Self {
+    pub(crate) fn allow_tables(mut self, allowed_tables: ResolvedTableAwareAllowlist) -> Self {
         self.table_allowlist = Some(allowed_tables);
         self
     }
 
     #[must_use]
-    pub fn query_id(mut self, query_id: Uuid) -> Self {
+    pub(crate) fn query_id(mut self, query_id: Uuid) -> Self {
         self.query_id = query_id;
         self
     }
 
     #[must_use]
-    pub fn parameters(mut self, parameters: Option<ParamValues>) -> Self {
+    pub(crate) fn parameters(mut self, parameters: Option<ParamValues>) -> Self {
         self.parameters = parameters;
         self
     }
@@ -122,7 +122,7 @@ impl QueryBuilder {
     /// If this is unset, the query attempts to observe the current
     /// [`runtime_request_context::RequestContext`]'s cancellation token.
     #[must_use]
-    pub fn cancellation_token(mut self, token: CancellationToken) -> Self {
+    pub(crate) fn cancellation_token(mut self, token: CancellationToken) -> Self {
         self.cancellation_token = Some(token);
         self
     }
@@ -148,7 +148,7 @@ impl QueryBuilder {
     /// [`ResultsCacheMode::Bypass`] skips both lookup and storage, ensuring the
     /// query executes against the current table state.
     #[must_use]
-    pub fn results_cache_mode(mut self, results_cache_mode: ResultsCacheMode) -> Self {
+    pub(crate) fn results_cache_mode(mut self, results_cache_mode: ResultsCacheMode) -> Self {
         self.results_cache_mode = results_cache_mode;
         self
     }

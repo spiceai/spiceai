@@ -33,10 +33,10 @@ use std::sync::Arc;
 pub mod provider;
 
 /// Catalog connector prefix for Cayenne catalogs.
-pub static PREFIX: &str = "cayenne";
+pub(crate) static PREFIX: &str = "cayenne";
 
 /// Parameters for configuring a Cayenne catalog.
-pub const PARAMETERS: &[ParameterSpec] = &[
+const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("data_dir")
         .description("Local directory for table data files. Defaults to spice data directory."),
     ParameterSpec::component("metadata_dir").description(

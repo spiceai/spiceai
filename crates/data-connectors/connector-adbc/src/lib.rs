@@ -94,7 +94,7 @@ pub enum Error {
     InvalidQueryFederation { value: String },
 }
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct Adbc {
     /// Wrapped in `Option` so `Drop` can move the factory to a blocking thread
@@ -286,14 +286,14 @@ impl std::fmt::Debug for AdbcFactory {
 
 impl AdbcFactory {
     #[must_use]
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             cache: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
     #[must_use]
-    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+    fn new_arc() -> Arc<dyn DataConnectorFactory> {
         Arc::new(Self::new()) as Arc<dyn DataConnectorFactory>
     }
 }
@@ -547,7 +547,7 @@ async fn enrich_with_bigquery_metadata_from_weak_pool(
     enrich_with_bigquery_metadata(driver_name, &pool, table_reference, provider).await
 }
 
-pub(crate) async fn enrich_with_bigquery_metadata(
+async fn enrich_with_bigquery_metadata(
     driver_name: &str,
     pool: &Arc<ADBCPool<adbc_driver_manager::ManagedDatabase>>,
     table_reference: &TableReference,
@@ -868,7 +868,7 @@ fn compute_adbc_cache_key(params: &ConnectorParams) -> String {
 }
 
 /// Builds the list of ADBC database options from connector parameters.
-pub(crate) fn build_db_options(
+fn build_db_options(
     uri: &str,
     username: Option<&str>,
     password: Option<&str>,
@@ -1098,7 +1098,7 @@ fn build_join_context(
     })
 }
 
-pub(crate) fn dialect_for_driver(driver_name: &str) -> Option<Arc<dyn Dialect + Send + Sync>> {
+fn dialect_for_driver(driver_name: &str) -> Option<Arc<dyn Dialect + Send + Sync>> {
     match driver_name {
         "bigquery" => Some(Arc::new(BigQueryDialect::new())),
         _ => None,

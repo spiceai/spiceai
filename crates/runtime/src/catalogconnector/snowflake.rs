@@ -32,7 +32,7 @@ use snowflake_api::SnowflakeApi;
 use std::any::Any;
 use std::sync::Arc;
 
-pub const PREFIX: &str = "snowflake";
+pub(crate) const PREFIX: &str = "snowflake";
 const SNOWFLAKE_DOCS: &str = "https://spiceai.org/docs/components/catalogs/snowflake";
 const SNOWFLAKE_ACCOUNT_IDENTIFIER_DOCS: &str =
     "https://docs.snowflake.com/en/user-guide/admin-account-identifier";
@@ -45,7 +45,7 @@ pub enum Error {
     MissingParameter { parameter: String },
 }
 
-pub const PARAMETERS: &[ParameterSpec] = &[
+pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("username")
         .secret()
         .description("Snowflake username for password or key-pair authentication.")
@@ -103,7 +103,7 @@ pub struct SnowflakeCatalog {
 
 impl SnowflakeCatalog {
     #[must_use]
-    pub fn new_connector(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
+    pub(crate) fn new_connector(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
         Arc::new(Self { params })
     }
 }

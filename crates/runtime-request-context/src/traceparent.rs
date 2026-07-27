@@ -27,7 +27,7 @@ pub struct TraceParent {
     pub span_id: SpanId,
 }
 
-pub fn extract_trace_parent(headers: &HeaderMap) -> Result<Option<TraceParent>, String> {
+pub(crate) fn extract_trace_parent(headers: &HeaderMap) -> Result<Option<TraceParent>, String> {
     let Some(header_value) = headers.get(TRACEPARENT_HEADER).map(|v| v.to_str()) else {
         return Ok(None);
     };

@@ -26,11 +26,11 @@ pub use lookup::*;
 #[derive(Clone, Copy, Debug)]
 pub struct RangeRecord {
     /// First glyph ID in the range
-    pub start: GlyphId,
+    start: GlyphId,
     /// Last glyph ID in the range
-    pub end: GlyphId,
+    end: GlyphId,
     /// Coverage Index of first glyph ID in range.
-    pub value: u16,
+    value: u16,
 }
 
 impl LazyArray16<'_, RangeRecord> {

@@ -222,7 +222,7 @@ impl<'a> Table<'a> {
     }
 
     /// Selects the best matching [`Strike`] based on `pixels_per_em`.
-    pub fn best_strike(&self, pixels_per_em: u16) -> Option<Strike<'a>> {
+    pub(crate) fn best_strike(&self, pixels_per_em: u16) -> Option<Strike<'a>> {
         let mut idx = 0;
         let mut max_ppem = 0;
         for (i, strike) in self.strikes.into_iter().enumerate() {

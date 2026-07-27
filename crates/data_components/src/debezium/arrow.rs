@@ -150,11 +150,11 @@ pub fn convert_fields_to_arrow_schema(fields: Vec<&ChangeEventField>) -> Result<
     Ok(Schema::new(arrow_fields))
 }
 
-pub fn to_record_batch(values: Vec<serde_json::Value>, schema: &Schema) -> Result<RecordBatch> {
+pub(crate) fn to_record_batch(values: Vec<serde_json::Value>, schema: &Schema) -> Result<RecordBatch> {
     Ok(to_struct_array(values, schema)?.into())
 }
 
-pub fn to_struct_array(values: Vec<serde_json::Value>, schema: &Schema) -> Result<StructArray> {
+fn to_struct_array(values: Vec<serde_json::Value>, schema: &Schema) -> Result<StructArray> {
     let mut struct_builder = StructBuilder::from_fields(schema.fields().clone(), values.len());
 
     for value in values {
@@ -164,7 +164,7 @@ pub fn to_struct_array(values: Vec<serde_json::Value>, schema: &Schema) -> Resul
     Ok(struct_builder.finish())
 }
 
-pub fn append_value_to_struct_builder(
+fn append_value_to_struct_builder(
     value: serde_json::Value,
     builder: &mut StructBuilder,
 ) -> Result<()> {
@@ -439,7 +439,7 @@ pub(crate) fn downcast_builder<T: ArrayBuilder>(builder: &mut dyn ArrayBuilder) 
 
 /// Parse a decimal from a Debezium JSON field value.
 /// Delegates to [`arrow_tools::decimal::convert_json_to_decimal`].
-pub fn convert_json_to_decimal(v: &Json, target_scale: i8) -> Result<Option<i128>> {
+fn convert_json_to_decimal(v: &Json, target_scale: i8) -> Result<Option<i128>> {
     decimal::convert_json_to_decimal(v, target_scale).map_err(|e| match e {
         decimal::Error::Overflow => Error::VariableScaleDecimalParsingOverflow,
         decimal::Error::Invalid { reason } => Error::InvalidDecimalJson { reason },

@@ -648,7 +648,7 @@ impl HttpTableProvider {
     }
 
     #[must_use]
-    pub fn max_request_partitions(&self) -> Option<usize> {
+    fn max_request_partitions(&self) -> Option<usize> {
         self.max_request_partitions
     }
 
@@ -826,7 +826,7 @@ impl HttpTableProvider {
     }
 
     #[must_use]
-    pub fn is_paginated(&self) -> bool {
+    fn is_paginated(&self) -> bool {
         self.pagination.is_some()
     }
 
@@ -1529,7 +1529,7 @@ impl HttpExec {
 
     /// Returns the maximum number of request partitions allowed, if configured.
     #[must_use]
-    pub fn max_request_partitions(&self) -> Option<usize> {
+    fn max_request_partitions(&self) -> Option<usize> {
         self.provider.max_request_partitions()
     }
 

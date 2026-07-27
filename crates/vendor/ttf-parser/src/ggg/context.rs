@@ -103,16 +103,16 @@ pub type SequenceRuleSet<'a> = LazyOffsetArray16<'a, SequenceRule<'a>>;
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug)]
 pub struct SequenceRule<'a> {
-    pub input: LazyArray16<'a, u16>,
-    pub lookups: LazyArray16<'a, SequenceLookupRecord>,
+    input: LazyArray16<'a, u16>,
+    lookups: LazyArray16<'a, SequenceLookupRecord>,
 }
 
 /// A sequence rule record.
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug)]
 pub struct SequenceLookupRecord {
-    pub sequence_index: u16,
-    pub lookup_list_index: LookupIndex,
+    sequence_index: u16,
+    lookup_list_index: LookupIndex,
 }
 
 impl FromData for SequenceLookupRecord {

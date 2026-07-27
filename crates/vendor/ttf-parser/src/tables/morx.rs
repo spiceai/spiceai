@@ -20,13 +20,13 @@ use crate::{aat, GlyphId};
 #[derive(Clone, Copy, Debug)]
 pub struct Feature {
     /// The type of feature.
-    pub kind: u16,
+    kind: u16,
     /// The feature's setting (aka selector).
-    pub setting: u16,
+    setting: u16,
     /// Flags for the settings that this feature and setting enables.
-    pub enable_flags: u32,
+    enable_flags: u32,
     /// Complement of flags for the settings that this feature and setting disable.
-    pub disable_flags: u32,
+    disable_flags: u32,
 }
 
 impl FromData for Feature {
@@ -48,9 +48,9 @@ impl FromData for Feature {
 #[derive(Clone, Copy, Debug)]
 pub struct ContextualEntryData {
     /// A mark index.
-    pub mark_index: u16,
+    mark_index: u16,
     /// A current index.
-    pub current_index: u16,
+    current_index: u16,
 }
 
 impl FromData for ContextualEntryData {
@@ -70,7 +70,7 @@ impl FromData for ContextualEntryData {
 #[derive(Clone)]
 pub struct ContextualSubtable<'a> {
     /// The contextual glyph substitution state table.
-    pub state: aat::ExtendedStateTable<'a, ContextualEntryData>,
+    state: aat::ExtendedStateTable<'a, ContextualEntryData>,
     offsets_data: &'a [u8],
     offsets: LazyArray32<'a, Offset32>,
     number_of_glyphs: NonZeroU16,
@@ -117,13 +117,13 @@ impl core::fmt::Debug for ContextualSubtable<'_> {
 #[derive(Clone, Debug)]
 pub struct LigatureSubtable<'a> {
     /// A state table.
-    pub state: aat::ExtendedStateTable<'a, u16>,
+    state: aat::ExtendedStateTable<'a, u16>,
     /// Ligature actions.
-    pub ligature_actions: LazyArray32<'a, u32>,
+    ligature_actions: LazyArray32<'a, u32>,
     /// Ligature components.
-    pub components: LazyArray32<'a, u16>,
+    components: LazyArray32<'a, u16>,
     /// Ligatures.
-    pub ligatures: LazyArray32<'a, GlyphId>,
+    ligatures: LazyArray32<'a, GlyphId>,
 }
 
 impl<'a> LigatureSubtable<'a> {
@@ -155,9 +155,9 @@ impl<'a> LigatureSubtable<'a> {
 #[derive(Clone, Copy, Debug)]
 pub struct InsertionEntryData {
     /// A current insert index.
-    pub current_insert_index: u16,
+    current_insert_index: u16,
     /// A marked insert index.
-    pub marked_insert_index: u16,
+    marked_insert_index: u16,
 }
 
 impl FromData for InsertionEntryData {
@@ -177,9 +177,9 @@ impl FromData for InsertionEntryData {
 #[derive(Clone, Debug)]
 pub struct InsertionSubtable<'a> {
     /// A state table.
-    pub state: aat::ExtendedStateTable<'a, InsertionEntryData>,
+    state: aat::ExtendedStateTable<'a, InsertionEntryData>,
     /// Insertion glyphs.
-    pub glyphs: LazyArray32<'a, GlyphId>,
+    glyphs: LazyArray32<'a, GlyphId>,
 }
 
 impl<'a> InsertionSubtable<'a> {
@@ -229,11 +229,11 @@ impl Coverage {
 #[derive(Clone, Debug)]
 pub struct Subtable<'a> {
     /// A subtable kind.
-    pub kind: SubtableKind<'a>,
+    kind: SubtableKind<'a>,
     /// A subtable coverage.
-    pub coverage: Coverage,
+    coverage: Coverage,
     /// Subtable feature flags.
-    pub feature_flags: u32,
+    feature_flags: u32,
 }
 
 /// A list of subtables in a metamorphosis chain.
@@ -339,11 +339,11 @@ impl<'a> Iterator for SubtablesIter<'a> {
 #[derive(Clone, Copy, Debug)]
 pub struct Chain<'a> {
     /// Default chain features.
-    pub default_flags: u32,
+    default_flags: u32,
     /// A list of chain features.
-    pub features: LazyArray32<'a, Feature>,
+    features: LazyArray32<'a, Feature>,
     /// A list of chain subtables.
-    pub subtables: Subtables<'a>,
+    subtables: Subtables<'a>,
 }
 
 /// A list of metamorphosis chains.
@@ -451,7 +451,7 @@ impl<'a> Iterator for ChainsIter<'a> {
 #[derive(Clone)]
 pub struct Table<'a> {
     /// A list of metamorphosis chains.
-    pub chains: Chains<'a>,
+    chains: Chains<'a>,
 }
 
 impl core::fmt::Debug for Table<'_> {
@@ -464,7 +464,7 @@ impl<'a> Table<'a> {
     /// Parses a table from raw data.
     ///
     /// `number_of_glyphs` is from the `maxp` table.
-    pub fn parse(number_of_glyphs: NonZeroU16, data: &'a [u8]) -> Option<Self> {
+    pub(crate) fn parse(number_of_glyphs: NonZeroU16, data: &'a [u8]) -> Option<Self> {
         Chains::parse(number_of_glyphs, data).map(|chains| Self { chains })
     }
 }

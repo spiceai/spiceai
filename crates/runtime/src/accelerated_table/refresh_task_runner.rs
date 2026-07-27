@@ -331,7 +331,7 @@ impl RefreshTaskRunner {
     }
 
     /// Subscribes a new acceleration table provider to the existing `AccelerationSink` managed by this `RefreshTask`.
-    pub async fn add_synchronized_table(&self, synchronized_table: SynchronizedTable) {
+    pub(crate) async fn add_synchronized_table(&self, synchronized_table: SynchronizedTable) {
         self.refresh_task
             .add_synchronized_table(synchronized_table)
             .await;

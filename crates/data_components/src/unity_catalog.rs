@@ -277,7 +277,7 @@ impl UnityCatalog {
         .await
     }
 
-    pub async fn list_schemas(&self, catalog_id: &str) -> Result<Option<Vec<UCSchema>>> {
+    async fn list_schemas(&self, catalog_id: &str) -> Result<Option<Vec<UCSchema>>> {
         let encoded_catalog =
             percent_encoding::utf8_percent_encode(catalog_id, percent_encoding::NON_ALPHANUMERIC);
         let path = format!("/api/2.1/unity-catalog/schemas?catalog_name={encoded_catalog}");
@@ -307,7 +307,7 @@ impl UnityCatalog {
         .await
     }
 
-    pub async fn list_tables(
+    async fn list_tables(
         &self,
         catalog_id: &str,
         schema_name: &str,
@@ -387,7 +387,7 @@ impl UnityCatalog {
     /// On Databricks, credential vending requires the metastore to have
     /// external data access enabled and the calling principal to hold the
     /// `EXTERNAL USE SCHEMA` privilege on the table's schema.
-    pub async fn temporary_table_credentials(
+    async fn temporary_table_credentials(
         &self,
         table_id: &str,
         operation: TableOperation,
@@ -585,7 +585,7 @@ impl UnityCatalog {
 #[derive(Debug, Clone, Deserialize)]
 pub struct UCTableEnvelope {
     #[serde(default)]
-    pub tables: Vec<UCTable>,
+    tables: Vec<UCTable>,
 }
 
 /// Response from `/api/2.1/unity-catalog/tables/{table_name}`
@@ -610,13 +610,13 @@ pub struct UCTable {
 impl UCTable {
     /// Returns the fully qualified name of the table: `catalog.schema.table`.
     #[must_use]
-    pub fn full_name(&self) -> String {
+    pub(crate) fn full_name(&self) -> String {
         format!("{}.{}.{}", self.catalog_name, self.schema_name, self.name)
     }
 
     /// Returns the parsed [`UCTableType`] for this table.
     #[must_use]
-    pub fn parsed_table_type(&self) -> UCTableType {
+    fn parsed_table_type(&self) -> UCTableType {
         UCTableType::from(self.table_type.as_str())
     }
 
@@ -654,7 +654,7 @@ pub enum UCTableType {
 impl UCTableType {
     /// Returns `true` if tables of this type can be queried directly.
     #[must_use]
-    pub const fn is_queryable(self) -> bool {
+    const fn is_queryable(self) -> bool {
         matches!(
             self,
             Self::Managed | Self::External | Self::Foreign | Self::MaterializedView
@@ -664,7 +664,7 @@ impl UCTableType {
     /// Returns `true` when UC effective-permissions is authoritative enough to
     /// reject access up front.
     #[must_use]
-    pub const fn requires_read_permission_validation(self) -> bool {
+    const fn requires_read_permission_validation(self) -> bool {
         !matches!(self, Self::Foreign)
     }
 }
@@ -685,35 +685,35 @@ impl From<&str> for UCTableType {
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct UCColumn {
-    pub name: String,
-    pub type_text: String,
-    pub type_name: String,
+    name: String,
+    type_text: String,
+    type_name: String,
     #[serde(default)]
-    pub position: Option<i64>,
+    position: Option<i64>,
     #[serde(default)]
-    pub type_precision: Option<i64>,
+    type_precision: Option<i64>,
     #[serde(default)]
-    pub type_scale: Option<i64>,
+    type_scale: Option<i64>,
     #[serde(default)]
-    pub type_json: Option<String>,
-    pub nullable: bool,
+    type_json: Option<String>,
+    nullable: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UCCatalog {
-    pub name: String,
+    name: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UCSchemaEnvelope {
     #[serde(default)]
-    pub schemas: Vec<UCSchema>,
+    schemas: Vec<UCSchema>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UCSchema {
-    pub name: String,
-    pub catalog_name: String,
+    name: String,
+    catalog_name: String,
 }
 
 // ============================================================================
@@ -729,7 +729,7 @@ pub enum TableOperation {
 
 impl TableOperation {
     #[must_use]
-    pub const fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::Read => "READ",
             Self::ReadWrite => "READ_WRITE",
@@ -744,19 +744,19 @@ impl TableOperation {
 #[derive(Clone, Deserialize)]
 pub struct TemporaryTableCredentials {
     #[serde(default)]
-    pub aws_temp_credentials: Option<AwsTempCredentials>,
+    aws_temp_credentials: Option<AwsTempCredentials>,
     #[serde(default)]
-    pub azure_user_delegation_sas: Option<AzureUserDelegationSas>,
+    azure_user_delegation_sas: Option<AzureUserDelegationSas>,
     #[serde(default)]
-    pub gcp_oauth_token: Option<GcpOauthToken>,
+    gcp_oauth_token: Option<GcpOauthToken>,
     #[serde(default)]
-    pub r2_temp_credentials: Option<R2TempCredentials>,
+    r2_temp_credentials: Option<R2TempCredentials>,
     /// Expiration of the credentials as epoch milliseconds.
     #[serde(default)]
-    pub expiration_time: i64,
+    expiration_time: i64,
     /// The storage URL the credentials are scoped to.
     #[serde(default)]
-    pub url: Option<String>,
+    url: Option<String>,
 }
 
 // Manual `Debug` so credential material can never leak into logs.
@@ -779,31 +779,31 @@ impl std::fmt::Debug for TemporaryTableCredentials {
 /// Temporary AWS STS credentials vended by Unity Catalog.
 #[derive(Clone, Deserialize)]
 pub struct AwsTempCredentials {
-    pub access_key_id: String,
-    pub secret_access_key: String,
+    access_key_id: String,
+    secret_access_key: String,
     #[serde(default)]
-    pub session_token: Option<String>,
+    session_token: Option<String>,
 }
 
 /// Azure user-delegation SAS token vended by Unity Catalog.
 #[derive(Clone, Deserialize)]
 pub struct AzureUserDelegationSas {
-    pub sas_token: String,
+    sas_token: String,
 }
 
 /// GCP OAuth token vended by Unity Catalog.
 #[derive(Clone, Deserialize)]
 pub struct GcpOauthToken {
-    pub oauth_token: String,
+    oauth_token: String,
 }
 
 /// Temporary Cloudflare R2 credentials vended by Unity Catalog.
 #[derive(Clone, Deserialize)]
 pub struct R2TempCredentials {
-    pub access_key_id: String,
-    pub secret_access_key: String,
+    access_key_id: String,
+    secret_access_key: String,
     #[serde(default)]
-    pub session_token: Option<String>,
+    session_token: Option<String>,
 }
 
 // ============================================================================
@@ -814,21 +814,21 @@ pub struct R2TempCredentials {
 #[derive(Debug, Clone, Deserialize)]
 pub struct UCPermissionsEnvelope {
     #[serde(default)]
-    pub privilege_assignments: Vec<UCPrivilegeAssignment>,
+    privilege_assignments: Vec<UCPrivilegeAssignment>,
 }
 
 /// A single privilege assignment returned by the UC permissions endpoint.
 #[derive(Debug, Clone, Deserialize)]
 pub struct UCPrivilegeAssignment {
-    pub principal: String,
+    principal: String,
     #[serde(default)]
-    pub privileges: Vec<UCPrivilege>,
+    privileges: Vec<UCPrivilege>,
 }
 
 /// A single privilege entry.
 #[derive(Debug, Clone, Deserialize)]
 pub struct UCPrivilege {
-    pub privilege: String,
+    privilege: String,
 }
 
 /// The subset of UC privileges relevant to read operations.

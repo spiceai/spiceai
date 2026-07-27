@@ -19,7 +19,7 @@ use util::concat_arrays;
 use super::{COMMON_MODEL_PARAMETERS_WITH_DEPRECATED, PARAM_WITH_DEPRE_LEN};
 use crate::parameters::ParameterSpec;
 
-pub(crate) const BEDROCK_PARAMETERS: [ParameterSpec; 8] = [
+const BEDROCK_PARAMETERS: [ParameterSpec; 8] = [
     ParameterSpec::runtime("aws_access_key_id")
         .description("The AWS access key ID to use for Bedrock models")
         .secret(),

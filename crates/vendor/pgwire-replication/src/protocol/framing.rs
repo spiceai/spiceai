@@ -6,42 +6,42 @@ use crate::error::{PgWireError, Result};
 
 /// Maximum backend message size (1GB) - prevents memory exhaustion from malformed length fields
 /// This is more than enough.
-pub const MAX_MESSAGE_SIZE: usize = 1024 * 1024 * 1024;
+pub(crate) const MAX_MESSAGE_SIZE: usize = 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendMessage {
-    pub tag: u8,
-    pub payload: Bytes, // payload excludes the 4-byte length field
+    pub(crate) tag: u8,
+    pub(crate) payload: Bytes, // payload excludes the 4-byte length field
 }
 
 impl BackendMessage {
     /// Returns true if this is an `ErrorResponse` ('E')
     #[inline]
-    pub fn is_error(&self) -> bool {
+    fn is_error(&self) -> bool {
         self.tag == b'E'
     }
 
     /// Returns true if this is a `ReadyForQuery` ('Z')
     #[inline]
-    pub fn is_ready_for_query(&self) -> bool {
+    fn is_ready_for_query(&self) -> bool {
         self.tag == b'Z'
     }
 
     /// Returns true if this is `CopyBothResponse` ('W')
     #[inline]
-    pub fn is_copy_both_response(&self) -> bool {
+    fn is_copy_both_response(&self) -> bool {
         self.tag == b'W'
     }
 
     /// Returns true if this is `CopyData` ('d')
     #[inline]
-    pub fn is_copy_data(&self) -> bool {
+    fn is_copy_data(&self) -> bool {
         self.tag == b'd'
     }
 
     /// Returns true if this is `AuthenticationRequest` ('R')
     #[inline]
-    pub fn is_auth_request(&self) -> bool {
+    fn is_auth_request(&self) -> bool {
         self.tag == b'R'
     }
 }
@@ -51,7 +51,7 @@ impl BackendMessage {
 /// # Errors
 /// Returns [`PgWireError::Io`] on a read failure or EOF, or
 /// [`PgWireError::Protocol`] if the framed length is invalid or oversized.
-pub async fn read_backend_message<R: AsyncRead + Unpin>(rd: &mut R) -> Result<BackendMessage> {
+pub(crate) async fn read_backend_message<R: AsyncRead + Unpin>(rd: &mut R) -> Result<BackendMessage> {
     let mut reader = MessageReader::new();
     reader.read(rd).await
 }
@@ -87,7 +87,7 @@ impl MessageReader {
     }
 
     #[must_use]
-    pub fn with_capacity(capacity: usize) -> Self {
+    fn with_capacity(capacity: usize) -> Self {
         Self {
             hdr: [0u8; 5],
             hdr_filled: 0,
@@ -241,7 +241,7 @@ impl FrameReader {
     }
 
     #[must_use]
-    pub fn with_capacity(capacity: usize, max_message_size: usize) -> Self {
+    fn with_capacity(capacity: usize, max_message_size: usize) -> Self {
         Self {
             buf: BytesMut::with_capacity(capacity),
             max_message_size,
@@ -259,7 +259,7 @@ impl FrameReader {
     /// and to assert the anti-amplification bound in tests.
     #[inline]
     #[must_use]
-    pub fn capacity(&self) -> usize {
+    fn capacity(&self) -> usize {
         self.buf.capacity()
     }
 
@@ -271,7 +271,7 @@ impl FrameReader {
     /// malformed — a malformed header surfaces as an error from `next`.
     #[inline]
     #[must_use]
-    pub fn has_buffered_frame(&self) -> bool {
+    pub(crate) fn has_buffered_frame(&self) -> bool {
         matches!(self.frame_len(), Ok(Some(frame_len)) if self.buf.len() >= frame_len)
     }
 
@@ -415,7 +415,7 @@ pub async fn read_backend_message_into<R: AsyncRead + Unpin>(
 ///
 /// # Errors
 /// Returns [`PgWireError::Io`] if the write or flush fails.
-pub async fn write_ssl_request<W: AsyncWrite + Unpin>(wr: &mut W) -> Result<()> {
+pub(crate) async fn write_ssl_request<W: AsyncWrite + Unpin>(wr: &mut W) -> Result<()> {
     let mut buf = [0u8; 8];
     buf[0..4].copy_from_slice(&(8i32).to_be_bytes());
     buf[4..8].copy_from_slice(&(80_877_103i32).to_be_bytes());
@@ -433,7 +433,7 @@ pub async fn write_ssl_request<W: AsyncWrite + Unpin>(wr: &mut W) -> Result<()> 
     clippy::cast_possible_wrap,
     reason = "startup message length is bounded well below i32::MAX"
 )]
-pub async fn write_startup_message<W: AsyncWrite + Unpin>(
+pub(crate) async fn write_startup_message<W: AsyncWrite + Unpin>(
     wr: &mut W,
     protocol_version: i32,
     params: &[(&str, &str)],
@@ -467,7 +467,7 @@ pub async fn write_startup_message<W: AsyncWrite + Unpin>(
     clippy::cast_possible_wrap,
     reason = "query message length is bounded well below i32::MAX"
 )]
-pub async fn write_query<W: AsyncWrite + Unpin>(wr: &mut W, sql: &str) -> Result<()> {
+pub(crate) async fn write_query<W: AsyncWrite + Unpin>(wr: &mut W, sql: &str) -> Result<()> {
     let mut buf = BytesMut::with_capacity(sql.len() + 64);
     buf.put_u8(b'Q');
     buf.put_i32(0);
@@ -491,7 +491,7 @@ pub async fn write_query<W: AsyncWrite + Unpin>(wr: &mut W, sql: &str) -> Result
     clippy::cast_possible_wrap,
     reason = "password/SASL message length is bounded well below i32::MAX"
 )]
-pub async fn write_password_message<W: AsyncWrite + Unpin>(
+pub(crate) async fn write_password_message<W: AsyncWrite + Unpin>(
     wr: &mut W,
     payload: &[u8],
 ) -> Result<()> {
@@ -517,7 +517,7 @@ pub async fn write_password_message<W: AsyncWrite + Unpin>(
     clippy::cast_possible_wrap,
     reason = "CopyData message length is bounded well below i32::MAX"
 )]
-pub async fn write_copy_data<W: AsyncWrite + Unpin>(wr: &mut W, payload: &[u8]) -> Result<()> {
+pub(crate) async fn write_copy_data<W: AsyncWrite + Unpin>(wr: &mut W, payload: &[u8]) -> Result<()> {
     let mut buf = BytesMut::with_capacity(payload.len() + 16);
     buf.put_u8(b'd');
     buf.put_i32(0);
@@ -535,7 +535,7 @@ pub async fn write_copy_data<W: AsyncWrite + Unpin>(wr: &mut W, payload: &[u8]) 
 ///
 /// # Errors
 /// Returns [`PgWireError::Io`] if the write or flush fails.
-pub async fn write_copy_done<W: AsyncWrite + Unpin>(wr: &mut W) -> Result<()> {
+pub(crate) async fn write_copy_done<W: AsyncWrite + Unpin>(wr: &mut W) -> Result<()> {
     let mut buf = BytesMut::with_capacity(5);
     buf.put_u8(b'c'); // CopyDone
     buf.put_i32(4); // length includes itself; CopyDone has no payload

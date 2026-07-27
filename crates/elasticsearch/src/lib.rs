@@ -54,7 +54,7 @@ impl Error {
     /// succeed on retry. Transient includes HTTP 429 (too many requests), any
     /// 5xx response (500–599), or a timed-out/connect-reset transport error.
     #[must_use]
-    pub fn is_transient(&self) -> bool {
+    fn is_transient(&self) -> bool {
         match self {
             Error::ElasticsearchError { status, .. } => {
                 *status == 429 || (500..=599).contains(status)
@@ -174,9 +174,9 @@ pub struct Client {
 #[derive(Debug, Clone, Copy)]
 pub struct RetryConfig {
     /// Maximum number of retry attempts after the initial request. `0` disables retries.
-    pub max_retries: u32,
+    max_retries: u32,
     /// Initial backoff delay; each subsequent retry doubles the delay (capped at 30s).
-    pub initial_backoff: Duration,
+    initial_backoff: Duration,
 }
 
 impl Default for RetryConfig {
@@ -191,9 +191,9 @@ impl Default for RetryConfig {
 /// Builder-style options for [`Client::new_with_options`].
 #[derive(Debug, Clone)]
 pub struct ClientOptions {
-    pub connect_timeout: Duration,
-    pub request_timeout: Duration,
-    pub retry: RetryConfig,
+    connect_timeout: Duration,
+    request_timeout: Duration,
+    retry: RetryConfig,
 }
 
 impl Default for ClientOptions {
@@ -215,7 +215,7 @@ impl Client {
     }
 
     /// Create a new client with explicit timeout and retry configuration.
-    pub fn new_with_options(
+    fn new_with_options(
         base_url: &str,
         username: Option<&str>,
         password: Option<&str>,
@@ -317,7 +317,7 @@ impl Client {
     }
 
     /// Execute a raw JSON search against `index`.
-    pub async fn search_raw(
+    async fn search_raw(
         &self,
         index: &str,
         body: &serde_json::Value,
@@ -334,7 +334,7 @@ impl Client {
     }
 
     /// Open an Elasticsearch point-in-time reader for `index`.
-    pub async fn open_point_in_time(&self, index: &str, keep_alive: &str) -> Result<String> {
+    async fn open_point_in_time(&self, index: &str, keep_alive: &str) -> Result<String> {
         let url = format!("{}/{index}/_pit", self.base_url);
         let resp = self
             .auth(self.http.post(&url))
@@ -348,7 +348,7 @@ impl Client {
     }
 
     /// Execute a raw JSON search using a point-in-time reader.
-    pub async fn search_point_in_time(&self, body: &serde_json::Value) -> Result<SearchResponse> {
+    async fn search_point_in_time(&self, body: &serde_json::Value) -> Result<SearchResponse> {
         let url = format!("{}/_search", self.base_url);
         let resp = self
             .auth(self.http.post(&url))
@@ -361,7 +361,7 @@ impl Client {
     }
 
     /// Close an Elasticsearch point-in-time reader.
-    pub async fn close_point_in_time(&self, pit_id: &str) -> Result<()> {
+    async fn close_point_in_time(&self, pit_id: &str) -> Result<()> {
         let url = format!("{}/_pit", self.base_url);
         let resp = self
             .auth(self.http.delete(&url))
@@ -376,7 +376,7 @@ impl Client {
     // ── Index Management ───────────────────────────────────────────────
 
     /// Check whether an index exists via `HEAD /<index>`.
-    pub async fn index_exists(&self, index: &str) -> Result<bool> {
+    async fn index_exists(&self, index: &str) -> Result<bool> {
         let url = format!("{}/{}", self.base_url, index);
         let resp = self
             .auth(self.http.head(&url))
@@ -402,7 +402,7 @@ impl Client {
     }
 
     /// Create an index with the provided mapping/settings body via `PUT /<index>`.
-    pub async fn create_index(
+    async fn create_index(
         &self,
         index: &str,
         body: &serde_json::Value,
@@ -419,7 +419,7 @@ impl Client {
     }
 
     /// Update the mapping of an existing index via `PUT /<index>/_mapping`.
-    pub async fn put_mapping(
+    async fn put_mapping(
         &self,
         index: &str,
         body: &serde_json::Value,
@@ -436,7 +436,7 @@ impl Client {
     }
 
     /// Fetch the current `index.refresh_interval` for an index via `GET /<index>/_settings`.
-    pub async fn get_index_refresh_interval(&self, index: &str) -> Result<Option<String>> {
+    async fn get_index_refresh_interval(&self, index: &str) -> Result<Option<String>> {
         let url = format!("{}/{}/_settings", self.base_url, index);
         let resp = self
             .auth(self.http.get(&url))
@@ -464,7 +464,7 @@ impl Client {
     }
 
     /// Update dynamic index settings via `PUT /<index>/_settings`.
-    pub async fn put_index_settings(
+    async fn put_index_settings(
         &self,
         index: &str,
         body: &serde_json::Value,
@@ -481,7 +481,7 @@ impl Client {
     }
 
     /// Make recently indexed documents searchable via `POST /<index>/_refresh`.
-    pub async fn refresh_index(&self, index: &str) -> Result<serde_json::Value> {
+    async fn refresh_index(&self, index: &str) -> Result<serde_json::Value> {
         let url = format!("{}/{}/_refresh", self.base_url, index);
         let resp = self
             .auth(self.http.post(&url))
@@ -493,7 +493,7 @@ impl Client {
     }
 
     /// Force-merge an index via `POST /<index>/_forcemerge`.
-    pub async fn force_merge(
+    async fn force_merge(
         &self,
         index: &str,
         max_num_segments: u32,

@@ -50,7 +50,7 @@ impl fmt::Display for ConversionError {
 
 impl std::error::Error for ConversionError {}
 
-pub struct OtelToArrowConverter {
+pub(crate) struct OtelToArrowConverter {
     time_unix_nano_builder: TimestampNanosecondBuilder,
     start_time_unix_nano_builder: TimestampNanosecondBuilder,
     resource_builder: ResourceBuilder,
@@ -394,7 +394,7 @@ impl AttributesBuilder {
 
 impl OtelToArrowConverter {
     #[must_use]
-    pub fn new(capacity: usize) -> Self {
+    pub(crate) fn new(capacity: usize) -> Self {
         OtelToArrowConverter {
             time_unix_nano_builder: TimestampNanosecondBuilder::with_capacity(capacity)
                 .with_data_type(DataType::Timestamp(
@@ -427,7 +427,7 @@ impl OtelToArrowConverter {
     /// # Errors
     ///
     /// Returns an error if the conversion fails.
-    pub fn convert(
+    pub(crate) fn convert(
         &mut self,
         resource_metrics: &ResourceMetrics,
     ) -> Result<RecordBatch, ConversionError> {

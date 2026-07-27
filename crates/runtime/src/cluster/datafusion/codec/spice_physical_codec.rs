@@ -66,7 +66,7 @@ impl Debug for SpicePhysicalCodec {
 }
 
 impl SpicePhysicalCodec {
-    pub fn new(runtime: Arc<Runtime>) -> Result<Arc<Self>> {
+    pub(crate) fn new(runtime: Arc<Runtime>) -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
             inner: Arc::new(BallistaPhysicalExtensionCodec::default()),
             runtime: Some(runtime),

@@ -336,7 +336,7 @@ fn data_type_tag(data_type: &DataType) -> Option<&'static str> {
 /// # Errors
 /// Returns an error if the directory structure cannot be read or parsing
 /// expected [`ScalarValue`]s fails.
-pub fn discover_hive_partitions(
+fn discover_hive_partitions(
     schema: &dyn ExprSchema,
     base_dir: &Path,
     partitioned_by: &[PartitionedBy],

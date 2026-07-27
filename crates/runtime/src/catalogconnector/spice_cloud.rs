@@ -47,7 +47,7 @@ pub enum Error {
     InvalidPath,
 }
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Clone)]
 pub struct SpiceCloudPlatformCatalog {
@@ -56,7 +56,7 @@ pub struct SpiceCloudPlatformCatalog {
 
 impl SpiceCloudPlatformCatalog {
     #[must_use]
-    pub fn new_connector(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
+    pub(crate) fn new_connector(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
         Arc::new(Self {
             params: params.parameters,
         })

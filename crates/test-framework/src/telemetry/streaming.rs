@@ -34,18 +34,18 @@ use tokio_util::sync::CancellationToken;
 /// A query metric event to be exported
 #[derive(Debug, Clone)]
 pub struct QueryMetricEvent {
-    pub query_name: Arc<str>,
-    pub duration_ms: f64,
-    pub success: bool,
-    pub worker_id: usize,
+    query_name: Arc<str>,
+    duration_ms: f64,
+    success: bool,
+    worker_id: usize,
     /// Reason for failure, if any (e.g., "error", "timeout")
-    pub failure_reason: Option<String>,
+    failure_reason: Option<String>,
 }
 
 impl QueryMetricEvent {
     /// Create a new query metric event
     #[must_use]
-    pub fn new(query_name: String, duration: Duration, success: bool, worker_id: usize) -> Self {
+    pub(crate) fn new(query_name: String, duration: Duration, success: bool, worker_id: usize) -> Self {
         Self {
             query_name: Arc::from(query_name),
             duration_ms: duration.as_secs_f64() * 1000.0,
@@ -57,7 +57,7 @@ impl QueryMetricEvent {
 
     /// Create a new query metric event with a failure reason
     #[must_use]
-    pub fn with_failure(
+    pub(crate) fn with_failure(
         query_name: String,
         duration: Duration,
         worker_id: usize,

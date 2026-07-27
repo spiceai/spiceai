@@ -26,4 +26,4 @@ pub static METER_PROVIDER_ONCE: OnceLock<Arc<dyn MeterProvider + Send + Sync>> =
 /// Before initialization, all metric recording operations are no-ops.
 /// Using `OnceLock` instead of `LazyLock` prevents a race where early access
 /// permanently locks the meter to a noop provider.
-pub static METER: OnceLock<Meter> = OnceLock::new();
+pub(crate) static METER: OnceLock<Meter> = OnceLock::new();

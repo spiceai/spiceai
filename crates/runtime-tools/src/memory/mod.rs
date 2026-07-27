@@ -47,13 +47,13 @@ pub static MEMORY_TABLE_SCHEMA: std::sync::LazyLock<SchemaRef> = std::sync::Lazy
 });
 
 pub struct MemoryTableElement {
-    pub id: Uuid,
-    pub value: String,
-    pub created_by: Option<String>,
-    pub created_at: i64, // Unix timestamp in Seconds
+    id: Uuid,
+    value: String,
+    created_by: Option<String>,
+    created_at: i64, // Unix timestamp in Seconds
 }
 
-pub fn try_from(data: &[MemoryTableElement]) -> Result<RecordBatch, ArrowError> {
+pub(crate) fn try_from(data: &[MemoryTableElement]) -> Result<RecordBatch, ArrowError> {
     let ids = StringArray::from_iter_values(data.iter().map(|d| d.id.to_string()));
     let values = StringArray::from_iter_values(data.iter().map(|d| d.value.as_str()));
     let created_by = data

@@ -19,17 +19,17 @@ pub struct Table {
     /// Units per EM.
     ///
     /// Guarantee to be in a 16..=16384 range.
-    pub units_per_em: u16,
+    pub(crate) units_per_em: u16,
     /// A bounding box that large enough to enclose any glyph from the face.
-    pub global_bbox: Rect,
+    pub(crate) global_bbox: Rect,
     /// An index format used by the [Index to Location Table](
     /// https://docs.microsoft.com/en-us/typography/opentype/spec/loca).
-    pub index_to_location_format: IndexToLocationFormat,
+    pub(crate) index_to_location_format: IndexToLocationFormat,
 }
 
 impl Table {
     /// Parses a table from raw data.
-    pub fn parse(data: &[u8]) -> Option<Self> {
+    pub(crate) fn parse(data: &[u8]) -> Option<Self> {
         // Do not check the exact length, because some fonts include
         // padding in table's length in table records, which is incorrect.
         if data.len() < 54 {

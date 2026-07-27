@@ -45,7 +45,7 @@ pub struct DeltaLake {
 
 impl DeltaLake {
     #[must_use]
-    pub fn new(
+    fn new(
         params: Parameters,
         io_runtime: Handle,
         table_parquet_options: TableParquetOptions,
@@ -68,7 +68,7 @@ impl DeltaLakeFactory {
     }
 
     #[must_use]
-    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+    fn new_arc() -> Arc<dyn DataConnectorFactory> {
         Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
     }
 }

@@ -26,7 +26,7 @@ const DEFAULT_CACHED_PLANS_MAX_CAPACITY: u64 = 512;
 
 impl Runtime {
     #[must_use]
-    pub fn init_caching(cache_config: Option<&CachingConfig>) -> Arc<Caching> {
+    pub(crate) fn init_caching(cache_config: Option<&CachingConfig>) -> Arc<Caching> {
         let Some(cache_config) = cache_config else {
             return Arc::new(Caching::new());
         };

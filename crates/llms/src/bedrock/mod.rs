@@ -49,7 +49,7 @@ use crate::openai::default_rate_controller;
 
 #[derive(Debug, Clone)]
 pub struct BedrockClient {
-    pub(crate) client: Arc<aws_sdk_bedrockruntime::Client>,
+    client: Arc<aws_sdk_bedrockruntime::Client>,
     // Retry strategy for transient or throttling errors
     retry_strategy: FibonacciBackoff,
 
@@ -74,7 +74,7 @@ impl BedrockClient {
     }
 
     /// Perform a [Converse Stream API operation](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ConverseStream.html) with appropriate rate-limiting and retry logic.
-    pub async fn do_converse_stream(
+    async fn do_converse_stream(
         &self,
         converse_build: ConverseStreamFluentBuilder,
     ) -> Result<ConverseStreamOutput, Box<dyn std::error::Error + Send + Sync>> {
@@ -106,7 +106,7 @@ impl BedrockClient {
     }
 
     /// Perform a Converse [API operation](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html) with appropriate rate-limiting and retry logic.
-    pub async fn do_converse(
+    async fn do_converse(
         &self,
         converse_build: ConverseFluentBuilder,
     ) -> Result<ConverseOutput, Box<dyn std::error::Error + Send + Sync>> {
@@ -138,7 +138,7 @@ impl BedrockClient {
     }
 
     /// Perform an Invoke [API operation](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_InvokeModel.html) with appropriate rate-limiting and retry logic.
-    pub async fn do_invoke(
+    async fn do_invoke(
         &self,
         model_id: impl Into<String>,
         body: impl Into<Vec<u8>>,
@@ -179,7 +179,7 @@ impl BedrockClient {
         .await
     }
 
-    pub(crate) async fn rate_limit_request_with_retry<O, Fut, F>(
+    async fn rate_limit_request_with_retry<O, Fut, F>(
         &self,
         make_request: F,
     ) -> Result<O, Box<dyn std::error::Error + Send + Sync>>

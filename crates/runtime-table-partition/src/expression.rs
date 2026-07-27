@@ -54,7 +54,7 @@ pub enum Error {
     },
 }
 
-pub type ValidationResult = Result<(), Error>;
+pub(crate) type ValidationResult = Result<(), Error>;
 
 #[derive(Clone, PartialEq, PartialOrd, Eq, Debug, Hash)]
 pub struct PartitionedBy {
@@ -131,7 +131,7 @@ pub fn validate_partition_expression(expr: &Expr, schema: &DFSchema) -> Validati
 ///
 /// # Errors
 /// Returns an error if the types are incompatible.
-pub fn validate_scalar_compatibility(
+pub(crate) fn validate_scalar_compatibility(
     expr: &Expr,
     scalar: &ScalarValue,
     schema: &DFSchema,
@@ -151,7 +151,7 @@ pub fn validate_scalar_compatibility(
 }
 
 /// Trait for defining validation criteria for an Expr.
-pub trait Criterion: Send + Sync {
+trait Criterion: Send + Sync {
     /// Returns the documentation string for this criterion.
     fn doc(&self) -> String;
 

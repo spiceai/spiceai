@@ -44,7 +44,7 @@ pub struct WriteRateLimitLayer {
 
 impl WriteRateLimitLayer {
     #[must_use]
-    pub fn new(rate_limiter: DirectRateLimiter, enabled: bool) -> Self {
+    pub(crate) fn new(rate_limiter: DirectRateLimiter, enabled: bool) -> Self {
         Self {
             rate_limiter: Arc::new(rate_limiter),
             enabled,

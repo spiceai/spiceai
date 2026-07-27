@@ -26,7 +26,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::str::FromStr;
 
-pub fn convert_to_datafusion_expr(filter: &MetadataFilter) -> Result<Expr> {
+fn convert_to_datafusion_expr(filter: &MetadataFilter) -> Result<Expr> {
     match filter {
         MetadataFilter::Simple(map) => convert_simple_filter(map),
         MetadataFilter::Complex(expr) => convert_expression(expr),

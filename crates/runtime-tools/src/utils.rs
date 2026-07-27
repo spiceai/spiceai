@@ -22,7 +22,7 @@ use schemars::{JsonSchema, schema_for};
 use serde::Serialize;
 use serde_json::Value;
 
-pub fn parameters<T: JsonSchema + Serialize>() -> Option<Value> {
+pub(crate) fn parameters<T: JsonSchema + Serialize>() -> Option<Value> {
     match serde_json::to_value(schema_for!(T)) {
         Ok(v) => Some(v),
         Err(e) => {
@@ -33,7 +33,7 @@ pub fn parameters<T: JsonSchema + Serialize>() -> Option<Value> {
 }
 
 /// Serialize record batches to a JSON string.
-pub fn write_to_json_string(
+pub(crate) fn write_to_json_string(
     data: &[RecordBatch],
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let buf = Vec::new();

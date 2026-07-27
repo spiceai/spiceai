@@ -59,7 +59,7 @@ impl CacheNamespace {
     /// **Must never** include the principal id, which is high-cardinality
     /// and (depending on auth method) sensitive.
     #[must_use]
-    pub fn kind(&self) -> &'static str {
+    pub(crate) fn kind(&self) -> &'static str {
         match self {
             CacheNamespace::Public => "public",
             CacheNamespace::Principal(_) => "principal",

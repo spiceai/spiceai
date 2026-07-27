@@ -40,7 +40,7 @@ pub struct FullTextConnector {
 }
 
 impl FullTextConnector {
-    pub fn new(inner_connector: Arc<dyn DataConnector>) -> Self {
+    pub(crate) fn new(inner_connector: Arc<dyn DataConnector>) -> Self {
         Self { inner_connector }
     }
 

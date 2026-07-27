@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use thiserror::Error;
 
-pub use algorithms::PasswordAlgorithm;
+pub(crate) use algorithms::PasswordAlgorithm;
 
 #[derive(Error, Debug)]
 pub enum DecryptionError {
@@ -202,20 +202,20 @@ pub enum EncryptionVersion<'a> {
 
 #[derive(Clone, Debug, Default)]
 pub struct EncryptionState {
-    pub(crate) version: i64,
-    pub(crate) revision: i64,
-    pub(crate) key_length: Option<usize>,
-    pub(crate) encrypt_metadata: bool,
-    pub(crate) crypt_filters: BTreeMap<Vec<u8>, Arc<dyn CryptFilter>>,
-    pub(crate) file_encryption_key: Vec<u8>,
-    pub(crate) stream_filter: Vec<u8>,
-    pub(crate) string_filter: Vec<u8>,
-    pub(crate) owner_value: Vec<u8>,
-    pub(crate) owner_encrypted: Vec<u8>,
-    pub(crate) user_value: Vec<u8>,
-    pub(crate) user_encrypted: Vec<u8>,
-    pub(crate) permissions: Permissions,
-    pub(crate) permission_encrypted: Vec<u8>,
+    version: i64,
+    revision: i64,
+    key_length: Option<usize>,
+    encrypt_metadata: bool,
+    crypt_filters: BTreeMap<Vec<u8>, Arc<dyn CryptFilter>>,
+    file_encryption_key: Vec<u8>,
+    stream_filter: Vec<u8>,
+    string_filter: Vec<u8>,
+    owner_value: Vec<u8>,
+    owner_encrypted: Vec<u8>,
+    user_value: Vec<u8>,
+    user_encrypted: Vec<u8>,
+    permissions: Permissions,
+    permission_encrypted: Vec<u8>,
 }
 
 impl TryFrom<EncryptionVersion<'_>> for EncryptionState {
@@ -534,7 +534,7 @@ impl EncryptionState {
         self.permission_encrypted.as_ref()
     }
 
-    pub fn decode<P>(document: &Document, password: P) -> Result<Self, Error>
+    pub(crate) fn decode<P>(document: &Document, password: P) -> Result<Self, Error>
     where
         P: AsRef<[u8]>,
     {
@@ -604,7 +604,7 @@ impl EncryptionState {
         Ok(state)
     }
 
-    pub fn encode(&self) -> Result<Dictionary, DecryptionError> {
+    pub(crate) fn encode(&self) -> Result<Dictionary, DecryptionError> {
         let mut encrypted = Dictionary::new();
 
         encrypted.set(b"Filter", Object::Name(b"Standard".to_vec()));
@@ -655,14 +655,14 @@ impl EncryptionState {
         Ok(encrypted)
     }
 
-    pub fn get_stream_filter(&self) -> Arc<dyn CryptFilter> {
+    fn get_stream_filter(&self) -> Arc<dyn CryptFilter> {
         self.crypt_filters
             .get(&self.stream_filter)
             .cloned()
             .unwrap_or(Arc::new(Rc4CryptFilter))
     }
 
-    pub fn get_string_filter(&self) -> Arc<dyn CryptFilter> {
+    fn get_string_filter(&self) -> Arc<dyn CryptFilter> {
         self.crypt_filters
             .get(&self.string_filter)
             .cloned()
@@ -671,7 +671,7 @@ impl EncryptionState {
 }
 
 /// Encrypts `obj`.
-pub fn encrypt_object(
+pub(crate) fn encrypt_object(
     state: &EncryptionState,
     obj_id: ObjectId,
     obj: &mut Object,
@@ -769,7 +769,7 @@ pub fn encrypt_object(
 }
 
 /// Decrypts `obj`.
-pub fn decrypt_object(
+pub(crate) fn decrypt_object(
     state: &EncryptionState,
     obj_id: ObjectId,
     obj: &mut Object,

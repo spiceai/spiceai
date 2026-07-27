@@ -32,7 +32,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Compute MD4 digest. Used in NTLM password hashing.
 #[must_use]
-pub fn md4(data: &[u8]) -> [u8; 16] {
+pub(crate) fn md4(data: &[u8]) -> [u8; 16] {
     let mut hasher = Md4::new();
     hasher.update(data);
     hasher.finalize().into()
@@ -42,7 +42,7 @@ pub fn md4(data: &[u8]) -> [u8; 16] {
 /// other digest helpers.
 #[cfg(test)]
 #[must_use]
-pub fn md5(data: &[u8]) -> [u8; 16] {
+fn md5(data: &[u8]) -> [u8; 16] {
     let mut hasher = Md5::new();
     hasher.update(data);
     hasher.finalize().into()
@@ -50,7 +50,7 @@ pub fn md5(data: &[u8]) -> [u8; 16] {
 
 /// Compute HMAC-MD5. Core of NTLMv2 authentication.
 #[must_use]
-pub fn hmac_md5(key: &[u8], data: &[u8]) -> [u8; 16] {
+pub(crate) fn hmac_md5(key: &[u8], data: &[u8]) -> [u8; 16] {
     // HMAC accepts any key length; `new_from_slice` can never fail here.
     let mut mac = <HmacMd5 as hmac::Mac>::new_from_slice(key)
         .unwrap_or_else(|_| unreachable!("HMAC accepts any key length"));
@@ -60,7 +60,7 @@ pub fn hmac_md5(key: &[u8], data: &[u8]) -> [u8; 16] {
 
 /// Compute SHA-256 digest.
 #[must_use]
-pub fn sha256(data: &[u8]) -> [u8; 32] {
+fn sha256(data: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(data);
     hasher.finalize().into()
@@ -68,7 +68,7 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
 
 /// Compute SHA-512 digest. Used for SMB 3.1.1 preauth integrity hash.
 #[must_use]
-pub fn sha512(data: &[u8]) -> [u8; 64] {
+pub(crate) fn sha512(data: &[u8]) -> [u8; 64] {
     let mut hasher = Sha512::new();
     hasher.update(data);
     hasher.finalize().into()
@@ -76,7 +76,7 @@ pub fn sha512(data: &[u8]) -> [u8; 64] {
 
 /// Compute HMAC-SHA256. Used in signing key derivation (SP800-108 KDF).
 #[must_use]
-pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     // HMAC accepts any key length; `new_from_slice` can never fail here.
     let mut mac = <HmacSha256 as hmac::Mac>::new_from_slice(key)
         .unwrap_or_else(|_| unreachable!("HMAC accepts any key length"));
@@ -86,7 +86,7 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
 
 /// Compute AES-128-CMAC (RFC 4493). Used for SMB 3.x message signing.
 #[must_use]
-pub fn aes128_cmac(key: &[u8; 16], data: &[u8]) -> [u8; 16] {
+pub(crate) fn aes128_cmac(key: &[u8; 16], data: &[u8]) -> [u8; 16] {
     // AES-128 key is exactly 16 bytes; `new_from_slice` can never fail here.
     let mut mac = <Cmac<Aes128> as Mac>::new_from_slice(key)
         .unwrap_or_else(|_| unreachable!("AES-128 uses a 16-byte key"));
@@ -95,13 +95,13 @@ pub fn aes128_cmac(key: &[u8; 16], data: &[u8]) -> [u8; 16] {
 }
 
 /// Fill `buf` with random bytes.
-pub fn random_bytes(buf: &mut [u8]) {
+pub(crate) fn random_bytes(buf: &mut [u8]) {
     rand::fill(buf);
 }
 
 /// Encode bytes as lowercase hex string.
 #[must_use]
-pub fn hex_encode(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(bytes.len() * 2);
     for &b in bytes {

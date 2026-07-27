@@ -59,7 +59,7 @@ impl<'a> SingleSubstitution<'a> {
 #[derive(Clone, Copy, Debug)]
 pub struct Sequence<'a> {
     /// A list of substitute glyphs.
-    pub substitutes: LazyArray16<'a, GlyphId>,
+    substitutes: LazyArray16<'a, GlyphId>,
 }
 
 impl<'a> FromSlice<'a> for Sequence<'a> {
@@ -78,8 +78,8 @@ pub type SequenceList<'a> = LazyOffsetArray16<'a, Sequence<'a>>;
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug)]
 pub struct MultipleSubstitution<'a> {
-    pub coverage: Coverage<'a>,
-    pub sequences: SequenceList<'a>,
+    coverage: Coverage<'a>,
+    sequences: SequenceList<'a>,
 }
 
 impl<'a> MultipleSubstitution<'a> {
@@ -105,7 +105,7 @@ impl<'a> MultipleSubstitution<'a> {
 #[derive(Clone, Copy, Debug)]
 pub struct AlternateSet<'a> {
     /// Array of alternate glyph IDs, in arbitrary order.
-    pub alternates: LazyArray16<'a, GlyphId>,
+    alternates: LazyArray16<'a, GlyphId>,
 }
 
 impl<'a> FromSlice<'a> for AlternateSet<'a> {
@@ -124,8 +124,8 @@ pub type AlternateSets<'a> = LazyOffsetArray16<'a, AlternateSet<'a>>;
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug)]
 pub struct AlternateSubstitution<'a> {
-    pub coverage: Coverage<'a>,
-    pub alternate_sets: AlternateSets<'a>,
+    coverage: Coverage<'a>,
+    alternate_sets: AlternateSets<'a>,
 }
 
 impl<'a> AlternateSubstitution<'a> {
@@ -150,9 +150,9 @@ impl<'a> AlternateSubstitution<'a> {
 #[derive(Clone, Copy, Debug)]
 pub struct Ligature<'a> {
     /// Ligature to substitute.
-    pub glyph: GlyphId,
+    glyph: GlyphId,
     /// Glyph components for one ligature.
-    pub components: LazyArray16<'a, GlyphId>,
+    components: LazyArray16<'a, GlyphId>,
 }
 
 impl<'a> FromSlice<'a> for Ligature<'a> {
@@ -181,8 +181,8 @@ pub type LigatureSets<'a> = LazyOffsetArray16<'a, LigatureSet<'a>>;
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug)]
 pub struct LigatureSubstitution<'a> {
-    pub coverage: Coverage<'a>,
-    pub ligature_sets: LigatureSets<'a>,
+    coverage: Coverage<'a>,
+    ligature_sets: LigatureSets<'a>,
 }
 
 impl<'a> LigatureSubstitution<'a> {
@@ -208,10 +208,10 @@ impl<'a> LigatureSubstitution<'a> {
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug)]
 pub struct ReverseChainSingleSubstitution<'a> {
-    pub coverage: Coverage<'a>,
-    pub backtrack_coverages: LazyOffsetArray16<'a, Coverage<'a>>,
-    pub lookahead_coverages: LazyOffsetArray16<'a, Coverage<'a>>,
-    pub substitutes: LazyArray16<'a, GlyphId>,
+    coverage: Coverage<'a>,
+    backtrack_coverages: LazyOffsetArray16<'a, Coverage<'a>>,
+    lookahead_coverages: LazyOffsetArray16<'a, Coverage<'a>>,
+    substitutes: LazyArray16<'a, GlyphId>,
 }
 
 impl<'a> ReverseChainSingleSubstitution<'a> {

@@ -47,7 +47,7 @@ impl Client {
         Self::with_base_url(api_key, BASE_URL)
     }
 
-    pub fn with_base_url(api_key: impl Into<String>, base_url: impl Into<String>) -> Result<Self> {
+    fn with_base_url(api_key: impl Into<String>, base_url: impl Into<String>) -> Result<Self> {
         let api_key = api_key.into();
         if api_key.is_empty() {
             return Err(Error::InvalidApiKey);

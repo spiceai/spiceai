@@ -228,7 +228,7 @@ pub struct FlightSQLTable {
 
 #[expect(clippy::needless_pass_by_value)]
 impl FlightSQLTable {
-    pub async fn create(
+    async fn create(
         name: &'static str,
         endpoint: &str,
         client: FlightSqlClient,
@@ -281,14 +281,14 @@ impl FlightSQLTable {
 
     /// Install the federation function deny-list (see [`FunctionSupport`]).
     #[must_use]
-    pub fn with_function_support(mut self, function_support: Option<FunctionSupport>) -> Self {
+    fn with_function_support(mut self, function_support: Option<FunctionSupport>) -> Self {
         self.function_support = function_support;
         self
     }
 
     /// Set the bearer token to propagate to per-endpoint `DoGet` clients.
     #[must_use]
-    pub fn with_token(mut self, token: String) -> Self {
+    fn with_token(mut self, token: String) -> Self {
         self.token = Some(token);
         self
     }
@@ -328,7 +328,7 @@ impl FlightSQLTable {
     }
 
     #[must_use]
-    pub fn get_table_schema_if_present(
+    fn get_table_schema_if_present(
         batches: Vec<RecordBatch>,
         table_reference: TableReference,
     ) -> Option<SchemaRef> {
@@ -389,7 +389,7 @@ impl FlightSQLTable {
         }
     }
 
-    pub async fn get_schema(
+    async fn get_schema(
         mut client: FlightSqlClient,
         table_reference: TableReference,
     ) -> Result<SchemaRef> {
@@ -632,7 +632,7 @@ impl FlightSqlExec {
     }
 
     #[must_use]
-    pub fn with_token(mut self, token: Option<String>) -> Self {
+    fn with_token(mut self, token: Option<String>) -> Self {
         self.token = token;
         self
     }
@@ -1070,7 +1070,7 @@ fn to_execution_error(e: impl Into<Box<dyn std::error::Error>>) -> DataFusionErr
     DataFusionError::Execution(format!("{}", e.into()))
 }
 
-pub async fn get_client_for_flight_endpoint(
+async fn get_client_for_flight_endpoint(
     client: &FlightSqlClient,
     ep: FlightEndpoint,
     cookie_store: &Arc<CookieStore>,

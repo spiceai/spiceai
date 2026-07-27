@@ -32,7 +32,7 @@ pub use runtime_cluster::{
 };
 pub use runtime_cluster::{executor_selection, service, store, write_through};
 
-pub use startup::{
+pub(crate) use startup::{
     accelerated_tables, executor_request_initial_partitions, first_unready_accelerated_table,
     initialize_partition_metadata, validate_partition_keys,
 };
@@ -104,7 +104,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// calling this function, so that bare, partial, and fully-qualified references
 /// all produce the same key and match correctly against the assignments map.
 #[expect(clippy::implicit_hasher)]
-pub fn get_partition_filter_exprs(
+pub(crate) fn get_partition_filter_exprs(
     tbl: &ResolvedTableReference,
     assignments: &HashMap<ResolvedTableReference, Vec<Expr>>,
 ) -> Vec<Expr> {

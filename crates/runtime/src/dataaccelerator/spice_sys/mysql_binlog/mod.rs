@@ -99,7 +99,7 @@ pub struct MySqlBinlogCheckpoint {
 }
 
 pub struct MySqlBinlogSys {
-    pub dataset_name: String,
+    dataset_name: String,
     acceleration_connection: AccelerationConnection,
 }
 

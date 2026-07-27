@@ -24,7 +24,7 @@ use search::generation::{CandidateGeneration, text_search::index::FullTextDataba
 use crate::candidate::text::TextSearchCandidate;
 
 /// Constructs a [`CandidateGeneration`] for full text search on the underlying [`tantivy::Index`] with full filter and column support via the underlying [`TableProvider`].
-pub async fn as_candidate_generations(
+pub(crate) async fn as_candidate_generations(
     database_index: &FullTextDatabaseIndex,
     df: Arc<dyn QueryEngine>,
     tbl: TableReference,

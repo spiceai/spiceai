@@ -70,7 +70,7 @@ fn loader_concurrency() -> usize {
 /// # Errors
 ///
 /// Returns an error if CSV generation fails or any database operation fails.
-pub async fn load_all(conn_str: &str, warehouses: usize, seed: Option<u64>) -> Result<()> {
+pub(crate) async fn load_all(conn_str: &str, warehouses: usize, seed: Option<u64>) -> Result<()> {
     let tmp_dir = tempfile::tempdir().map_err(|source| crate::Error::Io {
         action: "create seed CSV temp directory".into(),
         source,

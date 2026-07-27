@@ -160,10 +160,10 @@ pub(crate) struct NsqlContextJsonResponse {
     pub(crate) context: String,
 
     /// High-level SQL generation instructions.
-    pub(crate) instructions: Vec<String>,
+    instructions: Vec<String>,
 
     /// SQL engine and dialect details for Spice SQL.
-    pub(crate) sql: NsqlSqlContext,
+    sql: NsqlSqlContext,
 
     /// In-scope datasets with schema, metadata, relationship, key, and index details.
     pub(crate) datasets: Vec<NsqlDatasetContext>,
@@ -178,11 +178,11 @@ pub(crate) struct NsqlContextJsonResponse {
 #[derive(Clone, Debug, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub(crate) struct NsqlSqlContext {
-    pub(crate) engine: String,
-    pub(crate) version: String,
-    pub(crate) dialect: String,
-    pub(crate) parser: String,
-    pub(crate) notes: Vec<String>,
+    engine: String,
+    version: String,
+    dialect: String,
+    parser: String,
+    notes: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -303,35 +303,35 @@ pub(crate) struct NsqlFullTextSearchContext {
 #[derive(Clone, Debug, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub(crate) struct NsqlFunctionContext {
-    pub(crate) summary: String,
-    pub(crate) json: Vec<NsqlFunctionContextEntry>,
-    pub(crate) search: Vec<NsqlFunctionContextEntry>,
-    pub(crate) additional: Vec<NsqlFunctionContextEntry>,
-    pub(crate) spark_compatibility: NsqlSparkFunctionContext,
-    pub(crate) user_defined: Vec<UserFunctionContextEntry>,
+    summary: String,
+    json: Vec<NsqlFunctionContextEntry>,
+    search: Vec<NsqlFunctionContextEntry>,
+    additional: Vec<NsqlFunctionContextEntry>,
+    spark_compatibility: NsqlSparkFunctionContext,
+    user_defined: Vec<UserFunctionContextEntry>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub(crate) struct NsqlSparkFunctionContext {
-    pub(crate) description: String,
-    pub(crate) functions: Vec<String>,
+    description: String,
+    functions: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub(crate) struct NsqlFunctionContextEntry {
-    pub(crate) name: String,
+    name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) syntax: Option<String>,
+    syntax: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) description: Option<String>,
+    description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) function_type: Option<String>,
+    function_type: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub(crate) signatures: Vec<String>,
+    signatures: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) example: Option<String>,
+    example: Option<String>,
 }
 
 #[cfg(test)]
@@ -1997,7 +1997,7 @@ pub(crate) struct UserFunctionContextEntry {
     pub(crate) syntax: Option<String>,
     pub(crate) kind: String,
     pub(crate) volatility: String,
-    pub(crate) from: String,
+    from: String,
     pub(crate) description: Option<String>,
 }
 
@@ -2361,7 +2361,7 @@ fn write_dataset_context_list(
     }
 }
 
-pub(crate) fn render_nsql_dataset_relationship_context(datasets: &[NsqlDatasetContext]) -> String {
+fn render_nsql_dataset_relationship_context(datasets: &[NsqlDatasetContext]) -> String {
     let mut context = String::new();
 
     for dataset in datasets {

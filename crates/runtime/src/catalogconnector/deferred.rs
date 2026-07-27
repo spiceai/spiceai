@@ -38,7 +38,7 @@ impl Debug for DeferredCatalogProvider {
 }
 
 impl DeferredCatalogProvider {
-    pub fn new(rt: Arc<Runtime>, connector: Arc<dyn CatalogConnector>, catalog: Catalog) -> Self {
+    pub(crate) fn new(rt: Arc<Runtime>, connector: Arc<dyn CatalogConnector>, catalog: Catalog) -> Self {
         Self {
             rt,
             connector,
@@ -51,7 +51,7 @@ impl DeferredCatalogProvider {
         Arc::clone(&self.connector)
     }
 
-    pub async fn get_catalog_provider(&self) -> super::Result<Arc<dyn CatalogProvider>> {
+    pub(crate) async fn get_catalog_provider(&self) -> super::Result<Arc<dyn CatalogProvider>> {
         Ok(Arc::clone(&self.connector)
             .refreshable_catalog_provider(Arc::clone(&self.rt), &self.catalog)
             .await?)

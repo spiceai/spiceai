@@ -20,7 +20,7 @@ pub mod duckdb;
 pub mod elasticsearch;
 #[cfg(feature = "s3_vectors")]
 pub mod s3;
-pub mod table;
+pub(crate) mod table;
 
 #[cfg(test)]
 pub mod tests {
@@ -57,10 +57,10 @@ pub mod tests {
     /// This is just a [`MemTable`] that pretends it can support all filter pushdowns.
     /// This is useful for testing explain plans.
     #[derive(Debug)]
-    pub struct ExplainMemTable(pub MemTable, pub &'static str);
+    pub struct ExplainMemTable(MemTable, &'static str);
     impl ExplainMemTable {
         #[must_use]
-        pub fn new(table: MemTable, name: &'static str) -> Self {
+        fn new(table: MemTable, name: &'static str) -> Self {
             Self(table, name)
         }
     }
@@ -319,7 +319,7 @@ pub mod tests {
         clippy::missing_panics_doc
     )]
     #[must_use]
-    pub fn default_value_array(dt: &DataType) -> ArrayRef {
+    fn default_value_array(dt: &DataType) -> ArrayRef {
         match dt {
             DataType::Int8 => Arc::new(Int8Array::from(vec![0])) as ArrayRef,
             DataType::Int16 => Arc::new(Int16Array::from(vec![0])) as ArrayRef,
@@ -363,7 +363,7 @@ pub mod tests {
     /// Creates a [`RecordBatch`] with a single row that has default value of types, as per the [`Schema`].
     #[expect(clippy::missing_panics_doc)]
     #[must_use]
-    pub fn one_row_default_record_batch_for_schema(schema: &Arc<Schema>) -> RecordBatch {
+    fn one_row_default_record_batch_for_schema(schema: &Arc<Schema>) -> RecordBatch {
         let arrays: Vec<ArrayRef> = schema
             .fields()
             .iter()

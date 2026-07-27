@@ -46,12 +46,12 @@ use cayenne::ddl::operations;
 /// and then forward DDL to all connected executor nodes.
 #[derive(Debug)]
 pub struct DistributedCayenneDdlHandler {
-    pub executor_registry: Arc<ExecutorRegistry>,
+    executor_registry: Arc<ExecutorRegistry>,
 }
 
 impl DistributedCayenneDdlHandler {
     #[must_use]
-    pub fn new(executor_registry: Arc<ExecutorRegistry>) -> Self {
+    pub(crate) fn new(executor_registry: Arc<ExecutorRegistry>) -> Self {
         Self { executor_registry }
     }
 }

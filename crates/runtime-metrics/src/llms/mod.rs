@@ -16,7 +16,7 @@ limitations under the License.
 
 use super::{Gauge, LazyLock, Meter, global};
 
-pub static LLMS_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("llm"));
+static LLMS_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("llm"));
 
 pub static STATUS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     LLMS_METER

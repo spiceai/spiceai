@@ -60,7 +60,7 @@ pub enum Error {
     },
 }
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub use connector_postgres_common::{
     ReplicaIdentityOutcome, SkipReason, check_cdc_prerequisites, classify_replica_identity,
@@ -417,7 +417,7 @@ impl std::fmt::Debug for PostgresSchemaProvider {
 
 impl PostgresSchemaProvider {
     #[must_use]
-    pub fn new(
+    fn new(
         pool: Arc<PostgresConnectionPool>,
         schema_name: String,
         table_creator: Arc<dyn Read>,

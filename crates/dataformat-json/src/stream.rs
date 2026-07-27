@@ -87,7 +87,7 @@ impl<R: Read + Send> ArrayToNdjson<R> {
     ///
     /// Returns an error if the input does not start with a valid JSON array opening bracket `[`,
     /// or if there are I/O errors while reading the input.
-    pub fn try_new(mut inner: R) -> io::Result<Self> {
+    pub(crate) fn try_new(mut inner: R) -> io::Result<Self> {
         skip_ws_until(&mut inner, b'[')?; // eat prologue
 
         // Shared tee so we can inspect bytes that serde has read.
@@ -452,7 +452,7 @@ impl JsonPointerReader {
     /// - The input cannot be parsed as valid JSON
     /// - The pointer path does not resolve to a value
     /// - There are I/O errors while reading the input
-    pub fn new<R: Read>(mut reader: R, path: &str) -> io::Result<Self> {
+    fn new<R: Read>(mut reader: R, path: &str) -> io::Result<Self> {
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf)?;
         Self::from_vec(&buf, path)
@@ -467,7 +467,7 @@ impl JsonPointerReader {
     ///
     /// Returns an error if the bytes cannot be parsed as valid JSON or the pointer
     /// path does not resolve to a value.
-    pub fn from_vec(buf: &[u8], path: &str) -> io::Result<Self> {
+    pub(crate) fn from_vec(buf: &[u8], path: &str) -> io::Result<Self> {
         // Strip leading UTF-8 BOM if present so serde_json can parse the input.
         let buf = buf.strip_prefix(&UTF8_BOM).unwrap_or(buf);
 
@@ -531,7 +531,7 @@ const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
 /// # Errors
 ///
 /// Returns an error if the reader is empty or contains only whitespace.
-pub fn peek_first_non_ws_byte<R: BufRead>(reader: &mut R) -> io::Result<u8> {
+pub(crate) fn peek_first_non_ws_byte<R: BufRead>(reader: &mut R) -> io::Result<u8> {
     // Skip UTF-8 BOM if present at the start of the stream.
     // Handle incrementally: the BOM bytes may arrive split across buffers.
     {
@@ -597,7 +597,7 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 ///
 /// This fully parses the JSON via `serde_json::from_slice` to inspect its structure,
 /// so it should only be called on already-buffered data.
-pub fn is_soda_response(buf: &[u8]) -> bool {
+pub(crate) fn is_soda_response(buf: &[u8]) -> bool {
     let buf = buf.strip_prefix(&UTF8_BOM).unwrap_or(buf);
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(buf) else {
         return false;
@@ -665,7 +665,7 @@ fn soda_meta_data_field(field_name: &str) -> Field {
 ///
 /// Returns an error if the JSON is not a valid SODA response (missing `meta.view.columns`
 /// or if the columns array cannot be read).
-pub fn soda_schema_from_meta(
+pub(crate) fn soda_schema_from_meta(
     value: &serde_json::Value,
     include_metadata: bool,
 ) -> io::Result<Schema> {
@@ -729,7 +729,7 @@ impl SodaReader {
     /// - The input cannot be parsed as valid JSON
     /// - The JSON is not a valid SODA response (missing `meta.view.columns` or `data`)
     /// - The `data` field is not an array
-    pub fn new<R: Read>(mut reader: R, include_metadata: bool) -> io::Result<Self> {
+    fn new<R: Read>(mut reader: R, include_metadata: bool) -> io::Result<Self> {
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf)?;
         Self::from_vec(&buf, include_metadata)
@@ -743,7 +743,7 @@ impl SodaReader {
     ///
     /// Returns an error if the bytes cannot be parsed as valid JSON or are not
     /// a valid SODA response.
-    pub fn from_vec(buf: &[u8], include_metadata: bool) -> io::Result<Self> {
+    pub(crate) fn from_vec(buf: &[u8], include_metadata: bool) -> io::Result<Self> {
         // Strip leading UTF-8 BOM if present so serde_json can parse the input.
         let buf = buf.strip_prefix(&UTF8_BOM).unwrap_or(buf);
 
@@ -845,7 +845,7 @@ impl SodaReader {
 
     /// Returns the Arrow schema derived from the SODA response metadata.
     #[must_use]
-    pub fn schema(&self) -> &Schema {
+    pub(crate) fn schema(&self) -> &Schema {
         &self.schema
     }
 }
@@ -916,7 +916,7 @@ enum ParsingState {
 impl ArrayToNdjsonPush {
     /// Create a new push-based adapter
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             buffer: Vec::new(),
             pending: VecDeque::new(),
@@ -929,14 +929,14 @@ impl ArrayToNdjsonPush {
     /// # Errors
     ///
     /// Returns an error if the pushed data contains invalid JSON syntax.
-    pub fn push_bytes(&mut self, data: &[u8]) -> io::Result<()> {
+    pub(crate) fn push_bytes(&mut self, data: &[u8]) -> io::Result<()> {
         self.buffer.extend_from_slice(data);
         self.process_buffer()
     }
 
     /// Try to read processed NDJSON data
     ///
-    pub fn try_read(&mut self) -> ReadResult {
+    pub(crate) fn try_read(&mut self) -> ReadResult {
         if self.pending.is_empty() {
             if matches!(self.state, ParsingState::Complete) {
                 return ReadResult::Eof;
@@ -958,7 +958,7 @@ impl ArrayToNdjsonPush {
 
     /// Check if the adapter has finished processing (reached end of array)
     #[must_use]
-    pub fn is_complete(&self) -> bool {
+    fn is_complete(&self) -> bool {
         matches!(self.state, ParsingState::Complete)
     }
 

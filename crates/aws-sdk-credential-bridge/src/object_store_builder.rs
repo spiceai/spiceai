@@ -154,7 +154,7 @@ impl S3ObjectStoreBuilder {
     ///
     /// Returns an error if the URL doesn't contain a valid bucket name or
     /// if the `client_timeout` parameter cannot be parsed.
-    pub fn from_url_with_params(url: &Url, io_runtime: Handle) -> Result<Self> {
+    fn from_url_with_params(url: &Url, io_runtime: Handle) -> Result<Self> {
         let mut builder = Self::from_url(url, io_runtime)?;
 
         let params: HashMap<String, String> =
@@ -174,7 +174,7 @@ impl S3ObjectStoreBuilder {
     /// # Errors
     ///
     /// Returns an error if the `client_timeout` parameter cannot be parsed.
-    pub fn with_params(mut self, params: &HashMap<String, String>) -> Result<Self> {
+    fn with_params(mut self, params: &HashMap<String, String>) -> Result<Self> {
         if let Some(region) = params.get("region").or_else(|| params.get("s3_region")) {
             self.region = Some(region.clone());
         }
@@ -257,21 +257,21 @@ impl S3ObjectStoreBuilder {
 
     /// Sets the AWS region.
     #[must_use]
-    pub fn with_region(mut self, region: impl Into<String>) -> Self {
+    fn with_region(mut self, region: impl Into<String>) -> Self {
         self.region = Some(region.into());
         self
     }
 
     /// Sets a custom S3 endpoint.
     #[must_use]
-    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+    fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.endpoint = Some(endpoint.into());
         self
     }
 
     /// Sets explicit AWS credentials.
     #[must_use]
-    pub fn with_credentials(
+    fn with_credentials(
         mut self,
         access_key_id: impl Into<String>,
         secret_access_key: impl Into<String>,
@@ -283,14 +283,14 @@ impl S3ObjectStoreBuilder {
 
     /// Sets a session token for temporary credentials.
     #[must_use]
-    pub fn with_session_token(mut self, token: impl Into<String>) -> Self {
+    fn with_session_token(mut self, token: impl Into<String>) -> Self {
         self.session_token = Some(token.into());
         self
     }
 
     /// Sets the client request timeout.
     #[must_use]
-    pub fn with_client_timeout(mut self, timeout: Duration) -> Self {
+    fn with_client_timeout(mut self, timeout: Duration) -> Self {
         self.client_timeout = Some(timeout);
         self
     }
@@ -304,7 +304,7 @@ impl S3ObjectStoreBuilder {
 
     /// Sets whether to allow HTTP connections (vs HTTPS only).
     #[must_use]
-    pub fn with_allow_http(mut self, allow: bool) -> Self {
+    fn with_allow_http(mut self, allow: bool) -> Self {
         self.allow_http = Some(allow);
         self
     }

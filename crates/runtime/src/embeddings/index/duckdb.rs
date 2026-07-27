@@ -80,7 +80,7 @@ pub enum Error {
 }
 
 #[expect(clippy::too_many_arguments)]
-pub(crate) async fn try_from_table(
+async fn try_from_table(
     ds_name: &TableReference,
     column: String,
     config: ColumnLevelEmbeddingConfig,

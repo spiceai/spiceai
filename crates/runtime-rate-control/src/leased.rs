@@ -62,7 +62,7 @@ use snafu::prelude::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, Notify};
 
-pub(crate) const PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION: u32 = 3;
+const PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION: u32 = 3;
 
 const MAX_LEASE_RETRIES: usize = 3;
 /// Number of windows of history to retain in the persisted file.

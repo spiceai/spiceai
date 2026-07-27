@@ -62,7 +62,7 @@ impl Google {
 }
 
 #[must_use]
-pub fn to_completion_usage(usage_metadata: &UsageMetadata) -> CompletionUsage {
+pub(crate) fn to_completion_usage(usage_metadata: &UsageMetadata) -> CompletionUsage {
     // Extract audio tokens
     let prompt_audio_tokens = usage_metadata
         .prompt_tokens_details

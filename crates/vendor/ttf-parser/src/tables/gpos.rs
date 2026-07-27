@@ -71,8 +71,8 @@ impl core::fmt::Debug for HintingDevice<'_> {
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug)]
 pub struct VariationDevice {
-    pub outer_index: u16,
-    pub inner_index: u16,
+    outer_index: u16,
+    inner_index: u16,
 }
 
 /// A [Device Table](
@@ -148,22 +148,22 @@ impl FromData for ValueFormatFlags {
 #[derive(Clone, Copy, Default, Debug)]
 pub struct ValueRecord<'a> {
     /// Horizontal adjustment for placement, in design units.
-    pub x_placement: i16,
+    x_placement: i16,
     /// Vertical adjustment for placement, in design units.
-    pub y_placement: i16,
+    y_placement: i16,
     /// Horizontal adjustment for advance, in design units — only used for horizontal layout.
-    pub x_advance: i16,
+    x_advance: i16,
     /// Vertical adjustment for advance, in design units — only used for vertical layout.
-    pub y_advance: i16,
+    y_advance: i16,
 
     /// A [`Device`] table with horizontal adjustment for placement.
-    pub x_placement_device: Option<Device<'a>>,
+    x_placement_device: Option<Device<'a>>,
     /// A [`Device`] table with vertical adjustment for placement.
-    pub y_placement_device: Option<Device<'a>>,
+    y_placement_device: Option<Device<'a>>,
     /// A [`Device`] table with horizontal adjustment for advance.
-    pub x_advance_device: Option<Device<'a>>,
+    x_advance_device: Option<Device<'a>>,
     /// A [`Device`] table with vertical adjustment for advance.
-    pub y_advance_device: Option<Device<'a>>,
+    y_advance_device: Option<Device<'a>>,
 }
 
 impl<'a> ValueRecord<'a> {
@@ -636,8 +636,8 @@ impl core::fmt::Debug for CursiveAnchorSet<'_> {
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug)]
 pub struct CursiveAdjustment<'a> {
-    pub coverage: Coverage<'a>,
-    pub sets: CursiveAnchorSet<'a>,
+    coverage: Coverage<'a>,
+    sets: CursiveAnchorSet<'a>,
 }
 
 impl<'a> CursiveAdjustment<'a> {
@@ -663,13 +663,13 @@ impl<'a> CursiveAdjustment<'a> {
 #[derive(Clone, Copy, Debug)]
 pub struct MarkToBaseAdjustment<'a> {
     /// A mark coverage.
-    pub mark_coverage: Coverage<'a>,
+    mark_coverage: Coverage<'a>,
     /// A base coverage.
-    pub base_coverage: Coverage<'a>,
+    base_coverage: Coverage<'a>,
     /// A list of mark anchors.
-    pub marks: MarkArray<'a>,
+    marks: MarkArray<'a>,
     /// An anchors matrix.
-    pub anchors: AnchorMatrix<'a>,
+    anchors: AnchorMatrix<'a>,
 }
 
 impl<'a> MarkToBaseAdjustment<'a> {
@@ -699,10 +699,10 @@ impl<'a> MarkToBaseAdjustment<'a> {
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug)]
 pub struct MarkToLigatureAdjustment<'a> {
-    pub mark_coverage: Coverage<'a>,
-    pub ligature_coverage: Coverage<'a>,
-    pub marks: MarkArray<'a>,
-    pub ligature_array: LigatureArray<'a>,
+    mark_coverage: Coverage<'a>,
+    ligature_coverage: Coverage<'a>,
+    marks: MarkArray<'a>,
+    ligature_array: LigatureArray<'a>,
 }
 
 impl<'a> MarkToLigatureAdjustment<'a> {
@@ -838,13 +838,13 @@ impl core::fmt::Debug for MarkArray<'_> {
 #[derive(Clone, Copy, Debug)]
 pub struct Anchor<'a> {
     /// Horizontal value, in design units.
-    pub x: i16,
+    x: i16,
     /// Vertical value, in design units.
-    pub y: i16,
+    y: i16,
     /// A [`Device`] table with horizontal value.
-    pub x_device: Option<Device<'a>>,
+    x_device: Option<Device<'a>>,
     /// A [`Device`] table with vertical value.
-    pub y_device: Option<Device<'a>>,
+    y_device: Option<Device<'a>>,
 }
 
 impl<'a> Anchor<'a> {
@@ -886,9 +886,9 @@ impl<'a> Anchor<'a> {
 pub struct AnchorMatrix<'a> {
     data: &'a [u8],
     /// Number of rows in the matrix.
-    pub rows: u16,
+    rows: u16,
     /// Number of columns in the matrix.
-    pub cols: u16,
+    cols: u16,
     matrix: LazyArray32<'a, Option<Offset16>>,
 }
 
@@ -925,10 +925,10 @@ impl core::fmt::Debug for AnchorMatrix<'_> {
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug)]
 pub struct MarkToMarkAdjustment<'a> {
-    pub mark1_coverage: Coverage<'a>,
-    pub mark2_coverage: Coverage<'a>,
-    pub marks: MarkArray<'a>,
-    pub mark2_matrix: AnchorMatrix<'a>,
+    mark1_coverage: Coverage<'a>,
+    mark2_coverage: Coverage<'a>,
+    marks: MarkArray<'a>,
+    mark2_matrix: AnchorMatrix<'a>,
 }
 
 impl<'a> MarkToMarkAdjustment<'a> {

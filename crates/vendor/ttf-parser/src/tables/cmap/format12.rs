@@ -5,9 +5,9 @@ use crate::GlyphId;
 
 #[derive(Clone, Copy)]
 pub struct SequentialMapGroup {
-    pub start_char_code: u32,
-    pub end_char_code: u32,
-    pub start_glyph_id: u32,
+    pub(crate) start_char_code: u32,
+    pub(crate) end_char_code: u32,
+    pub(crate) start_glyph_id: u32,
 }
 
 impl FromData for SequentialMapGroup {
@@ -33,7 +33,7 @@ pub struct Subtable12<'a> {
 
 impl<'a> Subtable12<'a> {
     /// Parses a subtable from raw data.
-    pub fn parse(data: &'a [u8]) -> Option<Self> {
+    pub(crate) fn parse(data: &'a [u8]) -> Option<Self> {
         let mut s = Stream::new(data);
         s.skip::<u16>(); // format
         s.skip::<u16>(); // reserved
@@ -45,7 +45,7 @@ impl<'a> Subtable12<'a> {
     }
 
     /// Returns a glyph index for a code point.
-    pub fn glyph_index(&self, code_point: u32) -> Option<GlyphId> {
+    pub(crate) fn glyph_index(&self, code_point: u32) -> Option<GlyphId> {
         let (_, group) = self.groups.binary_search_by(|range| {
             use core::cmp::Ordering;
 

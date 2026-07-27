@@ -66,7 +66,7 @@ impl MetadataColumn {
     }
 
     #[must_use]
-    pub fn arrow_type(&self) -> DataType {
+    fn arrow_type(&self) -> DataType {
         match self {
             MetadataColumn::Location(_) => DataType::Utf8,
             MetadataColumn::LastModified => {
@@ -82,7 +82,7 @@ impl MetadataColumn {
     }
 
     #[must_use]
-    pub fn value_to_array(&self, meta: &ObjectMeta) -> ArrayRef {
+    pub(crate) fn value_to_array(&self, meta: &ObjectMeta) -> ArrayRef {
         match self {
             MetadataColumn::Location(prefix) => {
                 let prefix = prefix.as_deref().unwrap_or_default();
@@ -296,7 +296,7 @@ impl ExecutionPlan for ObjectStoreMetadataExec {
 }
 
 impl ObjectStoreMetadataExec {
-    pub(crate) fn new(
+    fn new(
         projected_schema: SchemaRef,
         filters: &[Expr],
         limit: Option<usize>,

@@ -44,7 +44,7 @@ use crate::{
 ///
 /// Centralized so the inference hints can be located — and removed from a query
 /// scan's output schema — in one place; see [`strip_inferred_metadata`].
-pub const INFERRED_METADATA_KEYS: [&str; 7] = [
+const INFERRED_METADATA_KEYS: [&str; 7] = [
     INFERRED_PRIMARY_KEY_METADATA_KEY,
     INFERRED_INDEXES_METADATA_KEY,
     INFERRED_SORT_COLUMNS_METADATA_KEY,

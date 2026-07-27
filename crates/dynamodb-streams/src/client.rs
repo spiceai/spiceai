@@ -159,7 +159,7 @@ pub struct ClientBuilder {
 
 impl ClientBuilder {
     #[must_use]
-    pub fn new(sdk_config: SdkConfig, table_name: String) -> Self {
+    fn new(sdk_config: SdkConfig, table_name: String) -> Self {
         Self {
             sdk_config,
             table_name,

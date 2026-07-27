@@ -61,7 +61,7 @@ pub struct DebeziumKafkaSys {
 }
 
 impl DebeziumKafkaSys {
-    pub async fn try_new(dataset: &Dataset, open_option: OpenOption) -> Result<Self> {
+    pub(crate) async fn try_new(dataset: &Dataset, open_option: OpenOption) -> Result<Self> {
         let registry = dataset.runtime.accelerator_engine_registry();
         Ok(Self {
             dataset_name: dataset.name.to_string(),

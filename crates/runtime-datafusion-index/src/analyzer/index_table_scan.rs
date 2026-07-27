@@ -335,7 +335,7 @@ pub(crate) struct IndexerExec {
 }
 
 impl IndexerExec {
-    pub(crate) fn new(
+    fn new(
         input_exec: Arc<dyn ExecutionPlan>,
         indexes: Vec<Arc<dyn Index + Send + Sync>>,
     ) -> Self {
@@ -661,11 +661,11 @@ mod test {
     };
 
     #[derive(Debug, Default)]
-    pub struct TestQueryPlanner {}
+    pub(crate) struct TestQueryPlanner {}
 
     impl TestQueryPlanner {
         #[must_use]
-        pub fn new() -> Self {
+        fn new() -> Self {
             Self {}
         }
     }

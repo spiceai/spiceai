@@ -50,9 +50,9 @@ pub struct FileHandle {
     client: Arc<SmbClient>,
     tree_id: u32,
     file_id: [u8; 16],
-    pub meta: ObjectMeta,
-    pub file_size: u64,
-    pub max_chunk: u32,
+    meta: ObjectMeta,
+    file_size: u64,
+    max_chunk: u32,
 }
 
 impl ShareSession {
@@ -166,7 +166,7 @@ impl ShareSession {
     // ── Streaming file operations ───────────────────────────────────────
 
     /// Open a file for streaming reads. Returns a handle pinned to one connection.
-    pub async fn open_read(&self, key: &str) -> io::Result<FileHandle> {
+    async fn open_read(&self, key: &str) -> io::Result<FileHandle> {
         let (client, tree_id) = self.pick().await?;
         let smb_path = to_smb_path(key);
         let file = client
@@ -838,7 +838,7 @@ impl FileHandle {
     }
 
     /// Pipelined read: send multiple read requests in one batch.
-    pub async fn read_pipeline(
+    async fn read_pipeline(
         &self,
         offset: u64,
         chunk_size: u32,
@@ -860,7 +860,7 @@ impl FileHandle {
     }
 
     /// Close the file handle.
-    pub async fn close(self) -> io::Result<()> {
+    async fn close(self) -> io::Result<()> {
         self.client.close(self.tree_id, &self.file_id).await
     }
 }
@@ -891,7 +891,7 @@ pub struct WalWriter {
     buf: Vec<u8>,
     chunk_size: usize,
     offset: u64,
-    pub total_size: u64,
+    total_size: u64,
 }
 
 impl WalWriter {
@@ -1022,7 +1022,7 @@ pub struct ObjectInfo {
     pub key: String,
     pub size: u64,
     pub last_modified: u64,
-    pub etag: String,
+    etag: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1061,7 +1061,7 @@ fn split_dir_pattern(path: &str) -> (String, String) {
 
 /// Convert Windows FILETIME (100ns since 1601) to Unix epoch seconds.
 #[must_use]
-pub fn filetime_to_epoch_secs(ft: u64) -> u64 {
+fn filetime_to_epoch_secs(ft: u64) -> u64 {
     const EPOCH_DIFF: u64 = 116_444_736_000_000_000;
     if ft <= EPOCH_DIFF {
         return 0;

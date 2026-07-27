@@ -388,7 +388,7 @@ impl RowLocation {
     /// Creates a new row location.
     #[inline]
     #[must_use]
-    pub const fn new(partition: u32, batch: u32, row: u32) -> Self {
+    pub(crate) const fn new(partition: u32, batch: u32, row: u32) -> Self {
         Self {
             partition,
             batch,
@@ -466,7 +466,7 @@ impl HashIndexBuilder {
 
     /// Enables or disables the bloom filter.
     #[must_use]
-    pub fn with_bloom_filter(mut self, enabled: bool) -> Self {
+    pub(crate) fn with_bloom_filter(mut self, enabled: bool) -> Self {
         self.use_bloom_filter = enabled;
         self
     }
@@ -1008,7 +1008,7 @@ impl HashIndex {
 
     /// Creates a new hash index with expected capacity.
     #[must_use]
-    pub fn with_capacity(key_columns: Vec<String>, expected_rows: usize) -> Self {
+    pub(crate) fn with_capacity(key_columns: Vec<String>, expected_rows: usize) -> Self {
         let per_shard = (expected_rows / NUM_SHARDS).max(16);
         let shards: Vec<Shard> = (0..NUM_SHARDS).map(|_| Shard::new(per_shard)).collect();
 
@@ -1022,7 +1022,7 @@ impl HashIndex {
 
     /// Creates a new hash index with bloom filter enabled.
     #[must_use]
-    pub fn with_bloom_filter(key_columns: Vec<String>, expected_items: usize) -> Self {
+    pub(crate) fn with_bloom_filter(key_columns: Vec<String>, expected_items: usize) -> Self {
         let per_shard = (expected_items / NUM_SHARDS).max(16);
         let shards: Vec<Shard> = (0..NUM_SHARDS).map(|_| Shard::new(per_shard)).collect();
 
@@ -1036,7 +1036,7 @@ impl HashIndex {
 
     /// Creates a builder for constructing a hash index.
     #[must_use]
-    pub fn builder(key_columns: Vec<String>) -> HashIndexBuilder {
+    pub(crate) fn builder(key_columns: Vec<String>) -> HashIndexBuilder {
         HashIndexBuilder::new(key_columns)
     }
 
@@ -1048,7 +1048,7 @@ impl HashIndex {
     }
 
     /// Returns the key columns.
-    pub fn key_columns(&self) -> &[String] {
+    pub(crate) fn key_columns(&self) -> &[String] {
         &self.key_columns
     }
 
@@ -1058,12 +1058,12 @@ impl HashIndex {
     }
 
     /// Returns true if empty.
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     /// Returns true if bloom filter is enabled.
-    pub fn has_bloom_filter(&self) -> bool {
+    pub(crate) fn has_bloom_filter(&self) -> bool {
         self.bloom.is_some()
     }
 
@@ -1104,7 +1104,7 @@ impl HashIndex {
 
     /// Checks if index might contain hash (bloom filter only).
     #[inline]
-    pub fn might_contain(&self, hash: u64) -> bool {
+    pub(crate) fn might_contain(&self, hash: u64) -> bool {
         let hash = normalize_hash(hash);
         match &self.bloom {
             Some(bloom) => bloom.read().might_contain(hash),
@@ -1114,7 +1114,7 @@ impl HashIndex {
 
     /// Checks if index contains hash.
     #[inline]
-    pub fn contains(&self, hash: u64) -> bool {
+    pub(crate) fn contains(&self, hash: u64) -> bool {
         self.get_by_hash(hash).is_some()
     }
 
@@ -1164,7 +1164,7 @@ impl HashIndex {
     /// if enabled. The actual memory usage may be slightly higher due to allocator
     /// overhead and struct padding.
     #[must_use]
-    pub fn memory_usage_bytes(&self) -> usize {
+    pub(crate) fn memory_usage_bytes(&self) -> usize {
         // Each slot is 16 bytes (8 byte hash + 8 byte RowLocation which packs into 8 bytes)
         const SLOT_SIZE: usize = 16;
 
@@ -1250,7 +1250,7 @@ impl HashIndex {
     /// # Errors
     ///
     /// Returns an error if key extraction fails for any batch, or if indices overflow u32.
-    pub fn add_batches(
+    pub(crate) fn add_batches(
         &self,
         partition_idx: u32,
         starting_batch_idx: u32,

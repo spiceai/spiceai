@@ -185,7 +185,7 @@ impl SpiceCloudPlatformSchemaProvider {
     /// This method retrieves a list of table names
     /// attempts to create a table provider for each table name, and
     /// collects these providers into a `HashMap`.
-    pub(crate) async fn try_new(
+    async fn try_new(
         client: Arc<RestCatalog>,
         namespace: NamespaceIdent,
         connector: Arc<dyn Read>,

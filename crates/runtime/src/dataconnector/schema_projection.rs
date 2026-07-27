@@ -32,10 +32,10 @@ use crate::dataconnector::{ConnectorComponent, DataConnectorError, DataConnector
 /// Per-connector knobs for parsing a projection.
 pub struct ProjectionPolicy<'a> {
     /// Connector name, used only for error messages (e.g. `"dynamodb"`).
-    pub connector: &'a str,
+    connector: &'a str,
     /// Columns that must be declared explicitly (e.g. primary-key / CDC-key
     /// columns) and may not be folded into the `json_object` catch-all.
-    pub required_columns: Vec<String>,
+    required_columns: Vec<String>,
 }
 
 impl<'a> ProjectionPolicy<'a> {

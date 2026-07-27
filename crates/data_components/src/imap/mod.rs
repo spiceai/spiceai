@@ -82,7 +82,7 @@ impl ImapTableProvider {
         }
     }
 
-    pub(crate) fn build_recordbatch(
+    fn build_recordbatch(
         &self,
         messages: Vec<EmailMessage>,
     ) -> Result<RecordBatch, ArrowError> {

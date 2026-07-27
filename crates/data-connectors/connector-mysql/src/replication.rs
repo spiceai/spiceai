@@ -55,7 +55,7 @@ const DEFAULT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(10);
 const DEFAULT_BOOTSTRAP_BATCH_SIZE: usize = 8192;
 const MAX_BOOTSTRAP_BATCH_SIZE: usize = 1_048_576;
 
-pub fn build_changes_stream(
+pub(crate) fn build_changes_stream(
     params: &Parameters,
     dataset: &Dataset,
     federated_table: Arc<FederatedTable>,

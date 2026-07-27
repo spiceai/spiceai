@@ -1200,7 +1200,7 @@ impl Runtime {
     ///
     /// Returns `None` if neither source yields a schema, in which
     /// case the dataset must take the eager path.
-    pub(crate) async fn try_static_schema_for_dataset(
+    async fn try_static_schema_for_dataset(
         &self,
         ds: &Dataset,
     ) -> Option<arrow_schema::SchemaRef> {

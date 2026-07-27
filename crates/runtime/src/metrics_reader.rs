@@ -79,7 +79,7 @@ impl MetricsReader {
     ///
     /// Returns an empty Vec if collection fails or there are no metrics.
     #[must_use]
-    pub fn collect_otlp(&self) -> Vec<u8> {
+    pub(crate) fn collect_otlp(&self) -> Vec<u8> {
         let mut rm = ResourceMetrics::default();
 
         if let Err(e) = self.reader.collect(&mut rm) {

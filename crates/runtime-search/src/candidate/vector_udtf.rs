@@ -32,7 +32,7 @@ pub struct VectorUDTFGeneration {
 }
 
 impl VectorUDTFGeneration {
-    pub fn new(
+    pub(crate) fn new(
         df: &Arc<dyn QueryEngine>,
         tbl: &TableReference,
         embedding_column: &str,

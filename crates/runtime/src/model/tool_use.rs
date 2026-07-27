@@ -59,7 +59,7 @@ pub struct ToolUsingChat {
 
 impl ToolUsingChat {
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         inner_chat: Arc<dyn Chat>,
         rt: Arc<Runtime>,
         tools: Vec<Arc<dyn SpiceModelTool>>,
@@ -74,7 +74,7 @@ impl ToolUsingChat {
     }
 
     #[must_use]
-    pub fn runtime_tools(&self) -> Vec<ChatCompletionTool> {
+    fn runtime_tools(&self) -> Vec<ChatCompletionTool> {
         self.tools
             .iter()
             .map(|t| ChatCompletionTool {

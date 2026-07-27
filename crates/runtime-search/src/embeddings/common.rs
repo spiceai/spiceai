@@ -64,14 +64,14 @@ pub(crate) fn base_col(col: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
-pub(crate) fn is_float_type(dt: &DataType) -> bool {
+fn is_float_type(dt: &DataType) -> bool {
     matches!(
         dt,
         DataType::Float16 | DataType::Float32 | DataType::Float64
     )
 }
 
-pub(crate) fn is_fixed_size_list_of_floats(dt: &DataType) -> bool {
+fn is_fixed_size_list_of_floats(dt: &DataType) -> bool {
     matches!(dt, DataType::FixedSizeList(field, _) if is_float_type(field.data_type()))
 }
 

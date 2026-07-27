@@ -85,7 +85,7 @@ impl BuiltinToolCatalog {
 
     /// Create a new `BuiltinToolCatalog` with a table allowlist applied to all tools.
     #[must_use]
-    pub fn with_table_allowlist(mut self, allowlist: ResolvedTableAwareAllowlist) -> Self {
+    pub(crate) fn with_table_allowlist(mut self, allowlist: ResolvedTableAwareAllowlist) -> Self {
         self.model_table_allowlist = Some(allowlist);
         self
     }

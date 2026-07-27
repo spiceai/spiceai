@@ -94,7 +94,7 @@ impl std::fmt::Debug for SessionStore {
 impl SessionStore {
     /// Creates a new empty session store with default TTL and max capacity.
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             sessions: Cache::builder()
                 .max_capacity(MAX_SESSIONS)
@@ -123,7 +123,7 @@ impl SessionStore {
     /// long-running sessions may see stale catalog information if the runtime's
     /// registered datasets change.
     #[must_use]
-    pub fn create_session(
+    pub(crate) fn create_session(
         &self,
         base_ctx: &SessionContext,
         api_key: Option<&str>,
@@ -163,7 +163,7 @@ impl SessionStore {
     /// Returns `Some(api_key)` if the session exists and was created with an API key.
     /// Returns `None` if the session doesn't exist or wasn't created with an API key.
     #[must_use]
-    pub fn validate_session(&self, session_id: &str) -> Option<String> {
+    pub(crate) fn validate_session(&self, session_id: &str) -> Option<String> {
         // Only return the principal if the session also exists
         if self.sessions.get(session_id).is_some() {
             self.session_principals.get(session_id)
@@ -177,7 +177,7 @@ impl SessionStore {
     /// Returns `None` if the session doesn't exist or has expired.
     /// Accessing a session refreshes its TTL.
     #[must_use]
-    pub fn get_session(&self, session_id: &str) -> Option<Arc<SessionContext>> {
+    fn get_session(&self, session_id: &str) -> Option<Arc<SessionContext>> {
         self.sessions.get(session_id)
     }
 
@@ -192,7 +192,7 @@ impl SessionStore {
     /// unowned sessions (the latter preserving behavior for unauthenticated
     /// setups).
     #[must_use]
-    pub fn owner_stable_id_from_http(&self, headers: &HeaderMap) -> Option<String> {
+    pub(crate) fn owner_stable_id_from_http(&self, headers: &HeaderMap) -> Option<String> {
         let session_id = extract_session_id_from_headers(headers)?;
         let owner_api_key = self.validate_session(&session_id)?;
         // `ApiKey::stable_id` hashes only the key bytes (group-independent), so
@@ -211,7 +211,7 @@ impl SessionStore {
     ///
     /// Returns `None` if no authorization header is present.
     #[must_use]
-    pub fn get_or_create_session(
+    fn get_or_create_session(
         &self,
         metadata: &MetadataMap,
         base_ctx: &SessionContext,
@@ -242,7 +242,7 @@ impl SessionStore {
     /// using the provided base context.
     ///
     /// Returns `None` if no authorization header is present.
-    pub fn get_or_create_session_from_http(
+    pub(crate) fn get_or_create_session_from_http(
         &self,
         headers: &http::HeaderMap,
         base_ctx: &SessionContext,
@@ -281,7 +281,7 @@ impl SessionStore {
     ///
     /// Returns `true` if the session existed and was removed.
     #[must_use]
-    pub fn remove_session(&self, session_id: &str) -> bool {
+    fn remove_session(&self, session_id: &str) -> bool {
         let removed = self.sessions.remove(session_id).is_some();
         self.sessions.run_pending_tasks();
         removed
@@ -289,7 +289,7 @@ impl SessionStore {
 
     /// Returns the number of active sessions.
     #[must_use]
-    pub fn session_count(&self) -> usize {
+    fn session_count(&self) -> usize {
         // MAX_SESSIONS is 10,000 which fits in usize on all platforms,
         // but we use try_from for explicit safety and better code quality
         if let Ok(count) = usize::try_from(self.sessions.entry_count()) {

@@ -17,8 +17,8 @@ limitations under the License.
 //! Logical optimizer rule that reorders inner-join chains to minimize execution cost.
 
 pub mod cost;
-pub mod join_graph;
-pub mod left_deep_join_plan;
+pub(crate) mod join_graph;
+pub(crate) mod left_deep_join_plan;
 pub mod rule;
 
 #[cfg(test)]

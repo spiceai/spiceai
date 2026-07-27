@@ -35,7 +35,7 @@ use snafu::prelude::*;
 use std::any::Any;
 use std::sync::Arc;
 
-pub const PREFIX: &str = "ducklake";
+pub(crate) const PREFIX: &str = "ducklake";
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -48,7 +48,7 @@ pub enum Error {
     UnableToInitializeDuckLake { source: duckdb::Error },
 }
 
-pub const PARAMETERS: &[ParameterSpec] = &[
+pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("connection_string")
         .description("The DuckLake connection string (e.g., 's3://bucket/path/metadata.ducklake'). If omitted, the catalog id from `from: ducklake:<connection_string>` is used."),
     ParameterSpec::component("name")
@@ -135,7 +135,7 @@ pub struct DuckLakeCatalog {
 
 impl DuckLakeCatalog {
     #[must_use]
-    pub fn new_connector(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
+    pub(crate) fn new_connector(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
         Arc::new(Self { params })
     }
 }

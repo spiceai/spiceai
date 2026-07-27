@@ -46,15 +46,15 @@ const fn default_memory_load_limit() -> usize {
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct LoadMemoryParams {
     /// Retrieve memories created in the 'last' interval as a human-readable duration string, e.g. "1h", "2m30s".
-    pub last: String,
+    last: String,
 
     /// Maximum number of memories to return.
     #[serde(default = "default_memory_load_limit")]
-    pub limit: usize,
+    limit: usize,
 
     /// Number of memories to skip for pagination.
     #[serde(default)]
-    pub offset: usize,
+    offset: usize,
 }
 
 fn validate_load_memory_params(
@@ -85,7 +85,7 @@ pub struct LoadMemoryTool {
 
 impl LoadMemoryTool {
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         df: Arc<dyn QueryEngine>,
         app: Arc<RwLock<Option<Arc<App>>>>,
         name: Option<&str>,

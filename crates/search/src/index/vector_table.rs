@@ -45,8 +45,8 @@ use crate::index::VectorIndex;
 #[derive(Debug, Clone)]
 pub struct VectorScanTableProvider {
     pub table_provider: Arc<dyn TableProvider>,
-    pub vector_index_list: Arc<LogicalPlan>,
-    pub primary_key: Vec<String>,
+    vector_index_list: Arc<LogicalPlan>,
+    primary_key: Vec<String>,
 }
 
 impl VectorScanTableProvider {
@@ -368,10 +368,10 @@ mod tests {
     /// This is just a [`MemTable`] that pretends it can support all filter pushdowns.
     /// This is useful for testing explain plans.
     #[derive(Debug)]
-    pub struct ExplainMemTable(pub MemTable, pub &'static str);
+    pub struct ExplainMemTable(MemTable, &'static str);
     impl ExplainMemTable {
         #[must_use]
-        pub fn new(table: MemTable, name: &'static str) -> Self {
+        fn new(table: MemTable, name: &'static str) -> Self {
             Self(table, name)
         }
     }
@@ -487,7 +487,7 @@ mod tests {
     }
     impl PretendVectorIndex {
         #[must_use]
-        pub fn new(embedded_column: String, primary_columns: Vec<Field>, schema: Schema) -> Self {
+        fn new(embedded_column: String, primary_columns: Vec<Field>, schema: Schema) -> Self {
             Self {
                 embedded_column,
                 primary_columns,
@@ -596,7 +596,7 @@ mod tests {
         }
     }
 
-    pub async fn test_explain(
+    async fn test_explain(
         provider: Arc<dyn TableProvider>,
         tbl: TableReference,
         sql: &str,
@@ -626,7 +626,7 @@ mod tests {
 
     #[expect(clippy::cast_sign_loss, clippy::cast_precision_loss)]
     #[must_use]
-    pub fn default_value_array(dt: &DataType) -> ArrayRef {
+    fn default_value_array(dt: &DataType) -> ArrayRef {
         match dt {
             DataType::Int8 => Arc::new(Int8Array::from(vec![0])) as ArrayRef,
             DataType::Int16 => Arc::new(Int16Array::from(vec![0])) as ArrayRef,
@@ -669,7 +669,7 @@ mod tests {
 
     /// Creates a [`RecordBatch`] with a single row that has default value of types, as per the [`Schema`].
     #[must_use]
-    pub fn one_row_default_record_batch_for_schema(schema: &Arc<Schema>) -> RecordBatch {
+    fn one_row_default_record_batch_for_schema(schema: &Arc<Schema>) -> RecordBatch {
         let arrays: Vec<ArrayRef> = schema
             .fields()
             .iter()
@@ -681,7 +681,7 @@ mod tests {
     }
 
     #[tokio::test]
-    pub async fn test_vector_scan_basic() -> Result<(), String> {
+    async fn test_vector_scan_basic() -> Result<(), String> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("pk", DataType::Int64, false),
             Field::new("body", DataType::Utf8, false),
@@ -748,7 +748,7 @@ mod tests {
     /// reaches the base table provider — otherwise the underlying scan runs without
     /// a limit and reads far more data than necessary.
     #[tokio::test]
-    pub async fn test_vector_scan_limit_pushdown_schema_sufficient() -> Result<(), String> {
+    async fn test_vector_scan_limit_pushdown_schema_sufficient() -> Result<(), String> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("pk", DataType::Int64, false),
             Field::new("body", DataType::Utf8, false),
@@ -799,7 +799,7 @@ mod tests {
 
     // [`VectorScanTableProvider`] cannot use metadata column to get data from vector index.
     #[tokio::test]
-    pub async fn test_vector_scan_index_metadata() -> Result<(), String> {
+    async fn test_vector_scan_index_metadata() -> Result<(), String> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("pk", DataType::Int64, false),
             Field::new("body", DataType::Utf8, false),
@@ -899,7 +899,7 @@ mod tests {
     }
 
     #[tokio::test]
-    pub async fn test_vector_scan_index_multicolumn_pk() -> Result<(), String> {
+    async fn test_vector_scan_index_multicolumn_pk() -> Result<(), String> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("pk1", DataType::Int64, false),
             Field::new("pk2", DataType::Boolean, false),

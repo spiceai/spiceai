@@ -25,20 +25,20 @@ use crate::{
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CohereEmbedRequest {
-    pub texts: Vec<String>,
-    pub input_type: CohereEmbeddingInputType,
+    texts: Vec<String>,
+    input_type: CohereEmbeddingInputType,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub truncate: Option<CohereEmbeddingTruncate>,
-    pub embedding_types: Option<Vec<CohereEmbeddingType>>,
+    truncate: Option<CohereEmbeddingTruncate>,
+    embedding_types: Option<Vec<CohereEmbeddingType>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CohereEmbedResponse {
-    pub embeddings: HashMap<CohereEmbeddingType, Vec<Vec<f32>>>,
-    pub id: String,
-    pub response_type: String,
-    pub texts: Option<Vec<String>>,
-    pub images: Option<Vec<String>>,
+    embeddings: HashMap<CohereEmbeddingType, Vec<Vec<f32>>>,
+    id: String,
+    response_type: String,
+    texts: Option<Vec<String>>,
+    images: Option<Vec<String>>,
 }
 
 #[derive(Debug, PartialEq, Clone, Eq, Hash, Serialize, Deserialize)]
@@ -91,7 +91,7 @@ impl Display for CohereEmbeddingInputType {
 
 impl CohereEmbeddingInputType {
     #[must_use]
-    pub fn all() -> Vec<CohereEmbeddingInputType> {
+    fn all() -> Vec<CohereEmbeddingInputType> {
         vec![
             Self::SearchDocument,
             Self::SearchQuery,
@@ -169,10 +169,10 @@ impl FromStr for CohereEmbeddingTruncate {
 
 #[derive(Debug)]
 pub struct CohereConfig {
-    pub model_name: String,
-    pub truncate: CohereEmbeddingTruncate,
-    pub input_type: CohereEmbeddingInputType,
-    pub embedding_type: CohereEmbeddingType,
+    pub(crate) model_name: String,
+    pub(crate) truncate: CohereEmbeddingTruncate,
+    pub(crate) input_type: CohereEmbeddingInputType,
+    pub(crate) embedding_type: CohereEmbeddingType,
 }
 
 const MAX_COHERE_INPUT_CHARACTER_LENGTH: usize = 2048;

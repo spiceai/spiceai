@@ -41,31 +41,31 @@ use spicepod::{
 };
 
 pub struct DatasetBuilder {
-    pub from: String,
-    pub name: TableReference,
-    pub access: AccessMode,
-    pub params: HashMap<String, String>,
-    pub metadata: HashMap<String, String>,
-    pub columns: Vec<Column>,
-    pub has_metadata_table: bool,
-    pub replication: Option<replication::Replication>,
-    pub time_column: Option<String>,
-    pub time_format: Option<TimeFormat>,
-    pub time_partition_column: Option<String>,
-    pub time_partition_format: Option<TimeFormat>,
-    pub acceleration: Option<acceleration::Acceleration>,
-    pub acceleration_snapshot_behavior: spicepod_acceleration::SnapshotBehavior,
-    pub acceleration_snapshot_compaction: spicepod_acceleration::SnapshotsCompaction,
-    pub embeddings: Vec<ColumnEmbeddingConfig>,
-    pub app: Option<Arc<App>>,
-    pub unsupported_type_action: Option<UnsupportedTypeAction>,
-    pub on_schema_change: OnSchemaChange,
-    pub ready_state: ReadyState,
-    pub metrics: Metrics,
-    pub runtime: Option<Arc<Runtime>>,
-    pub vectors: Option<VectorStore>,
-    pub full_text_search: Option<FtsStore>,
-    pub check_availability: CheckAvailability,
+    from: String,
+    pub(crate) name: TableReference,
+    access: AccessMode,
+    params: HashMap<String, String>,
+    metadata: HashMap<String, String>,
+    columns: Vec<Column>,
+    has_metadata_table: bool,
+    replication: Option<replication::Replication>,
+    time_column: Option<String>,
+    time_format: Option<TimeFormat>,
+    time_partition_column: Option<String>,
+    time_partition_format: Option<TimeFormat>,
+    acceleration: Option<acceleration::Acceleration>,
+    acceleration_snapshot_behavior: spicepod_acceleration::SnapshotBehavior,
+    acceleration_snapshot_compaction: spicepod_acceleration::SnapshotsCompaction,
+    embeddings: Vec<ColumnEmbeddingConfig>,
+    app: Option<Arc<App>>,
+    unsupported_type_action: Option<UnsupportedTypeAction>,
+    on_schema_change: OnSchemaChange,
+    ready_state: ReadyState,
+    metrics: Metrics,
+    runtime: Option<Arc<Runtime>>,
+    vectors: Option<VectorStore>,
+    full_text_search: Option<FtsStore>,
+    check_availability: CheckAvailability,
 }
 
 impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
@@ -191,7 +191,7 @@ impl DatasetBuilder {
     }
 
     #[expect(clippy::result_large_err)]
-    pub(crate) fn parse_table_reference(
+    fn parse_table_reference(
         name: &str,
     ) -> std::result::Result<TableReference, crate::Error> {
         match TableReference::parse_str(name) {
@@ -213,19 +213,19 @@ impl DatasetBuilder {
     }
 
     #[must_use]
-    pub fn with_time_column(mut self, time_column: String) -> Self {
+    pub(crate) fn with_time_column(mut self, time_column: String) -> Self {
         self.time_column = Some(time_column);
         self
     }
 
     #[must_use]
-    pub fn with_time_partition_column(mut self, time_partition_column: String) -> Self {
+    pub(crate) fn with_time_partition_column(mut self, time_partition_column: String) -> Self {
         self.time_partition_column = Some(time_partition_column);
         self
     }
 
     #[must_use]
-    pub fn with_metadata(mut self, metadata: HashMap<String, String>) -> Self {
+    pub(crate) fn with_metadata(mut self, metadata: HashMap<String, String>) -> Self {
         self.metadata = metadata;
         self
     }

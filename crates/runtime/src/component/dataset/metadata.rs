@@ -24,7 +24,7 @@ use super::Dataset;
 impl Dataset {
     /// Returns which `ListingTable` metadata columns are enabled for this dataset.
     #[must_use]
-    pub fn listing_table_metadata_columns(
+    pub(crate) fn listing_table_metadata_columns(
         &self,
         url_prefix: impl Into<Arc<str>>,
         schema: &Schema,

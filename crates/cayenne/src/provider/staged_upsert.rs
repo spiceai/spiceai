@@ -79,13 +79,13 @@ impl TransactionWriteToken {
     /// The table's begin sequence high-water (per-table; each table's allocator
     /// is independent).
     #[must_use]
-    pub fn stage_seq(&self) -> i64 {
+    pub(crate) fn stage_seq(&self) -> i64 {
         self.stage_seq
     }
 
     /// Whether no staging append was in flight at capture.
     #[must_use]
-    pub fn staging_clean(&self) -> bool {
+    pub(crate) fn staging_clean(&self) -> bool {
         self.staging_clean
     }
 }
@@ -148,7 +148,7 @@ impl CayenneStagedUpsert {
 
     /// Number of rows staged for commit.
     #[must_use]
-    pub fn row_count(&self) -> u64 {
+    pub(crate) fn row_count(&self) -> u64 {
         self.row_count
     }
 
@@ -169,7 +169,7 @@ impl CayenneStagedUpsert {
     /// Returns an error if the table needs the non-composable inline-tombstone or
     /// position-deletion publish path (rejected for multi-table), or if reserving
     /// sequences / writing deletion vectors fails.
-    pub async fn prepare_commit(mut self) -> Result<PreparedTxnCommit> {
+    pub(crate) async fn prepare_commit(mut self) -> Result<PreparedTxnCommit> {
         let on_conflict_deletions = std::mem::take(&mut self.on_conflict_deletions);
         // Reserve sequences + write deletion-vector files + build the inline
         // tombstone, WITHOUT committing the catalog metadata — `defer_catalog_commit`
@@ -221,7 +221,7 @@ impl CayenneStagedUpsert {
     /// error if applying the deletions, reserving the sequence, or the durable
     /// snapshot-sequence write fails. On a hard error the staged snapshot
     /// directory is left in place so the caller can retry the commit or roll back.
-    pub async fn commit(
+    pub(crate) async fn commit(
         mut self,
         footprint: std::collections::HashSet<u128>,
         footprint_complete: bool,
@@ -309,7 +309,7 @@ impl CayenneStagedUpsert {
     ///
     /// Infallible today; returns `Result` for symmetry with the other staged
     /// lifecycles and to allow future durable-cleanup steps.
-    pub async fn rollback(self) -> Result<()> {
+    pub(crate) async fn rollback(self) -> Result<()> {
         // Staging held no lock and the catalog was never touched, so this just
         // removes the orphan directory.
         cleanup_orphan_snapshot_dir(&self.table, &self.new_snapshot_id).await;
@@ -340,7 +340,7 @@ pub struct PreparedTxnCommit {
 impl PreparedTxnCommit {
     /// The written table's id (participants are committed in canonical id order).
     #[must_use]
-    pub fn table_id(&self) -> &str {
+    pub(crate) fn table_id(&self) -> &str {
         self.table.table_id()
     }
 
@@ -352,7 +352,7 @@ impl PreparedTxnCommit {
 
     /// Rows to be published on commit.
     #[must_use]
-    pub fn row_count(&self) -> u64 {
+    pub(crate) fn row_count(&self) -> u64 {
         self.row_count
     }
 
@@ -364,7 +364,7 @@ impl PreparedTxnCommit {
     ///
     /// Returns the first statement failure; the caller rolls back the shared
     /// transaction and aborts the whole multi-table commit.
-    pub async fn apply_in_txn(
+    pub(crate) async fn apply_in_txn(
         &mut self,
         catalog: &crate::CayenneCatalog,
         txn: &mut dyn crate::metastore::MetastoreTransaction,
@@ -411,7 +411,7 @@ impl PreparedTxnCommit {
     /// # Errors
     ///
     /// Returns an error only if swapping the in-memory deletion caches fails.
-    pub fn finish(self) -> Result<u64> {
+    pub(crate) fn finish(self) -> Result<u64> {
         let sequence = self.publish.snapshot_sequence;
         self.table
             .publish_prepared_on_conflict_deletions(self.publish);
@@ -448,7 +448,7 @@ impl PreparedTxnCommit {
     /// committed): the publish's `Drop` removes its staged deletion-vector files
     /// (still armed — `mark_committed` was never called); this also removes the
     /// unreferenced staged replacement-snapshot directory.
-    pub async fn rollback(self) {
+    pub(crate) async fn rollback(self) {
         cleanup_orphan_snapshot_dir(&self.table, &self.new_snapshot_id).await;
     }
 }

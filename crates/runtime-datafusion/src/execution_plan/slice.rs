@@ -36,7 +36,7 @@ pub struct SliceExec {
 
 impl SliceExec {
     /// Create a new `SliceExec`.
-    pub fn new(input: Arc<dyn ExecutionPlan>, partition: usize) -> Self {
+    fn new(input: Arc<dyn ExecutionPlan>, partition: usize) -> Self {
         let eq_properties = input.equivalence_properties().clone();
         let emission_type = input.pipeline_behavior();
         let boundedness = input.boundedness();

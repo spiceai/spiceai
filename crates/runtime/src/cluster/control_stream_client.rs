@@ -591,7 +591,7 @@ impl ControlStreamManager {
     /// Creates a new control stream manager.
     #[must_use]
     #[expect(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         executor_id: String,
         ballista_executor_id: String,
         client_tls_config: Option<ClientTlsConfig>,
@@ -621,12 +621,12 @@ impl ControlStreamManager {
     /// This handle is signaled when any connected scheduler sends a `PollNow` command.
     /// Pass this to the poll loop to enable immediate wake-up on new work.
     #[must_use]
-    pub fn poll_now_notify(&self) -> Arc<Notify> {
+    pub(crate) fn poll_now_notify(&self) -> Arc<Notify> {
         Arc::clone(&self.poll_now_notify)
     }
 
     /// Sends a shutdown notification to all connected schedulers.
-    pub async fn notify_shutdown(&self, reason: &str) {
+    pub(crate) async fn notify_shutdown(&self, reason: &str) {
         if self.streams.is_empty() {
             return;
         }
@@ -662,7 +662,7 @@ impl ControlStreamManager {
     }
 
     /// Updates the set of schedulers and spawns/removes control streams as needed.
-    pub fn update_schedulers(&mut self, scheduler_addresses: Vec<String>) {
+    pub(crate) fn update_schedulers(&mut self, scheduler_addresses: Vec<String>) {
         let next_schedulers: HashSet<String> = scheduler_addresses.into_iter().collect();
 
         let added: Vec<String> = next_schedulers
@@ -713,7 +713,7 @@ impl ControlStreamManager {
     }
 
     /// Cancels all control streams.
-    pub fn shutdown(&mut self) {
+    pub(crate) fn shutdown(&mut self) {
         for (_, handle) in self.streams.drain() {
             handle.cancel.cancel();
             handle.task.abort();

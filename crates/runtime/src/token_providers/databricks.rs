@@ -374,7 +374,7 @@ use token_provider::registry::TokenProviderRegistry;
 
 /// Build auth credentials from parameters.
 #[cfg(feature = "databricks")]
-pub fn build_auth_credentials(params: &Parameters) -> Result<AuthCredentials<'_>, AuthConfigError> {
+pub(crate) fn build_auth_credentials(params: &Parameters) -> Result<AuthCredentials<'_>, AuthConfigError> {
     let token = params.get("token").ok();
     let client_id = params.get("client_id").expose().ok();
     let client_secret = params.get("client_secret").ok();
@@ -432,7 +432,7 @@ pub async fn get_token_provider(
 
 /// Get or create an M2M token provider.
 #[cfg(feature = "databricks")]
-pub async fn get_m2m_token_provider(
+pub(crate) async fn get_m2m_token_provider(
     endpoint: &str,
     client_id: &str,
     client_secret: &SecretString,
@@ -455,7 +455,7 @@ pub async fn get_m2m_token_provider(
 
 /// Get or create a U2M token provider.
 #[cfg(feature = "databricks")]
-pub async fn get_u2m_token_provider(
+pub(crate) async fn get_u2m_token_provider(
     endpoint: &str,
     client_id: &str,
     token_provider_registry: &Arc<TokenProviderRegistry>,

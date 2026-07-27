@@ -29,48 +29,48 @@ use std::collections::HashMap;
 pub struct BedrockEmbeddingParams {
     /// The AWS access key ID.
     #[param(runtime, autoload_secret)]
-    pub aws_access_key_id: Option<SecretString>,
+    pub(crate) aws_access_key_id: Option<SecretString>,
     /// The AWS secret access key.
     #[param(runtime, autoload_secret)]
-    pub aws_secret_access_key: Option<SecretString>,
+    pub(crate) aws_secret_access_key: Option<SecretString>,
     /// The AWS session token.
     #[param(runtime, autoload_secret)]
-    pub aws_session_token: Option<SecretString>,
+    pub(crate) aws_session_token: Option<SecretString>,
     /// The AWS region to use for Bedrock embeddings.
     #[param(runtime)]
-    pub aws_region: Option<String>,
+    pub(crate) aws_region: Option<String>,
     /// IAM role credential source.
     #[param(runtime)]
-    pub aws_iam_role_source: Option<String>,
+    pub(crate) aws_iam_role_source: Option<String>,
     /// The AWS profile name to use for credential resolution.
     #[param(runtime)]
-    pub aws_profile: Option<String>,
+    pub(crate) aws_profile: Option<String>,
     /// Maximum number of Bedrock API requests per minute.
     #[param(runtime, default = "1500")]
-    pub requests_per_min_limit: u32,
+    pub(crate) requests_per_min_limit: u32,
     /// Maximum number of concurrent Bedrock API invocations.
     #[param(runtime, default = "40")]
-    pub max_concurrent_invocations: usize,
+    pub(crate) max_concurrent_invocations: usize,
     /// The number of dimensions for the embedding output.
     #[param(runtime)]
-    pub dimensions: Option<u32>,
+    pub(crate) dimensions: Option<u32>,
     /// Whether to normalize the embedding output.
     #[param(runtime)]
-    pub normalize: Option<bool>,
+    pub(crate) normalize: Option<bool>,
     /// Truncation mode for input text that exceeds the model's token limit.
     #[param(runtime, alias = "truncate")]
-    pub truncate_mode: Option<String>,
+    pub(crate) truncate_mode: Option<String>,
     /// The input type for Cohere embedding models.
     #[param(runtime)]
-    pub input_type: Option<CohereEmbeddingInputType>,
+    pub(crate) input_type: Option<CohereEmbeddingInputType>,
     /// The embedding purpose for Nova multimodal embedding models.
     #[param(runtime)]
-    pub embedding_purpose: Option<NovaEmbeddingPurpose>,
+    pub(crate) embedding_purpose: Option<NovaEmbeddingPurpose>,
 }
 
 impl BedrockEmbeddingParams {
     #[must_use]
-    pub fn runtime_params(&self) -> HashMap<String, SecretString> {
+    pub(crate) fn runtime_params(&self) -> HashMap<String, SecretString> {
         let mut params = HashMap::from([
             (
                 "requests_per_min_limit".to_string(),

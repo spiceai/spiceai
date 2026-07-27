@@ -117,7 +117,7 @@ impl std::fmt::Display for SFTPObjectStore {
 
 impl SFTPObjectStore {
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         user: String,
         password: String,
         host: String,

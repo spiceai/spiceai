@@ -469,7 +469,7 @@ impl RateController {
     /// Snapshot of all per-bucket leased metrics, for telemetry. Returns
     /// `(limiter_key, metrics)` pairs.
     #[must_use]
-    pub fn leased_bucket_metrics(&self) -> Vec<(String, Arc<LeasedBucketMetrics>)> {
+    fn leased_bucket_metrics(&self) -> Vec<(String, Arc<LeasedBucketMetrics>)> {
         self.leased_buckets
             .iter()
             .map(|b| (b.limiter_key().to_string(), b.metrics()))

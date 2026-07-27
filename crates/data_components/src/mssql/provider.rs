@@ -48,7 +48,7 @@ pub enum Error {
     TableProviderFailed { source: super::Error },
 }
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// System schemas to exclude from discovery.
 const SYSTEM_SCHEMAS: &[&str] = &["INFORMATION_SCHEMA", "sys", "guest"];
@@ -180,7 +180,7 @@ impl std::fmt::Debug for MssqlSchemaProvider {
 
 impl MssqlSchemaProvider {
     #[must_use]
-    pub fn new(
+    fn new(
         pool: Arc<SqlServerConnectionPool>,
         schema_name: String,
         include: Option<Arc<GlobSet>>,

@@ -81,7 +81,7 @@ impl SpiceRequestContextConfig {
     /// invalid. `trace_id` / `span_id` populate the `TraceParent` only if
     /// both parse as valid W3C ids.
     #[must_use]
-    pub fn to_request_context(&self) -> Arc<RequestContext> {
+    pub(crate) fn to_request_context(&self) -> Arc<RequestContext> {
         let protocol = self
             .protocol
             .map(Protocol::from)
@@ -106,7 +106,7 @@ impl SpiceRequestContextConfig {
     /// Returns `true` if any field carries a value — useful to decide
     /// whether the receiver should prefer this extension over a fallback.
     #[must_use]
-    pub fn is_populated(&self) -> bool {
+    pub(crate) fn is_populated(&self) -> bool {
         self.protocol.is_some() || self.trace_id.is_some() || self.span_id.is_some()
     }
 }

@@ -13,14 +13,14 @@ use thiserror::Error;
 /// as 2 byte code <0000> shouldn't be matched with a single byte <00> even though they have the same integer value.
 #[derive(Debug, Default)]
 pub struct ToUnicodeCMap {
-    pub bf_ranges: [RangeInclusiveMap<SourceCode, BfRangeTarget>; 4],
+    bf_ranges: [RangeInclusiveMap<SourceCode, BfRangeTarget>; 4],
     reverse_map: Option<HashMap<Vec<u16>, Vec<ReverseCMapEntry>>>,
 }
 /// Represents the information needed to map a Unicode sequence back to a source code.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ReverseCMapEntry {
-    pub source_code: SourceCode,
-    pub code_len: CodeLen,
+    pub(crate) source_code: SourceCode,
+    pub(crate) code_len: CodeLen,
     // Optionally, add priority if multiple source codes map to the same Unicode sequence
     // pub priority: u8,
 }
@@ -42,7 +42,7 @@ impl From<CMapParseError> for UnicodeCMapError {
 impl ToUnicodeCMap {
     const REPLACEMENT_CHAR: u16 = 0xfffd;
 
-    pub fn new() -> ToUnicodeCMap {
+    pub(crate) fn new() -> ToUnicodeCMap {
         ToUnicodeCMap {
             bf_ranges: [(); 4].map(|_| RangeInclusiveMap::new()),
             reverse_map: None,
@@ -161,7 +161,7 @@ impl ToUnicodeCMap {
         Ok(cmap)
     }
 
-    pub fn get(&self, code: SourceCode, code_len: CodeLen) -> Option<Vec<u16>> {
+    pub(crate) fn get(&self, code: SourceCode, code_len: CodeLen) -> Option<Vec<u16>> {
         if code_len > 4 || code_len == 0 {
             error!("Code lenght should be between l and 4 bytes, got {code_len}");
             return None;
@@ -190,12 +190,12 @@ impl ToUnicodeCMap {
             })
     }
 
-    pub fn get_or_replacement_char(&self, code: SourceCode, code_len: CodeLen) -> Vec<u16> {
+    pub(crate) fn get_or_replacement_char(&self, code: SourceCode, code_len: CodeLen) -> Vec<u16> {
         self.get(code, code_len)
             .unwrap_or(vec![ToUnicodeCMap::REPLACEMENT_CHAR])
     }
 
-    pub fn put(
+    pub(crate) fn put(
         &mut self,
         src_code_lo: SourceCode,
         src_code_hi: SourceCode,
@@ -209,7 +209,7 @@ impl ToUnicodeCMap {
         self.bf_ranges[(code_len - 1) as usize].insert(src_code_lo..=src_code_hi, target)
     }
 
-    pub fn put_char(&mut self, code: SourceCode, code_len: CodeLen, dst: Vec<u16>) {
+    fn put_char(&mut self, code: SourceCode, code_len: CodeLen, dst: Vec<u16>) {
         let target = if dst.len() == 1 {
             BfRangeTarget::UTF16CodePoint {
                 offset: u32::wrapping_sub(dst[0] as u32, code),
@@ -222,7 +222,7 @@ impl ToUnicodeCMap {
 
     /// Gets the source code(s) for a given Unicode sequence.
     /// Prioritizes shorter byte sequences if multiple mappings exist.
-    pub fn get_source_codes_for_unicode(
+    pub(crate) fn get_source_codes_for_unicode(
         &self,
         unicode_sequence: &[u16],
     ) -> Option<&[ReverseCMapEntry]> {

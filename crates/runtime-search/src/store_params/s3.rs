@@ -100,15 +100,15 @@ pub struct S3VectorsParams {
     #[param(autoload_secret)]
     pub index: Option<SecretString>,
     /// The AWS region to use.
-    pub aws_region: Option<String>,
+    aws_region: Option<String>,
     /// The AWS access key ID to use.
-    pub aws_access_key_id: Option<SecretString>,
+    aws_access_key_id: Option<SecretString>,
     /// The AWS secret access key to use.
-    pub aws_secret_access_key: Option<SecretString>,
+    aws_secret_access_key: Option<SecretString>,
     /// The AWS session token to use.
-    pub aws_session_token: Option<SecretString>,
+    aws_session_token: Option<SecretString>,
     /// IAM role credential source. 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables.
-    pub aws_iam_role_source: Option<AwsIamRoleSource>,
+    aws_iam_role_source: Option<AwsIamRoleSource>,
     /// Cache duration for listing S3 vector indexes (minimum: 5s). Defaults to list on every query.
     #[param(parse_with = fundu::parse_duration)]
     pub index_poll_interval: Option<std::time::Duration>,

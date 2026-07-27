@@ -24,8 +24,8 @@ use crate::crypto;
 
 // ── SMB2 magic ──────────────────────────────────────────────────────────────
 
-pub const SMB2_MAGIC: &[u8; 4] = b"\xfeSMB";
-pub const SMB2_HEADER_SIZE: usize = 64;
+const SMB2_MAGIC: &[u8; 4] = b"\xfeSMB";
+pub(crate) const SMB2_HEADER_SIZE: usize = 64;
 
 // Encoded buffer offsets within an SMB2 request message. Each is the fixed
 // offset from the start of the message at which variable-length payload
@@ -71,7 +71,7 @@ pub enum NtStatus {
 
 impl NtStatus {
     #[must_use]
-    pub fn from_u32(v: u32) -> Self {
+    pub(crate) fn from_u32(v: u32) -> Self {
         match v {
             0x0000_0000 => Self::Success,
             0xC000_0016 => Self::MoreProcessingRequired,
@@ -87,7 +87,7 @@ impl NtStatus {
     }
 
     #[must_use]
-    pub fn is_error(self) -> bool {
+    pub(crate) fn is_error(self) -> bool {
         let code = match self {
             Self::Success => 0x0000_0000,
             Self::MoreProcessingRequired => 0xC000_0016,
@@ -108,20 +108,20 @@ impl NtStatus {
 
 #[derive(Debug, Clone)]
 pub struct Header {
-    pub command: u16,
-    pub credit_charge: u16,
-    pub status: u32,
-    pub credits_requested: u16,
-    pub flags: u32,
-    pub next_command: u32,
-    pub message_id: u64,
-    pub tree_id: u32,
-    pub session_id: u64,
+    command: u16,
+    credit_charge: u16,
+    pub(crate) status: u32,
+    credits_requested: u16,
+    pub(crate) flags: u32,
+    pub(crate) next_command: u32,
+    pub(crate) message_id: u64,
+    pub(crate) tree_id: u32,
+    pub(crate) session_id: u64,
 }
 
 impl Header {
     #[must_use]
-    pub fn new(command: Command, message_id: u64) -> Self {
+    pub(crate) fn new(command: Command, message_id: u64) -> Self {
         Self {
             command: command as u16,
             credit_charge: 1,
@@ -138,13 +138,13 @@ impl Header {
     /// Set credit charge for operations transferring `payload_size` bytes.
     /// Required for Read/Write/QueryDirectory with payloads >64KB.
     #[must_use]
-    pub fn with_credit_charge(mut self, payload_size: u32) -> Self {
+    pub(crate) fn with_credit_charge(mut self, payload_size: u32) -> Self {
         self.credit_charge = credit_charge_for(payload_size);
         self
     }
 
     /// Encode the 64-byte SMB2 header into a buffer.
-    pub fn encode(&self, buf: &mut BytesMut) {
+    pub(crate) fn encode(&self, buf: &mut BytesMut) {
         buf.put_slice(SMB2_MAGIC); // 0: ProtocolId
         buf.put_u16_le(64); // 4: StructureSize
         buf.put_u16_le(self.credit_charge); // 6: CreditCharge
@@ -162,7 +162,7 @@ impl Header {
 
     /// Decode a 64-byte SMB2 header from bytes.
     #[must_use]
-    pub fn decode(buf: &[u8]) -> Option<Self> {
+    pub(crate) fn decode(buf: &[u8]) -> Option<Self> {
         if buf.len() < SMB2_HEADER_SIZE {
             return None;
         }
@@ -202,7 +202,7 @@ impl Header {
 /// Compute the credit charge for a payload of the given size.
 /// `CreditCharge = max(1, ceil(payload_size / 65536))`
 #[must_use]
-pub fn credit_charge_for(payload_size: u32) -> u16 {
+fn credit_charge_for(payload_size: u32) -> u16 {
     1.max(u16::try_from(payload_size.div_ceil(65536)).unwrap_or(u16::MAX))
 }
 
@@ -210,7 +210,7 @@ pub fn credit_charge_for(payload_size: u32) -> u16 {
 
 /// SMB 3.1.1 dialect (the only dialect we implement: signing-key derivation
 /// and the preauth integrity context shape are 3.1.1-specific).
-pub const DIALECT_SMB3_1_1: u16 = 0x0311;
+pub(crate) const DIALECT_SMB3_1_1: u16 = 0x0311;
 
 // Only 3.1.1 is offered. We must NOT advertise 3.0.x because subsequent
 // signing-key derivation assumes the 3.1.1 preauth-integrity-hash context
@@ -228,7 +228,7 @@ const SHA_512: u16 = 0x0001;
 const AES_128_GCM: u16 = 0x0002;
 const AES_128_CCM: u16 = 0x0001;
 
-pub fn encode_negotiate_request(buf: &mut BytesMut, client_guid: &[u8; 16]) {
+pub(crate) fn encode_negotiate_request(buf: &mut BytesMut, client_guid: &[u8; 16]) {
     let dialect_count = u16::try_from(DIALECTS.len()).unwrap_or(u16::MAX);
     let dialects_len = DIALECTS.len() * 2;
 
@@ -282,15 +282,15 @@ pub fn encode_negotiate_request(buf: &mut BytesMut, client_guid: &[u8; 16]) {
 
 #[derive(Debug)]
 pub struct NegotiateResponse {
-    pub security_mode: u16,
-    pub dialect_revision: u16,
-    pub max_transact_size: u32,
-    pub max_read_size: u32,
-    pub max_write_size: u32,
+    security_mode: u16,
+    pub(crate) dialect_revision: u16,
+    pub(crate) max_transact_size: u32,
+    pub(crate) max_read_size: u32,
+    pub(crate) max_write_size: u32,
 }
 
 #[must_use]
-pub fn decode_negotiate_response(body: &[u8]) -> Option<NegotiateResponse> {
+pub(crate) fn decode_negotiate_response(body: &[u8]) -> Option<NegotiateResponse> {
     if body.len() < 40 {
         return None;
     }
@@ -311,7 +311,7 @@ pub fn decode_negotiate_response(body: &[u8]) -> Option<NegotiateResponse> {
 
 // ── Session Setup ───────────────────────────────────────────────────────────
 
-pub fn encode_session_setup_request(buf: &mut BytesMut, security_blob: &[u8]) {
+pub(crate) fn encode_session_setup_request(buf: &mut BytesMut, security_blob: &[u8]) {
     let offset = SESSION_SETUP_SEC_BUF_OFFSET;
     let blob_len = u16::try_from(security_blob.len()).unwrap_or(u16::MAX);
     buf.put_u16_le(25); // StructureSize
@@ -327,12 +327,12 @@ pub fn encode_session_setup_request(buf: &mut BytesMut, security_blob: &[u8]) {
 
 #[derive(Debug)]
 pub struct SessionSetupResponse {
-    pub session_id: u64,
-    pub security_buffer: Bytes,
+    pub(crate) session_id: u64,
+    pub(crate) security_buffer: Bytes,
 }
 
 #[must_use]
-pub fn decode_session_setup_response(header: &Header, body: &[u8]) -> Option<SessionSetupResponse> {
+pub(crate) fn decode_session_setup_response(header: &Header, body: &[u8]) -> Option<SessionSetupResponse> {
     if body.len() < 9 {
         return None;
     }
@@ -357,7 +357,7 @@ pub fn decode_session_setup_response(header: &Header, body: &[u8]) -> Option<Ses
 
 // ── Tree Connect ────────────────────────────────────────────────────────────
 
-pub fn encode_tree_connect_request(buf: &mut BytesMut, path: &str) {
+pub(crate) fn encode_tree_connect_request(buf: &mut BytesMut, path: &str) {
     let path_bytes: Vec<u8> = path.encode_utf16().flat_map(u16::to_le_bytes).collect();
     let offset = TREE_CONNECT_PATH_OFFSET;
     let path_len = u16::try_from(path_bytes.len()).unwrap_or(u16::MAX);
@@ -407,9 +407,9 @@ pub enum CreateOptions {
 }
 
 /// Bit that adds `DELETE_ON_CLOSE` to a `CreateOptions` value.
-pub const CREATE_OPTION_DELETE_ON_CLOSE: u32 = 0x0000_1000;
+pub(crate) const CREATE_OPTION_DELETE_ON_CLOSE: u32 = 0x0000_1000;
 
-pub fn encode_create_request(
+pub(crate) fn encode_create_request(
     buf: &mut BytesMut,
     path: &str,
     desired_access: u32,
@@ -440,13 +440,13 @@ pub fn encode_create_request(
 
 #[derive(Debug, Clone)]
 pub struct CreateResponse {
-    pub file_id: [u8; 16],
-    pub last_write_time: u64,
-    pub file_size: u64,
+    pub(crate) file_id: [u8; 16],
+    pub(crate) last_write_time: u64,
+    pub(crate) file_size: u64,
 }
 
 #[must_use]
-pub fn decode_create_response(body: &[u8]) -> Option<CreateResponse> {
+pub(crate) fn decode_create_response(body: &[u8]) -> Option<CreateResponse> {
     if body.len() < 88 {
         return None;
     }
@@ -464,7 +464,7 @@ pub fn decode_create_response(body: &[u8]) -> Option<CreateResponse> {
 
 // ── Close ───────────────────────────────────────────────────────────────────
 
-pub fn encode_close_request(buf: &mut BytesMut, file_id: &[u8; 16]) {
+pub(crate) fn encode_close_request(buf: &mut BytesMut, file_id: &[u8; 16]) {
     buf.put_u16_le(24); // StructureSize
     buf.put_u16_le(0); // Flags
     buf.put_u32_le(0); // Reserved
@@ -473,7 +473,7 @@ pub fn encode_close_request(buf: &mut BytesMut, file_id: &[u8; 16]) {
 
 /// Encode a Close request with optional post-query attribute retrieval.
 /// When `postquery` is true, the server returns file metadata in the response.
-pub fn encode_close_request_ex(buf: &mut BytesMut, file_id: &[u8; 16], postquery: bool) {
+pub(crate) fn encode_close_request_ex(buf: &mut BytesMut, file_id: &[u8; 16], postquery: bool) {
     buf.put_u16_le(24); // StructureSize
     buf.put_u16_le(u16::from(postquery)); // Flags: SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB
     buf.put_u32_le(0); // Reserved
@@ -483,12 +483,12 @@ pub fn encode_close_request_ex(buf: &mut BytesMut, file_id: &[u8; 16], postquery
 /// Parsed Close response (meaningful when postquery was requested).
 #[derive(Debug, Clone)]
 pub struct CloseResponse {
-    pub last_write_time: u64,
-    pub file_size: u64,
+    pub(crate) last_write_time: u64,
+    file_size: u64,
 }
 
 #[must_use]
-pub fn decode_close_response(body: &[u8]) -> Option<CloseResponse> {
+pub(crate) fn decode_close_response(body: &[u8]) -> Option<CloseResponse> {
     if body.len() < 56 {
         return None;
     }
@@ -502,7 +502,7 @@ pub fn decode_close_response(body: &[u8]) -> Option<CloseResponse> {
 
 // ── Read ────────────────────────────────────────────────────────────────────
 
-pub fn encode_read_request(buf: &mut BytesMut, file_id: &[u8; 16], offset: u64, length: u32) {
+pub(crate) fn encode_read_request(buf: &mut BytesMut, file_id: &[u8; 16], offset: u64, length: u32) {
     buf.put_u16_le(49); // StructureSize
     buf.put_u8(0); // Padding
     buf.put_u8(0); // Flags
@@ -518,7 +518,7 @@ pub fn encode_read_request(buf: &mut BytesMut, file_id: &[u8; 16], offset: u64, 
 }
 
 #[must_use]
-pub fn decode_read_response(body: &[u8]) -> Option<Bytes> {
+pub(crate) fn decode_read_response(body: &[u8]) -> Option<Bytes> {
     if body.len() < 17 {
         return None;
     }
@@ -541,7 +541,7 @@ pub fn decode_read_response(body: &[u8]) -> Option<Bytes> {
 /// Zero-copy variant of `decode_read_response` — takes ownership of the
 /// response body `Vec` and slices into it without copying the data.
 #[must_use]
-pub fn decode_read_response_owned(body: Vec<u8>) -> Option<Bytes> {
+pub(crate) fn decode_read_response_owned(body: Vec<u8>) -> Option<Bytes> {
     if body.len() < 17 {
         return None;
     }
@@ -565,7 +565,7 @@ pub fn decode_read_response_owned(body: Vec<u8>) -> Option<Bytes> {
 
 // ── Write ───────────────────────────────────────────────────────────────────
 
-pub fn encode_write_request(buf: &mut BytesMut, file_id: &[u8; 16], offset: u64, data: &[u8]) {
+pub(crate) fn encode_write_request(buf: &mut BytesMut, file_id: &[u8; 16], offset: u64, data: &[u8]) {
     let data_offset = WRITE_DATA_OFFSET;
     let data_len = u32::try_from(data.len()).unwrap_or(u32::MAX);
     buf.put_u16_le(49); // StructureSize
@@ -589,7 +589,7 @@ pub fn encode_write_request(buf: &mut BytesMut, file_id: &[u8; 16], offset: u64,
 }
 
 #[must_use]
-pub fn decode_write_response(body: &[u8]) -> Option<u32> {
+pub(crate) fn decode_write_response(body: &[u8]) -> Option<u32> {
     if body.len() < 16 {
         return None;
     }
@@ -606,7 +606,7 @@ const FILE_RENAME_INFORMATION: u8 = 0x0A;
 /// `new_name` is the destination path relative to the share root, using
 /// backslash separators (SMB convention). `replace_if_exists` controls
 /// whether an existing file at the destination is overwritten.
-pub fn encode_set_info_rename(
+pub(crate) fn encode_set_info_rename(
     buf: &mut BytesMut,
     file_id: &[u8; 16],
     new_name: &str,
@@ -637,9 +637,9 @@ pub fn encode_set_info_rename(
 
 // ── Query Directory ─────────────────────────────────────────────────────────
 
-pub const FILE_ID_BOTH_DIRECTORY_INFORMATION: u8 = 0x25;
+pub(crate) const FILE_ID_BOTH_DIRECTORY_INFORMATION: u8 = 0x25;
 
-pub fn encode_query_directory_request(
+pub(crate) fn encode_query_directory_request(
     buf: &mut BytesMut,
     file_id: &[u8; 16],
     pattern: &str,
@@ -666,22 +666,22 @@ pub fn encode_query_directory_request(
 
 #[derive(Debug, Clone)]
 pub struct DirectoryEntry {
-    pub file_name: String,
-    pub file_size: u64,
-    pub file_attributes: u32,
-    pub last_write_time: u64,
+    pub(crate) file_name: String,
+    pub(crate) file_size: u64,
+    file_attributes: u32,
+    pub(crate) last_write_time: u64,
 }
 
 impl DirectoryEntry {
     #[must_use]
-    pub fn is_directory(&self) -> bool {
+    pub(crate) fn is_directory(&self) -> bool {
         self.file_attributes & 0x10 != 0
     }
 }
 
 /// Parse `FILE_ID_BOTH_DIRECTORY_INFORMATION` entries from a query directory response.
 #[must_use]
-pub fn parse_directory_entries(data: &[u8]) -> Vec<DirectoryEntry> {
+pub(crate) fn parse_directory_entries(data: &[u8]) -> Vec<DirectoryEntry> {
     let mut entries = Vec::new();
     let mut offset = 0usize;
 
@@ -735,19 +735,19 @@ pub fn parse_directory_entries(data: &[u8]) -> Vec<DirectoryEntry> {
 
 // ── Compound request support ───────────────────────────────────────────────
 
-pub const SMB2_FLAGS_RELATED: u32 = 0x0000_0004;
-pub const SMB2_FLAGS_SIGNED: u32 = 0x0000_0008;
+pub(crate) const SMB2_FLAGS_RELATED: u32 = 0x0000_0004;
+pub(crate) const SMB2_FLAGS_SIGNED: u32 = 0x0000_0008;
 
 /// `STATUS_PENDING` — server is still processing the request and will send
 /// the real response later. Callers should loop and read the next frame.
-pub const STATUS_PENDING: u32 = 0x0000_0103;
+pub(crate) const STATUS_PENDING: u32 = 0x0000_0103;
 
 /// Mask over the two high bits of an `NT_STATUS` indicating an error severity.
-pub const NT_STATUS_ERROR_MASK: u32 = 0xC000_0000;
+pub(crate) const NT_STATUS_ERROR_MASK: u32 = 0xC000_0000;
 
 /// Sentinel file ID — server substitutes the file ID from the preceding
 /// Create response in a related compound chain.
-pub const SENTINEL_FILE_ID: [u8; 16] = [0xFF; 16];
+pub(crate) const SENTINEL_FILE_ID: [u8; 16] = [0xFF; 16];
 
 // ── Frame helpers ───────────────────────────────────────────────────────────
 
@@ -763,7 +763,7 @@ fn frame_packet(header: &Header, body: &[u8]) -> BytesMut {
 }
 
 /// Build a complete SMB2 request packet: [`NetBIOS` length][Header][Body]
-pub fn build_request<F>(header: &Header, body_builder: F) -> BytesMut
+pub(crate) fn build_request<F>(header: &Header, body_builder: F) -> BytesMut
 where
     F: FnOnce(&mut BytesMut),
 {

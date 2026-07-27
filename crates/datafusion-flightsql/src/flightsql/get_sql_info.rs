@@ -413,7 +413,7 @@ static SQL_DATA_TYPE_TO_ARROW_DATA_TYPE: std::sync::LazyLock<
     .collect()
 });
 
-pub(crate) static SQL_INFO_SUPPORTS_CONVERT: std::sync::LazyLock<HashMap<i32, Vec<i32>>> =
+static SQL_INFO_SUPPORTS_CONVERT: std::sync::LazyLock<HashMap<i32, Vec<i32>>> =
     std::sync::LazyLock::new(|| {
         let mut convert: HashMap<i32, Vec<i32>> = HashMap::new();
         for (from_sql, from_arrow) in SQL_DATA_TYPE_TO_ARROW_DATA_TYPE.clone() {
@@ -564,6 +564,6 @@ static INSTANCE: std::sync::LazyLock<SqlInfoData> = std::sync::LazyLock::new(|| 
     }
 });
 
-pub(crate) fn get_sql_info_data() -> &'static SqlInfoData {
+fn get_sql_info_data() -> &'static SqlInfoData {
     &INSTANCE
 }

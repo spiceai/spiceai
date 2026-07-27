@@ -44,7 +44,7 @@ impl DocumentParserFactory for DocxParserFactory {
 pub struct DocxParser {}
 impl DocxParser {
     #[must_use]
-    pub fn new(_parser_options: &HashMap<String, String>) -> Self {
+    fn new(_parser_options: &HashMap<String, String>) -> Self {
         DocxParser::default()
     }
 }

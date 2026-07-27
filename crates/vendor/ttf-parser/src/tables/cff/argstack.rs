@@ -1,24 +1,24 @@
 use super::CFFError;
 
-pub struct ArgumentsStack<'a> {
-    pub data: &'a mut [f32],
-    pub len: usize,
-    pub max_len: usize,
+pub(crate) struct ArgumentsStack<'a> {
+    pub(crate) data: &'a mut [f32],
+    pub(crate) len: usize,
+    pub(crate) max_len: usize,
 }
 
 impl<'a> ArgumentsStack<'a> {
     #[inline]
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.len
     }
 
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     #[inline]
-    pub fn push(&mut self, n: f32) -> Result<(), CFFError> {
+    pub(crate) fn push(&mut self, n: f32) -> Result<(), CFFError> {
         if self.len == self.max_len {
             Err(CFFError::ArgumentsStackLimitReached)
         } else {
@@ -29,19 +29,19 @@ impl<'a> ArgumentsStack<'a> {
     }
 
     #[inline]
-    pub fn at(&self, index: usize) -> f32 {
+    pub(crate) fn at(&self, index: usize) -> f32 {
         self.data[index]
     }
 
     #[inline]
-    pub fn pop(&mut self) -> f32 {
+    pub(crate) fn pop(&mut self) -> f32 {
         debug_assert!(!self.is_empty());
         self.len -= 1;
         self.data[self.len]
     }
 
     #[inline]
-    pub fn reverse(&mut self) {
+    pub(crate) fn reverse(&mut self) {
         if self.is_empty() {
             return;
         }
@@ -52,7 +52,7 @@ impl<'a> ArgumentsStack<'a> {
     }
 
     #[inline]
-    pub fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.len = 0;
     }
 }

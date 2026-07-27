@@ -610,7 +610,7 @@ pub trait S3Vectors {
 }
 
 #[cfg(test)]
-pub mod tests {
+mod tests {
     use core::panic;
 
     use aws_config::{BehaviorVersion, Region};

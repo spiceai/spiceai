@@ -9,9 +9,9 @@ use crate::GlyphId;
 #[derive(Clone, Copy, Debug)]
 pub struct VerticalOriginMetrics {
     /// Glyph ID.
-    pub glyph_id: GlyphId,
+    glyph_id: GlyphId,
     /// Y coordinate, in the font's design coordinate system, of the vertical origin.
-    pub y: i16,
+    y: i16,
 }
 
 impl FromData for VerticalOriginMetrics {
@@ -31,16 +31,16 @@ impl FromData for VerticalOriginMetrics {
 #[derive(Clone, Copy, Debug)]
 pub struct Table<'a> {
     /// Default origin.
-    pub default_y: i16,
+    default_y: i16,
     /// A list of metrics for each glyph.
     ///
     /// Ordered by `glyph_id`.
-    pub metrics: LazyArray16<'a, VerticalOriginMetrics>,
+    metrics: LazyArray16<'a, VerticalOriginMetrics>,
 }
 
 impl<'a> Table<'a> {
     /// Parses a table from raw data.
-    pub fn parse(data: &'a [u8]) -> Option<Self> {
+    pub(crate) fn parse(data: &'a [u8]) -> Option<Self> {
         let mut s = Stream::new(data);
 
         let version = s.read::<u32>()?;

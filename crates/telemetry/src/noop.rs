@@ -37,7 +37,7 @@ pub(crate) struct NoopMeter {
 
 impl NoopMeter {
     /// Create a new no-op meter core.
-    pub(crate) fn new() -> Self {
+    fn new() -> Self {
         NoopMeter { _private: () }
     }
 }

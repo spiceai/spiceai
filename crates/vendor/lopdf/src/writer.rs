@@ -373,10 +373,10 @@ impl IncrementalDocument {
     }
 }
 
-pub struct Writer;
+pub(crate) struct Writer;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub enum XRefStreamFilter {
+pub(crate) enum XRefStreamFilter {
     ASCIIHexDecode,
     _FlateDecode, //this is generally a Zlib compressed Stream.
     None,
@@ -558,7 +558,7 @@ impl Writer {
         Ok(())
     }
 
-    pub fn write_object(file: &mut dyn Write, object: &Object) -> Result<()> {
+    pub(crate) fn write_object(file: &mut dyn Write, object: &Object) -> Result<()> {
         match object {
             Null => file.write_all(b"null"),
             Boolean(value) => {
@@ -704,7 +704,7 @@ impl Writer {
     }
 }
 
-pub struct CountingWrite<W: Write> {
+pub(crate) struct CountingWrite<W: Write> {
     inner: W,
     bytes_written: usize,
 }

@@ -109,7 +109,7 @@ fn configure_duckdb_httpfs(
     Ok(())
 }
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct DuckLake {
     duckdb_factory: DuckDBTableFactory,
@@ -136,7 +136,7 @@ impl DuckLakeFactory {
     }
 
     #[must_use]
-    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+    fn new_arc() -> Arc<dyn DataConnectorFactory> {
         Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
     }
 }

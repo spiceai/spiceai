@@ -49,8 +49,8 @@ use snafu::prelude::*;
 
 use crate::Read;
 
-pub use cql_dialect::CqlDialect;
-pub use table_schema::ScyllaDBTableSchema;
+pub(crate) use cql_dialect::CqlDialect;
+pub(crate) use table_schema::ScyllaDBTableSchema;
 
 pub type ScyllaDbConnectionPool =
     dyn DbConnectionPool<Arc<ScyllaSession>, &'static dyn Sync> + Send + Sync;

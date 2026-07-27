@@ -105,7 +105,7 @@ impl TimeRetentionFilterBuilder {
 
     /// Returns the name of the time column used for retention filtering.
     #[must_use]
-    pub fn column_name(&self) -> &str {
+    pub(crate) fn column_name(&self) -> &str {
         &self.column_name
     }
 
@@ -121,7 +121,7 @@ impl TimeRetentionFilterBuilder {
     /// never reclaims — violating the documented contract that NULL-timestamp rows
     /// are retained (`crates/runtime/src/accelerated_table/retention.rs`).
     #[must_use]
-    pub fn keep_filter(&self) -> Expr {
+    pub(crate) fn keep_filter(&self) -> Expr {
         let cutoff_nanos = self.cutoff_nanos();
         self.converter
             .convert(cutoff_nanos, Operator::GtEq)

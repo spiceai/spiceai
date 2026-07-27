@@ -21,13 +21,13 @@ mod format4;
 mod format6;
 
 pub use format0::Subtable0;
-pub use format10::Subtable10;
-pub use format12::Subtable12;
-pub use format13::Subtable13;
-pub use format14::{GlyphVariationResult, Subtable14};
+pub(crate) use format10::Subtable10;
+pub(crate) use format12::Subtable12;
+pub(crate) use format13::Subtable13;
+pub(crate) use format14::{GlyphVariationResult, Subtable14};
 pub use format2::Subtable2;
 pub use format4::Subtable4;
-pub use format6::Subtable6;
+pub(crate) use format6::Subtable6;
 
 /// A character encoding subtable variant.
 #[allow(missing_docs)]
@@ -48,17 +48,17 @@ pub enum Format<'a> {
 #[derive(Clone, Copy, Debug)]
 pub struct Subtable<'a> {
     /// Subtable platform.
-    pub platform_id: PlatformId,
+    platform_id: PlatformId,
     /// Subtable encoding.
-    pub encoding_id: u16,
+    encoding_id: u16,
     /// A subtable format.
-    pub format: Format<'a>,
+    pub(crate) format: Format<'a>,
 }
 
 impl<'a> Subtable<'a> {
     /// Checks that the current encoding is Unicode compatible.
     #[inline]
-    pub fn is_unicode(&self) -> bool {
+    pub(crate) fn is_unicode(&self) -> bool {
         // https://docs.microsoft.com/en-us/typography/opentype/spec/name#windows-encoding-ids
         const WINDOWS_UNICODE_BMP_ENCODING_ID: u16 = 1;
         const WINDOWS_UNICODE_FULL_REPERTOIRE_ENCODING_ID: u16 = 10;
@@ -95,7 +95,7 @@ impl<'a> Subtable<'a> {
     /// - when format is `MixedCoverage`, since it's not supported.
     /// - when format is `UnicodeVariationSequences`. Use `glyph_variation_index` instead.
     #[inline]
-    pub fn glyph_index(&self, code_point: u32) -> Option<GlyphId> {
+    pub(crate) fn glyph_index(&self, code_point: u32) -> Option<GlyphId> {
         match self.format {
             Format::ByteEncodingTable(ref subtable) => subtable.glyph_index(code_point),
             Format::HighByteMappingThroughTable(ref subtable) => subtable.glyph_index(code_point),
@@ -193,7 +193,7 @@ impl core::fmt::Debug for Subtables<'_> {
 
 impl<'a> Subtables<'a> {
     /// Returns a subtable at an index.
-    pub fn get(&self, index: u16) -> Option<Subtable<'a>> {
+    fn get(&self, index: u16) -> Option<Subtable<'a>> {
         let record = self.records.get(index)?;
         let data = self.data.get(record.offset.to_usize()..)?;
         let format = match Stream::read_at::<u16>(data, 0)? {
@@ -218,7 +218,7 @@ impl<'a> Subtables<'a> {
 
     /// Returns the number of subtables.
     #[inline]
-    pub fn len(&self) -> u16 {
+    fn len(&self) -> u16 {
         self.records.len()
     }
 
@@ -267,12 +267,12 @@ impl<'a> Iterator for SubtablesIter<'a> {
 #[derive(Clone, Copy, Debug)]
 pub struct Table<'a> {
     /// A list of subtables.
-    pub subtables: Subtables<'a>,
+    pub(crate) subtables: Subtables<'a>,
 }
 
 impl<'a> Table<'a> {
     /// Parses a table from raw data.
-    pub fn parse(data: &'a [u8]) -> Option<Self> {
+    pub(crate) fn parse(data: &'a [u8]) -> Option<Self> {
         let mut s = Stream::new(data);
         s.skip::<u16>(); // version
         let count = s.read::<u16>()?;

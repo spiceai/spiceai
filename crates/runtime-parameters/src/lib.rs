@@ -268,7 +268,7 @@ impl Parameters {
     ///
     /// Panics if the parameter is not found in the `all_params` list, as this is a programming error.
     #[must_use]
-    pub fn describe(&self, name: &str) -> &ParameterSpec {
+    fn describe(&self, name: &str) -> &ParameterSpec {
         if let Some(spec) = self.all_params.iter().find(|p| p.name == name) {
             spec
         } else {
@@ -329,7 +329,7 @@ impl Parameters {
     /// `delta_lake` manually initializes an object store not via the registry, and it uses
     /// `aws_` prefixed parameters. But after serialization, `ParquetExec` et al. have S3 URI schemes
     /// so they initialize using the registry.
-    pub fn canonicalize_s3_fragments(&mut self) {
+    fn canonicalize_s3_fragments(&mut self) {
         let mut params = self.params.iter().cloned().collect::<HashMap<_, _>>();
 
         for (prefixed_key, registry_key) in AWS_PREFIXED_FRAGMENT_PARAMS {
@@ -346,7 +346,7 @@ impl Parameters {
     /// `delta_lake` and other connectors use `azure_storage_*` prefixed parameters, but
     /// `SpiceObjectStoreRegistry.prepare_azure_object_store()` expects shorter names like
     /// `account`, `access_key`, etc. This method maps the prefixed names to the expected names.
-    pub fn canonicalize_azure_fragments(&mut self) {
+    fn canonicalize_azure_fragments(&mut self) {
         let mut params = self.params.iter().cloned().collect::<HashMap<_, _>>();
 
         for (prefixed_key, registry_key) in AZURE_PREFIXED_FRAGMENT_PARAMS {
@@ -362,7 +362,7 @@ impl Parameters {
     ///
     /// `delta_lake` and other connectors use `google_*` prefixed parameters, but the object store
     /// registry may expect different names. This method maps the prefixed names to the expected names.
-    pub fn canonicalize_gcs_fragments(&mut self) {
+    fn canonicalize_gcs_fragments(&mut self) {
         let mut params = self.params.iter().cloned().collect::<HashMap<_, _>>();
 
         for (prefixed_key, registry_key) in GCS_PREFIXED_FRAGMENT_PARAMS {
@@ -402,7 +402,7 @@ impl Parameters {
 #[derive(Clone)]
 pub struct Parameters {
     params: Vec<(String, SecretString)>,
-    pub(crate) prefix: &'static str,
+    prefix: &'static str,
     all_params: &'static [ParameterSpec],
 }
 

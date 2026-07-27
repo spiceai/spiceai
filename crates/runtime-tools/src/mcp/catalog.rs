@@ -338,7 +338,7 @@ pub enum McpClient {
 }
 
 impl McpClient {
-    pub async fn list_tools(
+    async fn list_tools(
         &self,
         params: Option<PaginatedRequestParams>,
     ) -> Result<ListToolsResult, ServiceError> {
@@ -347,7 +347,7 @@ impl McpClient {
             McpClient::Http(s) => s.list_tools(params).await,
         }
     }
-    pub async fn call_tool(
+    pub(crate) async fn call_tool(
         &self,
         params: CallToolRequestParams,
     ) -> Result<CallToolResult, ServiceError> {
@@ -357,7 +357,7 @@ impl McpClient {
         }
     }
 
-    pub async fn ping(&self) -> Result<(), ServiceError> {
+    async fn ping(&self) -> Result<(), ServiceError> {
         let result = match self {
             McpClient::Stdio(s) => {
                 s.peer()

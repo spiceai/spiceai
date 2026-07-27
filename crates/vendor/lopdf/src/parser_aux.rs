@@ -36,7 +36,7 @@ impl Stream {
 
 impl Document {
     /// Get decoded page content;
-    pub fn get_and_decode_page_content(
+    fn get_and_decode_page_content(
         &self,
         page_id: ObjectId,
     ) -> Result<Content<Vec<Operation>>> {
@@ -66,7 +66,7 @@ impl Document {
         Ok(text)
     }
 
-    pub fn extract_text_chunks(&self, page_numbers: &[u32]) -> Vec<Result<String>> {
+    fn extract_text_chunks(&self, page_numbers: &[u32]) -> Vec<Result<String>> {
         let pages: BTreeMap<u32, (u32, u16)> = self.get_pages();
         page_numbers
             .iter()

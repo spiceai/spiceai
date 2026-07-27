@@ -36,7 +36,7 @@ use crate::Result;
 /// # Errors
 ///
 /// Returns an error if any table cannot be dropped.
-pub async fn drop_tables(conn: &mut mysql_async::Conn) -> Result<()> {
+pub(crate) async fn drop_tables(conn: &mut mysql_async::Conn) -> Result<()> {
     println!("  dropping {} tables", crate::schema::ALL_TABLES.len());
 
     // Bound metadata-lock waits. A `DROP TABLE` blocked by another session holding
@@ -118,7 +118,7 @@ pub async fn drop_tables(conn: &mut mysql_async::Conn) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if any table or `_bench_ts` column cannot be created.
-pub async fn create_tables(conn: &mut mysql_async::Conn) -> Result<()> {
+pub(crate) async fn create_tables(conn: &mut mysql_async::Conn) -> Result<()> {
     let ddl_statements: &[(&str, &str)] = &[
         (
             "warehouse",
@@ -328,7 +328,7 @@ pub async fn create_tables(conn: &mut mysql_async::Conn) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if any index cannot be created.
-pub async fn create_indexes(conn: &mut mysql_async::Conn) -> Result<()> {
+pub(crate) async fn create_indexes(conn: &mut mysql_async::Conn) -> Result<()> {
     let indexes: &[(&str, &str)] = &[
         (
             "idx_customer",
@@ -410,7 +410,7 @@ async fn add_bench_ts_columns(conn: &mut mysql_async::Conn) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if any trigger cannot be created.
-pub async fn create_triggers(conn: &mut mysql_async::Conn) -> Result<()> {
+pub(crate) async fn create_triggers(conn: &mut mysql_async::Conn) -> Result<()> {
     for table in MUTATED_TABLES {
         // Attach the INSERT trigger (idempotent via DROP IF EXISTS + CREATE).
         let ins_trigger = format!("trg_bench_ts_ins_{table}");

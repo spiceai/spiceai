@@ -26,10 +26,10 @@ use telemetry::timing::TimeMeasurement;
 
 static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("flight"));
 
-pub(crate) static FLIGHT_REQUESTS: LazyLock<Counter<u64>> =
+static FLIGHT_REQUESTS: LazyLock<Counter<u64>> =
     LazyLock::new(|| METER.u64_counter("flight_requests").build());
 
-pub(crate) static FLIGHT_REQUEST_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+static FLIGHT_REQUEST_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
     METER
         .f64_histogram("flight_request_duration_ms")
         .with_unit("ms")

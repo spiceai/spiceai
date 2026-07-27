@@ -249,7 +249,7 @@ impl IcebergSchemaProvider {
     /// * `namespace` - The namespace containing the tables
     /// * `load_semaphore` - Semaphore to limit concurrent table loads
     /// * `include` - Optional glob patterns for filtering tables
-    pub(crate) async fn try_new(
+    async fn try_new(
         client: Arc<dyn Catalog>,
         namespace: NamespaceIdent,
         load_semaphore: Arc<Semaphore>,

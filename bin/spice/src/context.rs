@@ -76,7 +76,7 @@ impl RuntimeContext {
     /// # Errors
     ///
     /// Returns an error if the home directory cannot be determined.
-    pub fn new() -> Result<Self> {
+    fn new() -> Result<Self> {
         let home_dir = dirs::home_dir().ok_or_else(|| HomeDirectoryNotFoundSnafu.build())?;
         let spice_runtime_dir = home_dir.join(DOT_SPICE);
         let spice_bin_dir = spice_runtime_dir.join("bin");
@@ -174,78 +174,78 @@ impl RuntimeContext {
 
     /// Get the Spice runtime directory (~/.spice).
     #[must_use]
-    pub fn spice_runtime_dir(&self) -> &PathBuf {
+    pub(crate) fn spice_runtime_dir(&self) -> &PathBuf {
         &self.spice_runtime_dir
     }
 
     /// Get the Spice bin directory (~/.spice/bin).
     #[must_use]
-    pub fn spice_bin_dir(&self) -> &PathBuf {
+    pub(crate) fn spice_bin_dir(&self) -> &PathBuf {
         &self.spice_bin_dir
     }
 
     /// Get the current app directory.
     #[must_use]
-    pub fn app_dir(&self) -> &PathBuf {
+    pub(crate) fn app_dir(&self) -> &PathBuf {
         &self.app_dir
     }
 
     /// Get the spicepods directory.
     #[must_use]
-    pub fn pods_dir(&self) -> &PathBuf {
+    pub(crate) fn pods_dir(&self) -> &PathBuf {
         &self.pods_dir
     }
 
     /// Add extra headers to HTTP requests.
-    pub fn add_headers(&mut self, headers: HashMap<String, String>) {
+    fn add_headers(&mut self, headers: HashMap<String, String>) {
         self.extra_headers.extend(headers);
     }
 
     /// Get the HTTP endpoint.
     #[must_use]
-    pub fn http_endpoint(&self) -> &str {
+    pub(crate) fn http_endpoint(&self) -> &str {
         &self.http_endpoint
     }
 
     /// Get the API key if set.
     #[must_use]
-    pub fn api_key(&self) -> Option<&str> {
+    pub(crate) fn api_key(&self) -> Option<&str> {
         self.api_key.as_deref()
     }
 
     /// Check if cloud mode is enabled.
     #[must_use]
-    pub fn is_cloud(&self) -> bool {
+    pub(crate) fn is_cloud(&self) -> bool {
         self.cloud_region.is_some()
     }
 
     /// Get the cloud region if one was specified.
     #[must_use]
-    pub fn cloud_region(&self) -> Option<&str> {
+    pub(crate) fn cloud_region(&self) -> Option<&str> {
         self.cloud_region.as_deref()
     }
 
     /// Get the HTTP client.
     #[must_use]
-    pub fn http_client(&self) -> &reqwest::Client {
+    pub(crate) fn http_client(&self) -> &reqwest::Client {
         &self.http_client
     }
 
     /// Get the user agent string.
     #[must_use]
-    pub fn user_agent(&self) -> &str {
+    pub(crate) fn user_agent(&self) -> &str {
         &self.user_agent
     }
 
     /// Get the path to the spiced binary.
     #[must_use]
-    pub fn spiced_path(&self) -> PathBuf {
+    pub(crate) fn spiced_path(&self) -> PathBuf {
         self.spice_bin_dir.join(SPICED_FILENAME)
     }
 
     /// Check if the runtime is installed.
     #[must_use]
-    pub fn is_runtime_installed(&self) -> bool {
+    pub(crate) fn is_runtime_installed(&self) -> bool {
         self.spiced_path().exists()
     }
 
@@ -270,7 +270,7 @@ impl RuntimeContext {
     /// # Errors
     ///
     /// Returns an error when the Windows CLI is running natively instead of under WSL.
-    pub fn ensure_local_runtime_supported(&self) -> Result<()> {
+    pub(crate) fn ensure_local_runtime_supported(&self) -> Result<()> {
         if !Self::local_runtime_supported_on_platform(cfg!(windows), |key| std::env::var(key).ok())
         {
             return Err(WindowsNativeRuntimeUnsupportedSnafu.build());
@@ -284,7 +284,7 @@ impl RuntimeContext {
     /// # Errors
     ///
     /// Returns an error if the runtime is not installed or version cannot be determined.
-    pub fn runtime_version(&self) -> Result<String> {
+    pub(crate) fn runtime_version(&self) -> Result<String> {
         if !self.is_runtime_installed() {
             return Err(RuntimeNotInstalledSnafu.build());
         }
@@ -313,7 +313,7 @@ impl RuntimeContext {
     /// # Errors
     ///
     /// Returns an error if the runtime is not installed.
-    pub fn get_run_cmd(
+    pub(crate) fn get_run_cmd(
         &self,
         args: &[String],
         http_endpoint_override: Option<&str>,
@@ -362,7 +362,7 @@ impl RuntimeContext {
 
     /// Get the HTTP socket address (without http:// prefix).
     #[must_use]
-    pub fn http_socket_address(&self) -> String {
+    fn http_socket_address(&self) -> String {
         self.http_endpoint
             .trim_start_matches("http://")
             .trim_start_matches("https://")
@@ -374,7 +374,7 @@ impl RuntimeContext {
     /// # Errors
     ///
     /// Returns an error if the directory cannot be created.
-    pub fn prepare_install_dir(&self) -> Result<()> {
+    pub(crate) fn prepare_install_dir(&self) -> Result<()> {
         std::fs::create_dir_all(&self.spice_bin_dir).context(CreateDirectorySnafu {
             path: self.spice_bin_dir.clone(),
         })?;
@@ -396,7 +396,7 @@ impl RuntimeContext {
 
     /// Get headers for HTTP requests including API key and user agent.
     #[must_use]
-    pub fn get_headers(&self) -> HashMap<String, String> {
+    pub(crate) fn get_headers(&self) -> HashMap<String, String> {
         let mut headers = HashMap::new();
 
         if let Some(api_key) = &self.api_key {
@@ -417,7 +417,7 @@ impl RuntimeContext {
     /// # Errors
     ///
     /// Returns an error if the request fails.
-    pub async fn get(&self, path: &str) -> Result<reqwest::Response> {
+    pub(crate) async fn get(&self, path: &str) -> Result<reqwest::Response> {
         let url = format!("{}{}", self.http_endpoint, path);
         let mut request = self.http_client.get(&url);
 
@@ -436,7 +436,7 @@ impl RuntimeContext {
     /// # Errors
     ///
     /// Returns an error if the request fails.
-    pub async fn post(&self, path: &str, body: Option<String>) -> Result<reqwest::Response> {
+    pub(crate) async fn post(&self, path: &str, body: Option<String>) -> Result<reqwest::Response> {
         let url = format!("{}{}", self.http_endpoint, path);
         let mut request = self.http_client.post(&url);
 
@@ -461,7 +461,7 @@ impl RuntimeContext {
     /// # Errors
     ///
     /// Returns an error if the request fails.
-    pub async fn post_json<T: serde::Serialize>(
+    pub(crate) async fn post_json<T: serde::Serialize>(
         &self,
         path: &str,
         body: &T,

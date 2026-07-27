@@ -63,7 +63,7 @@ pub enum Error {
     DirectDriverNotPermitted,
 }
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct ODBC<'a>
 where
@@ -81,7 +81,7 @@ impl std::fmt::Debug for ODBC<'_> {
 pub struct SQLDialectParam(String);
 impl SQLDialectParam {
     #[must_use]
-    pub fn new(val: &str) -> Self {
+    fn new(val: &str) -> Self {
         Self(val.to_string())
     }
 }

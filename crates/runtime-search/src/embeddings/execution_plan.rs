@@ -462,7 +462,7 @@ pub(super) async fn get_vectors(
 /// across multiple threads using [`rayon::par_iter`]. The output is a [`FixedSizeListArray`],
 /// where each [`String`] gets embedded into a single [`f32`] vector.
 #[expect(clippy::cast_sign_loss)]
-pub(super) fn get_vectors_in_process(
+fn get_vectors_in_process(
     arr: Vec<Option<String>>,
     model: &Arc<dyn Embed>,
     vector_length: i32,
@@ -776,7 +776,7 @@ pub(super) async fn get_vectors_per_list_element(
 
 /// Sync counterpart to [`get_vectors_per_list_element`], using rayon
 /// for in-process embedding models.
-pub(super) fn get_vectors_per_list_element_in_process(
+fn get_vectors_per_list_element_in_process(
     rows: DecomposedListOfStrings,
     model: &Arc<dyn Embed>,
     vector_length: i32,
@@ -980,11 +980,11 @@ mod tests {
 
     #[derive(Default, Debug)]
     pub(crate) struct MockEmbedder {
-        pub map: HashMap<String, Vec<f32>>,
+        map: HashMap<String, Vec<f32>>,
     }
 
     impl MockEmbedder {
-        pub fn with_pair(mut self, input: &'static str, output: Vec<f32>) -> Self {
+        fn with_pair(mut self, input: &'static str, output: Vec<f32>) -> Self {
             self.map.insert(input.to_string(), output);
             self
         }

@@ -27,52 +27,52 @@ const TWO_BYTE_OPERATOR_MARK: u8 = 12;
 
 // https://docs.microsoft.com/en-us/typography/opentype/spec/cff2charstr#4-charstring-operators
 mod operator {
-    pub const HORIZONTAL_STEM: u8 = 1;
-    pub const VERTICAL_STEM: u8 = 3;
-    pub const VERTICAL_MOVE_TO: u8 = 4;
-    pub const LINE_TO: u8 = 5;
-    pub const HORIZONTAL_LINE_TO: u8 = 6;
-    pub const VERTICAL_LINE_TO: u8 = 7;
-    pub const CURVE_TO: u8 = 8;
-    pub const CALL_LOCAL_SUBROUTINE: u8 = 10;
-    pub const VS_INDEX: u8 = 15;
-    pub const BLEND: u8 = 16;
-    pub const HORIZONTAL_STEM_HINT_MASK: u8 = 18;
-    pub const HINT_MASK: u8 = 19;
-    pub const COUNTER_MASK: u8 = 20;
-    pub const MOVE_TO: u8 = 21;
-    pub const HORIZONTAL_MOVE_TO: u8 = 22;
-    pub const VERTICAL_STEM_HINT_MASK: u8 = 23;
-    pub const CURVE_LINE: u8 = 24;
-    pub const LINE_CURVE: u8 = 25;
-    pub const VV_CURVE_TO: u8 = 26;
-    pub const HH_CURVE_TO: u8 = 27;
-    pub const SHORT_INT: u8 = 28;
-    pub const CALL_GLOBAL_SUBROUTINE: u8 = 29;
-    pub const VH_CURVE_TO: u8 = 30;
-    pub const HV_CURVE_TO: u8 = 31;
-    pub const HFLEX: u8 = 34;
-    pub const FLEX: u8 = 35;
-    pub const HFLEX1: u8 = 36;
-    pub const FLEX1: u8 = 37;
-    pub const FIXED_16_16: u8 = 255;
+    pub(crate) const HORIZONTAL_STEM: u8 = 1;
+    pub(crate) const VERTICAL_STEM: u8 = 3;
+    pub(crate) const VERTICAL_MOVE_TO: u8 = 4;
+    pub(crate) const LINE_TO: u8 = 5;
+    pub(crate) const HORIZONTAL_LINE_TO: u8 = 6;
+    pub(crate) const VERTICAL_LINE_TO: u8 = 7;
+    pub(crate) const CURVE_TO: u8 = 8;
+    pub(crate) const CALL_LOCAL_SUBROUTINE: u8 = 10;
+    pub(crate) const VS_INDEX: u8 = 15;
+    pub(crate) const BLEND: u8 = 16;
+    pub(crate) const HORIZONTAL_STEM_HINT_MASK: u8 = 18;
+    pub(crate) const HINT_MASK: u8 = 19;
+    pub(crate) const COUNTER_MASK: u8 = 20;
+    pub(crate) const MOVE_TO: u8 = 21;
+    pub(crate) const HORIZONTAL_MOVE_TO: u8 = 22;
+    pub(crate) const VERTICAL_STEM_HINT_MASK: u8 = 23;
+    pub(crate) const CURVE_LINE: u8 = 24;
+    pub(crate) const LINE_CURVE: u8 = 25;
+    pub(crate) const VV_CURVE_TO: u8 = 26;
+    pub(crate) const HH_CURVE_TO: u8 = 27;
+    pub(crate) const SHORT_INT: u8 = 28;
+    pub(crate) const CALL_GLOBAL_SUBROUTINE: u8 = 29;
+    pub(crate) const VH_CURVE_TO: u8 = 30;
+    pub(crate) const HV_CURVE_TO: u8 = 31;
+    pub(crate) const HFLEX: u8 = 34;
+    pub(crate) const FLEX: u8 = 35;
+    pub(crate) const HFLEX1: u8 = 36;
+    pub(crate) const FLEX1: u8 = 37;
+    pub(crate) const FIXED_16_16: u8 = 255;
 }
 
 // https://docs.microsoft.com/en-us/typography/opentype/spec/cff2#table-9-top-dict-operator-entries
 mod top_dict_operator {
-    pub const CHAR_STRINGS_OFFSET: u16 = 17;
-    pub const VARIATION_STORE_OFFSET: u16 = 24;
-    pub const FONT_DICT_INDEX_OFFSET: u16 = 1236;
+    pub(crate) const CHAR_STRINGS_OFFSET: u16 = 17;
+    pub(crate) const VARIATION_STORE_OFFSET: u16 = 24;
+    pub(crate) const FONT_DICT_INDEX_OFFSET: u16 = 1236;
 }
 
 // https://docs.microsoft.com/en-us/typography/opentype/spec/cff2#table-10-font-dict-operator-entries
 mod font_dict_operator {
-    pub const PRIVATE_DICT_SIZE_AND_OFFSET: u16 = 18;
+    pub(crate) const PRIVATE_DICT_SIZE_AND_OFFSET: u16 = 18;
 }
 
 // https://docs.microsoft.com/en-us/typography/opentype/spec/cff2#table-16-private-dict-operators
 mod private_dict_operator {
-    pub const LOCAL_SUBROUTINES_OFFSET: u16 = 19;
+    pub(crate) const LOCAL_SUBROUTINES_OFFSET: u16 = 19;
 }
 
 #[derive(Clone, Copy, Default)]
@@ -169,15 +169,15 @@ impl Default for Scalars {
 }
 
 impl Scalars {
-    pub fn len(&self) -> u8 {
+    fn len(&self) -> u8 {
         self.len
     }
 
-    pub fn clear(&mut self) {
+    fn clear(&mut self) {
         self.len = 0;
     }
 
-    pub fn at(&self, i: u8) -> f32 {
+    fn at(&self, i: u8) -> f32 {
         if i < self.len {
             self.d[usize::from(i)]
         } else {
@@ -185,7 +185,7 @@ impl Scalars {
         }
     }
 
-    pub fn push(&mut self, n: f32) -> Option<()> {
+    fn push(&mut self, n: f32) -> Option<()> {
         if self.len < SCALARS_MAX {
             self.d[usize::from(self.len)] = n;
             self.len += 1;
@@ -480,7 +480,7 @@ pub struct Table<'a> {
 
 impl<'a> Table<'a> {
     /// Parses a table from raw data.
-    pub fn parse(data: &'a [u8]) -> Option<Self> {
+    pub(crate) fn parse(data: &'a [u8]) -> Option<Self> {
         let mut s = Stream::new(data);
 
         // Parse Header.
@@ -544,7 +544,7 @@ impl<'a> Table<'a> {
     }
 
     /// Outlines a glyph.
-    pub fn outline(
+    pub(crate) fn outline(
         &self,
         coordinates: &[NormalizedCoordinate],
         glyph_id: GlyphId,

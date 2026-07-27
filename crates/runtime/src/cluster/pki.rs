@@ -62,9 +62,9 @@ use crate::tls::{CertWatcher, ReloadScope, reload::record_reload_metric};
 /// Set of paths the bundle re-reads on every reload.
 #[derive(Clone, Debug)]
 pub struct ClusterPkiPaths {
-    pub ca: PathBuf,
-    pub cert: PathBuf,
-    pub key: PathBuf,
+    pub(crate) ca: PathBuf,
+    pub(crate) cert: PathBuf,
+    pub(crate) key: PathBuf,
 }
 
 /// One coherent snapshot of the cluster PKI. Constructed atomically;
@@ -140,7 +140,7 @@ impl ClusterPkiBundle {
     /// Returns an `io::Error` if any file cannot be read, any PEM is
     /// malformed, the chain does not validate, or the watcher refuses
     /// to register the reload callback.
-    pub fn try_new(paths: &ClusterPkiPaths, watcher: &CertWatcher) -> io::Result<Arc<Self>> {
+    pub(crate) fn try_new(paths: &ClusterPkiPaths, watcher: &CertWatcher) -> io::Result<Arc<Self>> {
         let snapshot = parse_and_validate(paths)?;
         // Snapshot the hint subjects from the initial verifier into an
         // owned `Vec` we can hand out as `&[DistinguishedName]` from
@@ -174,7 +174,7 @@ impl ClusterPkiBundle {
     /// `Arc<ClientTlsConfig>` view. Callers that need the value (tonic's
     /// channel builder takes by value) can `(*snap).clone()`.
     #[must_use]
-    pub fn client_tls_config(&self) -> Arc<ClientTlsConfig> {
+    pub(crate) fn client_tls_config(&self) -> Arc<ClientTlsConfig> {
         Arc::clone(&self.inner.load().client_tls)
     }
 

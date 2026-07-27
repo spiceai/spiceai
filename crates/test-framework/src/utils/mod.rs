@@ -31,7 +31,7 @@ use arrow::error::ArrowError;
 
 use crate::process::{MemoryReading, MemoryReadingsHandle};
 
-pub async fn wait_until_true<F, Fut>(max_wait: Duration, mut f: F) -> bool
+pub(crate) async fn wait_until_true<F, Fut>(max_wait: Duration, mut f: F) -> bool
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = bool>,
@@ -66,7 +66,7 @@ pub fn hash<T: Hash>(value: &T) -> u64 {
 ///
 /// Returns an error if a filter pattern is not a valid regex or if rebuilding
 /// a `RecordBatch` fails.
-pub fn sanitize_record_batches<P: AsRef<str>, R: AsRef<str>>(
+pub(crate) fn sanitize_record_batches<P: AsRef<str>, R: AsRef<str>>(
     batches: &[RecordBatch],
     filters: &[(P, R)],
 ) -> anyhow::Result<Vec<RecordBatch>> {
@@ -173,7 +173,7 @@ pub fn scan_directory_for_yamls(path: &PathBuf) -> anyhow::Result<Vec<PathBuf>> 
 }
 
 /// From a list of memory readings, return the maximum observed memory usage
-pub fn max_observed_memory(readings: &[MemoryReading]) -> f64 {
+fn max_observed_memory(readings: &[MemoryReading]) -> f64 {
     readings
         .iter()
         .map(|reading| reading.memory_usage)
@@ -181,7 +181,7 @@ pub fn max_observed_memory(readings: &[MemoryReading]) -> f64 {
 }
 
 /// From a list of memory readings, return the median observed memory usage
-pub fn median_observed_memory(readings: &[MemoryReading]) -> anyhow::Result<f64> {
+fn median_observed_memory(readings: &[MemoryReading]) -> anyhow::Result<f64> {
     let mut memory_usages: Vec<f64> = readings
         .iter()
         .map(|reading| reading.memory_usage)

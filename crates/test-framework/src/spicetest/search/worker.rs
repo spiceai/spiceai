@@ -29,19 +29,19 @@ use crate::constants::{HTTP_BASE_URL, SEARCH_ENDPOINT};
 #[derive(Debug, Default, Serialize, Clone)]
 pub struct SearchRequest {
     #[serde(skip)]
-    pub id: String,
+    id: String,
 
-    pub text: String,
+    text: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub datasets: Vec<String>,
+    datasets: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub limit: Option<usize>,
+    limit: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub where_cond: Option<String>,
+    where_cond: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub additional_columns: Vec<String>,
+    additional_columns: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub keywords: Vec<String>,
+    keywords: Vec<String>,
 }
 
 impl SearchRequest {
@@ -118,7 +118,7 @@ impl SearchConfig {
     }
 
     #[must_use]
-    pub fn into_requests(self) -> Vec<SearchRequest> {
+    pub(crate) fn into_requests(self) -> Vec<SearchRequest> {
         self.requests
     }
 }
@@ -129,8 +129,8 @@ pub(crate) struct VectorSearchWorkerResult {
 
 pub struct SearchResult {
     pub response: SearchResponse,
-    pub score: f64,
-    pub duration: Duration,
+    pub(crate) score: f64,
+    pub(crate) duration: Duration,
 }
 
 pub(crate) struct VectorSearchWorker {

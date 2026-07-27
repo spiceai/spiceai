@@ -100,7 +100,7 @@ pub struct StoreMemoryTool {
 
 impl StoreMemoryTool {
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         df: Arc<dyn QueryEngine>,
         app: Arc<RwLock<Option<Arc<App>>>>,
         name: Option<&str>,

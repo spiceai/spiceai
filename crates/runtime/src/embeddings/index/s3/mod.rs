@@ -54,7 +54,7 @@ use retry_client::S3VectorsRetryMiddlewareBuilder;
 /// Feeds the AWS credential resolver (`initiate_config_with_credentials`), which is shared
 /// with the Glue and Iceberg connectors and reads a [`Parameters`]. Type/enum validation,
 /// aliases, and typo warnings for the whole component live on [`S3VectorsParams`].
-pub(crate) const PARAMETERS: &[ParameterSpec] = &[
+const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("bucket")
         .description("The S3 bucket name to use for the S3 Vectors index.")
         .secret(),
@@ -98,7 +98,7 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
 
 /// Attempt to construct an [`S3Vector`] for the provided dataset/view on the given column.
 #[expect(clippy::too_many_arguments)]
-pub async fn try_from_table(
+pub(crate) async fn try_from_table(
     ds_name: &TableReference,
     column: String,
     config: ColumnLevelEmbeddingConfig,

@@ -40,7 +40,7 @@ pub struct ArrowAccelerator {
 
 impl ArrowAccelerator {
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             arrow_factory: ArrowFactory::new(),
         }

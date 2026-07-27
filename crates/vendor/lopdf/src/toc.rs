@@ -8,9 +8,9 @@ use super::{Document, Error, Object, Outline, Result};
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone)]
 pub struct TocType {
-    pub level: usize,
-    pub title: String,
-    pub page: usize,
+    level: usize,
+    title: String,
+    page: usize,
 }
 
 #[allow(dead_code)]
@@ -31,7 +31,7 @@ impl Toc {
 }
 
 #[derive(Debug, Clone)]
-pub struct Destination {
+pub(crate) struct Destination {
     map: IndexMap<Vec<u8>, Object>,
 }
 

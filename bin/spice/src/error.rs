@@ -148,7 +148,7 @@ pub enum Error {
 /// Returns `Err(Unauthorized)` for 401 responses.
 /// Returns `Err(RuntimeHttpError)` for other non-success responses.
 /// Returns `Err(RuntimeUnavailable)` for 403 responses that indicate API key issues.
-pub async fn check_response(
+pub(crate) async fn check_response(
     response: reqwest::Response,
     endpoint: &str,
 ) -> Result<reqwest::Response> {

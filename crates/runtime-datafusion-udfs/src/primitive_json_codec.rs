@@ -54,7 +54,7 @@ pub fn parse_primitive_arrow_type(s: &str) -> Option<DataType> {
 /// The JSON Schema type name for the JSON-encoded form of a primitive
 /// Arrow type. Returns [`None`] for non-primitives.
 #[must_use]
-pub fn arrow_to_json_schema_type(arrow: &str) -> Option<&'static str> {
+fn arrow_to_json_schema_type(arrow: &str) -> Option<&'static str> {
     parse_primitive_arrow_type(arrow).map(|dt| match dt {
         DataType::Int64 => "integer",
         DataType::Float64 => "number",
@@ -161,7 +161,7 @@ impl PrimitiveOutputBuilder {
     /// # Errors
     ///
     /// Surfaces the first [`append_value`](Self::append_value) error.
-    pub fn append_values(&mut self, values: &[Value]) -> Result<(), DataFusionError> {
+    fn append_values(&mut self, values: &[Value]) -> Result<(), DataFusionError> {
         for v in values {
             self.append_value(v)?;
         }

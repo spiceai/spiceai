@@ -33,7 +33,7 @@ use sha2::{Digest, Sha256};
 
 const ENDPOINT_CONST: &str = "https://telemetry.spiceai.io";
 
-pub static ENDPOINT: LazyLock<Arc<str>> = LazyLock::new(|| {
+static ENDPOINT: LazyLock<Arc<str>> = LazyLock::new(|| {
     std::env::var("SPICEAI_TELEMETRY_ENDPOINT")
         .unwrap_or_else(|_| ENDPOINT_CONST.into())
         .into()

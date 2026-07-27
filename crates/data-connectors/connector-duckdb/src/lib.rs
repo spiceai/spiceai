@@ -95,7 +95,7 @@ impl DuckDB {
     /// # Errors
     ///
     /// Returns an error if the in-memory `DuckDB` connection cannot be established.
-    pub fn create_in_memory(params: &ConnectorParams) -> AnyErrorResult<DuckDBTableFactory> {
+    fn create_in_memory(params: &ConnectorParams) -> AnyErrorResult<DuckDBTableFactory> {
         let pool = Arc::new(
             DuckDbConnectionPool::new_memory()
                 .map_err(|source| DataConnectorError::UnableToConnectInternal {
@@ -120,7 +120,7 @@ impl DuckDB {
     /// # Errors
     ///
     /// Returns an error if the file-based `DuckDB` connection cannot be established.
-    pub fn create_file(path: &str, params: &ConnectorParams) -> AnyErrorResult<DuckDBTableFactory> {
+    fn create_file(path: &str, params: &ConnectorParams) -> AnyErrorResult<DuckDBTableFactory> {
         let pool = Arc::new(
             DuckDbConnectionPool::new_file(path, &AccessMode::ReadOnly)
                 .map_err(|source| DataConnectorError::UnableToConnectInternal {
@@ -152,7 +152,7 @@ impl DuckDBFactory {
     }
 
     #[must_use]
-    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+    fn new_arc() -> Arc<dyn DataConnectorFactory> {
         Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
     }
 }

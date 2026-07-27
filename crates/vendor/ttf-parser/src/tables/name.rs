@@ -115,11 +115,11 @@ impl FromData for NameRecord {
 #[derive(Clone, Copy)]
 pub struct Name<'a> {
     /// A platform ID.
-    pub platform_id: PlatformId,
+    platform_id: PlatformId,
     /// A platform-specific encoding ID.
-    pub encoding_id: u16,
+    encoding_id: u16,
     /// A language ID.
-    pub language_id: u16,
+    language_id: u16,
     /// A [Name ID](https://docs.microsoft.com/en-us/typography/opentype/spec/name#name-ids).
     ///
     /// A predefined list of ID's can be found in the [`name_id`](name_id/index.html) module.
@@ -127,7 +127,7 @@ pub struct Name<'a> {
     /// A raw name data.
     ///
     /// Can be in any encoding. Can be empty.
-    pub name: &'a [u8],
+    name: &'a [u8],
 }
 
 impl<'a> Name<'a> {
@@ -220,7 +220,7 @@ pub struct Names<'a> {
 
 impl<'a> Names<'a> {
     /// Returns a name at index.
-    pub fn get(&self, index: u16) -> Option<Name<'a>> {
+    fn get(&self, index: u16) -> Option<Name<'a>> {
         let record = self.records.get(index)?;
         let name_start = record.offset.to_usize();
         let name_end = name_start + usize::from(record.length);
@@ -235,7 +235,7 @@ impl<'a> Names<'a> {
     }
 
     /// Returns a number of name records.
-    pub fn len(&self) -> u16 {
+    fn len(&self) -> u16 {
         self.records.len()
     }
 
@@ -295,12 +295,12 @@ impl<'a> Iterator for NamesIter<'a> {
 #[derive(Clone, Copy, Default, Debug)]
 pub struct Table<'a> {
     /// A list of names.
-    pub names: Names<'a>,
+    pub(crate) names: Names<'a>,
 }
 
 impl<'a> Table<'a> {
     /// Parses a table from raw data.
-    pub fn parse(data: &'a [u8]) -> Option<Self> {
+    pub(crate) fn parse(data: &'a [u8]) -> Option<Self> {
         // https://docs.microsoft.com/en-us/typography/opentype/spec/name#naming-table-format-1
         const LANG_TAG_RECORD_SIZE: u16 = 4;
 

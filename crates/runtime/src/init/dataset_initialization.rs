@@ -176,7 +176,7 @@ impl DatasetInitialization {
 
     /// Synchronous accessor: the dataset this plan will initialize.
     #[expect(dead_code)] // Reserved for upcoming deferred-initialization callers.
-    pub(crate) fn dataset(&self) -> &Dataset {
+    fn dataset(&self) -> &Dataset {
         &self.dataset
     }
 

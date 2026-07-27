@@ -28,7 +28,7 @@ const C_LAST_TOKENS: &[&str] = &[
 ];
 
 /// Generate a random string of characters in `[min_len, max_len]` (spec §4.3.2.2).
-pub fn rand_chars(rng: &mut impl Rng, min_len: usize, max_len: usize) -> String {
+pub(crate) fn rand_chars(rng: &mut impl Rng, min_len: usize, max_len: usize) -> String {
     let len = rng.random_range(min_len..=max_len);
     (0..len)
         .map(|_| CHARACTERS[rng.random_range(0..CHARACTERS.len())] as char)
@@ -36,7 +36,7 @@ pub fn rand_chars(rng: &mut impl Rng, min_len: usize, max_len: usize) -> String 
 }
 
 /// Generate a random string of uppercase letters in `[min_len, max_len]`.
-pub fn rand_letters(rng: &mut impl Rng, min_len: usize, max_len: usize) -> String {
+pub(crate) fn rand_letters(rng: &mut impl Rng, min_len: usize, max_len: usize) -> String {
     let len = rng.random_range(min_len..=max_len);
     (0..len)
         .map(|_| LETTERS[rng.random_range(0..LETTERS.len())] as char)
@@ -44,7 +44,7 @@ pub fn rand_letters(rng: &mut impl Rng, min_len: usize, max_len: usize) -> Strin
 }
 
 /// Generate a random string of digits in `[min_len, max_len]`.
-pub fn rand_numbers(rng: &mut impl Rng, min_len: usize, max_len: usize) -> String {
+pub(crate) fn rand_numbers(rng: &mut impl Rng, min_len: usize, max_len: usize) -> String {
     let len = rng.random_range(min_len..=max_len);
     (0..len)
         .map(|_| NUMBERS[rng.random_range(0..NUMBERS.len())] as char)
@@ -52,19 +52,19 @@ pub fn rand_numbers(rng: &mut impl Rng, min_len: usize, max_len: usize) -> Strin
 }
 
 /// Generate a random state code (2 uppercase letters).
-pub fn rand_state(rng: &mut impl Rng) -> String {
+pub(crate) fn rand_state(rng: &mut impl Rng) -> String {
     rand_letters(rng, 2, 2)
 }
 
 /// Generate a random zip code: 4 random digits + "11111" (spec §4.3.2.7).
-pub fn rand_zip(rng: &mut impl Rng) -> String {
+pub(crate) fn rand_zip(rng: &mut impl Rng) -> String {
     let mut s = rand_numbers(rng, 4, 4);
     s.push_str("11111");
     s
 }
 
 /// Generate a random tax rate in `[0.0000, 0.2000]` (spec §2.4.1).
-pub fn rand_tax(rng: &mut impl Rng) -> f64 {
+pub(crate) fn rand_tax(rng: &mut impl Rng) -> f64 {
     f64::from(rng.random_range(0..=2000)) / 10_000.0
 }
 
@@ -72,7 +72,7 @@ pub fn rand_tax(rng: &mut impl Rng) -> f64 {
 ///
 /// Returns a random a-string `[26..50]`. For 10% of rows, "ORIGINAL" is placed
 /// at a random position within the string.
-pub fn rand_original_string(rng: &mut impl Rng) -> String {
+pub(crate) fn rand_original_string(rng: &mut impl Rng) -> String {
     let mut bytes = rand_chars(rng, 26, 50).into_bytes();
     if rng.random_range(0..10) == 0 {
         let pos = rng.random_range(0..bytes.len().saturating_sub(8));
@@ -85,7 +85,7 @@ pub fn rand_original_string(rng: &mut impl Rng) -> String {
 
 /// Generate a C-Last name from syllables (spec §4.3.2.3).
 #[must_use]
-pub fn c_last_syllables(n: usize) -> String {
+pub(crate) fn c_last_syllables(n: usize) -> String {
     let mut s = String::with_capacity(15);
     s.push_str(C_LAST_TOKENS[n / 100]);
     s.push_str(C_LAST_TOKENS[(n / 10) % 10]);
@@ -94,14 +94,14 @@ pub fn c_last_syllables(n: usize) -> String {
 }
 
 /// Generate a random C-Last name using `NURand` (spec §2.1.6).
-pub fn rand_c_last(rng: &mut impl Rng, c_load: usize) -> String {
+pub(crate) fn rand_c_last(rng: &mut impl Rng, c_load: usize) -> String {
     let a = rng.random_range(0..256);
     let x = rng.random_range(0..1000);
     c_last_syllables(((a | x) + c_load) % 1000)
 }
 
 /// Generate a random customer ID using NURand(1023, 1, 3000) (spec §2.1.6).
-pub fn rand_customer_id(rng: &mut impl Rng) -> i32 {
+pub(crate) fn rand_customer_id(rng: &mut impl Rng) -> i32 {
     let a = rng.random_range(0..1024);
     let x = rng.random_range(1..=3000);
     let c = rng.random_range(0..1024);

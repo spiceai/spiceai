@@ -83,28 +83,28 @@ impl MetricsCollector {
         })
     }
 
-    pub fn inc_insert(&self) {
+    pub(crate) fn inc_insert(&self) {
         self.inserts.fetch_add(1, Ordering::Relaxed);
     }
-    pub fn inc_update(&self) {
+    pub(crate) fn inc_update(&self) {
         self.updates.fetch_add(1, Ordering::Relaxed);
     }
-    pub fn inc_delete(&self) {
+    pub(crate) fn inc_delete(&self) {
         self.deletes.fetch_add(1, Ordering::Relaxed);
     }
-    pub fn inc_truncate(&self) {
+    pub(crate) fn inc_truncate(&self) {
         self.truncates.fetch_add(1, Ordering::Relaxed);
     }
-    pub fn inc_transaction(&self) {
+    pub(crate) fn inc_transaction(&self) {
         self.transactions.fetch_add(1, Ordering::Relaxed);
     }
-    pub fn add_bootstrap_rows(&self, n: u64) {
+    pub(crate) fn add_bootstrap_rows(&self, n: u64) {
         self.bootstrap_rows.fetch_add(n, Ordering::Relaxed);
     }
-    pub fn mark_bootstrap_complete(&self) {
+    pub(crate) fn mark_bootstrap_complete(&self) {
         self.bootstrap_complete.store(1, Ordering::Relaxed);
     }
-    pub fn set_bootstrap_rows_expected(&self, n: u64) {
+    fn set_bootstrap_rows_expected(&self, n: u64) {
         self.bootstrap_rows_expected.store(n, Ordering::Relaxed);
     }
     pub fn set_gtid_enabled(&self, enabled: bool) {
@@ -113,7 +113,7 @@ impl MetricsCollector {
     }
 
     /// Record the acked (committed-to-sidecar-visible) binlog position.
-    pub fn set_committed_position(&self, file_ordinal: u64, pos: u64) {
+    pub(crate) fn set_committed_position(&self, file_ordinal: u64, pos: u64) {
         self.committed_file_ordinal
             .store(file_ordinal, Ordering::Relaxed);
         self.committed_pos.store(pos, Ordering::Relaxed);
@@ -122,7 +122,7 @@ impl MetricsCollector {
     /// Record the source's binlog head from the periodic status poll, plus
     /// the byte lag versus the stream's resume position when computable
     /// (`None` = head and resume are in different binlog files).
-    pub fn set_source_head(&self, file_ordinal: u64, pos: u64, lag_bytes: Option<u64>) {
+    pub(crate) fn set_source_head(&self, file_ordinal: u64, pos: u64, lag_bytes: Option<u64>) {
         self.source_head_file_ordinal
             .store(file_ordinal, Ordering::Relaxed);
         self.source_head_pos.store(pos, Ordering::Relaxed);
@@ -132,7 +132,7 @@ impl MetricsCollector {
 
     /// Record the source commit timestamp of the newest applied transaction,
     /// for the replication-lag signal.
-    pub fn record_commit_watermark(&self, at: SystemTime) {
+    pub(crate) fn record_commit_watermark(&self, at: SystemTime) {
         if let Ok(d) = at.duration_since(std::time::UNIX_EPOCH) {
             let ms = u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
             self.last_commit_unix_ms.store(ms, Ordering::Relaxed);
@@ -142,31 +142,31 @@ impl MetricsCollector {
     pub fn inc_decode_error(&self) {
         self.decode_errors.fetch_add(1, Ordering::Relaxed);
     }
-    pub fn inc_schema_mismatch_error(&self) {
+    pub(crate) fn inc_schema_mismatch_error(&self) {
         self.schema_mismatch_errors.fetch_add(1, Ordering::Relaxed);
     }
-    pub fn inc_recv_error(&self) {
+    pub(crate) fn inc_recv_error(&self) {
         self.recv_errors.fetch_add(1, Ordering::Relaxed);
     }
-    pub fn inc_reconnect(&self) {
+    pub(crate) fn inc_reconnect(&self) {
         self.reconnects.fetch_add(1, Ordering::Relaxed);
     }
-    pub fn inc_checkpoint_persist(&self) {
+    pub(crate) fn inc_checkpoint_persist(&self) {
         self.checkpoint_persists.fetch_add(1, Ordering::Relaxed);
     }
-    pub fn inc_checkpoint_persist_error(&self) {
+    pub(crate) fn inc_checkpoint_persist_error(&self) {
         self.checkpoint_persist_errors
             .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Mark this dataset an attached member of a shared binlog dump.
-    pub fn mark_member_attached(&self) {
+    pub(crate) fn mark_member_attached(&self) {
         self.member_attached.store(1, Ordering::Relaxed);
     }
 
     /// Mark this dataset detached from the shared dump (its floor is now held,
     /// pinning the shared resume position).
-    pub fn mark_member_detached(&self) {
+    pub(crate) fn mark_member_detached(&self) {
         self.member_attached.store(0, Ordering::Relaxed);
     }
 }

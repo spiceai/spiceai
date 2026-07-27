@@ -7,18 +7,18 @@ use crate::parser::Stream;
 #[derive(Clone, Copy, Debug)]
 pub struct Table {
     /// Face ascender.
-    pub ascender: i16,
+    pub(crate) ascender: i16,
     /// Face descender.
-    pub descender: i16,
+    pub(crate) descender: i16,
     /// Face line gap.
-    pub line_gap: i16,
+    pub(crate) line_gap: i16,
     /// Number of metrics in the `hmtx` table.
-    pub number_of_metrics: u16,
+    pub(crate) number_of_metrics: u16,
 }
 
 impl Table {
     /// Parses a table from raw data.
-    pub fn parse(data: &[u8]) -> Option<Self> {
+    pub(crate) fn parse(data: &[u8]) -> Option<Self> {
         // Do not check the exact length, because some fonts include
         // padding in table's length in table records, which is incorrect.
         if data.len() < 36 {

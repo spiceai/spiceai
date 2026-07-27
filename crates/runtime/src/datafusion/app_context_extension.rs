@@ -24,12 +24,12 @@ pub struct AppContextExtension {
 
 impl AppContextExtension {
     #[must_use]
-    pub fn new(app: Option<Arc<App>>) -> Self {
+    pub(crate) fn new(app: Option<Arc<App>>) -> Self {
         Self { app }
     }
 
     #[must_use]
-    pub fn app(&self) -> Option<Arc<App>> {
+    pub(crate) fn app(&self) -> Option<Arc<App>> {
         self.app.clone()
     }
 }

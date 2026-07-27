@@ -34,7 +34,7 @@ mod unnest;
 mod utils;
 
 pub use connector::{DynamoDB, DynamoDBFactory};
-pub use json_nest::project_dynamodb_row;
+pub(crate) use json_nest::project_dynamodb_row;
 
 /// The connector name used in Spicepod `from:` strings and for factory registration.
 pub const CONNECTOR_NAME: &str = "dynamodb";

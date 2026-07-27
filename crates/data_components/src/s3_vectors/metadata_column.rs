@@ -33,7 +33,7 @@ impl MetadataColumn {
     }
 
     #[must_use]
-    pub fn field(&self) -> FieldRef {
+    pub(crate) fn field(&self) -> FieldRef {
         match self {
             Self::Filterable(field) | Self::NonFilterable(field) => Arc::clone(field),
         }
@@ -45,7 +45,7 @@ pub struct MetadataColumns(Vec<MetadataColumn>);
 
 impl MetadataColumns {
     #[must_use]
-    pub fn none() -> Self {
+    pub(crate) fn none() -> Self {
         Self(vec![])
     }
 
@@ -81,7 +81,7 @@ impl MetadataColumns {
     }
 
     #[must_use]
-    pub fn non_filterable(&self) -> Vec<FieldRef> {
+    fn non_filterable(&self) -> Vec<FieldRef> {
         self.0
             .iter()
             .filter_map(|c| match c {
@@ -92,7 +92,7 @@ impl MetadataColumns {
     }
 
     #[must_use]
-    pub fn non_filterable_names(&self) -> Vec<String> {
+    pub(crate) fn non_filterable_names(&self) -> Vec<String> {
         self.non_filterable()
             .iter()
             .map(|f| f.name().clone())

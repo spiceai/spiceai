@@ -275,19 +275,19 @@ impl QueryHandle {
 
     /// Returns the Ballista job ID (or synthetic ID for cached results).
     #[must_use]
-    pub fn ballista_job_id(&self) -> &str {
+    pub(crate) fn ballista_job_id(&self) -> &str {
         &self.ballista_job_id
     }
 
     /// Returns true if this handle represents a cache hit.
     #[must_use]
-    pub fn is_cached(&self) -> bool {
+    pub(crate) fn is_cached(&self) -> bool {
         matches!(self.state, QueryHandleState::Cached { .. })
     }
 
     /// Returns the result schema.
     #[must_use]
-    pub fn schema(&self) -> SchemaRef {
+    fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
 

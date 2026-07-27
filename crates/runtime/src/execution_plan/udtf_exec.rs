@@ -66,7 +66,7 @@ pub struct UdtfExec {
 impl UdtfExec {
     /// Creates a new `UdtfExec` wrapping the given inner plan with UDTF arguments.
     #[must_use]
-    pub fn new(args: UdtfArgs, inner: Arc<dyn ExecutionPlan>) -> Self {
+    pub(crate) fn new(args: UdtfArgs, inner: Arc<dyn ExecutionPlan>) -> Self {
         let schema = inner.schema();
         let eq_properties = EquivalenceProperties::new(schema);
         let emission_type = inner.pipeline_behavior();
@@ -115,7 +115,7 @@ impl UdtfExec {
 
     /// Returns the UDTF arguments.
     #[must_use]
-    pub fn args(&self) -> &UdtfArgs {
+    pub(crate) fn args(&self) -> &UdtfArgs {
         &self.args
     }
 

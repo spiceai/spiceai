@@ -105,7 +105,7 @@ impl FromData for u64 {
 ///
 /// <https://docs.microsoft.com/en-us/typography/opentype/spec/otff#data-types>
 #[derive(Clone, Copy, Debug)]
-pub struct U24(pub u32);
+pub struct U24(pub(crate) u32);
 
 impl FromData for U24 {
     const SIZE: usize = 3;
@@ -119,18 +119,18 @@ impl FromData for U24 {
 
 /// A 16-bit signed fixed number with the low 14 bits of fraction (2.14).
 #[derive(Clone, Copy, Debug)]
-pub struct F2DOT14(pub i16);
+pub struct F2DOT14(pub(crate) i16);
 
 impl F2DOT14 {
     /// Converts i16 to f32.
     #[inline]
-    pub fn to_f32(self) -> f32 {
+    pub(crate) fn to_f32(self) -> f32 {
         f32::from(self.0) / 16384.0
     }
 
     #[cfg(feature = "variable-fonts")]
     #[inline]
-    pub fn apply_float_delta(&self, delta: f32) -> f32 {
+    pub(crate) fn apply_float_delta(&self, delta: f32) -> f32 {
         self.to_f32() + (delta as f64 * (1.0 / 16384.0)) as f32
     }
 }
@@ -171,7 +171,7 @@ impl Fixed {
 /// Rust doesn't implement `From<u32> for usize`,
 /// because it has to support 16 bit targets.
 /// We don't, so we can allow this.
-pub trait NumFrom<T>: Sized {
+pub(crate) trait NumFrom<T>: Sized {
     /// Converts u32 into usize.
     fn num_from(_: T) -> Self;
 }
@@ -201,7 +201,7 @@ impl NumFrom<char> for usize {
 }
 
 /// Just like TryFrom<N>, but for numeric types not supported by the Rust's std.
-pub trait TryNumFrom<T>: Sized {
+pub(crate) trait TryNumFrom<T>: Sized {
     /// Casts between numeric types.
     fn try_num_from(_: T) -> Option<Self>;
 }
@@ -272,7 +272,7 @@ impl<T> Default for LazyArray16<'_, T> {
 impl<'a, T: FromData> LazyArray16<'a, T> {
     /// Creates a new `LazyArray`.
     #[inline]
-    pub fn new(data: &'a [u8]) -> Self {
+    pub(crate) fn new(data: &'a [u8]) -> Self {
         LazyArray16 {
             data,
             data_type: core::marker::PhantomData,
@@ -293,7 +293,7 @@ impl<'a, T: FromData> LazyArray16<'a, T> {
 
     /// Returns the last value.
     #[inline]
-    pub fn last(&self) -> Option<T> {
+    pub(crate) fn last(&self) -> Option<T> {
         if !self.is_empty() {
             self.get(self.len() - 1)
         } else {
@@ -303,7 +303,7 @@ impl<'a, T: FromData> LazyArray16<'a, T> {
 
     /// Returns sub-array.
     #[inline]
-    pub fn slice(&self, range: Range<u16>) -> Option<Self> {
+    pub(crate) fn slice(&self, range: Range<u16>) -> Option<Self> {
         let start = usize::from(range.start) * T::SIZE;
         let end = usize::from(range.end) * T::SIZE;
         Some(LazyArray16 {
@@ -320,7 +320,7 @@ impl<'a, T: FromData> LazyArray16<'a, T> {
 
     /// Checks if array is empty.
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
@@ -335,7 +335,7 @@ impl<'a, T: FromData> LazyArray16<'a, T> {
 
     /// Performs a binary search using specified closure.
     #[inline]
-    pub fn binary_search_by<F>(&self, mut f: F) -> Option<(u16, T)>
+    pub(crate) fn binary_search_by<F>(&self, mut f: F) -> Option<(u16, T)>
     where
         F: FnMut(&T) -> core::cmp::Ordering,
     {
@@ -444,7 +444,7 @@ impl<T> Default for LazyArray32<'_, T> {
 impl<'a, T: FromData> LazyArray32<'a, T> {
     /// Creates a new `LazyArray`.
     #[inline]
-    pub fn new(data: &'a [u8]) -> Self {
+    pub(crate) fn new(data: &'a [u8]) -> Self {
         LazyArray32 {
             data,
             data_type: core::marker::PhantomData,
@@ -465,7 +465,7 @@ impl<'a, T: FromData> LazyArray32<'a, T> {
 
     /// Returns array's length.
     #[inline]
-    pub fn len(&self) -> u32 {
+    pub(crate) fn len(&self) -> u32 {
         (self.data.len() / T::SIZE) as u32
     }
 
@@ -476,7 +476,7 @@ impl<'a, T: FromData> LazyArray32<'a, T> {
 
     /// Performs a binary search by specified `key`.
     #[inline]
-    pub fn binary_search(&self, key: &T) -> Option<(u32, T)>
+    pub(crate) fn binary_search(&self, key: &T) -> Option<(u32, T)>
     where
         T: Ord,
     {
@@ -485,7 +485,7 @@ impl<'a, T: FromData> LazyArray32<'a, T> {
 
     /// Performs a binary search using specified closure.
     #[inline]
-    pub fn binary_search_by<F>(&self, mut f: F) -> Option<(u32, T)>
+    pub(crate) fn binary_search_by<F>(&self, mut f: F) -> Option<(u32, T)>
     where
         F: FnMut(&T) -> core::cmp::Ordering,
     {
@@ -601,14 +601,14 @@ impl<'a, T: FromSlice<'a>> LazyOffsetArray16<'a, T> {
 
     /// Returns a value at `index`.
     #[inline]
-    pub fn get(&self, index: u16) -> Option<T> {
+    pub(crate) fn get(&self, index: u16) -> Option<T> {
         let offset = self.offsets.get(index)??.to_usize();
         self.data.get(offset..).and_then(T::parse)
     }
 
     /// Returns array's length.
     #[inline]
-    pub fn len(&self) -> u16 {
+    fn len(&self) -> u16 {
         self.offsets.len()
     }
 
@@ -675,7 +675,7 @@ pub struct Stream<'a> {
 impl<'a> Stream<'a> {
     /// Creates a new `Stream` parser.
     #[inline]
-    pub fn new(data: &'a [u8]) -> Self {
+    pub(crate) fn new(data: &'a [u8]) -> Self {
         Stream { data, offset: 0 }
     }
 
@@ -683,7 +683,7 @@ impl<'a> Stream<'a> {
     ///
     /// Returns `None` when `offset` is out of bounds.
     #[inline]
-    pub fn new_at(data: &'a [u8], offset: usize) -> Option<Self> {
+    pub(crate) fn new_at(data: &'a [u8], offset: usize) -> Option<Self> {
         if offset <= data.len() {
             Some(Stream { data, offset })
         } else {
@@ -693,7 +693,7 @@ impl<'a> Stream<'a> {
 
     /// Checks that stream reached the end of the data.
     #[inline]
-    pub fn at_end(&self) -> bool {
+    pub(crate) fn at_end(&self) -> bool {
         self.offset >= self.data.len()
     }
 
@@ -701,13 +701,13 @@ impl<'a> Stream<'a> {
     ///
     /// Useful to indicate that we parsed all the data.
     #[inline]
-    pub fn jump_to_end(&mut self) {
+    pub(crate) fn jump_to_end(&mut self) {
         self.offset = self.data.len();
     }
 
     /// Returns the current offset.
     #[inline]
-    pub fn offset(&self) -> usize {
+    pub(crate) fn offset(&self) -> usize {
         self.offset
     }
 
@@ -715,7 +715,7 @@ impl<'a> Stream<'a> {
     ///
     /// Returns `None` when `Stream` is reached the end.
     #[inline]
-    pub fn tail(&self) -> Option<&'a [u8]> {
+    pub(crate) fn tail(&self) -> Option<&'a [u8]> {
         self.data.get(self.offset..)
     }
 
@@ -723,7 +723,7 @@ impl<'a> Stream<'a> {
     ///
     /// Doesn't check bounds.
     #[inline]
-    pub fn skip<T: FromData>(&mut self) {
+    pub(crate) fn skip<T: FromData>(&mut self) {
         self.advance(T::SIZE);
     }
 
@@ -731,13 +731,13 @@ impl<'a> Stream<'a> {
     ///
     /// Doesn't check bounds.
     #[inline]
-    pub fn advance(&mut self, len: usize) {
+    pub(crate) fn advance(&mut self, len: usize) {
         self.offset += len;
     }
 
     /// Advances by the specified `len` and checks for bounds.
     #[inline]
-    pub fn advance_checked(&mut self, len: usize) -> Option<()> {
+    pub(crate) fn advance_checked(&mut self, len: usize) -> Option<()> {
         if self.offset + len <= self.data.len() {
             self.advance(len);
             Some(())
@@ -751,19 +751,19 @@ impl<'a> Stream<'a> {
     /// Returns `None` when there is not enough data left in the stream
     /// or the type parsing failed.
     #[inline]
-    pub fn read<T: FromData>(&mut self) -> Option<T> {
+    pub(crate) fn read<T: FromData>(&mut self) -> Option<T> {
         self.read_bytes(T::SIZE).and_then(T::parse)
     }
 
     /// Parses the type from the steam at offset.
     #[inline]
-    pub fn read_at<T: FromData>(data: &[u8], offset: usize) -> Option<T> {
+    pub(crate) fn read_at<T: FromData>(data: &[u8], offset: usize) -> Option<T> {
         data.get(offset..offset + T::SIZE).and_then(T::parse)
     }
 
     /// Reads N bytes from the stream.
     #[inline]
-    pub fn read_bytes(&mut self, len: usize) -> Option<&'a [u8]> {
+    pub(crate) fn read_bytes(&mut self, len: usize) -> Option<&'a [u8]> {
         // An integer overflow here on 32bit systems is almost guarantee to be caused
         // by an incorrect parsing logic from the caller side.
         // Simply using `checked_add` here would silently swallow errors, which is not what we want.
@@ -776,14 +776,14 @@ impl<'a> Stream<'a> {
 
     /// Reads the next `count` types as a slice.
     #[inline]
-    pub fn read_array16<T: FromData>(&mut self, count: u16) -> Option<LazyArray16<'a, T>> {
+    pub(crate) fn read_array16<T: FromData>(&mut self, count: u16) -> Option<LazyArray16<'a, T>> {
         let len = usize::from(count) * T::SIZE;
         self.read_bytes(len).map(LazyArray16::new)
     }
 
     /// Reads the next `count` types as a slice.
     #[inline]
-    pub fn read_array32<T: FromData>(&mut self, count: u32) -> Option<LazyArray32<'a, T>> {
+    pub(crate) fn read_array32<T: FromData>(&mut self, count: u32) -> Option<LazyArray32<'a, T>> {
         let len = usize::num_from(count) * T::SIZE;
         self.read_bytes(len).map(LazyArray32::new)
     }
@@ -797,14 +797,14 @@ impl<'a> Stream<'a> {
 }
 
 /// A common offset methods.
-pub trait Offset {
+pub(crate) trait Offset {
     /// Converts the offset to `usize`.
     fn to_usize(&self) -> usize;
 }
 
 /// A type-safe u16 offset.
 #[derive(Clone, Copy, Debug)]
-pub struct Offset16(pub u16);
+pub struct Offset16(pub(crate) u16);
 
 impl Offset for Offset16 {
     #[inline]
@@ -838,7 +838,7 @@ impl FromData for Option<Offset16> {
 
 /// A type-safe u24 offset.
 #[derive(Clone, Copy, Debug)]
-pub struct Offset24(pub u32);
+pub struct Offset24(pub(crate) u32);
 
 impl Offset for Offset24 {
     #[inline]
@@ -872,7 +872,7 @@ impl FromData for Option<Offset24> {
 
 /// A type-safe u32 offset.
 #[derive(Clone, Copy, Debug)]
-pub struct Offset32(pub u32);
+pub struct Offset32(pub(crate) u32);
 
 impl Offset for Offset32 {
     #[inline]
@@ -905,13 +905,13 @@ impl FromData for Option<Offset32> {
 }
 
 #[inline]
-pub fn i16_bound(min: i16, val: i16, max: i16) -> i16 {
+pub(crate) fn i16_bound(min: i16, val: i16, max: i16) -> i16 {
     use core::cmp;
     cmp::max(min, cmp::min(max, val))
 }
 
 #[inline]
-pub fn f32_bound(min: f32, val: f32, max: f32) -> f32 {
+pub(crate) fn f32_bound(min: f32, val: f32, max: f32) -> f32 {
     debug_assert!(min.is_finite());
     debug_assert!(val.is_finite());
     debug_assert!(max.is_finite());

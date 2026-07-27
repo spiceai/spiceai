@@ -64,7 +64,7 @@ mod write;
 
 #[derive(Debug, Clone)]
 pub struct S3Vector {
-    pub table: S3VectorsTable,
+    table: S3VectorsTable,
 
     /// The name of the column in the associated [`TableProvider`] that produces the `data` column in [`S3VectorsTable`].
     pub embedded_column: String,
@@ -73,11 +73,11 @@ pub struct S3Vector {
     pub primary_key: Vec<Field>,
 
     /// Additional columns to add as metadata to the S3 vector index from the original dataset columns.
-    pub metadata_columns: MetadataColumns,
+    metadata_columns: MetadataColumns,
 
-    pub compute_query: Arc<dyn Embed>,
+    compute_query: Arc<dyn Embed>,
 
-    pub partition_by: Vec<Expr>,
+    partition_by: Vec<Expr>,
 
     batch_write_rows: usize,
 
@@ -117,7 +117,7 @@ impl S3Vector {
     }
 
     // If the index supports spill writes, retrieve the last spill index to commence writing from.
-    pub async fn spill_index(
+    async fn spill_index(
         &self,
     ) -> Result<Option<Arc<AtomicU8>>, data_components::s3_vectors::Error> {
         if !self.spill_writes {
@@ -338,7 +338,7 @@ impl VectorIndex for S3Vector {
 
 /// Convert a [`MetadataColumns`] into a set of [`Expr`]s suitable for a projection.
 #[must_use]
-pub(super) fn metadata_columns_to_exprs(metadata_columns: &MetadataColumns) -> Vec<Expr> {
+fn metadata_columns_to_exprs(metadata_columns: &MetadataColumns) -> Vec<Expr> {
     metadata_columns
         .iter()
         .map(|c| Expr::Column(Column::new_unqualified(c.name())))
@@ -405,7 +405,7 @@ fn data_type_to_union_variant(dt: &DataType) -> &str {
 }
 
 #[must_use]
-pub fn s3_vectors_primary_key_cast(primary_key: &[Field]) -> Vec<Expr> {
+fn s3_vectors_primary_key_cast(primary_key: &[Field]) -> Vec<Expr> {
     match primary_key {
         [f] => vec![cast(col(S3_VECTOR_PRIMARY_KEY_NAME), f.data_type().clone()).alias(f.name())],
         [] => vec![],

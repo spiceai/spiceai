@@ -45,7 +45,7 @@ pub struct DataUpdateReceiver {
 }
 
 impl DataUpdateReceiver {
-    pub async fn recv(&mut self) -> Result<DataUpdate, broadcast::error::RecvError> {
+    pub(crate) async fn recv(&mut self) -> Result<DataUpdate, broadcast::error::RecvError> {
         let Some(receiver) = self.receiver.as_mut() else {
             return Err(broadcast::error::RecvError::Closed);
         };
@@ -70,11 +70,11 @@ impl Drop for DataUpdateReceiver {
 
 impl DataUpdateBroadcaster {
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    pub async fn subscribe(&self, table_reference: &TableReference) -> DataUpdateReceiver {
+    pub(crate) async fn subscribe(&self, table_reference: &TableReference) -> DataUpdateReceiver {
         let receiver = if let Some(channel) = self.channels.read().await.get(table_reference) {
             channel.subscribe()
         } else {
@@ -95,7 +95,7 @@ impl DataUpdateBroadcaster {
         }
     }
 
-    pub async fn has_subscribers(&self, table_reference: &TableReference) -> bool {
+    pub(crate) async fn has_subscribers(&self, table_reference: &TableReference) -> bool {
         let Some(channel) = self.channels.read().await.get(table_reference).cloned() else {
             return false;
         };
@@ -108,7 +108,7 @@ impl DataUpdateBroadcaster {
         false
     }
 
-    pub async fn publish(&self, table_reference: &TableReference, update: DataUpdate) {
+    pub(crate) async fn publish(&self, table_reference: &TableReference, update: DataUpdate) {
         let Some(channel) = self.channels.read().await.get(table_reference).cloned() else {
             return;
         };
@@ -127,7 +127,7 @@ impl DataUpdateBroadcaster {
         }
     }
 
-    pub async fn close_subscribers(&self, table_reference: &TableReference) -> bool {
+    pub(crate) async fn close_subscribers(&self, table_reference: &TableReference) -> bool {
         self.channels
             .write()
             .await
@@ -135,7 +135,7 @@ impl DataUpdateBroadcaster {
             .is_some_and(|sender| sender.receiver_count() > 0)
     }
 
-    pub async fn prune_unused(&self, table_reference: &TableReference) -> bool {
+    async fn prune_unused(&self, table_reference: &TableReference) -> bool {
         let Some(channel) = self.channels.read().await.get(table_reference).cloned() else {
             return false;
         };
@@ -170,17 +170,17 @@ impl DataUpdateBroadcaster {
 use crate::datafusion::error::find_datafusion_root;
 
 pub struct StreamingDataUpdate {
-    pub data: SendableRecordBatchStream,
-    pub update_type: UpdateType,
+    pub(crate) data: SendableRecordBatchStream,
+    pub(crate) update_type: UpdateType,
 }
 
 impl StreamingDataUpdate {
     #[must_use]
-    pub fn new(data: SendableRecordBatchStream, update_type: UpdateType) -> Self {
+    pub(crate) fn new(data: SendableRecordBatchStream, update_type: UpdateType) -> Self {
         Self { data, update_type }
     }
 
-    pub async fn collect_data(self) -> Result<DataUpdate, DataFusionError> {
+    pub(crate) async fn collect_data(self) -> Result<DataUpdate, DataFusionError> {
         let schema = self.data.schema();
         let data = self
             .data
@@ -218,13 +218,13 @@ pub struct StreamingDataUpdateExecutionPlan {
 
 impl StreamingDataUpdateExecutionPlan {
     #[must_use]
-    pub fn new(record_batch_stream: SendableRecordBatchStream) -> Self {
+    pub(crate) fn new(record_batch_stream: SendableRecordBatchStream) -> Self {
         let schema = record_batch_stream.schema();
         Self::new_with_stream(schema, Some(record_batch_stream))
     }
 
     #[must_use]
-    pub fn new_empty(schema: SchemaRef) -> Self {
+    pub(crate) fn new_empty(schema: SchemaRef) -> Self {
         Self::new_with_stream(schema, None)
     }
 
@@ -244,7 +244,7 @@ impl StreamingDataUpdateExecutionPlan {
         }
     }
 
-    pub fn set_stream(
+    pub(crate) fn set_stream(
         &self,
         record_batch_stream: SendableRecordBatchStream,
     ) -> DataFusionResult<()> {
@@ -272,7 +272,7 @@ impl StreamingDataUpdateExecutionPlan {
         Ok(())
     }
 
-    pub fn clear_stream(&self) -> DataFusionResult<()> {
+    pub(crate) fn clear_stream(&self) -> DataFusionResult<()> {
         let mut stream = self.record_batch_stream.try_lock().map_err(|e| {
             DataFusionError::Execution(format!(
                 "StreamingDataUpdateExecutionPlan is already executing: {e}"

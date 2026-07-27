@@ -16,7 +16,7 @@ limitations under the License.
 
 use super::{Counter, Gauge, LazyLock, Meter, UpDownCounter, global};
 
-pub static DATASETS_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("dataset"));
+static DATASETS_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("dataset"));
 
 pub static UNAVAILABLE_TIME_MS: LazyLock<Gauge<f64>> = LazyLock::new(|| {
     DATASETS_METER

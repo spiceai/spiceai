@@ -24,17 +24,17 @@ use opentelemetry::{
 
 static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("embeddings"));
 
-pub(crate) static EMBEDDING_REQUESTS: LazyLock<Counter<u64>> =
+static EMBEDDING_REQUESTS: LazyLock<Counter<u64>> =
     LazyLock::new(|| METER.u64_counter("embeddings_requests").build());
 
-pub(crate) static FAILURES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+static FAILURES: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("embeddings_failures")
         .with_description("Number of embedding failures.")
         .build()
 });
 
-pub(crate) static EMBEDDING_INTERNAL_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+static EMBEDDING_INTERNAL_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
     METER
         .f64_histogram("embeddings_internal_request_duration_ms")
         .with_unit("ms")

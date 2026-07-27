@@ -53,7 +53,7 @@ fn now_naive() -> chrono::NaiveDateTime {
 /// # Errors
 ///
 /// Returns an error if the transaction fails.
-pub async fn execute(
+pub(crate) async fn execute(
     conn: &mut mysql_async::Conn,
     rng: &mut impl ::rand::Rng,
     txn_type: super::TxnType,

@@ -4,14 +4,14 @@ use std::collections::HashMap;
 #[derive(Debug, Clone)]
 pub struct Bookmark {
     /// Children, Must be a Collection that allows for insertion of the same page ID.
-    pub children: Vec<u32>,
-    pub title: String,
+    pub(crate) children: Vec<u32>,
+    title: String,
     /// 0, 1 for italic, 2 for bold, 3 for italic bold
-    pub format: u32,
+    format: u32,
     /// R,G,B
-    pub color: [f32; 3],
-    pub page: ObjectId,
-    pub id: u32,
+    color: [f32; 3],
+    pub(crate) page: ObjectId,
+    id: u32,
 }
 
 impl Bookmark {

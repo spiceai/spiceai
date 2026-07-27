@@ -23,10 +23,10 @@ use std::time::Duration;
 pub const DEFAULT_ENDPOINT: &str = "https://cloud.spice.ai";
 
 /// Default cadence for `Heartbeat` frames on an established stream.
-pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Default cadence for `Telemetry` frames on an established stream.
-pub const DEFAULT_TELEMETRY_INTERVAL: Duration = Duration::from_mins(1);
+const DEFAULT_TELEMETRY_INTERVAL: Duration = Duration::from_mins(1);
 
 /// File name (relative to `$SPICE_CONFIG_DIR`) where the cloud-managed
 /// spicepod is written when an `ApplySpicepod` command arrives.
@@ -35,11 +35,11 @@ pub const CLOUD_MANAGED_SPICEPOD_FILE: &str = "spicepod-cloud-managed.yml";
 /// File name (relative to `$SPICE_CONFIG_DIR`) where a freshly-scheduled
 /// adoption code is staged by `spice connect <code>` before `spiced`
 /// starts and consumes it on first Hello.
-pub const PENDING_ADOPT_CODE_FILE: &str = "pending-adopt-code";
+const PENDING_ADOPT_CODE_FILE: &str = "pending-adopt-code";
 
 /// File name (relative to `$SPICE_CONFIG_DIR`) where the runtime identity
 /// is persisted after adoption.
-pub const IDENTITY_FILE: &str = "identity.json";
+const IDENTITY_FILE: &str = "identity.json";
 
 /// Runtime config for the Cloud Connect client.
 #[derive(Debug, Clone)]
@@ -103,7 +103,7 @@ impl CloudConnectConfig {
     /// 2. `~/.spice`
     /// 3. Current directory (fallback)
     #[must_use]
-    pub fn default_config_dir() -> PathBuf {
+    fn default_config_dir() -> PathBuf {
         if let Ok(dir) = std::env::var("SPICE_CONFIG_DIR")
             && !dir.is_empty()
         {

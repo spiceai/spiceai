@@ -74,7 +74,7 @@ pub struct SpiceJsonSource {
 impl SpiceJsonSource {
     /// Initialize a [`SpiceJsonSource`] with the given `table_schema`.
     #[must_use]
-    pub fn new(table_schema: TableSchema) -> Self {
+    pub(crate) fn new(table_schema: TableSchema) -> Self {
         let projection = SplitProjection::unprojected(&table_schema);
         Self {
             batch_size: None,
@@ -89,31 +89,31 @@ impl SpiceJsonSource {
     }
 
     #[must_use]
-    pub fn with_format(mut self, format: Format) -> Self {
+    pub(crate) fn with_format(mut self, format: Format) -> Self {
         self.format = format;
         self
     }
 
     #[must_use]
-    pub fn with_json_pointer(mut self, json_pointer: Option<String>) -> Self {
+    pub(crate) fn with_json_pointer(mut self, json_pointer: Option<String>) -> Self {
         self.json_pointer = json_pointer;
         self
     }
 
     #[must_use]
-    pub fn with_unnest_struct(mut self, unnest_struct: Option<String>) -> Self {
+    pub(crate) fn with_unnest_struct(mut self, unnest_struct: Option<String>) -> Self {
         self.unnest_struct = unnest_struct;
         self
     }
 
     #[must_use]
-    pub fn with_soda_metadata(mut self, enabled: bool) -> Self {
+    pub(crate) fn with_soda_metadata(mut self, enabled: bool) -> Self {
         self.soda_metadata = enabled;
         self
     }
 
     #[must_use]
-    pub fn with_table_schema(mut self, table_schema: TableSchema) -> Self {
+    pub(crate) fn with_table_schema(mut self, table_schema: TableSchema) -> Self {
         self.projection = SplitProjection::unprojected(&table_schema);
         self.table_schema = table_schema;
         self

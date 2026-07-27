@@ -41,10 +41,10 @@ pub struct Tool {
 
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(rename = "dependsOn", default)]
-    pub depends_on: Vec<String>,
+    depends_on: Vec<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub metrics: Option<Metrics>,
+    metrics: Option<Metrics>,
 
     /// Whether this tool is also callable as a SQL UDF. Defaults to
     /// `false`; set to `true` to also register a `DataFusion` `ScalarUDF`

@@ -158,7 +158,7 @@ impl Default for CayennePropagateFilterAcrossEquiJoinKeys {
 impl CayennePropagateFilterAcrossEquiJoinKeys {
     /// Create a new instance of the rule.
     #[must_use]
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self::new_with_table_provider_predicate(<dyn TableProvider>::is::<CayenneTableProvider>)
     }
 
@@ -181,7 +181,7 @@ impl CayennePropagateFilterAcrossEquiJoinKeys {
 
     /// Create a new instance with a caller-provided table-source predicate.
     #[must_use]
-    pub fn new_with_table_source_predicate(
+    fn new_with_table_source_predicate(
         is_cayenne_table_source: impl Fn(&dyn TableSource) -> bool + Send + Sync + 'static,
     ) -> Self {
         Self {
@@ -365,7 +365,7 @@ impl Default for CayenneReassociateCrossJoin {
 impl CayenneReassociateCrossJoin {
     /// Create a new instance of the rule.
     #[must_use]
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self::new_with_table_provider_predicate(<dyn TableProvider>::is::<CayenneTableProvider>)
     }
 
@@ -388,7 +388,7 @@ impl CayenneReassociateCrossJoin {
 
     /// Create a new instance with a caller-provided table-source predicate.
     #[must_use]
-    pub fn new_with_table_source_predicate(
+    fn new_with_table_source_predicate(
         is_cayenne_table_source: impl Fn(&dyn TableSource) -> bool + Send + Sync + 'static,
     ) -> Self {
         Self {
@@ -448,7 +448,7 @@ impl Default for CayenneInListToRangeRewrite {
 impl CayenneInListToRangeRewrite {
     /// Create a new instance of the rule.
     #[must_use]
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self::new_with_table_provider_predicate(<dyn TableProvider>::is::<CayenneTableProvider>)
     }
 
@@ -467,7 +467,7 @@ impl CayenneInListToRangeRewrite {
 
     /// Create a new instance with a caller-provided table-source predicate.
     #[must_use]
-    pub fn new_with_table_source_predicate(
+    fn new_with_table_source_predicate(
         is_cayenne_table_source: impl Fn(&dyn TableSource) -> bool + Send + Sync + 'static,
     ) -> Self {
         Self {
@@ -577,7 +577,7 @@ impl Default for CayennePushDownSemiJoin {
 impl CayennePushDownSemiJoin {
     /// Create a new instance of the rule.
     #[must_use]
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self::new_with_table_provider_predicate(<dyn TableProvider>::is::<CayenneTableProvider>)
     }
 
@@ -596,7 +596,7 @@ impl CayennePushDownSemiJoin {
 
     /// Create a new instance with a caller-provided table-source predicate.
     #[must_use]
-    pub fn new_with_table_source_predicate(
+    fn new_with_table_source_predicate(
         is_cayenne_table_source: impl Fn(&dyn TableSource) -> bool + Send + Sync + 'static,
     ) -> Self {
         Self {

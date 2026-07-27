@@ -85,7 +85,7 @@ pub enum Error {
     UnsupportedFormat { dataset: String },
 }
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Work item handed from the HTTP ingest path to the dataset's changes stream.
 struct IngestWork {
@@ -96,17 +96,17 @@ struct IngestWork {
 /// Registered push target for one dataset.
 #[derive(Clone)]
 pub struct CdcIngestHandle {
-    pub schema: SchemaRef,
-    pub primary_keys: Vec<String>,
-    pub schema_registry_url: Option<String>,
-    pub avro_schema_json: Option<String>,
+    schema: SchemaRef,
+    primary_keys: Vec<String>,
+    schema_registry_url: Option<String>,
+    avro_schema_json: Option<String>,
     tx: mpsc::Sender<IngestWork>,
 }
 
 impl CdcIngestHandle {
     /// Decode a request body and push it onto the dataset's changes stream,
     /// waiting until the batch has been applied (commit ack).
-    pub async fn ingest(
+    async fn ingest(
         &self,
         dataset: &str,
         format: CdcFormat,
@@ -290,7 +290,7 @@ pub struct CdcIngest {
 }
 
 impl CdcIngest {
-    pub fn new(params: &Parameters) -> Self {
+    fn new(params: &Parameters) -> Self {
         Self {
             schema_registry_url: params
                 .get("schema_registry_url")
@@ -560,7 +560,7 @@ impl TableProvider for CdcIngestTable {
 }
 
 /// Public helper used by the HTTP layer.
-pub async fn ingest_http_body(
+pub(crate) async fn ingest_http_body(
     dataset_name: &str,
     content_type: Option<&str>,
     body: &[u8],

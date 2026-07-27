@@ -106,7 +106,7 @@ pub(crate) enum InlineMutationPolicy {
 
 impl InlineMutationPolicy {
     #[must_use]
-    pub(crate) fn from_blocking_conditions(blocking_conditions: [bool; 4]) -> Self {
+    fn from_blocking_conditions(blocking_conditions: [bool; 4]) -> Self {
         if blocking_conditions.into_iter().any(|condition| condition) {
             Self::Vortex
         } else {
@@ -115,7 +115,7 @@ impl InlineMutationPolicy {
     }
 
     #[must_use]
-    pub(crate) fn can_inline(self) -> bool {
+    fn can_inline(self) -> bool {
         matches!(self, Self::Inline)
     }
 }
@@ -133,7 +133,7 @@ pub(crate) struct InlineBatchBuffer {
 
 impl InlineBatchBuffer {
     #[must_use]
-    pub(crate) fn new(schema: SchemaRef, max_rows: usize, max_buffer_bytes: usize) -> Self {
+    fn new(schema: SchemaRef, max_rows: usize, max_buffer_bytes: usize) -> Self {
         Self {
             schema,
             batches: Vec::new(),
@@ -145,7 +145,7 @@ impl InlineBatchBuffer {
         }
     }
 
-    pub(crate) fn push(&mut self, batch: RecordBatch) {
+    fn push(&mut self, batch: RecordBatch) {
         self.total_rows = self.total_rows.saturating_add(batch.num_rows());
         self.total_bytes = self
             .total_bytes
@@ -155,7 +155,7 @@ impl InlineBatchBuffer {
     }
 
     #[must_use]
-    pub(crate) fn should_continue_buffering(&self) -> bool {
+    fn should_continue_buffering(&self) -> bool {
         !self.exceeded
     }
 
@@ -165,7 +165,7 @@ impl InlineBatchBuffer {
     /// cap is exceeded (the buffer still fits — the caller inlines or the stream
     /// simply ended).
     #[must_use]
-    pub(crate) fn overflow_reason(&self) -> Option<&'static str> {
+    fn overflow_reason(&self) -> Option<&'static str> {
         if self.total_rows > self.max_rows {
             Some("rows_cap")
         } else if self.total_bytes > self.max_buffer_bytes {
@@ -175,7 +175,7 @@ impl InlineBatchBuffer {
         }
     }
 
-    pub(crate) fn total_rows(&self) -> usize {
+    fn total_rows(&self) -> usize {
         self.total_rows
     }
 
@@ -186,16 +186,16 @@ impl InlineBatchBuffer {
     /// `estimated_bytes`, deliberately keeping hot CDC bursts on fewer write
     /// shards than their true size might warrant.
     #[must_use]
-    pub(crate) fn total_bytes(&self) -> usize {
+    fn total_bytes(&self) -> usize {
         self.total_bytes
     }
 
     #[must_use]
-    pub(crate) fn batches(&self) -> &[RecordBatch] {
+    fn batches(&self) -> &[RecordBatch] {
         &self.batches
     }
 
-    pub(crate) fn into_chained_stream(
+    fn into_chained_stream(
         self,
         remaining_stream: SendableRecordBatchStream,
         context: &Arc<TaskContext>,

@@ -328,7 +328,7 @@ fn names_from_json_rows(
 /// # Errors
 ///
 /// Returns an error if there is a failure in converting Snowflake to Arrow types.
-pub fn snowflake_schema_cast(record_batch: &RecordBatch) -> Result<RecordBatch, Error> {
+fn snowflake_schema_cast(record_batch: &RecordBatch) -> Result<RecordBatch, Error> {
     let mut fields = Vec::new();
     let mut columns = Vec::new();
 
@@ -621,7 +621,7 @@ where
 /// # Errors
 ///
 /// Returns an error if the JSON is malformed or contains an unsupported type.
-pub fn parse_snowflake_data_type(data_type_str: &str) -> Result<DataType, Error> {
+fn parse_snowflake_data_type(data_type_str: &str) -> Result<DataType, Error> {
     let data_type: serde_json::Value =
         serde_json::from_str(data_type_str).map_err(|e| Error::UnableToRetrieveSchema {
             reason: e.to_string(),

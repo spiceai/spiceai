@@ -16,11 +16,11 @@ limitations under the License.
 
 use std::path::PathBuf;
 
-pub const TLS_CLIENT_CERTIFICATE_FILE: &str = "tls_client_certificate_file";
-pub const TLS_CLIENT_KEY_FILE: &str = "tls_client_key_file";
-pub const TLS_CLIENT_CERTIFICATE: &str = "tls_client_certificate";
-pub const TLS_CLIENT_KEY: &str = "tls_client_key";
-pub const TLS_CLIENT_IDENTITY_PARAM_NAMES: [&str; 4] = [
+pub(crate) const TLS_CLIENT_CERTIFICATE_FILE: &str = "tls_client_certificate_file";
+pub(crate) const TLS_CLIENT_KEY_FILE: &str = "tls_client_key_file";
+pub(crate) const TLS_CLIENT_CERTIFICATE: &str = "tls_client_certificate";
+pub(crate) const TLS_CLIENT_KEY: &str = "tls_client_key";
+pub(crate) const TLS_CLIENT_IDENTITY_PARAM_NAMES: [&str; 4] = [
     TLS_CLIENT_CERTIFICATE_FILE,
     TLS_CLIENT_KEY_FILE,
     TLS_CLIENT_CERTIFICATE,
@@ -50,7 +50,7 @@ pub enum ClientIdentityConfigError {
 
 /// Resolves the mTLS client identity from the file-based parameter pair or the
 /// inline PEM parameter pair.
-pub fn resolve_client_identity_config(
+pub(crate) fn resolve_client_identity_config(
     cert_file: Option<PathBuf>,
     key_file: Option<PathBuf>,
     cert_inline: Option<Vec<u8>>,

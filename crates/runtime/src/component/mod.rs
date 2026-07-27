@@ -40,7 +40,7 @@ pub enum Error {
 
 pub mod access;
 pub mod catalog;
-pub mod column;
+pub(crate) mod column;
 pub mod dataset;
 pub mod view;
 
@@ -58,7 +58,7 @@ pub mod view;
 /// Disallowed:
 /// - `sneaky\"; CREATE TABLE foo (id int); -- putting comments!`
 /// - `validate your inputs!`
-pub fn validate_identifier(identifier: &str) -> Result<(), Error> {
+pub(crate) fn validate_identifier(identifier: &str) -> Result<(), Error> {
     let dialect: Box<dyn Dialect> = Box::new(GenericDialect);
     let mut tokenizer = Tokenizer::new(dialect.as_ref(), identifier);
     let Ok(tokens) = tokenizer.tokenize() else {
@@ -142,13 +142,13 @@ impl Default for ComponentInitialization {
 
 impl ComponentInitialization {
     #[must_use]
-    pub fn is_on_trigger(&self) -> bool {
+    pub(crate) fn is_on_trigger(&self) -> bool {
         matches!(self, ComponentInitialization::OnTrigger)
     }
 
     /// Returns whether the dataset health monitor should be enabled for this component.
     #[must_use]
-    pub fn is_dataset_health_monitor_enabled(&self) -> bool {
+    pub(crate) fn is_dataset_health_monitor_enabled(&self) -> bool {
         match self {
             ComponentInitialization::OnStartup(options) => {
                 options.dataset_health_monitor == DatasetHealthMonitor::Enabled
@@ -169,7 +169,7 @@ pub enum DatasetHealthMonitor {
 /// Options for components initialized on startup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StartupOptions {
-    pub dataset_health_monitor: DatasetHealthMonitor,
+    pub(crate) dataset_health_monitor: DatasetHealthMonitor,
 }
 
 #[cfg(test)]

@@ -54,7 +54,7 @@ use crate::{
 
 /// [`Databricks`] is provides both [`Chat`] and [`Embed`] capabilities for Databricks models.
 pub struct Databricks {
-    pub model: String,
+    model: String,
     client: Client<HostedModelConfig>,
     health_check: HealthCheck,
 
@@ -218,17 +218,17 @@ pub fn from_token_provider(
 #[derive(Debug, Deserialize, Clone, PartialEq, Serialize)]
 pub struct DatabricksCreateChatCompletionStreamResponse {
     /// The same as [`CreateChatCompletionStreamResponse`]
-    pub id: String,
-    pub choices: Vec<ChatChoiceStream>,
-    pub created: u32,
-    pub model: String,
-    pub service_tier: Option<ServiceTier>,
-    pub system_fingerprint: Option<String>,
-    pub object: String,
+    id: String,
+    choices: Vec<ChatChoiceStream>,
+    created: u32,
+    model: String,
+    service_tier: Option<ServiceTier>,
+    system_fingerprint: Option<String>,
+    object: String,
 
     /// Usage is different in Databricks
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub usage: Option<DatabricksCompletionUsage>,
+    usage: Option<DatabricksCompletionUsage>,
 }
 
 impl From<DatabricksCreateChatCompletionStreamResponse> for CreateChatCompletionStreamResponse {
@@ -260,11 +260,11 @@ impl From<DatabricksCreateChatCompletionStreamResponse> for CreateChatCompletion
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 pub struct DatabricksCompletionUsage {
-    pub prompt_tokens: Option<u32>,
-    pub completion_tokens: Option<u32>,
-    pub total_tokens: Option<u32>,
-    pub prompt_tokens_details: Option<PromptTokensDetails>,
-    pub completion_tokens_details: Option<CompletionTokensDetails>,
+    prompt_tokens: Option<u32>,
+    completion_tokens: Option<u32>,
+    total_tokens: Option<u32>,
+    prompt_tokens_details: Option<PromptTokensDetails>,
+    completion_tokens_details: Option<CompletionTokensDetails>,
 }
 
 impl From<DatabricksCompletionUsage> for CompletionUsage {

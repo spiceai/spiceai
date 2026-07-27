@@ -195,7 +195,7 @@ impl fmt::Debug for DistributedCayenneCreateTableExec {
 
 impl DistributedCayenneCreateTableExec {
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         params: operations::CreateTableParams,
         catalog_list: Arc<dyn CatalogProviderList>,
         executor_registry: Arc<ExecutorRegistry>,
@@ -453,7 +453,7 @@ impl fmt::Debug for DistributedCayenneDropTableExec {
 
 impl DistributedCayenneDropTableExec {
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         table_name: String,
         if_exists: bool,
         df_catalog_name: String,
@@ -593,7 +593,7 @@ impl fmt::Debug for DistributedCayenneCreateSchemaExec {
 
 impl DistributedCayenneCreateSchemaExec {
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         schema_name: String,
         if_not_exists: bool,
         catalog_name: String,
@@ -714,7 +714,7 @@ impl fmt::Debug for DistributedCayenneDeleteExec {
 
 impl DistributedCayenneDeleteExec {
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         table_name: datafusion::sql::TableReference,
         executor_registry: Arc<ExecutorRegistry>,
         filter_sql: Option<String>,
@@ -810,7 +810,7 @@ impl fmt::Debug for DistributedCayenneUpdateExec {
 
 impl DistributedCayenneUpdateExec {
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         table_name: datafusion::sql::TableReference,
         executor_registry: Arc<ExecutorRegistry>,
         filter_sql: Option<String>,
@@ -920,7 +920,7 @@ impl fmt::Debug for DistributedCayenneInsertExec {
 
 impl DistributedCayenneInsertExec {
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         table_name: datafusion::sql::TableReference,
         executor_registry: Arc<ExecutorRegistry>,
         ctx: Arc<datafusion::prelude::SessionContext>,
@@ -1088,7 +1088,7 @@ impl fmt::Debug for DistributedCayenneMergeExec {
 
 impl DistributedCayenneMergeExec {
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         target_table: datafusion::sql::TableReference,
         source_table: datafusion::sql::TableReference,
         on_keys: Vec<(String, String)>,

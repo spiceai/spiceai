@@ -53,19 +53,19 @@ use query_table::DuckDBVectorQueryTable;
 
 #[derive(Debug, Clone)]
 pub struct DuckDBVectorQueryContext {
-    pub pool: Arc<DuckDbConnectionPool>,
-    pub table_definition: Arc<TableDefinition>,
+    pool: Arc<DuckDbConnectionPool>,
+    table_definition: Arc<TableDefinition>,
 }
 
 #[derive(Debug, Clone)]
 pub struct DuckDBVectorIndex {
     pub embedded_column: String,
-    pub primary_key: Vec<Field>,
-    pub compute_query: Arc<dyn Embed>,
-    pub dims: i32,
-    pub source_schema: SchemaRef,
-    pub hnsw: DuckDBHnswOptions,
-    pub query_context: Option<DuckDBVectorQueryContext>,
+    primary_key: Vec<Field>,
+    compute_query: Arc<dyn Embed>,
+    dims: i32,
+    source_schema: SchemaRef,
+    hnsw: DuckDBHnswOptions,
+    query_context: Option<DuckDBVectorQueryContext>,
 }
 
 impl DuckDBVectorIndex {

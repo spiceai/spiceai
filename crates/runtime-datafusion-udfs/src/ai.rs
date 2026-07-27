@@ -58,7 +58,7 @@ const MAX_MESSAGE_SIZE: usize = 1_000_000; // 1MB per message
 const MAX_BATCH_SIZE: usize = 1000; // Maximum rows per batch
 
 pub static AI_UDF_NAME: &str = "ai";
-pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| {
+static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| {
     Documentation {
     doc_section: DocSection::default(),
     description: "Generates AI responses for text using a specified chat model".to_string(),
@@ -76,7 +76,7 @@ pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| {
 }
 });
 
-pub static SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
+static SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
     Signature::one_of(
         vec![
             // ai(message)

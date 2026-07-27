@@ -10,12 +10,12 @@ pub struct IncrementalDocument {
     prev_documents: Document,
 
     /// A new document appended to the previously loaded file.
-    pub new_document: Document,
+    pub(crate) new_document: Document,
 }
 
 impl IncrementalDocument {
     /// Create new PDF document.
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             bytes_documents: Vec::new(),
             prev_documents: Document::new(),
@@ -27,7 +27,7 @@ impl IncrementalDocument {
     ///
     /// The function expects the bytes and previous document to match.
     /// If they do not match exactly this might result in broken PDFs.
-    pub fn create_from(prev_bytes: Vec<u8>, prev_documents: Document) -> Self {
+    pub(crate) fn create_from(prev_bytes: Vec<u8>, prev_documents: Document) -> Self {
         Self {
             bytes_documents: prev_bytes,
             new_document: Document::new_from_prev(&prev_documents),
@@ -41,7 +41,7 @@ impl IncrementalDocument {
     }
 
     /// Get the bytes of the previous documents.
-    pub fn get_prev_documents_bytes(&self) -> &[u8] {
+    pub(crate) fn get_prev_documents_bytes(&self) -> &[u8] {
         &self.bytes_documents
     }
 

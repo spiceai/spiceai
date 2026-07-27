@@ -104,7 +104,7 @@ pub struct SpiceExtension {
 
 impl SpiceExtension {
     #[must_use]
-    pub fn new(manifest: ExtensionManifest) -> Self {
+    fn new(manifest: ExtensionManifest) -> Self {
         SpiceExtension {
             manifest,
             api_key: String::new(),
@@ -355,7 +355,7 @@ async fn get_spiceai_table_provider(
 ///
 /// This function will return an error if the accelerated table provider cannot be created
 #[expect(clippy::too_many_arguments)]
-pub async fn create_synced_internal_accelerated_table(
+async fn create_synced_internal_accelerated_table(
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     runtime_status: Arc<status::RuntimeStatus>,
     table_reference: TableReference,

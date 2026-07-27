@@ -74,7 +74,7 @@ Docs: https://spiceai.org/docs"#
 )]
 pub struct DatasetArgs {
     #[command(subcommand)]
-    pub command: DatasetCommands,
+    command: DatasetCommands,
 }
 
 /// Dataset subcommands.

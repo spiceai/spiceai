@@ -132,7 +132,7 @@ fn resolve_client_identity_params(
 
 #[derive(Debug, Clone)]
 pub struct FlightSQL {
-    pub flightsql_factory: DataComponentFlightSQLFactory,
+    flightsql_factory: DataComponentFlightSQLFactory,
 }
 
 #[derive(Default, Debug, Copy, Clone)]
@@ -145,7 +145,7 @@ impl FlightSQLFactory {
     }
 
     #[must_use]
-    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+    fn new_arc() -> Arc<dyn DataConnectorFactory> {
         Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
     }
 }

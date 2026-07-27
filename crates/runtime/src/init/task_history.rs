@@ -26,7 +26,7 @@ use std::fmt::Write;
 use std::sync::Arc;
 
 impl Runtime {
-    pub async fn init_task_history(self: Arc<Self>) -> Result<()> {
+    pub(crate) async fn init_task_history(self: Arc<Self>) -> Result<()> {
         // Skip task history initialization if there's no valid spicepod
         // Task history requires App infrastructure (datasets, table providers) to function
         let Some(app) = self.read_app().await else {

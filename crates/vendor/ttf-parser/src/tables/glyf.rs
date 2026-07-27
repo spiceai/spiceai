@@ -7,12 +7,12 @@ use crate::parser::{LazyArray16, NumFrom, Stream, F2DOT14};
 use crate::{loca, GlyphId, OutlineBuilder, Rect, RectF, Transform};
 
 pub(crate) struct Builder<'a> {
-    pub builder: &'a mut dyn OutlineBuilder,
-    pub transform: Transform,
+    pub(crate) builder: &'a mut dyn OutlineBuilder,
+    pub(crate) transform: Transform,
     is_default_ts: bool, // `bool` is faster than `Option` or `is_default`.
     // We have to always calculate the bbox, because `gvar` doesn't store one
     // and in case of a malformed bbox in `glyf`.
-    pub bbox: RectF,
+    pub(crate) bbox: RectF,
     first_on_curve: Option<Point>,
     first_off_curve: Option<Point>,
     last_off_curve: Option<Point>,
@@ -20,7 +20,7 @@ pub(crate) struct Builder<'a> {
 
 impl<'a> Builder<'a> {
     #[inline]
-    pub fn new(transform: Transform, bbox: RectF, builder: &'a mut dyn OutlineBuilder) -> Self {
+    pub(crate) fn new(transform: Transform, bbox: RectF, builder: &'a mut dyn OutlineBuilder) -> Self {
         Builder {
             builder,
             transform,
@@ -72,7 +72,7 @@ impl<'a> Builder<'a> {
     // - https://developer.apple.com/fonts/TrueType-Reference-Manual/RM01/Chap1.html
     // - https://stackoverflow.com/a/20772557
     #[inline]
-    pub fn push_point(&mut self, x: f32, y: f32, on_curve_point: bool, last_point: bool) {
+    pub(crate) fn push_point(&mut self, x: f32, y: f32, on_curve_point: bool, last_point: bool) {
         let p = Point { x, y };
         if self.first_on_curve.is_none() {
             if on_curve_point {
@@ -139,8 +139,8 @@ impl<'a> Builder<'a> {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CompositeGlyphInfo {
-    pub glyph_id: GlyphId,
-    pub transform: Transform,
+    pub(crate) glyph_id: GlyphId,
+    pub(crate) transform: Transform,
     #[allow(dead_code)]
     pub flags: CompositeGlyphFlags,
 }
@@ -152,7 +152,7 @@ pub(crate) struct CompositeGlyphIter<'a> {
 
 impl<'a> CompositeGlyphIter<'a> {
     #[inline]
-    pub fn new(data: &'a [u8]) -> Self {
+    pub(crate) fn new(data: &'a [u8]) -> Self {
         CompositeGlyphIter {
             stream: Stream::new(data),
         }
@@ -211,12 +211,12 @@ impl<'a> Iterator for CompositeGlyphIter<'a> {
 // fits into the machine word.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GlyphPoint {
-    pub x: i16,
-    pub y: i16,
+    pub(crate) x: i16,
+    pub(crate) y: i16,
     /// Indicates that a point is a point on curve
     /// and not a control point.
-    pub on_curve_point: bool,
-    pub last_point: bool,
+    pub(crate) on_curve_point: bool,
+    pub(crate) last_point: bool,
 }
 
 #[derive(Clone, Default)]
@@ -225,13 +225,13 @@ pub(crate) struct GlyphPointsIter<'a> {
     flags: FlagsIter<'a>,
     x_coords: CoordsIter<'a>,
     y_coords: CoordsIter<'a>,
-    pub points_left: u16, // Number of points left in the glyph.
+    pub(crate) points_left: u16, // Number of points left in the glyph.
 }
 
 #[cfg(feature = "variable-fonts")]
 impl GlyphPointsIter<'_> {
     #[inline]
-    pub fn current_contour(&self) -> u16 {
+    pub(crate) fn current_contour(&self) -> u16 {
         self.endpoints.index - 1
     }
 }
@@ -416,12 +416,12 @@ pub(crate) struct CompositeGlyphFlags(u16);
 
 #[rustfmt::skip]
 impl CompositeGlyphFlags {
-    #[inline] pub fn arg_1_and_2_are_words(self) -> bool { self.0 & 0x0001 != 0 }
-    #[inline] pub fn args_are_xy_values(self) -> bool { self.0 & 0x0002 != 0 }
-    #[inline] pub fn we_have_a_scale(self) -> bool { self.0 & 0x0008 != 0 }
-    #[inline] pub fn more_components(self) -> bool { self.0 & 0x0020 != 0 }
-    #[inline] pub fn we_have_an_x_and_y_scale(self) -> bool { self.0 & 0x0040 != 0 }
-    #[inline] pub fn we_have_a_two_by_two(self) -> bool { self.0 & 0x0080 != 0 }
+    #[inline] fn arg_1_and_2_are_words(self) -> bool { self.0 & 0x0001 != 0 }
+    #[inline] pub(crate) fn args_are_xy_values(self) -> bool { self.0 & 0x0002 != 0 }
+    #[inline] fn we_have_a_scale(self) -> bool { self.0 & 0x0008 != 0 }
+    #[inline] fn more_components(self) -> bool { self.0 & 0x0020 != 0 }
+    #[inline] fn we_have_an_x_and_y_scale(self) -> bool { self.0 & 0x0040 != 0 }
+    #[inline] fn we_have_a_two_by_two(self) -> bool { self.0 & 0x0080 != 0 }
 }
 
 // It's not defined in the spec, so we are using our own value.
@@ -574,7 +574,7 @@ fn resolve_coords_len(s: &mut Stream, points_total: u16) -> Option<(u32, u32)> {
 /// https://docs.microsoft.com/en-us/typography/opentype/spec/glyf).
 #[derive(Clone, Copy)]
 pub struct Table<'a> {
-    pub(crate) data: &'a [u8],
+    data: &'a [u8],
     loca_table: loca::Table<'a>,
 }
 
@@ -587,13 +587,13 @@ impl core::fmt::Debug for Table<'_> {
 impl<'a> Table<'a> {
     /// Parses a table from raw data.
     #[inline]
-    pub fn parse(loca_table: loca::Table<'a>, data: &'a [u8]) -> Option<Self> {
+    pub(crate) fn parse(loca_table: loca::Table<'a>, data: &'a [u8]) -> Option<Self> {
         Some(Table { loca_table, data })
     }
 
     /// Outlines a glyph.
     #[inline]
-    pub fn outline(&self, glyph_id: GlyphId, builder: &mut dyn OutlineBuilder) -> Option<Rect> {
+    pub(crate) fn outline(&self, glyph_id: GlyphId, builder: &mut dyn OutlineBuilder) -> Option<Rect> {
         let mut b = Builder::new(Transform::default(), RectF::new(), builder);
         let glyph_data = self.get(glyph_id)?;
         outline_impl(self.loca_table, self.data, glyph_data, 0, &mut b)?

@@ -20,15 +20,15 @@ use std::time::SystemTime;
 #[derive(Debug, Default)]
 pub struct MetricsCollector {
     /// Number of currently active shards (gauge)
-    pub active_shards_number: RwLock<usize>,
+    pub(crate) active_shards_number: RwLock<usize>,
     /// Total number of records produced (counter)
-    pub records: AtomicUsize,
+    pub(crate) records: AtomicUsize,
     /// Total number of transient errors encountered (counter)
-    pub transient_errors: AtomicUsize,
+    pub(crate) transient_errors: AtomicUsize,
     /// Total number of rebootstrap operations (counter)
     pub rebootstraps: AtomicUsize,
     /// Latest watermark from stream batches
-    pub watermark: RwLock<Option<SystemTime>>,
+    pub(crate) watermark: RwLock<Option<SystemTime>>,
 }
 
 #[derive(Debug)]

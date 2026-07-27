@@ -661,7 +661,7 @@ pub(crate) fn sample_cpu_pressure() {}
 /// Current process CPU busy-fraction (of available cores), or `None` when
 /// unavailable. Read on the background tick into the snapshot.
 #[must_use]
-pub(crate) fn cpu_pressure() -> Option<f64> {
+fn cpu_pressure() -> Option<f64> {
     milli_to_pressure(CPU_PRESSURE_MILLI.load(Ordering::Relaxed))
 }
 
@@ -1611,7 +1611,7 @@ impl Default for QueryObservations {
 impl QueryObservations {
     /// Empty observations anchored at the current instant (the QPH baseline).
     #[must_use]
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             lat_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             total_queries: AtomicU64::new(0),
@@ -1622,7 +1622,7 @@ impl QueryObservations {
 
     /// Record one finished query's wall latency. Lock-free (two `fetch_add`s);
     /// called by the runtime for every query that touched this table.
-    pub fn record_query(&self, latency_ms: f64) {
+    fn record_query(&self, latency_ms: f64) {
         let idx = LAT_BUCKET_BOUNDS_MS
             .iter()
             .position(|&hi| latency_ms <= hi)
@@ -1640,7 +1640,7 @@ impl QueryObservations {
     /// p99 latency estimate (upper bound of the bucket where the running cumulative
     /// count crosses 99%), or `None` if no queries have been recorded.
     #[must_use]
-    pub fn p99_latency_ms(&self) -> Option<f64> {
+    pub(crate) fn p99_latency_ms(&self) -> Option<f64> {
         // Two passes directly over the 16 atomics (no heap alloc): total, then the
         // bucket where the running count crosses 99%.
         let total: u64 = self
@@ -1667,7 +1667,7 @@ impl QueryObservations {
 
     /// Total queries recorded over the lifetime of these observations.
     #[must_use]
-    pub fn total_queries(&self) -> u64 {
+    fn total_queries(&self) -> u64 {
         self.total_queries.load(Ordering::Relaxed)
     }
 
@@ -1679,7 +1679,7 @@ impl QueryObservations {
     /// correct cut; it under-reacts to recent spikes (a true windowed rate is a
     /// future refinement).
     #[must_use]
-    pub fn qph(&self) -> Option<f64> {
+    fn qph(&self) -> Option<f64> {
         let total = self.total_queries.load(Ordering::Relaxed);
         if total == 0 {
             return None;
@@ -1711,7 +1711,7 @@ static QUERY_OBSERVATIONS: LazyLock<RwLock<HashMap<String, Arc<QueryObservations
 /// runtime, via `TableReference::table()`) must agree on this; using the bare name
 /// relies on globally-unique accelerated dataset names (true in Spice).
 #[must_use]
-pub(crate) fn table_registry_key(name: &str) -> String {
+fn table_registry_key(name: &str) -> String {
     datafusion_common::TableReference::from(name)
         .table()
         .to_string()
@@ -1877,7 +1877,7 @@ impl Default for Goals {
 impl Goals {
     /// No goals configured — [`decide`] behaves exactly as the legacy controller.
     #[must_use]
-    pub(crate) fn none() -> Self {
+    fn none() -> Self {
         Self {
             replication_lag: None,
             freshness: None,

@@ -86,7 +86,7 @@ pub enum KeyFilter {
 /// }
 /// ```
 #[must_use]
-pub fn try_match_index(
+pub(crate) fn try_match_index(
     filters: &[Expr],
     partition_key: &str,
     sort_key: Option<&str>,
@@ -132,7 +132,7 @@ pub fn try_match_index(
 /// OR conditions typically cannot be pushed down to key-based queries in `NoSQL` databases
 /// because they would require multiple partition lookups or a scan.
 #[must_use]
-pub fn contains_or(expr: &Expr) -> bool {
+pub(crate) fn contains_or(expr: &Expr) -> bool {
     // Use tree traversal to find any OR operator
     expr.apply(|e| match e {
         Expr::BinaryExpr(BinaryExpr {
@@ -162,7 +162,7 @@ pub fn contains_or(expr: &Expr) -> bool {
 /// - `Some(KeyFilter::Sort(expr))` if expression is sort key comparison
 /// - `None` if expression doesn't match any key column or uses unsupported operators
 #[must_use]
-pub fn try_extract_key_filter(
+pub(crate) fn try_extract_key_filter(
     expr: &Expr,
     partition_key: &str,
     sort_key: Option<&str>,

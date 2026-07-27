@@ -133,7 +133,7 @@ impl ModelSource {
 // - org: Organization name (allows word chars and hyphens)
 // - model: Model name (allows word chars, hyphens, and dots)
 // - revision: Optional revision/version (allows word chars, digits, hyphens, and dots)
-pub static HUGGINGFACE_PATH_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+pub(crate) static HUGGINGFACE_PATH_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     match Regex::new(
         r"\A(?:(?:huggingface|hf):)?(huggingface\.co\/)?(?<org>[\w\-]+)\/(?<model>[\w\-\.]+)(:(?<revision>[\w\d\-\.]+))?\z",
     ) {
@@ -336,10 +336,10 @@ impl Model {
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct ModelFile {
     pub path: String,
-    pub name: Option<String>,
+    name: Option<String>,
 
     /// Should use [`Self::file_type`] to access.
-    pub(crate) r#type: Option<ModelFileType>,
+    r#type: Option<ModelFileType>,
 
     pub params: Option<HashMap<String, String>>,
 }
@@ -358,7 +358,7 @@ impl ModelFile {
     /// Returns the [`ModelFileType`] if explicitly set, otherwise attempts to determine the file
     /// type for the [`ModelFile`] based on the file path.
     #[must_use]
-    pub fn file_type(&self) -> Option<ModelFileType> {
+    pub(crate) fn file_type(&self) -> Option<ModelFileType> {
         match self.r#type {
             Some(t) => Some(t),
             None => {
@@ -388,7 +388,7 @@ pub enum ModelFileType {
 /// Attempts to determine the file type for the [`ModelFile`] based on the file path. If
 /// [`determine_type_from_path`] is None, the file may be one of [`ModelFileType`], but the type
 /// could not be determined.
-pub(crate) fn determine_type_from_path(p: &str) -> Option<ModelFileType> {
+fn determine_type_from_path(p: &str) -> Option<ModelFileType> {
     let path = Path::new(p);
 
     if is_llm_file(path) {
@@ -417,7 +417,7 @@ pub(crate) fn determine_type_from_path(p: &str) -> Option<ModelFileType> {
 }
 
 /// Returns true if the file is an LLM model file. Possible false negatives, but attempts to be positively certain (i.e. avoid false positives).
-pub(crate) fn is_llm_file(p: &Path) -> bool {
+fn is_llm_file(p: &Path) -> bool {
     let Some(filename) = p.file_name().map(|f| f.to_string_lossy().to_string()) else {
         return false;
     };

@@ -34,15 +34,15 @@ pub enum Error {
     },
 }
 
-pub type Result<T> = std::result::Result<T, Error>;
+pub(crate) type Result<T> = std::result::Result<T, Error>;
 
 /// Acceleration configuration for an entire [`Catalog`]. See
 /// [`spicepod_catalog::CatalogAcceleration`] for the user-facing schema this
 /// mirrors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CatalogAcceleration {
-    pub engine: CatalogAccelerationEngine,
-    pub refresh_mode: CatalogRefreshMode,
+    engine: CatalogAccelerationEngine,
+    refresh_mode: CatalogRefreshMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -85,20 +85,20 @@ impl From<spicepod_catalog::CatalogAcceleration> for CatalogAcceleration {
 
 #[derive(Clone)]
 pub struct Catalog {
-    pub provider: String,
-    pub catalog_id: Option<String>,
-    pub from: String,
-    pub name: String,
-    pub access: AccessMode,
+    pub(crate) provider: String,
+    pub(crate) catalog_id: Option<String>,
+    pub(crate) from: String,
+    pub(crate) name: String,
+    pub(crate) access: AccessMode,
     pub(crate) orig_include: Vec<String>,
-    pub include: Option<GlobSet>,
-    pub(crate) orig_exclude: Vec<String>,
-    pub exclude: Option<GlobSet>,
-    pub params: HashMap<String, String>,
-    pub dataset_params: HashMap<String, String>,
-    pub acceleration: Option<CatalogAcceleration>,
-    pub app: Arc<App>,
-    pub runtime: Arc<Runtime>,
+    pub(crate) include: Option<GlobSet>,
+    orig_exclude: Vec<String>,
+    pub(crate) exclude: Option<GlobSet>,
+    pub(crate) params: HashMap<String, String>,
+    pub(crate) dataset_params: HashMap<String, String>,
+    pub(crate) acceleration: Option<CatalogAcceleration>,
+    pub(crate) app: Arc<App>,
+    runtime: Arc<Runtime>,
 }
 
 impl std::fmt::Debug for Catalog {
@@ -136,12 +136,12 @@ impl PartialEq for Catalog {
 
 impl Catalog {
     #[must_use]
-    pub fn app(&self) -> Arc<App> {
+    pub(crate) fn app(&self) -> Arc<App> {
         Arc::clone(&self.app)
     }
 
     #[must_use]
-    pub fn runtime(&self) -> Arc<Runtime> {
+    pub(crate) fn runtime(&self) -> Arc<Runtime> {
         Arc::clone(&self.runtime)
     }
 
@@ -202,20 +202,20 @@ impl Catalog {
 }
 
 pub struct CatalogBuilder {
-    pub provider: String,
-    pub catalog_id: Option<String>,
-    pub from: String,
-    pub name: String,
-    pub access: AccessMode,
+    provider: String,
+    catalog_id: Option<String>,
+    from: String,
+    pub(crate) name: String,
+    access: AccessMode,
     orig_include: Vec<String>,
-    pub include: Option<GlobSet>,
+    include: Option<GlobSet>,
     orig_exclude: Vec<String>,
-    pub exclude: Option<GlobSet>,
-    pub params: HashMap<String, String>,
-    pub dataset_params: HashMap<String, String>,
-    pub acceleration: Option<CatalogAcceleration>,
-    pub app: Option<Arc<App>>,
-    pub runtime: Option<Arc<Runtime>>,
+    exclude: Option<GlobSet>,
+    params: HashMap<String, String>,
+    dataset_params: HashMap<String, String>,
+    acceleration: Option<CatalogAcceleration>,
+    app: Option<Arc<App>>,
+    runtime: Option<Arc<Runtime>>,
 }
 
 #[expect(clippy::result_large_err)]
@@ -310,7 +310,7 @@ impl TryFrom<spicepod_catalog::Catalog> for CatalogBuilder {
 
 impl CatalogBuilder {
     #[expect(clippy::result_large_err)]
-    pub fn try_new(from: String, name: &str) -> std::result::Result<Self, crate::Error> {
+    pub(crate) fn try_new(from: String, name: &str) -> std::result::Result<Self, crate::Error> {
         validate_identifier(name).context(crate::ComponentSnafu)?;
 
         if name.eq_ignore_ascii_case(crate::datafusion::SPICE_DEFAULT_CATALOG) {
@@ -343,18 +343,18 @@ impl CatalogBuilder {
     }
 
     #[must_use]
-    pub fn with_app(mut self, app: Arc<App>) -> Self {
+    pub(crate) fn with_app(mut self, app: Arc<App>) -> Self {
         self.app = Some(app);
         self
     }
 
     #[must_use]
-    pub fn with_runtime(mut self, runtime: Arc<Runtime>) -> Self {
+    pub(crate) fn with_runtime(mut self, runtime: Arc<Runtime>) -> Self {
         self.runtime = Some(runtime);
         self
     }
 
-    pub fn build(self) -> Result<Catalog> {
+    pub(crate) fn build(self) -> Result<Catalog> {
         let app = self.app.ok_or(Error::UnableToBuildCatalog {
             catalog: self.name.clone(),
             missing_component: "app".to_string(),

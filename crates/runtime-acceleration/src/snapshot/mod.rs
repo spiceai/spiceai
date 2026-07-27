@@ -72,31 +72,31 @@ pub mod api {
     /// Summary of all snapshots for a dataset, returned by the list snapshots API.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct SnapshotSummary {
-        pub dataset_name: String,
-        pub location: String,
-        pub last_updated_ms: i64,
+        pub(crate) dataset_name: String,
+        pub(crate) location: String,
+        pub(crate) last_updated_ms: i64,
         #[serde(skip_serializing_if = "Option::is_none")]
-        pub engine: Option<String>,
+        pub(crate) engine: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        pub current_snapshot_id: Option<u64>,
-        pub snapshots: Vec<SnapshotInfo>,
+        pub(crate) current_snapshot_id: Option<u64>,
+        pub(crate) snapshots: Vec<SnapshotInfo>,
     }
 
     /// Information about a single snapshot.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct SnapshotInfo {
-        pub snapshot_id: u64,
-        pub timestamp_ms: i64,
-        pub location: String,
-        pub checksum: String,
-        pub checksum_algorithm: String,
-        pub size_bytes: u64,
+        pub(crate) snapshot_id: u64,
+        pub(crate) timestamp_ms: i64,
+        pub(crate) location: String,
+        pub(crate) checksum: String,
+        pub(crate) checksum_algorithm: String,
+        pub(crate) size_bytes: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
-        pub engine: Option<String>,
+        pub(crate) engine: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        pub row_count: Option<u64>,
-        pub is_current: bool,
-        pub status: String,
+        pub(crate) row_count: Option<u64>,
+        pub(crate) is_current: bool,
+        pub(crate) status: String,
     }
 
     /// Request body for setting the current snapshot.
@@ -579,7 +579,7 @@ pub enum AccelerationEngine {
 impl AccelerationEngine {
     /// Returns the file extension for snapshot files of this engine type.
     #[must_use]
-    pub fn snapshot_extension(&self) -> &'static str {
+    fn snapshot_extension(&self) -> &'static str {
         match self {
             Self::Cayenne => ".cayenne",
             #[cfg(feature = "duckdb")]
@@ -1009,7 +1009,7 @@ impl SnapshotManager {
     /// Returns an error if reading or parsing the snapshot metadata from the
     /// object store fails. Callers (e.g. snapshot-mode refresh) can use this
     /// to react to transient object-store failures.
-    pub async fn remote_current_snapshot_id(&self) -> Result<Option<u64>, SnapshotDownloadError> {
+    async fn remote_current_snapshot_id(&self) -> Result<Option<u64>, SnapshotDownloadError> {
         let handle = self.load_metadata().await.map_err(|e| match e {
             MetadataLoadError::Read { path, source } => {
                 SnapshotDownloadError::ReadMetadata { path, source }

@@ -180,7 +180,7 @@ pub mod kafka;
 pub mod localpod;
 pub mod memory;
 
-pub const ODBC_DATACONNECTOR: &str = "odbc"; // const needs to be accessible when ODBC isn't built
+pub(crate) const ODBC_DATACONNECTOR: &str = "odbc"; // const needs to be accessible when ODBC isn't built
 pub mod deferred;
 // ducklake: moved to crates/data-connectors/connector-ducklake
 // gcs: moved to crates/data-connectors/connector-gcs
@@ -464,7 +464,7 @@ pub async fn register_connector_factory(
 }
 
 /// Look up a registered connector factory by name.
-pub async fn get_connector_factory(name: &str) -> Option<Arc<dyn DataConnectorFactory>> {
+pub(crate) async fn get_connector_factory(name: &str) -> Option<Arc<dyn DataConnectorFactory>> {
     let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
     guard.get(name).map(Arc::clone)
 }
@@ -518,7 +518,7 @@ pub async fn register_all() {
 
 /// Names of every registered data connector. Useful for generating helpful
 /// "did you mean?" suggestions when a user references an unknown connector.
-pub async fn registered_connector_names() -> Vec<String> {
+pub(crate) async fn registered_connector_names() -> Vec<String> {
     let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
     let mut names: Vec<String> = guard.keys().cloned().collect();
     names.sort();
@@ -529,11 +529,11 @@ pub async fn registered_connector_names() -> Vec<String> {
 /// is lowest (bounded so short typos only match very close names). Routes
 /// through [`util::levenshtein::closest_match`] so the "did you mean" UX is
 /// consistent with runtime tunables and component-level parameters.
-pub async fn suggest_connector(name: &str) -> Option<String> {
+pub(crate) async fn suggest_connector(name: &str) -> Option<String> {
     util::levenshtein::closest_match(name, &registered_connector_names().await)
 }
 
-pub async fn unregister_all() {
+pub(crate) async fn unregister_all() {
     let mut registry = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
     registry.clear();
 }
@@ -738,7 +738,7 @@ impl<T: DataConnector + Debug + 'static> MetricsProviderComponent for T {
 }
 
 // Gets data from a table provider and returns it as a vector of RecordBatches.
-pub async fn get_data(
+pub(crate) async fn get_data(
     ctx: &mut SessionContext,
     table_name: TableReference,
     table_provider: Arc<dyn TableProvider>,

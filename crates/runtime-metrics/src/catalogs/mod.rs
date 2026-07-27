@@ -16,7 +16,7 @@ limitations under the License.
 
 use super::{Counter, Gauge, LazyLock, Meter, global};
 
-pub static CATALOGS_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("catalog"));
+static CATALOGS_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("catalog"));
 
 pub static LOAD_ERROR: LazyLock<Counter<u64>> = LazyLock::new(|| {
     CATALOGS_METER

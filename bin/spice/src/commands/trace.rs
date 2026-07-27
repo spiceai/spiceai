@@ -69,27 +69,27 @@ pub enum OutputFormat {
 )]
 pub struct TraceArgs {
     /// The task type to trace
-    pub task: String,
+    task: String,
 
     /// Return the trace with the given id
     #[arg(long)]
-    pub id: Option<String>,
+    id: Option<String>,
 
     /// Return the trace with the given trace id
     #[arg(long)]
-    pub trace_id: Option<String>,
+    trace_id: Option<String>,
 
     /// Include input data in the trace
     #[arg(long)]
-    pub include_input: bool,
+    include_input: bool,
 
     /// Include output data in the trace
     #[arg(long)]
-    pub include_output: bool,
+    include_output: bool,
 
     /// Truncate input/output data (default 80 when set without value)
     #[arg(long, default_missing_value = "80")]
-    pub truncate: Option<usize>,
+    truncate: Option<usize>,
 
     /// Output format
     #[arg(long, short = 'o', value_enum, default_value = "table")]

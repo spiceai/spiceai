@@ -174,7 +174,7 @@ pub struct SpiceAI {
 }
 
 impl SpiceAI {
-    pub fn flight_factory(
+    pub(crate) fn flight_factory(
         &self,
         dataset_path: SpiceAIDatasetPath,
     ) -> (FlightFactory, TableReference) {
@@ -225,7 +225,7 @@ pub struct SpiceAIFactory {}
 
 impl SpiceAIFactory {
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {}
     }
 

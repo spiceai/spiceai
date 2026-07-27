@@ -31,7 +31,7 @@ impl LocalFileRegistry {
         clippy::unused_async,
         reason = "Async for API consistency with SpicerackRegistry"
     )]
-    pub async fn get_pod(
+    pub(crate) async fn get_pod(
         &self,
         pod_path: &str,
         pods_dir: &Path,

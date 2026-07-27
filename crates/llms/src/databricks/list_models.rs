@@ -66,7 +66,7 @@ impl DatabricksModelLister {
 
     /// Returns common Databricks Foundation Model API model names as a fallback.
     #[must_use]
-    pub fn common_models() -> Vec<String> {
+    fn common_models() -> Vec<String> {
         vec![
             "databricks-meta-llama-3-3-70b-instruct".to_string(),
             "databricks-meta-llama-3-1-405b-instruct".to_string(),

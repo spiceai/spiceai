@@ -32,7 +32,7 @@ use arrow_schema::{ArrowError, DataType, SortOptions};
 use crate::row_converter::codec::{ColumnCodec, LengthTracker, null_sentinel};
 
 /// Reconstructs a fixed-width encoded value from its bytes, inverting first if `invert` is set.
-pub(crate) trait FromSlice {
+trait FromSlice {
     fn from_slice(slice: &[u8], invert: bool) -> Self;
 }
 

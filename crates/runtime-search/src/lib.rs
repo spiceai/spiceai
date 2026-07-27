@@ -17,7 +17,7 @@ limitations under the License.
 pub mod candidate;
 pub mod embeddings;
 pub mod error;
-pub mod full_text;
+pub(crate) mod full_text;
 pub mod full_text_udtf;
 pub mod request;
 pub mod rerank;

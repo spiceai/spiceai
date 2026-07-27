@@ -154,7 +154,7 @@ pub struct KafkaOffset {
 
 impl KafkaOffset {
     #[must_use]
-    pub fn next_read_offset(&self) -> i64 {
+    fn next_read_offset(&self) -> i64 {
         self.offset.saturating_add(1)
     }
 }
@@ -273,12 +273,12 @@ pub struct KafkaMetrics {
     /// least one valid partition. Until this flips, `records_lag == 0` only
     /// means "we haven't observed any stats yet", not "the consumer is
     /// caught up".
-    pub has_received_stats: AtomicBool,
+    has_received_stats: AtomicBool,
     /// Notified by the stats callback whenever the consumer is observed to
     /// be caught up (received at least one valid stats sample with
     /// `total_lag == 0`). Used by CDC connectors to emit a synthetic
     /// ready-signal envelope on quiet topics without polling.
-    pub caught_up: Notify,
+    caught_up: Notify,
 }
 
 struct KafkaConsumerContext {
@@ -305,15 +305,15 @@ impl KafkaMetrics {
         Self::default()
     }
 
-    pub fn update_records_lag(&self, lag: u64) {
+    fn update_records_lag(&self, lag: u64) {
         self.records_lag.store(lag, Ordering::Relaxed);
     }
 
-    pub fn update_records_consumed(&self, count: u64) {
+    fn update_records_consumed(&self, count: u64) {
         self.records_consumed.store(count, Ordering::Relaxed);
     }
 
-    pub fn update_bytes_consumed(&self, bytes: u64) {
+    fn update_bytes_consumed(&self, bytes: u64) {
         self.bytes_consumed.store(bytes, Ordering::Relaxed);
     }
 
@@ -330,7 +330,7 @@ impl KafkaMetrics {
     /// `is_dataset_ready=true` envelope on quiet topics. See the
     /// [`crate::cdc::ChangesStream`] readiness contract.
     #[must_use]
-    pub fn is_caught_up(&self) -> bool {
+    fn is_caught_up(&self) -> bool {
         self.has_received_stats.load(Ordering::Acquire)
             && self.records_lag.load(Ordering::Relaxed) == 0
     }
@@ -559,7 +559,7 @@ impl KafkaConsumer {
     }
 
     /// Stream JSON messages from the Kafka topic.
-    pub fn stream_json<K: DeserializeOwned, V: DeserializeOwned>(
+    pub(crate) fn stream_json<K: DeserializeOwned, V: DeserializeOwned>(
         &self,
     ) -> impl Stream<Item = Result<KafkaMessage<'_, K, V>>> {
         self.consumer.stream().filter_map(move |msg| {
@@ -588,13 +588,13 @@ impl KafkaConsumer {
         })
     }
 
-    pub fn store_offset(&self, topic: &str, partition: i32, offset: i64) -> Result<()> {
+    fn store_offset(&self, topic: &str, partition: i32, offset: i64) -> Result<()> {
         self.consumer
             .store_offset(topic, partition, offset)
             .context(UnableToCommitMessageSnafu)
     }
 
-    pub fn commit_stored_offsets(&self) -> Result<()> {
+    fn commit_stored_offsets(&self) -> Result<()> {
         self.consumer
             .commit_consumer_state(CommitMode::Async)
             .context(UnableToCommitConsumerStateSnafu)
@@ -718,7 +718,7 @@ impl KafkaConsumer {
     }
 
     #[must_use]
-    pub fn metrics(&self) -> &Arc<KafkaMetrics> {
+    pub(crate) fn metrics(&self) -> &Arc<KafkaMetrics> {
         &self.metrics
     }
 
@@ -1082,15 +1082,15 @@ impl<'a, K, V> KafkaMessage<'a, K, V> {
         &self.value
     }
 
-    pub fn topic(&self) -> &str {
+    fn topic(&self) -> &str {
         self.msg.topic()
     }
 
-    pub fn partition(&self) -> i32 {
+    fn partition(&self) -> i32 {
         self.msg.partition()
     }
 
-    pub fn offset(&self) -> i64 {
+    fn offset(&self) -> i64 {
         self.msg.offset()
     }
 
@@ -1113,7 +1113,7 @@ pub struct MessageBatchCommitter {
 }
 
 impl MessageBatchCommitter {
-    pub fn from_messages<K, V>(
+    pub(crate) fn from_messages<K, V>(
         consumer: &'static KafkaConsumer,
         messages: &[KafkaMessage<'_, K, V>],
     ) -> Self {
@@ -1131,7 +1131,7 @@ impl MessageBatchCommitter {
     }
 
     #[must_use]
-    pub fn from_borrowed_messages(
+    fn from_borrowed_messages(
         consumer: &'static KafkaConsumer,
         messages: &[BorrowedMessage<'_>],
     ) -> Self {
@@ -1149,7 +1149,7 @@ impl MessageBatchCommitter {
     }
 
     #[must_use]
-    pub fn with_offset_commit_hook(
+    pub(crate) fn with_offset_commit_hook(
         mut self,
         offset_commit_hook: Option<Arc<dyn KafkaOffsetCommitHook>>,
     ) -> Self {

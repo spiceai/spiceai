@@ -37,7 +37,7 @@ pub enum CacheKeyType {
 
 impl CacheKeyType {
     #[must_use]
-    pub fn from_app_runtime(app: Option<&Arc<App>>) -> Self {
+    pub(crate) fn from_app_runtime(app: Option<&Arc<App>>) -> Self {
         let Some(app) = app else {
             return Self::Default;
         };
@@ -97,7 +97,7 @@ impl Default for CacheControl {
 
 impl CacheControl {
     #[must_use]
-    pub fn from_headers(headers: &HeaderMap) -> Self {
+    pub(crate) fn from_headers(headers: &HeaderMap) -> Self {
         // This will be updated later if the runtime parameter `runtime.caching.sql_results.cache_key_type` is present.
         let cache_key_type = match headers.get("Spice-Cache-Key") {
             Some(header) if !header.is_empty() => CacheKeyType::ClientSupplied,

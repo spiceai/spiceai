@@ -70,7 +70,7 @@ impl FilteringExporter {
     /// * `inner` - The underlying OTEL exporter
     /// * `whitelist` - Metric names to export. Empty slice means export all metrics.
     #[must_use]
-    pub fn new(inner: MetricExporter, whitelist: &[String]) -> Self {
+    fn new(inner: MetricExporter, whitelist: &[String]) -> Self {
         Self {
             inner,
             whitelist: Arc::new(whitelist.iter().cloned().collect()),

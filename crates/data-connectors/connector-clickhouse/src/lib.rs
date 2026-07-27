@@ -122,7 +122,7 @@ pub enum Error {
     InvalidConnectionTimeoutValue { source: std::num::ParseIntError },
 }
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// `ClickHouse` data connector.
 #[derive(Debug)]
@@ -141,7 +141,7 @@ impl ClickhouseFactory {
     }
 
     #[must_use]
-    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+    fn new_arc() -> Arc<dyn DataConnectorFactory> {
         Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
     }
 }
@@ -302,10 +302,10 @@ impl From<ReadProviderError> for DataConnectorError {
 
 const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
-pub(crate) struct ClickhouseConfig {
-    pub(crate) options: Options,
-    pub(crate) db: Arc<str>,
-    pub(crate) compute_context: String,
+struct ClickhouseConfig {
+    options: Options,
+    db: Arc<str>,
+    compute_context: String,
 }
 
 impl ClickhouseConfig {

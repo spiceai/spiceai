@@ -152,7 +152,7 @@ pub enum FederatedResolutionError {
 }
 
 impl DeferredTableProvider {
-    pub fn schema(&self) -> SchemaRef {
+    fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
 }
@@ -164,7 +164,7 @@ impl FederatedTable {
     }
 
     /// Creates a federated table, and first checks if the schema matches the existing acceleration checkpoint.
-    pub async fn new(
+    pub(crate) async fn new(
         dataset: Arc<Dataset>,
         table_provider: Arc<dyn TableProvider>,
         data_connector: Arc<dyn DataConnector>,
@@ -401,7 +401,7 @@ impl FederatedTable {
     /// source schema change, returns the actionable message so the registration
     /// path can surface it as the dataset's error status.
     #[must_use]
-    pub fn schema_change_failure(&self) -> Option<&str> {
+    pub(crate) fn schema_change_failure(&self) -> Option<&str> {
         match self {
             Self::Immediate(_) => None,
             Self::Deferred(deferred) => deferred.schema_change_failure.as_deref(),
@@ -412,7 +412,7 @@ impl FederatedTable {
     /// we can create a deferred task to keep trying to connect to the table provider until it is available.
     ///
     /// Returns `None` if the dataset isn't a valid file-accelerated dataset.
-    pub async fn new_deferred(
+    pub(crate) async fn new_deferred(
         dataset: Arc<Dataset>,
         data_connector: Arc<dyn DataConnector>,
         shutdown_token: CancellationToken,
@@ -433,7 +433,7 @@ impl FederatedTable {
     /// Returns None if
     ///   1. Active write on the [`DeferredTableProvider`]'s state.
     ///   2. The [`DeferredTableProvider`] is not Ready.
-    pub fn try_table_provider_sync(&self) -> Option<Arc<dyn TableProvider>> {
+    pub(crate) fn try_table_provider_sync(&self) -> Option<Arc<dyn TableProvider>> {
         Some(Arc::clone(self.try_table_provider_sync_ref()?))
     }
 
@@ -442,7 +442,7 @@ impl FederatedTable {
     /// Returns None if
     ///   1. Active write on the [`DeferredTableProvider`]'s state.
     ///   2. The [`DeferredTableProvider`] is not Ready.
-    pub fn try_table_provider_sync_ref(&self) -> Option<&Arc<dyn TableProvider>> {
+    pub(crate) fn try_table_provider_sync_ref(&self) -> Option<&Arc<dyn TableProvider>> {
         let deferred_table_provider = match self {
             Self::Immediate(table_provider) => return Some(table_provider),
             Self::Deferred(deferred_table_provider) => deferred_table_provider,
@@ -470,7 +470,7 @@ impl FederatedTable {
     /// where `provider` is the fallback that errors on scan. The fallback
     /// provider is still returned in the `Err` variant so callers that just
     /// want a provider (e.g. query scan paths) can fall through to it.
-    pub async fn try_wait_table_provider(
+    pub(crate) async fn try_wait_table_provider(
         &self,
     ) -> Result<Arc<dyn TableProvider>, (FederatedResolutionError, Arc<dyn TableProvider>)> {
         let deferred_table_provider = match self {

@@ -61,7 +61,7 @@ pub struct SpicepodVersion {
 
 impl SpicepodVersion {
     /// `v1` — equivalent to parsing the string `"v1"`.
-    pub const V1: Self = Self {
+    pub(crate) const V1: Self = Self {
         major: 1,
         minor: None,
         patch: None,
@@ -69,7 +69,7 @@ impl SpicepodVersion {
     };
 
     /// `v2` — equivalent to parsing the string `"v2"`.
-    pub const V2: Self = Self {
+    pub(crate) const V2: Self = Self {
         major: 2,
         minor: None,
         patch: None,
@@ -77,22 +77,22 @@ impl SpicepodVersion {
     };
 
     #[must_use]
-    pub fn major(&self) -> u64 {
+    pub(crate) fn major(&self) -> u64 {
         self.major
     }
 
     #[must_use]
-    pub fn minor(&self) -> Option<u64> {
+    pub(crate) fn minor(&self) -> Option<u64> {
         self.minor
     }
 
     #[must_use]
-    pub fn patch(&self) -> Option<u64> {
+    pub(crate) fn patch(&self) -> Option<u64> {
         self.patch
     }
 
     #[must_use]
-    pub fn pre_release(&self) -> Option<&str> {
+    pub(crate) fn pre_release(&self) -> Option<&str> {
         self.pre_release.as_deref()
     }
 }

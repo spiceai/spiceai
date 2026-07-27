@@ -34,25 +34,25 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub struct UpdateConfig {
-    pub partition_key: String,
-    pub sort_key: Option<String>,
-    pub time_format: Arc<String>,
+    pub(crate) partition_key: String,
+    pub(crate) sort_key: Option<String>,
+    pub(crate) time_format: Arc<String>,
     /// Pairs of (`column_name`, `new_value_expr`). Only `Expr::Literal` values are supported.
-    pub assignments: Vec<(String, Expr)>,
-    pub filters: Vec<Expr>,
-    pub parallelism: usize,
+    pub(crate) assignments: Vec<(String, Expr)>,
+    pub(crate) filters: Vec<Expr>,
+    pub(crate) parallelism: usize,
 }
 
 pub struct DynamoDBUpdateExec {
-    pub db_client: Arc<DbClient>,
-    pub table_name: String,
-    pub config: UpdateConfig,
+    db_client: Arc<DbClient>,
+    table_name: String,
+    config: UpdateConfig,
     properties: Arc<PlanProperties>,
 }
 
 impl DynamoDBUpdateExec {
     #[must_use]
-    pub fn new(db_client: Arc<DbClient>, table_name: String, config: UpdateConfig) -> Self {
+    pub(crate) fn new(db_client: Arc<DbClient>, table_name: String, config: UpdateConfig) -> Self {
         let count_schema = Arc::new(Schema::new(vec![Field::new(
             "count",
             DataType::UInt64,

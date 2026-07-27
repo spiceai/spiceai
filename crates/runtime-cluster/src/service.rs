@@ -113,11 +113,11 @@ pub struct AssignmentConfig {
     /// reconciliation ([`PartitionService::reconcile_table`]) is uncapped to
     /// avoid leaving newly-discovered partitions unassigned when the refresh
     /// is forwarded to executors.
-    pub max_assignments_per_cycle: usize,
+    max_assignments_per_cycle: usize,
     /// Maximum partitions per executor (soft limit).
-    pub max_partitions_per_executor: usize,
+    max_partitions_per_executor: usize,
     /// How long to wait for partition discovery before timing out.
-    pub discovery_timeout: Duration,
+    discovery_timeout: Duration,
 }
 
 impl Default for AssignmentConfig {
@@ -678,7 +678,7 @@ impl PartitionService {
 ///
 /// Searches both datasets and views for a matching table reference.
 #[must_use]
-pub fn get_partition_config(
+fn get_partition_config(
     app: &app::App,
     table: &TableReference,
 ) -> Option<Vec<spicepod::partitioning::PartitionedBy>> {

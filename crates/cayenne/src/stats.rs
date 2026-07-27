@@ -206,7 +206,7 @@ pub(crate) fn column_stats_to_stats_set(cs: &ColumnStatistics) -> StatsSet {
 }
 
 /// Convert a Vortex [`StatsSet`] and column [`DType`] to `DataFusion` [`ColumnStatistics`].
-pub(crate) fn stats_set_to_column_stats(stats: &StatsSet, dtype: &DType) -> ColumnStatistics {
+fn stats_set_to_column_stats(stats: &StatsSet, dtype: &DType) -> ColumnStatistics {
     let min_value = vortex_precision_to_df(
         stats
             .get(Stat::Min)
@@ -256,7 +256,7 @@ pub(crate) fn stats_set_to_column_stats(stats: &StatsSet, dtype: &DType) -> Colu
 /// to track row counts correctly) are reported as `Precision::Absent` rather
 /// than silently wrapped into a bogus `usize`.
 #[must_use]
-pub fn file_statistics_to_df(file_stats: &FileStatistics, num_rows: i64) -> Statistics {
+pub(crate) fn file_statistics_to_df(file_stats: &FileStatistics, num_rows: i64) -> Statistics {
     let column_statistics: Vec<ColumnStatistics> = file_stats
         .into_iter()
         .map(|(stats, dtype)| stats_set_to_column_stats(stats, dtype))
@@ -311,7 +311,7 @@ pub(crate) fn serialize_file_statistics(stats: &FileStatistics) -> VortexResult<
 ///
 /// Returns an error if the flatbuffer bytes are malformed or do not match the
 /// expected schema.
-pub fn deserialize_file_statistics(bytes: &[u8], schema: &Schema) -> VortexResult<FileStatistics> {
+pub(crate) fn deserialize_file_statistics(bytes: &[u8], schema: &Schema) -> VortexResult<FileStatistics> {
     let struct_dtype = vortex_struct_dtype_from_schema(schema);
     let fb_stats = flatbuffers::root::<vortex::flatbuffers::footer::FileStatistics>(bytes)?;
     FileStatistics::from_flatbuffer(
@@ -322,7 +322,7 @@ pub fn deserialize_file_statistics(bytes: &[u8], schema: &Schema) -> VortexResul
 }
 
 /// Convert an Arrow [`Schema`] to a Vortex struct [`DType`].
-pub(crate) fn vortex_struct_dtype_from_schema(schema: &Schema) -> DType {
+fn vortex_struct_dtype_from_schema(schema: &Schema) -> DType {
     DType::from_arrow(schema)
 }
 

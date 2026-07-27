@@ -44,7 +44,7 @@ pub struct IcebergDdlHandler {
 
 impl IcebergDdlHandler {
     #[must_use]
-    pub fn new(datafusion_ref: SharedDataFusionRef) -> Self {
+    pub(crate) fn new(datafusion_ref: SharedDataFusionRef) -> Self {
         Self { datafusion_ref }
     }
 
