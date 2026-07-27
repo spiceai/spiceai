@@ -253,10 +253,11 @@ impl AccelerationSummary {
     }
 
     /// The single startup summary line, naming the shared slot and breaking the
-    /// accelerated count down by acceleration kind. Closes with an explicit note
-    /// that table discovery is one-shot (a documented non-goal: tables added to
-    /// the source after startup are not picked up until the Spice runtime is
-    /// restarted).
+    /// accelerated count down by acceleration kind. Closes with a note on the
+    /// discovery scope: `refresh()` re-runs on the catalog's periodic interval,
+    /// so a table *added* to a selected schema later is picked up and accelerated
+    /// on the next refresh -- but schema changes to existing tables and
+    /// renamed/dropped tables are not tracked (documented non-goals).
     fn summary_message(&self, catalog_name: &str, slot_name: &str) -> String {
         // Only mention views when there are some, so the common (view-free) case
         // stays terse.
@@ -269,7 +270,7 @@ impl AccelerationSummary {
             String::new()
         };
         format!(
-            "Catalog '{catalog_name}': accelerating {} table(s) via CDC ({} via primary key, {} via REPLICA IDENTITY USING INDEX, {} via REPLICA IDENTITY FULL; shared replication slot '{slot_name}'); {} table(s) excluded by include/exclude filters; {} table(s) skipped (no usable replica identity -- see warnings);{views_clause} tables are discovered once at startup -- tables added to the source afterward are not picked up until the Spice runtime (spiced) is restarted.",
+            "Catalog '{catalog_name}': accelerating {} table(s) via CDC ({} via primary key, {} via REPLICA IDENTITY USING INDEX, {} via REPLICA IDENTITY FULL; shared replication slot '{slot_name}'); {} table(s) excluded by include/exclude filters; {} table(s) skipped (no usable replica identity -- see warnings);{views_clause} tables added to these schema(s) later are picked up on the periodic catalog refresh; schema changes to existing tables, and renamed or dropped tables, are not tracked.",
             self.accelerated_total(),
             self.primary_key,
             self.unique_index,
@@ -328,11 +329,11 @@ struct SpawnedTable {
 }
 
 /// Discovery found no CDC-eligible table in the catalog. A hard, actionable
-/// startup error (see [`AcceleratedCatalogProvider::refresh`]): catalog
-/// discovery is one-shot (tables added after startup are a documented non-goal),
-/// so an empty result is a configuration problem to surface, not an empty
-/// catalog to register silently. `postgres.rs` maps this to a permanent
-/// configuration error.
+/// startup error (see [`AcceleratedCatalogProvider::refresh`]): failing the
+/// *initial* refresh means the catalog never registers -- and so never gets a
+/// periodic refresh to reconsider -- so an empty result is a configuration
+/// problem to surface, not an empty catalog to register silently. `postgres.rs`
+/// maps this to a permanent configuration error.
 #[derive(Debug, Snafu)]
 #[snafu(display(
     "Catalog '{catalog}': 0 of {discovered} discovered table(s) are eligible for CDC acceleration ({skipped} have no primary key or usable REPLICA IDENTITY; {excluded} excluded by include/exclude filters).{views_note} Give each table a usable CDC key -- a primary key (which REPLICA IDENTITY DEFAULT or FULL then keys on), or a UNIQUE NOT NULL index set as REPLICA IDENTITY USING INDEX -- and ensure the catalog's `include`/`exclude` patterns match them. Note that REPLICA IDENTITY FULL without a primary key is still skipped. Docs: {DOCS_URL}"
@@ -830,13 +831,13 @@ impl RefreshableCatalogProvider for AcceleratedCatalogProvider {
             plans.push((schema_name.clone(), plan));
         }
 
-        // Fail loudly when nothing is eligible: catalog discovery is one-shot
-        // (auto-detecting tables added after startup is a documented non-goal),
-        // so an empty result is a configuration problem to surface -- not an
-        // empty catalog to register silently. Returned before spawning or
-        // swapping `self.schemas`, so a later refresh that transiently sees zero
-        // leaves any previously-registered schemas intact. `postgres.rs` maps
-        // this to a permanent configuration error (ERROR status, no retry loop).
+        // Fail loudly when nothing is eligible: an empty result is a
+        // configuration problem to surface, not an empty catalog to register
+        // silently. Returned before spawning or swapping `self.schemas`, so a
+        // *later* periodic refresh that transiently sees zero leaves any
+        // previously-registered schemas intact. On the *initial* refresh,
+        // `postgres.rs` maps this to a permanent configuration error (ERROR
+        // status, catalog never registers -- see `NoEligibleTablesError`).
         if summary.accelerated_total() == 0 {
             // When the only relations in scope are view-like (a `0 of 0`
             // discovered-tables case), say so explicitly -- otherwise the message
@@ -1205,10 +1206,10 @@ mod tests {
         assert!(message.contains("3 table(s) excluded"), "{message}");
         assert!(message.contains("2 table(s) skipped"), "{message}");
         assert!(message.contains("5 view(s)"), "views clause: {message}");
-        // The one-shot-discovery non-goal is stated in the summary.
+        // The discovery-scope note is stated in the summary.
         assert!(
-            message.contains("discovered once at startup"),
-            "no-post-startup-discovery note: {message}"
+            message.contains("picked up on the periodic catalog refresh"),
+            "discovery-scope note: {message}"
         );
     }
 
@@ -1220,8 +1221,11 @@ mod tests {
         };
         let message = summary.summary_message("my_pg", "slot");
         assert!(!message.contains("not replicated"), "{message}");
-        // The discovery note is unconditional.
-        assert!(message.contains("discovered once at startup"), "{message}");
+        // The discovery-scope note is unconditional.
+        assert!(
+            message.contains("picked up on the periodic catalog refresh"),
+            "{message}"
+        );
     }
 
     #[test]

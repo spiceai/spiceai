@@ -823,8 +823,9 @@ async fn test_catalog_acceleration_respects_include_filter() -> Result<(), anyho
 /// A catalog whose every discovered table is ineligible (`REPLICA IDENTITY
 /// NOTHING`, keyless `DEFAULT`) must fail loudly -- reaching an `Error` status
 /// with an actionable message -- rather than registering an empty catalog.
-/// Discovery is one-shot (auto-detecting tables added after startup is a
-/// non-goal), so zero eligible tables is a permanent configuration error.
+/// Failing the initial refresh means the catalog never registers (and so never
+/// gets a periodic refresh to reconsider), so zero eligible tables at load is a
+/// permanent configuration error.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_catalog_acceleration_fails_loudly_when_no_tables_eligible()
 -> Result<(), anyhow::Error> {
