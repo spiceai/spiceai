@@ -84,6 +84,7 @@ fn to_openai_response(
 }
 
 impl MistralLlama {
+    #[expect(clippy::too_many_arguments)]
     pub async fn from(
         model_weights: &[PathBuf],
         config: Option<&Path>,
@@ -335,14 +336,14 @@ impl MistralLlama {
         .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })
     }
 
-    /// Build the mistral.rs PagedAttention config for a locally served model.
+    /// Build the mistral.rs `PagedAttention` config for a locally served model.
     /// Paged attention is auto-enabled on CUDA/unix when supported; the operator
     /// can force it off with the `paged_attention: false` model param (`enabled`).
     ///
-    /// Some architectures — e.g. the GLM-dsa GGUF — implement dense (Eager)
-    /// attention only and reject a PagedAttention config at load. Those
+    /// Some architectures — e.g. the `glm-dsa` GGUF — implement dense (Eager)
+    /// attention only and reject a `PagedAttention` config at load. Those
     /// deployments set `paged_attention: false` so the loader falls back to
-    /// Eager + NormalCache instead of failing.
+    /// Eager + `NormalCache` instead of failing.
     fn paged_attention_config(
         device: &Device,
         enabled: bool,

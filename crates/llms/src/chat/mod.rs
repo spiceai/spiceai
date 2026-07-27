@@ -768,6 +768,7 @@ pub async fn create_hf_model(
 }
 
 #[cfg(feature = "local_llm")]
+#[expect(clippy::too_many_arguments)]
 pub async fn create_local_model(
     model_weights: &[String],
     config: Option<&str>,
