@@ -61,6 +61,19 @@ impl CompoundSearchIndex {
             read_mode,
         })
     }
+
+    /// The tier reads and writes are served from first.
+    #[must_use]
+    pub fn primary(&self) -> &Arc<dyn SearchIndex> {
+        &self.primary
+    }
+
+    /// The tier reads fall back to (in [`CompoundReadMode::FallbackToSecondary`]) and every
+    /// write also reaches.
+    #[must_use]
+    pub fn secondary(&self) -> &Arc<dyn SearchIndex> {
+        &self.secondary
+    }
 }
 
 #[async_trait]
