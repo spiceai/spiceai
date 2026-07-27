@@ -683,6 +683,18 @@ fn underlying_federated_table_for_indexed_table(
 
     #[cfg(feature = "s3_vectors")]
     {
+        // A metadata-enrichment layer can sit between the IndexedTableProvider and its
+        // VectorScanTableProvider (table_provider_with_spicepod_metadata pushes spicepod
+        // metadata into the IndexedTableProvider's underlying). Peel it so the recursion
+        // reaches the raw source provider; otherwise it stops at the VectorScanTableProvider,
+        // whose schema carries the synthetic `<col>_embedding` columns, and the source's
+        // bootstrap SELECT references a column that doesn't exist in the source table.
+        if let Some(enriched) =
+            src_table_provider.downcast_ref::<data_components::MetadataEnrichedTableProvider>()
+        {
+            return underlying_federated_table_for_indexed_table(enriched.get_inner_ref());
+        }
+
         if let Some(vector_scan) =
             src_table_provider.downcast_ref::<search::index::VectorScanTableProvider>()
         {
