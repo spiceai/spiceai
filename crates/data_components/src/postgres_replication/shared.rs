@@ -2039,7 +2039,9 @@ impl MemberOverflow {
     }
 
     fn held_for(&self, key: &MemberKey) -> usize {
-        self.queues.get(key).map_or(0, std::collections::VecDeque::len)
+        self.queues
+            .get(key)
+            .map_or(0, std::collections::VecDeque::len)
     }
 
     fn push(&mut self, key: &MemberKey, envelope: MemberEnvelope) {
@@ -2081,7 +2083,11 @@ impl MemberOverflow {
                 .set_member_held_envelopes(u64::try_from(queue.len()).unwrap_or(u64::MAX));
             !queue.is_empty()
         });
-        self.total = self.queues.values().map(std::collections::VecDeque::len).sum();
+        self.total = self
+            .queues
+            .values()
+            .map(std::collections::VecDeque::len)
+            .sum();
     }
 
     /// Drop everything held. Called when the pump reconnects: the replay starts
@@ -2132,7 +2138,11 @@ async fn drain_overflow_to(
         };
         let Some(member) = source.member(&key) else {
             overflow.queues.remove(&key);
-            overflow.total = overflow.queues.values().map(std::collections::VecDeque::len).sum();
+            overflow.total = overflow
+                .queues
+                .values()
+                .map(std::collections::VecDeque::len)
+                .sum();
             continue;
         };
         let Some(envelope) = overflow
@@ -2157,7 +2167,11 @@ async fn drain_overflow_to(
             SendOutcome::ReceiverGone(w) => {
                 waited_us = waited_us.saturating_add(w);
                 overflow.queues.remove(&key);
-                overflow.total = overflow.queues.values().map(std::collections::VecDeque::len).sum();
+                overflow.total = overflow
+                    .queues
+                    .values()
+                    .map(std::collections::VecDeque::len)
+                    .sum();
                 source.detach_member(&key, "changes stream receiver dropped", true);
             }
             SendOutcome::ShutdownAbandon(w) => {
@@ -2796,7 +2810,9 @@ mod tests {
         );
         assert_eq!(overflow.total, 3, "total must track the per-member queues");
         for _ in 0..2 {
-            fast_rx.try_recv().expect("fast member received its envelope");
+            fast_rx
+                .try_recv()
+                .expect("fast member received its envelope");
         }
         assert!(
             fast_rx.try_recv().is_err(),
@@ -2831,7 +2847,11 @@ mod tests {
 
         // Only one slot free, so exactly one envelope may move.
         overflow.flush(&source);
-        assert_eq!(overflow.held_for(&key), 4, "flush must stop at a full channel");
+        assert_eq!(
+            overflow.held_for(&key),
+            4,
+            "flush must stop at a full channel"
+        );
 
         // Free two slots; exactly two more move.
         rx.try_recv().expect("drain 1");
@@ -2863,7 +2883,10 @@ mod tests {
 
         overflow.flush(&source);
         assert_eq!(overflow.held_for(&key), 0);
-        assert!(overflow.is_empty(), "detached member must not pin the budget");
+        assert!(
+            overflow.is_empty(),
+            "detached member must not pin the budget"
+        );
     }
 
     /// The hold-back is memory-bounded: `drain_overflow_to` blocks until the
