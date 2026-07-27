@@ -239,10 +239,11 @@ pub struct Dataset {
 
     /// How often the runtime probes the (non-accelerated) source backing this
     /// dataset to confirm it is still reachable. Accepts a duration string
-    /// (e.g. `60s`, `5m`); defaults to `60s`. Only applies when
-    /// `check_availability: auto` and the dataset is not accelerated. When a
-    /// probe fails the dataset is marked `Error` (visible via
-    /// `GET /v1/datasets?status=true`) until a later probe succeeds.
+    /// (e.g. `60s`, `5m`). Availability monitoring is **opt-in**: leave this
+    /// unset and the dataset is not monitored. Only applies to non-accelerated
+    /// datasets with `check_availability: auto`. When a probe fails the dataset
+    /// is marked `Error` (visible via `GET /v1/datasets?status=true`) until a
+    /// later probe succeeds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check_availability_interval: Option<String>,
 }

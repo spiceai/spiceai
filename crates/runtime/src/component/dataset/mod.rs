@@ -30,10 +30,10 @@ mod moved_tests;
 // `runtime-component`. Re-exported here for path compatibility
 // (`crate::component::dataset::{DatasetSpec, Acceleration, acceleration, ...}`).
 pub use runtime_component::dataset::{
-    CheckAvailability, DEFAULT_CHECK_AVAILABILITY_INTERVAL, DatasetSpec, Error,
-    FullTextSearchDatasetConfig, InvalidColumnTypeSnafu, InvalidConfigurationSnafu, OnSchemaChange,
-    ReadyState, Result, TimeFormat, UnsupportedTypeAction, acceleration, declared_schema,
-    declared_type, metadata, replication, schema_inference,
+    CheckAvailability, DatasetSpec, Error, FullTextSearchDatasetConfig, InvalidColumnTypeSnafu,
+    InvalidConfigurationSnafu, OnSchemaChange, ReadyState, Result, TimeFormat,
+    UnsupportedTypeAction, acceleration, declared_schema, declared_type, metadata, replication,
+    schema_inference,
 };
 // `validate_identifier` is used by `builder` via `super::validate_identifier`.
 use runtime_component::dataset::acceleration::Acceleration;

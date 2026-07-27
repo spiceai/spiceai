@@ -32,7 +32,7 @@ use tokio::sync::Mutex;
 use tracing_futures::Instrument;
 
 use crate::{
-    component::dataset::{CheckAvailability, DEFAULT_CHECK_AVAILABILITY_INTERVAL, Dataset},
+    component::dataset::{CheckAvailability, Dataset},
     datafusion::{
         DataFusion,
         error::{find_datafusion_root, format_datafusion_error},
@@ -45,6 +45,11 @@ use runtime_metrics as metrics;
 /// Lower bound on the monitor's wake-up cadence, so a very small
 /// `check_availability_interval` cannot spin the loop.
 const MIN_CHECK_TICK: Duration = Duration::from_secs(1);
+
+/// How often the loop wakes when no dataset is being monitored — just enough to
+/// notice newly registered datasets. Not user-facing (nothing is probed until a
+/// dataset opts in via `check_availability_interval`).
+const MONITOR_IDLE_TICK: Duration = Duration::from_secs(60);
 
 /// Upper bound on how far back the `task_history` "recently queried" lookup
 /// reaches, regardless of a dataset's configured interval, to keep that query
@@ -159,8 +164,17 @@ impl DatasetsHealthMonitor {
             return Ok(());
         }
 
+        // Availability monitoring is opt-in: a dataset is only monitored when it
+        // configures `check_availability_interval`.
+        let Some(interval) = dataset.check_availability_interval else {
+            tracing::debug!(
+                "Skipping dataset {} for availability monitoring (no check_availability_interval configured)",
+                dataset.name
+            );
+            return Ok(());
+        };
+
         let dataset_name = &dataset.name.to_string();
-        let interval = dataset.check_availability_interval();
 
         tracing::debug!(
             "Registering dataset {dataset_name} for periodic availability check every {}s",
@@ -477,8 +491,8 @@ fn report_dataset_unavailable_time(dataset_name: &str, last_available_time: Opti
 }
 
 /// Shortest configured probe interval among monitored datasets, clamped to a
-/// floor. Falls back to the default when nothing is monitored, so the loop
-/// still wakes periodically to pick up newly registered datasets.
+/// floor. Falls back to [`MONITOR_IDLE_TICK`] when nothing is monitored, so the
+/// loop still wakes periodically to pick up newly registered datasets.
 async fn shortest_interval(
     datasets: &Arc<Mutex<HashMap<String, Arc<DatasetAvailabilityInfo>>>>,
 ) -> Duration {
@@ -487,7 +501,7 @@ async fn shortest_interval(
         .values()
         .map(|d| d.interval)
         .min()
-        .unwrap_or(DEFAULT_CHECK_AVAILABILITY_INTERVAL)
+        .unwrap_or(MONITOR_IDLE_TICK)
         .max(MIN_CHECK_TICK)
 }
 
@@ -501,7 +515,7 @@ async fn snapshot_datasets(
         .values()
         .map(|d| d.interval)
         .max()
-        .unwrap_or(DEFAULT_CHECK_AVAILABILITY_INTERVAL);
+        .unwrap_or(MONITOR_IDLE_TICK);
     (datasets.values().map(Arc::clone).collect(), max_interval)
 }
 

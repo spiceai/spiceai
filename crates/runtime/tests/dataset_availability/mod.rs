@@ -215,8 +215,8 @@ async fn availability_monitor_marks_dataset_error_on_source_outage() -> Result<(
         .build()
         .map_err(|e| anyhow::anyhow!("failed to build dataset: {e}"))?;
     assert_eq!(
-        dataset.check_availability_interval(),
-        Duration::from_secs(1)
+        dataset.check_availability_interval,
+        Some(Duration::from_secs(1))
     );
 
     // Simulate the dataset having loaded successfully (its healthy state).
