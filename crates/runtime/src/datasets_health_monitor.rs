@@ -49,7 +49,7 @@ const MIN_CHECK_TICK: Duration = Duration::from_secs(1);
 /// How often the loop wakes when no dataset is being monitored — just enough to
 /// notice newly registered datasets. Not user-facing (nothing is probed until a
 /// dataset opts in via `check_availability_interval`).
-const MONITOR_IDLE_TICK: Duration = Duration::from_secs(60);
+const MONITOR_IDLE_TICK: Duration = Duration::from_mins(1);
 
 /// Upper bound on how far back the `task_history` "recently queried" lookup
 /// reaches, regardless of a dataset's configured interval, to keep that query
