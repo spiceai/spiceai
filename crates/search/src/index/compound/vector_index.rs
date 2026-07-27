@@ -76,6 +76,11 @@ impl CompoundVectorIndex {
             read_mode,
         }
     }
+
+    #[must_use]
+    pub fn read_mode(&self) -> CompoundReadMode {
+        self.read_mode
+    }
 }
 
 impl VectorIndex for CompoundVectorIndex {

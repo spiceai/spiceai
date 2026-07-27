@@ -116,6 +116,12 @@ impl EmbeddingConnector {
                 });
             }
 
+            let on_zero_results = dataset
+                .acceleration
+                .as_ref()
+                .map(|acceleration| acceleration.on_zero_results.clone())
+                .unwrap_or_default();
+
             let mut provider = Arc::clone(&inner_table_provider);
             for (effective_vector_store, columns) in vector_index_groups(vector_engine, dataset) {
                 provider = wrap_table_as_index(
@@ -127,6 +133,7 @@ impl EmbeddingConnector {
                     dataset.params.get("file_format").map(String::as_str),
                     provider,
                     &effective_vector_store,
+                    &on_zero_results,
                 )
                 .await
                 .map_err(|e| {
