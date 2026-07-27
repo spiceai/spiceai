@@ -338,7 +338,7 @@ impl MistralLlama {
 
     /// Build the mistral.rs `PagedAttention` config for a locally served model.
     /// Paged attention is auto-enabled on CUDA/unix when supported; the operator
-    /// can force it off with the `paged_attention: false` model param (`enabled`).
+    /// can force it off with the `paged_attention: false` model param.
     ///
     /// Some architectures — e.g. the `glm-dsa` GGUF — implement dense (Eager)
     /// attention only and reject a `PagedAttention` config at load. Those

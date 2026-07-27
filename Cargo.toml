@@ -507,7 +507,7 @@ candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "4
 candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "4ec91f16b21d3108354daf685f316104a67d08d7" } # spiceai
 candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "4ec91f16b21d3108354daf685f316104a67d08d7" } # spiceai
 # candle-index-select-cu is crates.io-sourced by text-embeddings-inference;
-# point it at the spiceai fork's candle-0.10-compatible fallback shim.
+# point it at the spiceai fork, which builds against candle 0.11.
 candle-index-select-cu = { git = "https://github.com/spiceai/candle-index-select-cu.git", rev = "75fc0b689b33a327907d36dd479f7d242640ca71" } # spiceai (candle 0.11)
 
 # datafusion-table-providers v0.11.0 pulls crates.io datafusion-federation, while the rest of the

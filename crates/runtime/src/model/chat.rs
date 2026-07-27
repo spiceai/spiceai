@@ -714,20 +714,22 @@ fn parse_context_length(params: &Parameters) -> Result<Option<usize>, LlmError> 
 /// preserving the engine's auto behavior (paged attention is enabled on
 /// CUDA/unix when the model supports it). Set `false` to force it off — needed
 /// for architectures that implement dense (Eager) attention only and reject a
-/// PagedAttention config at load (e.g. the GLM-dsa GGUF).
+/// `PagedAttention` config at load (e.g. the `glm-dsa` GGUF).
 #[cfg(feature = "models")]
 fn parse_paged_attention(params: &Parameters) -> Result<bool, LlmError> {
     let Some(raw) = params.get("paged_attention").expose().ok() else {
         return Ok(true);
     };
+    // Kept in step with the `paged_attention` ParameterSpec, which is `one_of` true/false:
+    // anything else is rejected by `Parameters::try_new` before reaching this parser, so
+    // accepting more here would only produce an error message advertising values the spec
+    // turns away.
     match raw.trim().to_ascii_lowercase().as_str() {
-        "true" | "yes" | "1" | "" => Ok(true),
-        "false" | "no" | "0" => Ok(false),
+        "true" | "" => Ok(true),
+        "false" => Ok(false),
         other => Err(LlmError::InvalidParamValueError {
             param: "paged_attention".to_string(),
-            message: format!(
-                "Must be one of 'true', 'false', 'yes', 'no', '1', or '0', got '{other}'"
-            ),
+            message: format!("Must be 'true' or 'false', got '{other}'"),
         }),
     }
 }
@@ -787,6 +789,100 @@ mod test {
             "openai",
             crate::model::params::openai::PARAMETERS,
         )
+    }
+
+    #[cfg(feature = "models")]
+    fn file_parameters(key: &str, value: Option<&str>) -> Parameters {
+        Parameters::new(
+            value.map_or_else(Vec::new, |value| {
+                vec![(key.to_string(), SecretString::from(value.to_string()))]
+            }),
+            "file",
+            crate::model::params::file::PARAMETERS,
+        )
+    }
+
+    #[test]
+    #[cfg(feature = "models")]
+    fn context_length_defaults_to_none() {
+        assert_eq!(
+            parse_context_length(&file_parameters("context_length", None))
+                .expect("absent context_length is valid"),
+            None
+        );
+        // Whitespace-only is treated as unset rather than as a parse failure, so an empty
+        // template value falls back to the engine default.
+        assert_eq!(
+            parse_context_length(&file_parameters("context_length", Some("  ")))
+                .expect("blank context_length is valid"),
+            None
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "models")]
+    fn context_length_parses_positive_integers() {
+        assert_eq!(
+            parse_context_length(&file_parameters("context_length", Some(" 8192 ")))
+                .expect("positive context_length is valid"),
+            Some(8192)
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "models")]
+    fn context_length_rejects_zero_and_non_integers() {
+        for bad in ["0", "-1", "4096.5", "many"] {
+            let err = parse_context_length(&file_parameters("context_length", Some(bad)))
+                .expect_err("non-positive-integer context_length should be invalid");
+            assert!(
+                matches!(err, LlmError::InvalidParamValueError { ref param, .. } if param == "context_length"),
+                "unexpected error for {bad:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "models")]
+    fn paged_attention_defaults_to_enabled() {
+        assert!(
+            parse_paged_attention(&file_parameters("paged_attention", None))
+                .expect("absent paged_attention is valid")
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "models")]
+    fn paged_attention_parses_booleans_ignoring_case() {
+        for on in ["true", "TRUE", "True", ""] {
+            assert!(
+                parse_paged_attention(&file_parameters("paged_attention", Some(on)))
+                    .unwrap_or_else(|e| panic!("{on:?} should parse: {e}")),
+                "{on:?} should enable paged attention"
+            );
+        }
+        for off in ["false", "FALSE", "False"] {
+            assert!(
+                !parse_paged_attention(&file_parameters("paged_attention", Some(off)))
+                    .unwrap_or_else(|e| panic!("{off:?} should parse: {e}")),
+                "{off:?} should disable paged attention"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "models")]
+    fn paged_attention_rejects_non_booleans() {
+        // The ParameterSpec is `one_of` true/false, so the parser deliberately accepts no
+        // wider vocabulary than the spec admits.
+        for bad in ["yes", "no", "1", "0", "maybe"] {
+            let err = parse_paged_attention(&file_parameters("paged_attention", Some(bad)))
+                .expect_err("non-boolean paged_attention should be invalid");
+            assert!(
+                matches!(err, LlmError::InvalidParamValueError { ref param, .. } if param == "paged_attention"),
+                "unexpected error for {bad:?}: {err}"
+            );
+        }
     }
 
     #[test]
