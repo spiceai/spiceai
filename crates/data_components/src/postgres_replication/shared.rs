@@ -2810,9 +2810,13 @@ mod tests {
         );
         assert_eq!(overflow.total, 3, "total must track the per-member queues");
         for _ in 0..2 {
-            fast_rx
+            let delivered = fast_rx
                 .try_recv()
                 .expect("fast member received its envelope");
+            assert!(
+                delivered.is_ok(),
+                "a held-back envelope must arrive intact, not as a stream error"
+            );
         }
         assert!(
             fast_rx.try_recv().is_err(),
@@ -2820,7 +2824,7 @@ mod tests {
         );
         // Sanity: the slow member's channel still holds only its prefill.
         for _ in 0..4 {
-            slow_rx.try_recv().expect("prefilled envelope");
+            let _prefilled = slow_rx.try_recv().expect("prefilled envelope");
         }
         assert!(slow_rx.try_recv().is_err());
     }
@@ -2854,8 +2858,8 @@ mod tests {
         );
 
         // Free two slots; exactly two more move.
-        rx.try_recv().expect("drain 1");
-        rx.try_recv().expect("drain 2");
+        let _drained = rx.try_recv().expect("drain 1");
+        let _drained = rx.try_recv().expect("drain 2");
         overflow.flush(&source);
         assert_eq!(overflow.held_for(&key), 2);
         assert_eq!(overflow.total, 2);
