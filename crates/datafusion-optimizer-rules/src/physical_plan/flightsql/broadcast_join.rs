@@ -30,12 +30,15 @@ limitations under the License.
 //! `executor_table` UDTF, and ships only the joined rows:
 //! ```text
 //! UnionExec[
-//!   BroadcastJoinFlightSqlExec(exec0): SELECT ... FROM (fact) f
-//!       JOIN (SELECT * FROM executor_table('e0',dim) UNION ALL ...) d ON ...
+//!   BroadcastJoinFlightSqlExec(exec0): SELECT ...
+//!       FROM (SELECT * FROM executor_table('e0',dim) UNION ALL ...) d
+//!       JOIN (fact) f ON ...
 //!   BroadcastJoinFlightSqlExec(exec1): <same SQL, run on exec1>
 //!   ...
 //! ]
 //! ```
+//! The dim union is the join's LEFT input so the executor hash-builds the
+//! small broadcast side, never its own fact slice (see `build_join_sql`).
 //! The per-executor SQL is identical (each executor's `FROM dim_or_fact` resolves
 //! to its own partition; the `executor_table` UNION addresses are the same), so
 //! it is built once and run against each fact-partition executor's client.
@@ -604,8 +607,18 @@ fn build_join_sql(
     }
     let select_list = select_items.join(", ");
 
+    // The dimension union is rendered FIRST — as the left input of the
+    // executor-local join — so the executor hash-builds the small broadcast
+    // side. The executor plans this SQL with its own `JoinSelection`, but it
+    // cannot cost-swap the sides: the `executor_table` scans carry only
+    // best-effort statistics (the local slice's, stamped as inexact), while
+    // the fact side is its local exact-stats scan, and an unknown-vs-known
+    // comparison never swaps. With the fact rendered first, each executor hash-built its
+    // ENTIRE fact slice — gigabytes, non-spillable — and exhausted its memory
+    // pool at scale (TPC-H q17 at SF100). Alias attribution in the ON and
+    // SELECT lists is order-independent, so only the build side changes.
     Some(format!(
-        "SELECT {select_list} FROM ({fact_sql}) f INNER JOIN ({dim_union}) d ON {on_clause}"
+        "SELECT {select_list} FROM ({dim_union}) d INNER JOIN ({fact_sql}) f ON {on_clause}"
     ))
 }
 
