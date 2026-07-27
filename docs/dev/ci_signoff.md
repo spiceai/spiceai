@@ -62,16 +62,28 @@ still posted (docs/YAML/script-only changes — and the **Attestation** check
 fast-tracks those PRs anyway, so you don't need to run this at all). Otherwise it
 maps changed files to workspace crates and runs, in order:
 
-1. `make lint-rust PACKAGES="…"` — lint the crates you touched
-2. `make nextest-packages PACKAGES="…"` — their unit tests
+1. `make lint-rust PACKAGES="…" FEATURES="…"` — lint the crates you touched
+2. `make nextest-packages PACKAGES="…" FEATURES="…"` — their unit tests
 3. `make lint-rust` — the full workspace lint
 4. `make build-cli-dev nextest` — CLI build + all unit tests
 
 Steps 1-2 exist to fail fast: a lint or test failure in the crate you edited is
 the likeliest outcome, and step 3 is by far the longest, so covering your own
-crates first turns a late failure into an early one. Each trades one extra
-compile of those crates when everything passes — `SIGNOFF_SKIP_TARGETED_LINT=1`
-and `SIGNOFF_SKIP_TARGETED_TESTS=1` opt out.
+crates first turns a late failure into an early one.
+`SIGNOFF_SKIP_TARGETED_LINT=1` and `SIGNOFF_SKIP_TARGETED_TESTS=1` opt out.
+
+**The scoped steps build each crate the way the workspace builds it.** The
+features come from a `cargo metadata` resolve of the whole workspace,
+package-qualified (`runtime/debezium,…`), rather than from the crate's own
+defaults. That matters because a crate's defaults are not what it is ever built
+with: `runtime` declares 54 features and **no `default`**, so a bare
+`cargo clippy -p runtime` compiles it with *zero* features, while the workspace
+resolve gives it 35 — `spiced`'s defaults unify them in. Linting and testing a
+configuration no real build produces is what makes a scoped pre-lint fail on code
+the full gate accepts, and it guarantees a cache miss against the gate that
+follows. The resolve is derived on every run, so there is no feature list to
+drift. If `cargo metadata` or `python3` is unavailable the steps fall back to
+package defaults rather than failing.
 
 The CLI is built with the same profile as the lint and test passes
 (`build-cli-dev`), not a release build: a release build shares no artifacts with
@@ -253,7 +265,7 @@ merge queue is still the real gate.
 
 | Stage | Trigger | Checks |
 | --- | --- | --- |
-| Local | `make signoff` | skip Rust if no Rust-affecting files in the branch diff; else targeted `make lint-rust PACKAGES=…` + `make nextest-packages PACKAGES=…`, full `make lint-rust`, `make build-cli-dev nextest` |
+| Local | `make signoff` | skip Rust if no Rust-affecting files in the branch diff; else targeted `make lint-rust PACKAGES=… FEATURES=…` + `make nextest-packages PACKAGES=… FEATURES=…` (features from the workspace resolve), full `make lint-rust`, `make build-cli-dev nextest` |
 | Remote | `make signoff-remote` | same checks via lab SSH (`$HOME/dev/spice2` on 192.168.1.100/101) if reachable, else self-hosted `signoff.yml`; posts `signoff` |
 | Pull request | `pull_request` | **Attestation** (validates the sign-off, or auto-passes a branch with no Rust-affecting files, a pure revert, or a single-commit Dependabot bump) + PR hygiene; merge-queue check names report lightweight skipped/passthrough results |
 | Merge queue | `merge_group` | the full required suite (below) + advisory niche checks |

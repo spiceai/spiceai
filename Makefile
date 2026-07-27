@@ -108,7 +108,7 @@ nextest:
 .PHONY: nextest-packages
 nextest-packages:
 	@test -n "$(strip $(PACKAGES))" || { echo 'nextest-packages requires PACKAGES="crate1 crate2"' >&2; exit 1; }
-	@cargo nextest run $(_LINT_PKG_FLAGS) --lib $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
+	@cargo nextest run $(_LINT_PKG_FLAGS) --lib $(_FEATURES_FLAGS) $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
 
 # Also update .github/workflows/integration.yml with changes to this target
 .PHONY: test-integration

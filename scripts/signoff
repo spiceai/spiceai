@@ -384,29 +384,31 @@ packages_for_changed_files() {
     return 1
   fi
 
-  local metadata files
-  # Read paths first — a heredoc would otherwise consume stdin for the program.
+  local files
+  # Read paths first — the program below reads metadata from stdin.
   files=$(cat)
   [[ -n "${files//[$'\t\n\r ']/}" ]] || return 0
 
-  # Keep stderr so cargo's own error (missing rustc, bad manifest, …) is visible.
-  metadata=$(cargo metadata --no-deps --format-version 1) \
-    || fail "cargo metadata failed — is this a Cargo workspace?"
-
-  # Paths + metadata via env (heredoc is the program source, not stdin data).
-  # Use a different env name than the readonly shell constant — bash rejects
-  # VAR=value command when VAR is readonly, even if the value is unchanged.
-  CHANGED_FILES="$files" PACKAGES_METADATA="$metadata" \
-    SIGNOFF_LINT_EXCLUDED="$LINT_EXCLUDED_PACKAGES" python3 <<'PY'
-import json, os
+  # Metadata streams over stdin rather than the environment: it is ~700 KB
+  # against a 1 MiB ARG_MAX covering argv plus the whole environment of exec(),
+  # and once the workspace outgrows that headroom python3 would stop starting
+  # and the targeted pre-lint would silently vanish. The changed-file list is a
+  # branch diff, small enough to stay in the environment. Keep cargo's stderr so
+  # its own error (missing rustc, bad manifest, …) stays visible.
+  cargo metadata --no-deps --format-version 1 \
+    | CHANGED_FILES="$files" SIGNOFF_LINT_EXCLUDED="$LINT_EXCLUDED_PACKAGES" python3 -c '
+import json, os, sys
 from pathlib import Path
 
-meta = json.loads(os.environ["PACKAGES_METADATA"])
+try:
+    meta = json.load(sys.stdin)
+except ValueError:
+    raise SystemExit("cargo metadata failed — is this a Cargo workspace?")
 excluded = set(os.environ.get("SIGNOFF_LINT_EXCLUDED", "").split())
 workspace_root = Path(meta["workspace_root"]).resolve()
 
 # Longest package root first so nested members (connector-postgres) win over
-# a parent path if both ever appeared (they shouldn't for exclusive members).
+# a parent path if both ever appeared (they should not for exclusive members).
 packages = []
 for p in meta["packages"]:
     name = p["name"]
@@ -436,7 +438,7 @@ for raw in os.environ["CHANGED_FILES"].splitlines():
 
 for name in sorted(found):
     print(name)
-PY
+'
 }
 
 # Resolve workspace packages touched by the current branch vs trunk. Prints a
@@ -465,6 +467,52 @@ changed_workspace_packages() {
 
   # Collapse newlines → spaces for `make PACKAGES=…`.
   echo "$packages" | tr '\n' ' ' | sed 's/[[:space:]]*$//'
+}
+
+# Feature set each named package carries in a full workspace resolve, formatted
+# for `--features` and package-qualified so multi-package selections stay
+# unambiguous.
+#
+# Without this a scoped `-p <crate>` run gets that crate's *own* defaults, which
+# is not what the workspace build produces: `runtime` declares 54 features and no
+# `default`, so `cargo clippy -p runtime` compiles it with zero features — a
+# configuration no real build ever produces, because `spiced`'s defaults unify 35
+# features into `runtime` across the workspace. The targeted steps would lint and
+# test different code than the gate, which is both the false-failure class that
+# SIGNOFF_SKIP_TARGETED_LINT exists to dodge and a guaranteed cache miss.
+# Deriving the set from the resolve keeps the two in step with no hand-maintained
+# list to drift.
+workspace_features_for_packages() {
+  local packages="$1"
+  [[ -n "${packages//[$'\t\n\r ']/}" ]] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+
+  # A resolve carrying dependencies is ~10 MB here, an order of magnitude past
+  # ARG_MAX, so it can only reach python over stdin.
+  cargo metadata --format-version 1 2>/dev/null | python3 -c '
+import json, sys
+
+try:
+    meta = json.load(sys.stdin)
+except ValueError:
+    raise SystemExit(0)
+
+wanted = set(sys.argv[1].split())
+# Match on workspace members only: a dependency can share a name with a member.
+members = set(meta.get("workspace_members", []))
+names = {p["id"]: p["name"] for p in meta["packages"]}
+
+features = []
+for node in meta.get("resolve", {}).get("nodes", []):
+    if node["id"] not in members or names.get(node["id"]) not in wanted:
+        continue
+    name = names[node["id"]]
+    # `default` is already on -- nothing here passes --no-default-features.
+    features.extend(
+        f"{name}/{feat}" for feat in sorted(node["features"]) if feat != "default"
+    )
+print(",".join(features))
+' "$packages" || return 0
 }
 
 # Filter a space-separated package list to those with a library target. The
@@ -565,6 +613,7 @@ branch_has_rust_changes() {
 # targeted run skips is still covered by the full `nextest` run later.
 run_targeted_tests() {
   local packages="$1"
+  local features="${2:-}"
   local test_packages
 
   if [[ -n "${SIGNOFF_SKIP_TARGETED_TESTS:-}" ]]; then
@@ -584,7 +633,7 @@ run_targeted_tests() {
   append_step_summary "### Targeted unit tests"$'\n'"Packages: \`${test_packages}\`"$'\n'
   # Explicit `|| return` so failures short-circuit even when the caller has
   # temporarily disabled `set -e` (see cmd_signoff).
-  make nextest-packages PACKAGES="$test_packages" || return $?
+  make nextest-packages PACKAGES="$test_packages" FEATURES="$features" || return $?
   info "Targeted unit tests passed."
 }
 
@@ -600,9 +649,10 @@ run_targeted_tests() {
 #   4. CLI build + unit tests
 #
 # Steps 1-2 cover the crate you actually edited before step 3, the longest step,
-# so its likeliest failures surface in minutes instead of at the end. Both trade
-# one extra compile of those crates when everything passes; SIGNOFF_SKIP_TARGETED_LINT
-# and SIGNOFF_SKIP_TARGETED_TESTS opt out.
+# so its likeliest failures surface in minutes instead of at the end. They build
+# it with the features the workspace resolves for it, so they exercise the same
+# code the gate will rather than a scoped-only configuration;
+# SIGNOFF_SKIP_TARGETED_LINT and SIGNOFF_SKIP_TARGETED_TESTS opt out.
 #
 # Sets SIGNOFF_CHECK_SUMMARY (short phrase for the commit-status description).
 # Output streams straight to the terminal — call this bare, never `$(run_checks)`,
@@ -610,6 +660,7 @@ run_targeted_tests() {
 run_checks() {
   local revision="${1:-}"
   local packages=""
+  local features=""
 
   # Non-Rust-only changes (docs, YAML, scripts, …): still attest, but skip the
   # expensive lint/build/test gate. Unknown diffs fall through and run checks.
@@ -625,17 +676,25 @@ run_checks() {
   fi
 
   if [[ -n "$packages" ]]; then
+    # Build these crates the way the workspace builds them, not the way they
+    # build alone — see workspace_features_for_packages. An empty result (no
+    # python3, cargo metadata unavailable) falls back to package defaults, which
+    # is the old behavior rather than a hard failure.
+    features=$(workspace_features_for_packages "$packages" || true)
     info "Targeted pre-lint for changed packages: ${packages}"
-    info "  (make lint-rust PACKAGES=\"${packages}\" FEATURES=)"
+    if [[ -n "$features" ]]; then
+      info "  (workspace-resolved features: $(printf '%s' "$features" | tr ',' '\n' | wc -l | tr -d ' '))"
+      debug "targeted features: ${features}"
+    else
+      info "  (no resolved features available — falling back to package defaults)"
+    fi
     append_step_summary "### Targeted pre-lint"$'\n'"Packages: \`${packages}\`"$'\n'
-    # Package defaults only — workspace features (models, …) are not valid on
-    # every crate. FEATURES= clears any user-exported FEATURES so the Makefile
-    # does not reintroduce a workspace-only set. Full lint below still uses the
-    # complete feature set. Explicit `|| return` so failures short-circuit even
+    # FEATURES is set explicitly so a user-exported value cannot reintroduce a
+    # workspace-only set. Explicit `|| return` so failures short-circuit even
     # when the caller has temporarily disabled `set -e` (see cmd_signoff).
-    make lint-rust PACKAGES="$packages" FEATURES= || return $?
+    make lint-rust PACKAGES="$packages" FEATURES="$features" || return $?
     info "Targeted pre-lint passed."
-    run_targeted_tests "$packages" || return $?
+    run_targeted_tests "$packages" "$features" || return $?
     info "Running full workspace lint…"
   else
     info "No changed workspace packages detected (or targeted lint skipped) — running full workspace lint…"
@@ -1208,6 +1267,10 @@ Checks (when verify is on):
   2. Targeted unit tests for those crates (make nextest-packages PACKAGES="…")
   3. Full workspace lint (make lint-rust)
   4. CLI build + unit tests (make build-cli-dev nextest)
+
+  Steps 1-2 pass the features each crate resolves to in a workspace build, not
+  the crate's own defaults — a scoped build of a crate that declares no
+  'default' (runtime) would otherwise compile with no features at all.
 
   Set SIGNOFF_SKIP_TARGETED_LINT=1 to skip step 1, SIGNOFF_SKIP_TARGETED_TESTS=1
   to skip step 2 (both trade an extra compile of those crates for early failure).
