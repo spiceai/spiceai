@@ -132,10 +132,15 @@ async fn delete_chunked_vector_by_outer_keys(
     inner: &Arc<dyn VectorIndex>,
     outer_keys: RecordBatch,
 ) -> DataFusionResult<()> {
-    let outer_columns: Vec<String> = outer_keys
-        .schema()
-        .fields()
-        .iter()
+    // Only the true outer primary key — not every column `outer_keys` happens to carry (it's
+    // shaped by `required_columns`, a superset that includes the search column and other
+    // metadata). `inner`'s stored value for those extra columns is chunk-specific (e.g. a
+    // fragment of the original search column), so matching on them would never equal the
+    // original row and silently leave chunks undeleted.
+    let outer_columns: Vec<String> = inner
+        .primary_fields()
+        .into_iter()
+        .filter(|f| f.name() != CHUNKED_INDEX_CHUNK_KEY)
         .map(|f| f.name().clone())
         .collect();
     let Some(predicate) = build_key_match_predicate(&outer_keys, &outer_columns)? else {
