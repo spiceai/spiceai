@@ -675,42 +675,39 @@ pub(crate) async fn try_wrap_view_accelerator_with_hnsw(
     Ok(true)
 }
 
+/// Peel the index/metadata wrapper layers off `src_table_provider` down to the raw
+/// source provider, so the source connector's changes stream sees the schema of the
+/// table it actually reads from.
+///
+/// Returning the wrapped provider instead has two failure modes: a
+/// `VectorScanTableProvider` schema carries the synthetic `<col>_embedding` columns, so
+/// a source bootstrap `SELECT` built from it references a column that does not exist in
+/// the source table; and returning `None` makes the caller fall back to a changes stream
+/// with no index writes, so changed rows reach the accelerator while the vector index
+/// goes stale.
 fn underlying_federated_table_for_indexed_table(
     src_table_provider: &Arc<dyn TableProvider>,
 ) -> Option<Arc<FederatedTable>> {
-    #[cfg(not(feature = "s3_vectors"))]
-    let _ = src_table_provider;
-
-    #[cfg(feature = "s3_vectors")]
+    // A metadata-enrichment layer can sit between the IndexedTableProvider and its
+    // VectorScanTableProvider (table_provider_with_spicepod_metadata pushes spicepod
+    // metadata into the IndexedTableProvider's underlying).
+    if let Some(enriched) =
+        src_table_provider.downcast_ref::<data_components::MetadataEnrichedTableProvider>()
     {
-        // A metadata-enrichment layer can sit between the IndexedTableProvider and its
-        // VectorScanTableProvider (table_provider_with_spicepod_metadata pushes spicepod
-        // metadata into the IndexedTableProvider's underlying). Peel it so the recursion
-        // reaches the raw source provider; otherwise it stops at the VectorScanTableProvider,
-        // whose schema carries the synthetic `<col>_embedding` columns, and the source's
-        // bootstrap SELECT references a column that doesn't exist in the source table.
-        if let Some(enriched) =
-            src_table_provider.downcast_ref::<data_components::MetadataEnrichedTableProvider>()
-        {
-            return underlying_federated_table_for_indexed_table(enriched.get_inner_ref());
-        }
-
-        if let Some(vector_scan) =
-            src_table_provider.downcast_ref::<search::index::VectorScanTableProvider>()
-        {
-            return underlying_federated_table_for_indexed_table(&vector_scan.table_provider);
-        }
-
-        if let Some(indexed_scan) = src_table_provider.downcast_ref::<IndexedTableProvider>() {
-            return underlying_federated_table_for_indexed_table(&indexed_scan.underlying);
-        }
-
-        Some(Arc::new(FederatedTable::Immediate(Arc::clone(
-            src_table_provider,
-        ))))
+        return underlying_federated_table_for_indexed_table(enriched.get_inner_ref());
     }
-    #[cfg(not(feature = "s3_vectors"))]
+
+    if let Some(vector_scan) =
+        src_table_provider.downcast_ref::<search::index::VectorScanTableProvider>()
     {
-        None
+        return underlying_federated_table_for_indexed_table(&vector_scan.table_provider);
     }
+
+    if let Some(indexed_scan) = src_table_provider.downcast_ref::<IndexedTableProvider>() {
+        return underlying_federated_table_for_indexed_table(&indexed_scan.underlying);
+    }
+
+    Some(Arc::new(FederatedTable::Immediate(Arc::clone(
+        src_table_provider,
+    ))))
 }
