@@ -1,9 +1,17 @@
 # Cayenne vs DuckDB benchmarks
 
-This page documents the head-to-head performance comparison between the
+This page documents the head-to-head **performance** comparison between the
 Cayenne and DuckDB accelerators. The goal is to make it easy to confirm
 Cayenne wins on every dimension that matters — ingestion, query, mutation,
 retention, throughput — and to catch regressions early.
+
+**Result correctness is a separate gate.** Full-content SQL result equality
+vs DuckDB/chDB (TPC-H/TPC-DS/ClickBench/CH-benCHmark/SpiceBench/SQLLancer)
+lives under `crates/cayenne/tests/correctness/` and is run with
+`cargo test -p cayenne --features result-correctness-duckdb|result-correctness-chdb`
+— not with `cargo bench` or the `duckdb-bench` / `chdb-bench` Criterion
+features. See `crates/cayenne/tests/correctness/README.md`. Do not treat
+those tests as perf regressions or fold them into this matrix.
 
 The comparison has two layers:
 

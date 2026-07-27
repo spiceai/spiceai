@@ -12,18 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Full-result Cayenne ↔ DuckDB parity on identical local data.
+//! # Result correctness (not performance)
 //!
-//! Requires `--features duckdb-bench`. Generates TPC-H via DuckDB's `tpch`
-//! extension, loads the same parquet bytes into Cayenne and DuckDB, and
-//! compares full result content (not row counts only). Also runs micro-bench
-//! SQL shapes and a reduced ClickBench hits fixture.
+//! Asserts Cayenne and DuckDB return **equivalent query results** for the same
+//! SQL on identical data. This is separate from Criterion `vs_duckdb_*` benches
+//! and from `tools/testoperator/dispatch/perf-cayenne-vs-duckdb/` — those measure
+//! latency/throughput; this gate only checks content equality.
 //!
-//! Scale factors default to SF1 (`CAYENNE_PARITY_TPCH_SF`, `CAYENNE_PARITY_TPCDS_SF`).
-//! Override to a smaller SF only for local iteration. ClickBench uses
-//! `CLICKBENCH_HITS_PARQUET` when set (full SF1 dump); otherwise a
-//! ranking-deterministic in-process fixture is used and the SF1 dataset
-//! absence is recorded under `CAYENNE_PARITY_SCRATCH`.
+//! Requires `--features result-correctness-duckdb` (not `duckdb-bench`).
+//! See `tests/correctness/README.md`.
+//!
+//! Suites: TPC-H SF1, TPC-DS SF1, ClickBench, CH-benCHmark SF1, SpiceBench
+//! (TPC-H scenario) SF1, SQLLancer corpus, micro SQL shapes.
+//! Scale defaults SF1 (`CAYENNE_PARITY_*_SF`). ClickBench: `CLICKBENCH_HITS_PARQUET`
+//! or ranking-deterministic fixture + env-failure log under `CAYENNE_PARITY_SCRATCH`.
 
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
@@ -32,7 +34,8 @@
 #![allow(clippy::cast_sign_loss)]
 #![allow(clippy::too_many_lines)]
 
-mod parity;
+#[path = "correctness/support/mod.rs"]
+mod support;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -40,9 +43,9 @@ use std::sync::Arc;
 use arrow::array::{Int64Array, RecordBatch, StringArray, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use duckdb::Connection;
-use parity::inventory::build_inventory;
-use parity::report::{RunResult, summary_line, write_coverage_report};
-use parity::{
+use support::inventory::build_inventory;
+use support::report::{RunResult, summary_line, write_coverage_report};
+use support::{
     CayenneHarness, ParityOutcome, TPCH_TABLES, compare_results, make_dim_batch, make_fact_batch,
     micro_bench_queries, write_parquet,
 };
@@ -1004,7 +1007,7 @@ fn chbench_sql_for_datafusion(sql: &str) -> String {
 }
 
 fn generate_chbench_parquet(out_dir: &Path, warehouses: i64) {
-    use parity::chbench_data::generate_chbench_duckdb_sql;
+    use support::chbench_data::generate_chbench_duckdb_sql;
     std::fs::create_dir_all(out_dir).expect("chbench out dir");
     let gen_db = out_dir.join("gen.duckdb");
     let conn = Connection::open(&gen_db).expect("duckdb open for chbench gen");
@@ -1015,7 +1018,7 @@ fn generate_chbench_parquet(out_dir: &Path, warehouses: i64) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn chbench_sf1_parity_vs_duckdb() {
-    use parity::chbench_data::CHBENCH_TABLES;
+    use support::chbench_data::CHBENCH_TABLES;
     use test_framework::queries::get_chbench_test_queries;
 
     let scratch = scratch_dir();
@@ -1167,7 +1170,7 @@ async fn spicebench_sf1_tpch_scenario_parity_vs_duckdb() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sqllancer_corpus_parity_vs_duckdb() {
-    use parity::sqllancer::{
+    use support::sqllancer::{
         SQLLANCER_TABLES, make_t0_batch, make_t1_batch, sqllancer_queries, t0_schema, t1_schema,
     };
 

@@ -12,7 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Cayenne query-result parity helpers: inventory, fixture setup, and report.
+//! Support code for Cayenne **result-correctness** integration tests
+//! (inventory, fixtures, SQLLancer corpus, reports).
+//!
+//! Not used by Criterion `vs_duckdb_*` / `vs_chdb_*` performance benches.
+//! See `tests/correctness/README.md`.
 
 #![allow(dead_code)]
 #![allow(clippy::expect_used)]

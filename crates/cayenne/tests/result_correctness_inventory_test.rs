@@ -12,25 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Inventory completeness + pure comparison-path tests for Cayenne parity.
+//! # Result correctness — inventory + pure compare path
 //!
-//! These tests do not link DuckDB or chDB. They prove:
-//! 1. The coverage inventory is complete relative to suite query sources.
-//! 2. The shipped `compare_query_result_batches` path fails on value mismatches
-//!    and passes on multiset-equal reordered results.
+//! Not a performance test. Does not link DuckDB or chDB. Proves:
+//! 1. The correctness inventory is complete vs suite SQL sources
+//!    (TPC-H/TPC-DS/ClickBench/CH-benCHmark/SpiceBench/SQLLancer/micro).
+//! 2. Shipped `compare_query_result_batches` fails on value mismatches and
+//!    passes multiset-equal reordered results.
+//!
+//! See `tests/correctness/README.md`.
 
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-mod parity;
+#[path = "correctness/support/mod.rs"]
+mod support;
 
 use std::sync::Arc;
 
 use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use parity::compare_results;
-use parity::inventory::{assert_inventory_complete, build_inventory, inventory_by_suite};
+use support::compare_results;
+use support::inventory::{assert_inventory_complete, build_inventory, inventory_by_suite};
 use test_framework::queries::Query;
 use test_framework::queries::validation::{
     QueryValidationFailReason, QueryValidationResult, RowOrder, compare_query_result_batches,
@@ -179,14 +183,14 @@ fn compare_results_wrapper_uses_order_by_from_sql() {
     // ORDER BY without LIMIT: multiset (tie order is not guaranteed).
     let out = compare_results(&ordered, &[a.clone()], &[b.clone()]);
     assert!(
-        matches!(out, parity::ParityOutcome::Pass),
+        matches!(out, support::ParityOutcome::Pass),
         "ORDER BY without LIMIT must accept multiset reordering: {out:?}"
     );
 
     // Multiset path: same multiset → pass
     let out = compare_results(&unordered, &[a.clone()], &[b.clone()]);
     assert!(
-        matches!(out, parity::ParityOutcome::Pass),
+        matches!(out, support::ParityOutcome::Pass),
         "unordered must accept multiset: {out:?}"
     );
 
@@ -198,7 +202,7 @@ fn compare_results_wrapper_uses_order_by_from_sql() {
     );
     let out = compare_results(&ordered_lim, &[a], &[b]);
     assert!(
-        matches!(out, parity::ParityOutcome::Fail { .. }),
+        matches!(out, support::ParityOutcome::Fail { .. }),
         "ORDER BY+LIMIT must preserve order: {out:?}"
     );
 }

@@ -37,7 +37,13 @@ pub fn write_coverage_report(path: &Path, results: &[RunResult]) -> std::io::Res
 
     let inventory = build_inventory();
     let mut md = String::new();
-    writeln!(md, "# Cayenne query-result parity coverage").ok();
+    writeln!(md, "# Cayenne result-correctness coverage").ok();
+    writeln!(md).ok();
+    writeln!(
+        md,
+        "> Correctness only — not a performance / Criterion benchmark report."
+    )
+    .ok();
     writeln!(md).ok();
     writeln!(
         md,
@@ -162,7 +168,7 @@ pub fn summary_line(results: &[RunResult]) -> String {
         })
         .count();
     format!(
-        "parity summary: pass={pass} excluded={excluded} fail={fail} total={}",
+        "correctness summary: pass={pass} excluded={excluded} fail={fail} total={}",
         results.len()
     )
 }

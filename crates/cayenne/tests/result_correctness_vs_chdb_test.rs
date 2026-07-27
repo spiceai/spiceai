@@ -12,23 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Full-result Cayenne ↔ chDB parity for expressible inventory queries.
+//! # Result correctness (not performance)
 //!
-//! Requires `--features chdb-bench`. Does **not** link DuckDB (the two
-//! engines cannot co-exist in one process). Runs:
-//! - micro-bench SQL shapes
-//! - SQLLancer curated corpus (three-engine gate; DuckDB lane is separate)
+//! Asserts Cayenne and chDB return **equivalent query results** for expressible
+//! inventory SQL on identical data. Separate from Criterion `vs_chdb_*` benches.
+//! Requires `--features result-correctness-chdb` (not `chdb-bench`). Does **not**
+//! link DuckDB (engines cannot co-exist in one process).
 //!
-//! TPC-H / TPC-DS / ClickBench / CH-benCHmark / SpiceBench suite SQL is
-//! inventory-excluded for chDB with documented dialect reasons — see
-//! `parity::inventory`.
+//! Runs: micro SQL shapes + SQLLancer corpus. Multi-table analytical suites are
+//! inventory-excluded for chDB with dialect reasons — see `support::inventory`
+//! and `tests/correctness/README.md`.
 
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::cast_possible_wrap)]
 #![allow(clippy::too_many_lines)]
 
-mod parity;
+#[path = "correctness/support/mod.rs"]
+mod support;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -37,9 +38,9 @@ use arrow::array::RecordBatch;
 use chdb_rust::arg::Arg;
 use chdb_rust::format::OutputFormat;
 use chdb_rust::session::SessionBuilder;
-use parity::inventory::build_inventory;
-use parity::report::{RunResult, summary_line, write_coverage_report};
-use parity::{
+use support::inventory::build_inventory;
+use support::report::{RunResult, summary_line, write_coverage_report};
+use support::{
     CayenneHarness, ParityOutcome, compare_results, make_dim_batch, make_fact_batch,
     micro_bench_queries, write_parquet,
 };
@@ -352,7 +353,7 @@ fn compare_as_string_rows(
 }
 
 async fn sqllancer_corpus_parity_vs_chdb_inner() {
-    use parity::sqllancer::{
+    use support::sqllancer::{
         make_t0_batch, make_t1_batch, sqllancer_queries, sqllancer_sql_for_chdb,
     };
 
