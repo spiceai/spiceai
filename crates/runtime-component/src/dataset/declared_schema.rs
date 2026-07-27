@@ -30,8 +30,8 @@ use arrow_schema::{Field, Schema, SchemaRef};
 use snafu::{ResultExt, Snafu};
 use spicepod::semantic::Column;
 
-use crate::component::dataset::Dataset;
-use crate::component::dataset::declared_type::{ParseTypeError, parse_declared_type};
+use crate::dataset::DatasetSpec;
+use crate::dataset::declared_type::{ParseTypeError, parse_declared_type};
 
 #[derive(Debug, Snafu)]
 pub enum DeclaredSchemaError {
@@ -50,7 +50,9 @@ pub enum DeclaredSchemaError {
 ///
 /// `nullable` defaults to `true` when not specified — Arrow's standard
 /// "unknown nullability is nullable" convention.
-pub fn declared_schema_for(dataset: &Dataset) -> Result<Option<SchemaRef>, DeclaredSchemaError> {
+pub fn declared_schema_for(
+    dataset: &DatasetSpec,
+) -> Result<Option<SchemaRef>, DeclaredSchemaError> {
     if dataset.columns.is_empty() {
         return Ok(None);
     }
@@ -79,7 +81,7 @@ pub fn declared_schema_for(dataset: &Dataset) -> Result<Option<SchemaRef>, Decla
 ///
 /// `dataset_name` is used only in error messages. Columns without a `type` are
 /// skipped; an error is returned if a `type` string cannot be parsed.
-pub(crate) fn schema_from_columns(
+pub fn schema_from_columns(
     dataset_name: &str,
     columns: &[Column],
 ) -> Result<Option<SchemaRef>, DeclaredSchemaError> {
@@ -103,61 +105,8 @@ pub(crate) fn schema_from_columns(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::component::dataset::builder::DatasetBuilder;
-    use app::AppBuilder;
-    use spicepod::semantic::Column;
-
-    async fn dataset_with_columns(cols: Vec<Column>) -> Dataset {
-        let app = std::sync::Arc::new(AppBuilder::new("test").build());
-        let rt = std::sync::Arc::new(crate::Runtime::builder().build().await);
-        let mut ds = DatasetBuilder::try_new("test:tbl".to_string(), "tbl")
-            .expect("builder")
-            .with_app(app)
-            .with_runtime(rt)
-            .build()
-            .expect("dataset");
-        ds.columns = cols;
-        ds
-    }
-
-    #[tokio::test]
-    async fn empty_columns_returns_none() {
-        let ds = dataset_with_columns(vec![]).await;
-        assert!(declared_schema_for(&ds).expect("no error").is_none());
-    }
-
-    #[tokio::test]
-    async fn missing_type_returns_none() {
-        let ds = dataset_with_columns(vec![
-            Column::new("id").with_type("bigint"),
-            Column::new("name"),
-        ])
-        .await;
-        assert!(declared_schema_for(&ds).expect("no error").is_none());
-    }
-
-    #[tokio::test]
-    async fn all_typed_returns_schema() {
-        let ds = dataset_with_columns(vec![
-            Column::new("id").with_type("bigint").with_nullable(false),
-            Column::new("name").with_type("text"),
-        ])
-        .await;
-        let schema = declared_schema_for(&ds).expect("no error").expect("some");
-        assert_eq!(schema.fields().len(), 2);
-        assert_eq!(schema.field(0).name(), "id");
-        assert!(!schema.field(0).is_nullable());
-        assert_eq!(schema.field(1).name(), "name");
-        assert!(schema.field(1).is_nullable());
-    }
-
-    #[tokio::test]
-    async fn invalid_type_returns_error() {
-        let ds = dataset_with_columns(vec![Column::new("bad").with_type("not_a_type")]).await;
-        let result = declared_schema_for(&ds);
-        assert!(result.is_err(), "expected error, got {result:?}");
-    }
-}
+// NOTE: `declared_schema_for` unit tests construct a full `Dataset` (via
+// `DatasetBuilder` + `Runtime`) and therefore live with the wrapper in the
+// `runtime` crate (`crates/runtime/src/component/dataset/mod.rs`), which can
+// name `Runtime`. They call `declared_schema_for(&dataset)` — `&Dataset` derefs
+// to `&DatasetSpec` at the call site.

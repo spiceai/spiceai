@@ -73,8 +73,13 @@ limitations under the License.
 //! not classify) is adopted only if the freshly-fetched source layout matches
 //! the event's column count ([`super::binlog::adopt_current_layout`]), else
 //! member-fatal; the count-match guard makes replaying pre-change row images
-//! self-fatal rather than mis-decoded. A durable pre-adopt/replay-boundary
-//! checkpoint machinery is intentionally *not* implemented in v1. Instead,
+//! self-fatal rather than mis-decoded. Because a fetched layout describes the
+//! source *now* rather than the event being decoded, every routed `TableMap` is
+//! additionally checked against the column types the event itself carries
+//! ([`super::binlog::layout_event_mismatch`]), which is what catches a
+//! same-column-count reorder adopted from ahead of the stream. A durable
+//! pre-adopt/replay-boundary checkpoint machinery is intentionally *not*
+//! implemented in v1. Instead,
 //! safety across a detach/rejoin is guaranteed structurally: every (re)subscribe
 //! re-resolves the start position from the member's own sidecar and re-checks
 //! its persisted layout fingerprint against the current source layout, so a
@@ -94,7 +99,7 @@ use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use futures::{StreamExt, stream};
 use mysql_async::Conn;
-use mysql_async::binlog::events::{EventData, RowsEventData, TableMapEvent};
+use mysql_async::binlog::events::{EventData, RotateEvent, RowsEventData, TableMapEvent};
 use rustc_hash::FxHashMap;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -102,8 +107,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use super::binlog::{
     AdoptedLayout, MIN_VALID_EVENT_POS, QueryKind, StatementKind, adopt_current_layout,
     classify_query, classify_statement, commit_ts_ms, compute_pk_source_indexes,
-    log_transient_reconnect, open_binlog_stream, purged_position_error, readiness_heartbeat,
-    record_watermark,
+    layout_event_mismatch, log_transient_reconnect, open_binlog_stream, purged_position_error,
+    readiness_heartbeat, record_watermark,
 };
 use super::changes::{MemberLayout, MysqlChangeRows};
 use super::config::{BinlogPosition, ReplicationParams};
@@ -1492,7 +1497,9 @@ async fn run_pump(source: Arc<SharedSource>) {
             };
 
             let header = event.header();
-            let event_end_pos = u64::from(header.log_pos());
+            // Offset within `current_file` this event advances the stream to. A
+            // real `ROTATE` rewrites both together (see [`rotate_target`]).
+            let mut event_end_pos = u64::from(header.log_pos());
             let event_timestamp = header.timestamp();
             let data = match event.read_data() {
                 Ok(data) => data,
@@ -1505,8 +1512,14 @@ async fn run_pump(source: Arc<SharedSource>) {
 
             match data {
                 Some(EventData::RotateEvent(rotate)) => {
-                    if !rotate.is_fake() {
-                        current_file = rotate.name().into_owned();
+                    // Take BOTH the file and the offset from the event: its
+                    // header offset belongs to the file being closed, so keeping
+                    // `event_end_pos` here would credit idle members a position
+                    // the newly opened file will not reach for a long time. See
+                    // [`rotate_target`].
+                    if let Some(target) = rotate_target(&rotate) {
+                        current_file = target.file;
+                        event_end_pos = target.pos;
                     }
                 }
                 Some(EventData::TableMapEvent(tme)) => {
@@ -1586,6 +1599,21 @@ async fn run_pump(source: Arc<SharedSource>) {
                         let g = lock(&member.layout);
                         Arc::clone(&g)
                     };
+                    // Every decode is routed from here, so this is the one place
+                    // that can check the layout against the event describing the
+                    // row images it will decode. A layout adopted from
+                    // `information_schema` reflects the source *now*, which under
+                    // lag can be a later DDL than the events in flight (#11764);
+                    // fail this member closed rather than scramble its columns.
+                    if let Some(mismatch) = layout_event_mismatch(&layout.layout, &tme) {
+                        member.metrics.inc_schema_mismatch_error();
+                        routes.remove(&table_id);
+                        member_fatal(&source, &mkey, format!(
+                            "source table {}.{} does not match the shape of the changes being replicated: column {} (position {}) is `{}` in the table definition but the change events carry a different type there. This happens when the source applies more than one ALTER TABLE while replication is behind, so the table definition read for the first one already reflects the second. Let replication catch up before the next schema change, then re-bootstrap by setting `mysql_replication_invalid_checkpoint_behavior: restart`.",
+                            mkey.0, mkey.1, mismatch.column, mismatch.ordinal, mismatch.source_type
+                        )).await;
+                        continue 'recv;
+                    }
                     let tme = Arc::new(tme.into_owned());
                     routes.insert(
                         table_id,
@@ -1754,6 +1782,21 @@ async fn run_pump(source: Arc<SharedSource>) {
 
 fn current_file_pos(file: &str) -> BinlogPosition {
     BinlogPosition::new(file.to_string(), 0)
+}
+
+/// Where a `ROTATE` event repositions the shared stream, or `None` for the fake
+/// rotate the server sends at the head of a dump (which opens no new file).
+///
+/// `ROTATE` is the one event whose header offset does **not** belong to the file
+/// it names: `log_pos` is the end of the event in the file being *closed*, while
+/// the payload names the file being *opened* and the offset to resume reading at
+/// (normally 4, just past the magic number). Pairing the new name with the
+/// closing file's offset yields a coordinate far beyond anything the new file
+/// holds — an idle member credited there has every later commit in that file
+/// suppressed by [`AckSlot::already_committed`], silently and for as long as the
+/// new file stays smaller than the old one (#12042).
+fn rotate_target(rotate: &RotateEvent<'_>) -> Option<BinlogPosition> {
+    (!rotate.is_fake()).then(|| BinlogPosition::new(rotate.name(), rotate.position()))
 }
 
 /// Deliver a committed transaction's buffered rows to their members, then
@@ -2358,6 +2401,61 @@ mod tests {
             file_checkpoint_verdict(false),
             CheckpointVerdict::Unresumable(_)
         ));
+    }
+
+    /// A real `ROTATE` closing `binlog.000041` at ~1 GiB and opening
+    /// `binlog.000042`: the stream continues at offset 4 of the *new* file, not
+    /// at the *closed* file's end offset (which the event header carries).
+    #[test]
+    fn rotate_targets_the_new_files_resume_offset() {
+        let rotate = RotateEvent::new(4, &b"binlog.000042"[..]);
+        assert_eq!(
+            rotate_target(&rotate),
+            Some(pos("binlog.000042", 4)),
+            "a rotate must reposition to the offset its payload names"
+        );
+    }
+
+    #[test]
+    fn a_fake_rotate_does_not_reposition_the_stream() {
+        // The artificial rotate at the head of a dump opens no new file.
+        let rotate = RotateEvent::new(0, &b"binlog.000042"[..]);
+        assert_eq!(rotate_target(&rotate), None);
+    }
+
+    /// Regression test for #12042.
+    ///
+    /// The pump credits idle streaming members the coordinate each event
+    /// advances the stream to. When a `ROTATE` contributed the *closing* file's
+    /// end offset under the *opening* file's name, an idle member's committed
+    /// floor jumped ~1 GiB past the new file's real offsets and `deliver_commit`
+    /// then dropped every following transaction as `already_committed` — with no
+    /// error, no detach, and no backpressure warning, for the rest of the run.
+    #[test]
+    fn a_rotate_credit_does_not_suppress_the_new_files_commits() {
+        let ack = AckTable::default();
+        let member = key("tpcc", "warehouse");
+        // An idle member caught up to the end of the file about to be closed.
+        ack.register(&member, pos("binlog.000041", 1_073_741_800), false);
+        ack.promote_ready_members();
+
+        let rotate = RotateEvent::new(4, &b"binlog.000042"[..]);
+        let target = rotate_target(&rotate).expect("a real rotate repositions the stream");
+        ack.credit_idle(&target, None);
+
+        assert_eq!(
+            ack.committed(&member),
+            Some(pos("binlog.000042", 4)),
+            "the credit must land at the new file's start"
+        );
+
+        // The first transaction of the newly opened file must still be delivered.
+        let next_commit = pos("binlog.000042", 1_182);
+        let slot = ack.slot(&member).expect("registered member has a slot");
+        assert!(
+            !slot.already_committed(&next_commit),
+            "commit at {next_commit} was suppressed as already-applied, so its rows are lost"
+        );
     }
 
     #[test]

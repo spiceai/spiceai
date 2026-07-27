@@ -342,6 +342,47 @@ pub enum SnapshotCreateTrigger {
     Batches(i64),
 }
 
+/// The decision behind [`AcceleratedTable::scan_readiness`], as a function of
+/// only the state it depends on so it can be exercised exhaustively.
+fn scan_readiness_for(
+    cluster_role: Option<&ClusterRole>,
+    initial_load_completed: bool,
+    refresh_mode: RefreshMode,
+    ready_state: ReadyState,
+) -> ScanReadiness {
+    if matches!(cluster_role, Some(ClusterRole::Scheduler)) {
+        return ScanReadiness::Scheduler;
+    }
+
+    if initial_load_completed || refresh_mode == RefreshMode::Caching {
+        return ScanReadiness::Accelerated;
+    }
+
+    match ready_state {
+        ReadyState::OnLoad => ScanReadiness::NotReady,
+        ReadyState::OnRegistration | ReadyState::OnSchemaResolved => {
+            ScanReadiness::ReadyStateFallback
+        }
+    }
+}
+
+/// How a scan of an [`AcceleratedTable`] must be served. See
+/// [`AcceleratedTable::scan_readiness`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanReadiness {
+    /// The accelerator can serve the scan.
+    Accelerated,
+    /// Accelerated tables aren't accelerated on a scheduler; the federated
+    /// source serves the scan regardless of load progress.
+    Scheduler,
+    /// The initial load has not completed and `ready_state: on_load` requires
+    /// it to, so the scan cannot be served at all.
+    NotReady,
+    /// The initial load has not completed, but `ready_state` allows the
+    /// federated source to serve the scan in the meantime.
+    ReadyStateFallback,
+}
+
 #[expect(clippy::struct_excessive_bools)]
 pub struct Builder {
     runtime_status: Arc<status::RuntimeStatus>,
@@ -1239,6 +1280,42 @@ impl AcceleratedTable {
         &self.federated
     }
 
+    /// How a scan of this table must be served, given how far the initial
+    /// accelerated load has progressed.
+    ///
+    /// [`TableProvider::scan`] consults this, and so may callers that want to
+    /// reject a request before doing expensive work (search embeds its query
+    /// text while building the plan, so it would otherwise pay for an embedding
+    /// round trip only to hit [`ScanReadiness::NotReady`] at physical planning).
+    /// Keeping the decision here means the two can never disagree.
+    #[must_use]
+    pub fn scan_readiness(&self) -> ScanReadiness {
+        scan_readiness_for(
+            self.cluster_role.as_ref(),
+            self.refresher().initial_load_completed(),
+            self.refresh_mode,
+            self.ready_state,
+        )
+    }
+
+    /// The error a scan would fail with while the initial load is still in
+    /// flight, or `None` when a scan can be served.
+    #[must_use]
+    pub fn not_ready_error(&self) -> Option<DataFusionError> {
+        match self.scan_readiness() {
+            ScanReadiness::NotReady => Some(self.acceleration_not_ready_error()),
+            ScanReadiness::Accelerated
+            | ScanReadiness::Scheduler
+            | ScanReadiness::ReadyStateFallback => None,
+        }
+    }
+
+    fn acceleration_not_ready_error(&self) -> DataFusionError {
+        DataFusionError::External(SpiceExternalError::acceleration_not_ready(
+            self.dataset_name.to_string(),
+        ))
+    }
+
     #[must_use]
     pub fn is_dual_write(&self) -> bool {
         self.write_mode.is_dual_write()
@@ -1462,35 +1539,28 @@ impl TableProvider for AcceleratedTable {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let is_caching_mode = self.refresh_mode == RefreshMode::Caching;
 
-        if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) {
-            // Accelerated tables aren't accelerated on scheduler. Just scan the federated source.
-            let federated_provider = self.federated.table_provider().await;
-            return federated_provider
-                .scan(state, projection, filters, limit)
-                .await;
-        }
-
-        // If the initial load hasn't completed yet, we need to handle the loading behavior.
-        if !self.refresher().initial_load_completed() && !is_caching_mode {
-            match self.ready_state {
-                ReadyState::OnLoad => {
-                    return Err(DataFusionError::External(
-                        SpiceExternalError::acceleration_not_ready(self.dataset_name.to_string()),
-                    ));
-                }
-                ReadyState::OnRegistration | ReadyState::OnSchemaResolved => {
-                    // Before the initial accelerated load completes, these ready states fall back
-                    // to the federated source. Resolving the federated provider is still
-                    // asynchronous here and may await the deferred provider becoming available.
-                    let federated_provider = self.federated.table_provider().await;
-                    metrics::READY_STATE_FALLBACK.add(
-                        1,
-                        &[KeyValue::new("dataset_name", self.dataset_name.to_string())],
-                    );
-                    return federated_provider
-                        .scan(state, projection, filters, limit)
-                        .await;
-                }
+        match self.scan_readiness() {
+            ScanReadiness::Accelerated => {}
+            ScanReadiness::Scheduler => {
+                // Accelerated tables aren't accelerated on scheduler. Just scan the federated source.
+                let federated_provider = self.federated.table_provider().await;
+                return federated_provider
+                    .scan(state, projection, filters, limit)
+                    .await;
+            }
+            ScanReadiness::NotReady => return Err(self.acceleration_not_ready_error()),
+            ScanReadiness::ReadyStateFallback => {
+                // Before the initial accelerated load completes, these ready states fall back
+                // to the federated source. Resolving the federated provider is still
+                // asynchronous here and may await the deferred provider becoming available.
+                let federated_provider = self.federated.table_provider().await;
+                metrics::READY_STATE_FALLBACK.add(
+                    1,
+                    &[KeyValue::new("dataset_name", self.dataset_name.to_string())],
+                );
+                return federated_provider
+                    .scan(state, projection, filters, limit)
+                    .await;
             }
         }
 
@@ -2186,6 +2256,107 @@ mod tests {
             vec![col("content"), lit("key")],
         ))
         .eq(lit("needle"))
+    }
+
+    /// Every combination of the state `scan_readiness_for` depends on, against
+    /// what `scan` did before the decision was extracted. `ready_state` only
+    /// matters once the initial load is outstanding, and `Caching` is ready
+    /// regardless of it — a scheduler ignores all of it.
+    #[test]
+    fn test_scan_readiness_covers_every_state_combination() {
+        let ready_states = [
+            ReadyState::OnLoad,
+            ReadyState::OnRegistration,
+            ReadyState::OnSchemaResolved,
+        ];
+        let refresh_modes = [
+            RefreshMode::Disabled,
+            RefreshMode::Full,
+            RefreshMode::Append,
+            RefreshMode::Changes,
+            RefreshMode::Caching,
+            RefreshMode::Snapshot,
+        ];
+
+        for ready_state in ready_states {
+            for refresh_mode in refresh_modes {
+                // A scheduler never accelerates, so nothing else is consulted.
+                for initial_load_completed in [false, true] {
+                    assert_eq!(
+                        scan_readiness_for(
+                            Some(&ClusterRole::Scheduler),
+                            initial_load_completed,
+                            refresh_mode,
+                            ready_state
+                        ),
+                        ScanReadiness::Scheduler,
+                        "scheduler must bypass acceleration ({ready_state:?}, {refresh_mode:?}, loaded={initial_load_completed})"
+                    );
+                }
+
+                // An executor is accelerated like any other non-scheduler node.
+                assert_eq!(
+                    scan_readiness_for(
+                        Some(&ClusterRole::Executor),
+                        true,
+                        refresh_mode,
+                        ready_state
+                    ),
+                    ScanReadiness::Accelerated,
+                    "an executor must accelerate ({ready_state:?}, {refresh_mode:?})"
+                );
+
+                // A completed initial load always serves from the accelerator.
+                assert_eq!(
+                    scan_readiness_for(None, true, refresh_mode, ready_state),
+                    ScanReadiness::Accelerated,
+                    "a completed load must serve from the accelerator ({ready_state:?}, {refresh_mode:?})"
+                );
+
+                let expected = match (refresh_mode, ready_state) {
+                    (RefreshMode::Caching, _) => ScanReadiness::Accelerated,
+                    (_, ReadyState::OnLoad) => ScanReadiness::NotReady,
+                    (_, ReadyState::OnRegistration | ReadyState::OnSchemaResolved) => {
+                        ScanReadiness::ReadyStateFallback
+                    }
+                };
+                assert_eq!(
+                    scan_readiness_for(None, false, refresh_mode, ready_state),
+                    expected,
+                    "outstanding load mishandled ({ready_state:?}, {refresh_mode:?})"
+                );
+            }
+        }
+    }
+
+    /// Only `ready_state: on_load` with an outstanding load refuses a scan; a
+    /// caller that pre-checks readiness must not reject anything else. See
+    /// #10956 — search asks before embedding the query text.
+    #[test]
+    fn test_only_on_load_with_outstanding_load_refuses_a_scan() {
+        assert_eq!(
+            scan_readiness_for(None, false, RefreshMode::Full, ReadyState::OnLoad),
+            ScanReadiness::NotReady
+        );
+
+        for readiness in [
+            scan_readiness_for(None, true, RefreshMode::Full, ReadyState::OnLoad),
+            scan_readiness_for(None, false, RefreshMode::Caching, ReadyState::OnLoad),
+            scan_readiness_for(None, false, RefreshMode::Full, ReadyState::OnRegistration),
+            scan_readiness_for(None, false, RefreshMode::Full, ReadyState::OnSchemaResolved),
+            scan_readiness_for(
+                Some(&ClusterRole::Scheduler),
+                false,
+                RefreshMode::Full,
+                ReadyState::OnLoad,
+            ),
+        ] {
+            assert_ne!(
+                readiness,
+                ScanReadiness::NotReady,
+                "{readiness:?} must remain scannable"
+            );
+        }
     }
 
     #[test]

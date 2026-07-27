@@ -1381,6 +1381,22 @@ impl CayenneAccelerator {
                     .collect();
             }
 
+            // Provenance of the sort order. Schema inference sets this to
+            // `inferred` when it fills `cayenne_sort_columns` itself; an operator
+            // who configured the sort order explicitly leaves it absent, which
+            // defaults to `user` (authoritative). Only an authoritative order may
+            // shadow the hot filter columns observed on scans — see
+            // `SortColumnsOrigin`. Unrecognized values fall back to the
+            // conservative `user`, which preserves pre-existing behavior.
+            if let Some(origin) = acceleration
+                .params
+                .get("cayenne_sort_columns_origin")
+                .or_else(|| acceleration.params.get("sort_columns_origin"))
+                && origin.trim().eq_ignore_ascii_case("inferred")
+            {
+                config.sort_columns_origin = cayenne::metadata::SortColumnsOrigin::Inferred;
+            }
+
             // Parse shard key columns (the hash-clustering key for intra-write
             // sharding; the engine derives it from the primary key when unset)
             if let Some(shard_cols_str) = acceleration
@@ -2423,8 +2439,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    62,
-    { S3_PARAMS_LEN + 62 },
+    63,
+    { S3_PARAMS_LEN + 63 },
 >(
     S3_PARAMETERS,
     [
@@ -2496,6 +2512,9 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Physical-GC cadence and orphan grace for superseded datalake objects: the background sweep runs about this often and deletes an object no longer referenced by the manifest only once it has been observed orphaned for at least this long (so an in-flight scan has a full interval to finish). Default: 300000 (5min)."),
         ParameterSpec::component("sort_columns")
             .description("Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id')."),
+        ParameterSpec::component("sort_columns_origin")
+            .description("Provenance of 'sort_columns'. Normally set by schema inference rather than by hand: 'user' (the default when absent) means the sort order was configured explicitly and is authoritative, while 'inferred' means schema inference filled it from the source's declared order (the primary key, for most CDC tables), which is a guess and is outranked by the filter columns actually observed on scans, so the adaptive layout can cluster for the real workload. Setting it explicitly is supported and is useful for reproducing the inferred configuration in a benchmark or test.")
+            .one_of(&["user", "inferred"]),
         ParameterSpec::component("shard_key_columns")
             .description("Comma-separated list of columns to hash-cluster rows by during intra-write sharding (the parallel encode fan-out), e.g. 'tenant_id'. When unset, the shard key derives from the primary key (PK-hash clustering); tables without a primary key shard round-robin. Schema inference fills this from the source's declared partition/shard key when the user leaves it unset. Ignored for sorted tables: sort_columns forces a single serial writer."),
         ParameterSpec::component("compression_strategy")

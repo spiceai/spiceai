@@ -28,12 +28,21 @@ use session::ImapSession;
 use snafu::prelude::*;
 
 pub mod provider;
+pub(crate) mod search;
 pub mod session;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Failed to fetch messages from IMAP mailbox: {source}"))]
     FetchMessages { source: imap::Error },
+    // `source` is boxed so carrying the criteria alongside it does not make this
+    // the largest variant — every `Result<_, Error>` in the crate pays for that.
+    #[snafu(display("Failed to search the IMAP mailbox with '{criteria}': {source}"))]
+    SearchMessages {
+        criteria: String,
+        #[snafu(source(from(imap::Error, Box::new)))]
+        source: Box<imap::Error>,
+    },
     #[snafu(display("Failed to open IMAP mailbox for reading: {source}"))]
     ExamineMailbox { source: imap::Error },
     #[snafu(display("Failed to get IMAP mailbox status: {source}"))]
