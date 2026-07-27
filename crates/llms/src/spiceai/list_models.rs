@@ -23,7 +23,7 @@ use std::collections::HashMap;
 
 use crate::config::HostedModelConfig;
 use crate::provider::{ListModels, ListModelsError, ListModelsResult, get_required_param};
-use crate::spiceai::api_base;
+use crate::spiceai::{api_base, is_cloud_platform};
 
 const PROVIDER_NAME: &str = "Spice Cloud";
 
@@ -35,22 +35,31 @@ pub struct SpiceAiModelLister {
 impl SpiceAiModelLister {
     /// Creates a new model lister from parameters.
     ///
-    /// Required parameter: `spiceai_api_key`
     /// Optional parameter: `spiceai_endpoint` (defaults to <https://data.spiceai.io>)
+    /// Parameter `spiceai_api_key`: required for the Spice.ai Cloud Platform, optional for a
+    /// Spice runtime that does not require authentication.
     pub fn from_params(params: &HashMap<String, SecretString>) -> ListModelsResult<Self> {
-        let api_key = get_required_param(params, "spiceai_api_key")?;
         let endpoint = params
             .get("spiceai_endpoint")
             .map(ExposeSecret::expose_secret);
+
+        let api_key = if is_cloud_platform(endpoint) {
+            Some(get_required_param(params, "spiceai_api_key")?)
+        } else {
+            params.get("spiceai_api_key")
+        };
 
         Ok(Self::new(api_key, endpoint))
     }
 
     /// Creates a new model lister with explicit credentials.
+    ///
+    /// `api_key` is optional so listing works against a Spice runtime reached over a trusted
+    /// network, matching what [`crate::spiceai::new_spiceai_client`] accepts for chat.
     #[must_use]
-    pub fn new(api_key: &SecretString, endpoint: Option<&str>) -> Self {
+    pub fn new(api_key: Option<&SecretString>, endpoint: Option<&str>) -> Self {
         let config = HostedModelConfig::from_url(&api_base(endpoint))
-            .with_api_key(Some(api_key.expose_secret()));
+            .with_api_key(api_key.map(ExposeSecret::expose_secret));
 
         Self {
             client: Client::with_config(config),
@@ -111,6 +120,33 @@ mod tests {
     #[test]
     fn test_from_params_missing_key() {
         let params = HashMap::new();
+        let result = SpiceAiModelLister::from_params(&params);
+        assert!(matches!(
+            result,
+            Err(ListModelsError::MissingParameter { .. })
+        ));
+    }
+
+    #[test]
+    fn from_params_allows_a_self_hosted_runtime_without_a_key() {
+        let mut params = HashMap::new();
+        params.insert(
+            "spiceai_endpoint".to_string(),
+            SecretString::from("http://localhost:8090"),
+        );
+
+        SpiceAiModelLister::from_params(&params)
+            .expect("a Spice runtime endpoint should not require an API key");
+    }
+
+    #[test]
+    fn from_params_still_requires_a_key_for_the_spelled_out_cloud_platform() {
+        let mut params = HashMap::new();
+        params.insert(
+            "spiceai_endpoint".to_string(),
+            SecretString::from(crate::spiceai::DEFAULT_ENDPOINT),
+        );
+
         let result = SpiceAiModelLister::from_params(&params);
         assert!(matches!(
             result,
