@@ -36,7 +36,7 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, IntervalUnit, SchemaRef};
 use mysql_async::binlog::events::{RowsEventData, TableMapEvent};
 
-use super::binlog::buffer_rows_event;
+use super::binlog::{FastRowsDecoder, buffer_rows_event, buffer_rows_event_fast};
 use super::metrics::MetricsCollector;
 use super::rows::{TransactionBuffer, build_change_batch};
 use super::setup::TableLayout;
@@ -146,22 +146,52 @@ impl ChangeRows for MysqlChangeRows {
     }
 
     fn build(self: Box<Self>) -> Result<ChangeBatch, ChangeBatchError> {
-        // Decode every buffered rows event into the transaction buffer using the
-        // SAME `buffer_rows_event` the per-dataset path uses (it records the
-        // per-row op metrics as it decodes), then build one Arrow batch.
+        // Decode every buffered rows event into the transaction buffer, then
+        // build one Arrow batch. The fast decoder hoists the per-row-image
+        // metadata rebuild out of the loop (~7× on CH-benCH row mixes); when it
+        // cannot be constructed for this table map, fall back to the
+        // `buffer_rows_event` walk, which reports the condition through
+        // `mysql_common`'s own error path. Both paths record the per-row op
+        // metrics as they decode.
+        let deferred = |e: super::Error| ChangeBatchError::DeferredBuild {
+            message: e.to_string(),
+        };
         let mut buffer = TransactionBuffer::new();
-        for event in &self.events {
-            buffer_rows_event(
-                event,
-                &self.tme,
-                &self.layout.layout,
-                &self.layout.pk_source_indexes,
-                &mut buffer,
-                &self.metrics,
-            )
-            .map_err(|e| ChangeBatchError::DeferredBuild {
-                message: e.to_string(),
-            })?;
+        // Escape hatch for A/B measurement (and emergency fallback): force the
+        // original walk decode.
+        let force_walk = std::env::var_os("SPICE_MYSQL_WALK_DECODE").is_some();
+        match (!force_walk)
+            .then(|| FastRowsDecoder::try_new(&self.tme))
+            .transpose()
+            .ok()
+            .flatten()
+        {
+            Some(decoder) => {
+                for event in &self.events {
+                    buffer_rows_event_fast(
+                        event,
+                        &decoder,
+                        &self.layout.layout,
+                        &self.layout.pk_source_indexes,
+                        &mut buffer,
+                        &self.metrics,
+                    )
+                    .map_err(deferred)?;
+                }
+            }
+            None => {
+                for event in &self.events {
+                    buffer_rows_event(
+                        event,
+                        &self.tme,
+                        &self.layout.layout,
+                        &self.layout.pk_source_indexes,
+                        &mut buffer,
+                        &self.metrics,
+                    )
+                    .map_err(deferred)?;
+                }
+            }
         }
         build_change_batch(
             &self.schema,
