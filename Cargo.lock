@@ -16950,7 +16950,6 @@ dependencies = [
 name = "runtime-cloud-connect"
 version = "2.2.0-unstable"
 dependencies = [
- "arrow",
  "async-trait",
  "aws-lc-rs",
  "axum",

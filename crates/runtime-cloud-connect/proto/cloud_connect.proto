@@ -58,10 +58,15 @@ message ClientMessage {
 }
 
 message ControlMessage {
+  // 3 was `RunQuery run_query`, retired in favour of proxying the runtime's
+  // own HTTP API. Reserved so the number is never reused: a peer built against
+  // an older copy of this contract still sends field 3 as a RunQuery, and a
+  // different message reusing the number would be decoded as one.
+  reserved 3;
+
   oneof body {
     Ack ack = 1;
     GetRuntimeInfo get_runtime_info = 2;
-    RunQuery run_query = 3;
     Restart restart = 4;
     ApplySpicepod apply_spicepod = 10;
     UpgradeRuntime upgrade_runtime = 11;
@@ -116,13 +121,13 @@ message CommandResult {
   string command_id = 1;
   bool success = 2;
   string error = 3;
-  // Small structured payloads (e.g. GetRuntimeInfo) and RunQuery metadata
-  // ({"row_count":N,"truncated":bool}). Tabular RunQuery data rides in
-  // result_arrow_ipc instead.
+  // Small structured payloads — a GetRuntimeInfo document, a proxied HTTP
+  // response envelope, a log tail. Verbatim text for the commands documented
+  // as returning it raw rather than JSON-encoded.
   string payload_json = 4;
-  // Arrow IPC stream bytes for tabular results (RunQuery). Empty for
-  // non-tabular commands. The cloud control plane decodes these natively;
-  // results are never JSON-encoded on the wire.
+  // Arrow IPC stream bytes for a command whose result is tabular. Empty for
+  // every command in this contract today; kept because a tabular result is
+  // decoded natively when one is added, rather than flattened to JSON.
   bytes result_arrow_ipc = 5;
 }
 
@@ -151,20 +156,6 @@ message AdoptAck {
 
 message GetRuntimeInfo {
   string command_id = 1;
-}
-
-// RunQuery executes SQL against a runtime. A standalone runtime queries
-// itself, and leaves the namespace/name/kind fields empty. A cluster operator
-// queries the spiced pod(s) of the named spicepod workload — namespace/name/
-// kind address it, as for GetStatus — and relays that runtime's /v1/sql JSON
-// response in CommandResult.payload_json with result_arrow_ipc left empty.
-message RunQuery {
-  string command_id = 1;
-  string sql = 2;
-  uint32 max_rows = 3;
-  string namespace = 4;
-  string name = 5;
-  string kind = 6;
 }
 
 message Restart {
