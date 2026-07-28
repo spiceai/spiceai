@@ -93,13 +93,19 @@ impl DataConnector for DeferredConnector {
         false
     }
 
+    // Unlike the stream capabilities above, this is a static property of the
+    // source the deferred dataset will eventually load from, not of the
+    // placeholder — so it forwards, matching `resolve_refresh_mode`. Answering
+    // `false` here would reject a durable-write-back dataset whose real source
+    // is perfectly safe.
+    fn supports_durable_write_back_delivery(&self) -> bool {
+        self.inner.supports_durable_write_back_delivery()
+    }
+
     fn changes_stream(
         &self,
         _federated_table: Arc<crate::federated_table::FederatedTable>,
         _dataset: &Dataset,
-        _accelerated_table_provider: Arc<dyn TableProvider>,
-        _accelerator_write_mutex: Arc<tokio::sync::Mutex<()>>,
-        _cpu_runtime: Option<tokio::runtime::Handle>,
     ) -> Option<data_components::cdc::ChangesStream> {
         None
     }

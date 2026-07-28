@@ -116,6 +116,12 @@ pub(crate) async fn prepare_view(
         if let Some(ref vectors) = view.vectors
             && vectors.enabled
         {
+            let on_zero_results = view
+                .acceleration
+                .as_ref()
+                .map(|acceleration| acceleration.on_zero_results.clone())
+                .unwrap_or_default();
+
             tbl_provider = wrap_table_as_index(
                 &Arc::new(ctx.clone()),
                 &view.runtime.embeds(),
@@ -125,6 +131,7 @@ pub(crate) async fn prepare_view(
                 file_format,
                 tbl_provider,
                 vectors,
+                &on_zero_results,
             )
             .await?;
         } else {
@@ -156,7 +163,7 @@ pub(crate) async fn prepare_view(
     // Configure full-text search
     if view.has_full_text_column() {
         tbl_provider = Arc::new(add_full_text_search_to_table(
-            tbl_provider,
+            &tbl_provider,
             &view.columns,
             &view.name,
         )?) as Arc<dyn TableProvider>;

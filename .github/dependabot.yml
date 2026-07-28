@@ -9,9 +9,13 @@ updates:
     directory: '/' # Location of package manifests
     schedule:
       interval: 'weekly'
+    # enforce-pull-with-spice requires both a kind/ and an area/ label, and it is
+    # a required check — without area/ these bumps cannot enter the merge queue
+    # however green their Attestation is.
     labels:
       - 'rust'
       - 'kind/dependencies'
+      - 'area/build'
     groups:
       aws-sdk:
         patterns:
@@ -33,6 +37,7 @@ updates:
     labels:
       - 'github_actions'
       - 'kind/dependencies'
+      - 'area/ci'
     groups:
       github-actions-dependencies:
         patterns:
@@ -45,6 +50,7 @@ updates:
     labels:
       - 'docker'
       - 'kind/dependencies'
+      - 'area/build'
     groups:
       docker-dependencies:
         patterns:

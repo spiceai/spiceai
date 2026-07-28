@@ -670,13 +670,35 @@ fn handle_query_error(e: query::Error) -> Status {
         query::Error::BindingParameters { source }
         | query::Error::UnableToExecuteQuery { source } => handle_datafusion_error(source),
         query::Error::QueryCancelled { .. } => Status::cancelled(e.to_string()),
+        query::Error::QueryTimedOut { .. } => Status::deadline_exceeded(e.to_string()),
         _ => to_tonic_err(e),
+    }
+}
+
+/// Map a shared-orchestrator [`TransactionError`](query::TransactionError) to the
+/// gRPC `Status` the `FlightSQL` transaction path returns. A `Conflict` is a
+/// retryable optimistic-concurrency loss (`Aborted`).
+pub(crate) fn transaction_error_to_status(error: query::TransactionError) -> Status {
+    use query::TransactionError;
+    match error {
+        TransactionError::Rejected(message) => Status::invalid_argument(message),
+        TransactionError::Plan(e) | TransactionError::Stream(e) => handle_datafusion_error(e),
+        TransactionError::Query(e) => handle_query_error(e),
+        TransactionError::Conflict { table } => Status::aborted(format!(
+            "transaction write conflict on '{table}': a participant table changed since the transaction started; retry"
+        )),
+        TransactionError::Publish(message) => {
+            Status::internal(format!("transaction publish failed: {message}"))
+        }
     }
 }
 
 pub(crate) fn handle_datafusion_error(e: DataFusionError) -> Status {
     if query::is_cancellation_error(&e) {
         return Status::cancelled(e.to_string());
+    }
+    if query::is_timeout_error(&e) {
+        return Status::deadline_exceeded(e.to_string());
     }
     match e {
         DataFusionError::Plan(err_msg) | DataFusionError::Execution(err_msg) => {
@@ -876,9 +898,10 @@ pub async fn start(
         .layer(BasicAuthLayer::new(session_aware_auth))
         .into_inner();
 
-    // Create the OpenTelemetry MetricsService
+    // Create the OpenTelemetry MetricsService. Pass a weak runtime handle so ingest can
+    // evolve an accelerated metric table's schema in place when new dimensions arrive.
     let query_engine: Arc<dyn runtime_query_engine::query_engine::QueryEngine> = rt.datafusion();
-    let otel_service = create_metrics_service(query_engine);
+    let otel_service = create_metrics_service(query_engine, Some(Arc::downgrade(&rt)));
 
     // Get job executor if available (cluster mode)
     let job_executor = rt.job_executor();

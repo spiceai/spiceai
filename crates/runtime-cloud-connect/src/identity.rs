@@ -14,13 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Local persistence for the post-adoption runtime identity.
+//! Local persistence for the post-enrollment runtime identity.
 //!
 //! The identity file lives at `$SPICE_CONFIG_DIR/identity.json` with
-//! `0600` perms on Unix. On first adoption we generate an ed25519
-//! keypair, send the public key to the server in `AdoptAck`, and
-//! receive a signed identity certificate that we persist alongside the
-//! private key for later reconnects.
+//! `0600` perms on Unix. On first boot the client generates a keypair
+//! (ECDSA P-256) and a PKCS#10 CSR, presents the adoption code + CSR to
+//! the **cloud enroll endpoint** over plain HTTPS (out-of-band, before
+//! any gRPC stream), and receives back the signed leaf certificate, the
+//! issuing-CA bundle, and the gateway address. The leaf, the matching
+//! private key, the CA bundle, and the gateway address are persisted
+//! here for the mTLS stream to the gateway. Generating the key and
+//! proving possession of it (via the CSR) *before* the cert is issued is
+//! what makes the issued cert genuinely bind the keypair used for mTLS.
+//!
+//! Renewals (~12h cadence against the cloud `/renew` endpoint) rotate the
+//! keypair: each renewal persists a fresh key + leaf over this file.
 //!
 //! The JSON layout is intentionally narrow — it is a private interface
 //! between the runtime and the local filesystem. Other Spice tooling
@@ -28,13 +36,12 @@ limitations under the License.
 
 use std::path::{Path, PathBuf};
 
-use ed25519_dalek::SigningKey;
-use ed25519_dalek::pkcs8::{EncodePrivateKey, EncodePublicKey};
-use rand_core::OsRng;
+use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyPair};
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
 
-/// Errors that can occur while reading or writing the identity file.
+/// Errors that can occur while reading or writing the identity file, or
+/// generating enrollment key material.
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Identity I/O error at {}: {source}", path.display()))]
@@ -52,13 +59,8 @@ pub enum Error {
     #[snafu(display("Failed to serialize identity JSON: {source}"))]
     Serialize { source: serde_json::Error },
 
-    #[snafu(display("Failed to encode private key in PKCS#8: {source}"))]
-    EncodePrivateKey { source: ed25519_dalek::pkcs8::Error },
-
-    #[snafu(display("Failed to encode public key in SPKI: {source}"))]
-    EncodePublicKey {
-        source: ed25519_dalek::pkcs8::spki::Error,
-    },
+    #[snafu(display("Failed to generate enrollment key material: {source}"))]
+    Enrollment { source: rcgen::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -66,17 +68,36 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Persisted runtime identity. Treat as opaque outside this crate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Identity {
-    /// Server-assigned identifier (`inst_...`).
+    /// Cloud-assigned stable instance identifier (`instance_id` from the
+    /// enroll response, e.g. `inst_...`).
     pub identifier: String,
-    /// PEM-encoded X.509 cert (or token) returned by the server in
-    /// `Adopt.identity_cert_pem`. Verbatim — the client does not parse
-    /// or validate it; it is sent back as `Hello.credential`.
+    /// PEM-encoded X.509 leaf certificate the cloud KMS CA signed from
+    /// the client's CSR (enroll response `identity_cert_pem`). On every
+    /// gateway connection this leaf (with `private_key_pem`) is presented
+    /// as the TLS client certificate — it *is* the credential, so the
+    /// `Hello.credential` is always empty.
     pub identity_cert_pem: String,
-    /// PEM-encoded PKCS#8 ed25519 private key.
+    /// PEM-encoded PKCS#8 private key for the current keypair. Kept
+    /// local (never sent); pairs with `identity_cert_pem` for mTLS and
+    /// signs the `/renew` proof-of-possession. Rotated on every renewal.
     pub private_key_pem: String,
-    /// PEM-encoded SPKI ed25519 public key. Echoes back in `AdoptAck`
-    /// so the server can pin it.
+    /// PEM-encoded SPKI public key. The cloud pins it at enroll/renew.
     pub public_key_pem: String,
+    /// PEM-encoded issuing-CA chain from the enroll response
+    /// (`ca_bundle_pem`). The client pins this to verify the gateway on
+    /// mTLS connections. Empty when the server did not supply one (the
+    /// client then falls back to public roots). Defaulted so identity
+    /// files written before this field existed still load.
+    #[serde(default)]
+    pub ca_bundle_pem: String,
+    /// Gateway `host:port` from the enroll response (`gateway_addr`) —
+    /// the address the mTLS `CloudConnect` stream connects to. Defaulted
+    /// so identity files written before this field existed still load;
+    /// an empty value means the identity predates the enroll-first flow
+    /// and cannot be used to reach the gateway (re-adopt with a fresh
+    /// code).
+    #[serde(default)]
+    pub gateway_addr: String,
     /// Unix timestamp (seconds) after which the identity cert is no
     /// longer accepted by the server. `0` means "unknown / unbounded".
     pub not_after_unix: u64,
@@ -178,35 +199,57 @@ impl IdentityStore {
         }
     }
 
-    /// Generate a fresh ed25519 keypair as PEM-encoded PKCS#8 (private)
-    /// and SPKI (public) strings. Used at adoption time before sending
-    /// `AdoptAck`.
+    /// Generate fresh enrollment material: an ECDSA P-256 keypair and a
+    /// PKCS#10 CSR for it, all PEM-encoded. Called before the cloud
+    /// enroll request — and again before every renewal, since each
+    /// renewal rotates the keypair — so the client proves possession of
+    /// its key (the CSR self-signature) before the cloud CA issues the
+    /// leaf certificate.
+    ///
+    /// The CSR carries a stable common name and a `clientAuth` extended
+    /// key usage so the issued leaf is directly usable as an mTLS client
+    /// certificate.
     ///
     /// # Errors
     ///
-    /// Returns an error if PEM encoding of the generated key material fails.
-    pub fn generate_keypair() -> Result<KeyPairPem> {
-        let signing_key = SigningKey::generate(&mut OsRng);
-        let verifying_key = signing_key.verifying_key();
-        let private_key_pem = signing_key
-            .to_pkcs8_pem(ed25519_dalek::pkcs8::spki::der::pem::LineEnding::LF)
-            .context(EncodePrivateKeySnafu)?
-            .to_string();
-        let public_key_pem = verifying_key
-            .to_public_key_pem(ed25519_dalek::pkcs8::spki::der::pem::LineEnding::LF)
-            .context(EncodePublicKeySnafu)?;
-        Ok(KeyPairPem {
+    /// Returns [`Error::Enrollment`] if key generation or CSR
+    /// serialization fails.
+    pub fn generate_enrollment() -> Result<EnrollmentMaterial> {
+        let key_pair = KeyPair::generate().context(EnrollmentSnafu)?;
+        let private_key_pem = key_pair.serialize_pem();
+        let public_key_pem = key_pair.public_key_pem();
+
+        // No SANs: this is a client identity, not a server, so it is
+        // identified by its issued serial / subject, not a hostname.
+        let mut params = CertificateParams::new(Vec::<String>::new()).context(EnrollmentSnafu)?;
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "spice-standalone-runtime");
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+
+        let csr = params
+            .serialize_request(&key_pair)
+            .context(EnrollmentSnafu)?;
+        let csr_pem = csr.pem().context(EnrollmentSnafu)?;
+
+        Ok(EnrollmentMaterial {
             private_key_pem,
             public_key_pem,
+            csr_pem,
         })
     }
 }
 
-/// Newly-generated keypair returned by [`IdentityStore::generate_keypair`].
+/// Freshly-generated enrollment material returned by
+/// [`IdentityStore::generate_enrollment`]: the client keypair (PEM) plus a
+/// PKCS#10 CSR built from it. The private key is retained locally and, on
+/// successful enroll/renew, persisted into the [`Identity`] alongside the
+/// signed leaf; the CSR is sent in the HTTP enroll (or renew) request.
 #[derive(Debug, Clone)]
-pub struct KeyPairPem {
+pub struct EnrollmentMaterial {
     pub private_key_pem: String,
     pub public_key_pem: String,
+    pub csr_pem: String,
 }
 
 #[cfg(unix)]
@@ -345,6 +388,9 @@ mod tests {
                 .to_string(),
             public_key_pem: "-----BEGIN PUBLIC KEY-----\nMOCK\n-----END PUBLIC KEY-----\n"
                 .to_string(),
+            ca_bundle_pem: "-----BEGIN CERTIFICATE-----\nMOCKCA\n-----END CERTIFICATE-----\n"
+                .to_string(),
+            gateway_addr: "gateway.test.spice.ai:7320".to_string(),
             not_after_unix: 0,
         }
     }
@@ -363,6 +409,30 @@ mod tests {
         assert_eq!(loaded.identifier, identity.identifier);
         assert_eq!(loaded.identity_cert_pem, identity.identity_cert_pem);
         assert_eq!(loaded.public_key_pem, identity.public_key_pem);
+        assert_eq!(loaded.ca_bundle_pem, identity.ca_bundle_pem);
+        assert_eq!(loaded.gateway_addr, identity.gateway_addr);
+    }
+
+    #[test]
+    fn load_tolerates_identity_without_ca_bundle() {
+        // Identity files written before `ca_bundle_pem` / `gateway_addr`
+        // existed must still load (the fields are `#[serde(default)]`).
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        let legacy = r#"{
+            "identifier": "inst_legacy",
+            "identity_cert_pem": "CERT",
+            "private_key_pem": "KEY",
+            "public_key_pem": "PUB",
+            "not_after_unix": 0
+        }"#;
+        std::fs::write(&path, legacy).expect("write legacy identity");
+        let loaded = IdentityStore::load_optional(&path)
+            .expect("load")
+            .expect("present");
+        assert_eq!(loaded.identifier, "inst_legacy");
+        assert!(loaded.ca_bundle_pem.is_empty());
+        assert!(loaded.gateway_addr.is_empty());
     }
 
     #[test]
@@ -401,10 +471,41 @@ mod tests {
     }
 
     #[test]
-    fn generate_keypair_produces_pem_pair() {
-        let pair = IdentityStore::generate_keypair().expect("generate");
-        assert!(pair.private_key_pem.contains("PRIVATE KEY"));
-        assert!(pair.public_key_pem.contains("PUBLIC KEY"));
+    fn generate_enrollment_produces_key_and_csr() {
+        let mat = IdentityStore::generate_enrollment().expect("generate");
+        assert!(mat.private_key_pem.contains("PRIVATE KEY"));
+        assert!(mat.public_key_pem.contains("PUBLIC KEY"));
+        assert!(
+            mat.csr_pem.contains("CERTIFICATE REQUEST"),
+            "CSR must be a PKCS#10 PEM, got: {}",
+            mat.csr_pem.lines().next().unwrap_or_default()
+        );
+    }
+
+    #[test]
+    fn generate_enrollment_csr_is_signable() {
+        // The CSR the client emits must be parseable and verifiable by the
+        // control plane. `from_pem` verifies the CSR's self-signature — so a
+        // successful parse already proves the client possesses the private
+        // key — and signing it with a throwaway CA proves the leaf-issuance
+        // round-trip the real dp performs.
+        use rcgen::{
+            BasicConstraints, CertificateParams, CertificateSigningRequestParams, IsCa, Issuer,
+            KeyPair, KeyUsagePurpose,
+        };
+
+        let mat = IdentityStore::generate_enrollment().expect("generate");
+
+        let ca_key = KeyPair::generate().expect("ca key");
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let issuer = Issuer::new(ca_params, ca_key);
+
+        let csr = CertificateSigningRequestParams::from_pem(&mat.csr_pem)
+            .expect("CSR parses and self-signature verifies");
+        let leaf = csr.signed_by(&issuer).expect("sign csr");
+        assert!(leaf.pem().contains("CERTIFICATE"));
     }
 
     #[test]

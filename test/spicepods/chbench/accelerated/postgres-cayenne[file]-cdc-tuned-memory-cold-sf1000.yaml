@@ -54,7 +54,7 @@ datasets:
     params:
       <<: *postgres_params
       pg_replication_slot: spice_district
-      pg_replication_initial_snapshot: 'true'
+      pg_replication_initial_snapshot: auto
       pg_replication_bootstrap_batch_size: '1048576'
     acceleration:
       enabled: true
@@ -110,15 +110,15 @@ datasets:
         cayenne_datalake_s3_allow_http: 'true'
         # Read-optimized cold files, larger than the 512 MB warm target so cold scans open fewer
         # footers.
-        cayenne_cold_target_file_size_mb: '1024'
+        cayenne_datalake_target_file_size_mb: '1024'
         # Promote a table's warm tier to cold once it exceeds 4 GiB. THE key tuning knob: promotion
         # re-materializes the whole visible table (Z-order clustered), so this is sized so the big
         # tables (order_line, stock, customer, oorder) graduate after the initial-snapshot
         # bootstrap while the small ones (district, new_order) stay warm — not so low that it
         # re-promotes per batch.
-        cayenne_cold_tier_warm_max_bytes: '4294967296'
-        # Background promoter cadence — re-checks the warm-size trigger every 30s.
-        cayenne_cold_tier_background_interval_ms: '30000'
+        cayenne_datalake_warm_max_bytes: '4294967296'
+        # Background datalake tiering-check cadence — re-checks the warm-size trigger every 30s.
+        cayenne_datalake_tiering_check_interval_ms: '30000'
         # cayenne_datalake_clustering_columns omitted -> Z-order falls back to the primary key
         # (sensible default for chbench point/range lookups); tune per-table if a scan dimension
         # dominates.
@@ -128,7 +128,7 @@ datasets:
     params:
       <<: *postgres_params
       pg_replication_slot: spice_customer
-      pg_replication_initial_snapshot: 'true'
+      pg_replication_initial_snapshot: auto
       pg_replication_bootstrap_batch_size: '1048576'
     acceleration:
       enabled: true
@@ -151,7 +151,7 @@ datasets:
     params:
       <<: *postgres_params
       pg_replication_slot: spice_new_order
-      pg_replication_initial_snapshot: 'true'
+      pg_replication_initial_snapshot: auto
       pg_replication_bootstrap_batch_size: '1048576'
     acceleration:
       enabled: true
@@ -170,7 +170,7 @@ datasets:
     params:
       <<: *postgres_params
       pg_replication_slot: spice_oorder
-      pg_replication_initial_snapshot: 'true'
+      pg_replication_initial_snapshot: auto
       pg_replication_bootstrap_batch_size: '1048576'
     acceleration:
       enabled: true
@@ -189,7 +189,7 @@ datasets:
     params:
       <<: *postgres_params
       pg_replication_slot: spice_order_line
-      pg_replication_initial_snapshot: 'true'
+      pg_replication_initial_snapshot: auto
       pg_replication_bootstrap_batch_size: '1048576'
     acceleration:
       enabled: true
@@ -213,7 +213,7 @@ datasets:
     params:
       <<: *postgres_params
       pg_replication_slot: spice_stock
-      pg_replication_initial_snapshot: 'true'
+      pg_replication_initial_snapshot: auto
       pg_replication_bootstrap_batch_size: '1048576'
     acceleration:
       enabled: true
@@ -237,7 +237,7 @@ datasets:
     params:
       <<: *postgres_params
       pg_replication_slot: spice_warehouse
-      pg_replication_initial_snapshot: 'true'
+      pg_replication_initial_snapshot: auto
       pg_replication_bootstrap_batch_size: '1048576'
     acceleration:
       enabled: true

@@ -93,7 +93,7 @@ impl ObjectStoreTextTable {
         ])
     }
 
-    fn get_content_value(
+    async fn get_content_value(
         raw: &Bytes,
         formatter: Option<&Arc<dyn DocumentParser>>,
         location: &Path,
@@ -101,6 +101,7 @@ impl ObjectStoreTextTable {
         let utf8 = match formatter {
             Some(f) => f
                 .parse(raw)
+                .await
                 .and_then(|doc| doc.as_flat_utf8())
                 .boxed()
                 .map_err(|e| format!("Error parsing document {location}: {e}").into()),
@@ -144,21 +145,20 @@ impl ObjectStoreTextTable {
         Ok(all_metas)
     }
 
-    fn to_record_batch(
+    async fn to_record_batch(
         meta: &ObjectMeta,
         raw: &Bytes,
         formatter: Option<&Arc<dyn DocumentParser>>,
         schema: SchemaRef,
         metadata_columns: &[MetadataColumn],
     ) -> Result<RecordBatch, ArrowError> {
-        let columns = schema
-            .fields()
-            .iter()
-            .map(|field| match field.name().as_str() {
+        let mut columns = Vec::with_capacity(schema.fields().len());
+        for field in schema.fields() {
+            let column = match field.name().as_str() {
                 "location" => {
                     Ok(Arc::new(StringArray::from(vec![meta.location.to_string()])) as ArrayRef)
                 }
-                "content" => Self::get_content_value(raw, formatter, &meta.location),
+                "content" => Self::get_content_value(raw, formatter, &meta.location).await,
                 "last_modified" => Ok(Arc::new(
                     TimestampMicrosecondArray::from(vec![meta.last_modified.timestamp_micros()])
                         .with_timezone("UTC"),
@@ -171,8 +171,9 @@ impl ObjectStoreTextTable {
                     .ok_or_else(|| {
                         ArrowError::SchemaError(format!("Unsupported field name: {}", field.name()))
                     }),
-            })
-            .collect::<Result<Vec<ArrayRef>, ArrowError>>()?;
+            }?;
+            columns.push(column);
+        }
 
         RecordBatch::try_new(schema, columns)
     }
@@ -376,7 +377,7 @@ pub(crate) fn to_sendable_stream(
                 Bytes::new()
             };
 
-            match ObjectStoreTextTable::to_record_batch(object_meta, &bytz, formatter.as_ref(), Arc::clone(&schema), &metadata_columns) {
+            match ObjectStoreTextTable::to_record_batch(object_meta, &bytz, formatter.as_ref(), Arc::clone(&schema), &metadata_columns).await {
                 Ok(batch) => {
                     yield Ok(batch);
                 },

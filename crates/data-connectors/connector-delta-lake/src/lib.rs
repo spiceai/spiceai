@@ -343,3 +343,13 @@ mod tests {
         assert_eq!(tenant_id, Some("tenant-id"));
     }
 }
+
+// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// should see this connector must force-link the crate (`use connector_delta_lake as _;`) -- a plain
+// Cargo dependency won't link the slice static. See `register_data_connector!` docs.
+runtime::register_data_connector!(
+    register_delta_lake_connector,
+    DELTA_LAKE_CONNECTOR_REGISTRATION,
+    CONNECTOR_NAME,
+    DeltaLakeFactory
+);

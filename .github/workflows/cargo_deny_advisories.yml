@@ -1,0 +1,116 @@
+---
+name: Check Rust Advisories
+
+on:
+  schedule:
+    - cron: '20 5 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+
+jobs:
+  advisories:
+    name: Check Rust Advisories
+    runs-on: self-hosted
+    permissions:
+      contents: read
+      issues: write
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --version 0.19.6 --locked --force
+
+      - name: Check Rust Advisories
+        id: advisories
+        run: |
+          set +e
+          cargo deny check advisories > cargo-deny-advisories.txt 2>&1
+          exit_code=$?
+          set -e
+
+          cat cargo-deny-advisories.txt
+          echo "exit_code=${exit_code}" >> "${GITHUB_OUTPUT}"
+
+          if [ "${exit_code}" -eq 0 ]; then
+            echo "failed=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "failed=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Create or update advisory issue
+        if: steps.advisories.outputs.failed == 'true'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const fs = require('fs');
+
+            const marker = '<!-- cargo-deny-advisories -->';
+            const title = 'Rust dependency advisory violations';
+            const output = fs.readFileSync('cargo-deny-advisories.txt', 'utf8').trim();
+            const maxOutputLength = 55000;
+            const truncatedOutput = output.length > maxOutputLength
+              ? `${output.slice(0, maxOutputLength)}\n\n[truncated]`
+              : output;
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = [
+              marker,
+'`cargo deny check advisories` found Rust dependency advisory violations.',
+              '',
+              `Run: ${runUrl}`,
+              `Commit: ${context.sha}`,
+              '',
+              '~~~text',
+              truncatedOutput || '(no output)',
+              '~~~',
+            ].join('\n');
+
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100,
+            });
+
+            const existingIssue = issues.find((issue) =>
+              !issue.pull_request &&
+              issue.title === title &&
+              issue.body?.includes(marker)
+            );
+
+            if (existingIssue) {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existingIssue.number,
+                body,
+              });
+              await github.rest.issues.addAssignees({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existingIssue.number,
+                assignees: ['claudespice'],
+              });
+              return;
+            }
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body,
+              assignees: ['claudespice'],
+            });
+
+      - name: Fail on advisory violations
+        if: steps.advisories.outputs.failed == 'true'
+        run: exit 1

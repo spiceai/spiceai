@@ -113,6 +113,17 @@ pub struct CayenneContext {
     /// inter-batch arrival interval (the offered-load signal). `None` until the
     /// first write.
     last_write: parking_lot::Mutex<Option<std::time::Instant>>,
+    /// Whether this table's writes are COUPLED to sibling writers through a
+    /// shared input demux — true for the partition child tables of a
+    /// partitioned dataset, whose per-partition writes are all fed by one
+    /// router over bounded channels. Coupled writes must never park on the
+    /// global encode budget: a parked child stalls the router, which starves
+    /// the permit-holding siblings of input — a hold-and-wait deadlock that
+    /// left partitioned tables permanently unready (spiceai/spiceai#11818).
+    /// Set only at construction ([`Self::new_for_partition_child`]); read by
+    /// the write path to bypass `write_budget` permit acquisition. Runtime-only
+    /// state — never persisted.
+    coupled_writer: std::sync::atomic::AtomicBool,
     /// Set of data files whose integrity digest has already been verified this
     /// process, keyed by `"<snapshot_id>/<file_path>"`. Used only when
     /// `integrity_checksums` is enabled, to bound verification to one whole-file
@@ -286,8 +297,37 @@ impl CayenneContext {
             bake_gate_last_samples: std::sync::atomic::AtomicU64::new(0),
             goal_stuck_ticks: std::sync::atomic::AtomicU64::new(0),
             last_write: parking_lot::Mutex::new(None),
+            coupled_writer: std::sync::atomic::AtomicBool::new(false),
             verified_data_files: parking_lot::Mutex::new(std::collections::HashSet::new()),
         })
+    }
+
+    /// Create the shared context for the partition CHILD tables of a
+    /// partitioned dataset. Identical to [`Self::new`] except the tables are
+    /// marked as coupled writers (see [`Self::is_coupled_writer`]): their
+    /// writes are all fed by one routing demux over bounded channels, so they
+    /// must never park on the global encode budget.
+    #[must_use]
+    pub fn new_for_partition_child(
+        config: &VortexConfig,
+        runtime_env: Arc<RuntimeEnv>,
+        dataset: &str,
+    ) -> Arc<Self> {
+        let context = Self::new(config, runtime_env, dataset);
+        context
+            .coupled_writer
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        context
+    }
+
+    /// Whether this table's writes are coupled to sibling writers through a
+    /// shared input demux (partition child tables). Coupled writes bypass the
+    /// global encode budget — parking there deadlocks the demux
+    /// (spiceai/spiceai#11818).
+    #[must_use]
+    pub fn is_coupled_writer(&self) -> bool {
+        self.coupled_writer
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Encoding effort configured for delta writes (`cayenne_delta_encoding`).
@@ -389,9 +429,40 @@ impl CayenneContext {
     }
 
     /// Check if sorting is enabled.
+    ///
+    /// True for BOTH user-configured and inference-derived sort columns, because
+    /// every caller that asks this question is asking "will the rewrite produce
+    /// a globally sorted snapshot?" — which is a property of the write, not of
+    /// who chose the key. Callers deciding *precedence* (which key to sort by)
+    /// must use [`Self::sort_columns_are_authoritative`] instead.
     #[must_use]
     pub fn has_sort_columns(&self) -> bool {
         !self.config.sort_columns.is_empty()
+    }
+
+    /// Whether [`Self::sort_columns`] is an operator statement of intent rather
+    /// than a schema-inference guess.
+    ///
+    /// Only an authoritative sort order may shadow the hot filter columns
+    /// observed on scans. An inferred order (the `PostgreSQL` CDC default, which
+    /// resolves to the primary key) ranks *below* those observations, so the
+    /// default-on adaptive layout can correct the guess.
+    #[must_use]
+    pub fn sort_columns_are_authoritative(&self) -> bool {
+        !self.config.sort_columns.is_empty()
+            && self.config.sort_columns_origin == crate::metadata::SortColumnsOrigin::User
+    }
+
+    /// Sort columns that schema inference supplied, if any — the lowest-priority
+    /// rung of the layout precedence chain (below observed filter columns).
+    /// Empty when the sort order is user-configured or absent.
+    #[must_use]
+    pub fn inferred_sort_columns(&self) -> &[String] {
+        if self.config.sort_columns_origin == crate::metadata::SortColumnsOrigin::Inferred {
+            &self.config.sort_columns
+        } else {
+            &[]
+        }
     }
 
     /// Get the configured intra-write shard-key columns. Empty = derive the
@@ -1012,13 +1083,28 @@ mod tests {
         );
     }
 
+    /// Partition child contexts are marked as coupled writers (their writes
+    /// share one routing demux and must bypass the global encode budget —
+    /// spiceai/spiceai#11818); ordinary contexts are not.
+    #[test]
+    fn partition_child_context_is_coupled_writer() {
+        let runtime_env = Arc::new(RuntimeEnv::default());
+        let ordinary =
+            CayenneContext::new(&VortexConfig::default(), Arc::clone(&runtime_env), "test");
+        assert!(!ordinary.is_coupled_writer());
+
+        let child =
+            CayenneContext::new_for_partition_child(&VortexConfig::default(), runtime_env, "test");
+        assert!(child.is_coupled_writer());
+    }
+
     /// Regression: the cold (datalake) promotion write must roll files at
-    /// `cayenne_cold_target_file_size_mb`, not the warm `target_vortex_file_size_mb`.
+    /// `cayenne_datalake_target_file_size_mb`, not the warm `target_vortex_file_size_mb`.
     ///
     /// Every sorted / PK-upsert table earns a single write shard, so the warm
     /// `write_shard_format` path returns the base format unchanged — whose
     /// `target_file_size_mb` is the warm size. Cold promotion therefore silently
-    /// rolled files at the warm size, leaving `cayenne_cold_target_file_size_mb`
+    /// rolled files at the warm size, leaving `cayenne_datalake_target_file_size_mb`
     /// inert. `cold_write_format` must build a format carrying the cold size.
     #[test]
     fn cold_write_format_rolls_files_at_cold_target_size() {
@@ -1043,7 +1129,7 @@ mod tests {
         assert_eq!(
             cold.options().target_file_size_mb,
             1024,
-            "cold format must use cayenne_cold_target_file_size_mb, not the warm size"
+            "cold format must use cayenne_datalake_target_file_size_mb, not the warm size"
         );
     }
 

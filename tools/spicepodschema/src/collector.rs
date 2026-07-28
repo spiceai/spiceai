@@ -23,7 +23,7 @@ limitations under the License.
 use runtime::dataaccelerator::DATA_ACCELERATOR_REGISTRATIONS;
 use runtime::dataconnector::DATA_CONNECTOR_REGISTRATIONS;
 use runtime::model::params::{
-    anthropic, azure, bedrock, databricks, file, google, huggingface, openai, xai,
+    anthropic, azure, bedrock, databricks, file, google, huggingface, openai, spiceai, xai,
 };
 use runtime_parameters::ParameterSpec;
 
@@ -34,6 +34,7 @@ use connector_clickhouse as _;
 use connector_delta_lake as _;
 use connector_dremio as _;
 use connector_duckdb as _;
+use connector_dynamodb as _;
 use connector_flightsql as _;
 use connector_ftp as _;
 use connector_graphql as _;
@@ -45,6 +46,15 @@ use connector_mysql as _;
 use connector_oracle as _;
 // #[expect(unused_imports)]
 // use runtime::dataconnector::odbc as _;
+use connector_abfs as _;
+use connector_cosmosdb as _;
+use connector_databricks as _;
+use connector_ducklake as _;
+use connector_elasticsearch as _;
+use connector_gcs as _;
+use connector_git as _;
+use connector_github as _;
+use connector_glue as _;
 use connector_postgres as _;
 use connector_scylladb as _;
 use connector_sftp as _;
@@ -52,6 +62,7 @@ use connector_sharepoint as _;
 use connector_smb as _;
 use connector_snowflake as _;
 use connector_spark as _;
+use connector_spiceai as _;
 #[expect(unused_imports)]
 use runtime::dataconnector::s3 as _;
 #[expect(unused_imports)]
@@ -65,8 +76,6 @@ use runtime::dataaccelerator::arrow as _;
 use runtime::dataaccelerator::cayenne as _;
 #[expect(unused_imports)]
 use runtime::dataaccelerator::duckdb as _;
-#[expect(unused_imports)]
-use runtime::dataaccelerator::partitioned_duckdb as _;
 #[expect(unused_imports)]
 use runtime::dataaccelerator::postgres as _;
 #[expect(unused_imports)]
@@ -140,8 +149,8 @@ pub fn collect_data_connectors() -> Vec<ConnectorSchema> {
 /// This function iterates over the distributed slice of data accelerator registrations
 /// and extracts the engine name, prefix, and parameters from each accelerator.
 ///
-/// Multiple registrations can share the same engine name (e.g. `duckdb` and
-/// `partitioned_duckdb` both register under `duckdb`), so results are sorted by
+/// Multiple registrations can share the same engine name (e.g. `arrow` and
+/// `partitioned_arrow` both register under `arrow`), so results are sorted by
 /// `(name, prefix)` and de-duplicated by `name`. Sorting by `prefix` as a
 /// secondary key makes the surviving entry deterministic across builds, since
 /// distributed-slice iteration order is not guaranteed.
@@ -251,5 +260,35 @@ pub fn collect_model_sources() -> Vec<ModelSourceSchema> {
             prefix: "google",
             parameters: google::PARAMETERS,
         },
+        ModelSourceSchema {
+            name: "spiceai",
+            prefix: "spiceai",
+            parameters: spiceai::PARAMETERS,
+        },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Spot-check drift guard: connectors that self-register into the `linkme` slice must appear
+    /// in the generated schema. This catches a broken force-linkage (`use connector_* as _;` in
+    /// this module) or a connector silently dropping out of `.schema/spicepod.schema.json`. The
+    /// sampled connectors span always-linked and feature-gated `connector-*` crates that register
+    /// via `register_data_connector!`; extend the list as more connectors adopt the pattern.
+    #[test]
+    fn documents_slice_registered_connectors() {
+        let names: Vec<String> = collect_data_connectors()
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert!(!names.is_empty(), "no data connectors were collected");
+        for expected in ["dynamodb", "postgres", "clickhouse", "mysql", "graphql"] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "connector '{expected}' missing from the generated schema; collected: {names:?}"
+            );
+        }
+    }
 }

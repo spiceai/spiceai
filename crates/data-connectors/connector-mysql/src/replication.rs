@@ -30,10 +30,11 @@ use std::time::Duration;
 use async_stream::try_stream;
 use async_trait::async_trait;
 use data_components::cdc::{ChangesStream, StreamError};
+use data_components::cdc::{InitialSnapshotMode, InvalidCheckpointBehavior};
 use data_components::mysql_replication::{
-    BinlogPosition, InvalidPositionBehavior, NoopPositionStore, PersistedPosition, PositionStore,
+    BinlogPosition, CursorType, NoopPositionStore, PersistedPosition, PositionStore,
     ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
-    SnapshotMode, StoreError, derive_server_id, process_nonce, start_replication_stream,
+    StoreError, derive_server_id, process_nonce, start_replication_stream,
 };
 use datafusion::sql::TableReference;
 use futures::StreamExt;
@@ -47,6 +48,8 @@ use runtime::dataaccelerator::spice_sys::{
 use runtime::federated_table::FederatedTable;
 use runtime::parameters::Parameters;
 use runtime_metrics::component::{MetricSpec, MetricType, ObserveMetricCallback};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 const DEFAULT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(10);
 const DEFAULT_BOOTSTRAP_BATCH_SIZE: usize = 8192;
@@ -261,9 +264,30 @@ impl PositionStore for SidecarPositionStore {
         // `MySqlBinlogSys::get` swallows read errors into `None`, matching the
         // MongoDB sidecar: an unreadable checkpoint re-bootstraps rather than
         // wedging the dataset.
-        Ok(self.sys.get().await.map(|cp| PersistedPosition {
+        let Some(cp) = self.sys.get().await else {
+            return Ok(None);
+        };
+        // `cursor_type` is written as exactly `file`/`gtid`. Distinguish:
+        //   - present + valid → use it;
+        //   - present + unparseable → corrupt row; error rather than guess (a
+        //     GTID dataset must not silently downgrade to file+offset);
+        //   - absent (`None`) → the column didn't exist (unreleased-feature dev
+        //     row, never a shipped one), so infer defensively from the GTID set.
+        let cursor_type = match cp.cursor_type.as_deref() {
+            Some(raw) => CursorType::from_stored(raw).ok_or_else(|| -> StoreError {
+                format!(
+                    "persisted cursor_type {raw:?} is not 'file' or 'gtid' (corrupt checkpoint)"
+                )
+                .into()
+            })?,
+            None if cp.gtid_executed.is_some() => CursorType::Gtid,
+            None => CursorType::File,
+        };
+        Ok(Some(PersistedPosition {
             position: BinlogPosition::new(cp.binlog_file, cp.binlog_pos),
             schema_json: cp.schema_json,
+            gtid_set: cp.gtid_executed,
+            cursor_type,
         }))
     }
 
@@ -273,6 +297,8 @@ impl PositionStore for SidecarPositionStore {
                 binlog_file: position.position.file.clone(),
                 binlog_pos: position.position.pos,
                 schema_json: position.schema_json.clone(),
+                gtid_executed: position.gtid_set.clone(),
+                cursor_type: Some(position.cursor_type.as_str().to_string()),
                 updated_at: None,
             })
             .await
@@ -387,6 +413,12 @@ pub(crate) const REPLICATION_METRICS: &[MetricSpec] = &[
          0 while the snapshot is still running.",
     )
     .auto_register(),
+    MetricSpec::new("replication_gtid_enabled", MetricType::ObservableGaugeU64)
+        .description(
+            "1 when the stream is positioning by GTID auto-positioning (failover-safe) — on \
+             cold bootstrap or resume; 0 for binlog file+offset positioning.",
+        )
+        .auto_register(),
     MetricSpec::new(
         "replication_decode_errors_total",
         MetricType::ObservableCounterU64,
@@ -432,6 +464,16 @@ pub(crate) const REPLICATION_METRICS: &[MetricSpec] = &[
     )
     .description(
         "Number of failed binlog-position checkpoint writes (retried on the next interval).",
+    )
+    .auto_register(),
+    MetricSpec::new(
+        "replication_member_attached",
+        MetricType::ObservableGaugeU64,
+    )
+    .description(
+        "1 while this dataset is an attached member of its shared binlog group, 0 once \
+         detached. A detached member holds the group's shared resume position back, so this \
+         is the unambiguous signal for which dataset stalled the group.",
     )
     .auto_register(),
 ];
@@ -509,6 +551,9 @@ pub(crate) fn observe_replication_metric(
                 instrument.observe(m.bootstrap_complete(), &attributes);
             }))
         }
+        "replication_gtid_enabled" => ObserveMetricCallback::U64(Box::new(move |instrument| {
+            instrument.observe(m.gtid_enabled(), &attributes);
+        })),
         "replication_decode_errors_total" => {
             ObserveMetricCallback::U64(Box::new(move |instrument| {
                 instrument.observe(m.decode_errors_total(), &attributes);
@@ -537,6 +582,9 @@ pub(crate) fn observe_replication_metric(
                 instrument.observe(m.checkpoint_persist_errors_total(), &attributes);
             }))
         }
+        "replication_member_attached" => ObserveMetricCallback::U64(Box::new(move |instrument| {
+            instrument.observe(m.member_attached(), &attributes);
+        })),
         _ => return None,
     };
     Some(callback)
@@ -544,33 +592,50 @@ pub(crate) fn observe_replication_metric(
 
 fn replication_params_from_connector_params(
     params: &Parameters,
-    dataset_name: &str,
+    // Every `refresh_mode: changes` dataset on a connection is coalesced onto one
+    // shared binlog dump keyed by connection identity, so `server_id` is derived
+    // from the connection (below), not the dataset — the dataset name is no
+    // longer needed here. Kept in the signature as the seam for a future
+    // per-dataset opt-out (which would key both `server_id` and the shared
+    // `SourceKey` on the dataset so it coalesces with nothing).
+    _dataset_name: &str,
 ) -> Result<ReplicationParams, String> {
     let opts = build_mysql_opts(params)?;
-    let server_id = match optional_string(params, "replication_server_id") {
-        Some(raw) => raw.trim().parse::<u32>().map_err(|e| {
+    // All `refresh_mode: changes` datasets on the same connection share one
+    // binlog dump under one `server_id` (the dump is server-wide), so the id is
+    // derived from the CONNECTION identity — every dataset on the same server
+    // computes the same id. An explicit `mysql_replication_server_id` still wins.
+    let server_id = if let Some(raw) = optional_string(params, "replication_server_id") {
+        raw.trim().parse::<u32>().map_err(|e| {
             let user_param = params.user_param("replication_server_id");
             format!("parameter `{user_param}` must be a u32 server id, got {raw:?}: {e}")
-        })?,
-        None => derive_server_id(dataset_name, process_nonce()),
+        })?
+    } else {
+        // Derive from the FULL connection identity that the shared-source
+        // key coalesces on — host/port/user PLUS password and TLS config —
+        // not just host/port/user. Two datasets that differ only by
+        // password or `sslmode` get distinct shared-source keys and thus
+        // separate binlog dumps; they must therefore also get distinct
+        // server_ids, because MySQL drops a replication connection whose
+        // server_id collides with another's (dump thrashing otherwise).
+        // `SslOpts`/`&str` both hash, so the same tuple that keys the
+        // source keys the id. `DefaultHasher::new()` is fixed-seed, so the
+        // derivation stays deterministic within a process (equal
+        // connections coalesce); cross-process variance is supplied by
+        // `process_nonce()` and is harmless (MySQL keeps no id state).
+        let mut hasher = DefaultHasher::new();
+        opts.pass().hash(&mut hasher);
+        opts.ssl_opts().hash(&mut hasher);
+        let conn_identity = format!(
+            "{}:{}:{}:{:x}",
+            opts.ip_or_hostname(),
+            opts.tcp_port(),
+            opts.user().unwrap_or_default(),
+            hasher.finish()
+        );
+        derive_server_id(&conn_identity, process_nonce())
     };
-    let snapshot_mode = match optional_string(params, "replication_snapshot_mode")
-        .as_deref()
-        .map(str::trim)
-    {
-        None | Some("") => SnapshotMode::Auto,
-        Some(value) => match value.to_ascii_lowercase().as_str() {
-            "auto" => SnapshotMode::Auto,
-            "never" => SnapshotMode::Never,
-            "always" => SnapshotMode::Always,
-            other => {
-                let user_param = params.user_param("replication_snapshot_mode");
-                return Err(format!(
-                    "parameter `{user_param}` must be 'auto', 'never', or 'always', got {other:?}"
-                ));
-            }
-        },
-    };
+    let snapshot_mode = parse_snapshot_mode(params)?;
     let checkpoint_interval = optional_duration(
         params,
         "replication_checkpoint_interval",
@@ -582,24 +647,12 @@ fn replication_params_from_connector_params(
         DEFAULT_BOOTSTRAP_BATCH_SIZE,
         MAX_BOOTSTRAP_BATCH_SIZE,
     )?;
-    let invalid_position_behavior =
-        match optional_string(params, "replication_invalid_position_behavior")
-            .as_deref()
-            .map(str::trim)
-        {
-            None | Some("") => InvalidPositionBehavior::Error,
-            Some(value) => match value.to_ascii_lowercase().as_str() {
-                "error" => InvalidPositionBehavior::Error,
-                "rebootstrap" => InvalidPositionBehavior::Rebootstrap,
-                other => {
-                    let user_param = params.user_param("replication_invalid_position_behavior");
-                    return Err(format!(
-                        "parameter `{user_param}` must be 'error' or 'rebootstrap', got {other:?}"
-                    ));
-                }
-            },
-        };
-
+    let invalid_position_behavior = parse_invalid_checkpoint_behavior(params)?;
+    let ready_lag = optional_duration(
+        params,
+        "replication_ready_lag",
+        data_components::cdc::DEFAULT_READY_LAG,
+    )?;
     Ok(ReplicationParams {
         opts,
         server_id,
@@ -607,6 +660,7 @@ fn replication_params_from_connector_params(
         bootstrap_batch_size,
         checkpoint_interval,
         invalid_position_behavior,
+        ready_lag,
     })
 }
 
@@ -772,6 +826,55 @@ fn optional_usize_in_range(
     }
 }
 
+/// Parse an optional enum-valued parameter. Returns `Ok(None)` when the key is
+/// absent or empty; `Ok(Some(v))` when a recognized (case-insensitive) value
+/// maps via `map`; and an `Err` naming the user-facing parameter otherwise.
+fn optional_enum<T>(
+    params: &Parameters,
+    key: &str,
+    expected: &str,
+    map: impl Fn(&str) -> Option<T>,
+) -> Result<Option<T>, String> {
+    let Some(raw) = optional_string(params, key) else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    map(&trimmed.to_ascii_lowercase()).map(Some).ok_or_else(|| {
+        let user_param = params.user_param(key);
+        format!("parameter `{user_param}` must be {expected}, got {trimmed:?}")
+    })
+}
+
+/// Resolve the initial-snapshot mode from `mysql_replication_initial_snapshot`
+/// (`auto|always|disabled`). Defaults to [`InitialSnapshotMode::Auto`] when unset.
+fn parse_snapshot_mode(params: &Parameters) -> Result<InitialSnapshotMode, String> {
+    Ok(optional_enum(
+        params,
+        "replication_initial_snapshot",
+        "'auto', 'always', or 'disabled'",
+        InitialSnapshotMode::from_canonical,
+    )?
+    .unwrap_or_default())
+}
+
+/// Resolve the invalid-checkpoint behavior from
+/// `mysql_replication_invalid_checkpoint_behavior` (`error|restart`).
+/// Defaults to [`InvalidCheckpointBehavior::Error`] when unset.
+fn parse_invalid_checkpoint_behavior(
+    params: &Parameters,
+) -> Result<InvalidCheckpointBehavior, String> {
+    Ok(optional_enum(
+        params,
+        "replication_invalid_checkpoint_behavior",
+        "'error' or 'restart'",
+        InvalidCheckpointBehavior::from_canonical,
+    )?
+    .unwrap_or_default())
+}
+
 fn extract_primary_keys(provider: &Arc<dyn datafusion::datasource::TableProvider>) -> Vec<String> {
     use datafusion::common::Constraint;
     let Some(constraints) = provider.constraints() else {
@@ -851,13 +954,14 @@ mod tests {
         ]);
         let repl = replication_params_from_connector_params(&params, "orders")
             .expect("valid params parse");
-        assert_eq!(repl.snapshot_mode, SnapshotMode::Auto);
+        assert_eq!(repl.snapshot_mode, InitialSnapshotMode::Auto);
         assert_eq!(repl.bootstrap_batch_size, DEFAULT_BOOTSTRAP_BATCH_SIZE);
         assert_eq!(repl.checkpoint_interval, DEFAULT_CHECKPOINT_INTERVAL);
         assert_eq!(
             repl.invalid_position_behavior,
-            InvalidPositionBehavior::Error
+            InvalidCheckpointBehavior::Error
         );
+        assert_eq!(repl.ready_lag, data_components::cdc::DEFAULT_READY_LAG);
         assert!(
             repl.server_id >= 100_000,
             "derived id clears reserved range"
@@ -865,6 +969,73 @@ mod tests {
         assert_eq!(repl.opts.ip_or_hostname(), "localhost");
         assert_eq!(repl.opts.db_name(), Some("mydb"));
         assert!(repl.opts.ssl_opts().is_none());
+    }
+
+    #[test]
+    fn same_connection_derives_a_stable_shared_server_id() {
+        // Sharing is always-on and keyed by connection: two DIFFERENT datasets on
+        // the same connection derive the SAME server_id (they ride one shared
+        // binlog dump), regardless of dataset name.
+        let on_host = |ds: &str, host: &str| {
+            let p = params_with(&[("host", host), ("sslmode", "disabled")]);
+            replication_params_from_connector_params(&p, ds).expect("valid params parse")
+        };
+        let orders = on_host("orders", "localhost");
+        let customers = on_host("customers", "localhost");
+        assert_eq!(
+            orders.server_id, customers.server_id,
+            "datasets on the same connection must share one server_id"
+        );
+
+        // A different connection (different host) derives a different id, so it
+        // coalesces onto its own shared dump rather than colliding on the source.
+        let other = on_host("orders", "other-host");
+        assert_ne!(
+            orders.server_id, other.server_id,
+            "a different connection identity derives a different server_id"
+        );
+    }
+
+    #[test]
+    fn differing_credentials_or_tls_derive_distinct_server_ids() {
+        // The shared-source key coalesces on host/port/user PLUS password and
+        // TLS config, so connections that differ only on the credential or the
+        // TLS mode run SEPARATE binlog dumps — and must therefore derive
+        // DISTINCT server_ids, or the two dumps would collide on the source
+        // (MySQL drops a replication connection with a duplicate server_id).
+        let derive = |pairs: &[(&str, &str)]| {
+            replication_params_from_connector_params(&params_with(pairs), "orders")
+                .expect("valid params parse")
+                .server_id
+        };
+
+        let base = derive(&[
+            ("host", "localhost"),
+            ("pass", "pw1"),
+            ("sslmode", "disabled"),
+        ]);
+
+        // Different password, same host/port/user.
+        let other_pass = derive(&[
+            ("host", "localhost"),
+            ("pass", "pw2"),
+            ("sslmode", "disabled"),
+        ]);
+        assert_ne!(
+            base, other_pass,
+            "a different password must derive a different server_id"
+        );
+
+        // TLS on vs off, same credentials.
+        let with_tls = derive(&[
+            ("host", "localhost"),
+            ("pass", "pw1"),
+            ("sslmode", "required"),
+        ]);
+        assert_ne!(
+            base, with_tls,
+            "a different TLS mode must derive a different server_id"
+        );
     }
 
     #[test]
@@ -888,44 +1059,63 @@ mod tests {
     }
 
     #[test]
-    fn invalid_position_behavior_parses_strictly() {
-        let params = params_with(&[("replication_invalid_position_behavior", "rebootstrap")]);
-        let repl = replication_params_from_connector_params(&params, "orders")
-            .expect("valid params parse");
-        assert_eq!(
-            repl.invalid_position_behavior,
-            InvalidPositionBehavior::Rebootstrap
-        );
-
-        let params = params_with(&[("replication_invalid_position_behavior", "reboot")]);
-        let err = replication_params_from_connector_params(&params, "orders")
-            .expect_err("typo must error");
-        assert!(err.contains("'error' or 'rebootstrap'"), "got: {err}");
-    }
-
-    #[test]
-    fn snapshot_mode_parses_strictly() {
+    fn initial_snapshot_parses_strictly() {
         for (raw, expected) in [
-            ("auto", SnapshotMode::Auto),
-            ("never", SnapshotMode::Never),
-            ("ALWAYS", SnapshotMode::Always),
+            ("auto", InitialSnapshotMode::Auto),
+            ("disabled", InitialSnapshotMode::Disabled),
+            ("ALWAYS", InitialSnapshotMode::Always),
         ] {
-            let params = params_with(&[("replication_snapshot_mode", raw)]);
+            let params = params_with(&[("replication_initial_snapshot", raw)]);
             let repl = replication_params_from_connector_params(&params, "orders")
                 .expect("valid params parse");
             assert_eq!(repl.snapshot_mode, expected, "raw: {raw}");
         }
 
-        // A typo must error loudly, not silently fall back to `auto` —
-        // a misread `never` would otherwise snapshot a table the operator
-        // explicitly opted out of copying.
-        let params = params_with(&[("replication_snapshot_mode", "nevr")]);
+        let params = params_with(&[("replication_initial_snapshot", "yes")]);
         let err = replication_params_from_connector_params(&params, "orders")
             .expect_err("typo'd mode must error");
         assert!(
-            err.contains("mysql_replication_snapshot_mode"),
+            err.contains("mysql_replication_initial_snapshot")
+                && err.contains("'auto', 'always', or 'disabled'"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn invalid_checkpoint_behavior_parses_strictly() {
+        for (raw, expected) in [
+            ("error", InvalidCheckpointBehavior::Error),
+            ("RESTART", InvalidCheckpointBehavior::Restart),
+        ] {
+            let params = params_with(&[("replication_invalid_checkpoint_behavior", raw)]);
+            let repl = replication_params_from_connector_params(&params, "orders")
+                .expect("valid params parse");
+            assert_eq!(repl.invalid_position_behavior, expected, "raw: {raw}");
+        }
+
+        let params = params_with(&[("replication_invalid_checkpoint_behavior", "reboot")]);
+        let err = replication_params_from_connector_params(&params, "orders")
+            .expect_err("typo must error");
+        assert!(
+            err.contains("mysql_replication_invalid_checkpoint_behavior")
+                && err.contains("'error' or 'restart'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn ready_lag_parses_and_defaults() {
+        // Explicit duration is parsed.
+        let params = params_with(&[("replication_ready_lag", "500ms")]);
+        let repl = replication_params_from_connector_params(&params, "orders")
+            .expect("valid params parse");
+        assert_eq!(repl.ready_lag, std::time::Duration::from_millis(500));
+
+        // An unparseable duration errors, naming the user-facing parameter.
+        let params = params_with(&[("replication_ready_lag", "soon")]);
+        let err = replication_params_from_connector_params(&params, "orders")
+            .expect_err("unparseable duration must error");
+        assert!(err.contains("ready_lag"), "got: {err}");
     }
 
     #[test]

@@ -34,10 +34,8 @@ pub mod shared;
 pub mod slot;
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 
 use arrow::datatypes::SchemaRef;
-use futures::{StreamExt, stream};
 use snafu::Snafu;
 
 use crate::cdc::{ChangesStream, StreamError};
@@ -182,6 +180,16 @@ pub struct ReplicationStreamInput {
     /// The connector reads this via its `MetricsProvider` to expose OpenTelemetry
     /// observables.
     pub metrics: Arc<ReplicationMetricsCollector>,
+    /// The dataset's `on_schema_change` policy, mapped to a
+    /// [`SchemaEvolutionPolicy`]. Drives the pump's per-member
+    /// [`schema_evolution::RelationSchemaTracker`]: with a policy other than
+    /// [`SchemaEvolutionPolicy::Block`], a mid-stream source column add / lossless
+    /// type widening is adopted into the member's working schema so subsequent
+    /// `ChangeBatch`es carry the wider data struct (which the runtime apply loop
+    /// then reconciles against the accelerator). Callers set this directly (the
+    /// connector maps the dataset's `on_schema_change`); [`start_replication_stream`]
+    /// consumes it as-is, and [`start_replication_stream_with_policy`] overrides it.
+    pub policy: SchemaEvolutionPolicy,
 }
 
 /// Starts the bootstrap+WAL replication stream.
@@ -211,8 +219,10 @@ pub struct ReplicationStreamInput {
 /// naturally paces the replication stream.
 #[must_use]
 pub fn start_replication_stream(input: ReplicationStreamInput) -> ChangesStream {
-    // No policy plumbed: `block` runs the legacy validation paths verbatim.
-    start_replication_stream_with_policy(input, SchemaEvolutionPolicy::Block)
+    // Uses the policy already set on `input` (the connector maps the dataset's
+    // `on_schema_change`); construct with `policy: SchemaEvolutionPolicy::Block`
+    // for the conservative default. Every dataset is served by the shared pump.
+    shared::subscribe(input)
 }
 
 /// [`start_replication_stream`] with the dataset's `on_schema_change` policy.
@@ -225,141 +235,25 @@ pub fn start_replication_stream(input: ReplicationStreamInput) -> ChangesStream 
 /// non-widening changes surface a clear actionable error. See
 /// [`schema_evolution::RelationSchemaTracker`].
 ///
-/// Slot-sharing datasets (`input.params.shared`) are multiplexed onto a single
-/// replication connection by [`shared::subscribe`], which does not plumb the
-/// policy to the source layer; their schema-change handling is enforced by the
-/// runtime apply loop instead.
+/// Every dataset is served by the shared pump ([`shared::subscribe`]) — a
+/// dataset on its own slot is just a one-member source — so the policy is
+/// carried on [`ReplicationStreamInput`] and reconciled by the shared pump's
+/// per-member [`schema_evolution::RelationSchemaTracker`] for all datasets,
+/// slot-sharing or not. `input.params.shared` governs only slot/publication
+/// naming, not which pump runs.
 #[must_use]
 pub fn start_replication_stream_with_policy(
-    input: ReplicationStreamInput,
+    mut input: ReplicationStreamInput,
     policy: SchemaEvolutionPolicy,
 ) -> ChangesStream {
-    // Datasets that opted into slot sharing are multiplexed onto one
-    // replication connection per (connection, slot) — see [`shared`].
-    if input.params.shared {
-        return shared::subscribe(input);
-    }
-    // Initialized to 0 until `start_inner` learns the effective start LSN from
-    // slot setup. This matters: KeepAlive replies and `replication_lag_bytes`
-    // both read from this atomic, and a pinned-at-0 value would report a wildly
-    // inflated lag until the first Commit. `start_inner` seeds it before
-    // handing the atomic to the WAL client.
-    let confirmed_flush = Arc::new(AtomicU64::new(0));
-    Box::pin(
-        stream::once(async move { start_inner(input, policy, confirmed_flush).await }).flat_map(
-            |result| match result {
-                Ok(stream) => stream,
-                Err(e) => stream::once(async move { Err(stream_error(&e)) }).boxed(),
-            },
-        ),
-    )
-}
-
-async fn start_inner(
-    input: ReplicationStreamInput,
-    schema_evolution_policy: SchemaEvolutionPolicy,
-    confirmed_flush: Arc<AtomicU64>,
-) -> Result<ChangesStream> {
-    let ReplicationStreamInput {
-        dataset_name,
-        params,
-        schema,
-        primary_keys,
-        schema_name,
-        table_name,
-        metrics,
-    } = input;
-
-    // 1. Set up slot and publication. This is idempotent: existing resources are reused.
-    //    After this call, seed `confirmed_flush` with the slot's consistent LSN
-    //    so KeepAlive replies before any commit don't ACK 0 (which would pin
-    //    lag_bytes artificially high and, in the resume case, accidentally
-    //    advance the slot backwards if we acted on it).
-    let outcome = slot::setup_slot_and_publication(&params, &schema_name, &table_name).await?;
-    if outcome.consistent_lsn > 0 {
-        confirmed_flush.store(outcome.consistent_lsn, std::sync::atomic::Ordering::Release);
-        metrics.set_confirmed_flush_lsn(outcome.consistent_lsn);
-    }
-
-    // 2. Run the snapshot if the slot was just created — or on every start
-    //    when the accelerator doesn't persist across restarts
-    //    (`snapshot_on_resume`) — provided bootstrap is enabled at all.
-    if !outcome.created_fresh && params.snapshot_on_resume && params.initial_snapshot {
-        tracing::info!(
-            dataset = %dataset_name,
-            slot = %outcome.slot_name,
-            "accelerator does not persist across restarts; running the initial snapshot \
-             despite resuming from an existing replication slot"
-        );
-    }
-    let bootstrap_stream =
-        if (outcome.created_fresh || params.snapshot_on_resume) && params.initial_snapshot {
-            Some(bootstrap::snapshot_stream(bootstrap::SnapshotInput {
-                params: params.clone(),
-                schema_name: schema_name.clone(),
-                table_name: table_name.clone(),
-                dataset_schema: Arc::clone(&schema),
-                primary_keys: primary_keys.clone(),
-                dataset_name: dataset_name.clone(),
-                metrics: Arc::clone(&metrics),
-            })?)
-        } else {
-            // No bootstrap this run — if the slot already existed, consider the
-            // accelerator "already populated" so operators see bootstrap_complete=1.
-            metrics.mark_bootstrap_complete();
-            None
-        };
-
-    // When we skip bootstrap (slot resume or `initial_snapshot: false`), emit
-    // an immediate empty `is_dataset_ready=true` envelope so the runtime marks
-    // the dataset ready without having to wait for the first WAL change. On
-    // quiet sources that wait could be indefinite.
-    let skip_bootstrap_ready: Option<ChangesStream> = if bootstrap_stream.is_none() {
-        let envelope = crate::cdc::build_ready_signal_envelope(&schema).map_err(|e| {
-            Error::SchemaMismatch {
-                message: e.to_string(),
-            }
-        })?;
-        Some(Box::pin(futures::stream::once(async move { Ok(envelope) })))
-    } else {
-        None
-    };
-
-    if !outcome.generated_columns.is_empty() {
-        tracing::warn!(
-            dataset = %dataset_name,
-            columns = ?outcome.generated_columns,
-            "source table has GENERATED column(s): Postgres does not publish generated \
-             columns over logical replication, so they are populated by the initial \
-             snapshot but will be NULL on replicated changes. Exclude them from the \
-             dataset schema if NULLs are unacceptable."
-        );
-    }
-
-    // 3. Start the WAL stream.
-    let wal_stream = client::start_wal_stream(client::WalStreamInput {
-        params,
-        slot_name: outcome.slot_name.clone(),
-        publication_name: outcome.publication_name.clone(),
-        start_lsn: outcome.consistent_lsn,
-        schema: Arc::clone(&schema),
-        primary_keys,
-        generated_columns: outcome.generated_columns.clone(),
-        dataset_name,
-        schema_evolution_policy,
-        // The dataset is already marked ready by `skip_bootstrap_ready` (if
-        // bootstrap was skipped) or by the final bootstrap envelope.
-        is_dataset_ready_on_first_event: false,
-        confirmed_flush,
-        metrics,
-    })
-    .await?;
-
-    Ok(match (bootstrap_stream, skip_bootstrap_ready) {
-        (Some(boot), _) => Box::pin(boot.chain(wal_stream)),
-        (None, Some(ready)) => Box::pin(ready.chain(wal_stream)),
-        (None, None) => wal_stream,
-    })
+    // Every dataset is served by the shared pump — a dataset on its own slot is
+    // just a one-member source (see [`shared`]). This unifies the apply path so
+    // the pgoutput streaming protocol, ack floor, and schema evolution have a
+    // single implementation. `input.params.shared` still governs slot/publication
+    // *naming* (slot-derived when a slot is named, per-dataset otherwise), not
+    // which pump runs.
+    input.policy = policy;
+    shared::subscribe(input)
 }
 
 fn stream_error(err: &Error) -> StreamError {

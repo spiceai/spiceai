@@ -220,8 +220,26 @@ fn is_sqlite_lock_error(error: &tokio_rusqlite::Error<rusqlite::Error>) -> bool 
     )
 }
 
+/// Returns true if the connection string targets an in-memory `SQLite` database
+/// (Cayenne memory mode). Memory mode always uses the memdb VFS
+/// (`file:<name>?vfs=memdb`) — the only form under which multiple pooled
+/// connections share ONE in-memory database. (`:memory:` / `mode=memory` would
+/// instead give each pooled connection its own private database.)
+///
+/// In-memory databases have no backing file, so the pool skips parent-directory
+/// creation and uses the `MEMORY` rollback journal (WAL is unsupported).
+///
+/// `pub(crate)` so [`crate::cayenne_catalog::CayenneCatalog::init`] applies the
+/// SAME guard as [`SqliteMetastore::open_connection`] — the two must agree on
+/// what counts as in-memory, or one path creates a stray directory the other
+/// skips (the memory-mode `file:` directory bug, #11922).
+pub(crate) fn is_memory_db_path(db_path: &str) -> bool {
+    db_path.contains("vfs=memdb")
+}
+
 async fn configure_sqlite_connection(
     conn: &tokio_rusqlite::Connection,
+    in_memory: bool,
 ) -> Result<(), tokio_rusqlite::Error<rusqlite::Error>> {
     // Resolve the tunable pragmas once. Defaults and rationale live on
     // `SqliteMetastoreConfig`; the runtime overrides them via
@@ -239,13 +257,24 @@ async fn configure_sqlite_connection(
                 if let Some(mode) = cfg.auto_vacuum.pragma_value() {
                     conn.pragma_update(None, "auto_vacuum", mode)?;
                 }
-                conn.pragma_update(None, "journal_mode", "WAL")?;
-                conn.pragma_update(None, "synchronous", "NORMAL")?;
+                if in_memory {
+                    // In-memory databases don't support WAL — use the MEMORY
+                    // rollback journal and set synchronous OFF (no backing file to
+                    // fsync). mmap_size / wal_autocheckpoint are meaningless without
+                    // a file and are skipped below.
+                    conn.pragma_update(None, "journal_mode", "MEMORY")?;
+                    conn.pragma_update(None, "synchronous", "OFF")?;
+                } else {
+                    conn.pragma_update(None, "journal_mode", "WAL")?;
+                    conn.pragma_update(None, "synchronous", "NORMAL")?;
+                }
                 conn.pragma_update(None, "cache_size", -cache_size_kib)?;
                 conn.pragma_update(None, "foreign_keys", true)?;
                 conn.pragma_update(None, "temp_store", "memory")?;
-                conn.pragma_update(None, "mmap_size", cfg.mmap_size_bytes)?;
-                conn.pragma_update(None, "wal_autocheckpoint", cfg.wal_autocheckpoint_pages)?;
+                if !in_memory {
+                    conn.pragma_update(None, "mmap_size", cfg.mmap_size_bytes)?;
+                    conn.pragma_update(None, "wal_autocheckpoint", cfg.wal_autocheckpoint_pages)?;
+                }
 
                 Ok::<_, rusqlite::Error>(())
             })
@@ -396,49 +425,71 @@ impl SqliteMetastore {
     ///
     async fn open_connection(&self) -> CatalogResult<tokio_rusqlite::Connection> {
         let db_path = self.db_path();
-        let db_dir =
-            Path::new(db_path)
-                .parent()
-                .ok_or_else(|| CatalogError::InvalidDatabasePath {
-                    path: db_path.to_string(),
-                })?;
+        let in_memory = is_memory_db_path(db_path);
 
-        if !db_dir.exists() {
-            tokio::fs::create_dir_all(db_dir).await?;
+        // In-memory databases (Cayenne memory mode) have no backing file, so
+        // there is no parent directory to create or fsync — skip straight to the
+        // open. File-mode DBs create and sync the parent dir as before.
+        if !in_memory {
+            let db_dir =
+                Path::new(db_path)
+                    .parent()
+                    .ok_or_else(|| CatalogError::InvalidDatabasePath {
+                        path: db_path.to_string(),
+                    })?;
 
-            // Best-effort parent directory sync (defense-in-depth with the sync
-            // already performed in CayenneCatalog::init).
-            if let Some(parent) = db_dir.parent() {
-                let parent_for_sync = parent.to_path_buf();
-                let parent_display = parent_for_sync.display().to_string();
-                let db_dir_display = db_dir.display().to_string();
-                match tokio::task::spawn_blocking(move || {
-                    std::fs::File::open(&parent_for_sync).and_then(|f| f.sync_all())
-                })
-                .await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => tracing::warn!(
-                        "Failed to sync parent directory {parent_display} after creating SQLite catalog DB directory {db_dir_display} (subsequent DB writes will still be durable): {error}"
-                    ),
-                    Err(error) => tracing::warn!(
-                        "Failed to join SQLite catalog DB parent directory sync task for {parent_display}: {error}"
-                    ),
+            if !db_dir.exists() {
+                tokio::fs::create_dir_all(db_dir).await?;
+
+                // Best-effort parent directory sync (defense-in-depth with the sync
+                // already performed in CayenneCatalog::init).
+                if let Some(parent) = db_dir.parent() {
+                    let parent_for_sync = parent.to_path_buf();
+                    let parent_display = parent_for_sync.display().to_string();
+                    let db_dir_display = db_dir.display().to_string();
+                    match tokio::task::spawn_blocking(move || {
+                        std::fs::File::open(&parent_for_sync).and_then(|f| f.sync_all())
+                    })
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => tracing::warn!(
+                            "Failed to sync parent directory {parent_display} after creating SQLite catalog DB directory {db_dir_display} (subsequent DB writes will still be durable): {error}"
+                        ),
+                        Err(error) => tracing::warn!(
+                            "Failed to join SQLite catalog DB parent directory sync task for {parent_display}: {error}"
+                        ),
+                    }
                 }
             }
         }
 
-        let conn = tokio_rusqlite::Connection::open(db_path)
+        // In-memory DSNs are URI filenames (e.g. `file:...?vfs=memdb`) that let
+        // every pooled connection attach to the SAME shared database;
+        // SQLITE_OPEN_URI is required to interpret them. It is part of
+        // OpenFlags::default(), but we pass flags explicitly so the URI
+        // dependency is not silently lost if that default ever changes. File
+        // mode keeps the plain open.
+        let open_result = if in_memory {
+            tokio_rusqlite::Connection::open_with_flags(
+                db_path.to_string(),
+                rusqlite::OpenFlags::default() | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+            )
             .await
-            .map_err(|e| CatalogError::Database {
-                message: format!("Failed to open SQLite database: {e}"),
-            })?;
+        } else {
+            tokio_rusqlite::Connection::open(db_path).await
+        };
+        let conn = open_result.map_err(|e| CatalogError::Database {
+            message: format!("Failed to open SQLite database: {e}"),
+        })?;
 
-        configure_sqlite_connection(&conn).await.map_err(
-            |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
-                message: format!("Failed to configure SQLite pragmas: {e}"),
-            },
-        )?;
+        configure_sqlite_connection(&conn, in_memory)
+            .await
+            .map_err(
+                |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                    message: format!("Failed to configure SQLite pragmas: {e}"),
+                },
+            )?;
 
         Ok(conn)
     }
@@ -579,6 +630,38 @@ impl SqliteMetastore {
             table_id BLOB NOT NULL,
             pk_bytes BLOB NOT NULL,
             sequence_number BIGINT NOT NULL,
+            PRIMARY KEY (table_id, pk_bytes)
+        ) WITHOUT ROWID
+    ";
+
+    /// Schema for the `cayenne_pending_write_back` table (durable federated
+    /// write-back, #11838).
+    ///
+    /// Tracks the primary keys that a durable-write-back table has committed to
+    /// the accelerator but not yet reconciled to the federated source. One row
+    /// per undelivered key; the delivery worker claims rows, reconciles the
+    /// key's current committed value to the source, then clears the row.
+    ///
+    /// `table_id` is the 16 raw UUID bytes (as in `cayenne_insert_record`);
+    /// `pk_bytes` is the `RowConverter` `OwnedRow` encoding of the full primary
+    /// key (bit-identical to the keyset/footprint `pk_digest` input) so the
+    /// worker can rebuild both the accelerator point-scan filter and the source
+    /// key. `sequence_number` is the table commit sequence that last dirtied the
+    /// key; the marker upsert is **monotone** (keeps `MAX`) and the worker's
+    /// compare-and-clear is `<= claimed_seq`, so a newer commit landing during
+    /// delivery leaves the marker above the claimed sequence and the stale clear
+    /// no-ops. `first_marked_at` is the oldest-undelivered timestamp (lag metric)
+    /// and is never overwritten on re-mark.
+    ///
+    /// Unlike `cayenne_insert_record`, this table is **never** cleared at
+    /// checkpoint/overwrite (that would drop acked-but-undelivered writes);
+    /// `drop_table` deletes its rows explicitly.
+    const PENDING_WRITE_BACK_TABLE_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS cayenne_pending_write_back (
+            table_id BLOB NOT NULL,
+            pk_bytes BLOB NOT NULL,
+            sequence_number BIGINT NOT NULL,
+            first_marked_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
             PRIMARY KEY (table_id, pk_bytes)
         ) WITHOUT ROWID
     ";
@@ -881,12 +964,13 @@ impl MetastoreBackend for SqliteMetastore {
             .call(|conn| {
                 // Create tables in a transaction
                 conn.execute_batch(&format!(
-                    "{}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {};",
+                    "{}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {};",
                     Self::TABLE_TABLE_DDL,
                     Self::TABLE_NAME_UNIQUE_INDEX_DDL,
                     Self::DELETE_FILE_TABLE_DDL,
                     Self::PARTITION_TABLE_DDL,
                     Self::INSERT_RECORD_TABLE_DDL,
+                    Self::PENDING_WRITE_BACK_TABLE_DDL,
                     Self::SNAPSHOT_SEQUENCE_TABLE_DDL,
                     Self::TABLE_STATISTICS_DDL,
                     Self::SNAPSHOT_FILE_STATISTICS_TABLE_DDL,
@@ -1353,7 +1437,7 @@ impl MetastoreBackend for SqliteMetastore {
                         conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
 
                     if journal_mode.eq_ignore_ascii_case("wal") {
-                        tracing::info!("Truncating Cayenne catalog WAL log");
+                        tracing::debug!("Truncating Cayenne catalog WAL log");
                         // Truncate the WAL log to persist changes and reduce file size
                         // wal_checkpoint returns results (busy, log, checkpointed), so we use query_row
                         let _: (i32, i32, i32) =
@@ -1364,7 +1448,7 @@ impl MetastoreBackend for SqliteMetastore {
 
                     // Run optimize to improve query performance for future connections
                     // PRAGMA optimize may return rows indicating what was optimized
-                    tracing::info!("Running optimize on Cayenne catalog");
+                    tracing::debug!("Running optimize on Cayenne catalog");
                     let mut stmt = conn.prepare("PRAGMA optimize")?;
                     let mut rows = stmt.query([])?;
                     while rows.next()?.is_some() {} // Consume all results to ensure PRAGMA completes
@@ -1522,14 +1606,35 @@ impl Drop for SqliteTransaction {
             // tokio_rusqlite::Connection::call sends a closure to the bg
             // thread; it will execute even after this Drop returns.
             // We spawn a task to await the future properly.
-            tokio::spawn(async move {
+            let rollback = async move {
                 let _ = conn
                     .call(|conn| {
                         let _ = conn.execute_batch("ROLLBACK");
                         Ok::<_, rusqlite::Error>(())
                     })
                     .await;
-            });
+            };
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(rollback);
+            } else {
+                // No ambient Tokio runtime (dropped from a non-Tokio thread).
+                // `tokio_rusqlite::Connection::call` awaits the background
+                // connection thread over a Tokio channel, so drive the
+                // best-effort rollback on a small current-thread runtime instead
+                // of a bare `futures::executor::block_on` (mirrors the Turso
+                // metastore transaction Drop). Log if the runtime cannot be built.
+                std::thread::spawn(move || {
+                    match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => rt.block_on(rollback),
+                        Err(err) => tracing::error!(
+                            "Failed to build fallback Tokio runtime to auto-rollback SqliteTransaction on drop: {err}"
+                        ),
+                    }
+                });
+            }
         }
     }
 }
@@ -1719,6 +1824,75 @@ mod tests {
         let db_path = dir.path().join("cayenne_test.db");
         let metastore = SqliteMetastore::new(format!("sqlite://{}", db_path.display()));
         (dir, metastore)
+    }
+
+    /// Build an in-memory (memdb) metastore for memory-mode tests. Each caller
+    /// MUST pass a unique `name` — memdb shares one in-memory database per name
+    /// across the whole process, so a shared name would leak state between tests.
+    fn in_memory_metastore(name: &str) -> SqliteMetastore {
+        SqliteMetastore::new(format!("sqlite://file:/{name}?vfs=memdb"))
+    }
+
+    /// Cayenne memory mode: an in-memory (memdb) metastore must be usable and,
+    /// crucially, SHARED across every pooled connection — a table created via one
+    /// pooled connection must be visible when a read round-robins to another.
+    /// This is the core memdb-sharing invariant; a private `:memory:` per
+    /// connection would fail the cross-connection read.
+    #[tokio::test]
+    async fn test_in_memory_metastore_shared_across_pool() {
+        let _guard = CONFIG_LOCK.lock().await;
+        set_sqlite_metastore_config(SqliteMetastoreConfig::default());
+
+        let metastore = in_memory_metastore("cayenne-mem-shared-pool");
+        assert!(is_memory_db_path(metastore.db_path()));
+
+        // Create the table via a pooled connection.
+        metastore
+            .execute_batch("CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY)")
+            .await
+            .expect("create table on a pooled connection");
+
+        // Every pooled connection must report the MEMORY journal (WAL is
+        // unsupported in-memory) — read it off a real pooled connection.
+        let pool = metastore.pool().await.expect("pool");
+        let journal_mode: String = pool.conns[0]
+            .lock()
+            .await
+            .call(|conn| conn.query_row("PRAGMA journal_mode", [], |row| row.get(0)))
+            .await
+            .expect("read journal_mode");
+        assert_eq!(
+            journal_mode.to_lowercase(),
+            "memory",
+            "in-memory metastore must use the MEMORY journal, got {journal_mode}"
+        );
+
+        // Insert enough rows that the round-robin pool spreads writes across
+        // multiple connections, then read the full count back — proving all
+        // connections share ONE database (memdb), not a private DB each.
+        for i in 0..64i64 {
+            metastore
+                .execute(ExecuteParams {
+                    sql: "INSERT INTO t (id) VALUES (?1)",
+                    params: vec![MetastoreValue::Integer(i)],
+                })
+                .await
+                .expect("insert row");
+        }
+        let count: i64 = metastore
+            .query_row(
+                QueryRowParams {
+                    sql: "SELECT COUNT(*) FROM t",
+                    params: vec![],
+                },
+                |row| row.get_i64(0),
+            )
+            .await
+            .expect("count rows");
+        assert_eq!(
+            count, 64,
+            "all inserts must be visible across the shared in-memory pool"
+        );
     }
 
     /// Create a tiny table and append `n` rows each carrying a ~`blob_kib` KiB

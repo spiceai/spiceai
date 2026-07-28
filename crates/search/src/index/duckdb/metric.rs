@@ -81,3 +81,11 @@ impl TryFrom<&str> for DuckDBDistanceMetric {
         }
     }
 }
+
+impl std::str::FromStr for DuckDBDistanceMetric {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::try_from(s)
+    }
+}

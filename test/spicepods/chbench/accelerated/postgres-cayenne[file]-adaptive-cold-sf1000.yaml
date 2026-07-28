@@ -6,21 +6,22 @@ name: postgres-cayenne[file]-adaptive-cold-sf1000
 # (RAM mem-tier -> warm local-disk Vortex -> COLD object store), but every Cayenne table runs
 # `cayenne_tuning: adaptive` instead of the hand-pinned knobs. The runtime warm-starts each adaptive
 # actuator (inline-flush, mem-tier bytes, compaction interval / trigger-files, deletion-index bake,
-# write concurrency, WARM target file size, query-admission reserve) from the detected host +
-# `schema_inference: extended`, then adapts them toward the `cayenne_goal_*` SLOs.
+# write concurrency, WARM target file size, query-admission reserve) from the detected host
+# (schema inference is always on), then adapts them toward the `cayenne_goal_*` SLOs.
 #
 # The cold (datalake) tier is NOT adaptive-tuned — no cold knob is an actuator — so its static knobs
 # are set explicitly on the high-volume tables and collapse no adaptive tuning bound:
 #   - cayenne_datalake_location                enables the tier (unset => disabled). Datalake + an
 #                                              inferred PK auto-forces deletion_mode: key, so
 #                                              cayenne_deletion_mode is intentionally left unset.
-#   - cayenne_cold_tier_warm_max_bytes         4 GiB warm->cold promotion trigger (expert override;
-#                                              unset defaults to 16 x cayenne_cold_target_file_size_mb
-#                                              = 16 GiB at this pod's 1024 MB file size — pin 4 GiB
+#   - cayenne_datalake_warm_max_bytes         4 GiB warm->cold promotion trigger (expert override;
+#                                              unset defaults to 16 x cayenne_datalake_target_file_size_mb
+#                                              = ~11.7 GiB at this pod's 750 MB file size — pin 4 GiB
 #                                              so the big tables graduate after bootstrap).
-#   - cayenne_cold_target_file_size_mb         1024 — read-optimized cold files, larger than the warm
-#                                              target so cold scans open fewer footers.
-#   - cayenne_cold_tier_background_interval_ms 30s promoter cadence.
+#   - cayenne_datalake_target_file_size_mb         750 — read-optimized cold files, larger than the warm
+#                                              target so cold scans open fewer footers; kept under the
+#                                              per-file PK-bloom cap so cold files stay bloom-backed.
+#   - cayenne_datalake_tiering_check_interval_ms 30s tiering-check cadence.
 # NOTE: `cayenne_target_file_size_mb` (the WARM/hot file size) is deliberately NOT set — it is an
 # adaptive actuator, and pinning it would collapse its tuning bounds to a point. Only the COLD file
 # size is set here; they are different knobs.
@@ -57,18 +58,17 @@ runtime:
 datasets:
   # ------------------------------------------------------------------
   # High-volume PK upsert tables — adaptive tuning + COLD object-store tier.
-  # No primary_key / on_conflict / indexes: `schema_inference: extended` detects them from the
+  # No primary_key / on_conflict / indexes: schema inference (always on) detects them from the
   # PostgreSQL source and seeds the upsert on_conflict the CDC (changes) path requires (it also
   # supplies the row_count/table_bytes the adaptive warm-start gates on, and the PK the cold tier
   # needs both to promote and to auto-force key deletes).
   # ------------------------------------------------------------------
   - from: postgres:district
     name: district
-    schema_inference: extended
     params:
       <<: *postgres_params
       pg_replication_slot: spice_district
-      pg_replication_initial_snapshot: 'true'
+      pg_replication_initial_snapshot: auto
     acceleration: &cayenne_accel_cold
       enabled: true
       engine: cayenne
@@ -91,53 +91,48 @@ datasets:
         cayenne_datalake_s3_secret: ${secrets:S3_SECRET}
         cayenne_datalake_s3_allow_http: 'true'
 
-        cayenne_cold_tier_warm_max_bytes: '4294967296' # 4 GiB warm->cold promotion trigger
-        cayenne_cold_target_file_size_mb: '1024'
-        cayenne_cold_tier_background_interval_ms: '30000'
+        cayenne_datalake_warm_max_bytes: '4294967296' # 4 GiB warm->cold promotion trigger
+        cayenne_datalake_target_file_size_mb: '750'
+        cayenne_datalake_tiering_check_interval_ms: '30000'
 
   - from: postgres:customer
     name: customer
-    schema_inference: extended
     params:
       <<: *postgres_params
       pg_replication_slot: spice_customer
-      pg_replication_initial_snapshot: 'true'
+      pg_replication_initial_snapshot: auto
     acceleration: *cayenne_accel_cold
 
   - from: postgres:new_order
     name: new_order
-    schema_inference: extended
     params:
       <<: *postgres_params
       pg_replication_slot: spice_new_order
-      pg_replication_initial_snapshot: 'true'
+      pg_replication_initial_snapshot: auto
     acceleration: *cayenne_accel_cold
 
   - from: postgres:oorder
     name: oorder
-    schema_inference: extended
     params:
       <<: *postgres_params
       pg_replication_slot: spice_oorder
-      pg_replication_initial_snapshot: 'true'
+      pg_replication_initial_snapshot: auto
     acceleration: *cayenne_accel_cold
 
   - from: postgres:order_line
     name: order_line
-    schema_inference: extended
     params:
       <<: *postgres_params
       pg_replication_slot: spice_order_line
-      pg_replication_initial_snapshot: 'true'
+      pg_replication_initial_snapshot: auto
     acceleration: *cayenne_accel_cold
 
   - from: postgres:stock
     name: stock
-    schema_inference: extended
     params:
       <<: *postgres_params
       pg_replication_slot: spice_stock
-      pg_replication_initial_snapshot: 'true'
+      pg_replication_initial_snapshot: auto
     acceleration: *cayenne_accel_cold
 
   # ------------------------------------------------------------------
@@ -146,11 +141,10 @@ datasets:
   # ------------------------------------------------------------------
   - from: postgres:warehouse
     name: warehouse
-    schema_inference: extended
     params:
       <<: *postgres_params
       pg_replication_slot: spice_warehouse
-      pg_replication_initial_snapshot: 'true'
+      pg_replication_initial_snapshot: auto
     acceleration: &cayenne_accel
       enabled: true
       engine: cayenne
@@ -162,11 +156,11 @@ datasets:
 
   # ------------------------------------------------------------------
   # Static reference tables (no OLTP mutations, full refresh) — adaptive, no cold tier.
-  # PK / on_conflict / indexes come from extended inference.
+  # PK / indexes come from schema inference (always on); on_conflict is seeded only
+  # for CDC (changes) datasets — a full refresh replaces the table and needs no upsert.
   # ------------------------------------------------------------------
   - from: postgres:item
     name: item
-    schema_inference: extended
     params:
       <<: *postgres_params
     acceleration: &cayenne_accel_full
@@ -178,21 +172,18 @@ datasets:
 
   - from: postgres:region
     name: region
-    schema_inference: extended
     params:
       <<: *postgres_params
     acceleration: *cayenne_accel_full
 
   - from: postgres:nation
     name: nation
-    schema_inference: extended
     params:
       <<: *postgres_params
     acceleration: *cayenne_accel_full
 
   - from: postgres:supplier
     name: supplier
-    schema_inference: extended
     params:
       <<: *postgres_params
     acceleration: *cayenne_accel_full

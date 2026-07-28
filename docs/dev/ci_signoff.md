@@ -20,8 +20,9 @@ Previously every PR push ran the whole suite — lint, build, unit tests,
 integration tests, E2E — and then the merge queue ran much of it *again* on
 merge. That is slow feedback and a lot of duplicated CI. With sign-off:
 
-- **Fast local feedback.** `make signoff` runs lint + unit tests on your
-  hardware, which is typically faster than waiting for a remote runner.
+- **Fast local feedback.** `make signoff` target-lints changed crates first,
+  then runs full lint + unit tests on your hardware — faster fail-first than a
+  remote runner, and faster than workspace lint alone when a change is wrong.
 - **No duplicated CI.** The full suite runs once, in the queue, on the merged
   commit — not on every push and again on merge.
 - **Same safety.** Nothing reaches `trunk` without the full suite passing on the
@@ -51,24 +52,180 @@ From a clean Git checkout or JJ workspace, with your branch/bookmark pushed
 and up to date:
 
 ```bash
-make signoff          # runs `make lint-rust` + `make build-cli nextest`, then attests
+make signoff          # targeted crate lint + tests → full lint + unit tests, then attests
 ```
 
-On success it posts a `signoff` commit status on your current `HEAD`. Open or
-refresh the PR and the **Attestation** check turns green, which — together with a
-review — lets a maintainer add the PR to the merge queue.
+`make signoff` first diffs the branch against `trunk`. If that diff has no
+Rust-affecting files (`.rs`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain*`,
+`.cargo/*`), Rust lint/build/unit tests are skipped and the sign-off status is
+still posted (docs/YAML/script-only changes — and for a branch in this
+repository **Attestation** fast-tracks the PR anyway, so you don't need to run
+this at all; the fast-track is same-repo only, so a docs-only PR from a fork
+still needs a maintainer sign-off). Otherwise it maps changed files to workspace
+crates and runs, in order:
 
-The sign-off is bound to the **exact commit** you pushed. If you push a new
-commit, the old sign-off no longer applies and you must run `make signoff` again.
+1. `make lint-rust PACKAGES="…" FEATURES="…"` — lint the crates you touched
+2. `make nextest-packages PACKAGES="…" FEATURES="…"` — their unit tests
+3. `make lint-rust` — the full workspace lint
+4. `make build-cli-dev nextest` — CLI build + all unit tests
+
+Steps 1-2 exist to fail fast: a lint or test failure in the crate you edited is
+the likeliest outcome, and step 3 is by far the longest, so covering your own
+crates first turns a late failure into an early one.
+`SIGNOFF_SKIP_TARGETED_LINT=1` and `SIGNOFF_SKIP_TARGETED_TESTS=1` opt out.
+
+**The scoped steps build each crate the way the workspace builds it.** The
+features come from a `cargo metadata` resolve of the whole workspace,
+package-qualified (`runtime/debezium,…`), rather than from the crate's own
+defaults. That matters because a crate's defaults are not what it is ever built
+with: `runtime` declares 54 features and **no `default`**, so a bare
+`cargo clippy -p runtime` compiles it with *zero* features, while the workspace
+resolve gives it 35 — `spiced`'s defaults unify them in. Linting and testing a
+configuration no real build produces is what makes a scoped pre-lint fail on code
+the full gate accepts, and it guarantees a cache miss against the gate that
+follows. The resolve is derived on every run, so there is no feature list to
+drift. If `cargo metadata` or `python3` is unavailable the steps fall back to
+package defaults rather than failing.
+
+The CLI is built with the same profile as the lint and test passes
+(`build-cli-dev`), not a release build: a release build shares no artifacts with
+them and would recompile its whole dependency graph just to prove the binary
+links. The merge queue's required `Build (release profile)` job builds the CLI,
+`spiced`, and the release install for real.
+
+On success it posts a `signoff` commit status on your current `HEAD`. If the
+**Attestation** check already ran and failed before the sign-off existed, the
+script re-runs that job via the `gh` CLI so it turns green without you having
+to open or refresh the PR. (If no run is found yet — e.g. before the PR's
+first CI run — or the rerun call fails, it falls back to prompting you to
+open/refresh the PR yourself.) That, together with a review, lets a
+maintainer add the PR to the merge queue.
+
+The sign-off is normally bound to the **exact commit** you pushed. If you push a
+code change, the old sign-off no longer applies and you must run `make signoff`
+again. The only exception is merging the PR's base branch. **Attestation** walks
+up to 100 successive merge commits on the first-parent chain to find a sign-off.
+`HEAD` must merge the current base commit, each older merged base must appear in
+order on the current base branch's first-parent history, and every merge tree
+must exactly match Git's conflict-free automatic result. A conflict resolution,
+amended merge, octopus merge, or merge from another branch still requires a new
+sign-off.
+`scripts/signoff status` reports only a commit's own status; the inheritance
+check runs in the PR's **Attestation** workflow.
+
+### Reverts are fast-tracked
+
+A pull request that only reverts commits already on the base branch passes
+**Attestation** automatically — no local `make signoff` needed. Undoing a change
+that already landed (and so already passed the full suite on its way in) is
+low-risk, and the merge queue still re-runs the whole suite on the merged
+result before it can reach `trunk`.
+
+The **Attestation** workflow fast-tracks a PR when **all** of the following hold:
+
+- Every commit the PR introduces is a Git revert — it carries the
+  `This reverts commit <sha>.` footer that `git revert` writes. A single
+  non-revert commit disqualifies the PR and it needs a normal sign-off.
+- Each reverted commit is already on the base branch (an ancestor of the base
+  tip). You can't fast-track "reverting" something that never merged.
+- The PR is from the same repository, not a fork. Fork contributors can't
+  self-sign-off anyway (posting a status needs write access), so a fork revert
+  still takes a maintainer sign-off — this keeps the trusted-committer boundary.
+
+To fast-track, just open the revert PR the normal way (e.g. `git revert <sha>`
+keeps the footer intact); the check passes on its own. If you amend a revert
+with extra changes, or squash the footer out of the message, it falls back to
+requiring a sign-off.
+
+### Branches with no Rust changes are fast-tracked
+
+A pull request whose diff contains no `.rs`, `Cargo.toml`/`Cargo.lock`,
+`rust-toolchain*`, or `.cargo/` paths passes **Attestation** automatically. Those
+are exactly the branches `make signoff` skips every Rust check for, so requiring
+it would attest a run that did no work. Docs, workflow YAML, spicepods, and
+scripts all land here. Renames are checked on both sides, so moving a `.rs` file
+to a non-Rust path still requires a sign-off, and a diff at GitHub's 3000-file
+listing cap is treated as unknown rather than assumed clean. Same-repo only, like
+the other fast-tracks.
+
+The merge queue still runs the full suite on the merged result — its
+`check_changes` gate applies the same reasoning there.
+
+### Dependabot bumps are fast-tracked
+
+A Dependabot pull request that is still exactly the one commit Dependabot pushed
+passes **Attestation** automatically — no local `make signoff` needed, so it can
+go straight into the merge queue on review. There is no human-authored change to
+attest, and the merge queue still runs the whole suite on the merged result
+before it can reach `trunk`.
+
+The **Attestation** workflow fast-tracks a PR when **all** of the following hold:
+
+- Dependabot opened the pull request (`dependabot[bot]`).
+- The PR introduces exactly one commit.
+- That commit is attributed to the `dependabot[bot]` account, was committed by
+  GitHub itself (its `web-flow` identity, `noreply@github.com`), and carries a
+  verified signature. All three matter: Dependabot's branches live in this
+  repository, so anyone with write access can push over them, and an author line
+  is plain commit metadata that anyone can write. Signature verification attests
+  the *committer*, not the author — so a person with a registered signing key
+  could sign a commit they authored under Dependabot's name and have it verify.
+  What they cannot do is claim GitHub's own committer identity, which Dependabot
+  gets because its commits are created through GitHub's API.
+- The PR is from the same repository, not a fork (Dependabot's branches always
+  are — this keeps the trusted-committer boundary the same as for reverts).
+
+**A bump that needs a fix needs a sign-off.** If the merge queue rejects the
+bump and you push a commit to make it build — or merge the base branch into the
+branch — the PR has more than Dependabot's one commit and falls back to
+requiring `make signoff` like any other change. (Dependabot rebases its own
+branch rather than merging, so routine base updates keep it at a single commit.)
 
 Options:
 
 ```bash
 scripts/signoff -f            # sign off even with an uncommitted/unpushed tree
 scripts/signoff --no-verify   # attest without running the checks (honor system)
-scripts/signoff status        # is HEAD signed off?
+scripts/signoff status        # does HEAD have its own sign-off?
 scripts/signoff --help        # full usage
 ```
+
+### Remote sign-off (lab SSH host or self-hosted runner)
+
+When you can't (or don't want to) run the checks on your machine:
+
+```bash
+make signoff-remote                 # current branch
+```
+
+`make signoff-remote` first probes lab hosts over SSH (`192.168.1.100`,
+`192.168.1.101` by default; override with `SIGNOFF_SSH_HOSTS`). The first host
+that answers and has a Git checkout at `$HOME/dev/spice2` is used: it fetches
+your pushed branch into that clone and runs `scripts/signoff -f` there (same
+checks and Rust-skip behavior as local). Override the remote path with an
+absolute path only: `SIGNOFF_SSH_REPO=/absolute/path` (`~` is not expanded).
+
+If no SSH host is usable, it falls back to dispatching the **Remote Sign-off**
+GitHub Actions workflow on a self-hosted runner:
+
+```bash
+gh workflow run signoff.yml -f branch=<your-branch>
+gh run watch --workflow signoff.yml
+```
+
+The Actions workflow:
+
+1. Checks out your branch (full history) and fetches `trunk`
+2. Target-lints crates touched by the branch vs `trunk` (GitHub compare API as a
+   fallback when merge-base isn't available), or skips Rust checks when the
+   branch has no Rust-affecting files
+3. Runs full `make lint-rust` + `make build-cli-dev nextest` when Rust is affected
+4. Posts pending → success/failure `signoff` statuses, then re-runs
+   **Attestation** if needed
+
+Requires write access to the repository (same as local sign-off — fork
+contributors still need a maintainer to sign off). The lab SSH path also needs
+SSH key access to the host and `gh` auth on that machine.
 
 ### Jujutsu workspaces
 
@@ -95,9 +252,11 @@ path, so existing Git behavior is unchanged.
 
 ### "No developer sign-off found for &lt;sha&gt;"
 
-The Attestation check couldn't find a green `signoff` status for the PR's head
-commit. Make sure the commit under review is pushed, then run `make signoff`
-again. A new push always needs a fresh sign-off.
+The Attestation check couldn't find an applicable green `signoff` status. It
+checks the PR's head commit first, then walks backward through clean, unmodified
+base merges on the first-parent chain. Make sure the commit under review is
+pushed, then run `make signoff` again. Any new code or manual merge resolution
+needs a fresh sign-off.
 
 ### External contributors (forks)
 
@@ -113,8 +272,9 @@ merge queue is still the real gate.
 
 | Stage | Trigger | Checks |
 | --- | --- | --- |
-| Local | `make signoff` | `make lint-rust`, `make build-cli nextest` |
-| Pull request | `pull_request` | **Attestation** + PR hygiene; merge-queue check names report lightweight skipped/passthrough results |
+| Local | `make signoff` | skip Rust if no Rust-affecting files in the branch diff; else targeted `make lint-rust PACKAGES=… FEATURES=…` + `make nextest-packages PACKAGES=… FEATURES=…` (features from the workspace resolve), full `make lint-rust`, `make build-cli-dev nextest` |
+| Remote | `make signoff-remote` | same checks via lab SSH (`$HOME/dev/spice2` on 192.168.1.100/101) if reachable, else self-hosted `signoff.yml`; posts `signoff` |
+| Pull request | `pull_request` | **Attestation** (validates the sign-off, or auto-passes a branch with no Rust-affecting files, a pure revert, or a single-commit Dependabot bump) + PR hygiene; merge-queue check names report lightweight skipped/passthrough results |
 | Merge queue | `merge_group` | the full required suite (below) + advisory niche checks |
 
 Required checks in the merge queue (the `trunk` ruleset):

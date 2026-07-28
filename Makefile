@@ -10,7 +10,7 @@ build-cli:
 
 .PHONY: build-cli-dev
 build-cli-dev:
-	cargo build -p spice
+	cargo build $(CARGO_PROFILE) -p spice
 
 .PHONY: build-spiced
 build-spiced:
@@ -61,29 +61,58 @@ ci:
 	make -C bin/spice
 	make -C bin/spiced
 
-# Local CI attestation ("developer sign-off"). Runs lint + unit tests, then
-# posts a `signoff` commit status on HEAD so the PR can enter the merge queue,
-# where the full suite runs. See scripts/signoff and docs/dev/ci_signoff.md.
+# Local CI attestation ("developer sign-off"). Skips Rust lint/build/tests when
+# the branch has no Rust-affecting files vs trunk (.rs, Cargo.toml/lock,
+# rust-toolchain*, .cargo/*); otherwise target-lints changed crates, then full
+# lint + unit tests. Posts a `signoff` commit status on HEAD so the PR can enter
+# the merge queue. See scripts/signoff and docs/dev/ci_signoff.md.
 .PHONY: signoff
 signoff:
 	@./scripts/signoff
+
+# Remote sign-off for the current branch: probe lab SSH hosts (192.168.1.100,
+# 192.168.1.101) for a Git checkout at $HOME/dev/spice2 and run scripts/signoff
+# there when available; otherwise dispatch the self-hosted GitHub Actions
+# signoff.yml workflow. Supports Git and JJ via scripts/signoff remote. Skips
+# Rust lint/build/tests when the branch has no Rust-affecting files vs trunk
+# (same as local signoff).
+.PHONY: signoff-remote
+signoff-remote:
+	@./scripts/signoff remote
 
 .PHONY: test
 test:
 	@cargo test --all --lib
 
+# Indent these with spaces, never a tab: this block follows the `test` recipe, so
+# a tab-indented line is parsed as another command in that recipe instead of an
+# assignment — which both breaks `make test` and silently empties the variable.
 ifdef RUST_PROFILE
     CARGO_PROFILE := --profile $(RUST_PROFILE)
-	NEXTEST_CARGO_PROFILE := --cargo-profile $(RUST_PROFILE)
+    NEXTEST_CARGO_PROFILE := --cargo-profile $(RUST_PROFILE)
 else
-	CARGO_PROFILE := --profile dev
-	NEXTEST_CARGO_PROFILE := --cargo-profile dev
+    CARGO_PROFILE := --profile dev
+    NEXTEST_CARGO_PROFILE := --cargo-profile dev
 endif
 
 .PHONY: nextest
 nextest:
 	@cargo nextest run --all --lib $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
 	@cargo nextest run -p cayenne --tests $(NEXTEST_CARGO_PROFILE)
+
+# Unit tests for named packages — the fail-fast pre-check scripts/signoff runs on
+# the crates a branch touched, before the full workspace gate. Same lib-only
+# scope and profile as `nextest`, so its test binaries carry into that run.
+# Callers must filter out packages without a library target: `--lib` is a fatal
+# `no library targets found` on bin-only crates.
+# --no-tests=pass because a scoped selection legitimately covers crates with no
+# unit tests (29 workspace libraries have none). nextest exits 4 on "no tests to
+# run" by default, which would abort the sign-off for a branch that only touched
+# one of them; the full `nextest` run still gates the workspace.
+.PHONY: nextest-packages
+nextest-packages:
+	@test -n "$(strip $(PACKAGES))" || { echo 'nextest-packages requires PACKAGES="crate1 crate2"' >&2; exit 1; }
+	@cargo nextest run --no-tests=pass $(_LINT_PKG_FLAGS) --lib $(_FEATURES_FLAGS) $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
 
 # Also update .github/workflows/integration.yml with changes to this target
 .PHONY: test-integration
@@ -108,13 +137,51 @@ test-integration-models-without-openai:
 test-bench:
 	@cargo bench -p runtime --features postgres,spark,mysql
 
+## Optional: PACKAGES="pkg1 pkg2" to lint specific packages instead of the whole workspace
+## Optional: FEATURES="feat1,feat2" to override features
+## Feature defaults: when FEATURES is unset, uses the full release feature set for
+## workspace-wide linting (unless PACKAGES is set, then uses package defaults —
+## workspace features like `models` are not valid on every crate).
+## Example: make lint-rust PACKAGES="runtime data_components"
+## Example: make lint-rust-fix PACKAGES="runtime data_components" FEATURES="duckdb,postgres"
+PACKAGES ?=
+FEATURES ?=
+# Use strip non-empty checks (not bare ifdef): PACKAGES/FEATURES are always
+# assigned via ?=, and empty command-line overrides (PACKAGES= FEATURES=) must
+# fall through to workspace defaults — not emit `-p`/`--features` with no value.
+ifneq ($(strip $(PACKAGES)),)
+_LINT_PKG_FLAGS := $(foreach p,$(PACKAGES),-p $(p))
+_LINT_WORKSPACE_FLAGS := $(_LINT_PKG_FLAGS)
+_FMT_FLAGS := $(_LINT_PKG_FLAGS)
+# Scoped runs rely on cargo's default target selection (the package's lib
+# and/or bins — the same set --lib --bins names): an explicit --lib is a fatal
+# `no library targets found` on bin-only packages (e.g. testoperator), which
+# breaks the targeted pre-lint that scripts/signoff derives for such branches.
+_LINT_TARGET_FLAGS :=
+else
+_LINT_WORKSPACE_FLAGS := --workspace --exclude libnfs --exclude lopdf --exclude ttf-parser --exclude pdf-extract
+_FMT_FLAGS := --all
+_LINT_TARGET_FLAGS := --lib --bins
+endif
+# Apply FEATURES if provided, otherwise default to hardcoded features only for workspace-wide linting
+ifneq ($(strip $(FEATURES)),)
+_FEATURES_FLAGS := --features $(FEATURES)
+else ifneq ($(strip $(PACKAGES)),)
+_FEATURES_FLAGS :=
+else
+_FEATURES_FLAGS := --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control,spicebench
+endif
+
 .PHONY: lint lint-rust
 lint: lint-rust
 
+# Full workspace lint (default), or scoped via PACKAGES=… for a fast fail-first pass.
 lint-rust:
-	cargo fmt --all -- --check
+	cargo fmt $(_FMT_FLAGS) -- --check
+	## Crate-layering guard (fast, no compile): no crate may depend on a higher tier. See docs/dev/crate_layering.md
+	python3 scripts/check_crate_layers.py
 	## All except metal, cuda, nfs (nfs requires system libnfs library)
-	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going --lib --bins --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control,spicebench --workspace --exclude libnfs --exclude lopdf --exclude ttf-parser --exclude pdf-extract -- \
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going $(_LINT_TARGET_FLAGS) $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -129,7 +196,7 @@ lint-rust:
 		-Dclippy::todo \
 		-Dclippy::assertions_on_result_states \
 		-Dclippy::allow_attributes
-	cargo clippy $(CARGO_PROFILE) --keep-going --tests --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control,spicebench --workspace --exclude libnfs --exclude lopdf --exclude ttf-parser --exclude pdf-extract -- \
+	cargo clippy $(CARGO_PROFILE) --keep-going --tests $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -146,33 +213,10 @@ lint-rust:
 		-Dclippy::allow_attributes \
 		-Aunfulfilled_lint_expectations
 
-## Optional: PACKAGES="pkg1 pkg2" to lint specific packages instead of the whole workspace
-## Optional: FEATURES="feat1,feat2" to override features
-## Feature defaults: when FEATURES is unset, uses aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control for workspace (unless PACKAGES is set, then uses package defaults)
-## Example: make lint-rust-fix PACKAGES="runtime data_components" FEATURES="duckdb,postgres"
-PACKAGES ?=
-FEATURES ?=
-ifdef PACKAGES
-_LINT_PKG_FLAGS := $(foreach p,$(PACKAGES),-p $(p))
-_LINT_WORKSPACE_FLAGS := $(_LINT_PKG_FLAGS)
-_FMT_FLAGS := $(_LINT_PKG_FLAGS)
-else
-_LINT_WORKSPACE_FLAGS := --workspace --exclude libnfs --exclude lopdf --exclude ttf-parser --exclude pdf-extract
-_FMT_FLAGS := --all
-endif
-# Apply FEATURES if provided, otherwise default to hardcoded features only for workspace-wide linting
-ifdef FEATURES
-_FEATURES_FLAGS := --features $(FEATURES)
-else ifdef PACKAGES
-_FEATURES_FLAGS :=
-else
-_FEATURES_FLAGS := --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control,spicebench
-endif
-
 lint-rust-fix:
 	cargo fmt $(_FMT_FLAGS)
 	## All except metal, cuda, nfs (nfs requires system libnfs library)
-	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --fix --allow-dirty $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) $(_LINT_TARGET_FLAGS) --fix --allow-dirty $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \

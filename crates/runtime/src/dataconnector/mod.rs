@@ -124,6 +124,17 @@ pub static DATA_CONNECTOR_REGISTRATIONS: [DataConnectorRegistration] = [..];
 ///
 /// Using this macro automatically adds the connector to the distributed slice,
 /// making it available for discovery by the runtime.
+///
+/// # Linking (connectors in their own crate)
+///
+/// The registration this generates is a `#[linkme::distributed_slice]` static, and a static
+/// is included only when its crate is actually linked — merely being a Cargo dependency is
+/// **not** enough, because the linker drops the unreferenced static. So a connector defined in
+/// its own crate (e.g. a `connector-*` crate) must be **force-linked** in every binary/tool that
+/// should see it, via `use <crate> as _;`: currently `bin/spiced` (so `register_all()` registers
+/// it) and `tools/spicepodschema` (so it appears in the generated schema). Miss that line and the
+/// connector silently vanishes from both. Connectors defined inside `runtime` itself need nothing
+/// extra, since `runtime` is always linked.
 #[macro_export]
 macro_rules! register_data_connector {
     ($fn_name:ident, $static_name:ident, $name:expr, $factory:path) => {
@@ -155,16 +166,16 @@ macro_rules! register_data_connector {
 // cosmosdb: moved to crates/data-connectors/connector-cosmosdb
 // #[cfg(feature = "cosmosdb")] pub mod cosmosdb;
 #[cfg(feature = "debezium")]
+pub mod cdc_ingest;
+#[cfg(feature = "debezium")]
 pub mod debezium;
-#[cfg(feature = "dynamodb")]
-pub mod dynamodb;
 pub mod file;
 
 // git: moved to crates/data-connectors/connector-git
 // github: moved to crates/data-connectors/connector-github
 pub mod https;
 // kafka connector moved to crates/data-connectors/connector-kafka; module kept for debezium sidecar types
-#[cfg(feature = "kafka")]
+#[cfg(feature = "debezium")]
 pub mod kafka;
 pub mod localpod;
 pub mod memory;
@@ -623,9 +634,6 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
         &self,
         _federated_table: Arc<FederatedTable>,
         _dataset: &Dataset,
-        _accelerated_table_provider: Arc<dyn TableProvider>,
-        _accelerator_write_mutex: Arc<Mutex<()>>,
-        _cpu_runtime: Option<tokio::runtime::Handle>,
     ) -> Option<ChangesStream> {
         None
     }
@@ -636,6 +644,33 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
 
     fn append_stream(&self, _federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
         None
+    }
+
+    /// Whether this connector can accept durable federated write-back delivery
+    /// without risking the silent loss of a committed write.
+    ///
+    /// Delivery reconciles a committed accelerator row to the source. Emulating
+    /// an upsert as a standalone `DELETE` followed by a separate `INSERT` is
+    /// **not** safe for a CDC-fed accelerator: the two are distinct source
+    /// commits, so the source echoes the `DELETE` back over CDC and erases the
+    /// committed row from the accelerator. If the follow-up `INSERT` then fails,
+    /// the next delivery pass sees the key as absent, treats the delete as
+    /// complete, and clears the marker — the write is gone from both sides with
+    /// no error raised.
+    ///
+    /// Returning `true` therefore asserts that delivery is atomic from the
+    /// source's point of view: either a single transaction covering both legs,
+    /// or a native conditional upsert (`INSERT … ON CONFLICT DO UPDATE`) that
+    /// removes the delete leg entirely for present keys.
+    ///
+    /// Defaults to `false` — the conservative answer. A connector that has not
+    /// been audited for this makes the dataset fail registration with an
+    /// actionable error rather than silently risk losing writes.
+    ///
+    /// **Wrappers must forward this.** Inheriting the default would report a
+    /// perfectly safe inner connector as unsafe and reject a valid dataset.
+    fn supports_durable_write_back_delivery(&self) -> bool {
+        false
     }
 
     async fn metadata_provider(
@@ -1127,6 +1162,70 @@ mod tests {
         assert!(
             result_two.expect("second factory should exist").is_ok(),
             "second connector should initialize successfully"
+        );
+    }
+
+    /// A source that advertises safe durable write-back delivery, so a wrapper
+    /// that silently inherits the trait default is visible as `false`.
+    #[derive(Debug)]
+    struct SafeDeliveryConnector;
+
+    #[async_trait]
+    impl DataConnector for SafeDeliveryConnector {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        async fn read_provider(
+            &self,
+            _dataset: &Dataset,
+        ) -> DataConnectorResult<Arc<dyn TableProvider>> {
+            unimplemented!("capability-forwarding test never reads")
+        }
+
+        fn supports_durable_write_back_delivery(&self) -> bool {
+            true
+        }
+    }
+
+    /// `supports_durable_write_back_delivery` has a `false` default, so any
+    /// wrapper that forgets to forward it silently reports a safe source as
+    /// unsafe and the registration gate rejects a valid dataset. That is the
+    /// defaulted-no-op wrapper bug (#10460) applied to this capability, and it
+    /// compiles cleanly — only a test catches it.
+    ///
+    /// `ElasticsearchFullTextConnector` forwards the same one-liner but is
+    /// behind the `elasticsearch` feature and needs a params-bearing dataset to
+    /// construct, so it is not exercised here.
+    #[test]
+    fn every_wrapper_forwards_durable_write_back_delivery_support() {
+        let inner: Arc<dyn DataConnector> = Arc::new(SafeDeliveryConnector);
+        assert!(
+            inner.supports_durable_write_back_delivery(),
+            "precondition: the wrapped source advertises safe delivery"
+        );
+
+        let deferred = crate::dataconnector::deferred::DeferredConnector::new(Arc::clone(&inner));
+        assert!(
+            deferred.supports_durable_write_back_delivery(),
+            "DeferredConnector must forward the source's delivery capability"
+        );
+
+        let full_text =
+            crate::search::full_text::connector::FullTextConnector::new(Arc::clone(&inner));
+        assert!(
+            full_text.supports_durable_write_back_delivery(),
+            "FullTextConnector must forward the source's delivery capability"
+        );
+
+        let embedding = crate::embeddings::connector::EmbeddingConnector::new(
+            Arc::clone(&inner),
+            Arc::new(RwLock::new(std::collections::HashMap::new())),
+            Arc::new(RwLock::new(Secrets::default())),
+        );
+        assert!(
+            embedding.supports_durable_write_back_delivery(),
+            "EmbeddingConnector must forward the source's delivery capability"
         );
     }
 }

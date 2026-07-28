@@ -258,6 +258,10 @@ jobs:
             HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew install expect
           fi
 
+      - name: Test the expect scripts driving the REPLs
+        run: |
+          ./test/models/expect_test.sh
+
       - name: Test vector search
         run: |
           ./test/models/search_01.exp
@@ -343,6 +347,10 @@ jobs:
           else
             HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew install expect
           fi
+
+      - name: Test the expect scripts driving the REPLs
+        run: |
+          ./test/models/expect_test.sh
 
       - name: Test vector search
         run: |
@@ -2025,7 +2033,12 @@ jobs:
           # first: "TProtocolException: Invalid data" (corrupt Thrift footer)
           # or "don't know what type:" with an empty type (schema element not
           # yet written). Tolerate both variants of that specific transient.
-          if grep -iE "(failed|error)" spice.log \
+          #
+          # Strip ANSI first: spiced logs with_ansi(true), so whitelist
+          # patterns like `WARN +runtime::...` miss `WARN\e[0m \e[2mruntime::...`
+          # and the same transient fails the job (see run 29659183104).
+          if sed $'s/\x1b\\[[0-9;]*m//g' spice.log \
+             | grep -iE "(failed|error)" \
              | grep -vE "WARN +runtime::accelerated_table::refresh_task: Failed to load data for dataset" \
              | grep -vE "^Invalid Error: TProtocolException: Invalid data$" \
              | grep -vE "^Invalid Error: don't know what type: *$"; then
@@ -2062,10 +2075,12 @@ jobs:
         run: |
           killall spice || true
           cat spice.log
-          # See note above: tolerate transient parquet-rename races emitted
-          # at WARN level by the refresh task (both the "TProtocolException:
-          # Invalid data" and empty-type "don't know what type:" variants).
-          if grep -iE "(failed|error)" spice.log \
+          # See note above: strip ANSI, then tolerate transient parquet-rename
+          # races emitted at WARN level by the refresh task (both the
+          # "TProtocolException: Invalid data" and empty-type "don't know what
+          # type:" variants).
+          if sed $'s/\x1b\\[[0-9;]*m//g' spice.log \
+             | grep -iE "(failed|error)" \
              | grep -vE "WARN +runtime::accelerated_table::refresh_task: Failed to load data for dataset" \
              | grep -vE "^Invalid Error: TProtocolException: Invalid data$" \
              | grep -vE "^Invalid Error: don't know what type: *$"; then

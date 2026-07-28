@@ -43,6 +43,12 @@ use datafusion_federation::FederatedTableProviderAdaptor;
 ///   }
 /// ]
 /// ```
+///
+/// `foreign_table` is a fully-qualified `catalog.schema.table` name whose
+/// components are quoted following `PostgreSQL` `quote_ident` semantics
+/// (quoted only when required, doubling any embedded `"`). This keeps the
+/// name unambiguous — and round-trippable via `TableReference::parse_str` —
+/// when a component legally contains a `.`, e.g. `catalog."my.schema".table`.
 pub const FOREIGN_KEYS_METADATA_KEY: &str = "foreign_keys";
 
 /// Canonical Arrow metadata key for user-facing table and column descriptions.
@@ -62,38 +68,38 @@ pub const CLUSTERING_METADATA_KEY: &str = "clustering";
 /// Canonical Arrow schema metadata key for a source-native clustering expression.
 pub const CLUSTERING_KEY_METADATA_KEY: &str = "clustering_key";
 
-/// Schema-level metadata key for an inferred primary key (extended schema inference).
+/// Schema-level metadata key for an inferred primary key (schema inference).
 ///
 /// The value is a JSON array of column names in key order, e.g. `["tenant_id","id"]`.
-/// Emitted by connectors that perform extended schema inference and consumed by the
+/// Emitted by connectors that perform schema inference and consumed by the
 /// runtime to fill `acceleration.primary_key` when the user left it unset.
 pub const INFERRED_PRIMARY_KEY_METADATA_KEY: &str = "spice.inferred_primary_key";
 
-/// Schema-level metadata key for inferred secondary indexes (extended schema inference).
+/// Schema-level metadata key for inferred secondary indexes (schema inference).
 ///
 /// The value is a JSON array of objects, each describing one index:
 /// `[{ "columns": ["email"], "unique": true }]`.
 pub const INFERRED_INDEXES_METADATA_KEY: &str = "spice.inferred_indexes";
 
-/// Schema-level metadata key for inferred sort/clustering columns (extended schema inference).
+/// Schema-level metadata key for inferred sort/clustering columns (schema inference).
 ///
 /// The value is a JSON array of objects in sort order, each with a direction:
 /// `[{ "column": "created_at", "desc": true }, { "column": "id", "desc": false }]`.
 pub const INFERRED_SORT_COLUMNS_METADATA_KEY: &str = "spice.inferred_sort_columns";
 
-/// Schema-level metadata key for the rough estimated row count (extended schema inference).
+/// Schema-level metadata key for the rough estimated row count (schema inference).
 ///
 /// The value is a base-10 integer string. This is a catalog estimate (e.g. Postgres
 /// `pg_class.reltuples`), not a precise count, and is surfaced as table statistics.
 pub const INFERRED_ROW_COUNT_METADATA_KEY: &str = "spice.inferred_row_count";
 
-/// Schema-level metadata key for the rough estimated table byte size (extended schema inference).
+/// Schema-level metadata key for the rough estimated table byte size (schema inference).
 ///
 /// The value is a base-10 integer string of bytes (e.g. Postgres `pg_relation_size`).
 pub const INFERRED_TABLE_BYTES_METADATA_KEY: &str = "spice.inferred_table_bytes";
 
 /// Schema-level metadata key for the source's declared distribution/shard key
-/// (extended schema inference): Postgres partition-key columns or the `MongoDB`
+/// (schema inference): Postgres partition-key columns or the `MongoDB`
 /// shard-key fields.
 ///
 /// The value is a JSON array of column names in key order: `["region", "id"]`.
@@ -112,10 +118,6 @@ pub type FieldMetadata = HashMap<String, HashMap<String, String>>;
 #[cfg(feature = "adbc")]
 pub mod adbc_helpers;
 pub mod arrow;
-#[cfg(feature = "clickhouse")]
-pub mod clickhouse;
-#[cfg(feature = "cosmosdb")]
-pub mod cosmosdb;
 #[cfg(feature = "databricks")]
 pub mod databricks;
 #[cfg(feature = "debezium")]
@@ -128,8 +130,6 @@ pub mod delta_lake;
 pub mod duckdb;
 #[cfg(feature = "duckdb")]
 pub mod ducklake;
-#[cfg(feature = "dynamodb")]
-pub mod dynamodb;
 #[cfg(feature = "elasticsearch")]
 pub mod elasticsearch;
 #[cfg(feature = "federation")]
@@ -142,16 +142,12 @@ pub mod iceberg;
 pub mod inferred_schema;
 #[cfg(any(feature = "debezium", feature = "kafka"))]
 pub mod kafka;
-#[cfg(feature = "mongodb")]
-pub mod mongodb;
 #[cfg(feature = "mssql")]
 pub mod mssql;
 #[cfg(feature = "mysql")]
 pub mod mysql;
 #[cfg(feature = "mysql")]
 pub mod mysql_replication;
-#[cfg(feature = "odbc")]
-pub mod odbc;
 #[cfg(feature = "oracle")]
 pub mod oracle;
 #[cfg(feature = "postgres")]
@@ -168,12 +164,8 @@ pub mod schema_discovery;
 /// `datafusion-table-providers` fork so providers defined there (`MongoDB`) can
 /// reuse it; re-exported here for the in-repo connectors (`DynamoDB`, Debezium).
 pub use datafusion_table_providers::schema_projection;
-#[cfg(feature = "scylladb")]
-pub mod scylladb;
 pub mod sql_expr;
 
-#[cfg(feature = "sharepoint")]
-pub mod sharepoint;
 #[cfg(feature = "snowflake")]
 pub mod snowflake;
 #[cfg(feature = "spark_connect")]
@@ -185,18 +177,13 @@ pub mod sqlite;
 pub mod turso;
 pub mod unity_catalog;
 
-pub mod git;
-pub mod github;
 pub mod key_filter;
 pub mod pk_filter_expr;
 pub mod rate_limit;
 
 pub mod cdc;
 pub mod delete;
-pub mod graphql;
 pub mod http;
-#[cfg(feature = "imap")]
-pub mod imap;
 pub mod index_maintenance;
 pub mod object;
 pub mod poly;

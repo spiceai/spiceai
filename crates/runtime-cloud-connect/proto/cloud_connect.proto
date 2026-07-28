@@ -59,6 +59,7 @@ message ControlMessage {
     GetStatus get_status = 22;
     Drain drain = 23;
     Pause pause = 24;
+    GetPodLogs get_pod_logs = 28;
   }
 }
 
@@ -75,7 +76,12 @@ message Hello {
   string public_ip_hint = 10;
   string operator_version = 30;
   map<string, string> runtime_versions = 31;
-  string agent_pubkey_pem = 32;
+  string agent_pubkey_pem = 32;     // client identity public key (PEM); set during enrollment
+  // PKCS#10 CSR (PEM) for the client-generated keypair. Present on the
+  // enrollment Hello; dp validates `credential`, signs this CSR with its
+  // issuing CA, and returns the leaf in Adopt.identity_cert_pem. Binding the
+  // issued cert to a client-proven key is what makes the subsequent mTLS real.
+  string csr_pem = 33;
 }
 
 message Heartbeat {
@@ -154,8 +160,9 @@ message UpgradeRuntime {
 message Adopt {
   string command_id = 1;
   string assigned_identifier = 2;
-  string identity_cert_pem = 3;
+  string identity_cert_pem = 3;     // leaf cert dp signed from Hello.csr_pem
   uint64 not_after_unix = 4;
+  string ca_bundle_pem = 5;         // dp issuing-CA chain the client pins for mTLS
 }
 
 message Forget {
@@ -193,4 +200,22 @@ message Drain {
 message Pause {
   string command_id = 1;
   bool paused = 2;
+}
+
+// GetPodLogs returns recent stdout/stderr of a spiced runtime. For
+// cluster (BYOC) instances the operator reads the logs from the customer
+// cluster's kube API. For a standalone spiced there is no pod: the runtime
+// returns its own recently-captured log lines. Either way the log text is
+// returned verbatim in CommandResult.payload_json (a raw string, not JSON).
+// Only `tail_lines` is meaningful for standalone; the namespace/kind/name/
+// pod_name fields address a workload in a cluster and are ignored otherwise.
+// Field numbers must stay identical to the ai-platform / operator copies of
+// this proto.
+message GetPodLogs {
+  string command_id = 1;
+  string namespace = 2;
+  string name = 3;
+  string kind = 4;
+  string pod_name = 5;
+  int64 tail_lines = 6;
 }

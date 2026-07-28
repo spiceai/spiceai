@@ -56,44 +56,501 @@ env:
 jobs:
   # On a pull request this is the ONLY job that runs. It validates the developer
   # sign-off — the `signoff` commit status posted by `make signoff` — for the PR's
-  # head commit. A green Attestation (plus review) is what lets the PR into the
-  # merge queue, where the heavy jobs below and the other workflows run the full
-  # suite. This is what replaces running all checks on every PR push.
+  # head commit. It can also walk through clean, unmodified base-merge commits
+  # on the first-parent chain to find an earlier sign-off. A green Attestation
+  # (plus review) is what lets the PR into the merge queue, where the
+  # heavy jobs below and the other workflows run the full suite. This is what
+  # replaces running all checks on every PR push.
   attestation:
-    # GitHub-hosted: this job only calls the API, and self-hosted runners don't
-    # run for fork PRs — which would leave external contributors' required
-    # Attestation check unreported and stuck.
+    # GitHub-hosted: self-hosted runners don't run for fork PRs, which would
+    # leave external contributors' required Attestation check unreported and
+    # stuck.
     name: Attestation
     runs-on: ubuntu-latest
     permissions:
       contents: read
       statuses: read
+      # pulls.listCommits for pure-revert fast-track detection
+      pull-requests: read
     steps:
-      - name: Validate developer sign-off
-        if: ${{ github.event_name == 'pull_request' }}
+      # Dependabot dependency bumps are fast-tracked: a PR Dependabot opened that
+      # is still exactly the one commit Dependabot pushed carries no
+      # human-authored change to sign off on, and the merge queue re-runs the
+      # whole suite on the merged result anyway. The moment the branch grows a
+      # second commit — a build fix after the queue rejects it, a base merge, a
+      # follow-up — the PR no longer matches and needs a normal `make signoff`.
+      - name: Fast-track Dependabot dependency bumps
+        id: dependabot
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.user.login == 'dependabot[bot]' }}
+        # Best-effort: any unexpected script failure must fall through to the
+        # normal developer sign-off path, not fail required Attestation.
+        continue-on-error: true
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
-            const sha = context.payload.pull_request.head.sha;
-            const { data } = await github.rest.repos.getCombinedStatusForRef({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              ref: sha,
-            });
-            // 'signoff' matches the hardcoded STATUS_CONTEXT in scripts/signoff.
-            const signoff = data.statuses.find((s) => s.context === 'signoff');
-            if (signoff && signoff.state === 'success') {
-              core.notice(`Signed off by ${signoff.creator?.login ?? 'unknown'}: ${signoff.description ?? ''}`);
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pull_number = context.payload.pull_request.number;
+
+            // Dependabot pushes its branches into this repository, so a fork PR
+            // can never be one — and auto-passing a fork would sidestep the
+            // trusted-committer boundary the sign-off model rests on.
+            const headRepo = context.payload.pull_request.head.repo?.full_name;
+            const baseRepo = context.payload.pull_request.base.repo?.full_name;
+            if (!headRepo || headRepo !== baseRepo) {
+              core.info('PR is from a fork; Dependabot fast-track does not apply.');
               return;
             }
-            core.setFailed(
-              `No developer sign-off found for ${sha}.\n\n` +
-              `On your machine, with this commit pushed, run:\n\n` +
-              `    make signoff\n\n` +
-              `It runs lint + unit tests locally and records a sign-off on this exact\n` +
-              `commit (push a new commit and you must sign off again). The full test\n` +
-              `suite then runs in the merge queue. See docs/dev/ci_signoff.md.`
+
+            let commits;
+            try {
+              commits = await github.paginate(github.rest.pulls.listCommits, {
+                owner,
+                repo,
+                pull_number,
+                per_page: 100,
+              });
+            } catch (error) {
+              core.info(
+                `Could not list PR commits for Dependabot fast-track (${error.message}); ` +
+                `falling back to developer sign-off.`
+              );
+              return;
+            }
+
+            if (commits.length !== 1) {
+              core.info(
+                `PR carries ${commits.length} commits; the Dependabot fast-track covers only ` +
+                `the single commit Dependabot pushed. Run make signoff on the pushed HEAD.`
+              );
+              return;
+            }
+
+            // Dependabot opened the PR, but its branch lives in this repository,
+            // so anyone with write access can replace that commit. Require the
+            // commit itself to be Dependabot's, on all three counts below.
+            const [commit] = commits;
+            if (commit.author?.login !== 'dependabot[bot]') {
+              core.info(
+                `The PR's single commit ${commit.sha} is authored by ` +
+                `${commit.author?.login ?? 'an unknown account'}, not dependabot[bot]; ` +
+                `Dependabot fast-track does not apply.`
+              );
+              return;
+            }
+
+            // The author line alone proves nothing: it is plain commit metadata,
+            // and GitHub's signature verification attests the *committer*, not
+            // the author. Someone with write access and a registered signing key
+            // could push a commit they authored as themselves while naming
+            // dependabot[bot] as author, and it would still verify. Dependabot
+            // creates its commits through GitHub's API, so GitHub signs them and
+            // the committer is its own web-flow identity (noreply@github.com) --
+            // which a locally-committed commit cannot claim. Verified against
+            // every Dependabot bump in this repository. If GitHub ever changes
+            // that identity this check fails closed: bumps stop being
+            // fast-tracked and fall back to a normal sign-off.
+            if (commit.committer?.login !== 'web-flow') {
+              core.info(
+                `The PR's single commit ${commit.sha} was committed by ` +
+                `${commit.committer?.login ?? 'an unknown account'} rather than GitHub ` +
+                `itself, so its signature does not attest Dependabot authorship; ` +
+                `Dependabot fast-track does not apply.`
+              );
+              return;
+            }
+
+            const verification = commit.commit?.verification;
+            if (!verification?.verified) {
+              core.info(
+                `The PR's single commit ${commit.sha} does not carry a verified signature ` +
+                `(${verification?.reason ?? 'no verification data'}); Dependabot fast-track ` +
+                `does not apply.`
+              );
+              return;
+            }
+
+            core.setOutput('fast_track', 'true');
+            core.notice(
+              `Fast-tracked Dependabot commit ${commit.sha.slice(0, 12)}; the full suite ` +
+              `still runs in the merge queue.`
             );
+
+      # Branches that can't affect Rust lint, build, or tests are fast-tracked.
+      # `make signoff` already skips every Rust check for these (see
+      # branch_has_rust_changes in scripts/signoff) and posts the status anyway,
+      # so requiring the developer to run it buys nothing — the sign-off would
+      # attest a run that did no work. The merge queue's `check_changes` gate
+      # applies the same reasoning to the merged result.
+      #
+      # KEEP THE PATTERN IN SYNC with branch_has_rust_changes in scripts/signoff.
+      # This one also inspects renames (previous_filename), so it is strictly the
+      # more conservative of the two.
+      - name: Fast-track branches with no Rust-affecting files
+        id: no_rust
+        if: ${{ github.event_name == 'pull_request' && steps.dependabot.outputs.fast_track != 'true' }}
+        # Best-effort: any unexpected script failure must fall through to the
+        # normal developer sign-off path, not fail required Attestation.
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pull_number = context.payload.pull_request.number;
+
+            // Same-repo only, matching the other fast-tracks: a fork PR still
+            // takes a maintainer sign-off (posting a status needs write access),
+            // and that trusted-committer boundary shouldn't depend on which
+            // files the PR happens to touch.
+            const headRepo = context.payload.pull_request.head.repo?.full_name;
+            const baseRepo = context.payload.pull_request.base.repo?.full_name;
+            if (!headRepo || headRepo !== baseRepo) {
+              core.info('PR is from a fork; no-Rust fast-track does not apply.');
+              return;
+            }
+
+            let files;
+            try {
+              files = await github.paginate(github.rest.pulls.listFiles, {
+                owner,
+                repo,
+                pull_number,
+                per_page: 100,
+              });
+            } catch (error) {
+              core.info(
+                `Could not list PR files for no-Rust fast-track (${error.message}); ` +
+                `falling back to developer sign-off.`
+              );
+              return;
+            }
+
+            // listFiles caps at 3000 entries with no truncation flag, so treat a
+            // diff at the cap as unknown rather than assume the tail is docs.
+            if (files.length === 0 || files.length >= 3000) {
+              core.info(
+                `PR reports ${files.length} changed files; no-Rust fast-track does not apply.`
+              );
+              return;
+            }
+
+            const rustAffecting =
+              /(\.rs$|(^|\/)Cargo\.(toml|lock)$|(^|\/)rust-toolchain(\.toml)?$|(^|\/)\.cargo\/)/;
+            for (const file of files) {
+              // A rename off a .rs path changes Rust sources even though the new
+              // name doesn't match, so both sides of the rename must be clean.
+              for (const path of [file.filename, file.previous_filename]) {
+                if (path && rustAffecting.test(path)) {
+                  core.info(
+                    `${path} can affect Rust lint/build/tests; no-Rust fast-track does ` +
+                    `not apply.`
+                  );
+                  return;
+                }
+              }
+            }
+
+            core.setOutput('fast_track', 'true');
+            core.notice(
+              `Fast-tracked ${files.length} changed file(s): no .rs, Cargo, rust-toolchain, ` +
+              `or .cargo/ paths, so a sign-off would run no Rust checks. The full suite ` +
+              `still runs in the merge queue.`
+            );
+
+      # Pure reverts are fast-tracked: undoing a commit that already landed on
+      # (and so passed the full suite through) the base branch is low-risk, and
+      # the merge queue re-runs the whole suite on the merged result anyway. A
+      # revert PR passes Attestation with no local sign-off. Every commit the PR
+      # introduces must be a Git revert (carry the "This reverts commit <sha>."
+      # footer), and each reverted commit must already be on the base branch.
+      # Same-repo only: fork contributors already can't self-sign-off (posting a
+      # status needs write access), so auto-passing a fork here would sidestep
+      # the trusted-committer boundary — a fork revert still takes a maintainer
+      # sign-off. Anything not matching falls through to the sign-off check below.
+      - name: Fast-track pure reverts
+        id: revert
+        if: ${{ github.event_name == 'pull_request' && steps.dependabot.outputs.fast_track != 'true' && steps.no_rust.outputs.fast_track != 'true' }}
+        # Best-effort: any unexpected script failure must fall through to the
+        # normal developer sign-off path, not fail required Attestation for
+        # every PR. listCommits/compare errors are also try/caught inside.
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pull_number = context.payload.pull_request.number;
+            const baseSha = context.payload.pull_request.base.sha;
+
+            const headRepo = context.payload.pull_request.head.repo?.full_name;
+            const baseRepo = context.payload.pull_request.base.repo?.full_name;
+            if (!headRepo || headRepo !== baseRepo) {
+              core.info('PR is from a fork; revert fast-track does not apply.');
+              return;
+            }
+
+            // Failures here must fall through to the normal sign-off path — never
+            // fail Attestation for the whole PR because we couldn't prove purity.
+            let commits;
+            try {
+              commits = await github.paginate(github.rest.pulls.listCommits, {
+                owner,
+                repo,
+                pull_number,
+                per_page: 100,
+              });
+            } catch (error) {
+              core.info(
+                `Could not list PR commits for revert fast-track (${error.message}); ` +
+                `falling back to developer sign-off.`
+              );
+              return;
+            }
+            if (commits.length === 0) {
+              core.info('PR introduces no commits; revert fast-track does not apply.');
+              return;
+            }
+
+            // The footer Git writes for each reverted commit (full 40-char SHA).
+            // `git revert` creates one commit per reverted commit; a single
+            // --no-commit batch can carry several footers, so collect every match.
+            const revertFooter = /^This reverts commit ([0-9a-f]{40})\.$/gm;
+            const revertedShas = new Set();
+            for (const c of commits) {
+              const message = c.commit?.message ?? '';
+              const matches = [...message.matchAll(revertFooter)];
+              if (matches.length === 0) {
+                core.info(
+                  `Commit ${c.sha} is not a Git revert (no "This reverts commit ..." ` +
+                  `footer); revert fast-track does not apply.`
+                );
+                return;
+              }
+              for (const m of matches) {
+                revertedShas.add(m[1]);
+              }
+            }
+
+            // Each reverted commit must already be on the base branch — you can
+            // only fast-track undoing something that actually landed. compare
+            // base...sha reports ahead_by === 0 exactly when sha carries no
+            // commits the base lacks, i.e. sha is an ancestor of (or equal to)
+            // the base tip.
+            for (const sha of revertedShas) {
+              let ancestor = false;
+              try {
+                const { data } = await github.rest.repos.compareCommitsWithBasehead({
+                  owner,
+                  repo,
+                  basehead: `${baseSha}...${sha}`,
+                });
+                ancestor = data.ahead_by === 0;
+              } catch (error) {
+                core.info(
+                  `Could not confirm reverted commit ${sha} is on the base branch ` +
+                  `(${error.message}); revert fast-track does not apply.`
+                );
+                return;
+              }
+              if (!ancestor) {
+                core.info(
+                  `Reverted commit ${sha} is not on the base branch; revert ` +
+                  `fast-track does not apply.`
+                );
+                return;
+              }
+            }
+
+            core.setOutput('fast_track', 'true');
+            core.notice(
+              `Fast-tracked ${commits.length} revert commit(s) reverting ` +
+              `${[...revertedShas].map((s) => s.slice(0, 12)).join(', ')}; ` +
+              `the full suite still runs in the merge queue.`
+            );
+
+      - name: Inspect developer sign-off
+        id: signoff
+        if: ${{ github.event_name == 'pull_request' && steps.dependabot.outputs.fast_track != 'true' && steps.no_rust.outputs.fast_track != 'true' && steps.revert.outputs.fast_track != 'true' }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const headSha = context.payload.pull_request.head.sha;
+            const baseSha = context.payload.pull_request.base.sha;
+            const maxInheritedMerges = 100;
+
+            // 'signoff' matches the hardcoded STATUS_CONTEXT in scripts/signoff.
+            async function successfulSignoff(sha) {
+              const { data } = await github.rest.repos.getCombinedStatusForRef({
+                owner,
+                repo,
+                ref: sha,
+              });
+              const signoff = data.statuses.find((status) => status.context === 'signoff');
+              return signoff?.state === 'success' ? signoff : undefined;
+            }
+
+            const merges = [];
+            let currentSha = headSha;
+            for (let depth = 0; depth <= maxInheritedMerges; depth += 1) {
+              const signoff = await successfulSignoff(currentSha);
+              if (signoff) {
+                if (merges.length === 0) {
+                  core.notice(
+                    `Signed off by ${signoff.creator?.login ?? 'unknown'}: ` +
+                    `${signoff.description ?? ''}`
+                  );
+                  return;
+                }
+
+                core.setOutput('inheritance_candidate', 'true');
+                core.setOutput('merge_chain', JSON.stringify(merges));
+                core.setOutput('signed_sha', currentSha);
+                core.setOutput('current_base_sha', baseSha);
+                core.notice(
+                  `Found sign-off on ${currentSha} behind ${merges.length} base merge(s); ` +
+                  `verifying each automatic merge result.`
+                );
+                return;
+              }
+
+              if (depth === maxInheritedMerges) {
+                core.setFailed(
+                  `No developer sign-off found within ${maxInheritedMerges} base merges of ` +
+                  `${headSha}. Run make signoff on the pushed HEAD.`
+                );
+                return;
+              }
+
+              const { data: commit } = await github.rest.repos.getCommit({
+                owner,
+                repo,
+                ref: currentSha,
+              });
+              const [previousHead, mergedBase, ...extraParents] = commit.parents;
+              if (!previousHead || !mergedBase || extraParents.length > 0) {
+                core.setFailed(
+                  `No developer sign-off found for ${headSha}. The first-parent chain reaches ` +
+                  `unsigned commit ${currentSha}, which is not a two-parent merge and cannot ` +
+                  `inherit an earlier sign-off.\n\nRun make signoff on the pushed HEAD. ` +
+                  `See docs/dev/ci_signoff.md.`
+                );
+                return;
+              }
+              if (merges.length === 0 && mergedBase.sha !== baseSha) {
+                core.setFailed(
+                  `No developer sign-off found for ${headSha}. HEAD does not merge the current ` +
+                  `base commit (${baseSha}), so it cannot inherit an earlier sign-off.\n\n` +
+                  `Run make signoff on the pushed HEAD. See docs/dev/ci_signoff.md.`
+                );
+                return;
+              }
+
+              merges.push({
+                head: currentSha,
+                previous: previousHead.sha,
+                base: mergedBase.sha,
+                tree: commit.commit.tree.sha,
+              });
+              currentSha = previousHead.sha;
+            }
+
+      # Only an otherwise-valid inheritance candidate needs repository history
+      # and blobs to reproduce the merge without relying on a lazy network fetch.
+      - name: Check out pull request history
+        if: ${{ github.event_name == 'pull_request' && steps.signoff.outputs.inheritance_candidate == 'true' }}
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate inherited developer sign-off
+        if: ${{ github.event_name == 'pull_request' && steps.signoff.outputs.inheritance_candidate == 'true' }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          MERGE_CHAIN: ${{ steps.signoff.outputs.merge_chain }}
+          SIGNED_SHA: ${{ steps.signoff.outputs.signed_sha }}
+          CURRENT_BASE_SHA: ${{ steps.signoff.outputs.current_base_sha }}
+        with:
+          script: |
+            const merges = JSON.parse(process.env.MERGE_CHAIN);
+            const signedSha = process.env.SIGNED_SHA;
+            const currentBaseSha = process.env.CURRENT_BASE_SHA;
+            const baseHistory = await exec.getExecOutput(
+              'git',
+              ['rev-list', '--first-parent', currentBaseSha],
+              { silent: true }
+            );
+            const basePositions = new Map(
+              baseHistory.stdout.trim().split('\n').map((sha, index) => [sha, index])
+            );
+            let newerBasePosition = -1;
+
+            for (const mergeCommit of merges) {
+              const basePosition = basePositions.get(mergeCommit.base);
+              if (basePosition === undefined || basePosition < newerBasePosition) {
+                core.setFailed(
+                  `Merge ${mergeCommit.head} uses base commit ${mergeCommit.base} out of order ` +
+                  `or outside the current base branch's first-parent history. Run make signoff ` +
+                  `on the pushed HEAD.`
+                );
+                return;
+              }
+
+              const merge = await exec.getExecOutput(
+                'git',
+                [
+                  'merge-tree',
+                  '--write-tree',
+                  '--no-messages',
+                  mergeCommit.previous,
+                  mergeCommit.base,
+                ],
+                { ignoreReturnCode: true, silent: true }
+              );
+              const reproducedTree = merge.stdout.trim();
+              if (merge.exitCode !== 0) {
+                core.setFailed(
+                  `Merge ${mergeCommit.head} of ${mergeCommit.base} into ` +
+                  `${mergeCommit.previous} is not conflict-free. Resolve the merge, then run ` +
+                  `make signoff on the pushed HEAD.`
+                );
+                return;
+              }
+              if (
+                !/^[0-9a-f]{40,64}$/.test(reproducedTree) ||
+                reproducedTree !== mergeCommit.tree
+              ) {
+                core.setFailed(
+                  `Merge ${mergeCommit.head} contains changes beyond Git's automatic merge of ` +
+                  `${mergeCommit.base} into ${mergeCommit.previous}. Run make signoff on the ` +
+                  `pushed HEAD.`
+                );
+                return;
+              }
+
+              newerBasePosition = basePosition;
+            }
+
+            core.notice(
+              `Inherited developer sign-off from ${signedSha} across ${merges.length} ` +
+              `clean base merge(s).`
+            );
+      - name: Dependabot fast-track passthrough
+        if: ${{ github.event_name == 'pull_request' && steps.dependabot.outputs.fast_track == 'true' }}
+        run: echo "Single-commit Dependabot bump fast-tracked past sign-off; the full suite runs on the merged result in the merge queue."
+
+      - name: No-Rust fast-track passthrough
+        if: ${{ github.event_name == 'pull_request' && steps.no_rust.outputs.fast_track == 'true' }}
+        run: echo "No Rust-affecting files in the diff, so a sign-off would run no Rust checks; the full suite runs on the merged result in the merge queue."
+
+      - name: Revert fast-track passthrough
+        if: ${{ github.event_name == 'pull_request' && steps.revert.outputs.fast_track == 'true' }}
+        run: echo "Pure revert fast-tracked past sign-off; the full suite runs on the merged result in the merge queue."
+
       - name: Merge queue passthrough
         if: ${{ github.event_name != 'pull_request' }}
         run: echo "Sign-off was validated at queue entry; the full suite runs in this merge_group run."
@@ -274,9 +731,14 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-cc
 
+      # build-cli-dev, not build-cli: the latter is hardcoded to --release, so
+      # this job compiled the CLI in release while running its tests under
+      # RUST_PROFILE (lint) — two profiles, sharing nothing, in one job. Nothing
+      # here consumes the release binary, and the required `Build (release
+      # profile)` job below does the real release installs.
       - name: Build CLI and run nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        run: make build-cli nextest
+        run: make build-cli-dev nextest
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}

@@ -30,8 +30,10 @@ use runtime_table_partition::provider::PartitionTableProvider;
 use util::RetryError;
 
 use crate::{
-    accelerated_table::refresh_task::retry_from_df_error, datafusion::error::find_datafusion_root,
-    dataupdate::StreamingDataUpdateExecutionPlan, schema_evolution::SCHEMA_EVOLUTION_DETECTED,
+    accelerated_table::{refresh_task::retry_from_df_error, sink::finalize_indexes},
+    datafusion::error::find_datafusion_root,
+    dataupdate::StreamingDataUpdateExecutionPlan,
+    schema_evolution::SCHEMA_EVOLUTION_DETECTED,
 };
 
 /// Returns the (dropped columns, narrowed columns) that casting `input_schema` to
@@ -250,18 +252,14 @@ impl TableSink {
             .flat_map(IndexedTableProvider::get_all_indexes)
             .collect();
 
-        for index in provider_indexes_after
-            .iter()
-            .chain(self.sink_indexes.iter())
-        {
-            tracing::debug!("Running on_write_complete for index '{}'", index.name());
-            if let Err(e) = index.on_write_complete().await {
-                tracing::warn!(
-                    "TableSink: on_write_complete failed for index '{}': {e}. Index may be stale until next refresh.",
-                    index.name()
-                );
-            }
-        }
+        finalize_indexes(
+            "TableSink",
+            provider_indexes_after
+                .iter()
+                .chain(self.sink_indexes.iter()),
+        )
+        .await
+        .map_err(retry_from_df_error)?;
 
         tracing::debug!(
             "TableSink::insert_into completed in {:.2}s (collect phase: {:.2}s)",

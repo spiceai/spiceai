@@ -85,6 +85,7 @@ use crate::extension::Extension;
 use crate::udtfs::ListUDFTableFunc;
 use runtime_async::cancellable_task::{CancellableTaskHandle, spawn_cancellable_task};
 pub mod accelerated_table;
+pub(crate) mod accelerator_memory_budget;
 pub mod auth;
 pub mod builder;
 pub mod catalogconnector;
@@ -304,6 +305,14 @@ pub enum Error {
         "An accelerated table for {dataset_name} was configured with 'refresh_mode = changes', but the data connector doesn't support a changes stream."
     ))]
     AcceleratedTableInvalidChanges { dataset_name: String },
+
+    #[snafu(display(
+        "Failed to register dataset {dataset_name} ({connector}): durable write-back needs a source that can apply a delivered row in one atomic step, and the {connector} connector cannot yet. Delivering as a separate delete and insert lets the deleted state echo back over CDC, which can silently drop a committed write. Remove 'on_conflict' to keep writes on the accelerator, or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+    ))]
+    DurableWriteBackUnsupportedBySource {
+        dataset_name: String,
+        connector: String,
+    },
 
     #[snafu(display(
         "An accelerated table has invalid configuration: {source}. Update the configuration and retry. For details, visit: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
@@ -1251,6 +1260,14 @@ impl Runtime {
         tls_config: Option<Arc<TlsConfig>>,
         endpoint_auth: EndpointAuth,
     ) -> Result<()> {
+        // Executors: mark cluster status Initializing before any await so a
+        // concurrent `load_components` cannot report ready from dataset-only
+        // status while task slots are still closed (Fix B for #11758).
+        if self.df.cluster_config.effective_role() == Some(ClusterRole::Executor) {
+            self.status
+                .update_cluster("executor", status::ComponentStatus::Initializing);
+        }
+
         Arc::clone(&self)
             .register_metrics_table(self.prometheus_registry.is_some())
             .await?;

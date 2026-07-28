@@ -13,14 +13,15 @@ name: mysql-cayenne[file]-adaptive-turso
 # host + inferred schema, then runs the closed-feedback loop that adapts those knobs over time
 # within the environment-derived [floor, ceiling] as the workload shifts.
 #
-# `schema_inference: extended` (per dataset) does double duty here, so nothing else is hand-set:
-#   - It auto-detects the primary key, secondary indexes, and (non-CDC) sort columns from the
-#     MySQL source and seeds an `upsert` on_conflict on the inferred PK — exactly what
-#     `refresh_mode: changes` needs to apply UPDATE/DELETE events. So PK / on_conflict / indexes
-#     are intentionally NOT declared below; inference fills them (it is gap-filling only and never
-#     overrides a user-set value, so declaring them would just suppress the very thing we test).
-#   - It supplies the inferred row_count/table_bytes the adaptive loop's data-aware warm-start
-#     gates on; without extended inference adaptive silently falls back to `auto` (static).
+# Schema inference (always on) does double duty here, so nothing else is hand-set:
+#   - It auto-detects the primary key (and rough table sizing) from the MySQL source and seeds
+#     an `upsert` on_conflict on the inferred PK — exactly what `refresh_mode: changes` needs to
+#     apply UPDATE/DELETE events. So PK / on_conflict are intentionally NOT declared below;
+#     inference fills them (it is gap-filling only and never overrides a user-set value, so
+#     declaring them would just suppress the very thing we test).
+#   - It supplies inferred row_count/table_bytes that sharpen the adaptive loop's data-aware
+#     warm-start. Adaptive is set explicitly, so it runs regardless; without inferred metadata
+#     the loop just relearns the row width from observed ingest.
 # Background compaction stays at the auto-derived (non-zero) default — the controller rides its
 # tick. No per-ACTUATOR knob value is set anywhere: an explicit knob would *pin* it under adaptive
 # (collapsing its tuning bounds to a point), so the un-pinned baseline gives the loop full freedom.
@@ -31,6 +32,9 @@ name: mysql-cayenne[file]-adaptive-turso
 # sql_results / task_history stay off to match the baseline, so a
 # comparison isolates the effect of adaptive tuning, not caching/history overhead.
 
+# All `refresh_mode: changes` datasets coalesce onto ONE shared binlog dump
+# (server_id derived from the connection identity - the engine default). The
+# -split variant pins distinct per-dataset server_ids for separate dumps.
 mysql_connection_params: &mysql_params
   mysql_host: ${env:CHBENCH_MYSQL_HOST}
   mysql_tcp_port: 3306
@@ -62,16 +66,14 @@ runtime:
 
 datasets:
   # ---- TPC-C core tables (mutated by OLTP workload) ----
-  # No primary_key / on_conflict / indexes: `schema_inference: extended` detects them from the
-  # MySQL source and seeds the upsert on_conflict the CDC (changes) path requires.
+  # No primary_key / on_conflict: schema inference (always on) detects the PK from the MySQL
+  # source and seeds the upsert on_conflict the CDC (changes) path requires.
 
   - from: mysql:warehouse
     name: warehouse
-    schema_inference: extended
     params:
       <<: *mysql_params
-      mysql_replication_snapshot_mode: auto
-      mysql_replication_server_id: '1001'
+      mysql_replication_initial_snapshot: auto
     acceleration: &cayenne_accel
       enabled: true
       engine: cayenne
@@ -83,6 +85,10 @@ datasets:
         # parallel within one apply on the memory-tier (changes) tables. Inert on the
         # full-refresh reference tables that share this anchor (not CDC memory mode).
         cayenne_cdc_mem_tier_shards: '4'
+        cdc_prefetch_buffer: '16384'
+        cdc_max_coalesced_envelopes: '16384'
+        cdc_max_coalesced_bytes: '536870912'
+        cdc_max_coalesce_age_ms: '2000'
         # The only line that differs from the sqlite-default adaptive twin: select the Turso
         # metastore backend. This is a structural backend choice, not a tunable actuator, so it
         # does not pin any knob under adaptive tuning.
@@ -94,64 +100,52 @@ datasets:
 
   - from: mysql:district
     name: district
-    schema_inference: extended
     params:
       <<: *mysql_params
-      mysql_replication_snapshot_mode: auto
-      mysql_replication_server_id: '1002'
+      mysql_replication_initial_snapshot: auto
     acceleration: *cayenne_accel
 
   - from: mysql:customer
     name: customer
-    schema_inference: extended
     params:
       <<: *mysql_params
-      mysql_replication_snapshot_mode: auto
-      mysql_replication_server_id: '1003'
+      mysql_replication_initial_snapshot: auto
     acceleration: *cayenne_accel
 
   - from: mysql:new_order
     name: new_order
-    schema_inference: extended
     params:
       <<: *mysql_params
-      mysql_replication_snapshot_mode: auto
-      mysql_replication_server_id: '1004'
+      mysql_replication_initial_snapshot: auto
     acceleration: *cayenne_accel
 
   - from: mysql:oorder
     name: oorder
-    schema_inference: extended
     params:
       <<: *mysql_params
-      mysql_replication_snapshot_mode: auto
-      mysql_replication_server_id: '1005'
+      mysql_replication_initial_snapshot: auto
     acceleration: *cayenne_accel
 
   - from: mysql:order_line
     name: order_line
-    schema_inference: extended
     params:
       <<: *mysql_params
-      mysql_replication_snapshot_mode: auto
-      mysql_replication_server_id: '1006'
+      mysql_replication_initial_snapshot: auto
     acceleration: *cayenne_accel
 
   - from: mysql:stock
     name: stock
-    schema_inference: extended
     params:
       <<: *mysql_params
-      mysql_replication_snapshot_mode: auto
-      mysql_replication_server_id: '1007'
+      mysql_replication_initial_snapshot: auto
     acceleration: *cayenne_accel
 
   # ---- Static reference tables (no OLTP mutations, full refresh) ----
-  # Same: PK / on_conflict / indexes come from extended inference.
+  # Same: the PK comes from schema inference (always on); on_conflict is seeded only
+  # for CDC (changes) datasets — a full refresh replaces the table and needs no upsert.
 
   - from: mysql:item
     name: item
-    schema_inference: extended
     params:
       <<: *mysql_params
     acceleration: &cayenne_accel_full
@@ -163,21 +157,18 @@ datasets:
 
   - from: mysql:region
     name: region
-    schema_inference: extended
     params:
       <<: *mysql_params
     acceleration: *cayenne_accel_full
 
   - from: mysql:nation
     name: nation
-    schema_inference: extended
     params:
       <<: *mysql_params
     acceleration: *cayenne_accel_full
 
   - from: mysql:supplier
     name: supplier
-    schema_inference: extended
     params:
       <<: *mysql_params
     acceleration: *cayenne_accel_full

@@ -27,12 +27,24 @@ limitations under the License.
 //! bare Arrow schema JSON object; the replication layer treats those as
 //! unknown layout and refuses unsafe resume.
 //!
+//! `gtid_executed` holds the source's executed GTID set for failover-safe
+//! resume (`COM_BINLOG_DUMP_GTID`); it is `NULL` for file+offset positioning.
+//! `cursor_type` (`file`|`gtid`) records the checkpoint's positioning type
+//! explicitly, so resume never has to *infer* it from whether `gtid_executed`
+//! is set — an empty GTID set (`gtid_mode = ON`, zero transactions yet) must
+//! still reload as `gtid`, and an engine that maps an empty string to `NULL`
+//! must not silently reclassify it as `file`. Both columns were added after the
+//! initial schema, so each is created lazily via `ALTER TABLE ... ADD COLUMN`
+//! on tables that predate it.
+//!
 //! ```sql
 //! CREATE TABLE spice_sys_mysql_binlog (
 //!     dataset_name TEXT PRIMARY KEY,
 //!     binlog_file TEXT NOT NULL,
 //!     binlog_pos BIGINT NOT NULL,
 //!     schema_json TEXT,
+//!     gtid_executed TEXT,
+//!     cursor_type TEXT,
 //!     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 //!     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 //! );
@@ -40,6 +52,7 @@ limitations under the License.
 
 use super::{AccelerationConnection, Error, Result, acceleration_connection};
 use crate::{component::dataset::Dataset, dataaccelerator::spice_sys::OpenOption};
+use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 #[cfg_attr(
     not(any(
@@ -70,6 +83,17 @@ pub struct MySqlBinlogCheckpoint {
     /// Optional serialized Arrow schema snapshot for detecting drift between
     /// runs.
     pub schema_json: Option<String>,
+    /// Optional executed GTID set (`uuid:range` text) for failover-safe resume
+    /// via `COM_BINLOG_DUMP_GTID`. `None` for file+offset positioning; may be an
+    /// empty string when `gtid_mode = ON` but no transactions have committed.
+    pub gtid_executed: Option<String>,
+    /// The checkpoint's positioning type (`file`|`gtid`), stored explicitly so
+    /// resume doesn't need to infer it from `gtid_executed`. `Option` only
+    /// because the column is nullable; this connector always writes it (the
+    /// feature has never shipped, so there are no legacy typeless checkpoints),
+    /// and the sidecar loader defensively resolves any `None` read by inferring
+    /// the type from `gtid_executed`.
+    pub cursor_type: Option<String>,
     /// When the row was last updated. Populated by the database layer on read.
     pub updated_at: Option<std::time::SystemTime>,
 }
@@ -89,6 +113,13 @@ impl MySqlBinlogSys {
         })
     }
 
+    #[cfg_attr(
+        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        expect(
+            clippy::unused_async,
+            reason = "async only when an async accelerator backend is compiled in; DuckDB helpers are synchronous"
+        )
+    )]
     pub async fn get(&self) -> Option<MySqlBinlogCheckpoint> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
@@ -111,7 +142,49 @@ impl MySqlBinlogSys {
         }
     }
 
-    pub async fn upsert(
+    /// Persist a checkpoint, retrying briefly on a transient accelerator write
+    /// lock.
+    ///
+    /// The sidecar shares the accelerator's connection pool, so a checkpoint
+    /// upsert contends with the accelerator's own CDC-apply transactions for
+    /// the single writer lock. A large batch commit can hold that lock past the
+    /// engine's `busy_timeout`, surfacing as `SQLITE_BUSY` / "database is
+    /// locked" (and equivalents on the other file engines). Without a retry a
+    /// single contention drops the whole checkpoint interval and widens the
+    /// crash-replay window; a few short retries convert most of these into a
+    /// successful persist. Still best-effort — a persistent lock returns the
+    /// error and the replication layer retries on the next interval.
+    pub async fn upsert(&self, checkpoint: &MySqlBinlogCheckpoint) -> Result<()> {
+        let backoff = FibonacciBackoffBuilder::new()
+            .max_retries(Some(UPSERT_MAX_RETRIES))
+            .max_duration(Some(UPSERT_MAX_RETRY_DELAY))
+            .build();
+
+        retry(backoff, || async {
+            self.upsert_once(checkpoint).await.map_err(|e| {
+                if is_retryable_lock_error(&e) {
+                    tracing::debug!(
+                        dataset = %self.dataset_name,
+                        error = %e,
+                        "binlog checkpoint upsert hit a transient accelerator write lock"
+                    );
+                    RetryError::transient(e)
+                } else {
+                    RetryError::permanent(e)
+                }
+            })
+        })
+        .await
+    }
+
+    #[cfg_attr(
+        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        expect(
+            clippy::unused_async,
+            reason = "async only when an async accelerator backend is compiled in; DuckDB helpers are synchronous"
+        )
+    )]
+    async fn upsert_once(
         &self,
         #[cfg_attr(
             not(any(
@@ -145,6 +218,13 @@ impl MySqlBinlogSys {
         }
     }
 
+    #[cfg_attr(
+        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        expect(
+            clippy::unused_async,
+            reason = "async only when an async accelerator backend is compiled in; DuckDB helpers are synchronous"
+        )
+    )]
     pub async fn delete(&self) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
@@ -203,4 +283,39 @@ impl MySqlBinlogSys {
     fn position_to_i64(pos: u64) -> i64 {
         i64::try_from(pos).unwrap_or(i64::MAX)
     }
+}
+
+/// Retries for a checkpoint upsert contending with the accelerator's writer
+/// lock, on top of the initial attempt. Bounded and short: paired with
+/// [`UPSERT_MAX_RETRY_DELAY`] the worst-case added latency stays well under one
+/// checkpoint interval, and a persistent lock just retries on the next interval
+/// anyway.
+const UPSERT_MAX_RETRIES: usize = 4;
+
+/// Per-attempt cap on the [`FibonacciBackoffBuilder`] delay for
+/// [`MySqlBinlogSys::upsert`] retries. The shared Fibonacci schedule starts at
+/// 1s, far longer than a transient writer-lock hand-off needs, so clamp each
+/// delay to keep the whole retry budget (~4 × 100ms) short relative to the
+/// checkpoint interval.
+const UPSERT_MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Whether a sidecar write failure is a transient lock/contention error worth
+/// retrying rather than surfacing.
+///
+/// Deliberately a string heuristic over the boxed engine error (rusqlite,
+/// Turso, `DuckDB`, and tokio-postgres all report contention differently),
+/// mirroring the reconnect classifier in
+/// `data_components::mysql_replication::resilience`. Slight over-matching is
+/// harmless: retries are bounded, so a misclassified non-lock error only costs
+/// a few short sleeps before it is returned unchanged.
+fn is_retryable_lock_error(err: &Error) -> bool {
+    const MARKERS: &[&str] = &[
+        "database is locked",
+        "database table is locked",
+        "sqlite_busy",
+        "sqlite_locked",
+        "deadlock",
+    ];
+    let msg = err.to_string().to_ascii_lowercase();
+    MARKERS.iter().any(|marker| msg.contains(marker))
 }

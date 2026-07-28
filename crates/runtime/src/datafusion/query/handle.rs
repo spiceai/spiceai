@@ -30,6 +30,7 @@ use crate::datafusion::query::QueryTracker;
 use crate::datafusion::query::error_code::ErrorCode;
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
+use ballista_core::JobId;
 use ballista_core::extension::BallistaConfigGrpcEndpoint;
 use ballista_core::serde::protobuf::job_status;
 use ballista_core::serde::scheduler::PartitionLocation;
@@ -142,6 +143,15 @@ enum QueryHandleState {
 pub struct QueryHandle {
     /// The Ballista scheduler job ID (or a synthetic ID for cached results).
     ballista_job_id: String,
+    /// Original SQL text (or `"<logical plan>"`) for the emitted
+    /// `EXPLAIN ANALYZE …` input label on plan-capture rows.
+    sql: Arc<str>,
+    /// Wall-clock start of this distributed submission, used for plan-capture
+    /// duration thresholds at finalize time.
+    query_start: std::time::Instant,
+    /// Set from the submitted [`LogicalPlan`] so finalize can skip capture for
+    /// `EXPLAIN` / `EXPLAIN ANALYZE` without re-inspecting SQL text.
+    plan_is_explain: bool,
     /// Internal state (running or cached).
     state: QueryHandleState,
     /// Result schema from the logical plan.
@@ -209,9 +219,15 @@ impl QueryHandle {
         tracker: Option<QueryTracker>,
         request_context: Arc<RequestContext>,
         task_history_span: Span,
+        sql: Arc<str>,
+        query_start: std::time::Instant,
+        plan_is_explain: bool,
     ) -> Self {
         Self {
             ballista_job_id,
+            sql,
+            query_start,
+            plan_is_explain,
             state: QueryHandleState::Running { scheduler },
             schema,
             datasets: Some(datasets),
@@ -236,9 +252,13 @@ impl QueryHandle {
         cache_key: Option<RawCacheKey>,
         cached_stream: SendableRecordBatchStream,
         request_context: Arc<RequestContext>,
+        sql: Arc<str>,
     ) -> Self {
         Self {
             ballista_job_id: job_id,
+            sql,
+            query_start: std::time::Instant::now(),
+            plan_is_explain: false,
             state: QueryHandleState::Cached {
                 cached_stream: Arc::new(Mutex::new(Some(cached_stream))),
             },
@@ -283,6 +303,11 @@ impl QueryHandle {
         self.cancel_token.clone()
     }
 
+    /// Ballista job id as the typed [`JobId`] expected by scheduler APIs.
+    fn ballista_job_id_typed(&self) -> JobId {
+        JobId::from(self.ballista_job_id.as_str())
+    }
+
     /// Polls the current status of the job.
     ///
     /// Returns the job status or an error if the status cannot be retrieved.
@@ -296,7 +321,7 @@ impl QueryHandle {
         let status = scheduler
             .state
             .task_manager
-            .get_job_status(&self.ballista_job_id)
+            .get_job_status(&self.ballista_job_id_typed())
             .await
             .map_err(|e| QueryHandleError::StatusError {
                 message: e.to_string(),
@@ -388,7 +413,7 @@ impl QueryHandle {
                     match event_result {
                         Ok(event) => {
                             // Only process events for our job
-                            if event.job_id != self.ballista_job_id {
+                            if event.job_id.as_str() != self.ballista_job_id {
                                 continue;
                             }
 
@@ -460,7 +485,7 @@ impl QueryHandle {
         let status = scheduler
             .state
             .task_manager
-            .get_job_status(&self.ballista_job_id)
+            .get_job_status(&self.ballista_job_id_typed())
             .await
             .map_err(|e| {
                 let err = QueryHandleError::StatusError {
@@ -504,7 +529,7 @@ impl QueryHandle {
             let status = scheduler
                 .state
                 .task_manager
-                .get_job_status(&self.ballista_job_id)
+                .get_job_status(&self.ballista_job_id_typed())
                 .await
                 .map_err(|e| {
                     let err = QueryHandleError::StatusError {
@@ -686,6 +711,10 @@ impl QueryHandle {
         };
 
         let job_id = self.ballista_job_id.clone();
+        let sql = Arc::clone(&self.sql);
+        let query_start = self.query_start;
+        let plan_is_explain = self.plan_is_explain;
+        let df = Arc::clone(&self.df);
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             // No tokio runtime here (likely Drop on a non-runtime
             // thread). Finalize the parent without stage detail or
@@ -727,7 +756,7 @@ impl QueryHandle {
                     let already_terminal = match scheduler_for_cancel
                         .state
                         .task_manager
-                        .get_job_status(&cancel_job_id)
+                        .get_job_status(&JobId::from(cancel_job_id.as_str()))
                         .await
                     {
                         Ok(Some(job_status)) => match job_status.status {
@@ -764,7 +793,7 @@ impl QueryHandle {
                 let graph = scheduler
                     .state
                     .task_manager
-                    .get_job_execution_graph(&job_id)
+                    .get_job_execution_graph(&JobId::from(job_id.as_str()))
                     .await
                     .ok()
                     .flatten();
@@ -774,6 +803,30 @@ impl QueryHandle {
                         &ballista_job_id,
                         graph.as_ref(),
                     );
+
+                    // Emit plan capture from the real distributed graph
+                    // (including failed jobs with partial metrics) whenever
+                    // ExplainAnalyze is configured and thresholds pass.
+                    // `plan_is_explain` was decided from the LogicalPlan at
+                    // submit time — no SQL re-scan on the finalize path.
+                    let elapsed_ms = query_start.elapsed().as_secs_f64() * 1000.0;
+                    if !plan_is_explain
+                        && let Some(cfg) = df.plan_capture_config()
+                        && cfg.analyze_enabled()
+                        && crate::datafusion::query::plan_capture::plan_capture_eligible(
+                            elapsed_ms, cfg,
+                        )
+                    {
+                        let output = crate::datafusion::query::plan_capture::render_distributed_plan_with_metrics(
+                            graph.as_ref(),
+                        );
+                        span_for_record.in_scope(|| {
+                            crate::datafusion::query::plan_capture::emit_plan_span(
+                                sql.as_ref(),
+                                &output,
+                            );
+                        });
+                    }
                 }
                 match final_error {
                     Some((msg, code)) => {
@@ -957,6 +1010,10 @@ impl PartitionResultStream {
                 MAX_PARTITION_RETRIEVAL_MESSAGE_SIZE,
                 use_tls,
                 customize_endpoint,
+                3,          // io_retries_times
+                3000,       // io_retry_wait_time_ms
+                67_108_864, // initial_connection_window_size (64 MiB)
+                16_777_216, // initial_stream_window_size (16 MiB)
             )
             .await
             .map_err(|e| {

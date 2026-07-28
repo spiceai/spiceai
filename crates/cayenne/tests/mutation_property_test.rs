@@ -161,6 +161,10 @@ struct OpWeights {
     overwrite: u32,
     compact: u32,
     restart: u32,
+    /// Settle + compact the warm tier to the cold store + one GC pass (the
+    /// production promotion-tick sequence, PRNG-scheduled). Requires
+    /// `Workload::cold`; keep 0 in non-cold configs.
+    move_to_cold_tier: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -182,6 +186,8 @@ struct Workload {
     /// `pk_keyset_cache_mb` for the table: `None` = default exact PK index,
     /// `Some(0)` = force the over-budget bloom existence-filter conflict path.
     pk_keyset_cache_mb: Option<usize>,
+    /// `true` = cold (datalake) tier enabled on a local `file://` store
+    cold: bool,
 }
 
 // ============================================================================
@@ -195,7 +201,16 @@ fn schema() -> Arc<Schema> {
     ]))
 }
 
-fn config(mode: Mode, durability: Durability, pk_keyset_cache_mb: Option<usize>) -> VortexConfig {
+/// GC grace for cold fuzz configs (`cold_tier_gc_interval_ms` doubles as the
+/// orphan grace) — short enough to age out within a walk.
+const COLD_GC_GRACE_MS: u64 = 25;
+
+fn config(
+    mode: Mode,
+    durability: Durability,
+    pk_keyset_cache_mb: Option<usize>,
+    cold_url: Option<String>,
+) -> VortexConfig {
     let base = VortexConfig {
         target_vortex_file_size_mb: 1,
         compaction_trigger_files: 4,
@@ -210,6 +225,23 @@ fn config(mode: Mode, durability: Durability, pk_keyset_cache_mb: Option<usize>)
         // default exact index. Lets one harness fuzz both existence paths.
         pk_keyset_cache_mb,
         ..VortexConfig::default()
+    };
+    let base = match cold_url {
+        Some(cold_url) => VortexConfig {
+            cold_tier_location: Some(cold_url),
+            // Any durable warm file triggers promotion.
+            cold_tier_warm_max_files: 1,
+            // No wall-clock promoter task: a timer fires at times unrelated to
+            // the op stream (destroying seed-deterministic replay), so the
+            // harness re-adds promotion + GC as the explicit, PRNG-scheduled
+            // `MoveToColdTier` op in the same serialization order production uses.
+            cold_tier_background_interval_ms: 0,
+            cold_tier_gc_interval_ms: COLD_GC_GRACE_MS,
+            cold_clustering_columns: vec!["id".to_string()],
+            cold_target_file_size_mb: 1,
+            ..base
+        },
+        None => base,
     };
     match mode {
         Mode::Key => VortexConfig {
@@ -226,7 +258,21 @@ async fn create_table(
     mode: Mode,
     durability: Durability,
     pk_keyset_cache_mb: Option<usize>,
+    cold: bool,
 ) -> TestResult<(Arc<CayenneTableProvider>, SessionContext)> {
+    // Local `file://` cold store per table (no object-store config needed —
+    // the default local store resolves it).
+    let cold_url = if cold {
+        assert!(
+            matches!(mode, Mode::Key),
+            "cold fuzz configs require Mode::Key (promotion no-ops in position mode)"
+        );
+        let cold_dir = fixture.temp_dir.path().join(format!("cold_{name}"));
+        tokio::fs::create_dir_all(&cold_dir).await?;
+        Some(format!("file://{}", cold_dir.to_string_lossy()))
+    } else {
+        None
+    };
     let opts = CreateTableOptions {
         table_name: name.to_string(),
         schema: schema(),
@@ -236,7 +282,7 @@ async fn create_table(
         ]))),
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
-        vortex_config: config(mode, durability, pk_keyset_cache_mb),
+        vortex_config: config(mode, durability, pk_keyset_cache_mb, cold_url),
     };
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
@@ -392,6 +438,38 @@ async fn settle(table: &Arc<CayenneTableProvider>, durability: Durability) -> Te
         let _ = table.bake_seq_prefix_protected_snapshots().await?;
     }
     table.maybe_compact_small_files().await?;
+    Ok(())
+}
+
+/// One background maintenance pass without full current-snapshot compaction.
+///
+/// Cold-tier fuzz configs disable timer-driven small-file compaction
+/// (`compaction_background_interval_ms = 0`) and drive cold promotion explicitly
+/// through `MoveToColdTier`. Keep the concurrent cold background loop shaped like
+/// production by running protected-snapshot maintenance, but not the test-only
+/// full current-snapshot rewrite.
+async fn settle_protected_maintenance_only(
+    table: &Arc<CayenneTableProvider>,
+    durability: Durability,
+) -> TestResult<()> {
+    table.flush_pending_maintenance().await?;
+    if durability == Durability::Memory {
+        table.checkpoint_mem_tier().await?;
+        let _ = table.bake_seq_prefix_protected_snapshots().await?;
+    }
+    table.compact_protected_snapshots_subset(usize::MAX).await?;
+    Ok(())
+}
+
+/// Prepare enough warm-tier files for a cold-promotion.
+async fn materialize_warm_files_for_cold_promotion(
+    table: &Arc<CayenneTableProvider>,
+    durability: Durability,
+) -> TestResult<()> {
+    table.flush_pending_maintenance().await?;
+    if durability == Durability::Memory {
+        table.checkpoint_mem_tier().await?;
+    }
     Ok(())
 }
 
@@ -556,6 +634,7 @@ enum Op {
     Overwrite { rows: Vec<(i64, i64)> },
     Compact,
     Restart,
+    MoveToColdTier,
 }
 
 fn random_rows(rng: &mut Rng, key_space: i64, batch_size: i64) -> Vec<(i64, i64)> {
@@ -581,7 +660,13 @@ fn random_rows(rng: &mut Rng, key_space: i64, batch_size: i64) -> Vec<(i64, i64)
 }
 
 fn gen_op(rng: &mut Rng, w: &OpWeights, key_space: i64, batch_size: i64) -> Op {
-    let total = w.upsert + w.delete + w.delete_all + w.overwrite + w.compact + w.restart;
+    let total = w.upsert
+        + w.delete
+        + w.delete_all
+        + w.overwrite
+        + w.compact
+        + w.restart
+        + w.move_to_cold_tier;
     debug_assert!(
         total > 0,
         "OpWeights must have a positive total weight (else the workload runs no real ops)"
@@ -595,6 +680,7 @@ fn gen_op(rng: &mut Rng, w: &OpWeights, key_space: i64, batch_size: i64) -> Op {
         (w.overwrite, 3),
         (w.compact, 4),
         (w.restart, 5),
+        (w.move_to_cold_tier, 6),
     ] {
         if pick < weight {
             return match kind {
@@ -609,7 +695,8 @@ fn gen_op(rng: &mut Rng, w: &OpWeights, key_space: i64, batch_size: i64) -> Op {
                     rows: random_rows(rng, key_space, batch_size),
                 },
                 4 => Op::Compact,
-                _ => Op::Restart,
+                5 => Op::Restart,
+                _ => Op::MoveToColdTier,
             };
         }
         pick -= weight;
@@ -634,7 +721,7 @@ fn apply_model(model: &mut Model, op: &Op) {
                 model.insert(*k, *v);
             }
         }
-        Op::Compact | Op::Restart => {}
+        Op::Compact | Op::Restart | Op::MoveToColdTier => {}
     }
 }
 
@@ -644,8 +731,15 @@ fn apply_model(model: &mut Model, op: &Op) {
 
 async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestResult<()> {
     let name = format!("seq_{:?}_{:?}_{seed}", w.mode, w.durability);
-    let (mut table, mut ctx) =
-        create_table(fixture, &name, w.mode, w.durability, w.pk_keyset_cache_mb).await?;
+    let (mut table, mut ctx) = create_table(
+        fixture,
+        &name,
+        w.mode,
+        w.durability,
+        w.pk_keyset_cache_mb,
+        w.cold,
+    )
+    .await?;
     let mut rng = Rng::new(seed);
     let mut model = Model::new();
     let mut history: Vec<Op> = Vec::with_capacity(w.ops);
@@ -686,6 +780,15 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
                     table.install_slot_advancer(Arc::new(NoopSlotAdvancer));
                 }
             }
+            Op::MoveToColdTier => {
+                // Durable warm files must exist for the trigger to fire.
+                materialize_warm_files_for_cold_promotion(&table, w.durability).await?;
+                // `Ok(false)` (warm tier below threshold) is fine.
+                let _ = table.promote_warm_to_cold().await?;
+                // GC serialized after promote, same task — the production
+                // promotion-tick order (out-of-band GC is unsupported).
+                table.run_cold_tier_gc_tick().await;
+            }
         }
         apply_model(&mut model, &op);
         let live = read_rows(&ctx, &name).await?;
@@ -717,8 +820,15 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
 
 async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestResult<()> {
     let name = format!("conc_{:?}_{:?}_{seed}", w.mode, w.durability);
-    let (table0, ctx0) =
-        create_table(fixture, &name, w.mode, w.durability, w.pk_keyset_cache_mb).await?;
+    let (table0, ctx0) = create_table(
+        fixture,
+        &name,
+        w.mode,
+        w.durability,
+        w.pk_keyset_cache_mb,
+        w.cold,
+    )
+    .await?;
     let mut rng = Rng::new(seed);
 
     for start in (0..w.population).step_by(20) {
@@ -729,16 +839,16 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
     }
     let mut model: Model = (0..w.population).map(|k| (k, k * 10)).collect();
 
-    // Restart-swappable table handle shared with the background compactor.
-    // Foreground ops AND compaction take a READ lock (so they still run
+    // Restart-swappable table handle shared with the background maintenance loop.
+    // Foreground ops AND maintenance take a READ lock (so they still run
     // concurrently — read locks are shared); a `Restart` op takes the WRITE
     // lock, which quiesces both, reopens the table from the catalog, and swaps
-    // the handle. This exercises restart/recovery CONCURRENTLY with compaction
-    // (the compactor holds its read lock across each pass, so a restart waits
-    // for an in-flight compaction rather than tearing it). The read context is
-    // tracked separately and only used for the post-quiesce assertions (the
-    // mutation helpers build their own contexts), so it just follows the latest
-    // reopened provider.
+    // the handle. This exercises restart/recovery CONCURRENTLY with maintenance
+    // (the loop holds its read lock across each pass, so a restart waits for an
+    // in-flight pass rather than tearing it). The read context is tracked
+    // separately and only used for the post-quiesce assertions (the mutation
+    // helpers build their own contexts), so it just follows the latest reopened
+    // provider.
     let handle = Arc::new(tokio::sync::RwLock::new(Arc::clone(&table0)));
     let mut ctx = ctx0;
     drop(table0);
@@ -747,15 +857,23 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
     let bg_handle = Arc::clone(&handle);
     let bg_stop = Arc::clone(&stop);
     let bg_durability = w.durability;
+    let bg_protected_only = w.cold;
     let compactor = tokio::spawn(async move {
         while !bg_stop.load(Ordering::Relaxed) {
             {
                 // Hold the read lock across the pass so a concurrent restart
-                // (write lock) waits for it instead of swapping mid-compaction.
-                // For memory this also checkpoints the RAM tier + bakes — the
-                // background CDC checkpointer racing foreground mem-tier appends.
+                // (write lock) waits for it instead of swapping mid-maintenance.
+                // Cold configs keep this production-shaped: protected-snapshot
+                // maintenance only, because timer-driven small-file compaction is
+                // disabled for these tables.
                 let t = bg_handle.read().await;
-                let _ = settle(&t, bg_durability).await;
+                if let Err(e) = if bg_protected_only {
+                    settle_protected_maintenance_only(&t, bg_durability).await
+                } else {
+                    settle(&t, bg_durability).await
+                } {
+                    panic!("background maintenance pass failed: {e}");
+                }
             }
             tokio::task::yield_now().await;
         }
@@ -763,8 +881,10 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
 
     // Foreground stream. `compact` is driven by the background loop (a foreground
     // Compact op is a no-op here); `restart` reopens under the write lock.
+    let mut history: Vec<Op> = Vec::with_capacity(w.ops);
     for _ in 0..w.ops {
         let op = gen_op(&mut rng, &w.weights, w.population, w.batch_size);
+        history.push(op.clone());
         match &op {
             Op::Upsert { rows } => {
                 let t = handle.read().await;
@@ -806,6 +926,16 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
                 *guard = nt;
                 ctx = nc;
             }
+            Op::MoveToColdTier => {
+                // Foreground promotion under the shared read lock, racing the
+                // background protected-snapshot maintenance loop. GC runs
+                // serialized after promote (production order); see the
+                // sequential arm.
+                let t = handle.read().await;
+                materialize_warm_files_for_cold_promotion(&t, w.durability).await?;
+                let _ = t.promote_warm_to_cold().await?;
+                t.run_cold_tier_gc_tick().await;
+            }
             Op::Compact => continue,
         }
         apply_model(&mut model, &op);
@@ -813,16 +943,20 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
     }
 
     stop.store(true, Ordering::Relaxed);
-    compactor.await.expect("compaction task joins");
+    compactor.await.expect("background maintenance task joins");
     let table = Arc::clone(&*handle.read().await);
-    settle(&table, w.durability).await?;
+    if w.cold {
+        settle_protected_maintenance_only(&table, w.durability).await?;
+    } else {
+        settle(&table, w.durability).await?;
+    }
     // Quiesce before the final assertion so no detached compaction from this (or
     // an earlier, since-replaced) instance commits mid-read.
     table.drain_in_flight_maintenance().await?;
 
     let live = read_rows(&ctx, &name).await?;
     let msg = format!(
-        "concurrent convergence failed mode={:?} durability={:?} seed={seed}",
+        "concurrent convergence failed mode={:?} durability={:?} seed={seed}\nhistory={history:?}",
         w.mode, w.durability,
     );
     assert_converged(&live, &model, &msg);
@@ -879,6 +1013,7 @@ const SEQUENTIAL_MIXED: OpWeights = OpWeights {
     overwrite: 12,
     compact: 8,
     restart: 7,
+    move_to_cold_tier: 0,
 };
 const CONCURRENT_MIXED: OpWeights = OpWeights {
     upsert: 40,
@@ -891,6 +1026,7 @@ const CONCURRENT_MIXED: OpWeights = OpWeights {
     // durability against racing compaction.
     compact: 0,
     restart: 4,
+    move_to_cold_tier: 0,
 };
 const CONCURRENT_UPSERT_ONLY: OpWeights = OpWeights {
     upsert: 100,
@@ -899,6 +1035,7 @@ const CONCURRENT_UPSERT_ONLY: OpWeights = OpWeights {
     overwrite: 0,
     compact: 0,
     restart: 0,
+    move_to_cold_tier: 0,
 };
 
 // Memory-CDC op mix. Excludes `delete_all`/`overwrite` (durable-rewrite ops with
@@ -912,6 +1049,7 @@ const MEMORY_MIXED: OpWeights = OpWeights {
     overwrite: 0,
     compact: 25,
     restart: 5,
+    move_to_cold_tier: 0,
 };
 
 fn sequential(mode: Mode) -> Workload {
@@ -925,6 +1063,7 @@ fn sequential(mode: Mode) -> Workload {
         ops: scaled_ops(50),
         seeds: scaled_seeds(24),
         pk_keyset_cache_mb: None,
+        cold: false,
     }
 }
 // Sequential memory-CDC: drives the mem-tier append + checkpoint + seq-prefix bake
@@ -942,6 +1081,7 @@ fn sequential_memory() -> Workload {
         ops: scaled_ops(60),
         seeds: scaled_seeds(16),
         pk_keyset_cache_mb: None,
+        cold: false,
     }
 }
 fn concurrent_mixed(mode: Mode) -> Workload {
@@ -955,6 +1095,7 @@ fn concurrent_mixed(mode: Mode) -> Workload {
         ops: scaled_ops(250),
         seeds: scaled_seeds(16),
         pk_keyset_cache_mb: None,
+        cold: false,
     }
 }
 // Concurrent memory-CDC: foreground mem-tier upserts/deletes racing a background
@@ -970,6 +1111,7 @@ fn concurrent_memory() -> Workload {
         ops: scaled_ops(200),
         seeds: scaled_seeds(8),
         pk_keyset_cache_mb: None,
+        cold: false,
     }
 }
 // High-collision variant: a small key space with many ops drives repeated
@@ -994,6 +1136,7 @@ fn concurrent_mixed_dense(mode: Mode, pk_keyset_cache_mb: Option<usize>) -> Work
         ops: scaled_ops(400),
         seeds: scaled_seeds(6),
         pk_keyset_cache_mb,
+        cold: false,
     }
 }
 fn concurrent_upsert_only(mode: Mode) -> Workload {
@@ -1007,6 +1150,58 @@ fn concurrent_upsert_only(mode: Mode) -> Workload {
         ops: scaled_ops(200),
         seeds: scaled_seeds(10),
         pk_keyset_cache_mb: None,
+        cold: false,
+    }
+}
+// Sequential cold walk: mixed ops + promotion/GC, model-checked after every op.
+// Covers: dirty rewrite, carry-forward, tombstone application across tiers,
+// delete/re-upsert of cold-resident keys, reopen with a cold manifest.
+// Population stays small: promotion is a whole-warm-tier rewrite, so lean on op
+// depth over key-space size.
+fn sequential_cold() -> Workload {
+    Workload {
+        mode: Mode::Key,
+        durability: Durability::File,
+        concurrency: Concurrency::Sequential,
+        weights: OpWeights {
+            upsert: 40,
+            delete: 25,
+            delete_all: 5,
+            overwrite: 10,
+            compact: 5,
+            restart: 5,
+            move_to_cold_tier: 10,
+        },
+        population: 8,
+        batch_size: 1,
+        ops: scaled_ops(60),
+        seeds: scaled_seeds(16),
+        pk_keyset_cache_mb: None,
+        cold: true,
+    }
+}
+// Concurrent cold: foreground mixed delete/upsert + promotions + restarts with
+// a background maintenance loop.
+fn concurrent_cold() -> Workload {
+    Workload {
+        mode: Mode::Key,
+        durability: Durability::File,
+        concurrency: Concurrency::ConcurrentWithCompaction,
+        weights: OpWeights {
+            upsert: 40,
+            delete: 55,
+            delete_all: 0,
+            overwrite: 0,
+            compact: 0,
+            restart: 3,
+            move_to_cold_tier: 8,
+        },
+        population: 32,
+        batch_size: 1,
+        ops: scaled_ops(200),
+        seeds: scaled_seeds(6),
+        pk_keyset_cache_mb: None,
+        cold: true,
     }
 }
 
@@ -1042,6 +1237,28 @@ async fn prop_concurrent_memory_sqlite() -> TestResult<()> {
     .map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 
+// --- Cold (datalake) tier convergence: promotion + GC as PRNG-scheduled ops ---
+//
+// `MoveToColdTier` settles the warm tier, promotes it to a local `file://` cold
+// store, and runs one GC pass — the production promotion-tick sequence. The op
+// is a model no-op, so every existing check does the work: `assert_converged`
+// catches loss/resurrection across tiers, `verify_aggregate_queries` catches
+// cross-tier double-counts (phantom rows visible in both warm and cold), and
+// `Restart` reopens from the catalog — validating the persisted cold manifest
+// on every walk.
+async fn prop_sequential_cold_impl(f: TestFixture) -> TestResult<()> {
+    run_workload(f, sequential_cold()).await
+}
+test_with_backends!(prop_sequential_cold_impl);
+
+// Foreground promotions + restarts with a background compactor/bake loop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prop_concurrent_cold_sqlite() -> TestResult<()> {
+    common::run_with_backend(BackendType::Sqlite, |f| run_workload(f, concurrent_cold()))
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+
 // --- Focused regression: re-upsert after overwrite+delete stays visible ---
 //
 // The minimal deterministic shape behind the sequential walks: INSERT OVERWRITE
@@ -1054,7 +1271,7 @@ async fn prop_concurrent_memory_sqlite() -> TestResult<()> {
 async fn reupsert_after_overwrite_delete_is_visible_impl(f: TestFixture) -> TestResult<()> {
     for mode in [Mode::Key, Mode::Position] {
         let name = format!("reupsert_min_{mode:?}");
-        let (table, ctx) = create_table(&f, &name, mode, Durability::File, None).await?;
+        let (table, ctx) = create_table(&f, &name, mode, Durability::File, None, false).await?;
 
         overwrite(&table, &[(1, 100)]).await?;
         delete_key(&table, 1, Durability::File).await?;
@@ -1162,7 +1379,7 @@ async fn prop_concurrent_mixed_dense_bloom_position_sqlite() -> TestResult<()> {
 
 async fn run_concurrent_reads_seed(fixture: &TestFixture, mode: Mode, seed: u64) -> TestResult<()> {
     let name = format!("iso_{mode:?}_{seed}");
-    let (table, ctx) = create_table(fixture, &name, mode, Durability::File, None).await?;
+    let (table, ctx) = create_table(fixture, &name, mode, Durability::File, None, false).await?;
     let mut rng = Rng::new(seed);
 
     let n: i64 = 200;

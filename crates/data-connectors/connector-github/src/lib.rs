@@ -15,6 +15,7 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
+use crate::github::{GithubFilesTableProvider, GithubRestClient};
 use crate::members::MembersTableArgs;
 use crate::pull_requests::PullRequestCommentType;
 use arrow::array::{Array, RecordBatch};
@@ -22,17 +23,14 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use chrono::{SecondsFormat, TimeZone, Utc, offset::LocalResult};
 use commits::{CommitsTableArgs, CommitsTableProvider};
-use data_components::graphql::client::UnnestBehavior;
-use data_components::{
-    github::{self, GithubFilesTableProvider, GithubRestClient},
-    graphql::{
-        self, FilterPushdownResult, GraphQLContext,
-        builder::GraphQLClientBuilder,
-        client::{GraphQLClient, GraphQLQuery, PaginationParameters},
-        provider::{GraphQLTableProvider, GraphQLTableProviderBuilder},
-    },
-    rate_limit::RateLimiter,
+use connector_graphql::graphql::client::UnnestBehavior;
+use connector_graphql::graphql::{
+    self, FilterPushdownResult, GraphQLContext,
+    builder::GraphQLClientBuilder,
+    client::{GraphQLClient, GraphQLQuery, PaginationParameters},
+    provider::{GraphQLTableProvider, GraphQLTableProviderBuilder},
 };
+use data_components::rate_limit::RateLimiter;
 use datafusion::{
     common::Column,
     datasource::TableProvider,
@@ -69,6 +67,8 @@ use runtime::dataconnector::{
     DataConnectorResult, NewDataConnectorResult,
 };
 use runtime::parameters::{ParameterSpec, Parameters};
+
+pub mod github;
 
 mod commits;
 mod issues;
@@ -2195,3 +2195,13 @@ mod tests {
         );
     }
 }
+
+// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// should see this connector must force-link the crate (`use connector_github as _;`) -- a plain
+// Cargo dependency won't link the slice static. See `register_data_connector!` docs.
+runtime::register_data_connector!(
+    register_github_connector,
+    GITHUB_CONNECTOR_REGISTRATION,
+    CONNECTOR_NAME,
+    GithubFactory
+);

@@ -349,6 +349,13 @@ impl RuntimeBuilder {
         let target_partitions = query.target_partitions;
         let max_concurrent_queries = query.max_concurrent_queries;
 
+        // The effective timeout is resolved per request by
+        // `RequestContextBuilder::build` from the app's `runtime.query.timeout`;
+        // validate here so a misconfigured value is warned about once at startup
+        if let Err(e) = query.timeout() {
+            tracing::warn!("{e} No query timeout will be applied.");
+        }
+
         let metrics = spicepod_rt.metrics.clone();
 
         let dataset_parallelism = spicepod_rt.dataset_load_parallelism;
@@ -502,6 +509,61 @@ impl RuntimeBuilder {
         // count grows.
         let cayenne_cdc_reservation_bytes =
             estimate_cayenne_cdc_reservation_bytes(self.app.as_ref(), &spicepod_rt.params);
+
+        // ---- Coordinated cgroup-aware memory budget for DuckDB accelerators ----
+        // The DataFusion query pool defaults to 90% of RAM and EACH distinct DuckDB
+        // instance defaults to DuckDB's own ~80%-of-RAM `memory_limit`; stacked they
+        // over-commit host memory (N datasets on N separate DuckDB files ⇒ N×80%).
+        // Compute a cgroup-aware split that fits, publish the per-instance cap for
+        // the DuckDB accelerator to apply, and warn with what was applied /
+        // recommended. An explicit `runtime.query.memory_limit` / per-dataset
+        // `duckdb_memory_limit` always overrides. See `accelerator_memory_budget`.
+        let duckdb_budget_inputs = duckdb_budget_inputs(self.app.as_ref());
+        let has_duckdb_instances = duckdb_budget_inputs.num_unset_instances > 0
+            || duckdb_budget_inputs.num_explicit_instances > 0;
+        let duckdb_query_pool_cap = if has_duckdb_instances {
+            let cayenne_active = compaction_memory_fraction.is_some();
+            let total_memory = crate::resource_monitor::get_total_memory();
+            // DuckDB's own default memory_limit is ~80% of HOST RAM (not the cgroup
+            // limit), so project the un-coordinated ceiling from host memory —
+            // otherwise a container (host RAM > cgroup) would under-estimate it and
+            // skip coordination exactly where the OOM risk is highest.
+            let duckdb_default_per_instance =
+                crate::accelerator_memory_budget::duckdb_default_per_instance_bytes(
+                    crate::resource_monitor::get_host_memory(),
+                );
+            let base_query_budget = crate::datafusion::builder::effective_query_memory_limit(
+                None,
+                cayenne_active,
+                cayenne_cdc_reservation_bytes,
+                None,
+            );
+            let plan = crate::accelerator_memory_budget::plan(
+                total_memory,
+                duckdb_default_per_instance,
+                base_query_budget,
+                memory_limit,
+                &duckdb_budget_inputs,
+            );
+            crate::accelerator_memory_budget::publish_duckdb_budget(
+                plan.per_instance_cap_bytes,
+                plan.duckdb_reservation_bytes,
+            );
+            emit_duckdb_memory_budget_warning(
+                &plan,
+                total_memory,
+                duckdb_default_per_instance,
+                &duckdb_budget_inputs,
+            );
+            plan.query_pool_cap_bytes
+        } else {
+            // No DuckDB accelerators (or the duckdb feature isn't compiled in): skip
+            // the cgroup/host memory probes and the planner entirely — the plan would
+            // NoOp anyway. Clear any previously-published budget so a hot-reload that
+            // removed all DuckDB accelerators doesn't leave a stale reservation.
+            crate::accelerator_memory_budget::publish_duckdb_budget(0, 0);
+            None
+        };
 
         #[cfg(not(windows))]
         if cayenne_footer_cache_mb.is_some() {
@@ -709,6 +771,7 @@ impl RuntimeBuilder {
         .cayenne_footer_cache_mb(cayenne_footer_cache_mb)
         .compaction_memory_fraction(compaction_memory_fraction)
         .cayenne_cdc_reservation_bytes(cayenne_cdc_reservation_bytes)
+        .duckdb_query_pool_cap(duckdb_query_pool_cap)
         .cayenne_optimizer_rules(cayenne_optimizer_rules);
 
         if let Some(DistributedNode::Scheduler {
@@ -787,6 +850,14 @@ impl RuntimeBuilder {
             telemetry_config: self.telemetry_config,
         };
 
+        // Executors: register cluster status before any concurrent
+        // `load_components` / `start_servers` race so readiness cannot pass on
+        // dataset-only status while task slots are still closed (#11758 Fix B).
+        if is_cluster_executor {
+            rt.status
+                .update_cluster("executor", status::ComponentStatus::Initializing);
+        }
+
         let mut extensions: HashMap<String, Arc<dyn Extension>> = HashMap::new();
         for factory in self.extensions {
             let mut extension = factory.create();
@@ -833,6 +904,16 @@ impl Default for RuntimeBuilder {
 }
 
 #[cfg(not(feature = "rate-control"))]
+// This build has no persisted rate-control backend, so this stub never awaits.
+// It must stay `async` to match the `rate-control` variant's signature: the sole
+// caller awaits the result unconditionally. The suppression is inherently
+// feature-conditional — it exists only in this `cfg(not(rate-control))` variant,
+// exactly the build where the lint fires; under `rate-control` this whole fn is
+// compiled out and the real variant awaits.
+#[expect(
+    clippy::unused_async,
+    reason = "signature parity with the rate-control variant; caller awaits unconditionally"
+)]
 async fn build_http_rate_control_registry(
     source_rate_control: Option<&SpicepodSourceRateControl>,
     secrets: Arc<RwLock<Secrets>>,
@@ -1103,6 +1184,191 @@ fn estimate_cayenne_cdc_reservation_bytes(
     total
 }
 
+/// Deduped-by-instance summary of the `DuckDB` accelerators in `app`, for the
+/// coordinated memory budget ([`crate::accelerator_memory_budget::plan`]).
+///
+/// Groups datasets by `DuckDB` instance identity — one per distinct resolved file
+/// path, plus a single shared key for all memory-mode datasets (mirroring the
+/// fork's `DbInstanceKey`) — and classifies each instance as explicit (some
+/// dataset sets `duckdb_memory_limit`, taking the max) or un-limited. Imperfect
+/// path canonicalization only ever OVER-counts instances, yielding smaller, safer
+/// caps.
+#[cfg(feature = "duckdb")]
+fn duckdb_budget_inputs(
+    app: Option<&Arc<app::App>>,
+) -> crate::accelerator_memory_budget::DuckDbBudgetInputs {
+    use crate::accelerator_memory_budget::DuckDbBudgetInputs;
+
+    /// Per-instance aggregation while grouping datasets by `DbInstanceKey`.
+    #[derive(Default)]
+    struct InstanceAgg {
+        explicit_max: Option<u64>,
+        has_unset: bool,
+        /// Datasets sharing this instance set DIFFERENT explicit `duckdb_memory_limit`
+        /// values. Since the setting is per-instance (last dataset created wins), the
+        /// effective limit is ambiguous — surfaced in the warning.
+        conflicting_explicit: bool,
+    }
+
+    let mut inputs = DuckDbBudgetInputs::default();
+    let Some(app) = app else {
+        return inputs;
+    };
+    let accelerator = crate::dataaccelerator::duckdb::DuckDBAccelerator::default();
+    let mut instances: HashMap<String, InstanceAgg> = HashMap::new();
+
+    for dataset in &app.datasets {
+        let Some(accel) = dataset.acceleration.as_ref() else {
+            continue;
+        };
+        if !accel.enabled
+            || !accel
+                .engine
+                .as_deref()
+                .is_some_and(|engine| engine.eq_ignore_ascii_case("duckdb"))
+        {
+            continue;
+        }
+        // Instance identity: memory-mode datasets share ONE in-memory instance;
+        // file-mode datasets group by their resolved DuckDB file path.
+        let key = if accel.mode == spicepod::acceleration::Mode::Memory {
+            "<in-memory>".to_string()
+        } else {
+            accelerator
+                .spicepod_dataset_duckdb_file_path(dataset)
+                .unwrap_or_else(|| format!("<file:{}>", dataset.name))
+        };
+        let params = accel
+            .params
+            .as_ref()
+            .map(spicepod::param::Params::as_string_map)
+            .unwrap_or_default();
+        // Parse with binary units (`true`) to match the DuckDB fork's own
+        // `MemoryLimitSetting` validation; an unparseable explicit value is treated
+        // as unset so the instance still gets a safe auto-cap (the fork would reject
+        // the bad value at creation anyway).
+        let explicit = params
+            .get("duckdb_memory_limit")
+            .and_then(|v| byte_unit::Byte::parse_str(v.trim(), true).ok())
+            .map(byte_unit::Byte::as_u64);
+
+        let agg = instances.entry(key).or_default();
+        match explicit {
+            Some(bytes) => {
+                // A different explicit value than one already seen on this instance
+                // means the datasets disagree on the per-instance limit.
+                if let Some(prev) = agg.explicit_max
+                    && prev != bytes
+                {
+                    agg.conflicting_explicit = true;
+                }
+                agg.explicit_max = Some(agg.explicit_max.map_or(bytes, |m| m.max(bytes)));
+            }
+            None => agg.has_unset = true,
+        }
+    }
+
+    for (key, agg) in instances {
+        if let Some(bytes) = agg.explicit_max {
+            inputs.num_explicit_instances += 1;
+            inputs.sum_explicit_bytes = inputs.sum_explicit_bytes.saturating_add(bytes);
+            // Inconsistent per-instance limit: some datasets set it and some didn't,
+            // or datasets set different explicit values. Either way it's ambiguous.
+            if agg.has_unset || agg.conflicting_explicit {
+                inputs.has_mixed_instance = true;
+            }
+        } else {
+            inputs.num_unset_instances += 1;
+            inputs.unset_instance_labels.push(key);
+        }
+    }
+    // Deterministic warning output: `instances` is a `HashMap`, so its iteration
+    // order (and thus the pushed label order) varies run-to-run. Sort so identical
+    // Spicepods always log the same `duckdb_unset_instance_paths` list, keeping log
+    // analysis and alert dedup stable.
+    inputs.unset_instance_labels.sort();
+    inputs
+}
+
+/// Without the `duckdb` feature no `DuckDB` accelerators can be configured, so the
+/// coordinated budget has nothing to do.
+#[cfg(not(feature = "duckdb"))]
+fn duckdb_budget_inputs(
+    _app: Option<&Arc<app::App>>,
+) -> crate::accelerator_memory_budget::DuckDbBudgetInputs {
+    crate::accelerator_memory_budget::DuckDbBudgetInputs::default()
+}
+
+/// Emits the "auto-limit with warning" guidance when the coordinated `DuckDB`
+/// budget engaged. `NoOp` (no `DuckDB` accelerators, or the naive ceilings already
+/// fit) stays silent.
+fn emit_duckdb_memory_budget_warning(
+    plan: &crate::accelerator_memory_budget::AcceleratorMemoryPlan,
+    total_memory: u64,
+    duckdb_default_per_instance: u64,
+    inputs: &crate::accelerator_memory_budget::DuckDbBudgetInputs,
+) {
+    use crate::accelerator_memory_budget::PlanOutcome;
+
+    if plan.outcome != PlanOutcome::Applied {
+        return;
+    }
+
+    let hb = |bytes: u64| util::human_readable_bytes(usize::try_from(bytes).unwrap_or(usize::MAX));
+    let n = inputs.num_unset_instances;
+    let total_h = hb(total_memory);
+    let query_h = hb(plan.effective_query_pool_bytes);
+    let per_instance_h = hb(plan.per_instance_cap_bytes);
+    // DuckDB's own default is ~80% of HOST RAM (not the cgroup total) — the value the
+    // projection/decision used.
+    let duckdb_default_h = hb(duckdb_default_per_instance);
+    let mixed = if inputs.has_mixed_instance {
+        " One or more DuckDB instances have inconsistent duckdb_memory_limit across the datasets that share them (mixed set/unset, or different explicit values); because DuckDB's memory_limit is per-instance the last dataset created wins, so set it consistently on all datasets sharing an instance."
+    } else {
+        ""
+    };
+
+    if n == 0 {
+        // Every DuckDB instance set an explicit duckdb_memory_limit — there are no
+        // un-limited instances to auto-cap, only the query pool was reduced to fit
+        // those explicit ceilings. (Describe just that, not a "0 instances capped".)
+        if plan.residual_overcommit {
+            tracing::warn!(
+                total_memory_bytes = total_memory,
+                query_pool_bytes = plan.effective_query_pool_bytes,
+                duckdb_explicit_bytes = inputs.sum_explicit_bytes,
+                "The explicit DuckDB accelerator memory limits plus the query memory limit exceed the coordinated memory budget and cut into the safety headroom below the {total_h} available to this process; combined ceilings may approach or exceed it and risk an OOM kill under load. Lower the per-dataset duckdb_memory_limit values and/or runtime.query.memory_limit so combined ceilings fit.{mixed} For details, visit: https://spiceai.org/docs/reference/memory"
+            );
+        } else {
+            tracing::warn!(
+                total_memory_bytes = total_memory,
+                query_pool_bytes = plan.effective_query_pool_bytes,
+                duckdb_explicit_bytes = inputs.sum_explicit_bytes,
+                "Reduced the DataFusion query memory limit to {query_h} so it plus the explicit DuckDB accelerator memory limits fit the {total_h} available to this process. To customize, set runtime.query.memory_limit.{mixed} For details, visit: https://spiceai.org/docs/reference/memory"
+            );
+        }
+    } else if plan.residual_overcommit {
+        tracing::warn!(
+            total_memory_bytes = total_memory,
+            projected_ceiling_bytes = plan.projected_ceiling_bytes,
+            query_pool_bytes = plan.effective_query_pool_bytes,
+            duckdb_unset_instances = n,
+            recommended_duckdb_memory_limit_bytes = plan.per_instance_cap_bytes,
+            recommended_query_memory_limit_bytes = plan.effective_query_pool_bytes,
+            "Even after auto-capping, the {n} DuckDB instance(s) without an explicit duckdb_memory_limit plus the query memory limit exceed the coordinated memory budget and cut into the safety headroom below the {total_h} available to this process; combined ceilings may approach or exceed it and risk an OOM kill under load. Reduce the number of distinct DuckDB files, or set runtime.query.memory_limit: \"{query_h}\" and duckdb_memory_limit: \"{per_instance_h}\" on each DuckDB-accelerated dataset so combined ceilings fit.{mixed} For details, visit: https://spiceai.org/docs/reference/memory"
+        );
+    } else {
+        tracing::warn!(
+            total_memory_bytes = total_memory,
+            query_pool_bytes = plan.effective_query_pool_bytes,
+            duckdb_unset_instances = n,
+            duckdb_per_instance_bytes = plan.per_instance_cap_bytes,
+            duckdb_unset_instance_paths = ?inputs.unset_instance_labels,
+            "Detected potential memory over-commit from DuckDB accelerators and automatically capped memory to fit the {total_h} available to this process: {n} DuckDB instance(s) without an explicit duckdb_memory_limit — each would otherwise default to ~80% of host RAM (about {duckdb_default_h} here, or more in a container where DuckDB sees the host's RAM rather than this process's cgroup limit) — are capped at {per_instance_h} each, and the query memory limit at {query_h}. To customize, set runtime.query.memory_limit and/or per-dataset duckdb_memory_limit.{mixed} For details, visit: https://spiceai.org/docs/reference/memory"
+        );
+    }
+}
+
 fn parse_f64_runtime_param(params: &HashMap<String, String>, key: &str) -> Option<f64> {
     let raw = params.get(key)?;
     match raw.parse::<f64>() {
@@ -1308,6 +1574,129 @@ mod test {
             let result = parse_memory_limit(input.map(ToString::to_string));
             assert_eq!(result, expected, "Input: {input:?}");
         }
+    }
+
+    /// The `DuckDB` budget adapter groups datasets by instance identity (distinct
+    /// file paths → distinct instances; a shared file or all memory-mode datasets →
+    /// one), classifies explicit vs un-limited, and ignores non-DuckDB engines.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn test_duckdb_budget_inputs_groups_by_instance() {
+        use spicepod::acceleration::{Acceleration, Mode};
+        use spicepod::component::dataset::Dataset;
+        use spicepod::param::Params;
+        use std::sync::Arc;
+
+        fn duckdb_ds(name: &str, mode: Mode, params: &[(&str, &str)]) -> Dataset {
+            let mut ds = Dataset::new("dummy:source", name);
+            ds.acceleration = Some(Acceleration {
+                enabled: true,
+                engine: Some("duckdb".to_string()),
+                mode,
+                params: Some(Params::from_string_map(
+                    params
+                        .iter()
+                        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                        .collect::<HashMap<String, String>>(),
+                )),
+                ..Acceleration::default()
+            });
+            ds
+        }
+
+        let inputs_for = |datasets: Vec<Dataset>| {
+            let app = datasets
+                .into_iter()
+                .fold(app::AppBuilder::new("mem-budget-test"), |b, ds| {
+                    b.with_dataset(ds)
+                })
+                .build();
+            duckdb_budget_inputs(Some(&Arc::new(app)))
+        };
+
+        // Two file-mode datasets on DISTINCT files → two un-limited instances.
+        let inputs = inputs_for(vec![
+            duckdb_ds("a", Mode::File, &[("duckdb_file", "/tmp/spice-mbt-a.db")]),
+            duckdb_ds("b", Mode::File, &[("duckdb_file", "/tmp/spice-mbt-b.db")]),
+        ]);
+        assert_eq!(inputs.num_unset_instances, 2);
+        assert_eq!(inputs.num_explicit_instances, 0);
+
+        // Two file-mode datasets on the SAME file share ONE instance.
+        let inputs = inputs_for(vec![
+            duckdb_ds(
+                "a",
+                Mode::File,
+                &[("duckdb_file", "/tmp/spice-mbt-shared.db")],
+            ),
+            duckdb_ds(
+                "b",
+                Mode::File,
+                &[("duckdb_file", "/tmp/spice-mbt-shared.db")],
+            ),
+        ]);
+        assert_eq!(inputs.num_unset_instances, 1);
+
+        // One explicit + one un-limited instance.
+        let inputs = inputs_for(vec![
+            duckdb_ds(
+                "a",
+                Mode::File,
+                &[
+                    ("duckdb_file", "/tmp/spice-mbt-x.db"),
+                    ("duckdb_memory_limit", "2GiB"),
+                ],
+            ),
+            duckdb_ds("b", Mode::File, &[("duckdb_file", "/tmp/spice-mbt-y.db")]),
+        ]);
+        assert_eq!(inputs.num_unset_instances, 1);
+        assert_eq!(inputs.num_explicit_instances, 1);
+        assert_eq!(inputs.sum_explicit_bytes, 2 * 1024 * 1024 * 1024);
+
+        // All memory-mode datasets collapse to ONE in-memory instance.
+        let inputs = inputs_for(vec![
+            duckdb_ds("a", Mode::Memory, &[]),
+            duckdb_ds("b", Mode::Memory, &[]),
+        ]);
+        assert_eq!(inputs.num_unset_instances, 1);
+
+        // A non-DuckDB (Arrow) accelerated dataset is ignored.
+        let mut arrow_ds = Dataset::new("dummy:source", "arrow");
+        arrow_ds.acceleration = Some(Acceleration {
+            enabled: true,
+            engine: None,
+            mode: Mode::Memory,
+            ..Acceleration::default()
+        });
+        let inputs = inputs_for(vec![arrow_ds]);
+        assert_eq!(inputs.num_unset_instances, 0);
+        assert_eq!(inputs.num_explicit_instances, 0);
+
+        // Two datasets on the SAME file with DIFFERENT explicit limits → one
+        // explicit instance flagged as inconsistent (per-instance limit is ambiguous).
+        let inputs = inputs_for(vec![
+            duckdb_ds(
+                "a",
+                Mode::File,
+                &[
+                    ("duckdb_file", "/tmp/spice-mbt-conflict.db"),
+                    ("duckdb_memory_limit", "2GiB"),
+                ],
+            ),
+            duckdb_ds(
+                "b",
+                Mode::File,
+                &[
+                    ("duckdb_file", "/tmp/spice-mbt-conflict.db"),
+                    ("duckdb_memory_limit", "4GiB"),
+                ],
+            ),
+        ]);
+        assert_eq!(inputs.num_explicit_instances, 1);
+        assert_eq!(inputs.num_unset_instances, 0);
+        assert!(inputs.has_mixed_instance, "conflicting per-instance limits");
+        // The instance's ceiling uses the max of the conflicting values.
+        assert_eq!(inputs.sum_explicit_bytes, 4 * 1024 * 1024 * 1024);
     }
 
     #[test]

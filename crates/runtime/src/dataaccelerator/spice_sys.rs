@@ -52,7 +52,6 @@ use super::turso::{Error as TursoError, TursoAccelerator};
 #[cfg(feature = "duckdb")]
 use {
     super::duckdb::{DuckDBAccelerator, Error as DuckDbError},
-    super::partitioned_duckdb::{Error as PartitionedDuckDbError, PartitionedDuckDBAccelerator},
     datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool,
 };
 #[cfg(feature = "sqlite")]
@@ -63,6 +62,7 @@ use {
 
 use crate::component::dataset::acceleration::Engine;
 use crate::dataaccelerator::AcceleratorEngineRegistry;
+use runtime_checkpoint_api::BlobCheckpointStore;
 
 pub mod dataset_checkpoint;
 #[cfg(feature = "debezium")]
@@ -71,7 +71,9 @@ pub mod debezium_kafka;
 #[cfg(feature = "kafka")]
 pub mod kafka;
 
-#[cfg(feature = "dynamodb")]
+// Driver-free sidecar (SQL + JSON only, like `dataset_checkpoint`/`caching_engine`),
+// so it is always compiled: the `connector-dynamodb` crate calls
+// `dynamodb::init_checkpoint_store` regardless of which accelerator backend is enabled.
 pub mod dynamodb;
 
 #[cfg(feature = "mongodb")]
@@ -117,10 +119,6 @@ pub enum Error {
     #[cfg(feature = "duckdb")]
     #[snafu(display("Unable to create DuckDB connection pool: {source}"))]
     DuckDbPool { source: DuckDbError },
-
-    #[cfg(feature = "duckdb")]
-    #[snafu(display("Unable to create Partitioned DuckDB connection pool: {source}"))]
-    PartitionedDuckDbPool { source: PartitionedDuckDbError },
 
     #[cfg(feature = "sqlite")]
     #[snafu(display("Failed to resolve SQLite file path: {source}"))]
@@ -220,6 +218,104 @@ pub enum OpenOption {
     OpenExisting,
 }
 
+/// Construct the per-dataset **blob** checkpoint store backed by the dataset's own
+/// accelerator, writing into the sidecar `table_name`. Returns `None` when the dataset
+/// has no usable accelerator connection (acceleration disabled, or the engine isn't
+/// compiled in), so a CDC connector degrades to re-bootstrapping from scratch rather
+/// than failing.
+///
+/// This is the seam that lets CDC connectors persist their stream position without
+/// naming any runtime-internal accelerator type: they receive an
+/// `Arc<dyn BlobCheckpointStore>` and never see the engine. Resolving the connection
+/// needs the accelerator engine registry, which is why this factory lives in `runtime`.
+#[cfg(any(
+    feature = "duckdb",
+    feature = "sqlite",
+    feature = "postgres-accel",
+    feature = "turso"
+))]
+pub async fn checkpoint_store(
+    dataset: &crate::component::dataset::Dataset,
+    table_name: &'static str,
+) -> Option<Arc<dyn BlobCheckpointStore>> {
+    let registry = dataset.runtime.accelerator_engine_registry();
+    let connection = match acceleration_connection(dataset, registry, OpenOption::CreateIfNotExists)
+        .await
+    {
+        Ok(connection) => connection,
+        Err(e) => {
+            // Surface *why* checkpointing is unavailable (missing engine feature,
+            // missing file, pool-init failure, …) instead of a silent `None`.
+            tracing::warn!(
+                dataset = %dataset.name,
+                error = %e,
+                "Could not resolve the dataset's accelerator connection for checkpoint storage; the connector will run without a persisted checkpoint"
+            );
+            return None;
+        }
+    };
+    let dataset_name = dataset.name.to_string();
+
+    // Exhaustive over the compiled `AccelerationConnection` variants — no wildcard, so
+    // adding an accelerator variant forces a matching arm here.
+    let store: Arc<dyn BlobCheckpointStore> = match connection {
+        #[cfg(feature = "duckdb")]
+        AccelerationConnection::DuckDB(pool) => {
+            Arc::new(runtime_checkpoint_duckdb::DuckDbBlobCheckpointStore::new(
+                pool,
+                dataset_name,
+                table_name,
+            ))
+        }
+        #[cfg(feature = "postgres-accel")]
+        AccelerationConnection::Postgres(pool) => Arc::new(
+            runtime_checkpoint_postgres::PostgresBlobCheckpointStore::new(
+                pool,
+                dataset_name,
+                table_name,
+            ),
+        ),
+        #[cfg(feature = "sqlite")]
+        AccelerationConnection::SQLite(pool) => {
+            Arc::new(runtime_checkpoint_sqlite::SqliteBlobCheckpointStore::new(
+                pool,
+                dataset_name,
+                table_name,
+            ))
+        }
+        #[cfg(feature = "turso")]
+        AccelerationConnection::Turso(pool) => Arc::new(
+            runtime_checkpoint_turso::TursoBlobCheckpointStore::new(pool, dataset_name, table_name),
+        ),
+        #[cfg(all(not(windows), feature = "sqlite"))]
+        AccelerationConnection::Cayenne(pool) => {
+            Arc::new(runtime_checkpoint_sqlite::SqliteBlobCheckpointStore::new(
+                pool,
+                dataset_name,
+                table_name,
+            ))
+        }
+    };
+    Some(store)
+}
+
+/// No accelerator backend is compiled in, so nothing can persist a checkpoint: the
+/// connector runs stateless (ephemeral, re-bootstrapping on restart). Signature parity
+/// with the accelerator-backed variant above (see it for the full contract).
+#[cfg(not(any(
+    feature = "duckdb",
+    feature = "sqlite",
+    feature = "postgres-accel",
+    feature = "turso"
+)))]
+pub async fn checkpoint_store(
+    dataset: &crate::component::dataset::Dataset,
+    table_name: &'static str,
+) -> Option<Arc<dyn BlobCheckpointStore>> {
+    let _ = (dataset, table_name);
+    None
+}
+
 async fn acceleration_connection(
     source: &dyn AccelerationSource,
     #[cfg_attr(
@@ -265,56 +361,8 @@ async fn acceleration_connection(
 
             Ok(AccelerationConnection::DuckDB(Arc::new(pool)))
         }
-        #[cfg(feature = "duckdb")]
-        Engine::PartitionedDuckDB => {
-            let accelerator = registry
-                .get_accelerator_engine(acceleration_settings.engine)
-                .await
-                .context(AcceleratorEngineUnavailableSnafu {
-                    engine: Engine::PartitionedDuckDB,
-                })?;
-            let duckdb_accelerator = accelerator
-                .as_any()
-                .downcast_ref::<PartitionedDuckDBAccelerator>()
-                .context(DowncastFailedSnafu {
-                    target: "PartitionedDuckDBAccelerator",
-                })?;
-
-            let pool = duckdb_accelerator
-                .get_shared_pool(source)
-                .await
-                .context(PartitionedDuckDbPoolSnafu)?;
-
-            Ok(AccelerationConnection::DuckDB(pool))
-        }
-        #[cfg(feature = "duckdb")]
-        Engine::TableModePartitionedDuckDB => {
-            use crate::dataaccelerator::partitioned_duckdb::tables_mode::TablesModePartitionedDuckDBAccelerator;
-
-            let accelerator = registry
-                .get_accelerator_engine(acceleration_settings.engine)
-                .await
-                .context(AcceleratorEngineUnavailableSnafu {
-                    engine: Engine::TableModePartitionedDuckDB,
-                })?;
-            let duckdb_accelerator = accelerator
-                .as_any()
-                .downcast_ref::<TablesModePartitionedDuckDBAccelerator>()
-                .context(DowncastFailedSnafu {
-                    target: "TableModePartitionedDuckDBAccelerator",
-                })?;
-
-            let pool = duckdb_accelerator
-                .get_shared_pool(source)
-                .await
-                .context(PartitionedDuckDbPoolSnafu)?;
-
-            Ok(AccelerationConnection::DuckDB(pool))
-        }
         #[cfg(not(feature = "duckdb"))]
-        Engine::DuckDB | Engine::PartitionedDuckDB | Engine::TableModePartitionedDuckDB => {
-            DuckDbFeatureNotEnabledSnafu.fail()
-        }
+        Engine::DuckDB => DuckDbFeatureNotEnabledSnafu.fail(),
         #[cfg(feature = "sqlite")]
         Engine::Sqlite => {
             let accelerator = registry

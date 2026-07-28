@@ -749,26 +749,69 @@ pub(crate) fn check_and_filter_unique_constraint<S: std::hash::BuildHasher + Def
 
         Ok(unique_set)
     } else {
-        // For smaller datasets, use HashSet (better for small sizes)
+        // For smaller datasets, use HashSet (better for small sizes).
+        // Check with &str first so duplicate/conflict paths do not allocate a throwaway String.
         let mut unique_set = HashSet::with_capacity_and_hasher(ids.len(), S::default());
-        ids.iter()
-            .map(|&id| {
-                if unique_set.insert(id.to_string()) {
-                    if existing_ids.is_some_and(|existing| existing.contains(id)) {
-                        return Err(DataFusionError::Execution(format!(
-                            "Primary key ({id}) already exists and is not unique"
-                        )));
-                    }
-                    Ok(())
-                } else {
-                    Err(DataFusionError::Execution(
-                        "Primary key values must be unique".to_string(),
-                    ))
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
+        for &id in ids {
+            if unique_set.contains(id) {
+                return Err(DataFusionError::Execution(
+                    "Primary key values must be unique".to_string(),
+                ));
+            }
+            if existing_ids.is_some_and(|existing| existing.contains(id)) {
+                return Err(DataFusionError::Execution(format!(
+                    "Primary key ({id}) already exists and is not unique"
+                )));
+            }
+            unique_set.insert(id.to_string());
+        }
 
         Ok(unique_set)
+    }
+}
+
+/// Format an unsigned integer into a `String` via a stack digit buffer (avoids `fmt` machinery).
+#[inline]
+fn u64_to_key_string(mut n: u64) -> String {
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    match String::from_utf8(buf[i..].to_vec()) {
+        Ok(s) => s,
+        // Only ASCII digits are written above; this branch is unreachable in practice.
+        Err(e) => String::from_utf8_lossy(&e.into_bytes()).into_owned(),
+    }
+}
+
+/// Format a signed integer into a `String` via a stack digit buffer (avoids `fmt` machinery).
+#[inline]
+fn i64_to_key_string(n: i64) -> String {
+    if n >= 0 {
+        return u64_to_key_string(n.cast_unsigned());
+    }
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    let mut n = n.unsigned_abs();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    i -= 1;
+    buf[i] = b'-';
+    match String::from_utf8(buf[i..].to_vec()) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(&e.into_bytes()).into_owned(),
     }
 }
 
@@ -808,7 +851,7 @@ pub(crate) fn extract_primary_keys_str(
                     keys.push(if array.is_null(row_idx) {
                         None
                     } else {
-                        Some(array.value(row_idx).to_string())
+                        Some(i64_to_key_string(i64::from(array.value(row_idx))))
                     });
                 }
             }
@@ -823,7 +866,7 @@ pub(crate) fn extract_primary_keys_str(
                     keys.push(if array.is_null(row_idx) {
                         None
                     } else {
-                        Some(array.value(row_idx).to_string())
+                        Some(i64_to_key_string(i64::from(array.value(row_idx))))
                     });
                 }
             }
@@ -838,7 +881,7 @@ pub(crate) fn extract_primary_keys_str(
                     keys.push(if array.is_null(row_idx) {
                         None
                     } else {
-                        Some(array.value(row_idx).to_string())
+                        Some(i64_to_key_string(i64::from(array.value(row_idx))))
                     });
                 }
             }
@@ -853,7 +896,7 @@ pub(crate) fn extract_primary_keys_str(
                     keys.push(if array.is_null(row_idx) {
                         None
                     } else {
-                        Some(array.value(row_idx).to_string())
+                        Some(i64_to_key_string(array.value(row_idx)))
                     });
                 }
             }
@@ -868,7 +911,7 @@ pub(crate) fn extract_primary_keys_str(
                     keys.push(if array.is_null(row_idx) {
                         None
                     } else {
-                        Some(array.value(row_idx).to_string())
+                        Some(u64_to_key_string(u64::from(array.value(row_idx))))
                     });
                 }
             }
@@ -883,7 +926,7 @@ pub(crate) fn extract_primary_keys_str(
                     keys.push(if array.is_null(row_idx) {
                         None
                     } else {
-                        Some(array.value(row_idx).to_string())
+                        Some(u64_to_key_string(u64::from(array.value(row_idx))))
                     });
                 }
             }
@@ -898,7 +941,7 @@ pub(crate) fn extract_primary_keys_str(
                     keys.push(if array.is_null(row_idx) {
                         None
                     } else {
-                        Some(array.value(row_idx).to_string())
+                        Some(u64_to_key_string(u64::from(array.value(row_idx))))
                     });
                 }
             }
@@ -913,7 +956,7 @@ pub(crate) fn extract_primary_keys_str(
                     keys.push(if array.is_null(row_idx) {
                         None
                     } else {
-                        Some(array.value(row_idx).to_string())
+                        Some(u64_to_key_string(array.value(row_idx)))
                     });
                 }
             }
@@ -925,10 +968,11 @@ pub(crate) fn extract_primary_keys_str(
                         DataFusionError::Execution("Failed to downcast to StringArray".to_string())
                     })?;
                 for row_idx in 0..num_rows {
+                    // Ownership is required by the Vec<Option<String>> return type.
                     keys.push(if array.is_null(row_idx) {
                         None
                     } else {
-                        Some(array.value(row_idx).to_string())
+                        Some(String::from(array.value(row_idx)))
                     });
                 }
             }
@@ -945,7 +989,7 @@ pub(crate) fn extract_primary_keys_str(
                     keys.push(if array.is_null(row_idx) {
                         None
                     } else {
-                        Some(array.value(row_idx).to_string())
+                        Some(String::from(array.value(row_idx)))
                     });
                 }
             }
@@ -965,12 +1009,12 @@ pub(crate) fn extract_primary_keys_str(
         return Ok(keys);
     }
 
-    // Composite key path: must concatenate multiple columns
+    // Composite key path: concatenate into one String (no intermediate Vec of part Strings).
     let mut keys = Vec::with_capacity(num_rows);
 
     'row: for row_idx in 0..num_rows {
-        let mut parts = Vec::with_capacity(pk_indices_ordered.len());
-        for &col_idx in pk_indices_ordered {
+        let mut key = String::new();
+        for (part_i, &col_idx) in pk_indices_ordered.iter().enumerate() {
             let col = batch.column(col_idx);
 
             // Optimization: Check nullity first before expensive conversion
@@ -981,10 +1025,12 @@ pub(crate) fn extract_primary_keys_str(
 
             let val = ScalarValue::try_from_array(col, row_idx)
                 .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-            parts.push(val.to_string());
+            if part_i > 0 {
+                key.push('|');
+            }
+            // `String` as `fmt::Write` never fails; append Display output without a temp String.
+            let _ = std::fmt::Write::write_fmt(&mut key, format_args!("{val}"));
         }
-        // Join all PK parts with a delimiter
-        let key = parts.join("|");
         keys.push(Some(key));
     }
 
@@ -999,15 +1045,16 @@ fn extract_constraint_keys_str(
     let mut keys = Vec::with_capacity(num_rows);
 
     for row_idx in 0..num_rows {
-        let mut parts = Vec::with_capacity(pk_indices_ordered.len());
-        for &col_idx in pk_indices_ordered {
+        let mut key = String::new();
+        for (part_i, &col_idx) in pk_indices_ordered.iter().enumerate() {
             let col = batch.column(col_idx);
             let val = ScalarValue::try_from_array(col, row_idx)
                 .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-            parts.push(val.to_string());
+            if part_i > 0 {
+                key.push('|');
+            }
+            let _ = std::fmt::Write::write_fmt(&mut key, format_args!("{val}"));
         }
-        // Join all parts with a delimiter
-        let key = parts.join("|");
         keys.push(key);
     }
 
@@ -1015,15 +1062,14 @@ fn extract_constraint_keys_str(
 }
 
 fn constraint_identifiers(rb: &[&RecordBatch], constraint_idx: &[usize]) -> Result<Vec<String>> {
-    // Create unique string for each constraint columns across all `new_batches` rows.
-    let new_keys: Vec<_> = rb
-        .iter()
-        .map(|b| extract_constraint_keys_str(b, constraint_idx))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .flatten()
-        .collect();
-
+    let mut total_rows = 0usize;
+    for b in rb {
+        total_rows += b.num_rows();
+    }
+    let mut new_keys = Vec::with_capacity(total_rows);
+    for b in rb {
+        new_keys.extend(extract_constraint_keys_str(b, constraint_idx)?);
+    }
     Ok(new_keys)
 }
 
@@ -1148,15 +1194,14 @@ fn primary_key_identifier(
     rb: &[&RecordBatch],
     primary_keys_ordered: &[usize],
 ) -> Result<Vec<Option<String>>> {
-    // Create unique string for each primary key across all `new_batches` rows.
-    let new_keys: Vec<_> = rb
-        .iter()
-        .map(|b| extract_primary_keys_str(b, primary_keys_ordered))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .flatten()
-        .collect();
-
+    let mut total_rows = 0usize;
+    for b in rb {
+        total_rows += b.num_rows();
+    }
+    let mut new_keys = Vec::with_capacity(total_rows);
+    for b in rb {
+        new_keys.extend(extract_primary_keys_str(b, primary_keys_ordered)?);
+    }
     Ok(new_keys)
 }
 
@@ -1214,9 +1259,9 @@ impl DataSink for MemSink {
             // because we'll remove all existing rows with these keys before inserting
             if matches!(self.overwrite, InsertOp::Replace) {
                 // Just collect unique keys and check for nulls, don't enforce uniqueness
-                for id in &new_primary_key_ids {
+                for id in new_primary_key_ids {
                     if let Some(key) = id {
-                        new_key_set.insert(key.clone());
+                        new_key_set.insert(key);
                     } else {
                         return Err(DataFusionError::Execution(
                             "Primary key values cannot be null".to_string(),
@@ -1398,7 +1443,10 @@ fn delete_primary_keys_from_snapshot(
 
 #[async_trait]
 impl DeletionSink for MemDeletionSink {
-    async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    async fn delete_from(
+        &self,
+        _context: Arc<TaskContext>,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(primary_key) = &self.primary_key
             && let Some(primary_key_values) =
                 delete_primary_key_values(&self.filters, &self.schema, primary_key)

@@ -38,8 +38,8 @@ use arrow::array::{Array, AsArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use data_components::cdc::{ChangeEnvelope, ChangesStream};
 use data_components::postgres_replication::{
-    PgOutputFormat, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput, config,
-    start_replication_stream,
+    PgOutputFormat, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
+    SchemaEvolutionPolicy, config, start_replication_stream,
 };
 use futures::StreamExt;
 use secrecy::SecretString;
@@ -83,6 +83,7 @@ fn shared_params(port: u16) -> ReplicationParams {
         member_channel_capacity:
             data_components::postgres_replication::shared::DEFAULT_MEMBER_CHANNEL_CAPACITY,
         pg_output_format: PgOutputFormat::Binary,
+        ready_lag: Duration::from_secs(2),
     }
 }
 
@@ -90,8 +91,10 @@ fn input_for(port: u16, table: &str) -> ReplicationStreamInput {
     input_with_schema(port, table, dataset_schema())
 }
 
-/// A non-shared dataset on its own slot/publication (`shared: false`), for the
-/// mixed-mode coexistence test.
+/// A dataset on its own dedicated slot/publication (`shared: false`), for the
+/// mixed-mode coexistence test. Note `shared: false` now selects only
+/// slot/publication *naming* (a per-dataset slot), not a separate apply path —
+/// every dataset runs on the shared pump, this one just as a one-member source.
 fn independent_input(port: u16, table: &str) -> ReplicationStreamInput {
     let mut params = shared_params(port);
     params.slot_name = INDEP_SLOT.into();
@@ -105,6 +108,7 @@ fn independent_input(port: u16, table: &str) -> ReplicationStreamInput {
         schema_name: "public".into(),
         table_name: table.to_string(),
         metrics: ReplicationMetricsCollector::new(),
+        policy: SchemaEvolutionPolicy::Block,
     }
 }
 
@@ -117,6 +121,7 @@ fn input_with_schema(port: u16, table: &str, schema: SchemaRef) -> ReplicationSt
         schema_name: "public".into(),
         table_name: table.to_string(),
         metrics: ReplicationMetricsCollector::new(),
+        policy: SchemaEvolutionPolicy::Block,
     }
 }
 
@@ -264,6 +269,59 @@ async fn next_envelope(
         .map_err(|e| anyhow::anyhow!("stream error waiting for {what}: {e}"))
 }
 
+fn num_rows(envelope: &ChangeEnvelope) -> usize {
+    envelope
+        .change_batch()
+        .expect("built change batch")
+        .record
+        .num_rows()
+}
+
+/// Pull the next envelope that carries rows, committing and skipping any
+/// zero-row idle heartbeats that interleave on the (now heartbeat-emitting)
+/// live stream. Lag-based readiness emits zero-row heartbeats on a caught-up
+/// source, so "the next envelope is my change" is no longer valid — real change
+/// batches always carry rows, heartbeats never do.
+async fn next_change_envelope(
+    stream: &mut ChangesStream,
+    what: &str,
+) -> Result<ChangeEnvelope, anyhow::Error> {
+    let deadline = std::time::Instant::now() + Duration::from_mins(1);
+    loop {
+        let envelope = next_envelope(stream, what).await?;
+        if num_rows(&envelope) > 0 {
+            return Ok(envelope);
+        }
+        envelope.commit().await?;
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "only idle heartbeats arrived while waiting for {what}"
+        );
+    }
+}
+
+/// Poll the stream until an envelope reports `is_dataset_ready`, committing
+/// everything seen along the way. On a caught-up, quiet source this is the
+/// source-attested idle heartbeat; on a busy source it is the first live commit
+/// whose source-commit time is within `ready_lag` of now.
+async fn wait_for_ready(
+    stream: &mut ChangesStream,
+    what: &str,
+) -> Result<ChangeEnvelope, anyhow::Error> {
+    let deadline = std::time::Instant::now() + Duration::from_mins(1);
+    loop {
+        let envelope = next_envelope(stream, what).await?;
+        if envelope.is_dataset_ready() {
+            return Ok(envelope);
+        }
+        envelope.commit().await?;
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "dataset never reached Ready while waiting for {what}"
+        );
+    }
+}
+
 fn ops_of(envelope: &ChangeEnvelope) -> Vec<String> {
     let ops = envelope
         .change_batch()
@@ -290,14 +348,15 @@ fn ids_of(envelope: &ChangeEnvelope) -> Vec<i32> {
     (0..ids.len()).map(|i| ids.value(i)).collect()
 }
 
-/// Read one envelope, assert a single row with the given op + id, commit it.
+/// Read one change envelope (skipping zero-row idle heartbeats), assert a
+/// single row with the given op + id, commit it.
 async fn expect_single_change(
     stream: &mut ChangesStream,
     what: &str,
     op: &str,
     id: i32,
 ) -> Result<(), anyhow::Error> {
-    let envelope = next_envelope(stream, what).await?;
+    let envelope = next_change_envelope(stream, what).await?;
     assert_eq!(ops_of(&envelope), vec![op.to_string()], "{what}: op");
     assert_eq!(ids_of(&envelope), vec![id], "{what}: id");
     envelope.commit().await?;
@@ -405,8 +464,17 @@ async fn shared_slot_multiplexes_multiple_datasets() -> Result<(), anyhow::Error
         2,
         "bootstrap a rows"
     );
-    assert!(boot_a.is_dataset_ready(), "bootstrap a must mark ready");
+    // Bootstrap boundary is not-ready now; readiness is lag-based and follows
+    // from the caught-up live/heartbeat path.
+    assert!(
+        !boot_a.is_dataset_ready(),
+        "bootstrap a boundary must not signal ready; readiness is lag-based"
+    );
     boot_a.commit().await?;
+    wait_for_ready(&mut stream_a, "bootstrap a readiness catch-up")
+        .await?
+        .commit()
+        .await?;
 
     let mut stream_b = start_replication_stream(input_for(port, "shared_repl_b"));
     let boot_b = next_envelope(&mut stream_b, "bootstrap b").await?;
@@ -419,8 +487,15 @@ async fn shared_slot_multiplexes_multiple_datasets() -> Result<(), anyhow::Error
         3,
         "bootstrap b rows"
     );
-    assert!(boot_b.is_dataset_ready(), "bootstrap b must mark ready");
+    assert!(
+        !boot_b.is_dataset_ready(),
+        "bootstrap b boundary must not signal ready; readiness is lag-based"
+    );
     boot_b.commit().await?;
+    wait_for_ready(&mut stream_b, "bootstrap b readiness catch-up")
+        .await?
+        .commit()
+        .await?;
 
     // --- 2. One slot, one publication covering both tables, one walsender. ---
     assert_eq!(slot_count(&source).await?, 1, "exactly one slot");
@@ -497,7 +572,10 @@ async fn shared_slot_multiplexes_multiple_datasets() -> Result<(), anyhow::Error
         1,
         "bootstrap c rows"
     );
-    assert!(boot_c.is_dataset_ready(), "bootstrap c must mark ready");
+    assert!(
+        !boot_c.is_dataset_ready(),
+        "bootstrap c boundary must not signal ready; readiness is lag-based"
+    );
     assert_eq!(
         tags_of(&boot_c, 0),
         vec![Some("x".to_string()), Some("y z".to_string())],
@@ -516,6 +594,10 @@ async fn shared_slot_multiplexes_multiple_datasets() -> Result<(), anyhow::Error
         "bootstrap captures GENERATED column values"
     );
     boot_c.commit().await?;
+    wait_for_ready(&mut stream_c, "bootstrap c readiness catch-up")
+        .await?
+        .commit()
+        .await?;
 
     assert_eq!(slot_count(&source).await?, 1, "still exactly one slot");
     assert_eq!(
@@ -531,7 +613,7 @@ async fn shared_slot_multiplexes_multiple_datasets() -> Result<(), anyhow::Error
                      'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', 99.99)",
         )
         .await?;
-    let live_c = next_envelope(&mut stream_c, "insert c").await?;
+    let live_c = next_change_envelope(&mut stream_c, "insert c").await?;
     assert_eq!(ops_of(&live_c), vec!["c".to_string()], "insert c: op");
     assert_eq!(ids_of(&live_c), vec![101], "insert c: id");
     assert_eq!(
@@ -612,7 +694,7 @@ async fn shared_slot_multiplexes_multiple_datasets() -> Result<(), anyhow::Error
              WHERE id = 1",
         )
         .await?;
-    let blob_write = next_envelope(&mut stream_d, "blob write").await?;
+    let blob_write = next_change_envelope(&mut stream_d, "blob write").await?;
     assert_eq!(ops_of(&blob_write), vec!["u".to_string()], "blob write op");
     assert_eq!(
         string_col_of(&blob_write, "blob", 0).len(),
@@ -624,7 +706,7 @@ async fn shared_slot_multiplexes_multiple_datasets() -> Result<(), anyhow::Error
     source
         .simple_query("UPDATE public.shared_repl_d SET name = 'd1x' WHERE id = 1")
         .await?;
-    let toast_update = next_envelope(&mut stream_d, "unchanged-TOAST update").await?;
+    let toast_update = next_change_envelope(&mut stream_d, "unchanged-TOAST update").await?;
     assert_eq!(
         ops_of(&toast_update),
         vec!["u".to_string()],
@@ -659,23 +741,12 @@ async fn shared_slot_multiplexes_multiple_datasets() -> Result<(), anyhow::Error
         .await?;
 
     let mut stream_a2 = start_replication_stream(input_for(port, "shared_repl_a"));
-    // Resume path: no snapshot, just the immediate ready signal...
-    let ready = next_envelope(&mut stream_a2, "rejoin ready signal").await?;
-    assert_eq!(
-        ready
-            .change_batch()
-            .expect("built change batch")
-            .record
-            .num_rows(),
-        0,
-        "rejoin must resume from the slot, not re-snapshot"
-    );
-    assert!(ready.is_dataset_ready());
-    ready.commit().await?;
-
-    // ...then WAL replay from the held confirmed_flush_lsn. At-least-once:
-    // the gap insert (13) MUST arrive; commits already applied before the
-    // restart (id 12) MAY be replayed — both are `a` rows only.
+    // Resume path: no snapshot and no immediate ready signal (the prelude is
+    // empty under lag-based readiness). The first output is the WAL replay from
+    // the held confirmed_flush_lsn; readiness follows once the stream catches
+    // up. At-least-once: the gap insert (13) MUST arrive; commits already
+    // applied before the restart (id 12) MAY be replayed — both are `a` rows
+    // only. Zero-row idle heartbeats may interleave and are skipped.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let mut saw_gap_row = false;
     while !saw_gap_row {
@@ -683,7 +754,7 @@ async fn shared_slot_multiplexes_multiple_datasets() -> Result<(), anyhow::Error
             std::time::Instant::now() < deadline,
             "timed out waiting for gap row id=13 after rejoin"
         );
-        let envelope = next_envelope(&mut stream_a2, "post-rejoin change").await?;
+        let envelope = next_change_envelope(&mut stream_a2, "post-rejoin change").await?;
         for (op, id) in ops_of(&envelope).iter().zip(ids_of(&envelope)) {
             assert_eq!(op, "c", "post-rejoin replay op");
             assert!(
@@ -694,6 +765,14 @@ async fn shared_slot_multiplexes_multiple_datasets() -> Result<(), anyhow::Error
         }
         envelope.commit().await?;
     }
+
+    // Once the replayed gap is drained, the resumed dataset reaches Ready via
+    // the caught-up live/heartbeat path — the restart-resume readiness-catchup
+    // guarantee.
+    wait_for_ready(&mut stream_a2, "rejoin readiness catch-up")
+        .await?
+        .commit()
+        .await?;
 
     // --- 6b. Non-persistent accelerator: snapshot forced on slot resume. ---
     // With `snapshot_on_resume` (set by the connector for memory-mode
@@ -715,12 +794,21 @@ async fn shared_slot_multiplexes_multiple_datasets() -> Result<(), anyhow::Error
         6,
         "snapshot_on_resume must deliver the full table on rejoin"
     );
-    assert!(boot_a3.is_dataset_ready());
+    // The forced-snapshot final envelope is a not-ready boundary now; readiness
+    // is lag-based and follows from the caught-up live/heartbeat path.
+    assert!(
+        !boot_a3.is_dataset_ready(),
+        "forced resume snapshot boundary must not signal ready; readiness is lag-based"
+    );
     assert!(
         ops_of(&boot_a3).iter().all(|op| op == "c"),
         "forced resume snapshot rows are op=c"
     );
     boot_a3.commit().await?;
+    wait_for_ready(&mut stream_a3, "forced resume readiness catch-up")
+        .await?
+        .commit()
+        .await?;
 
     // --- 7. Misconfiguration is rejected with clear errors. ---
     // Duplicate table on the same slot:
@@ -807,8 +895,17 @@ async fn shared_slot_partitioned_source_table_streams_changes() -> Result<(), an
         2,
         "bootstrap covers rows from both partitions"
     );
-    assert!(boot.is_dataset_ready(), "bootstrap must mark ready");
+    // Bootstrap boundary is not-ready now; readiness is lag-based and follows
+    // from the caught-up live/heartbeat path.
+    assert!(
+        !boot.is_dataset_ready(),
+        "bootstrap boundary must not signal ready; readiness is lag-based"
+    );
     boot.commit().await?;
+    wait_for_ready(&mut stream, "bootstrap readiness catch-up")
+        .await?
+        .commit()
+        .await?;
 
     // With publish_via_partition_root the publication lists the parent, not the
     // leaves — which is also what keeps `has_table` true across restarts.
