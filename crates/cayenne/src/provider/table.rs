@@ -56,10 +56,10 @@ use super::on_conflict::{
     RowKeyDeletionDelta, ShardedApplyResult, pk_deletion_snapshot_for_strategy,
 };
 use super::pk_index::{
-    COLD_PK_BLOOM_PER_FILE_MAX_BYTES, CachedPkIndex, CachedPkKeyset, ColdPkExistence,
-    PK_INDEX_PERSIST_MAX_BYTES, PkBloom, PkDigestSet, PkExistenceRef, PkKeysetInsertOutcome,
-    RowLocation, ShardedPkIndex, approx_captured_file_bytes, deserialize_pk_bloom_sidecar,
-    pk_digest, serialize_pk_bloom_sidecar, shard_of_pk,
+    BoundedShardedPkIndexBuilder, COLD_PK_BLOOM_PER_FILE_MAX_BYTES, CachedPkIndex, CachedPkKeyset,
+    ColdPkExistence, PK_INDEX_PERSIST_MAX_BYTES, PkBloom, PkDigestSet, PkExistenceRef,
+    PkKeysetInsertOutcome, RowLocation, ShardedPkIndex, approx_captured_file_bytes,
+    deserialize_pk_bloom_sidecar, pk_digest, serialize_pk_bloom_sidecar, shard_of_pk,
 };
 use super::streaming::StreamingExec;
 use crate::bounded_fifo::BoundedFifoSet;
@@ -6845,7 +6845,7 @@ impl CayenneTableProvider {
         *self.pk_keyset_cache.lock() = None;
         // The keyset is gone: while it is `None`, `transaction_has_conflict`
         // already takes the per-table fallback, and the next rebuild floor-stamps
-        // every key to the current high-water (`load_existing_keyset`) or returns
+        // every key to the current high-water (`load_existing_pk_index`) or returns
         // a Bloom (also per-table fallback). Either way the stale stamps that set
         // the degraded flag cannot survive, so clear it here. `Release` pairs with
         // the `Acquire` load in `transaction_has_conflict` (see the setter above).
@@ -7366,7 +7366,7 @@ impl CayenneTableProvider {
     /// `cayenne_cold_tier_file` manifest and store it in `cold_pk_existence`,
     /// returning how the keyset rebuild should treat the cold tier.
     ///
-    /// Called on every keyset cache MISS (the same point `load_existing_keyset`
+    /// Called on every keyset cache MISS (the same point `load_existing_pk_index`
     /// would run its cold scan), so the two stay coupled: NO object-store I/O —
     /// the per-file blooms come straight from the manifest rows.
     ///
@@ -7431,19 +7431,29 @@ impl CayenneTableProvider {
         Ok(ColdKeysetSource::Bloom)
     }
 
-    /// Rebuild the exact PK keyset from durable state.
+    /// Rebuild the PK existence index from durable state in ONE bounded
+    /// streaming pass: every scanned key routes straight to its shard
+    /// ([`BoundedShardedPkIndexBuilder`]), and an upsert table whose exact
+    /// keysets would exceed the byte budget degrades to bounded per-shard
+    /// blooms mid-scan instead of materializing the over-budget keyset and
+    /// re-sharding/discarding it afterwards (an O(table-rows) second pass +
+    /// unbounded allocation that ran inside the CDC apply loop — on a large
+    /// freshly-snapshotted table it starved the stream for the whole run).
+    /// `shards == 1` serves the serial path; the caller unwraps the single
+    /// shard.
     ///
     /// `fold_cold`: `true` scans the cold store to fold cold-resident keys into
-    /// the keyset (the exact path — `DoNothing`, or a cold file lacks a bloom);
+    /// the index (the exact path — `DoNothing`, or a cold file lacks a bloom);
     /// `false` skips that O(cold-rows) scan because the cold contribution is
     /// served by the [`ColdPkExistence`] bloom (`resolve_cold_keyset_source`).
     /// Immaterial when the cold tier is disabled (the pass is a no-op).
-    async fn load_existing_keyset(
+    async fn load_existing_pk_index(
         &self,
         pk_indices: &[usize],
         converter: &RowConverter,
         fold_cold: bool,
-    ) -> Result<CachedPkKeyset> {
+        shards: usize,
+    ) -> Result<ShardedPkIndex> {
         // Capture the snapshot LIST — un-checkpointed mem-tier shards, the
         // protected set, and the current snapshot id — COHERENTLY under the
         // listing fence. A protected-snapshot compaction installs a NEW current
@@ -7506,7 +7516,13 @@ impl CayenneTableProvider {
             _ => None,
         };
 
-        let mut keyset = CachedPkKeyset::with_capacity(1024);
+        // Byte budget only for upsert tables — a bloom is a sound existence
+        // answer there; `do-nothing` needs an exact answer (a false positive
+        // would wrongly drop a genuinely new row) and keeps the exact build.
+        let budget = self
+            .upsert_bloom_eligible()
+            .then(|| self.context.pk_keyset_cache_max_bytes());
+        let mut keyset = BoundedShardedPkIndexBuilder::new(shards, budget);
         let mut row_id_base: i64 = 0;
 
         // After projection, batch columns are at indices 0..pk_indices.len()
@@ -7635,15 +7651,16 @@ impl CayenneTableProvider {
         // this rebuild must conservatively treat these keys as changed —
         // stamping the end high-water makes the commit-time per-key check
         // over-abort rather than miss the conflict (a silent lost update).
+        // No-op once degraded to blooms (per-table OCC fallback).
         keyset.stamp_all_sequences_min(self.sequence_high_water().await);
 
-        Ok(keyset)
+        Ok(keyset.finish())
     }
 
     /// Re-add the CURRENT un-checkpointed mem-tier keys to a freshly rebuilt keyset,
     /// so a cold rebuild does not drop keys that live ONLY in the RAM tier (a
     /// brand-new insert not yet checkpointed, or an updated key whose superseding
-    /// copy is still in RAM). The durable scan in [`Self::load_existing_keyset`] sees
+    /// copy is still in RAM). The durable scan in [`Self::load_existing_pk_index`] sees
     /// only checkpointed files; a rebuild forced by [`Self::clear_cached_pk_keyset`]
     /// (compaction / deletion-vector refresh) does NOT flush the mem-tier first, so
     /// without this fold the next UPDATE of a RAM-only key would false-negative in
@@ -7665,7 +7682,7 @@ impl CayenneTableProvider {
         mem_snapshots: &[Arc<crate::provider::mem_tier::MemTier>],
         pk_indices: &[usize],
         converter: &RowConverter,
-        keyset: &mut CachedPkKeyset,
+        keyset: &mut BoundedShardedPkIndexBuilder,
     ) -> Result<()> {
         for tier in mem_snapshots {
             for seg in tier.segments.iter() {
@@ -7896,7 +7913,7 @@ impl CayenneTableProvider {
 
     /// Try to reconstruct the PK existence index from the persisted sidecar,
     /// skipping the full-table keyset scan. Returns `None` (→ caller falls back to
-    /// the full `load_existing_keyset`) unless the table is upsert-eligible, the
+    /// the full `load_existing_pk_index`) unless the table is upsert-eligible, the
     /// sidecar exists and validates, AND its checkpoint snapshot still equals the
     /// current snapshot (guaranteeing the bloom covers the full current snapshot —
     /// upsert tables only add data after a checkpoint, never rewriting the current
@@ -7938,7 +7955,7 @@ impl CayenneTableProvider {
         }
         // Capture the mem-tier shards, the protected set, and the current snapshot
         // id COHERENTLY under the listing fence — identical to the full rebuild in
-        // `load_existing_keyset`. A compaction/checkpoint landing between these
+        // `load_existing_pk_index`. A compaction/checkpoint landing between these
         // reads must not leave a live key in NEITHER the durable delta
         // (protected/inline, extended below) NOR the RAM mem-tier fold, which would
         // drop it from the bloom and false-negative the next update (over-count).
@@ -7991,7 +8008,7 @@ impl CayenneTableProvider {
         // Fold the un-checkpointed RAM mem-tier too: in `cdc_durability: memory` it
         // is post-checkpoint delta just like the protected/inline layers, and a
         // RAM-only key omitted here would false-negative its next update and leak
-        // the prior copy (durable over-count). Mirrors `load_existing_keyset`.
+        // the prior copy (durable over-count). Mirrors `load_existing_pk_index`.
         Self::fold_mem_tier_keys_into_bloom(&mem_snapshots, pk_indices, converter, &mut bloom)?;
         tracing::debug!(
             table = self.table_metadata.table_name.as_str(),
@@ -8006,7 +8023,7 @@ impl CayenneTableProvider {
         batches: &[RecordBatch],
         pk_indices: &[usize],
         converter: &RowConverter,
-        keyset: &mut CachedPkKeyset,
+        keyset: &mut BoundedShardedPkIndexBuilder,
     ) -> Result<()> {
         for batch in batches {
             let pk_columns: Vec<_> = pk_indices
@@ -8055,7 +8072,7 @@ impl CayenneTableProvider {
         deleted_row_keys: Option<&KeyDeletionIndex>,
         min_delete_seq_threshold: Option<i64>,
         table_name: &str,
-        keyset: &mut CachedPkKeyset,
+        keyset: &mut BoundedShardedPkIndexBuilder,
         row_id_base: &mut i64,
     ) -> Result<()> {
         while let Some(batch) = stream.next().await {
@@ -8111,7 +8128,9 @@ impl CayenneTableProvider {
                         }
                     }
                     PkDeletionStrategyWithCache::PositionBased { .. } => {
-                        unreachable!("PositionBased strategy should not reach load_existing_keyset")
+                        unreachable!(
+                            "PositionBased strategy should not reach load_existing_pk_index"
+                        )
                     }
                 };
 
@@ -8282,16 +8301,14 @@ impl CayenneTableProvider {
                 .await
             {
                 Ok(Some(index)) => index,
-                _ => CachedPkIndex::Exact(
-                    self.load_existing_keyset(pk_indices, converter, fold_cold)
-                        .await?,
-                ),
+                _ => {
+                    self.load_existing_pk_index_serial(pk_indices, converter, fold_cold)
+                        .await?
+                }
             }
         } else {
-            CachedPkIndex::Exact(
-                self.load_existing_keyset(pk_indices, converter, fold_cold)
-                    .await?,
-            )
+            self.load_existing_pk_index_serial(pk_indices, converter, fold_cold)
+                .await?
         };
         record_cayenne_write_phase(
             self.table_metadata.table_name.as_str(),
@@ -8304,6 +8321,36 @@ impl CayenneTableProvider {
             self.table_metadata.table_name
         );
         Ok(existing_keys)
+    }
+
+    /// [`Self::load_existing_pk_index`] at `shards == 1`, unwrapped into the
+    /// serial [`CachedPkIndex`] shape. An upsert table over the byte budget now
+    /// comes back as a bounded `Bloom` instead of an unbounded exact keyset
+    /// that `store_cached_pk_index` would only convert (or drop) after the
+    /// fact.
+    async fn load_existing_pk_index_serial(
+        &self,
+        pk_indices: &[usize],
+        converter: &RowConverter,
+        fold_cold: bool,
+    ) -> Result<CachedPkIndex> {
+        let index = self
+            .load_existing_pk_index(pk_indices, converter, fold_cold, 1)
+            .await?;
+        Ok(match index {
+            ShardedPkIndex::Exact(keysets) => CachedPkIndex::Exact(
+                Vec::from(keysets)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| CachedPkKeyset::with_capacity(0)),
+            ),
+            ShardedPkIndex::Bloom(blooms) => CachedPkIndex::Bloom(
+                Vec::from(blooms)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| PkBloom::with_byte_budget(0)),
+            ),
+        })
     }
 
     /// Sharded analog of [`Self::prepare_stream_for_insert`] for the N>1 in-memory
@@ -8377,16 +8424,13 @@ impl CayenneTableProvider {
         }))
     }
 
-    /// Build the per-shard PK existence index (§2.3c) by reusing the existing
-    /// single-index machinery, then routing keys to `n` shards by
-    /// [`shard_of_pk`] on each key's `OwnedRow` bytes (§3.5).
-    ///
-    /// - Exact path: build the single keyset exactly as the serial path does
-    ///   (cache reuse or full rebuild), then [`ShardedPkIndex::from_exact`].
-    /// - Bloom path: a combined bloom CANNOT be split (its keys are
-    ///   unrecoverable), so when an over-budget upsert table falls back to a
-    ///   bloom we build `n` per-shard blooms by routing each loaded key. At
-    ///   `n == 1` the single bloom wraps directly.
+    /// Build the per-shard PK existence index (§2.3c): reuse the per-shard
+    /// cache when present, else rebuild via [`Self::load_existing_pk_index`],
+    /// which routes every key to its shard ([`shard_of_pk`] on the key's
+    /// `OwnedRow` bytes, §3.5) in one bounded streaming pass. At `n == 1` a
+    /// persisted checkpoint index (exact keyset or bloom — a combined bloom
+    /// CANNOT be split, so it is only usable unsharded) wraps directly with
+    /// no re-shard pass.
     async fn build_sharded_pk_index(
         &self,
         pk_indices: &[usize],
@@ -8423,65 +8467,62 @@ impl CayenneTableProvider {
         let allow_checkpoint = !matches!(cold_source, ColdKeysetSource::Scan);
 
         // Cold rebuild. Try the persisted single bloom only at n==1 (it can't be
-        // split); at n>1 build N sharded blooms (or the exact keyset) directly. All
-        // paths route through `load_existing_keyset`, which folds the un-checkpointed
-        // mem-tier keys into the keyset (so a cold rebuild forced by
-        // `clear_cached_pk_keyset` cannot drop a RAM-only key — see there).
+        // split). All paths route through `load_existing_pk_index`, which folds
+        // the un-checkpointed mem-tier keys into the index (so a cold rebuild
+        // forced by `clear_cached_pk_keyset` cannot drop a RAM-only key — see
+        // there) and builds the N shard views in ONE budget-bounded streaming
+        // pass — routing each scanned key to its shard as it arrives, degrading
+        // an over-budget upsert table to bounded per-shard blooms mid-scan. It
+        // never materializes the whole exact keyset just to re-shard
+        // (`from_exact`) or discard it: on a large freshly-snapshotted table
+        // that second O(rows) pass and its unbounded allocation ran inside the
+        // CDC apply loop and starved the stream for the entire run.
+        //
+        // The rebuild is the dominant first-apply cost yet ran untimed here
+        // (the serial path's `keyset_rebuild` timer didn't cover it) — time it
+        // so per-phase telemetry attributes the stall.
+        let keyset_rebuild_start = Instant::now();
         if n == 1 {
             let index = if allow_checkpoint {
                 match self
                     .try_load_persisted_pk_index(pk_indices, converter)
                     .await
                 {
-                    Ok(Some(index)) => index,
-                    _ => CachedPkIndex::Exact(
-                        self.load_existing_keyset(pk_indices, converter, fold_cold)
-                            .await?,
-                    ),
+                    Ok(Some(CachedPkIndex::Exact(keyset))) => {
+                        Some(ShardedPkIndex::from_exact(keyset, 1))
+                    }
+                    Ok(Some(CachedPkIndex::Bloom(bloom))) => {
+                        Some(ShardedPkIndex::Bloom(vec![bloom].into_boxed_slice()))
+                    }
+                    _ => None,
                 }
             } else {
-                CachedPkIndex::Exact(
-                    self.load_existing_keyset(pk_indices, converter, fold_cold)
-                        .await?,
-                )
+                None
             };
-            return match index {
-                CachedPkIndex::Exact(keyset) => Ok(ShardedPkIndex::from_exact(keyset, 1)),
-                CachedPkIndex::Bloom(bloom) => {
-                    Ok(ShardedPkIndex::Bloom(vec![bloom].into_boxed_slice()))
+            let index = match index {
+                Some(index) => index,
+                None => {
+                    self.load_existing_pk_index(pk_indices, converter, fold_cold, 1)
+                        .await?
                 }
             };
+            record_cayenne_write_phase(
+                self.table_metadata.table_name.as_str(),
+                "keyset_rebuild",
+                keyset_rebuild_start,
+            );
+            return Ok(index);
         }
 
-        // n>1 cold rebuild: an over-budget upsert table builds N sharded blooms
-        // (no false negatives — a superset per shard); otherwise the exact keyset
-        // routed by `from_exact`.
-        if self.upsert_bloom_eligible() {
-            // Build the exact keyset first to learn whether it fits the byte
-            // budget; if it does, route it (exact). If it does NOT, fall back to N
-            // sharded blooms over the same scan. This mirrors
-            // `store_cached_pk_index`'s exact->bloom threshold, split N ways.
-            let keyset = self
-                .load_existing_keyset(pk_indices, converter, fold_cold)
-                .await?;
-            let max_bytes = self.context.pk_keyset_cache_max_bytes();
-            if keyset.approx_bytes > max_bytes {
-                let mut blooms: Vec<PkBloom> = (0..n)
-                    .map(|_| PkBloom::with_byte_budget(max_bytes / n.max(1)))
-                    .collect();
-                for key in keyset.rows() {
-                    let s = shard_of_pk(key.as_ref(), n);
-                    blooms[s].insert(key.as_ref());
-                }
-                return Ok(ShardedPkIndex::Bloom(blooms.into_boxed_slice()));
-            }
-            return Ok(ShardedPkIndex::from_exact(keyset, n));
-        }
-
-        let keyset = self
-            .load_existing_keyset(pk_indices, converter, fold_cold)
+        let index = self
+            .load_existing_pk_index(pk_indices, converter, fold_cold, n)
             .await?;
-        Ok(ShardedPkIndex::from_exact(keyset, n))
+        record_cayenne_write_phase(
+            self.table_metadata.table_name.as_str(),
+            "keyset_rebuild",
+            keyset_rebuild_start,
+        );
+        Ok(index)
     }
 
     pub(crate) fn apply_on_conflict_to_batch(
@@ -12045,7 +12086,15 @@ impl CayenneTableProvider {
         // Pick over the CURRENT snapshot's files only (not the protected set):
         // this trigger is about current-dir small-file accumulation. If no tier
         // has enough small files, there is nothing to consolidate.
+        //
+        // Sample the snapshot pointer and the append fence BEFORE the listing
+        // (the contract `visible_file_stream_for_rewrite` documents): the listing
+        // walks the directory one `metadata()` await per entry (a paginated LIST
+        // on S3), so a publish can land mid-walk and be missed by it. Sampled
+        // first, that publish is always visible to the subset rewrite's commit
+        // guard, which then aborts instead of dropping the appended file.
         let snapshot_id = self.get_current_snapshot_id();
+        let generation_before = self.current_dir_generation.load(Ordering::Relaxed);
         let files = self.list_snapshot_files_with_sizes(&snapshot_id).await?;
         if files.len() < 2 {
             return Ok(false);
@@ -12084,7 +12133,12 @@ impl CayenneTableProvider {
         // subset of current files. Otherwise full rewrite (also folds protected).
         if self.can_subset_rewrite_current_small_files(&candidate, &files) {
             match self
-                .rewrite_current_snapshot_small_file_subset(&candidate, &files)
+                .rewrite_current_snapshot_small_file_subset(
+                    &candidate,
+                    &files,
+                    &snapshot_id,
+                    generation_before,
+                )
                 .await
             {
                 Ok(true) => {
@@ -12168,15 +12222,26 @@ impl CayenneTableProvider {
     /// Callers must hold `compaction_lock` and satisfy
     /// [`Self::can_subset_rewrite_current_small_files`]. Returns `Ok(false)` when
     /// a concurrent append races the encode (generation fence).
+    ///
+    /// `source_snapshot_id` and `generation_before` are the snapshot pointer and
+    /// [`Self::current_dir_generation`] the caller sampled BEFORE listing
+    /// `files`, and both must be sampled in that order — the same contract
+    /// [`Self::visible_file_stream_for_rewrite`] documents for the full rewrite.
+    /// This rewrite carries forward exactly `files - candidate.paths`, so a
+    /// current-dir publish concurrent with the caller's listing is absent from
+    /// `files`; sampling the fence here instead would observe that publish's bump
+    /// as the pre-state and let the commit guard pass, dropping the appended
+    /// file's rows. Sampling before the listing makes such a publish always
+    /// visible at commit, so the pass aborts rather than publishing a short
+    /// snapshot.
     async fn rewrite_current_snapshot_small_file_subset(
         &self,
         candidate: &CompactionCandidate<&str>,
         files: &[(String, u64)],
+        source_snapshot_id: &str,
+        generation_before: u64,
     ) -> Result<bool> {
         let pass_start = Instant::now();
-        let old_snapshot_id = self.get_current_snapshot_id();
-        let generation_before = self.current_dir_generation.load(Ordering::Relaxed);
-        let snapshot_id_before = old_snapshot_id.clone();
 
         let picked: std::collections::HashSet<&str> = candidate.paths.iter().copied().collect();
         let unpicked: Vec<&str> = files
@@ -12202,7 +12267,7 @@ impl CayenneTableProvider {
 
         // 1. Stage candidate files alone (hardlink/copy) for a tight scan.
         if let Err(e) = self
-            .link_or_copy_snapshot_files(&old_snapshot_id, &staging_snapshot_id, &picked_list)
+            .link_or_copy_snapshot_files(source_snapshot_id, &staging_snapshot_id, &picked_list)
             .await
         {
             cleanup_all.await;
@@ -12211,7 +12276,7 @@ impl CayenneTableProvider {
 
         // 2. Hard-link unpicked settled files into the destination snapshot.
         if let Err(e) = self
-            .link_or_copy_snapshot_files(&old_snapshot_id, &new_snapshot_id, &unpicked)
+            .link_or_copy_snapshot_files(source_snapshot_id, &new_snapshot_id, &unpicked)
             .await
         {
             cleanup_all.await;
@@ -12308,7 +12373,7 @@ impl CayenneTableProvider {
         {
             let listing_guard = self.listing_fence.write().await;
             let snapshot_id_now = self.get_current_snapshot_id();
-            if snapshot_id_now != snapshot_id_before {
+            if snapshot_id_now != source_snapshot_id {
                 drop(listing_guard);
                 self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
                     .await;
@@ -13256,7 +13321,12 @@ impl CayenneTableProvider {
         // for the protected+current union) would break subset hardlink basenames
         // and incorrectly inflate "total files" for the proper-subset gate.
         // Full rewrite still folds protected snapshots via its own scan.
+        //
+        // Snapshot pointer and append fence are sampled BEFORE the listing so a
+        // publish that lands mid-walk stays visible to the subset rewrite's
+        // commit guard — see `compact_current_snapshot_small_files`.
         let snapshot_id = self.get_current_snapshot_id();
+        let generation_before = self.current_dir_generation.load(Ordering::Relaxed);
         let files = self.list_snapshot_files_with_sizes(&snapshot_id).await?;
 
         if files.len() < 2 {
@@ -13290,7 +13360,12 @@ impl CayenneTableProvider {
         // otherwise full snapshot re-encode (folds protected + clears DVs).
         if self.can_subset_rewrite_current_small_files(&candidate, &files) {
             match self
-                .rewrite_current_snapshot_small_file_subset(&candidate, &files)
+                .rewrite_current_snapshot_small_file_subset(
+                    &candidate,
+                    &files,
+                    &snapshot_id,
+                    generation_before,
+                )
                 .await
             {
                 Ok(true) => {
@@ -28056,6 +28131,229 @@ mod tests {
         assert!(!subset_rewrite_eligibility(true, true, 3, 4, 10));
     }
 
+    /// A two-file subset candidate over the first two of `files`, for tests that
+    /// exercise the subset rewrite itself rather than the picker's tier
+    /// thresholds. `files` must hold at least three entries so the candidate is a
+    /// proper subset (the gate `can_subset_rewrite_current_small_files` enforces).
+    fn subset_candidate_of_first_two(files: &[(String, u64)]) -> CompactionCandidate<&str> {
+        CompactionCandidate {
+            tier: crate::provider::compaction::Tier::Small,
+            paths: files
+                .iter()
+                .take(2)
+                .map(|(path, _)| path.as_str())
+                .collect(),
+            total_bytes: files.iter().take(2).map(|(_, size)| *size).sum(),
+        }
+    }
+
+    /// The subset rewrite carries forward exactly the files its caller listed, so
+    /// a current-dir publish that races that listing is in neither the carried
+    /// set nor — if the fence were sampled after the listing — the commit guard.
+    /// Regression test for #12074: the pass must abort rather than publish a
+    /// snapshot missing the appended file's rows.
+    #[tokio::test]
+    async fn subset_rewrite_aborts_on_an_append_that_raced_the_caller_listing() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let batch_of = |start: i64, n: i64| {
+            let ids: Vec<i64> = (start..start + n).collect();
+            // Pad the payload so each append settles as its own Small-tier file
+            // rather than being inlined.
+            let values: Vec<String> = ids.iter().map(|i| format!("v_{i:0400}")).collect();
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(StringArray::from(values)),
+                ],
+            )
+            .expect("batch built")
+        };
+
+        let vortex_config = VortexConfig {
+            target_vortex_file_size_mb: 1,
+            // High trigger + no background pass: this test drives the subset
+            // rewrite directly, so no automatic compaction may rotate the
+            // snapshot underneath it.
+            compaction_trigger_files: 1_000,
+            compaction_background_interval_ms: 0,
+            compaction_max_files_per_pick: 2,
+            inline_max_rows: 0,
+            deletion_mode: crate::metadata::DeletionMode::Key,
+            ..VortexConfig::default()
+        };
+        let ctx = SessionContext::new();
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "subset_append_fence",
+            Arc::clone(&schema),
+            vortex_config,
+            // A primary key keeps the table off the position-delete strategy,
+            // which the subset gate excludes.
+            vec!["id".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        for i in 0..4 {
+            insert_batch(&provider, batch_of(i * 50, 50)).await;
+        }
+
+        // Sample exactly as the fixed callers do: snapshot pointer and append
+        // fence BEFORE the listing that feeds the rewrite.
+        let snapshot_id = provider.get_current_snapshot_id();
+        let generation_before = provider.current_dir_generation.load(Ordering::Relaxed);
+        let files = provider
+            .list_snapshot_files_with_sizes(&snapshot_id)
+            .await
+            .expect("listed current snapshot files");
+        assert!(
+            files.len() >= 3,
+            "need a proper subset to pick from, listed {} file(s)",
+            files.len()
+        );
+
+        // Build the candidate directly rather than through `pick_candidates`:
+        // the picker's tier/byte thresholds are covered by its own tests, and
+        // pinning the candidate here keeps this test about the append fence.
+        let candidate = subset_candidate_of_first_two(&files);
+        assert!(
+            provider.can_subset_rewrite_current_small_files(&candidate, &files),
+            "fixture must land on the subset path"
+        );
+
+        // The racing append: publishes a new file into the current dir and bumps
+        // the fence, exactly as one landing mid-listing would. Its rows are
+        // absent from `files`, so a rewrite that carried `files` forward and
+        // still committed would drop them.
+        insert_batch(&provider, batch_of(1_000, 50)).await;
+        let generation_after = provider.current_dir_generation.load(Ordering::Relaxed);
+        assert_ne!(
+            generation_before, generation_after,
+            "the racing append must bump the current-dir generation"
+        );
+
+        let committed = provider
+            .rewrite_current_snapshot_small_file_subset(
+                &candidate,
+                &files,
+                &snapshot_id,
+                generation_before,
+            )
+            .await
+            .expect("subset rewrite must abort cleanly, not error");
+        assert!(
+            !committed,
+            "the subset rewrite must abort when an append raced the listing"
+        );
+
+        // The decisive assertion: no row was lost. Both the pre-listing rows and
+        // the racing append's rows are still readable.
+        let ids = scan_sorted_ids(&provider).await;
+        let expected: Vec<i64> = (0..200).chain(1_000..1_050).collect();
+        assert_eq!(
+            ids, expected,
+            "every committed row must survive the aborted subset rewrite"
+        );
+    }
+
+    /// Counterpart to the abort case: with no append racing the listing the
+    /// subset rewrite must still commit, and the published snapshot must hold
+    /// every row (re-encoded candidates plus hard-linked unpicked files).
+    #[tokio::test]
+    async fn subset_rewrite_commits_and_preserves_every_row_without_a_race() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let batch_of = |start: i64, n: i64| {
+            let ids: Vec<i64> = (start..start + n).collect();
+            let values: Vec<String> = ids.iter().map(|i| format!("v_{i:0400}")).collect();
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(StringArray::from(values)),
+                ],
+            )
+            .expect("batch built")
+        };
+
+        let vortex_config = VortexConfig {
+            target_vortex_file_size_mb: 1,
+            compaction_trigger_files: 1_000,
+            compaction_background_interval_ms: 0,
+            compaction_max_files_per_pick: 2,
+            inline_max_rows: 0,
+            deletion_mode: crate::metadata::DeletionMode::Key,
+            ..VortexConfig::default()
+        };
+        let ctx = SessionContext::new();
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "subset_commit_no_race",
+            Arc::clone(&schema),
+            vortex_config,
+            vec!["id".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        for i in 0..4 {
+            insert_batch(&provider, batch_of(i * 50, 50)).await;
+        }
+
+        let snapshot_id = provider.get_current_snapshot_id();
+        let generation_before = provider.current_dir_generation.load(Ordering::Relaxed);
+        let files = provider
+            .list_snapshot_files_with_sizes(&snapshot_id)
+            .await
+            .expect("listed current snapshot files");
+        assert!(
+            files.len() >= 3,
+            "need a proper subset to rewrite, listed {} file(s)",
+            files.len()
+        );
+        let candidate = subset_candidate_of_first_two(&files);
+        assert!(
+            provider.can_subset_rewrite_current_small_files(&candidate, &files),
+            "fixture must land on the subset path"
+        );
+
+        let committed = provider
+            .rewrite_current_snapshot_small_file_subset(
+                &candidate,
+                &files,
+                &snapshot_id,
+                generation_before,
+            )
+            .await
+            .expect("subset rewrite succeeds");
+        assert!(
+            committed,
+            "with no racing append the subset rewrite must commit"
+        );
+        assert_ne!(
+            provider.get_current_snapshot_id(),
+            snapshot_id,
+            "a committed subset rewrite must publish a new snapshot"
+        );
+
+        let ids = scan_sorted_ids(&provider).await;
+        assert_eq!(
+            ids,
+            (0..200).collect::<Vec<i64>>(),
+            "the subset rewrite must preserve every row"
+        );
+    }
+
     #[test]
     fn subset_write_amp_x100_is_total_over_candidate_percent() {
         // Full rewrite of 10 MiB when candidate is 1 MiB → 1000% amp (10×).
@@ -29550,7 +29848,7 @@ mod tests {
             position_deletions: Arc::new(ArcSwap::from_pointee(PositionBitmap::new())),
         };
 
-        let mut keyset = CachedPkKeyset::with_capacity(0);
+        let mut keyset = BoundedShardedPkIndexBuilder::new(1, None);
         let mut row_id_base: i64 = 0;
 
         CayenneTableProvider::process_stream_into_keyset(
@@ -29587,7 +29885,7 @@ mod tests {
             position_deletions: Arc::new(ArcSwap::from_pointee(PositionBitmap::new())),
         };
 
-        let mut keyset = CachedPkKeyset::with_capacity(0);
+        let mut keyset = BoundedShardedPkIndexBuilder::new(1, None);
         let mut row_id_base: i64 = 0;
 
         // threshold=10: only deletions with del_seq > 10 apply
@@ -29622,7 +29920,7 @@ mod tests {
 
         let strategy = PkDeletionStrategyWithCache::empty_int64_pk();
 
-        let mut keyset = CachedPkKeyset::with_capacity(0);
+        let mut keyset = BoundedShardedPkIndexBuilder::new(1, None);
         let mut row_id_base: i64 = 0;
 
         CayenneTableProvider::process_stream_into_keyset(
@@ -39311,7 +39609,7 @@ mod tests {
     /// Regression (SF-100 tuned-memory local over-count, `order_line`/`stock` +73K
     /// DURABLE): the PK keyset is invalidated by compaction/refresh
     /// (`clear_cached_pk_keyset`), and the cold rebuild reconstructs it via
-    /// `load_existing_keyset` from DURABLE SNAPSHOT FILES ONLY. Without folding the
+    /// `load_existing_pk_index` from DURABLE SNAPSHOT FILES ONLY. Without folding the
     /// un-checkpointed MEM-TIER keys back in, an UPDATE of an omitted-but-live key
     /// finds it absent in `apply_on_conflict_to_batch`, records NO tombstone, and the
     /// prior copy stays live => `COUNT(*)` > distinct keys — durably (compaction can't
@@ -40871,11 +41169,11 @@ mod tests {
         let pk_converter = provider
             .build_pk_converter(&pk_indices)
             .expect("build pk converter");
-        let keyset = provider
-            .load_existing_keyset(&pk_indices, &pk_converter, true)
+        let index = provider
+            .load_existing_pk_index_serial(&pk_indices, &pk_converter, true)
             .await
             .expect("cold keyset rebuild");
-        provider.store_cached_pk_index(CachedPkIndex::Exact(keyset));
+        provider.store_cached_pk_index(index);
         assert!(
             provider.should_capture_positions(),
             "deletion_mode: position on a PK table must enable the position read-back"
@@ -41651,7 +41949,7 @@ mod tests {
 
     /// Regression: the persisted-bloom fast path (`try_load_persisted_pk_index`)
     /// must fold the un-checkpointed RAM mem-tier, exactly like the full
-    /// `load_existing_keyset` rebuild does. A key written to the mem tier AFTER the
+    /// `load_existing_pk_index` rebuild does. A key written to the mem tier AFTER the
     /// last checkpoint lives ONLY in RAM — it is in neither the persisted sidecar
     /// bloom (which covers the checkpointed snapshot) nor the protected/inline
     /// delta. Without the `fold_mem_tier_keys_into_bloom` fold, a rebuild through
@@ -45018,7 +45316,7 @@ mod tests {
         );
 
         // Faithfulness check: a REAL `clear_cached_pk_keyset` rebuild goes through
-        // `load_existing_keyset`, which floor-stamps every key to the end-of-scan
+        // `load_existing_pk_index`, which floor-stamps every key to the end-of-scan
         // high-water (`stamp_all_sequences_min(sequence_high_water())`). Model that
         // by floor-stamping id=1 to the high-water (7). The same transaction then
         // correctly CONFLICTS via the per-key stamp (7 > begin 5) — the production
@@ -45037,7 +45335,7 @@ mod tests {
                 &empty_write_set,
                 current_high_water,
             ),
-            "a floor-stamped rebuild (the production clear->load_existing_keyset \
+            "a floor-stamped rebuild (the production clear->load_existing_pk_index \
              path) must still conflict the stage_seq=5 txn against high-water 7"
         );
     }
