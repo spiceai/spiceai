@@ -172,6 +172,74 @@ pub async fn list_tables(
     Ok(names)
 }
 
+/// A view-like relation that cannot be CDC-accelerated, paired with a
+/// human-readable label for the kind of relation it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewRelation {
+    /// The relation name.
+    pub name: String,
+    /// A human-readable label for its `pg_class.relkind` (`view`,
+    /// `materialized view`, or `foreign table`).
+    pub kind: &'static str,
+}
+
+/// Query `pg_catalog.pg_class` for the view-like relations (views `v`,
+/// materialized views `m`, foreign tables `f`) in `schema_name` -- exactly the
+/// relations [`list_tables`] with `include_views = false` deliberately omits
+/// because they cannot be primary-keyed or CDC-accelerated.
+///
+/// The accelerated catalog uses this to *warn* that these relations will not be
+/// replicated, rather than dropping them silently. Uses the same
+/// `has_table_privilege` filter as [`list_tables`] so it never names a relation
+/// the current role cannot read.
+///
+/// # Errors
+///
+/// Returns an error if a connection can't be obtained from `pool`, or the
+/// query fails.
+pub async fn list_views(
+    pool: &PostgresConnectionPool,
+    schema_name: &str,
+) -> Result<Vec<ViewRelation>> {
+    let conn = pool.connect_direct().await.context(ConnectionFailedSnafu)?;
+
+    // 'v' = view, 'm' = materialized view, 'f' = foreign table -- the view-like
+    // relations `list_tables` omits. Bound to a named slice and passed by
+    // reference, matching `list_tables`' relkind pattern.
+    let relkinds: &[&str] = &["v", "m", "f"];
+    let rows = conn
+        .conn
+        .query(
+            "SELECT c.relname, c.relkind::text FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 \
+             AND c.relkind::text = ANY($2) \
+             AND pg_catalog.has_table_privilege(c.oid, 'SELECT') \
+             ORDER BY c.relname",
+            &[&schema_name, &relkinds],
+        )
+        .await
+        .context(QueryFailedSnafu)?;
+
+    let views: Vec<ViewRelation> = rows
+        .iter()
+        .map(|row| {
+            let name: String = row.get(0);
+            let relkind: String = row.get(1);
+            let kind = match relkind.as_str() {
+                "m" => "materialized view",
+                "f" => "foreign table",
+                // "v" and any forward-compatibility surprise map to the generic
+                // label; the query only ever returns v/m/f.
+                _ => "view",
+            };
+            ViewRelation { name, kind }
+        })
+        .collect();
+
+    Ok(views)
+}
+
 /// Query `pg_catalog` for the primary-key columns of `schema_name.table_name`,
 /// in key order. Empty when the table has no primary key.
 ///

@@ -89,6 +89,30 @@ async fn seed_tables(port: usize) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// Seed one CDC-eligible table (`orders`, primary key) alongside view-like
+/// relations that cannot be CDC-accelerated: a regular view and a materialized
+/// view over it. The catalog should accelerate `orders`, warn that the views
+/// aren't replicated, and leave the views absent from its namespace -- without
+/// failing (a view is not a REPLICA-IDENTITY error, #11911).
+async fn seed_table_and_views(port: usize) -> Result<(), anyhow::Error> {
+    let pool = common::get_postgres_connection_pool(port, None).await?;
+    let conn = pool
+        .connect_direct()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    conn.conn
+        .simple_query(
+            "CREATE TABLE orders (id INT PRIMARY KEY, customer TEXT NOT NULL); \
+             INSERT INTO orders (id, customer) VALUES (1, 'alice'), (2, 'bob'); \
+             CREATE VIEW orders_view AS SELECT id, customer FROM orders; \
+             CREATE MATERIALIZED VIEW orders_matview AS SELECT id, customer FROM orders;",
+        )
+        .await?;
+
+    Ok(())
+}
+
 /// Seed one table per `REPLICA IDENTITY` mode so the catalog's per-table
 /// eligibility can be observed end-to-end: the three keyed tables
 /// (`ri_default`, `ri_using_index`, `ri_full`) must become queryable, while the
@@ -440,6 +464,61 @@ async fn test_catalog_acceleration_bootstraps_tables_with_primary_key() -> Resul
         .await
 }
 
+/// A view-like relation (view / materialized view) is not CDC-accelerable, so
+/// it must be handled gracefully -- the accelerated catalog emits a "not
+/// replicated" warning (asserted at the unit level via `AccelerationSummary`;
+/// not asserted here because the runtime test harness drops worker-thread
+/// tracing) rather than a fatal REPLICA-IDENTITY error. This test validates the
+/// observable outcome: the catalog still loads (its one eligible table
+/// accelerates and becomes Ready) and the views are simply absent from the
+/// catalog's namespace (#11911).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_catalog_acceleration_excludes_views_and_still_loads() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some(
+        "integration=debug,info,runtime::catalogconnector=debug",
+    ));
+
+    test_request_context()
+        .scope(async {
+            let port = common::get_random_port()?;
+            let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+
+            seed_table_and_views(port).await?;
+
+            // The catalog loads successfully despite the views -- a view is not a
+            // fatal REPLICA-IDENTITY error. `start_runtime` asserts readiness.
+            let rt = start_runtime(accelerated_pg_catalog(port)).await?;
+
+            // The eligible base table accelerates and becomes queryable.
+            wait_for_table_ready(&rt, "orders").await?;
+
+            // The view and materialized view are absent from the catalog's
+            // namespace (not replicated), so querying them fails.
+            let view_query = run_query(
+                &rt,
+                &format!("SELECT COUNT(*) FROM {CATALOG_NAME}.public.orders_view"),
+            )
+            .await;
+            anyhow::ensure!(
+                view_query.is_err(),
+                "a view must not be queryable through the accelerated catalog"
+            );
+
+            let matview_query = run_query(
+                &rt,
+                &format!("SELECT COUNT(*) FROM {CATALOG_NAME}.public.orders_matview"),
+            )
+            .await;
+            anyhow::ensure!(
+                matview_query.is_err(),
+                "a materialized view must not be queryable through the accelerated catalog"
+            );
+
+            Ok(())
+        })
+        .await
+}
+
 /// A table excluded by the catalog's `exclude` patterns is never
 /// synthesized into a dataset -- it's simply absent from the catalog's
 /// namespace, not merely left unaccelerated. This is what the startup
@@ -744,8 +823,9 @@ async fn test_catalog_acceleration_respects_include_filter() -> Result<(), anyho
 /// A catalog whose every discovered table is ineligible (`REPLICA IDENTITY
 /// NOTHING`, keyless `DEFAULT`) must fail loudly -- reaching an `Error` status
 /// with an actionable message -- rather than registering an empty catalog.
-/// Discovery is one-shot (auto-detecting tables added after startup is a
-/// non-goal), so zero eligible tables is a permanent configuration error.
+/// Failing the initial refresh means the catalog never registers (and so never
+/// gets a periodic refresh to reconsider), so zero eligible tables at load is a
+/// permanent configuration error.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_catalog_acceleration_fails_loudly_when_no_tables_eligible()
 -> Result<(), anyhow::Error> {
@@ -788,8 +868,12 @@ async fn test_catalog_acceleration_fails_loudly_when_no_tables_eligible()
             // explains itself.
             match rt.status().get_catalog_statuses().get(CATALOG_NAME) {
                 Some(ComponentStatus::Error(Some(message))) => {
+                    // Actionable message: names the zero-eligible outcome and the
+                    // REPLICA IDENTITY fix (the exact count is dynamic, so match on
+                    // the stable phrasing rather than "0 of N").
                     anyhow::ensure!(
-                        message.contains("no tables are eligible"),
+                        message.contains("discovered table(s) are eligible for CDC acceleration")
+                            && message.contains("REPLICA IDENTITY"),
                         "error message should be actionable, got: {message}"
                     );
                 }
