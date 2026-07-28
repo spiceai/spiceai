@@ -391,7 +391,7 @@ const SLOT_RELEASE_GRACE: Duration = Duration::from_secs(5);
 const SLOT_WAIT_BUDGET_WHEN_TIMEOUT_DISABLED: Duration = Duration::from_secs(90);
 /// Absolute safety ceiling on the slot-availability wait. The wait is normally
 /// the server's `wal_sender_timeout` (+ [`SLOT_RELEASE_GRACE`]) so we wait
-/// exactly as long as PostgreSQL takes to release a dead consumer's slot; this
+/// exactly as long as `PostgreSQL` takes to release a dead consumer's slot; this
 /// only bounds a pathologically large (or misconfigured) `wal_sender_timeout` so
 /// catalog startup can't hang for an unreasonable time. The default 60s
 /// `wal_sender_timeout` is far under this.
