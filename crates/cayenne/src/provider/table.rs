@@ -6850,23 +6850,15 @@ impl CayenneTableProvider {
     }
 
     /// Install EMPTY exact PK existence caches. Correct ONLY at a
-    /// provably-empty moment (table creation): an empty table's keyset is
-    /// exactly empty, and every write from this point maintains the installed
-    /// index (`record_pk_keys_with_location`; the sharded analog in §5 Phase 6
-    /// of `append_to_shard`), so the first conflict-validated batch skips the
-    /// O(live-rows) `load_existing_pk_index` cold scan entirely. On a
-    /// freshly-snapshotted CDC table that scan otherwise runs inside the apply
-    /// loop at the first post-snapshot upsert (profiled ~60 s at 30M rows,
-    /// ~475 s at 300M rows) and, through the shared pump's must-deliver
-    /// backpressure, stalls every member of the replication group behind it.
-    ///
-    /// Budget safety is the write path's existing machinery: maintained
-    /// inserts degrade an over-budget exact keyset to blooms
-    /// (`PkKeysetInsertOutcome::OverBudget` / the sharded recompute-once
-    /// tally), identically to a scanned rebuild that goes over budget.
-    ///
-    /// No-op for tables without conflict handling — nothing consults the
-    /// keyset there, so installing one would only accrue unused maintenance.
+    /// provably-empty moment (table creation): the keyset is exactly empty,
+    /// and every write from here maintains it (`record_pk_keys_with_location`
+    /// / the per-shard record in `append_to_shard`), so the first
+    /// conflict-validated batch skips the O(live-rows)
+    /// `load_existing_pk_index` cold scan — which otherwise runs inside the
+    /// CDC apply loop at the first post-snapshot upsert (~475 s at 300M rows)
+    /// and stalls the whole replication group behind it. Over-budget
+    /// maintained inserts degrade to blooms exactly like a scanned rebuild.
+    /// No-op without conflict handling (nothing consults the keyset).
     pub(crate) fn install_empty_pk_index_caches(&self) {
         if self.table_metadata.on_conflict.is_none() {
             return;
@@ -30193,12 +30185,9 @@ mod tests {
         );
     }
 
-    /// A just-created conflict-handling table must start with WARM (empty
-    /// exact) PK existence caches: the initial load's writes then maintain
-    /// them, and the first upsert skips the O(live-rows) cold
-    /// `load_existing_pk_index` scan — profiled at ~475 s on a freshly
-    /// snapshotted 300M-row CDC table, where it ran inside the apply loop and
-    /// stalled the whole shared replication group behind it.
+    /// A just-created conflict-handling table starts with warm (empty exact)
+    /// PK existence caches, so the first upsert never pays the cold
+    /// `load_existing_pk_index` scan (see `install_empty_pk_index_caches`).
     #[tokio::test]
     async fn create_table_installs_warm_empty_pk_index_caches() {
         use arrow::datatypes::{DataType, Field, Schema};
