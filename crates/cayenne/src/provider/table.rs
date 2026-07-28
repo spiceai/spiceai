@@ -23635,9 +23635,9 @@ impl CayenneTableProvider {
         Ok(plans)
     }
 
-    /// Unions `plans`, dropping any bare `EmptyExec` branch (it can never produce a row —
-    /// e.g. `create_snapshot_scan_plan_with_config` hands one back, unwrapped, when a
-    /// snapshot matches zero files) instead of needlessly widening the plan with it.
+    /// Unions [`ExecutionPlan`]s, dropping any [`EmptyExec`], instead of needlessly widening the
+    /// plan. If all [`EmptyExec`], return [`EmptyExec`].
+    ///
     /// `plans` must be non-empty.
     fn union_skipping_empty(
         plans: Vec<Arc<dyn ExecutionPlan>>,
@@ -25847,13 +25847,6 @@ impl TableProvider for CayenneTableProvider {
                 &deletion_snapshot,
             )?;
 
-            // `filtered_main_plan` can itself be a bare `EmptyExec` (unwrapped —
-            // `create_snapshot_scan_plan_with_config` returns it directly when the
-            // current snapshot matches zero files, skipping the usual
-            // `CayenneAccelerationExec` wrap) e.g. right after compaction rotates the
-            // current snapshot pointer while the live data still sits in a protected
-            // snapshot. `Self::union_skipping_empty` drops that branch instead of
-            // needlessly unioning it in alongside the real protected-snapshot data.
             let mut all_plans = vec![filtered_main_plan];
             all_plans.extend(protected_snapshot_plans);
             Self::union_skipping_empty(all_plans)?
@@ -25864,8 +25857,6 @@ impl TableProvider for CayenneTableProvider {
         // protected-snapshot arms above stay byte-identical. The cold branch is a
         // Vortex `DataSourceExec`, so FilterPushdown still pushes the scan
         // predicate into it and the redundant top FilterExec is still removed.
-        // `union_skipping_empty` drops `plan` here too if the branch above
-        // collapsed to a bare `EmptyExec` (e.g. no protected snapshots either).
         let plan: Arc<dyn ExecutionPlan> = if let Some(cold_exec) = cold_plan {
             Self::union_skipping_empty(vec![plan, cold_exec])?
         } else {
