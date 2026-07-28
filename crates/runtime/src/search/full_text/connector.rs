@@ -18,6 +18,7 @@ use data_components::cdc::ChangesStream;
 use datafusion::datasource::TableProvider;
 use runtime_datafusion_index::IndexedTableProvider;
 use search::generation::text_search::index::FullTextDatabaseIndex;
+use search::index::compound::CompoundSearchIndex;
 use std::any::Any;
 use std::sync::Arc;
 
@@ -65,10 +66,15 @@ impl FullTextConnector {
         // A full-text index written by this change stream must not defer its commits
         // to the sink write lifecycle: the two share one tantivy writer, so a window
         // commit would publish a partial refresh and a window rollback would discard
-        // these change-stream documents.
+        // these change-stream documents. A `CompoundSearchIndex` nests its warm
+        // full-text tier, so mark through it too — a bare downcast to
+        // `FullTextDatabaseIndex` would miss it.
         for index in &all_indexes {
-            if let Some(full_text) = index.as_any().downcast_ref::<FullTextDatabaseIndex>() {
+            let index = index.as_any();
+            if let Some(full_text) = index.downcast_ref::<FullTextDatabaseIndex>() {
                 full_text.mark_cdc_attached();
+            } else if let Some(compound) = index.downcast_ref::<CompoundSearchIndex>() {
+                compound.mark_cdc_attached();
             }
         }
 
