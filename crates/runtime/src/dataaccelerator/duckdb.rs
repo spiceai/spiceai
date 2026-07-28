@@ -342,7 +342,7 @@ impl DuckDBAccelerator {
             {
                 return Err(Box::new(Error::InvalidConfiguration {
                     detail: Arc::from(format!(
-                        "Failed to register dataset {dataset_display_name} (duckdb accelerator): 'on_full_refresh: replace_file' cannot be used while dataset {peer} uses 'refresh_mode: snapshot' on the same DuckDB file. Both replace {self_path} out-of-band, so refreshes would fail intermittently as each retires the other's file. Give one of them its own 'duckdb_file', or set 'on_full_refresh: in_place'. See: {DUCKDB_ACCELERATOR_DOCS}",
+                        "Failed to register dataset {dataset_display_name} (duckdb accelerator): 'on_full_refresh: replace_file' cannot be used while dataset {peer} uses 'refresh_mode: snapshot' on the same DuckDB file. Both replace {self_path} out-of-band, so refreshes would fail intermittently as each retires the other's file. Give one of them its own 'duckdb_file', or set 'on_full_refresh: reuse_file'. See: {DUCKDB_ACCELERATOR_DOCS}",
                         peer = peer.name,
                     )),
                 }));
@@ -615,7 +615,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("on_refresh_recompute_statistics"),
     ParameterSpec::runtime("on_refresh_sort_columns"),
     ParameterSpec::runtime("on_full_refresh").description(
-        "How a full refresh writes into a file-mode DuckDB acceleration: 'in_place' (default) rewrites the table inside the live database file; 'replace_file' writes a new database file, checkpoints it, and atomically replaces the live file with it, bounding database file growth.",
+        "How a full refresh writes into a file-mode DuckDB acceleration: 'reuse_file' (default) keeps writing into the current database file; 'replace_file' writes a new database file, checkpoints it, and atomically replaces the live file with it, bounding database file growth.",
     ),
     ParameterSpec::runtime("optimizer_duckdb_aggregate_pushdown"),
 ];
@@ -775,7 +775,7 @@ impl DataAccelerator for DuckDBAccelerator {
         let dataset_display_name =
             source.map_or_else(|| cmd.name.to_string(), |src| src.name().to_string());
         match cmd.options.remove("on_full_refresh").as_deref() {
-            None | Some("in_place") => {}
+            None | Some("reuse_file") => {}
             Some("replace_file") => {
                 let is_file_mode = source.map_or_else(
                     // Without an `AccelerationSource` the mode is only available
@@ -785,7 +785,7 @@ impl DataAccelerator for DuckDBAccelerator {
                             matches!(mode.as_str(), "file" | "file_create" | "file_update")
                         })
                     },
-                    runtime_acceleration::AccelerationSource::is_file_accelerated,
+                    AccelerationSource::is_file_accelerated,
                 );
                 ensure!(
                     is_file_mode,
@@ -805,7 +805,7 @@ impl DataAccelerator for DuckDBAccelerator {
             }
             Some(other) => super::InvalidConfigurationSnafu {
                 msg: format!(
-                    "Failed to register dataset {dataset_display_name} (duckdb accelerator): Invalid 'on_full_refresh' value '{other}'. Expected 'in_place' or 'replace_file'. See: {DUCKDB_ACCELERATOR_DOCS}"
+                    "Failed to register dataset {dataset_display_name} (duckdb accelerator): Invalid 'on_full_refresh' value '{other}'. Expected 'reuse_file' or 'replace_file'. See: {DUCKDB_ACCELERATOR_DOCS}"
                 ),
             }
             .fail()?,
@@ -2030,7 +2030,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duckdb_on_full_refresh_defaults_to_in_place() {
+    async fn duckdb_on_full_refresh_defaults_to_reuse_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = dir
             .path()
