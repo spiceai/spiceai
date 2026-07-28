@@ -74,10 +74,7 @@ fn make_dataset(data_dir: &str, metadata_dir: &str) -> Dataset {
         mode: Mode::File,
         params: Some(Params::from_string_map(HashMap::from([
             ("cayenne_file_path".to_string(), data_dir.to_string()),
-            (
-                "cayenne_metadata_dir".to_string(),
-                metadata_dir.to_string(),
-            ),
+            ("cayenne_metadata_dir".to_string(), metadata_dir.to_string()),
         ]))),
         ..Acceleration::default()
     });
@@ -179,12 +176,13 @@ async fn checkpoint_schema(rt: &Arc<Runtime>, ds: &Dataset) -> Option<Arc<Schema
     let app_ref = rt.app();
     let app_lock = app_ref.read().await;
     let app = app_lock.as_ref()?;
-    let runtime_dataset = runtime::component::dataset::builder::DatasetBuilder::try_from(ds.clone())
-        .ok()?
-        .with_app(Arc::clone(app))
-        .with_runtime(Arc::clone(rt))
-        .build()
-        .ok()?;
+    let runtime_dataset =
+        runtime::component::dataset::builder::DatasetBuilder::try_from(ds.clone())
+            .ok()?
+            .with_app(Arc::clone(app))
+            .with_runtime(Arc::clone(rt))
+            .build()
+            .ok()?;
     let checkpoint = DatasetCheckpoint::try_new(
         &runtime_dataset,
         runtime_dataset.runtime.accelerator_engine_registry(),

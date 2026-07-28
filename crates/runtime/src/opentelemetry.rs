@@ -686,7 +686,13 @@ fn attributes_to_fields_and_columns(
     let mut columns: IndexMap<String, Box<dyn ArrayBuilder>> = IndexMap::new();
     let mut warned_collisions: HashSet<&str> = HashSet::new();
 
-    initialize_attribute_schema(metric, &mut fields, &mut columns, existing_schema, value_columns);
+    initialize_attribute_schema(
+        metric,
+        &mut fields,
+        &mut columns,
+        existing_schema,
+        value_columns,
+    );
 
     for (i, inner_attributes) in attributes.iter().enumerate() {
         for attribute in *inner_attributes {
