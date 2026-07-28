@@ -670,7 +670,13 @@ fn attributes_to_fields_and_columns(
     let mut columns: IndexMap<String, Box<dyn ArrayBuilder>> = IndexMap::new();
     let mut warned_collisions: HashSet<&str> = HashSet::new();
 
-    initialize_attribute_schema(&mut fields, &mut columns, existing_schema, value_columns);
+    initialize_attribute_schema(
+        metric,
+        &mut fields,
+        &mut columns,
+        existing_schema,
+        value_columns,
+    );
 
     for (i, inner_attributes) in attributes.iter().enumerate() {
         for attribute in *inner_attributes {
@@ -786,7 +792,37 @@ fn attributes_to_fields_and_columns(
     (fields, columns)
 }
 
+/// Builder matching a stored dimension column's Arrow type, or `None` when this module has no
+/// builder for it.
+///
+/// `UInt64` and the two list types cover the columns the histogram path writes — `count` and
+/// the `bucket_counts`/`explicit_bounds` arrays. Those are value columns on a histogram and so
+/// skipped by [`initialize_attribute_schema`], but a metric whose data points arrive in a
+/// different shape later sees them as ordinary stored dimensions. The list element field is
+/// taken from the stored schema so the built array's type matches the field exactly.
+fn dimension_builder_for(field: &Field) -> Option<Box<dyn ArrayBuilder>> {
+    match field.data_type() {
+        DataType::Utf8 => Some(Box::new(StringBuilder::new())),
+        DataType::Boolean => Some(Box::new(BooleanBuilder::new())),
+        DataType::Int64 => Some(Box::new(Int64Builder::new())),
+        DataType::UInt64 => Some(Box::new(UInt64Builder::new())),
+        DataType::Float64 => Some(Box::new(Float64Builder::new())),
+        DataType::Binary => Some(Box::new(BinaryBuilder::new())),
+        DataType::List(item) => match item.data_type() {
+            DataType::UInt64 => Some(Box::new(
+                ListBuilder::new(UInt64Builder::new()).with_field(Arc::clone(item)),
+            )),
+            DataType::Float64 => Some(Box::new(
+                ListBuilder::new(Float64Builder::new()).with_field(Arc::clone(item)),
+            )),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn initialize_attribute_schema(
+    metric: &str,
     fields: &mut IndexMap<String, Arc<Field>>,
     columns: &mut IndexMap<String, Box<dyn ArrayBuilder>>,
     existing_schema: Option<&Schema>,
@@ -803,25 +839,21 @@ fn initialize_attribute_schema(
                 continue;
             }
 
+            // `fields` and `columns` are zipped positionally into the batch, so a field seeded
+            // without a builder makes the two lists disagree and `RecordBatch::try_new` rejects
+            // the whole export. Seed the pair together, or drop the column and let the write
+            // path report the schema mismatch it can describe.
+            let Some(builder) = dimension_builder_for(field) else {
+                tracing::warn!(
+                    "Metric {metric} has stored column {name} of unsupported type {data_type}, dropping it from this export",
+                    name = field.name(),
+                    data_type = field.data_type(),
+                );
+                continue;
+            };
+
             fields.insert(field.name().clone(), Arc::clone(field));
-            match field.data_type() {
-                DataType::Utf8 => {
-                    columns.insert(field.name().clone(), Box::new(StringBuilder::new()));
-                }
-                DataType::Boolean => {
-                    columns.insert(field.name().clone(), Box::new(BooleanBuilder::new()));
-                }
-                DataType::Int64 => {
-                    columns.insert(field.name().clone(), Box::new(Int64Builder::new()));
-                }
-                DataType::Float64 => {
-                    columns.insert(field.name().clone(), Box::new(Float64Builder::new()));
-                }
-                DataType::Binary => {
-                    columns.insert(field.name().clone(), Box::new(BinaryBuilder::new()));
-                }
-                _ => {}
-            }
+            columns.insert(field.name().clone(), builder);
         }
     }
 }
@@ -842,12 +874,20 @@ fn append_null(
     key: &str,
 ) {
     if let Some(field) = fields.get(key) {
+        // Keep in step with `dimension_builder_for`: a column it can seed but this cannot null
+        // stays short of the other columns, and `RecordBatch::try_new` rejects the export.
         match field.data_type() {
             DataType::Utf8 => append_null!(columns, key, StringBuilder),
             DataType::Boolean => append_null!(columns, key, BooleanBuilder),
             DataType::Int64 => append_null!(columns, key, Int64Builder),
+            DataType::UInt64 => append_null!(columns, key, UInt64Builder),
             DataType::Float64 => append_null!(columns, key, Float64Builder),
             DataType::Binary => append_null!(columns, key, BinaryBuilder),
+            DataType::List(item) => match item.data_type() {
+                DataType::UInt64 => append_null!(columns, key, ListBuilder<UInt64Builder>),
+                DataType::Float64 => append_null!(columns, key, ListBuilder<Float64Builder>),
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -1313,6 +1353,98 @@ mod tests {
             column(&third_batch, "count").as_string::<i32>().is_null(0),
             "missing dimension should be null"
         );
+    }
+
+    /// A stored column is seeded so it keeps its position and gets a null backfill, which needs
+    /// both a builder to seed and a null to append. The histogram path writes `count` as
+    /// `UInt64` and the two bucket arrays as lists, and those are dimensions — not value
+    /// columns — for a data point of another shape, so seeding must cover them.
+    #[test]
+    fn histogram_columns_seed_as_dimensions_on_a_later_gauge_export() {
+        let histogram = Data::Histogram(Histogram {
+            data_points: vec![histogram_data_point(
+                5,
+                Some(12.5),
+                Some(0.5),
+                Some(9.0),
+                vec![1, 2, 2],
+                vec![1.0, 5.0],
+                vec![string_attribute("host", "a")],
+            )],
+            aggregation_temporality: 0,
+        });
+        let stored = metric_data_to_record_batch("latency", &histogram, None)
+            .0
+            .expect("histogram batch builds")
+            .schema();
+
+        let gauge = Data::Gauge(opentelemetry_proto::tonic::metrics::v1::Gauge {
+            data_points: vec![number_data_point(1.0, vec![string_attribute("host", "b")])],
+        });
+        let (result, _) = metric_data_to_record_batch("latency", &gauge, Some(&stored));
+        let batch = result.expect("gauge batch builds against the stored histogram schema");
+
+        assert_eq!(
+            field_names(&batch.schema()),
+            vec![
+                VALUE_COLUMN_NAME,
+                TIME_UNIX_NANO_COLUMN_NAME,
+                START_TIME_UNIX_NANO_COLUMN_NAME,
+                COUNT_COLUMN_NAME,
+                SUM_COLUMN_NAME,
+                MIN_COLUMN_NAME,
+                MAX_COLUMN_NAME,
+                BUCKET_COUNTS_COLUMN_NAME,
+                EXPLICIT_BOUNDS_COLUMN_NAME,
+                "host",
+            ],
+            "every stored dimension must keep its position"
+        );
+        assert_eq!(batch.num_rows(), 1);
+        for name in [
+            COUNT_COLUMN_NAME,
+            SUM_COLUMN_NAME,
+            BUCKET_COUNTS_COLUMN_NAME,
+            EXPLICIT_BOUNDS_COLUMN_NAME,
+        ] {
+            assert!(
+                column(&batch, name).is_null(0),
+                "{name} is not carried by this data point shape, so it must be null"
+            );
+        }
+        assert_eq!(column(&batch, "host").as_string::<i32>().value(0), "b");
+    }
+
+    /// A stored column this module cannot build must be dropped from the batch rather than
+    /// added to the field list alone: the fields and columns are zipped positionally, so a
+    /// field without a column makes `RecordBatch::try_new` reject the whole export.
+    #[test]
+    fn stored_column_without_a_builder_is_dropped_instead_of_desyncing_the_batch() {
+        let stored = Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Float64, true),
+            Field::new(TIME_UNIX_NANO_COLUMN_NAME, DataType::UInt64, true),
+            Field::new(START_TIME_UNIX_NANO_COLUMN_NAME, DataType::UInt64, true),
+            // No builder exists for Int32 on the attribute path.
+            Field::new("region", DataType::Int32, true),
+            Field::new("host", DataType::Utf8, true),
+        ]);
+
+        let gauge = Data::Gauge(opentelemetry_proto::tonic::metrics::v1::Gauge {
+            data_points: vec![number_data_point(1.0, vec![string_attribute("host", "a")])],
+        });
+        let (result, _) = metric_data_to_record_batch("svc", &gauge, Some(&stored));
+        let batch = result.expect("batch builds with the unsupported column dropped");
+
+        assert_eq!(
+            field_names(&batch.schema()),
+            vec![
+                VALUE_COLUMN_NAME,
+                TIME_UNIX_NANO_COLUMN_NAME,
+                START_TIME_UNIX_NANO_COLUMN_NAME,
+                "host",
+            ]
+        );
+        assert_eq!(column(&batch, "host").as_string::<i32>().value(0), "a");
     }
 
     /// An attribute that really does collide with one of the metric's own value columns cannot
