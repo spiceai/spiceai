@@ -61,6 +61,9 @@ pub enum Error {
 
     #[snafu(display("Failed to generate enrollment key material: {source}"))]
     Enrollment { source: rcgen::Error },
+
+    #[snafu(display("Failed to generate enrollment encryption key material: {reason}"))]
+    EncKeyGeneration { reason: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -101,6 +104,19 @@ pub struct Identity {
     /// Unix timestamp (seconds) after which the identity cert is no
     /// longer accepted by the server. `0` means "unknown / unbounded".
     pub not_after_unix: u64,
+    /// PEM-encoded PKCS#8 X25519 encryption private key. The cloud
+    /// HPKE-seals secret payloads to the matching public key; this key
+    /// unseals them. Kept local (never sent). Unlike the identity keypair
+    /// it is NOT rotated on renewal — the renew exchange carries no
+    /// channel to re-pin it. Defaulted (empty) so identity files written
+    /// before this field existed still load.
+    #[serde(default)]
+    pub enc_private_key_pem: String,
+    /// PEM-encoded SPKI (RFC 8410) X25519 encryption public key, as sent
+    /// to the cloud in the enroll request (`enc_pubkey_pem`). Defaulted so
+    /// older identity files still load.
+    #[serde(default)]
+    pub enc_public_key_pem: String,
 }
 
 impl Identity {
@@ -199,21 +215,26 @@ impl IdentityStore {
         }
     }
 
-    /// Generate fresh enrollment material: an ECDSA P-256 keypair and a
-    /// PKCS#10 CSR for it, all PEM-encoded. Called before the cloud
-    /// enroll request — and again before every renewal, since each
-    /// renewal rotates the keypair — so the client proves possession of
-    /// its key (the CSR self-signature) before the cloud CA issues the
-    /// leaf certificate.
+    /// Generate fresh enrollment material: an ECDSA P-256 identity keypair
+    /// with a PKCS#10 CSR for it, plus an X25519 encryption keypair, all
+    /// PEM-encoded. Called before the cloud enroll request — and again
+    /// before every renewal, since each renewal rotates the identity
+    /// keypair — so the client proves possession of its key (the CSR
+    /// self-signature) before the cloud CA issues the leaf certificate.
+    /// (Renewal ignores the fresh encryption keypair: the enrolled one is
+    /// carried over, since the renew exchange cannot re-pin it.)
     ///
     /// The CSR carries a stable common name and a `clientAuth` extended
     /// key usage so the issued leaf is directly usable as an mTLS client
-    /// certificate.
+    /// certificate. The encryption public key is sent at enroll
+    /// (`enc_pubkey_pem`, RFC 8410 SPKI) for the cloud to HPKE-seal secret
+    /// payloads to.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Enrollment`] if key generation or CSR
-    /// serialization fails.
+    /// serialization fails, or [`Error::EncKeyGeneration`] if the
+    /// encryption keypair cannot be generated or encoded.
     pub fn generate_enrollment() -> Result<EnrollmentMaterial> {
         let key_pair = KeyPair::generate().context(EnrollmentSnafu)?;
         let private_key_pem = key_pair.serialize_pem();
@@ -232,12 +253,67 @@ impl IdentityStore {
             .context(EnrollmentSnafu)?;
         let csr_pem = csr.pem().context(EnrollmentSnafu)?;
 
+        let (enc_private_key_pem, enc_public_key_pem) = generate_enc_keypair_pem()?;
+
         Ok(EnrollmentMaterial {
             private_key_pem,
             public_key_pem,
             csr_pem,
+            enc_private_key_pem,
+            enc_public_key_pem,
         })
     }
+}
+
+/// RFC 8410 PKCS#8 v1 header for an X25519 private key:
+/// `SEQUENCE { version 0, AlgorithmIdentifier { id-X25519 },
+/// OCTET STRING { OCTET STRING (32-byte seed) } }`. The structure is fully
+/// fixed for X25519, so the DER is this constant prefix followed by the
+/// raw seed — `aws-lc-rs` exports X25519 private keys only as the raw seed
+/// (its PKCS#8 serializer is EC-only).
+const X25519_PKCS8_PREFIX: [u8; 16] = [
+    0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x6e, 0x04, 0x22, 0x04, 0x20,
+];
+
+/// Generate an X25519 encryption keypair, returning `(private PKCS#8 PEM,
+/// public SPKI PEM)` — the RFC 8410 encodings the cloud expects in
+/// `enc_pubkey_pem` and that later unseal HPKE payloads locally.
+fn generate_enc_keypair_pem() -> Result<(String, String)> {
+    use aws_lc_rs::agreement;
+    use aws_lc_rs::encoding::{AsBigEndian as _, AsDer as _, Curve25519SeedBin, PublicKeyX509Der};
+
+    fn enc_err(what: &str) -> Error {
+        Error::EncKeyGeneration {
+            reason: format!("{what} failed"),
+        }
+    }
+    let private_key = agreement::PrivateKey::generate(&agreement::X25519)
+        .map_err(|_| enc_err("key generation"))?;
+    let seed: Curve25519SeedBin<'_> = private_key
+        .as_be_bytes()
+        .map_err(|_| enc_err("private key seed export"))?;
+    snafu::ensure!(
+        seed.as_ref().len() == 32,
+        EncKeyGenerationSnafu {
+            reason: format!(
+                "unexpected X25519 seed length {} (expected 32)",
+                seed.as_ref().len()
+            ),
+        }
+    );
+    let mut private_der = Vec::with_capacity(X25519_PKCS8_PREFIX.len() + 32);
+    private_der.extend_from_slice(&X25519_PKCS8_PREFIX);
+    private_der.extend_from_slice(seed.as_ref());
+
+    let public_der: PublicKeyX509Der<'_> = private_key
+        .compute_public_key()
+        .map_err(|_| enc_err("public key derivation"))?
+        .as_der()
+        .map_err(|_| enc_err("public key SPKI encoding"))?;
+
+    let private_pem = pem::encode(&pem::Pem::new("PRIVATE KEY", private_der));
+    let public_pem = pem::encode(&pem::Pem::new("PUBLIC KEY", public_der.as_ref().to_vec()));
+    Ok((private_pem, public_pem))
 }
 
 /// Freshly-generated enrollment material returned by
@@ -250,6 +326,13 @@ pub struct EnrollmentMaterial {
     pub private_key_pem: String,
     pub public_key_pem: String,
     pub csr_pem: String,
+    /// X25519 encryption private key (PKCS#8 PEM); persisted into the
+    /// [`Identity`] at enroll, ignored on renewal (the enrolled key is
+    /// carried over).
+    pub enc_private_key_pem: String,
+    /// X25519 encryption public key (RFC 8410 SPKI PEM); sent as the
+    /// enroll request's `enc_pubkey_pem`.
+    pub enc_public_key_pem: String,
 }
 
 #[cfg(unix)]
@@ -392,7 +475,47 @@ mod tests {
                 .to_string(),
             gateway_addr: "gateway.test.spice.ai:7320".to_string(),
             not_after_unix: 0,
+            enc_private_key_pem:
+                "-----BEGIN PRIVATE KEY-----\nMOCKENC\n-----END PRIVATE KEY-----\n".to_string(),
+            enc_public_key_pem: "-----BEGIN PUBLIC KEY-----\nMOCKENC\n-----END PUBLIC KEY-----\n"
+                .to_string(),
         }
+    }
+
+    #[test]
+    fn enrollment_enc_keypair_is_valid_rfc8410() {
+        use aws_lc_rs::agreement;
+        use aws_lc_rs::encoding::{AsDer as _, PublicKeyX509Der};
+
+        let material = IdentityStore::generate_enrollment().expect("generate material");
+
+        // The private key must be a PKCS#8 v1 X25519 structure: the fixed
+        // RFC 8410 prefix plus the 32-byte seed.
+        let private = pem::parse(&material.enc_private_key_pem).expect("private PEM parses");
+        assert_eq!(private.tag(), "PRIVATE KEY");
+        assert_eq!(private.contents().len(), 48, "prefix (16) + seed (32)");
+        assert_eq!(&private.contents()[..16], X25519_PKCS8_PREFIX.as_slice());
+
+        // Round-trip: the seed carried by the DER must parse back as an
+        // X25519 private key whose derived public SPKI matches the
+        // advertised public PEM — proving the hand-assembled PKCS#8 wraps
+        // the right key. (`from_private_key_der` rejects X25519, so the
+        // raw-seed constructor is the round-trip path.)
+        let parsed =
+            agreement::PrivateKey::from_private_key(&agreement::X25519, &private.contents()[16..])
+                .expect("seed from the hand-built PKCS#8 must parse as X25519");
+        let derived: PublicKeyX509Der<'_> = parsed
+            .compute_public_key()
+            .expect("derive public key")
+            .as_der()
+            .expect("SPKI encode");
+        let public = pem::parse(&material.enc_public_key_pem).expect("public PEM parses");
+        assert_eq!(public.tag(), "PUBLIC KEY");
+        assert_eq!(
+            public.contents(),
+            derived.as_ref(),
+            "advertised SPKI must match the key derived from the private PKCS#8"
+        );
     }
 
     #[test]

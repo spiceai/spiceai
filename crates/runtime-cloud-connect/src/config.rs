@@ -49,6 +49,44 @@ pub const PENDING_ADOPT_CODE_FILE: &str = "pending-adopt-code";
 /// is persisted after adoption.
 pub const IDENTITY_FILE: &str = "identity.json";
 
+/// Canonical env var carrying a first-contact adoption code, for hosts
+/// where the `spice` CLI is not available (containers, cloud-init).
+pub const ADOPT_CODE_ENV: &str = "SPICE_CONNECT_ADOPT_CODE";
+
+/// Deprecated alias for [`ADOPT_CODE_ENV`], honored for backward
+/// compatibility. Reading it logs a deprecation warning.
+pub const ADOPT_CODE_ENV_DEPRECATED: &str = "SPICE_ADOPT_CODE";
+
+/// Env var carrying the org-scoped app name to attach the instance to at
+/// enroll (mirrors `spice connect --app-name`), for hosts with no CLI.
+pub const ADOPT_APP_NAME_ENV: &str = "SPICE_CONNECT_ADOPT_APP_NAME";
+
+/// Env var mirroring `spice connect --create`: when truthy (`true`/`1`)
+/// and the app named by [`ADOPT_APP_NAME_ENV`] does not exist, the cloud
+/// creates it at enroll and attaches the instance.
+pub const ADOPT_CREATE_APP_ENV: &str = "SPICE_CONNECT_ADOPT_CREATE";
+
+/// Read the adoption code from the environment: the canonical
+/// [`ADOPT_CODE_ENV`] wins; the deprecated [`ADOPT_CODE_ENV_DEPRECATED`]
+/// is honored with a warning. Empty values are treated as unset.
+#[must_use]
+pub fn adoption_code_from_env() -> Option<String> {
+    if let Ok(code) = std::env::var(ADOPT_CODE_ENV)
+        && !code.is_empty()
+    {
+        return Some(code);
+    }
+    if let Ok(code) = std::env::var(ADOPT_CODE_ENV_DEPRECATED)
+        && !code.is_empty()
+    {
+        tracing::warn!(
+            "{ADOPT_CODE_ENV_DEPRECATED} is deprecated and will be removed in a future release; use {ADOPT_CODE_ENV} instead"
+        );
+        return Some(code);
+    }
+    None
+}
+
 /// Runtime config for the Cloud Connect client.
 #[derive(Debug, Clone)]
 pub struct CloudConnectConfig {
@@ -99,6 +137,17 @@ pub struct CloudConnectConfig {
     /// single-use code.
     pub pending_adopt_code_path: Option<PathBuf>,
 
+    /// Org-scoped app name to attach the instance to at enroll
+    /// (`spice connect --app-name` / [`ADOPT_APP_NAME_ENV`]). Sent in the
+    /// enroll request; the cloud validates it before consuming the code.
+    /// `None` enrolls unattached (or under the code's own app scope).
+    pub adopt_app_name: Option<String>,
+
+    /// When `true` and `adopt_app_name` names no existing app, the cloud
+    /// creates the app at enroll and attaches the instance
+    /// (`spice connect --create` / [`ADOPT_CREATE_APP_ENV`]).
+    pub adopt_create_app: bool,
+
     /// Runtime semver-like string (`v2.0.0-build.deadbeef`). Sent in
     /// `Hello.runtime_version`.
     pub runtime_version: String,
@@ -138,13 +187,36 @@ impl CloudConnectConfig {
     /// per-instance state is local.
     #[must_use]
     pub fn default_config_dir() -> PathBuf {
+        Self::resolve_config_dir(None)
+    }
+
+    /// Resolve the Cloud Connect config directory for an explicit instance
+    /// directory (`spice connect --dir <path>`).
+    ///
+    /// Precedence:
+    /// 1. `$SPICE_CONFIG_DIR` env var (explicit override, wins even over
+    ///    `--dir` so a single knob controls every consumer of the config
+    ///    dir)
+    /// 2. `<instance_dir>/.spice` when an instance directory is given
+    /// 3. `./.spice` (the current working directory)
+    ///
+    /// A relative `instance_dir` is resolved against the current working
+    /// directory so the returned path is absolute whenever the cwd is
+    /// available — the path is baked into installed services and must not
+    /// depend on where a later process starts.
+    #[must_use]
+    pub fn resolve_config_dir(instance_dir: Option<&std::path::Path>) -> PathBuf {
         if let Ok(dir) = std::env::var("SPICE_CONFIG_DIR")
             && !dir.is_empty()
         {
             return PathBuf::from(dir);
         }
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        cwd.join(".spice")
+        match instance_dir {
+            Some(dir) if dir.is_absolute() => dir.join(".spice"),
+            Some(dir) => cwd.join(dir).join(".spice"),
+            None => cwd.join(".spice"),
+        }
     }
 
     /// Resolve the canonical identity file path for the current
@@ -164,7 +236,8 @@ impl CloudConnectConfig {
     /// and the environment.
     ///
     /// Precedence for the adoption credential:
-    /// 1. `SPICE_ADOPT_CODE` env var.
+    /// 1. [`ADOPT_CODE_ENV`] env var ([`ADOPT_CODE_ENV_DEPRECATED`] is a
+    ///    deprecated alias).
     /// 2. `$SPICE_CONFIG_DIR/pending-adopt-code` file.
     /// 3. None (rely on identity at `$SPICE_CONFIG_DIR/identity.json`).
     ///
@@ -174,7 +247,14 @@ impl CloudConnectConfig {
     /// `SPICE_CLOUD_GATEWAY_ENDPOINT` env var overrides it.
     #[must_use]
     pub fn from_env(runtime_version: impl Into<String>) -> Self {
-        let config_dir = Self::default_config_dir();
+        Self::from_env_at(runtime_version, Self::default_config_dir())
+    }
+
+    /// [`Self::from_env`] with the config directory pinned by the caller
+    /// instead of resolved from the environment — used by `spice connect
+    /// --dir <path>`, where the instance directory is an explicit argument.
+    #[must_use]
+    pub fn from_env_at(runtime_version: impl Into<String>, config_dir: PathBuf) -> Self {
         let identity_path = config_dir.join(IDENTITY_FILE);
         let pending_path = config_dir.join(PENDING_ADOPT_CODE_FILE);
 
@@ -186,9 +266,7 @@ impl CloudConnectConfig {
             .ok()
             .filter(|v| !v.is_empty());
 
-        let (adoption_code, pending_adopt_code_path) = if let Ok(code) =
-            std::env::var("SPICE_ADOPT_CODE")
-            && !code.is_empty()
+        let (adoption_code, pending_adopt_code_path) = if let Some(code) = adoption_code_from_env()
         {
             // Env var wins; we do not delete the pending file in this
             // branch because it's an out-of-band re-adopt signal.
@@ -215,6 +293,13 @@ impl CloudConnectConfig {
             (None, None)
         };
 
+        let adopt_app_name = std::env::var(ADOPT_APP_NAME_ENV)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let adopt_create_app = std::env::var(ADOPT_CREATE_APP_ENV)
+            .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1"));
+
         Self {
             enroll_endpoint,
             gateway_endpoint,
@@ -224,6 +309,8 @@ impl CloudConnectConfig {
             config_dir,
             adoption_code,
             pending_adopt_code_path,
+            adopt_app_name,
+            adopt_create_app,
             runtime_version: runtime_version.into(),
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
             telemetry_interval: DEFAULT_TELEMETRY_INTERVAL,
@@ -279,12 +366,86 @@ mod tests {
     }
 
     #[test]
+    fn resolve_config_dir_env_var_wins_over_instance_dir() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        // SAFETY: tests gate env-var mutations behind a mutex.
+        unsafe {
+            std::env::set_var("SPICE_CONFIG_DIR", "/tmp/spice-env-dir");
+        }
+        let dir = CloudConnectConfig::resolve_config_dir(Some(std::path::Path::new("/opt/edge-1")));
+        assert_eq!(
+            dir,
+            PathBuf::from("/tmp/spice-env-dir"),
+            "SPICE_CONFIG_DIR must win over --dir"
+        );
+        unsafe {
+            std::env::remove_var("SPICE_CONFIG_DIR");
+        }
+    }
+
+    #[test]
+    fn resolve_config_dir_anchors_at_instance_dir() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        // SAFETY: tests gate env-var mutations behind a mutex.
+        unsafe {
+            std::env::remove_var("SPICE_CONFIG_DIR");
+        }
+        let dir = CloudConnectConfig::resolve_config_dir(Some(std::path::Path::new("/opt/edge-1")));
+        assert_eq!(dir, PathBuf::from("/opt/edge-1/.spice"));
+    }
+
+    #[test]
+    fn resolve_config_dir_makes_relative_instance_dir_absolute() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        // SAFETY: tests gate env-var mutations behind a mutex.
+        unsafe {
+            std::env::remove_var("SPICE_CONFIG_DIR");
+        }
+        let dir = CloudConnectConfig::resolve_config_dir(Some(std::path::Path::new("edge-1")));
+        let expected = std::env::current_dir()
+            .expect("cwd available in tests")
+            .join("edge-1")
+            .join(".spice");
+        assert_eq!(
+            dir, expected,
+            "a relative --dir must be resolved against the cwd at enroll time"
+        );
+    }
+
+    #[test]
+    fn adoption_code_canonical_env_wins_over_deprecated_alias() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        // SAFETY: tests gate env-var mutations behind a mutex.
+        unsafe {
+            std::env::set_var(ADOPT_CODE_ENV, "SPICE-ADOPT-NEWER-AAAAA");
+            std::env::set_var(ADOPT_CODE_ENV_DEPRECATED, "SPICE-ADOPT-OLDER-AAAAA");
+        }
+        assert_eq!(
+            adoption_code_from_env().as_deref(),
+            Some("SPICE-ADOPT-NEWER-AAAAA")
+        );
+        unsafe {
+            std::env::remove_var(ADOPT_CODE_ENV);
+        }
+        assert_eq!(
+            adoption_code_from_env().as_deref(),
+            Some("SPICE-ADOPT-OLDER-AAAAA"),
+            "the deprecated alias must still be honored"
+        );
+        unsafe {
+            std::env::remove_var(ADOPT_CODE_ENV_DEPRECATED);
+        }
+        assert_eq!(adoption_code_from_env(), None);
+    }
+
+    #[test]
     fn from_env_uses_default_endpoint_when_unset() {
         let _guard = ENV_LOCK.lock().expect("env lock poisoned");
         unsafe {
             std::env::remove_var("SPICE_CLOUD_ENDPOINT");
             std::env::remove_var("SPICE_CLOUD_GATEWAY_ENDPOINT");
-            std::env::remove_var("SPICE_ADOPT_CODE");
+            std::env::remove_var(ADOPT_CODE_ENV);
+            std::env::remove_var(ADOPT_CODE_ENV_DEPRECATED);
         }
         let config = CloudConnectConfig::from_env("v0.0.0-test");
         assert_eq!(config.enroll_endpoint, DEFAULT_ENDPOINT);

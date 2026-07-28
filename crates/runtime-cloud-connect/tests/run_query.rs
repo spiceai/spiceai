@@ -253,6 +253,8 @@ fn config_with(
         config_dir,
         adoption_code: None,
         pending_adopt_code_path: None,
+        adopt_app_name: None,
+        adopt_create_app: false,
         runtime_version: "v0.0.0-test".to_string(),
         heartbeat_interval: Duration::from_secs(30),
         telemetry_interval: Duration::from_mins(1),
@@ -269,6 +271,8 @@ fn preseed_identity(path: &std::path::Path) {
         ca_bundle_pem: String::new(),
         gateway_addr: String::new(),
         not_after_unix: 0,
+        enc_private_key_pem: String::new(),
+        enc_public_key_pem: String::new(),
     };
     IdentityStore::store(path, &identity).unwrap();
 }
