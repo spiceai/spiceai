@@ -153,7 +153,7 @@ pub enum Error {
     InvalidConfiguration { msg: String },
 
     #[snafu(display(
-        "Unknown acceleration engine '{engine}'. Valid engines are: arrow, duckdb, sqlite, turso, postgres, cayenne. Docs: https://spiceai.org/docs/components/data-accelerators"
+        "Unknown acceleration engine '{engine}'. Valid engines are: arrow, duckdb, sqlite, turso, postgres/postgresql, cayenne/vortex. Docs: https://spiceai.org/docs/components/data-accelerators"
     ))]
     UnknownEngine { engine: Arc<str> },
 
@@ -367,8 +367,6 @@ pub trait DataAccelerator: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
-    ///
-    /// Also returns the behaviors of the table provider created by the accelerator engine.
     async fn create_external_table(
         &self,
         cmd: CreateExternalTable,
