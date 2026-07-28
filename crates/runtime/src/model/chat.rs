@@ -173,10 +173,7 @@ pub async fn construct_model(
         ModelSource::Bedrock => Err(LlmError::UnknownModelSource {
             from: "bedrock".into(),
         }),
-        ModelSource::SpiceAI => Err(LlmError::UnsupportedTaskForModel {
-            from: "spiceai".into(),
-            task: "llm".into(),
-        }),
+        ModelSource::SpiceAI => spiceai(model_id, params),
     }?;
 
     let system_prompt = match component.params.get("system_prompt") {
@@ -519,6 +516,33 @@ async fn databricks(
             ) as Arc<dyn Chat>)
         }
     }
+}
+
+/// Builds a chat model served by the Spice.ai Cloud Platform, or by another Spice runtime
+/// (a Spice-to-Spice connection). Both expose an `OpenAI`-compatible API under `/v1`.
+fn spiceai(model_id: Option<String>, params: &Parameters) -> Result<Arc<dyn Chat>, LlmError> {
+    // Treat a blank id the same as a missing one: a client built with an empty model name fails
+    // later with a far less obvious error.
+    let Some(model_id) = model_id.filter(|id| !id.trim().is_empty()) else {
+        return Err(LlmError::ModelNotProvided {
+            model_source: "spiceai".to_string(),
+        });
+    };
+
+    let endpoint = params.get("endpoint").expose().ok();
+    let api_key = params.get("api_key").expose().ok();
+
+    // A self-hosted Spice runtime may not require authentication, but the Spice.ai Cloud Platform
+    // always does — so an unset key there is a misconfiguration, not a valid anonymous setup.
+    if api_key.is_none() && llms::spiceai::is_cloud_platform(endpoint) {
+        return Err(LlmError::FailedToLoadModel {
+            source: "Missing `spiceai_api_key`. Models served by the Spice.ai Cloud Platform require an API key. Set `spiceai_api_key`, or set `spiceai_endpoint` to the Spice runtime serving the model. See: https://spiceai.org/docs/components/models".into(),
+        });
+    }
+
+    Ok(Arc::new(llms::spiceai::new_spiceai_client(
+        model_id, endpoint, api_key,
+    )) as Arc<dyn Chat>)
 }
 
 fn openai(model_id: Option<String>, params: &Parameters) -> Result<Arc<dyn Chat>, LlmError> {
@@ -978,5 +1002,82 @@ mod test {
             err,
             LlmError::InvalidParamValueError { ref param, .. } if param == "distributed_backend"
         ));
+    }
+
+    fn spiceai_params(entries: &[(&str, &str)]) -> Parameters {
+        Parameters::new(
+            entries
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), SecretString::from((*v).to_string())))
+                .collect(),
+            "spiceai",
+            crate::model::params::spiceai::PARAMETERS,
+        )
+    }
+
+    #[test]
+    fn spiceai_builds_a_cloud_platform_model() {
+        let params = spiceai_params(&[("api_key", "test-key")]);
+
+        spiceai(Some("openai/gpt-4o".to_string()), &params)
+            .expect("a Spice.ai Cloud Platform model with an API key should load");
+    }
+
+    #[test]
+    fn spiceai_builds_a_spice_to_spice_model_without_a_key() {
+        let params = spiceai_params(&[("endpoint", "http://localhost:8090")]);
+
+        spiceai(Some("local-llm".to_string()), &params)
+            .expect("a Spice runtime endpoint should not require an API key");
+    }
+
+    #[test]
+    fn spiceai_requires_a_model_id() {
+        let params = spiceai_params(&[("api_key", "test-key")]);
+
+        let Err(err) = spiceai(None, &params) else {
+            panic!("a model id is required");
+        };
+        assert!(matches!(
+            err,
+            LlmError::ModelNotProvided { ref model_source } if model_source == "spiceai"
+        ));
+    }
+
+    #[test]
+    fn spiceai_rejects_a_blank_model_id() {
+        let params = spiceai_params(&[("api_key", "test-key")]);
+
+        for blank in ["", "   "] {
+            let Err(err) = spiceai(Some(blank.to_string()), &params) else {
+                panic!("a blank model id should be rejected, got a client for {blank:?}");
+            };
+            assert!(matches!(
+                err,
+                LlmError::ModelNotProvided { ref model_source } if model_source == "spiceai"
+            ));
+        }
+    }
+
+    #[test]
+    fn spiceai_cloud_platform_requires_an_api_key() {
+        let params = spiceai_params(&[]);
+
+        let Err(err) = spiceai(Some("openai/gpt-4o".to_string()), &params) else {
+            panic!("the Spice.ai Cloud Platform requires an API key");
+        };
+        assert!(matches!(err, LlmError::FailedToLoadModel { .. }));
+    }
+
+    #[test]
+    fn spiceai_cloud_platform_requires_an_api_key_when_the_endpoint_is_spelled_out() {
+        // `Parameters::try_new` substitutes the spec default when `spiceai_endpoint` is unset, so
+        // the API-key requirement has to hold for a present endpoint too, not just an absent one.
+        let params = spiceai_params(&[("endpoint", llms::spiceai::DEFAULT_ENDPOINT)]);
+
+        let Err(err) = spiceai(Some("openai/gpt-4o".to_string()), &params) else {
+            panic!("the Spice.ai Cloud Platform requires an API key");
+        };
+        assert!(matches!(err, LlmError::FailedToLoadModel { .. }));
     }
 }
