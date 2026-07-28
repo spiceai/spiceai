@@ -14,10 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Spice Cloud LLM provider.
+//! Spice model provider — models served by the Spice.ai Cloud Platform, or by another Spice
+//! runtime (a Spice-to-Spice connection).
+//!
+//! Both serve an `OpenAI`-compatible API, so models are driven through the shared
+//! [`crate::openai::Openai`] client rather than a bespoke protocol.
 
 #![allow(clippy::missing_errors_doc)]
 
+mod chat;
 mod list_models;
 
+pub use chat::{DEFAULT_ENDPOINT, api_base, is_cloud_platform, new_spiceai_client};
 pub use list_models::SpiceAiModelLister;

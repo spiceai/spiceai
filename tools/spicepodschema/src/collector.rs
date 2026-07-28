@@ -23,7 +23,7 @@ limitations under the License.
 use runtime::dataaccelerator::DATA_ACCELERATOR_REGISTRATIONS;
 use runtime::dataconnector::DATA_CONNECTOR_REGISTRATIONS;
 use runtime::model::params::{
-    anthropic, azure, bedrock, databricks, file, google, huggingface, openai, xai,
+    anthropic, azure, bedrock, databricks, file, google, huggingface, openai, spiceai, xai,
 };
 use runtime_parameters::ParameterSpec;
 
@@ -259,6 +259,11 @@ pub fn collect_model_sources() -> Vec<ModelSourceSchema> {
             name: "google",
             prefix: "google",
             parameters: google::PARAMETERS,
+        },
+        ModelSourceSchema {
+            name: "spiceai",
+            prefix: "spiceai",
+            parameters: spiceai::PARAMETERS,
         },
     ]
 }
