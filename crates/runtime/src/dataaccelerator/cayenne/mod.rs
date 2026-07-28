@@ -2122,19 +2122,28 @@ impl CayenneAccelerator {
                 && acceleration.refresh_mode == Some(RefreshMode::Changes)
         });
 
-        // Default per-scan freshness, derived from the dataset's `access` mode. A
-        // read-only dataset takes no user DML (writes require BOTH a ReadWrite API key
-        // and `access: read_write`), so its data only moves via refresh/CDC — already
-        // eventually-consistent within the freshness SLO. Serving a recently-built
-        // ScanView within a bounded lag therefore stays in-contract AND lets concurrent
-        // analytical scans share one build (the demand cache's cross-query reuse lever).
-        // A read-write dataset (or any source we cannot prove read-only) uses 0 =
-        // read-your-writes, so a scan always sees its own writes.
+        // Default per-scan freshness. Bounded staleness is only in-contract for a
+        // read-only CDC *replica* (`refresh_mode: changes`): its data streams in
+        // continuously and is eventually-consistent by design, so a read tolerates a
+        // bounded lag — and there the demand cache's cross-query reuse lever pays off
+        // (concurrent analytical scans share one build). Read-only alone is NOT enough:
+        // a full-refresh / snapshot / append table is expected to reflect its last
+        // refresh immediately (refresh-then-query reads its own writes), and a read-only
+        // table can still take direct `delete_from`/DML via the accelerator — so serving
+        // a pre-mutation view there is a stale (wrong) result. Any table we cannot prove
+        // is a read-only CDC replica therefore uses 0 = read-your-writes, so a scan
+        // always sees the latest state. (A read-write dataset requires BOTH a ReadWrite
+        // API key and `access: read_write`.)
+        let is_cdc_replica = source
+            .acceleration()
+            .is_some_and(|acceleration| acceleration.refresh_mode == Some(RefreshMode::Changes));
         let default_scan_freshness = match source
             .as_any()
             .downcast_ref::<crate::component::dataset::Dataset>()
         {
-            Some(dataset) if !dataset.access().allows_write() => read_only_scan_freshness(),
+            Some(dataset) if is_cdc_replica && !dataset.access().allows_write() => {
+                read_only_scan_freshness()
+            }
             _ => std::time::Duration::ZERO,
         };
 

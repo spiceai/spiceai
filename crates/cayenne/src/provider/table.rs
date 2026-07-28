@@ -1413,11 +1413,14 @@ pub struct CayenneTableProvider {
     /// Per-scan freshness tolerance (the read-current lag) applied by [`Self::scan`].
     /// `0` = read-your-writes: every scan captures and serves the CURRENT state.
     /// Non-zero lets concurrent analytical scans share a recently-built [`ScanView`]
-    /// within the lag (the demand cache's cross-query reuse lever). Derived from the
-    /// dataset's `access` mode at construction (read-write → `0` for read-your-writes;
-    /// read-only → a bounded non-zero lag, since a read-only dataset takes no user DML)
-    /// and set via the builder. A plain in-memory `Duration` (`Copy`), shared across
-    /// writer clones. See [`Self::scan_view_at_current_input`].
+    /// within the lag (the demand cache's cross-query reuse lever). Derived at
+    /// construction from the dataset's `access` mode AND refresh mode: only a read-only
+    /// CDC replica (`access: read` + `refresh_mode: changes`) — eventually-consistent by
+    /// design — gets a bounded non-zero lag; every other table (a read-only
+    /// full-refresh/snapshot/append table, which must reflect its last refresh
+    /// immediately, or any writable dataset) gets `0` for read-your-writes. Set via the
+    /// builder. A plain in-memory `Duration` (`Copy`), shared across writer clones. See
+    /// [`Self::scan_view_at_current_input`].
     ///
     /// NOTE: `0` for read-write datasets rebuilds per scan under a mixed read/write
     /// workload (any mutation re-keys the capture), even across RESULT-PRESERVING churn
