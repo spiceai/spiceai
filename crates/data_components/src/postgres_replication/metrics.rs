@@ -316,6 +316,10 @@ impl MetricsCollector {
     /// metric begins reporting — a dataset on a dedicated (non-shared) slot never
     /// calls this, so its series stays absent rather than a misleading `0`.
     pub fn mark_member_attached(&self) {
+        // Seed the hold-back gauge so a healthy shared-slot member publishes 0
+        // rather than nothing — an absent series is ambiguous on a dashboard.
+        self.member_held_envelopes_known
+            .store(true, Ordering::Release);
         self.member_attached.store(1, Ordering::Relaxed);
         // Release pairs with the Acquire load in `member_attached()` so a reader
         // that observes `known == true` also sees the value store above.

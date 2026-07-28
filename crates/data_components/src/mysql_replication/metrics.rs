@@ -178,6 +178,10 @@ impl MetricsCollector {
     /// Mark this dataset an attached member of a shared binlog dump.
     pub fn mark_member_attached(&self) {
         self.member_attached.store(1, Ordering::Relaxed);
+        // Same reason as Postgres: a healthy shared-dump member should publish 0,
+        // not an absent series.
+        self.member_held_envelopes_known
+            .store(true, Ordering::Release);
     }
 
     /// Mark this dataset detached from the shared dump (its floor is now held,

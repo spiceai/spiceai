@@ -619,9 +619,14 @@ impl MetricsProvider for PostgresMetricsProvider {
             "replication_member_held_envelopes" => {
                 Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
                     // Shared-slot datasets only (`Some`); a dedicated slot reports
-                    // no series rather than a constant 0.
+                    // no series rather than a constant 0. Carries the `slot` label
+                    // like `member_attached` so datasets can be grouped by slot.
                     if let Some(v) = m.member_held_envelopes() {
-                        instrument.observe(v, &attributes);
+                        let mut attrs = attributes.clone();
+                        if let Some(slot) = m.slot_name() {
+                            attrs.push(KeyValue::new("slot", slot));
+                        }
+                        instrument.observe(v, &attrs);
                     }
                 })))
             }

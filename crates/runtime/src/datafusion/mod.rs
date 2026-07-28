@@ -5671,6 +5671,7 @@ mod tests {
                     vectors: None,
                     full_text_search: None,
                     check_availability: crate::component::dataset::CheckAvailability::Disabled,
+                    check_availability_interval: None,
                     on_schema_change: crate::component::dataset::OnSchemaChange::default(),
                 },
                 app: Arc::new(app::App::default()),

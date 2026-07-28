@@ -28,7 +28,7 @@ limitations under the License.
 //!   one place at a time — the caller's `try_send` fast path applies *only* while
 //!   that member's queue is empty; once anything is held back, every later
 //!   envelope for that member appends to the queue and reaches the channel
-//!   through [`MemberOverflow::flush`], oldest first.
+//!   through [`MemberOverflow::flush_member`], oldest first.
 //! * **Memory is bounded.** The caller enforces a cap and falls back to a
 //!   blocking send past it, so a member that never drains still back-pressures
 //!   the source rather than growing the hold-back without limit.
