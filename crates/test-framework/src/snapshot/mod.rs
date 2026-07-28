@@ -248,7 +248,6 @@ fn get_indent_level(line: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-
     #[test]
     fn test_temp_dir_regex_pattern() -> Result<(), String> {
         let test_cases = [
