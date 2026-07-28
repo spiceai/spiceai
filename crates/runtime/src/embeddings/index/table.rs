@@ -22,6 +22,8 @@ use datafusion::datasource::TableProvider;
 use datafusion::{prelude::SessionContext, sql::TableReference};
 #[cfg(feature = "models")]
 use runtime_datafusion_udfs::embed::EMBED_UDF_NAME;
+#[cfg(not(feature = "models"))]
+const EMBED_UDF_NAME: &str = "embed";
 use spicepod::vector::VectorStore;
 use std::sync::Arc;
 use tokio::sync::RwLock;
