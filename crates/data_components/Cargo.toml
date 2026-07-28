@@ -61,7 +61,7 @@ iceberg-datafusion.workspace = true
 indexmap.workspace = true
 logos.workspace = true
 mysql_async = { workspace = true, optional = true }
-# Value-only row-image parsing (mysql_replication::binlog::FastRowsDecoder):
+# Value-only row-image parsing (mysql_replication::binlog::TableMapRowDecoder):
 # `ParseBuf` is not re-exported by mysql_async; the version matches the
 # mysql_async pin so this adds no extra compilation unit.
 mysql_common = { version = "0.35.5", default-features = false, features = ["binlog"], optional = true }
