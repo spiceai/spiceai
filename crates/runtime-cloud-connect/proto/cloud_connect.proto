@@ -16,6 +16,18 @@
 // runtime (standalone or cluster-managed) and the Spice Cloud control
 // plane. One service, two instance kinds disambiguated by
 // `Hello.kind`.
+//
+// THIS FILE IS THE AUTHORITATIVE COPY of the Cloud Connect wire contract.
+// The other implementations of the protocol keep their own copies rather
+// than generating from this one, so a change starts here and lands in
+// every copy in the same review — a field number or message shape that
+// moves on one side alone is a wire break that only shows up at runtime.
+//
+// The bytes each side derives but never sends — the HPKE suite, `key_id`,
+// and the additional authenticated data of the sealed-secret payloads —
+// are not expressible in proto. Those live in the `cloud-connect-crypto`
+// crate, which is the equivalent single source for them, and are shared
+// as code rather than copied.
 syntax = "proto3";
 package spice.cloud.v1;
 
@@ -209,8 +221,6 @@ message Pause {
 // returned verbatim in CommandResult.payload_json (a raw string, not JSON).
 // Only `tail_lines` is meaningful for standalone; the namespace/kind/name/
 // pod_name fields address a workload in a cluster and are ignored otherwise.
-// Field numbers must stay identical to the ai-platform / operator copies of
-// this proto.
 message GetPodLogs {
   string command_id = 1;
   string namespace = 2;
