@@ -37,8 +37,9 @@ pub(crate) fn build_replication_config(
 ) -> ReplicationConfig {
     // Map our `SslMode` to pgwire-replication's `TlsConfig`. The crate uses
     // rustls and its own SslMode enum (Disabled / Require / VerifyCa /
-    // VerifyFull), so we pick the matching constructor and pass the optional
-    // CA path.
+    // VerifyFull), so we pick the matching constructor and hand over the CA
+    // bundle as-is — path or PEM content, the same value the setup and
+    // bootstrap connections verify against.
     let tls = match params.sslmode {
         // Prefer maps to plaintext for WAL streaming. Rationale:
         // pgwire-replication does not expose a safe "try TLS then fall back

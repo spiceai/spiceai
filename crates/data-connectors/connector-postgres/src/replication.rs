@@ -638,7 +638,10 @@ fn replication_params_from_connector_params(
     let identity = crate::connection::connection_identity_from_params(params)?;
     let sslmode = config::SslMode::from_str_strict(identity.sslmode.as_deref())
         .map_err(|reason| format!("parameter `{}` {reason}", params.user_param("sslmode")))?;
-    let sslrootcert = identity.sslrootcert.map(std::path::PathBuf::from);
+    let sslrootcert = identity
+        .sslrootcert
+        .as_deref()
+        .map(config::ca_certificate_from_param);
 
     // An explicitly-named slot is shareable: every dataset on the same
     // connection naming the same slot is multiplexed onto one replication
@@ -921,6 +924,7 @@ fn extract_primary_keys(provider: &Arc<dyn datafusion::datasource::TableProvider
 #[cfg(test)]
 mod tests {
     use super::*;
+    use data_components::postgres_replication::CaCertificate;
 
     fn params_with_bootstrap_batch_size(value: &str) -> Parameters {
         Parameters::new(
@@ -943,6 +947,88 @@ mod tests {
 
     fn empty_params() -> Parameters {
         Parameters::new(vec![], "pg", crate::PARAMETERS)
+    }
+
+    /// Self-signed CA (`CN=Spice Replication Test CA`, `CA:TRUE`), expiring in 2126.
+    const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIC4DCCAcigAwIBAgIJAODHR+uzOPBvMA0GCSqGSIb3DQEBCwUAMCQxIjAgBgNV
+BAMMGVNwaWNlIFJlcGxpY2F0aW9uIFRlc3QgQ0EwIBcNMjYwNzI4MDU0MDQ0WhgP
+MjEyNjA3MDQwNTQwNDRaMCQxIjAgBgNVBAMMGVNwaWNlIFJlcGxpY2F0aW9uIFRl
+c3QgQ0EwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCzoou00DrTAevF
+RZ6+PFmSBUhzZXsABQFztlPigZzJ1m8hnja66hnkWKyIid9DcitnjkWgtQZCVxm6
+s05tM6QAy5lI2wlfWD7hQi+yIWKv2dcVuD/J4hWPjmG5a5VtRAInV0yBymkCRI6Z
+68JYfvKh+Rku1y6H3dUfNm8dxCbo589L1U8ucJqlQv9Iy/X7Lze+pj2JFU/L1g3t
+k/5ziVgJjdh3VetrHkU1YOiHRPFsqXOxXc2lpzUjd23QR3FfkZkVgLUfEvPWHRSf
+xipaPFhllw9WUWEl6bVqAGO0btPO1OKKqBlIcizf2YO2+lFs/o0e7bApGzI3l5HP
+VZr/e6ZLAgMBAAGjEzARMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQAD
+ggEBACC1XMNpbA+172MQks9R7cqRY5I0HObJRX3dpIsOqrm3EUcHMt9kx7QrO1Af
+gzAWC0ZNHppeU/cuq9ZKZQiFrSmr5fKtXzsxkvgLYRCFO+ZCKZl9k3z9j0AQbTPR
+klJa4bo2SS6WbmoATimD6e0moT++neRIDx7MlijtWB8grfhuH7yFN9xoTRDgdYBU
+KLeFNAIi+S5cVzUwjMiOQnmljphKSRoQnihpA/c6WAVAN3VqMdoPpfmR2pTi7rio
+38busw0nt/y+JCVWzNDr/i5f3mvNi5SaHZ5PTOVnocyMUw+ysx5eQOrJwrirW9XD
+TXTE85+Or9IUwDI9543jsyCvuQ8=
+-----END CERTIFICATE-----
+";
+
+    /// A complete connection, so parsing reaches `sslrootcert` instead of
+    /// aborting on a missing required parameter.
+    fn params_with_sslrootcert(value: &str) -> Parameters {
+        Parameters::new(
+            vec![
+                ("host".to_string(), SecretString::from("pg.internal")),
+                ("user".to_string(), SecretString::from("spice")),
+                ("db".to_string(), SecretString::from("myapp")),
+                ("sslmode".to_string(), SecretString::from("verify-full")),
+                ("sslrootcert".to_string(), SecretString::from(value)),
+            ],
+            "pg",
+            crate::PARAMETERS,
+        )
+    }
+
+    /// `pg_sslrootcert` is documented as accepting a path *or* inline PEM
+    /// content, and a CA injected as a secret arrives as content. Both spellings
+    /// must reach the replication stream as a usable trust anchor.
+    #[test]
+    fn inline_pem_sslrootcert_reaches_replication_params_as_content() {
+        let repl =
+            replication_params_from_connector_params(&params_with_sslrootcert(TEST_CA_PEM), "hits")
+                .expect("inline PEM sslrootcert should parse");
+
+        assert_eq!(repl.sslmode, config::SslMode::VerifyFull);
+        assert_eq!(
+            repl.sslrootcert,
+            Some(CaCertificate::Pem(TEST_CA_PEM.as_bytes().to_vec())),
+            "inline PEM must not be reinterpreted as a filesystem path"
+        );
+    }
+
+    #[test]
+    fn inline_pem_sslrootcert_survives_a_single_line_secret() {
+        let repl = replication_params_from_connector_params(
+            &params_with_sslrootcert(&TEST_CA_PEM.replace('\n', "\\n")),
+            "hits",
+        )
+        .expect("single-line inline PEM sslrootcert should parse");
+
+        assert_eq!(
+            repl.sslrootcert,
+            Some(CaCertificate::Pem(TEST_CA_PEM.as_bytes().to_vec()))
+        );
+    }
+
+    #[test]
+    fn path_sslrootcert_reaches_replication_params_as_a_path() {
+        let repl = replication_params_from_connector_params(
+            &params_with_sslrootcert("/etc/ssl/pg-ca.pem"),
+            "hits",
+        )
+        .expect("sslrootcert path should parse");
+
+        assert_eq!(
+            repl.sslrootcert,
+            Some(CaCertificate::Path("/etc/ssl/pg-ca.pem".into()))
+        );
     }
 
     // Regression for #11994: CDC must honor `pg_connection_string` the same way

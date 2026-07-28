@@ -75,6 +75,6 @@ pub mod protocol;
 pub mod tls;
 
 pub use client::{ReplicationClient, ReplicationEvent, ReplicationEventReceiver, TryRecvEvent};
-pub use config::{PgOutputFormat, ReplicationConfig, SslMode, TlsConfig};
+pub use config::{CaCertificate, PgOutputFormat, ReplicationConfig, SslMode, TlsConfig};
 pub use error::{PgWireError, Result};
 pub use lsn::Lsn;
