@@ -2081,16 +2081,18 @@ impl DataFusion {
         }
         .await;
 
-        if registration.is_err() {
-            // Registration failed after we claimed the entry: return it to the queue so a later
-            // write retries it, rather than leaving the dataset unregistered.
-            self.pending_sink_tables
-                .write()
-                .await
-                .push(pending_registration);
+        match registration {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                // Registration failed after we claimed the entry: return it to the queue so a
+                // later write retries it, rather than leaving the dataset unregistered.
+                self.pending_sink_tables
+                    .write()
+                    .await
+                    .push(pending_registration);
+                Err(e)
+            }
         }
-
-        registration
     }
 
     pub async fn write_data(
