@@ -485,7 +485,19 @@ impl DuckDBAccelerator {
 /// generation files. The dedup key is the resolved path, so two datasets that
 /// spell the same file differently (`./x.db` and `x.db`) still recover once —
 /// a second pass could otherwise delete a live swap's staging file.
-async fn recover_interrupted_file_swap_once(path: &str) {
+/// Recovery is a *required* step, not best-effort: the errors that escape
+/// `recover_database_file_generations` are the ones that leave the file state
+/// unknown (the directory could not be enumerated, or a completed generation
+/// could not be adopted). Continuing past one of those would open whatever
+/// happens to be at the configured path — and when the configured file is
+/// missing because a swap got as far as unlinking it, that means DuckDB creates
+/// a fresh empty database and the dataset silently loses its `spice_sys_*`
+/// metadata (dataset checkpoints, CDC offsets). Failing `init` instead keeps the
+/// generation files on disk for the next attempt. Failures to *delete* stale
+/// files are non-fatal and handled inside the engine.
+async fn recover_interrupted_file_swap_once(
+    path: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     static RECOVERED_PATHS: std::sync::LazyLock<tokio::sync::Mutex<HashSet<PathBuf>>> =
         std::sync::LazyLock::new(|| tokio::sync::Mutex::new(HashSet::new()));
 
@@ -499,8 +511,8 @@ async fn recover_interrupted_file_swap_once(path: &str) {
     };
 
     let mut recovered = RECOVERED_PATHS.lock().await;
-    if !recovered.insert(key) {
-        return;
+    if recovered.contains(&key) {
+        return Ok(());
     }
 
     let owned_path = path.to_string();
@@ -509,24 +521,28 @@ async fn recover_interrupted_file_swap_once(path: &str) {
     })
     .await
     .map_err(|e| e.to_string())
-    .and_then(|result| result.map_err(|e| e.to_string()));
+    .and_then(|result| result.map_err(|e| e.to_string()))
+    .map_err(|e| {
+        Error::AccelerationInitializationFailed {
+            source: format!(
+                "Failed to recover the DuckDB acceleration file {path} from an interrupted file replacement: {e}. Resolve the file state at that path and restart."
+            )
+            .into(),
+        }
+    })?;
 
-    match recovery {
-        Ok(recovery) => {
-            if recovery.adopted.is_some() || !recovery.removed.is_empty() {
-                tracing::info!(
-                    "Recovered DuckDB acceleration file {path} from an interrupted file swap (adopted: {adopted:?}, removed {removed} leftover file(s))",
-                    adopted = recovery.adopted,
-                    removed = recovery.removed.len()
-                );
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                "Failed to recover DuckDB acceleration file {path} from a prior file swap: {e}"
-            );
-        }
+    if recovery.adopted.is_some() || !recovery.removed.is_empty() {
+        tracing::info!(
+            "Recovered DuckDB acceleration file {path} from an interrupted file replacement (adopted: {adopted:?}, removed {removed} leftover file(s))",
+            adopted = recovery.adopted,
+            removed = recovery.removed.len()
+        );
     }
+
+    // Recorded only on success, so a failed pass is retried rather than skipped
+    // by a later dataset sharing this file.
+    recovered.insert(key);
+    Ok(())
 }
 
 /// Returns the `DuckDB` file path that would be used for a file-based `DuckDB` acceleration for this acceleration source
@@ -582,7 +598,8 @@ impl Default for DuckDBAccelerator {
     }
 }
 
-const DUCKDB_ACCELERATOR_DOCS: &str = "https://spiceai.org/docs/components/data-accelerators/duckdb";
+const DUCKDB_ACCELERATOR_DOCS: &str =
+    "https://spiceai.org/docs/components/data-accelerators/duckdb";
 
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("file_watcher"),
@@ -677,7 +694,7 @@ impl DataAccelerator for DuckDBAccelerator {
             // Recover from any interrupted database file swap (crashed or
             // partially completed) before the first connection pool opens this
             // file — and before FileCreate mode decides whether a file exists.
-            recover_interrupted_file_swap_once(&path).await;
+            recover_interrupted_file_swap_once(&path).await?;
 
             // If mode is FileCreate, snapshot the existing file (if enabled) then delete it to start fresh
             if acceleration.mode == Mode::FileCreate {
@@ -768,14 +785,13 @@ impl DataAccelerator for DuckDBAccelerator {
                             matches!(mode.as_str(), "file" | "file_create" | "file_update")
                         })
                     },
-                    |src| src.is_file_accelerated(),
+                    runtime_acceleration::AccelerationSource::is_file_accelerated,
                 );
                 ensure!(
                     is_file_mode,
                     super::InvalidConfigurationSnafu {
                         msg: format!(
-                            "Failed to register dataset {name} (duckdb accelerator): 'on_full_refresh: replace_file' requires file-mode acceleration. Set 'mode: file' or remove 'on_full_refresh'. See: {DUCKDB_ACCELERATOR_DOCS}",
-                            name = dataset_display_name,
+                            "Failed to register dataset {dataset_display_name} (duckdb accelerator): 'on_full_refresh: replace_file' requires file-mode acceleration. Set 'mode: file' or remove 'on_full_refresh'. See: {DUCKDB_ACCELERATOR_DOCS}"
                         ),
                     }
                 );
@@ -789,12 +805,11 @@ impl DataAccelerator for DuckDBAccelerator {
             }
             Some(other) => super::InvalidConfigurationSnafu {
                 msg: format!(
-                    "Failed to register dataset {name} (duckdb accelerator): Invalid 'on_full_refresh' value '{other}'. Expected 'in_place' or 'replace_file'. See: {DUCKDB_ACCELERATOR_DOCS}",
-                    name = dataset_display_name,
+                    "Failed to register dataset {dataset_display_name} (duckdb accelerator): Invalid 'on_full_refresh' value '{other}'. Expected 'in_place' or 'replace_file'. See: {DUCKDB_ACCELERATOR_DOCS}"
                 ),
             }
             .fail()?,
-        };
+        }
 
         let is_changes_refresh = source
             .and_then(|src| src.acceleration())

@@ -170,7 +170,14 @@ fn replace_file_dataset(
 }
 
 fn full_refresh_replace_file_dataset(from: &str, name: &str, path: &str) -> Dataset {
-    replace_file_dataset(from, name, path, RefreshMode::Full, Some("replace_file"), None)
+    replace_file_dataset(
+        from,
+        name,
+        path,
+        RefreshMode::Full,
+        Some("replace_file"),
+        None,
+    )
 }
 
 /// Writes `rows` of incompressible data to a CSV `file://` source. `md5` output
@@ -290,8 +297,7 @@ async fn test_duckdb_file_swap_rejects_snapshot_refresh_peer_on_same_file()
 /// across repeated replacements — including through a join that forces the
 /// cross-file attachment to be used.
 #[tokio::test]
-async fn test_duckdb_file_replace_refreshes_cross_file_attachment()
--> Result<(), anyhow::Error> {
+async fn test_duckdb_file_replace_refreshes_cross_file_attachment() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
 
@@ -630,8 +636,8 @@ async fn test_duckdb_file_swap_bounded_growth_under_query_load() -> Result<(), a
 /// checkpoint is re-persisted in a tight loop while another dataset swaps, and
 /// the checkpoint must still be present afterwards.
 #[tokio::test]
-async fn test_duckdb_file_swap_preserves_concurrent_out_of_band_writes()
--> Result<(), anyhow::Error> {
+async fn test_duckdb_file_swap_preserves_concurrent_out_of_band_writes() -> Result<(), anyhow::Error>
+{
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
 
@@ -764,7 +770,9 @@ async fn test_duckdb_file_swap_recovers_interrupted_swap_on_boot() -> Result<(),
             // and only the generation survives, alongside `.building` debris
             // from a staging load that never finished.
             let generation = dir.path().join("recovery.db.refresh.1700000000000-0");
-            let building = dir.path().join("recovery.db.refresh.1700000000001-1.building");
+            let building = dir
+                .path()
+                .join("recovery.db.refresh.1700000000001-1.building");
             std::fs::rename(&db_file, &generation)?;
             std::fs::write(&building, b"incomplete staging output")?;
 
