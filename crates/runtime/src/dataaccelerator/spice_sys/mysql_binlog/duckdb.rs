@@ -105,6 +105,13 @@ impl MySqlBinlogSys {
     ) -> Option<MySqlBinlogCheckpoint> {
         use std::time::{Duration, UNIX_EPOCH};
 
+        // The column migrations below issue DDL, so this read path is also a
+        // writer to the shared acceleration file and takes the write gate.
+        let write_gate = pool.write_gate();
+        let _write_guard = write_gate
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let mut db_conn = Arc::clone(pool).connect_sync().ok()?;
         let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
             .ok()?
