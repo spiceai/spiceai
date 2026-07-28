@@ -64,6 +64,7 @@ impl CompoundSearchIndex {
             read_mode,
         })
     }
+    #[must_use]
     pub fn primary(&self) -> &Arc<dyn SearchIndex> {
         &self.primary
     }

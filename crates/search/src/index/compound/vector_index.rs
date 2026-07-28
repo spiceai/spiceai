@@ -81,6 +81,7 @@ impl CompoundVectorIndex {
         }
     }
 
+    #[must_use]
     pub fn primary(&self) -> &Arc<dyn VectorIndex> {
         &self.primary
     }

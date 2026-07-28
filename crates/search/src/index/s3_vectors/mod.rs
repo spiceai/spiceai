@@ -402,7 +402,7 @@ impl Index for S3Vector {
             .delete_by_keys(key_strings)
             .await
             .boxed()
-            .map_err(|e| DataFusionError::External(e))
+            .map_err(DataFusionError::External)
     }
 }
 
