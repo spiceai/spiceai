@@ -59,8 +59,9 @@ use app::App;
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
 use data_components::postgres::provider::{
-    ReplicaIdentityOutcome, check_cdc_prerequisites, classify_replica_identity, list_schemas,
-    list_tables, replica_identity, replication_slot_status, wal_sender_timeout_ms,
+    ReplicaIdentityOutcome, check_cdc_prerequisites, classify_replica_identity,
+    ensure_replication_slot_capacity, list_schemas, list_tables, replica_identity,
+    replication_slot_status, wal_sender_timeout_ms,
 };
 use data_components::postgres_replication::config::catalog_slot_name;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
@@ -420,9 +421,11 @@ impl AcceleratedCatalogProvider {
     /// same catalog resolves to the *same* slot -- and `PostgreSQL` permits only
     /// one consumer per slot. So:
     ///
-    ///   - slot absent -> return; the per-table replication path creates it;
+    ///   - slot absent -> a new slot will be created, so first check the server
+    ///     has capacity ([`ensure_replication_slot_capacity`]) and fail loudly if
+    ///     `max_replication_slots` is exhausted; otherwise return;
     ///   - slot present but inactive -> return; it is reused (a restart/reschedule
-    ///     resumes from its `restart_lsn`, no re-snapshot);
+    ///     resumes from its `restart_lsn`, no re-snapshot), so no capacity is used;
     ///   - slot present and active -> another consumer holds it. But a fast
     ///     self-restart after an ungraceful exit can *also* see the slot active
     ///     (the server keeps the dead consumer's slot active until
@@ -463,8 +466,17 @@ impl AcceleratedCatalogProvider {
                 .await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
             match status {
-                // Absent (will be created) or present-but-inactive (safe to reuse).
-                None => return Ok(()),
+                // Absent: a new slot will be created for this catalog, so verify
+                // the server has capacity now -- an exhausted `max_replication_slots`
+                // otherwise fails later, deep in replication setup, with a cryptic
+                // error instead of an actionable one at startup.
+                None => {
+                    ensure_replication_slot_capacity(&self.pool)
+                        .await
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                    return Ok(());
+                }
+                // Present but inactive: reused, not created -- no capacity consumed.
                 Some(status) if !status.active => return Ok(()),
                 Some(status) => {
                     if tokio::time::Instant::now() >= deadline {
