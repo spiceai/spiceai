@@ -432,5 +432,10 @@ name = "cdc_cayenne_inline"
 harness = false
 name = "cdc_delete_burst"
 
+[[bench]]
+harness = false
+name = "mysql_cdc_e2e"
+required-features = ["mysql"]
+
 [lints]
 workspace = true

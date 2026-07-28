@@ -14,39 +14,38 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Deferred (off-the-pump) decode + Arrow build for the shared binlog dump.
+//! Decode + Arrow build for the shared binlog dump's committed transactions.
 //!
-//! Mirrors [`crate::postgres_replication::changes::PgChangeRows`]: the shared
-//! pump ([`super::shared`]) must not pay the O(rows × columns) tuple decode and
-//! Arrow-typing cost on its single serialization point, or one large/slow table
-//! would stall every other member behind it. So at each rows event the pump
-//! only buffers the **owned** wire payload (`RowsEventData<'static>`) plus
-//! `Arc` snapshots of the table-map columns and the member's decode layout, and
-//! hands them to this [`MysqlChangeRows`]. [`ChangeRows::build`] then runs the
-//! decode + [`build_change_batch`] later, on the per-dataset consumer thread.
+//! The pump decodes each commit's buffered rows events into a ready
+//! [`ChangeBatch`] before delivery ([`super::shared`]'s `deliver_commit`), the
+//! shape [`crate::cdc::ChangeEnvelope::new`] carries. Unlike Postgres — whose
+//! per-message pgoutput decode is cheap enough to defer to the per-dataset
+//! consumer ([`crate::postgres_replication::changes::PgChangeRows`]) — a
+//! `MySQL` rows-event decode is the dominant cost of a change build, and
+//! deferring it serializes that cost with the accelerator write on the
+//! consumer, starving the write path (measured at 73–81 % of the CDC apply
+//! loop on SF1000 CH-benCH runs). Decoding on the pump pipelines it with the
+//! consumer's writes instead; the pump's must-deliver backpressure already
+//! paces it by the slowest member either way.
 //!
-//! Two consequences, both intended:
-//!   - shared-pump CPU stays ~flat as members grow, and
-//!   - a row-decode failure surfaces as a per-dataset [`StreamError`] from
-//!     `build` (via [`ChangeBatchError::DeferredBuild`]) rather than a pump-side
-//!     `member_fatal`, so one malformed table faults only its own stream.
+//! A row-decode failure is member-fatal (`member_fatal`), so one malformed
+//! table still faults only its own dataset's stream, exactly as the deferred
+//! build's per-dataset `StreamError` did.
 
-use std::sync::Arc;
-
-use arrow::datatypes::{DataType, IntervalUnit, SchemaRef};
+use arrow::datatypes::SchemaRef;
 use mysql_async::binlog::events::{RowsEventData, TableMapEvent};
 
 use super::binlog::buffer_rows_event;
 use super::metrics::MetricsCollector;
 use super::rows::{TransactionBuffer, build_change_batch};
 use super::setup::TableLayout;
-use crate::cdc::{ChangeBatch, ChangeBatchError, ChangeRows};
+use crate::cdc::ChangeBatch;
 
 /// The positional decode layout of one member, snapshotted immutably behind an
 /// `Arc`. The shared pump clones the current `Arc` into a route at
 /// `TableMapEvent` install time and swaps in a fresh `Arc` on a compatible
-/// mid-stream ALTER, so the snapshot handed to a [`MysqlChangeRows`] is always
-/// the layout valid *when its rows were written* — never a reference the pump
+/// mid-stream ALTER, so the snapshot a commit is decoded against is always the
+/// layout valid *when its rows were written* — never a reference the pump
 /// keeps mutating.
 pub(super) struct MemberLayout {
     pub(super) layout: TableLayout,
@@ -56,151 +55,34 @@ pub(super) struct MemberLayout {
     pub(super) pk_source_indexes: Vec<usize>,
 }
 
-/// Deferred [`ChangeRows`] for one member's rows within one committed source
-/// transaction. Carries owned wire payloads; the decode runs in [`Self::build`].
-pub(crate) struct MysqlChangeRows {
-    schema: SchemaRef,
-    primary_keys: Vec<String>,
-    /// Decode-time layout snapshot (see [`MemberLayout`]).
-    layout: Arc<MemberLayout>,
-    /// Table-map columns valid for `events`, snapshotted at route install.
-    tme: Arc<TableMapEvent<'static>>,
-    /// Owned row-event payloads buffered by the pump for this table+commit.
-    events: Vec<RowsEventData<'static>>,
+/// Decode one commit's buffered rows events for one member into a
+/// [`ChangeBatch`]: every event through [`buffer_rows_event`] (which records
+/// the per-row op metrics as it decodes), then one Arrow build.
+///
+/// # Errors
+///
+/// Returns the decode or batch-build error; the pump treats it as
+/// member-fatal so only this dataset's stream faults.
+pub(super) fn decode_events_to_batch(
+    schema: &SchemaRef,
+    primary_keys: &[String],
+    layout: &MemberLayout,
+    tme: &TableMapEvent<'static>,
+    events: &[RowsEventData<'static>],
     source_commit_ts_ms: Option<i64>,
-    /// Per-row `inc_insert/inc_update/inc_delete` are recorded here in
-    /// [`Self::build`] — NOT on the pump. Unlike Postgres (1 pgoutput message =
-    /// 1 row, countable by a tag-peek), a `MySQL` rows event holds N rows whose
-    /// count is only known by decoding, so the per-row op metrics move to the
-    /// consumer. `inc_transaction` / `record_watermark` stay on the pump.
-    metrics: Arc<MetricsCollector>,
-    /// Precomputed decode-free metadata (see [`Self::new`]).
-    row_hint: usize,
-    byte_len: usize,
-}
-
-impl MysqlChangeRows {
-    pub(super) fn new(
-        schema: SchemaRef,
-        primary_keys: Vec<String>,
-        layout: Arc<MemberLayout>,
-        tme: Arc<TableMapEvent<'static>>,
-        events: Vec<RowsEventData<'static>>,
-        source_commit_ts_ms: Option<i64>,
-        metrics: Arc<MetricsCollector>,
-    ) -> Self {
-        // Both metadata figures are computed WITHOUT decoding, from the buffered
-        // wire size (`rows_data()` is a byte-slice accessor, no row parse).
-        let wire_bytes: usize = events.iter().map(|e| e.rows_data().len()).sum();
-        let per_row_fixed: usize = schema
-            .fields()
-            .iter()
-            .map(|f| arrow_fixed_width(f.data_type()))
-            .sum();
-        // Row count can't be known without decoding a MySQL rows event, so this
-        // is an estimate: wire bytes over a per-row floor, never below one row
-        // per event. Over/under-estimating only affects builder pre-allocation;
-        // the exact-zero case is served by `is_empty` (events are never empty).
-        let row_hint = wire_bytes.div_ceil(per_row_fixed.max(1)).max(events.len());
-        // Coalescing byte estimate: raw wire bytes floored at the fixed-width
-        // Arrow footprint (NULL/short columns under-count the eventual Arrow
-        // allocation), matching `PgChangeRows`.
-        let byte_len = wire_bytes.max(row_hint.saturating_mul(per_row_fixed));
-        Self {
-            schema,
-            primary_keys,
-            layout,
+    metrics: &MetricsCollector,
+) -> super::Result<ChangeBatch> {
+    let mut buffer = TransactionBuffer::new();
+    for event in events {
+        buffer_rows_event(
+            event,
             tme,
-            events,
-            source_commit_ts_ms,
+            &layout.layout,
+            &layout.pk_source_indexes,
+            &mut buffer,
             metrics,
-            row_hint,
-            byte_len,
-        }
+        )?;
     }
-}
-
-impl ChangeRows for MysqlChangeRows {
-    fn is_empty(&self) -> bool {
-        // Exact: a MySQL rows event always carries at least one row, so no
-        // buffered events ⟺ no output rows.
-        self.events.is_empty()
-    }
-
-    fn num_rows_hint(&self) -> usize {
-        self.row_hint
-    }
-
-    fn encoded_len(&self) -> usize {
-        self.byte_len
-    }
-
-    fn source_commit_ts_ms(&self) -> Option<i64> {
-        self.source_commit_ts_ms
-    }
-
-    fn is_heartbeat(&self) -> bool {
-        // Row batches always carry rows; readiness heartbeats are emitted
-        // separately as zero-row envelopes.
-        false
-    }
-
-    fn build(self: Box<Self>) -> Result<ChangeBatch, ChangeBatchError> {
-        // Decode every buffered rows event into the transaction buffer using the
-        // SAME `buffer_rows_event` the per-dataset path uses (it records the
-        // per-row op metrics as it decodes), then build one Arrow batch.
-        let mut buffer = TransactionBuffer::new();
-        for event in &self.events {
-            buffer_rows_event(
-                event,
-                &self.tme,
-                &self.layout.layout,
-                &self.layout.pk_source_indexes,
-                &mut buffer,
-                &self.metrics,
-            )
-            .map_err(|e| ChangeBatchError::DeferredBuild {
-                message: e.to_string(),
-            })?;
-        }
-        build_change_batch(
-            &self.schema,
-            &self.primary_keys,
-            &self.layout.column_map,
-            &buffer.changes,
-        )
-        .map(|b| b.with_source_commit_ts_ms(self.source_commit_ts_ms))
-        .map_err(|e| ChangeBatchError::DeferredBuild {
-            message: e.to_string(),
-        })
-    }
-}
-
-/// Fixed per-value Arrow byte width for a data type, or 0 for variable-width
-/// types (whose bytes are already reflected in the buffered wire size). Used
-/// only to floor the coalescing byte estimate at the real Arrow footprint;
-/// mirrors `postgres_replication::changes::arrow_fixed_width`.
-fn arrow_fixed_width(data_type: &DataType) -> usize {
-    match data_type {
-        DataType::Boolean | DataType::Int8 | DataType::UInt8 => 1,
-        DataType::Int16 | DataType::UInt16 | DataType::Float16 => 2,
-        DataType::Int32
-        | DataType::UInt32
-        | DataType::Float32
-        | DataType::Date32
-        | DataType::Time32(_)
-        | DataType::Interval(IntervalUnit::YearMonth) => 4,
-        DataType::Int64
-        | DataType::UInt64
-        | DataType::Float64
-        | DataType::Date64
-        | DataType::Time64(_)
-        | DataType::Duration(_)
-        | DataType::Interval(IntervalUnit::DayTime)
-        | DataType::Timestamp(_, _) => 8,
-        DataType::Decimal128(_, _) | DataType::Interval(IntervalUnit::MonthDayNano) => 16,
-        DataType::Decimal256(_, _) => 32,
-        DataType::FixedSizeBinary(len) => usize::try_from(*len).unwrap_or(0),
-        _ => 0,
-    }
+    build_change_batch(schema, primary_keys, &layout.column_map, &buffer.changes)
+        .map(|b| b.with_source_commit_ts_ms(source_commit_ts_ms))
 }

@@ -5901,6 +5901,7 @@ dependencies = [
  "insta",
  "logos",
  "mysql_async",
+ "mysql_common",
  "native-tls",
  "num_cpus",
  "object_store 0.13.2",

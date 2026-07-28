@@ -110,7 +110,7 @@ use super::binlog::{
     layout_event_mismatch, log_transient_reconnect, open_binlog_stream, purged_position_error,
     readiness_heartbeat, record_watermark,
 };
-use super::changes::{MemberLayout, MysqlChangeRows};
+use super::changes::{MemberLayout, decode_events_to_batch};
 use super::config::{BinlogPosition, ReplicationParams};
 use super::metrics::MetricsCollector;
 use super::rows::{build_change_batch, truncate_change};
@@ -1800,10 +1800,12 @@ fn rotate_target(rotate: &RotateEvent<'_>) -> Option<BinlogPosition> {
 }
 
 /// Deliver a committed transaction's buffered rows to their members, then
-/// credit idle streaming members up to the commit position. The pump does the
-/// O(1)-per-table work only (route lookup, watermark, transaction count, commit
-/// bookkeeping); the tuple decode + Arrow build are deferred into the
-/// per-dataset consumer via [`MysqlChangeRows`].
+/// credit idle streaming members up to the commit position. The decode +
+/// Arrow build run HERE, on the pump, so members receive ready batches
+/// ([`ChangeEnvelope::new`]) and their consumers spend the apply loop on
+/// accelerator writes instead of serializing the (dominant) `MySQL` rows-event
+/// decode with them — see the [`super::changes`] module docs for why this
+/// differs from the deferred Postgres shape.
 async fn deliver_commit(
     source: &Arc<SharedSource>,
     routes: &FxHashMap<u64, Route>,
@@ -1831,24 +1833,34 @@ async fn deliver_commit(
         if !slot.has(STREAMING) || slot.already_committed(commit_pos) {
             continue;
         }
-        // O(1), no decode: freshness watermark + transaction count. The per-row
-        // op counters are recorded off-pump in `MysqlChangeRows::build`.
+        // Freshness watermark + transaction count; the per-row op counters are
+        // recorded by the decode below.
         record_watermark(&member.metrics, event_timestamp);
         member.metrics.inc_transaction();
         let is_ready = crate::cdc::source_commit_within_ready_lag(commit_ts, member.ready_lag);
-        // Hand the OWNED payload + immutable layout/columns snapshots downstream;
-        // the decode + build runs on the consumer, and a decode failure surfaces
-        // as a `StreamError` on this one dataset's stream.
-        let rows = MysqlChangeRows::new(
-            Arc::clone(&member.schema),
-            member.primary_keys.clone(),
-            Arc::clone(layout),
-            Arc::clone(tme),
-            events,
+        // A decode failure faults only this member (the same isolation the
+        // deferred build's per-dataset `StreamError` gave), attributed here
+        // where the failing table map and layout snapshot are in hand.
+        let batch = match decode_events_to_batch(
+            &member.schema,
+            &member.primary_keys,
+            layout,
+            tme,
+            &events,
             commit_ts,
-            Arc::clone(&member.metrics),
-        );
-        let envelope = ChangeEnvelope::new_from_rows(
+            &member.metrics,
+        ) {
+            Ok(batch) => batch,
+            Err(e) => {
+                member.metrics.inc_decode_error();
+                member_fatal(source, key, format!(
+                    "decoding a committed transaction for {}.{} failed: {e}. Re-bootstrap by setting `mysql_replication_invalid_checkpoint_behavior: restart`.",
+                    key.0, key.1
+                )).await;
+                continue;
+            }
+        };
+        let envelope = ChangeEnvelope::new(
             Box::new(SharedPositionCommitter {
                 slot: Arc::clone(slot),
                 flush_to: commit_pos.clone(),
@@ -1856,11 +1868,18 @@ async fn deliver_commit(
                 source_commit_ts_ms: commit_ts,
                 gtids: gtid.into_iter().collect(),
             }),
-            Box::new(rows),
+            batch,
             is_ready,
         );
         slot.deliver(commit_pos);
-        match deliver_to_member(&member.sender, Ok(envelope), shutdown_epoch).await {
+        match deliver_to_member(
+            &member.sender,
+            Ok(envelope),
+            shutdown_epoch,
+            &member.dataset_name,
+        )
+        .await
+        {
             DeliverOutcome::Sent => {}
             DeliverOutcome::ReceiverGone => {
                 source.detach_member(key, "changes stream receiver dropped", true);
@@ -1944,7 +1963,14 @@ async fn handle_statement(
                     is_ready,
                 );
                 slot.deliver(&commit_pos);
-                match deliver_to_member(&member.sender, Ok(envelope), shutdown_epoch).await {
+                match deliver_to_member(
+                    &member.sender,
+                    Ok(envelope),
+                    shutdown_epoch,
+                    &member.dataset_name,
+                )
+                .await
+                {
                     DeliverOutcome::Sent => {}
                     DeliverOutcome::ReceiverGone => {
                         source.detach_member(&mkey, "changes stream receiver dropped", true);
@@ -2015,13 +2041,17 @@ enum DeliverOutcome {
 
 /// Must-deliver one envelope into a member's bounded channel, warning on a
 /// prolonged stall and abandoning on shutdown. One slow member must not wedge
-/// the pump (and thus the group) or block shutdown indefinitely.
+/// the pump (and thus the group) or block shutdown indefinitely. The warning
+/// carries the cumulative wait for THIS delivery, so a monotonically growing
+/// value distinguishes one long continuous stall from scattered brief ones.
 async fn deliver_to_member(
     sender: &mpsc::Sender<std::result::Result<ChangeEnvelope, StreamError>>,
     envelope: std::result::Result<ChangeEnvelope, StreamError>,
     shutdown_epoch: u64,
+    dataset: &str,
 ) -> DeliverOutcome {
     let mut pending = envelope;
+    let mut stalled_for = Duration::ZERO;
     loop {
         match sender.send_timeout(pending, MEMBER_SEND_STALL_WARN).await {
             Ok(()) => return DeliverOutcome::Sent,
@@ -2030,7 +2060,8 @@ async fn deliver_to_member(
                 if crate::cdc::shutdown_epoch() != shutdown_epoch {
                     return DeliverOutcome::ShutdownAbandon;
                 }
-                tracing::warn!(stalled_for = ?MEMBER_SEND_STALL_WARN, "shared mysql binlog member sink is not draining; the pump is waiting to deliver committed changes");
+                stalled_for += MEMBER_SEND_STALL_WARN;
+                tracing::warn!(dataset = %dataset, stalled_for = ?stalled_for, "shared mysql binlog member sink is not draining; the pump is waiting to deliver committed changes");
                 pending = returned;
             }
         }
@@ -2702,6 +2733,7 @@ mod tests {
             &sender,
             Err(StreamError::External("x".to_string())),
             crate::cdc::shutdown_epoch(),
+            "test_dataset",
         )
         .await;
         assert!(matches!(outcome, DeliverOutcome::ReceiverGone));
