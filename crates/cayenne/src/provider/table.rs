@@ -2009,8 +2009,16 @@ impl CayenneTableProviderBuilder {
             durable_write_back: self.durable_write_back,
         };
 
-        CayenneTableProvider::new_internal(&table_name, self.catalog, self.runtime_env, options)
-            .await
+        let provider =
+            CayenneTableProvider::new_internal(&table_name, self.catalog, self.runtime_env, options)
+                .await?;
+        // A just-created table is provably empty: warm the PK existence caches
+        // now so the initial load's writes maintain them and the first upsert
+        // never pays the cold `load_existing_pk_index` scan (see
+        // `install_empty_pk_index_caches`). Open-of-existing-data paths do not
+        // come through here and keep the lazy bounded rebuild.
+        provider.install_empty_pk_index_caches();
+        Ok(provider)
     }
 }
 
@@ -6839,6 +6847,42 @@ impl CayenneTableProvider {
     /// ordering rather than relying on a lock being co-held in every case.
     pub(crate) fn mark_pk_keyset_occ_degraded(&self) {
         self.pk_keyset_occ_degraded.store(true, Ordering::Release);
+    }
+
+    /// Install EMPTY exact PK existence caches. Correct ONLY at a
+    /// provably-empty moment (table creation): an empty table's keyset is
+    /// exactly empty, and every write from this point maintains the installed
+    /// index (`record_pk_keys_with_location`; the sharded analog in §5 Phase 6
+    /// of `append_to_shard`), so the first conflict-validated batch skips the
+    /// O(live-rows) `load_existing_pk_index` cold scan entirely. On a
+    /// freshly-snapshotted CDC table that scan otherwise runs inside the apply
+    /// loop at the first post-snapshot upsert (profiled ~60 s at 30M rows,
+    /// ~475 s at 300M rows) and, through the shared pump's must-deliver
+    /// backpressure, stalls every member of the replication group behind it.
+    ///
+    /// Budget safety is the write path's existing machinery: maintained
+    /// inserts degrade an over-budget exact keyset to blooms
+    /// (`PkKeysetInsertOutcome::OverBudget` / the sharded recompute-once
+    /// tally), identically to a scanned rebuild that goes over budget.
+    ///
+    /// No-op for tables without conflict handling — nothing consults the
+    /// keyset there, so installing one would only accrue unused maintenance.
+    pub(crate) fn install_empty_pk_index_caches(&self) {
+        if self.table_metadata.on_conflict.is_none() {
+            return;
+        }
+        *self.pk_keyset_cache.lock() =
+            Some(CachedPkIndex::Exact(CachedPkKeyset::with_capacity(0)));
+        let shards = self.mem_tier_shard_count();
+        if shards > 1 {
+            let keysets: Vec<CachedPkKeyset> = (0..shards)
+                .map(|_| CachedPkKeyset::with_capacity(0))
+                .collect();
+            *self.sharded_pk_keyset_cache.lock() =
+                Some(ShardedPkIndex::Exact(keysets.into_boxed_slice()));
+        }
+        // A fresh empty exact keyset has no stale stamps to distrust.
+        self.pk_keyset_occ_degraded.store(false, Ordering::Release);
     }
 
     pub(crate) fn clear_cached_pk_keyset(&self) {
@@ -30147,6 +30191,72 @@ mod tests {
             provider.mem_tier.is_empty(),
             "the mem-tier must be fully purged after the delete-all"
         );
+    }
+
+    /// A just-created conflict-handling table must start with WARM (empty
+    /// exact) PK existence caches: the initial load's writes then maintain
+    /// them, and the first upsert skips the O(live-rows) cold
+    /// `load_existing_pk_index` scan — profiled at ~475 s on a freshly
+    /// snapshotted 300M-row CDC table, where it ran inside the apply loop and
+    /// stalled the whole shared replication group behind it.
+    #[tokio::test]
+    async fn create_table_installs_warm_empty_pk_index_caches() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir created");
+        let metadata_dir = format!(
+            "{}/metadata",
+            temp_dir.path().to_str().expect("should be str")
+        );
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("should be str"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let options = CreateTableOptions {
+            table_name: "warm_pk_index".to_string(),
+            schema,
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            )),
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config: VortexConfig {
+                cdc_mem_tier_shards: 4,
+                ..VortexConfig::default()
+            },
+        };
+        let provider = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+            .create(options)
+            .await
+            .expect("table created");
+
+        match provider.pk_keyset_cache.lock().as_ref() {
+            Some(CachedPkIndex::Exact(keyset)) => {
+                assert_eq!(keyset.len(), 0, "a fresh table's keyset must be exactly empty");
+            }
+            Some(CachedPkIndex::Bloom(_)) => panic!("fresh table must not start with a bloom"),
+            None => panic!("create_table must install the warm empty keyset"),
+        }
+        match provider.sharded_pk_keyset_cache.lock().as_ref() {
+            Some(ShardedPkIndex::Exact(keysets)) => {
+                assert_eq!(
+                    keysets.len(),
+                    provider.mem_tier_shard_count(),
+                    "one empty keyset per configured mem-tier shard"
+                );
+                assert!(keysets.iter().all(|keyset| keyset.len() == 0));
+            }
+            Some(ShardedPkIndex::Bloom(_)) => panic!("fresh table must not start with blooms"),
+            None => panic!("create_table must install the warm empty sharded keysets"),
+        }
     }
 
     /// A table with no primary key has `pk_deletion_strategy: PositionBased`, so
