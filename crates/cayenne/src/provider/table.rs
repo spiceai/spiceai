@@ -23644,7 +23644,7 @@ impl CayenneTableProvider {
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         let (mut non_empty, empty): (Vec<_>, Vec<_>) = plans
             .into_iter()
-            .partition(|plan| !plan.as_any().is::<EmptyExec>());
+            .partition(|plan| !plan.is::<EmptyExec>());
 
         match non_empty.len() {
             0 => empty.into_iter().next().ok_or_else(|| {
