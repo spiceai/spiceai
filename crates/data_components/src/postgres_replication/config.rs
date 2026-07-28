@@ -16,11 +16,32 @@ limitations under the License.
 
 //! Replication parameters derived from connector params + environment.
 
-use std::path::PathBuf;
 use std::time::Duration;
 
-use pgwire_replication::PgOutputFormat;
+use pgwire_replication::{CaCertificate, PgOutputFormat};
 use secrecy::{ExposeSecret, SecretString};
+
+/// Interpret a user-supplied `pg_sslrootcert` value as either PEM content or a
+/// path to a PEM file.
+///
+/// A CA bundle is just as often injected as a configuration value — an
+/// orchestrator secret, an environment variable — as it is mounted as a file, so
+/// both spellings must verify identically. The two are told apart by content, on
+/// the PEM armor: anything containing a `BEGIN CERTIFICATE` block is PEM, and
+/// everything else is a path. Detecting on the armor rather than on the shape of
+/// the string (length, newlines, a leading `/`) keeps every value that is a path
+/// today still a path.
+///
+/// Content arriving through a channel that does not survive real newlines (a
+/// single-line environment variable, a JSON string pasted verbatim) carries them
+/// as the two characters `\` and `n`; those are restored before parsing.
+#[must_use]
+pub fn ca_certificate_from_param(value: &str) -> CaCertificate {
+    if value.contains("-----BEGIN CERTIFICATE-----") {
+        return CaCertificate::Pem(value.replace("\\n", "\n").into_bytes());
+    }
+    CaCertificate::Path(value.into())
+}
 
 /// Parameters for a single dataset's replication stream.
 ///
@@ -40,9 +61,10 @@ pub struct ReplicationParams {
     pub password: SecretString,
     pub database: String,
     pub sslmode: SslMode,
-    /// Optional path to a PEM-encoded CA certificate bundle. Only used when
-    /// `sslmode` is `VerifyCa` or `VerifyFull`.
-    pub sslrootcert: Option<PathBuf>,
+    /// Optional PEM-encoded CA certificate bundle, either inline or by path (see
+    /// [`ca_certificate_from_param`]). Only used when `sslmode` is `VerifyCa` or
+    /// `VerifyFull`.
+    pub sslrootcert: Option<CaCertificate>,
 
     pub slot_name: String,
     pub publication_name: String,
@@ -562,19 +584,25 @@ impl ReplicationParams {
         }
         // verify-full: both chain and hostname checked (native-tls default).
 
-        if let Some(ca_path) = &self.sslrootcert {
-            // Async I/O — this method is called from Tokio runtime threads
-            // during setup/bootstrap; std::fs::read would block the reactor.
-            let pem_bytes = tokio::fs::read(ca_path)
-                .await
-                .map_err(|e| TlsConfigError::ReadCa {
-                    path: ca_path.clone(),
-                    source: e,
-                })?;
-            let certs = parse_pem_certificates(ca_path, &pem_bytes)?;
+        if let Some(ca) = &self.sslrootcert {
+            let source = ca.describe();
+            let pem_bytes = match ca {
+                // Async I/O — this method is called from Tokio runtime threads
+                // during setup/bootstrap; std::fs::read would block the reactor.
+                CaCertificate::Path(path) => {
+                    std::borrow::Cow::Owned(tokio::fs::read(path).await.map_err(|e| {
+                        TlsConfigError::ReadCa {
+                            source_label: source.clone(),
+                            source: e,
+                        }
+                    })?)
+                }
+                CaCertificate::Pem(pem) => std::borrow::Cow::Borrowed(pem.as_slice()),
+            };
+            let certs = parse_pem_certificates(&source, &pem_bytes)?;
             if certs.is_empty() {
                 return Err(TlsConfigError::EmptyCaBundle {
-                    path: ca_path.clone(),
+                    source_label: source,
                 });
             }
             for cert in certs {
@@ -588,22 +616,26 @@ impl ReplicationParams {
 }
 
 /// Errors raised while assembling TLS configuration from `ReplicationParams`.
+/// The `source_label` fields name where the CA came from — a path, or
+/// `inline PEM content (N bytes)` — never the certificate itself, which is
+/// kilobytes of base64 that would swamp a single-line log record.
 #[derive(Debug)]
 pub enum TlsConfigError {
     ReadCa {
-        path: PathBuf,
+        source_label: String,
         source: std::io::Error,
     },
     ParseCa {
+        source_label: String,
         source: native_tls::Error,
     },
     /// `BEGIN CERTIFICATE` marker with no matching `END CERTIFICATE`.
     TruncatedPem {
-        path: PathBuf,
+        source_label: String,
     },
-    /// `sslrootcert` supplied but file contained zero parseable certificates.
+    /// `sslrootcert` supplied but it contained zero parseable certificates.
     EmptyCaBundle {
-        path: PathBuf,
+        source_label: String,
     },
     BuildConnector(native_tls::Error),
 }
@@ -611,25 +643,31 @@ pub enum TlsConfigError {
 impl std::fmt::Display for TlsConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TlsConfigError::ReadCa { path, source } => {
+            TlsConfigError::ReadCa {
+                source_label,
+                source,
+            } => {
                 write!(
                     f,
-                    "failed to read sslrootcert at {}: {source}",
-                    path.display()
+                    "failed to read sslrootcert from {source_label}: {source}"
                 )
             }
-            TlsConfigError::ParseCa { source } => {
-                write!(f, "failed to parse sslrootcert PEM: {source}")
+            TlsConfigError::ParseCa {
+                source_label,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to parse sslrootcert PEM from {source_label}: {source}"
+                )
             }
-            TlsConfigError::TruncatedPem { path } => write!(
+            TlsConfigError::TruncatedPem { source_label } => write!(
                 f,
-                "sslrootcert at {} has a BEGIN CERTIFICATE block without a matching END marker",
-                path.display()
+                "sslrootcert from {source_label} has a BEGIN CERTIFICATE block without a matching END marker"
             ),
-            TlsConfigError::EmptyCaBundle { path } => write!(
+            TlsConfigError::EmptyCaBundle { source_label } => write!(
                 f,
-                "sslrootcert at {} contains no parseable CA certificates",
-                path.display()
+                "sslrootcert from {source_label} contains no parseable CA certificates"
             ),
             TlsConfigError::BuildConnector(source) => {
                 write!(f, "failed to build native-tls connector: {source}")
@@ -642,7 +680,7 @@ impl std::error::Error for TlsConfigError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             TlsConfigError::ReadCa { source, .. } => Some(source),
-            TlsConfigError::ParseCa { source } | TlsConfigError::BuildConnector(source) => {
+            TlsConfigError::ParseCa { source, .. } | TlsConfigError::BuildConnector(source) => {
                 Some(source)
             }
             TlsConfigError::TruncatedPem { .. } | TlsConfigError::EmptyCaBundle { .. } => None,
@@ -656,7 +694,7 @@ impl std::error::Error for TlsConfigError {
 /// parsed so far — the alternative would leave operators thinking their CA
 /// bundle is loaded when it isn't.
 fn parse_pem_certificates(
-    path: &std::path::Path,
+    source_label: &str,
     pem: &[u8],
 ) -> std::result::Result<Vec<native_tls::Certificate>, TlsConfigError> {
     let mut certs = Vec::new();
@@ -665,13 +703,16 @@ fn parse_pem_certificates(
         let tail = &remaining[begin..];
         let Some(end_rel) = find_subslice(tail, b"-----END CERTIFICATE-----") else {
             return Err(TlsConfigError::TruncatedPem {
-                path: path.to_path_buf(),
+                source_label: source_label.to_string(),
             });
         };
         let end = begin + end_rel + b"-----END CERTIFICATE-----".len();
         let block = &remaining[begin..end];
-        let cert = native_tls::Certificate::from_pem(block)
-            .map_err(|source| TlsConfigError::ParseCa { source })?;
+        let cert =
+            native_tls::Certificate::from_pem(block).map_err(|source| TlsConfigError::ParseCa {
+                source_label: source_label.to_string(),
+                source,
+            })?;
         certs.push(cert);
         remaining = &remaining[end..];
     }
@@ -685,6 +726,193 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Self-signed CA (`CN=Spice Replication Test CA`, `CA:TRUE`), expiring in
+    /// 2126. Real DER so `native_tls` actually accepts it as a trust anchor —
+    /// a placeholder string would make these tests pass for the wrong reason.
+    const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIC4DCCAcigAwIBAgIJAODHR+uzOPBvMA0GCSqGSIb3DQEBCwUAMCQxIjAgBgNV
+BAMMGVNwaWNlIFJlcGxpY2F0aW9uIFRlc3QgQ0EwIBcNMjYwNzI4MDU0MDQ0WhgP
+MjEyNjA3MDQwNTQwNDRaMCQxIjAgBgNVBAMMGVNwaWNlIFJlcGxpY2F0aW9uIFRl
+c3QgQ0EwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCzoou00DrTAevF
+RZ6+PFmSBUhzZXsABQFztlPigZzJ1m8hnja66hnkWKyIid9DcitnjkWgtQZCVxm6
+s05tM6QAy5lI2wlfWD7hQi+yIWKv2dcVuD/J4hWPjmG5a5VtRAInV0yBymkCRI6Z
+68JYfvKh+Rku1y6H3dUfNm8dxCbo589L1U8ucJqlQv9Iy/X7Lze+pj2JFU/L1g3t
+k/5ziVgJjdh3VetrHkU1YOiHRPFsqXOxXc2lpzUjd23QR3FfkZkVgLUfEvPWHRSf
+xipaPFhllw9WUWEl6bVqAGO0btPO1OKKqBlIcizf2YO2+lFs/o0e7bApGzI3l5HP
+VZr/e6ZLAgMBAAGjEzARMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQAD
+ggEBACC1XMNpbA+172MQks9R7cqRY5I0HObJRX3dpIsOqrm3EUcHMt9kx7QrO1Af
+gzAWC0ZNHppeU/cuq9ZKZQiFrSmr5fKtXzsxkvgLYRCFO+ZCKZl9k3z9j0AQbTPR
+klJa4bo2SS6WbmoATimD6e0moT++neRIDx7MlijtWB8grfhuH7yFN9xoTRDgdYBU
+KLeFNAIi+S5cVzUwjMiOQnmljphKSRoQnihpA/c6WAVAN3VqMdoPpfmR2pTi7rio
+38busw0nt/y+JCVWzNDr/i5f3mvNi5SaHZ5PTOVnocyMUw+ysx5eQOrJwrirW9XD
+TXTE85+Or9IUwDI9543jsyCvuQ8=
+-----END CERTIFICATE-----
+";
+
+    /// `verify-full` params — the strictest mode, and the one that actually
+    /// consults `sslrootcert`. A weaker mode would build a connector even with
+    /// the CA ignored, which is exactly the vacuity this fix is about.
+    fn verify_full_params(sslrootcert: Option<CaCertificate>) -> ReplicationParams {
+        ReplicationParams {
+            host: "localhost".to_string(),
+            port: 5432,
+            user: "u".to_string(),
+            password: SecretString::from(String::new()),
+            database: "db".to_string(),
+            sslmode: SslMode::VerifyFull,
+            sslrootcert,
+            slot_name: "slot".to_string(),
+            publication_name: "pub".to_string(),
+            initial_snapshot: true,
+            snapshot_on_resume: false,
+            temporary_slot: false,
+            status_interval: Duration::from_secs(5),
+            ready_lag: Duration::from_secs(2),
+            bootstrap_batch_size: 1024,
+            shared: false,
+            member_channel_capacity: 16,
+            pg_output_format: PgOutputFormat::Binary,
+        }
+    }
+
+    #[test]
+    fn a_value_carrying_pem_armor_is_inline_content_everything_else_is_a_path() {
+        assert_eq!(
+            ca_certificate_from_param(TEST_CA_PEM),
+            CaCertificate::Pem(TEST_CA_PEM.as_bytes().to_vec())
+        );
+
+        // Every spelling that works as a path today must stay a path.
+        for path in [
+            "/etc/ssl/pg-ca.pem",
+            "ca.pem",
+            "./certs/ca.crt",
+            "/var/run/secrets/ca-bundle",
+            "C:\\certs\\ca.pem",
+        ] {
+            assert_eq!(
+                ca_certificate_from_param(path),
+                CaCertificate::Path(path.into()),
+                "{path} must be treated as a filesystem path"
+            );
+        }
+    }
+
+    #[test]
+    fn escaped_newlines_in_inline_pem_are_restored() {
+        let single_line = TEST_CA_PEM.replace('\n', "\\n");
+        assert!(!single_line.contains('\n'));
+
+        let CaCertificate::Pem(pem) = ca_certificate_from_param(&single_line) else {
+            panic!("armored content must be detected as inline PEM");
+        };
+        assert_eq!(pem, TEST_CA_PEM.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn native_tls_connector_trusts_an_inline_pem_ca() {
+        let params = verify_full_params(Some(ca_certificate_from_param(TEST_CA_PEM)));
+
+        let connector = params
+            .native_tls_connector()
+            .await
+            .expect("inline PEM CA must be accepted");
+        assert!(
+            connector.is_some(),
+            "verify-full must produce a TLS connector"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_tls_connector_trusts_a_ca_read_from_a_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ca.pem");
+        tokio::fs::write(&path, TEST_CA_PEM)
+            .await
+            .expect("write CA fixture");
+
+        let param = path.to_str().expect("utf-8 path");
+        let params = verify_full_params(Some(ca_certificate_from_param(param)));
+        assert!(matches!(params.sslrootcert, Some(CaCertificate::Path(_))));
+
+        let connector = params
+            .native_tls_connector()
+            .await
+            .expect("CA path must keep working");
+        assert!(
+            connector.is_some(),
+            "verify-full must produce a TLS connector"
+        );
+    }
+
+    /// `MakeTlsConnector` is not `Debug`, so `expect_err` is unavailable.
+    async fn tls_error(ca: CaCertificate, must_fail: &str) -> TlsConfigError {
+        match verify_full_params(Some(ca)).native_tls_connector().await {
+            Ok(_) => panic!("{must_fail}"),
+            Err(e) => e,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_ca_that_is_neither_readable_nor_pem_is_a_hard_error() {
+        // Not armored, so it is a path — and it does not exist. Verification
+        // must fail rather than fall back to no trust anchor.
+        let missing = tls_error(
+            ca_certificate_from_param("/nonexistent/spice-test-ca.pem"),
+            "an unreadable CA path must not be ignored",
+        )
+        .await;
+        assert!(matches!(missing, TlsConfigError::ReadCa { .. }));
+        assert!(
+            missing
+                .to_string()
+                .contains("/nonexistent/spice-test-ca.pem")
+        );
+
+        // Armored but not a certificate: detected as inline PEM, then rejected.
+        let garbage = tls_error(
+            CaCertificate::Pem(
+                b"-----BEGIN CERTIFICATE-----\nnot base64\n-----END CERTIFICATE-----\n".to_vec(),
+            ),
+            "unparseable inline PEM must not be ignored",
+        )
+        .await;
+        assert!(matches!(garbage, TlsConfigError::ParseCa { .. }));
+
+        // Truncated armor is caught rather than silently yielding zero anchors.
+        let truncated = tls_error(
+            CaCertificate::Pem(b"-----BEGIN CERTIFICATE-----\nMIIC\n".to_vec()),
+            "truncated inline PEM must not be ignored",
+        )
+        .await;
+        assert!(matches!(truncated, TlsConfigError::TruncatedPem { .. }));
+    }
+
+    #[test]
+    fn errors_and_debug_output_never_echo_inline_certificate_content() {
+        let ca = ca_certificate_from_param(TEST_CA_PEM);
+        let body = "MIIC4DCCAcigAwIBAgIJAODHR";
+
+        assert!(!ca.describe().contains(body));
+        assert!(!format!("{ca:?}").contains(body));
+        assert!(!format!("{:?}", verify_full_params(Some(ca.clone()))).contains(body));
+
+        let label = ca.describe();
+        for err in [
+            TlsConfigError::TruncatedPem {
+                source_label: label.clone(),
+            },
+            TlsConfigError::EmptyCaBundle {
+                source_label: label,
+            },
+        ] {
+            let rendered = err.to_string();
+            assert!(!rendered.contains(body), "error leaked PEM content");
+            assert!(rendered.contains("inline PEM content"));
+            assert!(!rendered.contains('\n'), "error must stay single-line");
+        }
+    }
 
     #[test]
     fn sanitize_replaces_non_alnum() {

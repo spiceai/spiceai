@@ -6,7 +6,8 @@
 mod common;
 
 use pgwire_replication::{
-    client::ReplicationEvent, ReplicationClient, ReplicationConfig, SslMode, TlsConfig,
+    client::ReplicationEvent, CaCertificate, ReplicationClient, ReplicationConfig, SslMode,
+    TlsConfig,
 };
 use std::path::PathBuf;
 
@@ -44,7 +45,7 @@ pub async fn main() -> anyhow::Result<()> {
 
         tls: TlsConfig {
             mode: SslMode::VerifyFull,
-            ca_pem_path: Some(ca_pem_path),
+            ca: Some(CaCertificate::Path(ca_pem_path)),
             sni_hostname: Some(sni_hostname),
             client_cert_pem_path: None,
             client_key_pem_path: None,
