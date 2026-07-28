@@ -6,21 +6,18 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": "0.03",
+      "_score": "0.01",
       "data": {
-        "question": "A Mission Control Officer at Cape Canaveral makes the statement \"lift-off, T minus 50 seconds.\" How long is it before lift-off?"
+        "question": "In a group of 3 machines where 2 are faulty, what is the probability that the first two machines tested are both faulty?"
       },
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
-          "The statement \"T minus 50 seconds\" indicates that there are $\\boxed{50 \\text{ seconds}}$ remaining until lift-off."
-        ],
-        "question": [
-          "A Mission Control Officer at Cape Canaveral makes the statement \"lift-off, T minus 50 seconds.\" How long is it before lift-off?"
+          "\\[\nP(\\text{First faulty and second faulty}) = \\frac{2}{3} \\times \\frac{1}{2} = \\boxed{\\frac{1}{3}}\n\\]"
         ]
       },
       "primary_key": {
-        "id": 9
+        "id": 525
       }
     },
     {
@@ -36,21 +33,6 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 361
-      }
-    },
-    {
-      "_score": "0.01",
-      "data": {
-        "question": "In a group of 3 machines where 2 are faulty, what is the probability that the first two machines tested are both faulty?"
-      },
-      "dataset": "spice.public.qs",
-      "matches": {
-        "answer": [
-          "\\[\nP(\\text{First faulty and second faulty}) = \\frac{2}{3} \\times \\frac{1}{2} = \\boxed{\\frac{1}{3}}\n\\]"
-        ]
-      },
-      "primary_key": {
-        "id": 525
       }
     },
     {
