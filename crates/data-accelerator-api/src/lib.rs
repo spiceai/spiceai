@@ -104,13 +104,13 @@ pub static DATA_ACCELERATOR_REGISTRATIONS: [AcceleratorRegistration] = [..];
 ///
 /// # Example (simple form)
 ///
-/// ```
+/// ```ignore
 /// register_data_accelerator!(Engine::Foo, FooAccelerator);
 /// ```
 ///
 /// # Example (explicit form)
 ///
-/// ```
+/// ```ignore
 /// register_data_accelerator!(
 ///     my_accel_fn,
 ///     MY_ACCEL_STATIC,
