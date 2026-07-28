@@ -15,13 +15,14 @@ limitations under the License.
 */
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fmt::{self, Debug},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use arrow::array::{AsArray, RecordBatch};
+use arrow::array::{Array, AsArray, RecordBatch};
+use arrow::datatypes::TimestampNanosecondType;
 use datafusion::{datasource::TableProvider, error::DataFusionError, sql::TableReference};
 use futures::{future::join_all, stream::TryStreamExt};
 use iceberg_datafusion::IcebergTableProvider;
@@ -37,12 +38,23 @@ use crate::{
         error::{find_datafusion_root, format_datafusion_error},
     },
     search::util::find_concrete_table_provider,
+    status::{ComponentStatus, RuntimeStatus},
 };
 use runtime_metrics as metrics;
 
-const DATASETS_AVAILABILITY_CHECK_INTERVAL_SECONDS: u64 = 60; // every minute
-const DATASET_UNAVAILABLE_THRESHOLD_MINUTES: u64 = 10;
-const DATASET_UNAVAILABLE_THRESHOLD_SECONDS: u64 = DATASET_UNAVAILABLE_THRESHOLD_MINUTES * 60; // 10 minutes
+/// Lower bound on the monitor's wake-up cadence, so a very small
+/// `check_availability_interval` cannot spin the loop.
+const MIN_CHECK_TICK: Duration = Duration::from_secs(1);
+
+/// How often the loop wakes when no dataset is being monitored — just enough to
+/// notice newly registered datasets. Not user-facing (nothing is probed until a
+/// dataset opts in via `check_availability_interval`).
+const MONITOR_IDLE_TICK: Duration = Duration::from_mins(1);
+
+/// Upper bound on how far back the `task_history` "recently queried" lookup
+/// reaches, regardless of a dataset's configured interval, to keep that query
+/// cheap. Datasets with an interval longer than this are still probed directly.
+const MAX_RECENT_QUERY_LOOKBACK: Duration = Duration::from_hours(1); // 1 hour
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -76,8 +88,12 @@ pub enum Error {
 #[derive(Clone)]
 pub struct DatasetAvailabilityInfo {
     name: String,
+    /// Canonical table reference used to key the runtime status registry.
+    table_ref: TableReference,
     table_provider: Arc<dyn TableProvider>,
     last_available_time: SystemTime,
+    /// How often this dataset's source should be probed.
+    interval: Duration,
 }
 
 impl Debug for DatasetAvailabilityInfo {
@@ -85,22 +101,31 @@ impl Debug for DatasetAvailabilityInfo {
         f.debug_struct("DatasetAvailabilityInfo")
             .field("name", &self.name)
             .field("last_available_time", &self.last_available_time)
+            .field("interval", &self.interval)
             .finish_non_exhaustive()
     }
 }
 
 impl DatasetAvailabilityInfo {
-    pub fn new(name: String, table_provider: Arc<dyn TableProvider>) -> Self {
+    pub fn new(
+        table_ref: TableReference,
+        table_provider: Arc<dyn TableProvider>,
+        interval: Duration,
+    ) -> Self {
         Self {
-            name,
+            name: table_ref.to_string(),
+            table_ref,
             table_provider,
             last_available_time: SystemTime::now(),
+            interval,
         }
     }
 }
 
 enum AvailabilityVerificationResult {
-    Available,
+    /// The source was reachable; carries the time availability was confirmed
+    /// (probe time, or the end time of a recent successful query).
+    Available(SystemTime),
     Unavailable(SystemTime, String),
 }
 
@@ -139,9 +164,22 @@ impl DatasetsHealthMonitor {
             return Ok(());
         }
 
+        // Availability monitoring is opt-in: a dataset is only monitored when it
+        // configures `check_availability_interval`.
+        let Some(interval) = dataset.check_availability_interval else {
+            tracing::debug!(
+                "Skipping dataset {} for availability monitoring (no check_availability_interval configured)",
+                dataset.name
+            );
+            return Ok(());
+        };
+
         let dataset_name = &dataset.name.to_string();
 
-        tracing::debug!("Registering dataset {dataset_name} for periodic availability check");
+        tracing::debug!(
+            "Registering dataset {dataset_name} for periodic availability check every {}s",
+            interval.as_secs()
+        );
 
         let table_provider = self.get_table_provider(dataset.name.clone()).await?;
 
@@ -158,8 +196,9 @@ impl DatasetsHealthMonitor {
         monitored_datasets.insert(
             dataset_name.clone(),
             Arc::new(DatasetAvailabilityInfo::new(
-                dataset_name.clone(),
+                dataset.name.clone(),
                 table_provider,
+                interval,
             )),
         );
 
@@ -189,16 +228,23 @@ impl DatasetsHealthMonitor {
         Ok(table)
     }
 
-    // returns a list of dataset names that had successful queries against them in the last 10 minutes
-    pub async fn get_recently_accessed_datasets(
+    /// Returns, per dataset, the most recent time it was the subject of a
+    /// successful (`error_code IS NULL`) query within `lookback`.
+    ///
+    /// A recent successful query is itself proof the source is reachable, so the
+    /// monitor can skip a redundant probe (and clear a stale `Error`) for
+    /// actively-queried datasets.
+    async fn recent_success_times(
         df: Arc<DataFusion>,
-    ) -> Result<Arc<HashSet<String>>> {
+        lookback: Duration,
+    ) -> Result<HashMap<String, SystemTime>> {
+        let lookback_secs = lookback.as_secs().max(1);
         let query = format!(
             "
-SELECT labels.datasets AS datasets
+SELECT labels.datasets AS datasets, end_time
 FROM runtime.task_history
 WHERE labels.datasets IS NOT NULL
-AND NOW() < end_time + INTERVAL '{DATASET_UNAVAILABLE_THRESHOLD_MINUTES}' MINUTE
+AND NOW() < end_time + INTERVAL '{lookback_secs}' SECOND
 AND labels.error_code IS NULL"
         );
         let query_result = df
@@ -207,23 +253,23 @@ AND labels.error_code IS NULL"
             .run()
             .await
             .context(DataFusionQuerySnafu)?;
-        let datasets_with_recent_activity = query_result
+        let batches = query_result
             .data
             .try_collect::<Vec<RecordBatch>>()
             .await
             .map_err(find_datafusion_root)
             .context(UnableToGetRecentlyAccessedDatasetsSnafu)?;
 
-        let mut datasets_with_recent_activity_set: HashSet<String> = HashSet::new();
+        let mut latest: HashMap<String, SystemTime> = HashMap::new();
 
-        for record_batch in &datasets_with_recent_activity {
-            let column = record_batch.column(0);
-            let datasets: Vec<&str> = match column.data_type() {
+        for batch in &batches {
+            let datasets_col = batch.column(0);
+            let names: Vec<Option<&str>> = match datasets_col.data_type() {
                 arrow::datatypes::DataType::Utf8 => {
-                    column.as_string::<i32>().into_iter().flatten().collect()
+                    datasets_col.as_string::<i32>().iter().collect()
                 }
                 arrow::datatypes::DataType::LargeUtf8 => {
-                    column.as_string::<i64>().into_iter().flatten().collect()
+                    datasets_col.as_string::<i64>().iter().collect()
                 }
                 dt => {
                     return Err(Error::UnexpectedDataType {
@@ -231,103 +277,133 @@ AND labels.error_code IS NULL"
                     });
                 }
             };
+            let end_times = batch.column(1).as_primitive::<TimestampNanosecondType>();
 
-            for dataset in datasets {
-                for name in dataset.split(',') {
-                    datasets_with_recent_activity_set.insert(name.to_string());
+            for (row, maybe_names) in names.into_iter().enumerate() {
+                let Some(row_names) = maybe_names else {
+                    continue;
+                };
+                if end_times.is_null(row) {
+                    continue;
+                }
+                // `end_time` is stored as nanoseconds since the Unix epoch.
+                let Ok(nanos) = u64::try_from(end_times.value(row)) else {
+                    continue;
+                };
+                let ts = UNIX_EPOCH + Duration::from_nanos(nanos);
+                for name in row_names.split(',') {
+                    latest
+                        .entry(name.to_string())
+                        .and_modify(|existing| {
+                            if ts > *existing {
+                                *existing = ts;
+                            }
+                        })
+                        .or_insert(ts);
                 }
             }
         }
 
-        Ok(Arc::new(datasets_with_recent_activity_set))
+        Ok(latest)
     }
 
     pub fn start(&self) {
         tracing::debug!("Starting datasets availability monitoring");
         let monitored_datasets = Arc::clone(&self.monitored_datasets);
         let df = Arc::clone(&self.df);
+        let runtime_status = df.runtime_status();
         let is_task_history_enabled = self.is_task_history_enabled;
         tokio::spawn(async move {
-            // no need to check status immediately after start
-            tokio::time::sleep(tokio::time::Duration::from_secs(
-                DATASET_UNAVAILABLE_THRESHOLD_SECONDS,
-            ))
-            .await;
-
             loop {
-                tracing::debug!("Checking datasets availability");
-                // Only datasets without recent activity/availability
-                let datasets_to_check = datasets_for_availability_check(&monitored_datasets).await;
+                // Wake at the shortest configured interval so each dataset is
+                // probed close to its own cadence; the floor stops a tiny
+                // interval from spinning the loop.
+                let tick = shortest_interval(&monitored_datasets).await;
+                tokio::time::sleep(tick).await;
 
-                // check `task_history` first to exclude anything that had a successful query in the last 10 minutes
-                let recently_accessed_datasets = if is_task_history_enabled {
-                    match Self::get_recently_accessed_datasets(Arc::clone(&df)).await {
-                        Ok(datasets) => datasets,
+                let (snapshot, max_interval) = snapshot_datasets(&monitored_datasets).await;
+                if snapshot.is_empty() {
+                    continue;
+                }
+                tracing::debug!("Checking datasets availability");
+
+                // A recent successful query proves the source is reachable, so
+                // fold it in to avoid redundantly probing actively-queried
+                // datasets (and to clear a stale Error for them).
+                let recent = if is_task_history_enabled {
+                    let lookback = max_interval.min(MAX_RECENT_QUERY_LOOKBACK);
+                    match Self::recent_success_times(Arc::clone(&df), lookback).await {
+                        Ok(map) => map,
                         Err(e) => {
                             tracing::warn!("{e}");
-                            Arc::new(HashSet::new())
+                            HashMap::new()
                         }
                     }
                 } else {
-                    Arc::new(HashSet::new())
+                    HashMap::new()
                 };
 
-                tracing::trace!(
-                    "Datasets excluded from availability check as they were recently successfully accessed: {recently_accessed_datasets:?}"
-                );
+                let now = SystemTime::now();
+                let mut tasks = Vec::new();
+                for item in snapshot {
+                    // Confirm availability from a recent successful query without a probe.
+                    if let Some(query_time) = recent.get(&item.name).copied()
+                        && now.duration_since(query_time).unwrap_or(Duration::MAX) < item.interval
+                    {
+                        update_dataset_availability_info(
+                            &monitored_datasets,
+                            &runtime_status,
+                            &item,
+                            AvailabilityVerificationResult::Available(query_time),
+                        )
+                        .await;
+                        continue;
+                    }
 
-                // subset them from the datasets to check
-                let datasets_to_check: Vec<_> = datasets_to_check
-                    .into_iter()
-                    .filter(|item| !recently_accessed_datasets.contains(&item.name))
-                    .collect();
+                    // Not due for a probe yet.
+                    if now
+                        .duration_since(item.last_available_time)
+                        .unwrap_or(Duration::MAX)
+                        < item.interval
+                    {
+                        continue;
+                    }
 
-                tracing::trace!("Datasets to check: {datasets_to_check:?}");
-
-                let tasks: Vec<_> = datasets_to_check
-                    .into_iter()
-                    .map(|item| {
-                        let df = Arc::clone(&df);
-                        let monitored_datasets = Arc::clone(&monitored_datasets);
-                        tokio::spawn(async move {
-                            tracing::trace!("Verifying connectivity for dataset {}", &item.name);
-
-                            let span = tracing::span!(target: "task_history", tracing::Level::INFO, "test_connectivity", input = &item.name);
-                            let connectivity_test_result =
-                                match test_connectivity(&item.table_provider, df).instrument(span.clone()).await
-                                {
-                                    Ok(()) => AvailabilityVerificationResult::Available,
-                                    Err(err) => {
-                                        let err_message = match err.find_root() {
-                                            DataFusionError::Execution(e) => e.clone(),
-                                            _ => err.to_string(),
-                                        };
-
-                                        tracing::error!(target: "task_history", parent: &span, "{err_message}");
-                                        AvailabilityVerificationResult::Unavailable(
-                                        item.last_available_time,
-                                        err_message,
-                                    )},
+                    let df = Arc::clone(&df);
+                    let monitored_datasets = Arc::clone(&monitored_datasets);
+                    let runtime_status = Arc::clone(&runtime_status);
+                    tasks.push(tokio::spawn(async move {
+                        tracing::trace!("Verifying connectivity for dataset {}", &item.name);
+                        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "test_connectivity", input = %item.name);
+                        let result = match test_connectivity(&item.table_provider, df)
+                            .instrument(span.clone())
+                            .await
+                        {
+                            Ok(()) => AvailabilityVerificationResult::Available(SystemTime::now()),
+                            Err(err) => {
+                                let err_message = match err.find_root() {
+                                    DataFusionError::Execution(e) => e.clone(),
+                                    _ => err.to_string(),
                                 };
-
-                            update_dataset_availability_info(
-                                &monitored_datasets,
-                                &item.name,
-                                connectivity_test_result,
-                            )
-                            .await;
-                        })
-                    })
-                    .collect();
+                                tracing::error!(target: "task_history", parent: &span, "{err_message}");
+                                AvailabilityVerificationResult::Unavailable(
+                                    item.last_available_time,
+                                    err_message,
+                                )
+                            }
+                        };
+                        update_dataset_availability_info(
+                            &monitored_datasets,
+                            &runtime_status,
+                            &item,
+                            result,
+                        )
+                        .await;
+                    }));
+                }
 
                 join_all(tasks).await;
-
                 tracing::trace!("Finished checking datasets availability");
-
-                tokio::time::sleep(Duration::from_secs(
-                    DATASETS_AVAILABILITY_CHECK_INTERVAL_SECONDS,
-                ))
-                .await;
             }
         });
     }
@@ -335,21 +411,62 @@ AND labels.error_code IS NULL"
 
 async fn update_dataset_availability_info(
     monitored_datasets: &Arc<Mutex<HashMap<String, Arc<DatasetAvailabilityInfo>>>>,
-    dataset_name: &String,
+    runtime_status: &Arc<RuntimeStatus>,
+    item: &DatasetAvailabilityInfo,
     test_result: AvailabilityVerificationResult,
 ) {
     match test_result {
-        AvailabilityVerificationResult::Available => {
-            tracing::trace!("Successfully verified access to federated dataset {dataset_name}");
-            let mut monitored_datasets_lock = monitored_datasets.lock().await;
-            if let Some(dataset) = monitored_datasets_lock.get_mut(dataset_name) {
-                Arc::make_mut(dataset).last_available_time = SystemTime::now();
+        AvailabilityVerificationResult::Available(available_at) => {
+            tracing::trace!(
+                "Successfully verified access to federated dataset {}",
+                item.name
+            );
+            {
+                let mut lock = monitored_datasets.lock().await;
+                if let Some(dataset) = lock.get_mut(&item.name)
+                    && available_at > dataset.last_available_time
+                {
+                    Arc::make_mut(dataset).last_available_time = available_at;
+                }
             }
-            report_dataset_unavailable_time(dataset_name, None);
+            report_dataset_unavailable_time(&item.name, None);
+
+            // Only restore Ready when we previously flipped the dataset to Error,
+            // so a recovery never clobbers a Refreshing/ShuttingDown/Initializing
+            // state the rest of the runtime owns.
+            if runtime_status
+                .get_dataset_status(&item.table_ref)
+                .is_some_and(|s| s.is_error())
+            {
+                runtime_status.update_dataset(&item.table_ref, ComponentStatus::Ready);
+                tracing::info!(
+                    "Dataset {} source is reachable again; status restored to Ready",
+                    item.name
+                );
+            }
         }
         AvailabilityVerificationResult::Unavailable(last_available_time, err) => {
-            tracing::warn!("Failed to verify the dataset {dataset_name} was available. {err}");
-            report_dataset_unavailable_time(dataset_name, Some(last_available_time));
+            tracing::warn!(
+                "Failed to verify the dataset {} was available. {err}",
+                item.name
+            );
+            report_dataset_unavailable_time(&item.name, Some(last_available_time));
+
+            // Only transition a healthy (Ready) or already-errored dataset; leave
+            // transient lifecycle states (Initializing/Refreshing/ShuttingDown)
+            // to the load/refresh paths that own them.
+            if runtime_status
+                .get_dataset_status(&item.table_ref)
+                .is_some_and(|s| matches!(s, ComponentStatus::Ready | ComponentStatus::Error(_)))
+            {
+                runtime_status.update_dataset(
+                    &item.table_ref,
+                    ComponentStatus::error_with_message(format!(
+                        "Failed to reach the source for dataset {} during availability check: {err}",
+                        item.name
+                    )),
+                );
+            }
         }
     }
 }
@@ -373,21 +490,33 @@ fn report_dataset_unavailable_time(dataset_name: &str, last_available_time: Opti
     }
 }
 
-async fn datasets_for_availability_check(
+/// Shortest configured probe interval among monitored datasets, clamped to a
+/// floor. Falls back to [`MONITOR_IDLE_TICK`] when nothing is monitored, so the
+/// loop still wakes periodically to pick up newly registered datasets.
+async fn shortest_interval(
     datasets: &Arc<Mutex<HashMap<String, Arc<DatasetAvailabilityInfo>>>>,
-) -> Vec<Arc<DatasetAvailabilityInfo>> {
-    let now = SystemTime::now();
+) -> Duration {
     let datasets = datasets.lock().await;
     datasets
-        .iter()
-        .filter(|(_, item)| {
-            now.duration_since(item.last_available_time)
-                .unwrap_or_default()
-                .as_secs()
-                > DATASET_UNAVAILABLE_THRESHOLD_SECONDS
-        })
-        .map(|(_, item)| Arc::clone(item))
-        .collect::<Vec<_>>()
+        .values()
+        .map(|d| d.interval)
+        .min()
+        .unwrap_or(MONITOR_IDLE_TICK)
+        .max(MIN_CHECK_TICK)
+}
+
+/// Snapshot the monitored datasets plus the longest configured interval (used
+/// to bound the `task_history` recent-query lookback).
+async fn snapshot_datasets(
+    datasets: &Arc<Mutex<HashMap<String, Arc<DatasetAvailabilityInfo>>>>,
+) -> (Vec<Arc<DatasetAvailabilityInfo>>, Duration) {
+    let datasets = datasets.lock().await;
+    let max_interval = datasets
+        .values()
+        .map(|d| d.interval)
+        .max()
+        .unwrap_or(MONITOR_IDLE_TICK);
+    (datasets.values().map(Arc::clone).collect(), max_interval)
 }
 
 async fn test_connectivity(
@@ -452,6 +581,95 @@ mod test {
             .expect("should register dataset");
 
         monitor.deregister_dataset(&dataset.name.to_string()).await;
+    }
+
+    fn test_availability_info(table_ref: &TableReference) -> DatasetAvailabilityInfo {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let table_provider: Arc<dyn TableProvider> =
+            Arc::new(MemTable::try_new(schema, vec![vec![]]).expect("memtable"));
+        DatasetAvailabilityInfo::new(table_ref.clone(), table_provider, Duration::from_mins(1))
+    }
+
+    /// A failed probe flips a Ready dataset to Error, and a later successful
+    /// probe restores it to Ready — this is what surfaces via
+    /// `GET /v1/datasets?status=true`.
+    #[tokio::test]
+    async fn availability_result_drives_dataset_status() {
+        let status = RuntimeStatus::new();
+        let table_ref = TableReference::bare("orders");
+        status.update_dataset(&table_ref, ComponentStatus::Ready);
+
+        let info = test_availability_info(&table_ref);
+        let monitored: Arc<Mutex<HashMap<String, Arc<DatasetAvailabilityInfo>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        monitored
+            .lock()
+            .await
+            .insert(info.name.clone(), Arc::new(info.clone()));
+
+        // Source unavailable -> Error (with message).
+        update_dataset_availability_info(
+            &monitored,
+            &status,
+            &info,
+            AvailabilityVerificationResult::Unavailable(
+                SystemTime::now(),
+                "connection refused".to_string(),
+            ),
+        )
+        .await;
+        let errored = status.get_dataset_status(&table_ref).expect("status");
+        assert!(errored.is_error(), "expected Error, got {errored:?}");
+        assert!(
+            errored
+                .error_message()
+                .is_some_and(|m| m.contains("connection refused")),
+            "error message should carry the source failure"
+        );
+
+        // Source reachable again -> Ready.
+        update_dataset_availability_info(
+            &monitored,
+            &status,
+            &info,
+            AvailabilityVerificationResult::Available(SystemTime::now()),
+        )
+        .await;
+        assert_eq!(
+            status.get_dataset_status(&table_ref),
+            Some(ComponentStatus::Ready)
+        );
+    }
+
+    /// The monitor must not clobber a transient lifecycle state (e.g. a dataset
+    /// mid-reload) with Error.
+    #[tokio::test]
+    async fn availability_does_not_clobber_transient_status() {
+        let status = RuntimeStatus::new();
+        let table_ref = TableReference::bare("orders");
+        status.update_dataset(&table_ref, ComponentStatus::Initializing);
+
+        let info = test_availability_info(&table_ref);
+        let monitored: Arc<Mutex<HashMap<String, Arc<DatasetAvailabilityInfo>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        monitored
+            .lock()
+            .await
+            .insert(info.name.clone(), Arc::new(info.clone()));
+
+        update_dataset_availability_info(
+            &monitored,
+            &status,
+            &info,
+            AvailabilityVerificationResult::Unavailable(SystemTime::now(), "boom".to_string()),
+        )
+        .await;
+
+        assert_eq!(
+            status.get_dataset_status(&table_ref),
+            Some(ComponentStatus::Initializing),
+            "a probe failure must not override a non-Ready lifecycle state"
+        );
     }
 
     fn create_test_datafusion(
