@@ -9,6 +9,7 @@ members = [
     "crates/arrow_tools",
     "crates/aws-sdk-credential-bridge",
     "crates/chunking",
+    "crates/cloud-connect-crypto",
     "crates/data-connectors/*",
     "crates/datafusion-ddl",
     "crates/datafusion-dml",
@@ -259,6 +260,7 @@ globset = "0.4.16"
 governor = "0.10.4"
 graph-rs-sdk = { git = "https://github.com/spiceai/graph-rs-sdk", rev = "af383410a9c86915263fbd1145b8becfc1e317b5" } # branch: spiceai
 graphql-parser = "0.4.0"
+hex = "0.4.3"
 hf-hub = { version = "0.4", features = ["tokio"] }
 http = "1.3.1"
 httpdate = "1.0"
@@ -352,6 +354,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10.8"
 snafu = "0.8.6"
+cloud-connect-crypto = { path = "crates/cloud-connect-crypto" }
 runtime-cloud-connect = { path = "crates/runtime-cloud-connect" }
 spice-cloud-client = { path = "crates/spice-cloud-client" }
 snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "744ffd77fe82171a805562ce001a341a94d52541" } # branch: spiceai-58
