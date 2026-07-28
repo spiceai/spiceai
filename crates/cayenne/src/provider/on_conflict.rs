@@ -471,7 +471,7 @@ impl DeletionSink for PkKeysetInvalidatingDeletionSink {
             // at ~6106 and the Bloom arm at ~6159 keep the row and emit at most a
             // no-op delete). So for upsert tables we SKIP the clear entirely and
             // keep the stale-superset index — eliminating the O(live-rows)
-            // `load_existing_keyset` cold rebuild the next CDC insert batch would
+            // `load_existing_pk_index` cold rebuild the next CDC insert batch would
             // otherwise pay (measured 277 ms × 244 = 68 s/600 s on `new_order`).
             //
             // `DoNothing` tables need an EXACT answer (a stale-present entry would
@@ -573,7 +573,7 @@ impl DeletionSink for InlineAwareDeletionSink {
             // here. For an `Upsert` table a stale-present existence entry only
             // yields a harmless redundant delete on a later re-insert (the
             // `PkBloom` false-positive invariant, see `provider::pk_index::PkBloom`), so we SKIP
-            // the clear and avoid the O(live-rows) `load_existing_keyset` rebuild
+            // the clear and avoid the O(live-rows) `load_existing_pk_index` rebuild
             // the next insert batch would pay. `DoNothing` tables need exactness
             // (a stale entry would wrongly drop a new row) and keep the full clear.
             if self.table.upsert_bloom_eligible() {

@@ -18,6 +18,8 @@ use data_components::cdc::ChangesStream;
 use datafusion::datasource::TableProvider;
 use runtime_datafusion_index::IndexedTableProvider;
 use search::generation::text_search::index::FullTextDatabaseIndex;
+use search::index::chunking::ChunkedSearchIndex;
+use search::index::compound::CompoundSearchIndex;
 use std::any::Any;
 use std::sync::Arc;
 
@@ -34,7 +36,7 @@ use crate::search::util::find_concrete_table_provider;
 use futures::StreamExt;
 use runtime_metrics::component::MetricsProvider;
 
-/// A [`DataConnector`] middleware that, for [`Dataset`]s needing full text search capabilies, creates a [`IndexedTableProvider`] using the underlying [`TableProvider`]s and a [`FullTextDatabaseIndex`]. If no full text search capabilities are needed it is not unnecessarily nested.
+/// A [`DataConnector`] middleware that, for [`Dataset`]s needing full text search capabilies, creates a [`IndexedTableProvider`] using the underlying [`TableProvider`]s and a [`FullTextDatabaseIndex`](search::generation::text_search::index::FullTextDatabaseIndex). If no full text search capabilities are needed it is not unnecessarily nested.
 #[derive(Debug)]
 pub struct FullTextConnector {
     inner_connector: Arc<dyn DataConnector>,
@@ -65,11 +67,13 @@ impl FullTextConnector {
         // A full-text index written by this change stream must not defer its commits
         // to the sink write lifecycle: the two share one tantivy writer, so a window
         // commit would publish a partial refresh and a window rollback would discard
-        // these change-stream documents.
+        // these change-stream documents. `IndexedTableProvider::get_all_indexes` returns
+        // whatever was registered, unpeeled, so the tantivy tier can be reached only
+        // indirectly — nested as the primary of a `CompoundSearchIndex` (the warm/external
+        // full-text compound, registered in place of its tiers) or wrapped in a
+        // `ChunkedSearchIndex` — so peel through those to reach it.
         for index in &all_indexes {
-            if let Some(full_text) = index.as_any().downcast_ref::<FullTextDatabaseIndex>() {
-                full_text.mark_cdc_attached();
-            }
+            mark_full_text_cdc_attached(index.as_any());
         }
 
         let indexes = Indexes::new(all_indexes);
@@ -81,6 +85,24 @@ impl FullTextConnector {
                 .then(move |item| index_change_envelope(item, Arc::clone(&indexes)))
                 .boxed(),
         )
+    }
+}
+
+/// Marks the [`FullTextDatabaseIndex`] reachable from `index` as CDC-attached, so it never
+/// opens a deferred-commit window that a change stream's writes could be rolled back out of.
+///
+/// `index` may not be a `FullTextDatabaseIndex` itself — the warm/external full-text compound
+/// registers a `CompoundSearchIndex` in its place, with the tantivy tier nested as its primary
+/// (or, in principle, wrapped in a `ChunkedSearchIndex`) — so this peels through the composing
+/// index types that can hold one before giving up.
+fn mark_full_text_cdc_attached(index: &dyn Any) {
+    if let Some(full_text) = index.downcast_ref::<FullTextDatabaseIndex>() {
+        full_text.mark_cdc_attached();
+    } else if let Some(compound) = index.downcast_ref::<CompoundSearchIndex>() {
+        mark_full_text_cdc_attached(compound.primary().as_any());
+        mark_full_text_cdc_attached(compound.secondary().as_any());
+    } else if let Some(chunked) = index.downcast_ref::<ChunkedSearchIndex>() {
+        mark_full_text_cdc_attached(chunked.inner().as_any());
     }
 }
 
@@ -206,5 +228,95 @@ impl DataConnector for FullTextConnector {
         dataset: &crate::component::dataset::Dataset,
     ) -> crate::component::ComponentInitialization {
         self.inner_connector.initialization_for_dataset(dataset)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::record_batch;
+    use arrow::util::pretty::pretty_format_batches;
+    use datafusion::datasource::MemTable;
+    use futures::TryStreamExt;
+    use runtime_datafusion_index::Index;
+    use search::index::SearchIndex;
+    use search::index::compound::CompoundReadMode;
+
+    fn test_table() -> Arc<dyn TableProvider> {
+        let batch = record_batch!(("id", Int32, [1]), ("content", Utf8, ["seed"]))
+            .expect("failed to create test batch");
+        Arc::new(
+            MemTable::try_new(batch.schema(), vec![vec![batch]])
+                .expect("failed to create test table"),
+        )
+    }
+
+    fn full_text_tier() -> FullTextDatabaseIndex {
+        FullTextDatabaseIndex::try_new(
+            test_table(),
+            vec!["content".to_string()],
+            Some(vec!["id".to_string()]),
+            None,
+            &["content".to_string()],
+        )
+        .expect("failed to create FullTextDatabaseIndex")
+    }
+
+    /// Regression test for #12061: the warm/external full-text tier registers a
+    /// `CompoundSearchIndex` in place of its tiers, so `IndexedTableProvider::get_all_indexes`
+    /// never surfaces the nested `FullTextDatabaseIndex` directly. `mark_full_text_cdc_attached`
+    /// has to peel through the compound to reach it, or the tantivy tier keeps deferring
+    /// commits and a failed refresh discards change-stream documents for good.
+    #[tokio::test]
+    async fn mark_full_text_cdc_attached_reaches_compound_primary() {
+        let warm = full_text_tier();
+        let compound = CompoundSearchIndex::try_new(
+            Arc::new(warm.clone()) as Arc<dyn SearchIndex>,
+            Arc::new(full_text_tier()) as Arc<dyn SearchIndex>,
+            CompoundReadMode::PrimaryOnly,
+        )
+        .expect("two full-text tiers over the same table are compatible");
+
+        mark_full_text_cdc_attached(&compound);
+
+        // A sink-driven refresh opens a write window on both tiers.
+        compound
+            .on_write_start()
+            .await
+            .expect("on_write_start failed");
+
+        // A change-stream document arrives while that window is open.
+        compound
+            .compute_index(vec![
+                record_batch!(("id", Int32, [2]), ("content", Utf8, ["apple banana"]))
+                    .expect("failed to create test batch"),
+            ])
+            .await
+            .expect("compute_index failed");
+
+        // The refresh then fails, discarding whatever the window staged.
+        compound
+            .on_write_failed()
+            .await
+            .expect("on_write_failed failed");
+
+        warm.reader
+            .reload()
+            .expect("failed to reload the warm tier's reader");
+        let search_index = warm
+            .full_text_search_field_index("content")
+            .expect("failed to create FullTextSearchFieldIndex");
+        let rb = search_index
+            .search("apple".to_string(), &[], 1000)
+            .await
+            .expect("search failed")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("failed to collect search results");
+        let results = format!("{}", pretty_format_batches(&rb).expect("failed to format"));
+        assert!(
+            results.contains("apple banana"),
+            "a change-stream document written through a compound must be committed, not staged in the failed window, got:\n{results}"
+        );
     }
 }

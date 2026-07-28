@@ -865,8 +865,8 @@ pub async fn run(args: Args) -> Result<()> {
     // `--cloud-connect` flag, or when an identity is on disk or an adoption
     // code is available. Failures here are non-fatal: spiced keeps running.
     // Started only after `load_components()` completes so an adopted control
-    // plane can't issue RunQuery / GetRuntimeInfo against a half-loaded
-    // runtime (datasets/models still registering).
+    // plane can't issue GetRuntimeInfo against a half-loaded runtime
+    // (datasets/models still registering).
     let cloud_connect_handle = if components_loaded {
         cloud_connect::maybe_start(
             env!("CARGO_PKG_VERSION"),
