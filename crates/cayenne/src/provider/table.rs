@@ -6848,26 +6848,23 @@ impl CayenneTableProvider {
         self.pk_keyset_occ_degraded.store(true, Ordering::Release);
     }
 
-    /// Write-path probe: when no PK cache is live and the table is PROVABLY
-    /// empty (no mem-tier rows, no inlined rows, no durable snapshot files,
-    /// no cold files), install EMPTY exact caches — the empty table's keyset
-    /// is exactly empty, every write from here maintains it
-    /// (`record_pk_keys_with_location` / the per-shard record in
-    /// `append_to_shard`), and the first conflict-validated batch skips the
-    /// O(live-rows) `load_existing_pk_index` cold scan, which otherwise runs
-    /// inside the CDC apply loop at the first post-snapshot upsert (~475 s at
-    /// 300M rows) and stalls the whole replication group behind it.
+    /// Write-path probe: when no PK cache is live and the table is provably
+    /// empty (no mem-tier, inlined, durable, or cold rows), install EMPTY
+    /// exact caches. Every later write maintains them
+    /// (`record_pk_keys_with_location`, `append_to_shard`), so the first
+    /// conflict-validated batch skips the O(live-rows)
+    /// `load_existing_pk_index` scan — which otherwise runs inside the CDC
+    /// apply loop at the first post-snapshot upsert (~475 s at 300M rows)
+    /// and stalls the whole replication group behind it.
     ///
-    /// Probing at the WRITE — not at table creation — makes reuse paths safe
-    /// by construction: `create_table` is create-or-reuse and partitions /
-    /// registration re-open existing tables, where installing an empty
-    /// "exact" keyset over real rows would false-negate conflict validation
-    /// into duplicates. Any doubt (unreadable listing) leaves the lazy
-    /// rebuild in place. Probes once per cache lifetime;
-    /// `clear_cached_pk_keyset` re-arms it, so a delete-all's next write on
-    /// the now-empty table re-installs. Over-budget maintained inserts
-    /// degrade to blooms exactly like a scanned rebuild. No-op without
-    /// conflict handling (nothing consults the keyset).
+    /// Probing at the write — not at table creation — keeps reuse paths
+    /// safe: `create_table` is create-or-reuse, and an empty install over
+    /// existing rows would turn conflict validation into duplicates. Any
+    /// doubt (unreadable listing) keeps the lazy rebuild. Probes once per
+    /// cache lifetime; `clear_cached_pk_keyset` re-arms it, so a delete-all's
+    /// next write re-installs. Both call sites hold the per-table write
+    /// lock; the re-check after the awaits is belt-and-braces against a
+    /// concurrently populated cache.
     pub(crate) async fn maybe_install_warm_pk_caches(&self) {
         if self.table_metadata.on_conflict.is_none() {
             return;
@@ -6875,17 +6872,7 @@ impl CayenneTableProvider {
         if self.pk_warm_probe_done.swap(true, Ordering::AcqRel) {
             return;
         }
-        // Two separate statements: `a.lock().is_some() || b.lock().is_some()`
-        // keeps the first guard alive across the second acquisition (`||`
-        // temporaries live for the whole expression), inverting the
-        // sharded-then-single order `record_pk_keys_with_location` takes.
-        if self.pk_keyset_cache.lock().is_some() {
-            return;
-        }
-        if self.sharded_pk_keyset_cache.lock().is_some() {
-            return;
-        }
-        if !self.mem_tier.is_empty() || self.inlined_row_count.load(Ordering::Acquire) != 0 {
+        if !self.pk_caches_absent_and_memory_empty() {
             return;
         }
         let table_id = &self.table_metadata.table_id;
@@ -6900,6 +6887,10 @@ impl CayenneTableProvider {
         match self.catalog.list_cold_tier_files(table_id).await {
             Ok(files) if files.is_empty() => {}
             _ => return,
+        }
+        // Re-check: this future may have suspended across the listings above.
+        if !self.pk_caches_absent_and_memory_empty() {
+            return;
         }
 
         *self.pk_keyset_cache.lock() =
@@ -6919,6 +6910,18 @@ impl CayenneTableProvider {
             shards,
             "installed warm empty PK existence caches (empty table probe)"
         );
+    }
+
+    /// One lock at a time: `record_pk_keys_with_location` takes
+    /// sharded-then-single, so holding both here would invert the order.
+    fn pk_caches_absent_and_memory_empty(&self) -> bool {
+        if self.pk_keyset_cache.lock().is_some() {
+            return false;
+        }
+        if self.sharded_pk_keyset_cache.lock().is_some() {
+            return false;
+        }
+        self.mem_tier.is_empty() && self.inlined_row_count.load(Ordering::Acquire) == 0
     }
 
     pub(crate) fn clear_cached_pk_keyset(&self) {
@@ -6996,26 +6999,20 @@ impl CayenneTableProvider {
             return;
         }
 
-        // Mirror the keys into the sharded (N>1) cache FIRST, unconditionally:
-        // the per-shard record in `append_to_shard` covers only mem-tier
-        // appends, so rows committed through the inline/file/staging paths
-        // would otherwise exist solely in the single keyset below — and a
-        // long-lived sharded exact keyset would false-negate them into
-        // duplicate upserts (observed as SF1000 row-count over-counts). Runs
-        // before the single keyset's checked-out early-return so a concurrent
-        // checkout cannot drop the sharded entries; the two locks are never
-        // held together.
+        // Mirror into the sharded (N>1) cache first, unconditionally: the
+        // per-shard record in `append_to_shard` covers only mem-tier appends,
+        // so inline/file/staging commits would otherwise leave holes in a
+        // long-lived sharded exact keyset and upserts of those keys would
+        // duplicate instead of superseding. Runs before the single keyset's
+        // checked-out early-return; the two locks are never held together.
         {
             let mut sharded = self.sharded_pk_keyset_cache.lock();
             let mut drop_index = false;
             if let Some(index) = sharded.as_mut() {
                 index.record_keys(keys, location);
-                // Budget enforcement for the maintained index — without it a
-                // large initial load grows the exact keysets unbounded. An
-                // upsert table degrades to per-shard blooms (a false positive
-                // only yields a harmless redundant delete); `DoNothing` needs
-                // exactness, so over budget it drops the cache and the next
-                // validation pays the lazy bounded rebuild instead.
+                // Byte budget: upsert degrades to per-shard blooms (a false
+                // positive is only a redundant delete); `DoNothing` needs
+                // exactness, so drop and let the next validation lazy-rebuild.
                 let max_bytes = self.context.pk_keyset_cache_max_bytes();
                 if index.approx_bytes() > max_bytes {
                     if self.upsert_bloom_eligible() {
