@@ -33,7 +33,9 @@ pub struct NewOrderStmts {
     pub(crate) select_item: Statement,
     /// One prepared statement per district (`s_dist_01` through `s_dist_10`).
     pub(crate) select_stock: [Statement; 10],
+    #[expect(dead_code, reason = "prepared but not yet read anywhere yet")]
     update_stock: Statement,
+    #[expect(dead_code, reason = "prepared but not yet read anywhere yet")]
     insert_order_line: Statement,
 }
 
