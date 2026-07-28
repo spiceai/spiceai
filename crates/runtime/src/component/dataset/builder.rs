@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use super::{
     CheckAvailability, Dataset, Error, InvalidColumnTypeSnafu, InvalidConfigurationSnafu,
@@ -41,31 +41,32 @@ use spicepod::{
 };
 
 pub struct DatasetBuilder {
-    from: String,
-    pub(crate) name: TableReference,
-    access: AccessMode,
-    params: HashMap<String, String>,
-    metadata: HashMap<String, String>,
-    columns: Vec<Column>,
-    has_metadata_table: bool,
-    replication: Option<replication::Replication>,
-    time_column: Option<String>,
-    time_format: Option<TimeFormat>,
-    time_partition_column: Option<String>,
-    time_partition_format: Option<TimeFormat>,
-    acceleration: Option<acceleration::Acceleration>,
-    acceleration_snapshot_behavior: spicepod_acceleration::SnapshotBehavior,
-    acceleration_snapshot_compaction: spicepod_acceleration::SnapshotsCompaction,
-    embeddings: Vec<ColumnEmbeddingConfig>,
-    app: Option<Arc<App>>,
-    unsupported_type_action: Option<UnsupportedTypeAction>,
-    on_schema_change: OnSchemaChange,
-    ready_state: ReadyState,
-    metrics: Metrics,
-    runtime: Option<Arc<Runtime>>,
-    vectors: Option<VectorStore>,
-    full_text_search: Option<FtsStore>,
-    check_availability: CheckAvailability,
+    pub from: String,
+    pub name: TableReference,
+    pub access: AccessMode,
+    pub params: HashMap<String, String>,
+    pub metadata: HashMap<String, String>,
+    pub columns: Vec<Column>,
+    pub has_metadata_table: bool,
+    pub replication: Option<replication::Replication>,
+    pub time_column: Option<String>,
+    pub time_format: Option<TimeFormat>,
+    pub time_partition_column: Option<String>,
+    pub time_partition_format: Option<TimeFormat>,
+    pub acceleration: Option<acceleration::Acceleration>,
+    pub acceleration_snapshot_behavior: spicepod_acceleration::SnapshotBehavior,
+    pub acceleration_snapshot_compaction: spicepod_acceleration::SnapshotsCompaction,
+    pub embeddings: Vec<ColumnEmbeddingConfig>,
+    pub app: Option<Arc<App>>,
+    pub unsupported_type_action: Option<UnsupportedTypeAction>,
+    pub on_schema_change: OnSchemaChange,
+    pub ready_state: ReadyState,
+    pub metrics: Metrics,
+    pub runtime: Option<Arc<Runtime>>,
+    pub vectors: Option<VectorStore>,
+    pub full_text_search: Option<FtsStore>,
+    pub check_availability: CheckAvailability,
+    pub check_availability_interval: Option<Duration>,
 }
 
 impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
@@ -108,6 +109,35 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
         validate_identifier(&dataset.name).context(crate::ComponentSnafu)?;
 
         let table_reference = Dataset::parse_table_reference(&dataset.name)?;
+
+        // Parse the duration string once here (raw string stays in the Spicepod
+        // representation; the runtime component holds the typed value). An
+        // invalid value fails dataset construction rather than silently
+        // disabling the check.
+        let check_availability_interval = dataset
+            .check_availability_interval
+            .as_deref()
+            .map(|raw| {
+                fundu::parse_duration(raw).map_err(|source| {
+                    crate::component::dataset::Error::UnableToParseFieldAsDuration {
+                        field: "check_availability_interval".to_string(),
+                        source,
+                    }
+                })
+            })
+            .transpose()
+            .context(crate::InvalidSpicepodDatasetSnafu)?;
+
+        // Availability monitoring only applies to non-accelerated datasets, so
+        // warn (rather than silently ignore) when it is configured on an
+        // accelerated one.
+        if check_availability_interval.is_some() && acceleration.as_ref().is_some_and(|a| a.enabled)
+        {
+            tracing::warn!(
+                "Dataset {} sets `check_availability_interval` but is accelerated; availability monitoring applies only to non-accelerated datasets and will be ignored. An accelerated dataset keeps serving from the accelerator even when its source is unavailable.",
+                dataset.name
+            );
+        }
 
         // If the dataset is enabled for a vector engine, use this instead of JIT.
         if let Some(vector_engine) = &dataset.vectors {
@@ -154,6 +184,7 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             vectors: dataset.vectors,
             full_text_search: dataset.full_text_search,
             check_availability: CheckAvailability::from(dataset.check_availability),
+            check_availability_interval,
         })
     }
 }
@@ -187,11 +218,14 @@ impl DatasetBuilder {
             vectors: None,
             full_text_search: None,
             check_availability: CheckAvailability::default(),
+            check_availability_interval: None,
         })
     }
 
     #[expect(clippy::result_large_err)]
-    fn parse_table_reference(name: &str) -> std::result::Result<TableReference, crate::Error> {
+    pub(crate) fn parse_table_reference(
+        name: &str,
+    ) -> std::result::Result<TableReference, crate::Error> {
         match TableReference::parse_str(name) {
             table_ref @ (TableReference::Bare { .. } | TableReference::Partial { .. }) => {
                 Ok(table_ref)
@@ -211,19 +245,19 @@ impl DatasetBuilder {
     }
 
     #[must_use]
-    pub(crate) fn with_time_column(mut self, time_column: String) -> Self {
+    pub fn with_time_column(mut self, time_column: String) -> Self {
         self.time_column = Some(time_column);
         self
     }
 
     #[must_use]
-    pub(crate) fn with_time_partition_column(mut self, time_partition_column: String) -> Self {
+    pub fn with_time_partition_column(mut self, time_partition_column: String) -> Self {
         self.time_partition_column = Some(time_partition_column);
         self
     }
 
     #[must_use]
-    pub(crate) fn with_metadata(mut self, metadata: HashMap<String, String>) -> Self {
+    pub fn with_metadata(mut self, metadata: HashMap<String, String>) -> Self {
         self.metadata = metadata;
         self
     }
@@ -293,6 +327,7 @@ impl DatasetBuilder {
                 vectors: self.vectors,
                 full_text_search: self.full_text_search,
                 check_availability: self.check_availability,
+                check_availability_interval: self.check_availability_interval,
             },
             app,
             runtime,
