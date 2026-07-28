@@ -81,6 +81,7 @@ impl CompoundSearchIndex {
                 nested.mark_cdc_attached();
             }
         }
+    }
 
     /// The tier reads and writes are served from first.
     #[must_use]
@@ -93,7 +94,6 @@ impl CompoundSearchIndex {
     #[must_use]
     pub fn secondary(&self) -> &Arc<dyn SearchIndex> {
         &self.secondary
-
     }
 }
 
