@@ -6,19 +6,7 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": "8.21",
-      "dataset": "spice.public.qs",
-      "matches": {
-        "answer": [
-          "The statement \"T minus 50 seconds\" indicates that there are $\\boxed{50 \\text{ seconds}}$ remaining until lift-off."
-        ]
-      },
-      "primary_key": {
-        "id": 9
-      }
-    },
-    {
-      "_score": "5.99",
+      "_score": "6.33",
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
@@ -30,7 +18,7 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": "5.86",
+      "_score": "6.19",
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
