@@ -439,7 +439,12 @@ impl DataConnector for CdcIngest {
         let dataset_name = dataset.name.to_string();
         Some(Box::pin(stream! {
             let table_provider = federated_table.table_provider().await;
-            let Some(table) = table_provider.downcast_ref::<CdcIngestTable>() else {
+            // Search the provider chain rather than downcasting the outermost layer:
+            // spicepod metadata, embeddings and full-text search each wrap the
+            // connector's own provider before it reaches the changes stream.
+            let Some(table) =
+                crate::search::util::find_concrete_table_provider::<CdcIngestTable>(&table_provider)
+            else {
                 tracing::error!(
                     dataset = %dataset_name,
                     "CDC ingest could not resolve its table provider, so no change events will be accepted. This dataset will not become ready"

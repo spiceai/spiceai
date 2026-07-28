@@ -118,6 +118,7 @@ use runtime_acceleration::snapshot::SnapshotManager;
 use runtime_async::ManagedTokioRuntime;
 use runtime_datafusion_index::IndexedTableProvider;
 use runtime_query_engine::query_engine::Error as QueryEngineError;
+use runtime_search::embeddings::table::EmbeddingTable;
 use runtime_table_partition::provider::PartitionTableProvider;
 use schema::ensure_schema_exists;
 use snafu::prelude::*;
@@ -708,16 +709,51 @@ pub(crate) fn table_provider_with_spicepod_metadata(
     // If the provider is an IndexedTableProvider, push the metadata enrichment
     // inside it so that the IndexTableScan analyzer can still discover it via
     // downcast_ref::<IndexedTableProvider>().
+    //
+    // Recurse rather than enriching the underlying directly: a dataset with both
+    // `embeddings` and `full_text_search` nests an `EmbeddingTable` or a
+    // `VectorScanTableProvider` under this `IndexedTableProvider`, and those inner
+    // wrappers have the same discoverability requirement (see the arms below).
     if let Some(indexed) = provider.downcast_ref::<IndexedTableProvider>() {
-        let enriched_underlying = metadata_enriched_table_provider(
+        let enriched_underlying = table_provider_with_spicepod_metadata(
             indexed.get_underlying(),
-            table_metadata.clone(),
-            field_metadata,
+            table_metadata,
+            columns,
         );
         return Arc::new(IndexedTableProvider::with_indexes(
             enriched_underlying,
             indexed.get_all_indexes(),
         ));
+    }
+
+    // Same reasoning for an EmbeddingTable: push the metadata enrichment onto the
+    // base table so the wrapper stays discoverable via downcast_ref::<EmbeddingTable>().
+    // The CDC changes stream relies on EmbeddingConnector unwrapping this provider to
+    // its base table (see embeddings::connector::EmbeddingConnector::changes_stream);
+    // wrapping the EmbeddingTable opaquely instead hides it, so no changes stream is
+    // attached and `refresh_mode: changes` fails with "a changes stream is required".
+    if let Some(embedding) = provider.downcast_ref::<EmbeddingTable>() {
+        let mut enriched = embedding.clone();
+        enriched.base_table = table_provider_with_spicepod_metadata(
+            Arc::clone(&embedding.base_table),
+            table_metadata,
+            columns,
+        );
+        return Arc::new(enriched);
+    }
+
+    // And for a VectorScanTableProvider, which a dataset with `vectors` enabled nests
+    // under the `IndexedTableProvider`. `EmbeddingConnector::changes_stream` unwraps it
+    // to reach the raw source provider; a metadata layer on top hides it, so the source
+    // never receives a changes stream.
+    if let Some(vector_scan) = provider.downcast_ref::<search::index::VectorScanTableProvider>() {
+        let mut enriched = vector_scan.clone();
+        enriched.table_provider = table_provider_with_spicepod_metadata(
+            Arc::clone(&vector_scan.table_provider),
+            table_metadata,
+            columns,
+        );
+        return Arc::new(enriched);
     }
 
     metadata_enriched_table_provider(provider, table_metadata.clone(), field_metadata)
@@ -5477,6 +5513,203 @@ mod tests {
         assert_eq!(
             name_field.metadata().get("description").map(String::as_str),
             Some("display name")
+        );
+    }
+
+    #[test]
+    fn embedding_table_metadata_wrap_preserves_downcast() {
+        // Regression test for CDC-over-embeddings: when a dataset carries table- or
+        // column-level metadata, `table_provider_with_spicepod_metadata` must keep an
+        // `EmbeddingTable` discoverable via `downcast_ref::<EmbeddingTable>()` (pushing
+        // the metadata onto the base table) rather than wrapping it opaquely in a
+        // `MetadataEnrichedTableProvider`. `EmbeddingConnector::changes_stream` unwraps
+        // the `EmbeddingTable` to its base table to build the source changes stream; an
+        // opaque wrapper hides it, so no stream is attached and `refresh_mode: changes`
+        // fails with "a changes stream is required".
+        let base_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("content", DataType::Utf8, true),
+        ]));
+        let base_table = Arc::new(
+            MemTable::try_new(base_schema, vec![vec![]]).expect("mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+
+        let embedding_table = Arc::new(EmbeddingTable {
+            base_table,
+            embedded_columns: HashMap::new(),
+            embedding_models: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+        }) as Arc<dyn TableProvider>;
+
+        let mut table_metadata = HashMap::new();
+        table_metadata.insert("source_owner".to_string(), "analytics".to_string());
+        let mut content_column = Column::new("content");
+        content_column.description = Some("post body".to_string());
+        let columns = vec![content_column];
+
+        let wrapped = table_provider_with_spicepod_metadata(
+            Arc::clone(&embedding_table),
+            &table_metadata,
+            &columns,
+        );
+
+        let wrapped_embedding = wrapped.downcast_ref::<EmbeddingTable>().expect(
+            "metadata wrap must keep the EmbeddingTable discoverable for the changes stream",
+        );
+
+        // Metadata enrichment is pushed onto the base table, not layered opaquely on top.
+        assert!(
+            wrapped_embedding
+                .base_table
+                .downcast_ref::<MetadataEnrichedTableProvider>()
+                .is_some(),
+            "base table should be metadata-enriched"
+        );
+    }
+
+    /// Builds the provider stack a dataset with `embeddings` produces:
+    /// `EmbeddingTable` over the source provider.
+    fn embedding_table_over_memtable() -> Arc<dyn TableProvider> {
+        let base_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("content", DataType::Utf8, true),
+        ]));
+        let base_table = Arc::new(
+            MemTable::try_new(base_schema, vec![vec![]]).expect("mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+
+        Arc::new(EmbeddingTable {
+            base_table,
+            embedded_columns: HashMap::new(),
+            embedding_models: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+        }) as Arc<dyn TableProvider>
+    }
+
+    /// Builds the provider stack a dataset with `vectors` enabled produces:
+    /// `VectorScanTableProvider` over the source provider.
+    fn vector_scan_over_memtable() -> Arc<dyn TableProvider> {
+        let base_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("content", DataType::Utf8, true),
+        ]));
+        let base_table = Arc::new(
+            MemTable::try_new(base_schema, vec![vec![]]).expect("mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+
+        Arc::new(search::index::VectorScanTableProvider {
+            table_provider: base_table,
+            vector_index_list: Arc::new(datafusion::logical_expr::LogicalPlan::EmptyRelation(
+                datafusion::logical_expr::EmptyRelation {
+                    produce_one_row: false,
+                    schema: Arc::new(datafusion::common::DFSchema::empty()),
+                },
+            )),
+            primary_key: vec!["id".to_string()],
+        }) as Arc<dyn TableProvider>
+    }
+
+    fn spicepod_metadata_fixture() -> (HashMap<String, String>, Vec<Column>) {
+        let mut table_metadata = HashMap::new();
+        table_metadata.insert("source_owner".to_string(), "analytics".to_string());
+        let mut content_column = Column::new("content");
+        content_column.description = Some("post body".to_string());
+        (table_metadata, vec![content_column])
+    }
+
+    #[test]
+    fn embedding_table_metadata_wrap_preserves_table_metadata() {
+        // `EmbeddingTable::schema()` rebuilds the schema from its base table's fields.
+        // Pushing metadata enrichment onto the base table only works if that rebuild
+        // carries the base schema's metadata; otherwise dataset-level spicepod
+        // `metadata:` silently disappears from the source-facing schema.
+        let (table_metadata, columns) = spicepod_metadata_fixture();
+
+        let wrapped = table_provider_with_spicepod_metadata(
+            embedding_table_over_memtable(),
+            &table_metadata,
+            &columns,
+        );
+
+        let schema = wrapped.schema();
+        assert_eq!(
+            schema.metadata().get("source_owner").map(String::as_str),
+            Some("analytics"),
+            "table-level spicepod metadata must survive the metadata wrap"
+        );
+        assert_eq!(
+            schema
+                .field_with_name("content")
+                .expect("content field")
+                .metadata()
+                .get("description")
+                .map(String::as_str),
+            Some("post body"),
+            "column-level spicepod metadata must survive the metadata wrap"
+        );
+    }
+
+    #[test]
+    fn embedding_table_under_indexed_provider_stays_discoverable() {
+        // A dataset with both `embeddings` and `full_text_search` nests an
+        // `EmbeddingTable` under the `IndexedTableProvider` the FTS connector builds.
+        // `FullTextConnector::with_indexed_stream` hands `get_underlying()` to
+        // `EmbeddingConnector::changes_stream`, which downcasts to `EmbeddingTable`; if
+        // the metadata wrap hides it there, no changes stream is attached and
+        // `refresh_mode: changes` fails with "a changes stream is required".
+        let indexed = Arc::new(IndexedTableProvider::with_indexes(
+            embedding_table_over_memtable(),
+            vec![],
+        )) as Arc<dyn TableProvider>;
+
+        let (table_metadata, columns) = spicepod_metadata_fixture();
+        let wrapped = table_provider_with_spicepod_metadata(indexed, &table_metadata, &columns);
+
+        let found_indexed = wrapped
+            .downcast_ref::<IndexedTableProvider>()
+            .expect("IndexedTableProvider must remain discoverable for the index analyzer");
+
+        assert!(
+            found_indexed
+                .get_underlying()
+                .downcast_ref::<EmbeddingTable>()
+                .is_some(),
+            "EmbeddingTable nested under an IndexedTableProvider must stay discoverable"
+        );
+    }
+
+    #[test]
+    fn vector_scan_under_indexed_provider_stays_discoverable() {
+        // A dataset with `embeddings`, `full_text_search` and `vectors` enabled nests a
+        // `VectorScanTableProvider` under the `IndexedTableProvider` (the FTS index is
+        // added to the same provider the vector engine created).
+        // `FullTextConnector::with_indexed_stream` hands `get_underlying()` to
+        // `EmbeddingConnector::changes_stream`, which downcasts to
+        // `VectorScanTableProvider` to reach the raw source; if the metadata wrap hides
+        // it there, `refresh_mode: changes` fails with "a changes stream is required".
+        let indexed = Arc::new(IndexedTableProvider::with_indexes(
+            vector_scan_over_memtable(),
+            vec![],
+        )) as Arc<dyn TableProvider>;
+
+        let (table_metadata, columns) = spicepod_metadata_fixture();
+        let wrapped = table_provider_with_spicepod_metadata(indexed, &table_metadata, &columns);
+
+        let found_indexed = wrapped
+            .downcast_ref::<IndexedTableProvider>()
+            .expect("IndexedTableProvider must remain discoverable for the index analyzer");
+
+        let underlying = found_indexed.get_underlying();
+        let vector_scan = underlying
+            .downcast_ref::<search::index::VectorScanTableProvider>()
+            .expect("VectorScanTableProvider under an IndexedTableProvider must stay discoverable");
+
+        // Enrichment lands below the vector scan, on the raw source provider, so the
+        // source-facing bootstrap schema carries no synthetic embedding columns.
+        assert!(
+            vector_scan
+                .table_provider
+                .downcast_ref::<MetadataEnrichedTableProvider>()
+                .is_some(),
+            "metadata enrichment should be pushed onto the vector scan's source provider"
         );
     }
 
