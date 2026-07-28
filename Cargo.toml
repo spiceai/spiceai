@@ -241,7 +241,7 @@ datafusion-proto-common = "54.1.0"
 datafusion-pruning = "54.1.0"
 datafusion-spark = "54.1.0"
 datafusion-substrait = "54.1.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "b298f4e8a37a4ec76a8f7e96a391662279dd8760" } # spiceai-54 + duckdb 1.5.5 (branch: viktor/spiceai-54-duckdb-1.5.5)
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "98238d550d579c3522b0e86db081882367f8a376" } # spiceai-54 (includes duckdb 1.5.5, PR #35)
 delta_kernel = { version = "0.23.0", features = [
     "default-engine-rustls",
     "arrow-58",
