@@ -121,10 +121,13 @@ version = "2.2.0-unstable"
 # Test-context exemptions (allow-expect-in-tests, thresholds) live in `clippy.toml`.
 [workspace.lints.rust]
 # `tokio_unstable` is enabled via `RUSTFLAGS="--cfg tokio_unstable"` to expose the
-# per-worker tokio RuntimeMetrics (busy/park/steal). Declare it so the otherwise-unknown
-# cfg name doesn't trip the `unexpected_cfgs` lint on builds without the flag. Declared
-# workspace-wide (via each crate's `lints.workspace = true`) rather than per-crate.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
+# per-worker tokio RuntimeMetrics (busy/park/steal). `cayenne_loom` is enabled the
+# same way (`RUSTFLAGS="--cfg cayenne_loom"`) to swap std atomics for loom's
+# model-checked ones in cayenne's `StructuralVersion` seqlock model tests. Declare
+# both so the otherwise-unknown cfg names don't trip the `unexpected_cfgs` lint on
+# builds without the flag. Declared workspace-wide (via each crate's
+# `lints.workspace = true`) rather than per-crate.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)', 'cfg(cayenne_loom)'] }
 
 [workspace.lints.clippy]
 # Deny the pedantic group with a lower priority so the specific opt-outs below win.
@@ -278,6 +281,10 @@ itertools = "0.14"
 linkme = "0.3.35"
 log = "0.4.22"
 logos = "0.16.1"
+# Model-checked concurrency primitives for cayenne's `StructuralVersion` seqlock
+# tests; compiled only under `RUSTFLAGS="--cfg cayenne_loom"` (a cfg-gated
+# dev-dependency), so it never enters normal builds.
+loom = "0.7"
 mailparse = "0.16.1"
 moka = { version = "0.12", features = ["future"] }
 mongodb = { version = "3.5.2", features = ["openssl-tls"] }

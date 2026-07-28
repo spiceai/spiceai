@@ -3604,6 +3604,7 @@ dependencies = [
  "im",
  "insta",
  "libc",
+ "loom",
  "object_store 0.13.2",
  "parking_lot",
  "paste",
