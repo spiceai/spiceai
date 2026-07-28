@@ -455,6 +455,9 @@ impl Default for DuckDBAccelerator {
     }
 }
 
+const DUCKDB_ACCELERATOR_DOCS: &str =
+    "https://spiceai.org/docs/components/data-accelerators/duckdb";
+
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("file_watcher"),
     ParameterSpec::component("file"),
@@ -463,8 +466,12 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("preserve_insertion_order"),
     ParameterSpec::component("index_scan_percentage"),
     ParameterSpec::component("index_scan_max_count"),
-    ParameterSpec::component("checkpoint_on_write")
-        .description("Run a DuckDB CHECKPOINT after each overwrite refresh completes"),
+    ParameterSpec::runtime("on_full_refresh").description(
+        "Behavior after a full refresh overwrite: 'reuse_file' (default) leaves the \
+        database file as-is; 'checkpoint_file' checkpoints the database after the \
+        refresh commit, returning dropped table generations to the free list to bound \
+        file growth.",
+    ),
     ParameterSpec::runtime("connection_pool_size").description(
         "The maximum number of client connections created in the duckdb connection pool.",
     ),
@@ -618,6 +625,42 @@ impl DataAccelerator for DuckDBAccelerator {
                 "recompute_statistics_on_write".to_string(),
                 recompute_statistics_on_write,
             );
+        }
+
+        let dataset_display_name =
+            source.map_or_else(|| cmd.name.to_string(), |src| src.name().to_string());
+        match cmd.options.remove("on_full_refresh").as_deref() {
+            None | Some("reuse_file") => {}
+            Some("checkpoint_file") => {
+                let is_file_mode = source.map_or_else(
+                    // Without an `AccelerationSource` the mode is only available
+                    // as the raw option string that `Mode`'s `Display` wrote.
+                    || {
+                        cmd.options.get("mode").is_some_and(|mode| {
+                            matches!(mode.as_str(), "file" | "file_create" | "file_update")
+                        })
+                    },
+                    AccelerationSource::is_file_accelerated,
+                );
+                ensure!(
+                    is_file_mode,
+                    super::InvalidConfigurationSnafu {
+                        msg: format!(
+                            "Failed to register dataset {dataset_display_name} (duckdb accelerator): 'on_full_refresh: checkpoint_file' requires file-mode acceleration. Set 'mode: file' or remove 'on_full_refresh'. See: {DUCKDB_ACCELERATOR_DOCS}"
+                        ),
+                    }
+                );
+                // Translate to the engine write setting that checkpoints the
+                // database after Overwrite loads commit.
+                cmd.options
+                    .insert("checkpoint_on_write".to_string(), "enabled".to_string());
+            }
+            Some(other) => super::InvalidConfigurationSnafu {
+                msg: format!(
+                    "Failed to register dataset {dataset_display_name} (duckdb accelerator): Invalid 'on_full_refresh' value '{other}'. Expected 'reuse_file' or 'checkpoint_file'. See: {DUCKDB_ACCELERATOR_DOCS}"
+                ),
+            }
+            .fail()?,
         }
 
         let is_changes_refresh = source
@@ -1748,7 +1791,6 @@ mod tests {
         array::{Int64Array, RecordBatch, StringArray, TimestampSecondArray, UInt64Array},
         datatypes::{DataType, Field, Schema},
     };
-    use datafusion::catalog::TableProviderFactory;
     use datafusion::{
         common::{Constraints, TableReference, ToDFSchema},
         execution::context::SessionContext,
@@ -1832,40 +1874,91 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn duckdb_checkpoint_on_write_param_reaches_write_settings() {
-        let mut options = HashMap::new();
-        options.insert("checkpoint_on_write".to_string(), "enabled".to_string());
-        let external_table = external_table_with_options(options);
-
-        let factory = super::create_factory();
-        let ctx = SessionContext::new();
-        let provider = factory
-            .create(&ctx.state(), &external_table)
-            .await
-            .expect("to create table provider");
-
-        let writer = provider
+    async fn create_provider_write_settings(
+        options: HashMap<String, String>,
+    ) -> Result<
+        datafusion_table_providers::duckdb::write_settings::DuckDBWriteSettings,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        let accelerator = DuckDBAccelerator::new();
+        let cmd = external_table_with_options(options);
+        let provider = accelerator
+            .create_external_table(cmd, None, vec![], None)
+            .await?;
+        let poly = provider
+            .downcast_ref::<data_components::poly::PolyTableProvider>()
+            .expect("PolyTableProvider");
+        let writer = poly.writer();
+        let writer = writer
             .downcast_ref::<DuckDBTableWriter>()
-            .expect("factory should return a DuckDBTableWriter");
-        assert!(writer.write_settings().checkpoint_on_write);
+            .expect("DuckDBTableWriter");
+        Ok(writer.write_settings().clone())
     }
 
     #[tokio::test]
-    async fn duckdb_checkpoint_on_write_disabled_by_default() {
-        let external_table = external_table_with_options(HashMap::new());
+    async fn duckdb_on_full_refresh_checkpoint_file_enables_checkpoint_on_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir
+            .path()
+            .join("checkpoint_param.db")
+            .to_string_lossy()
+            .to_string();
+        let mut options = HashMap::new();
+        options.insert("mode".to_string(), "file".to_string());
+        options.insert("open".to_string(), db);
+        options.insert("on_full_refresh".to_string(), "checkpoint_file".to_string());
 
-        let factory = super::create_factory();
-        let ctx = SessionContext::new();
-        let provider = factory
-            .create(&ctx.state(), &external_table)
+        let settings = create_provider_write_settings(options)
             .await
-            .expect("to create table provider");
+            .expect("provider should be created");
+        assert!(settings.checkpoint_on_write);
+    }
 
-        let writer = provider
-            .downcast_ref::<DuckDBTableWriter>()
-            .expect("factory should return a DuckDBTableWriter");
-        assert!(!writer.write_settings().checkpoint_on_write);
+    #[tokio::test]
+    async fn duckdb_on_full_refresh_defaults_to_reuse_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir
+            .path()
+            .join("checkpoint_param_default.db")
+            .to_string_lossy()
+            .to_string();
+        let mut options = HashMap::new();
+        options.insert("mode".to_string(), "file".to_string());
+        options.insert("open".to_string(), db);
+
+        let settings = create_provider_write_settings(options)
+            .await
+            .expect("provider should be created");
+        assert!(!settings.checkpoint_on_write);
+    }
+
+    #[tokio::test]
+    async fn duckdb_on_full_refresh_checkpoint_file_rejected_for_memory_mode() {
+        let mut options = HashMap::new();
+        options.insert("on_full_refresh".to_string(), "checkpoint_file".to_string());
+
+        let err = create_provider_write_settings(options)
+            .await
+            .expect_err("checkpoint_file should require file mode");
+        assert!(
+            err.to_string().contains("requires file-mode acceleration"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn duckdb_on_full_refresh_invalid_value_rejected() {
+        let mut options = HashMap::new();
+        options.insert("mode".to_string(), "file".to_string());
+        options.insert("on_full_refresh".to_string(), "sometimes".to_string());
+
+        let err = create_provider_write_settings(options)
+            .await
+            .expect_err("invalid on_full_refresh value should be rejected");
+        assert!(
+            err.to_string().contains("Invalid 'on_full_refresh' value"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
