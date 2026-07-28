@@ -471,6 +471,11 @@ impl CloudConnect for GatewayServer {
                             captured.lock().await.audits.push(event);
                         }
                     }
+                    // A standalone runtime announces no per-connection
+                    // encryption key, so this never arrives. The arm is spelled
+                    // out rather than wildcarded so a new client message still
+                    // has to be accounted for here.
+                    Some(proto::client_message::Body::SecretsKey(_)) => {}
                     None => break,
                 }
             }
@@ -1071,6 +1076,9 @@ async fn run_query_read_only_caps_and_audit() {
                 command_id: "cmd-select".to_string(),
                 sql: "SELECT id, label FROM t".to_string(),
                 max_rows: 10,
+                // A standalone instance queries itself, so the
+                // workload-addressing fields are empty.
+                ..Default::default()
             },
         )));
 
@@ -1138,6 +1146,7 @@ async fn run_query_read_only_caps_and_audit() {
                 command_id: "cmd-write".to_string(),
                 sql: "DELETE FROM secrets WHERE id = 1".to_string(),
                 max_rows: 0,
+                ..Default::default()
             },
         )));
 

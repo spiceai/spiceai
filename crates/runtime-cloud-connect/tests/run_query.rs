@@ -292,6 +292,9 @@ async fn run_query_returns_documented_envelope_and_audit() {
             command_id: "cmd-q-1".to_string(),
             sql: "SELECT id, name FROM t".to_string(),
             max_rows: 100,
+            // A standalone instance queries itself, so the workload-addressing
+            // fields are empty.
+            ..Default::default()
         })),
     };
     let mock = MockServer::new(vec![run_query_cmd]);
@@ -392,6 +395,7 @@ async fn run_query_propagates_truncation_flag() {
             command_id: "cmd-trunc".to_string(),
             sql: "SELECT id FROM big".to_string(),
             max_rows: 2,
+            ..Default::default()
         })),
     };
     let mock = MockServer::new(vec![cmd]);
@@ -462,6 +466,7 @@ async fn run_query_failure_is_safe_and_audited() {
             command_id: "cmd-err".to_string(),
             sql: "SELECT * FROM does_not_exist".to_string(),
             max_rows: 100,
+            ..Default::default()
         })),
     };
     let mock = MockServer::new(vec![cmd]);

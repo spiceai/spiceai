@@ -821,6 +821,23 @@ impl ClientDriver {
             proto::control_message::Body::Pause(cmd) => {
                 send_unsupported(tx, &cmd.command_id, "Pause").await;
             }
+            // Sealed secrets are delivered to an instance that enrolled an
+            // encryption key and announced a per-connection one; a standalone
+            // runtime does neither yet, so it has no key to open either seal
+            // with. Reporting that is the fail-closed answer — the alternative
+            // is a dispatch the control plane never hears back about.
+            proto::control_message::Body::ApplySecrets(cmd) => {
+                send_unsupported(tx, &cmd.command_id, "ApplySecrets").await;
+            }
+            proto::control_message::Body::DeleteSecrets(cmd) => {
+                send_unsupported(tx, &cmd.command_id, "DeleteSecrets").await;
+            }
+            proto::control_message::Body::QueryMetrics(cmd) => {
+                send_unsupported(tx, &cmd.command_id, "QueryMetrics").await;
+            }
+            proto::control_message::Body::ProxyRuntimeRequest(cmd) => {
+                send_unsupported(tx, &cmd.command_id, "ProxyRuntimeRequest").await;
+            }
             proto::control_message::Body::GetPodLogs(cmd) => {
                 match self.runtime.get_pod_logs(cmd.tail_lines).await {
                     // The log text rides verbatim in payload_json (a raw
