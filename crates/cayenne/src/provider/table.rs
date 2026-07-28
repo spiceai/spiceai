@@ -6875,8 +6875,14 @@ impl CayenneTableProvider {
         if self.pk_warm_probe_done.swap(true, Ordering::AcqRel) {
             return;
         }
-        if self.pk_keyset_cache.lock().is_some() || self.sharded_pk_keyset_cache.lock().is_some()
-        {
+        // Two separate statements: `a.lock().is_some() || b.lock().is_some()`
+        // keeps the first guard alive across the second acquisition (`||`
+        // temporaries live for the whole expression), inverting the
+        // sharded-then-single order `record_pk_keys_with_location` takes.
+        if self.pk_keyset_cache.lock().is_some() {
+            return;
+        }
+        if self.sharded_pk_keyset_cache.lock().is_some() {
             return;
         }
         if !self.mem_tier.is_empty() || self.inlined_row_count.load(Ordering::Acquire) != 0 {
@@ -6991,17 +6997,39 @@ impl CayenneTableProvider {
         }
 
         // Mirror the keys into the sharded (N>1) cache FIRST, unconditionally:
-        // the per-shard Phase-6 record covers only mem-tier appends, so rows
-        // committed through the inline/file/staging paths would otherwise
-        // exist solely in the single keyset below — and a long-lived sharded
-        // exact keyset would false-negate them into duplicate upserts
-        // (observed as SF1000 row-count over-counts). Runs before the single
-        // keyset's checked-out early-return so a concurrent checkout cannot
-        // drop the sharded entries; the two locks are never held together.
+        // the per-shard record in `append_to_shard` covers only mem-tier
+        // appends, so rows committed through the inline/file/staging paths
+        // would otherwise exist solely in the single keyset below — and a
+        // long-lived sharded exact keyset would false-negate them into
+        // duplicate upserts (observed as SF1000 row-count over-counts). Runs
+        // before the single keyset's checked-out early-return so a concurrent
+        // checkout cannot drop the sharded entries; the two locks are never
+        // held together.
         {
             let mut sharded = self.sharded_pk_keyset_cache.lock();
+            let mut drop_index = false;
             if let Some(index) = sharded.as_mut() {
                 index.record_keys(keys, location);
+                // Budget enforcement for the maintained index — without it a
+                // large initial load grows the exact keysets unbounded. An
+                // upsert table degrades to per-shard blooms (a false positive
+                // only yields a harmless redundant delete); `DoNothing` needs
+                // exactness, so over budget it drops the cache and the next
+                // validation pays the lazy bounded rebuild instead.
+                let max_bytes = self.context.pk_keyset_cache_max_bytes();
+                if index.approx_bytes() > max_bytes {
+                    if self.upsert_bloom_eligible() {
+                        let per_shard = max_bytes / index.shard_count().max(1);
+                        index.degrade_to_blooms(per_shard);
+                    } else {
+                        drop_index = true;
+                    }
+                }
+            }
+            if drop_index {
+                *sharded = None;
+            }
+            if let Some(index) = sharded.as_ref() {
                 self.table_memory.set_keyset_bytes(index.approx_bytes());
             }
         }
