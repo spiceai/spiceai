@@ -23635,6 +23635,40 @@ impl CayenneTableProvider {
         Ok(plans)
     }
 
+    /// Unions `plans` into a single `ExecutionPlan`, skipping any branch that is a bare
+    /// `EmptyExec` — it can never produce a row (e.g. `create_snapshot_scan_plan_with_config`
+    /// hands one back, unwrapped, when the current snapshot matches zero files right after
+    /// compaction rotates its pointer). Unioning it in anyway only widens the plan for no
+    /// benefit. Returns the sole survivor directly when only one non-empty branch remains
+    /// (`UnionExec::try_new` requires at least two inputs), or the first `EmptyExec` if every
+    /// branch was empty.
+    ///
+    /// `plans` must be non-empty; every call site here passes at least one real branch.
+    fn union_skipping_empty(
+        plans: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        let mut non_empty = Vec::with_capacity(plans.len());
+        let mut first_empty: Option<Arc<dyn ExecutionPlan>> = None;
+        for plan in plans {
+            if plan.as_any().is::<EmptyExec>() {
+                if first_empty.is_none() {
+                    first_empty = Some(Arc::clone(&plan));
+                }
+            } else {
+                non_empty.push(plan);
+            }
+        }
+        match non_empty.len() {
+            0 => first_empty.ok_or_else(|| {
+                datafusion_common::DataFusionError::Internal(
+                    "union_skipping_empty called with no plans".to_string(),
+                )
+            }),
+            1 => Ok(non_empty.remove(0)),
+            _ => Ok(Arc::new(UnionExec::try_new(non_empty)?)),
+        }
+    }
+
     fn snapshot_scan_schema(file_schema: &SchemaRef, options: &ListingOptions) -> SchemaRef {
         // `SchemaBuilder::from(&Schema)` clones the metadata HashMap, but we then
         // overwrite that metadata via `.with_metadata(...)` below. Building from
@@ -25825,26 +25859,16 @@ impl TableProvider for CayenneTableProvider {
                 &deletion_snapshot,
             )?;
 
-            // The current snapshot can itself be a bare `EmptyExec` (unwrapped —
+            // `filtered_main_plan` can itself be a bare `EmptyExec` (unwrapped —
             // `create_snapshot_scan_plan_with_config` returns it directly when the
-            // snapshot matches zero files, skipping the usual `CayenneAccelerationExec`
-            // wrap) e.g. right after compaction rotates the current snapshot pointer
-            // while the live data still sits in a protected snapshot. `apply_deletion_filter`'s
-            // no-op fast path passes that bare `EmptyExec` straight through, unlike
-            // `apply_partial_deletion_filter`'s protected-snapshot branches, which always
-            // wrap. Contribute nothing rather than unioning in a branch that can never
-            // produce a row — it only widens the plan for no benefit.
-            let mut all_plans = if filtered_main_plan.as_any().is::<EmptyExec>() {
-                protected_snapshot_plans
-            } else {
-                let mut plans = vec![filtered_main_plan];
-                plans.extend(protected_snapshot_plans);
-                plans
-            };
-            match all_plans.len() {
-                1 => all_plans.remove(0),
-                _ => UnionExec::try_new(all_plans)?,
-            }
+            // current snapshot matches zero files, skipping the usual
+            // `CayenneAccelerationExec` wrap) e.g. right after compaction rotates the
+            // current snapshot pointer while the live data still sits in a protected
+            // snapshot. `Self::union_skipping_empty` drops that branch instead of
+            // needlessly unioning it in alongside the real protected-snapshot data.
+            let mut all_plans = vec![filtered_main_plan];
+            all_plans.extend(protected_snapshot_plans);
+            Self::union_skipping_empty(all_plans)?
         };
 
         // Union the cold object-store tier if present. Added as its own union
@@ -25852,22 +25876,24 @@ impl TableProvider for CayenneTableProvider {
         // protected-snapshot arms above stay byte-identical. The cold branch is a
         // Vortex `DataSourceExec`, so FilterPushdown still pushes the scan
         // predicate into it and the redundant top FilterExec is still removed.
+        // `union_skipping_empty` drops `plan` here too if the branch above
+        // collapsed to a bare `EmptyExec` (e.g. no protected snapshots either).
         let plan: Arc<dyn ExecutionPlan> = if let Some(cold_exec) = cold_plan {
-            UnionExec::try_new(vec![plan, cold_exec])?
+            Self::union_skipping_empty(vec![plan, cold_exec])?
         } else {
             plan
         };
 
         // Union inlined data if present
         let plan: Arc<dyn ExecutionPlan> = if let Some(inline_exec) = inlined_plan {
-            UnionExec::try_new(vec![plan, inline_exec])?
+            Self::union_skipping_empty(vec![plan, inline_exec])?
         } else {
             plan
         };
 
         // Union the in-memory CDC tier if present (memory mode).
         let plan: Arc<dyn ExecutionPlan> = if let Some(mem_exec) = mem_plan {
-            UnionExec::try_new(vec![plan, mem_exec])?
+            Self::union_skipping_empty(vec![plan, mem_exec])?
         } else {
             plan
         };
