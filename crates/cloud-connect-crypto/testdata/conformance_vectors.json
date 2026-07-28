@@ -1,0 +1,430 @@
+{
+  "version": 1,
+  "generated_by": "cloud-connect-crypto (spiceai/spiceai). Regenerate with `UPDATE_CLOUD_CONNECT_VECTORS=1 cargo test -p cloud-connect-crypto`; do not hand-edit.",
+  "suite": {
+    "hpke_info": "spice-cloud-connect/secrets/v1",
+    "hpke_info_hex": "73706963652d636c6f75642d636f6e6e6563742f736563726574732f7631",
+    "kem_id": 32,
+    "kdf_id": 1,
+    "aead_id": 3,
+    "max_secret_plaintext_size": 1048576,
+    "max_sealed_secrets_size": 1049600
+  },
+  "canonicalization": {
+    "trimmed": [
+      "namespace",
+      "secret_name"
+    ],
+    "verbatim": [
+      "external_id",
+      "key_id",
+      "command_id"
+    ],
+    "trim": "Remove leading and trailing characters with the Unicode White_Space property (Rust `str::trim`). This is NOT JavaScript's `String.prototype.trim`, which also removes U+FEFF; see the `bom_is_not_whitespace` vector.",
+    "separator_hex": "00",
+    "notes": [
+      "Both AAD forms are built from the same canonical components; an implementation must not canonicalise per layer.",
+      "The canonical namespace and secret_name are what goes on the wire, because the seal is bound to them.",
+      "Nothing is Unicode-normalised or case-folded; NFC and NFD spellings of the same text are different components.",
+      "Adding a component to either form means deciding its rule first and implementing it in every implementation in one change."
+    ]
+  },
+  "key_id": [
+    {
+      "name": "all_zero_key",
+      "public_key_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "key_id": "66687aadf862bd77"
+    },
+    {
+      "name": "derived_key",
+      "public_key_hex": "e8fe239ee733bfe54357fd77f8af14092022b69419d294e53b1d8576a650370a",
+      "key_id": "4fbb141f7e68958b"
+    },
+    {
+      "name": "empty_input",
+      "public_key_hex": "",
+      "key_id": "e3b0c44298fc1c14"
+    }
+  ],
+  "aad": [
+    {
+      "name": "plain",
+      "note": "Nothing to canonicalise. The baseline both forms are read against.",
+      "input": {
+        "external_id": "cell_x",
+        "namespace": "publicorg-7",
+        "secret_name": "spicepod-secrets",
+        "key_id": "4fbb141f7e68958b",
+        "command_id": "ctrl-1"
+      },
+      "canonical": {
+        "external_id": "cell_x",
+        "namespace": "publicorg-7",
+        "secret_name": "spicepod-secrets",
+        "key_id": "4fbb141f7e68958b",
+        "command_id": "ctrl-1"
+      },
+      "inner_aad_hex": "63656c6c5f78007075626c69636f72672d37007370696365706f642d736563726574730034666262313431663765363839353862",
+      "outer_aad_hex": "63656c6c5f78007075626c69636f72672d37007370696365706f642d736563726574730034666262313431663765363839353862006374726c2d31"
+    },
+    {
+      "name": "namespace_padded",
+      "note": "Leading and trailing ASCII whitespace on namespace is removed.",
+      "input": {
+        "external_id": "cell_x",
+        "namespace": "  publicorg-7\n",
+        "secret_name": "spicepod-secrets",
+        "key_id": "4fbb141f7e68958b",
+        "command_id": "ctrl-1"
+      },
+      "canonical": {
+        "external_id": "cell_x",
+        "namespace": "publicorg-7",
+        "secret_name": "spicepod-secrets",
+        "key_id": "4fbb141f7e68958b",
+        "command_id": "ctrl-1"
+      },
+      "inner_aad_hex": "63656c6c5f78007075626c69636f72672d37007370696365706f642d736563726574730034666262313431663765363839353862",
+      "outer_aad_hex": "63656c6c5f78007075626c69636f72672d37007370696365706f642d736563726574730034666262313431663765363839353862006374726c2d31"
+    },
+    {
+      "name": "secret_name_padded",
+      "note": "Leading and trailing ASCII whitespace on secret_name is removed.",
+      "input": {
+        "external_id": "cell_x",
+        "namespace": "publicorg-7",
+        "secret_name": "\tspicepod-secrets ",
+        "key_id": "4fbb141f7e68958b",
+        "command_id": "ctrl-1"
+      },
+      "canonical": {
+        "external_id": "cell_x",
+        "namespace": "publicorg-7",
+        "secret_name": "spicepod-secrets",
+        "key_id": "4fbb141f7e68958b",
+        "command_id": "ctrl-1"
+      },
+      "inner_aad_hex": "63656c6c5f78007075626c69636f72672d37007370696365706f642d736563726574730034666262313431663765363839353862",
+      "outer_aad_hex": "63656c6c5f78007075626c69636f72672d37007370696365706f642d736563726574730034666262313431663765363839353862006374726c2d31"
+    },
+    {
+      "name": "verbatim_components_keep_their_padding",
+      "note": "external_id, key_id and command_id are NOT trimmed. An implementation that trims them seals over bytes nobody else produces.",
+      "input": {
+        "external_id": "  cell_x ",
+        "namespace": "publicorg-7",
+        "secret_name": "spicepod-secrets",
+        "key_id": " padded-key-id ",
+        "command_id": " ctrl-1\n"
+      },
+      "canonical": {
+        "external_id": "  cell_x ",
+        "namespace": "publicorg-7",
+        "secret_name": "spicepod-secrets",
+        "key_id": " padded-key-id ",
+        "command_id": " ctrl-1\n"
+      },
+      "inner_aad_hex": "202063656c6c5f7820007075626c69636f72672d37007370696365706f642d7365637265747300207061646465642d6b65792d696420",
+      "outer_aad_hex": "202063656c6c5f7820007075626c69636f72672d37007370696365706f642d7365637265747300207061646465642d6b65792d69642000206374726c2d310a"
+    },
+    {
+      "name": "interior_whitespace_survives",
+      "note": "Trimming touches the ends only; a space inside a name is part of it.",
+      "input": {
+        "external_id": "cell x",
+        "namespace": " my ns ",
+        "secret_name": " my name ",
+        "key_id": "4fbb141f7e68958b",
+        "command_id": "ctrl 1"
+      },
+      "canonical": {
+        "external_id": "cell x",
+        "namespace": "my ns",
+        "secret_name": "my name",
+        "key_id": "4fbb141f7e68958b",
+        "command_id": "ctrl 1"
+      },
+      "inner_aad_hex": "63656c6c2078006d79206e73006d79206e616d650034666262313431663765363839353862",
+      "outer_aad_hex": "63656c6c2078006d79206e73006d79206e616d650034666262313431663765363839353862006374726c2031"
+    },
+    {
+      "name": "empty_command_id",
+      "note": "The one case where a naive join would make the outer form collide with the inner one. The outer form must be exactly one byte longer.",
+      "input": {
+        "external_id": "cell_x",
+        "namespace": "publicorg-7",
+        "secret_name": "spicepod-secrets",
+        "key_id": "4fbb141f7e68958b",
+        "command_id": ""
+      },
+      "canonical": {
+        "external_id": "cell_x",
+        "namespace": "publicorg-7",
+        "secret_name": "spicepod-secrets",
+        "key_id": "4fbb141f7e68958b",
+        "command_id": ""
+      },
+      "inner_aad_hex": "63656c6c5f78007075626c69636f72672d37007370696365706f642d736563726574730034666262313431663765363839353862",
+      "outer_aad_hex": "63656c6c5f78007075626c69636f72672d37007370696365706f642d73656372657473003466626231343166376536383935386200"
+    },
+    {
+      "name": "empty_external_id",
+      "note": "external_id is verbatim and may be empty; the join still emits its separator.",
+      "input": {
+        "external_id": "",
+        "namespace": "publicorg-7",
+        "secret_name": "spicepod-secrets",
+        "key_id": "4fbb141f7e68958b",
+        "command_id": "ctrl-1"
+      },
+      "canonical": {
+        "external_id": "",
+        "namespace": "publicorg-7",
+        "secret_name": "spicepod-secrets",
+        "key_id": "4fbb141f7e68958b",
+        "command_id": "ctrl-1"
+      },
+      "inner_aad_hex": "007075626c69636f72672d37007370696365706f642d736563726574730034666262313431663765363839353862",
+      "outer_aad_hex": "007075626c69636f72672d37007370696365706f642d736563726574730034666262313431663765363839353862006374726c2d31"
+    },
+    {
+      "name": "nbsp_is_whitespace",
+      "note": "U+00A0 has the Unicode White_Space property, so it is trimmed.",
+      "input": {
+        "external_id": "cell_x",
+        "namespace": " publicorg-7 ",
+        "secret_name": "spicepod-secrets",
+        "key_id": "4fbb141f7e68958b",
+        "command_id": "ctrl-1"
+      },
+      "canonical": {
+        "external_id": "cell_x",
+        "namespace": "publicorg-7",
+        "secret_name": "spicepod-secrets",
+        "key_id": "4fbb141f7e68958b",
+        "command_id": "ctrl-1"
+      },
+      "inner_aad_hex": "63656c6c5f78007075626c69636f72672d37007370696365706f642d736563726574730034666262313431663765363839353862",
+      "outer_aad_hex": "63656c6c5f78007075626c69636f72672d37007370696365706f642d736563726574730034666262313431663765363839353862006374726c2d31"
+    },
+    {
+      "name": "ideographic_space_is_whitespace",
+      "note": "U+3000 has the Unicode White_Space property, so it is trimmed.",
+      "input": {
+        "external_id": "cell_x",
+        "namespace": "　publicorg-7　",
+        "secret_name": "spicepod-secrets",
+        "key_id": "4fbb141f7e68958b",
+        "command_id": "ctrl-1"
+      },
+      "canonical": {
+        "external_id": "cell_x",
+        "namespace": "publicorg-7",
+        "secret_name": "spicepod-secrets",
+        "key_id": "4fbb141f7e68958b",
+        "command_id": "ctrl-1"
+      },
+      "inner_aad_hex": "63656c6c5f78007075626c69636f72672d37007370696365706f642d736563726574730034666262313431663765363839353862",
+      "outer_aad_hex": "63656c6c5f78007075626c69636f72672d37007370696365706f642d736563726574730034666262313431663765363839353862006374726c2d31"
+    },
+    {
+      "name": "bom_is_not_whitespace",
+      "note": "U+FEFF does NOT have the White_Space property and must survive. JavaScript's String.prototype.trim removes it, so an implementation that reaches for its own trim diverges here and nowhere else.",
+      "input": {
+        "external_id": "cell_x",
+        "namespace": "﻿publicorg-7﻿",
+        "secret_name": "spicepod-secrets",
+        "key_id": "4fbb141f7e68958b",
+        "command_id": "ctrl-1"
+      },
+      "canonical": {
+        "external_id": "cell_x",
+        "namespace": "﻿publicorg-7﻿",
+        "secret_name": "spicepod-secrets",
+        "key_id": "4fbb141f7e68958b",
+        "command_id": "ctrl-1"
+      },
+      "inner_aad_hex": "63656c6c5f7800efbbbf7075626c69636f72672d37efbbbf007370696365706f642d736563726574730034666262313431663765363839353862",
+      "outer_aad_hex": "63656c6c5f7800efbbbf7075626c69636f72672d37efbbbf007370696365706f642d736563726574730034666262313431663765363839353862006374726c2d31"
+    },
+    {
+      "name": "unicode_nfc",
+      "note": "Paired with unicode_nfd: the composed spelling.",
+      "input": {
+        "external_id": "cell_x",
+        "namespace": "café-1",
+        "secret_name": "spicepod-secrets",
+        "key_id": "4fbb141f7e68958b",
+        "command_id": "ctrl-1"
+      },
+      "canonical": {
+        "external_id": "cell_x",
+        "namespace": "café-1",
+        "secret_name": "spicepod-secrets",
+        "key_id": "4fbb141f7e68958b",
+        "command_id": "ctrl-1"
+      },
+      "inner_aad_hex": "63656c6c5f7800636166c3a92d31007370696365706f642d736563726574730034666262313431663765363839353862",
+      "outer_aad_hex": "63656c6c5f7800636166c3a92d31007370696365706f642d736563726574730034666262313431663765363839353862006374726c2d31"
+    },
+    {
+      "name": "unicode_nfd",
+      "note": "Paired with unicode_nfc: the decomposed spelling of the same text. The two AADs must differ — no implementation may normalise.",
+      "input": {
+        "external_id": "cell_x",
+        "namespace": "café-1",
+        "secret_name": "spicepod-secrets",
+        "key_id": "4fbb141f7e68958b",
+        "command_id": "ctrl-1"
+      },
+      "canonical": {
+        "external_id": "cell_x",
+        "namespace": "café-1",
+        "secret_name": "spicepod-secrets",
+        "key_id": "4fbb141f7e68958b",
+        "command_id": "ctrl-1"
+      },
+      "inner_aad_hex": "63656c6c5f780063616665cc812d31007370696365706f642d736563726574730034666262313431663765363839353862",
+      "outer_aad_hex": "63656c6c5f780063616665cc812d31007370696365706f642d736563726574730034666262313431663765363839353862006374726c2d31"
+    },
+    {
+      "name": "non_ascii_verbatim_components",
+      "note": "Components are joined as UTF-8 bytes, not as code points.",
+      "input": {
+        "external_id": "セル_x",
+        "namespace": "publicorg-7",
+        "secret_name": "spicepod-secrets",
+        "key_id": "4fbb141f7e68958b",
+        "command_id": "ctrl-🔒"
+      },
+      "canonical": {
+        "external_id": "セル_x",
+        "namespace": "publicorg-7",
+        "secret_name": "spicepod-secrets",
+        "key_id": "4fbb141f7e68958b",
+        "command_id": "ctrl-🔒"
+      },
+      "inner_aad_hex": "e382bbe383ab5f78007075626c69636f72672d37007370696365706f642d736563726574730034666262313431663765363839353862",
+      "outer_aad_hex": "e382bbe383ab5f78007075626c69636f72672d37007370696365706f642d736563726574730034666262313431663765363839353862006374726c2df09f9492"
+    }
+  ],
+  "rejected": [
+    {
+      "name": "empty_namespace",
+      "note": "Nothing addresses a Kubernetes object, so the payload could never be applied even if it opened.",
+      "input": {
+        "external_id": "cell_x",
+        "namespace": "",
+        "secret_name": "spicepod-secrets",
+        "key_id": "abc123",
+        "command_id": "ctrl-1"
+      },
+      "error": "empty_component",
+      "component": "namespace"
+    },
+    {
+      "name": "whitespace_only_namespace",
+      "note": "Empty after trimming is empty.",
+      "input": {
+        "external_id": "cell_x",
+        "namespace": "   \t\n",
+        "secret_name": "spicepod-secrets",
+        "key_id": "abc123",
+        "command_id": "ctrl-1"
+      },
+      "error": "empty_component",
+      "component": "namespace"
+    },
+    {
+      "name": "empty_secret_name",
+      "note": "As empty_namespace, on the other trimmed component.",
+      "input": {
+        "external_id": "cell_x",
+        "namespace": "publicorg-7",
+        "secret_name": "",
+        "key_id": "abc123",
+        "command_id": "ctrl-1"
+      },
+      "error": "empty_component",
+      "component": "secret_name"
+    },
+    {
+      "name": "whitespace_only_secret_name",
+      "note": "Empty after trimming is empty.",
+      "input": {
+        "external_id": "cell_x",
+        "namespace": "publicorg-7",
+        "secret_name": "   ",
+        "key_id": "abc123",
+        "command_id": "ctrl-1"
+      },
+      "error": "empty_component",
+      "component": "secret_name"
+    },
+    {
+      "name": "separator_in_external_id",
+      "note": "A component carrying the separator could forge a field boundary: external_id \"a\\0b\" joins to the same bytes as external_id \"a\" with namespace \"b\".",
+      "input": {
+        "external_id": "a\u0000b",
+        "namespace": "publicorg-7",
+        "secret_name": "spicepod-secrets",
+        "key_id": "abc123",
+        "command_id": "ctrl-1"
+      },
+      "error": "separator_in_component",
+      "component": "external_id"
+    },
+    {
+      "name": "separator_in_namespace",
+      "note": "As separator_in_external_id, on a trimmed component.",
+      "input": {
+        "external_id": "cell_x",
+        "namespace": "public\u0000org-7",
+        "secret_name": "spicepod-secrets",
+        "key_id": "abc123",
+        "command_id": "ctrl-1"
+      },
+      "error": "separator_in_component",
+      "component": "namespace"
+    },
+    {
+      "name": "separator_in_secret_name",
+      "note": "As separator_in_external_id, on the other trimmed component.",
+      "input": {
+        "external_id": "cell_x",
+        "namespace": "publicorg-7",
+        "secret_name": "spicepod\u0000secrets",
+        "key_id": "abc123",
+        "command_id": "ctrl-1"
+      },
+      "error": "separator_in_component",
+      "component": "secret_name"
+    },
+    {
+      "name": "separator_in_key_id",
+      "note": "As separator_in_external_id, on a verbatim component.",
+      "input": {
+        "external_id": "cell_x",
+        "namespace": "publicorg-7",
+        "secret_name": "spicepod-secrets",
+        "key_id": "abc\u0000123",
+        "command_id": "ctrl-1"
+      },
+      "error": "separator_in_component",
+      "component": "key_id"
+    },
+    {
+      "name": "separator_in_command_id",
+      "note": "Only the outer form carries command_id, so only it can be forged this way — the rejection still belongs to both.",
+      "input": {
+        "external_id": "cell_x",
+        "namespace": "publicorg-7",
+        "secret_name": "spicepod-secrets",
+        "key_id": "abc123",
+        "command_id": "ctrl\u0000-1"
+      },
+      "error": "separator_in_component",
+      "component": "command_id"
+    }
+  ]
+}

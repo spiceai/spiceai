@@ -16,6 +16,18 @@
 // runtime (standalone or cluster-managed) and the Spice Cloud control
 // plane. One service, two instance kinds disambiguated by
 // `Hello.kind`.
+//
+// THIS FILE IS THE AUTHORITATIVE COPY of the Cloud Connect wire contract.
+// The other implementations of the protocol keep their own copies rather
+// than generating from this one, so a change starts here and lands in
+// every copy in the same review — a field number or message shape that
+// moves on one side alone is a wire break that only shows up at runtime.
+//
+// The bytes each side derives but never sends — the HPKE suite, `key_id`,
+// and the additional authenticated data of the sealed-secret payloads —
+// are not expressible in proto. Those live in the `cloud-connect-crypto`
+// crate, which is the equivalent single source for them, and are shared
+// as code rather than copied.
 syntax = "proto3";
 package spice.cloud.v1;
 
@@ -41,14 +53,20 @@ message ClientMessage {
     Telemetry telemetry = 4;
     EventLog event = 5;
     AdoptAck adopt_ack = 6;
+    SecretsKey secrets_key = 7;
   }
 }
 
 message ControlMessage {
+  // 3 was `RunQuery run_query`, retired in favour of proxying the runtime's
+  // own HTTP API. Reserved so the number is never reused: a peer built against
+  // an older copy of this contract still sends field 3 as a RunQuery, and a
+  // different message reusing the number would be decoded as one.
+  reserved 3;
+
   oneof body {
     Ack ack = 1;
     GetRuntimeInfo get_runtime_info = 2;
-    RunQuery run_query = 3;
     Restart restart = 4;
     ApplySpicepod apply_spicepod = 10;
     UpgradeRuntime upgrade_runtime = 11;
@@ -59,7 +77,11 @@ message ControlMessage {
     GetStatus get_status = 22;
     Drain drain = 23;
     Pause pause = 24;
+    ApplySecrets apply_secrets = 25;
+    DeleteSecrets delete_secrets = 26;
+    QueryMetrics query_metrics = 27;
     GetPodLogs get_pod_logs = 28;
+    ProxyRuntimeRequest proxy_runtime_request = 29;
   }
 }
 
@@ -99,13 +121,13 @@ message CommandResult {
   string command_id = 1;
   bool success = 2;
   string error = 3;
-  // Small structured payloads (e.g. GetRuntimeInfo) and RunQuery metadata
-  // ({"row_count":N,"truncated":bool}). Tabular RunQuery data rides in
-  // result_arrow_ipc instead.
+  // Small structured payloads — a GetRuntimeInfo document, a proxied HTTP
+  // response envelope, a log tail. Verbatim text for the commands documented
+  // as returning it raw rather than JSON-encoded.
   string payload_json = 4;
-  // Arrow IPC stream bytes for tabular results (RunQuery). Empty for
-  // non-tabular commands. The cloud control plane decodes these natively;
-  // results are never JSON-encoded on the wire.
+  // Arrow IPC stream bytes for a command whose result is tabular. Empty for
+  // every command in this contract today; kept because a tabular result is
+  // decoded natively when one is added, rather than flattened to JSON.
   bytes result_arrow_ipc = 5;
 }
 
@@ -134,12 +156,6 @@ message AdoptAck {
 
 message GetRuntimeInfo {
   string command_id = 1;
-}
-
-message RunQuery {
-  string command_id = 1;
-  string sql = 2;
-  uint32 max_rows = 3;
 }
 
 message Restart {
@@ -202,6 +218,86 @@ message Pause {
   bool paused = 2;
 }
 
+// Sealed secrets delivery. A secret value is sealed TWICE with HPKE
+// (RFC 9180), so no component between the Spice Cloud control plane and the
+// receiving instance ever holds the plaintext:
+//
+//   INNER — the control plane seals SecretPayload to the instance's
+//           *enrolled* X25519 encryption key, whose public half the instance
+//           registers when it enrolls and rotates on every renewal. Neither
+//           the gateway nor anything else in the path can open it.
+//   OUTER — the gateway seals that inner envelope (SealedSecretPayload) to
+//           the instance's *per-connection* key, announced in SecretsKey and
+//           held in memory only. The gateway is sealing opaque bytes it
+//           cannot read, which keeps recorded ciphertext undecryptable even
+//           if the instance's persisted enrolled key is later compromised.
+//
+// Nesting: SecretPayload -> inner seal -> SealedSecretPayload -> outer seal ->
+// ApplySecrets.{enc,ciphertext}. The instance opens outer, then inner. There
+// is no plaintext delivery path: a session that announced no SecretsKey
+// cannot receive secrets, and a payload that fails to open at either layer is
+// rejected rather than applied.
+//
+// The bytes that are NOT on the wire — the HPKE suite, the info label, the
+// key_id derivation, and the additional authenticated data both sides derive
+// independently — are the other half of this contract, and proto cannot
+// express them. They live in the `cloud-connect-crypto` crate, which is the
+// single source for them; see that crate rather than reimplementing from
+// these comments.
+message SecretsKey {
+  string key_id = 1;     // see cloud-connect-crypto: derive_key_id
+  uint32 kem_id = 2;     // RFC 9180 registry id for the KEM
+  uint32 kdf_id = 3;     // RFC 9180 registry id for the KDF
+  uint32 aead_id = 4;    // RFC 9180 registry id for the AEAD
+  bytes public_key = 5;  // raw KEM public key bytes (32 for X25519)
+  reserved 6;            // future: signature by the instance's identity key
+}
+
+message ApplySecrets {
+  string command_id = 1;
+  string namespace = 2;
+  string secret_name = 3;
+  string key_id = 4;     // OUTER: which announced SecretsKey was sealed to
+  bytes enc = 5;         // OUTER: HPKE encapsulated key
+  bytes ciphertext = 6;  // OUTER: sealed serialized SealedSecretPayload
+}
+
+message DeleteSecrets {
+  string command_id = 1;
+  string namespace = 2;
+  string secret_name = 3;
+}
+
+// The inner, control-plane-sealed envelope: the plaintext of the outer seal,
+// which the gateway wraps into ApplySecrets.ciphertext without being able to
+// read it.
+message SealedSecretPayload {
+  // INNER: the enrolled recipient key the control plane sealed to — the
+  // instance's current or previous encryption key. Derived exactly as
+  // SecretsKey.key_id is.
+  string key_id = 1;
+  bytes enc = 2;         // INNER: HPKE encapsulated key
+  bytes ciphertext = 3;  // INNER: sealed serialized SecretPayload
+}
+
+// The plaintext schema sealed inside SealedSecretPayload.ciphertext.
+message SecretPayload {
+  map<string, bytes> string_data = 1;
+}
+
+// Operator-only (reserved). QueryMetrics proxies a PromQL range query to the
+// Prometheus deployed alongside the operator in the customer cluster, so the
+// control plane can serve monitoring charts without reaching customer
+// infrastructure directly. The operator returns the Prometheus query_range
+// JSON response verbatim in CommandResult.payload_json.
+message QueryMetrics {
+  string command_id = 1;
+  string promql = 2;
+  int64 start_unix = 3;
+  int64 end_unix = 4;
+  string step = 5;
+}
+
 // GetPodLogs returns recent stdout/stderr of a spiced runtime. For
 // cluster (BYOC) instances the operator reads the logs from the customer
 // cluster's kube API. For a standalone spiced there is no pod: the runtime
@@ -209,8 +305,6 @@ message Pause {
 // returned verbatim in CommandResult.payload_json (a raw string, not JSON).
 // Only `tail_lines` is meaningful for standalone; the namespace/kind/name/
 // pod_name fields address a workload in a cluster and are ignored otherwise.
-// Field numbers must stay identical to the ai-platform / operator copies of
-// this proto.
 message GetPodLogs {
   string command_id = 1;
   string namespace = 2;
@@ -218,4 +312,25 @@ message GetPodLogs {
   string kind = 4;
   string pod_name = 5;
   int64 tail_lines = 6;
+}
+
+// Operator-only (reserved). ProxyRuntimeRequest forwards an HTTP request to a
+// ready spiced pod of the named workload and returns the response, so the
+// control plane can serve a runtime's HTTP API (for example the async
+// /v1/queries submit/status/results flow) for instances whose pods it cannot
+// reach directly. The operator replies with a JSON envelope in
+// CommandResult.payload_json:
+//   {"status":<int>,"content_type":"<str>","body_b64":"<base64>"}
+// A standalone spiced serves its own HTTP API directly, so it has no reason
+// to proxy to itself.
+message ProxyRuntimeRequest {
+  string command_id = 1;
+  string namespace = 2;
+  string name = 3;
+  string kind = 4;
+  string method = 5;               // GET or POST
+  string path = 6;                 // request path incl. leading slash
+  string query = 7;                // raw query string (no leading '?')
+  bytes body = 8;
+  map<string, string> headers = 9; // forwarded request headers
 }

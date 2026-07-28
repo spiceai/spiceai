@@ -43,7 +43,7 @@ use runtime::status::ComponentStatus;
 use runtime_cloud_connect::config::{
     CLOUD_MANAGED_SPICEPOD_FILE, CloudConnectConfig, IDENTITY_FILE, PENDING_ADOPT_CODE_FILE,
 };
-use runtime_cloud_connect::handlers::{QueryResult, RuntimeHandle};
+use runtime_cloud_connect::handlers::RuntimeHandle;
 use runtime_cloud_connect::{CloudConnect, identity::IdentityStore};
 
 use crate::log_capture::LogRingBuffer;
@@ -256,73 +256,6 @@ impl RuntimeHandle for SpicedRuntimeHandle {
             "models": models,
             "catalogs": catalogs,
             "views": views,
-        })
-    }
-
-    /// Execute a SQL statement and return the results as a native Arrow IPC
-    /// stream (schema + record batches) plus row-count / truncation metadata.
-    /// The runtime never flattens rows to JSON — the cloud control plane
-    /// decodes the Arrow directly and renders JSON only at its REST edge.
-    ///
-    /// Caps:
-    /// - `max_rows == 0` → default cap of [`DEFAULT_RUN_QUERY_ROW_CAP`].
-    /// - Hard ceiling of [`RUN_QUERY_HARD_ROW_CAP`] rows regardless.
-    /// - Byte budget of [`RUN_QUERY_BYTE_BUDGET`] on the encoded IPC stream
-    ///   — exceeding either cap sets `truncated: true`.
-    async fn execute_sql(&self, sql: &str, max_rows: u32) -> Result<QueryResult, String> {
-        use futures::StreamExt as _;
-
-        let cap = resolve_run_query_cap(max_rows);
-
-        let df = self.runtime.datafusion();
-        // Cloud-originated RunQuery is a remote management surface; we
-        // never want an adopted control plane to be able to mutate the
-        // local runtime via DDL/DML. Force read-only at the query layer
-        // regardless of principal — there is no signed-in user here.
-        let query = df.query_builder(sql).read_only(true).build();
-        let result = query.run().await.map_err(|e| e.to_string())?;
-        let mut stream = result.data;
-        // Capture the stream schema BEFORE consuming. A query that returns
-        // zero batches (empty result set) still has a real schema, so
-        // without this snapshot the envelope would advertise empty columns.
-        let stream_schema = stream.schema();
-
-        // Collect up to `cap` rows worth of batches. We stop streaming
-        // once we have enough rows so we don't pull the rest of a huge
-        // result set into memory just to throw it away.
-        let mut batches: Vec<arrow::record_batch::RecordBatch> = Vec::new();
-        let mut collected_rows: usize = 0;
-        let mut source_truncated = false;
-        while let Some(batch) = stream.next().await {
-            let batch = batch.map_err(|e| e.to_string())?;
-            let take_rows = cap.saturating_sub(collected_rows);
-            if take_rows == 0 {
-                // We've hit the cap. Only flag truncation if this next
-                // batch actually carries rows — an empty trailing batch
-                // means the result ended exactly at the cap, not beyond it.
-                if batch.num_rows() > 0 {
-                    source_truncated = true;
-                }
-                break;
-            }
-            if batch.num_rows() > take_rows {
-                source_truncated = true;
-                batches.push(batch.slice(0, take_rows));
-                break;
-            }
-            collected_rows += batch.num_rows();
-            batches.push(batch);
-        }
-
-        // Encode the collected batches to an Arrow IPC stream, enforcing
-        // the byte budget. If encoding would exceed the budget we stop
-        // writing further batches and mark the result truncated.
-        let (arrow_ipc, encoded_rows, byte_truncated) =
-            encode_ipc_bounded(stream_schema.as_ref(), &batches, RUN_QUERY_BYTE_BUDGET)?;
-        Ok(QueryResult {
-            arrow_ipc,
-            row_count: encoded_rows,
-            truncated: source_truncated || byte_truncated,
         })
     }
 
@@ -629,112 +562,9 @@ async fn replace_canonical_spicepod(incoming: &Path, path: &Path) -> Result<(), 
     }
 }
 
-/// Byte budget for an encoded `RunQuery` Arrow IPC stream. A coarse secondary
-/// guard on top of the row cap so a few very wide rows can't blow past the
-/// gRPC message size. The budget is enforced on the *encoded* size of every
-/// batch — including the first — so a single wide first batch can never produce
-/// a stream above the cap; the overflowing batch and everything after it are
-/// dropped and the result is flagged truncated.
-pub const RUN_QUERY_BYTE_BUDGET: usize = 5 * 1024 * 1024;
-
-/// Encode `batches` into an Arrow IPC stream (`schema` first) whose total
-/// encoded size never exceeds `budget`. Each batch is appended only if, after
-/// encoding, the stream still fits the budget; the first batch to overflow (and
-/// all subsequent batches) is dropped and `truncated` is set. Returns the
-/// bytes, the number of rows actually written, and whether the budget cut the
-/// stream short.
-///
-/// Because the check is applied *after* encoding each batch, even a single
-/// oversized first batch is rejected — the function then emits the largest
-/// prefix that fits (possibly schema-only) rather than an over-budget stream.
-fn encode_ipc_bounded(
-    schema: &arrow::datatypes::Schema,
-    batches: &[arrow::record_batch::RecordBatch],
-    budget: usize,
-) -> Result<(Vec<u8>, u64, bool), String> {
-    // Encode the accepted-prefix once at the end, but discover how many
-    // batches fit by trial-encoding the running prefix. The budget guards the
-    // *finished* stream, so the prospective length must include the IPC
-    // end-of-stream marker that `finish` appends.
-    let mut accepted = 0usize;
-    let mut rows: u64 = 0;
-    for batch in batches {
-        let candidate = encode_ipc(schema, &batches[..=accepted])?;
-        if candidate.len() > budget {
-            // This batch (and thus the rest) pushes the encoded stream past
-            // the cap — stop here and emit only the prefix that fit.
-            break;
-        }
-        accepted += 1;
-        rows += batch.num_rows() as u64;
-    }
-    let truncated = accepted < batches.len();
-    let buf = encode_ipc(schema, &batches[..accepted])?;
-    Ok((buf, rows, truncated))
-}
-
-/// Encode `schema` + `batches` into a complete (finished) Arrow IPC stream.
-fn encode_ipc(
-    schema: &arrow::datatypes::Schema,
-    batches: &[arrow::record_batch::RecordBatch],
-) -> Result<Vec<u8>, String> {
-    use arrow::ipc::writer::StreamWriter;
-    let mut buf: Vec<u8> = Vec::new();
-    let mut writer = StreamWriter::try_new(&mut buf, schema)
-        .map_err(|e| format!("arrow ipc init failed: {e}"))?;
-    for batch in batches {
-        writer
-            .write(batch)
-            .map_err(|e| format!("arrow ipc write failed: {e}"))?;
-    }
-    writer
-        .finish()
-        .map_err(|e| format!("arrow ipc finish failed: {e}"))?;
-    drop(writer);
-    Ok(buf)
-}
-
-/// Default row cap when the cloud control plane sets `max_rows = 0`.
-pub const DEFAULT_RUN_QUERY_ROW_CAP: usize = 1_000;
-/// Hard row ceiling that the runtime always enforces, even when the
-/// control plane requests more.
-pub const RUN_QUERY_HARD_ROW_CAP: usize = 10_000;
-
-/// Resolve the effective row cap for a `RunQuery`:
-/// - `max_rows == 0` → [`DEFAULT_RUN_QUERY_ROW_CAP`]
-/// - else → `min(max_rows, RUN_QUERY_HARD_ROW_CAP)`
-#[must_use]
-pub fn resolve_run_query_cap(max_rows: u32) -> usize {
-    if max_rows == 0 {
-        DEFAULT_RUN_QUERY_ROW_CAP
-    } else {
-        (max_rows as usize).min(RUN_QUERY_HARD_ROW_CAP)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn run_query_cap_defaults_when_unset() {
-        assert_eq!(resolve_run_query_cap(0), DEFAULT_RUN_QUERY_ROW_CAP);
-    }
-
-    #[test]
-    fn run_query_cap_honors_caller_below_hard_cap() {
-        assert_eq!(resolve_run_query_cap(50), 50);
-        assert_eq!(resolve_run_query_cap(9_999), 9_999);
-        assert_eq!(resolve_run_query_cap(10_000), 10_000);
-    }
-
-    #[test]
-    fn run_query_cap_clamps_to_hard_cap() {
-        // The hard cap is 10_000 — even when the caller asks for 99_999
-        // we never serialize more than 10_000 rows.
-        assert_eq!(resolve_run_query_cap(99_999), RUN_QUERY_HARD_ROW_CAP);
-        assert_eq!(resolve_run_query_cap(u32::MAX), RUN_QUERY_HARD_ROW_CAP);
-    }
 
     /// Minimal valid spicepod (no components — an empty app is valid).
     const VALID_SPICEPOD: &str = "version: v2\nkind: Spicepod\nname: cloud-managed-test\n";
@@ -803,91 +633,6 @@ mod tests {
         assert!(!dir.join("spicepod-cloud-managed.incoming.yml").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    use arrow::array::StringArray;
-    use arrow::datatypes::{DataType, Field, Schema};
-    use arrow::record_batch::RecordBatch;
-
-    /// Build a single-column single-row batch whose one string cell is
-    /// `width` bytes, so its encoded IPC size is dominated by that payload.
-    fn wide_row_batch(schema: &Arc<Schema>, width: usize) -> RecordBatch {
-        let cell = "x".repeat(width);
-        RecordBatch::try_new(
-            Arc::clone(schema),
-            vec![Arc::new(StringArray::from(vec![cell]))],
-        )
-        .expect("build wide-row batch")
-    }
-
-    #[test]
-    fn encode_ipc_bounded_caps_a_wide_first_batch() {
-        // A single first batch larger than the budget must NOT be emitted as an
-        // oversized stream — the result is truncated down to the schema-only
-        // prefix and the bytes stay within budget.
-        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, false)]));
-        let budget = 4 * 1024;
-        let big = wide_row_batch(&schema, 64 * 1024);
-
-        let (bytes, rows, truncated) =
-            encode_ipc_bounded(schema.as_ref(), std::slice::from_ref(&big), budget)
-                .expect("encode succeeds");
-
-        assert!(truncated, "an over-budget first batch must flag truncation");
-        assert_eq!(rows, 0, "the oversized batch is dropped, so no rows ship");
-        assert!(
-            bytes.len() <= budget,
-            "emitted stream {} bytes must stay within budget {budget}",
-            bytes.len()
-        );
-        // The schema-only prefix is still a valid, readable IPC stream.
-        let reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)
-            .expect("schema-only stream is valid");
-        assert_eq!(reader.schema().fields().len(), 1);
-    }
-
-    #[test]
-    fn encode_ipc_bounded_stops_before_overflowing_batch() {
-        // Several batches that each fit individually but collectively exceed the
-        // budget: only the prefix that fits is emitted and truncation is set.
-        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, false)]));
-        let budget = 8 * 1024;
-        let batches: Vec<RecordBatch> = (0..8).map(|_| wide_row_batch(&schema, 2 * 1024)).collect();
-
-        let (bytes, rows, truncated) =
-            encode_ipc_bounded(schema.as_ref(), &batches, budget).expect("encode succeeds");
-
-        assert!(truncated, "exceeding the budget must flag truncation");
-        assert!(rows >= 1, "at least the first fitting batch is written");
-        assert!(
-            rows < batches.len() as u64,
-            "not all batches fit the budget"
-        );
-        assert!(
-            bytes.len() <= budget,
-            "emitted stream {} bytes must stay within budget {budget}",
-            bytes.len()
-        );
-    }
-
-    #[test]
-    fn encode_ipc_bounded_keeps_all_batches_under_budget() {
-        // When everything fits, all rows are written and nothing is truncated.
-        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, false)]));
-        let batches: Vec<RecordBatch> = (0..4).map(|_| wide_row_batch(&schema, 16)).collect();
-
-        let (bytes, rows, truncated) =
-            encode_ipc_bounded(schema.as_ref(), &batches, RUN_QUERY_BYTE_BUDGET)
-                .expect("encode succeeds");
-
-        assert!(!truncated, "well-under-budget input must not truncate");
-        assert_eq!(rows, batches.len() as u64, "all rows written");
-        assert!(bytes.len() <= RUN_QUERY_BYTE_BUDGET);
-        // Round-trips back to the same row count.
-        let reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)
-            .expect("stream is valid");
-        let total: usize = reader.map(|b| b.expect("batch").num_rows()).sum();
-        assert_eq!(total, batches.len());
     }
 
     #[test]

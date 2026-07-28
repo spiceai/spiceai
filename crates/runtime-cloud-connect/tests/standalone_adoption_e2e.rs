@@ -17,8 +17,8 @@ limitations under the License.
 //! Full standalone-adoption end-to-end suite for Spice Cloud Connect
 //! (enroll-first model, DR-025).
 //!
-//! Unlike `adoption_flow.rs` / `run_query.rs` (which run the gateway over
-//! an insecure h2c channel and return canned enroll responses), this suite
+//! Unlike `adoption_flow.rs` (which runs the gateway over an insecure h2c
+//! channel and returns canned enroll responses), this suite
 //! stands up the full split control plane:
 //!
 //! - a **cloud mock** (axum, HTTP): `/v1/cloud-connect/enroll` atomically
@@ -41,15 +41,13 @@ limitations under the License.
 //!    code loads the persisted identity and reconnects over mTLS.
 //! 4. `heartbeat_and_telemetry_cadence` — periodic frames on their
 //!    configured cadences.
-//! 5. `run_query` — read-only dispatch with row/byte caps and an audit
-//!    `EventLog` carrying the SHA-256 of the SQL (never the SQL itself).
-//! 6. `apply_spicepod` — the YAML is written and hot-applied.
-//! 7. `reconnect_over_mtls` — after the server drops the stream, the
+//! 5. `apply_spicepod` — the YAML is written and hot-applied.
+//! 6. `reconnect_over_mtls` — after the server drops the stream, the
 //!    client reconnects, presenting its client certificate again.
-//! 8. `renewal` — a short-lived leaf triggers the renewal loop: a fresh
+//! 7. `renewal` — a short-lived leaf triggers the renewal loop: a fresh
 //!    keypair + CSR + PoP signature against `/renew`, and the rotated
 //!    identity is persisted.
-//! 9. `forget` — the server sends `Forget`, the client clears
+//! 8. `forget` — the server sends `Forget`, the client clears
 //!    `identity.json` and the cloud-connect task exits while the
 //!    (simulated) runtime stays up.
 //!
@@ -74,11 +72,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use arrow::array::{Int64Array, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::ipc::reader::StreamReader;
-use arrow::ipc::writer::StreamWriter;
-use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
 use base64::Engine as _;
@@ -87,7 +80,7 @@ use rcgen::{
     ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, PublicKeyData as _, SanType,
 };
 use runtime_cloud_connect::config::CloudConnectConfig;
-use runtime_cloud_connect::handlers::{QueryResult, RuntimeHandle};
+use runtime_cloud_connect::handlers::RuntimeHandle;
 use runtime_cloud_connect::identity::IdentityStore;
 use runtime_cloud_connect::proto;
 use runtime_cloud_connect::proto::cloud_connect_server::{CloudConnect, CloudConnectServer};
@@ -471,6 +464,11 @@ impl CloudConnect for GatewayServer {
                             captured.lock().await.audits.push(event);
                         }
                     }
+                    // A standalone runtime announces no per-connection
+                    // encryption key, so this never arrives. The arm is spelled
+                    // out rather than wildcarded so a new client message still
+                    // has to be accounted for here.
+                    Some(proto::client_message::Body::SecretsKey(_)) => {}
                     None => break,
                 }
             }
@@ -513,50 +511,28 @@ async fn spawn_gateway(server: GatewayServer, ca: &TestCa) -> SocketAddr {
 
 // --------------------------------------------------------------------------
 // A realistic runtime handle (mirrors the spiced adapter's observable
-// behavior: Arrow-IPC results with row/byte caps, spicepod-to-disk apply).
+// behavior: spicepod-to-disk apply).
 // --------------------------------------------------------------------------
-
-/// Test constant caps, mirroring the spiced adapter's shape.
-const HARD_ROW_CAP: usize = 1_000;
-const BYTE_BUDGET: usize = 64 * 1024;
 
 #[derive(Default)]
 struct E2eRuntimeState {
-    last_sql: Option<String>,
-    last_max_rows: Option<u32>,
     applied_spicepod: Option<(std::path::PathBuf, String)>,
 }
 
 struct E2eRuntime {
     state: Arc<Mutex<E2eRuntimeState>>,
-    /// Number of rows the fabricated table "contains" — the source of
-    /// truncation when it exceeds the effective cap.
-    source_rows: usize,
 }
 
 impl E2eRuntime {
-    fn new(source_rows: usize) -> (Arc<Self>, Arc<Mutex<E2eRuntimeState>>) {
+    fn new() -> (Arc<Self>, Arc<Mutex<E2eRuntimeState>>) {
         let state = Arc::new(Mutex::new(E2eRuntimeState::default()));
         (
             Arc::new(Self {
                 state: Arc::clone(&state),
-                source_rows,
             }),
             state,
         )
     }
-}
-
-fn encode_ipc(schema: &Schema, batches: &[RecordBatch]) -> Vec<u8> {
-    let mut buf = Vec::new();
-    {
-        let mut w = StreamWriter::try_new(&mut buf, schema).expect("ipc writer");
-        for b in batches {
-            w.write(b).expect("ipc write");
-        }
-        w.finish().expect("ipc finish");
-    }
-    buf
 }
 
 #[async_trait]
@@ -566,75 +542,6 @@ impl RuntimeHandle for E2eRuntime {
     }
     async fn active_models(&self) -> u32 {
         1
-    }
-
-    async fn execute_sql(&self, sql: &str, max_rows: u32) -> Result<QueryResult, String> {
-        {
-            let mut st = self.state.lock().await;
-            st.last_sql = Some(sql.to_string());
-            st.last_max_rows = Some(max_rows);
-        }
-
-        // Read-only surface: cloud-originated RunQuery must never mutate the
-        // runtime. The real enforcement lives in the spiced adapter
-        // (`query_builder(...).read_only(true)`); here we simulate its
-        // rejection so the boundary behavior (sanitized error + audit) is
-        // exercised end-to-end.
-        let verb = sql.split_whitespace().next().unwrap_or("");
-        if verb.eq_ignore_ascii_case("insert")
-            || verb.eq_ignore_ascii_case("update")
-            || verb.eq_ignore_ascii_case("delete")
-            || verb.eq_ignore_ascii_case("create")
-            || verb.eq_ignore_ascii_case("drop")
-        {
-            return Err(format!("read-only: refusing to execute `{sql}`"));
-        }
-
-        // Row cap: min(requested, hard). max_rows == 0 means "server default";
-        // treat it as the hard cap here.
-        let effective = if max_rows == 0 {
-            HARD_ROW_CAP
-        } else {
-            (max_rows as usize).min(HARD_ROW_CAP)
-        };
-        let mut row_truncated = false;
-        let emit = if self.source_rows > effective {
-            row_truncated = true;
-            effective
-        } else {
-            self.source_rows
-        };
-
-        let schema = Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("label", DataType::Utf8, false),
-        ]);
-        let ids: Vec<i64> = (0..i64::try_from(emit).expect("emit row count fits in i64")).collect();
-        let labels: Vec<String> = (0..emit).map(|i| format!("row-{i}")).collect();
-        let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-        let batch = RecordBatch::try_new(
-            Arc::new(schema.clone()),
-            vec![
-                Arc::new(Int64Array::from(ids)),
-                Arc::new(StringArray::from(label_refs)),
-            ],
-        )
-        .expect("batch");
-
-        // Byte budget: a coarse secondary guard. If the encoded stream would
-        // exceed the budget, drop the batch (schema-only) and flag truncation.
-        let full = encode_ipc(&schema, std::slice::from_ref(&batch));
-        let (arrow_ipc, row_count, byte_truncated) = if full.len() > BYTE_BUDGET {
-            (encode_ipc(&schema, &[]), 0, true)
-        } else {
-            (full, emit as u64, false)
-        };
-
-        Ok(QueryResult {
-            arrow_ipc,
-            row_count,
-            truncated: row_truncated || byte_truncated,
-        })
     }
 
     async fn apply_spicepod(
@@ -831,7 +738,7 @@ async fn enrollment_issues_identity_and_streams_over_mtls() {
         Duration::from_hours(12),
     );
 
-    let (runtime, _rt_state) = E2eRuntime::new(0);
+    let (runtime, _rt_state) = E2eRuntime::new();
     let (handle, identity) = enroll(&harness, &config, runtime).await;
 
     // The enroll request carried the out-of-band contract: adoption code +
@@ -891,7 +798,7 @@ async fn adoption_code_is_single_use() {
         Some(ADOPTION_CODE.to_string()),
         Duration::from_hours(12),
     );
-    let (runtime1, _s1) = E2eRuntime::new(0);
+    let (runtime1, _s1) = E2eRuntime::new();
     let (handle1, _identity) = enroll(&harness, &config1, runtime1).await;
     handle1.shutdown().await;
 
@@ -905,7 +812,7 @@ async fn adoption_code_is_single_use() {
         Some(ADOPTION_CODE.to_string()),
         Duration::from_hours(12),
     );
-    let (runtime2, _s2) = E2eRuntime::new(0);
+    let (runtime2, _s2) = E2eRuntime::new();
     let handle2 = runtime_cloud_connect::CloudConnect::start(config2, runtime2)
         .await
         .expect("start")
@@ -949,7 +856,7 @@ async fn identity_is_reused_across_restart_over_mtls() {
         Some(ADOPTION_CODE.to_string()),
         Duration::from_hours(12),
     );
-    let (runtime, _s) = E2eRuntime::new(0);
+    let (runtime, _s) = E2eRuntime::new();
     let (handle, _identity) = enroll(&harness, &enroll_cfg, runtime).await;
     handle.shutdown().await; // simulate process stop; identity.json persists.
 
@@ -966,7 +873,7 @@ async fn identity_is_reused_across_restart_over_mtls() {
         None,
         Duration::from_hours(12),
     );
-    let (runtime2, _s2) = E2eRuntime::new(0);
+    let (runtime2, _s2) = E2eRuntime::new();
     let handle2 = runtime_cloud_connect::CloudConnect::start(reuse_cfg, runtime2)
         .await
         .expect("start")
@@ -1007,7 +914,7 @@ async fn heartbeat_and_telemetry_cadence() {
         Some(ADOPTION_CODE.to_string()),
         Duration::from_hours(12),
     );
-    let (runtime, _s) = E2eRuntime::new(0);
+    let (runtime, _s) = E2eRuntime::new();
     let (handle, _identity) = enroll(&harness, &config, runtime).await;
 
     // With a 150ms heartbeat and 250ms telemetry cadence, several of each must
@@ -1046,132 +953,6 @@ async fn heartbeat_and_telemetry_cadence() {
 }
 
 #[tokio::test]
-async fn run_query_read_only_caps_and_audit() {
-    let harness = Harness::new(24 * 60 * 60).await;
-    let dir = tempfile::tempdir().unwrap();
-    let config = harness.config(
-        dir.path().join("identity.json"),
-        dir.path().to_path_buf(),
-        Some(ADOPTION_CODE.to_string()),
-        Duration::from_hours(12),
-    );
-    // The fabricated table has more rows than the requested cap, so the
-    // result must come back truncated.
-    let (runtime, rt_state) = E2eRuntime::new(50);
-    let (handle, _identity) = enroll(&harness, &config, runtime).await;
-
-    // (a) A read-only SELECT with a row cap below the source size.
-    harness
-        .gateway
-        .outbound
-        .lock()
-        .await
-        .push_back(ctrl(proto::control_message::Body::RunQuery(
-            proto::RunQuery {
-                command_id: "cmd-select".to_string(),
-                sql: "SELECT id, label FROM t".to_string(),
-                max_rows: 10,
-            },
-        )));
-
-    let captured = Arc::clone(&harness.gateway.captured);
-    let got = wait_until_async(Duration::from_secs(5), || {
-        let captured = Arc::clone(&captured);
-        async move {
-            let c = captured.lock().await;
-            c.results.iter().any(|r| r.command_id == "cmd-select")
-                && c.audits.iter().any(|e| e.event_json.contains("cmd-select"))
-        }
-    })
-    .await;
-    assert!(got, "RunQuery result + audit must arrive within 5s");
-
-    // The runtime received the raw max_rows the control plane requested.
-    assert_eq!(rt_state.lock().await.last_max_rows, Some(10));
-
-    let result = with_captured!(captured, c => c
-        .results
-        .iter()
-        .find(|r| r.command_id == "cmd-select")
-        .cloned())
-    .expect("select result");
-    assert!(result.success, "select must succeed: {}", result.error);
-
-    // Metadata rides in payload_json; tabular data is native Arrow IPC.
-    let meta: Value = serde_json::from_str(&result.payload_json).expect("meta json");
-    assert_eq!(meta["row_count"], 10, "row cap applied");
-    assert_eq!(meta["truncated"], true, "source exceeded the cap");
-    let reader =
-        StreamReader::try_new(std::io::Cursor::new(result.result_arrow_ipc.clone()), None).unwrap();
-    let rows: usize = reader.map(|b| b.unwrap().num_rows()).sum();
-    assert_eq!(rows, 10, "Arrow IPC carries exactly the capped rows");
-
-    // The audit EventLog carries the SHA-256 of the SQL — never the SQL text.
-    let audit = with_captured!(captured, c => c
-        .audits
-        .iter()
-        .find(|e| e.event_json.contains("cmd-select"))
-        .cloned())
-    .expect("select audit");
-    assert_eq!(audit.identifier, ASSIGNED_ID);
-    let ap: Value = serde_json::from_str(&audit.event_json).unwrap();
-    assert_eq!(ap["action"], "run_query");
-    assert_eq!(ap["success"], true);
-    assert_eq!(ap["row_count"], 10);
-    assert_eq!(ap["truncated"], true);
-    let sql_hash = ap["sql_hash"].as_str().unwrap();
-    assert_eq!(sql_hash.len(), 64, "sha256 hex digest");
-    assert!(
-        !audit.event_json.contains("SELECT"),
-        "audit must not leak SQL"
-    );
-
-    // (b) A mutating statement must be rejected (read-only surface) and the
-    // failure audited without leaking the statement.
-    harness
-        .gateway
-        .outbound
-        .lock()
-        .await
-        .push_back(ctrl(proto::control_message::Body::RunQuery(
-            proto::RunQuery {
-                command_id: "cmd-write".to_string(),
-                sql: "DELETE FROM secrets WHERE id = 1".to_string(),
-                max_rows: 0,
-            },
-        )));
-
-    let got_err = wait_until_async(Duration::from_secs(5), || {
-        let captured = Arc::clone(&captured);
-        async move {
-            captured
-                .lock()
-                .await
-                .results
-                .iter()
-                .any(|r| r.command_id == "cmd-write")
-        }
-    })
-    .await;
-    assert!(got_err, "write result must arrive within 5s");
-
-    let werr = with_captured!(captured, c => c
-        .results
-        .iter()
-        .find(|r| r.command_id == "cmd-write")
-        .cloned())
-    .expect("write result");
-    assert!(!werr.success, "mutating statement must be rejected");
-    assert!(
-        !werr.error.contains("secrets"),
-        "sanitized error must not echo the SQL: {}",
-        werr.error
-    );
-
-    handle.shutdown().await;
-}
-
-#[tokio::test]
 async fn apply_spicepod_hot_applies_and_persists() {
     let harness = Harness::new(24 * 60 * 60).await;
     let dir = tempfile::tempdir().unwrap();
@@ -1181,7 +962,7 @@ async fn apply_spicepod_hot_applies_and_persists() {
         Some(ADOPTION_CODE.to_string()),
         Duration::from_hours(12),
     );
-    let (runtime, rt_state) = E2eRuntime::new(0);
+    let (runtime, rt_state) = E2eRuntime::new();
     let (handle, _identity) = enroll(&harness, &config, runtime).await;
 
     let yaml = "version: v2\nkind: Spicepod\nname: e2e-cloud-managed\n";
@@ -1248,7 +1029,7 @@ async fn reconnects_over_mtls_after_disconnect() {
         Some(ADOPTION_CODE.to_string()),
         Duration::from_hours(12),
     );
-    let (runtime, _s) = E2eRuntime::new(0);
+    let (runtime, _s) = E2eRuntime::new();
 
     let handle = runtime_cloud_connect::CloudConnect::start(config.clone(), runtime)
         .await
@@ -1309,7 +1090,7 @@ async fn renewal_rotates_keypair_and_persists() {
         Some(ADOPTION_CODE.to_string()),
         Duration::from_secs(2),
     );
-    let (runtime, _s) = E2eRuntime::new(0);
+    let (runtime, _s) = E2eRuntime::new();
 
     // Start the client directly (not via the `enroll` helper): the
     // pre-rotation identity must be snapshotted as soon as it lands on
@@ -1406,7 +1187,7 @@ async fn forget_clears_identity_and_exits() {
         Some(ADOPTION_CODE.to_string()),
         Duration::from_hours(12),
     );
-    let (runtime, _s) = E2eRuntime::new(0);
+    let (runtime, _s) = E2eRuntime::new();
     let (handle, _identity) = enroll(&harness, &config, runtime).await;
     assert!(identity_path.exists(), "identity present after enrollment");
 
