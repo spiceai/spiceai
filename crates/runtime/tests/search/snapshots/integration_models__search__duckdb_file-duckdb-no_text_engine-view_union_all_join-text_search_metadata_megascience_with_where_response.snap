@@ -4,5 +4,18 @@ expression: normalize_search_response(resp)
 ---
 {
   "duration_ms": "duration_ms_val",
-  "results": []
+  "results": [
+    {
+      "_score": "7.52",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "Relative or \"stress\" polycythaemia, which is secondary to a depletion in the plasma volume."
+        ]
+      },
+      "primary_key": {
+        "id": 890
+      }
+    }
+  ]
 }
