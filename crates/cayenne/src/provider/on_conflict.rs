@@ -895,40 +895,6 @@ pub(crate) enum PkDeletionSnapshot {
     RowConverterBased { tombstones: Arc<KeyDeletionIndex> },
 }
 
-/// One memoized merged (file ∪ mem-tier) deletion snapshot for the scan path.
-/// See the `merged_scan_deletions` field docs for the key's torn-state proof.
-pub(crate) struct MergedScanDeletions {
-    /// The FILE-side deletion snapshot the merge was built from, RETAINED for
-    /// the lifetime of the memo.
-    ///
-    /// The memo key's file-side identity is the `Arc::as_ptr` of this snapshot's
-    /// index ([`Self::file_index_ptr`]). Holding the `Arc` here — not merely its
-    /// raw address — is load-bearing for correctness: a live `Arc` allocation
-    /// can never be freed and its address handed to a *different* index
-    /// generation, so a pointer match proves the live file-side index IS this
-    /// same generation, never a coincidental ABA alias. Without the retention a
-    /// deletion publish could free this index and a later publish reuse its
-    /// freed address, yielding a false memo hit that serves a stale merged view
-    /// and resurrects deleted rows (#11303).
-    pub(crate) file_index: PkDeletionSnapshot,
-    /// [`crate::provider::mem_tier::MemTier::version`] of the tier merged in.
-    pub(crate) tier_version: u64,
-    /// Structural epoch observed when the memo was built.
-    pub(crate) structural_epoch: u64,
-    pub(crate) merged: PkDeletionSnapshot,
-}
-
-impl MergedScanDeletions {
-    /// `Arc::as_ptr` identity of the retained file-side index — the memo key's
-    /// file-side component. Read from [`Self::file_index`] so the compared
-    /// pointer and the pinned allocation can never diverge. Always `Some` in
-    /// practice: the memo is only stored once the source index has an identity
-    /// (`PositionBased` returns before the store).
-    pub(crate) fn file_index_ptr(&self) -> Option<usize> {
-        self.file_index.index_ptr()
-    }
-}
-
 /// PK membership of a mem-tier checkpoint's flushed corpus (the visible inline +
 /// tier rows being encoded into the new snapshot), keyed by deletion strategy.
 /// Splits the tier's tombstones at durable-commit time: a tombstoned key WITH a
@@ -982,43 +948,6 @@ impl PkDeletionSnapshot {
             Self::PositionBased => 0,
             Self::Int64Pk { tombstones } => tombstones.delete_len(),
             Self::RowConverterBased { tombstones } => tombstones.delete_len(),
-        }
-    }
-
-    /// Extend this snapshot by ONE append's tombstone delta — O(delta), the
-    /// persistent-index extend. Used by the append path to keep the
-    /// merged-scan-deletions memo CURRENT in lockstep (under sustained CDC the
-    /// version-keyed memo can otherwise never hit: every append bumps the tier
-    /// version, and the O(tier) rebuild per scan was the churn-coupled collapse
-    /// the `mem_tier_join_shapes` live lanes measure at 175-247x).
-    pub(crate) fn extended_by_delta(
-        &self,
-        delta: &crate::provider::mem_tier::SegmentTombstones,
-    ) -> Self {
-        // Every key in `delta` shares one reserved delete sequence (one CDC
-        // apply), so the memo extend applies that single scalar to all of them —
-        // identical to extending by a per-key map whose values are all that seq.
-        let seq = delta.delete_sequence();
-        match self {
-            Self::PositionBased => Self::PositionBased,
-            Self::Int64Pk { tombstones } => {
-                if delta.is_int64_empty() {
-                    return self.clone();
-                }
-                let updated = tombstones.extend_max_deletes(delta.int64_keys().map(|pk| (pk, seq)));
-                Self::Int64Pk {
-                    tombstones: Arc::new(updated),
-                }
-            }
-            Self::RowConverterBased { tombstones } => {
-                if delta.is_row_keys_empty() {
-                    return self.clone();
-                }
-                let updated = tombstones.extend_max_deletes(delta.row_keys().map(|key| (key, seq)));
-                Self::RowConverterBased {
-                    tombstones: Arc::new(updated),
-                }
-            }
         }
     }
 

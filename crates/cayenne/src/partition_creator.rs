@@ -294,9 +294,14 @@ impl PartitionCreator for CayennePartitionCreator {
             .boxed()
             .context(creator::CreatePartitionSnafu)?;
 
+        let table_provider = Arc::new(cayenne_table);
+        // Wire the demand scan-view cache (weak self-ref for spawn_blocking builds +
+        // the idle evictor) so a partition provider offloads its builds and releases
+        // idle cached views' pinned snapshot dirs, like the top-level provider.
+        table_provider.init_scan_view_cache();
         Ok(Partition {
             partition_values,
-            table_provider: Arc::new(cayenne_table),
+            table_provider,
         })
     }
 
@@ -380,9 +385,11 @@ impl PartitionCreator for CayennePartitionCreator {
                 }
             };
 
+            let table_provider = Arc::new(cayenne_table);
+            table_provider.init_scan_view_cache();
             result.push(Partition {
                 partition_values,
-                table_provider: Arc::new(cayenne_table),
+                table_provider,
             });
         }
 
