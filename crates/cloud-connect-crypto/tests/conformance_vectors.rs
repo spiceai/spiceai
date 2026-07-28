@@ -33,34 +33,22 @@ fn vectors_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/conformance_vectors.json")
 }
 
-fn generated() -> String {
-    conformance_suite_json().unwrap_or_else(|e| panic!("failed to build the suite: {e}"))
-}
-
-/// The artifact as a consumer would read it. During a regeneration run this
-/// returns what the generator produced rather than the file, because the test
-/// below is rewriting that file concurrently.
-fn artifact() -> String {
-    if std::env::var_os(UPDATE_ENV).is_some() {
-        return generated();
-    }
-    let path = vectors_path();
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
+/// Whether this run is regenerating the artifact rather than checking it.
+fn regenerating() -> bool {
+    std::env::var_os(UPDATE_ENV).is_some()
 }
 
 #[test]
 fn the_committed_artifact_matches_the_generator() {
     let path = vectors_path();
-    let generated = generated();
+    let generated = conformance_suite_json().expect("build the conformance suite");
 
-    if std::env::var_os(UPDATE_ENV).is_some() {
-        std::fs::write(&path, &generated)
-            .unwrap_or_else(|e| panic!("failed to write {}: {e}", path.display()));
+    if regenerating() {
+        std::fs::write(&path, &generated).expect("rewrite the committed conformance artifact");
     }
 
-    let committed = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+    let committed =
+        std::fs::read_to_string(&path).expect("read the committed conformance artifact");
     assert_eq!(
         committed,
         generated,
@@ -81,7 +69,14 @@ fn the_committed_artifact_matches_the_generator() {
 /// a rule that is wrong in both. This can.
 #[test]
 fn the_committed_aads_are_reproducible_from_the_rule_alone() {
-    let suite: ConformanceSuite = serde_json::from_str(&artifact()).expect("parse the artifact");
+    // On a regeneration run the test above is rewriting the file, so read what
+    // the generator produced rather than racing it.
+    let artifact = if regenerating() {
+        conformance_suite_json().expect("build the conformance suite")
+    } else {
+        std::fs::read_to_string(vectors_path()).expect("read the committed conformance artifact")
+    };
+    let suite: ConformanceSuite = serde_json::from_str(&artifact).expect("parse the artifact");
 
     let separator = hex::decode(&suite.canonicalization.separator_hex).expect("separator hex");
     let join = |parts: &[&str]| -> String {
