@@ -38,17 +38,30 @@ pub const KDF_ID: u32 = 0x0001;
 /// RFC 9180 registry id for the AEAD: `ChaCha20-Poly1305`.
 pub const AEAD_ID: u32 = 0x0003;
 
-/// Cap on the plaintext handed to [`crate::RecipientKey::seal`], matching the
-/// Kubernetes `Secret` size limit — the payload has to fit in one once applied.
+/// Bytes the AEAD appends to a ciphertext: the Poly1305 authentication tag.
+pub const AEAD_TAG_LEN: usize = 16;
+
+/// Cap on the **secret payload** — the inner seal's plaintext. Matches the
+/// Kubernetes `Secret` size limit, which is the real constraint: the payload has
+/// to fit in one once applied.
 pub const MAX_SECRET_PLAINTEXT_SIZE: usize = 1 << 20;
 
-/// Headroom over [`MAX_SECRET_PLAINTEXT_SIZE`] for the encapsulated key, the
-/// AEAD tag, and the envelope framing each seal layer adds.
+/// Headroom over [`MAX_SECRET_PLAINTEXT_SIZE`] for what the two seal layers add
+/// on top of the secret itself — an encapsulated key and an AEAD tag per layer,
+/// plus the inner envelope's own framing.
 pub const SEALED_OVERHEAD_HEADROOM: usize = 1024;
 
 /// Cap a recipient applies to a sealed blob **as it arrives**, before spending
 /// anything on it. Applied to the outer blob, which bounds the inner envelope
 /// nested inside it.
+///
+/// The caps form a chain that has to close, or a secret at exactly the
+/// Kubernetes limit becomes undeliverable: the outer seal's plaintext is the
+/// serialized inner envelope, which is *necessarily larger* than the secret it
+/// wraps, so it cannot be held to [`MAX_SECRET_PLAINTEXT_SIZE`]. See
+/// [`crate::SealLayer`], which is what keeps each layer to the right cap, and
+/// `the_size_caps_let_a_maximum_sized_secret_through_both_layers` for the
+/// arithmetic.
 pub const MAX_SEALED_SECRETS_SIZE: usize = MAX_SECRET_PLAINTEXT_SIZE + SEALED_OVERHEAD_HEADROOM;
 
 /// Length of a raw X25519 key, public or private (RFC 7748).

@@ -68,7 +68,8 @@ decision here.
 ### Replacing a local copy
 
 The crate produces the same bytes as the copies it replaces, but the API is not
-identical. Two differences are worth knowing before the swap:
+identical, and one size cap changed value. Three differences are worth knowing
+before the swap:
 
 - **There are no free AAD functions.** Both forms come off a `SecretAddress`,
   which is built from the message fields once and canonicalises them. A sealer
@@ -76,10 +77,21 @@ identical. Two differences are worth knowing before the swap:
   it puts on the wire should be `address.namespace()` / `address.secret_name()`.
   For the two layers of one payload, build the address once and re-point it at
   the outer recipient with `with_key_id`.
-- **The two size caps are now named apart.** `MAX_SECRET_PLAINTEXT_SIZE` (1 MiB)
-  is the cap on what goes *into* a seal; `MAX_SEALED_SECRETS_SIZE` (1 MiB +
-  1 KiB) is the cap a recipient applies to a sealed blob as it *arrives*. Both
-  values are unchanged; only the names disambiguate them.
+- **`seal` takes a `SealLayer`, and the outer layer's cap is larger than the
+  inner one's.** The two layers seal different things: the inner seals the secret
+  payload, the outer seals the serialized envelope wrapping it. That envelope is
+  *always* bigger than the secret inside it — an encapsulated key, an AEAD tag,
+  and its own framing — so holding the outer layer to the secret's 1 MiB limit
+  makes a secret at exactly that limit sealable once and then impossible to wrap.
+  `SealLayer::Outer` is bounded instead so its ciphertext still fits a
+  recipient's arrival cap. A copy that capped both layers at 1 MiB has this bug;
+  the fix widens what is accepted, so nothing that worked before stops working.
+- **The two size caps are named apart.** `MAX_SECRET_PLAINTEXT_SIZE` (1 MiB) is
+  the Kubernetes `Secret` limit and caps the inner payload;
+  `MAX_SEALED_SECRETS_SIZE` (1 MiB + 1 KiB) caps a sealed blob as it *arrives*
+  and is enforced inside `open`, so an oversized ciphertext is refused on its
+  length before anything is decrypted rather than after the AEAD tag at the end
+  of it fails.
 
 Smaller ones: failures are a typed `Error` rather than a `String`, `open` and
 `seal` are on the key types, `to_pkcs8_pem` returns a `Zeroizing<String>` (build

@@ -38,10 +38,10 @@ use crate::encoding::{
     PRIVATE_KEY_PEM_TAG, PUBLIC_KEY_PEM_TAG, X25519_PKCS8_PREFIX, encode_pem, pem_len, spki_der,
     write_pem,
 };
-use crate::error::{InvalidPrivateKeySnafu, RandomnessSnafu, Result};
+use crate::error::{InvalidPrivateKeySnafu, RandomnessSnafu, Result, SealedPayloadTooLargeSnafu};
 use crate::key_id::derive_key_id;
 use crate::recipient::RecipientKey;
-use crate::suite::{Aead, HPKE_INFO, Kdf, Kem, X25519_KEY_LEN};
+use crate::suite::{Aead, HPKE_INFO, Kdf, Kem, MAX_SEALED_SECRETS_SIZE, X25519_KEY_LEN};
 
 /// Bytes of input keying material fed to the KEM's deterministic key
 /// derivation. 32 bytes matches the KEM's own secret size — more would not add
@@ -190,11 +190,27 @@ impl EncryptionKeypair {
     /// Open a sealed payload (HPKE base mode, single-shot). The returned buffer
     /// zeroizes on drop.
     ///
+    /// `ciphertext` is bounded by [`MAX_SEALED_SECRETS_SIZE`] before anything is
+    /// spent on it. The AEAD tag is at the *end*, so a peer that sends a
+    /// gigabyte of noise would otherwise get a gigabyte allocated and decrypted
+    /// before the tag check rejects it. The cap is applied here rather than left
+    /// to the caller because every recipient needs it and this is the one place
+    /// they all share; a caller that also bounds the message on arrival is not
+    /// duplicating anything that hurts.
+    ///
     /// # Errors
-    /// Returns [`crate::Error::Open`] on any failure. The cause is deliberately
-    /// not distinguished — which check failed is what an attacker probing a
-    /// recipient would want to learn.
+    /// Returns [`crate::Error::SealedPayloadTooLarge`] when `ciphertext` is over
+    /// the cap, and [`crate::Error::Open`] on any other failure. `Open` carries
+    /// no cause: which check failed is what an attacker probing a recipient
+    /// would want to learn.
     pub fn open(&self, enc: &[u8], ciphertext: &[u8], aad: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+        ensure!(
+            ciphertext.len() <= MAX_SEALED_SECRETS_SIZE,
+            SealedPayloadTooLargeSnafu {
+                len: ciphertext.len(),
+                limit: MAX_SEALED_SECRETS_SIZE,
+            }
+        );
         let encapped =
             <Kem as KemTrait>::EncappedKey::from_bytes(enc).map_err(|_| crate::Error::Open)?;
         hpke::single_shot_open::<Aead, Kdf, Kem>(
@@ -286,8 +302,9 @@ impl EncryptionKeyring {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SecretAddress;
     use crate::error::Error;
+    use crate::suite::MAX_SEALED_SECRETS_SIZE;
+    use crate::{SealLayer, SecretAddress};
 
     fn address(key_id: &str) -> SecretAddress {
         SecretAddress::new("cell_x", "publicorg-7", "spicepod-secrets", key_id)
@@ -303,7 +320,7 @@ mod tests {
         let aad = address.outer_aad("ctrl-1").expect("outer aad");
         let sealed = keypair
             .recipient()
-            .seal(b"super-secret", &aad)
+            .seal(SealLayer::Inner, b"super-secret", &aad)
             .expect("seal");
 
         let opened = keypair
@@ -323,6 +340,32 @@ mod tests {
         .expect("outer aad");
         assert!(matches!(
             keypair.open(&sealed.enc, &sealed.ciphertext, &elsewhere),
+            Err(Error::Open)
+        ));
+    }
+
+    /// The AEAD tag is at the end of the ciphertext, so without a length check
+    /// first, a peer sending noise gets all of it allocated and decrypted before
+    /// the tag rejects it. The cap has to be enforced from the length alone,
+    /// before any of that work.
+    #[test]
+    fn open_rejects_an_oversized_ciphertext_without_decrypting_it() {
+        let keypair = EncryptionKeypair::derive(b"arrival-cap");
+        let enc = [0u8; 32];
+
+        assert!(matches!(
+            keypair.open(&enc, &vec![0u8; MAX_SEALED_SECRETS_SIZE + 1], b"aad"),
+            Err(Error::SealedPayloadTooLarge {
+                limit: MAX_SEALED_SECRETS_SIZE,
+                ..
+            })
+        ));
+
+        // At the cap it is a normal open attempt again — rejected on the tag,
+        // not on the length, so the cap is not quietly cutting valid payloads
+        // short.
+        assert!(matches!(
+            keypair.open(&enc, &vec![0u8; MAX_SEALED_SECRETS_SIZE], b"aad"),
             Err(Error::Open)
         ));
     }
@@ -369,7 +412,7 @@ mod tests {
         let aad = address(keypair.key_id()).inner_aad();
         let sealed = keypair
             .recipient()
-            .seal(b"across-a-restart", &aad)
+            .seal(SealLayer::Inner, b"across-a-restart", &aad)
             .expect("seal");
         let opened = restored
             .open(&sealed.enc, &sealed.ciphertext, &aad)
@@ -466,7 +509,7 @@ mod tests {
         let aad = address(&previous_id).inner_aad();
         let sealed = previous
             .recipient()
-            .seal(b"sealed-before-the-rotation", &aad)
+            .seal(SealLayer::Inner, b"sealed-before-the-rotation", &aad)
             .expect("seal");
 
         // The instance renews, so the key the payload was sealed to becomes the

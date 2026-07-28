@@ -86,7 +86,8 @@ pub use aad::{AAD_SEPARATOR, SecretAddress};
 pub use error::{Error, Result};
 pub use key_id::{KEY_ID_DIGEST_BYTES, derive_key_id};
 pub use keypair::{EncryptionKeypair, EncryptionKeyring};
-pub use recipient::{RecipientKey, Sealed};
+pub use recipient::{RecipientKey, SealLayer, Sealed};
 pub use suite::{
-    AEAD_ID, HPKE_INFO, KDF_ID, KEM_ID, MAX_SEALED_SECRETS_SIZE, MAX_SECRET_PLAINTEXT_SIZE,
+    AEAD_ID, AEAD_TAG_LEN, HPKE_INFO, KDF_ID, KEM_ID, MAX_SEALED_SECRETS_SIZE,
+    MAX_SECRET_PLAINTEXT_SIZE,
 };

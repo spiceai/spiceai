@@ -24,7 +24,44 @@ use crate::error::{
     UnsupportedSuiteSnafu,
 };
 use crate::key_id::derive_key_id;
-use crate::suite::{AEAD_ID, Aead, HPKE_INFO, KDF_ID, KEM_ID, Kdf, Kem, MAX_SECRET_PLAINTEXT_SIZE};
+use crate::suite::{
+    AEAD_ID, AEAD_TAG_LEN, Aead, HPKE_INFO, KDF_ID, KEM_ID, Kdf, Kem, MAX_SEALED_SECRETS_SIZE,
+    MAX_SECRET_PLAINTEXT_SIZE,
+};
+
+/// Which of the two layers a seal is performing.
+///
+/// The layers differ in *what their plaintext is*, and so in how large it may
+/// legitimately be. Holding both to the secret-payload cap would make a secret
+/// at exactly the Kubernetes limit impossible to deliver, because the outer
+/// layer's plaintext is the inner envelope — which is always larger than the
+/// secret inside it.
+///
+/// Only the caller knows which layer it is sealing, so that is a parameter; the
+/// cap which follows from it is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SealLayer {
+    /// The inner seal, whose plaintext is the secret payload itself.
+    Inner,
+    /// The outer seal, whose plaintext is the serialized inner envelope.
+    Outer,
+}
+
+impl SealLayer {
+    /// The largest plaintext this layer may seal.
+    ///
+    /// `Inner` is bounded by the secret payload's own limit. `Outer` is bounded
+    /// so the ciphertext it produces still fits the cap a recipient applies on
+    /// arrival ([`MAX_SEALED_SECRETS_SIZE`]) — which is what makes the chain
+    /// close for a maximum-sized secret.
+    #[must_use]
+    pub const fn max_plaintext_size(self) -> usize {
+        match self {
+            Self::Inner => MAX_SECRET_PLAINTEXT_SIZE,
+            Self::Outer => MAX_SEALED_SECRETS_SIZE - AEAD_TAG_LEN,
+        }
+    }
+}
 
 /// One HPKE seal: the encapsulated key and the ciphertext, in the shape the
 /// wire carries them.
@@ -133,16 +170,19 @@ impl RecipientKey {
     /// contents the sealer cannot read, and neither layer's sealer should ever
     /// log what it was handed.
     ///
+    /// `layer` says which of the two seals this is, which is what sets the cap
+    /// on `plaintext` — see [`SealLayer`].
+    ///
     /// # Errors
     /// Returns [`crate::Error::PayloadTooLarge`] when `plaintext` exceeds
-    /// [`MAX_SECRET_PLAINTEXT_SIZE`], or [`crate::Error::Seal`] when HPKE
-    /// fails.
-    pub fn seal(&self, plaintext: &[u8], aad: &[u8]) -> Result<Sealed> {
+    /// `layer.max_plaintext_size()`, or [`crate::Error::Seal`] when HPKE fails.
+    pub fn seal(&self, layer: SealLayer, plaintext: &[u8], aad: &[u8]) -> Result<Sealed> {
+        let limit = layer.max_plaintext_size();
         ensure!(
-            plaintext.len() <= MAX_SECRET_PLAINTEXT_SIZE,
+            plaintext.len() <= limit,
             PayloadTooLargeSnafu {
                 len: plaintext.len(),
-                limit: MAX_SECRET_PLAINTEXT_SIZE,
+                limit,
             }
         );
         let public_key = <Kem as KemTrait>::PublicKey::from_bytes(&self.public_key)
@@ -223,7 +263,9 @@ mod tests {
     fn seal_round_trips_through_the_matching_private_key() {
         let keypair = EncryptionKeypair::derive(b"seal-round-trip");
         let key = RecipientKey::from_public_key(keypair.public_key()).expect("valid key");
-        let sealed = key.seal(b"payload-bytes", b"aad-bytes").expect("seal");
+        let sealed = key
+            .seal(SealLayer::Inner, b"payload-bytes", b"aad-bytes")
+            .expect("seal");
 
         assert_eq!(key.key_id(), keypair.key_id());
         let opened = keypair
@@ -238,23 +280,77 @@ mod tests {
     fn each_seal_encapsulates_a_fresh_key() {
         let keypair = EncryptionKeypair::derive(b"fresh-encapsulation");
         let key = keypair.recipient();
-        let first = key.seal(b"same", b"same").expect("seal");
-        let second = key.seal(b"same", b"same").expect("seal");
+        let first = key.seal(SealLayer::Inner, b"same", b"same").expect("seal");
+        let second = key.seal(SealLayer::Inner, b"same", b"same").expect("seal");
         assert_ne!(first.enc, second.enc);
         assert_ne!(first.ciphertext, second.ciphertext);
     }
 
     #[test]
-    fn a_payload_over_the_cap_is_rejected_before_it_is_sealed() {
+    fn a_payload_over_its_layer_cap_is_rejected_before_it_is_sealed() {
         let key = EncryptionKeypair::derive(b"size-cap").recipient();
-        key.seal(&vec![0u8; MAX_SECRET_PLAINTEXT_SIZE], b"aad")
-            .expect("the cap itself must be accepted");
-        assert!(matches!(
-            key.seal(&vec![0u8; MAX_SECRET_PLAINTEXT_SIZE + 1], b"aad"),
-            Err(Error::PayloadTooLarge {
-                limit: MAX_SECRET_PLAINTEXT_SIZE,
-                ..
-            })
-        ));
+        for layer in [SealLayer::Inner, SealLayer::Outer] {
+            let limit = layer.max_plaintext_size();
+            key.seal(layer, &vec![0u8; limit], b"aad")
+                .expect("the cap itself must be accepted");
+            assert!(
+                matches!(
+                    key.seal(layer, &vec![0u8; limit + 1], b"aad"),
+                    Err(Error::PayloadTooLarge { limit: l, .. }) if l == limit
+                ),
+                "{layer:?} accepted a plaintext over its cap"
+            );
+        }
+    }
+
+    /// The outer layer's plaintext is the inner envelope, which is always bigger
+    /// than the secret inside it. If both layers were held to the secret's own
+    /// cap, a secret at exactly the Kubernetes limit could be sealed once and
+    /// then never wrapped — undeliverable, with the failure landing on the
+    /// component doing the wrapping rather than the one that set the size.
+    ///
+    /// Walks the real chain at the maximum size and checks it closes: the
+    /// envelope is over the inner cap (so the distinction is load-bearing, not
+    /// theoretical), the outer seal takes it, and what comes out is still small
+    /// enough for a recipient's arrival cap to admit.
+    /// What the serialized inner envelope adds on top of the seal it carries,
+    /// beyond the encapsulated key and ciphertext: the `key_id` string and the
+    /// proto framing around all three fields.
+    const ENVELOPE_FRAMING_LEN: usize = 32;
+
+    #[test]
+    fn the_size_caps_let_a_maximum_sized_secret_through_both_layers() {
+        let enrolled = EncryptionKeypair::derive(b"max-size-enrolled");
+        let announced = EncryptionKeypair::derive(b"max-size-announced");
+
+        let inner = enrolled
+            .recipient()
+            .seal(
+                SealLayer::Inner,
+                &vec![0xab; MAX_SECRET_PLAINTEXT_SIZE],
+                b"inner-aad",
+            )
+            .expect("a secret at the Kubernetes limit seals");
+
+        // Stand in for the serialized envelope carrying that seal.
+        let envelope_len = inner.enc.len() + inner.ciphertext.len() + ENVELOPE_FRAMING_LEN;
+        assert!(
+            envelope_len > MAX_SECRET_PLAINTEXT_SIZE,
+            "the envelope must exceed the inner cap, or this proves nothing"
+        );
+
+        let outer = announced
+            .recipient()
+            .seal(SealLayer::Outer, &vec![0xcd; envelope_len], b"outer-aad")
+            .expect("the envelope wrapping a maximum-sized secret seals");
+
+        assert!(
+            outer.ciphertext.len() <= MAX_SEALED_SECRETS_SIZE,
+            "the outer ciphertext ({}) must fit a recipient's arrival cap ({MAX_SEALED_SECRETS_SIZE})",
+            outer.ciphertext.len()
+        );
+        announced
+            .open(&outer.enc, &outer.ciphertext, b"outer-aad")
+            .expect("a recipient accepts and opens it");
     }
 }

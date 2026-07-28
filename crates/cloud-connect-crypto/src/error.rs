@@ -83,6 +83,17 @@ pub enum Error {
     ))]
     PayloadTooLarge { len: usize, limit: usize },
 
+    // Separate from `Open` on purpose. This one is decided from the length
+    // alone, before any key agreement or decryption happens, and the length is
+    // something the sender already knows — so naming it leaks nothing and is
+    // the difference between a diagnosable rejection and an unexplained one.
+    #[snafu(display(
+        "Failed to open a Cloud Connect sealed secret payload: the sealed payload is {len} bytes, \
+         over the {limit}-byte limit, and was rejected without being decrypted. A payload this \
+         size cannot have been produced by a conforming sealer."
+    ))]
+    SealedPayloadTooLarge { len: usize, limit: usize },
+
     #[snafu(display("Failed to seal a Cloud Connect secret payload: HPKE encryption failed."))]
     Seal,
 
