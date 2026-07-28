@@ -2239,8 +2239,10 @@ impl CayenneTableProviderBuilder {
 
     /// Set the per-scan freshness tolerance (read-current lag). `0` =
     /// read-your-writes (the default). The runtime derives this from the dataset's
-    /// `access` mode: `0` for read-write datasets, a bounded non-zero lag for
-    /// read-only ones. See [`CayenneTableProvider::default_scan_freshness`].
+    /// `access` mode AND refresh mode: a bounded non-zero lag only for a read-only CDC
+    /// replica (`access: read` + `refresh_mode: changes`), and `0` for every other
+    /// table (read-write, or read-only non-CDC). See
+    /// [`CayenneTableProvider::default_scan_freshness`].
     #[must_use]
     pub fn with_default_scan_freshness(mut self, freshness: Duration) -> Self {
         self.default_scan_freshness = freshness;

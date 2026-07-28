@@ -648,32 +648,43 @@ fn warn_if_low_disk_blocking(label: &str, path: &str) {
     );
 }
 
-/// Default read-current freshness (bounded staleness), in ms, for READ-ONLY Cayenne
-/// datasets. Read-only datasets take no user DML, so a scan need not be
-/// read-your-writes; serving a recently-built `ScanView` within this lag lets
+/// Default read-current freshness (bounded staleness), in ms, for a READ-ONLY Cayenne
+/// CDC replica (`access: read` + `refresh_mode: changes`). Such a replica's data
+/// streams in only via CDC and is eventually-consistent by design, so a scan need not
+/// be read-your-writes; serving a recently-built `ScanView` within this lag lets
 /// concurrent analytical scans share one build (the demand cache's reuse lever) while
-/// staying far inside the freshness SLO. Read-write datasets ignore this and always
-/// use 0 (read-your-writes). 1 s is a conservative bounded-staleness default, far
-/// inside the freshness SLO; tune as the A/B data lands.
+/// staying far inside the freshness SLO. Every other table uses 0 (read-your-writes):
+/// read-write datasets, and read-only NON-CDC tables (full-refresh/snapshot/append),
+/// which must reflect their last refresh immediately and can still take a direct
+/// `delete_from` via the accelerator. 1 s is a conservative bounded-staleness default,
+/// far inside the freshness SLO; tune as the A/B data lands.
 const DEFAULT_READ_ONLY_SCAN_FRESHNESS_MS: u64 = 1000;
 
-/// The read-current lag applied to READ-ONLY Cayenne datasets:
+/// The read-current lag applied to a READ-ONLY Cayenne CDC replica:
 /// [`DEFAULT_READ_ONLY_SCAN_FRESHNESS_MS`], overridable via the
 /// `CAYENNE_SCAN_VIEW_FRESHNESS_MS` environment variable (a process-wide operational
 /// knob, not per-table data config, so it stays out of `configuration_matches`).
-/// Setting it to `0` opts read-only datasets back into read-your-writes (the A/B
-/// no-reuse baseline). Never affects read-write datasets, which always use 0.
+/// Setting it to `0` opts CDC replicas back into read-your-writes (the A/B no-reuse
+/// baseline). Never affects any other table, which always uses 0.
+///
+/// Parsed once into a process-global `LazyLock`: the env var is a process-wide knob, so
+/// caching avoids re-parsing on every provider/partition construction AND emits the
+/// invalid-value warning at most once (rather than per construction).
 fn read_only_scan_freshness() -> std::time::Duration {
-    let ms = match std::env::var("CAYENNE_SCAN_VIEW_FRESHNESS_MS") {
-        Err(_) => DEFAULT_READ_ONLY_SCAN_FRESHNESS_MS,
-        // A set-but-invalid value is a misconfiguration; warn (don't silently
-        // swallow it) before falling back, mirroring `parse_env_u64`.
-        Ok(raw) => raw.trim().parse::<u64>().unwrap_or_else(|_| {
-            tracing::warn!("Ignoring invalid CAYENNE_SCAN_VIEW_FRESHNESS_MS={raw:?}: expected a non-negative integer (milliseconds); using default {DEFAULT_READ_ONLY_SCAN_FRESHNESS_MS} ms.");
-            DEFAULT_READ_ONLY_SCAN_FRESHNESS_MS
-        }),
-    };
-    std::time::Duration::from_millis(ms)
+    static READ_ONLY_SCAN_FRESHNESS: LazyLock<std::time::Duration> = LazyLock::new(|| {
+        let ms = match std::env::var("CAYENNE_SCAN_VIEW_FRESHNESS_MS") {
+            Err(_) => DEFAULT_READ_ONLY_SCAN_FRESHNESS_MS,
+            // A set-but-invalid value is a misconfiguration; warn (don't silently
+            // swallow it) before falling back, mirroring `parse_env_u64`. `{raw:?}`
+            // escapes control characters so untrusted input cannot inject log lines.
+            Ok(raw) => raw.trim().parse::<u64>().unwrap_or_else(|_| {
+                tracing::warn!("Ignoring invalid CAYENNE_SCAN_VIEW_FRESHNESS_MS={raw:?}: expected a non-negative integer (milliseconds); using default {DEFAULT_READ_ONLY_SCAN_FRESHNESS_MS} ms.");
+                DEFAULT_READ_ONLY_SCAN_FRESHNESS_MS
+            }),
+        };
+        std::time::Duration::from_millis(ms)
+    });
+    *READ_ONLY_SCAN_FRESHNESS
 }
 
 fn apply_refresh_mode_defaults(
