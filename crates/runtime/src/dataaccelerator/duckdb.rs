@@ -200,12 +200,17 @@ impl DuckDBAccelerator {
                 let max_size =
                     Self::get_pool_max_size(num_accelerating_datasets, acceleration, storage);
                 let min_idle = Self::get_pool_min_idle(storage, max_size);
+                // Instance-scoped pragmas are instance setup queries (applied
+                // once per DuckDB instance, and re-applied to the replacement
+                // instance after an `on_full_refresh: swap_file` file swap) —
+                // not per-connection queries, which a draining connection would
+                // re-apply to a retiring instance.
                 let mut pool_builder = DuckDbConnectionPoolBuilder::file(&duckdb_file)
                     .with_max_size(Some(max_size))
                     .with_min_idle(Some(min_idle))
-                    .with_connection_setup_query("PRAGMA enable_checkpoint_on_shutdown");
+                    .with_instance_setup_query("PRAGMA enable_checkpoint_on_shutdown");
                 for pragma in Self::storage_setup_queries(storage) {
-                    pool_builder = pool_builder.with_connection_setup_query(*pragma);
+                    pool_builder = pool_builder.with_instance_setup_query(*pragma);
                 }
                 self.duckdb_factory
                     .get_or_init_instance_with_builder(pool_builder)
@@ -226,7 +231,7 @@ impl DuckDBAccelerator {
                 let pool_builder = DuckDbConnectionPoolBuilder::memory()
                     .with_max_size(Some(max_size))
                     .with_min_idle(Some(min_idle))
-                    .with_connection_setup_query("PRAGMA enable_checkpoint_on_shutdown");
+                    .with_instance_setup_query("PRAGMA enable_checkpoint_on_shutdown");
                 self.duckdb_factory
                     .get_or_init_instance_with_builder(pool_builder)
                     .await
@@ -402,6 +407,53 @@ impl DuckDBAccelerator {
     }
 }
 
+/// Runs interrupted-file-swap recovery for a configured `DuckDB` file path once
+/// per process, before any connection pool for that file exists.
+///
+/// Datasets sharing one `DuckDB` file initialize concurrently; the global async
+/// mutex both serializes and deduplicates their recovery so exactly one pass
+/// runs per file, and no dataset builds a pool while recovery is renaming
+/// generation files.
+async fn recover_interrupted_file_swap_once(path: &str) {
+    static RECOVERED_PATHS: std::sync::LazyLock<tokio::sync::Mutex<HashSet<String>>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(HashSet::new()));
+
+    let mut recovered = RECOVERED_PATHS.lock().await;
+    if recovered.contains(path) {
+        return;
+    }
+
+    let owned_path = path.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        datafusion_table_providers::duckdb::recover_database_file_generations(&owned_path)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(recovery)) => {
+            if recovery.adopted.is_some() || !recovery.removed.is_empty() {
+                tracing::info!(
+                    "Recovered DuckDB acceleration file {path} from an interrupted file swap (adopted: {adopted:?}, removed {removed} leftover file(s))",
+                    adopted = recovery.adopted,
+                    removed = recovery.removed.len()
+                );
+            }
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(
+                "Failed to recover DuckDB acceleration file {path} from a prior file swap: {e}"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Failed to recover DuckDB acceleration file {path} from a prior file swap: {e}"
+            );
+        }
+    }
+
+    recovered.insert(path.to_string());
+}
+
 /// Returns the `DuckDB` file path that would be used for a file-based `DuckDB` acceleration for this acceleration source
 ///
 /// # Parameters
@@ -468,6 +520,9 @@ const PARAMETERS: &[ParameterSpec] = &[
     ),
     ParameterSpec::runtime("on_refresh_recompute_statistics"),
     ParameterSpec::runtime("on_refresh_sort_columns"),
+    ParameterSpec::runtime("on_full_refresh").description(
+        "How a full refresh writes into a file-mode DuckDB acceleration: 'in_place' (default) rewrites the table inside the live database file; 'swap_file' writes a new database file, checkpoints it, and atomically swaps it in, bounding database file growth.",
+    ),
     ParameterSpec::runtime("optimizer_duckdb_aggregate_pushdown"),
 ];
 
@@ -541,6 +596,11 @@ impl DataAccelerator for DuckDBAccelerator {
                 }
                 .into());
             }
+
+            // Recover from any interrupted database file swap (crashed or
+            // partially completed) before the first connection pool opens this
+            // file — and before FileCreate mode decides whether a file exists.
+            recover_interrupted_file_swap_once(&path).await;
 
             // If mode is FileCreate, snapshot the existing file (if enabled) then delete it to start fresh
             if acceleration.mode == Mode::FileCreate {
@@ -618,6 +678,43 @@ impl DataAccelerator for DuckDBAccelerator {
             );
         }
 
+        let dataset_display_name = source.map_or_else(
+            || cmd.name.to_string(),
+            |src| src.name().to_string(),
+        );
+        let full_refresh_swap = match cmd.options.remove("on_full_refresh").as_deref() {
+            None | Some("in_place") => false,
+            Some("swap_file") => true,
+            Some(other) => super::InvalidConfigurationSnafu {
+                msg: format!(
+                    "Failed to register dataset {dataset_display_name} (duckdb accelerator): Invalid 'on_full_refresh' value '{other}'. Expected 'in_place' or 'swap_file'. See: https://spiceai.org/docs/components/data-accelerators/duckdb"
+                ),
+            }
+            .fail()?,
+        };
+        if full_refresh_swap {
+            let is_file_mode = source.map_or_else(
+                || {
+                    cmd.options
+                        .get("mode")
+                        .is_some_and(|mode| mode.contains("file"))
+                },
+                |src| src.is_file_accelerated(),
+            );
+            ensure!(
+                is_file_mode,
+                super::InvalidConfigurationSnafu {
+                    msg: format!(
+                        "Failed to register dataset {dataset_display_name} (duckdb accelerator): 'on_full_refresh: swap_file' requires file-mode acceleration. Set 'mode: file' or remove 'on_full_refresh'. See: https://spiceai.org/docs/components/data-accelerators/duckdb"
+                    ),
+                }
+            );
+            // Translate to the engine write setting that switches Overwrite
+            // loads to the database-file-swap path.
+            cmd.options
+                .insert("overwrite_file_swap".to_string(), "enabled".to_string());
+        }
+
         let is_changes_refresh = source
             .and_then(|src| src.acceleration())
             .and_then(|acceleration| acceleration.refresh_mode)
@@ -680,6 +777,15 @@ impl DataAccelerator for DuckDBAccelerator {
                         "attach_databases".to_string(),
                         attach_databases.iter().join(";"),
                     );
+                    if full_refresh_swap {
+                        // DuckDB attaches a database file once per instance; the
+                        // other datasets' instances keep their attachment to this
+                        // dataset's pre-swap file (by then unlinked) open until
+                        // the runtime restarts.
+                        tracing::warn!(
+                            "Dataset {dataset_display_name}: 'on_full_refresh: swap_file' is set while other DuckDB acceleration files exist. Cross-file DuckDB federated queries will read this dataset's pre-swap data until the runtime restarts. Colocate the datasets in one DuckDB file to avoid this."
+                        );
+                    }
                 }
             }
         }
@@ -834,6 +940,11 @@ impl DataAccelerator for DuckDBAccelerator {
 
         tokio::task::spawn_blocking(
             move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                let write_gate = pool.write_gate();
+                let _write_guard = write_gate
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+
                 let mut conn = pool.connect_sync()?;
                 let duckdb_conn = DuckDB::duckdb_conn(&mut conn).boxed()?;
                 let tx = duckdb_conn.get_underlying_conn_mut().transaction().boxed()?;
@@ -882,6 +993,11 @@ impl DataAccelerator for DuckDBAccelerator {
 
         let result = tokio::task::spawn_blocking(
             move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                let write_gate = pool.write_gate();
+                let _write_guard = write_gate
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+
                 let mut conn = pool.connect_sync()?;
                 let duckdb_conn = DuckDB::duckdb_conn(&mut conn).boxed()?;
                 let tx = duckdb_conn
@@ -1784,6 +1900,96 @@ mod tests {
             column_defaults: HashMap::default(),
             temporary: false,
         }
+    }
+
+    async fn create_provider_write_settings(
+        options: HashMap<String, String>,
+    ) -> Result<
+        datafusion_table_providers::duckdb::write_settings::DuckDBWriteSettings,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        let accelerator = DuckDBAccelerator::new();
+        let cmd = external_table_with_options(options);
+        let provider = accelerator
+            .create_external_table(cmd, None, vec![], None)
+            .await?;
+        let poly = provider
+            .as_any()
+            .downcast_ref::<data_components::poly::PolyTableProvider>()
+            .expect("PolyTableProvider");
+        let writer = poly.writer();
+        let writer = writer
+            .as_any()
+            .downcast_ref::<datafusion_table_providers::duckdb::write::DuckDBTableWriter>()
+            .expect("DuckDBTableWriter");
+        Ok(writer.write_settings().clone())
+    }
+
+    #[tokio::test]
+    async fn duckdb_on_full_refresh_swap_file_enables_overwrite_file_swap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir
+            .path()
+            .join("swap_param.db")
+            .to_string_lossy()
+            .to_string();
+        let mut options = HashMap::new();
+        options.insert("mode".to_string(), "file".to_string());
+        options.insert("open".to_string(), db);
+        options.insert("on_full_refresh".to_string(), "swap_file".to_string());
+
+        let settings = create_provider_write_settings(options)
+            .await
+            .expect("provider should be created");
+        assert!(settings.overwrite_file_swap);
+    }
+
+    #[tokio::test]
+    async fn duckdb_on_full_refresh_defaults_to_in_place() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir
+            .path()
+            .join("swap_param_default.db")
+            .to_string_lossy()
+            .to_string();
+        let mut options = HashMap::new();
+        options.insert("mode".to_string(), "file".to_string());
+        options.insert("open".to_string(), db);
+
+        let settings = create_provider_write_settings(options)
+            .await
+            .expect("provider should be created");
+        assert!(!settings.overwrite_file_swap);
+    }
+
+    #[tokio::test]
+    async fn duckdb_on_full_refresh_swap_file_rejected_for_memory_mode() {
+        let mut options = HashMap::new();
+        options.insert("mode".to_string(), "memory".to_string());
+        options.insert("on_full_refresh".to_string(), "swap_file".to_string());
+
+        let err = create_provider_write_settings(options)
+            .await
+            .expect_err("memory mode must reject swap_file");
+        assert!(
+            err.to_string().contains("requires file-mode"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn duckdb_on_full_refresh_invalid_value_rejected() {
+        let mut options = HashMap::new();
+        options.insert("mode".to_string(), "memory".to_string());
+        options.insert("on_full_refresh".to_string(), "sometimes".to_string());
+
+        let err = create_provider_write_settings(options)
+            .await
+            .expect_err("invalid value must be rejected");
+        assert!(
+            err.to_string().contains("Invalid 'on_full_refresh' value"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

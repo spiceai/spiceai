@@ -58,6 +58,8 @@ mod query_push_down;
 mod refresh;
 mod retention_arrow;
 #[cfg(feature = "duckdb")]
+mod file_swap_duckdb;
+#[cfg(feature = "duckdb")]
 mod single_instance_duckdb;
 #[cfg(feature = "snapshots")]
 mod snapshot_lock_contention;
