@@ -57,6 +57,7 @@ members = [
     "crates/runtime-parameters",
     "crates/runtime-parameters-derive",
     "crates/runtime-secrets",
+    "crates/runtime-status",
     "crates/runtime-table-partition",
     "crates/runtime-rate-control",
     "crates/runtime-request-context",

@@ -153,6 +153,7 @@ runtime-proto = { path = "../runtime-proto" }
 runtime-rate-control = { path = "../runtime-rate-control" }
 runtime-request-context = { path = "../runtime-request-context" }
 runtime-secrets = { path = "../runtime-secrets", default-features = false }
+runtime-status = { path = "../runtime-status" }
 runtime-table-partition = { path = "../runtime-table-partition" }
 rusqlite = { workspace = true, optional = true }
 rustls.workspace = true
