@@ -16771,6 +16771,7 @@ dependencies = [
  "runtime-request-context",
  "runtime-search",
  "runtime-secrets",
+ "runtime-status",
  "runtime-table-partition",
  "runtime-tools",
  "rusqlite",
@@ -17368,6 +17369,18 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "runtime-status"
+version = "2.2.0-unstable"
+dependencies = [
+ "datafusion-common",
+ "opentelemetry",
+ "runtime-api-types",
+ "runtime-metrics",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
