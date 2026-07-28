@@ -983,6 +983,42 @@ impl ShardedPkIndex {
             }
         }
     }
+
+    /// Record `keys` into whichever shard each key routes to
+    /// ([`shard_of_pk`]) — the commit-path analog of
+    /// [`Self::record_keys_in_shard`], for callers whose key set is NOT
+    /// pre-routed (the inline/file/staging commit paths record a whole
+    /// batch's validated keys at once). Without this, keys committed off the
+    /// mem-tier path exist only in the single-keyset cache and a long-lived
+    /// sharded exact keyset false-negates them into duplicate upserts.
+    /// Existence-only inserts (`max_bytes: usize::MAX`), same as the
+    /// per-shard path; the caller re-applies the byte budget once afterwards.
+    pub(crate) fn record_keys(&mut self, keys: &PkDigestSet, location: &RowLocation) {
+        let n = self.shard_count();
+        match self {
+            Self::Exact(keysets) => {
+                for (digest, key) in keys.iter_with_digest() {
+                    let shard = shard_of_pk(key.as_ref(), n);
+                    if let Some(keyset) = keysets.get_mut(shard) {
+                        let _ = keyset.try_insert_with_digest(
+                            digest,
+                            key,
+                            location.clone(),
+                            usize::MAX,
+                        );
+                    }
+                }
+            }
+            Self::Bloom(blooms) => {
+                for key in keys.iter() {
+                    let shard = shard_of_pk(key.as_ref(), n);
+                    if let Some(bloom) = blooms.get_mut(shard) {
+                        bloom.insert(key.as_ref());
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Borrowed view of a [`CachedPkIndex`] handed to per-batch validation. The
