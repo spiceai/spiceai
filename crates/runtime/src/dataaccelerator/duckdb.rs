@@ -490,7 +490,7 @@ impl DuckDBAccelerator {
 /// unknown (the directory could not be enumerated, or a completed generation
 /// could not be adopted). Continuing past one of those would open whatever
 /// happens to be at the configured path — and when the configured file is
-/// missing because a swap got as far as unlinking it, that means DuckDB creates
+/// missing because a swap got as far as unlinking it, that means `DuckDB` creates
 /// a fresh empty database and the dataset silently loses its `spice_sys_*`
 /// metadata (dataset checkpoints, CDC offsets). Failing `init` instead keeps the
 /// generation files on disk for the next attempt. Failures to *delete* stale
