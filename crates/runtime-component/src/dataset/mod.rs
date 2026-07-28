@@ -377,6 +377,11 @@ pub struct DatasetSpec {
     pub vectors: Option<VectorStore>,
     pub full_text_search: Option<spicepod::fts::FtsStore>,
     pub check_availability: CheckAvailability,
+    /// How often the availability monitor probes this (non-accelerated)
+    /// dataset's source, parsed from the Spicepod duration string at
+    /// construction. Availability monitoring is **opt-in**: `None` means the
+    /// dataset is not monitored at all.
+    pub check_availability_interval: Option<Duration>,
 }
 
 impl std::fmt::Debug for DatasetSpec {
@@ -404,6 +409,10 @@ impl std::fmt::Debug for DatasetSpec {
             .field("vectors", &self.vectors)
             .field("full_text_search", &self.full_text_search)
             .field("check_availability", &self.check_availability)
+            .field(
+                "check_availability_interval",
+                &self.check_availability_interval,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -432,6 +441,7 @@ impl PartialEq for DatasetSpec {
             && self.vectors == other.vectors
             && self.full_text_search == other.full_text_search
             && self.check_availability == other.check_availability
+            && self.check_availability_interval == other.check_availability_interval
     }
 }
 

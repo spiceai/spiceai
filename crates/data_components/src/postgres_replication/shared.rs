@@ -1973,9 +1973,12 @@ async fn deliver_to_member(
                     return SendOutcome::ShutdownAbandon(w);
                 }
                 metrics.add_send_stalled(MEMBER_SEND_STALL_WARN.as_secs());
+                // Log the cumulative wait for THIS delivery, not the constant
+                // poll interval: a monotonically growing value distinguishes
+                // one long continuous stall from scattered brief ones.
                 tracing::warn!(
                     dataset = %dataset_name,
-                    stalled_for = ?MEMBER_SEND_STALL_WARN,
+                    stalled_for = ?send_start.elapsed(),
                     "shared Postgres CDC member sink is not draining; the pump is \
                      waiting to deliver committed changes (watch \
                      dataset_postgres_replication_member_send_stalled_seconds_total)"
