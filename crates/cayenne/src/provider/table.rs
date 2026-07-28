@@ -23635,31 +23635,19 @@ impl CayenneTableProvider {
         Ok(plans)
     }
 
-    /// Unions `plans` into a single `ExecutionPlan`, skipping any branch that is a bare
-    /// `EmptyExec` — it can never produce a row (e.g. `create_snapshot_scan_plan_with_config`
-    /// hands one back, unwrapped, when the current snapshot matches zero files right after
-    /// compaction rotates its pointer). Unioning it in anyway only widens the plan for no
-    /// benefit. Returns the sole survivor directly when only one non-empty branch remains
-    /// (`UnionExec::try_new` requires at least two inputs), or the first `EmptyExec` if every
-    /// branch was empty.
-    ///
-    /// `plans` must be non-empty; every call site here passes at least one real branch.
+    /// Unions `plans`, dropping any bare `EmptyExec` branch (it can never produce a row —
+    /// e.g. `create_snapshot_scan_plan_with_config` hands one back, unwrapped, when a
+    /// snapshot matches zero files) instead of needlessly widening the plan with it.
+    /// `plans` must be non-empty.
     fn union_skipping_empty(
         plans: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        let mut non_empty = Vec::with_capacity(plans.len());
-        let mut first_empty: Option<Arc<dyn ExecutionPlan>> = None;
-        for plan in plans {
-            if plan.as_any().is::<EmptyExec>() {
-                if first_empty.is_none() {
-                    first_empty = Some(Arc::clone(&plan));
-                }
-            } else {
-                non_empty.push(plan);
-            }
-        }
+        let (mut non_empty, empty): (Vec<_>, Vec<_>) = plans
+            .into_iter()
+            .partition(|plan| !plan.as_any().is::<EmptyExec>());
+
         match non_empty.len() {
-            0 => first_empty.ok_or_else(|| {
+            0 => empty.into_iter().next().ok_or_else(|| {
                 datafusion_common::DataFusionError::Internal(
                     "union_skipping_empty called with no plans".to_string(),
                 )
