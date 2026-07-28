@@ -348,10 +348,7 @@ impl SharepointClient {
     }
 
     /// Returns the underlying content of a drive item.
-    async fn get_drive_item_content(
-        &self,
-        item_id: &str,
-    ) -> Result<Bytes, GraphFailure> {
+    async fn get_drive_item_content(&self, item_id: &str) -> Result<Bytes, GraphFailure> {
         let resp = match self.drive_client() {
             DriveApi::Id(client) => client.item(item_id).get_items_content(),
             DriveApi::Default(client) => client.item(item_id).get_items_content(),

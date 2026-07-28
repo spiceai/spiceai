@@ -65,7 +65,12 @@ pub struct SecondaryIndex {
 impl SecondaryIndex {
     /// Creates a new secondary index.
     #[must_use]
-    pub(crate) fn new(name: String, columns: Vec<String>, unique: bool, index: Arc<HashIndex>) -> Self {
+    pub(crate) fn new(
+        name: String,
+        columns: Vec<String>,
+        unique: bool,
+        index: Arc<HashIndex>,
+    ) -> Self {
         Self {
             name,
             columns,
@@ -326,10 +331,7 @@ impl IndexedMemTable {
     ///
     /// For data-critical queries, prefer using SQL queries via `scan()`,
     /// which verifies actual key values after hash lookup.
-    async fn get_batch_by_keys<K: std::hash::Hash>(
-        &self,
-        keys: &[K],
-    ) -> Result<Vec<RecordBatch>> {
+    async fn get_batch_by_keys<K: std::hash::Hash>(&self, keys: &[K]) -> Result<Vec<RecordBatch>> {
         let index = match &self.index {
             Some(idx) => idx,
             None => {

@@ -13,7 +13,11 @@ use cmap::ToUnicodeCMap;
 use encoding_rs::UTF_16BE;
 use log::debug;
 
-pub(crate) fn bytes_to_string(encoding: &CodedCharacterSet, bytes: &[u8], out: &mut String) -> Result<()> {
+pub(crate) fn bytes_to_string(
+    encoding: &CodedCharacterSet,
+    bytes: &[u8],
+    out: &mut String,
+) -> Result<()> {
     for b in bytes {
         let Some(g) = encoding.get(*b as usize).copied().flatten() else {
             continue;

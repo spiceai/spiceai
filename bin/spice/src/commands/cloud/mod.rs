@@ -29,7 +29,9 @@ use snafu::ResultExt;
 use std::{fmt, io::IsTerminal};
 
 pub(crate) use client::{CloudClient, is_device_authorization_denied_error, parse_org_app};
-pub(crate) use config::{CloudLink, get_linked_app, load_cloud_link, remove_cloud_link, save_cloud_link};
+pub(crate) use config::{
+    CloudLink, get_linked_app, load_cloud_link, remove_cloud_link, save_cloud_link,
+};
 use spice_cloud_client::{
     endpoints::{data_region_name, normalize_data_region},
     types::{AppKind, IngestionMetrics, PodMetrics, UpdateChannel},

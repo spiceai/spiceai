@@ -191,9 +191,7 @@ impl DatasetBuilder {
     }
 
     #[expect(clippy::result_large_err)]
-    fn parse_table_reference(
-        name: &str,
-    ) -> std::result::Result<TableReference, crate::Error> {
+    fn parse_table_reference(name: &str) -> std::result::Result<TableReference, crate::Error> {
         match TableReference::parse_str(name) {
             table_ref @ (TableReference::Bare { .. } | TableReference::Partial { .. }) => {
                 Ok(table_ref)

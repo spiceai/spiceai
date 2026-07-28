@@ -84,7 +84,11 @@ impl QueryBuilder {
     ///
     /// Use this when the plan has already been parsed externally (e.g. for
     /// read-only auth validation) to avoid re-parsing.
-    pub(crate) fn from_plan(plan: LogicalPlan, sql: impl Into<Arc<str>>, df: Arc<DataFusion>) -> Self {
+    pub(crate) fn from_plan(
+        plan: LogicalPlan,
+        sql: impl Into<Arc<str>>,
+        df: Arc<DataFusion>,
+    ) -> Self {
         Self {
             df,
             method: SqlOrPlan::Plan(Box::new(plan), sql.into()),

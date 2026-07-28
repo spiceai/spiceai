@@ -202,7 +202,11 @@ pub(crate) fn build_byte_range(start: u64, end: u64) -> Range<u64> {
 
 /// Create an `ObjectMeta` from basic file information.
 #[must_use]
-pub(crate) fn build_object_meta(location: Path, size: u64, last_modified: DateTime<Utc>) -> ObjectMeta {
+pub(crate) fn build_object_meta(
+    location: Path,
+    size: u64,
+    last_modified: DateTime<Utc>,
+) -> ObjectMeta {
     ObjectMeta {
         location,
         size,

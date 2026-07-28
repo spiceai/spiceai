@@ -144,9 +144,7 @@ impl std::fmt::Display for GuardrailVersion {
     }
 }
 
-fn validate_guardrail_version(
-    s: impl Into<String>,
-) -> Result<GuardrailVersion, GuardrailError> {
+fn validate_guardrail_version(s: impl Into<String>) -> Result<GuardrailVersion, GuardrailError> {
     let value = s.into();
     if let Some(caps) = GUARDRAIL_VERSION_RE.captures(&value) {
         // Check if it matched a number

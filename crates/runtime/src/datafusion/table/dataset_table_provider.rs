@@ -110,7 +110,11 @@ impl DatasetTableProvider {
     /// to the catalog and used for SQL planning until the real provider
     /// takes over.
     #[must_use]
-    pub(crate) fn new(name: TableReference, schema: SchemaRef, init: DatasetInitialization) -> Self {
+    pub(crate) fn new(
+        name: TableReference,
+        schema: SchemaRef,
+        init: DatasetInitialization,
+    ) -> Self {
         Self {
             name,
             schema,

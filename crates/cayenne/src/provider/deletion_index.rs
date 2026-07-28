@@ -1383,7 +1383,11 @@ impl KeyDeletionIndex {
     /// all runs (main scan), byte-identical to [`get`](Self::get).
     #[inline]
     #[must_use]
-    pub(crate) fn get_with_min_seq(&self, key: &[u8], min_delete_seq: Option<i64>) -> Option<Tombstone> {
+    pub(crate) fn get_with_min_seq(
+        &self,
+        key: &[u8],
+        min_delete_seq: Option<i64>,
+    ) -> Option<Tombstone> {
         let key_hash = hash_key_128(key);
         let bloom_hash = bloom_half(key_hash);
         // Global bloom is a safe superset over every run's deletion keys, so a

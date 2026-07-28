@@ -201,7 +201,11 @@ pub struct JobState {
 impl JobState {
     /// Creates a new pending job state.
     #[must_use]
-    pub(crate) fn new_pending(job_id: String, sql: String, parameters: Option<serde_json::Value>) -> Self {
+    pub(crate) fn new_pending(
+        job_id: String,
+        sql: String,
+        parameters: Option<serde_json::Value>,
+    ) -> Self {
         let now_ms = now_ms_or_zero();
         Self {
             schema_version: JOB_SCHEMA_VERSION,

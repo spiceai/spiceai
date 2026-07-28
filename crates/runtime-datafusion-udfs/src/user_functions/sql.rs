@@ -393,7 +393,10 @@ impl ScalarUDFImpl for SqlScalarUdf {
 /// Returns [`SqlBuildError`] when the return schema is missing or invalid, any
 /// argument type is invalid, or the query cannot be planned against a typed
 /// `args` table.
-pub(crate) async fn build_table_udtf(decl: &Function, body: &str) -> Result<Arc<dyn TableFunctionImpl>> {
+pub(crate) async fn build_table_udtf(
+    decl: &Function,
+    body: &str,
+) -> Result<Arc<dyn TableFunctionImpl>> {
     let arg_schema = function_arg_schema(&decl.signature.args)?;
     let table_args = table_arg_specs(&decl.signature.tables)?;
     let output_schema = table_return_schema(decl)?;

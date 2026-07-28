@@ -355,7 +355,10 @@ impl RefreshTaskBuilder {
     }
 
     #[must_use]
-    pub(crate) fn with_last_updated_at(mut self, last_updated_at: Arc<AtomicI64>) -> RefreshTaskBuilder {
+    pub(crate) fn with_last_updated_at(
+        mut self,
+        last_updated_at: Arc<AtomicI64>,
+    ) -> RefreshTaskBuilder {
         self.last_updated_at = last_updated_at;
         self
     }
@@ -371,7 +374,10 @@ impl RefreshTaskBuilder {
 
     /// Set whether the acceleration uses S3 Express One Zone storage.
     #[must_use]
-    pub(crate) fn with_s3_express_acceleration(mut self, is_s3_express: bool) -> RefreshTaskBuilder {
+    pub(crate) fn with_s3_express_acceleration(
+        mut self,
+        is_s3_express: bool,
+    ) -> RefreshTaskBuilder {
         self.is_s3_express_acceleration = is_s3_express;
         self
     }

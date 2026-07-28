@@ -100,10 +100,7 @@ impl<T: 'static> SearchVisitor<T> {
     }
 
     #[must_use]
-    fn down(
-        mut self,
-        func: impl FnMut(&Arc<dyn ExecutionPlan>) -> Option<T> + 'static,
-    ) -> Self {
+    fn down(mut self, func: impl FnMut(&Arc<dyn ExecutionPlan>) -> Option<T> + 'static) -> Self {
         self.f_down = Some(Box::new(func));
         self
     }

@@ -589,7 +589,10 @@ pub(crate) fn add_component(section: ComponentSection, args: &ComponentAddArgs) 
     write_if_changed(&manifest_path, &spicepod, &before, created)
 }
 
-pub(crate) fn configure_component(section: ComponentSection, args: &ComponentConfigureArgs) -> Result<()> {
+pub(crate) fn configure_component(
+    section: ComponentSection,
+    args: &ComponentConfigureArgs,
+) -> Result<()> {
     let (manifest_path, mut spicepod, created) = load_manifest(args.options.manifest.as_deref())?;
     let before = spicepod.clone();
     mutate_component(

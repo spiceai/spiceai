@@ -79,7 +79,9 @@ impl LlmRuntimeStores {
     }
 
     #[must_use]
-    pub(crate) fn responses_api_support(&self) -> Arc<RwLock<HashMap<String, ResponsesApiSupport>>> {
+    pub(crate) fn responses_api_support(
+        &self,
+    ) -> Arc<RwLock<HashMap<String, ResponsesApiSupport>>> {
         Arc::clone(&self.responses_api_support)
     }
 }

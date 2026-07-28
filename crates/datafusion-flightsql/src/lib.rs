@@ -117,10 +117,7 @@ impl FlightSqlService {
     /// Returns the per-session context if the request carries a known session
     /// ID (via `x-session-id` or `Authorization: Bearer <id>`), otherwise
     /// falls back to the base context.
-    fn session_ctx(
-        &self,
-        metadata: &tonic::metadata::MetadataMap,
-    ) -> Arc<SessionContext> {
+    fn session_ctx(&self, metadata: &tonic::metadata::MetadataMap) -> Arc<SessionContext> {
         self.session_store
             .get_session_from_metadata(metadata)
             .unwrap_or_else(|| Arc::clone(&self.ctx))
@@ -224,10 +221,7 @@ impl FlightSqlService {
     ///
     /// Applies `expand_views_schema` so that the advertised schema matches
     /// what `sql_to_flight_stream` will actually produce.
-    async fn get_arrow_schema(
-        ctx: &Arc<SessionContext>,
-        sql: &str,
-    ) -> Result<Schema, Status> {
+    async fn get_arrow_schema(ctx: &Arc<SessionContext>, sql: &str) -> Result<Schema, Status> {
         let df = ctx.sql(sql).await.map_err(handle_datafusion_error)?;
         let schema = df.schema().as_arrow().clone();
         Ok(arrow_tools::schema::expand_views_schema(&schema))

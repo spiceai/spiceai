@@ -665,7 +665,10 @@ impl Document {
     }
 
     /// Get fonts used by a page.
-    pub(crate) fn get_page_fonts(&self, page_id: ObjectId) -> Result<BTreeMap<Vec<u8>, &Dictionary>> {
+    pub(crate) fn get_page_fonts(
+        &self,
+        page_id: ObjectId,
+    ) -> Result<BTreeMap<Vec<u8>, &Dictionary>> {
         fn collect_fonts_from_resources<'a>(
             resources: &'a Dictionary,
             fonts: &mut BTreeMap<Vec<u8>, &'a Dictionary>,

@@ -231,12 +231,7 @@ impl CachedPkKeyset {
     /// `pk_digest(&key)`), overwriting an existing entry's location. Lets the
     /// per-apply recording paths reuse the digest already stored in a
     /// [`PkDigestSet`] instead of re-hashing.
-    fn insert_with_digest(
-        &mut self,
-        digest: u128,
-        key: OwnedRow,
-        location: RowLocation,
-    ) {
+    fn insert_with_digest(&mut self, digest: u128, key: OwnedRow, location: RowLocation) {
         debug_assert_eq!(
             digest,
             pk_digest(&key),

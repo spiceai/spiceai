@@ -91,10 +91,7 @@ impl ImapTableProvider {
         }
     }
 
-    fn build_recordbatch(
-        &self,
-        messages: Vec<EmailMessage>,
-    ) -> Result<RecordBatch, ArrowError> {
+    fn build_recordbatch(&self, messages: Vec<EmailMessage>) -> Result<RecordBatch, ArrowError> {
         let mut dates = vec![];
         let mut subjects = vec![];
         let mut froms = vec![];

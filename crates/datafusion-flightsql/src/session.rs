@@ -120,7 +120,10 @@ impl SessionStore {
     /// Look up the session context from gRPC request metadata, returning `None`
     /// when no recognisable session ID header is present.
     #[must_use]
-    pub(crate) fn get_session_from_metadata(&self, metadata: &MetadataMap) -> Option<Arc<SessionContext>> {
+    pub(crate) fn get_session_from_metadata(
+        &self,
+        metadata: &MetadataMap,
+    ) -> Option<Arc<SessionContext>> {
         let session_id = extract_session_id(metadata)?;
         self.get_session(&session_id)
     }

@@ -1254,10 +1254,7 @@ impl Runtime {
     ///
     /// Returns `None` if neither source yields a schema, in which
     /// case the dataset must take the eager path.
-    async fn try_static_schema_for_dataset(
-        &self,
-        ds: &Dataset,
-    ) -> Option<arrow_schema::SchemaRef> {
+    async fn try_static_schema_for_dataset(&self, ds: &Dataset) -> Option<arrow_schema::SchemaRef> {
         // We must NOT construct the connector here — deferred bring-up
         // exists precisely to skip that work at startup. We only
         // resolve `ConnectorParams` (no I/O) so the factory can decide

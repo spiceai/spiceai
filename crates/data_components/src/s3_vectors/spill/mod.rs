@@ -169,7 +169,10 @@ pub async fn get_last_spill_index_for_virtual_index(
 
 /// Returns the current index identifier, accounting for spilling.
 #[must_use]
-pub(crate) fn current_index(idx: &S3VectorIdentifier, spill_index: &Arc<AtomicU8>) -> S3VectorIdentifier {
+pub(crate) fn current_index(
+    idx: &S3VectorIdentifier,
+    spill_index: &Arc<AtomicU8>,
+) -> S3VectorIdentifier {
     let spill_num = spill_index.load(Ordering::SeqCst);
     if spill_num == 0 {
         idx.clone()

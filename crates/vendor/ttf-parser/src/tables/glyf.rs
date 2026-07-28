@@ -20,7 +20,11 @@ pub(crate) struct Builder<'a> {
 
 impl<'a> Builder<'a> {
     #[inline]
-    pub(crate) fn new(transform: Transform, bbox: RectF, builder: &'a mut dyn OutlineBuilder) -> Self {
+    pub(crate) fn new(
+        transform: Transform,
+        bbox: RectF,
+        builder: &'a mut dyn OutlineBuilder,
+    ) -> Self {
         Builder {
             builder,
             transform,
@@ -593,7 +597,11 @@ impl<'a> Table<'a> {
 
     /// Outlines a glyph.
     #[inline]
-    pub(crate) fn outline(&self, glyph_id: GlyphId, builder: &mut dyn OutlineBuilder) -> Option<Rect> {
+    pub(crate) fn outline(
+        &self,
+        glyph_id: GlyphId,
+        builder: &mut dyn OutlineBuilder,
+    ) -> Option<Rect> {
         let mut b = Builder::new(Transform::default(), RectF::new(), builder);
         let glyph_data = self.get(glyph_id)?;
         outline_impl(self.loca_table, self.data, glyph_data, 0, &mut b)?

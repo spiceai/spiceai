@@ -38,7 +38,11 @@ impl Debug for DeferredCatalogProvider {
 }
 
 impl DeferredCatalogProvider {
-    pub(crate) fn new(rt: Arc<Runtime>, connector: Arc<dyn CatalogConnector>, catalog: Catalog) -> Self {
+    pub(crate) fn new(
+        rt: Arc<Runtime>,
+        connector: Arc<dyn CatalogConnector>,
+        catalog: Catalog,
+    ) -> Self {
         Self {
             rt,
             connector,

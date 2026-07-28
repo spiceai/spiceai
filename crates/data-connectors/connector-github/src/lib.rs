@@ -1390,10 +1390,7 @@ impl DataConnector for Github {
     }
 }
 
-fn parse_globs(
-    component: &ConnectorComponent,
-    input: &str,
-) -> DataConnectorResult<Arc<GlobSet>> {
+fn parse_globs(component: &ConnectorComponent, input: &str) -> DataConnectorResult<Arc<GlobSet>> {
     let patterns: Vec<&str> = input.split(&[',', ';'][..]).collect();
     let mut builder = GlobSetBuilder::new();
 

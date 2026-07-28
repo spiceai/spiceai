@@ -190,9 +190,7 @@ impl DatasetsHealthMonitor {
     }
 
     // returns a list of dataset names that had successful queries against them in the last 10 minutes
-    async fn get_recently_accessed_datasets(
-        df: Arc<DataFusion>,
-    ) -> Result<Arc<HashSet<String>>> {
+    async fn get_recently_accessed_datasets(df: Arc<DataFusion>) -> Result<Arc<HashSet<String>>> {
         let query = format!(
             "
 SELECT labels.datasets AS datasets

@@ -1785,7 +1785,10 @@ impl DataFusion {
         self.resolve_pending_initializations(&table_refs).await
     }
 
-    pub(crate) async fn load_deferred_dataset(&self, table_reference: TableReference) -> Result<()> {
+    pub(crate) async fn load_deferred_dataset(
+        &self,
+        table_reference: TableReference,
+    ) -> Result<()> {
         let deferred_tables = self.deferred_tables.read().await;
         if let Some(deferred_registration) = deferred_tables.get(&table_reference.to_string()) {
             let read_provider = deferred_registration
@@ -1964,11 +1967,7 @@ impl DataFusion {
 
     /// Replace the table provider registered under `name` with
     /// `provider`. Used by the deferred dataset initialization swap.
-    fn replace_table(
-        &self,
-        name: &TableReference,
-        provider: Arc<dyn TableProvider>,
-    ) -> Result<()> {
+    fn replace_table(&self, name: &TableReference, provider: Arc<dyn TableProvider>) -> Result<()> {
         // Register the real provider directly, without a preceding
         // `deregister_table`. The underlying schema provider registers via an
         // atomic map insert that overwrites (and returns) the previous
@@ -2012,7 +2011,11 @@ impl DataFusion {
         }
     }
 
-    pub(crate) async fn load_deferred_catalog(&self, name: &str, access: &AccessMode) -> Result<()> {
+    pub(crate) async fn load_deferred_catalog(
+        &self,
+        name: &str,
+        access: &AccessMode,
+    ) -> Result<()> {
         let deferred_catalogs = self.deferred_catalogs.read().await;
         if let Some(catalog) = deferred_catalogs.get(name) {
             if let Ok(provider) = catalog.get_catalog_provider().await {
@@ -2336,7 +2339,10 @@ impl DataFusion {
         Ok(())
     }
 
-    pub(crate) async fn get_arrow_schema(&self, dataset: impl Into<TableReference>) -> Result<Schema> {
+    pub(crate) async fn get_arrow_schema(
+        &self,
+        dataset: impl Into<TableReference>,
+    ) -> Result<Schema> {
         let table_reference = dataset.into();
         let table_provider = self.get_table_provider(&table_reference).await?;
         Ok(table_provider.schema().as_ref().clone())

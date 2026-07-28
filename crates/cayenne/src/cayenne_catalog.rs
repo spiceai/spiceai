@@ -111,11 +111,7 @@ pub(crate) enum MetastoreImpl {
 
 impl MetastoreImpl {
     /// Helper to query a single row from metastore, working with both `SQLite` and Turso
-    async fn query_row_helper<F, T>(
-        &self,
-        params: QueryRowParams<'_>,
-        f: F,
-    ) -> CatalogResult<T>
+    async fn query_row_helper<F, T>(&self, params: QueryRowParams<'_>, f: F) -> CatalogResult<T>
     where
         F: FnOnce(&dyn MetastoreRow) -> CatalogResult<T> + Send + 'static,
         T: Send + 'static,
@@ -146,11 +142,7 @@ impl MetastoreImpl {
     }
 
     /// Helper to query multiple rows from metastore, working with both `SQLite` and Turso
-    async fn query_helper<F, T>(
-        &self,
-        params: QueryParams<'_>,
-        f: F,
-    ) -> CatalogResult<Vec<T>>
+    async fn query_helper<F, T>(&self, params: QueryParams<'_>, f: F) -> CatalogResult<Vec<T>>
     where
         F: Fn(&dyn MetastoreRow) -> CatalogResult<T> + Send + 'static,
         T: Send + 'static,

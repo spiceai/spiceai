@@ -150,7 +150,10 @@ pub fn convert_fields_to_arrow_schema(fields: Vec<&ChangeEventField>) -> Result<
     Ok(Schema::new(arrow_fields))
 }
 
-pub(crate) fn to_record_batch(values: Vec<serde_json::Value>, schema: &Schema) -> Result<RecordBatch> {
+pub(crate) fn to_record_batch(
+    values: Vec<serde_json::Value>,
+    schema: &Schema,
+) -> Result<RecordBatch> {
     Ok(to_struct_array(values, schema)?.into())
 }
 

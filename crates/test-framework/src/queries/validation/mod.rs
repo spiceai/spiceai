@@ -514,10 +514,7 @@ fn validate_batches_as_strings(
     Ok(QueryValidationResult::Pass)
 }
 
-fn validate_tpch_query(
-    query: &Query,
-    batches: &[RecordBatch],
-) -> Result<QueryValidationResult> {
+fn validate_tpch_query(query: &Query, batches: &[RecordBatch]) -> Result<QueryValidationResult> {
     let Some(expected_batches) = TPCH_ANSWERS.get(&query.name) else {
         return Ok(QueryValidationResult::Fail(
             QueryValidationFailReason::NoExpectedAnswer,

@@ -219,7 +219,10 @@ fn parse_limit_scalar(scalar: &ScalarValue) -> Result<u64, DataFusionError> {
 
 impl VectorSearchTableFunc {
     #[must_use]
-    pub(crate) fn new(df: Weak<DataFusion>, explicit_pks: HashMap<TableReference, Vec<String>>) -> Self {
+    pub(crate) fn new(
+        df: Weak<DataFusion>,
+        explicit_pks: HashMap<TableReference, Vec<String>>,
+    ) -> Self {
         let ptr = df.as_ptr().addr() as u64;
         Self {
             df,

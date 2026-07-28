@@ -247,7 +247,11 @@ pub(crate) fn record_partition_discovery_duration(node_id: &str, dataset: &str, 
 }
 
 /// Record a partition state operation (add / remove / reassign).
-pub(crate) fn record_partition_state_operation(node_id: &str, op: PartitionStateOperation, count: u64) {
+pub(crate) fn record_partition_state_operation(
+    node_id: &str,
+    op: PartitionStateOperation,
+    count: u64,
+) {
     if count == 0 {
         return;
     }
@@ -259,7 +263,11 @@ pub(crate) fn record_partition_state_operation(node_id: &str, op: PartitionState
 }
 
 /// Record a partitioned-write forward to an executor.
-pub(crate) fn record_partitioned_write_forward(node_id: &str, executor: &str, status: WriteForwardStatus) {
+pub(crate) fn record_partitioned_write_forward(
+    node_id: &str,
+    executor: &str,
+    status: WriteForwardStatus,
+) {
     let labels = [
         KeyValue::new("node_id", node_id.to_string()),
         KeyValue::new("executor", executor.to_string()),
@@ -336,7 +344,11 @@ static EXECUTOR_SCHEDULER_CONNECTION_RETRIES: LazyLock<Counter<u64>> = LazyLock:
 });
 
 /// Set the scheduler→executor active-connection gauge for one executor (0 or 1).
-pub(crate) fn set_scheduler_executor_active_connection(node_id: &str, executor: &str, active: bool) {
+pub(crate) fn set_scheduler_executor_active_connection(
+    node_id: &str,
+    executor: &str,
+    active: bool,
+) {
     let labels = [
         KeyValue::new("node_id", node_id.to_string()),
         KeyValue::new("executor", executor.to_string()),

@@ -808,7 +808,10 @@ impl Refresher {
         self
     }
 
-    pub(crate) fn with_completion_notifier(&mut self, on_complete_notification: Arc<Notify>) -> &mut Self {
+    pub(crate) fn with_completion_notifier(
+        &mut self,
+        on_complete_notification: Arc<Notify>,
+    ) -> &mut Self {
         self.on_complete_notification = Some(on_complete_notification);
         self
     }

@@ -198,7 +198,11 @@ pub(crate) fn write_secure_file(path: &Path, contents: &[u8]) -> Result<()> {
 }
 
 /// Ensures a YAML sequence field contains a string item, returning whether it changed the value.
-pub(crate) fn ensure_string_sequence_item(value: &mut Value, field: &str, item: &str) -> Result<bool> {
+pub(crate) fn ensure_string_sequence_item(
+    value: &mut Value,
+    field: &str,
+    item: &str,
+) -> Result<bool> {
     let sequence = ensure_sequence_field(value, field)?;
 
     if sequence
@@ -213,7 +217,11 @@ pub(crate) fn ensure_string_sequence_item(value: &mut Value, field: &str, item: 
 }
 
 /// Ensures a component reference sequence contains a `ref` entry, returning whether it changed the value.
-pub(crate) fn ensure_component_reference(value: &mut Value, field: &str, reference: &str) -> Result<bool> {
+pub(crate) fn ensure_component_reference(
+    value: &mut Value,
+    field: &str,
+    reference: &str,
+) -> Result<bool> {
     let sequence = ensure_sequence_field(value, field)?;
 
     if sequence.iter().any(|entry| {

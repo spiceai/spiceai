@@ -64,7 +64,10 @@ pub struct Reaper {
 
 impl Reaper {
     #[must_use]
-    pub(crate) fn new(cluster: Arc<ClusterStateStore>, heartbeats: Arc<SchedulerHeartbeatStore>) -> Self {
+    pub(crate) fn new(
+        cluster: Arc<ClusterStateStore>,
+        heartbeats: Arc<SchedulerHeartbeatStore>,
+    ) -> Self {
         Self {
             cluster,
             heartbeats,

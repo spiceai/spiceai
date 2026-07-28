@@ -51,7 +51,9 @@ impl BackendMessage {
 /// # Errors
 /// Returns [`PgWireError::Io`] on a read failure or EOF, or
 /// [`PgWireError::Protocol`] if the framed length is invalid or oversized.
-pub(crate) async fn read_backend_message<R: AsyncRead + Unpin>(rd: &mut R) -> Result<BackendMessage> {
+pub(crate) async fn read_backend_message<R: AsyncRead + Unpin>(
+    rd: &mut R,
+) -> Result<BackendMessage> {
     let mut reader = MessageReader::new();
     reader.read(rd).await
 }
@@ -517,7 +519,10 @@ pub(crate) async fn write_password_message<W: AsyncWrite + Unpin>(
     clippy::cast_possible_wrap,
     reason = "CopyData message length is bounded well below i32::MAX"
 )]
-pub(crate) async fn write_copy_data<W: AsyncWrite + Unpin>(wr: &mut W, payload: &[u8]) -> Result<()> {
+pub(crate) async fn write_copy_data<W: AsyncWrite + Unpin>(
+    wr: &mut W,
+    payload: &[u8],
+) -> Result<()> {
     let mut buf = BytesMut::with_capacity(payload.len() + 16);
     buf.put_u8(b'd');
     buf.put_i32(0);

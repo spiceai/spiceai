@@ -305,9 +305,7 @@ impl FileBasedDeletionSink {
 
     /// Internal implementation that returns structured deletion results
     /// including cleanup metadata for post-delete operations.
-    async fn delete_from_internal(
-        &self,
-    ) -> crate::provider::Result<FileBasedDeletionResult> {
+    async fn delete_from_internal(&self) -> crate::provider::Result<FileBasedDeletionResult> {
         // Parse the filter expression to extract column name and threshold
         let (col_name, _op, threshold) = extract_retention_column_and_threshold(&self.filter)
             .map_err(|e| Error::Internal {

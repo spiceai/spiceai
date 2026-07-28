@@ -89,7 +89,10 @@ impl CloudClient {
     }
 
     /// Exchange an auth code for an access token.
-    pub(crate) async fn exchange_code(&self, auth_code: &str) -> Result<Option<AuthExchangeResponse>> {
+    pub(crate) async fn exchange_code(
+        &self,
+        auth_code: &str,
+    ) -> Result<Option<AuthExchangeResponse>> {
         self.inner.exchange_code(auth_code).await.map_err(into_cli)
     }
 
@@ -210,7 +213,11 @@ impl CloudClient {
         self.inner.create_app(&request).await.map_err(into_cli)
     }
 
-    pub(crate) async fn update_app(&self, org_app: &str, params: UpdateAppParams<'_>) -> Result<App> {
+    pub(crate) async fn update_app(
+        &self,
+        org_app: &str,
+        params: UpdateAppParams<'_>,
+    ) -> Result<App> {
         let app = self.get_app(org_app).await?;
         let resources = build_resources(params.cpu, params.memory);
         // Create and update both send storage size at the app level. The executor field remains
@@ -341,7 +348,12 @@ impl CloudClient {
         self.inner.get_secret(app.id, name).await.map_err(into_cli)
     }
 
-    pub(crate) async fn set_secret(&self, org_app: &str, name: &str, value: &str) -> Result<Secret> {
+    pub(crate) async fn set_secret(
+        &self,
+        org_app: &str,
+        name: &str,
+        value: &str,
+    ) -> Result<Secret> {
         let app = self.get_app(org_app).await?;
         self.inner
             .set_secret(app.id, name, value)

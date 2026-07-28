@@ -612,7 +612,10 @@ fn trailer(input: ParserInput) -> NomResult<Dictionary> {
     delimited(pair(tag(&b"trailer"[..]), space), dictionary, space).parse(input)
 }
 
-pub(crate) fn xref_and_trailer(input: ParserInput, reader: &Reader) -> crate::Result<(Xref, Dictionary)> {
+pub(crate) fn xref_and_trailer(
+    input: ParserInput,
+    reader: &Reader,
+) -> crate::Result<(Xref, Dictionary)> {
     let xref_trailer = map(pair(xref, trailer), |(mut xref, trailer)| {
         xref.size = trailer
             .get(b"Size")
@@ -820,7 +823,9 @@ pub(crate) fn content(input: ParserInput) -> Option<Content<Vec<Operation>>> {
     strip_nom(_content.parse(input))
 }
 
-pub(crate) fn content_strict(input: ParserInput) -> Result<Content<Vec<Operation>>, error::ParseError> {
+pub(crate) fn content_strict(
+    input: ParserInput,
+) -> Result<Content<Vec<Operation>>, error::ParseError> {
     let (rest, content) = _content
         .parse(input)
         .map_err(|_| error::ParseError::InvalidContentStream)?;

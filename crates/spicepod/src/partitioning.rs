@@ -35,7 +35,9 @@ pub enum PartitionedBySchema {
     Named(std::collections::HashMap<String, String>),
 }
 
-pub(crate) fn deserialize_partition_by<'de, D>(deserializer: D) -> Result<Vec<PartitionedBy>, D::Error>
+pub(crate) fn deserialize_partition_by<'de, D>(
+    deserializer: D,
+) -> Result<Vec<PartitionedBy>, D::Error>
 where
     D: Deserializer<'de>,
 {

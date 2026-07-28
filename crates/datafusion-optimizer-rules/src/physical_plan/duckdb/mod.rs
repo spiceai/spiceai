@@ -9,4 +9,5 @@ pub mod intermediate_index_cte;
 
 pub(crate) type ConcreteDuckSqlExec =
     DuckSqlExec<PooledConnection<DuckdbConnectionManager>, DuckDBParameter>;
-pub(crate) static PARSER_DIALECT: sqlparser::dialect::DuckDbDialect = sqlparser::dialect::DuckDbDialect {};
+pub(crate) static PARSER_DIALECT: sqlparser::dialect::DuckDbDialect =
+    sqlparser::dialect::DuckDbDialect {};

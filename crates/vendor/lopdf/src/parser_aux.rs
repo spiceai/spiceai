@@ -36,10 +36,7 @@ impl Stream {
 
 impl Document {
     /// Get decoded page content;
-    fn get_and_decode_page_content(
-        &self,
-        page_id: ObjectId,
-    ) -> Result<Content<Vec<Operation>>> {
+    fn get_and_decode_page_content(&self, page_id: ObjectId) -> Result<Content<Vec<Operation>>> {
         let content_data = self.get_page_content(page_id)?;
         Content::decode(&content_data)
     }

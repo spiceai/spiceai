@@ -50,7 +50,7 @@ impl CompoundVectorIndex {
     /// # Errors
     ///
     /// Returns an [`Error`] describing the first incompatibility found.
-    pub(crate) fn try_new(
+    pub fn try_new(
         primary: Arc<dyn VectorIndex>,
         secondary: Arc<dyn VectorIndex>,
         read_mode: CompoundReadMode,

@@ -30,7 +30,9 @@ impl FlightTable {
         ))
     }
 
-    pub(crate) fn create_federated_table_provider(self: Arc<Self>) -> FederatedTableProviderAdaptor {
+    pub(crate) fn create_federated_table_provider(
+        self: Arc<Self>,
+    ) -> FederatedTableProviderAdaptor {
         let table_source = Self::create_federated_table_source(Arc::clone(&self));
         FederatedTableProviderAdaptor::new_with_provider(table_source, self)
     }

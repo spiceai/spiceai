@@ -1202,7 +1202,11 @@ impl Reader<'_> {
             .ok_or(Error::MissingXrefEntry)
     }
 
-    pub(crate) fn get_object(&self, id: ObjectId, already_seen: &mut HashSet<ObjectId>) -> Result<Object> {
+    pub(crate) fn get_object(
+        &self,
+        id: ObjectId,
+        already_seen: &mut HashSet<ObjectId>,
+    ) -> Result<Object> {
         if already_seen.contains(&id) {
             warn!(
                 "reference cycle detected resolving object {} {}",

@@ -141,10 +141,7 @@ impl RowConverter {
     /// # Errors
     /// Returns [`ArrowError::NotYetImplemented`] if any field's data type is not supported by
     /// that version.
-    fn with_version(
-        version: RowFormatVersion,
-        fields: Vec<SortField>,
-    ) -> Result<Self, ArrowError> {
+    fn with_version(version: RowFormatVersion, fields: Vec<SortField>) -> Result<Self, ArrowError> {
         match version {
             RowFormatVersion::V1 => Ok(Self::Version1(RowCodec::new(fields, v1::build_codec)?)),
         }

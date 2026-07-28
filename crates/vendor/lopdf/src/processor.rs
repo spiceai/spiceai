@@ -278,7 +278,11 @@ impl Document {
         }
     }
 
-    pub(crate) fn change_page_content(&mut self, page_id: ObjectId, content: Vec<u8>) -> Result<()> {
+    pub(crate) fn change_page_content(
+        &mut self,
+        page_id: ObjectId,
+        content: Vec<u8>,
+    ) -> Result<()> {
         let contents = self
             .get_dictionary(page_id)
             .and_then(|page| page.get(b"Contents"))?;

@@ -1019,9 +1019,7 @@ fn build_stream_from_plan(
     }
 }
 
-fn to_execution_error(
-    e: impl Into<Box<dyn std::error::Error + Send + Sync>>,
-) -> DataFusionError {
+fn to_execution_error(e: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> DataFusionError {
     DataFusionError::Execution(format!("{}", e.into()))
 }
 

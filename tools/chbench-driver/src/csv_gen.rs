@@ -514,7 +514,11 @@ fn generate_warehouse_range(
 /// # Errors
 ///
 /// Returns [`Error::Io`] if any CSV file cannot be created or written.
-pub(crate) fn generate(dir: &Path, warehouses: usize, seed: Option<u64>) -> Result<Vec<GeneratedShard>> {
+pub(crate) fn generate(
+    dir: &Path,
+    warehouses: usize,
+    seed: Option<u64>,
+) -> Result<Vec<GeneratedShard>> {
     let base_seed = seed.unwrap_or_else(|| rand::rng().random());
     let mut rng = StdRng::seed_from_u64(base_seed);
     let mut shards: Vec<GeneratedShard> = Vec::new();

@@ -455,7 +455,11 @@ impl JobStore {
     }
 
     /// Reads a result chunk from the object store.
-    pub(crate) async fn read_chunk(&self, job_id: &str, chunk_index: usize) -> Result<Vec<RecordBatch>> {
+    pub(crate) async fn read_chunk(
+        &self,
+        job_id: &str,
+        chunk_index: usize,
+    ) -> Result<Vec<RecordBatch>> {
         let path = self.chunk_path(job_id, chunk_index);
 
         let result = self.store.get(&path).await.map_err(|e| match e {
@@ -553,7 +557,10 @@ impl JobStore {
     /// Lists all jobs, optionally filtered by status.
     ///
     /// Returns an error if any job state file fails to be read or deserialized.
-    pub(crate) async fn list_jobs(&self, status_filter: Option<JobStatus>) -> Result<Vec<JobState>> {
+    pub(crate) async fn list_jobs(
+        &self,
+        status_filter: Option<JobStatus>,
+    ) -> Result<Vec<JobState>> {
         let jobs_prefix = self.jobs_prefix();
         let mut stream = self.store.list(Some(&jobs_prefix));
         let mut jobs = Vec::new();

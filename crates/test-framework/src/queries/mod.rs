@@ -264,7 +264,10 @@ impl Query {
     /// Returns an error if:
     /// - The SQL query cannot be parsed
     /// - The query contains multiple statements (only single statements are supported)
-    pub(crate) fn rewrite_with_reference_schema(&self, reference_schema: &str) -> anyhow::Result<Self> {
+    pub(crate) fn rewrite_with_reference_schema(
+        &self,
+        reference_schema: &str,
+    ) -> anyhow::Result<Self> {
         use datafusion::sql::sqlparser::ast::{
             Ident, ObjectNamePart, TableAlias, TableFactor, VisitMut, VisitorMut,
         };

@@ -958,7 +958,10 @@ fn extract_join_subtree(plan: LogicalPlan) -> Result<(LogicalPlan, Vec<LogicalPl
 /// # Errors
 ///
 /// Returns an error if reconstructing any wrapper operator fails.
-pub(crate) fn reconstruct_plan(join_plan: LogicalPlan, wrappers: Vec<LogicalPlan>) -> Result<LogicalPlan> {
+pub(crate) fn reconstruct_plan(
+    join_plan: LogicalPlan,
+    wrappers: Vec<LogicalPlan>,
+) -> Result<LogicalPlan> {
     let mut current = join_plan;
 
     // Apply wrappers in reverse order (from innermost to outermost)

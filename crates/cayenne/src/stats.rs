@@ -311,7 +311,10 @@ pub(crate) fn serialize_file_statistics(stats: &FileStatistics) -> VortexResult<
 ///
 /// Returns an error if the flatbuffer bytes are malformed or do not match the
 /// expected schema.
-pub(crate) fn deserialize_file_statistics(bytes: &[u8], schema: &Schema) -> VortexResult<FileStatistics> {
+pub(crate) fn deserialize_file_statistics(
+    bytes: &[u8],
+    schema: &Schema,
+) -> VortexResult<FileStatistics> {
     let struct_dtype = vortex_struct_dtype_from_schema(schema);
     let fb_stats = flatbuffers::root::<vortex::flatbuffers::footer::FileStatistics>(bytes)?;
     FileStatistics::from_flatbuffer(

@@ -22,7 +22,11 @@ impl<'a> Table<'a> {
     }
 
     /// Returns a raster image for the glyph.
-    pub(crate) fn get(&self, glyph_id: GlyphId, pixels_per_em: u16) -> Option<RasterGlyphImage<'a>> {
+    pub(crate) fn get(
+        &self,
+        glyph_id: GlyphId,
+        pixels_per_em: u16,
+    ) -> Option<RasterGlyphImage<'a>> {
         let location = self.locations.get(glyph_id, pixels_per_em)?;
         let mut s = Stream::new_at(self.data, location.offset)?;
         let metrics = match location.format.metrics {

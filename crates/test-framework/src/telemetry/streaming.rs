@@ -45,7 +45,12 @@ pub struct QueryMetricEvent {
 impl QueryMetricEvent {
     /// Create a new query metric event
     #[must_use]
-    pub(crate) fn new(query_name: String, duration: Duration, success: bool, worker_id: usize) -> Self {
+    pub(crate) fn new(
+        query_name: String,
+        duration: Duration,
+        success: bool,
+        worker_id: usize,
+    ) -> Self {
         Self {
             query_name: Arc::from(query_name),
             duration_ms: duration.as_secs_f64() * 1000.0,

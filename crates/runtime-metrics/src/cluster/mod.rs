@@ -324,15 +324,14 @@ static EXECUTOR_SHUFFLE_READ_LOCAL_COUNT: LazyLock<Counter<u64>> = LazyLock::new
 
 /// Duration of local shuffle read operations in milliseconds.
 /// Labels: `node_id`
-static EXECUTOR_SHUFFLE_READ_LOCAL_DURATION_MS: LazyLock<Histogram<f64>> =
-    LazyLock::new(|| {
-        CLUSTER_METER
-            .f64_histogram("executor_shuffle_read_local_duration_ms")
-            .with_description("Duration of local shuffle read operations in milliseconds.")
-            .with_unit("ms")
-            .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
-            .build()
-    });
+static EXECUTOR_SHUFFLE_READ_LOCAL_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+    CLUSTER_METER
+        .f64_histogram("executor_shuffle_read_local_duration_ms")
+        .with_description("Duration of local shuffle read operations in milliseconds.")
+        .with_unit("ms")
+        .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
+        .build()
+});
 
 /// Total bytes read from remote shuffle files (fetched from another executor).
 /// Labels: `node_id`
@@ -366,14 +365,13 @@ static EXECUTOR_SHUFFLE_READ_REMOTE_COUNT: LazyLock<Counter<u64>> = LazyLock::ne
 
 /// Duration histogram for remote shuffle read operations (network fetch time).
 /// Labels: `node_id`
-static EXECUTOR_SHUFFLE_READ_REMOTE_DURATION_MS: LazyLock<Histogram<f64>> =
-    LazyLock::new(|| {
-        CLUSTER_METER
-            .f64_histogram("executor_shuffle_read_remote_duration_ms")
-            .with_description("Duration of remote shuffle read operations in milliseconds.")
-            .with_unit("ms")
-            .build()
-    });
+static EXECUTOR_SHUFFLE_READ_REMOTE_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+    CLUSTER_METER
+        .f64_histogram("executor_shuffle_read_remote_duration_ms")
+        .with_description("Duration of remote shuffle read operations in milliseconds.")
+        .with_unit("ms")
+        .build()
+});
 
 // =============================================================================
 // Scheduler Result Fetch Metrics

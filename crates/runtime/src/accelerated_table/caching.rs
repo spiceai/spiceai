@@ -84,10 +84,7 @@ pub(crate) fn is_reserved_caching_column(name: &str) -> bool {
 /// every persisted row carries its originating namespace tag, which is
 /// what `__spice_cache_namespace = $current_ns` filtering keys off of on
 /// read.
-fn stamp_namespace_column(
-    batch: RecordBatch,
-    namespace_id: &str,
-) -> DataFusionResult<RecordBatch> {
+fn stamp_namespace_column(batch: RecordBatch, namespace_id: &str) -> DataFusionResult<RecordBatch> {
     use arrow::array::StringArray;
     use arrow::datatypes::{DataType, Field, Schema};
     let schema = batch.schema();

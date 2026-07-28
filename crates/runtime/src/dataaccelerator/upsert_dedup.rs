@@ -368,7 +368,10 @@ fn extract_upsert_options<S: std::hash::BuildHasher>(
 ///
 /// Returns the original provider if deduplication is not needed.
 #[must_use]
-pub(crate) fn wrap_with_upsert_dedup_if_needed<T: TableProvider + 'static, S: std::hash::BuildHasher>(
+pub(crate) fn wrap_with_upsert_dedup_if_needed<
+    T: TableProvider + 'static,
+    S: std::hash::BuildHasher,
+>(
     provider: Arc<T>,
     options: &std::collections::HashMap<String, String, S>,
     constraints: Constraints,

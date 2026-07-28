@@ -335,10 +335,7 @@ pub(crate) struct IndexerExec {
 }
 
 impl IndexerExec {
-    fn new(
-        input_exec: Arc<dyn ExecutionPlan>,
-        indexes: Vec<Arc<dyn Index + Send + Sync>>,
-    ) -> Self {
+    fn new(input_exec: Arc<dyn ExecutionPlan>, indexes: Vec<Arc<dyn Index + Send + Sync>>) -> Self {
         Self {
             input_exec,
             indexes,

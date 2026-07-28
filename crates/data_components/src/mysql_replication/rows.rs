@@ -101,7 +101,12 @@ impl TransactionBuffer {
     /// Accelerators apply [`ChangeOp::Update`] as an upsert keyed by the new
     /// primary key, so a primary-key change must also emit a delete for the
     /// old key; otherwise the old accelerated row is orphaned.
-    pub(crate) fn push_update(&mut self, pk_source_indexes: &[usize], old: Vec<Value>, new: Vec<Value>) {
+    pub(crate) fn push_update(
+        &mut self,
+        pk_source_indexes: &[usize],
+        old: Vec<Value>,
+        new: Vec<Value>,
+    ) {
         let key_changed = pk_source_indexes
             .iter()
             .any(|idx| old.get(*idx) != new.get(*idx));
@@ -158,7 +163,10 @@ impl Default for TransactionBuffer {
 ///     `BinlogValue → Value` conversion itself).
 ///
 /// Everything else passes through unchanged.
-pub(crate) fn normalize_binlog_value(column: &SourceColumn, value: BinlogValue<'_>) -> Result<Value> {
+pub(crate) fn normalize_binlog_value(
+    column: &SourceColumn,
+    value: BinlogValue<'_>,
+) -> Result<Value> {
     if let Some(variants) = &column.enum_variants
         && let BinlogValue::Value(Value::Int(index)) = &value
     {

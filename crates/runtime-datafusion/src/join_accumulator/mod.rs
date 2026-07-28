@@ -272,10 +272,7 @@ impl CollectLeftAccumulator for ExactLeftAccumulator {
 impl ExactLeftAccumulator {
     /// Creates an accumulator with a custom local in-list memory limit.
     #[must_use]
-    fn new_with_memory_limit(
-        expr: Arc<dyn PhysicalExpr>,
-        max_inlist_memory_size: usize,
-    ) -> Self {
+    fn new_with_memory_limit(expr: Arc<dyn PhysicalExpr>, max_inlist_memory_size: usize) -> Self {
         tracing::debug!("Trying to build ExactLeftAccumulator.");
         Self {
             arrays: Vec::new(),

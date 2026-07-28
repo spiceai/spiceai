@@ -438,7 +438,9 @@ fn missing_for_mode(mode: &str, parameter: &str) -> AuthConfigError {
 
 /// Build auth credentials from parameters.
 #[cfg(feature = "databricks")]
-pub(crate) fn build_auth_credentials(params: &Parameters) -> Result<AuthCredentials<'_>, AuthConfigError> {
+pub(crate) fn build_auth_credentials(
+    params: &Parameters,
+) -> Result<AuthCredentials<'_>, AuthConfigError> {
     let token = params.get("token").ok();
     let client_id = params.get("client_id").expose().ok();
     let client_secret = params.get("client_secret").ok();

@@ -293,9 +293,7 @@ impl Service {
         ))
     }
 
-    fn ipc_write_options_for_context(
-        context: &RequestContext,
-    ) -> Result<IpcWriteOptions, Status> {
+    fn ipc_write_options_for_context(context: &RequestContext) -> Result<IpcWriteOptions, Status> {
         let ipc_compression = context
             .extension::<AppContextExtension>()
             .and_then(|app_ext| app_ext.app())

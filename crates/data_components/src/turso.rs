@@ -1156,10 +1156,7 @@ impl TursoTableProvider {
     /// Read-side conversions intentionally fall back to NULL to keep queries available in the
     /// face of schema/type drift, so this is detection-only: it never alters the batch.
     #[must_use]
-    fn count_conversion_failures(
-        rows: &[Vec<TursoValue>],
-        batch: &RecordBatch,
-    ) -> Vec<usize> {
+    fn count_conversion_failures(rows: &[Vec<TursoValue>], batch: &RecordBatch) -> Vec<usize> {
         (0..batch.num_columns())
             .map(|col_idx| {
                 let array = batch.column(col_idx);

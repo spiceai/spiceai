@@ -84,7 +84,11 @@ impl ScyllaDBTableSchema {
     /// # Returns
     ///
     /// A `ScyllaDBTableSchema` with partition and clustering key information.
-    pub(crate) async fn fetch(session: &Session, keyspace: &str, table: &str) -> Result<Self, Error> {
+    pub(crate) async fn fetch(
+        session: &Session,
+        keyspace: &str,
+        table: &str,
+    ) -> Result<Self, Error> {
         // Escape single quotes to prevent CQL injection
         let escaped_keyspace = keyspace.replace('\'', "''");
         let escaped_table = table.replace('\'', "''");
@@ -202,7 +206,10 @@ impl ScyllaDBTableSchema {
     /// This implementation only pushes down filters on the first partition key column
     /// (for simplicity) and optionally the first clustering key column.
     #[must_use]
-    pub(crate) fn supports_filters_pushdown(&self, filters: &[&Expr]) -> Vec<TableProviderFilterPushDown> {
+    pub(crate) fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Vec<TableProviderFilterPushDown> {
         let partition_key = self.partition_key();
         let clustering_key = self.clustering_key();
 

@@ -146,8 +146,7 @@ mod udtfs;
 mod view;
 mod worker;
 
-type PartitionAssignments =
-    HashMap<ResolvedTableReference, Vec<::datafusion::logical_expr::Expr>>;
+type PartitionAssignments = HashMap<ResolvedTableReference, Vec<::datafusion::logical_expr::Expr>>;
 pub type SharedPartitionAssignments = Arc<RwLock<PartitionAssignments>>;
 
 #[derive(Debug, Snafu)]
@@ -761,9 +760,7 @@ impl Runtime {
     /// `PartitionsLoaded` and other unsolicited messages back to schedulers.
     /// Only available when this runtime is running as a cluster executor.
     #[must_use]
-    fn executor_outbound_broadcaster(
-        &self,
-    ) -> Option<crate::cluster::ExecutorOutboundBroadcaster> {
+    fn executor_outbound_broadcaster(&self) -> Option<crate::cluster::ExecutorOutboundBroadcaster> {
         match self.distributed.as_ref() {
             Some(DistributedNode::Executor {
                 outbound_broadcaster,

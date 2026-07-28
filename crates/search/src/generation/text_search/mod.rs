@@ -195,11 +195,7 @@ pub struct FullTextSearchFieldIndex {
 }
 
 impl FullTextSearchFieldIndex {
-    fn try_new(
-        index_search: Searcher,
-        field: String,
-        primary_key: Vec<String>,
-    ) -> Result<Self> {
+    fn try_new(index_search: Searcher, field: String, primary_key: Vec<String>) -> Result<Self> {
         let stored_columns: HashSet<String> = index_search
             .schema()
             .fields()

@@ -152,7 +152,10 @@ pub(crate) type DecomposedRow = HashMap<String, Option<String>>;
 /// <https://github.com/spiceai/spiceai/issues/11155>.
 ///
 /// [`HttpExec::parse_content`]: super::provider::HttpExec
-pub(crate) fn decompose_json_row(json_row: &str, nesting: &HttpJsonNesting) -> Result<DecomposedRow> {
+pub(crate) fn decompose_json_row(
+    json_row: &str,
+    nesting: &HttpJsonNesting,
+) -> Result<DecomposedRow> {
     let mut out: DecomposedRow = HashMap::new();
     let Ok(mut value) = serde_json::from_str::<serde_json::Value>(json_row) else {
         // Not valid JSON: preserve the raw row instead of failing the

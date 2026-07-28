@@ -222,7 +222,10 @@ impl JobExecutor {
     }
 
     /// Lists all jobs, optionally filtered by status.
-    pub(crate) async fn list_jobs(&self, status_filter: Option<JobStatus>) -> Result<Vec<JobState>> {
+    pub(crate) async fn list_jobs(
+        &self,
+        status_filter: Option<JobStatus>,
+    ) -> Result<Vec<JobState>> {
         self.job_store.list_jobs(status_filter).await
     }
 

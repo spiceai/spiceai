@@ -323,7 +323,11 @@ impl DatasetCheckpoint {
             reason = "async only when an async accelerator backend is compiled in; DuckDB helpers are synchronous"
         )
     )]
-    pub(crate) async fn checkpoint(&self, schema: &SchemaRef, refresh_sql: Option<&str>) -> Result<()> {
+    pub(crate) async fn checkpoint(
+        &self,
+        schema: &SchemaRef,
+        refresh_sql: Option<&str>,
+    ) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => {

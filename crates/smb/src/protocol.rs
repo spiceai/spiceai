@@ -332,7 +332,10 @@ pub struct SessionSetupResponse {
 }
 
 #[must_use]
-pub(crate) fn decode_session_setup_response(header: &Header, body: &[u8]) -> Option<SessionSetupResponse> {
+pub(crate) fn decode_session_setup_response(
+    header: &Header,
+    body: &[u8],
+) -> Option<SessionSetupResponse> {
     if body.len() < 9 {
         return None;
     }
@@ -502,7 +505,12 @@ pub(crate) fn decode_close_response(body: &[u8]) -> Option<CloseResponse> {
 
 // ── Read ────────────────────────────────────────────────────────────────────
 
-pub(crate) fn encode_read_request(buf: &mut BytesMut, file_id: &[u8; 16], offset: u64, length: u32) {
+pub(crate) fn encode_read_request(
+    buf: &mut BytesMut,
+    file_id: &[u8; 16],
+    offset: u64,
+    length: u32,
+) {
     buf.put_u16_le(49); // StructureSize
     buf.put_u8(0); // Padding
     buf.put_u8(0); // Flags
@@ -565,7 +573,12 @@ pub(crate) fn decode_read_response_owned(body: Vec<u8>) -> Option<Bytes> {
 
 // ── Write ───────────────────────────────────────────────────────────────────
 
-pub(crate) fn encode_write_request(buf: &mut BytesMut, file_id: &[u8; 16], offset: u64, data: &[u8]) {
+pub(crate) fn encode_write_request(
+    buf: &mut BytesMut,
+    file_id: &[u8; 16],
+    offset: u64,
+    data: &[u8],
+) {
     let data_offset = WRITE_DATA_OFFSET;
     let data_len = u32::try_from(data.len()).unwrap_or(u32::MAX);
     buf.put_u16_le(49); // StructureSize

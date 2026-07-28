@@ -98,7 +98,10 @@ pub struct SnapshotCreationConfig {
 
 impl SnapshotCreationConfig {
     #[must_use]
-    pub(crate) fn new(manager: Arc<SnapshotManager>, create_trigger: SnapshotCreateTrigger) -> Self {
+    pub(crate) fn new(
+        manager: Arc<SnapshotManager>,
+        create_trigger: SnapshotCreateTrigger,
+    ) -> Self {
         Self {
             manager,
             create_trigger,

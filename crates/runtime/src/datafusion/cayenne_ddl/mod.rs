@@ -49,12 +49,16 @@ pub(crate) fn is_cayenne_catalog(provider: &dyn CatalogProvider) -> bool {
 /// Extract the [`CayenneCatalogProvider`] reference, peeling the transparent
 /// catalog wrappers. Delegates to the wrapper-aware helper in the `cayenne`
 /// crate so the peeling logic lives in one place.
-pub(crate) fn get_cayenne_provider(provider: &dyn CatalogProvider) -> Option<&CayenneCatalogProvider> {
+pub(crate) fn get_cayenne_provider(
+    provider: &dyn CatalogProvider,
+) -> Option<&CayenneCatalogProvider> {
     cayenne::ddl::get_cayenne_provider(provider)
 }
 
 /// Return a [`PartitionAwareCatalog`] reference if the provider is Cayenne-backed.
-pub(crate) fn as_partition_aware(provider: &dyn CatalogProvider) -> Option<&dyn PartitionAwareCatalog> {
+pub(crate) fn as_partition_aware(
+    provider: &dyn CatalogProvider,
+) -> Option<&dyn PartitionAwareCatalog> {
     let cayenne_catalog = get_cayenne_provider(provider)?;
     Some(cayenne_catalog as &dyn PartitionAwareCatalog)
 }

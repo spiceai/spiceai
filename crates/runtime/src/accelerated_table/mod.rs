@@ -508,7 +508,10 @@ impl Builder {
         self
     }
 
-    pub(crate) fn zero_results_action(&mut self, zero_results_action: ZeroResultsAction) -> &mut Self {
+    pub(crate) fn zero_results_action(
+        &mut self,
+        zero_results_action: ZeroResultsAction,
+    ) -> &mut Self {
         self.zero_results_action = zero_results_action;
         self
     }
@@ -1374,7 +1377,10 @@ impl AcceleratedTable {
         Arc::clone(&self.synchronized_children)
     }
 
-    pub(crate) async fn update_refresh_sql(&self, mut refresh_sql: refresh::RefreshSQL) -> Result<()> {
+    pub(crate) async fn update_refresh_sql(
+        &self,
+        mut refresh_sql: refresh::RefreshSQL,
+    ) -> Result<()> {
         let dataset_name = &self.dataset_name;
 
         let mut refresh = self.refresh_params.write().await;
@@ -2130,7 +2136,10 @@ impl RetentionBuilder {
     }
 
     #[must_use]
-    pub(crate) fn time_partition_format(mut self, time_partition_format: Option<TimeFormat>) -> Self {
+    pub(crate) fn time_partition_format(
+        mut self,
+        time_partition_format: Option<TimeFormat>,
+    ) -> Self {
         self.time_partition_format = time_partition_format;
         self
     }

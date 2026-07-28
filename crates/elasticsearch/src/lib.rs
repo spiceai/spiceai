@@ -317,11 +317,7 @@ impl Client {
     }
 
     /// Execute a raw JSON search against `index`.
-    async fn search_raw(
-        &self,
-        index: &str,
-        body: &serde_json::Value,
-    ) -> Result<SearchResponse> {
+    async fn search_raw(&self, index: &str, body: &serde_json::Value) -> Result<SearchResponse> {
         let url = format!("{}/{}/_search", self.base_url, index);
         let resp = self
             .auth(self.http.post(&url))
@@ -493,11 +489,7 @@ impl Client {
     }
 
     /// Force-merge an index via `POST /<index>/_forcemerge`.
-    async fn force_merge(
-        &self,
-        index: &str,
-        max_num_segments: u32,
-    ) -> Result<serde_json::Value> {
+    async fn force_merge(&self, index: &str, max_num_segments: u32) -> Result<serde_json::Value> {
         let url = format!("{}/{}/_forcemerge", self.base_url, index);
         let max_num_segments = max_num_segments.to_string();
         let resp = self

@@ -531,7 +531,10 @@ impl DataFusionBuilder {
     }
 
     #[must_use]
-    pub(crate) fn spill_compression(mut self, spill_compression: Option<SpiceSpillCompression>) -> Self {
+    pub(crate) fn spill_compression(
+        mut self,
+        spill_compression: Option<SpiceSpillCompression>,
+    ) -> Self {
         self.spill_compression = match spill_compression {
             Some(SpiceSpillCompression::Zstd) => Some(SpillCompression::Zstd),
             Some(SpiceSpillCompression::Lz4Frame) => Some(SpillCompression::Lz4Frame),

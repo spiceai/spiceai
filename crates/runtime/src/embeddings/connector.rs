@@ -623,9 +623,7 @@ fn duckdb_vector_store_for_view(view: &View) -> Option<VectorStore> {
 }
 
 #[cfg(feature = "duckdb")]
-fn duckdb_embedding_columns_from_view(
-    view: &View,
-) -> Vec<(String, ColumnLevelEmbeddingConfig)> {
+fn duckdb_embedding_columns_from_view(view: &View) -> Vec<(String, ColumnLevelEmbeddingConfig)> {
     let mut embedding_columns = Vec::new();
 
     for column in &view.columns {

@@ -510,9 +510,7 @@ pub(crate) async fn verify_s3_endpoint(endpoint: &str) -> Result<()> {
 ///   Namespace { name: "spiceai_sandbox", properties: {} }
 /// )
 /// ```
-fn parse_catalog_url(
-    url: &str,
-) -> Result<(String, HashMap<String, String>, Option<Namespace>)> {
+fn parse_catalog_url(url: &str) -> Result<(String, HashMap<String, String>, Option<Namespace>)> {
     let (base_uri, props, path_info) = parse_iceberg_url(url)?;
 
     match path_info {
@@ -662,7 +660,9 @@ fn parse_iceberg_url(url: &str) -> Result<(String, HashMap<String, String>, Iceb
 ///   "my_table"
 /// )
 /// ```
-pub(crate) fn parse_table_url(url: &str) -> Result<(String, HashMap<String, String>, Namespace, String)> {
+pub(crate) fn parse_table_url(
+    url: &str,
+) -> Result<(String, HashMap<String, String>, Namespace, String)> {
     let (base_uri, props, path_info) = parse_iceberg_url(url)?;
 
     match path_info {

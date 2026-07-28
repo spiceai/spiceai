@@ -28,7 +28,9 @@ pub struct OracleConnectionPool {
 }
 
 impl OracleConnectionPool {
-    pub(crate) async fn get(&self) -> super::Result<bb8::PooledConnection<'_, OracleConnectionManager>> {
+    pub(crate) async fn get(
+        &self,
+    ) -> super::Result<bb8::PooledConnection<'_, OracleConnectionManager>> {
         let conn = self
             .pool
             .get()

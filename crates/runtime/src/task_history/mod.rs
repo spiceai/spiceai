@@ -375,9 +375,7 @@ impl TaskSpan {
     }
 }
 
-fn downcast_builder<T: ArrayBuilder>(
-    builder: &mut dyn ArrayBuilder,
-) -> Result<&mut T, Error> {
+fn downcast_builder<T: ArrayBuilder>(builder: &mut dyn ArrayBuilder) -> Result<&mut T, Error> {
     builder
         .as_any_mut()
         .downcast_mut::<T>()
