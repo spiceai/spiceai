@@ -25825,9 +25825,26 @@ impl TableProvider for CayenneTableProvider {
                 &deletion_snapshot,
             )?;
 
-            let mut all_plans = vec![filtered_main_plan];
-            all_plans.extend(protected_snapshot_plans);
-            UnionExec::try_new(all_plans)?
+            // The current snapshot can itself be a bare `EmptyExec` (unwrapped —
+            // `create_snapshot_scan_plan_with_config` returns it directly when the
+            // snapshot matches zero files, skipping the usual `CayenneAccelerationExec`
+            // wrap) e.g. right after compaction rotates the current snapshot pointer
+            // while the live data still sits in a protected snapshot. `apply_deletion_filter`'s
+            // no-op fast path passes that bare `EmptyExec` straight through, unlike
+            // `apply_partial_deletion_filter`'s protected-snapshot branches, which always
+            // wrap. Contribute nothing rather than unioning in a branch that can never
+            // produce a row — it only widens the plan for no benefit.
+            let mut all_plans = if filtered_main_plan.as_any().is::<EmptyExec>() {
+                protected_snapshot_plans
+            } else {
+                let mut plans = vec![filtered_main_plan];
+                plans.extend(protected_snapshot_plans);
+                plans
+            };
+            match all_plans.len() {
+                1 => all_plans.remove(0),
+                _ => UnionExec::try_new(all_plans)?,
+            }
         };
 
         // Union the cold object-store tier if present. Added as its own union
