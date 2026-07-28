@@ -23653,7 +23653,7 @@ impl CayenneTableProvider {
                 )
             }),
             1 => Ok(non_empty.remove(0)),
-            _ => Ok(Arc::new(UnionExec::try_new(non_empty)?)),
+            _ => UnionExec::try_new(non_empty),
         }
     }
 
