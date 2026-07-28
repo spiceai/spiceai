@@ -463,6 +463,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("preserve_insertion_order"),
     ParameterSpec::component("index_scan_percentage"),
     ParameterSpec::component("index_scan_max_count"),
+    ParameterSpec::component("checkpoint_on_write")
+        .description("Run a DuckDB CHECKPOINT after each overwrite refresh completes"),
     ParameterSpec::runtime("connection_pool_size").description(
         "The maximum number of client connections created in the duckdb connection pool.",
     ),
@@ -1746,6 +1748,7 @@ mod tests {
         array::{Int64Array, RecordBatch, StringArray, TimestampSecondArray, UInt64Array},
         datatypes::{DataType, Field, Schema},
     };
+    use datafusion::catalog::TableProviderFactory;
     use datafusion::{
         common::{Constraints, TableReference, ToDFSchema},
         execution::context::SessionContext,
@@ -1753,6 +1756,7 @@ mod tests {
         physical_plan::collect,
         scalar::ScalarValue,
     };
+    use datafusion_table_providers::duckdb::write::DuckDBTableWriter;
     use datafusion_table_providers::util::test::MockExec;
 
     use crate::component::dataset::acceleration::Acceleration;
@@ -1826,6 +1830,42 @@ mod tests {
                 .options
                 .contains_key("recompute_statistics_on_write")
         );
+    }
+
+    #[tokio::test]
+    async fn duckdb_checkpoint_on_write_param_reaches_write_settings() {
+        let mut options = HashMap::new();
+        options.insert("checkpoint_on_write".to_string(), "enabled".to_string());
+        let external_table = external_table_with_options(options);
+
+        let factory = super::create_factory();
+        let ctx = SessionContext::new();
+        let provider = factory
+            .create(&ctx.state(), &external_table)
+            .await
+            .expect("to create table provider");
+
+        let writer = provider
+            .downcast_ref::<DuckDBTableWriter>()
+            .expect("factory should return a DuckDBTableWriter");
+        assert!(writer.write_settings().checkpoint_on_write);
+    }
+
+    #[tokio::test]
+    async fn duckdb_checkpoint_on_write_disabled_by_default() {
+        let external_table = external_table_with_options(HashMap::new());
+
+        let factory = super::create_factory();
+        let ctx = SessionContext::new();
+        let provider = factory
+            .create(&ctx.state(), &external_table)
+            .await
+            .expect("to create table provider");
+
+        let writer = provider
+            .downcast_ref::<DuckDBTableWriter>()
+            .expect("factory should return a DuckDBTableWriter");
+        assert!(!writer.write_settings().checkpoint_on_write);
     }
 
     #[tokio::test]
