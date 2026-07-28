@@ -160,11 +160,27 @@ impl MetricsService for Service {
                         );
                         continue;
                     };
-                    let existing_schema = (self
+                    let existing_schema = match self
                         .datafusion
                         .get_arrow_schema(TableReference::bare(metric.name.clone()))
-                        .await)
-                        .ok();
+                        .await
+                    {
+                        Ok(schema) => Some(schema),
+                        // The dataset is not yet registered (e.g. a `sink` dataset parked
+                        // until its first write after a restart). Fall back to the
+                        // acceleration checkpoint so a data point that omits a NULL dimension
+                        // is still built against the stored (wide) schema, rather than a
+                        // narrower batch the write rejects as a removed column.
+                        Err(_) => match self.runtime.as_ref().and_then(Weak::upgrade) {
+                            Some(runtime) => runtime
+                                .accelerated_checkpoint_schema(&TableReference::bare(
+                                    metric.name.clone(),
+                                ))
+                                .await
+                                .map(|schema| schema.as_ref().clone()),
+                            None => None,
+                        },
+                    };
                     let (record_batch_result, data_points_count) = metric_data_to_record_batch(
                         metric.name.as_str(),
                         &data,
@@ -845,6 +861,22 @@ fn append_null(
     }
 }
 
+/// Builds the OpenTelemetry metrics ingest [`Service`] (the `MetricsService::export` handler).
+///
+/// Exposed so the ingest handler can be driven directly (e.g. in tests) without standing up a
+/// gRPC transport; production wiring goes through [`create_metrics_service`].
+#[must_use]
+pub fn build_metrics_service(
+    datafusion: Arc<dyn QueryEngine>,
+    runtime: Option<Weak<Runtime>>,
+) -> Service {
+    Service {
+        datafusion,
+        runtime,
+        once_tracer: OnceTracer::new(),
+    }
+}
+
 /// Creates the OpenTelemetry `MetricsService` server that can be added to a gRPC server.
 ///
 /// This is used to add OpenTelemetry metrics ingestion to the Flight gRPC server.
@@ -853,12 +885,8 @@ pub fn create_metrics_service(
     datafusion: Arc<dyn QueryEngine>,
     runtime: Option<Weak<Runtime>>,
 ) -> MetricsServiceServer<Service> {
-    let service = Service {
-        datafusion,
-        runtime,
-        once_tracer: OnceTracer::new(),
-    };
-    MetricsServiceServer::new(service).accept_compressed(CompressionEncoding::Gzip)
+    MetricsServiceServer::new(build_metrics_service(datafusion, runtime))
+        .accept_compressed(CompressionEncoding::Gzip)
 }
 
 #[cfg(test)]

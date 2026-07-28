@@ -106,6 +106,8 @@ mod mysql;
 mod odbc;
 #[cfg(feature = "oracle")]
 mod oracle;
+#[cfg(not(windows))]
+mod otel_restart;
 mod plan_capture;
 #[cfg(feature = "postgres")]
 mod postgres;
