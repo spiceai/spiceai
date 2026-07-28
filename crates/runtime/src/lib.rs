@@ -307,6 +307,14 @@ pub enum Error {
     AcceleratedTableInvalidChanges { dataset_name: String },
 
     #[snafu(display(
+        "Failed to register dataset {dataset_name} ({connector}): durable write-back needs a source that can apply a delivered row in one atomic step, and the {connector} connector cannot yet. Delivering as a separate delete and insert lets the deleted state echo back over CDC, which can silently drop a committed write. Remove 'on_conflict' to keep writes on the accelerator, or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+    ))]
+    DurableWriteBackUnsupportedBySource {
+        dataset_name: String,
+        connector: String,
+    },
+
+    #[snafu(display(
         "An accelerated table has invalid configuration: {source}. Update the configuration and retry. For details, visit: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
     ))]
     InvalidAccelerationConfiguration {
