@@ -109,6 +109,8 @@ pub struct MetricsCollector {
     /// blocking (bounded memory), and `member_send_stalled_seconds_total` will
     /// tick again. Only ever set for shared-slot datasets.
     member_held_envelopes: AtomicU64,
+    /// Gates observation to shared-slot datasets, like `member_attached_known`.
+    member_held_envelopes_known: AtomicBool,
 
     // Shared-slot membership liveness. `member_attached` is `1` while this
     // dataset is an attached member of its shared replication slot and `0` once
@@ -286,8 +288,12 @@ impl MetricsCollector {
     /// same amount from `reader_processing_micros_total` at the source, so that
     /// counter stays decode-only; this exports the subtracted wait for
     /// attribution.
-    /// Publish the pump's current hold-back depth for this member.
+    /// Publish the pump's current hold-back depth for this member. Also marks the
+    /// series as applicable, so a dedicated-slot dataset (whose pump never holds
+    /// anything back) reports no series rather than a misleading constant 0.
     pub fn set_member_held_envelopes(&self, n: u64) {
+        self.member_held_envelopes_known
+            .store(true, Ordering::Release);
         self.member_held_envelopes.store(n, Ordering::Relaxed);
     }
 
@@ -513,9 +519,19 @@ impl Metrics {
             .load(Ordering::Relaxed)
     }
 
+    /// `None` for a dedicated (non-shared) slot, which has no hold-back concept
+    /// and reports no series — never a misleading constant `0`.
     #[must_use]
-    pub fn member_held_envelopes(&self) -> u64 {
-        self.collector.member_held_envelopes.load(Ordering::Relaxed)
+    pub fn member_held_envelopes(&self) -> Option<u64> {
+        if self
+            .collector
+            .member_held_envelopes_known
+            .load(Ordering::Acquire)
+        {
+            Some(self.collector.member_held_envelopes.load(Ordering::Relaxed))
+        } else {
+            None
+        }
     }
 }
 

@@ -117,6 +117,7 @@ use super::{
 };
 use rustc_hash::FxHashMap;
 
+use crate::cdc::member_overflow::{FlushOutcome, MemberOverflow};
 use crate::cdc::{ChangeEnvelope, ChangesStream, CommitChange, CommitError, StreamError};
 use crate::postgres_replication::pgoutput::RelationId;
 
@@ -1231,7 +1232,7 @@ async fn run_pump(source: Arc<SharedSource>) {
     // outside the reconnect loop only to keep the allocation; it is CLEARED on
     // each connect, because the replay starts at the minimum `committed` across
     // members and re-delivers anything still held.
-    let mut overflow = MemberOverflow::default();
+    let mut overflow: MemberOverflow<MemberKey> = MemberOverflow::default();
 
     'reconnect: loop {
         if crate::cdc::shutdown_epoch() != shutdown_epoch {
@@ -1312,6 +1313,11 @@ async fn run_pump(source: Arc<SharedSource>) {
         // begins at the minimum `committed` across members, so every commit
         // still held is about to be re-delivered; keeping them would duplicate
         // work and, worse, interleave stale envelopes with the replay.
+        // Zero the depth gauges before dropping the backlog, or they stay stuck
+        // at their pre-reconnect value while nothing is actually held.
+        for key in overflow.members() {
+            publish_held(&source, &key, 0);
+        }
         overflow.clear();
         let mut decoder = pgoutput::Decoder::new();
         // Relation id -> (member key, resolved handle). Caching the `Arc<MemberHandle>`
@@ -1570,7 +1576,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                     // what lets a lagging member's hold-back drain during a quiet
                     // stretch instead of waiting for the next commit.
                     if !overflow.is_empty() {
-                        overflow.flush(&source);
+                        flush_overflow(&source, &mut overflow);
                     }
                     if !txn_open {
                         source.ack.credit_idle(wal_end.0);
@@ -2006,177 +2012,84 @@ async fn deliver_to_member(
     }
 }
 
-/// Envelope as it travels from the pump to a member's channel.
-type MemberEnvelope = std::result::Result<ChangeEnvelope, StreamError>;
-
-/// Pump-local per-member hold-back queues, drained into member channels as they
-/// free up. This is what stops one slow member's full channel from stalling the
-/// pump — and therefore every *other* member on the slot.
+/// How much the pump may hold back, as a multiple of the per-member channel
+/// depth **times the number of members on the slot**. Scaling by member count
+/// keeps the per-member headroom constant as a slot grows, instead of squeezing
+/// every member's share as members are added.
 ///
-/// A shared slot decodes the WAL once and fans out, but delivery used to be
-/// strictly synchronous: a full member channel blocked the pump, which stopped
-/// it calling `client.recv()`, so every member advanced at the slowest member's
-/// rate. Measured at SF-100: moving a table with its own slot (3.4 s staleness)
-/// onto a slot shared with heavier tables took it to 503.7 s — a 146x regression
-/// driven entirely by its slot-mates.
-///
-/// Ordering is preserved per member because a member's channel is fed from
-/// exactly one place at a time: the direct `try_send` fast path applies *only*
-/// while that member's queue is empty; once anything is held back, every later
-/// envelope for that member appends to the queue and reaches the channel through
-/// [`MemberOverflow::flush`], oldest first.
-#[derive(Default)]
-struct MemberOverflow {
-    queues: FxHashMap<MemberKey, std::collections::VecDeque<MemberEnvelope>>,
-    /// Envelopes held across all members, maintained alongside `queues` so the
-    /// global cap is O(1) to test on the hot path.
-    total: usize,
-}
-
-impl MemberOverflow {
-    fn is_empty(&self) -> bool {
-        self.total == 0
-    }
-
-    fn held_for(&self, key: &MemberKey) -> usize {
-        self.queues
-            .get(key)
-            .map_or(0, std::collections::VecDeque::len)
-    }
-
-    fn push(&mut self, key: &MemberKey, envelope: MemberEnvelope) {
-        self.queues
-            .entry(key.clone())
-            .or_default()
-            .push_back(envelope);
-        self.total = self.total.saturating_add(1);
-    }
-
-    /// Non-blocking drain: move as much as each member's channel will take.
-    /// Members whose channel is still full keep their remaining backlog.
-    fn flush(&mut self, source: &Arc<SharedSource>) {
-        self.queues.retain(|key, queue| {
-            let Some(member) = source.member(key) else {
-                // Member detached; its held envelopes are unreachable. Dropping
-                // them cannot lose data: `committed` (the ack floor) only
-                // advances on durable apply, so the floor still holds this
-                // member's position and a reconnect replays from it.
-                return false;
-            };
-            while let Some(envelope) = queue.pop_front() {
-                match member.sender.try_send(envelope) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(returned)) => {
-                        queue.push_front(returned);
-                        break;
-                    }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        queue.clear();
-                        break;
-                    }
-                }
-            }
-            // Publish the depth so a lagging member is visible: with the pump no
-            // longer blocked, a full channel stops showing up as pump stall time.
-            member
-                .metrics
-                .set_member_held_envelopes(u64::try_from(queue.len()).unwrap_or(u64::MAX));
-            !queue.is_empty()
-        });
-        self.total = self
-            .queues
-            .values()
-            .map(std::collections::VecDeque::len)
-            .sum();
-    }
-
-    /// Drop everything held. Called when the pump reconnects: the replay starts
-    /// at the minimum `committed` across members and re-delivers these commits,
-    /// so held envelopes are stale, not lost.
-    fn clear(&mut self) {
-        self.queues.clear();
-        self.total = 0;
-    }
-}
-
-/// Total envelopes the pump will hold back across all members before it stops
-/// reading the connection. Expressed as a multiple of the per-member channel
-/// depth so the two scale together: the point of holding back is to let light
-/// members keep flowing past a heavy one, and a heavy member is "behind" once it
-/// has more than a channel's worth queued.
-///
-/// This is the memory bound. Past it the pump reverts to the blocking send —
-/// the pre-existing behaviour — so a member that never drains still applies
-/// back-pressure to the slot rather than growing the hold-back without limit.
+/// This is the memory bound. Past it the pump reverts to the blocking send, so a
+/// member that never drains still back-pressures the slot.
 const MEMBER_OVERFLOW_CAPACITY_MULTIPLIER: usize = 4;
 
+/// Publish a member's current hold-back depth.
+fn publish_held(source: &Arc<SharedSource>, key: &MemberKey, depth: usize) {
+    if let Some(member) = source.member(key) {
+        member
+            .metrics
+            .set_member_held_envelopes(u64::try_from(depth).unwrap_or(u64::MAX));
+    }
+}
+
+/// Non-blocking drain of every member's hold-back, refreshing each depth gauge.
+fn flush_overflow(source: &Arc<SharedSource>, overflow: &mut MemberOverflow<MemberKey>) {
+    for key in overflow.members() {
+        let Some(member) = source.member(&key) else {
+            overflow.drop_member(&key);
+            continue;
+        };
+        if overflow.flush_member(&key, &member.sender) == FlushOutcome::ReceiverGone {
+            // Detach here rather than waiting for the next reap: a dead member
+            // pins the slot's ack floor, so every extra second costs WAL.
+            source.detach_member(&key, "changes stream receiver dropped", true);
+        }
+        publish_held(source, &key, overflow.held_for(&key));
+    }
+}
+
 /// Block until the hold-back is back under `target`, draining oldest-first from
-/// the member holding the most. Uses the same bounded, shutdown-aware wait as
-/// the direct path, so stall warnings and `member_send_wait_micros_total` keep
-/// their meaning. Returns the microseconds awaited.
+/// the member holding the most. Uses the same bounded, shutdown-aware wait as the
+/// direct path, so stall warnings and `member_send_wait_micros_total` keep their
+/// meaning. Returns the microseconds awaited and whether shutdown intervened.
 async fn drain_overflow_to(
     source: &Arc<SharedSource>,
-    overflow: &mut MemberOverflow,
+    overflow: &mut MemberOverflow<MemberKey>,
     target: usize,
     shutdown_epoch: u64,
 ) -> (u64, bool) {
     let mut waited_us: u64 = 0;
-    while overflow.total > target {
-        overflow.flush(source);
-        if overflow.total <= target {
+    while overflow.total() > target {
+        flush_overflow(source, overflow);
+        if overflow.total() <= target {
             break;
         }
-        // Pick the member holding the most: it is the one pinning the budget,
-        // and draining it frees the most room for everyone else.
-        let Some(key) = overflow
-            .queues
-            .iter()
-            .max_by_key(|(_, queue)| queue.len())
-            .map(|(key, _)| key.clone())
-        else {
-            break;
-        };
+        let Some(key) = overflow.deepest() else { break };
         let Some(member) = source.member(&key) else {
-            overflow.queues.remove(&key);
-            overflow.total = overflow
-                .queues
-                .values()
-                .map(std::collections::VecDeque::len)
-                .sum();
+            overflow.drop_member(&key);
             continue;
         };
-        let Some(envelope) = overflow
-            .queues
-            .get_mut(&key)
-            .and_then(std::collections::VecDeque::pop_front)
-        else {
-            overflow.queues.remove(&key);
+        let Some(envelope) = overflow.pop_front(&key) else {
             continue;
         };
-        overflow.total = overflow.total.saturating_sub(1);
-        match deliver_to_member(
+        let outcome = deliver_to_member(
             &member.metrics,
             &member.dataset_name,
             &member.sender,
             envelope,
             shutdown_epoch,
         )
-        .await
-        {
+        .await;
+        // Refresh after the pop so the gauge cannot over-report once the drain
+        // exits without another flush.
+        publish_held(source, &key, overflow.held_for(&key));
+        match outcome {
             SendOutcome::Sent(w) => waited_us = waited_us.saturating_add(w),
             SendOutcome::ReceiverGone(w) => {
                 waited_us = waited_us.saturating_add(w);
-                overflow.queues.remove(&key);
-                overflow.total = overflow
-                    .queues
-                    .values()
-                    .map(std::collections::VecDeque::len)
-                    .sum();
+                overflow.drop_member(&key);
+                publish_held(source, &key, 0);
                 source.detach_member(&key, "changes stream receiver dropped", true);
             }
-            SendOutcome::ShutdownAbandon(w) => {
-                return (waited_us.saturating_add(w), true);
-            }
+            SendOutcome::ShutdownAbandon(w) => return (waited_us.saturating_add(w), true),
         }
     }
     (waited_us, false)
@@ -2205,7 +2118,7 @@ async fn deliver_commit(
     routes: &RouteMap,
     txn: TxnBuffer,
     commit: CommitBoundary,
-    overflow: &mut MemberOverflow,
+    overflow: &mut MemberOverflow<MemberKey>,
 ) -> u64 {
     let CommitBoundary {
         end_lsn,
@@ -2311,6 +2224,7 @@ async fn deliver_commit(
                 Ok(()) => continue,
                 Err(mpsc::error::TrySendError::Full(returned)) => {
                     overflow.push(member_key, returned);
+                    publish_held(source, member_key, overflow.held_for(member_key));
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     source.detach_member(member_key, "changes stream receiver dropped", true);
@@ -2319,6 +2233,7 @@ async fn deliver_commit(
             }
         } else {
             overflow.push(member_key, Ok(envelope));
+            publish_held(source, member_key, overflow.held_for(member_key));
         }
 
         // Memory bound: past the budget the pump reverts to blocking, so a
@@ -2326,8 +2241,9 @@ async fn deliver_commit(
         let cap = source
             .params
             .member_channel_capacity
-            .saturating_mul(MEMBER_OVERFLOW_CAPACITY_MULTIPLIER);
-        if overflow.total > cap {
+            .saturating_mul(MEMBER_OVERFLOW_CAPACITY_MULTIPLIER)
+            .saturating_mul(source.live_member_count().max(1));
+        if overflow.total() > cap {
             let (waited, abandon) = drain_overflow_to(source, overflow, cap, shutdown_epoch).await;
             total_send_wait_us = total_send_wait_us.saturating_add(waited);
             if abandon {
@@ -2339,7 +2255,7 @@ async fn deliver_commit(
     // Opportunistic, non-blocking: give held-back envelopes the room that the
     // members' sinks freed while this commit was being routed.
     if !overflow.is_empty() {
-        overflow.flush(source);
+        flush_overflow(source, overflow);
     }
 
     // The slot-level freshness watermark for this commit is published to every
@@ -2766,133 +2682,6 @@ mod tests {
         ));
     }
 
-    /// Regression test for shared-slot head-of-line blocking: a member whose
-    /// channel is full must not stop delivery to a member whose channel is
-    /// empty. Measured at SF-100 before this: a table with its own slot sat at
-    /// 3.4 s staleness and moving it onto a slot shared with heavier tables took
-    /// it to 503.7 s (146x) purely from its slot-mates' backlog.
-    #[tokio::test]
-    async fn overflow_lets_a_free_member_flow_past_a_blocked_one() {
-        let schema = tiny_schema();
-        let (source, mut probes) = test_source_with_members(2);
-        let (slow_key, _, mut slow_rx) = probes.remove(0);
-        let (fast_key, _, mut fast_rx) = probes.remove(0);
-        let env = || Ok(crate::cdc::build_ready_signal_envelope(&schema).expect("env"));
-
-        // Fill the slow member's channel (test channels are capacity 4).
-        let slow = source.member(&slow_key).expect("slow member");
-        for _ in 0..4 {
-            slow.sender.try_send(env()).expect("prefill slow channel");
-        }
-        assert!(slow.sender.try_send(env()).is_err(), "slow channel is full");
-
-        let mut overflow = MemberOverflow::default();
-        for _ in 0..3 {
-            overflow.push(&slow_key, env());
-        }
-        for _ in 0..2 {
-            overflow.push(&fast_key, env());
-        }
-        assert_eq!(overflow.total, 5);
-
-        overflow.flush(&source);
-
-        // The blocked member keeps its backlog; the free member is fully drained.
-        assert_eq!(
-            overflow.held_for(&slow_key),
-            3,
-            "a full channel must retain its held-back envelopes"
-        );
-        assert_eq!(
-            overflow.held_for(&fast_key),
-            0,
-            "a member with a free channel must not wait behind a blocked one"
-        );
-        assert_eq!(overflow.total, 3, "total must track the per-member queues");
-        for _ in 0..2 {
-            let delivered = fast_rx
-                .try_recv()
-                .expect("fast member received its envelope");
-            assert!(
-                delivered.is_ok(),
-                "a held-back envelope must arrive intact, not as a stream error"
-            );
-        }
-        assert!(
-            fast_rx.try_recv().is_err(),
-            "fast member should have received exactly its own two envelopes"
-        );
-        // Sanity: the slow member's channel still holds only its prefill.
-        for _ in 0..4 {
-            let _prefilled = slow_rx.try_recv().expect("prefilled envelope");
-        }
-        assert!(slow_rx.try_recv().is_err());
-    }
-
-    /// Held-back envelopes reach the channel oldest-first and only as fast as the
-    /// sink frees room — the property that keeps a member's stream in LSN order
-    /// once anything has been held back for it.
-    #[tokio::test]
-    async fn overflow_flush_is_oldest_first_and_bounded_by_channel_room() {
-        let schema = tiny_schema();
-        let (source, mut probes) = test_source_with_members(1);
-        let (key, _, mut rx) = probes.remove(0);
-        let env = || Ok(crate::cdc::build_ready_signal_envelope(&schema).expect("env"));
-
-        let member = source.member(&key).expect("member");
-        for _ in 0..3 {
-            member.sender.try_send(env()).expect("prefill 3 of 4");
-        }
-
-        let mut overflow = MemberOverflow::default();
-        for _ in 0..5 {
-            overflow.push(&key, env());
-        }
-
-        // Only one slot free, so exactly one envelope may move.
-        overflow.flush(&source);
-        assert_eq!(
-            overflow.held_for(&key),
-            4,
-            "flush must stop at a full channel"
-        );
-
-        // Free two slots; exactly two more move.
-        let _drained = rx.try_recv().expect("drain 1");
-        let _drained = rx.try_recv().expect("drain 2");
-        overflow.flush(&source);
-        assert_eq!(overflow.held_for(&key), 2);
-        assert_eq!(overflow.total, 2);
-    }
-
-    /// A detached member's backlog is dropped rather than pinned forever. This is
-    /// safe because `committed` (the ack floor) only advances on durable apply,
-    /// so the floor still holds the member's position and a reconnect replays
-    /// from it — the same reason `clear()` on reconnect cannot lose data.
-    #[tokio::test]
-    async fn overflow_drops_backlog_for_a_vanished_member() {
-        let schema = tiny_schema();
-        let (source, mut probes) = test_source_with_members(1);
-        let (key, _, rx) = probes.remove(0);
-        let mut overflow = MemberOverflow::default();
-        for _ in 0..3 {
-            overflow.push(
-                &key,
-                Ok(crate::cdc::build_ready_signal_envelope(&schema).expect("env")),
-            );
-        }
-        drop(rx);
-        source.detach_member(&key, "test", true);
-        source.reap_closed_members();
-
-        overflow.flush(&source);
-        assert_eq!(overflow.held_for(&key), 0);
-        assert!(
-            overflow.is_empty(),
-            "detached member must not pin the budget"
-        );
-    }
-
     /// The hold-back is memory-bounded: `drain_overflow_to` blocks until the
     /// total is back under the target, so a member that never drains still
     /// back-pressures the slot instead of growing the queue without limit.
@@ -2908,7 +2697,7 @@ mod tests {
         for _ in 0..4 {
             member.sender.try_send(env()).expect("fill channel");
         }
-        let mut overflow = MemberOverflow::default();
+        let mut overflow: MemberOverflow<MemberKey> = MemberOverflow::default();
         for _ in 0..4 {
             overflow.push(&key, env());
         }
@@ -2925,9 +2714,19 @@ mod tests {
         let (waited_us, abandon) = drain_overflow_to(&source, &mut overflow, 2, epoch).await;
         assert!(!abandon, "no shutdown during the test");
         assert!(
-            overflow.total <= 2,
+            overflow.total() <= 2,
             "drain must bring the hold-back under the target, got {}",
-            overflow.total
+            overflow.total()
+        );
+        // The wiring under test: the gauge reflects the post-drain depth rather
+        // than a stale pre-drain value.
+        assert_eq!(
+            crate::postgres_replication::ReplicationMetrics::new(Arc::clone(
+                &source.member(&key).expect("member").metrics
+            ))
+            .member_held_envelopes(),
+            Some(u64::try_from(overflow.held_for(&key)).unwrap_or(u64::MAX)),
+            "held-envelopes gauge must track the hold-back after a drain"
         );
         assert!(waited_us > 0, "blocking on a full channel must be recorded");
         let _rx = drainer.await.expect("drainer task");

@@ -336,6 +336,19 @@ pub(crate) const REPLICATION_METRICS: &[MetricSpec] = &[
         .unit("By")
         .auto_register(),
     MetricSpec::new(
+        "replication_member_held_envelopes",
+        MetricType::ObservableGaugeU64,
+    )
+    .description(
+        "Committed-change envelopes the shared binlog pump is currently holding back for \
+         this dataset because its delivery channel is full. The pump keeps reading the dump \
+         and serving the group's other members while this is non-zero, so this is the signal \
+         for 'this dataset is behind its binlog-group peers'. A value pinned at the hold-back \
+         cap means the pump has reverted to blocking to bound memory. Only reported for \
+         datasets sharing a binlog dump.",
+    )
+    .auto_register(),
+    MetricSpec::new(
         "replication_source_head_pos",
         MetricType::ObservableGaugeU64,
     )
@@ -492,6 +505,15 @@ pub(crate) fn observe_replication_metric(
                 instrument.observe(v, &attributes);
             }
         })),
+        "replication_member_held_envelopes" => {
+            ObserveMetricCallback::U64(Box::new(move |instrument| {
+                // Shared-dump datasets only (`Some`); a dedicated dump reports no
+                // series rather than a constant 0.
+                if let Some(v) = m.member_held_envelopes() {
+                    instrument.observe(v, &attributes);
+                }
+            }))
+        }
         "replication_lag_bytes" => ObserveMetricCallback::U64(Box::new(move |instrument| {
             // Observe only when computable, so an absent series (rather than
             // `0`) means "unknown".

@@ -118,6 +118,7 @@ use super::{
     CursorType, Error, GtidSet, PersistedPosition, PositionStore, ReplicationStreamInput, Result,
     check_resume_compatibility, encode_checkpoint_schema_json, stream_error,
 };
+use crate::cdc::member_overflow::{FlushOutcome, MemberOverflow};
 use crate::cdc::{ChangeEnvelope, ChangesStream, CommitChange, CommitError, StreamError};
 use crate::cdc::{InitialSnapshotMode, InvalidCheckpointBehavior};
 
@@ -1316,6 +1317,13 @@ async fn run_pump(source: Arc<SharedSource>) {
     // writes (position + GTID set — see `PersistIdentity`).
     let mut last_persisted: HashMap<MemberKey, PersistIdentity> = HashMap::new();
 
+    // Per-member hold-back so one slow member cannot stop the pump reading the
+    // dump (and thus stall every peer on it). Declared outside the reconnect loop
+    // only to keep the allocation; CLEARED on each connect, because a resume
+    // replays from the group's minimum committed position and re-delivers
+    // anything still held.
+    let mut overflow: MemberOverflow<MemberKey> = MemberOverflow::default();
+
     'reconnect: loop {
         if crate::cdc::shutdown_epoch() != shutdown_epoch {
             persist_all(&source, &mut last_persisted).await;
@@ -1407,6 +1415,13 @@ async fn run_pump(source: Arc<SharedSource>) {
         // so `FxHashMap` (a fast u64 hash) is preferred over std's SipHash. `txn`
         // buffers OWNED raw row payloads per table; the tuple decode + Arrow
         // build run off the pump in `MysqlChangeRows::build`.
+        // Zero the depth gauges before dropping the backlog, or they stay stuck at
+        // their pre-reconnect value while nothing is actually held. The held
+        // envelopes themselves are stale — the resume re-delivers them.
+        for key in overflow.members() {
+            publish_held(&source, &key, 0);
+        }
+        overflow.clear();
         let mut routes: FxHashMap<u64, Route> = FxHashMap::default();
         let mut txn: FxHashMap<u64, Vec<RowsEventData<'static>>> = FxHashMap::default();
         let mut txn_open = false;
@@ -1650,10 +1665,13 @@ async fn run_pump(source: Arc<SharedSource>) {
                         &source,
                         &routes,
                         std::mem::take(&mut txn),
-                        &commit_pos,
-                        event_timestamp,
-                        shutdown_epoch,
-                        current_txn_gtid,
+                        CommitBoundary {
+                            commit_pos: &commit_pos,
+                            event_timestamp,
+                            shutdown_epoch,
+                            gtid: current_txn_gtid,
+                        },
+                        &mut overflow,
                     )
                     .await;
                 }
@@ -1673,10 +1691,13 @@ async fn run_pump(source: Arc<SharedSource>) {
                                 &source,
                                 &routes,
                                 std::mem::take(&mut txn),
-                                &commit_pos,
-                                event_timestamp,
-                                shutdown_epoch,
-                                current_txn_gtid,
+                                CommitBoundary {
+                                    commit_pos: &commit_pos,
+                                    event_timestamp,
+                                    shutdown_epoch,
+                                    gtid: current_txn_gtid,
+                                },
+                                &mut overflow,
                             )
                             .await;
                         }
@@ -1804,15 +1825,29 @@ fn rotate_target(rotate: &RotateEvent<'_>) -> Option<BinlogPosition> {
 /// O(1)-per-table work only (route lookup, watermark, transaction count, commit
 /// bookkeeping); the tuple decode + Arrow build are deferred into the
 /// per-dataset consumer via [`MysqlChangeRows`].
+/// The commit boundary being routed: where it ends in the binlog, when the
+/// source committed it, its GTID when GTID-positioning, and the shutdown epoch
+/// the pump started under.
+struct CommitBoundary<'a> {
+    commit_pos: &'a BinlogPosition,
+    event_timestamp: u32,
+    shutdown_epoch: u64,
+    gtid: Option<(uuid::Uuid, u64)>,
+}
+
 async fn deliver_commit(
     source: &Arc<SharedSource>,
     routes: &FxHashMap<u64, Route>,
     txn: FxHashMap<u64, Vec<RowsEventData<'static>>>,
-    commit_pos: &BinlogPosition,
-    event_timestamp: u32,
-    shutdown_epoch: u64,
-    gtid: Option<(uuid::Uuid, u64)>,
+    commit: CommitBoundary<'_>,
+    overflow: &mut MemberOverflow<MemberKey>,
 ) {
+    let CommitBoundary {
+        commit_pos,
+        event_timestamp,
+        shutdown_epoch,
+        gtid,
+    } = commit;
     let commit_ts = commit_ts_ms(event_timestamp);
     for (table_id, events) in txn {
         if events.is_empty() {
@@ -1859,14 +1894,42 @@ async fn deliver_commit(
             Box::new(rows),
             is_ready,
         );
+        // Marks the envelope in-flight for ack accounting BEFORE it is queued or
+        // sent, so a held envelope pins the group's resume position exactly as an
+        // in-flight send does — the safe side.
         slot.deliver(commit_pos);
-        match deliver_to_member(&member.sender, Ok(envelope), shutdown_epoch).await {
-            DeliverOutcome::Sent => {}
-            DeliverOutcome::ReceiverGone => {
-                source.detach_member(key, "changes stream receiver dropped", true);
+        // Fast path only while nothing is held for this member; otherwise the
+        // envelope must queue behind what is waiting, or it would reach the
+        // channel out of binlog order.
+        if overflow.held_for(key) == 0 {
+            match member.sender.try_send(Ok(envelope)) {
+                Ok(()) => continue,
+                Err(mpsc::error::TrySendError::Full(returned)) => {
+                    overflow.push(key, returned);
+                    publish_held(source, key, overflow.held_for(key));
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    source.detach_member(key, "changes stream receiver dropped", true);
+                    continue;
+                }
             }
-            DeliverOutcome::ShutdownAbandon => return,
+        } else {
+            overflow.push(key, Ok(envelope));
+            publish_held(source, key, overflow.held_for(key));
         }
+
+        // MySQL's member channel depth is a constant (there is no per-source
+        // override as on the Postgres side), so the cap derives from it directly.
+        let cap = DEFAULT_MEMBER_CHANNEL_CAPACITY
+            .saturating_mul(MEMBER_OVERFLOW_CAPACITY_MULTIPLIER)
+            .saturating_mul(source.live_member_count().max(1));
+        if overflow.total() > cap && drain_overflow_to(source, overflow, cap, shutdown_epoch).await
+        {
+            return;
+        }
+    }
+    if !overflow.is_empty() {
+        flush_overflow(source, overflow);
     }
     source.ack.credit_idle(commit_pos, gtid);
 }
@@ -2011,6 +2074,73 @@ enum DeliverOutcome {
     Sent,
     ReceiverGone,
     ShutdownAbandon,
+}
+
+/// How much the pump may hold back, as a multiple of the per-member channel depth
+/// times the number of members on the dump. A shared binlog dump fans one stream
+/// out to every member, so without this a single lagging member stalls the pump
+/// and every peer advances at its rate.
+///
+/// This is the memory bound: past it the pump reverts to the blocking send, so a
+/// member that never drains still back-pressures the group.
+const MEMBER_OVERFLOW_CAPACITY_MULTIPLIER: usize = 4;
+
+fn publish_held(source: &Arc<SharedSource>, key: &MemberKey, depth: usize) {
+    if let Some(member) = source.member(key) {
+        member
+            .metrics
+            .set_member_held_envelopes(u64::try_from(depth).unwrap_or(u64::MAX));
+    }
+}
+
+/// Non-blocking drain of every member's hold-back, refreshing each depth gauge.
+fn flush_overflow(source: &Arc<SharedSource>, overflow: &mut MemberOverflow<MemberKey>) {
+    for key in overflow.members() {
+        let Some(member) = source.member(&key) else {
+            overflow.drop_member(&key);
+            continue;
+        };
+        if overflow.flush_member(&key, &member.sender) == FlushOutcome::ReceiverGone {
+            source.detach_member(&key, "changes stream receiver dropped", true);
+        }
+        publish_held(source, &key, overflow.held_for(&key));
+    }
+}
+
+/// Block until the hold-back is under `target`, draining oldest-first from the
+/// member holding the most. Returns whether shutdown intervened.
+async fn drain_overflow_to(
+    source: &Arc<SharedSource>,
+    overflow: &mut MemberOverflow<MemberKey>,
+    target: usize,
+    shutdown_epoch: u64,
+) -> bool {
+    while overflow.total() > target {
+        flush_overflow(source, overflow);
+        if overflow.total() <= target {
+            break;
+        }
+        let Some(key) = overflow.deepest() else { break };
+        let Some(member) = source.member(&key) else {
+            overflow.drop_member(&key);
+            continue;
+        };
+        let Some(envelope) = overflow.pop_front(&key) else {
+            continue;
+        };
+        let outcome = deliver_to_member(&member.sender, envelope, shutdown_epoch).await;
+        publish_held(source, &key, overflow.held_for(&key));
+        match outcome {
+            DeliverOutcome::Sent => {}
+            DeliverOutcome::ReceiverGone => {
+                overflow.drop_member(&key);
+                publish_held(source, &key, 0);
+                source.detach_member(&key, "changes stream receiver dropped", true);
+            }
+            DeliverOutcome::ShutdownAbandon => return true,
+        }
+    }
+    false
 }
 
 /// Must-deliver one envelope into a member's bounded channel, warning on a

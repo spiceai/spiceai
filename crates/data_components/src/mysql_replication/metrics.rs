@@ -20,13 +20,19 @@ limitations under the License.
 //! instead of LSN).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::SystemTime;
 
 /// Shared collector; the stream holds an `Arc` and updates it as it
 /// processes events.
 #[derive(Debug, Default)]
 pub struct MetricsCollector {
+    /// Envelopes the shared-dump pump is currently holding back for this member
+    /// because its channel is full. Non-zero means this dataset is behind its
+    /// binlog-group peers while the pump keeps serving them.
+    member_held_envelopes: AtomicU64,
+    /// Gates observation to shared-dump datasets.
+    member_held_envelopes_known: AtomicBool,
     inserts: AtomicU64,
     updates: AtomicU64,
     deletes: AtomicU64,
@@ -107,6 +113,16 @@ impl MetricsCollector {
     pub fn set_bootstrap_rows_expected(&self, n: u64) {
         self.bootstrap_rows_expected.store(n, Ordering::Relaxed);
     }
+    /// Publish the pump's current hold-back depth for this member — the signal
+    /// for "this dataset is behind its binlog-group peers". Also marks the series
+    /// applicable, so a dedicated dump reports no series rather than a constant 0.
+    pub fn set_member_held_envelopes(&self, n: u64) {
+        self.member_held_envelopes_known
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.member_held_envelopes
+            .store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn set_gtid_enabled(&self, enabled: bool) {
         self.gtid_enabled
             .store(u64::from(enabled), Ordering::Relaxed);
@@ -178,6 +194,21 @@ pub struct Metrics {
 }
 
 impl Metrics {
+    /// `None` for a dedicated dump, which has no hold-back concept and reports no
+    /// series — never a misleading constant `0`.
+    #[must_use]
+    pub fn member_held_envelopes(&self) -> Option<u64> {
+        if self
+            .collector
+            .member_held_envelopes_known
+            .load(Ordering::Acquire)
+        {
+            Some(self.collector.member_held_envelopes.load(Ordering::Relaxed))
+        } else {
+            None
+        }
+    }
+
     #[must_use]
     pub fn new(collector: Arc<MetricsCollector>) -> Self {
         Self { collector }
