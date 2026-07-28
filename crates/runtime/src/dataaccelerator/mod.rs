@@ -1482,6 +1482,11 @@ mod accelerator_compat_tests {
                         params,
                         ..Acceleration::default()
                     });
+                    // These compat tests exercise DML (insert / overwrite / delete), so
+                    // the dataset is read-write. Marking it so also drives Cayenne's
+                    // access-derived scan freshness to 0 (read-your-writes), which these
+                    // tests assert (e.g. test_overwrite_operations reads its own writes).
+                    dataset.access = crate::component::access::AccessMode::ReadWrite;
 
                     // Vortex may panic on unsupported types (e.g., Duration), so we catch that
                     // We need to catch panics from the async operation by using FutureExt::catch_unwind

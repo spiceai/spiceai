@@ -48,10 +48,10 @@ use super::manifest::{ManifestSequenceTag, SeqPrefixPlan};
 use super::mutation_writer::AppendMutationWriter;
 use super::on_conflict::{
     BatchValidationResult, CheckpointCorpusKeys, ExtractedPrimaryKeys, InlineAwareDeletionSink,
-    InlinedDataRewrite, Int64DeletionDelta, MergedScanDeletions, OnConflictContext,
-    OnConflictDeletionUpdate, OnConflictDeletions, OnConflictUpdate, OnConflictValidationStream,
-    PendingTombstoneDeltas, PkDeletionSnapshot, PkKeysetInvalidatingDeletionSink,
-    PreparedInsertStream, PreparedOnConflictDeletionPublish, PreparedOnConflictDurablePayload,
+    InlinedDataRewrite, Int64DeletionDelta, OnConflictContext, OnConflictDeletionUpdate,
+    OnConflictDeletions, OnConflictUpdate, OnConflictValidationStream, PendingTombstoneDeltas,
+    PkDeletionSnapshot, PkKeysetInvalidatingDeletionSink, PreparedInsertStream,
+    PreparedOnConflictDeletionPublish, PreparedOnConflictDurablePayload,
     PreparedProtectedSnapshotUpdate, PreparedShardedInsertStream, ProtectedSnapshotScan,
     RowKeyDeletionDelta, ShardedApplyResult, pk_deletion_snapshot_for_strategy,
 };
@@ -970,62 +970,325 @@ pub(crate) async fn reserve_sequences_in(
     Ok(first)
 }
 
-/// One memoized, deletion-filtered mem-tier visible set for the scan path.
-///
-/// Keyed the SAME way as [`MergedScanDeletions`] — (file-index `Arc` ptr, the
-/// per-shard content `version` hash, structural epoch) — so any concurrent
-/// append/clear/publish forces a rebuild and a stale pairing can never be
-/// served. Like `MergedScanDeletions`, the file-index `Arc` is RETAINED here
-/// (`file_index`) so its address cannot be freed and reused by a later index
-/// generation, keeping the ptr comparison ABA-safe (#11303). Where
-/// `merged_scan_deletions` memoizes the merged tombstone
-/// *snapshot*, this memoizes the merge-on-read *output*: the visible batches
-/// after `filter_inlined_batch_for_deletions` has already run.
-///
-/// Stored PER SEGMENT (each with its statistics), not as one flat batch list,
-/// because the deletion filtering is version-invariant but a query's pruning
-/// predicate is per-query: the memo serves the deletion-filtered batches and
-/// the caller re-applies the (cheap, statistics-only) pruning at serve time.
-/// This kills the per-table-reference re-filtering a multi-reference query
-/// (q20/q21 semi-/anti-joins reference the CDC table 2-3×) paid on every
-/// reference, and lets repeated same-version queries skip merge-on-read
-/// entirely.
-struct MemTierVisibleMemo {
-    /// The file-side deletion snapshot the visibility was filtered against,
-    /// RETAINED for the lifetime of the memo (`None` for position-based, which
-    /// does not filter here). Retaining the `Arc` — not merely its address —
-    /// pins the index generation so its address cannot be freed and reused by a
-    /// later generation, making the [`Self::file_index_ptr`] identity ABA-safe;
-    /// see [`MergedScanDeletions::file_index`] and #11303.
-    file_index: Option<PkDeletionSnapshot>,
-    /// [`crate::provider::mem_tier::ShardedMemTier::version_hash_of`] of the
-    /// shards the batches were built from.
-    tier_version: u64,
-    /// Structural epoch observed when the memo was built.
-    structural_epoch: u64,
-    /// Per-segment deletion-filtered visible batches, unpruned. `Arc<[_]>` so a
-    /// memo hit is an `Arc`-pointer clone, never an O(segments) copy.
-    segments: Arc<[VisibleMemTierSegment]>,
-}
-
-impl MemTierVisibleMemo {
-    /// `Arc::as_ptr` identity of the retained file-side index — the memo key's
-    /// file-side component (`None` for position-based). Read from
-    /// [`Self::file_index`] so the compared pointer and the pinned allocation
-    /// can never diverge.
-    fn file_index_ptr(&self) -> Option<usize> {
-        self.file_index
-            .as_ref()
-            .and_then(PkDeletionSnapshot::index_ptr)
-    }
-}
-
 /// One retained mem-tier segment's deletion-filtered visible batches plus the
 /// segment statistics a query's pruning predicate is evaluated against at serve
-/// time. See [`MemTierVisibleMemo`].
+/// time. Held per-segment (not one flat batch list) because the deletion
+/// filtering is version-invariant but a query's pruning predicate is per-query:
+/// the [`ScanView`] carries the deletion-filtered batches and the scan re-applies
+/// the (cheap, statistics-only) pruning at serve time. `Arc<[_]>` in the
+/// `ScanView` so borrowing the bundle is a pointer clone, never an O(segments)
+/// copy.
 struct VisibleMemTierSegment {
     statistics: Arc<Statistics>,
     batches: Vec<RecordBatch>,
+}
+
+/// The consistent per-scan capture of everything a scan reads, taken under one
+/// `listing_fence.read()` plus the mem-tier aggregate seqlock and the bounded
+/// inline-view retry (see [`CayenneTableProvider::capture_raw_scan_input`]).
+///
+/// This is the raw INPUT to the KDI merge + visible-segment computation
+/// ([`CayenneTableProvider::build_scan_view`]); a [`ScanView`] pairs a
+/// `RawScanInput` with that computed output. Extracting it out of the `scan()`
+/// prologue lets the demand-driven [`ScanViewCache`] capture the same consistent
+/// state and build the merged bundle OFF the query path (`spawn_blocking`), once
+/// per distinct scan-visible identity, instead of every concurrent scan recomputing
+/// it — with concurrent scans on that identity sharing one build.
+///
+/// Consistency is STRUCTURAL: every field is captured against one fence-held
+/// moment, so the file snapshot, the mem-tier shards, the file-side deletion
+/// snapshot, and the inline view can never be mixed across versions. The
+/// [`Self::scan_guard`] pins the snapshot dirs for the whole scan lifetime (D2),
+/// so the fence can be released after the capture without a compaction GC'ing a
+/// file the scan still reads.
+///
+/// `Clone` is a cheap shallow clone (Arc / atom / String copies; the
+/// `PkDeletionSnapshot` is itself an `Arc` clone) — used by the builder to retain
+/// the prior capture for the next [`Self::changed`] comparison while the current
+/// one moves into the published [`ScanView`]. Cloning the `scan_guard` `Arc` SHARES
+/// the same in-flight lease (it does NOT re-increment the snapshot ref-count), so a
+/// clone never double-pins.
+#[derive(Clone)]
+struct RawScanInput {
+    /// Per-shard immutable mem-tier snapshots (`ArcSwap::load_full` per shard).
+    /// Empty in file mode. At N==1 this is the single shard, matching the prior
+    /// single `.tier().load_full()` capture.
+    mem_tier_shards: Vec<Arc<crate::provider::mem_tier::MemTier>>,
+    /// Maintained-aggregate visibility epoch captured under the IVM seqlock, or
+    /// `None` when the seqlock was odd/changed during capture (the optimizer then
+    /// keeps the correct base-scan aggregate rather than a torn maintained one).
+    maintained_aggregate_epoch: Option<u64>,
+    /// File-side PK deletion snapshot (`pk_deletion_snapshot()`), captured under
+    /// `scan_state_lock.read()`. The merged (file ∪ mem-tier) view is computed
+    /// from this by `build_scan_view`; the raw file-side snapshot is retained here
+    /// so its index `Arc` pins the generation (ABA-safe ptr identity, #11303).
+    deletion_snapshot: PkDeletionSnapshot,
+    /// Protected-snapshot map (`protected_snapshots.load_full()`), captured in the
+    /// SAME `scan_state_lock` block as `deletion_snapshot` and `inlined_view`.
+    protected_map: Arc<HashMap<String, i64>>,
+    /// Inline-memtable view captured under `scan_state_lock.read()` via the bounded
+    /// (`MAX_SCAN_CAPTURE_ATTEMPTS`) retry that rebuilds a stale cache and retries.
+    inlined_view: Arc<Vec<InlinedViewEntry>>,
+    /// Current snapshot id captured under the read fence — the file set the scan
+    /// reads. Pinned against GC by [`Self::scan_guard`].
+    current_snapshot_id: String,
+    /// Inline-memtable structural epoch (`inlined_structural_epoch`) observed at
+    /// capture. Part of the [`Self::changed`] key — the same key the retired memos
+    /// used, so a build is skipped iff no scan-visible state moved.
+    structural_epoch: u64,
+    /// In-flight-scan GC guard over the current + protected snapshot ids, minted
+    /// under the read fence so the listing-flip invariant holds (D2). Held by the
+    /// `ScanView`, so a query cloning `Arc<ScanView>` transitively keeps its
+    /// snapshot dirs alive for the full execution even after the builder evicts the
+    /// view. Ref-hold churns per VIEW-publish, not per query.
+    scan_guard: Arc<SnapshotScanRef>,
+    /// The (gated) read schema (`read_schema()`) captured under the SAME fence +
+    /// seqlock-validated window as the rest of this snapshot. Every scan-plan branch
+    /// (main file scan, protected snapshots, inline + RAM tiers) is built from THIS
+    /// schema rather than re-reading the live `table_schema` per branch, so a
+    /// concurrent `evolve_schema_live` swap between capture and plan-build can never
+    /// desync the branches from each other or from the captured data. Determined by
+    /// `structural_version` (a schema-evolve advances the generation → a fresh key),
+    /// so it needs no separate `ScanViewKey` component.
+    read_schema: SchemaRef,
+}
+
+impl RawScanInput {
+    /// The cache-key identity of this capture at forced-structural generation
+    /// `structural_version`. The composite identity of the whole scan-visible state:
+    /// two captures with equal keys denote interchangeable views. Includes
+    /// `structural_version` — the seqlock generation the capture was validated at
+    /// (see [`Self::scan_view_at_current_input`]) — so a live schema-evolution mints a
+    /// fresh key even when no snapshot/tier component moved (an empty-tier widening).
+    /// Every component is a monotonic id or a pointer that is ABA-safe because the
+    /// cached `ScanView` retains the `Arc` it names (its address cannot be reused while
+    /// an entry keyed on it lives; cf. #11303) — so the key is self-consistent with the
+    /// captured snapshot the view is built from, needing no re-validation.
+    fn key(&self, structural_version: u64) -> ScanViewKey {
+        ScanViewKey {
+            snapshot_id: self.current_snapshot_id.clone(),
+            structural_version,
+            structural_epoch: self.structural_epoch,
+            maintained_aggregate_epoch: self.maintained_aggregate_epoch,
+            mem_tier_versions: self.mem_tier_shards.iter().map(|s| s.version).collect(),
+            deletion_index_ptr: self.deletion_snapshot.index_ptr(),
+            protected_map_ptr: Arc::as_ptr(&self.protected_map).addr(),
+            inlined_view_ptr: Arc::as_ptr(&self.inlined_view).addr(),
+        }
+    }
+}
+
+/// Identity of a [`RawScanInput`] capture — the cache key for its built [`ScanView`].
+/// Two identical `ScanViewKey`s denote the same scan-visible state, so their views are
+/// interchangeable. See [`RawScanInput::key`] for the ABA-safety / self-consistency
+/// argument (why pointer components are sound as a persistent key).
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct ScanViewKey {
+    snapshot_id: String,
+    structural_version: u64,
+    structural_epoch: u64,
+    maintained_aggregate_epoch: Option<u64>,
+    mem_tier_versions: Vec<u64>,
+    deletion_index_ptr: Option<usize>,
+    protected_map_ptr: usize,
+    inlined_view_ptr: usize,
+}
+
+/// A scan-ready, internally-consistent view of the table: a [`RawScanInput`]
+/// capture PLUS the computed KDI merge + visible mem-tier segments derived from
+/// it. This is the whole unit a scan runs on; every field descends from the SAME
+/// fence-held capture, so stale-deletions-against-fresh-data (or the reverse) is
+/// impossible by construction.
+///
+/// [`CayenneTableProvider::build_scan_view`] computes it. The demand-driven
+/// [`ScanViewCache`] builds one per distinct [`ScanViewKey`] on first access and
+/// lets every concurrent scan on the same state borrow the same bundle (dedup)
+/// instead of each recomputing the merge.
+struct ScanView {
+    /// The consistent capture the merge + segments were computed from. Also holds
+    /// the `scan_guard` that pins the snapshot dirs for the scan lifetime.
+    raw: RawScanInput,
+    /// Merged (file ∪ mem-tier) PK deletion snapshot — `merged_deletion_snapshot_sharded`
+    /// over `raw`. What the scan's deletion filter is applied against.
+    merged_deletions: PkDeletionSnapshot,
+    /// Per-segment deletion-filtered visible mem-tier batches, UNPRUNED (the
+    /// version-invariant core of the mem-tier scan). The per-query statistics
+    /// pruning predicate is applied at serve time by
+    /// `build_mem_tier_scan_plan_from_segments`. `Arc<[_]>` so borrowing the view
+    /// is an O(1) pointer clone, never an O(segments) copy.
+    visible_segments: Arc<[VisibleMemTierSegment]>,
+    /// Whole-tier tombstone UNION over the captured shards — the global inline
+    /// corpus is hidden by EVERY shard's tombstones. Computed once here and reused
+    /// for the inline pruning. At N==1 this is shard 0's tombstone clone (O(1)).
+    union_tombstones: crate::provider::mem_tier::InMemTombstones,
+    /// The forced-structural generation ([`super::structural_version::StructuralVersion`])
+    /// this bundle was validated at (EVEN — a non-torn capture; see
+    /// [`CayenneTableProvider::scan_view_at_current_input`]). It is folded into the
+    /// [`ScanViewKey`] so a **live schema-evolution** — the sole event wired to
+    /// `StructuralVersion::begin_mutation()`, whose off-fence all-shards mem-tier flush
+    /// could otherwise tear a straddling capture — mints a fresh key, and it gates the
+    /// read-current (lag > 0) fast path so a stale-tolerant scan is never served a
+    /// pre-evolution bundle. The other forced snapshot events (truncate / full-delete /
+    /// `INSERT OVERWRITE` / reopen) are fence-serialized and advance only the additive
+    /// `scan_input_version`, so a read-your-writes (lag == 0) capture sees them via the
+    /// snapshot id and they need no structural bump.
+    structural_version: u64,
+}
+
+/// A completed, cached scan view plus its identity and ordering metadata. Held by
+/// [`ScanViewCache::latest_complete`].
+struct CompletedScanView {
+    /// The identity this view was built for. A read-your-writes (lag == 0) scan whose
+    /// capture keys to this serves it directly (no rebuild).
+    key: ScanViewKey,
+    /// Ordering axis — the `scan_input_version` observed at capture. Higher = newer.
+    /// A SAFE heuristic: any completed view at a given identity is valid, so a wrong
+    /// "which is newest" pick is still correct; it only decides which completed build
+    /// wins the single `latest_complete` slot.
+    order: u64,
+    /// When the underlying state was captured — the staleness reference for the
+    /// read-current (lag > 0) path (`now - captured_at <= lag` ⇒ servable).
+    captured_at: Instant,
+    /// When this slot was last SERVED (a read-current within-lag serve or a
+    /// read-your-writes exact-key hit); seeded at promotion time. Drives idle eviction: the background sweep
+    /// drops the view only after it has gone unserved for the idle window, so a view
+    /// still being reused — including a read-your-writes exact-key hit that stays
+    /// valid regardless of age — is retained, not dropped mid-reuse.
+    last_access: Instant,
+    view: Arc<ScanView>,
+}
+
+/// A `Shared` build future: N concurrent scans that key to the same identity await
+/// ONE build (dedup / no thundering herd). Errors are carried as `Arc` because
+/// `Shared` requires a `Clone` output; an errored build is dropped (not poisoned)
+/// on drain, and the awaiting scan re-enters to start a fresh build.
+type ScanViewBuild = futures::future::Shared<
+    futures::future::BoxFuture<
+        'static,
+        std::result::Result<Arc<ScanView>, Arc<datafusion_common::DataFusionError>>,
+    >,
+>;
+
+/// An in-flight build shared by every scan that keyed to the same identity.
+struct InFlightScanView {
+    key: ScanViewKey,
+    order: u64,
+    captured_at: Instant,
+    build: ScanViewBuild,
+}
+
+/// The decision a scan reaches under the cache lock, executed (awaited) after the
+/// lock is released. Keeps `.await` outside the `parking_lot` guard.
+enum ScanViewAction {
+    /// A completed view to return immediately.
+    Serve(Arc<ScanView>),
+    /// A build (own or deduplicated) to await.
+    Await(ScanViewBuild),
+}
+
+/// Result of probing the cache for a specific [`ScanViewKey`].
+enum ScanViewProbe {
+    /// A completed view with this exact identity — serve it, no rebuild.
+    Hit(Arc<ScanView>),
+    /// A build for this identity is in flight — await it (dedup).
+    Pending(ScanViewBuild),
+    /// Nothing for this identity — the caller must start a build.
+    Miss,
+}
+
+/// Demand-driven cache of [`ScanView`] bundles, keyed by scan-visible identity.
+/// Replaces the per-scan merge-on-read memos: a bundle is built only for a
+/// version a scan actually queries (build-only-what's-queried), which relieves the
+/// per-version rebuild CPU that competed with the CDC apply under churn.
+///
+/// Two slots, not a map: a single self-replacing `latest_complete` (a newer completed
+/// build overwrites it, oldest-out — implicit eviction) plus a short `in_flight` list
+/// for dedup. Guarded by a `parking_lot::Mutex`; the rule is **decide under the lock,
+/// await OUTSIDE it** — the mutex is never held across `.await`.
+#[derive(Default)]
+struct ScanViewCache {
+    /// The newest completed bundle. `None` until the first build resolves.
+    latest_complete: Option<CompletedScanView>,
+    /// Builds still resolving. Self-trims on [`Self::drain_completed`].
+    in_flight: Vec<InFlightScanView>,
+}
+
+impl ScanViewCache {
+    /// Peek every in-flight build (a `Shared` peek — NO poll), promote the
+    /// highest-`order` SUCCESS to `latest_complete`, and drop completed entries
+    /// (errored or superseded), leaving only still-pending builds. A build is
+    /// observed complete only once some awaiter or the independent driver task has
+    /// driven it to completion; a build no one has driven simply stays pending here.
+    fn drain_completed(&mut self) {
+        let mut idx = 0;
+        while idx < self.in_flight.len() {
+            if self.in_flight[idx].build.peek().is_none() {
+                idx += 1;
+                continue;
+            }
+            // Ready: remove it (swap_remove moves the last entry into `idx`, so do
+            // NOT advance — re-examine `idx` next iteration) and promote-or-drop.
+            let done = self.in_flight.swap_remove(idx);
+            let Some(Ok(view)) = done.build.peek() else {
+                continue; // errored build — drop it (not poisoned)
+            };
+            let newer = self
+                .latest_complete
+                .as_ref()
+                .is_none_or(|current| done.order >= current.order);
+            if newer {
+                self.latest_complete = Some(CompletedScanView {
+                    key: done.key,
+                    order: done.order,
+                    captured_at: done.captured_at,
+                    // Seed last-access at PROMOTION time (not `captured_at`): a build
+                    // slower than the idle window would otherwise be promoted already
+                    // "stale" and evicted on the next tick before any scan could reuse
+                    // it. Serves refresh it from here.
+                    last_access: Instant::now(),
+                    view: Arc::clone(view),
+                });
+            }
+        }
+    }
+
+    /// The `latest_complete` view iff it is servable for a read-current scan: captured
+    /// within `lag` of `now` AND at the current structural generation (so a
+    /// stale-tolerant scan is never served a pre-schema-evolution view). Records the
+    /// access (`last_access`) ONLY on a true serve — a within-lag-but-obsolete view is
+    /// NOT refreshed, so the evictor can still drop it and release its pinned dirs.
+    fn servable_within_lag(
+        &mut self,
+        now: Instant,
+        lag: Duration,
+        structural: u64,
+    ) -> Option<Arc<ScanView>> {
+        let current = self.latest_complete.as_mut()?;
+        let servable = now.duration_since(current.captured_at) <= lag
+            && current.view.structural_version == structural;
+        servable.then(|| {
+            current.last_access = now;
+            Arc::clone(&current.view)
+        })
+    }
+
+    /// Probe for an exact identity: serve a completed view, await an in-flight build,
+    /// or report a miss. Used by the read-your-writes (lag == 0) path and the
+    /// read-current MISS path. Records the access (`last_access`) on a hit so a view
+    /// still being reused (an exact-key hit is valid regardless of age) is not
+    /// idle-evicted.
+    fn find_by_key(&mut self, key: &ScanViewKey) -> ScanViewProbe {
+        if let Some(current) = self.latest_complete.as_mut()
+            && current.key == *key
+        {
+            current.last_access = Instant::now();
+            return ScanViewProbe::Hit(Arc::clone(&current.view));
+        }
+        if let Some(entry) = self.in_flight.iter().find(|entry| entry.key == *key) {
+            return ScanViewProbe::Pending(entry.build.clone());
+        }
+        ScanViewProbe::Miss
+    }
 }
 
 /// Test-only mid-pass hook: an async callback fired between a compaction
@@ -1147,6 +1410,28 @@ pub struct CayenneTableProvider {
     /// derived from the acceleration settings and set via the builder, and shared
     /// across writer clones (a plain in-memory `bool`, `Copy`).
     durable_write_back: bool,
+    /// Per-scan freshness tolerance (the read-current lag) applied by [`Self::scan`].
+    /// `0` = read-your-writes: every scan captures and serves the CURRENT state.
+    /// Non-zero lets concurrent analytical scans share a recently-built [`ScanView`]
+    /// within the lag (the demand cache's cross-query reuse lever). Derived at
+    /// construction from the dataset's `access` mode AND refresh mode: only a read-only
+    /// CDC replica (`access: read` + `refresh_mode: changes`) — eventually-consistent by
+    /// design — gets a bounded non-zero lag; every other table (a read-only
+    /// full-refresh/snapshot/append table, which must reflect its last refresh
+    /// immediately, or any writable dataset) gets `0` for read-your-writes. Set via the
+    /// builder. A plain in-memory `Duration` (`Copy`), shared across writer clones. See
+    /// [`Self::scan_view_at_current_input`].
+    ///
+    /// NOTE: `0` for read-write datasets rebuilds per scan under a mixed read/write
+    /// workload (any mutation re-keys the capture), even across RESULT-PRESERVING churn
+    /// (compaction / checkpoint) that leaves query results identical. If that proves too
+    /// eager, the intended refinement is to export a monotonic WRITE-WATERMARK bumped
+    /// only by result-changing writes and serve any view whose watermark ≥ the reader's
+    /// start — coarse read-your-writes that reuses across result-preserving churn, with
+    /// this `Duration` staying as the bounded-staleness fallback. Deferred: it moves a
+    /// value that is currently a heuristic onto the correctness path and needs a
+    /// write-vs-preserving bump audit + loom test, so it is out of scope for this change.
+    default_scan_freshness: Duration,
     /// Write lock to serialize insert operations and prevent concurrent write races.
     /// This ensures that:
     /// - Only one `insert()` runs at a time per table
@@ -1300,22 +1585,39 @@ pub struct CayenneTableProvider {
     /// cached view with just the new rows instead of rebuilding it from the
     /// whole corpus. See the [`InlinedCache`] "Incremental maintenance contract".
     inlined_structural_epoch: Arc<AtomicU64>,
-    /// Memo for the per-scan merged (file ∪ mem-tier) deletion snapshot. Keyed
-    /// by (file-index `Arc` ptr, tier content `version`, structural epoch) — a
-    /// hit requires all three, so any concurrent append/clear/publish forces a
-    /// rebuild and a stale pairing can never be served. The file-index `Arc` is
-    /// RETAINED in the memo (`MergedScanDeletions::file_index`) so its address
-    /// cannot be freed and reused by a later index generation, keeping the ptr
-    /// comparison ABA-safe (#11303). Kills the per-scan
-    /// O(tier-tombstones) `with_mem_tier_tombstones` extend that correlated
-    /// plans (q20: 322ms -> 74s) paid per outer-group rescan.
-    merged_scan_deletions: Arc<arc_swap::ArcSwapOption<MergedScanDeletions>>,
-    /// Memo for the per-scan mem-tier visible batch set (the merge-on-read
-    /// OUTPUT), keyed identically to `merged_scan_deletions`. See
-    /// [`MemTierVisibleMemo`]. Eliminates the per-table-reference re-filtering a
-    /// multi-reference query paid, and serves repeated same-version queries
-    /// without re-running `filter_inlined_batch_for_deletions`.
-    mem_tier_visible_memo: Arc<arc_swap::ArcSwapOption<MemTierVisibleMemo>>,
+    /// Demand-driven cache of [`ScanView`] bundles (see [`ScanViewCache`]). A bundle is
+    /// built only for a version a scan actually queries — the merge + visible-segment
+    /// computation is offloaded to `spawn_blocking` (D3) and deduplicated across
+    /// concurrent scans on the same state. Retires the two per-scan `ArcSwapOption`
+    /// memos (`merged_scan_deletions`, `mem_tier_visible_memo`). Shared across
+    /// `clone_for_write` clones. `parking_lot::Mutex` — decide under
+    /// the lock, await OUTSIDE it (never held across `.await`).
+    scan_view_cache: Arc<ParkingMutex<ScanViewCache>>,
+    /// A weak self-reference the cache uses to obtain an owned `Arc<Self>` for its
+    /// `spawn_blocking` builds (a build closure must be `'static`, so it cannot borrow
+    /// `&self`). Set once via [`Self::init_weak_self`] right after the provider is
+    /// `Arc`-wrapped; unset only for a provider never wrapped (unit-test path), where
+    /// the cache builds inline instead. Shared across clones — pointing at the original
+    /// provider, whose shared state every clone mirrors.
+    weak_self: Arc<std::sync::OnceLock<std::sync::Weak<CayenneTableProvider>>>,
+    /// Monotonic scan-input version, bumped by [`Self::notify_scan_input_change`] on
+    /// EVERY mutation (ordinary or forced). It is the cache's ORDERING axis (which
+    /// completed build wins the `latest_complete` slot) and a cheap freshness signal;
+    /// it is NOT a correctness gate. Shared across `clone_for_write` clones.
+    scan_input_version: Arc<AtomicU64>,
+    /// Seqlock bracketing a demand capture (`read_validated_async`) so a scan never
+    /// builds a bundle whose capture straddled a mutation that changes the per-shard
+    /// mem-tier visibility NON-ATOMICALLY across shards OFF the listing fence — a tear
+    /// the fence cannot serialize (the capture loads each shard's `ArcSwap` separately,
+    /// so at `cdc_mem_tier_shards > 1` a partial mix is observable). Only
+    /// `evolve_schema_live`'s all-shards flush qualifies today. Ordinary + overwrite
+    /// snapshot publishing does NOT bump it — those run under `listing_fence.write()`,
+    /// so a capture (holding `listing_fence.read()`) sees them all-or-nothing. Its
+    /// even value is folded into the [`ScanViewKey`] (so a schema-evolve mints a fresh
+    /// key) and gates the read-current fast path. INERT at `cdc_mem_tier_shards == 1`
+    /// (single-shard capture is atomic), which memory mode enforces. Shared across
+    /// clones.
+    structural_version: Arc<crate::provider::structural_version::StructuralVersion>,
     /// Count of staged inline-conflict tombstones written with `published =
     /// false` whose owning snapshot has not yet finalized (flipped the flag).
     ///
@@ -1804,6 +2106,7 @@ pub struct CayenneTableProviderBuilder {
     context: Option<Arc<CayenneContext>>,
     maintained_aggregates: Vec<MaintainedAggregateSpec>,
     durable_write_back: bool,
+    default_scan_freshness: Duration,
 }
 
 struct PendingMaintainedAggregateInsert {
@@ -1882,6 +2185,7 @@ struct CayenneTableProviderOpenOptions {
     context: Option<Arc<CayenneContext>>,
     maintained_aggregate_specs: Vec<MaintainedAggregateSpec>,
     durable_write_back: bool,
+    default_scan_freshness: Duration,
 }
 
 impl CayenneTableProviderBuilder {
@@ -1898,6 +2202,8 @@ impl CayenneTableProviderBuilder {
             context: None,
             maintained_aggregates: Vec::new(),
             durable_write_back: false,
+            // Read-your-writes by default; the runtime raises it for read-only datasets.
+            default_scan_freshness: Duration::ZERO,
         }
     }
 
@@ -1969,6 +2275,18 @@ impl CayenneTableProviderBuilder {
         self
     }
 
+    /// Set the per-scan freshness tolerance (read-current lag). `0` =
+    /// read-your-writes (the default). The runtime derives this from the dataset's
+    /// `access` mode AND refresh mode: a bounded non-zero lag only for a read-only CDC
+    /// replica (`access: read` + `refresh_mode: changes`), and `0` for every other
+    /// table (read-write, or read-only non-CDC). See
+    /// [`CayenneTableProvider::default_scan_freshness`].
+    #[must_use]
+    pub fn with_default_scan_freshness(mut self, freshness: Duration) -> Self {
+        self.default_scan_freshness = freshness;
+        self
+    }
+
     /// Open an existing table by name.
     ///
     /// # Errors
@@ -1984,6 +2302,7 @@ impl CayenneTableProviderBuilder {
             context: self.context,
             maintained_aggregate_specs: self.maintained_aggregates,
             durable_write_back: self.durable_write_back,
+            default_scan_freshness: self.default_scan_freshness,
         };
 
         CayenneTableProvider::new_internal(table_name, self.catalog, self.runtime_env, options)
@@ -2007,6 +2326,7 @@ impl CayenneTableProviderBuilder {
             context: self.context,
             maintained_aggregate_specs: self.maintained_aggregates,
             durable_write_back: self.durable_write_back,
+            default_scan_freshness: self.default_scan_freshness,
         };
 
         CayenneTableProvider::new_internal(&table_name, self.catalog, self.runtime_env, options)
@@ -2452,6 +2772,15 @@ impl CayenneTableProvider {
         let started = Instant::now();
         let _write_guard = self.write_lock.lock().await;
 
+        // Bracket the widen in the scan-view seqlock: unlike a fenced snapshot
+        // publish, the all-shards mem-tier FLUSH below runs OFF the listing fence
+        // (under `write_lock` + `mem_checkpoint_lock`), so at `cdc_mem_tier_shards > 1`
+        // a scan-view capture could observe some shards flushed and others not — a
+        // tear the fence cannot serialize. The seqlock makes a straddling capture
+        // discard-and-retry. Held under `write_lock`, so no two forced events
+        // overlap; dropped at fn end. Inert at N == 1 (single-shard capture is atomic).
+        let _structural_guard = self.structural_version.begin_mutation();
+
         // Step 2: drain Stage-B publishes. They complete without `write_lock`
         // (visibility lock + listing fence only), and no new ones can start.
         if !self
@@ -2853,6 +3182,13 @@ impl CayenneTableProvider {
         new_snapshot_id: &str,
         new_listing_table: Arc<ListingTable>,
     ) {
+        // No scan-view seqlock bracket needed: the caller holds `listing_fence.write()`
+        // and every step here is synchronous, while a scan-view capture holds
+        // `listing_fence.read()` across its WHOLE capture — so the capture observes
+        // this overwrite fully-before or fully-after, never a partial mix. Snapshot
+        // publishing is additive: the monotonic `scan_input_version` bumps below
+        // (via `update_current_snapshot_id` + `invalidate_inlined_cache`) advance the
+        // freshness gate; no torn-capture discard is possible.
         self.update_current_snapshot_id(new_snapshot_id);
         self.clear_all_deletion_caches();
         // `commit_overwrite_in_txn` already cleared the inlined data/deletes in the
@@ -5014,6 +5350,7 @@ impl CayenneTableProvider {
             context,
             maintained_aggregate_specs,
             durable_write_back,
+            default_scan_freshness,
         } = options;
 
         let table_metadata = catalog.get_table(table_name).await?;
@@ -5246,6 +5583,7 @@ impl CayenneTableProvider {
             pk_row_converter,
             pk_column_indices,
             durable_write_back,
+            default_scan_freshness,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             visibility_lock: Arc::new(tokio::sync::Mutex::new(())),
             scan_state_lock: Arc::new(tokio::sync::RwLock::new(())),
@@ -5271,8 +5609,12 @@ impl CayenneTableProvider {
             mem_tier_pending_superseded: Arc::new(AtomicI64::new(0)),
             inlined_generation: Arc::new(AtomicU64::new(0)),
             inlined_structural_epoch: Arc::new(AtomicU64::new(0)),
-            merged_scan_deletions: Arc::new(arc_swap::ArcSwapOption::const_empty()),
-            mem_tier_visible_memo: Arc::new(arc_swap::ArcSwapOption::const_empty()),
+            scan_view_cache: Arc::new(ParkingMutex::new(ScanViewCache::default())),
+            weak_self: Arc::new(std::sync::OnceLock::new()),
+            scan_input_version: Arc::new(AtomicU64::new(0)),
+            structural_version: Arc::new(
+                crate::provider::structural_version::StructuralVersion::new(),
+            ),
             pending_inline_tombstones: Arc::new(AtomicU64::new(0)),
             published_inlined_seq: Arc::new(AtomicI64::new(initial_inlined_seq)),
             seq_allocator,
@@ -5408,6 +5750,11 @@ impl CayenneTableProvider {
                 "Failed to initialize maintained aggregate state; queries will fall back to base table scans"
             );
         }
+
+        // No cold-start seed: the demand-driven cache ([`ScanViewCache`]) builds a
+        // bundle lazily on the first scan of each distinct scan-visible state (and
+        // deduplicates concurrent scans on it). The first scan therefore pays one
+        // build; every subsequent scan of the same state hits `latest_complete`.
 
         Ok(provider)
     }
@@ -6352,6 +6699,7 @@ impl CayenneTableProvider {
             pk_row_converter: self.pk_row_converter.as_ref().map(Arc::clone),
             pk_column_indices: self.pk_column_indices.clone(),
             durable_write_back: self.durable_write_back,
+            default_scan_freshness: self.default_scan_freshness,
             write_lock: Arc::clone(&self.write_lock), // Shared across all clones for same table
             visibility_lock: Arc::clone(&self.visibility_lock),
             scan_state_lock: Arc::clone(&self.scan_state_lock),
@@ -6378,8 +6726,10 @@ impl CayenneTableProvider {
             mem_tier_pending_superseded: Arc::clone(&self.mem_tier_pending_superseded),
             inlined_generation: Arc::clone(&self.inlined_generation),
             inlined_structural_epoch: Arc::clone(&self.inlined_structural_epoch),
-            merged_scan_deletions: Arc::clone(&self.merged_scan_deletions),
-            mem_tier_visible_memo: Arc::clone(&self.mem_tier_visible_memo),
+            scan_view_cache: Arc::clone(&self.scan_view_cache),
+            weak_self: Arc::clone(&self.weak_self),
+            scan_input_version: Arc::clone(&self.scan_input_version),
+            structural_version: Arc::clone(&self.structural_version),
             pending_inline_tombstones: Arc::clone(&self.pending_inline_tombstones),
             published_inlined_seq: Arc::clone(&self.published_inlined_seq),
             // Shared so every writer clone of the same table allocates from one
@@ -10028,6 +10378,24 @@ impl CayenneTableProvider {
         self.inlined_structural_epoch
             .fetch_add(1, Ordering::Release);
         self.inlined_generation.fetch_add(1, Ordering::Release);
+        // A structural bump changes what a scan sees, so advance the scan-input version
+        // (the demand cache's ordering axis; the next read-your-writes capture re-keys
+        // over the new state). Single funnel for inline mutations, checkpoint clears,
+        // overwrite, recovery, on-conflict, and deferred-snapshot publishes.
+        self.notify_scan_input_change();
+    }
+
+    /// Advance the monotonic scan-input version: a cheap signal (NO lock, NO capture,
+    /// NO clone) that scan-visible state may have changed. It is the demand cache's
+    /// ORDERING axis (which completed build wins the `latest_complete` slot — see
+    /// [`ScanViewCache`]) and a cheap freshness signal, NOT a correctness gate: a
+    /// read-your-writes scan captures the CURRENT state directly, so it sees the
+    /// mutation regardless of this counter. Spurious calls are harmless (they only
+    /// nudge the ordering heuristic), so callers may bump LIBERALLY. Wired at every
+    /// mutation that changes a scan input (the sites that invalidated the retired
+    /// memos, direct or indirect).
+    fn notify_scan_input_change(&self) {
+        self.scan_input_version.fetch_add(1, Ordering::Release);
     }
 
     /// Convert typed PK values into raw key bytes for deletion vector writing.
@@ -18258,6 +18626,10 @@ impl CayenneTableProvider {
             self.table_metadata.table_name,
             new_snapshot_id
         );
+        // The snapshot the scan reads (and the dirs a cached scan-view bundle pins)
+        // changed — advance the scan-input version so the next capture re-keys over the
+        // new snapshot. Single funnel for compaction / overwrite / restore / catalog-refresh id flips.
+        self.notify_scan_input_change();
     }
 
     /// Refresh in-memory query state by reloading from the catalog (source of truth).
@@ -18479,6 +18851,11 @@ impl CayenneTableProvider {
             self.table_metadata.table_name
         );
 
+        // The file set the scan reads changed — advance the scan-input version so the
+        // next capture re-keys and rebuilds over the new files. Covers file-mode
+        // appends / compaction / overwrite listing rebuilds.
+        self.notify_scan_input_change();
+
         Ok(())
     }
 
@@ -18515,6 +18892,11 @@ impl CayenneTableProvider {
         // under its own commit fence observes every publish that landed during
         // its off-fence re-encode. See [`Self::current_dir_generation`].
         self.current_dir_generation.fetch_add(1, Ordering::Relaxed);
+
+        // Fence-held chokepoint where appended files become scan-visible — advance the
+        // scan-input version (the delta-apply publish path that does not go through
+        // `refresh_listing_table_under_held_fence`).
+        self.notify_scan_input_change();
 
         // [sound output_ordering] This delta-applies newly-added (UNSORTED) files
         // onto the current snapshot's cached listing in place — invalidate the
@@ -19884,63 +20266,460 @@ impl CayenneTableProvider {
         Ok(Some(arrow::compute::filter_record_batch(&batch, &filter)?))
     }
 
-    /// Merge the mem-tier tombstones into the file-side deletion index for one
-    /// scan, memoized. The raw `with_mem_tier_tombstones` extend is
-    /// O(tier-tombstones) (plus bloom inserts) and a correlated plan re-scans —
-    /// and would re-merge — per outer group. The memo key is (file-index `Arc`
-    /// ptr, per-shard version VECTOR collapsed to one `u64`, structural epoch): a
-    /// hit requires all three, so any append/clear/publish on ANY shard forces a
-    /// rebuild and a stale pairing can never be served; quiescent re-scans pay
-    /// one `ArcSwap` load per shard. When there is no file-side index
-    /// (position-based) or no tier tombstones the merge is the identity and the
-    /// memo is skipped.
-    ///
-    /// N-way `merged_deletion_snapshot`: merge the file-side `PkDeletionSnapshot`
-    /// (global, NOT sharded — it filters file rows, which have no shard
-    /// structure) with the UNION of every captured shard's tombstones. The memo
-    /// key's `tier_version` becomes the per-shard version VECTOR collapsed to one
-    /// `u64` (`version_hash`), so the memo invalidates when ANY shard's version
-    /// moves. At N==1 `version_hash` == shard 0's raw `version` and
-    /// `union_tombstones` == shard 0's tombstone clone, so the memo key AND the
-    /// merged snapshot are byte-identical to `merged_deletion_snapshot`.
+    /// Merge the file-side `PkDeletionSnapshot` with the UNION of every captured
+    /// shard's mem-tier tombstones (the KDI merge, `extend_max_deletes`). The
+    /// identity when there is no file-side index (position-based) or no tier
+    /// tombstones. The demand cache computes this ONCE per distinct [`ScanViewKey`]
+    /// (inside [`Self::build_scan_view`]) and every scan on that state borrows the
+    /// cached [`ScanView`], so — unlike the retired per-scan `merged_scan_deletions`
+    /// `ArcSwapOption` memo — it does not memoize; the cache-key identity is the reuse
+    /// mechanism.
     fn merged_deletion_snapshot_sharded(
-        &self,
         deletion_snapshot: PkDeletionSnapshot,
         shards: &[Arc<crate::provider::mem_tier::MemTier>],
     ) -> PkDeletionSnapshot {
-        let Some(file_index_ptr) = deletion_snapshot.index_ptr() else {
+        if deletion_snapshot.index_ptr().is_none() {
             return deletion_snapshot;
-        };
+        }
         // Whole-tier union over the captured shard snapshots. Skip the merge (the
-        // identity) when no shard carries tombstones.
+        // identity) when no shard carries tombstones. At N==1 `union_tombstones` is
+        // shard 0's tombstone clone (O(1)), so the merge is byte-identical to the
+        // single-shard `merged_deletion_snapshot`.
         let union = crate::provider::mem_tier::ShardedMemTier::union_tombstones(shards);
         if union.is_empty() {
             return deletion_snapshot;
         }
-        // Per-shard version VECTOR collapsed to one key (changes when any shard
-        // moves). Hash the CAPTURED snapshots (not the live `ArcSwap`s) so the
-        // memo key matches the tombstones it was built from.
-        let tier_version = crate::provider::mem_tier::ShardedMemTier::version_hash_of(shards);
-        let structural_epoch = self.inlined_structural_epoch.load(Ordering::Relaxed);
-        if let Some(memo) = self.merged_scan_deletions.load_full()
-            && memo.file_index_ptr() == Some(file_index_ptr)
-            && memo.tier_version == tier_version
-            && memo.structural_epoch == structural_epoch
-        {
-            return memo.merged.clone();
+        deletion_snapshot.with_mem_tier_tombstones_map(&union)
+    }
+
+    /// Bound on the inline-view capture retry (see [`Self::capture_raw_scan_input`]).
+    /// On the final attempt the freshest rebuilt view is accepted even if the live
+    /// generation advanced again, so a durable-publish burst cannot starve capture.
+    const MAX_SCAN_CAPTURE_ATTEMPTS: u32 = 3;
+
+    /// Capture the consistent per-scan input ([`RawScanInput`]) under one
+    /// `listing_fence.read()`. This reproduces the `scan()` prologue exactly: the
+    /// mem-tier aggregate seqlock capture, the bounded inline-view retry under
+    /// `scan_state_lock.read()`, the current snapshot id, the observed structural
+    /// epoch, and the in-flight-scan GC guard minted under the fence.
+    ///
+    /// This is the ONLY lock the scan-view builder acquires per build. The fence is
+    /// held only for the capture, not across plan-build: the [`SnapshotScanRef`]
+    /// minted here pins the captured snapshot dirs against a concurrent-compaction
+    /// GC for the whole scan lifetime (D2, the listing-flip invariant — the guard
+    /// increments the ref-count under the read fence, and a compaction flip takes
+    /// the write fence, so after the flip no NEW capture can reference the
+    /// superseded snapshot and its count only falls). Every field is captured
+    /// against one fence-held moment, so the returned bundle is internally
+    /// consistent by construction (rows + the deletes that hide their old copies +
+    /// the file set all come from the same instant).
+    async fn capture_raw_scan_input(&self) -> datafusion_common::Result<RawScanInput> {
+        // Warm the inlined cache before taking the consistency guards so the read
+        // under `scan_state_lock` is a cheap cache hit in the common case. If a
+        // writer invalidates the cache after this point, the guarded capture below
+        // drops the guard, rebuilds, and retries.
+        if self.cached_inlined_row_count() > 0 {
+            self.read_inlined_batches().await.map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to warm inlined data cache for table {}: {e}",
+                    self.table_metadata.table_name
+                ))
+            })?;
         }
-        let merged = deletion_snapshot.with_mem_tier_tombstones_map(&union);
-        self.merged_scan_deletions
-            .store(Some(Arc::new(MergedScanDeletions {
-                // Retain the file-side source snapshot (pins its index `Arc` so
-                // the `file_index_ptr` identity above stays ABA-safe — #11303);
-                // `deletion_snapshot` is unused past this point.
-                file_index: deletion_snapshot,
-                tier_version,
-                structural_epoch,
-                merged: merged.clone(),
-            })));
-        merged
+
+        // Hold listing_fence.read() for the capture so the deletion snapshot, the
+        // protected_snapshots set, and the current snapshot's file listing are all
+        // captured atomically against a concurrent writer barrier. A staged CDC
+        // upsert publishes its file move, its deletion caches, and protected_snapshots
+        // under listing_fence.write() (CayenneCdcWrite::finish), so holding the read
+        // fence across all three captures here guarantees this scan observes that
+        // publish either fully or not at all — never the new snapshot's rows without
+        // the deletes that hide the old versions.
+        let listing_fence_wait_start = Instant::now();
+        let _fence = self.listing_fence.read().await;
+        self.record_listing_fence_wait_duration(listing_fence_wait_start.elapsed());
+
+        // Capture EVERY shard's in-memory CDC tier with a per-shard atomic `ArcSwap`
+        // load (each an O(1) `Arc` clone — no copy), pinning N immutable `MemTier`
+        // snapshots. The tier swaps are decoupled from the listing fence, so an
+        // off-fence append that swaps a newer shard mid-scan bumps that shard's
+        // version + structural epoch and is simply invisible to this capture. When
+        // maintained aggregates are configured, `capture_mem_tier_aggregate_scan_state`
+        // gates optimizer substitution on an even, unchanged seqlock generation.
+        let (mem_tier_shards, maintained_aggregate_epoch) =
+            self.capture_mem_tier_aggregate_scan_state();
+
+        // Capture the (deletion view, protected snapshot map, inlined data) triple
+        // atomically under `scan_state_lock.read()`. This serializes with non-staged
+        // publish paths that update the deletion view and protected snapshot map
+        // without taking the listing fence.
+        //
+        // The capture is BOUNDED. Each miss (the cached inline view is not
+        // generation-current) drops the guard, rebuilds the cache, and retries; on
+        // the FINAL attempt the just-rebuilt view is accepted EVEN IF the live
+        // generation advanced again during the rebuild. That is safe: the deletion
+        // snapshot and protected-snapshot map captured in the SAME read-locked block
+        // are at-least-as-new as the view, mem-tier tombstones are re-applied to the
+        // view at use-site against the captured tier snapshot, and file-backed rows
+        // flow through the merged deletion snapshot — so a row the (at-most-one-
+        // rebuild-stale) view has not baked out is still hidden downstream. Without
+        // the bound, a writer advancing the generation faster than one rebuild
+        // completes (a durable-publish burst) would starve this capture indefinitely.
+        let capture_wait_start = Instant::now();
+        let mut capture_attempts: u32 = 0;
+        let (deletion_snapshot, protected_map, inlined_view) = loop {
+            capture_attempts += 1;
+            let final_attempt = capture_attempts >= Self::MAX_SCAN_CAPTURE_ATTEMPTS;
+            let captured = {
+                let _view_guard = self.scan_state_lock.read().await;
+                let view = match self.try_read_inlined_view_for_scan() {
+                    Some(view) => Some(view),
+                    None if final_attempt => {
+                        tracing::warn!(
+                            target: "cayenne::scan",
+                            table = %self.table_metadata.table_name,
+                            attempts = capture_attempts,
+                            waited_ms = u64::try_from(
+                                capture_wait_start.elapsed().as_millis()
+                            )
+                            .unwrap_or(u64::MAX),
+                            "inlined-view capture kept missing under concurrent \
+                             inline publishes; accepting the freshest rebuilt \
+                             view (the deletion + tier snapshots captured in \
+                             this same block keep visibility correct)"
+                        );
+                        Some(Arc::clone(&self.inlined_cache.load().view))
+                    }
+                    None => None,
+                };
+                view.map(|inlined_view| {
+                    (
+                        self.pk_deletion_snapshot(),
+                        self.protected_snapshots.load_full(),
+                        inlined_view,
+                    )
+                })
+            };
+
+            if let Some(captured) = captured {
+                break captured;
+            }
+
+            self.read_inlined_batches().await.map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to read inlined data for table {}: {e}",
+                    self.table_metadata.table_name
+                ))
+            })?;
+        };
+
+        // Read under the held fence: the current snapshot id (the file set) and the
+        // structural epoch (the version key `changed()` compares).
+        let current_snapshot_id = self.get_current_snapshot_id();
+        let structural_epoch = self.inlined_structural_epoch.load(Ordering::Relaxed);
+
+        // Capture the (gated) read schema under the SAME held fence + seqlock-validated
+        // window, so it is consistent with the data captured above and every scan-plan
+        // branch can build from this one schema instead of re-reading the live
+        // `table_schema` (which a concurrent `evolve_schema_live` could swap mid-plan).
+        let read_schema = self.read_schema();
+
+        // Pin the snapshot dirs this scan reads (the captured current snapshot + all
+        // protected snapshots) against concurrent-compaction GC for the FULL scan
+        // lifetime — plan-build AND execution. Created under the read fence, so the
+        // listing-flip invariant holds. The guard rides the returned `ScanView`
+        // (and, downstream, the plan + each output stream) and drops only when every
+        // scan on this view completes.
+        let scan_guard = {
+            let mut ids = Vec::with_capacity(protected_map.len() + 1);
+            ids.push(current_snapshot_id.clone());
+            ids.extend(protected_map.keys().cloned());
+            SnapshotScanRef::new(Arc::clone(&self.snapshot_scan_refs), ids)
+        };
+
+        Ok(RawScanInput {
+            mem_tier_shards,
+            maintained_aggregate_epoch,
+            deletion_snapshot,
+            protected_map,
+            inlined_view,
+            current_snapshot_id,
+            structural_epoch,
+            scan_guard,
+            read_schema,
+        })
+    }
+
+    /// Compute the scan-ready [`ScanView`] from a [`RawScanInput`] capture: the KDI
+    /// merge (`merged_deletion_snapshot_sharded`) + the per-segment visible mem-tier
+    /// batches (`visible_mem_tier_segments_unpruned`, memoized) + the whole-tier
+    /// tombstone union — all over the SAME capture, so the bundle is internally
+    /// consistent by construction.
+    ///
+    /// Pure, synchronous CPU (no `.await`); O(tier tombstones + segments). Run in
+    /// `spawn_blocking` by the demand cache (see [`Self::spawn_scan_view_build`]) so it
+    /// never stalls a tokio worker or the query cores. `structural_version` is the
+    /// seqlock generation the `raw` capture was validated at (the `v0` from
+    /// `read_validated_async`), stamped into the [`ScanView`] and its [`ScanViewKey`].
+    fn build_scan_view(
+        &self,
+        raw: RawScanInput,
+        structural_version: u64,
+    ) -> datafusion_common::Result<ScanView> {
+        // Clone the file-side snapshot for the merge (an `Arc` clone); `raw` keeps
+        // its own copy so the view carries the file-side source for reference.
+        let merged_deletions = Self::merged_deletion_snapshot_sharded(
+            raw.deletion_snapshot.clone(),
+            &raw.mem_tier_shards,
+        );
+        let visible_segments = self.visible_mem_tier_segments(&raw.mem_tier_shards)?;
+        let union_tombstones =
+            crate::provider::mem_tier::ShardedMemTier::union_tombstones(&raw.mem_tier_shards);
+        Ok(ScanView {
+            raw,
+            merged_deletions,
+            visible_segments,
+            union_tombstones,
+            structural_version,
+        })
+    }
+
+    /// Cap on concurrent in-flight builds cached for dedup. Read-your-writes scans key
+    /// to the CURRENT state, so distinct in-flight identities are few in practice; this
+    /// bounds cache memory under pathological churn. Over the cap, a build still runs
+    /// (awaited locally) but is not cached for dedup — bounded memory, correct result.
+    const MAX_IN_FLIGHT_SCAN_VIEWS: usize = 8;
+
+    /// Bound on the seqlock capture retry across a live schema-evolution (odd/torn
+    /// generation). Each retry yields; the window is one schema-evolve, so a handful of
+    /// yields settles it. Exceeding this fails the scan loud rather than spinning.
+    const MAX_STRUCTURAL_CAPTURE_RETRIES: u32 = 32;
+
+    /// Tick period of the background [`Self::run_scan_view_evictor`] sweep. Bounds how
+    /// long a no-longer-servable cached view lingers (and pins its snapshot dirs)
+    /// after a table goes idle, on top of its own freshness bound.
+    const SCAN_VIEW_EVICTION_INTERVAL: Duration = Duration::from_secs(5);
+
+    /// Initialize the demand scan-view cache once the provider is wrapped in an `Arc`:
+    /// record a weak self-reference (so the cache can obtain an owned `Arc<Self>` for
+    /// its `spawn_blocking` builds — a build closure is `'static` and cannot borrow
+    /// `&self`) and spawn the periodic eviction sweep. Call once, right after the
+    /// `Arc::new`. Idempotent — a lost race stores the identical weak pointer and does
+    /// not double-spawn. Shared across `clone_for_write` clones (all mirror the same
+    /// state), so the original provider's weak ref serves every clone's builds.
+    pub fn init_scan_view_cache(self: &Arc<Self>) {
+        // `set` succeeds only on the FIRST call, so the evictor is spawned exactly once
+        // per real provider (never per `clone_for_write` clone, which shares the cache).
+        if self.weak_self.set(Arc::downgrade(self)).is_ok() {
+            task::spawn(Self::run_scan_view_evictor(Arc::downgrade(self)));
+        }
+    }
+
+    /// Background sweep that DROPS a cached `latest_complete` view once it has gone
+    /// UNSERVED for the idle window — even when NO query is running. A completed view
+    /// holds its capture's [`SnapshotScanRef`], pinning the snapshot dirs it reads; on a
+    /// table that was queried once and then went idle, that reference would otherwise
+    /// keep those dirs alive forever, blocking compaction GC. The demand cache only
+    /// refreshes `latest_complete` on a scan miss, so with no scans nothing would ever
+    /// release it — hence a timer rather than piggybacking on the query path.
+    ///
+    /// It evicts on IDLE TIME (`now - last_access`), not age-since-capture, so a view
+    /// still being reused is retained rather than dropped mid-reuse — including a
+    /// read-your-writes (`freshness == 0`) exact-key hit, which stays valid regardless
+    /// of the view's age as long as the scan-visible state has not moved. Only a view
+    /// that has not been served for `max(default_scan_freshness, SCAN_VIEW_EVICTION_INTERVAL)`
+    /// is dropped. An in-flight build (and a query currently executing, which cloned its
+    /// own `Arc`) is untouched — dropping the cache's reference just lets the dirs free
+    /// once the last user finishes. Holds only a `Weak<Self>`, so it never pins the
+    /// provider and exits on the first tick after the table is torn down.
+    async fn run_scan_view_evictor(weak: std::sync::Weak<Self>) {
+        loop {
+            tokio::time::sleep(Self::SCAN_VIEW_EVICTION_INTERVAL).await;
+            let Some(provider) = weak.upgrade() else {
+                return; // provider torn down
+            };
+            provider.evict_stale_scan_view(Instant::now());
+            drop(provider);
+        }
+    }
+
+    /// One eviction step (the body of [`Self::run_scan_view_evictor`], factored out so
+    /// it is testable without the timer): drain completed builds, then drop
+    /// `latest_complete` iff it has not been SERVED within the idle window
+    /// (`max(default_scan_freshness, SCAN_VIEW_EVICTION_INTERVAL)`). Keying on
+    /// last-access (not age) keeps a still-reused view — e.g. a read-your-writes
+    /// exact-key hit, valid at any age while the state is unchanged — instead of
+    /// dropping it mid-reuse; an idle view's pinned snapshot dirs are released for GC.
+    fn evict_stale_scan_view(&self, now: Instant) {
+        let idle_window = self
+            .default_scan_freshness
+            .max(Self::SCAN_VIEW_EVICTION_INTERVAL);
+        let mut cache = self.scan_view_cache.lock();
+        cache.drain_completed();
+        if cache
+            .latest_complete
+            .as_ref()
+            .is_some_and(|current| now.duration_since(current.last_access) > idle_window)
+        {
+            cache.latest_complete = None;
+        }
+    }
+
+    /// Start a `ScanView` build for `raw` (validated at seqlock generation
+    /// `structural_version`) as a `Shared` future, so N concurrent scans on the same
+    /// identity await ONE build (dedup). The CPU-bound merge + visible-segment build
+    /// runs in `spawn_blocking` (D3) off the tokio worker. An INDEPENDENTLY-SPAWNED
+    /// driver task polls a clone of the `Shared` to completion, so a completed build is
+    /// observable via `peek()` (and reusable by read-current scans) even if the
+    /// originating scan is cancelled before it resolves.
+    ///
+    /// Fallback (no `weak_self` — a provider never `Arc`-wrapped, i.e. the unit-test
+    /// path): build inline and wrap the ready result. Correct; just not offloaded or
+    /// independently driven.
+    fn spawn_scan_view_build(&self, raw: RawScanInput, structural_version: u64) -> ScanViewBuild {
+        use futures::FutureExt;
+        let Some(provider) = self.weak_self.get().and_then(std::sync::Weak::upgrade) else {
+            // Fallback (no `weak_self` — a provider never `Arc`-wrapped, i.e. the
+            // unit-test path): build inline and wrap the ready result.
+            let result = self
+                .build_scan_view(raw, structural_version)
+                .map(Arc::new)
+                .map_err(Arc::new);
+            return futures::future::ready(result).boxed().shared();
+        };
+        let build = async move {
+            task::spawn_blocking(move || provider.build_scan_view(raw, structural_version))
+                .await
+                .map_err(|join_error| {
+                    Arc::new(datafusion_common::DataFusionError::Execution(format!(
+                        "scan-view build task failed to join: {join_error}"
+                    )))
+                })?
+                .map(Arc::new)
+                .map_err(Arc::new)
+        }
+        .boxed()
+        .shared();
+        // Independent driver: drives the shared build to completion regardless of
+        // whether the originating scan stays parked on it.
+        task::spawn(build.clone());
+        build
+    }
+
+    /// Obtain the [`ScanView`] bundle for a scan from the demand-driven cache, at the
+    /// requested `freshness` tolerance. Decide under the cache mutex, await OUTSIDE it
+    /// (the mutex is never held across `.await`).
+    ///
+    /// **Read-current (`freshness > 0`, stale-tolerant analytical path).** Fast path:
+    /// under the cache mutex, drain completed builds and serve `latest_complete` iff it
+    /// was captured within `freshness` AND its structural generation still matches
+    /// `structural_version.current()` — the latter guard means a stale-tolerant scan is
+    /// NEVER served a pre-schema-evolution bundle (a schema-evolve advances the
+    /// generation). No capture, no fence on this path. On a miss it falls through to a
+    /// fresh build (below).
+    ///
+    /// **Read-your-writes (`freshness == 0`, the default and correctness path).**
+    /// Capture the CURRENT state atomically under the structural seqlock
+    /// (`read_validated_async`, so the key's structural version is self-consistent with
+    /// the captured snapshot — a capture that straddled a live schema-evolution is
+    /// discarded and retried), key it, then under the cache mutex: serve an exact-key
+    /// completed view, await an in-flight build for the same key (dedup), or start a
+    /// build. Because the capture reflects the writer's own mutations (a direct DML bump
+    /// changes the snapshot id / tier version → a fresh key → a miss → a rebuild from
+    /// current state), the scan sees its own writes — fixing the overwrite regression.
+    async fn scan_view_at_current_input(
+        &self,
+        freshness: Duration,
+    ) -> datafusion_common::Result<Arc<ScanView>> {
+        // Read-current fast path: serve a recent, structurally-current completed view.
+        if !freshness.is_zero() {
+            let now = Instant::now();
+            let mut cache = self.scan_view_cache.lock();
+            cache.drain_completed();
+            // Read the seqlock generation UNDER the cache mutex, immediately before the
+            // servability check, so no live schema-evolution can slip in between the
+            // read and the compare (a pre-lock read left a TOCTOU window across the
+            // `.lock()` + `drain_completed()`). An in-flight evolution reads ODD and can
+            // never equal a completed view's always-EVEN `structural_version`, so a
+            // straddling evolution falls through to the read-your-writes rebuild below.
+            let structural = self.structural_version.current();
+            if let Some(view) = cache.servable_within_lag(now, freshness, structural) {
+                return Ok(view);
+            }
+            // Miss (nothing fresh enough, or superseded by a schema-evolve): fall
+            // through to a fresh read-your-writes build. Drop the guard first — the
+            // capture below awaits and the mutex must never be held across `.await`.
+            drop(cache);
+        }
+
+        // Capture the CURRENT state under the structural seqlock, retrying across a
+        // (rare) live schema-evolution that leaves the generation odd/torn.
+        let mut attempts: u32 = 0;
+        loop {
+            attempts += 1;
+            let (structural_version, raw) = match self
+                .structural_version
+                .read_validated_async(|| self.capture_raw_scan_input())
+                .await
+            {
+                Some((v0, Ok(raw))) => (v0, raw),
+                Some((_v0, Err(error))) => return Err(error),
+                None => {
+                    // A live schema-evolution was in flight or raced the capture. Yield
+                    // and re-capture at the settled generation (bounded — fail loud
+                    // rather than spin if it never settles).
+                    if attempts >= Self::MAX_STRUCTURAL_CAPTURE_RETRIES {
+                        return Err(datafusion_common::DataFusionError::Execution(format!(
+                            "Scan of table {} could not capture a stable scan view across \
+                             {attempts} structural retries (persistent schema-evolution churn?)",
+                            self.table_metadata.table_name
+                        )));
+                    }
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+            };
+
+            let key = raw.key(structural_version);
+            let order = self.scan_input_version.load(Ordering::Acquire);
+            let captured_at = Instant::now();
+
+            // Decide under the lock; the build future is awaited AFTER releasing it.
+            let action = {
+                let mut cache = self.scan_view_cache.lock();
+                cache.drain_completed();
+                match cache.find_by_key(&key) {
+                    ScanViewProbe::Hit(view) => ScanViewAction::Serve(view),
+                    ScanViewProbe::Pending(build) => ScanViewAction::Await(build),
+                    ScanViewProbe::Miss => {
+                        let build = self.spawn_scan_view_build(raw, structural_version);
+                        // Cache the in-flight build for dedup, unless we are over the
+                        // churn cap (then build standalone — bounded memory, no dedup).
+                        if cache.in_flight.len() < Self::MAX_IN_FLIGHT_SCAN_VIEWS {
+                            cache.in_flight.push(InFlightScanView {
+                                key,
+                                order,
+                                captured_at,
+                                build: build.clone(),
+                            });
+                        }
+                        ScanViewAction::Await(build)
+                    }
+                }
+            };
+
+            return match action {
+                ScanViewAction::Serve(view) => Ok(view),
+                ScanViewAction::Await(build) => build.await.map_err(|error| {
+                    // The shared build errored; it was dropped (not promoted) on drain,
+                    // so a subsequent scan re-enters and starts a fresh build.
+                    datafusion_common::DataFusionError::Execution(format!(
+                        "Failed to build scan view for table {}: {error}",
+                        self.table_metadata.table_name
+                    ))
+                }),
+            };
+        }
     }
 
     fn mem_tier_deletion_maps(
@@ -20295,10 +21074,9 @@ impl CayenneTableProvider {
                     None,
                 );
             self.mem_tier.shard(0).store(Arc::new(next));
-            // Overwrite changes the entire visible set and invalidates every prior
-            // tombstone/visibility memo — drop them so the next scan rebuilds.
-            self.mem_tier_visible_memo.store(None);
-            self.merged_scan_deletions.store(None);
+            // Memory-mode overwrite swaps the entire tier without a structural-epoch
+            // bump, so advance the scan-input version (the next capture re-keys over the new tier).
+            self.notify_scan_input_change();
         }
         Ok(incoming_rows)
     }
@@ -21099,7 +21877,6 @@ impl CayenneTableProvider {
                 source_position,
             );
             let epoch = next.epoch;
-            let next_version = next.version;
             // N=1 publishes the tier swap and IVM epoch under this shard lock. Use
             // the same scan seqlock as N>1 so a reader cannot capture the new tier
             // and then attach the old aggregate epoch (or the reverse).
@@ -21118,15 +21895,6 @@ impl CayenneTableProvider {
             // throughput bottleneck (an eager lock-held O(tier) re-filter
             // measured ~72% of `cdc_path_inmemory`).
             self.mem_tier.shard(shard_id).store(Arc::new(next));
-            // Drop the visible-batch memo (it holds full-tier `RecordBatch`
-            // clones for the PRE-append version): an append changes the visible
-            // set, so — unlike the extend-in-place merged-scan-deletions memo
-            // below — it cannot be cheaply updated, and leaving it stored would
-            // pin the old batches' RAM until the next scan. store(None) releases
-            // them now; the next scan rebuilds. (Under sustained CDC the memo
-            // rarely hits anyway — every append re-keys the tier version — so
-            // this loses no hit-rate while it does reclaim the RAM.)
-            self.mem_tier_visible_memo.store(None);
             // §5 Phase 6: record this shard's kept keys into the cached sharded
             // existence index for THIS shard, still UNDER `locks[shard_id]`, so the
             // bloom INSERT is atomic with the segment swap above (a later HIT-path
@@ -21158,52 +21926,17 @@ impl CayenneTableProvider {
             // capture-retry loop until a checkpoint zeroed the row count.
             // Durable-path mutations (inline rewrite/insert, tombstone publish,
             // checkpoint clears, overwrite, open-time recovery) still bump —
-            // only the RAM-tier append is exempt.
+            // only the RAM-tier append is exempt. (The old N==1 lockstep that
+            // delta-extended the `merged_scan_deletions` memo here is retired with
+            // that memo: the demand cache recomputes the merged view once per distinct
+            // scan-visible identity, off the query path via `spawn_blocking`.)
             //
-            // Keep the merged-scan-deletions memo CURRENT in lockstep: extend it
-            // by this append's tombstone delta (O(delta)) and re-key it to the
-            // post-append tier version (the structural epoch is unchanged by a
-            // tier append — see the invariant above — so the stored key matches
-            // what a scan-time `merged_deletion_snapshot` lookup computes; a
-            // concurrent durable structural bump simply misses the memo and
-            // rebuilds, exactly as before). Without this the memo can
-            // never hit under sustained CDC (every append re-keys the tier) and
-            // each scan pays an O(tier) merged-index rebuild — the churn-coupled
-            // 175-247x collapse the `mem_tier_join_shapes` live lanes measure.
-            // Only valid while the memo still matches the live file-side index
-            // (`cur.version` pre-append + the current strategy snapshot ptr);
-            // any mismatch leaves the memo stale-keyed and the next scan
-            // rebuilds, exactly as before.
-            //
-            // N>1 GATE: the memo key is the cross-shard version VECTOR
-            // (`version_hash`), and this append knows only ITS shard's
-            // `cur.version`/`next_version` — not the combined key — so the
-            // single-version comparison/re-key here cannot maintain it. Worse,
-            // an apply's N shard appends run CONCURRENTLY under disjoint locks,
-            // so two of them racing the single `merged_scan_deletions` `ArcSwap`
-            // store would lose updates. So at N>1 we skip the lockstep extend and
-            // let the scan-side `merged_deletion_snapshot_sharded` rebuild the
-            // memo (and re-hit on quiescent re-scans, version_hash stable until
-            // the next apply) — correct, since the lockstep extend is purely an
-            // optimization. Byte-identical at N==1 (`version_hash` == raw
-            // `version`, single shard, no concurrency).
-            if self.mem_tier_shard_count() == 1
-                && let Some(memo) = self.merged_scan_deletions.load_full()
-                && memo.tier_version == cur.version
-                && memo.file_index_ptr() == self.pk_deletion_snapshot().index_ptr()
-            {
-                let structural_epoch = self.inlined_structural_epoch.load(Ordering::Relaxed);
-                self.merged_scan_deletions
-                    .store(Some(Arc::new(MergedScanDeletions {
-                        // The file-side index is unchanged by a tier append —
-                        // carry the retained source snapshot forward (keeps its
-                        // `Arc` pinned so the ptr identity stays ABA-safe, #11303).
-                        file_index: memo.file_index.clone(),
-                        tier_version: next_version,
-                        structural_epoch,
-                        merged: memo.merged.extended_by_delta(&tombstones),
-                    })));
-            }
+            // Advance the scan-input version: a mem-tier append changes the visible
+            // set + tier version but deliberately does NOT bump the structural epoch
+            // (see the invariant above), so it is NOT covered by the
+            // `bump_inlined_structural_epoch` funnel and must signal here. The tier
+            // version change re-keys the next read-your-writes capture.
+            self.notify_scan_input_change();
             record_cayenne_write_phase(
                 &self.table_metadata.table_name,
                 "inmemory_fence_work",
@@ -22335,13 +23068,10 @@ impl CayenneTableProvider {
         let survivors = cur.retain_after(flushed_segment_count);
         let released = cur.bytes.saturating_sub(survivors.bytes);
         self.mem_tier.shard(shard_id).store(Arc::new(survivors));
-        // Drop the visible-batch memo: it may pin `RecordBatch`es (Arc refs to
-        // the tier buffers) from the pre-clear tier version, which would keep the
-        // just-flushed prefix's RAM alive until the next scan rebuilds the memo —
-        // defeating this clear's purpose (releasing RAM at checkpoint, especially
-        // under memory pressure or when the table goes idle afterward). Rebuilt
-        // lazily on the next scan; a store(None) is a single atomic publish.
-        self.mem_tier_visible_memo.store(None);
+        // A cached `ScanView` holds the pre-clear visible segments only until a fresh
+        // capture re-keys past this tier swap (the checkpoint's structural-epoch bump),
+        // so the just-flushed prefix's RAM is released once the last scan borrowing the
+        // old bundle drops it — no per-scan memo to drop here.
         released
     }
 
@@ -22524,76 +23254,51 @@ impl CayenneTableProvider {
     /// [`Self::filter_inlined_batch_for_deletions`] — the SAME merge-on-read keep
     /// rule (and the same disjoint-skip fast path) as the durable inline corpus,
     /// with the tombstones supplied from the in-RAM map instead of the metastore.
+    /// Each shard applies its OWN tombstones to its OWN segments, correct precisely
+    /// because shard `s`'s tombstones only reference shard `s`'s keys (disjoint key
+    /// spaces — §2.3e); the flat result concatenates every shard's retained
+    /// segments. At N==1 this is exactly the single shard's visible segments.
     ///
-    /// N-way mem-tier scan plan: CONCATENATE every shard's visible batches into
-    /// one `MemorySourceConfig` exec. Disjoint keys across shards ⇒ a
-    /// concatenation, not a merge (a key's whole version history + its max
-    /// `delete_sequence` live in exactly ONE shard, so no cross-shard "which
-    /// version wins" decision exists — §2.3e). Each shard applies its OWN
-    /// tombstones to its OWN segments via `visible_mem_tier_batches`, correct
-    /// precisely because shard `s`'s tombstones only reference shard `s`'s keys.
-    /// The disjoint min/max gate (`int64_deleted_key_range`) runs per shard
-    /// inside `filter_inlined_batch_for_deletions`. At N==1 this is exactly
-    /// `build_mem_tier_scan_plan(shards[0])`.
-    fn build_mem_tier_scan_plan_sharded(
+    /// The per-shard, deletion-filtered visible mem-tier segments (the
+    /// version-invariant core of the mem-tier scan). This is the pure computation
+    /// [`Self::build_scan_view`] captures into a [`ScanView`]; the per-query pruning
+    /// predicate + plan build stays in [`Self::build_mem_tier_scan_plan_from_segments`].
+    /// The demand cache computes this ONCE per distinct [`ScanViewKey`] (the cached
+    /// [`ScanView`] is the single owner), so — unlike the retired per-scan
+    /// `mem_tier_visible_memo` `ArcSwapOption` — it does not memoize.
+    fn visible_mem_tier_segments(
         &self,
         shards: &[Arc<crate::provider::mem_tier::MemTier>],
+    ) -> datafusion_common::Result<Arc<[VisibleMemTierSegment]>> {
+        Ok(Arc::from(
+            self.visible_mem_tier_segments_unpruned(shards)
+                .map_err(|e| {
+                    datafusion_common::DataFusionError::Execution(format!(
+                        "Failed to apply in-memory CDC tier deletion visibility for table {}: {e}",
+                        self.table_metadata.table_name
+                    ))
+                })?,
+        ))
+    }
+
+    /// Serve a mem-tier scan plan from precomputed visible segments (from a
+    /// [`ScanView`]): apply the per-query statistics-only pruning predicate to each
+    /// segment, concatenate the surviving visible batches (disjoint keys across
+    /// shards ⇒ concatenation, not merge — §2.3e), and wrap them in a memory exec.
+    fn build_mem_tier_scan_plan_from_segments(
+        &self,
+        segments: &[VisibleMemTierSegment],
         effective_projection: Option<&Vec<usize>>,
         pruning_predicate: Option<&Arc<dyn PhysicalExpr>>,
         target_partitions: usize,
+        read_schema: &SchemaRef,
     ) -> datafusion_common::Result<Option<Arc<dyn ExecutionPlan>>> {
-        // Memo key — same three-part discipline as `merged_scan_deletions`: the
-        // file-side index identity, the per-shard content-version hash, and the
-        // structural epoch. A hit requires all three, so any concurrent
-        // append/clear/publish forces a rebuild; a mid-build advance bumps one
-        // part, so a possibly-inconsistent memo is invalidated on the NEXT scan
-        // and is never served. `file_index_ptr` is read from the SAME source
-        // `filter_inlined_batch_for_deletions` reads live (`pk_deletion_strategy`
-        // via `pk_deletion_snapshot`), so the key reflects what the memoized
-        // batches were filtered against.
-        // Retain the file-side source snapshot in the memo (pins its index `Arc`
-        // so the `file_index_ptr` identity stays ABA-safe — #11303).
-        let file_index = self.pk_deletion_snapshot();
-        let file_index_ptr = file_index.index_ptr();
-        let tier_version = crate::provider::mem_tier::ShardedMemTier::version_hash_of(shards);
-        let structural_epoch = self.inlined_structural_epoch.load(Ordering::Relaxed);
-
-        let segments = if let Some(memo) = self.mem_tier_visible_memo.load_full()
-            && memo.file_index_ptr() == file_index_ptr
-            && memo.tier_version == tier_version
-            && memo.structural_epoch == structural_epoch
-        {
-            Arc::clone(&memo.segments)
-        } else {
-            let built: Arc<[VisibleMemTierSegment]> = Arc::from(
-                self.visible_mem_tier_segments_unpruned(shards)
-                    .map_err(|e| {
-                        datafusion_common::DataFusionError::Execution(format!(
-                            "Failed to apply in-memory CDC tier deletion visibility for table {}: {e}",
-                            self.table_metadata.table_name
-                        ))
-                    })?,
-            );
-            self.mem_tier_visible_memo
-                .store(Some(Arc::new(MemTierVisibleMemo {
-                    file_index: Some(file_index),
-                    tier_version,
-                    structural_epoch,
-                    segments: Arc::clone(&built),
-                })));
-            built
-        };
-
         if segments.is_empty() {
             return Ok(None);
         }
-
-        // Serve: apply the per-query (statistics-only) pruning predicate to each
-        // memoized segment, then concatenate the surviving visible batches.
-        // Disjoint keys across shards ⇒ concatenation, not merge (§2.3e).
         let schema = Arc::clone(&self.table_metadata.schema);
         let mut visible_batches: Vec<RecordBatch> = Vec::new();
-        for segment in segments.iter() {
+        for segment in segments {
             if let Some(predicate) = pruning_predicate
                 && super::file_pruning::should_prune_statistics(
                     segment.statistics.as_ref(),
@@ -22609,12 +23314,17 @@ impl CayenneTableProvider {
         if visible_batches.is_empty() {
             return Ok(None);
         }
-        self.finish_mem_tier_scan_plan(visible_batches, effective_projection, target_partitions)
+        self.finish_mem_tier_scan_plan(
+            visible_batches,
+            effective_projection,
+            target_partitions,
+            read_schema,
+        )
     }
 
     /// Build the per-segment, deletion-filtered visible batches for every shard,
-    /// WITHOUT applying any pruning predicate — the memoizable, version-invariant
-    /// core of the sharded mem-tier scan (see [`MemTierVisibleMemo`]). Each shard
+    /// WITHOUT applying any pruning predicate — the version-invariant core of the
+    /// sharded mem-tier scan (captured into a [`ScanView`]). Each shard
     /// applies its OWN tombstones to its OWN segments (correct because shard
     /// `s`'s tombstones only reference shard `s`'s keys); the flat result
     /// concatenates every shard's retained segments. The per-query pruning
@@ -22659,12 +23369,13 @@ impl CayenneTableProvider {
         visible_batches: Vec<RecordBatch>,
         effective_projection: Option<&Vec<usize>>,
         target_partitions: usize,
+        read_schema: &SchemaRef,
     ) -> datafusion_common::Result<Option<Arc<dyn ExecutionPlan>>> {
         // Project to the effective projection (reusing the inlined-plan logic).
-        // Build from the (gated) read schema so the RAM-tier branch matches the
-        // main file scan: view types when force_view is on, stored Utf8/Binary
-        // otherwise. Cast each batch to that target (a no-op when force_view off).
-        let read_schema = self.read_schema();
+        // Build from the CAPTURED (gated) read schema (threaded down from `scan()`)
+        // so the RAM-tier branch matches the main file scan: view types when
+        // force_view is on, stored Utf8/Binary otherwise. Cast each batch to that
+        // target (a no-op when force_view off).
         let proj_schema = if let Some(proj) = effective_projection {
             let schema_fields = read_schema.fields();
             let fields: Vec<arrow_schema::FieldRef> = proj
@@ -22673,7 +23384,7 @@ impl CayenneTableProvider {
                 .collect();
             Arc::new(arrow_schema::Schema::new(fields))
         } else {
-            read_schema
+            Arc::clone(read_schema)
         };
 
         let projected_batches: Vec<RecordBatch> = visible_batches
@@ -25615,148 +26326,41 @@ impl TableProvider for CayenneTableProvider {
         // or once every file has been verified this process.
         self.verify_data_file_integrity().await?;
 
-        // Warm the inlined cache before taking the consistency guards so the
-        // read under `scan_state_lock` is a cheap cache hit in the common case.
-        // If a writer invalidates the cache after this point, the guarded
-        // capture below drops the guard, rebuilds, and retries.
-        if self.cached_inlined_row_count() > 0 {
-            self.read_inlined_batches().await.map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to warm inlined data cache for table {}: {e}",
-                    self.table_metadata.table_name
-                ))
-            })?;
-        }
-
-        // Hold listing_fence.read() for the remainder of this scan's plan-build
-        // so the deletion snapshot, the protected_snapshots set, and the current
-        // snapshot's file listing are all captured atomically against a
-        // concurrent writer barrier. A staged CDC upsert publishes its file move,
-        // its deletion caches, and protected_snapshots under listing_fence.write()
-        // (CayenneCdcWrite::finish), so holding the read fence across all three
-        // captures here guarantees this scan observes that publish either fully
-        // or not at all — never the new snapshot's rows without the deletes that
-        // hide the old versions. Concurrent scans share the read fence; only a
-        // writer barrier holding the write fence blocks them, and vice versa.
-        let listing_fence_wait_start = Instant::now();
-        let _fence = self.listing_fence.read().await;
-        self.record_listing_fence_wait_duration(listing_fence_wait_start.elapsed());
-
-        // Capture EVERY shard's in-memory CDC tier with a per-shard atomic
-        // `ArcSwap` load (each an O(1) `Arc` clone — no copy), pinning N
-        // immutable `MemTier` snapshots for this scan. The tier swaps are
-        // decoupled from the listing fence — an append/checkpoint swaps a shard
-        // under its `mem_tier_publish_locks[s]`, NOT `listing_fence.write()` — so
-        // the read fence held here does NOT freeze the tier. It does not need to:
-        // the rows below come from THESE captured snapshots' segments and the
-        // merged deletion view (`merged_deletion_snapshot_sharded`) is keyed on
-        // the per-shard version VECTOR (`version_hash_of`), so the scan is
-        // internally consistent (rows + the deletes that hide their old copies
-        // come from the same captured snapshots). An off-fence append that swaps
-        // a newer shard mid-scan bumps that shard's version (changing the
-        // combined hash) + structural epoch, so it is simply invisible to this
-        // in-flight scan (and the version-keyed `merged_scan_deletions` memo
-        // rebuilds rather than serving a mismatched view) — correct, since a scan
-        // need not observe a write that lands after its snapshot. Per R2, the N
-        // shard captures are NOT a single atomic load, so a concurrent apply's
-        // fan-out can be observed in shard A before shard B — LWW-safe (each key
-        // is correct and monotone within its one owning shard), with a brief
-        // partial-batch cross-key visibility window the CH-bench target does not
-        // rely on. Empty (and skipped below) in file mode, so the file-mode plan
-        // is byte-identical. At N==1 this captures the single shard exactly as
-        // the prior single `.tier().load_full()` did. When maintained aggregates
-        // are configured, `capture_mem_tier_aggregate_scan_state` gates optimizer
-        // substitution on an even, unchanged seqlock generation around these
-        // loads and the IVM epoch. A racing scan keeps the base aggregate rather
-        // than waiting or using a torn maintained snapshot; ordinary base scans
-        // retain the accepted partial-batch cross-key visibility behavior.
-        let (mem_tier_shards, maintained_aggregate_epoch) =
-            self.capture_mem_tier_aggregate_scan_state();
-        let mem_tier_any_rows = mem_tier_shards.iter().any(|s| !s.is_empty());
-
-        // Capture the (deletion view, protected snapshot map, inlined data)
-        // triple atomically under `scan_state_lock.read()`. This serializes with
-        // non-staged publish paths that update the deletion view and protected
-        // snapshot map without taking the listing fence.
+        // Obtain the scan-view bundle from the demand cache at this dataset's freshness
+        // (`default_scan_freshness`: 0 = read-your-writes for read-write datasets; a
+        // bounded lag for read-only ones — see [`Self::scan_view_at_current_input`]). The
+        // KDI merge + visible mem-tier segments are computed OFF the query path (in
+        // `spawn_blocking`) and deduplicated across concurrent scans on the same state,
+        // so the scan no longer recomputes them per-scan (the retired memos' job).
+        // Everything below descends from that ONE capture, so it is internally
+        // consistent (the merged deletions hide the old copies of the exact rows this
+        // scan sees), and the bundle's `scan_guard` pins the captured snapshot dirs
+        // for the full scan lifetime, so plan-build runs WITHOUT the listing fence.
         //
-        // The capture is BOUNDED. Each miss (the cached inline view is not
-        // generation-current) drops the guard, rebuilds the cache, and retries;
-        // on the FINAL attempt the just-rebuilt view is accepted EVEN IF the
-        // live generation advanced again during the rebuild. That is safe: the
-        // deletion snapshot and protected-snapshot map captured in the SAME
-        // read-locked block are at-least-as-new as the view, mem-tier tombstones
-        // are re-applied to the view at use-site against the scan's captured
-        // tier snapshot (`pruned_inlined_batches` below), and file-backed rows
-        // flow through the merged deletion snapshot + per-branch key filters —
-        // so a row the (at-most-one-rebuild-stale) view has not baked out is
-        // still hidden downstream. Without the bound, any writer that advances
-        // the generation faster than one rebuild completes (a durable-publish
-        // burst) starves this scan indefinitely.
-        let max_capture_attempts: u32 = 3;
-        let capture_wait_start = Instant::now();
-        let mut capture_attempts: u32 = 0;
-        let (deletion_snapshot, protected_map, inlined_view) = loop {
-            capture_attempts += 1;
-            let final_attempt = capture_attempts >= max_capture_attempts;
-            let captured = {
-                let _view_guard = self.scan_state_lock.read().await;
-                let view = match self.try_read_inlined_view_for_scan() {
-                    Some(view) => Some(view),
-                    // Final attempt: accept the freshest available view (the
-                    // rebuild preceding this attempt stored a real, at most
-                    // one-rebuild-stale cache). The WARN doubles as the
-                    // scan-starvation instrumentation; it is naturally
-                    // rate-limited by firing only after the generation outran
-                    // a full rebuild on every prior attempt.
-                    None if final_attempt => {
-                        tracing::warn!(
-                            target: "cayenne::scan",
-                            table = %self.table_metadata.table_name,
-                            attempts = capture_attempts,
-                            waited_ms = u64::try_from(
-                                capture_wait_start.elapsed().as_millis()
-                            )
-                            .unwrap_or(u64::MAX),
-                            "inlined-view capture kept missing under concurrent \
-                             inline publishes; accepting the freshest rebuilt \
-                             view (the deletion + tier snapshots captured in \
-                             this same block keep visibility correct)"
-                        );
-                        Some(Arc::clone(&self.inlined_cache.load().view))
-                    }
-                    None => None,
-                };
-                view.map(|inlined_view| {
-                    (
-                        self.pk_deletion_snapshot(),
-                        self.protected_snapshots.load_full(),
-                        inlined_view,
-                    )
-                })
-            };
-
-            if let Some(captured) = captured {
-                break captured;
-            }
-
-            self.read_inlined_batches().await.map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to read inlined data for table {}: {e}",
-                    self.table_metadata.table_name
-                ))
-            })?;
-        };
-        let deletion_snapshot =
-            self.merged_deletion_snapshot_sharded(deletion_snapshot, &mem_tier_shards);
+        // The fields are cloned out (cheap `Arc` / short-`String` / `im`-HAMT clones)
+        // so downstream plan-build owns them exactly as when it captured inline.
+        let scan_view = self
+            .scan_view_at_current_input(self.default_scan_freshness)
+            .await?;
+        let mem_tier_any_rows = scan_view.raw.mem_tier_shards.iter().any(|s| !s.is_empty());
+        let maintained_aggregate_epoch = scan_view.raw.maintained_aggregate_epoch;
+        let protected_map = Arc::clone(&scan_view.raw.protected_map);
+        let inlined_view = Arc::clone(&scan_view.raw.inlined_view);
+        let current_snapshot_id = scan_view.raw.current_snapshot_id.clone();
+        let scan_guard = Arc::clone(&scan_view.raw.scan_guard);
+        let deletion_snapshot = scan_view.merged_deletions.clone();
+        let visible_segments = Arc::clone(&scan_view.visible_segments);
+        let mem_tier_union_tombstones = scan_view.union_tombstones.clone();
+        // The read schema captured atomically with this snapshot; every plan branch
+        // below builds from it (not a live re-read) so they stay mutually consistent
+        // across a concurrent schema-evolution.
+        let read_schema = Arc::clone(&scan_view.raw.read_schema);
+        drop(scan_view);
         let need_pk_deletion = deletion_snapshot.has_deletions();
 
-        // Whole-tier tombstone UNION over the captured shard snapshots — the
-        // global inline corpus is hidden by EVERY shard's tombstones (a delete of
+        // The whole-tier tombstone union hides the global inline corpus (a delete of
         // key `k` lives in shard `h(k)`, but the inline rows it hides are not
-        // sharded). Computed once and reused for the inline pruning below. At
-        // N==1 this is shard 0's tombstone clone (O(1)).
-        let mem_tier_union_tombstones =
-            crate::provider::mem_tier::ShardedMemTier::union_tombstones(&mem_tier_shards);
+        // sharded). Reused for the inline pruning below.
         let mem_tier_removal = if mem_tier_union_tombstones.is_empty() {
             None
         } else {
@@ -25897,46 +26501,34 @@ impl TableProvider for CayenneTableProvider {
             state.config()
         };
 
-        // `listing_fence.read()` is already held (acquired at the top of this
-        // scan so the deletion snapshot, protected_snapshots, and the file
-        // listing are captured atomically against a concurrent writer barrier —
-        // #10125 §6.4). The plan is built from the live current_snapshot_id so it
-        // can apply per-scan DataFusion config (target_partitions, etc.).
-        let current_snapshot_id = self.get_current_snapshot_id();
+        // `current_snapshot_id` was captured under the read fence in
+        // `capture_raw_scan_input` (#10125 §6.4) and pinned by `scan_guard`, so the
+        // plan is built from that captured (GC-protected) snapshot id — no fence is
+        // held here. Per-scan DataFusion config (target_partitions, etc.) still applies.
         // [sound output_ordering] Advertise the sort-column ordering on the main
         // file branch ONLY when provably sound: the current snapshot was produced
         // by the sorted compaction rewrite (attestation id matches) AND this scan
         // has no unsorted branches — no in-RAM mem-tier rows, no inline-corpus
         // rows, no protected snapshots (each would union an unsorted stream, and a
-        // UnionExec drops ordering anyway). Read under the held `listing_fence`,
-        // consistent with the attestation's fenced writes. The deletion filter and
-        // `CayenneAccelerationExec` preserve ordering; round-robin repartition is
-        // gated off for ordered plans.
+        // UnionExec drops ordering anyway). `current_sorted_snapshot` is compared to
+        // the CAPTURED (pinned) `current_snapshot_id`: a compaction that flips the
+        // attestation after the capture points it at a NEWER snapshot id, so the
+        // comparison then fails and ordering is conservatively NOT advertised —
+        // never advertised for a snapshot this scan does not read. The deletion
+        // filter and `CayenneAccelerationExec` preserve ordering; round-robin
+        // repartition is gated off for ordered plans.
         let allow_sorted_ordering = self.context.has_sort_columns()
             && self.current_sorted_snapshot.load_full().as_deref()
                 == Some(current_snapshot_id.as_str())
             && !mem_tier_any_rows
             && protected_map.is_empty()
             && inlined_batches.is_empty();
-        // Pin the snapshot dirs this scan reads (the captured current snapshot + all
-        // protected snapshots) against concurrent-compaction GC for the FULL scan
-        // lifetime — plan-build AND execution. Created under the read fence (held
-        // here), so the listing-flip invariant holds: no new scan can reference a
-        // superseded snapshot, its ref-count only falls, and cleanup that sees 0 may
-        // delete it. The guard rides the returned plan + each output stream and drops
-        // (releasing the refs) only when execution completes — fixing the Vortex
-        // file-not-found race where a long query outlived the old time-based grace.
-        let scan_guard = {
-            let mut ids = Vec::with_capacity(protected_map.len() + 1);
-            ids.push(current_snapshot_id.clone());
-            ids.extend(protected_map.keys().cloned());
-            SnapshotScanRef::new(Arc::clone(&self.snapshot_scan_refs), ids)
-        };
         // View-typed schema for the query scan output (string/binary -> view),
-        // matching the advertised `TableProvider::schema()`. Threaded into every
-        // union branch (file scan, protected snapshots, inline + RAM tiers) so
-        // they agree and joins plan on view arrays. See `viewify_read_schema`.
-        let read_schema = self.read_schema();
+        // matching the advertised `TableProvider::schema()`. This is the schema
+        // CAPTURED with the scan snapshot (above), threaded into every union branch
+        // (file scan, protected snapshots, inline + RAM tiers) so they agree with
+        // each other and with the captured data even across a concurrent
+        // schema-evolution, and joins plan on view arrays. See `viewify_read_schema`.
         let listing_scan_start = Instant::now();
         let main_plan_result = self
             .create_snapshot_scan_plan_with_config(
@@ -25959,12 +26551,12 @@ impl TableProvider for CayenneTableProvider {
             .await;
         self.record_listing_scan_duration(listing_scan_start.elapsed());
         let main_plan = main_plan_result?;
-        // Note: we deliberately keep `_fence` alive until after the main plan
-        // has been built (i.e. until end of this function). Direct scan
-        // planning resolves the file listing eagerly, so the fence really only
-        // needs to outlive `create_snapshot_scan_plan(...).await`; we hold it
-        // slightly longer for clarity and to avoid micro-optimizing a
-        // microsecond-scale wait.
+        // The listing fence is NOT held here: `capture_raw_scan_input` released it
+        // when the capture returned, and `scan_guard` pins the captured snapshot
+        // dirs against GC for the full scan lifetime (plan-build + execution). Direct
+        // scan planning resolves the file listing eagerly against that pinned
+        // snapshot id, so a concurrent listing flip cannot delete a file this scan
+        // reads (the ref-count keeps it, cleanup skips count > 0).
 
         // Check for protected snapshots that need to be scanned with partial deletion filter.
         let protected_snapshot_plans = self
@@ -26011,8 +26603,9 @@ impl TableProvider for CayenneTableProvider {
             // branch matches the main file scan exactly: view types when
             // force_view is on, stored Utf8/Binary otherwise. The inline corpus
             // holds stored Utf8/Binary, so cast each batch to that target (a no-op
-            // reschema when force_view is off).
-            let read_schema = self.read_schema();
+            // reschema when force_view is off). Use the CAPTURED schema (not a live
+            // re-read) so this branch agrees with the file/protected/RAM branches.
+            let read_schema = Arc::clone(&read_schema);
             let proj_schema = if let Some(ref proj) = effective_projection {
                 let schema_fields = read_schema.fields();
                 let fields: Vec<arrow_schema::FieldRef> = proj
@@ -26079,18 +26672,18 @@ impl TableProvider for CayenneTableProvider {
             }
         };
 
-        // Build a MemoryExec for the in-memory CDC tier captured under the read
-        // fence, applying the tier's own tombstones merge-on-read (the same
-        // `filter_inlined_batch_for_deletions` path the durable inline corpus
-        // uses; only the tombstone SOURCE differs — the in-RAM map vs the
-        // metastore). `None` (and skipped) in file mode, where the tier is empty.
+        // Build a MemoryExec for the in-memory CDC tier from the view's precomputed
+        // visible segments, applying the tier's tombstones merge-on-read (already
+        // baked into the segments) plus the per-query pruning predicate. `None` (and
+        // skipped) in file mode, where the tier is empty.
         let mem_plan: Option<Arc<dyn ExecutionPlan>> = self
-            .build_mem_tier_scan_plan_sharded(
-                &mem_tier_shards,
+            .build_mem_tier_scan_plan_from_segments(
+                &visible_segments,
                 effective_projection.as_ref(),
                 mem_tier_pruning_predicate.as_ref(),
                 // Scan-resolved (1 for PK point lookups) — see the inline branch.
                 scan_listing_config.target_partitions(),
+                &read_schema,
             )?
             .map(|mem_exec| self.wrap_memory_branch_with_scan_filters(mem_exec, filters));
 
@@ -33814,14 +34407,6 @@ mod tests {
             expected,
             "initial scan builds the correct file+RAM merge view"
         );
-        let merged_before = provider
-            .merged_scan_deletions
-            .load_full()
-            .expect("initial scan stored the merged-deletions memo");
-        let visible_before = provider
-            .mem_tier_visible_memo
-            .load_full()
-            .expect("initial scan stored the visible-batch memo");
         let shards_before: Vec<_> = provider
             .mem_tier
             .shards()
@@ -33847,29 +34432,13 @@ mod tests {
             crate::provider::mem_tier::ShardedMemTier::version_hash_of(&shards_after);
         assert_eq!(
             version_after, version_before,
-            "the seal pipeline must not perturb the scan memo version key"
+            "the seal pipeline must not perturb the scan-view version key"
         );
 
         assert_eq!(
             collect_id_value_pairs(&ctx, &provider, "seal_memo_stable").await,
             expected,
             "scan results stay unchanged after the seal"
-        );
-        let merged_after = provider
-            .merged_scan_deletions
-            .load_full()
-            .expect("merged-deletions memo still present");
-        let visible_after = provider
-            .mem_tier_visible_memo
-            .load_full()
-            .expect("visible-batch memo still present");
-        assert!(
-            Arc::ptr_eq(&merged_before, &merged_after),
-            "a seal must not force the merged-deletions memo to rebuild"
-        );
-        assert!(
-            Arc::ptr_eq(&visible_before, &visible_after),
-            "a seal must not force the visible-batch memo to rebuild"
         );
     }
 
@@ -35856,6 +36425,16 @@ mod tests {
             "precondition: re-insert hides the old copy, only value 999 visible"
         );
 
+        // Quiesce the detached post-write maintenance the inserts above scheduled
+        // (the manifest rebuild grabs `compaction_lock` — see the post-write path)
+        // BEFORE we pin manifests, so it cannot (a) hold the lock out from under the
+        // bake's best-effort `try_lock` nor (b) run a listing rebuild that overwrites
+        // the pins we set below. Drain must precede pinning — never inside the retry.
+        provider
+            .drain_in_flight_maintenance()
+            .await
+            .expect("drain in-flight maintenance before pinning manifests");
+
         // Populate manifests, then PIN them: older prefix (oldest 3) at `T = D`,
         // kept snapshots (newest 3, incl. the SURVIVOR) strictly above `D`, so the
         // SURVIVOR is referenced in place and the OLD-100 snapshot is baked.
@@ -35901,11 +36480,26 @@ mod tests {
             }
         }
 
-        let baked = provider
-            .bake_seq_prefix_protected_snapshots()
-            .await
-            .expect("bake should not error");
-        assert!(baked, "older prefix must bake");
+        // Best-effort bake, driven the way the production maintenance tick drives
+        // it: `bake_seq_prefix_protected_snapshots` `try_lock`s `compaction_lock` and
+        // returns `Ok(false)` when it loses (a straggler pass still releasing after
+        // the drain), which the tick simply retries next time. Mirror that with a
+        // bounded retry — yielding (not sleeping) so any lock holder makes progress —
+        // rather than asserting a single call wins the race. We do NOT re-drain in
+        // the loop: a second drain would run a listing rebuild that clobbers the pins.
+        let mut baked = false;
+        for _ in 0..5 {
+            if provider
+                .bake_seq_prefix_protected_snapshots()
+                .await
+                .expect("bake should not error")
+            {
+                baked = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(baked, "older prefix must bake within the bounded retry");
 
         // The <= T (= D) delete of key 100 is pruned from the index.
         let tombstones = int64_tombstones(&provider);
@@ -40048,16 +40642,26 @@ mod tests {
         );
     }
 
-    /// Merged-scan-deletions memo: repeated scans in a quiescent window reuse
-    /// ONE merged (file ∪ mem-tier) deletion snapshot (the q20 correlated-rescan
-    /// fix), and any append invalidates it (new tier version ⇒ rebuild). Also
-    /// re-asserts visibility correctness across the memoized path.
+    /// The demand cache decides whether to reuse a `ScanView` by comparing the
+    /// [`ScanViewKey`] of a fresh capture against the cached one. This asserts both
+    /// directions:
+    /// - two quiescent captures (no write between) produce EQUAL keys — every cheap
+    ///   anchor (current snapshot id, structural epoch, per-shard version, file-index
+    ///   ptr, protected-map / inline-view `Arc`) is stable, so a read-your-writes scan
+    ///   HITS the cached bundle instead of rebuilding;
+    /// - a capture taken after a RAM append produces a DIFFERENT key (the tier version
+    ///   moved), so the scan rebuilds — never serving a stale view across a mutation.
+    ///
+    /// It also exercises [`CayenneTableProvider::capture_raw_scan_input`] itself
+    /// (the extracted scan prologue), which every scan now routes through — so the
+    /// unchanged rows returned by the other scan-based tests are the "capture equals
+    /// the inline prologue" evidence.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn merged_scan_deletions_memo_reuses_and_invalidates() {
+    async fn raw_scan_input_key_tracks_mutations() {
         let ctx = SessionContext::new();
         let runtime_env = ctx.runtime_env();
         let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
-            "merge_memo",
+            "raw_capture_key",
             Arc::clone(&runtime_env),
             VortexConfig {
                 cdc_durability: crate::metadata::CdcDurability::Memory,
@@ -40070,102 +40674,7 @@ mod tests {
         let schema = Arc::clone(&provider.table_metadata.schema);
         provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
 
-        // Durable rows first (a file-side index exists), then a RAM upsert that
-        // tombstones one of them — the scan must merge file ∪ tier deletions.
-        insert_batch(
-            &provider,
-            id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20]),
-        )
-        .await;
-        provider
-            .checkpoint_inlined_data()
-            .await
-            .expect("flush inline rows to the file tier");
-        let write = provider
-            .write_cdc_append_stream(
-                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[100])),
-                &ctx.task_ctx(),
-            )
-            .await
-            .expect("RAM upsert");
-        assert!(
-            write.in_memory_epoch().is_some(),
-            "upsert engaged the RAM tier"
-        );
-
-        // First scan builds + stores the memo; the result must be merge-correct.
-        assert_eq!(
-            collect_id_value_pairs(&ctx, &provider, "merge_memo").await,
-            vec![(1, 100), (2, 20)],
-            "tier tombstone must hide the durable copy of PK 1"
-        );
-        let first = provider
-            .merged_scan_deletions
-            .load_full()
-            .expect("first scan stored the merged-deletions memo");
-
-        // Second scan (no writes in between) must REUSE the same memo entry.
-        assert_eq!(
-            collect_id_value_pairs(&ctx, &provider, "merge_memo").await,
-            vec![(1, 100), (2, 20)],
-            "memoized merge returns identical visibility"
-        );
-        let second = provider
-            .merged_scan_deletions
-            .load_full()
-            .expect("memo still present");
-        assert!(
-            Arc::ptr_eq(&first, &second),
-            "a quiescent re-scan must HIT the memo (same entry), not rebuild it"
-        );
-
-        // An append invalidates: the next scan rebuilds (a different entry).
-        let write2 = provider
-            .write_cdc_append_stream(
-                single_batch_stream(id_value_batch(Arc::clone(&schema), &[2], &[200])),
-                &ctx.task_ctx(),
-            )
-            .await
-            .expect("second RAM upsert");
-        assert!(
-            write2.in_memory_epoch().is_some(),
-            "second upsert engaged RAM"
-        );
-        assert_eq!(
-            collect_id_value_pairs(&ctx, &provider, "merge_memo").await,
-            vec![(1, 100), (2, 200)],
-            "post-append scan reflects the new tombstone"
-        );
-        let third = provider
-            .merged_scan_deletions
-            .load_full()
-            .expect("memo rebuilt after append");
-        assert!(
-            !Arc::ptr_eq(&first, &third),
-            "an append must invalidate the memo (tier version changed)"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn mem_tier_visible_memo_reuses_and_invalidates() {
-        let ctx = SessionContext::new();
-        let runtime_env = ctx.runtime_env();
-        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
-            "visible_memo",
-            Arc::clone(&runtime_env),
-            VortexConfig {
-                cdc_durability: crate::metadata::CdcDurability::Memory,
-                deletion_mode: crate::metadata::DeletionMode::Key,
-                inline_max_rows: 1024,
-                ..VortexConfig::default()
-            },
-        )
-        .await;
-        let schema = Arc::clone(&provider.table_metadata.schema);
-        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
-
-        // A resident RAM tier (no checkpoint) so the scan takes the mem-tier
-        // visible-batch path that the memo covers.
+        // A resident RAM tier so the capture reflects tier state.
         let write = provider
             .write_cdc_append_stream(
                 single_batch_stream(id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20])),
@@ -40178,33 +40687,31 @@ mod tests {
             "append engaged the RAM tier"
         );
 
-        // First scan builds + stores the visible-batch memo.
-        assert_eq!(
-            collect_id_value_pairs(&ctx, &provider, "visible_memo").await,
-            vec![(1, 10), (2, 20)],
-        );
+        let structural = provider.structural_version.current();
         let first = provider
-            .mem_tier_visible_memo
-            .load_full()
-            .expect("first scan stored the visible-batch memo");
-
-        // A quiescent re-scan (no writes) must HIT the same memo entry, not
-        // rebuild it — the per-reference re-filtering this fix removes.
-        assert_eq!(
-            collect_id_value_pairs(&ctx, &provider, "visible_memo").await,
-            vec![(1, 10), (2, 20)],
-        );
+            .capture_raw_scan_input()
+            .await
+            .expect("first capture");
         let second = provider
-            .mem_tier_visible_memo
-            .load_full()
-            .expect("memo still present");
-        assert!(
-            Arc::ptr_eq(&first, &second),
-            "a quiescent re-scan must HIT the visible-batch memo, not rebuild it"
+            .capture_raw_scan_input()
+            .await
+            .expect("second capture (no write between)");
+        assert_eq!(
+            first.key(structural),
+            second.key(structural),
+            "two quiescent captures must key identically (a read-your-writes scan hits the cache)"
         );
+        // The cheap anchors must be genuinely stable, not trivially always-equal.
+        assert_eq!(first.current_snapshot_id, second.current_snapshot_id);
+        assert_eq!(first.structural_epoch, second.structural_epoch);
+        assert_eq!(
+            first.maintained_aggregate_epoch,
+            second.maintained_aggregate_epoch
+        );
+        assert!(Arc::ptr_eq(&first.inlined_view, &second.inlined_view));
+        assert!(Arc::ptr_eq(&first.protected_map, &second.protected_map));
 
-        // An append bumps the tier version → the next scan rebuilds a DIFFERENT
-        // entry AND reflects the new row (no stale visibility served).
+        // A RAM append moves the tier version, so the next capture keys DIFFERENTLY.
         let write2 = provider
             .write_cdc_append_stream(
                 single_batch_stream(id_value_batch(Arc::clone(&schema), &[3], &[30])),
@@ -40216,55 +40723,59 @@ mod tests {
             write2.in_memory_epoch().is_some(),
             "second append engaged RAM"
         );
-        assert_eq!(
-            collect_id_value_pairs(&ctx, &provider, "visible_memo").await,
-            vec![(1, 10), (2, 20), (3, 30)],
-            "post-append scan reflects the new row"
-        );
+        let structural_after = provider.structural_version.current();
         let third = provider
-            .mem_tier_visible_memo
-            .load_full()
-            .expect("memo rebuilt after append");
-        assert!(
-            !Arc::ptr_eq(&first, &third),
-            "an append must invalidate the visible-batch memo (tier version changed)"
+            .capture_raw_scan_input()
+            .await
+            .expect("post-append capture");
+        assert_ne!(
+            third.key(structural_after),
+            first.key(structural),
+            "a capture after a RAM append must key differently (tier version moved)"
         );
     }
 
-    /// Strong count of the file-side deletion index held inside a
-    /// `PkDeletionSnapshot` (the allocation the scan memos key on by
-    /// `Arc::as_ptr`). `0` for position-based (no index).
-    fn file_index_strong_count(snapshot: &PkDeletionSnapshot) -> usize {
-        match snapshot {
-            PkDeletionSnapshot::Int64Pk { tombstones } => Arc::strong_count(tombstones),
-            PkDeletionSnapshot::RowConverterBased { tombstones } => Arc::strong_count(tombstones),
-            PkDeletionSnapshot::PositionBased => 0,
+    /// Flatten a bundle's visible mem-tier segments into sorted `(id, value)` pairs
+    /// (the `id_value_batch` test schema is `id: Int64, value: Int64`). Used to
+    /// compare a demand-cache bundle against an inline build.
+    fn collect_segment_pairs(segments: &[VisibleMemTierSegment]) -> Vec<(i64, i64)> {
+        let mut pairs = Vec::new();
+        for segment in segments {
+            for batch in &segment.batches {
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id column is Int64");
+                let vals = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("value column is Int64");
+                for i in 0..batch.num_rows() {
+                    pairs.push((ids.value(i), vals.value(i)));
+                }
+            }
         }
+        pairs.sort_unstable();
+        pairs
     }
 
-    /// #11303 regression: the per-scan deletion memos must RETAIN (pin) the
-    /// file-side deletion index they key on, not merely cache its raw
-    /// `Arc::as_ptr`.
-    ///
-    /// The memo key compares `Arc::as_ptr(file_index)`. If the memo does not
-    /// keep that `Arc` alive, a deletion publish can free the index and a later
-    /// publish can reuse its freed address for a new generation — a false
-    /// pointer match (ABA) that serves a stale merged deletion view and
-    /// resurrects deleted rows. Pinning the source `Arc` makes the address
-    /// non-reusable while the memo is live, so a pointer match can only mean
-    /// "same generation".
-    ///
-    /// The ABA itself is allocator-dependent and non-deterministic to trigger,
-    /// so this asserts the retention INVARIANT that eliminates it: after a scan
-    /// builds the memos, clearing them must drop the file-side index's strong
-    /// count (the memos were holding references to it). On the pre-fix code the
-    /// memos held no reference, so clearing them would not move the count.
+    /// Read-your-writes (`freshness == 0`) — the correctness default. A scan through
+    /// the demand cache must see its own writes on the VERY NEXT scan: after an append,
+    /// `scan_view_at_current_input(0)` captures the current state, keys to it (a fresh
+    /// key ⇒ cache miss ⇒ rebuild), and serves a bundle reflecting the append — never a
+    /// stale prior bundle (the class of the overwrite regression this replaces).
+    /// A second scan of the SAME state HITS the cached bundle (same `Arc`) — the dedup /
+    /// reuse the cache preserves. (`weak_self` is unset here, so the cache builds inline;
+    /// the identity + freshness logic is identical to the production `spawn_blocking`
+    /// path.)
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn deletion_memos_pin_file_index_against_aba() {
+    async fn scan_view_cache_serves_own_writes_and_reuses() {
         let ctx = SessionContext::new();
         let runtime_env = ctx.runtime_env();
         let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
-            "aba_pin",
+            "scan_view_cache_ryw",
             Arc::clone(&runtime_env),
             VortexConfig {
                 cdc_durability: crate::metadata::CdcDurability::Memory,
@@ -40277,58 +40788,262 @@ mod tests {
         let schema = Arc::clone(&provider.table_metadata.schema);
         provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
 
-        // Durable rows + checkpoint (a file-side deletion index exists), then a
-        // RAM upsert tombstoning a durable key so a scan builds BOTH the merged
-        // and the visible-batch deletion memos.
-        insert_batch(
-            &provider,
-            id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20]),
-        )
-        .await;
-        provider
-            .checkpoint_inlined_data()
-            .await
-            .expect("flush inline rows to the file tier");
-        let write = provider
+        let _ = provider
             .write_cdc_append_stream(
-                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[100])),
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20])),
                 &ctx.task_ctx(),
             )
             .await
-            .expect("RAM upsert");
+            .expect("first RAM append");
+        let first = provider
+            .scan_view_at_current_input(Duration::ZERO)
+            .await
+            .expect("read-your-writes build 1");
+        assert_eq!(
+            collect_segment_pairs(&first.visible_segments),
+            vec![(1, 10), (2, 20)],
+            "first read-your-writes scan reflects the first append"
+        );
+
+        // Same state, no mutation between: the next scan HITS the cached bundle.
+        let reused = provider
+            .scan_view_at_current_input(Duration::ZERO)
+            .await
+            .expect("read-your-writes build 2 (reuse)");
+        assert!(
+            Arc::ptr_eq(&first, &reused),
+            "an unchanged state must serve the SAME cached bundle (dedup / reuse)"
+        );
+
+        // A second append: read-your-writes must see it on the very next scan.
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[3], &[30])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("second RAM append");
+        let after = provider
+            .scan_view_at_current_input(Duration::ZERO)
+            .await
+            .expect("read-your-writes build 3");
+        assert!(
+            !Arc::ptr_eq(&first, &after),
+            "a mutated state must rebuild (a fresh key), not serve the stale bundle"
+        );
+        assert_eq!(
+            collect_segment_pairs(&after.visible_segments),
+            vec![(1, 10), (2, 20), (3, 30)],
+            "read-your-writes scan sees the second append immediately"
+        );
+    }
+
+    /// Read-current (`freshness > 0`, stale-tolerant) — the analytical alignment path.
+    /// Once a bundle is cached, a read-current scan within the lag serves that
+    /// (now-stale) bundle rather than rebuilding, while a read-your-writes
+    /// (`freshness == 0`) scan of the same moment sees the newer state. This is the
+    /// bounded-staleness knob the SF1000 latency A/B exercises.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_view_cache_read_current_serves_within_lag() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "scan_view_cache_lag",
+            Arc::clone(&runtime_env),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("first RAM append");
+        // Build the bundle, then a second read-your-writes scan promotes it to
+        // `latest_complete` (drain observes the first build complete).
+        let _ = provider
+            .scan_view_at_current_input(Duration::ZERO)
+            .await
+            .expect("build");
+        let _ = provider
+            .scan_view_at_current_input(Duration::ZERO)
+            .await
+            .expect("promote to latest_complete");
+
+        // Mutate: the cached bundle is now stale.
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[3], &[30])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("second RAM append");
+
+        // Read-current with a generous lag serves the STALE cached bundle (no rebuild).
+        let stale = provider
+            .scan_view_at_current_input(Duration::from_hours(1))
+            .await
+            .expect("read-current within lag");
+        assert_eq!(
+            collect_segment_pairs(&stale.visible_segments),
+            vec![(1, 10), (2, 20)],
+            "read-current within the lag serves the cached (stale) bundle"
+        );
+
+        // Read-your-writes at the same moment sees the newer state.
+        let fresh = provider
+            .scan_view_at_current_input(Duration::ZERO)
+            .await
+            .expect("read-your-writes after mutation");
+        assert_eq!(
+            collect_segment_pairs(&fresh.visible_segments),
+            vec![(1, 10), (2, 20), (3, 30)],
+            "read-your-writes bypasses the lag and sees the mutation"
+        );
+    }
+
+    /// The background evictor drops a cached `latest_complete` once it has aged past the
+    /// dataset's freshness bound, releasing the snapshot dirs its capture pinned — so an
+    /// idle table (queried once, then quiet) does not pin an old snapshot forever and
+    /// block compaction GC. Eviction only removes an already-non-servable view, and a
+    /// subsequent scan rebuilds correctly. (This provider's `default_scan_freshness` is
+    /// the builder default `0`, so any cached view is immediately stale-for-reuse.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_view_cache_evictor_releases_idle_cached_view() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "scan_view_cache_evict",
+            Arc::clone(&runtime_env),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("RAM append");
+        // Two scans populate + promote a completed view into `latest_complete`.
+        let _ = provider
+            .scan_view_at_current_input(Duration::ZERO)
+            .await
+            .expect("build");
+        let _ = provider
+            .scan_view_at_current_input(Duration::ZERO)
+            .await
+            .expect("promote to latest_complete");
+        assert!(
+            provider.scan_view_cache.lock().latest_complete.is_some(),
+            "a completed view must be cached before eviction"
+        );
+
+        // A sweep NOW must NOT evict: the view was just served (last_access ~ now), so
+        // it is within the idle window — a still-reused view is retained, not dropped.
+        provider.evict_stale_scan_view(Instant::now());
+        assert!(
+            provider.scan_view_cache.lock().latest_complete.is_some(),
+            "a just-served view is within the idle window and must be retained"
+        );
+
+        // A sweep far in the future (past the idle window with no intervening serve)
+        // evicts it, releasing its pinned snapshot dirs.
+        provider.evict_stale_scan_view(Instant::now() + Duration::from_hours(1));
+        assert!(
+            provider.scan_view_cache.lock().latest_complete.is_none(),
+            "an idle (long-unserved) cached view must be evicted, releasing its pinned snapshot dirs"
+        );
+
+        // Eviction must not break correctness: the next scan rebuilds the current state.
+        let rebuilt = provider
+            .scan_view_at_current_input(Duration::ZERO)
+            .await
+            .expect("rebuild after eviction");
+        assert_eq!(
+            collect_segment_pairs(&rebuilt.visible_segments),
+            vec![(1, 10), (2, 20)],
+            "a scan after eviction rebuilds and still returns the correct rows"
+        );
+    }
+
+    /// A `ScanView` a scan is holding must stay valid across a concurrent mem-tier
+    /// checkpoint + CLEAR (D2 — GC/clear-during-scan): the bundle's captured mem-tier
+    /// `Arc`s keep the deletion-filtered batches alive by refcount even after the live
+    /// tier is flushed to a file and cleared, so an in-flight scan sees no
+    /// use-after-clear, no lost rows, and no resurrection — it returns the consistent
+    /// pinned view it captured.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn held_scan_view_survives_checkpoint_and_clear() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "held_view_gc",
+            Arc::clone(&runtime_env),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        let write = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("RAM append");
         assert!(
             write.in_memory_epoch().is_some(),
-            "upsert engaged the RAM tier"
+            "append engaged the RAM tier"
         );
 
-        // Build the memos and re-assert visibility over the memoized path.
+        // Capture + build the bundle a scan would borrow, and HOLD the Arc for the
+        // rest of the test (as an in-flight scan's plan would).
+        let held: Arc<ScanView> = {
+            let raw = provider.capture_raw_scan_input().await.expect("capture");
+            Arc::new(provider.build_scan_view(raw, 0).expect("build"))
+        };
         assert_eq!(
-            collect_id_value_pairs(&ctx, &provider, "aba_pin").await,
-            vec![(1, 100), (2, 20)],
-            "tier tombstone must hide the durable copy of PK 1"
-        );
-        assert!(
-            provider.merged_scan_deletions.load_full().is_some(),
-            "the scan must have stored the merged-deletions memo"
+            collect_segment_pairs(&held.visible_segments),
+            vec![(1, 10), (2, 20)],
+            "the held bundle carries the mem-tier rows"
         );
 
-        // The live file-side deletion index. `pk_deletion_snapshot()` clones its
-        // inner `Arc`, giving the test exactly one reference to count against;
-        // no write happens after this, so the live cell still holds the same
-        // generation the memos keyed on.
-        let live = provider.pk_deletion_snapshot();
-        let count_with_memos = file_index_strong_count(&live);
-        // Clearing the memos must release the reference(s) they were PINNING.
-        provider.merged_scan_deletions.store(None);
-        provider.mem_tier_visible_memo.store(None);
-        let count_without_memos = file_index_strong_count(&live);
+        // Flush the RAM tier to a durable file and CLEAR the live tier out from under
+        // the held bundle.
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("checkpoint flushes + clears the mem tier");
 
-        assert!(
-            count_with_memos > count_without_memos,
-            "the scan deletion memos must PIN the file-side index (ABA guard, #11303): \
-             strong count was {count_with_memos} with the memos present and \
-             {count_without_memos} after clearing them — a pre-fix memo that cached only \
-             the raw pointer would leave the count unchanged"
+        // The held bundle must STILL return the same rows: its captured mem-tier Arcs
+        // pin the batches by refcount independent of the (now-cleared) live tier.
+        assert_eq!(
+            collect_segment_pairs(&held.visible_segments),
+            vec![(1, 10), (2, 20)],
+            "the held bundle survives the checkpoint + clear (no use-after-clear / loss)"
         );
     }
 

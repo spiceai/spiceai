@@ -133,6 +133,15 @@ tokio-stream = { workspace = true }
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 libc = "0.2"
 
+# `loom` model-checks the `StructuralVersion` seqlock's memory orderings
+# (`provider/structural_version.rs`). Gated on `cfg(cayenne_loom)` so it is
+# compiled ONLY under `RUSTFLAGS="--cfg cayenne_loom"` and never enters normal
+# test/CI builds. Run with:
+#   RUSTFLAGS="--cfg cayenne_loom" cargo test -p cayenne --lib \
+#     provider::structural_version --release
+[target.'cfg(cayenne_loom)'.dev-dependencies]
+loom = { workspace = true }
+
 [[bench]]
 harness = false
 name = "zorder_clustering"
