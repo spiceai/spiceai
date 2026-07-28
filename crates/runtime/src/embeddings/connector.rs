@@ -30,7 +30,7 @@ use crate::embeddings::index::table::wrap_table_as_index;
 use crate::federated_table::FederatedTable;
 use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 use crate::model::EmbeddingModelStore;
-use crate::search::util::{FEDERATED_ADAPTOR_INNER, METADATA_ENRICHED_INNER};
+use crate::search::util::{EMBEDDING_INNER, FEDERATED_ADAPTOR_INNER, METADATA_ENRICHED_INNER};
 use crate::secrets::Secrets;
 use async_trait::async_trait;
 use data_components::cdc::{ChangeEnvelope, ChangesStream, StreamError, replace_change_batch_data};
@@ -736,10 +736,10 @@ const TRANSPARENT_CDC_WRAPPERS: &[InnerProviderFn] =
 /// Peel an [`IndexedTableProvider`]'s index and enrichment layers down to the raw
 /// source provider, so the source connector's changes stream sees the schema of the
 /// table it actually reads from — only real source columns, never the synthetic
-/// `<col>_embedding` columns that a `VectorScanTableProvider` merges into its schema
-/// (which would make the source's bootstrap `SELECT` reference a column that does not
-/// exist in the source table). A metadata-enrichment layer can sit between the
-/// `IndexedTableProvider` and its `VectorScanTableProvider`, so it is peeled here too.
+/// `<col>_embedding` columns that a `VectorScanTableProvider` or `EmbeddingTable` merges
+/// into its schema (which would make the source's bootstrap `SELECT` reference a column
+/// that does not exist in the source table). A metadata-enrichment layer can sit between
+/// the `IndexedTableProvider` and its inner provider, so it is peeled here too.
 ///
 /// This always resolves to a source provider (never `None`): the caller re-applies the
 /// index writes over the returned stream, so a missing source table would otherwise
@@ -750,6 +750,7 @@ fn underlying_federated_table_for_indexed_table(
     const PEEL: &[InnerProviderFn] = &[
         INDEXED_INNER,
         VECTOR_SCAN_INNER,
+        EMBEDDING_INNER,
         METADATA_ENRICHED_INNER,
         FEDERATED_ADAPTOR_INNER,
     ];

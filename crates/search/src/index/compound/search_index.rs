@@ -23,7 +23,6 @@ use datafusion::{error::DataFusionError, logical_expr::LogicalPlan};
 use futures::future::try_join_all;
 use runtime_datafusion_index::Index;
 
-use crate::generation::text_search::index::FullTextDatabaseIndex;
 use crate::index::{SearchIndex, VectorIndex};
 
 use super::{
@@ -61,26 +60,6 @@ impl CompoundSearchIndex {
             secondary,
             read_mode,
         })
-    }
-
-    /// Propagate CDC attachment to any full-text tier this compound composes.
-    ///
-    /// A full-text compound's primary (warm) tier is a [`FullTextDatabaseIndex`] whose
-    /// single tantivy writer is shared with the sink write lifecycle; like a standalone
-    /// full-text index it must disable its deferred-commit window when a change stream
-    /// also writes to it, or a concurrent refresh/append could publish its staged
-    /// change-stream documents early or discard them on rollback (see
-    /// [`FullTextDatabaseIndex::mark_cdc_attached`]). Tiers that manage their own commits
-    /// (e.g. the Elasticsearch secondary) are unaffected and left untouched.
-    pub fn mark_cdc_attached(&self) {
-        for tier in [&self.primary, &self.secondary] {
-            let tier = tier.as_any();
-            if let Some(full_text) = tier.downcast_ref::<FullTextDatabaseIndex>() {
-                full_text.mark_cdc_attached();
-            } else if let Some(nested) = tier.downcast_ref::<CompoundSearchIndex>() {
-                nested.mark_cdc_attached();
-            }
-        }
     }
 
     /// The tier reads and writes are served from first.
