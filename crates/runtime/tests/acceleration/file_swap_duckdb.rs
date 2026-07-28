@@ -419,14 +419,14 @@ async fn test_duckdb_file_swap_mixed_refresh_modes_share_one_file() -> Result<()
                     Some("replace_file"),
                     Some("3s"),
                 ))
-                // In-place full refresh on the same file: mixing the two
+                // A reuse_file (default) full refresh on the same file: mixing the two
                 // `on_full_refresh` modes must not lose either one's data.
                 .with_dataset(replace_file_dataset(
                     "https://public-data.spiceai.org/decimal.parquet",
-                    "in_place",
+                    "reuse_file_ds",
                     &db_path,
                     RefreshMode::Full,
-                    Some("in_place"),
+                    Some("reuse_file"),
                     Some("2s"),
                 ))
                 // Refreshed once at startup and never again: its rows only stay
@@ -481,19 +481,19 @@ async fn test_duckdb_file_swap_mixed_refresh_modes_share_one_file() -> Result<()
 
             // All four datasets, and every dataset's checkpoint, live in the
             // final swapped-in file.
-            let [swapper, swapper_two, in_place, carried, checkpoints] = counts_on_disk::<5>(
+            let [swapper, swapper_two, reuse_file_ds, carried, checkpoints] = counts_on_disk::<5>(
                 &db_path,
                 "SELECT (SELECT COUNT(1) FROM swapper)::BIGINT,
                         (SELECT COUNT(1) FROM swapper_two)::BIGINT,
-                        (SELECT COUNT(1) FROM in_place)::BIGINT,
+                        (SELECT COUNT(1) FROM reuse_file_ds)::BIGINT,
                         (SELECT COUNT(1) FROM carried_forward)::BIGINT,
                         (SELECT COUNT(1) FROM spice_sys_dataset_checkpoint)::BIGINT",
             )
             .await?;
 
-            if swapper == 0 || swapper_two == 0 || in_place == 0 {
+            if swapper == 0 || swapper_two == 0 || reuse_file_ds == 0 {
                 return Err(anyhow!(
-                    "every refreshing dataset must survive the swaps (swapper={swapper}, swapper_two={swapper_two}, in_place={in_place})"
+                    "every refreshing dataset must survive the swaps (swapper={swapper}, swapper_two={swapper_two}, reuse_file_ds={reuse_file_ds})"
                 ));
             }
             if carried != expected_carried {
