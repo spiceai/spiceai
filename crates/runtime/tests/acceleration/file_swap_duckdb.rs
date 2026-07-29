@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! `on_full_refresh: replace_file` — a full refresh streams into a fresh DuckDB
+//! `on_full_refresh: replace_file` — a full refresh streams into a fresh `DuckDB`
 //! database file which is then atomically swapped over the configured path.
 //!
 //! The swap's correctness rests on two invariants that these tests exercise:
@@ -42,6 +42,7 @@ use runtime::dataaccelerator::spice_sys::{OpenOption, dataset_checkpoint::Datase
 use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
 use spicepod::component::dataset::Dataset;
 use spicepod::param::Params;
+use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -52,7 +53,7 @@ use crate::{
     utils::{register_test_connectors, run_query, test_request_context, wait_until_true},
 };
 
-const LOAD_TIMEOUT: Duration = Duration::from_secs(60);
+const LOAD_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Names of the swap's on-disk artifacts beside `db_file`: staging/generation
 /// files (`{db}.refresh.*`) and the write-ahead log. None may survive a
@@ -72,7 +73,7 @@ fn swap_debris_beside(db_file: &Path) -> Result<Vec<String>, anyhow::Error> {
         .collect())
 }
 
-/// Polls until no swap artifacts remain beside `db_file`. Retired DuckDB
+/// Polls until no swap artifacts remain beside `db_file`. Retired `DuckDB`
 /// instances only release their files once the last pooled connection drains,
 /// so the debris check has to wait for the actual condition.
 async fn wait_for_swaps_to_settle(db_file: &Path) -> Result<(), anyhow::Error> {
@@ -137,12 +138,12 @@ async fn counts_on_disk<const N: usize>(
     bigint_row(&batches)
 }
 
-fn acceleration_params(path: &str, on_full_refresh: Option<&str>) -> Option<Params> {
+fn acceleration_params(path: &str, on_full_refresh: Option<&str>) -> Params {
     let mut params = vec![("duckdb_file".to_string(), path.to_string())];
     if let Some(mode) = on_full_refresh {
         params.push(("on_full_refresh".to_string(), mode.to_string()));
     }
-    Some(Params::from_string_map(params.into_iter().collect()))
+    Params::from_string_map(params.into_iter().collect())
 }
 
 /// A dataset accelerated into the shared `path`, with `on_full_refresh` and the
@@ -157,7 +158,7 @@ fn replace_file_dataset(
 ) -> Dataset {
     let mut dataset = Dataset::new(from, name);
     dataset.acceleration = Some(Acceleration {
-        params: acceleration_params(path, on_full_refresh),
+        params: Some(acceleration_params(path, on_full_refresh)),
         enabled: true,
         engine: Some("duckdb".to_string()),
         mode: Mode::File,
@@ -181,7 +182,7 @@ fn full_refresh_replace_file_dataset(from: &str, name: &str, path: &str) -> Data
 }
 
 /// Writes `rows` of incompressible data to a CSV `file://` source. `md5` output
-/// defeats DuckDB's compression, so a database file's size tracks the rows it
+/// defeats `DuckDB`'s compression, so a database file's size tracks the rows it
 /// holds rather than block-count noise — which is what makes the growth
 /// assertion in `..._bounded_growth_under_query_load` meaningful.
 fn write_csv_source(path: &Path, rows: u64) -> Result<(), anyhow::Error> {
@@ -190,7 +191,7 @@ fn write_csv_source(path: &Path, rows: u64) -> Result<(), anyhow::Error> {
         // A 32-char pseudo-random payload derived from the id, generated here
         // rather than by DuckDB so the source is a plain file.
         let payload = format!("{:032x}", id.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-        csv.push_str(&format!("{id},{payload}\n"));
+        writeln!(csv, "{id},{payload}")?;
     }
     std::fs::write(path, csv)?;
     Ok(())
@@ -288,8 +289,8 @@ async fn test_duckdb_file_swap_rejects_snapshot_refresh_peer_on_same_file()
         .await
 }
 
-/// A dataset accelerated into a *different* DuckDB file `ATTACH`es this
-/// dataset's file, and DuckDB binds that attachment to a file once per instance.
+/// A dataset accelerated into a *different* `DuckDB` file `ATTACH`es this
+/// dataset's file, and `DuckDB` binds that attachment to a file once per instance.
 /// A file replacement therefore leaves the peer instance holding the retired
 /// file, which would serve pre-replacement data to cross-file federated queries
 /// until the process restarted. Attachments re-resolve themselves when the file
@@ -381,7 +382,7 @@ async fn test_duckdb_file_replace_refreshes_cross_file_attachment() -> Result<()
 }
 
 /// T1 — datasets on **different refresh schedules and `on_full_refresh` modes**
-/// share one DuckDB file without conflicting or producing inconsistent results.
+/// share one `DuckDB` file without conflicting or producing inconsistent results.
 ///
 /// Two datasets full-refresh via `replace_file` on different intervals (so their
 /// swaps overlap and must serialize on the per-file write gate), a third
@@ -827,7 +828,7 @@ async fn test_duckdb_file_swap_recovers_interrupted_swap_on_boot() -> Result<(),
         .await
 }
 
-/// Two datasets share one DuckDB file with `on_full_refresh: replace_file`; both
+/// Two datasets share one `DuckDB` file with `on_full_refresh: replace_file`; both
 /// full refreshes run concurrently at startup, so the swaps serialize on the
 /// per-file write gate and each must carry the other's data forward. The
 /// database file must end up as a fresh generation (new inode) at the

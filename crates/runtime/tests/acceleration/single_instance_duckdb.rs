@@ -73,7 +73,7 @@ async fn test_acceleration_duckdb_single_instance() -> Result<(), anyhow::Error>
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
             let runtime_datasets =
-                super::load_runtime_datasets(&rt, std::time::Duration::from_secs(60)).await?;
+                super::load_runtime_datasets(&rt, std::time::Duration::from_mins(1)).await?;
 
             // Verify checkpoints are created before shutting down runtime
             wait_for_checkpoints(runtime_datasets, 120).await?;
