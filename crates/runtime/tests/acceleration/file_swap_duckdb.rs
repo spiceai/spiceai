@@ -52,7 +52,7 @@ use crate::{
     utils::{register_test_connectors, run_query, test_request_context, wait_until_true},
 };
 
-const LOAD_TIMEOUT: Duration = Duration::from_secs(60);
+const LOAD_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Names of the swap's on-disk artifacts beside `db_file`: staging/generation
 /// files (`{db}.refresh.*`) and the write-ahead log. None may survive a
