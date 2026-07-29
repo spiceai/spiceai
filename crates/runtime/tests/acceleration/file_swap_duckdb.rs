@@ -39,6 +39,7 @@ use futures::TryStreamExt;
 use anyhow::anyhow;
 use runtime::Runtime;
 use runtime::dataaccelerator::spice_sys::{OpenOption, dataset_checkpoint::DatasetCheckpoint};
+use runtime::status::ComponentStatus;
 use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
 use spicepod::component::dataset::Dataset;
 use spicepod::param::Params;
@@ -223,13 +224,14 @@ async fn dataset_error_message(rt: &Arc<Runtime>, dataset: &str) -> Result<Strin
         let table_ref = table_ref.clone();
         async move {
             status
-                .get_dataset_status(&table_ref)
-                .is_some_and(|s| s.is_error())
+                .get_dataset_statuses()
+                .get(&table_ref)
+                .is_some_and(ComponentStatus::is_error)
         }
     })
     .await;
 
-    let observed = status.get_dataset_status(&table_ref);
+    let observed = status.get_dataset_statuses().get(&table_ref).cloned();
     loading.abort();
 
     if !became_error {
@@ -686,9 +688,8 @@ async fn test_duckdb_file_swap_preserves_concurrent_out_of_band_writes() -> Resu
                 .find(|ds| ds.name.to_string() == "writer")
                 .ok_or_else(|| anyhow!("'writer' dataset not found"))?
                 .clone();
-            let registry = writer_dataset.runtime.accelerator_engine_registry();
             let checkpoint =
-                DatasetCheckpoint::try_new(&writer_dataset, registry, OpenOption::OpenExisting)
+                DatasetCheckpoint::try_new(&writer_dataset, OpenOption::OpenExisting)
                     .await
                     .map_err(|e| anyhow!("failed to open the writer's checkpoint: {e}"))?;
             let schema = Arc::new(arrow::datatypes::Schema::new(vec![

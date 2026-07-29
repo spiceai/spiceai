@@ -1957,7 +1957,7 @@ mod tests {
             .expect("PolyTableProvider");
         let writer = poly.writer();
         let writer = writer
-            .downcast_ref::<datafusion_table_providers::duckdb::write::DuckDBTableWriter>()
+            .downcast_ref::<DuckDBTableWriter>()
             .expect("DuckDBTableWriter");
         Ok(writer.write_settings().clone())
     }
