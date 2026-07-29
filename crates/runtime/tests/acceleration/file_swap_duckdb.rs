@@ -55,30 +55,42 @@ use crate::{
 
 const LOAD_TIMEOUT: Duration = Duration::from_mins(1);
 
-/// Names of the swap's on-disk artifacts beside `db_file`: staging/generation
-/// files (`{db}.refresh.*`) and the write-ahead log. None may survive a
-/// completed swap.
-fn swap_debris_beside(db_file: &Path) -> Result<Vec<String>, anyhow::Error> {
+/// Staging and generation files (`{db}.refresh.*`) left beside `db_file`. These
+/// belong to the replacement protocol and none may survive a completed
+/// replacement.
+///
+/// A `{db}.wal` is deliberately *not* counted: it is ordinary `DuckDB` state from
+/// whatever committed most recently, so a test that writes right up to shutdown
+/// legitimately leaves one behind for the next open to replay. Only the tests
+/// that end on a completed replacement with no writes after it assert on it, via
+/// [`wal_beside`].
+fn replacement_debris_beside(db_file: &Path) -> Result<Vec<String>, anyhow::Error> {
     let dir = db_file.parent().unwrap_or(Path::new("."));
     let Some(file_name) = db_file.file_name().and_then(|n| n.to_str()) else {
         return Ok(Vec::new());
     };
     let generation_prefix = format!("{file_name}.refresh.");
-    let wal_name = format!("{file_name}.wal");
 
     Ok(std::fs::read_dir(dir)?
         .filter_map(Result::ok)
         .map(|e| e.file_name().to_string_lossy().to_string())
-        .filter(|name| name.starts_with(&generation_prefix) || *name == wal_name)
+        .filter(|name| name.starts_with(&generation_prefix))
         .collect())
 }
 
-/// Polls until no swap artifacts remain beside `db_file`. Retired `DuckDB`
-/// instances only release their files once the last pooled connection drains,
-/// so the debris check has to wait for the actual condition.
-async fn wait_for_swaps_to_settle(db_file: &Path) -> Result<(), anyhow::Error> {
+/// Whether a write-ahead log sits beside `db_file`.
+fn wal_beside(db_file: &Path) -> bool {
+    let mut wal = db_file.as_os_str().to_os_string();
+    wal.push(".wal");
+    Path::new(&wal).exists()
+}
+
+/// Polls until no staging/generation debris remains beside `db_file`. Retired
+/// `DuckDB` instances only release their files once the last pooled connection
+/// drains, so the check has to wait for the actual condition.
+async fn wait_for_replacements_to_settle(db_file: &Path) -> Result<(), anyhow::Error> {
     let settled = wait_until_true(Duration::from_secs(30), || async {
-        swap_debris_beside(db_file).is_ok_and(|debris| debris.is_empty())
+        replacement_debris_beside(db_file).is_ok_and(|debris| debris.is_empty())
     })
     .await;
 
@@ -86,8 +98,8 @@ async fn wait_for_swaps_to_settle(db_file: &Path) -> Result<(), anyhow::Error> {
         Ok(())
     } else {
         Err(anyhow!(
-            "file swap left debris behind: {:?}",
-            swap_debris_beside(db_file)?
+            "file replacement left debris behind: {:?}",
+            replacement_debris_beside(db_file)?
         ))
     }
 }
@@ -201,17 +213,12 @@ fn write_csv_source(path: &Path, rows: u64) -> Result<(), anyhow::Error> {
 /// dataset's error message. Unlike [`load_runtime_datasets`] this must not
 /// assert the runtime becomes ready — the point is that a dataset does not load.
 async fn dataset_error_message(rt: &Arc<Runtime>, dataset: &str) -> Result<String, anyhow::Error> {
-    tokio::select! {
-        () = tokio::time::sleep(LOAD_TIMEOUT) => {
-            return Err(anyhow!("Timed out waiting for components to load"));
-        }
-        () = Arc::clone(rt).load_components() => {}
-    }
+    let loading = tokio::spawn(Arc::clone(rt).load_components());
 
     let table_ref = datafusion::sql::TableReference::bare(dataset.to_string());
     let status = rt.datafusion().runtime_status();
 
-    let became_error = wait_until_true(Duration::from_secs(30), || {
+    let became_error = wait_until_true(LOAD_TIMEOUT, || {
         let status = Arc::clone(&status);
         let table_ref = table_ref.clone();
         async move {
@@ -223,6 +230,8 @@ async fn dataset_error_message(rt: &Arc<Runtime>, dataset: &str) -> Result<Strin
     .await;
 
     let observed = status.get_dataset_status(&table_ref);
+    loading.abort();
+
     if !became_error {
         return Err(anyhow!(
             "expected dataset '{dataset}' to be rejected, but its status is {observed:?}"
@@ -374,7 +383,7 @@ async fn test_duckdb_file_replace_refreshes_cross_file_attachment() -> Result<()
 
             rt.shutdown().await;
             drop(rt);
-            wait_for_swaps_to_settle(Path::new(&replaced_db)).await?;
+            wait_for_replacements_to_settle(Path::new(&replaced_db)).await?;
 
             Ok(())
         })
@@ -484,7 +493,7 @@ async fn test_duckdb_file_swap_mixed_refresh_modes_share_one_file() -> Result<()
 
             rt.shutdown().await;
             drop(rt);
-            wait_for_swaps_to_settle(&db_file).await?;
+            wait_for_replacements_to_settle(&db_file).await?;
 
             // All four datasets, and every dataset's checkpoint, live in the
             // final swapped-in file.
@@ -622,7 +631,7 @@ async fn test_duckdb_file_swap_bounded_growth_under_query_load() -> Result<(), a
 
             rt.shutdown().await;
             drop(rt);
-            wait_for_swaps_to_settle(&db_file).await?;
+            wait_for_replacements_to_settle(&db_file).await?;
 
             Ok(())
         })
@@ -707,11 +716,11 @@ async fn test_duckdb_file_swap_preserves_concurrent_out_of_band_writes() -> Resu
 
             rt.shutdown().await;
             drop(rt);
-            wait_for_swaps_to_settle(&db_file).await?;
+            wait_for_replacements_to_settle(&db_file).await?;
 
             // The acknowledged checkpoints must be readable from the file the
             // swaps left behind — and no foreign WAL may sit beside it (that is
-            // asserted by `wait_for_swaps_to_settle` above).
+            // asserted by `wait_for_replacements_to_settle` above).
             let [checkpoints] = counts_on_disk::<1>(
                 &db_path,
                 "SELECT COUNT(1)::BIGINT FROM spice_sys_dataset_checkpoint",
@@ -735,6 +744,11 @@ async fn test_duckdb_file_swap_preserves_concurrent_out_of_band_writes() -> Resu
 /// happened (adopted, because the old file was already unlinked). Boot recovery
 /// must normalize both before any pool opens the file, and queries must then
 /// serve the adopted data.
+///
+/// The second runtime is configured at a *different* path than the first, which
+/// is what a real second boot looks like from recovery's point of view: recovery
+/// runs at most once per path per process, so reusing the first path here would
+/// simply skip it and assert nothing.
 #[tokio::test]
 async fn test_duckdb_file_swap_recovers_interrupted_swap_on_boot() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -761,7 +775,7 @@ async fn test_duckdb_file_swap_recovers_interrupted_swap_on_boot() -> Result<(),
             wait_for_checkpoints(runtime_datasets, 120).await?;
             rt.shutdown().await;
             drop(rt);
-            wait_for_swaps_to_settle(&db_file).await?;
+            wait_for_replacements_to_settle(&db_file).await?;
 
             let [seeded_rows] =
                 counts_on_disk::<1>(&db_path, "SELECT COUNT(1)::BIGINT FROM decimal").await?;
@@ -770,10 +784,12 @@ async fn test_duckdb_file_swap_recovers_interrupted_swap_on_boot() -> Result<(),
             // was renamed over the configured path: the configured file is gone
             // and only the generation survives, alongside `.building` debris
             // from a staging load that never finished.
-            let generation = dir.path().join("recovery.db.refresh.1700000000000-0");
+            let recovered_file = dir.path().join("recovered.db");
+            let recovered_path = recovered_file.to_string_lossy().to_string();
+            let generation = dir.path().join("recovered.db.refresh.1700000000000-0");
             let building = dir
                 .path()
-                .join("recovery.db.refresh.1700000000001-1.building");
+                .join("recovered.db.refresh.1700000000001-1.building");
             std::fs::rename(&db_file, &generation)?;
             std::fs::write(&building, b"incomplete staging output")?;
 
@@ -783,7 +799,7 @@ async fn test_duckdb_file_swap_recovers_interrupted_swap_on_boot() -> Result<(),
                 .with_dataset(full_refresh_replace_file_dataset(
                     "https://public-data.spiceai.org/decimal.parquet",
                     "decimal",
-                    &db_path,
+                    &recovered_path,
                 ))
                 .build();
 
@@ -803,10 +819,10 @@ async fn test_duckdb_file_swap_recovers_interrupted_swap_on_boot() -> Result<(),
                     generation.display()
                 ));
             }
-            if !db_file.exists() {
+            if !recovered_file.exists() {
                 return Err(anyhow!(
                     "boot recovery must restore the configured path {}",
-                    db_file.display()
+                    recovered_file.display()
                 ));
             }
 
@@ -821,7 +837,7 @@ async fn test_duckdb_file_swap_recovers_interrupted_swap_on_boot() -> Result<(),
 
             rt.shutdown().await;
             drop(rt);
-            wait_for_swaps_to_settle(&db_file).await?;
+            wait_for_replacements_to_settle(&recovered_file).await?;
 
             Ok(())
         })
@@ -878,7 +894,15 @@ async fn test_acceleration_duckdb_full_refresh_file_swap() -> Result<(), anyhow:
 
             rt.shutdown().await;
             drop(rt);
-            wait_for_swaps_to_settle(&db_file).await?;
+            wait_for_replacements_to_settle(&db_file).await?;
+
+            // Nothing writes after the final replacement here, so the file it
+            // left behind must be the checkpointed, WAL-free one it produced.
+            if wal_beside(&db_file) {
+                return Err(anyhow!(
+                    "a completed replacement must leave a checkpointed, WAL-free file"
+                ));
+            }
 
             // The swap replaced the file at the configured path with a fresh
             // generation.
