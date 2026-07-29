@@ -1410,7 +1410,7 @@ mod tests {
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::transport::{Channel, Server};
 
-    /// Fixed-map secret store for ExpandSecret allowlist tests.
+    /// Fixed-map secret store for `ExpandSecret` allowlist tests.
     struct FakeSecretStore(HashMap<String, String>);
 
     #[async_trait]
