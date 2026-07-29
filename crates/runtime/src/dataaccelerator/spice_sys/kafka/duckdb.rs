@@ -26,6 +26,11 @@ impl KafkaSys {
         pool: &Arc<DuckDbConnectionPool>,
         metadata: &KafkaMetadata,
     ) -> Result<()> {
+        let write_gate = pool.write_gate();
+        let _write_guard = write_gate
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
         let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
             .map_err(Error::external)?
@@ -66,6 +71,13 @@ impl KafkaSys {
         &self,
         pool: &Arc<DuckDbConnectionPool>,
     ) -> Result<Option<KafkaMetadata>> {
+        // `ensure_kafka_tables` below issues DDL, so this read path is also a
+        // writer to the shared acceleration file and takes the write gate.
+        let write_gate = pool.write_gate();
+        let _write_guard = write_gate
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
         let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
             .map_err(Error::external)?
@@ -107,6 +119,11 @@ impl KafkaSys {
         pool: &Arc<DuckDbConnectionPool>,
         offsets: &[KafkaOffset],
     ) -> Result<()> {
+        let write_gate = pool.write_gate();
+        let _write_guard = write_gate
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
         let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
             .map_err(Error::external)?

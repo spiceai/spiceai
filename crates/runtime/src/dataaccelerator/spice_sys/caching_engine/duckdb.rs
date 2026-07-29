@@ -21,6 +21,11 @@ use std::sync::Arc;
 
 impl CachingEngineSys {
     pub(super) fn update_fetched_at_duckdb(&self, pool: &Arc<DuckDbConnectionPool>) -> Result<()> {
+        let write_gate = pool.write_gate();
+        let _write_guard = write_gate
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
         let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn)
             .map_err(Error::external)?
