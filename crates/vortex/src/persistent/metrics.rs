@@ -32,7 +32,6 @@ pub(crate) static PATH_LABEL: &str = "file_path";
 #[derive(Default)]
 pub struct VortexMetricsFinder(Vec<MetricsSet>);
 
-
 impl ExecutionPlanVisitor for VortexMetricsFinder {
     type Error = DataFusionError;
     fn pre_visit(&mut self, plan: &dyn ExecutionPlan) -> Result<bool, Self::Error> {

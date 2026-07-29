@@ -16,9 +16,9 @@ limitations under the License.
 
 #[cfg(test)]
 use crate::error::{InvalidFilterSnafu, InvalidValueTypeSnafu, Result};
-use crate::filter::{FieldOperation, FilterExpression, LogicalOperation, MetadataFilter};
 #[cfg(test)]
 use crate::filter::Operator;
+use crate::filter::{FieldOperation, FilterExpression, LogicalOperation, MetadataFilter};
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::{Expr, Operator as DFOperator};

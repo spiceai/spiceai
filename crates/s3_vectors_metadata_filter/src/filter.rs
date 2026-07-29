@@ -14,18 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#[cfg(test)]
+use crate::error::{EmptyArraySnafu, InvalidFilterSnafu, InvalidValueTypeSnafu, JsonParsingSnafu};
 use crate::{
     Error,
     error::{MaxRecursionDepthExceededSnafu, Result, UnsupportedOperatorSnafu},
 };
-#[cfg(test)]
-use crate::error::{EmptyArraySnafu, InvalidFilterSnafu, InvalidValueTypeSnafu, JsonParsingSnafu};
 use aws_smithy_types::Document;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use snafu::ensure;
 #[cfg(test)]
 use snafu::ResultExt;
+use snafu::ensure;
 use std::{collections::HashMap, fmt, str::FromStr};
 
 /// Maximum recursion depth for nested `S3 Vectors` structures.
