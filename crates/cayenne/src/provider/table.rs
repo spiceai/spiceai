@@ -24627,6 +24627,27 @@ impl CayenneTableProvider {
         Ok(plans)
     }
 
+    /// Unions [`ExecutionPlan`]s, dropping any [`EmptyExec`], instead of needlessly widening the
+    /// plan. If all [`EmptyExec`], return [`EmptyExec`].
+    ///
+    /// `plans` must be non-empty.
+    fn union_skipping_empty(
+        plans: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        let (mut non_empty, empty): (Vec<_>, Vec<_>) =
+            plans.into_iter().partition(|plan| !plan.is::<EmptyExec>());
+
+        match non_empty.len() {
+            0 => empty.into_iter().next().ok_or_else(|| {
+                datafusion_common::DataFusionError::Internal(
+                    "union_skipping_empty called with no plans".to_string(),
+                )
+            }),
+            1 => Ok(non_empty.remove(0)),
+            _ => UnionExec::try_new(non_empty),
+        }
+    }
+
     fn snapshot_scan_schema(file_schema: &SchemaRef, options: &ListingOptions) -> SchemaRef {
         // `SchemaBuilder::from(&Schema)` clones the metadata HashMap, but we then
         // overwrite that metadata via `.with_metadata(...)` below. Building from
@@ -26706,7 +26727,7 @@ impl TableProvider for CayenneTableProvider {
 
             let mut all_plans = vec![filtered_main_plan];
             all_plans.extend(protected_snapshot_plans);
-            UnionExec::try_new(all_plans)?
+            Self::union_skipping_empty(all_plans)?
         };
 
         // Union the cold object-store tier if present. Added as its own union
@@ -26715,21 +26736,21 @@ impl TableProvider for CayenneTableProvider {
         // Vortex `DataSourceExec`, so FilterPushdown still pushes the scan
         // predicate into it and the redundant top FilterExec is still removed.
         let plan: Arc<dyn ExecutionPlan> = if let Some(cold_exec) = cold_plan {
-            UnionExec::try_new(vec![plan, cold_exec])?
+            Self::union_skipping_empty(vec![plan, cold_exec])?
         } else {
             plan
         };
 
         // Union inlined data if present
         let plan: Arc<dyn ExecutionPlan> = if let Some(inline_exec) = inlined_plan {
-            UnionExec::try_new(vec![plan, inline_exec])?
+            Self::union_skipping_empty(vec![plan, inline_exec])?
         } else {
             plan
         };
 
         // Union the in-memory CDC tier if present (memory mode).
         let plan: Arc<dyn ExecutionPlan> = if let Some(mem_exec) = mem_plan {
-            UnionExec::try_new(vec![plan, mem_exec])?
+            Self::union_skipping_empty(vec![plan, mem_exec])?
         } else {
             plan
         };
