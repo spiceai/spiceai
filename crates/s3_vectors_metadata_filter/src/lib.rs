@@ -42,61 +42,6 @@ limitations under the License.
 //! |----------|-------------|-------------|---------|
 //! | `$and` | Logical AND | Array of filters | `{"$and": [{"genre": "drama"}, {"year": {"$gte": 2020}}]}` |
 //! | `$or` | Logical OR | Array of filters | `{"$or": [{"genre": "drama"}, {"year": {"$gte": 2020}}]}` |
-//!
-//! ## Usage
-//! ### Basic Usage
-//! ```rust
-//! use vector_metadata_filter::*;
-//!
-//! // Parse a simple equality filter
-//! let filter_json = r#"{"genre": "documentary"}"#;
-//! let filter = MetadataFilter::from_json(filter_json)?;
-//!
-//! // Validate the filter
-//! filter.validate()?;
-//!
-//! // Convert to DataFusion expression
-//! let datafusion_expr = convert_to_datafusion_expr(&filter)?;
-//! ```
-//!
-//! ### Complex Filters
-//! ```rust
-//! use vector_metadata_filter::*;
-//!
-//! // Multiple conditions on the same field
-//! let filter_json = r#"{"price": {"$gte": 10, "$lte": 50}}"#;
-//! let filter = MetadataFilter::from_json(filter_json)?;
-//! // Logical operations
-//! let filter_json = r#"{
-//!     "$and": [
-//!         {"genre": {"$eq": "drama"}},
-//!         {"year": {"$gte": 2020}},
-//!         {"rating": {"$in": [8, 9, 10]}}
-//!     ]
-//! }"#;
-//! let filter = MetadataFilter::from_json(filter_json)?;
-//!
-//! // Convert to DataFusion for query execution
-//! let expr = convert_to_datafusion_expr(&filter)?;
-//! ```
-//!
-//! ### Error Handling
-//! ```rust
-//! use vector_metadata_filter::*;
-//!
-//! // Invalid filter will return detailed error
-//! let invalid_filter = r#"{"year": {"$gt": "not_a_number"}}"#;
-//! let filter = MetadataFilter::from_json(invalid_filter)?;
-//!
-//! match filter.validate() {
-//!     Ok(_) => println!("Filter is valid"),
-//!     Err(Error::InvalidValueType { operator, expected, actual }) => {
-//!         println!("Invalid value type for {}: expected {}, got {}",
-//!                  operator, expected, actual);
-//!     }
-//!     Err(e) => println!("Validation error: {}", e),
-//! }
-//! ```
 
 #![allow(clippy::missing_errors_doc)]
 

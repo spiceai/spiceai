@@ -43,6 +43,5 @@ pub mod node;
 pub mod planner;
 
 pub use handler::{CatalogDmlHandler, DeleteParams, InsertParams, MergeParams, UpdateParams};
-pub(crate) use helpers::dml_count_output_schema;
 pub use node::{DmlExtensionNode, DmlNodeOp};
 pub use planner::DmlExtensionPlanner;

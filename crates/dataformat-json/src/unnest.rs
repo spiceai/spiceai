@@ -53,6 +53,7 @@ pub struct FieldPath {
 /// assert_eq!(path.field_names, vec!["person", "name"]);
 /// assert_eq!(path.field_indices, vec![0, 0]);
 /// ```
+#[cfg(test)]
 #[must_use]
 fn map_flattened_to_original(
     flattened_field_name: &str,

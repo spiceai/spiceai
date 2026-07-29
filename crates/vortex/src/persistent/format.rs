@@ -98,6 +98,7 @@ impl ProjectionPushdown {
     }
 
     /// Converts a legacy boolean projection-pushdown setting into the enum mode.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn from_bool(enabled: bool) -> Self {
         if enabled { Self::On } else { Self::Off }
@@ -346,13 +347,7 @@ impl VortexFormatFactory {
     }
 
     /// Override the default options for this factory.
-    ///
-    /// For example:
-    /// ```rust
-    /// use vortex_datafusion::{VortexFormatFactory, VortexTableOptions};
-    ///
-    /// let factory = VortexFormatFactory::new().with_options(VortexTableOptions::default());
-    /// ```
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn with_options(mut self, options: VortexTableOptions) -> Self {
         self.options = Some(options);

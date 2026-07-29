@@ -14,18 +14,28 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#[cfg(test)]
 use crate::error::{InvalidFilterSnafu, InvalidValueTypeSnafu, Result};
-use crate::filter::{FieldOperation, FilterExpression, LogicalOperation, MetadataFilter, Operator};
+use crate::filter::{FieldOperation, FilterExpression, LogicalOperation, MetadataFilter};
+#[cfg(test)]
+use crate::filter::Operator;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
-use datafusion::logical_expr::{Expr, Operator as DFOperator, binary_expr, col, lit};
+use datafusion::logical_expr::{Expr, Operator as DFOperator};
+#[cfg(test)]
+use datafusion::logical_expr::{binary_expr, col, lit};
+#[cfg(test)]
 use datafusion::prelude::{and, or};
 
+#[cfg(test)]
 use datafusion::scalar::ScalarValue;
+#[cfg(test)]
 use serde_json::Value;
 use std::collections::HashMap;
+#[cfg(test)]
 use std::str::FromStr;
 
+#[cfg(test)]
 fn convert_to_datafusion_expr(filter: &MetadataFilter) -> Result<Expr> {
     match filter {
         MetadataFilter::Simple(map) => convert_simple_filter(map),
@@ -356,6 +366,7 @@ fn scalar_to_json_value(
     }
 }
 
+#[cfg(test)]
 fn convert_simple_filter(map: &HashMap<String, Value>) -> Result<Expr> {
     let mut expressions = Vec::new();
 
@@ -370,6 +381,7 @@ fn convert_simple_filter(map: &HashMap<String, Value>) -> Result<Expr> {
     combine_with_and(expressions)
 }
 
+#[cfg(test)]
 fn convert_expression(expr: &FilterExpression) -> Result<Expr> {
     match expr {
         FilterExpression::Field(map) => convert_field_expressions(map),
@@ -377,6 +389,7 @@ fn convert_expression(expr: &FilterExpression) -> Result<Expr> {
     }
 }
 
+#[cfg(test)]
 fn convert_field_expressions(map: &HashMap<String, FieldOperation>) -> Result<Expr> {
     let mut expressions = Vec::new();
 
@@ -388,6 +401,7 @@ fn convert_field_expressions(map: &HashMap<String, FieldOperation>) -> Result<Ex
     combine_with_and(expressions)
 }
 
+#[cfg(test)]
 fn convert_field_operation(field: &str, operation: &FieldOperation) -> Result<Vec<Expr>> {
     match operation {
         FieldOperation::Direct(value) => Ok(vec![binary_expr(
@@ -411,6 +425,7 @@ fn convert_field_operation(field: &str, operation: &FieldOperation) -> Result<Ve
     }
 }
 
+#[cfg(test)]
 fn convert_operator_expression(field: &str, operator: Operator, value: &Value) -> Result<Expr> {
     match operator {
         Operator::Eq => Ok(binary_expr(
@@ -501,6 +516,7 @@ fn convert_operator_expression(field: &str, operator: Operator, value: &Value) -
     }
 }
 
+#[cfg(test)]
 fn convert_logical_expression(logical: &LogicalOperation) -> Result<Expr> {
     let mut expressions = Vec::new();
 
@@ -527,6 +543,7 @@ fn convert_logical_expression(logical: &LogicalOperation) -> Result<Expr> {
     combine_with_and(expressions)
 }
 
+#[cfg(test)]
 fn combine_with_and(expressions: Vec<Expr>) -> Result<Expr> {
     let mut iter = expressions.into_iter();
     let Some(mut expr) = iter.next() else {
@@ -541,6 +558,7 @@ fn combine_with_and(expressions: Vec<Expr>) -> Result<Expr> {
     Ok(expr)
 }
 
+#[cfg(test)]
 fn combine_with_or(expressions: Vec<Expr>) -> Result<Expr> {
     let mut iter = expressions.into_iter();
     let Some(mut expr) = iter.next() else {
@@ -555,6 +573,7 @@ fn combine_with_or(expressions: Vec<Expr>) -> Result<Expr> {
     Ok(expr)
 }
 
+#[cfg(test)]
 fn json_value_to_scalar(value: &Value) -> Result<ScalarValue> {
     match value {
         Value::String(s) => Ok(ScalarValue::Utf8(Some(s.clone()))),
@@ -578,6 +597,7 @@ fn json_value_to_scalar(value: &Value) -> Result<ScalarValue> {
     }
 }
 
+#[cfg(test)]
 fn value_type_name(value: &Value) -> &'static str {
     match value {
         Value::Null => "null",

@@ -16,15 +16,16 @@ limitations under the License.
 
 use crate::{
     Error,
-    error::{
-        EmptyArraySnafu, InvalidFilterSnafu, InvalidValueTypeSnafu, JsonParsingSnafu,
-        MaxRecursionDepthExceededSnafu, Result, UnsupportedOperatorSnafu,
-    },
+    error::{MaxRecursionDepthExceededSnafu, Result, UnsupportedOperatorSnafu},
 };
+#[cfg(test)]
+use crate::error::{EmptyArraySnafu, InvalidFilterSnafu, InvalidValueTypeSnafu, JsonParsingSnafu};
 use aws_smithy_types::Document;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use snafu::{ResultExt, ensure};
+use snafu::ensure;
+#[cfg(test)]
+use snafu::ResultExt;
 use std::{collections::HashMap, fmt, str::FromStr};
 
 /// Maximum recursion depth for nested `S3 Vectors` structures.
@@ -281,7 +282,7 @@ impl FromStr for Operator {
 }
 impl Operator {
     #[must_use]
-    pub(crate) fn as_str(&self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Operator::Eq => "$eq",
             Operator::Ne => "$ne",
@@ -422,11 +423,13 @@ fn format_value_with_depth(value: &Value, depth: usize) -> String {
 }
 
 impl MetadataFilter {
+    #[cfg(test)]
     pub(crate) fn from_json(json: &str) -> Result<Self> {
         let value: Value = serde_json::from_str(json).context(JsonParsingSnafu)?;
         Self::from_value(&value)
     }
 
+    #[cfg(test)]
     fn from_value(value: &Value) -> Result<Self> {
         match value {
             Value::Object(obj) => {
@@ -468,10 +471,12 @@ impl MetadataFilter {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn to_json(&self) -> Result<String> {
         serde_json::to_string(self).context(JsonParsingSnafu)
     }
 
+    #[cfg(test)]
     pub(crate) fn validate(&self) -> Result<()> {
         match self {
             MetadataFilter::Simple(map) => {
@@ -488,6 +493,7 @@ impl MetadataFilter {
     }
 }
 
+#[cfg(test)]
 fn validate_field_name(field: &str) -> Result<()> {
     if field.is_empty() {
         return InvalidFilterSnafu {
@@ -504,6 +510,7 @@ fn validate_field_name(field: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_primitive_value(value: &Value) -> Result<()> {
     match value {
         Value::String(_) | Value::Number(_) | Value::Bool(_) => Ok(()),
@@ -520,6 +527,7 @@ fn validate_primitive_value(value: &Value) -> Result<()> {
     }
 }
 
+#[cfg(test)]
 fn validate_expression(expr: &FilterExpression) -> Result<()> {
     match expr {
         FilterExpression::Field(map) => {
@@ -535,6 +543,7 @@ fn validate_expression(expr: &FilterExpression) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_field_operation(op: &FieldOperation) -> Result<()> {
     match op {
         FieldOperation::Direct(value) => validate_primitive_value(value),
@@ -548,6 +557,7 @@ fn validate_field_operation(op: &FieldOperation) -> Result<()> {
     }
 }
 
+#[cfg(test)]
 fn validate_operator_value(operator: Operator, value: &Value) -> Result<()> {
     match operator {
         Operator::Eq | Operator::Ne => {
@@ -611,6 +621,7 @@ fn validate_operator_value(operator: Operator, value: &Value) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_logical_operation(logical: &LogicalOperation) -> Result<()> {
     if let Some(and_filters) = &logical.and {
         if and_filters.is_empty() {
@@ -632,6 +643,7 @@ fn validate_logical_operation(logical: &LogicalOperation) -> Result<()> {
 }
 
 impl LogicalOperation {
+    #[cfg(test)]
     fn from_value(value: &Value) -> Result<Self> {
         if let Value::Object(obj) = value {
             let mut logical = LogicalOperation {
@@ -680,6 +692,7 @@ impl LogicalOperation {
 }
 
 impl FilterExpression {
+    #[cfg(test)]
     fn from_value(value: &Value) -> Result<Self> {
         if let Value::Object(obj) = value {
             // Check if this is a logical operation
@@ -722,6 +735,7 @@ impl From<&Value> for FieldOperation {
     }
 }
 
+#[cfg(test)]
 fn value_type_name(value: &Value) -> &'static str {
     match value {
         Value::Null => "null",
@@ -749,15 +763,6 @@ pub fn document_to_json_map(document: Document) -> Result<Map<String, Value>> {
         }
         _ => Ok(Map::new()),
     }
-}
-
-/// Converts a `Document` to a JSON `Value`.
-///
-/// # Errors
-///
-/// Returns an error if the document nesting exceeds `MAX_RECURSION_DEPTH`.
-fn document_to_json_value(document: Document) -> Result<Value> {
-    document_to_json_value_with_depth(document, 0)
 }
 
 fn document_to_json_value_with_depth(document: Document, depth: usize) -> Result<Value> {
@@ -968,7 +973,7 @@ mod tests {
             doc = Document::Object(map);
         }
 
-        let result = document_to_json_value(doc);
+        let result = document_to_json_value_with_depth(doc, 0);
         assert!(
             result.is_err(),
             "Expected MaxRecursionDepthExceeded error for deeply nested Document"
@@ -985,7 +990,7 @@ mod tests {
             doc = Document::Object(map);
         }
 
-        let result = document_to_json_value(doc);
+        let result = document_to_json_value_with_depth(doc, 0);
         assert!(
             result.is_ok(),
             "Expected success for moderately nested Document"

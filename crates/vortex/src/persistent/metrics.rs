@@ -11,7 +11,6 @@ use datafusion_datasource::source::DataSourceExec;
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::ExecutionPlanVisitor;
 use datafusion_physical_plan::Metric as DatafusionMetric;
-use datafusion_physical_plan::accept;
 use datafusion_physical_plan::metrics::Count;
 use datafusion_physical_plan::metrics::Gauge;
 use datafusion_physical_plan::metrics::Label as DatafusionLabel;
@@ -33,19 +32,6 @@ pub(crate) static PATH_LABEL: &str = "file_path";
 #[derive(Default)]
 pub struct VortexMetricsFinder(Vec<MetricsSet>);
 
-impl VortexMetricsFinder {
-    /// Find all metrics for `VortexExec` nodes.
-    fn find_all(plan: &dyn ExecutionPlan) -> Vec<MetricsSet> {
-        let mut finder = Self::default();
-        match accept(plan, &mut finder) {
-            Ok(()) => finder.0,
-            Err(err) => {
-                tracing::warn!(error = %err, "Failed to collect Vortex metrics from physical plan");
-                Vec::new()
-            }
-        }
-    }
-}
 
 impl ExecutionPlanVisitor for VortexMetricsFinder {
     type Error = DataFusionError;
@@ -190,75 +176,4 @@ fn f_to_u(f: f64) -> Option<usize> {
     }
 
     f.trunc().to_string().parse().ok()
-}
-
-#[cfg(test)]
-mod tests {
-
-    use datafusion_datasource::source::DataSourceExec;
-    use datafusion_physical_plan::ExecutionPlanVisitor;
-    use datafusion_physical_plan::accept;
-
-    use super::VortexMetricsFinder;
-    use crate::common_tests::TestSessionContext;
-
-    /// Counts the number of DataSourceExec nodes in a plan.
-    struct DataSourceExecCounter(usize);
-
-    impl ExecutionPlanVisitor for DataSourceExecCounter {
-        type Error = std::convert::Infallible;
-        fn pre_visit(
-            &mut self,
-            plan: &dyn datafusion_physical_plan::ExecutionPlan,
-        ) -> Result<bool, Self::Error> {
-            if plan.is::<DataSourceExec>() {
-                self.0 += 1;
-                Ok(false)
-            } else {
-                Ok(true)
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn metrics_finder_returns_one_set_per_data_source_exec() -> anyhow::Result<()> {
-        let ctx = TestSessionContext::default();
-
-        ctx.session
-            .sql(
-                "CREATE EXTERNAL TABLE my_tbl \
-                (c1 VARCHAR NOT NULL, c2 INT NOT NULL) \
-                STORED AS vortex \
-                LOCATION 'files/'",
-            )
-            .await?;
-
-        ctx.session
-            .sql("INSERT INTO my_tbl VALUES ('a', 1), ('b', 2)")
-            .await?
-            .collect()
-            .await?;
-
-        let df = ctx.session.sql("SELECT * FROM my_tbl").await?;
-        let (state, plan) = df.into_parts();
-        let physical_plan = state.create_physical_plan(&plan).await?;
-
-        // Count DataSourceExec nodes
-        let mut counter = DataSourceExecCounter(0);
-        accept(physical_plan.as_ref(), &mut counter)?;
-
-        // Get metrics sets
-        let metrics_sets = VortexMetricsFinder::find_all(physical_plan.as_ref());
-
-        assert!(!metrics_sets.is_empty());
-        assert_eq!(
-            metrics_sets.len(),
-            counter.0,
-            "Expected one MetricsSet per DataSourceExec, got {} sets for {} DataSourceExec nodes",
-            metrics_sets.len(),
-            counter.0
-        );
-
-        Ok(())
-    }
 }

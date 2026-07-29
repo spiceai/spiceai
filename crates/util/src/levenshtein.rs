@@ -79,6 +79,7 @@ pub fn distance(a: &str, b: &str) -> usize {
 /// assert!((similarity("", "") - 1.0).abs() < f64::EPSILON);
 /// assert!((similarity("abc", "xyz") - 0.0).abs() < f64::EPSILON);
 /// ```
+#[cfg(test)]
 #[expect(clippy::cast_precision_loss)]
 #[must_use]
 fn similarity(a: &str, b: &str) -> f64 {

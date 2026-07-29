@@ -452,6 +452,7 @@ impl JsonPointerReader {
     /// - The input cannot be parsed as valid JSON
     /// - The pointer path does not resolve to a value
     /// - There are I/O errors while reading the input
+    #[cfg(test)]
     fn new<R: Read>(mut reader: R, path: &str) -> io::Result<Self> {
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf)?;
@@ -729,6 +730,7 @@ impl SodaReader {
     /// - The input cannot be parsed as valid JSON
     /// - The JSON is not a valid SODA response (missing `meta.view.columns` or `data`)
     /// - The `data` field is not an array
+    #[cfg(test)]
     fn new<R: Read>(mut reader: R, include_metadata: bool) -> io::Result<Self> {
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf)?;
@@ -957,6 +959,7 @@ impl ArrayToNdjsonPush {
     }
 
     /// Check if the adapter has finished processing (reached end of array)
+    #[cfg(test)]
     #[must_use]
     fn is_complete(&self) -> bool {
         matches!(self.state, ParsingState::Complete)

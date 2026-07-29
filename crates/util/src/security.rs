@@ -22,6 +22,7 @@ limitations under the License.
 //! - SQL injection via unquoted table identifiers
 
 use datafusion::sql::TableReference;
+#[cfg(test)]
 use std::path::Path;
 
 /// The maximum safe nesting depth for JSON values.
@@ -73,6 +74,7 @@ pub const MAX_SAFE_JSON_DEPTH: usize = 32;
 /// assert_eq!(sanitize_filename("/var/log/secrets.txt").unwrap(), "secrets.txt");
 /// assert_eq!(sanitize_filename("subdir/model.bin").unwrap(), "model.bin");
 /// ```
+#[cfg(test)]
 #[must_use = "sanitized filename must be used to prevent path traversal vulnerabilities"]
 fn sanitize_filename(input: &str) -> Result<String, String> {
     Path::new(input)
@@ -122,6 +124,7 @@ fn sanitize_filename(input: &str) -> Result<String, String> {
 /// let empty = b"";
 /// assert!(validate_non_empty_bytes(empty, "config.json").is_err());
 /// ```
+#[cfg(test)]
 fn validate_non_empty_bytes(bytes: &[u8], context: &str) -> Result<(), String> {
     if bytes.is_empty() {
         Err(format!("Downloaded file {context} is empty"))

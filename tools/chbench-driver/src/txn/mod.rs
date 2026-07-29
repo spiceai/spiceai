@@ -63,7 +63,7 @@ impl fmt::Display for TxnType {
 
 /// Standard TPC-C transaction mix weights (must sum to 100).
 /// Index order: `NewOrder`, Payment, Delivery, `OrderStatus`, `StockLevel`.
-pub(crate) const DEFAULT_MIX: [u32; 5] = [45, 43, 4, 4, 4];
+pub const DEFAULT_MIX: [u32; 5] = [45, 43, 4, 4, 4];
 
 /// All transaction types in mix-weight index order.
 const TXN_TYPES: [TxnType; 5] = [
