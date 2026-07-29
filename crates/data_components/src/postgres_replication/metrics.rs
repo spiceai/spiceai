@@ -114,6 +114,17 @@ pub struct MetricsCollector {
     /// `member_envelope_eager_merges_total` so the two stages can be attributed
     /// separately.
     member_envelope_mailbox_merges_total: AtomicU64,
+    /// Times a transaction could NOT be folded into this member's unclaimed
+    /// mailbox tail because a configured bound refused it — the per-envelope row
+    /// limit or the mailbox byte budget — rather than because the envelopes were
+    /// not foldable at all. The mailbox bounds ship deliberately low (folding is
+    /// a back-pressure absorber, not a throughput lever), so a persistently
+    /// rising value here alongside a rising
+    /// `member_envelope_mailbox_merges_total` is the evidence that raising
+    /// `SPICE_POSTGRES_CDC_MAX_BACKPRESSURE_ROWS_PER_ENVELOPE` /
+    /// `SPICE_POSTGRES_CDC_MAX_MAILBOX_BYTES` would absorb more. A flat zero
+    /// means the bounds are not binding and there is nothing to tune.
+    member_mailbox_coalesce_limited_total: AtomicU64,
 
     // Shared-slot membership liveness. `member_attached` is `1` while this
     // dataset is an attached member of its shared replication slot and `0` once
@@ -311,6 +322,12 @@ impl MetricsCollector {
     /// this member's mailbox (shared slot).
     pub fn inc_envelope_merged_mailbox(&self) {
         self.member_envelope_mailbox_merges_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    /// Count a fold refused by a configured mailbox bound (shared slot) — the
+    /// signal that raising that bound would coalesce more.
+    pub fn inc_mailbox_coalesce_limited(&self) {
+        self.member_mailbox_coalesce_limited_total
             .fetch_add(1, Ordering::Relaxed);
     }
     pub fn inc_reconnect(&self) {
@@ -549,6 +566,13 @@ impl Metrics {
     pub fn member_envelope_mailbox_merges_total(&self) -> u64 {
         self.collector
             .member_envelope_mailbox_merges_total
+            .load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn member_mailbox_coalesce_limited_total(&self) -> u64 {
+        self.collector
+            .member_mailbox_coalesce_limited_total
             .load(Ordering::Relaxed)
     }
 }

@@ -83,23 +83,29 @@ limitations under the License.
 //!    the *first* commit it absorbed. The age bound is what keeps a low-traffic
 //!    table from being held indefinitely.
 //! 2. Publishing appends to the member's bounded coalescing mailbox, folding into
-//!    the unclaimed incoming tail up to a separate backpressure row limit with no
-//!    age limit — a stalled sink therefore collapses envelopes rather than
-//!    multiplying them. The receiver atomically swaps the published vector and
-//!    drains it without pump involvement.
+//!    the unclaimed incoming tail with no age limit — a stalled sink therefore
+//!    collapses envelopes rather than multiplying them. The receiver atomically
+//!    swaps the published vector and drains it without pump involvement.
 //!
-//! The mailbox is bounded in both items and estimated bytes
-//! ([`DEFAULT_MAX_MAILBOX_BYTES`]) so tail folding cannot grow memory without
-//! limit. Once it can neither merge nor admit, `deliver_commit` backpressures the
-//! pump, which stops it calling `client.recv()` and lets events pile up in the
-//! `pgwire_replication` worker's channel. The worker keeps emitting standby
+//! The two stages are deliberately asymmetric. Stage 1 is the throughput lever
+//! and carries the working limits; stage 2 only engages once a member's sink has
+//! stopped draining, so its bounds
+//! ([`DEFAULT_MAX_BACKPRESSURE_ROWS_PER_ENVELOPE`],
+//! [`DEFAULT_MAX_MAILBOX_BYTES`]) ship low — enough to blunt a transient stall
+//! without letting buffered memory drift far above what stage 1 already implies.
+//! Once the mailbox can neither merge nor admit, `deliver_commit` backpressures
+//! the pump, which stops it calling `client.recv()` and lets events pile up in
+//! the `pgwire_replication` worker's channel. The worker keeps emitting standby
 //! status feedback on `status_interval`, so Postgres never hits
 //! `wal_sender_timeout`.
 //!
-//! `dataset_postgres_replication_member_envelopes_delivered_total` against
-//! `..._wal_transactions_total` gives the coalescing factor the accelerator's
-//! apply loop sees; the two `..._envelope_{eager,mailbox}_merges_total` counters
-//! attribute it between the stages.
+//! Observability, per member:
+//! `..._member_envelopes_delivered_total` against `..._wal_transactions_total`
+//! gives the coalescing factor the accelerator's apply loop sees;
+//! `..._envelope_{eager,mailbox}_merges_total` attribute it between the stages;
+//! and `..._member_mailbox_coalesce_limited_total` reports when stage 2's low
+//! bounds are what refused a fold — a flat zero means they never bind, a rising
+//! value is the evidence for raising them.
 //!
 //! The pump-side [`MEMBER_SEND_STALL_WARN`] loop is therefore for
 //! observability and shutdown responsiveness, not server-side liveness.
@@ -239,26 +245,37 @@ pub const DEFAULT_MEMBER_CHANNEL_CAPACITY: usize = 1024;
 const DEFAULT_MAX_ENVELOPE_AGE: std::time::Duration = std::time::Duration::from_millis(10);
 const MAX_MAX_ENVELOPE_AGE_MS: u64 = 60_000;
 
-/// Conservative output-row limits for pump-local eager coalescing and
-/// mailbox-tail backpressure coalescing. A single source transaction may exceed
-/// either limit and is still admitted intact; limits only prevent appending
-/// another transaction.
+/// Output-row limit for the pump's eager hold: how large one envelope may grow
+/// before it is published. A single source transaction may exceed it and is
+/// still admitted intact; the limit only prevents folding in another.
 const DEFAULT_MAX_ROWS_PER_ENVELOPE: usize = 8_192;
 const MAX_MAX_ROWS_PER_ENVELOPE: usize = 1_048_576;
+
+/// Row limit for mailbox-tail folding — deliberately a quarter of the eager
+/// limit.
+///
+/// Mailbox folding is a back-pressure absorber, not a throughput lever: it only
+/// engages once a member's sink has stopped draining, and measurement shows the
+/// eager hold already collapses envelopes ~46x before anything reaches the
+/// mailbox. So the default is set low enough to blunt a transient stall while
+/// keeping buffered memory close to what the eager stage alone implies, and
+/// `member_mailbox_coalesce_limited_total` reports when the bound actually binds
+/// — that counter, not a guess, is the signal to raise it.
+const DEFAULT_MAX_BACKPRESSURE_ROWS_PER_ENVELOPE: usize = 2_048;
 
 /// Ceiling on the estimated Arrow bytes one member's mailbox may hold across
 /// every buffered envelope (see [`MemberMailbox::buffered_bytes`]).
 ///
-/// The per-envelope row limit alone does not bound mailbox memory: tail merging
-/// only ever targets the newest unclaimed envelope, so a member whose sink has
-/// stopped draining fills each of `max_items` envelopes to
-/// `backpressure_max_rows` in turn. At the defaults that is 1024 x 8192 rows, and
-/// for a wide high-volume table hundreds of megabytes — where one envelope per
-/// source transaction was a few megabytes. This budget keeps the win (a
-/// collapsed envelope count) while pinning worst-case buffered memory to a
-/// predictable figure, and matches the accelerator's own `max_coalesced_bytes`
-/// default so the two stages of the pipeline reserve comparable headroom.
-const DEFAULT_MAX_MAILBOX_BYTES: usize = 128 * 1024 * 1024;
+/// Two effects make an item count alone a poor memory bound. The eager hold
+/// already puts tens of transactions in each queued envelope, so `max_items`
+/// envelopes is tens of times more data than the one-transaction-per-envelope
+/// shape it was sized for; and tail folding only ever targets the newest
+/// unclaimed envelope, so a stalled sink fills each of `max_items` envelopes to
+/// the row limit in turn. This budget bounds both, and is set to the same order
+/// as the eager stage's natural footprint at measured transaction shapes rather
+/// than to the accelerator's much larger `max_coalesced_bytes`. Raise it only
+/// against evidence from `member_mailbox_coalesce_limited_total`.
+const DEFAULT_MAX_MAILBOX_BYTES: usize = 32 * 1024 * 1024;
 const MAX_MAX_MAILBOX_BYTES: usize = 8 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
@@ -280,10 +297,13 @@ struct CoalescingLimits {
 ///   through, disabling stage 1 entirely.
 /// - `SPICE_POSTGRES_CDC_MAX_ROWS_PER_ENVELOPE` (8192, max 1048576) — rows at
 ///   which a held envelope is published.
-/// - `SPICE_POSTGRES_CDC_MAX_BACKPRESSURE_ROWS_PER_ENVELOPE` (8192, max 1048576) —
+/// - `SPICE_POSTGRES_CDC_MAX_BACKPRESSURE_ROWS_PER_ENVELOPE` (2048, max 1048576) —
 ///   rows at which mailbox-tail folding seals an envelope.
-/// - `SPICE_POSTGRES_CDC_MAX_MAILBOX_BYTES` (128 MiB, max 8 GiB) — estimated Arrow
+/// - `SPICE_POSTGRES_CDC_MAX_MAILBOX_BYTES` (32 MiB, max 8 GiB) — estimated Arrow
 ///   bytes one member's mailbox may hold in total.
+///
+/// The last two are the stage-2 bounds and ship low on purpose; raise them
+/// against `..._member_mailbox_coalesce_limited_total`, not on a guess.
 static COALESCING_LIMITS: LazyLock<CoalescingLimits> = LazyLock::new(|| CoalescingLimits {
     max_envelope_age: std::time::Duration::from_millis(env_u64_in_range(
         "SPICE_POSTGRES_CDC_MAX_ENVELOPE_AGE_MS",
@@ -297,7 +317,7 @@ static COALESCING_LIMITS: LazyLock<CoalescingLimits> = LazyLock::new(|| Coalesci
     ),
     backpressure_max_rows: env_usize_in_range(
         "SPICE_POSTGRES_CDC_MAX_BACKPRESSURE_ROWS_PER_ENVELOPE",
-        DEFAULT_MAX_ROWS_PER_ENVELOPE,
+        DEFAULT_MAX_BACKPRESSURE_ROWS_PER_ENVELOPE,
         MAX_MAX_ROWS_PER_ENVELOPE,
     ),
     max_mailbox_bytes: env_usize_in_range(
@@ -776,16 +796,27 @@ struct PendingPgEnvelope {
     first_received_at: std::time::Instant,
 }
 
+/// Why a fold did not happen. The distinction matters for tuning: a `Limited`
+/// refusal means raising a configured bound would have folded this transaction,
+/// whereas `Incompatible` is a correctness boundary no bound can move.
+enum MergeOutcome {
+    Merged,
+    Limited(PendingPgEnvelope),
+    Incompatible(PendingPgEnvelope),
+}
+
 impl PendingPgEnvelope {
-    fn try_merge(&mut self, other: Self, max_rows: usize) -> Option<Self> {
-        if !Arc::ptr_eq(&self.slot, &other.slot)
-            || self
-                .rows
-                .num_rows_hint()
-                .saturating_add(other.rows.num_rows_hint())
-                > max_rows
+    fn try_merge(&mut self, other: Self, max_rows: usize) -> MergeOutcome {
+        if !Arc::ptr_eq(&self.slot, &other.slot) {
+            return MergeOutcome::Incompatible(other);
+        }
+        if self
+            .rows
+            .num_rows_hint()
+            .saturating_add(other.rows.num_rows_hint())
+            > max_rows
         {
-            return Some(other);
+            return MergeOutcome::Limited(other);
         }
 
         let Self {
@@ -796,8 +827,10 @@ impl PendingPgEnvelope {
             is_dataset_ready,
             first_received_at,
         } = other;
+        // A differing relation generation or working schema: not foldable at any
+        // limit (see `PgChangeRows::try_append`).
         if let Some(rows) = self.rows.try_append(other_rows) {
-            return Some(Self {
+            return MergeOutcome::Incompatible(Self {
                 rows,
                 slot,
                 flush_to,
@@ -814,7 +847,7 @@ impl PendingPgEnvelope {
         // within a stream, since later commits are closer to now, but taking the
         // newest keeps the flag exact rather than relying on that.)
         self.is_dataset_ready = is_dataset_ready;
-        None
+        MergeOutcome::Merged
     }
 
     fn into_envelope(self) -> ChangeEnvelope {
@@ -1005,22 +1038,36 @@ impl MemberMailboxSender {
         if self.is_closed() || self.shared.sender_closed.load(Ordering::Acquire) {
             return MailboxSendOutcome::Closed(envelope);
         }
-        if self.shared.may_merge()
-            && let Some(PendingItem::Changes(current)) = incoming.last_mut()
-        {
-            let merged_bytes = envelope.rows.encoded_len();
-            match current.try_merge(envelope, self.shared.limits.backpressure_max_rows) {
-                None => {
-                    self.shared
-                        .buffered_bytes
-                        .fetch_add(merged_bytes, Ordering::AcqRel);
-                    return MailboxSendOutcome::Merged;
+        // Whether a configured bound (not a correctness boundary) is what stopped
+        // this transaction folding into the tail. Reported so operators can tell a
+        // mailbox that is absorbing back-pressure from one that is being clipped
+        // by its own limits.
+        let mut coalesce_limited = false;
+        if let Some(PendingItem::Changes(current)) = incoming.last_mut() {
+            if self.shared.may_merge() {
+                let merged_bytes = envelope.rows.encoded_len();
+                match current.try_merge(envelope, self.shared.limits.backpressure_max_rows) {
+                    MergeOutcome::Merged => {
+                        self.shared
+                            .buffered_bytes
+                            .fetch_add(merged_bytes, Ordering::AcqRel);
+                        return MailboxSendOutcome::Merged;
+                    }
+                    MergeOutcome::Limited(returned) => {
+                        coalesce_limited = true;
+                        envelope = returned;
+                    }
+                    MergeOutcome::Incompatible(returned) => envelope = returned,
                 }
-                Some(returned) => envelope = returned,
+            } else {
+                // The byte budget, not the row limit, is what refused the fold.
+                coalesce_limited = true;
             }
         }
 
         if !self.shared.may_admit() {
+            // Counting the refused fold is left to the retry that finally lands,
+            // so a long stall reports it once rather than once per wakeup.
             return MailboxSendOutcome::Full(envelope);
         }
 
@@ -1035,7 +1082,7 @@ impl MemberMailboxSender {
         if wake_receiver {
             self.shared.receiver_waker.wake();
         }
-        MailboxSendOutcome::Sent
+        MailboxSendOutcome::Sent { coalesce_limited }
     }
 
     fn try_send_control(
@@ -1061,7 +1108,9 @@ impl MemberMailboxSender {
         if wake_receiver {
             self.shared.receiver_waker.wake();
         }
-        MailboxSendOutcome::Sent
+        MailboxSendOutcome::Sent {
+            coalesce_limited: false,
+        }
     }
 
     async fn send_control(
@@ -1072,7 +1121,7 @@ impl MemberMailboxSender {
             let notified = self.shared.capacity_notify.notified();
             match self.try_send_control(item) {
                 // Control items never merge — `try_send_control` only appends.
-                MailboxSendOutcome::Sent | MailboxSendOutcome::Merged => return None,
+                MailboxSendOutcome::Sent { .. } | MailboxSendOutcome::Merged => return None,
                 MailboxSendOutcome::Closed(returned) => return Some(returned),
                 MailboxSendOutcome::Full(returned) => {
                     item = returned;
@@ -1090,8 +1139,12 @@ impl Drop for MemberMailboxSender {
 }
 
 enum MailboxSendOutcome<T> {
-    /// Appended as a new item.
-    Sent,
+    /// Appended as a new item. `coalesce_limited` marks that a configured bound —
+    /// not a correctness boundary — is what kept it from folding into the tail,
+    /// which is the signal that raising that bound would coalesce more.
+    Sent {
+        coalesce_limited: bool,
+    },
     /// Folded into the unclaimed tail without consuming an item slot.
     Merged,
     Full(T),
@@ -1102,7 +1155,7 @@ enum MailboxSendOutcome<T> {
 impl<T> MailboxSendOutcome<T> {
     /// Whether the item reached the mailbox, however it got there.
     fn is_delivered(&self) -> bool {
-        matches!(self, Self::Sent | Self::Merged)
+        matches!(self, Self::Sent { .. } | Self::Merged)
     }
 }
 
@@ -2210,8 +2263,11 @@ async fn run_pump(source: Arc<SharedSource>) {
                                         envelope,
                                     } = held;
                                     let published = match held_member.sender.try_publish(envelope) {
-                                        MailboxSendOutcome::Sent => {
+                                        MailboxSendOutcome::Sent { coalesce_limited } => {
                                             held_member.metrics.inc_envelope_delivered();
+                                            if coalesce_limited {
+                                                held_member.metrics.inc_mailbox_coalesce_limited();
+                                            }
                                             true
                                         }
                                         MailboxSendOutcome::Merged => {
@@ -2616,11 +2672,16 @@ async fn deliver_to_member(
     loop {
         let notified = sender.shared.capacity_notify.notified();
         match sender.try_publish(pending) {
-            outcome @ (MailboxSendOutcome::Sent | MailboxSendOutcome::Merged) => {
-                if matches!(outcome, MailboxSendOutcome::Merged) {
-                    metrics.inc_envelope_merged_mailbox();
-                } else {
-                    metrics.inc_envelope_delivered();
+            MailboxSendOutcome::Merged => {
+                metrics.inc_envelope_merged_mailbox();
+                let w = waited(send_start);
+                metrics.add_member_send_wait_micros(w);
+                return SendOutcome::Sent(w);
+            }
+            MailboxSendOutcome::Sent { coalesce_limited } => {
+                metrics.inc_envelope_delivered();
+                if coalesce_limited {
+                    metrics.inc_mailbox_coalesce_limited();
                 }
                 let w = waited(send_start);
                 metrics.add_member_send_wait_micros(w);
@@ -2722,10 +2783,13 @@ async fn push_eager_envelope(
             .envelope
             .try_merge(next_envelope, limits.eager_max_rows)
     } else {
-        Some(next_envelope)
+        MergeOutcome::Incompatible(next_envelope)
     };
+    // Either refusal seals the hold and starts a new one. `Limited` is normal
+    // operation here (a full envelope is exactly what we want to publish), so
+    // unlike the mailbox it is not a tuning signal.
     let unmerged = match merge_result {
-        None => {
+        MergeOutcome::Merged => {
             current.member.metrics.inc_envelope_merged_eager();
             // Keep holding unless the fold filled the envelope. The deadline is
             // unchanged either way — merging never extends it.
@@ -2734,13 +2798,12 @@ async fn push_eager_envelope(
             }
             None
         }
-        // Unmergeable (row limit, a new relation generation / working schema, or
-        // a replaced member handle): seal the hold and start a new one from
-        // `next`.
-        Some(returned) => Some(EagerPendingEnvelope {
-            member: next_member,
-            envelope: returned,
-        }),
+        MergeOutcome::Limited(returned) | MergeOutcome::Incompatible(returned) => {
+            Some(EagerPendingEnvelope {
+                member: next_member,
+                envelope: returned,
+            })
+        }
     };
 
     let Some(sealed) = hold.pending.remove(member_key) else {
@@ -3317,7 +3380,9 @@ mod tests {
 
         assert!(matches!(
             tx.try_publish(pending_change(&slot, 10, 100, false)),
-            MailboxSendOutcome::Sent
+            MailboxSendOutcome::Sent {
+                coalesce_limited: false
+            }
         ));
         assert!(
             matches!(
@@ -3656,6 +3721,71 @@ mod tests {
         assert_eq!(
             tx.shared.buffered_bytes.load(Ordering::Acquire),
             PENDING_CHANGE_BYTES
+        );
+    }
+
+    /// The row limit refusing a fold is a tuning signal: raising it would have
+    /// coalesced more.
+    #[test]
+    fn row_limit_refusal_is_reported_as_coalesce_limited() {
+        let (tx, _rx) = member_mailbox_with_limits(4, test_limits(8, 1));
+        let slot = Arc::new(AckSlot::new(0, false));
+        assert!(matches!(
+            tx.try_publish(pending_change(&slot, 10, 100, false)),
+            MailboxSendOutcome::Sent {
+                coalesce_limited: false
+            }
+        ));
+        assert!(
+            matches!(
+                tx.try_publish(pending_change(&slot, 20, 200, false)),
+                MailboxSendOutcome::Sent {
+                    coalesce_limited: true
+                }
+            ),
+            "a fold refused by the row limit should be flagged for tuning"
+        );
+    }
+
+    /// Same for the byte budget — with item slots to spare, so it is the budget
+    /// and not capacity doing the refusing.
+    #[test]
+    fn byte_budget_refusal_is_reported_as_coalesce_limited() {
+        let mut limits = test_limits(1024, 1024);
+        limits.max_mailbox_bytes = PENDING_CHANGE_BYTES;
+        let (tx, _rx) = member_mailbox_with_limits(8, limits);
+        let slot = Arc::new(AckSlot::new(0, false));
+        assert!(
+            tx.try_publish(pending_change(&slot, 10, 100, false))
+                .is_delivered()
+        );
+        assert!(matches!(
+            tx.try_publish(pending_change(&slot, 20, 200, false)),
+            MailboxSendOutcome::Full(_)
+        ));
+    }
+
+    /// A fold refused because the envelopes are not foldable at all must NOT be
+    /// reported as limit-bound — no configured bound would change it, and
+    /// counting it would send operators tuning knobs that cannot help.
+    #[test]
+    fn incompatible_refusal_is_not_reported_as_coalesce_limited() {
+        // Generous limits, so only compatibility can refuse the fold.
+        let (tx, _rx) = member_mailbox_with_limits(4, test_limits(1024, 1024));
+        let first_slot = Arc::new(AckSlot::new(0, false));
+        let other_slot = Arc::new(AckSlot::new(0, false));
+        assert!(
+            tx.try_publish(pending_change(&first_slot, 10, 100, false))
+                .is_delivered()
+        );
+        assert!(
+            matches!(
+                tx.try_publish(pending_change(&other_slot, 20, 200, false)),
+                MailboxSendOutcome::Sent {
+                    coalesce_limited: false
+                }
+            ),
+            "a different ack slot is a correctness boundary, not a tuning signal"
         );
     }
 

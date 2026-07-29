@@ -481,6 +481,20 @@ const METRICS: &[MetricSpec] = &[
          slot.",
     )
     .auto_register(),
+    MetricSpec::new(
+        "replication_member_mailbox_coalesce_limited_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description(
+        "Times a committed transaction could not be folded into this dataset's unclaimed \
+         delivery-mailbox tail because a configured bound refused it, rather than because the \
+         changes were not foldable. The mailbox bounds ship deliberately low, since mailbox \
+         folding absorbs back-pressure rather than adding throughput. A value that stays at 0 \
+         means the bounds never bind and there is nothing to tune; a rising value alongside a \
+         rising member_envelope_mailbox_merges_total is the evidence that raising them would \
+         absorb more. Only reported for datasets on a shared (explicitly-named) slot.",
+    )
+    .auto_register(),
 ];
 
 #[derive(Debug, Clone)]
@@ -652,6 +666,11 @@ impl MetricsProvider for PostgresMetricsProvider {
             "replication_member_envelope_mailbox_merges_total" => {
                 Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
                     instrument.observe(m.member_envelope_mailbox_merges_total(), &attributes);
+                })))
+            }
+            "replication_member_mailbox_coalesce_limited_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.member_mailbox_coalesce_limited_total(), &attributes);
                 })))
             }
             _ => None,
