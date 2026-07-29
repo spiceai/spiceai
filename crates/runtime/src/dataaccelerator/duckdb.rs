@@ -615,7 +615,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("on_refresh_recompute_statistics"),
     ParameterSpec::runtime("on_refresh_sort_columns"),
     ParameterSpec::runtime("on_full_refresh").description(
-        "How a full refresh writes into a file-mode DuckDB acceleration: 'reuse_file' (default) keeps writing into the current database file; 'replace_file' writes a new database file, checkpoints it, and atomically replaces the live file with it, bounding database file growth.",
+        "How a full refresh writes into a file-mode DuckDB acceleration: 'reuse_file' (default) keeps writing into the current database file; 'replace_file' writes a new database file, checkpoints it, and atomically replaces the live file with it, bounding database file growth; 'checkpoint_file' keeps the current file but checkpoints it after each refresh commit, returning dropped table generations to the free list.",
     ),
     ParameterSpec::runtime("optimizer_duckdb_aggregate_pushdown"),
 ];
@@ -776,7 +776,7 @@ impl DataAccelerator for DuckDBAccelerator {
             source.map_or_else(|| cmd.name.to_string(), |src| src.name().to_string());
         match cmd.options.remove("on_full_refresh").as_deref() {
             None | Some("reuse_file") => {}
-            Some("replace_file") => {
+            Some(behavior @ ("replace_file" | "checkpoint_file")) => {
                 let is_file_mode = source.map_or_else(
                     // Without an `AccelerationSource` the mode is only available
                     // as the raw option string that `Mode`'s `Display` wrote.
@@ -791,21 +791,28 @@ impl DataAccelerator for DuckDBAccelerator {
                     is_file_mode,
                     super::InvalidConfigurationSnafu {
                         msg: format!(
-                            "Failed to register dataset {dataset_display_name} (duckdb accelerator): 'on_full_refresh: replace_file' requires file-mode acceleration. Set 'mode: file' or remove 'on_full_refresh'. See: {DUCKDB_ACCELERATOR_DOCS}"
+                            "Failed to register dataset {dataset_display_name} (duckdb accelerator): 'on_full_refresh: {behavior}' requires file-mode acceleration. Set 'mode: file' or remove 'on_full_refresh'. See: {DUCKDB_ACCELERATOR_DOCS}"
                         ),
                     }
                 );
-                if let Some(src) = source {
-                    self.validate_replace_file_peers(src, &dataset_display_name)?;
+                if behavior == "replace_file" {
+                    if let Some(src) = source {
+                        self.validate_replace_file_peers(src, &dataset_display_name)?;
+                    }
+                    // Translate to the engine write setting that switches Overwrite
+                    // loads to the database-file-swap path.
+                    cmd.options
+                        .insert("overwrite_file_swap".to_string(), "enabled".to_string());
+                } else {
+                    // Translate to the engine write setting that checkpoints the
+                    // database after Overwrite loads commit.
+                    cmd.options
+                        .insert("checkpoint_on_write".to_string(), "enabled".to_string());
                 }
-                // Translate to the engine write setting that switches Overwrite
-                // loads to the database-file-swap path.
-                cmd.options
-                    .insert("overwrite_file_swap".to_string(), "enabled".to_string());
             }
             Some(other) => super::InvalidConfigurationSnafu {
                 msg: format!(
-                    "Failed to register dataset {dataset_display_name} (duckdb accelerator): Invalid 'on_full_refresh' value '{other}'. Expected 'reuse_file' or 'replace_file'. See: {DUCKDB_ACCELERATOR_DOCS}"
+                    "Failed to register dataset {dataset_display_name} (duckdb accelerator): Invalid 'on_full_refresh' value '{other}'. Expected 'reuse_file', 'replace_file', or 'checkpoint_file'. See: {DUCKDB_ACCELERATOR_DOCS}"
                 ),
             }
             .fail()?,
@@ -1956,6 +1963,7 @@ mod tests {
         physical_plan::collect,
         scalar::ScalarValue,
     };
+    use datafusion_table_providers::duckdb::write::DuckDBTableWriter;
     use datafusion_table_providers::util::test::MockExec;
 
     use crate::component::dataset::acceleration::Acceleration;
@@ -2045,6 +2053,7 @@ mod tests {
             .await
             .expect("provider should be created");
         assert!(!settings.overwrite_file_swap);
+        assert!(!settings.checkpoint_on_write);
     }
 
     #[tokio::test]
@@ -2116,6 +2125,40 @@ mod tests {
             !external_table
                 .options
                 .contains_key("recompute_statistics_on_write")
+        );
+    }
+
+    #[tokio::test]
+    async fn duckdb_on_full_refresh_checkpoint_file_enables_checkpoint_on_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir
+            .path()
+            .join("checkpoint_param.db")
+            .to_string_lossy()
+            .to_string();
+        let mut options = HashMap::new();
+        options.insert("mode".to_string(), "file".to_string());
+        options.insert("open".to_string(), db);
+        options.insert("on_full_refresh".to_string(), "checkpoint_file".to_string());
+
+        let settings = create_provider_write_settings(options)
+            .await
+            .expect("provider should be created");
+        assert!(settings.checkpoint_on_write);
+    }
+
+    #[tokio::test]
+    async fn duckdb_on_full_refresh_checkpoint_file_rejected_for_memory_mode() {
+        let mut options = HashMap::new();
+        options.insert("mode".to_string(), "memory".to_string());
+        options.insert("on_full_refresh".to_string(), "checkpoint_file".to_string());
+
+        let err = create_provider_write_settings(options)
+            .await
+            .expect_err("memory mode must reject checkpoint_file");
+        assert!(
+            err.to_string().contains("requires file-mode"),
+            "unexpected error: {err}"
         );
     }
 
