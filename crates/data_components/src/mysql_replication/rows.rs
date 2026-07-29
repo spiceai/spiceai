@@ -48,7 +48,7 @@ use crate::cdc::{ChangeBatch, changes_schema};
 
 /// One logical change decoded from the binlog (or synthesized by the
 /// snapshot/truncate paths).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DecodedChange {
     pub op: ChangeOp,
     /// Full row image in source column order ([`super::setup::TableLayout`]
