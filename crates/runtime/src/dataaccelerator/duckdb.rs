@@ -1968,7 +1968,6 @@ mod tests {
         physical_plan::collect,
         scalar::ScalarValue,
     };
-    use datafusion_table_providers::duckdb::write::DuckDBTableWriter;
     use datafusion_table_providers::util::test::MockExec;
 
     use crate::component::dataset::acceleration::Acceleration;
