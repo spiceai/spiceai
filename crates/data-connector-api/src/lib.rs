@@ -45,6 +45,12 @@ impl From<&Arc<DatasetSpec>> for ConnectorComponent {
     }
 }
 
+impl From<&Arc<CatalogSpec>> for ConnectorComponent {
+    fn from(catalog: &Arc<CatalogSpec>) -> Self {
+        ConnectorComponent::Catalog(Arc::clone(catalog))
+    }
+}
+
 impl std::fmt::Display for ConnectorComponent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
