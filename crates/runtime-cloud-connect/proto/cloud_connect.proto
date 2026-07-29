@@ -171,15 +171,14 @@ message ControlMessage {
     ApplySecrets apply_secrets = 14;
     DeleteSecrets delete_secrets = 15;
     QueryMetrics query_metrics = 16;
-    ProxyRuntimeRequest proxy_runtime_request = 17;
   }
 
   // Correlates the eventual `CommandResult`. Empty for an unsolicited
   // message that expects no reply.
-  string command_id = 18;
+  string command_id = 17;
   // The workload the command addresses, for the commands that address one.
   // Absent for a standalone instance, which is the workload.
-  WorkloadRef target = 19;
+  WorkloadRef target = 18;
 }
 
 // Addresses a workload inside a cluster instance. `kind` is a Kubernetes
@@ -248,21 +247,12 @@ message CommandResult {
     // Opaque bytes — Arrow IPC stream bytes for a tabular result, for
     // example, decoded natively rather than flattened to JSON.
     bytes binary = 3;
-    // A proxied HTTP response (ProxyRuntimeRequest).
-    HttpResponse http = 4;
   }
 
-  string command_id = 5;
-  ResultCode code = 6;
+  string command_id = 4;
+  ResultCode code = 5;
   // Human-readable detail. Explains a non-OK `code`; usually empty on OK.
-  string message = 7;
-}
-
-message HttpResponse {
-  uint32 status = 1;
-  string content_type = 2;
-  bytes body = 3;
-  map<string, string> headers = 4;
+  string message = 6;
 }
 
 // Windowed numeric metrics: the open channel for everything outside the fixed
@@ -434,19 +424,4 @@ message QueryMetrics {
   google.protobuf.Timestamp start = 2;
   google.protobuf.Timestamp end = 3;
   string step = 4;
-}
-
-// Operator-only (reserved). ProxyRuntimeRequest forwards an HTTP request to a
-// ready spiced pod of the workload named by `ControlMessage.target` and
-// returns the response in CommandResult.payload.http, so the control plane
-// can serve a runtime's HTTP API (for example the async /v1/queries
-// submit/status/results flow) for instances whose pods it cannot reach
-// directly. A standalone spiced serves its own HTTP API, so it has no reason
-// to proxy to itself.
-message ProxyRuntimeRequest {
-  string method = 1;               // GET or POST
-  string path = 2;                 // request path incl. leading slash
-  string query = 3;                // raw query string (no leading '?')
-  bytes body = 4;
-  map<string, string> headers = 5; // forwarded request headers
 }

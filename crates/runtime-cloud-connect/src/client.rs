@@ -789,8 +789,7 @@ impl ClientDriver {
             | proto::control_message::Body::Pause(_)
             | proto::control_message::Body::ApplySecrets(_)
             | proto::control_message::Body::DeleteSecrets(_)
-            | proto::control_message::Body::QueryMetrics(_)
-            | proto::control_message::Body::ProxyRuntimeRequest(_) => {
+            | proto::control_message::Body::QueryMetrics(_) => {
                 send_unsupported(
                     tx,
                     &command_id,
@@ -1135,7 +1134,6 @@ fn command_name(body: &proto::control_message::Body) -> &'static str {
         Body::DeleteSecrets(_) => "DeleteSecrets",
         Body::QueryMetrics(_) => "QueryMetrics",
         Body::GetLogs(_) => "GetLogs",
-        Body::ProxyRuntimeRequest(_) => "ProxyRuntimeRequest",
     }
 }
 
