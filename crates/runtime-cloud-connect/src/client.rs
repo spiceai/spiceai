@@ -683,84 +683,6 @@ impl ClientDriver {
                 let info = self.runtime.runtime_info_json().await;
                 send_result(tx, &cmd.command_id, true, "", info).await;
             }
-            proto::control_message::Body::RunQuery(cmd) => {
-                let sql_hash = sql_hash(&cmd.sql);
-                tracing::info!(
-                    target: "cloud_connect_audit",
-                    command_id = %cmd.command_id,
-                    max_rows = cmd.max_rows,
-                    sql_len = cmd.sql.len(),
-                    sql_hash = %sql_hash,
-                    "RunQuery command received from cloud control plane"
-                );
-                let identifier = live_identifier.read().await.clone();
-                let started = std::time::Instant::now();
-                // Race the query against shutdown so a slow cloud-originated
-                // query can't hold the driver task until the shutdown timeout
-                // — abandon it and exit promptly if shutdown fires mid-query.
-                let exec_outcome = tokio::select! {
-                    r = self.runtime.execute_sql(&cmd.sql, cmd.max_rows) => r,
-                    () = self.shutdown.wait() => {
-                        tracing::info!(
-                            command_id = %cmd.command_id,
-                            "Cloud Connect: shutdown during RunQuery; abandoning command"
-                        );
-                        return Some(ExitReason::Shutdown);
-                    }
-                };
-                match exec_outcome {
-                    Ok(result) => {
-                        let duration_ms =
-                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                        emit_run_query_audit(
-                            tx,
-                            &identifier,
-                            &RunQueryAudit {
-                                command_id: &cmd.command_id,
-                                sql_hash: &sql_hash,
-                                row_count: result.row_count,
-                                truncated: result.truncated,
-                                duration_ms,
-                                success: true,
-                            },
-                        )
-                        .await;
-                        // Tabular data rides as native Arrow IPC; payload_json
-                        // carries only the row-count / truncation metadata.
-                        let meta = serde_json::json!({
-                            "row_count": result.row_count,
-                            "truncated": result.truncated,
-                        });
-                        send_query_result(tx, &cmd.command_id, result.arrow_ipc, meta).await;
-                    }
-                    Err(err) => {
-                        let duration_ms =
-                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                        emit_run_query_audit(
-                            tx,
-                            &identifier,
-                            &RunQueryAudit {
-                                command_id: &cmd.command_id,
-                                sql_hash: &sql_hash,
-                                row_count: 0,
-                                truncated: false,
-                                duration_ms,
-                                success: false,
-                            },
-                        )
-                        .await;
-                        // Safe error: never includes the SQL text.
-                        send_result(
-                            tx,
-                            &cmd.command_id,
-                            false,
-                            &sanitize_error(&err, &cmd.sql),
-                            serde_json::Value::Null,
-                        )
-                        .await;
-                    }
-                }
-            }
             proto::control_message::Body::Restart(cmd) => {
                 let r = self.runtime.restart(cmd.graceful).await;
                 reply_with(tx, &cmd.command_id, r).await;
@@ -820,6 +742,23 @@ impl ClientDriver {
             }
             proto::control_message::Body::Pause(cmd) => {
                 send_unsupported(tx, &cmd.command_id, "Pause").await;
+            }
+            // Sealed secrets are delivered to an instance that enrolled an
+            // encryption key and announced a per-connection one; a standalone
+            // runtime does neither yet, so it has no key to open either seal
+            // with. Reporting that is the fail-closed answer — the alternative
+            // is a dispatch the control plane never hears back about.
+            proto::control_message::Body::ApplySecrets(cmd) => {
+                send_unsupported(tx, &cmd.command_id, "ApplySecrets").await;
+            }
+            proto::control_message::Body::DeleteSecrets(cmd) => {
+                send_unsupported(tx, &cmd.command_id, "DeleteSecrets").await;
+            }
+            proto::control_message::Body::QueryMetrics(cmd) => {
+                send_unsupported(tx, &cmd.command_id, "QueryMetrics").await;
+            }
+            proto::control_message::Body::ProxyRuntimeRequest(cmd) => {
+                send_unsupported(tx, &cmd.command_id, "ProxyRuntimeRequest").await;
             }
             proto::control_message::Body::GetPodLogs(cmd) => {
                 match self.runtime.get_pod_logs(cmd.tail_lines).await {
@@ -1178,28 +1117,6 @@ async fn send_result_text(tx: &mpsc::Sender<proto::ClientMessage>, command_id: &
     }
 }
 
-/// Send a successful tabular `CommandResult` whose data is a native Arrow IPC
-/// stream (`arrow_ipc`) with row-count / truncation metadata in `meta`.
-async fn send_query_result(
-    tx: &mpsc::Sender<proto::ClientMessage>,
-    command_id: &str,
-    arrow_ipc: Vec<u8>,
-    meta: serde_json::Value,
-) {
-    let msg = proto::ClientMessage {
-        body: Some(proto::client_message::Body::Result(proto::CommandResult {
-            command_id: command_id.to_string(),
-            success: true,
-            error: String::new(),
-            payload_json: serde_json::to_string(&meta).unwrap_or_default(),
-            result_arrow_ipc: arrow_ipc,
-        })),
-    };
-    if let Err(err) = tx.send(msg).await {
-        tracing::warn!("Cloud Connect: failed to send query CommandResult: {err}");
-    }
-}
-
 /// Forward a `Result<Value, String>` from a runtime call as a `CommandResult`.
 async fn reply_with(
     tx: &mpsc::Sender<proto::ClientMessage>,
@@ -1222,213 +1139,6 @@ async fn send_unsupported(tx: &mpsc::Sender<proto::ClientMessage>, command_id: &
         serde_json::Value::Null,
     )
     .await;
-}
-
-/// Hash a SQL string with SHA-256 so the audit log carries a stable
-/// identifier for the statement without leaking the statement itself.
-fn sql_hash(sql: &str) -> String {
-    use sha2::{Digest as _, Sha256};
-    let digest = Sha256::digest(sql.as_bytes());
-    // Hex is compact, log-friendly, and avoids any worry about base64
-    // padding showing up in structured logs.
-    let mut out = String::with_capacity(digest.len() * 2);
-    for b in digest {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{b:02x}");
-    }
-    out
-}
-
-/// Return the longest prefix of `s` no longer than `max` bytes that ends on
-/// a UTF-8 char boundary. Used to bound work on the error-redaction path.
-fn bounded_prefix(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        return s;
-    }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
-}
-
-/// Trim a runtime error string to a short, safe summary. We deliberately
-/// avoid surfacing the full `DataFusion` error message because it can
-/// echo back the SQL fragment, table contents, or row values that
-/// triggered the failure.
-///
-/// Strategy:
-/// 1. Take the first line only.
-/// 2. Strip any literal occurrences of the original `sql` (and substrings
-///    long enough to leak meaningful query content) — `DataFusion` errors
-///    sometimes include the SQL without quoting.
-/// 3. Replace any backtick-, single-quote-, or double-quote-delimited
-///    spans with a `<redacted>` placeholder — these almost always carry
-///    user data (table names, identifiers, column values).
-/// 4. Cap at 256 chars.
-fn sanitize_error(err: &str, sql: &str) -> String {
-    const MAX_LEN: usize = 256;
-    // Bound the work on the error path: inbound gRPC errors can be up to
-    // 16 MiB and a pathological one may have no newlines, so cap the slice
-    // we scan/redact. The result is truncated to MAX_LEN anyway, so a few
-    // KiB of context is far more than enough.
-    const MAX_SCAN: usize = 8 * 1024;
-    let first_line = err.lines().next().unwrap_or("query failed");
-    let first_line = bounded_prefix(first_line, MAX_SCAN);
-    let no_sql = redact_sql_occurrences(first_line, sql);
-    let redacted = redact_quoted_spans(&no_sql);
-    if redacted.len() <= MAX_LEN {
-        redacted
-    } else {
-        let mut s: String = redacted.chars().take(MAX_LEN).collect();
-        s.push('…');
-        s
-    }
-}
-
-/// Replace occurrences of the original SQL — both the full text and any
-/// substring of length >= [`MIN_SQL_FRAGMENT_LEN`] — with `<sql>` so an
-/// error that quotes the query without backticks/quotes does not leak
-/// back to the control plane.
-fn redact_sql_occurrences(input: &str, sql: &str) -> String {
-    /// Below this length a fragment is unlikely to carry meaningful user
-    /// SQL (e.g. `SELECT`, `FROM`, `WHERE`) and replacing it would mangle
-    /// every error message. Tuned empirically.
-    const MIN_SQL_FRAGMENT_LEN: usize = 16;
-
-    // Cap the SQL length the O(n²) fragment scan walks over. The input is
-    // already bounded by the caller; bounding the SQL keeps the sliding
-    // window cheap for very large queries. A prefix is enough — any leaked
-    // fragment of the query is still redacted up to this length.
-    const MAX_SQL_SCAN: usize = 4 * 1024;
-
-    let sql_trim = bounded_prefix(sql.trim(), MAX_SQL_SCAN);
-    if sql_trim.is_empty() {
-        return input.to_string();
-    }
-
-    // First pass: remove the full SQL verbatim if it appears.
-    let mut out = input.replace(sql_trim, "<sql>");
-
-    // Second pass: scan for the longest substrings of `sql_trim` that
-    // appear in the (already partially redacted) error. We only check
-    // substrings >= MIN_SQL_FRAGMENT_LEN to avoid eating common keywords.
-    if sql_trim.len() >= MIN_SQL_FRAGMENT_LEN {
-        // Slide a window over the SQL; if a window appears in `out`,
-        // replace it. Use byte indices and char boundaries to stay
-        // UTF-8-safe.
-        let bytes = sql_trim.as_bytes();
-        let mut start = 0;
-        while start + MIN_SQL_FRAGMENT_LEN <= bytes.len() {
-            // Skip indices that are not on a char boundary.
-            if !sql_trim.is_char_boundary(start) {
-                start += 1;
-                continue;
-            }
-            // Find the longest suffix starting at `start` that still
-            // appears in `out`. Greedy: try the longest first, shorten.
-            let mut end = bytes.len();
-            while end > start + MIN_SQL_FRAGMENT_LEN {
-                if !sql_trim.is_char_boundary(end) {
-                    end -= 1;
-                    continue;
-                }
-                let fragment = &sql_trim[start..end];
-                if out.contains(fragment) {
-                    out = out.replace(fragment, "<sql>");
-                    break;
-                }
-                end -= 1;
-            }
-            start += 1;
-        }
-    }
-
-    out
-}
-
-/// Walk the input and replace any text between matching backticks /
-/// single quotes / double quotes with `<redacted>`. Unterminated
-/// delimiters discard the rest of the input.
-fn redact_quoted_spans(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars();
-    while let Some(c) = chars.next() {
-        if c == '`' || c == '\'' || c == '"' {
-            // Skip until the matching delimiter or end of string.
-            let mut found_close = false;
-            for next in chars.by_ref() {
-                if next == c {
-                    found_close = true;
-                    break;
-                }
-            }
-            out.push_str("<redacted>");
-            if !found_close {
-                break;
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-/// Fields describing a single `RunQuery` invocation for the audit log.
-struct RunQueryAudit<'a> {
-    command_id: &'a str,
-    sql_hash: &'a str,
-    row_count: u64,
-    truncated: bool,
-    duration_ms: u64,
-    success: bool,
-}
-
-/// Emit a `kind: "audit"` `EventLog` describing a `RunQuery` invocation.
-async fn emit_run_query_audit(
-    tx: &mpsc::Sender<proto::ClientMessage>,
-    identifier: &str,
-    audit: &RunQueryAudit<'_>,
-) {
-    let RunQueryAudit {
-        command_id,
-        sql_hash,
-        row_count,
-        truncated,
-        duration_ms,
-        success,
-    } = *audit;
-    let event = serde_json::json!({
-        "action": "run_query",
-        "sql_hash": sql_hash,
-        "row_count": row_count,
-        "truncated": truncated,
-        "duration_ms": duration_ms,
-        "command_id": command_id,
-        "success": success,
-    });
-    let event_json = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
-    tracing::info!(
-        target: "cloud_connect_audit",
-        command_id = %command_id,
-        sql_hash = %sql_hash,
-        row_count = row_count,
-        truncated = truncated,
-        duration_ms = duration_ms,
-        success = success,
-        "RunQuery audit event"
-    );
-    let msg = proto::ClientMessage {
-        body: Some(proto::client_message::Body::Event(proto::EventLog {
-            identifier: identifier.to_string(),
-            kind: "audit".to_string(),
-            event_json,
-            timestamp_unix: crate::heartbeat::now_unix(),
-        })),
-    };
-    if let Err(err) = tx.send(msg).await {
-        tracing::warn!("Cloud Connect: failed to send audit EventLog: {err}");
-    }
 }
 
 fn humanize(d: Duration) -> String {

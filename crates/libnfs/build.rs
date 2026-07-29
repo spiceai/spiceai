@@ -55,6 +55,15 @@ fn main() {
         .allowlist_type("statvfs")
         .allowlist_type("timeval")
         .allowlist_type("AUTH")
+        // `AUTH` is forward-declared in `nfsc/libnfs.h` and only ever used behind a pointer
+        // (`nfs_set_auth`, `rpc_set_auth`); its definition lives in `nfsc/libnfs-zdr.h`, which the
+        // raw headers include transitively. Whether bindgen resolves the forward declaration to
+        // that definition varies by clang version: when it does not, it emits a one-byte
+        // placeholder struct (`_address: u8`) together with a layout assertion for the completed
+        // 64-byte type, and that assertion fails const-evaluation. Modeling the type as opaque
+        // pins it to a correctly sized blob on every platform, so the layout assertion holds
+        // and stays meaningful.
+        .opaque_type("AUTH")
         .allowlist_var("ftype3_.*");
 
     // Allow custom include path

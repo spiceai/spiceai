@@ -52,6 +52,9 @@ md5 = ["dep:md5"]
 #     received (bounds oversized-length amplification).
 #   * `ReplicationConfig::max_message_size` (src/config.rs) makes the accepted
 #     backend-message size a configurable, pre-allocation-checked bound.
+#   * `TlsConfig::ca` accepts a `CaCertificate` (src/config.rs): the trusted CA
+#     bundle may be a filesystem path or PEM content, so a CA injected as a
+#     configuration value never has to be staged on disk to be verified against.
 
 [dependencies]
 bytes = "1"
