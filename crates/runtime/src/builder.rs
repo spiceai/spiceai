@@ -1235,7 +1235,7 @@ fn duckdb_budget_inputs(
             "<in-memory>".to_string()
         } else {
             accelerator
-                .spicepod_dataset_duckdb_file_path(dataset)
+                .spicepod_duckdb_file_path(accel)
                 .unwrap_or_else(|| format!("<file:{}>", dataset.name))
         };
         let params = accel
