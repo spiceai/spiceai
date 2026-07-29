@@ -430,7 +430,7 @@ impl FullTextDatabaseIndex {
             .collect::<Result<Vec<RecordBatch>, _>>()
             .context(InvalidIndexingSnafu {
                 context:
-                    "An error occured creating the a unique column for the full text search index"
+                    "An error occurred creating the unique column for the full text search index"
                         .to_string(),
             })
     }

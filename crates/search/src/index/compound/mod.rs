@@ -219,8 +219,9 @@ async fn compound_write(
 
 /// Apply one change-data-capture batch to both indexes, forwarding the deletion mask so a tier
 /// that keeps its own copy of a row removes the rows the source deleted instead of re-indexing
-/// them as upserts. Outputs are merged as in [`compound_write`]. Both calls run concurrently
-/// and both are driven to completion even if one fails, so neither index is left mid-write.
+/// them as upserts. Outputs are merged as in [`compound_write`], and a failure names the tier it
+/// came from. Both calls run concurrently and both are driven to completion even if one fails, so
+/// neither index is left mid-write.
 async fn compound_compute_index_for_changes(
     primary: &dyn SearchIndex,
     secondary: &dyn SearchIndex,
@@ -231,8 +232,14 @@ async fn compound_compute_index_for_changes(
         primary.compute_index_for_changes(batch.clone(), deleted),
         secondary.compute_index_for_changes(batch, deleted)
     );
-    let primary_out = primary_result?;
-    let secondary_out = secondary_result?;
+    let primary_out = primary_result
+        .boxed()
+        .context(PrimaryIndexWriteSnafu)
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let secondary_out = secondary_result
+        .boxed()
+        .context(SecondaryIndexWriteSnafu)
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
     merge_tier_outputs(primary_out, &secondary_out)
         .map_err(|e| DataFusionError::External(Box::new(e)))

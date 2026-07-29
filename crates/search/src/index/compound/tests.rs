@@ -485,6 +485,40 @@ async fn change_batches_forward_the_deletion_mask_to_both_tiers() {
     }
 }
 
+/// A change batch fails the same way a write does, so a CDC failure says which tier broke
+/// instead of surfacing the tier's bare error with nothing to attribute it to.
+#[tokio::test]
+async fn change_batch_error_names_the_failing_index() {
+    for (failing, other) in [("primary", "secondary"), ("secondary", "primary")] {
+        let events = Arc::new(Mutex::new(vec![]));
+        let mut primary = MockIndex::new("primary", &events);
+        let mut secondary = MockIndex::new("secondary", &events);
+        if failing == "primary" {
+            primary.fail_write = true;
+        } else {
+            secondary.fail_write = true;
+        }
+
+        let idx = compound(primary, secondary, CompoundReadMode::PrimaryOnly);
+        let err = idx
+            .compute_index_for_changes(input_batch(2), &BooleanArray::from(vec![false, true]))
+            .await
+            .expect_err("a tier failure must propagate");
+        assert!(
+            err.to_string().contains(&format!("{failing} index")),
+            "error must identify the failing side: {err}"
+        );
+        // The other tier must still have been driven to completion.
+        let events = events.lock().expect("event log mutex").clone();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.starts_with(&format!("{other}:compute_index_for_changes"))),
+            "the {other} tier must still be driven to completion, got: {events:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn write_error_names_the_failing_index() {
     let events = Arc::new(Mutex::new(vec![]));
