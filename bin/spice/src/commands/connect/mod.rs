@@ -534,10 +534,16 @@ async fn enroll_instance(
     }
 
     // Complete the HTTPS enroll right here — `spiced` is never started.
-    // The CLI and the runtime ship in lockstep, so the CLI's own version
-    // stands in for the runtime version in the reported host facts.
-    let mut config =
-        CloudConnectConfig::from_env_at(env!("CARGO_PKG_VERSION"), config_dir.to_path_buf());
+    //
+    // Report the version of the runtime that will actually run, probed from the
+    // binary itself, so the registry row never shows a version the host is not
+    // running. The CLI's own version is only a fallback for when `spiced` cannot
+    // be executed; the two agree in shipped builds, where the CLI and the
+    // runtime move in lockstep.
+    let runtime_version = ctx
+        .runtime_version()
+        .unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string());
+    let mut config = CloudConnectConfig::from_env_at(runtime_version, config_dir.to_path_buf());
     // The credential resolved above wins over any env/staged state that
     // `from_env_at` picked up.
     config.adoption_code = Some(credential.code().to_string());
@@ -669,7 +675,16 @@ fn install_service(ctx: &RuntimeContext, config_dir: &Path) -> Result<()> {
     // The unit runs from the *instance* directory, not the `.spice` config dir
     // beneath it: that directory is the spicepod root the runtime loads from.
     let instance_dir = instance_dir_for(config_dir);
-    let spiced_path = ctx.spiced_path();
+    // Resolved, not derived from `$HOME`: `sudo` rewrites `HOME` to `/root`, and
+    // the runtime the operator installed is normally under their own home.
+    let spiced_path = ctx.resolve_spiced_path().ok_or_else(|| Error::InvalidArgument {
+        message: format!(
+            "Failed to install the Spice Cloud Connect service: no Spice runtime was found at {}. \
+             Install it with `spice install` and re-run `sudo spice connect --install`. \
+             See: https://spiceai.org/docs",
+            ctx.spiced_path().display()
+        ),
+    })?;
 
     let unit = service::install(&instance_dir, &spiced_path)?;
 
@@ -677,7 +692,15 @@ fn install_service(ctx: &RuntimeContext, config_dir: &Path) -> Result<()> {
     println!("  service:   {}", unit.name);
     println!("  unit file: {}", unit.path.display());
     println!("  directory: {}", instance_dir.display());
-    println!("  runtime:   {}", spiced_path.display());
+    // Name both paths: the operator needs to know which build was installed and
+    // that the service runs a root-owned copy of it, not the original.
+    println!("  runtime:   {}", unit.runtime.display());
+    if unit.runtime != spiced_path {
+        println!("             staged from {}", spiced_path.display());
+    }
+    if let Ok(version) = ctx.runtime_version() {
+        println!("  version:   {version}");
+    }
     if let Some(state) = service::is_active(&unit.name) {
         println!("  state:     {state}");
     }

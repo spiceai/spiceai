@@ -61,6 +61,12 @@ const UNIT_PREFIX: &str = "spiced-cloud-connect";
 /// what makes the name unique; the fragment only makes it legible.
 const MAX_NAME_FRAGMENT: usize = 32;
 
+/// Root-owned directory the installed service's `spiced` is staged into.
+const RUNTIME_STAGE_DIR: &str = "/usr/local/lib/spice";
+
+/// Path the unit's `ExecStart` points at.
+const STAGED_RUNTIME: &str = "/usr/local/lib/spice/spiced";
+
 /// A systemd unit installed for one instance directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InstalledUnit {
@@ -70,6 +76,8 @@ pub(crate) struct InstalledUnit {
     pub(crate) path: PathBuf,
     /// The instance directory baked in as `WorkingDirectory`.
     pub(crate) working_dir: PathBuf,
+    /// The `spiced` binary the unit runs — the root-owned staged copy.
+    pub(crate) runtime: PathBuf,
 }
 
 /// Derive this instance directory's unit name.
@@ -251,21 +259,142 @@ fn is_root() -> bool {
     false
 }
 
+/// Stage `source` as the root-owned `spiced` the installed service runs.
+///
+/// The unit runs as root, so its `ExecStart` must not be a path an unprivileged
+/// user can write: the runtime is commonly installed under an operator's
+/// `~/.spice/bin`, and pointing a root service at it would let that user swap
+/// the binary and gain root. Copying into a root-owned directory (0755, and
+/// created by a root process so root-owned) severs that.
+///
+/// Copying every install also makes the documented upgrade path work: re-running
+/// `--install` restages whatever `spiced` the CLI now resolves. One host has one
+/// staged runtime, shared by every instance's unit — so a re-install in one
+/// instance directory does change the binary the others run at their next
+/// restart.
+///
+/// A debug `spiced` runs to about a gigabyte, so the copy is skipped when a
+/// sidecar stamp shows the destination was staged from exactly this source file.
+/// The stamp is required rather than comparing timestamps directly, because
+/// `fs::copy` gives the destination a fresh modified time — a
+/// same-length-and-mtime test would never match and would recopy every run,
+/// while a "destination is newer" test could skip a genuine upgrade and leave
+/// the service on the old runtime while the install output reported the new
+/// version.
+fn stage_runtime(source: &Path) -> Result<PathBuf> {
+    let dest = PathBuf::from(STAGED_RUNTIME);
+
+    std::fs::create_dir_all(RUNTIME_STAGE_DIR).map_err(|e| Error::CloudConnectIo {
+        message: format!("create {RUNTIME_STAGE_DIR}: {e}"),
+    })?;
+
+    let stamp_path = dest.with_extension("stamp");
+    let stamp = source_stamp(source);
+    if let Some(ref stamp) = stamp
+        && runtime_is_already_staged(&dest, &stamp_path, stamp)
+    {
+        return Ok(dest);
+    }
+
+    // A stale stamp must never outlive the binary it describes: drop it before
+    // copying so an interrupted stage cannot leave a stamp claiming a runtime
+    // that was never written.
+    let _ = std::fs::remove_file(&stamp_path);
+
+    // Copy to a sibling temp then rename, so a running service is never left
+    // pointing at a half-written binary (`rename` on the same filesystem is
+    // atomic, and an already-executing image keeps running from its open inode).
+    let staging = dest.with_extension("incoming");
+    let _ = std::fs::remove_file(&staging);
+    std::fs::copy(source, &staging).map_err(|e| Error::CloudConnectIo {
+        message: format!(
+            "stage the Spice runtime from {} to {}: {e}",
+            source.display(),
+            staging.display()
+        ),
+    })?;
+    set_executable(&staging)?;
+    std::fs::rename(&staging, &dest).map_err(|e| Error::CloudConnectIo {
+        message: format!(
+            "install the staged Spice runtime at {}: {e}",
+            dest.display()
+        ),
+    })?;
+
+    // Written last, so it only ever describes a runtime that is actually in
+    // place. A failure here costs one needless copy next time, nothing more.
+    if let Some(stamp) = stamp {
+        let _ = std::fs::write(&stamp_path, stamp);
+    }
+
+    Ok(dest)
+}
+
+/// Identity of the source binary: length and modified time, which together
+/// change on any rebuild. `None` when the source cannot be described, in which
+/// case the caller always restages.
+fn source_stamp(source: &Path) -> Option<String> {
+    let meta = source.metadata().ok()?;
+    let modified = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    Some(format!(
+        "{} {} {}",
+        meta.len(),
+        modified.as_nanos(),
+        source.display()
+    ))
+}
+
+/// `true` when `dest` exists and `stamp_path` records that it was staged from
+/// exactly this source. Anything else restages, so the check can only ever skip
+/// work that has already been done.
+fn runtime_is_already_staged(dest: &Path, stamp_path: &Path, stamp: &str) -> bool {
+    if !dest.is_file() {
+        return false;
+    }
+    std::fs::read_to_string(stamp_path).is_ok_and(|recorded| recorded == stamp)
+}
+
+#[cfg(unix)]
+fn set_executable(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    // 0755: root-writable, world-executable — systemd starts it as root, and the
+    // permissions are what stop anyone else replacing it.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).map_err(|e| {
+        Error::CloudConnectIo {
+            message: format!("make {} executable: {e}", path.display()),
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn set_executable(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 /// Install (or reinstall) and start the unit for `instance_dir`.
 ///
-/// Idempotent, and the in-place upgrade path: re-running rewrites the unit
-/// against the current `spiced` binary and restarts the service, leaving the
+/// Idempotent, and the in-place upgrade path: re-running restages the current
+/// `spiced` binary, rewrites the unit, and restarts the service, leaving the
 /// staged identity untouched. Returns the installed unit.
+///
+/// `spiced_path` is where the CLI found the runtime; it is copied to a
+/// root-owned location (see [`stage_runtime`]) rather than referenced in place.
 ///
 /// # Errors
 ///
-/// Returns an error when the unit cannot be written or when `systemctl` fails.
-/// Since this runs *after* the enroll, the messages say that the identity is
-/// already staged and how to resume.
+/// Returns an error when the runtime cannot be staged, the unit cannot be
+/// written, or `systemctl` fails. Since this runs *after* the enroll, the
+/// messages say that the identity is already staged and how to resume.
 pub(crate) fn install(instance_dir: &Path, spiced_path: &Path) -> Result<InstalledUnit> {
+    let staged_runtime = stage_runtime(spiced_path)?;
+
     let name = unit_name_for_dir(instance_dir);
     let path = PathBuf::from(SYSTEMD_UNIT_DIR).join(&name);
-    let unit = render_unit(instance_dir, spiced_path);
+    let unit = render_unit(instance_dir, &staged_runtime);
 
     std::fs::write(&path, unit).map_err(|e| Error::CloudConnectIo {
         message: format!(
@@ -288,6 +417,7 @@ pub(crate) fn install(instance_dir: &Path, spiced_path: &Path) -> Result<Install
         name,
         path,
         working_dir: instance_dir.to_path_buf(),
+        runtime: staged_runtime,
     })
 }
 
@@ -333,11 +463,20 @@ pub(crate) fn find_for_dir(instance_dir: &Path) -> Option<InstalledUnit> {
     if !path.is_file() {
         return None;
     }
-    let working_dir = read_working_dir(&path).unwrap_or_else(|| instance_dir.to_path_buf());
+    let unit = std::fs::read_to_string(&path).ok();
+    let working_dir = unit
+        .as_deref()
+        .and_then(parse_working_dir)
+        .unwrap_or_else(|| instance_dir.to_path_buf());
+    let runtime = unit
+        .as_deref()
+        .and_then(parse_exec_runtime)
+        .unwrap_or_else(|| PathBuf::from(STAGED_RUNTIME));
     Some(InstalledUnit {
         name,
         path,
         working_dir,
+        runtime,
     })
 }
 
@@ -365,11 +504,15 @@ pub(crate) fn discover_all() -> Vec<InstalledUnit> {
             if !path.is_file() {
                 return None;
             }
-            let working_dir = read_working_dir(&path)?;
+            let unit = std::fs::read_to_string(&path).ok()?;
+            let working_dir = parse_working_dir(&unit)?;
+            let runtime =
+                parse_exec_runtime(&unit).unwrap_or_else(|| PathBuf::from(STAGED_RUNTIME));
             Some(InstalledUnit {
                 name,
                 path,
                 working_dir,
+                runtime,
             })
         })
         .collect();
@@ -377,20 +520,29 @@ pub(crate) fn discover_all() -> Vec<InstalledUnit> {
     units
 }
 
-/// Extract `WorkingDirectory=` from a unit file's `[Service]` section.
-fn read_working_dir(path: &Path) -> Option<PathBuf> {
-    let contents = std::fs::read_to_string(path).ok()?;
-    parse_working_dir(&contents)
-}
-
 /// Parse the `WorkingDirectory=` value out of a rendered unit.
 fn parse_working_dir(unit: &str) -> Option<PathBuf> {
+    unit_directive(unit, "WorkingDirectory=").map(PathBuf::from)
+}
+
+/// Parse the binary `ExecStart=` runs out of a rendered unit, dropping its
+/// arguments. Lets `status` report which runtime an installed service is
+/// actually running, including a unit written before the runtime moved.
+fn parse_exec_runtime(unit: &str) -> Option<PathBuf> {
+    let exec = unit_directive(unit, "ExecStart=")?;
+    // systemd allows `-`/`@`/`+` prefixes on the executable; strip them so the
+    // reported path is the binary itself.
+    let exec = exec.trim_start_matches(['-', '@', '+', '!', ':']);
+    exec.split_whitespace().next().map(PathBuf::from)
+}
+
+/// The value of a `Key=` directive in a rendered unit, trimmed and non-empty.
+fn unit_directive<'a>(unit: &'a str, key: &str) -> Option<&'a str> {
     unit.lines()
         .map(str::trim)
-        .find_map(|line| line.strip_prefix("WorkingDirectory="))
+        .find_map(|line| line.strip_prefix(key))
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
 }
 
 /// The service's current state as `systemctl is-active` reports it
@@ -526,6 +678,104 @@ mod tests {
         // A rate limit would let a crash loop give up permanently.
         assert!(unit.contains("StartLimitIntervalSec=0"));
         assert!(unit.contains("WantedBy=multi-user.target"));
+    }
+
+    #[test]
+    fn rendered_unit_runs_the_root_owned_staged_runtime() {
+        // The unit runs as root, so ExecStart must be the staged root-owned copy
+        // — never the operator's `~/.spice/bin/spiced`, which they could later
+        // replace to gain root.
+        let unit = render_unit(Path::new("/opt/edge-1"), Path::new(STAGED_RUNTIME));
+        assert_eq!(
+            parse_exec_runtime(&unit),
+            Some(PathBuf::from(STAGED_RUNTIME))
+        );
+        assert!(
+            !STAGED_RUNTIME.contains("/home/"),
+            "must not be under a user home"
+        );
+    }
+
+    #[test]
+    fn parse_exec_runtime_drops_arguments_and_prefixes() {
+        assert_eq!(
+            parse_exec_runtime(
+                "[Service]\nExecStart=/usr/local/lib/spice/spiced --cloud-connect\n"
+            ),
+            Some(PathBuf::from("/usr/local/lib/spice/spiced")),
+            "the reported runtime is the binary, not the whole command line"
+        );
+        // systemd's special executable prefixes are not part of the path.
+        assert_eq!(
+            parse_exec_runtime("ExecStart=-/usr/bin/spiced --cloud-connect\n"),
+            Some(PathBuf::from("/usr/bin/spiced"))
+        );
+        assert_eq!(
+            parse_exec_runtime("[Service]\nWorkingDirectory=/opt/x\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn staging_skips_only_an_exact_restage_and_never_a_rebuild() {
+        let dir = std::env::temp_dir().join(format!("spice-stage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let source = dir.join("spiced");
+        let dest = dir.join("staged");
+        let stamp_path = dir.join("staged.stamp");
+
+        std::fs::write(&source, b"runtime-v1").expect("write source");
+        let stamp = source_stamp(&source).expect("stamp the source");
+
+        // Nothing staged yet.
+        assert!(!runtime_is_already_staged(&dest, &stamp_path, &stamp));
+
+        // Staged, but before the stamp is written: still restages, so an
+        // interrupted stage is retried rather than trusted.
+        std::fs::copy(&source, &dest).expect("copy");
+        assert!(!runtime_is_already_staged(&dest, &stamp_path, &stamp));
+
+        // Binary in place and stamped from this exact source: skip the copy.
+        std::fs::write(&stamp_path, &stamp).expect("write stamp");
+        assert!(runtime_is_already_staged(&dest, &stamp_path, &stamp));
+
+        // A rebuild changes the stamp, so an upgrade is never skipped — the
+        // failure that would leave the service on an old runtime while the
+        // install output reported the new version.
+        std::fs::write(&source, b"runtime-v2").expect("rebuild source");
+        let rebuilt = source_stamp(&source).expect("stamp the rebuild");
+        assert_ne!(rebuilt, stamp, "a rebuild must produce a different stamp");
+        assert!(!runtime_is_already_staged(&dest, &stamp_path, &rebuilt));
+
+        // A missing binary with a leftover stamp also restages.
+        std::fs::remove_file(&dest).expect("remove staged binary");
+        assert!(!runtime_is_already_staged(&dest, &stamp_path, &stamp));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn source_stamp_distinguishes_length_and_mtime() {
+        let dir = std::env::temp_dir().join(format!("spice-stamp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let a = dir.join("a");
+        let b = dir.join("b");
+        std::fs::write(&a, b"same-length").expect("write a");
+        std::fs::write(&b, b"same-length").expect("write b");
+
+        let stamp_a = source_stamp(&a).expect("stamp a");
+        // The path is part of the stamp, so two equal-length files never
+        // masquerade as each other.
+        assert_ne!(stamp_a, source_stamp(&b).expect("stamp b"));
+        assert!(
+            stamp_a.starts_with("11 "),
+            "length leads the stamp: {stamp_a}"
+        );
+        assert_eq!(source_stamp(&dir.join("missing")), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -738,15 +738,23 @@ mod connect {
         let bin_dir = home.join(".spice").join("bin");
         fs::create_dir_all(&bin_dir).expect("create fake .spice/bin");
         let spiced = bin_dir.join("spiced");
+        // `--version` prints and exits without serving, as the real binary does,
+        // and deliberately leaves no marker: `spice connect` probes it to report
+        // the runtime version in the enroll host facts, which is not the same as
+        // starting the runtime. Any other invocation is a real start.
         fs::write(
             &spiced,
-            "#!/bin/sh\ntouch \"$(dirname \"$0\")/spiced-ran\"\nexit 0\n",
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"--version\" ]; then echo 'spiced v0.0.0-fake'; exit 0; fi\n\
+             touch \"$(dirname \"$0\")/spiced-ran\"\n\
+             exit 0\n",
         )
         .expect("write fake spiced");
         fs::set_permissions(&spiced, fs::Permissions::from_mode(0o755)).expect("chmod fake spiced");
     }
 
-    /// Marker the fake `spiced` touches when executed.
+    /// Marker the fake `spiced` touches when started (a `--version` probe does
+    /// not count — see [`install_fake_spiced`]).
     #[cfg(unix)]
     fn spiced_ran_marker(home: &std::path::Path) -> std::path::PathBuf {
         home.join(".spice").join("bin").join("spiced-ran")
@@ -1297,6 +1305,37 @@ mod connect {
         assert!(
             body["instance"].get("region").is_none(),
             "the declared region must not be nested in the probed host facts: {body}"
+        );
+    }
+
+    /// The reported runtime version is probed from the `spiced` that will
+    /// actually run, not taken from the CLI's own version. A dev CLI paired with
+    /// a released runtime would otherwise put a version on the registry row that
+    /// the instance is not running.
+    #[cfg(unix)]
+    #[test]
+    fn test_connect_reports_the_installed_runtime_version() {
+        let dir = TempDir::new().expect("create temp config dir");
+        let home = TempDir::new().expect("create temp home");
+        install_fake_spiced(home.path());
+        let (endpoint, server) = spawn_one_shot_http_capturing(200, &enroll_ok_body());
+
+        spice_cmd()
+            .env("HOME", home.path())
+            .env("SPICE_CONFIG_DIR", dir.path())
+            .arg("connect")
+            .arg("SPICE-ADOPT-AAAAA-BBBBB")
+            .arg("--endpoint")
+            .arg(&endpoint)
+            .assert()
+            .success();
+
+        let request = server.join().expect("mock captured the enroll request");
+        let body: serde_json::Value =
+            serde_json::from_str(&request).expect("enroll request body is JSON");
+        assert_eq!(
+            body["instance"]["runtime_version"], "spiced v0.0.0-fake",
+            "the host facts must carry the runtime's own version, not the CLI's: {body}"
         );
     }
 
