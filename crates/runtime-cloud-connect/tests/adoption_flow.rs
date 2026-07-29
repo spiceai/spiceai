@@ -33,9 +33,9 @@ limitations under the License.
 
 #![expect(
     clippy::unwrap_used,
+    clippy::expect_used,
     clippy::doc_markdown,
     clippy::struct_field_names,
-    clippy::items_after_statements,
     reason = "integration-test harness — readability over lint strictness"
 )]
 

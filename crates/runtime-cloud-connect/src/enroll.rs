@@ -277,7 +277,10 @@ impl EnrollClient {
             enc_pubkey_pem: &material.enc_public_key_pem,
             instance: facts,
             app_name,
-            create_app: create_app.then_some(true),
+            // `create_app` is meaningless without an app to name, so it
+            // rides only alongside `app_name` — the wire never carries the
+            // orphaned combination even if a caller sets the flag alone.
+            create_app: app_name.and(create_app.then_some(true)),
         };
         let wire: EnrollResponseWire = self.post_json(&self.enroll_url, &request).await?;
         let not_after_unix = parse_not_after(&self.enroll_url, &wire.not_after)?;
@@ -476,12 +479,14 @@ pub struct EnrollNowOutcome {
 /// so a persistence failure here is a hard error (the single-use code is
 /// already consumed at that point; the error message says so).
 ///
-/// On a credential rejection (HTTP 401: invalid/consumed code) the staged
-/// pending-code file is removed so a later `spiced` start does not retry a
-/// dead code. Other authoritative 4xx rejections (app-attachment
-/// validation) keep the file — the cloud checks attachment BEFORE
-/// consuming the code, so a corrected retry can still redeem it. On
-/// transient failures (transport, 5xx) the staged file is likewise kept.
+/// The staged pending-code file is removed exactly when the code is spent:
+/// on a successful enroll, on a credential rejection (HTTP 401:
+/// invalid/consumed code), and on a persistence failure (the cloud consumed
+/// the code to issue the identity that could not be written) — so a later
+/// `spiced` start never retries a dead code. It is kept when the code
+/// survives: other authoritative 4xx rejections (app-attachment validation,
+/// which the cloud checks BEFORE consuming the code) and transient failures
+/// (transport, 5xx), so a corrected or retried request can still redeem it.
 ///
 /// # Errors
 ///
@@ -504,6 +509,13 @@ pub async fn enroll_now(config: &CloudConnectConfig) -> Result<EnrollNowOutcome,
         }
     };
 
+    // The enroll succeeded, so the cloud has consumed the code: the staged
+    // copy is spent regardless of whether the identity below persists.
+    // Discard it here so a persistence failure can't leave a dead code that
+    // `status` reports as redeemable and a later `spiced` start re-presents
+    // for a 401.
+    discard_pending_code_file(config);
+
     // spawn_blocking: identity persistence is file I/O with fsync inside an
     // async context.
     let path = config.identity_path.clone();
@@ -522,7 +534,6 @@ pub async fn enroll_now(config: &CloudConnectConfig) -> Result<EnrollNowOutcome,
         path: config.identity_path.clone(),
     })?;
 
-    discard_pending_code_file(config);
     Ok(EnrollNowOutcome { identity, app_name })
 }
 

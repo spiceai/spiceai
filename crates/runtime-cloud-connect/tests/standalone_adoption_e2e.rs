@@ -59,9 +59,6 @@ limitations under the License.
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::doc_markdown,
-    clippy::struct_field_names,
-    clippy::items_after_statements,
-    clippy::too_many_lines,
     reason = "integration-test harness — readability over lint strictness"
 )]
 
@@ -851,7 +848,7 @@ async fn one_shot_enroll_then_separate_run_connects_with_stored_identity() {
         None,
         Duration::from_hours(12),
     );
-    let (runtime, _rt_state) = E2eRuntime::new(0);
+    let (runtime, _rt_state) = E2eRuntime::new();
     let handle = runtime_cloud_connect::CloudConnect::start(run_config, runtime)
         .await
         .expect("start")
@@ -943,6 +940,90 @@ async fn one_shot_enroll_carries_app_attachment() {
     assert_eq!(requests.len(), 1, "exactly one enroll request");
     assert_eq!(requests[0]["app_name"], "e2e-app");
     assert_eq!(requests[0]["create_app"], true);
+}
+
+/// `create_app` is meaningless without an app to name, so it must never
+/// reach the wire alone — an invalid enroll request. Reachable by setting
+/// `SPICE_CONNECT_ADOPT_CREATE` with no `SPICE_CONNECT_ADOPT_APP_NAME`
+/// (the `--create` flag pair is guarded by clap, the env pair is not).
+#[tokio::test]
+async fn one_shot_enroll_omits_create_app_without_app_name() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+
+    let mut config = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        Some(ADOPTION_CODE.to_string()),
+        Duration::from_hours(12),
+    );
+    config.adopt_app_name = None;
+    config.adopt_create_app = true;
+
+    let outcome = runtime_cloud_connect::enroll::enroll_now(&config)
+        .await
+        .expect("enroll succeeds unattached");
+    assert_eq!(outcome.app_name, None, "nothing was attached");
+
+    let requests = harness.cloud.enroll_requests.lock().await.clone();
+    assert_eq!(requests.len(), 1, "exactly one enroll request");
+    assert!(
+        requests[0].get("app_name").is_none(),
+        "no app name was configured"
+    );
+    assert!(
+        requests[0].get("create_app").is_none(),
+        "create_app must not ride without app_name"
+    );
+}
+
+/// A persistence failure lands *after* the cloud consumed the code to issue
+/// the identity, so the staged copy is spent: it must be discarded, not left
+/// for `status` to report as redeemable and a later `spiced` start to
+/// re-present for a 401.
+#[tokio::test]
+async fn one_shot_enroll_discards_staged_code_when_identity_cannot_persist() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+    let pending_path = dir.path().join("pending-adopt-code");
+    std::fs::write(&pending_path, ADOPTION_CODE).unwrap();
+
+    // The identity's parent is a regular file, so the directory for it
+    // cannot be created and the issued identity cannot be written.
+    let blocker = dir.path().join("blocker");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+
+    let mut config = harness.config(
+        blocker.join("identity.json"),
+        dir.path().to_path_buf(),
+        Some(ADOPTION_CODE.to_string()),
+        Duration::from_hours(12),
+    );
+    config.pending_adopt_code_path = Some(pending_path.clone());
+
+    let err = runtime_cloud_connect::enroll::enroll_now(&config)
+        .await
+        .expect_err("an unwritable identity path must fail the enroll");
+    assert!(
+        matches!(
+            err,
+            runtime_cloud_connect::enroll::EnrollNowError::Persist { .. }
+        ),
+        "expected a persistence failure, got: {err}"
+    );
+    assert!(
+        !err.is_authoritative_rejection(),
+        "a local persistence failure is not a cloud rejection"
+    );
+    assert!(
+        !pending_path.exists(),
+        "the code was consumed to issue the identity, so it must not stay staged"
+    );
+    assert_eq!(
+        harness.cloud.enroll_requests.lock().await.len(),
+        1,
+        "the code was presented exactly once"
+    );
 }
 
 #[tokio::test]

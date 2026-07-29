@@ -297,8 +297,18 @@ impl CloudConnectConfig {
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
-        let adopt_create_app = std::env::var(ADOPT_CREATE_APP_ENV)
+        let mut adopt_create_app = std::env::var(ADOPT_CREATE_APP_ENV)
             .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1"));
+        // "Create the app" needs an app to name. The `--create` flag is
+        // guarded by clap (`requires = "app_name"`); the env pair has no
+        // such guard, so enforce it here rather than sending a request the
+        // cloud would reject.
+        if adopt_create_app && adopt_app_name.is_none() {
+            tracing::warn!(
+                "{ADOPT_CREATE_APP_ENV} is set but {ADOPT_APP_NAME_ENV} is empty; ignoring it. Set {ADOPT_APP_NAME_ENV} to the app to attach this instance to, or attach it in the Spice Cloud portal after enrolling. See: https://spiceai.org/docs"
+            );
+            adopt_create_app = false;
+        }
 
         Self {
             enroll_endpoint,
@@ -436,6 +446,34 @@ mod tests {
             std::env::remove_var(ADOPT_CODE_ENV_DEPRECATED);
         }
         assert_eq!(adoption_code_from_env(), None);
+    }
+
+    #[test]
+    fn from_env_ignores_create_app_without_an_app_name() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        // SAFETY: tests gate env-var mutations behind a mutex.
+        unsafe {
+            std::env::remove_var(ADOPT_APP_NAME_ENV);
+            std::env::set_var(ADOPT_CREATE_APP_ENV, "true");
+        }
+        let config = CloudConnectConfig::from_env("v0.0.0-test");
+        assert!(
+            !config.adopt_create_app,
+            "creating an app needs an app to name"
+        );
+
+        // With a name it takes effect.
+        unsafe {
+            std::env::set_var(ADOPT_APP_NAME_ENV, "edge-fleet");
+        }
+        let config = CloudConnectConfig::from_env("v0.0.0-test");
+        assert_eq!(config.adopt_app_name.as_deref(), Some("edge-fleet"));
+        assert!(config.adopt_create_app);
+
+        unsafe {
+            std::env::remove_var(ADOPT_APP_NAME_ENV);
+            std::env::remove_var(ADOPT_CREATE_APP_ENV);
+        }
     }
 
     #[test]
