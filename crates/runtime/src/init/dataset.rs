@@ -1395,7 +1395,7 @@ impl Runtime {
                 .await
                 .context(UnableToAttachDataConnectorSnafu {
                     data_connector: source.clone(),
-                    connector_component: ConnectorComponent::from(&ds),
+                    connector_component: ConnectorComponent::from(ds.as_ref()),
                 })?;
 
             self.status
@@ -1486,7 +1486,7 @@ impl Runtime {
             .await
             .context(UnableToAttachDataConnectorSnafu {
                 data_connector: source.clone(),
-                connector_component: ConnectorComponent::from(&ds),
+                connector_component: ConnectorComponent::from(ds.as_ref()),
             })?;
 
         if notifier.is_some() {
