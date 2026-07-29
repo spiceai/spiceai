@@ -76,7 +76,7 @@ pub fn configure_endpoint_for_high_throughput(endpoint: Endpoint) -> Endpoint {
         .initial_connection_window_size(HTTP2_INITIAL_CONNECTION_WINDOW_SIZE)
         .http2_keep_alive_interval(HTTP2_KEEP_ALIVE_INTERVAL)
         .keep_alive_timeout(HTTP2_KEEP_ALIVE_TIMEOUT)
-        .keep_alive_while_idle(true);
+        .keep_alive_while_idle(true)
 }
 
 #[derive(Debug)]
