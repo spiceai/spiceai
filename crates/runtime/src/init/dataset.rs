@@ -1265,7 +1265,7 @@ impl Runtime {
         let source = ds.source();
         let factory = dataconnector::get_connector_factory(source).await?;
 
-        let params = ConnectorParamsBuilder::new(source.into(), ds.into())
+        let params = ConnectorParamsBuilder::for_dataset(source.into(), ds)
             .build(self.secrets(), self.tokio_io_runtime())
             .await
             .ok()?;
@@ -1296,7 +1296,7 @@ impl Runtime {
     ) -> Result<Arc<dyn DataConnector>> {
         let source = ds.source();
 
-        let params = ConnectorParamsBuilder::new(source.into(), (&ds).into())
+        let params = ConnectorParamsBuilder::for_dataset(source.into(), &ds)
             .build(self.secrets(), self.tokio_io_runtime())
             .await
             .context(UnableToInitializeDataConnectorSnafu)?;

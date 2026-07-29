@@ -16,9 +16,9 @@ limitations under the License.
 
 use crate::accelerated_table::{self, AcceleratedTable};
 use crate::component::ComponentInitialization;
-use crate::component::catalog::Catalog;
-use crate::component::dataset::Dataset;
+use crate::component::catalog::{Catalog, CatalogSpec};
 use crate::component::dataset::acceleration::RefreshMode;
+use crate::component::dataset::{Dataset, DatasetSpec};
 use crate::datafusion::error::find_datafusion_root;
 use crate::federated_table::FederatedTable;
 pub use crate::parameters::ParameterSpec;
@@ -825,27 +825,38 @@ pub async fn get_data(
     Ok(record_batch_stream)
 }
 
+/// The component (dataset or catalog) a data connector is being built for,
+/// carried as its **configuration only**: connectors read a component's
+/// spicepod configuration, never the orchestrator it is attached to. Runtime
+/// capabilities a connector needs while it is built are reached through
+/// [`parameters::ConnectorContext`] instead.
 #[derive(Debug, Clone)]
 pub enum ConnectorComponent {
-    Catalog(Arc<Catalog>),
-    Dataset(Arc<Dataset>),
+    Catalog(Arc<CatalogSpec>),
+    Dataset(Arc<DatasetSpec>),
 }
 
 impl From<&Dataset> for ConnectorComponent {
     fn from(dataset: &Dataset) -> Self {
-        ConnectorComponent::Dataset(Arc::new(dataset.clone()))
+        ConnectorComponent::Dataset(Arc::new(dataset.spec.clone()))
     }
 }
 
 impl From<&Arc<Dataset>> for ConnectorComponent {
     fn from(dataset: &Arc<Dataset>) -> Self {
+        ConnectorComponent::Dataset(Arc::new(dataset.spec.clone()))
+    }
+}
+
+impl From<&Arc<DatasetSpec>> for ConnectorComponent {
+    fn from(dataset: &Arc<DatasetSpec>) -> Self {
         ConnectorComponent::Dataset(Arc::clone(dataset))
     }
 }
 
 impl From<&Catalog> for ConnectorComponent {
     fn from(catalog: &Catalog) -> Self {
-        ConnectorComponent::Catalog(Arc::new(catalog.clone()))
+        ConnectorComponent::Catalog(Arc::new(catalog.spec.clone()))
     }
 }
 
@@ -932,13 +943,10 @@ mod tests {
                 .build()
                 .expect("Failed to build dataset");
 
-        ConnectorParamsBuilder::new(
-            connector_name.into(),
-            ConnectorComponent::Dataset(Arc::new(dataset)),
-        )
-        .build(secrets, Handle::current())
-        .await
-        .expect("failed to build connector params")
+        ConnectorParamsBuilder::for_dataset(connector_name.into(), &dataset)
+            .build(secrets, Handle::current())
+            .await
+            .expect("failed to build connector params")
     }
 
     #[tokio::test]
@@ -978,13 +986,10 @@ mod tests {
             .build()
             .expect("Failed to build dataset");
 
-        let params = ConnectorParamsBuilder::new(
-            "default_factory".into(),
-            ConnectorComponent::Dataset(Arc::new(dataset.clone())),
-        )
-        .build(secrets, Handle::current())
-        .await
-        .expect("failed to build connector params");
+        let params = ConnectorParamsBuilder::for_dataset("default_factory".into(), &dataset)
+            .build(secrets, Handle::current())
+            .await
+            .expect("failed to build connector params");
 
         let factory = DefaultFactory;
         assert!(factory.static_schema(&params, &dataset).is_none());
@@ -1054,10 +1059,7 @@ mod tests {
         dataset.unsupported_type_action = Some(DatasetUnsupportedTypeAction::Ignore);
 
         let secrets = Arc::new(RwLock::new(Secrets::default()));
-        let builder = ConnectorParamsBuilder::new(
-            "test".into(),
-            ConnectorComponent::Dataset(Arc::new(dataset)),
-        );
+        let builder = ConnectorParamsBuilder::for_dataset("test".into(), &dataset);
 
         let result = builder.build(secrets, Handle::current()).await;
         assert!(result.is_ok());
