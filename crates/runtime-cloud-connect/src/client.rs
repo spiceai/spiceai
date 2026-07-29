@@ -703,7 +703,7 @@ impl ClientDriver {
             }
             proto::control_message::Body::GetRuntimeInfo(_) => {
                 let info = self.runtime.runtime_info_json().await;
-                send_ok(tx, &command_id, json_payload(&info)).await;
+                send_ok_json(tx, &command_id, &info).await;
             }
             proto::control_message::Body::Restart(cmd) => {
                 if self
@@ -900,13 +900,13 @@ impl ClientDriver {
             tracing::warn!("Cloud Connect: failed to send AdoptAck: {err}");
         }
 
-        send_ok(
+        send_ok_json(
             tx,
             command_id,
-            json_payload(&serde_json::json!({
+            &serde_json::json!({
                 "status": "adopted",
                 "identifier": identity.identifier,
-            })),
+            }),
         )
         .await;
     }
@@ -955,12 +955,7 @@ impl ClientDriver {
         self.identity = None;
         live_identifier.write().await.clear();
 
-        send_ok(
-            tx,
-            command_id,
-            json_payload(&serde_json::json!({ "status": "removed" })),
-        )
-        .await;
+        send_ok_json(tx, command_id, &serde_json::json!({ "status": "removed" })).await;
         true
     }
 }
@@ -1169,16 +1164,22 @@ fn result_code(err: &CommandError) -> proto::ResultCode {
 
 /// Encode a JSON document as the `json` payload arm. A `Null` document means
 /// the command produced no payload at all, which is the absent arm.
-fn json_payload(value: &serde_json::Value) -> Option<proto::command_result::Payload> {
+///
+/// An encoding failure is an error, never an absent payload: a result the
+/// control plane reads as OK-with-no-payload is indistinguishable from a
+/// command that legitimately returned nothing, so dropping the document would
+/// silently lose the answer.
+fn json_payload(
+    value: &serde_json::Value,
+) -> Result<Option<proto::command_result::Payload>, CommandError> {
     if value.is_null() {
-        return None;
+        return Ok(None);
     }
     match serde_json::to_string(value) {
-        Ok(json) => Some(proto::command_result::Payload::Json(json)),
-        Err(err) => {
-            tracing::warn!("Cloud Connect: failed to encode a command payload as JSON: {err}");
-            None
-        }
+        Ok(json) => Ok(Some(proto::command_result::Payload::Json(json))),
+        Err(err) => Err(CommandError::internal(format!(
+            "the command succeeded but its result could not be encoded as JSON: {err}"
+        ))),
     }
 }
 
@@ -1210,6 +1211,23 @@ async fn send_ok(
     payload: Option<proto::command_result::Payload>,
 ) {
     send_result(tx, command_id, proto::ResultCode::Ok, "", payload).await;
+}
+
+/// Answer OK carrying `payload` as the JSON arm — or INTERNAL if the document
+/// cannot be encoded, so the control plane never reads an unsendable result as
+/// a success that returned nothing.
+async fn send_ok_json(
+    tx: &mpsc::Sender<proto::ClientMessage>,
+    command_id: &str,
+    payload: &serde_json::Value,
+) {
+    match json_payload(payload) {
+        Ok(arm) => send_ok(tx, command_id, arm).await,
+        Err(err) => {
+            tracing::error!("Cloud Connect: {command_id}: {err}");
+            send_command_error(tx, command_id, &err).await;
+        }
+    }
 }
 
 async fn send_command_error(
@@ -1247,7 +1265,7 @@ async fn reply_with_json(
     result: Result<serde_json::Value, CommandError>,
 ) {
     match result {
-        Ok(payload) => send_ok(tx, command_id, json_payload(&payload)).await,
+        Ok(payload) => send_ok_json(tx, command_id, &payload).await,
         Err(err) => send_command_error(tx, command_id, &err).await,
     }
 }
@@ -1361,6 +1379,29 @@ mod tests {
         let trust = server_trust("CA-BUNDLE-PEM", Some("DEV-CA-PEM"));
         assert!(trust.native_roots);
         assert_eq!(trust.extra_cas, vec!["CA-BUNDLE-PEM", "DEV-CA-PEM"]);
+    }
+
+    #[test]
+    fn json_payload_absent_only_for_a_null_document() {
+        // Null means "this command produced no payload", which is the absent
+        // arm. Anything else must produce a payload — an absent arm alongside
+        // an OK code reads to the control plane as a command that returned
+        // nothing, so it must never be how an encoding failure surfaces.
+        assert!(
+            json_payload(&serde_json::Value::Null)
+                .expect("null encodes")
+                .is_none()
+        );
+
+        let arm = json_payload(&serde_json::json!({ "status": "adopted" }))
+            .expect("object encodes")
+            .expect("a non-null document must produce a payload arm");
+        match arm {
+            proto::command_result::Payload::Json(json) => {
+                assert_eq!(json, r#"{"status":"adopted"}"#);
+            }
+            other => panic!("a JSON document must take the json arm, got {other:?}"),
+        }
     }
 
     #[test]
