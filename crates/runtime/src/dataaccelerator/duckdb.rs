@@ -268,7 +268,7 @@ impl DuckDBAccelerator {
                         | spicepod::acceleration::Mode::FileCreate
                         | spicepod::acceleration::Mode::FileUpdate
                 ) && self
-                    .spicepod_dataset_duckdb_file_path(spicepod_ds)
+                    .spicepod_duckdb_file_path(acceleration)
                     .is_some_and(|dataset_file_path| dataset_file_path == this_file_path)
                 {
                     instance_usage += 1;
@@ -330,7 +330,7 @@ impl DuckDBAccelerator {
             ) {
                 continue;
             }
-            let Some(peer_path) = self.spicepod_dataset_duckdb_file_path(peer) else {
+            let Some(peer_path) = self.spicepod_duckdb_file_path(acceleration) else {
                 continue;
             };
 
@@ -352,11 +352,16 @@ impl DuckDBAccelerator {
         Ok(())
     }
 
-    pub(crate) fn spicepod_dataset_duckdb_file_path(
+    /// The `DuckDB` file path an acceleration block resolves to, read straight from
+    /// the Spicepod rather than from an initialized component.
+    ///
+    /// Takes the acceleration block alone because the path depends only on it — the
+    /// same block on a dataset or on a view names the same file, and therefore the
+    /// same `DuckDB` instance.
+    pub(crate) fn spicepod_duckdb_file_path(
         &self,
-        dataset: &spicepod::component::dataset::Dataset,
+        acceleration: &spicepod::acceleration::Acceleration,
     ) -> Option<String> {
-        let acceleration = dataset.acceleration.as_ref()?;
         let mut params = acceleration
             .params
             .as_ref()
