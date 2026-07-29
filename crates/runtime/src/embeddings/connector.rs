@@ -30,16 +30,21 @@ use crate::embeddings::index::table::wrap_table_as_index;
 use crate::federated_table::FederatedTable;
 use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 use crate::model::EmbeddingModelStore;
+use crate::search::util::{EMBEDDING_INNER, FEDERATED_ADAPTOR_INNER, METADATA_ENRICHED_INNER};
 use crate::secrets::Secrets;
 use async_trait::async_trait;
 use data_components::cdc::{ChangeEnvelope, ChangesStream, StreamError, replace_change_batch_data};
 use datafusion::datasource::TableProvider;
 use futures::StreamExt;
 use itertools::Itertools;
-use runtime_datafusion_index::IndexedTableProvider;
+use runtime_datafusion_index::{
+    INDEXED_INNER, IndexedTableProvider, InnerProviderFn, find_concrete_table_provider_with,
+};
 use runtime_metrics::component::MetricsProvider;
 use search::generation::text_search::index::FullTextDatabaseIndex;
+use search::index::SearchIndex;
 use search::index::VectorScanTableProvider;
+use search::index::compound::CompoundSearchIndex;
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
 use spicepod::semantic::Column;
 #[cfg(feature = "duckdb")]
@@ -347,27 +352,36 @@ impl DataConnector for EmbeddingConnector {
         dataset: &Dataset,
     ) -> Option<ChangesStream> {
         let table_provider = federated_table.try_table_provider_sync()?;
-        if let Some(indexed_table) = table_provider
-            .downcast_ref::<IndexedTableProvider>()
-            .cloned()
+        if let Some(indexed_table) = find_concrete_table_provider_with::<IndexedTableProvider>(
+            &table_provider,
+            TRANSPARENT_CDC_WRAPPERS,
+        )
+        .cloned()
         {
-            let Some(underlying_federated_table) =
-                underlying_federated_table_for_indexed_table(&table_provider)
-            else {
-                return self
-                    .inner_connector
-                    .changes_stream(federated_table, dataset);
-            };
+            let underlying_federated_table =
+                underlying_federated_table_for_indexed_table(&table_provider);
 
-            // Avoid reindexing full-text indexes.
+            // Re-apply only vector indexes here; full-text indexes are the outer
+            // FullTextConnector's responsibility. A `CompoundSearchIndex` names itself
+            // the same whether it composes a text or a vector tier, so classify it by
+            // `as_vector_index()` (as compound_index_kind / search_engine do): keep
+            // vector-composing compounds, drop full-text ones.
             let indexes = Indexes::new(
                 indexed_table
                     .get_all_indexes()
                     .into_iter()
                     .filter(|idx| {
-                        idx.as_any()
+                        if idx
+                            .as_any()
                             .downcast_ref::<FullTextDatabaseIndex>()
-                            .is_none()
+                            .is_some()
+                        {
+                            return false;
+                        }
+                        if let Some(compound) = idx.as_any().downcast_ref::<CompoundSearchIndex>() {
+                            return Arc::new(compound.clone()).as_vector_index().is_some();
+                        }
+                        true
                     })
                     .collect(),
             );
@@ -381,14 +395,20 @@ impl DataConnector for EmbeddingConnector {
             Some(stream)
 
         // `VectorScanTableProvider` is generally wrapped by a `IndexedTableProvider` (as above), but in the case both [`Self`] and the [`FullTextConnector`] exist, the latter will unwrap the `IndexedTableProvider` first. It will correctly handle indexing vector indexes as that point.
-        } else if let Some(vector_scan) = table_provider.downcast_ref::<VectorScanTableProvider>() {
+        } else if let Some(vector_scan) = find_concrete_table_provider_with::<VectorScanTableProvider>(
+            &table_provider,
+            TRANSPARENT_CDC_WRAPPERS,
+        ) {
             self.inner_connector.changes_stream(
                 Arc::new(FederatedTable::Immediate(Arc::clone(
                     &vector_scan.table_provider,
                 ))),
                 dataset,
             )
-        } else if let Some(embedding_table) = table_provider.downcast_ref::<EmbeddingTable>() {
+        } else if let Some(embedding_table) = find_concrete_table_provider_with::<EmbeddingTable>(
+            &table_provider,
+            TRANSPARENT_CDC_WRAPPERS,
+        ) {
             let embedding_table = Arc::new(embedding_table.clone());
             let underlying_table = Arc::clone(&embedding_table.base_table);
             let underlying_federated_table = Arc::new(FederatedTable::Immediate(underlying_table));
@@ -413,13 +433,15 @@ impl DataConnector for EmbeddingConnector {
     fn append_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
         let table_provider = federated_table.try_table_provider_sync()?;
 
-        if let Some(indexed_table) = table_provider
-            .downcast_ref::<IndexedTableProvider>()
-            .cloned()
+        if let Some(indexed_table) = find_concrete_table_provider_with::<IndexedTableProvider>(
+            &table_provider,
+            TRANSPARENT_CDC_WRAPPERS,
+        )
+        .cloned()
         {
             let indexed_table = Arc::new(indexed_table);
             let underlying_federated_table =
-                underlying_federated_table_for_indexed_table(&table_provider)?;
+                underlying_federated_table_for_indexed_table(&table_provider);
 
             let indexes = Indexes::new(indexed_table.get_all_indexes());
 
@@ -432,7 +454,13 @@ impl DataConnector for EmbeddingConnector {
             return Some(stream);
         }
 
-        let embedding_table = Arc::new(table_provider.downcast_ref::<EmbeddingTable>()?.clone());
+        let embedding_table = Arc::new(
+            find_concrete_table_provider_with::<EmbeddingTable>(
+                &table_provider,
+                TRANSPARENT_CDC_WRAPPERS,
+            )?
+            .clone(),
+        );
         let underlying_table = Arc::clone(&embedding_table.base_table);
         let underlying_federated_table = Arc::new(FederatedTable::Immediate(underlying_table));
 
@@ -686,30 +714,51 @@ pub(crate) async fn try_wrap_view_accelerator_with_hnsw(
     Ok(true)
 }
 
+/// Inner-provider accessor for [`VectorScanTableProvider`]: its base table.
+const VECTOR_SCAN_INNER: InnerProviderFn = |tbl| {
+    tbl.downcast_ref::<VectorScanTableProvider>()
+        .map(|v| &v.table_provider)
+};
+
+/// Wrapper layers that carry no meaning for the source changes stream and must
+/// stay transparent to the CDC unwrap.
+///
+/// An outer search connector unwraps to us (e.g. `FullTextConnector` hands its
+/// `IndexedTableProvider`'s underlying to the inner `EmbeddingConnector`), and the
+/// accelerated-table setup wraps the source provider in metadata enrichment on the
+/// read-write path. Peeling only these layers — never our own `IndexedTableProvider`
+/// / `EmbeddingTable` / `VectorScanTableProvider` — lets us still detect which of our
+/// providers sits on top, exactly as `find_concrete_table_provider` does for
+/// full-text search.
+const TRANSPARENT_CDC_WRAPPERS: &[InnerProviderFn] =
+    &[METADATA_ENRICHED_INNER, FEDERATED_ADAPTOR_INNER];
+
+/// Peel an [`IndexedTableProvider`]'s index and enrichment layers down to the raw
+/// source provider, so the source connector's changes stream sees the schema of the
+/// table it actually reads from — only real source columns, never the synthetic
+/// `<col>_embedding` columns that a `VectorScanTableProvider` or `EmbeddingTable` merges
+/// into its schema (which would make the source's bootstrap `SELECT` reference a column
+/// that does not exist in the source table). A metadata-enrichment layer can sit between
+/// the `IndexedTableProvider` and its inner provider, so it is peeled here too.
+///
+/// This always resolves to a source provider (never `None`): the caller re-applies the
+/// index writes over the returned stream, so a missing source table would otherwise
+/// drop the changes stream and leave the index stale.
 fn underlying_federated_table_for_indexed_table(
     src_table_provider: &Arc<dyn TableProvider>,
-) -> Option<Arc<FederatedTable>> {
-    #[cfg(not(feature = "s3_vectors"))]
-    let _ = src_table_provider;
+) -> Arc<FederatedTable> {
+    const PEEL: &[InnerProviderFn] = &[
+        INDEXED_INNER,
+        VECTOR_SCAN_INNER,
+        EMBEDDING_INNER,
+        METADATA_ENRICHED_INNER,
+        FEDERATED_ADAPTOR_INNER,
+    ];
 
-    #[cfg(feature = "s3_vectors")]
-    {
-        if let Some(vector_scan) =
-            src_table_provider.downcast_ref::<search::index::VectorScanTableProvider>()
-        {
-            return underlying_federated_table_for_indexed_table(&vector_scan.table_provider);
-        }
-
-        if let Some(indexed_scan) = src_table_provider.downcast_ref::<IndexedTableProvider>() {
-            return underlying_federated_table_for_indexed_table(&indexed_scan.underlying);
-        }
-
-        Some(Arc::new(FederatedTable::Immediate(Arc::clone(
-            src_table_provider,
-        ))))
+    let mut current = src_table_provider;
+    while let Some(inner) = PEEL.iter().find_map(|peel| peel(current.as_ref())) {
+        current = inner;
     }
-    #[cfg(not(feature = "s3_vectors"))]
-    {
-        None
-    }
+
+    Arc::new(FederatedTable::Immediate(Arc::clone(current)))
 }

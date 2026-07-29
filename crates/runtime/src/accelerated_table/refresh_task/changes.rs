@@ -1915,6 +1915,11 @@ impl RefreshTask {
         let mut committers: Vec<Box<dyn cdc::CommitChange + Send + Sync>> =
             Vec::with_capacity(envelopes.len());
         let mut batches: Vec<ChangeBatch> = Vec::with_capacity(envelopes.len());
+        // Time the deferred-batch build loop: for sources that defer the decode
+        // (MySQL binlog rows), each envelope pays a `spawn_blocking` round-trip
+        // here — a per-envelope cost otherwise invisible between the recv_wait
+        // and coalesce stage timers.
+        let decode_start = Instant::now();
         for env in envelopes {
             // Build the (possibly deferred) batch here, on the per-dataset apply
             // task — off the source's shared read/route path. A deferred build
@@ -1942,6 +1947,7 @@ impl RefreshTask {
             committers.push(committer);
             batches.push(batch);
         }
+        record_cdc_fixed_cost(context.metric_labels, "decode", decode_start);
 
         // Mixed-schema runs (mid-stream schema evolution): `concat_change_batches`
         // requires equal schemas. When the dataset's policy allows evolution,

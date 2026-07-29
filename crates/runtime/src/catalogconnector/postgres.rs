@@ -141,8 +141,10 @@ impl CatalogConnector for PostgresCatalog {
         catalog_provider.refresh().await.map_err(|e| {
             // Two classes of permanent (non-retryable) configuration problem,
             // surfaced as a terminal ERROR status instead of retried forever:
-            //   - zero eligible tables (discovery is one-shot, so retrying the
-            //     empty discovery can't resolve it); and
+            //   - zero eligible tables: this is the *initial* refresh, so failing
+            //     it means the catalog never registers and never gets a periodic
+            //     refresh -- fixing the source/filters then requires a restart, so
+            //     surface it loudly rather than starting an empty catalog; and
             //   - the catalog's replication slot already actively held by another
             //     live consumer after the bounded wait (running two instances
             //     against one catalog is a misconfiguration, not a transient).
