@@ -42,6 +42,21 @@ const MAX_QUOTED_MESSAGE_LEN: usize = 512;
 /// Keys an error body may carry its human-readable text under.
 const MESSAGE_KEYS: [&str; 3] = ["Message", "message", "error"];
 
+/// Signatures a zip record can open with: local file header, end-of-central-directory (an empty
+/// archive), and the spanned/split marker.
+const ZIP_SIGNATURES: [&[u8]; 3] = [b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"];
+
+/// Whether a body the zip reader rejected still claims to be an archive.
+///
+/// A download cut short keeps its signature, so it is a damaged archive rather than a message the
+/// registry meant for the user - and reporting it as one would quote the raw bytes back as if the
+/// server had said them.
+fn claims_to_be_an_archive(body: &[u8]) -> bool {
+    ZIP_SIGNATURES
+        .iter()
+        .any(|signature| body.starts_with(signature))
+}
+
 /// Pull the human-readable message out of a registry error body.
 ///
 /// Spicerack reports errors as `{"Message": "...", "Code": 0, "Type": "error"}`; anything else
@@ -175,20 +190,22 @@ impl SpicerackRegistry {
 
         // The registry can answer a success status with an error body - a JSON payload under
         // `Content-Type: application/zip`. Reporting that as a corrupt archive throws the
-        // server's own message away, so when the body reads as text, quote it back instead. The
-        // zip reader decides what is an archive, so a body it accepts is never diverted here.
+        // server's own message away, so when the body is text the registry meant for the user,
+        // quote it back instead. A body still carrying a zip signature is a damaged archive, not
+        // a message, even when its bytes happen to be valid UTF-8. The zip reader decides what is
+        // an archive, so a body it accepts is never diverted here.
         let mut archive = match zip::ZipArchive::new(file) {
             Ok(archive) => archive,
             Err(source) => {
                 return Err(match std::str::from_utf8(&bytes) {
-                    Ok(text) => Error::NotAnArchive {
+                    Ok(text) if !claims_to_be_an_archive(&bytes) => Error::NotAnArchive {
                         pod: pod_full_path.to_string(),
                         status: status.as_u16(),
                         content_type,
                         body_len: bytes.len(),
                         message: registry_error_message(text),
                     },
-                    Err(_) => Error::ZipExtraction { source },
+                    _ => Error::ZipExtraction { source },
                 });
             }
         };
@@ -430,6 +447,26 @@ mod tests {
                 .count(),
             0,
             "a failed extraction must not leave an empty pod directory behind"
+        );
+    }
+
+    /// A download cut short can leave bytes that are valid UTF-8, and quoting those back as the
+    /// registry's own words would invent a message the server never sent. The zip signature is
+    /// what separates a damaged archive from an error body.
+    #[tokio::test]
+    async fn a_truncated_archive_whose_bytes_are_text_is_still_reported_as_a_bad_archive() {
+        let body = b"PK\x03\x04 truncated but perfectly valid UTF-8".to_vec();
+        assert!(
+            std::str::from_utf8(&body).is_ok(),
+            "the body must be valid UTF-8 for this test to exercise the signature check"
+        );
+
+        let (result, _pods_dir) = fetch_pod_serving(body).await;
+
+        let err = result.expect_err("a truncated archive cannot be extracted");
+        assert!(
+            matches!(err, Error::ZipExtraction { .. }),
+            "{err} should stay a ZipExtraction"
         );
     }
 
