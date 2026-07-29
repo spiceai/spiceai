@@ -389,7 +389,7 @@ impl ClusterService for ClusterServiceImpl {
             request.executor_id
         );
 
-        let secrets = self.secrets.read().await;
+        let secrets = Secrets::snapshot(&self.secrets).await;
         let Some(value) = secrets
             .get_secret(&request.key)
             .await

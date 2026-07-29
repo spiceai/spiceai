@@ -17,7 +17,7 @@ limitations under the License.
 use crate::component::dataset::acceleration::{self, Acceleration, Engine, IndexType, Mode};
 use crate::parameters::ParameterSpec;
 use crate::parameters::Parameters;
-use crate::secrets::{ExposeSecret, ParamStr, Secrets};
+use crate::secrets::{ExposeSecret, Secrets, get_params_with_secrets};
 use crate::spice_data_base_path;
 use ::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
@@ -35,7 +35,6 @@ use datafusion_table_providers::util::{
 use linkme::distributed_slice;
 use runtime_acceleration::snapshot::AccelerationLayout;
 use runtime_table_partition::expression::{PartitionedBy, partition_by_expressions};
-use secrecy::SecretString;
 use snafu::prelude::*;
 use std::path::PathBuf;
 use std::{any::Any, collections::HashMap, sync::Arc};
@@ -230,16 +229,12 @@ impl AcceleratorEngineRegistry {
             .fail()?;
         }
 
-        let cloned_secrets = Arc::clone(&secrets);
-        let secret_guard = cloned_secrets.read().await;
-        let mut params_with_secrets: HashMap<String, SecretString> = HashMap::new();
-
-        // Inject secrets from the user-supplied params.
-        // This will replace any instances of `${ store:key }` with the actual secret value.
-        for (k, v) in &acceleration_settings.params {
-            let secret = secret_guard.inject_secrets(k, ParamStr(v)).await;
-            params_with_secrets.insert(k.clone(), secret);
-        }
+        // No lock is held over the expansion: `Parameters::try_new` below
+        // takes the same lock for its autoload pass, and tokio's `RwLock` is
+        // write-preferring, so nesting the two would deadlock as soon as a
+        // writer queued between them.
+        let params_with_secrets =
+            get_params_with_secrets(Arc::clone(&secrets), &acceleration_settings.params).await;
 
         let params = Parameters::try_new(
             &format!("accelerator {}", accelerator.name()),
@@ -1112,6 +1107,98 @@ mod test {
             .expect("indexes should create an IndexedMemTable");
         assert!(!indexed.has_index());
         assert!(indexed.has_secondary_indexes());
+    }
+
+    /// A store that parks on its first lookup until released, standing in for
+    /// the network round trip a remote secret store makes. Later lookups
+    /// answer immediately so the test releases exactly one park.
+    struct ParkedSecretStore {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        parked: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl crate::secrets::SecretStore for ParkedSecretStore {
+        async fn get_secret(
+            &self,
+            _key: &str,
+        ) -> crate::secrets::AnyErrorResult<Option<secrecy::SecretString>> {
+            if !self.parked.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok(Some(secrecy::SecretString::from("resolved")))
+        }
+    }
+
+    /// Expanding `${ store:key }` params must not hold the secrets lock:
+    /// `Parameters::try_new` takes the same lock for its autoload pass, and
+    /// tokio's `RwLock` is write-preferring, so a registry swap queued between
+    /// the two would trap that inner read behind a guard this frame never
+    /// releases.
+    #[tokio::test]
+    async fn test_create_accelerator_table_does_not_deadlock_on_a_registry_swap() {
+        use crate::builder::RuntimeBuilder;
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+
+        let mut registry = Secrets::new();
+        registry.register_store(
+            "env",
+            Arc::new(ParkedSecretStore {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+                parked: std::sync::atomic::AtomicBool::new(false),
+            }),
+        );
+        let secrets = Arc::new(RwLock::new(registry));
+
+        let runtime = Arc::new(RuntimeBuilder::new().build().await);
+        let ctx = Arc::clone(&runtime.df.ctx);
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, false)]));
+
+        let creation = tokio::spawn({
+            let secrets = Arc::clone(&secrets);
+            async move {
+                let acceleration_settings = Acceleration {
+                    enabled: true,
+                    mode: Mode::Memory,
+                    engine: Engine::Arrow,
+                    params: HashMap::from([("arrow_key".to_string(), "${ env:KEY }".to_string())]),
+                    ..Acceleration::default()
+                };
+                runtime
+                    .accelerator_engine_registry
+                    .create_accelerator_table(
+                        "arrow_secret_expansion".into(),
+                        schema,
+                        None,
+                        &acceleration_settings,
+                        secrets,
+                        None,
+                        ctx,
+                    )
+                    .await
+            }
+        });
+
+        // The expansion is in flight; a swap of the whole registry (what the
+        // cluster executor bind path does) must not have to wait for it.
+        entered.notified().await;
+        drop(
+            tokio::time::timeout(std::time::Duration::from_secs(5), secrets.write())
+                .await
+                .expect("a registry swap must not wait for an in-flight secret lookup"),
+        );
+
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(30), creation)
+            .await
+            .expect("table creation must not deadlock behind the queued registry swap")
+            .expect("table creation task should not panic")
+            .expect("accelerator table should be created");
     }
 }
 
