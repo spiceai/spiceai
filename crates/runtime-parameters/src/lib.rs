@@ -504,8 +504,12 @@ impl<'a> ExposedParamLookup<'a> {
 
 pub use runtime_parameter_spec::{ParameterSpec, ParameterType};
 
-pub mod typed;
+// The typed-params runtime lives in the `runtime-parameters-typed` foundation
+// leaf so crates below `runtime-parameters` can derive it without a cycle
+// (see that crate's docs). Re-exported here so `runtime_parameters::typed::…`
+// stays the public path.
 pub use runtime_parameters_derive::TypedParams;
+pub use runtime_parameters_typed as typed;
 
 /// Suggest the closest valid parameter name for a user-typo'd key.
 ///

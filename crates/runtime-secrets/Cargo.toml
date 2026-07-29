@@ -19,7 +19,8 @@ secrecy.workspace = true
 serde_json.workspace = true
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
-runtime-parameter-spec = { path = "../runtime-parameter-spec" }
+runtime-parameters-typed = { path = "../runtime-parameters-typed" }
+runtime-parameters-derive = { path = "../runtime-parameters-derive" }
 tracing.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 percent-encoding.workspace = true

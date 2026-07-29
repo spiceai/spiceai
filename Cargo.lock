@@ -16765,6 +16765,7 @@ dependencies = [
  "runtime-metrics",
  "runtime-object-store",
  "runtime-parameters",
+ "runtime-parameters-typed",
  "runtime-proto",
  "runtime-query-engine",
  "runtime-rate-control",
@@ -17206,6 +17207,7 @@ dependencies = [
  "itertools 0.14.0",
  "runtime-parameter-spec",
  "runtime-parameters-derive",
+ "runtime-parameters-typed",
  "runtime-secrets",
  "secrecy",
  "snafu",
@@ -17221,6 +17223,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "runtime-parameters-typed"
+version = "2.2.0-unstable"
+dependencies = [
+ "secrecy",
+ "snafu",
+ "tokio",
+ "tracing",
+ "util",
 ]
 
 [[package]]
@@ -17319,6 +17332,7 @@ dependencies = [
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
  "runtime-parameters",
+ "runtime-parameters-typed",
  "runtime-proto",
  "runtime-query-engine",
  "runtime-request-context",
@@ -17360,7 +17374,8 @@ dependencies = [
  "percent-encoding",
  "rand 0.10.1",
  "reqwest 0.13.4",
- "runtime-parameter-spec",
+ "runtime-parameters-derive",
+ "runtime-parameters-typed",
  "secrecy",
  "serde_json",
  "snafu",

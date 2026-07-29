@@ -54,7 +54,7 @@ use aws_config::timeout::TimeoutConfig;
 use aws_sdk_credential_bridge::default_aws_config;
 use aws_sdk_secretsmanager::{error::SdkError, operation::get_secret_value::GetSecretValueError};
 use aws_sdk_sts::operation::get_caller_identity::GetCallerIdentityError;
-use runtime_parameter_spec::ParameterSpec;
+use runtime_parameters_derive::TypedParams;
 use secrecy::zeroize::Zeroizing;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::{OptionExt, ResultExt, Snafu};
@@ -69,41 +69,52 @@ use crate::SecretStore;
 /// components with a consistent vocabulary. When `region` is omitted, the
 /// AWS SDK falls back to the standard credential-provider chain
 /// (`AWS_REGION` / `AWS_DEFAULT_REGION` / IMDS).
-pub const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::runtime("region")
-        .description(
-            "AWS region the Secrets Manager secret lives in. When omitted, the SDK \
-             falls back to AWS_REGION / AWS_DEFAULT_REGION / IMDS.",
-        )
-        .examples(&["us-east-1", "eu-west-2"]),
-    ParameterSpec::runtime("endpoint_url")
-        .description(
-            "Override the Secrets Manager endpoint URL. Useful for VPC endpoints, \
-             FIPS endpoints, or local testing against e.g. LocalStack.",
-        )
-        .examples(&[
-            "https://secretsmanager.us-east-1.amazonaws.com",
-            "https://localhost:4566",
-        ]),
-    // Static credential params. Naming matches the S3 connector
-    // (`key`, `secret`, `session_token`) so AWS-flavored components share
-    // a vocabulary. When `key` and `secret` are both supplied they take
-    // precedence over the default credential chain; when omitted, the
-    // SDK's standard provider chain (env vars / shared config / web
-    // identity / ECS / IMDS) is used.
-    ParameterSpec::runtime("key").description(
-        "AWS access key ID for static credentials. Must be set together with `secret`. \
-             Typically sourced from another secret store, e.g. `${ env:AWS_ACCESS_KEY_ID }`.",
-    ),
-    ParameterSpec::runtime("secret").description(
-        "AWS secret access key for static credentials. Must be set together with `key`. \
-             Typically sourced from another secret store, e.g. `${ env:AWS_SECRET_ACCESS_KEY }`.",
-    ),
-    ParameterSpec::runtime("session_token").description(
-        "Optional AWS session token. Only meaningful alongside `key` and `secret`, \
-             e.g. for short-lived STS credentials.",
-    ),
-];
+///
+/// Static credential params. Naming matches the S3 connector
+/// (`key`, `secret`, `session_token`) so AWS-flavored components share a
+/// vocabulary. When `key` and `secret` are both supplied they take precedence
+/// over the default credential chain; when omitted, the SDK's standard provider
+/// chain (env vars / shared config / web identity / ECS / IMDS) is used.
+#[derive(Debug, TypedParams)]
+#[params(prefix = "aws_secrets_manager", deny_unknown)]
+pub struct AwsSecretsManagerParams {
+    /// AWS region the Secrets Manager secret lives in. When omitted, the SDK
+    /// falls back to `AWS_REGION` / `AWS_DEFAULT_REGION` / IMDS.
+    #[param(runtime)]
+    pub region: Option<String>,
+    /// Override the Secrets Manager endpoint URL. Useful for VPC endpoints,
+    /// FIPS endpoints, or local testing against e.g. `LocalStack`.
+    #[param(runtime)]
+    pub endpoint_url: Option<String>,
+    /// AWS access key ID for static credentials. Must be set together with `secret`.
+    /// Typically sourced from another secret store, e.g. `${ env:AWS_ACCESS_KEY_ID }`.
+    #[param(runtime, rename = "key")]
+    pub access_key_id: Option<String>,
+    /// AWS secret access key for static credentials. Must be set together with `key`.
+    /// Typically sourced from another secret store, e.g. `${ env:AWS_SECRET_ACCESS_KEY }`.
+    #[param(runtime, rename = "secret")]
+    pub secret_access_key: Option<SecretString>,
+    /// Optional AWS session token. Only meaningful alongside `key` and `secret`,
+    /// e.g. for short-lived STS credentials.
+    #[param(runtime)]
+    pub session_token: Option<SecretString>,
+}
+
+impl AwsSecretsManagerParams {
+    /// Builds the resolved [`AwsSecretsManagerConfig`] from the `from:` selector
+    /// (the secret name) and the typed params.
+    #[must_use]
+    pub fn into_config(self, secret_name: String) -> AwsSecretsManagerConfig {
+        AwsSecretsManagerConfig {
+            secret_name,
+            region: self.region,
+            endpoint_url: self.endpoint_url,
+            access_key_id: self.access_key_id,
+            secret_access_key: self.secret_access_key,
+            session_token: self.session_token,
+        }
+    }
+}
 
 /// Resolved configuration for the `aws_secrets_manager` secret store.
 ///
@@ -137,22 +148,6 @@ impl std::fmt::Debug for AwsSecretsManagerConfig {
                 &self.session_token.as_ref().map(|_| "<redacted>"),
             )
             .finish()
-    }
-}
-
-impl AwsSecretsManagerConfig {
-    /// Builds an [`AwsSecretsManagerConfig`] from the parsed selector and a
-    /// validated parameter map.
-    #[must_use]
-    pub fn from_params(secret_name: String, params: &HashMap<String, String>) -> Self {
-        Self {
-            secret_name,
-            region: params.get("region").cloned(),
-            endpoint_url: params.get("endpoint_url").cloned(),
-            access_key_id: params.get("key").cloned(),
-            secret_access_key: params.get("secret").cloned().map(SecretString::from),
-            session_token: params.get("session_token").cloned().map(SecretString::from),
-        }
     }
 }
 
@@ -320,9 +315,9 @@ impl AwsSecretsManager {
         })
     }
 
-    /// Creates a new [`AwsSecretsManager`] store from a validated
+    /// Creates a new [`AwsSecretsManager`] store from a resolved
     /// [`AwsSecretsManagerConfig`] (i.e. one produced by
-    /// [`crate::validate_params`]).
+    /// [`AwsSecretsManagerParams::into_config`]).
     ///
     /// # Errors
     ///
