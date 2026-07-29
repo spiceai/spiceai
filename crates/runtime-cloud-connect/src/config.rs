@@ -49,13 +49,9 @@ pub const PENDING_ADOPT_CODE_FILE: &str = "pending-adopt-code";
 /// is persisted after adoption.
 pub const IDENTITY_FILE: &str = "identity.json";
 
-/// Canonical env var carrying a first-contact adoption code, for hosts
-/// where the `spice` CLI is not available (containers, cloud-init).
+/// Env var carrying a first-contact adoption code, for hosts where the
+/// `spice` CLI is not available (containers, cloud-init).
 pub const ADOPT_CODE_ENV: &str = "SPICE_CONNECT_ADOPT_CODE";
-
-/// Deprecated alias for [`ADOPT_CODE_ENV`], honored for backward
-/// compatibility. Reading it logs a deprecation warning.
-pub const ADOPT_CODE_ENV_DEPRECATED: &str = "SPICE_ADOPT_CODE";
 
 /// Env var carrying the org-scoped app name to attach the instance to at
 /// enroll (mirrors `spice connect --app-name`), for hosts with no CLI.
@@ -66,25 +62,10 @@ pub const ADOPT_APP_NAME_ENV: &str = "SPICE_CONNECT_ADOPT_APP_NAME";
 /// creates it at enroll and attaches the instance.
 pub const ADOPT_CREATE_APP_ENV: &str = "SPICE_CONNECT_ADOPT_CREATE";
 
-/// Read the adoption code from the environment: the canonical
-/// [`ADOPT_CODE_ENV`] wins; the deprecated [`ADOPT_CODE_ENV_DEPRECATED`]
-/// is honored with a warning. Empty values are treated as unset.
-#[must_use]
-pub fn adoption_code_from_env() -> Option<String> {
-    if let Ok(code) = std::env::var(ADOPT_CODE_ENV)
-        && !code.is_empty()
-    {
-        return Some(code);
-    }
-    if let Ok(code) = std::env::var(ADOPT_CODE_ENV_DEPRECATED)
-        && !code.is_empty()
-    {
-        tracing::warn!(
-            "{ADOPT_CODE_ENV_DEPRECATED} is deprecated and will be removed in a future release; use {ADOPT_CODE_ENV} instead"
-        );
-        return Some(code);
-    }
-    None
+/// Read the adoption code from [`ADOPT_CODE_ENV`]. An empty value is
+/// treated as unset.
+fn adoption_code_from_env() -> Option<String> {
+    std::env::var(ADOPT_CODE_ENV).ok().filter(|c| !c.is_empty())
 }
 
 /// Runtime config for the Cloud Connect client.
@@ -236,8 +217,7 @@ impl CloudConnectConfig {
     /// and the environment.
     ///
     /// Precedence for the adoption credential:
-    /// 1. [`ADOPT_CODE_ENV`] env var ([`ADOPT_CODE_ENV_DEPRECATED`] is a
-    ///    deprecated alias).
+    /// 1. [`ADOPT_CODE_ENV`] env var.
     /// 2. `$SPICE_CONFIG_DIR/pending-adopt-code` file.
     /// 3. None (rely on identity at `$SPICE_CONFIG_DIR/identity.json`).
     ///
@@ -423,27 +403,26 @@ mod tests {
     }
 
     #[test]
-    fn adoption_code_canonical_env_wins_over_deprecated_alias() {
+    fn adoption_code_env_treats_empty_as_unset() {
         let _guard = ENV_LOCK.lock().expect("env lock poisoned");
         // SAFETY: tests gate env-var mutations behind a mutex.
         unsafe {
-            std::env::set_var(ADOPT_CODE_ENV, "SPICE-ADOPT-NEWER-AAAAA");
-            std::env::set_var(ADOPT_CODE_ENV_DEPRECATED, "SPICE-ADOPT-OLDER-AAAAA");
+            std::env::set_var(ADOPT_CODE_ENV, "SPICE-ADOPT-7K2PX-9XYZ2");
         }
         assert_eq!(
             adoption_code_from_env().as_deref(),
-            Some("SPICE-ADOPT-NEWER-AAAAA")
+            Some("SPICE-ADOPT-7K2PX-9XYZ2")
         );
+
+        // An exported-but-empty var is how a shell passes "no code"; it must
+        // not be presented to the cloud as a credential.
+        unsafe {
+            std::env::set_var(ADOPT_CODE_ENV, "");
+        }
+        assert_eq!(adoption_code_from_env(), None);
+
         unsafe {
             std::env::remove_var(ADOPT_CODE_ENV);
-        }
-        assert_eq!(
-            adoption_code_from_env().as_deref(),
-            Some("SPICE-ADOPT-OLDER-AAAAA"),
-            "the deprecated alias must still be honored"
-        );
-        unsafe {
-            std::env::remove_var(ADOPT_CODE_ENV_DEPRECATED);
         }
         assert_eq!(adoption_code_from_env(), None);
     }
@@ -483,7 +462,6 @@ mod tests {
             std::env::remove_var("SPICE_CLOUD_ENDPOINT");
             std::env::remove_var("SPICE_CLOUD_GATEWAY_ENDPOINT");
             std::env::remove_var(ADOPT_CODE_ENV);
-            std::env::remove_var(ADOPT_CODE_ENV_DEPRECATED);
         }
         let config = CloudConnectConfig::from_env("v0.0.0-test");
         assert_eq!(config.enroll_endpoint, DEFAULT_ENDPOINT);

@@ -27,8 +27,7 @@ limitations under the License.
 //!
 //! 1. The `--cloud-connect` flag was passed.
 //! 2. `$SPICE_CONFIG_DIR/identity.json` exists.
-//! 3. `SPICE_CONNECT_ADOPT_CODE` env var is set (`SPICE_ADOPT_CODE` is a
-//!    deprecated alias).
+//! 3. `SPICE_CONNECT_ADOPT_CODE` env var is set.
 //! 4. `$SPICE_CONFIG_DIR/pending-adopt-code` file exists.
 //!
 //! If none of the above is true, this module never opens a connection.
@@ -62,9 +61,7 @@ const DEFAULT_POD_LOG_TAIL_LINES: usize = 500;
 /// Cheap probe for whether Spice Cloud Connect is configured for this
 /// instance, using the same signals as [`maybe_start`]: the explicit
 /// `--cloud-connect` flag, an on-disk identity, a staged pending adoption
-/// code, or the `SPICE_CONNECT_ADOPT_CODE` env var (or its deprecated
-/// `SPICE_ADOPT_CODE` alias — no deprecation warning here, since this may
-/// run before tracing is initialized; `from_env` warns later).
+/// code, or the `SPICE_CONNECT_ADOPT_CODE` env var.
 ///
 /// Called from `init_tracing` (before [`maybe_start`]) to decide whether to
 /// install the log-capture layer. It runs in the same process — hence the
@@ -79,8 +76,6 @@ pub(crate) fn is_configured(cloud_connect_flag: bool) -> bool {
     config_dir.join(IDENTITY_FILE).exists()
         || config_dir.join(PENDING_ADOPT_CODE_FILE).exists()
         || std::env::var_os(runtime_cloud_connect::config::ADOPT_CODE_ENV)
-            .is_some_and(|v| !v.is_empty())
-        || std::env::var_os(runtime_cloud_connect::config::ADOPT_CODE_ENV_DEPRECATED)
             .is_some_and(|v| !v.is_empty())
 }
 
