@@ -556,11 +556,11 @@ impl S3VectorsTable {
         }
     }
 
-    /// Deletes vectors by key from this index.
+    /// Deletes vectors by key from this single physical index.
     ///
-    /// Only deletes from the base index — if `spill_writes` placed some of these keys' vectors
-    /// into a spillover index (created when the base index hit its quota), this does not reach
-    /// them. Spill-aware delete is a known follow-up, not yet needed by any current caller.
+    /// Only reaches the index `self` is bound to — a caller managing multiple physical indexes
+    /// for one logical index (spillover, partitioning) is responsible for calling this once per
+    /// relevant target (see `search::index::s3_vectors::S3Vector::delete_target_tables`).
     pub async fn delete_by_keys(&self, keys: Vec<String>) -> Result<()> {
         if keys.is_empty() {
             return Ok(());
