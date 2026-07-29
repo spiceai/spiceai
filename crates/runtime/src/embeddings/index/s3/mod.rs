@@ -41,7 +41,7 @@ use crate::{
     model::EmbeddingModelStore,
     parameters::{ParameterSpec, Parameters},
 };
-use runtime_parameters::typed::TypedParams as _;
+use runtime_parameters_typed::TypedParams as _;
 use runtime_search::store_params::s3::{S3DistanceMetric, S3VectorsParams};
 use runtime_secrets::{Secrets, get_params_with_secrets};
 use secrecy::ExposeSecret;

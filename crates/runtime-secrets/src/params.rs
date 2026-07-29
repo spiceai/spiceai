@@ -32,10 +32,11 @@ limitations under the License.
 //!   initialized before any `${ store:KEY }` resolution is possible, so that
 //!   would be a chicken-and-egg cycle. Only the bootstrap `env` store is
 //!   available at this point.
-//! - [`non_empty`] / [`non_empty_secret`] normalize blank values to `None`,
-//!   used by the stores' `into_config` conversions.
+//! - [`non_empty`] / [`non_empty_secret`] / [`non_empty_path`] normalize blank
+//!   values to `None`, used by the stores' `into_config` conversions.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
@@ -69,6 +70,19 @@ pub(crate) fn non_empty_secret(value: Option<SecretString>) -> Option<SecretStri
         None
     } else {
         Some(SecretString::from(trimmed.to_string()))
+    }
+}
+
+/// [`non_empty`] for filesystem-path values.
+#[must_use]
+pub(crate) fn non_empty_path(value: Option<PathBuf>) -> Option<PathBuf> {
+    let value = value?;
+    let trimmed = value.to_string_lossy();
+    let trimmed = trimmed.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(trimmed))
     }
 }
 

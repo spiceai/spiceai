@@ -123,7 +123,7 @@ pub struct S3VectorsParams {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use runtime_parameters::typed::{ParamsError, TypedParams as _};
+    use runtime_parameters_typed::{ParamsError, TypedParams as _};
     use runtime_secrets::Secrets;
     use secrecy::ExposeSecret;
     use std::collections::HashMap;

@@ -16,7 +16,7 @@ limitations under the License.
 
 //! `#[derive(TypedParams)]` — typed spicepod component parameters.
 //!
-//! Generates an implementation of `runtime_parameters::typed::TypedParams` that
+//! Generates an implementation of `runtime_parameters_typed::TypedParams` that
 //! deserializes the secret-injected string map produced by
 //! `runtime_secrets::get_params_with_secrets` into a plain Rust struct, preserving
 //! the runtime's parameter semantics: per-variant key prefixing, unknown-key

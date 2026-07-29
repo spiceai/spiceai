@@ -31,10 +31,14 @@ limitations under the License.
 //!
 //! # Layering
 //!
-//! This crate is a foundation leaf: it does not depend on `runtime-secrets`.
-//! Secret autoload is abstracted behind the [`SecretAutoload`] trait so that
-//! `runtime-secrets` (which owns the `Secrets` registry) and everything above
-//! it can both build on the typed-params machinery without a dependency cycle.
+//! This crate is a foundation leaf with no dependents above it in the graph,
+//! so any crate — regardless of its own tier — can derive `TypedParams`
+//! without risking a cycle. Secret autoload is abstracted behind the
+//! [`SecretAutoload`] trait rather than naming a concrete secrets registry, so
+//! that a lower-tier crate owning its own resolver can implement the trait and
+//! build on the typed-params machinery directly. `runtime-secrets` is simply
+//! the first crate that needed this — the pattern generalizes to any
+//! component's parameters, wherever in the graph it lives.
 
 use std::collections::HashMap;
 use std::fmt::Display;

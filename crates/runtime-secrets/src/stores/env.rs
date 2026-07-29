@@ -30,7 +30,7 @@ const ENV_SECRET_PREFIX: &str = "SPICE_";
 pub struct EnvParams {
     /// Path to a `.env` file to load secrets from. Defaults to `.env`.
     #[param(runtime)]
-    pub file_path: Option<String>,
+    pub file_path: Option<PathBuf>,
 }
 
 impl EnvParams {
@@ -46,7 +46,7 @@ impl EnvParams {
 /// Resolved configuration for the `env` secret store.
 #[derive(Debug, Clone, Default)]
 pub struct EnvConfig {
-    pub file_path: Option<String>,
+    pub file_path: Option<PathBuf>,
 }
 
 pub struct EnvSecretStoreBuilder {

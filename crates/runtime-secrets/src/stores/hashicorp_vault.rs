@@ -46,6 +46,7 @@ limitations under the License.
 //!   invalid addresses fail at config load with a concrete message.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -106,7 +107,7 @@ pub struct HashicorpVaultParams {
     /// Filesystem path to the service-account JWT for `auth_method: kubernetes`.
     /// Defaults to `/var/run/secrets/kubernetes.io/serviceaccount/token`.
     /// Ignored unless `hashicorp_vault_jwt` is unset.
-    pub kubernetes_token_path: Option<String>,
+    pub kubernetes_token_path: Option<PathBuf>,
     /// Mount path of the auth backend, *without* the leading `auth/` segment.
     /// Defaults to the auth method name (e.g. `approle`, `kubernetes`, `jwt`).
     /// Override when the backend has been mounted at a non-default path
@@ -114,14 +115,14 @@ pub struct HashicorpVaultParams {
     pub auth_mount: Option<String>,
     /// Filesystem path to a PEM-encoded CA certificate to add to the TLS trust
     /// store. Use for self-signed Vault deployments.
-    pub ca_cert: Option<String>,
+    pub ca_cert: Option<PathBuf>,
     /// Skip TLS certificate verification. Strongly discouraged outside local
     /// development.
     #[param(default = "false", parse_with = parse_tls_skip_verify)]
     pub tls_skip_verify: bool,
-    /// Per-request timeout in seconds for Vault HTTP calls. Defaults to 10.
-    #[param(rename = "request_timeout", default = "10", parse_with = parse_request_timeout_secs)]
-    pub request_timeout_secs: u64,
+    /// Per-request timeout for Vault HTTP calls. Defaults to 10 seconds.
+    #[param(rename = "request_timeout", default = "10", parse_with = parse_request_timeout)]
+    pub request_timeout: Duration,
 }
 
 /// Parses `hashicorp_vault_tls_skip_verify`, preserving the historically
@@ -136,8 +137,8 @@ fn parse_tls_skip_verify(raw: &str) -> Result<bool, std::convert::Infallible> {
 
 /// Parses `hashicorp_vault_request_timeout` (integer seconds), trimming
 /// surrounding whitespace so a templated `"10 "` still parses.
-fn parse_request_timeout_secs(raw: &str) -> Result<u64, std::num::ParseIntError> {
-    raw.trim().parse()
+fn parse_request_timeout(raw: &str) -> Result<Duration, std::num::ParseIntError> {
+    Ok(Duration::from_secs(raw.trim().parse()?))
 }
 
 impl HashicorpVaultParams {
@@ -164,10 +165,10 @@ impl HashicorpVaultParams {
             secret_id: crate::params::non_empty_secret(self.secret_id),
             role: crate::params::non_empty(self.role),
             jwt: crate::params::non_empty_secret(self.jwt),
-            kubernetes_token_path: crate::params::non_empty(self.kubernetes_token_path),
-            ca_cert: crate::params::non_empty(self.ca_cert),
+            kubernetes_token_path: crate::params::non_empty_path(self.kubernetes_token_path),
+            ca_cert: crate::params::non_empty_path(self.ca_cert),
             tls_skip_verify: self.tls_skip_verify,
-            request_timeout: Duration::from_secs(self.request_timeout_secs),
+            request_timeout: self.request_timeout,
         }
     }
 }
@@ -352,8 +353,8 @@ pub struct HashicorpVaultConfig {
     pub secret_id: Option<SecretString>,
     pub role: Option<String>,
     pub jwt: Option<SecretString>,
-    pub kubernetes_token_path: Option<String>,
-    pub ca_cert: Option<String>,
+    pub kubernetes_token_path: Option<PathBuf>,
+    pub ca_cert: Option<PathBuf>,
     pub tls_skip_verify: bool,
     pub request_timeout: Duration,
 }
@@ -653,9 +654,9 @@ impl HashicorpVault {
         let path = self
             .config
             .kubernetes_token_path
-            .as_deref()
-            .unwrap_or(DEFAULT_K8S_TOKEN_PATH)
-            .to_string();
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_K8S_TOKEN_PATH));
+        let path_display = path.display().to_string();
         // The SA JWT is a small (<2 KiB) file on disk; we use
         // `spawn_blocking` rather than `tokio::fs` to avoid pulling the
         // `fs` feature into `runtime-secrets`'s `tokio` dependency.
@@ -663,10 +664,10 @@ impl HashicorpVault {
         let token = tokio::task::spawn_blocking(move || std::fs::read_to_string(&read_path))
             .await
             .map_err(|e| Error::UnableToReadKubernetesToken {
-                path: path.clone(),
+                path: path_display.clone(),
                 source: std::io::Error::other(e.to_string()),
             })?
-            .with_context(|_| UnableToReadKubernetesTokenSnafu { path: path.clone() })?;
+            .with_context(|_| UnableToReadKubernetesTokenSnafu { path: path_display })?;
         Ok(SecretString::from(token.trim().to_string()))
     }
 
@@ -982,11 +983,12 @@ fn build_http_client(config: &HashicorpVaultConfig) -> Result<Client> {
         builder = builder.danger_accept_invalid_certs(true);
     }
     if let Some(ca_path) = config.ca_cert.as_deref() {
+        let path_display = ca_path.display().to_string();
         let pem = std::fs::read(ca_path).context(UnableToReadCaCertSnafu {
-            path: ca_path.to_string(),
+            path: path_display.clone(),
         })?;
         let cert = reqwest::tls::Certificate::from_pem(&pem).context(InvalidCaCertSnafu {
-            path: ca_path.to_string(),
+            path: path_display,
         })?;
         builder = builder.add_root_certificate(cert);
     }

@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use runtime_parameters::TypedParams;
-use runtime_parameters::typed::{ParamsError, TypedParams as _};
+use runtime_parameters_typed::{ParamsError, TypedParams as _};
 use runtime_secrets::{AnyErrorResult, SecretStore, Secrets};
 use secrecy::{ExposeSecret, SecretString};
 use tokio::sync::RwLock;

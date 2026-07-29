@@ -870,7 +870,7 @@ async fn load_secret_store(store_type: SecretStoreType) -> Result<Arc<dyn Secret
         SecretStoreType::Env(config) => {
             let mut builder = EnvSecretStoreBuilder::new();
             if let Some(path) = config.file_path {
-                builder = builder.with_path(path.into());
+                builder = builder.with_path(path);
             }
             Ok(Arc::new(builder.build()) as Arc<dyn SecretStore>)
         }
@@ -1416,7 +1416,10 @@ params:
             super::SecretStoreType::AwsSecretsManager(cfg) => {
                 assert_eq!(cfg.secret_name, "my-secret");
                 assert_eq!(cfg.region.as_deref(), Some("eu-west-2"));
-                assert_eq!(cfg.endpoint_url.as_deref(), Some("https://localhost:4566"));
+                assert_eq!(
+                    cfg.endpoint_url.as_ref().map(url::Url::as_str),
+                    Some("https://localhost:4566")
+                );
             }
             _ => panic!("expected AwsSecretsManager variant"),
         }
@@ -1459,6 +1462,7 @@ params:
         use spicepod::component::secret::Secret as SpicepodSecret;
         use spicepod::param::Params;
         use std::collections::HashMap;
+        use std::path::Path;
 
         let mut p = HashMap::new();
         p.insert("file_path".to_string(), "/tmp/spice.env".to_string());
@@ -1477,7 +1481,7 @@ params:
             .expect("validates");
         match resolved {
             super::SecretStoreType::Env(cfg) => {
-                assert_eq!(cfg.file_path.as_deref(), Some("/tmp/spice.env"));
+                assert_eq!(cfg.file_path.as_deref(), Some(Path::new("/tmp/spice.env")));
             }
             _ => panic!("expected Env variant"),
         }
@@ -1524,7 +1528,10 @@ params:
         match resolved {
             super::SecretStoreType::AwsSecretsManager(cfg) => {
                 assert_eq!(cfg.region.as_deref(), Some("ap-south-1"));
-                assert_eq!(cfg.endpoint_url.as_deref(), Some("https://localhost:4566"));
+                assert_eq!(
+                    cfg.endpoint_url.as_ref().map(url::Url::as_str),
+                    Some("https://localhost:4566")
+                );
             }
             _ => panic!("expected AwsSecretsManager variant"),
         }
@@ -1594,7 +1601,12 @@ params:
             .expect("validates");
         match resolved {
             super::SecretStoreType::AwsSecretsManager(cfg) => {
-                assert_eq!(cfg.access_key_id.as_deref(), Some("AKIA_TEST"));
+                assert_eq!(
+                    cfg.access_key_id
+                        .as_ref()
+                        .map(|s| s.expose_secret().to_string()),
+                    Some("AKIA_TEST".to_string())
+                );
                 assert_eq!(
                     cfg.secret_access_key
                         .as_ref()
