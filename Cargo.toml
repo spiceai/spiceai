@@ -240,7 +240,7 @@ datafusion-proto-common = "54.1.0"
 datafusion-pruning = "54.1.0"
 datafusion-spark = "54.1.0"
 datafusion-substrait = "54.1.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "60a4d2a964ec1753609f4334c3c5aaad227bc489" } # branch: sgrebnov/0728-swap-plus-checkpoint (lukim/duckdb-file-swap + spiceai-54)
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "1b83cbf0e131fc30e53663ed519f077a5ee65917" } # spiceai-54
 delta_kernel = { version = "0.23.0", features = [
     "default-engine-rustls",
     "arrow-58",
@@ -528,7 +528,7 @@ datafusion-federation = { git = "https://github.com/spiceai/datafusion-federatio
 
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "714d64fd5369efc4835109be0fd718db5a3be0aa" } # branch: spiceai-0.23.0
 
-duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "4387e69564d85a411802e0782bc503b53577c50d" } # branch: spiceai-58-arrow58
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "7229b20daf24765c84d294c52cf4b4165ca79073" } # branch: spiceai-1.5.5
 rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd" } # master @ tip (PR #2 merged: rusqlite 0.40.1 + bundled-decimal)
 tokio-rusqlite = { git = "https://github.com/spiceai/tokio-rusqlite.git", rev = "b10df82e3bbc4f4700562a14a3a00714cbc2f0c7" }
 
