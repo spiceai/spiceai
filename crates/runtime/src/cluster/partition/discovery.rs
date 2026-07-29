@@ -142,7 +142,13 @@ async fn execute_partition_discovery_query(
     // dataset stays `Refreshing` until executors ack their partition loads,
     // and PartitionsLoaded acks can't happen until discovery completes —
     // waiting for `Ready` would deadlock.
-    df.runtime_status().wait_for_dataset_registered(table).await;
+    if df.runtime_status().wait_for_dataset_registered(table).await
+        == crate::status::WaitOutcome::ShuttingDown
+    {
+        return Err(Error::ShutdownBeforeTableRegistered {
+            table: table_name.clone(),
+        });
+    }
 
     // Must get table source of `AcceleratedTable` to get true value of partition.
     // The table may be registered directly as AcceleratedTable, or wrapped in a
