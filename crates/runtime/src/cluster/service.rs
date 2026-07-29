@@ -62,7 +62,7 @@ use runtime_proto::{
     executor_control_message::Message as ExecutorMessage,
     scheduler_control_message::Message as SchedulerMessage,
 };
-use runtime_secrets::Secrets;
+use runtime_secrets::{Secrets, iter_secret_references};
 use secrecy::ExposeSecret;
 use std::collections::{HashMap, HashSet};
 use std::task::{Context, Poll};
@@ -368,6 +368,14 @@ impl ClusterService for ClusterServiceImpl {
             ));
         }
 
+        // Empty key is never a valid secret reference and is rejected before
+        // any store lookup or allowlist work.
+        if request.key.is_empty() {
+            return Err(Status::invalid_argument(
+                "Unable to expand secret: empty key",
+            ));
+        }
+
         let span = tracing::span!(
             target: "task_history",
             tracing::Level::INFO,
@@ -383,6 +391,39 @@ impl ClusterService for ClusterServiceImpl {
             request.key
         );
 
+        // Only keys referenced by the current app (spicepod) may be expanded.
+        // This closes the "any mTLS peer can request any env/vault key by name"
+        // hole: unreferenced secrets in the host environment or external stores
+        // are never returned, and unallowlisted keys never hit the secret store
+        // (so deny does not create a lookup side-channel).
+        let allowed_keys = {
+            let app_guard = self.app.read().await;
+            let Some(ref app) = *app_guard else {
+                tracing::warn!(
+                    executor_id = %request.executor_id,
+                    "Denied cluster secret expansion: app context not available"
+                );
+                return Err(Status::failed_precondition(
+                    "Secret expansion requires a loaded app definition",
+                ));
+            };
+            expandable_secret_keys(app)
+        };
+
+        if !allowed_keys.contains(request.key.as_str()) {
+            tracing::warn!(
+                executor_id = %request.executor_id,
+                key = %request.key,
+                "Denied cluster secret expansion: key is not referenced by the app"
+            );
+            // Same status/message shape as a miss so callers cannot distinguish
+            // "not in spicepod" from "not in any store" for unallowlisted keys.
+            return Err(Status::invalid_argument(format!(
+                "Unable to expand secret {}",
+                request.key
+            )));
+        }
+
         tracing::debug!(
             "ExpandSecret: expanding secret {} for executor {}",
             request.key,
@@ -397,7 +438,7 @@ impl ClusterService for ClusterServiceImpl {
         else {
             tracing::error!(target: "task_history", "Secret not found");
             return Err(Status::invalid_argument(format!(
-                "Unable to read secret {}",
+                "Unable to expand secret {}",
                 request.key
             )));
         };
@@ -1256,6 +1297,27 @@ fn encode_batches_to_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>, arrow::erro
     Ok(buffer)
 }
 
+/// Collects the set of secret keys the cluster may expand via [`ExpandSecret`].
+///
+/// Keys are taken from every `${ store:key }` reference in the serialized app
+/// definition (datasets, catalogs, models, tools, runtime auth, snapshots, …).
+/// Only these keys are eligible for expansion; arbitrary host/env/vault keys
+/// that the spicepod never references are denied.
+///
+/// Serialization failure fails closed (empty set) so a broken app cannot
+/// open the expansion surface.
+fn expandable_secret_keys(app: &App) -> HashSet<String> {
+    match serde_json::to_string(app) {
+        Ok(json) => iter_secret_references(&json).map(|r| r.key).collect(),
+        Err(e) => {
+            tracing::error!(
+                "Failed to serialize app while building ExpandSecret allowlist: {e}. Denying all secret expansion."
+            );
+            HashSet::new()
+        }
+    }
+}
+
 /// Rewrites a task history SQL query to use `local_task_history` instead of `task_history`.
 ///
 /// This function parses the SQL, validates it references the expected table, and rewrites
@@ -1332,16 +1394,58 @@ fn rewrite_task_history_sql(sql: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use app::AppBuilder;
     use arrow::datatypes::{DataType, Field, Schema};
+    use async_trait::async_trait;
     use datafusion::datasource::MemTable;
     use runtime_proto::{
         cluster_service_client::ClusterServiceClient, cluster_service_server::ClusterServiceServer,
     };
+    use runtime_secrets::{AnyErrorResult, SecretStore};
+    use secrecy::SecretString;
+    use spicepod::component::dataset::Dataset;
+    use spicepod::param::Params;
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::transport::{Channel, Server};
 
-    async fn make_test_service() -> ClusterServiceImpl {
+    /// Fixed-map secret store for ExpandSecret allowlist tests.
+    struct FakeSecretStore(HashMap<String, String>);
+
+    #[async_trait]
+    impl SecretStore for FakeSecretStore {
+        async fn get_secret(&self, key: &str) -> AnyErrorResult<Option<SecretString>> {
+            Ok(self.0.get(key).map(|v| SecretString::from(v.clone())))
+        }
+    }
+
+    fn secrets_with(entries: &[(&str, &str)]) -> Secrets {
+        let mut secrets = Secrets::new();
+        secrets.register_store(
+            "fake",
+            Arc::new(FakeSecretStore(
+                entries
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
+            )),
+        );
+        secrets
+    }
+
+    fn app_with_secret_ref(param: &str, reference: &str) -> Arc<App> {
+        let mut ds = Dataset::new("memory:data", "orders");
+        let map: HashMap<String, String> =
+            HashMap::from([(param.to_string(), reference.to_string())]);
+        ds.params = Some(Params::from_string_map(map));
+        Arc::new(AppBuilder::new("test").with_dataset(ds).build())
+    }
+
+    async fn make_test_service_with(
+        app: Option<Arc<App>>,
+        secrets: Secrets,
+        allow_secret_expansion: bool,
+    ) -> ClusterServiceImpl {
         let runtime = crate::Runtime::builder().build().await;
         let datafusion = Arc::new(
             DataFusion::builder(
@@ -1385,15 +1489,19 @@ mod tests {
         ));
 
         ClusterServiceImpl::new(
-            Arc::new(TokioRwLock::new(None)),
-            Arc::new(TokioRwLock::new(Secrets::default())),
+            Arc::new(TokioRwLock::new(app)),
+            Arc::new(TokioRwLock::new(secrets)),
             "127.0.0.1:0".to_string(),
             Arc::new(TokioRwLock::new(HashMap::new())),
             datafusion,
             executor_registry,
             None,
-            true,
+            allow_secret_expansion,
         )
+    }
+
+    async fn make_test_service() -> ClusterServiceImpl {
+        make_test_service_with(None, Secrets::default(), true).await
     }
 
     async fn make_test_client() -> (ClusterServiceClient<Channel>, CancellationToken) {
@@ -1422,6 +1530,146 @@ mod tests {
             .expect("test cluster service client should connect");
 
         (client, shutdown)
+    }
+
+    #[test]
+    fn expandable_secret_keys_collects_dataset_and_model_refs() {
+        let app = app_with_secret_ref("pg_pass", "${ secrets:PG_PASS }");
+        let keys = expandable_secret_keys(&app);
+        assert!(
+            keys.contains("PG_PASS"),
+            "expected PG_PASS in allowlist, got {keys:?}"
+        );
+        assert!(
+            !keys.contains("AWS_SECRET_ACCESS_KEY"),
+            "unreferenced keys must not be allowlisted"
+        );
+    }
+
+    #[test]
+    fn expandable_secret_keys_empty_when_app_has_no_refs() {
+        let app = AppBuilder::new("empty").build();
+        let keys = expandable_secret_keys(&app);
+        assert!(keys.is_empty(), "expected empty allowlist, got {keys:?}");
+    }
+
+    #[tokio::test]
+    async fn expand_secret_allows_app_referenced_key() {
+        let app = app_with_secret_ref("pg_pass", "${ secrets:PG_PASS }");
+        let secrets = secrets_with(&[
+            ("PG_PASS", "correct-horse"),
+            ("UNRELATED_ENV_SECRET", "should-not-leak"),
+        ]);
+        let service = make_test_service_with(Some(app), secrets, true).await;
+
+        let response = service
+            .expand_secret(Request::new(ExpandSecretRequest {
+                executor_id: "executor-1".to_string(),
+                key: "PG_PASS".to_string(),
+            }))
+            .await
+            .expect("referenced secret should expand");
+
+        let body = response.into_inner();
+        assert_eq!(body.key, "PG_PASS");
+        assert_eq!(body.value, "correct-horse");
+    }
+
+    #[tokio::test]
+    async fn expand_secret_denies_unreferenced_key_even_if_present_in_store() {
+        let app = app_with_secret_ref("pg_pass", "${ secrets:PG_PASS }");
+        let secrets = secrets_with(&[
+            ("PG_PASS", "correct-horse"),
+            ("AWS_SECRET_ACCESS_KEY", "should-not-leak"),
+        ]);
+        let service = make_test_service_with(Some(app), secrets, true).await;
+
+        let err = service
+            .expand_secret(Request::new(ExpandSecretRequest {
+                executor_id: "executor-1".to_string(),
+                key: "AWS_SECRET_ACCESS_KEY".to_string(),
+            }))
+            .await
+            .expect_err("unreferenced secret must be denied");
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message().contains("Unable to expand secret"),
+            "unexpected message: {}",
+            err.message()
+        );
+        // Must not leak the secret value in the error.
+        assert!(!err.message().contains("should-not-leak"));
+    }
+
+    #[tokio::test]
+    async fn expand_secret_denies_when_mtls_disabled() {
+        let app = app_with_secret_ref("pg_pass", "${ secrets:PG_PASS }");
+        let secrets = secrets_with(&[("PG_PASS", "correct-horse")]);
+        let service = make_test_service_with(Some(app), secrets, false).await;
+
+        let err = service
+            .expand_secret(Request::new(ExpandSecretRequest {
+                executor_id: "executor-1".to_string(),
+                key: "PG_PASS".to_string(),
+            }))
+            .await
+            .expect_err("ExpandSecret without mTLS must be denied");
+
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(err.message().contains("requires cluster mTLS"));
+    }
+
+    #[tokio::test]
+    async fn expand_secret_denies_when_app_missing() {
+        let secrets = secrets_with(&[("PG_PASS", "correct-horse")]);
+        let service = make_test_service_with(None, secrets, true).await;
+
+        let err = service
+            .expand_secret(Request::new(ExpandSecretRequest {
+                executor_id: "executor-1".to_string(),
+                key: "PG_PASS".to_string(),
+            }))
+            .await
+            .expect_err("ExpandSecret without app must be denied");
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn expand_secret_denies_empty_key() {
+        let app = app_with_secret_ref("pg_pass", "${ secrets:PG_PASS }");
+        let secrets = secrets_with(&[("PG_PASS", "correct-horse")]);
+        let service = make_test_service_with(Some(app), secrets, true).await;
+
+        let err = service
+            .expand_secret(Request::new(ExpandSecretRequest {
+                executor_id: "executor-1".to_string(),
+                key: String::new(),
+            }))
+            .await
+            .expect_err("empty key must be denied");
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn expand_secret_referenced_but_missing_from_store_is_invalid_argument() {
+        let app = app_with_secret_ref("pg_pass", "${ secrets:PG_PASS }");
+        // Allowlisted key is referenced by the app but not present in any store.
+        let secrets = secrets_with(&[]);
+        let service = make_test_service_with(Some(app), secrets, true).await;
+
+        let err = service
+            .expand_secret(Request::new(ExpandSecretRequest {
+                executor_id: "executor-1".to_string(),
+                key: "PG_PASS".to_string(),
+            }))
+            .await
+            .expect_err("missing allowlisted secret must fail");
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("Unable to expand secret PG_PASS"));
     }
 
     #[tokio::test]
