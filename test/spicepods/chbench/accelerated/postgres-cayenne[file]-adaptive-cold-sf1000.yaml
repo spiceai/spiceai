@@ -78,7 +78,6 @@ datasets:
         cayenne_tuning: adaptive
         # In-memory CDC intra-apply sharding: 4 PK-hash shards validate+append in parallel within
         # one apply on the memory-tier (changes) tables. Not an adaptive actuator.
-        cayenne_cdc_mem_tier_shards: '4'
         # --- Datalake (cold) object-store tier (RAM mem-tier -> warm local disk -> COLD). All
         # static config; none of these are adaptive actuators, so setting them collapses no tuning
         # bound. The location is namespaced by table_id, so one shared prefix is safe for every
@@ -152,7 +151,6 @@ datasets:
       refresh_mode: changes
       params: &cayenne_params
         cayenne_tuning: adaptive
-        cayenne_cdc_mem_tier_shards: '4'
 
   # ------------------------------------------------------------------
   # Static reference tables (no OLTP mutations, full refresh) — adaptive, no cold tier.

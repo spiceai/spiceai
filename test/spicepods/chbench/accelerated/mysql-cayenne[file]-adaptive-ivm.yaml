@@ -85,7 +85,6 @@ datasets:
         # In-memory CDC intra-apply sharding: 4 PK-hash shards validate+append in
         # parallel within one apply on the memory-tier (changes) tables. Inert on the
         # full-refresh reference tables that share this anchor (not CDC memory mode).
-        cayenne_cdc_mem_tier_shards: '4'
         # Goal-driven SLOs are set globally under `runtime.params` (above) and
         # inherited by every dataset, so they are intentionally not repeated here.
         # (A dataset that needed a sharper target would override the relevant

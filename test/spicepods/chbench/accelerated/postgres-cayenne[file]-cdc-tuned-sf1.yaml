@@ -2,12 +2,21 @@ version: v1
 kind: Spicepod
 name: postgres-cayenne[file]-cdc-tuned-sf1
 
+# CDC prefetch is NOT pinned: it uses the runtime default (128 envelopes).
+# It was previously pinned to 16384, the runtime maximum, for throughput. That
+# channel caps ENVELOPES, not bytes, and each envelope carries a materialized
+# 8192-row batch — so 16384 slots meant up to 134M rows in flight per dataset,
+# more rows than most of these tables contain, with all 7 snapshotting at once
+# under initial_snapshot: auto. It appears in no memory budget, and the gauge
+# reports envelopes, so it read "16384/16384" identically whether it held 35 GB
+# or 35 MB. At SF-1000 spiced reached 95.8 GB of anonymous RSS in under 7
+# minutes, with bootstrap still incomplete, and was OOM-killed.
+
 # Target: xlarge-runner — 64 vCPU / 256 GiB RAM, SSD storage. sf1 run: identical to
 # the sf1000 tuning — at this scale every PK keyset fits the exact path under any
 # pin, so the keyset value is not load-bearing; kept aligned for comparability.
 #
 # Key tuning:
-#   - cdc_prefetch_buffer / cdc_max_coalesced_envelopes 16384 (runtime max after Lever D
 #     raised CDC_PREFETCH_BUFFER_MAX / CDC_MAX_COALESCED_ENVELOPES_MAX 4096->16384):
 #     larger CDC bursts cut metastore round-trips and keep WAL drain ahead of bursty OLTP.
 #   - target_partitions 48: read-path parallelism tuned for the current runner sweep.
@@ -15,9 +24,6 @@ name: postgres-cayenne[file]-cdc-tuned-sf1
 #     upsert tables; reference tables use lighter settings.
 runtime:
   params:
-    cdc_prefetch_buffer: '16384'
-    cdc_max_coalesced_envelopes: '16384'
-    cdc_max_coalesced_bytes: '536870912' # 512 MB
     cdc_max_coalesce_age_ms: '4000'
     cdc_commit_timeout_ms: '60000'
     cayenne_sort_merge_min_rows: '50000000'

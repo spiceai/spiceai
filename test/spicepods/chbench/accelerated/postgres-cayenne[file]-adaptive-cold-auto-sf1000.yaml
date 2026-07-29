@@ -59,7 +59,6 @@ datasets:
         cayenne_tuning: adaptive
         # In-memory CDC intra-apply sharding: 4 PK-hash shards validate+append in parallel within
         # one apply on the memory-tier (changes) tables. Not an adaptive actuator.
-        cayenne_cdc_mem_tier_shards: '4'
         # --- Datalake (cold) object-store tier: ONLY the location + credentials are set, which is
         # all that enables the tier. Promotion trigger / cold file size / cadence are intentionally
         # left UNSET so they run on engine defaults / auto-tuning (this pod's whole point). The
@@ -127,7 +126,6 @@ datasets:
       refresh_mode: changes
       params: &cayenne_params
         cayenne_tuning: adaptive
-        cayenne_cdc_mem_tier_shards: '4'
 
   # ------------------------------------------------------------------
   # Static reference tables (no OLTP mutations, full refresh) — adaptive, no cold tier.

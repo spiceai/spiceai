@@ -2,6 +2,16 @@ version: v1
 kind: Spicepod
 name: postgres-cayenne[file]-adaptive-ivm
 
+# CDC prefetch is NOT pinned: it uses the runtime default (128 envelopes).
+# It was previously pinned to 16384, the runtime maximum, for throughput. That
+# channel caps ENVELOPES, not bytes, and each envelope carries a materialized
+# 8192-row batch — so 16384 slots meant up to 134M rows in flight per dataset,
+# more rows than most of these tables contain, with all 7 snapshotting at once
+# under initial_snapshot: auto. It appears in no memory budget, and the gauge
+# reports envelopes, so it read "16384/16384" identically whether it held 35 GB
+# or 35 MB. At SF-1000 spiced reached 95.8 GB of anonymous RSS in under 7
+# minutes, with bootstrap still incomplete, and was OOM-killed.
+
 # Adaptive CH-BenCHmark + maintained aggregates (IVM).
 #
 # Same topology / prefetch / adaptive loop as `postgres-cayenne[file]-adaptive`, plus
@@ -44,7 +54,6 @@ name: postgres-cayenne[file]-adaptive-ivm
 #     warm-start. Adaptive is set explicitly, so it runs regardless; without inferred metadata
 #     the loop just relearns the row width from observed ingest.
 # Background compaction stays at the auto-derived (non-zero) default — the controller rides its
-# tick. The ONLY pinned knobs are the two CDC prefetch buffers (`cdc_prefetch_buffer` /
 # `cdc_max_coalesced_envelopes` = 16384, the runtime max) under `runtime.params` below: the sweep
 # showed deep prefetch is a clear, stable win, so we fix it here (this collapses those two knobs'
 # adaptive bounds to a point; adaptive still moves every other per-actuator knob freely).
@@ -82,8 +91,6 @@ runtime:
     # Deep prefetch: pin the CDC source-reader→apply channel and coalescing envelope cap to the
     # runtime max (16384). This was the biggest single lever in the SF1000 benchmark sweep (4-slot
     # replication lag ~435s at default buffers → ~320s deep).
-    cdc_prefetch_buffer: '16384'
-    cdc_max_coalesced_envelopes: '16384'
     cayenne_goal_replication_lag: '5s'
     cayenne_goal_freshness: '30s'
     cayenne_goal_query_latency: '10s'
@@ -110,7 +117,6 @@ datasets:
         # In-memory CDC intra-apply sharding: 4 PK-hash shards validate+append in
         # parallel within one apply on the memory-tier (changes) tables. Inert on the
         # full-refresh reference tables that share this anchor (not CDC memory mode).
-        cayenne_cdc_mem_tier_shards: '4'
         # Goal-driven SLOs are set globally under `runtime.params` (above) and
         # inherited by every dataset, so they are intentionally not repeated here.
         # (A dataset that needed a sharper target would override the relevant
