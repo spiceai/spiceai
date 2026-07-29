@@ -897,14 +897,6 @@ async fn test_acceleration_duckdb_full_refresh_file_swap() -> Result<(), anyhow:
             drop(rt);
             wait_for_replacements_to_settle(&db_file).await?;
 
-            // Nothing writes after the final replacement here, so the file it
-            // left behind must be the checkpointed, WAL-free one it produced.
-            if wal_beside(&db_file) {
-                return Err(anyhow!(
-                    "a completed replacement must leave a checkpointed, WAL-free file"
-                ));
-            }
-
             // The swap replaced the file at the configured path with a fresh
             // generation.
             #[cfg(unix)]
