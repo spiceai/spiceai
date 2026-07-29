@@ -249,7 +249,7 @@ delta_kernel = { version = "0.23.0", features = [
 derive_builder = "0.20.2"
 dotenv = { path = "crates/dotenv" }
 duration-parse = { path = "crates/duration-parse" }
-duckdb = "1.10503" # 1.10503.x corresponds to DuckDB v1.5.3
+duckdb = "1.10505" # 1.10505.x corresponds to DuckDB v1.5.5
 dyn-hash = "1.0.0"
 encoding_rs = "0.8.34"
 fundu = "2.0.1"
