@@ -61,9 +61,9 @@ const LOAD_TIMEOUT: Duration = Duration::from_mins(1);
 ///
 /// A `{db}.wal` is deliberately *not* counted: it is ordinary `DuckDB` state from
 /// whatever committed most recently, so a test that writes right up to shutdown
-/// legitimately leaves one behind for the next open to replay. Only the tests
-/// that end on a completed replacement with no writes after it assert on it, via
-/// [`wal_beside`].
+/// legitimately leaves one behind for the next open to replay. A test that
+/// requires the file to be checkpointed waits for the owning instance to close
+/// separately, via [`wal_len_beside`].
 fn replacement_debris_beside(db_file: &Path) -> Result<Vec<String>, anyhow::Error> {
     let dir = db_file.parent().unwrap_or(Path::new("."));
     let Some(file_name) = db_file.file_name().and_then(|n| n.to_str()) else {
@@ -78,11 +78,13 @@ fn replacement_debris_beside(db_file: &Path) -> Result<Vec<String>, anyhow::Erro
         .collect())
 }
 
-/// Whether a write-ahead log sits beside `db_file`.
-fn wal_beside(db_file: &Path) -> bool {
+/// The size of the write-ahead log sitting beside `db_file`, if there is one.
+/// The size is what makes a failure message actionable: a WAL holding a single
+/// metadata commit is a handful of bytes, one holding a whole refresh is not.
+fn wal_len_beside(db_file: &Path) -> Option<u64> {
     let mut wal = db_file.as_os_str().to_os_string();
     wal.push(".wal");
-    Path::new(&wal).exists()
+    std::fs::metadata(Path::new(&wal)).ok().map(|m| m.len())
 }
 
 /// Polls until no staging/generation debris remains beside `db_file`. Retired
@@ -896,11 +898,22 @@ async fn test_acceleration_duckdb_full_refresh_file_swap() -> Result<(), anyhow:
             drop(rt);
             wait_for_replacements_to_settle(&db_file).await?;
 
-            // Nothing writes after the final replacement here, so the file it
-            // left behind must be the checkpointed, WAL-free one it produced.
-            if wal_beside(&db_file) {
+            // The file left behind must be the checkpointed, WAL-free one the
+            // replacement produced. The WAL that carries the post-swap dataset
+            // checkpoint commit is removed by the shutdown checkpoint of the
+            // instance owning the file, which completes after
+            // `wait_for_replacements_to_settle` returns — its debris check
+            // deliberately ignores `{db}.wal` — so poll for the condition
+            // rather than sampling it once.
+            let wal_free = wait_until_true(Duration::from_secs(30), || async {
+                wal_len_beside(&db_file).is_none()
+            })
+            .await;
+            if !wal_free {
                 return Err(anyhow!(
-                    "a completed replacement must leave a checkpointed, WAL-free file"
+                    "a completed replacement must leave a checkpointed, WAL-free file, but a {} byte WAL remains beside {}",
+                    wal_len_beside(&db_file).unwrap_or_default(),
+                    db_file.display()
                 ));
             }
 
