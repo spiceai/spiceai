@@ -253,10 +253,12 @@ jobs:
             }
 
             core.setOutput('fast_track', 'true');
+            // Name the pattern rather than a subset of what it matches: the two drift
+            // apart every time a path is added to the gate.
             core.notice(
-              `Fast-tracked ${files.length} changed file(s): no .rs, Cargo, rust-toolchain, ` +
-              `or .cargo/ paths, so a sign-off would run no Rust checks. The full suite ` +
-              `still runs in the merge queue.`
+              `Fast-tracked ${files.length} changed file(s): none matches the ` +
+              `rustAffecting pattern in .github/workflows/pr.yml, so a sign-off would ` +
+              `run no Rust checks. The full suite still runs in the merge queue.`
             );
 
       # Pure reverts are fast-tracked: undoing a commit that already landed on

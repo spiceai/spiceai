@@ -704,7 +704,9 @@ run_checks() {
   # expensive lint/build/test gate. Unknown diffs fall through and run checks.
   if [[ -n "$revision" ]] && ! branch_has_rust_changes "$revision"; then
     info "No Rust-affecting files changed vs ${LINT_BASE_BRANCH} — skipping Rust lint, build, and unit tests"
-    append_step_summary "### Rust checks"$'\n'"Skipped (no \`.rs\` / Cargo / rust-toolchain / \`.cargo/\` / lint-config files in the branch diff vs \`${LINT_BASE_BRANCH}\`)."$'\n'
+    # Name the pattern rather than a subset of what it matches: the two drift apart
+    # every time a path is added to the gate.
+    append_step_summary "### Rust checks"$'\n'"Skipped (nothing in the branch diff vs \`${LINT_BASE_BRANCH}\` matches \`RUST_AFFECTING_PATH_PATTERN\` in \`scripts/signoff\`)."$'\n'
     SIGNOFF_CHECK_SUMMARY="no Rust changes (lint/test skipped)"
     return 0
   fi
