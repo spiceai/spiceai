@@ -62,9 +62,7 @@ const LOAD_TIMEOUT: Duration = Duration::from_mins(1);
 ///
 /// A `{db}.wal` is deliberately *not* counted: it is ordinary `DuckDB` state from
 /// whatever committed most recently, so a test that writes right up to shutdown
-/// legitimately leaves one behind for the next open to replay. Only the tests
-/// that end on a completed replacement with no writes after it assert on it, via
-/// [`wal_beside`].
+/// legitimately leaves one behind for the next open to replay.
 fn replacement_debris_beside(db_file: &Path) -> Result<Vec<String>, anyhow::Error> {
     let dir = db_file.parent().unwrap_or(Path::new("."));
     let Some(file_name) = db_file.file_name().and_then(|n| n.to_str()) else {
@@ -77,13 +75,6 @@ fn replacement_debris_beside(db_file: &Path) -> Result<Vec<String>, anyhow::Erro
         .map(|e| e.file_name().to_string_lossy().to_string())
         .filter(|name| name.starts_with(&generation_prefix))
         .collect())
-}
-
-/// Whether a write-ahead log sits beside `db_file`.
-fn wal_beside(db_file: &Path) -> bool {
-    let mut wal = db_file.as_os_str().to_os_string();
-    wal.push(".wal");
-    Path::new(&wal).exists()
 }
 
 /// Polls until no staging/generation debris remains beside `db_file`. Retired
