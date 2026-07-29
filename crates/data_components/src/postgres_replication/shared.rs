@@ -1015,6 +1015,11 @@ impl MemberMailboxSender {
     fn close(&self) {
         self.shared.sender_closed.store(true, Ordering::Release);
         self.shared.receiver_waker.wake();
+        // Also release anyone parked waiting for capacity. `send_control` blocks
+        // on `capacity_notify` and only re-reads `sender_closed` after being
+        // woken, so closing without this wake would leave that sender asleep
+        // until the receiver happened to drain — and on a stalled sink, never.
+        self.shared.capacity_notify.notify_waiters();
     }
 
     /// Publish a pending data envelope, appending it to the compatible,
@@ -3725,6 +3730,48 @@ mod tests {
         assert_eq!(
             tx.shared.buffered_bytes.load(Ordering::Acquire),
             PENDING_CHANGE_BYTES
+        );
+    }
+
+    /// `close` must release a sender parked waiting for capacity, not just the
+    /// receiver. `send_control` re-reads `sender_closed` only after a wake, so a
+    /// close that woke only the receiver would leave the sender asleep until the
+    /// sink drained — and a stalled sink never does. Unreachable today (one
+    /// sender per mailbox, all sends from the pump task), which is exactly why it
+    /// needs a test: a second sender would turn it into a hang.
+    #[tokio::test]
+    async fn close_releases_a_sender_parked_on_a_full_mailbox() {
+        let (tx, _rx) = member_mailbox_with_limits(1, test_limits(8, 8));
+        let slot = Arc::new(AckSlot::new(0, false));
+        // Fill the single item slot so the next control send must park.
+        assert!(
+            tx.try_publish(pending_change(&slot, 10, 100, false))
+                .is_delivered()
+        );
+        let heartbeat = crate::cdc::build_ready_signal_envelope(&tiny_schema()).expect("heartbeat");
+        assert!(matches!(
+            tx.try_send_control(Ok(heartbeat)),
+            MailboxSendOutcome::Full(_)
+        ));
+
+        let tx = Arc::new(tx);
+        let sender = Arc::clone(&tx);
+        let parked = tokio::spawn(async move {
+            let heartbeat =
+                crate::cdc::build_ready_signal_envelope(&tiny_schema()).expect("second heartbeat");
+            sender.send_control(Ok(heartbeat)).await
+        });
+        // Let it reach the await, then close. The receiver never drains.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tx.close();
+
+        let returned = tokio::time::timeout(std::time::Duration::from_secs(5), parked)
+            .await
+            .expect("close must release the parked sender rather than hang it")
+            .expect("sender task panicked");
+        assert!(
+            returned.is_some(),
+            "a closed mailbox should hand the item back, not swallow it"
         );
     }
 
