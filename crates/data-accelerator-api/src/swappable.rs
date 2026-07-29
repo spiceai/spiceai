@@ -171,6 +171,11 @@ impl SwappableTableProvider {
     ///
     /// Lock poisoning is recovered transparently via
     /// [`std::sync::PoisonError::into_inner`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SwapError::SchemaMismatch`] if the new provider's schema is incompatible
+    /// with the cached schema.
     pub fn swap(&self, new_inner: Arc<dyn TableProvider>) -> Result<(), SwapError> {
         if !schemas_compatible(new_inner.schema().as_ref(), self.cached_schema.as_ref()) {
             return Err(SwapError::SchemaMismatch);
