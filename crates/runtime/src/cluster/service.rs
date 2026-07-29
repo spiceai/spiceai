@@ -1267,17 +1267,30 @@ fn encode_batches_to_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>, arrow::erro
 /// [`Status::permission_denied`] so callers can distinguish policy rejections
 /// from unexpected internal failures.
 fn map_task_history_query_error(e: &crate::datafusion::query::Error) -> Status {
-    let message = e.to_string();
+    // Classify on the underlying DataFusion message, not `Error`'s Display —
+    // `UnableToExecuteQuery` already prefixes with "Failed to execute query: ",
+    // and re-wrapping that string would double the prefix and couple the
+    // mutation classifier to wrapper formatting.
+    let underlying = match e {
+        crate::datafusion::query::Error::UnableToExecuteQuery { source }
+        | crate::datafusion::query::Error::UnableToCreateMemoryStream { source }
+        | crate::datafusion::query::Error::UnableToCollectResults { source }
+        | crate::datafusion::query::Error::BindingParameters { source } => source.to_string(),
+        other => other.to_string(),
+    };
+
     // Prefer PermissionDenied for any mutation rejection so cluster peers get a
     // clear policy signal rather than a 500-class Internal. The read-only
     // validator is the primary gate; the general operations validator can also
     // reject writes first (e.g. internal datasets) with a different message.
-    if is_task_history_mutation_rejection(&message) {
+    if is_task_history_mutation_rejection(&underlying) {
         Status::permission_denied(format!(
-            "Task history queries are read-only and cannot mutate data: {message}"
+            "Task history queries are read-only and cannot mutate data: {underlying}"
         ))
     } else {
-        Status::internal(format!("Failed to execute query: {message}"))
+        // `Error`'s Display already formats `UnableToExecuteQuery` as
+        // "Failed to execute query: …"; use it as-is to avoid a second prefix.
+        Status::internal(e.to_string())
     }
 }
 
@@ -1609,6 +1622,14 @@ mod tests {
         let status = map_task_history_query_error(&e);
         assert_eq!(status.code(), tonic::Code::PermissionDenied);
         assert!(status.message().contains("read-only"));
+        // Underlying Plan text only — no Error Display wrapper re-prefixed.
+        assert!(
+            !status
+                .message()
+                .contains("Failed to execute query: Failed to execute query:"),
+            "must not double-prefix Display: {}",
+            status.message()
+        );
     }
 
     #[test]
@@ -1620,6 +1641,24 @@ mod tests {
         };
         let status = map_task_history_query_error(&e);
         assert_eq!(status.code(), tonic::Code::Internal);
+        // Error Display already includes "Failed to execute query: " once.
+        assert!(
+            status.message().starts_with("Failed to execute query:"),
+            "unexpected message: {}",
+            status.message()
+        );
+        assert!(
+            !status
+                .message()
+                .contains("Failed to execute query: Failed to execute query:"),
+            "must not double-prefix Display: {}",
+            status.message()
+        );
+        assert!(
+            status.message().contains("something unexpected"),
+            "unexpected message: {}",
+            status.message()
+        );
     }
 
     #[test]
