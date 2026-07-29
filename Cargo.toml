@@ -9,6 +9,7 @@ members = [
     "crates/arrow_tools",
     "crates/aws-sdk-credential-bridge",
     "crates/chunking",
+    "crates/cloud-connect-crypto",
     "crates/data-connectors/*",
     "crates/datafusion-ddl",
     "crates/datafusion-dml",
@@ -56,6 +57,7 @@ members = [
     "crates/runtime-parameters",
     "crates/runtime-parameters-derive",
     "crates/runtime-secrets",
+    "crates/runtime-status",
     "crates/runtime-table-partition",
     "crates/runtime-rate-control",
     "crates/runtime-request-context",
@@ -120,10 +122,13 @@ version = "2.2.0-unstable"
 # Test-context exemptions (allow-expect-in-tests, thresholds) live in `clippy.toml`.
 [workspace.lints.rust]
 # `tokio_unstable` is enabled via `RUSTFLAGS="--cfg tokio_unstable"` to expose the
-# per-worker tokio RuntimeMetrics (busy/park/steal). Declare it so the otherwise-unknown
-# cfg name doesn't trip the `unexpected_cfgs` lint on builds without the flag. Declared
-# workspace-wide (via each crate's `lints.workspace = true`) rather than per-crate.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
+# per-worker tokio RuntimeMetrics (busy/park/steal). `cayenne_loom` is enabled the
+# same way (`RUSTFLAGS="--cfg cayenne_loom"`) to swap std atomics for loom's
+# model-checked ones in cayenne's `StructuralVersion` seqlock model tests. Declare
+# both so the otherwise-unknown cfg names don't trip the `unexpected_cfgs` lint on
+# builds without the flag. Declared workspace-wide (via each crate's
+# `lints.workspace = true`) rather than per-crate.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)', 'cfg(cayenne_loom)'] }
 
 [workspace.lints.clippy]
 # Deny the pedantic group with a lower priority so the specific opt-outs below win.
@@ -259,6 +264,7 @@ globset = "0.4.16"
 governor = "0.10.4"
 graph-rs-sdk = { git = "https://github.com/spiceai/graph-rs-sdk", rev = "af383410a9c86915263fbd1145b8becfc1e317b5" } # branch: spiceai
 graphql-parser = "0.4.0"
+hex = "0.4.3"
 hf-hub = { version = "0.4", features = ["tokio"] }
 http = "1.3.1"
 httpdate = "1.0"
@@ -276,6 +282,10 @@ itertools = "0.14"
 linkme = "0.3.35"
 log = "0.4.22"
 logos = "0.16.1"
+# Model-checked concurrency primitives for cayenne's `StructuralVersion` seqlock
+# tests; compiled only under `RUSTFLAGS="--cfg cayenne_loom"` (a cfg-gated
+# dev-dependency), so it never enters normal builds.
+loom = "0.7"
 mailparse = "0.16.1"
 moka = { version = "0.12", features = ["future"] }
 mongodb = { version = "3.5.2", features = ["openssl-tls"] }
@@ -352,6 +362,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10.8"
 snafu = "0.8.6"
+cloud-connect-crypto = { path = "crates/cloud-connect-crypto" }
 runtime-cloud-connect = { path = "crates/runtime-cloud-connect" }
 spice-cloud-client = { path = "crates/spice-cloud-client" }
 snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "744ffd77fe82171a805562ce001a341a94d52541" } # branch: spiceai-58

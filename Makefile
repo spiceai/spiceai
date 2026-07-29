@@ -95,9 +95,16 @@ else
     NEXTEST_CARGO_PROFILE := --cargo-profile dev
 endif
 
+# `libnfs` binds a system library, and on a modern glibc its generated bindings
+# carry a layout assertion for a type the headers only forward-declare, so the
+# crate fails to compile at all (spiceai/spiceai#12130). `lint-rust` already
+# excludes it via `_LINT_WORKSPACE_FLAGS`; excluding it here too keeps both halves
+# of the gate agreeing on which crates need system libraries, so a sign-off on
+# such a host fails only for reasons in the branch under test. The crate has no
+# unit tests of its own.
 .PHONY: nextest
 nextest:
-	@cargo nextest run --all --lib $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
+	@cargo nextest run --all --exclude libnfs --lib $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
 	@cargo nextest run -p cayenne --tests $(NEXTEST_CARGO_PROFILE)
 
 # Unit tests for named packages — the fail-fast pre-check scripts/signoff runs on

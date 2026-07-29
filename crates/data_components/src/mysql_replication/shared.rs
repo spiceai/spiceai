@@ -1860,7 +1860,14 @@ async fn deliver_commit(
             is_ready,
         );
         slot.deliver(commit_pos);
-        match deliver_to_member(&member.sender, Ok(envelope), shutdown_epoch).await {
+        match deliver_to_member(
+            &member.sender,
+            Ok(envelope),
+            shutdown_epoch,
+            &member.dataset_name,
+        )
+        .await
+        {
             DeliverOutcome::Sent => {}
             DeliverOutcome::ReceiverGone => {
                 source.detach_member(key, "changes stream receiver dropped", true);
@@ -1944,7 +1951,14 @@ async fn handle_statement(
                     is_ready,
                 );
                 slot.deliver(&commit_pos);
-                match deliver_to_member(&member.sender, Ok(envelope), shutdown_epoch).await {
+                match deliver_to_member(
+                    &member.sender,
+                    Ok(envelope),
+                    shutdown_epoch,
+                    &member.dataset_name,
+                )
+                .await
+                {
                     DeliverOutcome::Sent => {}
                     DeliverOutcome::ReceiverGone => {
                         source.detach_member(&mkey, "changes stream receiver dropped", true);
@@ -2020,8 +2034,10 @@ async fn deliver_to_member(
     sender: &mpsc::Sender<std::result::Result<ChangeEnvelope, StreamError>>,
     envelope: std::result::Result<ChangeEnvelope, StreamError>,
     shutdown_epoch: u64,
+    dataset: &str,
 ) -> DeliverOutcome {
     let mut pending = envelope;
+    let mut stalled_for = Duration::ZERO;
     loop {
         match sender.send_timeout(pending, MEMBER_SEND_STALL_WARN).await {
             Ok(()) => return DeliverOutcome::Sent,
@@ -2030,7 +2046,8 @@ async fn deliver_to_member(
                 if crate::cdc::shutdown_epoch() != shutdown_epoch {
                     return DeliverOutcome::ShutdownAbandon;
                 }
-                tracing::warn!(stalled_for = ?MEMBER_SEND_STALL_WARN, "shared mysql binlog member sink is not draining; the pump is waiting to deliver committed changes");
+                stalled_for += MEMBER_SEND_STALL_WARN;
+                tracing::warn!(dataset = %dataset, stalled_for = ?stalled_for, "shared mysql binlog member sink is not draining; the pump is waiting to deliver committed changes");
                 pending = returned;
             }
         }
@@ -2702,6 +2719,7 @@ mod tests {
             &sender,
             Err(StreamError::External("x".to_string())),
             crate::cdc::shutdown_epoch(),
+            "test_dataset",
         )
         .await;
         assert!(matches!(outcome, DeliverOutcome::ReceiverGone));

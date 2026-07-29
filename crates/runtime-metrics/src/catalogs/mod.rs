@@ -32,15 +32,16 @@ pub static STATUS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
             .build()
 });
 
-/// Number of tables a CDC-accelerated catalog resolved into each disposition,
-/// labeled by `catalog` and `category` (`accelerated`, `skipped`, `excluded`).
-/// A gauge, not a counter: it reflects the current disposition after each
-/// catalog refresh re-plans the whole namespace, so it can rise or fall.
+/// Number of relations a CDC-accelerated catalog resolved into each disposition,
+/// labeled by `catalog` and `category` (`accelerated`, `skipped`, `excluded`,
+/// `views_not_replicated`). A gauge, not a counter: it reflects the current
+/// disposition after each catalog refresh re-plans the whole namespace, so it
+/// can rise or fall.
 pub static ACCELERATION_TABLES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     CATALOGS_METER
         .u64_gauge("catalog_acceleration_tables")
         .with_description(
-            "Tables resolved by a CDC-accelerated catalog, labeled by catalog and category (accelerated, skipped, excluded).",
+            "Relations resolved by a CDC-accelerated catalog, labeled by catalog and category (accelerated, skipped, excluded, views_not_replicated).",
         )
         .build()
 });
