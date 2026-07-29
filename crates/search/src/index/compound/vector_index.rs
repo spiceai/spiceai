@@ -21,7 +21,7 @@ use arrow_schema::Field;
 use async_trait::async_trait;
 use datafusion::{error::DataFusionError, logical_expr::LogicalPlan};
 use futures::future::try_join_all;
-use runtime_datafusion_index::Index;
+use runtime_datafusion_index::{Index, IndexWriteMode};
 
 use crate::index::{SearchIndex, VectorIndex};
 
@@ -132,25 +132,25 @@ impl Index for CompoundVectorIndex {
         try_join_all(futs).await
     }
 
-    async fn on_write_start(&self) -> Result<(), DataFusionError> {
-        compound_on_write_start(self.primary.as_ref(), self.secondary.as_ref()).await
+    async fn on_write_start(&self, mode: IndexWriteMode) -> Result<(), DataFusionError> {
+        compound_on_write_start(self.primary.as_ref(), self.secondary.as_ref(), mode).await
     }
 
-    async fn on_write_failed(&self) -> Result<(), DataFusionError> {
+    async fn on_write_failed(&self, mode: IndexWriteMode) -> Result<(), DataFusionError> {
         // Drive both to completion — a failure on one index must not skip the other's
         // cleanup — then surface the primary's error first.
         let (primary_result, secondary_result) = futures::join!(
-            self.primary.on_write_failed(),
-            self.secondary.on_write_failed()
+            self.primary.on_write_failed(mode),
+            self.secondary.on_write_failed(mode)
         );
         primary_result.and(secondary_result)
     }
 
-    async fn on_write_complete(&self) -> Result<(), DataFusionError> {
+    async fn on_write_complete(&self, mode: IndexWriteMode) -> Result<(), DataFusionError> {
         // As with `on_write_failed`: both completion callbacks must run.
         let (primary_result, secondary_result) = futures::join!(
-            self.primary.on_write_complete(),
-            self.secondary.on_write_complete()
+            self.primary.on_write_complete(mode),
+            self.secondary.on_write_complete(mode)
         );
         primary_result.and(secondary_result)
     }

@@ -41,6 +41,7 @@ use arrow::array::RecordBatch;
 use arrow_schema::{ArrowError, Field, FieldRef, Schema};
 use datafusion::error::DataFusionError;
 use itertools::Itertools;
+use runtime_datafusion_index::IndexWriteMode;
 use snafu::{ResultExt, Snafu, ensure};
 
 pub use search_index::CompoundSearchIndex;
@@ -262,14 +263,15 @@ fn compound_required_columns(
 async fn compound_on_write_start(
     primary: &dyn SearchIndex,
     secondary: &dyn SearchIndex,
+    mode: IndexWriteMode,
 ) -> Result<(), DataFusionError> {
-    primary.on_write_start().await?;
-    if let Err(secondary_err) = secondary.on_write_start().await {
+    primary.on_write_start(mode).await?;
+    if let Err(secondary_err) = secondary.on_write_start(mode).await {
         // Roll back only the primary: the secondary's `on_write_start` is the call that
         // failed, and `on_write_failed` restores state set up by a *successful*
         // `on_write_start` — an implementation whose start fails partway owns its own
         // cleanup. Calling it here could "restore" settings that were never overridden.
-        if let Err(rollback_err) = primary.on_write_failed().await {
+        if let Err(rollback_err) = primary.on_write_failed(mode).await {
             tracing::warn!(
                 "Failed to roll back the primary index of a compound search index after the secondary index failed to start a write: {rollback_err}"
             );

@@ -25,7 +25,7 @@ use datafusion::{
 };
 use opentelemetry::KeyValue;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
-use runtime_datafusion_index::{Index, IndexedTableProvider};
+use runtime_datafusion_index::{Index, IndexWriteMode, IndexedTableProvider};
 use runtime_table_partition::provider::PartitionTableProvider;
 use util::RetryError;
 
@@ -151,6 +151,15 @@ impl TableSink {
             overwrite
         );
 
+        // A full refresh (`InsertOp::Overwrite`) replaces the index's entire contents; any
+        // other write appends. External indexes use this to remove stale entries on a full
+        // refresh — the `InsertOp` alone only reaches the accelerator's own storage.
+        let write_mode = if matches!(overwrite, InsertOp::Overwrite) {
+            IndexWriteMode::Overwrite
+        } else {
+            IndexWriteMode::Append
+        };
+
         let ctx = SessionContext::new();
         let target_schema = self.table_provider.schema();
         warn_on_narrowing_schema_cast(&record_batch_stream.schema(), &target_schema);
@@ -204,7 +213,7 @@ impl TableSink {
             .chain(self.sink_indexes.iter())
         {
             tracing::debug!("Running on_write_start for index '{}'", index.name());
-            if let Err(e) = index.on_write_start().await {
+            if let Err(e) = index.on_write_start(write_mode).await {
                 tracing::warn!(
                     "TableSink: on_write_start failed for index '{}': {e}. Continuing with write.",
                     index.name()
@@ -218,7 +227,7 @@ impl TableSink {
                 "TableSink: collect() failed after {:.2}s: {e}",
                 collect_start.elapsed().as_secs_f64()
             );
-            run_on_write_failed(&providers_before_write, &self.sink_indexes).await;
+            run_on_write_failed(&providers_before_write, &self.sink_indexes, write_mode).await;
             return Err(retry_from_df_error(e));
         }
 
@@ -257,6 +266,7 @@ impl TableSink {
             provider_indexes_after
                 .iter()
                 .chain(self.sink_indexes.iter()),
+            write_mode,
         )
         .await
         .map_err(retry_from_df_error)?;
@@ -273,6 +283,7 @@ impl TableSink {
 async fn run_on_write_failed(
     providers: &[Arc<dyn TableProvider>],
     sink_indexes: &[Arc<dyn Index + Send + Sync>],
+    mode: IndexWriteMode,
 ) {
     let provider_indexes: Vec<Arc<dyn Index + Send + Sync>> = providers
         .iter()
@@ -281,7 +292,7 @@ async fn run_on_write_failed(
         .collect();
 
     for index in provider_indexes.iter().chain(sink_indexes.iter()) {
-        if let Err(e) = index.on_write_failed().await {
+        if let Err(e) = index.on_write_failed(mode).await {
             tracing::warn!(
                 "TableSink: on_write_failed failed for index '{}': {e}. Index write state may need manual cleanup.",
                 index.name()

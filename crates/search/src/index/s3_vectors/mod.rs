@@ -44,7 +44,7 @@ use datafusion_expr::{LogicalPlanBuilder, ScalarUDF, binary_expr, cast, col};
 use datafusion_functions_json::udfs::json_get_udf;
 use futures::future::try_join_all;
 use llms::embeddings::Embed;
-use runtime_datafusion_index::Index;
+use runtime_datafusion_index::{Index, IndexWriteMode};
 use runtime_table_partition::insert::partition_batch;
 use snafu::ResultExt;
 
@@ -381,6 +381,21 @@ impl Index for S3Vector {
             .into_iter()
             .map(|rb| async { self.write(rb).await.map_err(DataFusionError::External) });
         try_join_all(futs).await
+    }
+
+    async fn on_write_complete(&self, mode: IndexWriteMode) -> Result<(), DataFusionError> {
+        // `compute_index` upserts vectors by primary key, so a full refresh replaces the rows
+        // it re-writes but leaves vectors whose keys were dropped from the source untouched.
+        // Removing them safely requires snapshotting the index's keys at write start and
+        // deleting the keys not re-written this cycle; that purge is not yet wired here, so a
+        // full refresh currently leaves stale vectors searchable. See the issue below.
+        if mode == IndexWriteMode::Overwrite {
+            tracing::warn!(
+                "S3 Vectors index '{}' finished a full refresh, but vectors for rows dropped from the source since the previous refresh are not yet removed and may remain searchable. Tracking: https://github.com/spiceai/spiceai/issues/12145",
+                self.name()
+            );
+        }
+        Ok(())
     }
 }
 

@@ -238,7 +238,7 @@ mod tests {
     use arrow::util::pretty::pretty_format_batches;
     use datafusion::datasource::MemTable;
     use futures::TryStreamExt;
-    use runtime_datafusion_index::Index;
+    use runtime_datafusion_index::{Index, IndexWriteMode};
     use search::index::SearchIndex;
     use search::index::compound::CompoundReadMode;
 
@@ -281,7 +281,7 @@ mod tests {
 
         // A sink-driven refresh opens a write window on both tiers.
         compound
-            .on_write_start()
+            .on_write_start(IndexWriteMode::Append)
             .await
             .expect("on_write_start failed");
 
@@ -296,7 +296,7 @@ mod tests {
 
         // The refresh then fails, discarding whatever the window staged.
         compound
-            .on_write_failed()
+            .on_write_failed(IndexWriteMode::Append)
             .await
             .expect("on_write_failed failed");
 

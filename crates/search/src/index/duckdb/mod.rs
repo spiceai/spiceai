@@ -31,7 +31,7 @@ use datafusion_table_providers::{
 };
 use futures::future::try_join_all;
 use llms::embeddings::Embed;
-use runtime_datafusion_index::Index;
+use runtime_datafusion_index::{Index, IndexWriteMode};
 use snafu::ResultExt;
 
 use crate::{
@@ -256,7 +256,12 @@ impl Index for DuckDBVectorIndex {
     /// Creates (or verifies existence of) the HNSW index on the current underlying table
     /// after a full refresh completes. For CDC/append datasets the index is created once at
     /// init time; DuckDB VSS maintains it automatically on subsequent inserts.
-    async fn on_write_complete(&self) -> DataFusionResult<()> {
+    ///
+    /// The mode is irrelevant here: the accelerator's own `InsertOp::Overwrite` already
+    /// replaced the backing table's rows on a full refresh, so there are no stale entries
+    /// for this index to remove — it only (re)builds the HNSW structure over whatever rows
+    /// the accelerator now holds.
+    async fn on_write_complete(&self, _mode: IndexWriteMode) -> DataFusionResult<()> {
         let Some(ctx) = &self.query_context else {
             tracing::debug!(
                 column = %self.embedded_column,

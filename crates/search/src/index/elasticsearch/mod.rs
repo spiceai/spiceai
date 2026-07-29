@@ -25,7 +25,7 @@ mod write;
 use std::any::Any;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use arrow::array::RecordBatch;
@@ -39,7 +39,7 @@ use datafusion_expr::LogicalPlanBuilder;
 use elasticsearch::Elasticsearch;
 use futures::future::try_join_all;
 use llms::embeddings::Embed;
-use runtime_datafusion_index::Index;
+use runtime_datafusion_index::{Index, IndexWriteMode};
 use tokio::sync::Mutex;
 
 use crate::SEARCH_SCORE_COLUMN_NAME;
@@ -54,6 +54,29 @@ use data_components::elasticsearch::search_table::{
 /// Elasticsearch index scan. Matches the DuckDB vector backend's default
 /// (`DEFAULT_DUCKDB_VECTOR_SEARCH_LIMIT`).
 const DEFAULT_ELASTICSEARCH_VECTOR_SEARCH_LIMIT: usize = 1000;
+
+/// `_source` field carrying the write generation a document was last written in. On a full
+/// refresh (`refresh_mode: full`) `on_write_start` bumps the generation, every document
+/// written that cycle is stamped with the new value, and `on_write_complete` deletes every
+/// document that still carries an older generation — the rows dropped from the source since
+/// the previous full refresh. The name has no leading underscore (Elasticsearch reserves
+/// those for metadata fields) and is distinctive enough that a collision with a source
+/// column is rejected rather than silently overwriting user data.
+pub(crate) const ES_WRITE_GENERATION_FIELD: &str = "spice_write_generation";
+
+/// The `_delete_by_query` filter selecting every document whose [`ES_WRITE_GENERATION_FIELD`]
+/// is not `generation` — the documents left over from an earlier full refresh. Built with an
+/// explicit map because the field name is a constant, not a string literal.
+fn stale_generation_query(generation: u64) -> serde_json::Value {
+    let mut term = serde_json::Map::new();
+    term.insert(
+        ES_WRITE_GENERATION_FIELD.to_string(),
+        serde_json::Value::from(generation),
+    );
+    serde_json::json!({
+        "bool": { "must_not": { "term": serde_json::Value::Object(term) } }
+    })
+}
 
 /// Adapter that implements [`QueryEmbedder`] using an [`Embed`] model.
 #[derive(Debug)]
@@ -139,6 +162,13 @@ pub struct ElasticsearchIndexWriteMaintenance {
     write_cycle_active: AtomicBool,
     refresh_interval_overridden: AtomicBool,
     previous_refresh_interval: Mutex<PreviousRefreshInterval>,
+    /// The generation stamped onto documents written in the current (or most recent) write
+    /// cycle. Bumped once per full-refresh cycle in `on_write_start`; read by the write path
+    /// to stamp each document ([`ES_WRITE_GENERATION_FIELD`]).
+    write_generation: AtomicU64,
+    /// Whether the active write cycle is a full refresh whose stale documents must be purged
+    /// in `on_write_complete`. Set in `on_write_start`, cleared once the cycle ends.
+    overwrite_cycle: AtomicBool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -163,17 +193,36 @@ impl ElasticsearchIndexWriteMaintenance {
             write_cycle_active: AtomicBool::new(false),
             refresh_interval_overridden: AtomicBool::new(false),
             previous_refresh_interval: Mutex::new(PreviousRefreshInterval::default()),
+            write_generation: AtomicU64::new(0),
+            overwrite_cycle: AtomicBool::new(false),
         }
+    }
+
+    /// The generation the write path stamps onto each document this cycle.
+    fn current_generation(&self) -> u64 {
+        self.write_generation.load(Ordering::Acquire)
     }
 
     async fn on_write_start(
         &self,
         client: &dyn Elasticsearch,
         es_index: &str,
+        mode: IndexWriteMode,
     ) -> Result<(), DataFusionError> {
         let first_start = !self.write_cycle_active.swap(true, Ordering::AcqRel);
         if !first_start {
             return Ok(());
+        }
+
+        // Open the cycle's generation exactly once, before any document is written. A full
+        // refresh bumps the generation so this cycle's documents are distinguishable from the
+        // previous generation's; `on_write_complete` then deletes whatever still carries an
+        // older one. An append reuses the current generation and never purges.
+        if mode == IndexWriteMode::Overwrite {
+            self.write_generation.fetch_add(1, Ordering::AcqRel);
+            self.overwrite_cycle.store(true, Ordering::Release);
+        } else {
+            self.overwrite_cycle.store(false, Ordering::Release);
         }
 
         let Some(refresh_interval) = self.options.refresh_interval_during_write.as_deref() else {
@@ -217,6 +266,10 @@ impl ElasticsearchIndexWriteMaintenance {
         if !self.write_cycle_active.swap(false, Ordering::AcqRel) {
             return Ok(());
         }
+        // A failed full refresh must not delete anything: the previous generation stays
+        // intact and keeps serving queries, and this cycle's partial documents are purged by
+        // the next successful full refresh (they carry a now-stale generation).
+        self.overwrite_cycle.store(false, Ordering::Release);
         self.restore_refresh_interval(client, es_index).await?;
         Ok(())
     }
@@ -228,6 +281,24 @@ impl ElasticsearchIndexWriteMaintenance {
     ) -> Result<(), DataFusionError> {
         if !self.write_cycle_active.swap(false, Ordering::AcqRel) {
             return Ok(());
+        }
+
+        // Purge stale documents before restoring the refresh interval, so the delete lands in
+        // the same suspended-refresh window as the write and the final `_refresh` publishes
+        // the new documents and the deletions together (no window in which a query sees the
+        // dropped rows). Best-effort: a failed purge leaves the stale rows for the next
+        // refresh rather than failing an otherwise-successful write.
+        if self.overwrite_cycle.swap(false, Ordering::AcqRel) {
+            let generation = self.current_generation();
+            let query = stale_generation_query(generation);
+            match client.delete_by_query(es_index, &query).await {
+                Ok(_) => tracing::debug!(
+                    "Purged stale documents from Elasticsearch index '{es_index}' (generation != {generation})."
+                ),
+                Err(e) => tracing::warn!(
+                    "Failed to purge stale documents from Elasticsearch index '{es_index}' after a full refresh: {e}. Rows dropped from the source may remain searchable until the next refresh."
+                ),
+            }
         }
 
         let restored_refresh_interval = self.restore_refresh_interval(client, es_index).await?;
@@ -456,19 +527,19 @@ impl Index for ElasticsearchIndex {
         try_join_all(futs).await
     }
 
-    async fn on_write_start(&self) -> Result<(), DataFusionError> {
+    async fn on_write_start(&self, mode: IndexWriteMode) -> Result<(), DataFusionError> {
         self.write_maintenance
-            .on_write_start(self.client.as_ref(), &self.es_index)
+            .on_write_start(self.client.as_ref(), &self.es_index, mode)
             .await
     }
 
-    async fn on_write_failed(&self) -> Result<(), DataFusionError> {
+    async fn on_write_failed(&self, _mode: IndexWriteMode) -> Result<(), DataFusionError> {
         self.write_maintenance
             .on_write_failed(self.client.as_ref(), &self.es_index)
             .await
     }
 
-    async fn on_write_complete(&self) -> Result<(), DataFusionError> {
+    async fn on_write_complete(&self, _mode: IndexWriteMode) -> Result<(), DataFusionError> {
         self.write_maintenance
             .on_write_complete(self.client.as_ref(), &self.es_index)
             .await
@@ -635,6 +706,7 @@ impl SearchIndex for ElasticsearchTextIndex {
             &self.es_index,
             &self.primary_key,
             self.batch_write_rows,
+            self.write_maintenance.current_generation(),
             &record,
         )
         .await
@@ -698,19 +770,19 @@ impl Index for ElasticsearchTextIndex {
         try_join_all(futs).await
     }
 
-    async fn on_write_start(&self) -> Result<(), DataFusionError> {
+    async fn on_write_start(&self, mode: IndexWriteMode) -> Result<(), DataFusionError> {
         self.write_maintenance
-            .on_write_start(self.client.as_ref(), &self.es_index)
+            .on_write_start(self.client.as_ref(), &self.es_index, mode)
             .await
     }
 
-    async fn on_write_failed(&self) -> Result<(), DataFusionError> {
+    async fn on_write_failed(&self, _mode: IndexWriteMode) -> Result<(), DataFusionError> {
         self.write_maintenance
             .on_write_failed(self.client.as_ref(), &self.es_index)
             .await
     }
 
-    async fn on_write_complete(&self) -> Result<(), DataFusionError> {
+    async fn on_write_complete(&self, _mode: IndexWriteMode) -> Result<(), DataFusionError> {
         self.write_maintenance
             .on_write_complete(self.client.as_ref(), &self.es_index)
             .await
@@ -737,6 +809,8 @@ mod write_maintenance_tests {
         refresh_index_calls: AtomicU32,
         force_merge_calls: AtomicU32,
         last_force_merge_segments: std::sync::Mutex<Option<u32>>,
+        delete_by_query_calls: AtomicU32,
+        last_delete_by_query: std::sync::Mutex<Option<serde_json::Value>>,
     }
 
     #[async_trait::async_trait]
@@ -839,6 +913,15 @@ mod write_maintenance_tests {
         ) -> elasticsearch::Result<serde_json::Value> {
             unimplemented!()
         }
+        async fn delete_by_query(
+            &self,
+            _: &str,
+            query: &serde_json::Value,
+        ) -> elasticsearch::Result<serde_json::Value> {
+            self.delete_by_query_calls.fetch_add(1, Ordering::Relaxed);
+            *self.last_delete_by_query.lock().expect("lock poisoned") = Some(query.clone());
+            Ok(serde_json::json!({ "deleted": 0 }))
+        }
     }
 
     fn make_maintenance(
@@ -853,7 +936,7 @@ mod write_maintenance_tests {
         let client = MockElasticsearch::default();
         let m = make_maintenance(ElasticsearchIndexWriteOptions::default());
 
-        m.on_write_start(&client, "my-index")
+        m.on_write_start(&client, "my-index", IndexWriteMode::Append)
             .await
             .expect("on_write_start should succeed");
 
@@ -874,13 +957,13 @@ mod write_maintenance_tests {
         });
 
         // Simulate three batches before on_write_complete.
-        m.on_write_start(&client, "my-index")
+        m.on_write_start(&client, "my-index", IndexWriteMode::Append)
             .await
             .expect("first start");
-        m.on_write_start(&client, "my-index")
+        m.on_write_start(&client, "my-index", IndexWriteMode::Append)
             .await
             .expect("second start — must be no-op");
-        m.on_write_start(&client, "my-index")
+        m.on_write_start(&client, "my-index", IndexWriteMode::Append)
             .await
             .expect("third start — must be no-op");
 
@@ -909,7 +992,9 @@ mod write_maintenance_tests {
             force_merge_segments: None,
         });
 
-        m.on_write_start(&client, "my-index").await.expect("start");
+        m.on_write_start(&client, "my-index", IndexWriteMode::Append)
+            .await
+            .expect("start");
         m.on_write_complete(&client, "my-index")
             .await
             .expect("complete");
@@ -941,7 +1026,9 @@ mod write_maintenance_tests {
             force_merge_segments: Some(1),
         });
 
-        m.on_write_start(&client, "my-index").await.expect("start");
+        m.on_write_start(&client, "my-index", IndexWriteMode::Append)
+            .await
+            .expect("start");
         m.on_write_complete(&client, "my-index")
             .await
             .expect("complete");
@@ -975,7 +1062,7 @@ mod write_maintenance_tests {
         });
 
         // First write cycle fails.
-        m.on_write_start(&client, "my-index")
+        m.on_write_start(&client, "my-index", IndexWriteMode::Append)
             .await
             .expect("start cycle 1");
         m.on_write_failed(&client, "my-index")
@@ -983,7 +1070,7 @@ mod write_maintenance_tests {
             .expect("failed cycle 1");
 
         // Second write cycle — must re-apply the override.
-        m.on_write_start(&client, "my-index")
+        m.on_write_start(&client, "my-index", IndexWriteMode::Append)
             .await
             .expect("start cycle 2");
 
@@ -1018,5 +1105,102 @@ mod write_maintenance_tests {
         assert_eq!(client.refresh_index_calls.load(Ordering::Relaxed), 0);
         assert_eq!(client.force_merge_calls.load(Ordering::Relaxed), 0);
         assert_eq!(client.put_settings_calls.load(Ordering::Relaxed), 0);
+    }
+
+    /// Regression test for #12145: a full-refresh (`Overwrite`) cycle bumps the write
+    /// generation on start and, on complete, purges every document that does not carry the
+    /// new generation — the rows dropped from the source since the previous refresh.
+    #[tokio::test]
+    async fn overwrite_cycle_purges_previous_generation_on_complete() {
+        let client = MockElasticsearch::default();
+        let m = make_maintenance(ElasticsearchIndexWriteOptions::default());
+
+        // First full refresh: generation advances 0 -> 1.
+        m.on_write_start(&client, "my-index", IndexWriteMode::Overwrite)
+            .await
+            .expect("start");
+        assert_eq!(
+            m.current_generation(),
+            1,
+            "an overwrite cycle must open a new generation"
+        );
+        m.on_write_complete(&client, "my-index")
+            .await
+            .expect("complete");
+
+        assert_eq!(
+            client.delete_by_query_calls.load(Ordering::Relaxed),
+            1,
+            "a full refresh must purge stale documents exactly once"
+        );
+        let query = client
+            .last_delete_by_query
+            .lock()
+            .expect("lock poisoned")
+            .clone()
+            .expect("delete_by_query should have been issued");
+        assert_eq!(
+            query,
+            stale_generation_query(1),
+            "the purge must delete every document whose generation is not the current one"
+        );
+    }
+
+    /// An append (`Append`) cycle must never purge and must not advance the generation:
+    /// deleting on append would drop the documents the append is adding to.
+    #[tokio::test]
+    async fn append_cycle_never_purges() {
+        let client = MockElasticsearch::default();
+        let m = make_maintenance(ElasticsearchIndexWriteOptions::default());
+
+        m.on_write_start(&client, "my-index", IndexWriteMode::Append)
+            .await
+            .expect("start");
+        assert_eq!(
+            m.current_generation(),
+            0,
+            "an append must not advance the write generation"
+        );
+        m.on_write_complete(&client, "my-index")
+            .await
+            .expect("complete");
+
+        assert_eq!(
+            client.delete_by_query_calls.load(Ordering::Relaxed),
+            0,
+            "an append must never delete documents"
+        );
+    }
+
+    /// A failed full refresh must not purge: the previous generation stays intact and keeps
+    /// serving queries; the partial new generation is reconciled by the next full refresh.
+    #[tokio::test]
+    async fn failed_overwrite_cycle_does_not_purge() {
+        let client = MockElasticsearch::default();
+        let m = make_maintenance(ElasticsearchIndexWriteOptions::default());
+
+        m.on_write_start(&client, "my-index", IndexWriteMode::Overwrite)
+            .await
+            .expect("start");
+        m.on_write_failed(&client, "my-index")
+            .await
+            .expect("failed");
+
+        assert_eq!(
+            client.delete_by_query_calls.load(Ordering::Relaxed),
+            0,
+            "a failed full refresh must not delete anything"
+        );
+
+        // A subsequent successful full refresh advances the generation again and purges,
+        // cleaning up the failed cycle's partial documents.
+        m.on_write_start(&client, "my-index", IndexWriteMode::Overwrite)
+            .await
+            .expect("start 2");
+        assert_eq!(m.current_generation(), 2);
+        m.on_write_complete(&client, "my-index")
+            .await
+            .expect("complete 2");
+        assert_eq!(client.delete_by_query_calls.load(Ordering::Relaxed), 1);
     }
 }

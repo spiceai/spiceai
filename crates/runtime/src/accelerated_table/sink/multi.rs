@@ -37,7 +37,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use util::RetryError;
 
 use data_components::index_maintenance::perform_index_maintenance;
-use runtime_datafusion_index::Index;
+use runtime_datafusion_index::{Index, IndexWriteMode};
 
 use crate::{
     accelerated_table::{
@@ -144,6 +144,13 @@ impl MultiSink {
         overwrite: InsertOp,
     ) -> Result<(), RetryError<crate::accelerated_table::Error>> {
         let schema = record_batch_stream.schema();
+        // A full refresh replaces every synchronized index's contents; any other write
+        // appends. Threaded to the sink indexes so external indexes can drop stale entries.
+        let write_mode = if matches!(overwrite, InsertOp::Overwrite) {
+            IndexWriteMode::Overwrite
+        } else {
+            IndexWriteMode::Append
+        };
         let (tx, _) = broadcast::channel::<RecordBatch>(32);
         let mut join_set = JoinSet::new();
 
@@ -158,7 +165,7 @@ impl MultiSink {
                 "MultiSink: running on_write_start for index '{}'",
                 index.name()
             );
-            if let Err(e) = index.on_write_start().await {
+            if let Err(e) = index.on_write_start(write_mode).await {
                 tracing::warn!(
                     "MultiSink: on_write_start failed for index '{}': {e}. Continuing with write.",
                     index.name()
@@ -221,7 +228,7 @@ impl MultiSink {
         if let Some(first_error) = errors.into_iter().next() {
             // Run on_write_failed for all sink_indexes.
             for index in &self.sink_indexes {
-                if let Err(e) = index.on_write_failed().await {
+                if let Err(e) = index.on_write_failed(write_mode).await {
                     tracing::warn!(
                         "MultiSink: on_write_failed failed for index '{}': {e}. Index write state may need manual cleanup.",
                         index.name()
@@ -255,7 +262,7 @@ impl MultiSink {
         }
 
         // Run on_write_complete for all sink_indexes.
-        finalize_indexes("MultiSink", self.sink_indexes.iter())
+        finalize_indexes("MultiSink", self.sink_indexes.iter(), write_mode)
             .await
             .map_err(retry_from_df_error)?;
 

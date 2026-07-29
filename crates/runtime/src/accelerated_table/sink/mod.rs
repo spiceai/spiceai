@@ -19,7 +19,7 @@ use datafusion::{
     physical_plan::RecordBatchStream,
 };
 use multi::MultiSink;
-use runtime_datafusion_index::Index;
+use runtime_datafusion_index::{Index, IndexWriteMode};
 use std::{pin::Pin, sync::Arc};
 use table::TableSink;
 use util::RetryError;
@@ -96,6 +96,7 @@ impl AccelerationSink {
 pub(crate) async fn finalize_indexes<'a>(
     sink: &str,
     indexes: impl Iterator<Item = &'a Arc<dyn Index + Send + Sync>>,
+    mode: IndexWriteMode,
 ) -> Result<(), DataFusionError> {
     let mut fatal: Option<DataFusionError> = None;
 
@@ -104,7 +105,7 @@ pub(crate) async fn finalize_indexes<'a>(
             "{sink}: running on_write_complete for index '{}'",
             index.name()
         );
-        let Err(e) = index.on_write_complete().await else {
+        let Err(e) = index.on_write_complete(mode).await else {
             continue;
         };
 
@@ -143,7 +144,7 @@ mod tests {
     use crate::datafusion::error::find_datafusion_root;
     use datafusion::error::{DataFusionError, Result as DataFusionResult};
 
-    use super::{Arc, Index, finalize_indexes};
+    use super::{Arc, Index, IndexWriteMode, finalize_indexes};
 
     /// An [`Index`] whose finalize outcome and fatality are configurable, recording how
     /// many times it was finalized.
@@ -153,6 +154,7 @@ mod tests {
         fails: bool,
         fatal: bool,
         finalize_calls: AtomicUsize,
+        last_mode: std::sync::Mutex<Option<IndexWriteMode>>,
     }
 
     impl FinalizeIndex {
@@ -162,11 +164,16 @@ mod tests {
                 fails,
                 fatal,
                 finalize_calls: AtomicUsize::new(0),
+                last_mode: std::sync::Mutex::new(None),
             })
         }
 
         fn finalize_calls(&self) -> usize {
             self.finalize_calls.load(Ordering::SeqCst)
+        }
+
+        fn last_mode(&self) -> Option<IndexWriteMode> {
+            *self.last_mode.lock().expect("last_mode mutex")
         }
     }
 
@@ -180,7 +187,8 @@ mod tests {
             vec![]
         }
 
-        async fn on_write_complete(&self) -> DataFusionResult<()> {
+        async fn on_write_complete(&self, mode: IndexWriteMode) -> DataFusionResult<()> {
+            *self.last_mode.lock().expect("last_mode mutex") = Some(mode);
             self.finalize_calls.fetch_add(1, Ordering::SeqCst);
             if self.fails {
                 return Err(DataFusionError::Execution(format!(
@@ -215,7 +223,7 @@ mod tests {
         ];
         let erased = erase(&indexes);
 
-        finalize_indexes("TestSink", erased.iter())
+        finalize_indexes("TestSink", erased.iter(), IndexWriteMode::Overwrite)
             .await
             .expect("no index failed to finalize");
 
@@ -229,7 +237,7 @@ mod tests {
         let indexes = vec![FinalizeIndex::new("best_effort", true, false)];
         let erased = erase(&indexes);
 
-        finalize_indexes("TestSink", erased.iter())
+        finalize_indexes("TestSink", erased.iter(), IndexWriteMode::Overwrite)
             .await
             .expect("a best-effort finalize failure must not fail the write");
         assert_eq!(indexes[0].finalize_calls(), 1);
@@ -242,7 +250,7 @@ mod tests {
         let indexes = vec![FinalizeIndex::new("full_text", true, true)];
         let erased = erase(&indexes);
 
-        let err = finalize_indexes("TestSink", erased.iter())
+        let err = finalize_indexes("TestSink", erased.iter(), IndexWriteMode::Overwrite)
             .await
             .expect_err("a fatal finalize failure must fail the write");
 
@@ -265,7 +273,7 @@ mod tests {
         let indexes = vec![FinalizeIndex::new("full_text", true, true)];
         let erased = erase(&indexes);
 
-        let err = finalize_indexes("TestSink", erased.iter())
+        let err = finalize_indexes("TestSink", erased.iter(), IndexWriteMode::Overwrite)
             .await
             .expect_err("a fatal finalize failure must fail the write");
 
@@ -287,7 +295,7 @@ mod tests {
         ];
         let erased = erase(&indexes);
 
-        finalize_indexes("TestSink", erased.iter())
+        finalize_indexes("TestSink", erased.iter(), IndexWriteMode::Overwrite)
             .await
             .expect_err("a fatal finalize failure must fail the write");
 
@@ -305,7 +313,7 @@ mod tests {
         ];
         let erased = erase(&indexes);
 
-        let err = finalize_indexes("TestSink", erased.iter())
+        let err = finalize_indexes("TestSink", erased.iter(), IndexWriteMode::Overwrite)
             .await
             .expect_err("a fatal finalize failure must fail the write");
 
@@ -323,8 +331,29 @@ mod tests {
     #[tokio::test]
     async fn no_indexes_is_a_successful_finalize() {
         let erased: Vec<Arc<dyn Index + Send + Sync>> = vec![];
-        finalize_indexes("TestSink", erased.iter())
+        finalize_indexes("TestSink", erased.iter(), IndexWriteMode::Overwrite)
             .await
             .expect("an empty index set cannot fail");
+    }
+
+    /// Regression test for #12145: the write mode a full refresh (`Overwrite`) or an append
+    /// carries must reach each index's `on_write_complete`, so an external index can tell a
+    /// replace-everything refresh from an add-to-existing one and remove stale entries.
+    #[tokio::test]
+    async fn finalize_forwards_the_write_mode_to_each_index() {
+        for mode in [IndexWriteMode::Append, IndexWriteMode::Overwrite] {
+            let indexes = vec![FinalizeIndex::new("a", false, false)];
+            let erased = erase(&indexes);
+
+            finalize_indexes("TestSink", erased.iter(), mode)
+                .await
+                .expect("finalize should succeed");
+
+            assert_eq!(
+                indexes[0].last_mode(),
+                Some(mode),
+                "the write mode must be forwarded verbatim to on_write_complete"
+            );
+        }
     }
 }

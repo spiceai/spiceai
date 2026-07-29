@@ -30,7 +30,7 @@ use datafusion::{
     physical_plan::ExecutionPlan,
     prelude::SessionContext,
 };
-use runtime_datafusion_index::Index;
+use runtime_datafusion_index::{Index, IndexWriteMode};
 
 use super::{CompoundReadMode, CompoundSearchIndex, CompoundVectorIndex, Error};
 use crate::index::{SearchIndex, VectorIndex};
@@ -145,7 +145,7 @@ impl Index for MockIndex {
         vec![self.search_column.clone(), self.label.to_string()]
     }
 
-    async fn on_write_start(&self) -> Result<(), DataFusionError> {
+    async fn on_write_start(&self, _mode: IndexWriteMode) -> Result<(), DataFusionError> {
         self.record("on_write_start");
         if self.fail_on_write_start {
             return Err(DataFusionError::Execution(format!(
@@ -156,12 +156,12 @@ impl Index for MockIndex {
         Ok(())
     }
 
-    async fn on_write_failed(&self) -> Result<(), DataFusionError> {
+    async fn on_write_failed(&self, _mode: IndexWriteMode) -> Result<(), DataFusionError> {
         self.record("on_write_failed");
         Ok(())
     }
 
-    async fn on_write_complete(&self) -> Result<(), DataFusionError> {
+    async fn on_write_complete(&self, _mode: IndexWriteMode) -> Result<(), DataFusionError> {
         self.record("on_write_complete");
         Ok(())
     }
@@ -483,9 +483,15 @@ async fn lifecycle_hooks_forward_to_both_indexes() {
     let secondary = MockIndex::new("secondary", &events);
     let idx = compound(primary, secondary, CompoundReadMode::PrimaryOnly);
 
-    idx.on_write_start().await.expect("start");
-    idx.on_write_complete().await.expect("complete");
-    idx.on_write_failed().await.expect("failed");
+    idx.on_write_start(IndexWriteMode::Overwrite)
+        .await
+        .expect("start");
+    idx.on_write_complete(IndexWriteMode::Overwrite)
+        .await
+        .expect("complete");
+    idx.on_write_failed(IndexWriteMode::Overwrite)
+        .await
+        .expect("failed");
 
     let events = events.lock().expect("event log mutex").clone();
     for side in ["primary", "secondary"] {
@@ -564,7 +570,7 @@ async fn on_write_start_rolls_back_primary_when_secondary_fails() {
     secondary.fail_on_write_start = true;
 
     let idx = compound(primary, secondary, CompoundReadMode::PrimaryOnly);
-    idx.on_write_start()
+    idx.on_write_start(IndexWriteMode::Overwrite)
         .await
         .expect_err("secondary start failure must propagate");
 

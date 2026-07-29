@@ -1,0 +1,53 @@
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Grep",
+      "Glob",
+      "Edit",
+      "Write",
+      "Bash(rg:*)",
+      "Bash(ls:*)",
+      "Bash(cat:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(gh issue comment:*)",
+      "Bash(gh issue view:*)"
+    ],
+    "deny": [
+      "Read(~/.ssh/**)",
+      "Read(~/.aws/**)",
+      "Read(~/.config/**)",
+      "Read(~/Github/**/.env)",
+      "Read(~/Github/**/.env.*)",
+      "Read(~/Github/**/secrets/**)",
+      "Read(~/Github/**/*.key)",
+      "Read(~/Github/**/*.pem)",
+      "Edit(~/Github/**)",
+      "Write(~/Github/**)",
+      "Bash(cargo:*)",
+      "Bash(git push:*)",
+      "Bash(git commit:*)",
+      "Bash(git add:*)",
+      "Bash(gh pr:*)",
+      "Bash(gh workflow:*)",
+      "Bash(curl:*)",
+      "Bash(wget:*)",
+      "Bash(rm:*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/jeadie_compute/Github/spiceai-automation/block-dangerous.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

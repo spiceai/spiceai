@@ -530,6 +530,30 @@ impl Client {
         resp.json().await.context(JsonParseSnafu)
     }
 
+    /// Delete every document matching `query` via `POST /<index>/_delete_by_query`.
+    ///
+    /// Used to purge stale documents on a full refresh: the query selects the documents
+    /// left over from a previous generation. `conflicts=proceed` keeps the delete going
+    /// past version conflicts (a concurrent upsert of a surviving key) rather than aborting
+    /// the whole purge on the first conflict.
+    pub async fn delete_by_query(
+        &self,
+        index: &str,
+        query: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let url = format!("{}/{}/_delete_by_query", self.base_url, index);
+        let body = serde_json::json!({ "query": query });
+        let resp = self
+            .auth(self.http.post(&url))
+            .query(&[("conflicts", "proceed")])
+            .json(&body)
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+        let resp = check_status(resp).await?;
+        resp.json().await.context(JsonParseSnafu)
+    }
+
     /// Bulk index documents. Each element is `(optional_id, source_doc)`.
     pub async fn bulk_index(
         &self,
@@ -653,6 +677,11 @@ pub trait Elasticsearch: std::fmt::Debug + Send + Sync {
         index: &str,
         docs: &[(Option<String>, serde_json::Value)],
     ) -> Result<serde_json::Value>;
+    async fn delete_by_query(
+        &self,
+        index: &str,
+        query: &serde_json::Value,
+    ) -> Result<serde_json::Value>;
 }
 
 #[async_trait::async_trait]
@@ -736,5 +765,13 @@ impl Elasticsearch for Client {
         docs: &[(Option<String>, serde_json::Value)],
     ) -> Result<serde_json::Value> {
         self.bulk_index(index, docs).await
+    }
+
+    async fn delete_by_query(
+        &self,
+        index: &str,
+        query: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.delete_by_query(index, query).await
     }
 }

@@ -26,7 +26,7 @@ use async_trait::async_trait;
 use datafusion::datasource::{DefaultTableSource, TableProvider};
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder};
-use runtime_datafusion_index::Index;
+use runtime_datafusion_index::{Index, IndexWriteMode};
 use snafu::ResultExt;
 use tantivy::merge_policy::LogMergePolicy;
 use tantivy::schema::{DocParsingError, SchemaBuilder};
@@ -151,7 +151,7 @@ impl Index for FullTextDatabaseIndex {
         true
     }
 
-    async fn on_write_start(&self) -> Result<(), DataFusionError> {
+    async fn on_write_start(&self, mode: IndexWriteMode) -> Result<(), DataFusionError> {
         // A CDC-fed index never defers: its change stream calls `compute_index`
         // outside this lifecycle, and the shared writer cannot commit one caller's
         // documents without also publishing (or, on rollback, discarding) the other's.
@@ -176,11 +176,27 @@ impl Index for FullTextDatabaseIndex {
         rollback_writer(&mut index_writer)
             .context(TextSearchIndexingSnafu)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        // A full refresh replaces the entire index. `compute_index` only upserts the
+        // primary keys present in each batch, so rows dropped from the source since the
+        // previous refresh would otherwise survive as stale documents. Stage a delete of
+        // every existing document into this same uncommitted window: the single commit in
+        // `on_write_complete` then atomically swaps the whole index for the new set (no
+        // window in which queries see an empty or partial index), and `on_write_failed`
+        // rolls the delete back with everything else so a failed refresh keeps the
+        // previous contents. Append leaves existing documents untouched.
+        if mode == IndexWriteMode::Overwrite {
+            index_writer
+                .delete_all_documents()
+                .context(TextSearchIndexingSnafu)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        }
+
         self.defer_commit.store(true, Ordering::Release);
         Ok(())
     }
 
-    async fn on_write_complete(&self) -> Result<(), DataFusionError> {
+    async fn on_write_complete(&self, _mode: IndexWriteMode) -> Result<(), DataFusionError> {
         // End the deferred-commit window with a single commit + reader reload for
         // the whole refresh/append. Take the writer lock *before* clearing the flag so
         // no concurrent `compute_index` (e.g. the CDC path) can observe a cleared flag
@@ -212,7 +228,7 @@ impl Index for FullTextDatabaseIndex {
             .map_err(|e| DataFusionError::External(Box::new(e)))
     }
 
-    async fn on_write_failed(&self) -> Result<(), DataFusionError> {
+    async fn on_write_failed(&self, _mode: IndexWriteMode) -> Result<(), DataFusionError> {
         // Discard everything staged in the current window so a partial refresh is
         // never committed, and reset the flag. Take the writer lock *before* clearing
         // the flag: otherwise a concurrent `compute_index` could observe the cleared
@@ -654,7 +670,7 @@ mod tests {
     use arrow_schema::{ArrowError, Schema};
     use datafusion::datasource::{MemTable, TableProvider};
     use futures::{StreamExt, TryStreamExt};
-    use runtime_datafusion_index::Index;
+    use runtime_datafusion_index::{Index, IndexWriteMode};
     use std::time::Duration;
 
     /// Create a basic [`MemTable`] with fields: `id`, `content`.
@@ -858,6 +874,112 @@ mod tests {
             .expect("Failed to collect search results");
 
         format!("{}", pretty_format_batches(&rb).expect("failed to format"))
+    }
+
+    /// Total number of documents a `content` query matches.
+    async fn hits(index: &FullTextDatabaseIndex, query: &str) -> usize {
+        let search_index = index
+            .full_text_search_field_index("content")
+            .expect("Failed to create FullTextSearchFieldIndex");
+        search_index
+            .search(query.to_string(), &[], 1000)
+            .await
+            .expect("Failed to search")
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .expect("Failed to collect search results")
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum()
+    }
+
+    /// Drive one sink-style write cycle: open the window, stage the batch, commit.
+    async fn refresh(index: &FullTextDatabaseIndex, mode: IndexWriteMode, batch: RecordBatch) {
+        index.on_write_start(mode).await.expect("on_write_start");
+        index
+            .compute_index(vec![batch])
+            .await
+            .expect("compute_index");
+        index
+            .on_write_complete(mode)
+            .await
+            .expect("on_write_complete");
+    }
+
+    /// Regression test for #12145: a full refresh (`Overwrite`) must remove documents whose
+    /// rows disappeared from the source, not merely upsert the rows that remain. Without the
+    /// delete-all staged at overwrite start, `compute_index`'s per-key upsert would leave the
+    /// dropped rows searchable forever.
+    #[tokio::test]
+    async fn full_refresh_removes_documents_dropped_from_the_source() {
+        let index = new_test_index();
+
+        refresh(
+            &index,
+            IndexWriteMode::Overwrite,
+            batch(
+                &[1, 2, 3, 4, 5],
+                &["alpha", "beta", "gamma", "delta", "epsilon"],
+            ),
+        )
+        .await;
+        assert_eq!(
+            hits(&index, "delta").await,
+            1,
+            "the row is searchable after the first full refresh"
+        );
+
+        // Second full refresh: ids 4 and 5 are gone from the source; 6 and 7 are new.
+        refresh(
+            &index,
+            IndexWriteMode::Overwrite,
+            batch(&[1, 2, 3, 6, 7], &["alpha", "beta", "gamma", "zeta", "eta"]),
+        )
+        .await;
+
+        assert_eq!(
+            hits(&index, "delta").await,
+            0,
+            "a full refresh must delete documents whose rows were dropped from the source"
+        );
+        assert_eq!(hits(&index, "epsilon").await, 0);
+        assert_eq!(
+            hits(&index, "zeta").await,
+            1,
+            "rows added by the refresh are searchable"
+        );
+        assert_eq!(
+            hits(&index, "alpha").await,
+            1,
+            "rows that survived the refresh remain searchable"
+        );
+    }
+
+    /// An append (`Append`) must not delete anything: it adds to the existing documents.
+    #[tokio::test]
+    async fn append_keeps_existing_documents() {
+        let index = new_test_index();
+
+        refresh(
+            &index,
+            IndexWriteMode::Overwrite,
+            batch(&[1, 2], &["alpha", "beta"]),
+        )
+        .await;
+        refresh(
+            &index,
+            IndexWriteMode::Append,
+            batch(&[3, 4], &["gamma", "delta"]),
+        )
+        .await;
+
+        for token in ["alpha", "beta", "gamma", "delta"] {
+            assert_eq!(
+                hits(&index, token).await,
+                1,
+                "append must leave earlier documents ({token}) searchable"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1125,9 +1247,12 @@ mod tests {
     #[tokio::test]
     async fn test_merge_policy_survives_a_writer_rollback() {
         let index = new_test_index();
-        index.on_write_start().await.expect("on_write_start failed");
         index
-            .on_write_failed()
+            .on_write_start(IndexWriteMode::Append)
+            .await
+            .expect("on_write_start failed");
+        index
+            .on_write_failed(IndexWriteMode::Append)
             .await
             .expect("on_write_failed failed");
 
@@ -1188,7 +1313,10 @@ mod tests {
         .expect("Failed to create FullTextDatabaseIndex");
 
         // Open a deferred-commit window, mirroring the sink's on_write_start hook.
-        index.on_write_start().await.expect("on_write_start failed");
+        index
+            .on_write_start(IndexWriteMode::Append)
+            .await
+            .expect("on_write_start failed");
 
         index
             .compute_index(vec![
@@ -1220,7 +1348,7 @@ mod tests {
 
         // Closing the window performs the single commit + reader reload.
         index
-            .on_write_complete()
+            .on_write_complete(IndexWriteMode::Append)
             .await
             .expect("on_write_complete failed");
 
@@ -1280,7 +1408,10 @@ mod tests {
         )
         .expect("Failed to create FullTextDatabaseIndex");
 
-        index.on_write_start().await.expect("on_write_start failed");
+        index
+            .on_write_start(IndexWriteMode::Append)
+            .await
+            .expect("on_write_start failed");
 
         index
             .compute_index(vec![
@@ -1295,7 +1426,7 @@ mod tests {
 
         // The write failed: discard the staged window instead of committing it.
         index
-            .on_write_failed()
+            .on_write_failed(IndexWriteMode::Append)
             .await
             .expect("on_write_failed failed");
 
@@ -1326,7 +1457,10 @@ mod tests {
         index.mark_cdc_attached();
 
         // Opening a window is a no-op for a CDC-fed index.
-        index.on_write_start().await.expect("on_write_start failed");
+        index
+            .on_write_start(IndexWriteMode::Append)
+            .await
+            .expect("on_write_start failed");
 
         index
             .compute_index(vec![
@@ -1350,7 +1484,7 @@ mod tests {
 
         // And a failed window must not discard those committed documents.
         index
-            .on_write_failed()
+            .on_write_failed(IndexWriteMode::Append)
             .await
             .expect("on_write_failed failed");
 
@@ -1399,7 +1533,7 @@ mod tests {
 
         // A sink-driven refresh opens a write window on both tiers.
         compound
-            .on_write_start()
+            .on_write_start(IndexWriteMode::Append)
             .await
             .expect("on_write_start failed");
 
@@ -1414,7 +1548,7 @@ mod tests {
 
         // The refresh then fails, discarding whatever the window staged.
         compound
-            .on_write_failed()
+            .on_write_failed(IndexWriteMode::Append)
             .await
             .expect("on_write_failed failed");
 

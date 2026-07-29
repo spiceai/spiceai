@@ -36,7 +36,7 @@ use serde_json::Value;
 use snafu::{ResultExt, Snafu};
 use util::{convert_string_arrow_to_iterator, distribute_nulls};
 
-use crate::index::elasticsearch::ElasticsearchIndex;
+use crate::index::elasticsearch::{ES_WRITE_GENERATION_FIELD, ElasticsearchIndex};
 use crate::index::embedding_col;
 
 #[derive(Debug, Snafu)]
@@ -109,6 +109,11 @@ pub enum Error {
         "Failed to write to Elasticsearch index '{index}': source column '{column}' collides with the configured vector_field name. Rename one of the columns so the embedding vector does not silently overwrite a source value."
     ))]
     VectorFieldCollidesWithSourceColumn { index: String, column: String },
+
+    #[snafu(display(
+        "Failed to write to Elasticsearch index '{index}': source column '{column}' collides with the reserved '{column}' field Spice uses to track full-refresh generations. Rename the source column so full-refresh cleanup does not overwrite its values."
+    ))]
+    WriteGenerationFieldCollidesWithSourceColumn { index: String, column: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -247,6 +252,21 @@ fn build_documents(
         .fail();
     }
 
+    // Stamp every document with the current write generation so a full refresh can delete the
+    // documents left over from the previous generation (see `ES_WRITE_GENERATION_FIELD`).
+    // Refuse to write if a source column shadows the field rather than silently clobbering it.
+    if column_encoders
+        .iter()
+        .any(|(name, _)| name == ES_WRITE_GENERATION_FIELD)
+    {
+        return WriteGenerationFieldCollidesWithSourceColumnSnafu {
+            index: es_index.to_string(),
+            column: ES_WRITE_GENERATION_FIELD.to_string(),
+        }
+        .fail();
+    }
+    let write_generation = index.write_maintenance.current_generation();
+
     let mut docs: Vec<(Option<String>, Value)> = Vec::with_capacity(record.num_rows());
     let mut value_buf: Vec<u8> = Vec::with_capacity(256);
 
@@ -330,6 +350,10 @@ fn build_documents(
                 .collect(),
         );
         doc.insert(index.vector_field.clone(), vec_json);
+        doc.insert(
+            ES_WRITE_GENERATION_FIELD.to_string(),
+            Value::Number(write_generation.into()),
+        );
 
         docs.push((primary_keys[row].clone(), Value::Object(doc)));
     }
@@ -606,10 +630,11 @@ pub async fn write_text(
     es_index: &str,
     primary_key: &[Field],
     batch_write_rows: usize,
+    write_generation: u64,
     record: &RecordBatch,
 ) -> Result<RecordBatch> {
     let primary_keys = extract_primary_key_from_fields(primary_key, es_index, record)?;
-    let docs = build_text_documents(es_index, record, &primary_keys)?;
+    let docs = build_text_documents(es_index, record, &primary_keys, write_generation)?;
 
     if docs.is_empty() {
         tracing::debug!(
@@ -640,6 +665,7 @@ fn build_text_documents(
     es_index: &str,
     record: &RecordBatch,
     primary_keys: &[Option<String>],
+    write_generation: u64,
 ) -> Result<Vec<(Option<String>, serde_json::Value)>> {
     let schema = record.schema();
     let encoder_options = EncoderOptions::default();
@@ -661,6 +687,19 @@ fn build_text_documents(
                 index: es_index.to_string(),
             })?;
         column_encoders.push((field.name().clone(), encoder));
+    }
+
+    // Same reserved generation field as the vector write path: refuse to overwrite a
+    // colliding source column rather than corrupt it (see `ES_WRITE_GENERATION_FIELD`).
+    if column_encoders
+        .iter()
+        .any(|(name, _)| name == ES_WRITE_GENERATION_FIELD)
+    {
+        return WriteGenerationFieldCollidesWithSourceColumnSnafu {
+            index: es_index.to_string(),
+            column: ES_WRITE_GENERATION_FIELD.to_string(),
+        }
+        .fail();
     }
 
     let mut docs: Vec<(Option<String>, serde_json::Value)> = Vec::with_capacity(record.num_rows());
@@ -686,6 +725,10 @@ fn build_text_documents(
                 })?;
             doc.insert(name.clone(), v);
         }
+        doc.insert(
+            ES_WRITE_GENERATION_FIELD.to_string(),
+            serde_json::Value::Number(write_generation.into()),
+        );
         docs.push((primary_keys[row].clone(), serde_json::Value::Object(doc)));
     }
 

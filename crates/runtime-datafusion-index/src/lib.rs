@@ -38,6 +38,27 @@ pub enum Error {
     NoExpressions { expr_len: usize },
 }
 
+/// Whether a [`TableSink`] write replaces the index's entire contents or adds to them.
+///
+/// Derived from the `InsertOp` the sink already carries: `refresh_mode: full`
+/// (`InsertOp::Overwrite`) yields [`IndexWriteMode::Overwrite`]; every other write yields
+/// [`IndexWriteMode::Append`]. It is passed to the write lifecycle hooks so an external
+/// index (one whose data does not live in the accelerator's own storage, e.g. Elasticsearch
+/// or S3 Vectors) can remove entries that are no longer present in the source on a full
+/// refresh. The accelerator's own storage is replaced by the `InsertOp::Overwrite` write
+/// itself; this signal exists for the indexes that write side-effects that the `InsertOp`
+/// never reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexWriteMode {
+    /// The write adds to the existing index contents (`refresh_mode: append`, caching, and
+    /// any non-overwrite write). Existing entries are left untouched.
+    Append,
+    /// The write replaces the index's entire contents with the written rows
+    /// (`refresh_mode: full`). Entries whose primary keys are not written this cycle are
+    /// stale and must be removed.
+    Overwrite,
+}
+
 #[async_trait]
 pub trait Index: Debug + Send + Sync + 'static {
     fn name(&self) -> &'static str;
@@ -54,8 +75,14 @@ pub trait Index: Debug + Send + Sync + 'static {
     /// Called before data is written via the [`TableSink`] path (full refresh or append).
     ///
     /// Default is a no-op. Implementations use this to prepare external index state for a
-    /// bounded write window. Not called for CDC writes.
-    async fn on_write_start(&self) -> Result<()> {
+    /// bounded write window — including, for [`IndexWriteMode::Overwrite`], marking the start
+    /// of a new generation so stale entries can be removed in [`Index::on_write_complete`].
+    /// Guaranteed to run before any [`Index::compute_index`] call for the same write. Not
+    /// called for CDC writes.
+    ///
+    /// Wrapper implementations MUST forward `mode` to the index they wrap.
+    async fn on_write_start(&self, mode: IndexWriteMode) -> Result<()> {
+        let _ = mode;
         Ok(())
     }
 
@@ -63,18 +90,29 @@ pub trait Index: Debug + Send + Sync + 'static {
     ///
     /// Default is a no-op. Implementations use this to restore temporary external index
     /// settings when a refresh or append fails before [`Index::on_write_complete`] can run.
-    async fn on_write_failed(&self) -> Result<()> {
+    /// A failed [`IndexWriteMode::Overwrite`] must NOT delete anything: the previous
+    /// generation stays intact and keeps serving queries, and the partial new generation is
+    /// reconciled by the next successful full refresh.
+    ///
+    /// Wrapper implementations MUST forward `mode` to the index they wrap.
+    async fn on_write_failed(&self, mode: IndexWriteMode) -> Result<()> {
+        let _ = mode;
         Ok(())
     }
 
     /// Called after data has been written via the [`TableSink`] path (full refresh or append).
     ///
     /// Default is a no-op. Implementations use this to create or verify persistent structures
-    /// (e.g. a vector HNSW index) after each write. Using `IF NOT EXISTS` semantics makes it
+    /// (e.g. a vector HNSW index) after each write, and — for [`IndexWriteMode::Overwrite`] —
+    /// to remove entries that were not written this cycle (stale rows dropped from the source
+    /// since the previous full refresh). Using `IF NOT EXISTS` semantics makes finalize steps
     /// safe to call on both overwrite (recreates on new table) and append (no-op if index
     /// already exists). Not called for CDC writes — those maintain indexes automatically via
     /// `DuckDB` VSS on each insert.
-    async fn on_write_complete(&self) -> Result<()> {
+    ///
+    /// Wrapper implementations MUST forward `mode` to the index they wrap.
+    async fn on_write_complete(&self, mode: IndexWriteMode) -> Result<()> {
+        let _ = mode;
         Ok(())
     }
 

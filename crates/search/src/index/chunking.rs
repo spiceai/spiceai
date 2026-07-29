@@ -29,7 +29,7 @@ use datafusion::{
 use datafusion_expr::ident;
 use futures::future::try_join_all;
 use itertools::Itertools;
-use runtime_datafusion_index::Index;
+use runtime_datafusion_index::{Index, IndexWriteMode};
 use snafu::{ResultExt, Snafu};
 use util::{arrow::repeat, convert_string_arrow_to_iterator};
 
@@ -87,16 +87,16 @@ impl Index for ChunkedSearchIndex {
         try_join_all(futs).await
     }
 
-    async fn on_write_start(&self) -> Result<(), DataFusionError> {
-        self.inner.on_write_start().await
+    async fn on_write_start(&self, mode: IndexWriteMode) -> Result<(), DataFusionError> {
+        self.inner.on_write_start(mode).await
     }
 
-    async fn on_write_failed(&self) -> Result<(), DataFusionError> {
-        self.inner.on_write_failed().await
+    async fn on_write_failed(&self, mode: IndexWriteMode) -> Result<(), DataFusionError> {
+        self.inner.on_write_failed(mode).await
     }
 
-    async fn on_write_complete(&self) -> Result<(), DataFusionError> {
-        self.inner.on_write_complete().await
+    async fn on_write_complete(&self, mode: IndexWriteMode) -> Result<(), DataFusionError> {
+        self.inner.on_write_complete(mode).await
     }
 
     fn write_complete_failure_is_fatal(&self) -> bool {
@@ -763,16 +763,16 @@ impl Index for ChunkedVectorIndex {
         .await
     }
 
-    async fn on_write_start(&self) -> Result<(), DataFusionError> {
-        self.inner.on_write_start().await
+    async fn on_write_start(&self, mode: IndexWriteMode) -> Result<(), DataFusionError> {
+        self.inner.on_write_start(mode).await
     }
 
-    async fn on_write_failed(&self) -> Result<(), DataFusionError> {
-        self.inner.on_write_failed().await
+    async fn on_write_failed(&self, mode: IndexWriteMode) -> Result<(), DataFusionError> {
+        self.inner.on_write_failed(mode).await
     }
 
-    async fn on_write_complete(&self) -> Result<(), DataFusionError> {
-        self.inner.on_write_complete().await
+    async fn on_write_complete(&self, mode: IndexWriteMode) -> Result<(), DataFusionError> {
+        self.inner.on_write_complete(mode).await
     }
 
     fn write_complete_failure_is_fatal(&self) -> bool {

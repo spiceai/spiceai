@@ -23,7 +23,7 @@ use datafusion_table_providers::{
     duckdb::{TableDefinition, write::DuckDBTableWriter},
     sql::db_connection_pool::duckdbpool::DuckDbConnectionPool,
 };
-use runtime_datafusion_index::{Index, IndexedTableProvider};
+use runtime_datafusion_index::{Index, IndexWriteMode, IndexedTableProvider};
 use runtime_secrets::{Secrets, get_params_with_secrets};
 use search::{generation::util::get_primary_keys, index::duckdb::DuckDBVectorIndex};
 use snafu::prelude::*;
@@ -209,7 +209,9 @@ pub(crate) async fn wrap_accelerator_with_duckdb_vector_indexes(
         // before any CDC writes arrive. DuckDB VSS then auto-maintains it on each insert.
         // For full-refresh (overwrite) datasets this may be a no-op (the table may be empty
         // or not yet exist); the index is (re)created after each refresh via `on_write_complete`.
-        if let Err(e) = vector_index.on_write_complete().await {
+        // Init-time structure creation, not a refresh: Append never triggers a purge, and
+        // `DuckDBVectorIndex` ignores the mode anyway (its rows live in the accelerator).
+        if let Err(e) = vector_index.on_write_complete(IndexWriteMode::Append).await {
             tracing::debug!(
                 table = %tbl,
                 column = %vector_index.embedded_column,
