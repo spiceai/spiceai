@@ -44,6 +44,7 @@ pub use memory::MemoryVectorIndex;
 pub use native_vector::NativeVectorIndex;
 pub use vector_table::VectorScanTableProvider;
 
+#[cfg(feature = "text_search")]
 use crate::generation::text_search::index::FullTextDatabaseIndex;
 #[cfg(feature = "duckdb")]
 use crate::index::duckdb::DuckDBVectorIndex;
@@ -144,6 +145,7 @@ pub fn as_search_index(index: &Arc<dyn Index + Send + Sync>) -> Option<&dyn Sear
     if let Some(idx) = index.as_any().downcast_ref::<CompoundVectorIndex>() {
         return Some(idx as &dyn SearchIndex);
     }
+    #[cfg(feature = "text_search")]
     if let Some(idx) = index.as_any().downcast_ref::<FullTextDatabaseIndex>() {
         return Some(idx as &dyn SearchIndex);
     }
