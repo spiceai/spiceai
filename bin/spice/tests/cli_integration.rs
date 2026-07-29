@@ -753,7 +753,7 @@ mod connect {
             .stdout(predicate::str::contains("SPICE-ADOPT"))
             .stdout(predicate::str::contains("Spice Cloud"))
             .stdout(predicate::str::contains("status"))
-            .stdout(predicate::str::contains("forget"));
+            .stdout(predicate::str::contains("remove"));
     }
 
     /// `spice connect <CODE>` should stage the code at
@@ -773,7 +773,7 @@ mod connect {
         cmd.env("HOME", home.path())
             .env("SPICE_CONFIG_DIR", config_dir)
             .arg("connect")
-            .arg("SPICE-ADOPT-AAAA-BBBB")
+            .arg("SPICE-ADOPT-AAAAA-BBBBB")
             .assert()
             .success()
             .stdout(predicate::str::contains(
@@ -783,7 +783,7 @@ mod connect {
         let pending = config_dir.join("pending-adopt-code");
         assert!(pending.exists(), "pending-adopt-code should be created");
         let content = fs::read_to_string(&pending).expect("read pending-adopt-code");
-        assert_eq!(content, "SPICE-ADOPT-AAAA-BBBB");
+        assert_eq!(content, "SPICE-ADOPT-AAAAA-BBBBB");
 
         // Status should report pending adoption.
         let mut cmd = spice_cmd();
@@ -818,24 +818,24 @@ mod connect {
         );
     }
 
-    /// `spice connect forget` with no prior state should be a no-op.
+    /// `spice connect remove` with no prior state should be a no-op.
     #[test]
-    fn test_connect_forget_when_nothing_to_clear() {
+    fn test_connect_remove_when_nothing_to_clear() {
         let dir = TempDir::new().expect("create temp config dir");
         let mut cmd = spice_cmd();
         cmd.env("SPICE_CONFIG_DIR", dir.path())
             .arg("connect")
-            .arg("forget")
+            .arg("remove")
             .assert()
             .success()
-            .stdout(predicate::str::contains("nothing to forget"));
+            .stdout(predicate::str::contains("nothing to remove"));
     }
 
-    /// `spice connect forget` after `spice connect <CODE>` should clear
+    /// `spice connect remove` after `spice connect <CODE>` should clear
     /// the pending file.
     #[cfg(unix)]
     #[test]
-    fn test_connect_forget_clears_pending_code() {
+    fn test_connect_remove_clears_pending_code() {
         let dir = TempDir::new().expect("create temp config dir");
         let config_dir = dir.path();
         let home = TempDir::new().expect("create temp home");
@@ -844,7 +844,7 @@ mod connect {
             .env("HOME", home.path())
             .env("SPICE_CONFIG_DIR", config_dir)
             .arg("connect")
-            .arg("SPICE-ADOPT-AAAA-BBBB")
+            .arg("SPICE-ADOPT-AAAAA-BBBBB")
             .assert()
             .success();
         assert!(config_dir.join("pending-adopt-code").exists());
@@ -852,7 +852,7 @@ mod connect {
         spice_cmd()
             .env("SPICE_CONFIG_DIR", config_dir)
             .arg("connect")
-            .arg("forget")
+            .arg("remove")
             .assert()
             .success()
             .stdout(predicate::str::contains("identity cleared"));

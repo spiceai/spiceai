@@ -26,7 +26,7 @@ limitations under the License.
 //!    spice connect SPICE-ADOPT-7K2PX-9XYZ2-A1B2C-D3E4F
 //!    ```
 //!
-//!    or one of the explicit subcommands `status`/`forget`.
+//!    or one of the explicit subcommands `status`/`remove`.
 //!
 //! 2. **Legacy pod-add behavior** (kept for back-compat): when the
 //!    argument is a Spicepod path on Spice.ai Cloud (e.g.
@@ -53,10 +53,10 @@ CLOUD CONNECT ADOPTION:
                                           and is shown as "Pending Adoption" in
                                           the portal.
   spice connect status                    Show the current adoption state.
-  spice connect forget                    Clear the local identity on disk.
+  spice connect remove                    Clear the local identity on disk.
                                           A running `spiced` keeps its
                                           in-memory identity until it is
-                                          restarted or the cloud sends a Forget
+                                          restarted or the cloud sends a Remove
                                           command (a mere stream drop just
                                           reconnects with the same identity),
                                           so restart spiced to stop remote
@@ -71,7 +71,7 @@ LEGACY POD-ADD BEHAVIOR:
 EXAMPLES
   spice connect SPICE-ADOPT-7K2PX-9XYZ2-A1B2C-D3E4F
   spice connect status
-  spice connect forget
+  spice connect remove
   spice connect spiceai/quickstart
 
 Docs: https://spiceai.org/docs"#
@@ -104,7 +104,7 @@ pub enum ConnectCommand {
 
     /// Clear the local Spice Cloud Connect identity. spiced will
     /// continue running unmanaged after the next restart.
-    Forget,
+    Remove,
 }
 
 /// Execute the `spice connect` command.
@@ -152,7 +152,7 @@ pub async fn execute(ctx: &RuntimeContext, args: ConnectArgs) -> Result<()> {
 fn execute_subcommand(cmd: &ConnectCommand) -> Result<()> {
     match cmd {
         ConnectCommand::Status => print_status(),
-        ConnectCommand::Forget => forget_identity(),
+        ConnectCommand::Remove => remove_identity(),
     }
 }
 
@@ -176,7 +176,7 @@ async fn stage_adoption_code(
 
     // If the user did NOT pass `--endpoint`, remove any previous override
     // so the next `spiced` start doesn't silently re-use a stale endpoint
-    // from an earlier connect. A `forget` also clears this file, but
+    // from an earlier connect. A `remove` also clears this file, but
     // re-staging without `--endpoint` is the more common case.
     if endpoint.is_none()
         && let Err(e) = std::fs::remove_file(&endpoint_path)
@@ -259,11 +259,10 @@ fn print_status() -> Result<()> {
         })?;
 
     if let Some(id) = identity {
-        let expiry = if id.not_after_unix == 0 {
-            "unbounded".to_string()
-        } else {
-            format!("unix={} (expired={})", id.not_after_unix, id.is_expired())
-        };
+        let expiry = id.not_after_unix.map_or_else(
+            || "unbounded".to_string(),
+            |secs| format!("unix={secs} (expired={})", id.is_expired()),
+        );
         println!("Spice Cloud Connect: adopted");
         println!("  identifier:  {}", id.identifier);
         println!("  identity:    {}", identity_path.display());
@@ -297,7 +296,7 @@ fn print_status() -> Result<()> {
     Ok(())
 }
 
-fn forget_identity() -> Result<()> {
+fn remove_identity() -> Result<()> {
     let identity_path = runtime_cloud_connect::config::CloudConnectConfig::default_identity_path();
     let pending_path =
         runtime_cloud_connect::config::CloudConnectConfig::default_pending_adopt_code_path();
@@ -342,7 +341,7 @@ fn forget_identity() -> Result<()> {
             "Spice Cloud Connect identity cleared. Run `spice connect <SPICE-ADOPT-...>` to re-adopt."
         );
     } else {
-        println!("Spice Cloud Connect: nothing to forget.");
+        println!("Spice Cloud Connect: nothing to remove.");
     }
     Ok(())
 }

@@ -16972,6 +16972,7 @@ dependencies = [
  "gethostname",
  "pem",
  "prost",
+ "prost-types",
  "rand 0.10.1",
  "rcgen",
  "reqwest 0.13.4",
