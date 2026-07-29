@@ -767,6 +767,7 @@ fn machine_error_code(error: &spice::error::Error) -> &'static str {
         spice::error::Error::ConnectionFailed { .. } => "connection_failed",
         spice::error::Error::HttpRequestFailed { .. } => "http_request_failed",
         spice::error::Error::InvalidResponse { .. } => "invalid_response",
+        spice::error::Error::Registry { .. } => "registry",
         spice::error::Error::ConfigIo { .. } => "config_io",
         spice::error::Error::ConfigParse { .. } => "config_parse",
         spice::error::Error::CreateDirectory { .. } => "create_directory",
