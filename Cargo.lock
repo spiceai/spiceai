@@ -5897,6 +5897,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "data-accelerator-api"
+version = "2.2.0-unstable"
+dependencies = [
+ "arrow",
+ "arrow_tools",
+ "async-trait",
+ "datafusion",
+ "datafusion-table-providers",
+ "futures",
+ "linkme",
+ "paste",
+ "runtime-acceleration",
+ "runtime-parameters",
+ "runtime-secrets",
+ "runtime-table-partition",
+ "secrecy",
+ "snafu",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "data-encoding"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -16668,6 +16690,7 @@ dependencies = [
  "criterion 0.7.0",
  "csv",
  "dashmap",
+ "data-accelerator-api",
  "data_components",
  "dataformat-json",
  "datafusion",

@@ -38,7 +38,7 @@ use datafusion::{
 };
 use futures::StreamExt;
 
-use super::UpsertOptions;
+use datafusion_table_providers::util::constraints::UpsertOptions;
 
 /// A wrapper `TableProvider` that applies batch deduplication based on `UpsertOptions`
 /// before passing data to the underlying provider.

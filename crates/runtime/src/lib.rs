@@ -1943,15 +1943,9 @@ impl Runtime {
     }
 }
 
-#[must_use]
-pub fn spice_data_base_path() -> String {
-    let Ok(working_dir) = std::env::current_dir() else {
-        return ".".to_string();
-    };
-
-    let base_folder = working_dir.join(".spice/data");
-    base_folder.to_str().unwrap_or(".").to_string()
-}
+// Moved to `data-accelerator-api` (so the accelerator builder can name the data
+// directory without an upward dependency); re-exported here for path compatibility.
+pub use data_accelerator_api::spice_data_base_path;
 
 #[cfg(any(feature = "duckdb", feature = "sqlite", feature = "turso"))]
 #[expect(clippy::result_large_err)]

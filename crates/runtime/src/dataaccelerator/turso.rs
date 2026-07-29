@@ -64,7 +64,7 @@ use crate::{
     datafusion::udf::deny_spice_specific_functions,
     make_spice_data_directory,
     parameters::ParameterSpec,
-    register_data_accelerator, spice_data_base_path,
+    spice_data_base_path,
 };
 
 use super::{AccelerationSource, BootstrapStatus, DataAccelerator, upsert_dedup};
@@ -881,7 +881,7 @@ impl DataAccelerator for TursoAccelerator {
     }
 }
 
-register_data_accelerator!(Engine::Turso, TursoAccelerator);
+data_accelerator_api::register_data_accelerator!(Engine::Turso, TursoAccelerator);
 
 #[cfg(test)]
 mod tests {

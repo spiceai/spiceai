@@ -10,6 +10,7 @@ members = [
     "crates/aws-sdk-credential-bridge",
     "crates/chunking",
     "crates/cloud-connect-crypto",
+    "crates/data-accelerator-api",
     "crates/data-connectors/*",
     "crates/datafusion-ddl",
     "crates/datafusion-dml",
