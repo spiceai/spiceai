@@ -6941,8 +6941,7 @@ impl CayenneTableProvider {
             return;
         }
 
-        *self.pk_keyset_cache.lock() =
-            Some(CachedPkIndex::Exact(CachedPkKeyset::with_capacity(0)));
+        *self.pk_keyset_cache.lock() = Some(CachedPkIndex::Exact(CachedPkKeyset::with_capacity(0)));
         let shards = self.mem_tier_shard_count();
         if shards > 1 {
             let keysets: Vec<CachedPkKeyset> = (0..shards)
@@ -30368,7 +30367,11 @@ mod tests {
         provider.maybe_install_warm_pk_caches().await;
         match provider.pk_keyset_cache.lock().as_ref() {
             Some(CachedPkIndex::Exact(keyset)) => {
-                assert_eq!(keyset.len(), 0, "an empty table's keyset must be exactly empty");
+                assert_eq!(
+                    keyset.len(),
+                    0,
+                    "an empty table's keyset must be exactly empty"
+                );
             }
             Some(CachedPkIndex::Bloom(_)) => panic!("empty table must not start with a bloom"),
             None => panic!("the probe must install the warm empty keyset"),
@@ -30460,7 +30463,10 @@ mod tests {
                     "file-committed keys must land in the sharded exact keyset"
                 );
             }
-            other => panic!("expected exact sharded keysets, present={}", other.is_some()),
+            other => panic!(
+                "expected exact sharded keysets, present={}",
+                other.is_some()
+            ),
         }
     }
 

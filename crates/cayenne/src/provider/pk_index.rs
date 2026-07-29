@@ -1061,8 +1061,8 @@ pub(crate) enum PkExistenceRef<'a> {
 mod tests {
     use super::{
         BoundedShardedPkIndexBuilder, COLD_PK_BLOOM_PER_FILE_MAX_BYTES, CachedPkKeyset,
-        ColdPkExistence, PkBloom, PkDigestSet, PkKeysetInsertOutcome, RowLocation,
-        ShardedPkIndex, approx_pk_keyset_entry_bytes, pk_digest, shard_of_pk,
+        ColdPkExistence, PkBloom, PkDigestSet, PkKeysetInsertOutcome, RowLocation, ShardedPkIndex,
+        approx_pk_keyset_entry_bytes, pk_digest, shard_of_pk,
     };
 
     /// `record_keys` routes each key to its `shard_of_pk` shard, and
