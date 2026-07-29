@@ -334,7 +334,7 @@ impl CayenneStagedAppend {
     pub async fn prepare(self) -> Result<PreparedStagedAppend> {
         // Empty-table probe (see `maybe_install_warm_pk_caches`): a staged
         // append can be a fresh table's very first write, and its committed
-        // keys must land in LIVE caches for the warm-index invariant to hold.
+        // keys must land in live caches for the warm-index invariant to hold.
         self.table.maybe_install_warm_pk_caches().await;
         // Register the in-flight append BEFORE its WAL becomes discoverable on
         // disk. Recovery treats any committed WAL whose id is not in the

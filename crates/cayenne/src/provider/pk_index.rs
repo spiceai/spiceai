@@ -986,14 +986,13 @@ impl ShardedPkIndex {
 
     /// Record `keys` into whichever shard each key routes to
     /// ([`shard_of_pk`]) — the commit-path analog of
-    /// [`Self::record_keys_in_shard`] (the `append_to_shard` per-shard
-    /// update), for callers whose key set is NOT pre-routed: the
-    /// inline/file/staging commit paths record a whole batch's validated
-    /// keys at once. Without this, keys committed off the mem-tier path
-    /// exist only in the single-keyset cache and a long-lived sharded exact
-    /// keyset false-negates them into duplicate upserts. Existence-only
-    /// inserts (`max_bytes: usize::MAX`); the caller re-applies the byte
-    /// budget once afterwards (see [`Self::degrade_to_blooms`]).
+    /// [`Self::record_keys_in_shard`], for callers whose key set is not
+    /// pre-routed (the inline/file/staging commit paths record a whole
+    /// batch's validated keys at once). Without this, keys committed off the
+    /// mem-tier path exist only in the single-keyset cache and a long-lived
+    /// sharded exact keyset false-negates them into duplicate upserts.
+    /// Existence-only inserts; the caller re-applies the byte budget once
+    /// afterwards (see [`Self::degrade_to_blooms`]).
     pub(crate) fn record_keys(&mut self, keys: &PkDigestSet, location: &RowLocation) {
         let n = self.shard_count();
         match self {

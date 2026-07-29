@@ -6849,7 +6849,7 @@ impl CayenneTableProvider {
     }
 
     /// Write-path probe: when no PK cache is live and the table is provably
-    /// empty (no mem-tier, inlined, durable, or cold rows), install EMPTY
+    /// empty (no mem-tier, inlined, durable, or cold rows), install empty
     /// exact caches. Every later write maintains them
     /// (`record_pk_keys_with_location`, `append_to_shard`), so the first
     /// conflict-validated batch skips the O(live-rows)
@@ -30269,10 +30269,9 @@ mod tests {
     }
 
     /// The write-path probe installs warm (empty exact) PK existence caches
-    /// on a provably-empty table — and ONLY then (see
-    /// `maybe_install_warm_pk_caches`): creation itself installs nothing
-    /// (`create_table` is create-or-reuse, so creation is not proof of
-    /// emptiness), and a non-empty table keeps the lazy rebuild.
+    /// on a provably-empty table, and only then: creation itself installs
+    /// nothing (`create_table` is create-or-reuse, so creation is not proof
+    /// of emptiness), and a non-empty table keeps the lazy rebuild.
     #[tokio::test]
     async fn create_table_installs_warm_empty_pk_index_caches() {
         use arrow::datatypes::{DataType, Field, Schema};
@@ -30312,7 +30311,7 @@ mod tests {
             .await
             .expect("table created");
 
-        // Creation installs NOTHING: create-or-reuse is not proof of emptiness.
+        // Creation installs nothing: create-or-reuse is not proof of emptiness.
         assert!(provider.pk_keyset_cache.lock().is_none());
         assert!(provider.sharded_pk_keyset_cache.lock().is_none());
 
@@ -30338,7 +30337,7 @@ mod tests {
             None => panic!("the probe must install the warm empty sharded keysets"),
         }
 
-        // Gate: a NON-empty table must never get an empty install. Mark the
+        // Gate: a non-empty table must never get an empty install. Mark the
         // table non-empty via the probe's own emptiness signal, clear the
         // caches (re-arms the probe), re-probe.
         provider.inlined_row_count.store(3, Ordering::Release);
@@ -30352,11 +30351,10 @@ mod tests {
     }
 
     /// Keys committed through the inline/file/staging paths must be mirrored
-    /// into the LIVE sharded existence cache: the per-shard Phase-6 record
-    /// covers only mem-tier appends, so with warm caches live from the first
-    /// write, an unmirrored commit path leaves holes in an "exact" keyset —
-    /// upserts of those keys then false-negate into duplicate rows (observed
-    /// as SF1000 row-count over-counts).
+    /// into the live sharded existence cache: `append_to_shard`'s per-shard
+    /// record covers only mem-tier appends, so with warm caches live from the
+    /// first write, an unmirrored commit path leaves holes in an "exact"
+    /// keyset and upserts of those keys duplicate instead of superseding.
     #[tokio::test]
     async fn commit_path_keys_mirror_into_the_sharded_cache() {
         use crate::provider::pk_index::pk_digest;
