@@ -80,6 +80,11 @@ pub enum Error {
     #[snafu(display("Timed out waiting for table {table} to be registered"))]
     TableRegistrationTimeout { table: String },
 
+    #[snafu(display(
+        "Stopped waiting for table {table} to be registered: the runtime is shutting down"
+    ))]
+    ShutdownBeforeTableRegistered { table: String },
+
     #[snafu(display("Table {table} is not an accelerated table"))]
     NotAcceleratedTable { table: String },
 

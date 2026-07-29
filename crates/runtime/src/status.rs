@@ -19,4 +19,4 @@ limitations under the License.
 //! and await status. Re-exported here so in-crate callers keep using
 //! `crate::status::{RuntimeStatus, ComponentStatus, ...}`.
 
-pub use runtime_status::{ComponentStatus, RuntimeReadyState, RuntimeStatus};
+pub use runtime_status::{ComponentStatus, RuntimeReadyState, RuntimeStatus, WaitOutcome};

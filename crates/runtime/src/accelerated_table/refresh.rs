@@ -1110,7 +1110,14 @@ impl Refresher {
                 let refresh_clone = Arc::clone(&self.refresh);
 
                 tokio::spawn(async move {
-                    runtime_status_clone.wait_for_ready().await;
+                    // A shutdown before readiness means the initial load never
+                    // completed — checkpointing a partial accelerator would
+                    // publish it as a complete snapshot.
+                    if runtime_status_clone.wait_for_ready().await
+                        == crate::status::WaitOutcome::ShuttingDown
+                    {
+                        return;
+                    }
                     if !bootstrap_status.is_bootstrapped() {
                         let refresh_sql = refresh_clone
                             .read()
