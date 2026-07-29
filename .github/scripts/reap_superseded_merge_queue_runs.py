@@ -117,6 +117,18 @@ class GitHubApi:
                 runs.extend(batch)
                 if len(batch) < PAGE_SIZE:
                     break
+            else:
+                # The page cap was reached without a short page, so runs older
+                # than the ones listed may exist and this pass cannot see them.
+                # Say so: the whole point of the reaper is the long-stuck
+                # orphan, and silently dropping the tail of a newest-first
+                # listing is exactly how that orphan goes unreaped.
+                print(
+                    f"WARNING: stopped listing {status} runs at the "
+                    f"{MAX_PAGES}-page cap ({MAX_PAGES * PAGE_SIZE} runs); "
+                    "older superseded runs may remain",
+                    file=sys.stderr,
+                )
         return runs
 
     def branch_exists(self, branch):
@@ -210,7 +222,10 @@ def cancel_runs(api, runs, dry_run):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description="Cancel workflow runs left behind by superseded "
+        "merge-queue batches."
+    )
     parser.add_argument(
         "--repository",
         default=os.getenv("GITHUB_REPOSITORY"),

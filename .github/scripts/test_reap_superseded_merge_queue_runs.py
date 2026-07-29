@@ -3,7 +3,9 @@
 #
 # Unit tests for reap_superseded_merge_queue_runs.py.
 
+import contextlib
 import io
+import json
 import os
 import sys
 import unittest
@@ -268,6 +270,25 @@ class GitHubApiTests(unittest.TestCase):
         # One request per unfinished status, each returning a short page.
         self.assertEqual(urlopen.call_count, len(reaper.UNFINISHED_STATUSES))
         self.assertEqual(len(runs), len(reaper.UNFINISHED_STATUSES))
+
+    @unittest.mock.patch("urllib.request.urlopen")
+    def test_listing_warns_when_it_hits_the_page_cap(self, urlopen):
+        full_page = json.dumps(
+            {"workflow_runs": [{"id": i} for i in range(reaper.PAGE_SIZE)]}
+        ).encode()
+        urlopen.side_effect = lambda *args, **kwargs: FakeResponse(200, full_page)
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            runs = self.api.list_unfinished_merge_group_runs()
+
+        # Every page is full, so each status runs to the cap rather than
+        # stopping short, and the truncation is reported once per status.
+        per_status = reaper.MAX_PAGES * reaper.PAGE_SIZE
+        self.assertEqual(len(runs), per_status * len(reaper.UNFINISHED_STATUSES))
+        self.assertEqual(
+            stderr.getvalue().count("WARNING"), len(reaper.UNFINISHED_STATUSES)
+        )
 
 
 if __name__ == "__main__":
