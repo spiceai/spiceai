@@ -262,9 +262,8 @@ impl DuckDBAccelerator {
     /// [`AccelerationSource::initialized_sources`] so every component sharing an
     /// instance computes the same size, whichever one of them creates the pool.
     ///
-    /// The count starts at one and every matching component adds to it, so it runs
-    /// one ahead of the components actually on the instance, and a component whose
-    /// acceleration is disabled still counts. Only the pool size reads it, and
+    /// The count runs one ahead of the instance's real component total and a
+    /// disabled acceleration still counts — only the pool size reads it, and
     /// over-counting only ever over-provisions.
     fn get_num_accelerating_components(&self, path: Option<&str>, app: &Arc<App>) -> u32 {
         let mut instance_usage: u32 = 1;
@@ -3088,15 +3087,18 @@ mod tests {
         let shared_file = "/tmp/spice_12160_shared.db";
         let other_file = "/tmp/spice_12160_other.db";
         let file_params = |path: &'static str| vec![("duckdb_file", path)];
-
-        let app = app_with(
-            vec![spicepod_dataset(
+        let shared_dataset = || {
+            spicepod_dataset(
                 "shared_ds",
                 spicepod_duckdb_acceleration(
                     spicepod::acceleration::Mode::File,
                     &file_params(shared_file),
                 ),
-            )],
+            )
+        };
+
+        let app = app_with(
+            vec![shared_dataset()],
             vec![
                 spicepod_view(
                     "shared_view_1",
@@ -3154,31 +3156,32 @@ mod tests {
             "views sharing the DuckDB file must be counted alongside datasets"
         );
 
-        // What the count is for: an EBS instance defaults to a pool of 4, so the
-        // three views are the difference between a pool sized for its real
+        // The same app minus its views is what a dataset-only walk sees, and what
+        // the count is for: an EBS instance defaults to a pool of 4, so the three
+        // views are the difference between a pool sized for the instance's real
         // concurrency and one that queues on connection acquisition.
+        let views_dropped = app_with(vec![shared_dataset()], vec![]);
         let acceleration = Acceleration {
             engine: Engine::DuckDB,
             mode: Mode::File,
             ..Default::default()
         };
-        assert_eq!(
+        let pool_max_size = |app: &Arc<app::App>| {
             DuckDBAccelerator::get_pool_max_size(
-                accelerator.get_num_accelerating_components(Some(shared_file), &app),
+                accelerator.get_num_accelerating_components(Some(shared_file), app),
                 &acceleration,
                 super::ResolvedAccelerationStorage::Ebs,
-            ),
+            )
+        };
+        assert_eq!(
+            pool_max_size(&app),
             5,
             "the pool must be sized for every component on the instance"
         );
         assert_eq!(
-            DuckDBAccelerator::get_pool_max_size(
-                2,
-                &acceleration,
-                super::ResolvedAccelerationStorage::Ebs,
-            ),
+            pool_max_size(&views_dropped),
             super::DEFAULT_EBS_CONNECTION_POOL_SIZE,
-            "a dataset-only count stays clamped to the default pool size"
+            "without its views the same instance stays clamped to the default"
         );
     }
 
