@@ -71,7 +71,7 @@ message ControlMessage {
     ApplySpicepod apply_spicepod = 10;
     UpgradeRuntime upgrade_runtime = 11;
     Adopt adopt = 12;
-    Forget forget = 13;
+    Remove remove = 13;
     ApplyManifest apply_manifest = 20;
     DeleteManifest delete_manifest = 21;
     GetStatus get_status = 22;
@@ -181,7 +181,11 @@ message Adopt {
   string ca_bundle_pem = 5;         // dp issuing-CA chain the client pins for mTLS
 }
 
-message Forget {
+// Release this instance: the runtime clears its local identity and drops off
+// the control plane, while `spiced` keeps serving local traffic. The
+// cloud-dispatched direction of the same operation as `spice connect remove`;
+// both land the registry row on the terminal `removed` status.
+message Remove {
   string command_id = 1;
 }
 

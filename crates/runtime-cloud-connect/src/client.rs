@@ -39,14 +39,14 @@ limitations under the License.
 //! clicked Adopt) — the cert was already issued at enroll, so the client
 //! just acknowledges against the identity it holds.
 //!
-//! If a Forget arrives, we clear the local identity from disk and, on
+//! If a `Remove` arrives, we clear the local identity from disk and, on
 //! success, exit the cloud-connect task — spiced itself stays up and keeps
 //! serving local spicepod traffic as before. This matches the adoption
-//! semantics where "Forget" releases management but doesn't destroy the
+//! semantics where a release stops management but doesn't destroy the
 //! device. To re-adopt, the user runs `spice connect <code>` and restarts
-//! spiced. If the on-disk identity cannot be cleared, the Forget is
+//! spiced. If the on-disk identity cannot be cleared, the `Remove` is
 //! reported as failed and the driver stays connected with the still-valid
-//! identity rather than falsely exiting as forgotten.
+//! identity rather than falsely reporting the instance as released.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -87,7 +87,7 @@ pub(crate) struct ClientDriver {
     runtime: Arc<dyn RuntimeHandle>,
     shutdown: Arc<Shutdown>,
     /// Currently-effective identity, if any. Set by out-of-band enrollment,
-    /// replaced on renewal (rotated keypair); cleared on Forget or when
+    /// replaced on renewal (rotated keypair); cleared on `Remove` or when
     /// the cloud permanently refuses renewal (revocation).
     identity: Option<Identity>,
     /// Earliest instant the next in-stream renewal attempt may run — set
@@ -117,7 +117,7 @@ impl ClientDriver {
     ///
     /// The driver is fully fault-tolerant: a transport, decode, or
     /// stream error triggers a reconnect with backoff; only an explicit
-    /// shutdown notify, a Forget, or a non-recoverable credential state
+    /// shutdown notify, a `Remove`, or a non-recoverable credential state
     /// exits the loop.
     pub(crate) async fn run(mut self) -> Result<()> {
         let enroll_client = match EnrollClient::new(&self.config) {
@@ -171,9 +171,9 @@ impl ClientDriver {
 
             match self.connect_and_run(&enroll_client, &endpoint).await {
                 Ok(ExitReason::Shutdown) => return Ok(()),
-                Ok(ExitReason::Forget) => {
+                Ok(ExitReason::Removed) => {
                     tracing::info!(
-                        "Cloud Connect: Forget acknowledged; cloud-connect task exiting. spiced remains running and serving local spicepod traffic. To re-adopt, run `spice connect <code>` and restart spiced."
+                        "Cloud Connect: Remove acknowledged; this instance was released and the cloud-connect task is exiting. spiced remains running and serving local spicepod traffic. To re-adopt, run `spice connect <code>` and restart spiced."
                     );
                     return Ok(());
                 }
@@ -285,7 +285,7 @@ impl ClientDriver {
                 Ok(()) => {}
                 Err(err) if err.is_authoritative_rejection() => {
                     // Renewal authoritatively refused by the cloud: the
-                    // instance was forgotten/revoked cloud-side (refusing
+                    // instance was removed or revoked cloud-side (refusing
                     // renewal IS the revocation, DR-025) or the pinned key no
                     // longer matches. The identity is dead; the next pass
                     // enrolls with a staged code or exits with re-adopt
@@ -365,13 +365,18 @@ impl ClientDriver {
         client: &EnrollClient,
         code: &str,
     ) -> Result<(), enroll::Error> {
-        let (identity, app_name) = enroll::acquire_identity(client, code, &self.config).await?;
+        let (identity, registration) = enroll::acquire_identity(client, code, &self.config).await?;
         self.persist_identity(&identity).await;
         tracing::info!(
-            "Cloud Connect: enrolled as {}{} (gateway {}); identity stored at {}",
+            "Cloud Connect: enrolled as {}{}{} (gateway {}); identity stored at {}",
             identity.identifier,
-            app_name
+            registration
+                .app_name
                 .map(|app| format!(" attached to app {app}"))
+                .unwrap_or_default(),
+            registration
+                .region
+                .map(|region| format!(" in region {region}"))
                 .unwrap_or_default(),
             identity.gateway_addr,
             self.config.identity_path.display()
@@ -475,7 +480,7 @@ impl ClientDriver {
     }
 
     /// Clear the identity from disk and memory (best-effort on the disk
-    /// side — unlike Forget, the cloud has already invalidated it, so a
+    /// side — unlike `Remove`, the cloud has already invalidated it, so a
     /// stale file only produces a failed renewal on the next start).
     async fn clear_identity(&mut self) {
         if let Err(err) = IdentityStore::clear_async(&self.config.identity_path).await {
@@ -549,7 +554,7 @@ impl ClientDriver {
 
         // Spawn periodic heartbeat + telemetry tasks. They emit through
         // the same outbound channel. The identifier is shared by RwLock
-        // so a Forget can blank it for frames still in flight on the
+        // so a `Remove` can blank it for frames still in flight on the
         // draining stream.
         let runtime = Arc::clone(&self.runtime);
         let identifier = Arc::new(RwLock::new(identity.identifier.clone()));
@@ -718,12 +723,12 @@ impl ClientDriver {
             proto::control_message::Body::Adopt(cmd) => {
                 self.handle_adopt(tx, cmd, live_identifier).await;
             }
-            proto::control_message::Body::Forget(cmd) => {
-                // Only exit as forgotten if the identity was actually cleared;
+            proto::control_message::Body::Remove(cmd) => {
+                // Only exit as removed if the identity was actually cleared;
                 // on a clear failure stay connected with the still-valid
-                // identity rather than falsely exiting as forgotten.
-                if self.handle_forget(tx, cmd, live_identifier).await {
-                    return Some(ExitReason::Forget);
+                // identity rather than falsely reporting a release.
+                if self.handle_remove(tx, cmd, live_identifier).await {
+                    return Some(ExitReason::Removed);
                 }
             }
             // Operator-only commands: acknowledge with an error.
@@ -794,7 +799,7 @@ impl ClientDriver {
         // cert-delivery fields on the command.
         let Some(identity) = self.identity.clone() else {
             // Reaching the stream at all requires an identity (mTLS), so
-            // this indicates a driver bug or a Forget racing the Adopt.
+            // this indicates a driver bug or a `Remove` racing the Adopt.
             tracing::error!("Cloud Connect: received Adopt while holding no identity; refusing");
             send_result(
                 tx,
@@ -863,31 +868,31 @@ impl ClientDriver {
         .await;
     }
 
-    /// Handle a `Forget` command. Returns `true` only if the on-disk identity
+    /// Handle a `Remove` command. Returns `true` only if the on-disk identity
     /// was actually removed (or was already absent) — i.e. the instance is
-    /// genuinely forgotten and the caller may exit as such.
+    /// genuinely released and the caller may exit as such.
     ///
     /// If clearing `identity.json` fails, the file would still be loaded on the
     /// next start and Cloud Connect would silently reconnect, so reporting
     /// success here would lie to the control plane. In that case we keep the
     /// in-memory identity, report the command as failed, and return `false`
     /// so the driver stays connected with the still-valid identity instead of
-    /// exiting as forgotten.
-    async fn handle_forget(
+    /// exiting as released.
+    async fn handle_remove(
         &mut self,
         tx: &mpsc::Sender<proto::ClientMessage>,
-        cmd: proto::Forget,
+        cmd: proto::Remove,
         live_identifier: &Arc<RwLock<String>>,
     ) -> bool {
         // Clear identity from disk first. Use the async clear so the remote
-        // `Forget` path does not block a Tokio worker on `std::fs` I/O while
+        // `Remove` path does not block a Tokio worker on `std::fs` I/O while
         // the Cloud Connect stream is active. `clear_async` treats a missing
         // file as success, so reaching the error branch means the file exists
         // but could not be removed.
         if let Err(err) = IdentityStore::clear_async(&self.config.identity_path).await {
             tracing::warn!(
                 "Cloud Connect: failed to clear identity at {}: {err}; \
-                 reporting Forget as failed and staying connected (the unchanged \
+                 reporting Remove as failed and staying connected (the unchanged \
                  identity would otherwise reconnect on restart)",
                 self.config.identity_path.display()
             );
@@ -914,7 +919,7 @@ impl ClientDriver {
             &cmd.command_id,
             true,
             "",
-            serde_json::json!({ "status": "forgotten" }),
+            serde_json::json!({ "status": "removed" }),
         )
         .await;
         true
@@ -936,7 +941,10 @@ enum CredentialStep {
 enum ExitReason {
     Shutdown,
     Disconnected,
-    Forget,
+    /// The cloud dispatched `Remove`: the local identity was cleared and the
+    /// instance released. `spiced` keeps serving; only the cloud-connect task
+    /// exits.
+    Removed,
     /// The cloud permanently refused to renew the identity (revocation);
     /// the local identity was cleared before exiting the stream.
     IdentityRevoked,

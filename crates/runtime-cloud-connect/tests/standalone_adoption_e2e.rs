@@ -47,7 +47,7 @@ limitations under the License.
 //! 7. `renewal` — a short-lived leaf triggers the renewal loop: a fresh
 //!    keypair + CSR + PoP signature against `/renew`, and the rotated
 //!    identity is persisted.
-//! 8. `forget` — the server sends `Forget`, the client clears
+//! 8. `remove` — the server sends `Remove`, the client clears
 //!    `identity.json` and the cloud-connect task exits while the
 //!    (simulated) runtime stays up.
 //!
@@ -194,6 +194,10 @@ struct CloudMock {
     /// The public key pinned at the last enroll/renew — the only key whose
     /// PoP signature authorizes a rotation (mirrors the cloud's pinning).
     pinned_point: Arc<Mutex<Option<Vec<u8>>>>,
+    /// The region on the instance's registry row, standing in for the stored
+    /// column: an enroll declaring a region writes it, one that declares none
+    /// leaves it untouched.
+    stored_region: Arc<Mutex<Option<String>>>,
     enroll_requests: Arc<Mutex<Vec<Value>>>,
     renew_requests: Arc<Mutex<Vec<Value>>>,
 }
@@ -208,6 +212,7 @@ impl CloudMock {
             leaf_validity_secs,
             codes: Arc::new(Mutex::new(codes)),
             pinned_point: Arc::new(Mutex::new(None)),
+            stored_region: Arc::new(Mutex::new(None)),
             enroll_requests: Arc::new(Mutex::new(Vec::new())),
             renew_requests: Arc::new(Mutex::new(Vec::new())),
         }
@@ -259,6 +264,20 @@ async fn mock_enroll(
     // echoes the requested app back, matching the response contract.
     if let Some(app_name) = body["app_name"].as_str() {
         response["app_name"] = serde_json::Value::String(app_name.to_string());
+    }
+    // The real cloud reports the region now stored on the row: the declared
+    // one when the request carried it, otherwise whatever the row already
+    // held (a re-enrol with no `region` leaves it alone). The mock stands in
+    // for that stored value.
+    let stored_region = match body["region"].as_str() {
+        Some(region) => {
+            *mock.stored_region.lock().await = Some(region.to_string());
+            Some(region.to_string())
+        }
+        None => mock.stored_region.lock().await.clone(),
+    };
+    if let Some(region) = stored_region {
+        response["region"] = serde_json::Value::String(region);
     }
     (StatusCode::OK, Json(response))
 }
@@ -625,6 +644,7 @@ impl Harness {
             pending_adopt_code_path: None,
             adopt_app_name: None,
             adopt_create_app: false,
+            instance_region: None,
             runtime_version: "v0.0.0-e2e".to_string(),
             // Sub-second cadences keep the suite fast while still exercising
             // the periodic frame paths.
@@ -827,7 +847,10 @@ async fn one_shot_enroll_then_separate_run_connects_with_stored_identity() {
         .await
         .expect("one-shot enroll succeeds");
     assert_eq!(outcome.identity.identifier, ASSIGNED_ID);
-    assert_eq!(outcome.app_name, None, "no attachment was requested");
+    assert_eq!(
+        outcome.registration.app_name, None,
+        "no attachment was requested"
+    );
     assert!(
         config.identity_path.exists(),
         "identity must be persisted by the one-shot enroll"
@@ -934,12 +957,99 @@ async fn one_shot_enroll_carries_app_attachment() {
     let outcome = runtime_cloud_connect::enroll::enroll_now(&config)
         .await
         .expect("enroll with attachment succeeds");
-    assert_eq!(outcome.app_name.as_deref(), Some("e2e-app"));
+    assert_eq!(outcome.registration.app_name.as_deref(), Some("e2e-app"));
 
     let requests = harness.cloud.enroll_requests.lock().await.clone();
     assert_eq!(requests.len(), 1, "exactly one enroll request");
     assert_eq!(requests[0]["app_name"], "e2e-app");
     assert_eq!(requests[0]["create_app"], true);
+}
+
+/// The declared instance region rides the enroll request as a **sibling of
+/// the probed host facts** and comes back on the registry row. Any
+/// syntactically valid label enrolls — including one no region catalog knows —
+/// because a standalone host may not be in a cloud region at all.
+#[tokio::test]
+async fn one_shot_enroll_records_the_declared_region() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+
+    let mut config = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        Some(ADOPTION_CODE.to_string()),
+        Duration::from_hours(12),
+    );
+    config.instance_region = Some("on-prem-syd".to_string());
+
+    let outcome = runtime_cloud_connect::enroll::enroll_now(&config)
+        .await
+        .expect("enroll with a non-catalog region succeeds");
+    assert_eq!(outcome.registration.region.as_deref(), Some("on-prem-syd"));
+
+    let requests = harness.cloud.enroll_requests.lock().await.clone();
+    assert_eq!(requests.len(), 1, "exactly one enroll request");
+    assert_eq!(requests[0]["region"], "on-prem-syd");
+    assert!(
+        requests[0]["instance"].get("region").is_none(),
+        "the declared region must not be nested inside the probed host facts"
+    );
+}
+
+/// Omitting `--region` on a re-enrol must leave the stored region alone.
+/// Re-enrolment is how a standalone instance recovers past its renewal grace
+/// window, so a request that unconditionally wrote the region would erase one
+/// set in the portal on every recovery.
+#[tokio::test]
+async fn re_enroll_without_a_region_leaves_the_stored_region_untouched() {
+    // A second code stands in for the re-issued one a past-grace recovery uses.
+    const SECOND_CODE: &str = "SPICE-ADOPT-22222-22222-22222-22222";
+
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+
+    // First enroll declares the region.
+    let mut config = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        Some(ADOPTION_CODE.to_string()),
+        Duration::from_hours(12),
+    );
+    config.instance_region = Some("us-west-2".to_string());
+    let first = runtime_cloud_connect::enroll::enroll_now(&config)
+        .await
+        .expect("first enroll succeeds");
+    assert_eq!(first.registration.region.as_deref(), Some("us-west-2"));
+
+    harness
+        .cloud
+        .codes
+        .lock()
+        .await
+        .insert(SECOND_CODE.to_string());
+
+    let mut re_enroll = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        Some(SECOND_CODE.to_string()),
+        Duration::from_hours(12),
+    );
+    re_enroll.instance_region = None;
+    let second = runtime_cloud_connect::enroll::enroll_now(&re_enroll)
+        .await
+        .expect("re-enroll without a region succeeds");
+
+    let requests = harness.cloud.enroll_requests.lock().await.clone();
+    assert_eq!(requests.len(), 2, "two enroll requests");
+    assert!(
+        requests[1].get("region").is_none(),
+        "an omitted region must not appear on the wire at all — `null` would clear it"
+    );
+    assert_eq!(
+        second.registration.region.as_deref(),
+        Some("us-west-2"),
+        "the region set by the first enroll must survive the re-enrol"
+    );
 }
 
 /// `create_app` is meaningless without an app to name, so it must never
@@ -963,7 +1073,7 @@ async fn one_shot_enroll_omits_create_app_without_app_name() {
     let outcome = runtime_cloud_connect::enroll::enroll_now(&config)
         .await
         .expect("enroll succeeds unattached");
-    assert_eq!(outcome.app_name, None, "nothing was attached");
+    assert_eq!(outcome.registration.app_name, None, "nothing was attached");
 
     let requests = harness.cloud.enroll_requests.lock().await.clone();
     assert_eq!(requests.len(), 1, "exactly one enroll request");
@@ -1417,7 +1527,7 @@ async fn renewal_rotates_keypair_and_persists() {
 }
 
 #[tokio::test]
-async fn forget_clears_identity_and_exits() {
+async fn remove_clears_identity_and_exits() {
     let harness = Harness::new(24 * 60 * 60).await;
     let dir = tempfile::tempdir().unwrap();
     let identity_path = dir.path().join("identity.json");
@@ -1431,20 +1541,20 @@ async fn forget_clears_identity_and_exits() {
     let (handle, _identity) = enroll(&harness, &config, runtime).await;
     assert!(identity_path.exists(), "identity present after enrollment");
 
-    // Server issues Forget.
+    // Server issues Remove.
     harness
         .gateway
         .outbound
         .lock()
         .await
-        .push_back(ctrl(proto::control_message::Body::Forget(proto::Forget {
-            command_id: "cmd-forget".to_string(),
+        .push_back(ctrl(proto::control_message::Body::Remove(proto::Remove {
+            command_id: "cmd-remove".to_string(),
         })));
 
     // The client clears identity.json and the cloud-connect task exits; spiced
     // itself (here, the runtime handle) is untouched.
     let cleared = wait_until(Duration::from_secs(5), || !identity_path.exists()).await;
-    assert!(cleared, "Forget must remove identity.json");
+    assert!(cleared, "Remove must clear identity.json");
 
     let captured = Arc::clone(&harness.gateway.captured);
     let acked = wait_until_async(Duration::from_secs(5), || {
@@ -1455,12 +1565,12 @@ async fn forget_clears_identity_and_exits() {
                 .await
                 .results
                 .iter()
-                .any(|r| r.command_id == "cmd-forget" && r.success)
+                .any(|r| r.command_id == "cmd-remove" && r.success)
         }
     })
     .await;
-    assert!(acked, "server must see a successful Forget result");
+    assert!(acked, "server must see a successful Remove result");
 
-    // shutdown() returns promptly because the task already exited on Forget.
+    // shutdown() returns promptly because the task already exited on Remove.
     handle.shutdown().await;
 }

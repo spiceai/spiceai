@@ -62,6 +62,11 @@ pub const ADOPT_APP_NAME_ENV: &str = "SPICE_CONNECT_ADOPT_APP_NAME";
 /// creates it at enroll and attaches the instance.
 pub const ADOPT_CREATE_APP_ENV: &str = "SPICE_CONNECT_ADOPT_CREATE";
 
+/// Env var mirroring `spice connect --region`: where *this instance* runs
+/// (`us-west-2`, `on-prem-syd`, …). A customer-declared label recorded on
+/// the registry row, not a probed fact.
+pub const ADOPT_REGION_ENV: &str = "SPICE_CONNECT_ADOPT_REGION";
+
 /// Read the adoption code from [`ADOPT_CODE_ENV`]. An empty value is
 /// treated as unset.
 fn adoption_code_from_env() -> Option<String> {
@@ -128,6 +133,17 @@ pub struct CloudConnectConfig {
     /// creates the app at enroll and attaches the instance
     /// (`spice connect --create` / [`ADOPT_CREATE_APP_ENV`]).
     pub adopt_create_app: bool,
+
+    /// Where this instance runs (`spice connect --region` /
+    /// [`ADOPT_REGION_ENV`]) — a customer-declared label, not a probed fact,
+    /// so it rides the enroll request as a sibling of the host facts rather
+    /// than as one of them. The cloud records it on the registry row and
+    /// resolves the instance's gateway stamp from it.
+    ///
+    /// `None` means "leave the stored value alone": a re-enrol (the recovery
+    /// path once the renewal grace window has passed) must not erase a region
+    /// set in the portal.
+    pub instance_region: Option<String>,
 
     /// Runtime semver-like string (`v2.0.0-build.deadbeef`). Sent in
     /// `Hello.runtime_version`.
@@ -290,6 +306,24 @@ impl CloudConnectConfig {
             adopt_create_app = false;
         }
 
+        // A malformed region is dropped rather than sent: the cloud rejects it
+        // before consuming the adoption code, so enrolling anyway would only
+        // turn a typo in the environment into a failed enrollment.
+        let instance_region = std::env::var(ADOPT_REGION_ENV)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .and_then(|region| {
+                if crate::is_valid_instance_region(&region) {
+                    Some(region)
+                } else {
+                    tracing::warn!(
+                        "{ADOPT_REGION_ENV} value {region:?} is not a valid region label; ignoring it. Expected 2-64 lowercase letters, digits, or hyphens (for example 'us-west-2' or 'on-prem-syd'). Set the region on the instance in the Spice Cloud portal instead. See: https://spiceai.org/docs"
+                    );
+                    None
+                }
+            });
+
         Self {
             enroll_endpoint,
             gateway_endpoint,
@@ -301,6 +335,7 @@ impl CloudConnectConfig {
             pending_adopt_code_path,
             adopt_app_name,
             adopt_create_app,
+            instance_region,
             runtime_version: runtime_version.into(),
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
             telemetry_interval: DEFAULT_TELEMETRY_INTERVAL,
