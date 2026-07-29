@@ -396,19 +396,20 @@ impl ClusterService for ClusterServiceImpl {
         // hole: unreferenced secrets in the host environment or external stores
         // are never returned, and unallowlisted keys never hit the secret store
         // (so deny does not create a lookup side-channel).
-        let allowed_keys = {
-            let app_guard = self.app.read().await;
-            let Some(ref app) = *app_guard else {
-                tracing::warn!(
-                    executor_id = %request.executor_id,
-                    "Denied cluster secret expansion: app context not available"
-                );
-                return Err(Status::failed_precondition(
-                    "Secret expansion requires a loaded app definition",
-                ));
-            };
-            expandable_secret_keys(app)
+        //
+        // Snapshot the `Arc<App>` under the lock and drop the guard before the
+        // (CPU-bound) allowlist build so ExpandSecret does not hold the app
+        // write path while serializing/scanning the spicepod.
+        let Some(app) = self.app.read().await.clone() else {
+            tracing::warn!(
+                executor_id = %request.executor_id,
+                "Denied cluster secret expansion: app context not available"
+            );
+            return Err(Status::failed_precondition(
+                "Secret expansion requires a loaded app definition",
+            ));
         };
+        let allowed_keys = expandable_secret_keys(&app);
 
         if !allowed_keys.contains(request.key.as_str()) {
             tracing::warn!(
@@ -1533,7 +1534,7 @@ mod tests {
     }
 
     #[test]
-    fn expandable_secret_keys_collects_dataset_and_model_refs() {
+    fn expandable_secret_keys_collects_dataset_refs() {
         let app = app_with_secret_ref("pg_pass", "${ secrets:PG_PASS }");
         let keys = expandable_secret_keys(&app);
         assert!(
