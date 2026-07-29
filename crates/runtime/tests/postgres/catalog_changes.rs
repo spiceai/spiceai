@@ -43,7 +43,9 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use app::AppBuilder;
-use data_components::postgres::provider::{check_cdc_prerequisites, replication_slot_status};
+use data_components::postgres::provider::{
+    check_cdc_prerequisites, ensure_replication_slot_capacity, replication_slot_status,
+};
 use data_components::postgres_replication::config::catalog_slot_name;
 use datafusion::assert_batches_eq;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
@@ -578,6 +580,69 @@ async fn test_check_cdc_prerequisites_rejects_non_logical_wal_level() -> Result<
             anyhow::ensure!(
                 message.contains("wal_level"),
                 "expected error naming wal_level, got: {message}"
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+/// The slot-capacity pre-flight passes on a server with room, then rejects one
+/// whose `max_replication_slots` is exhausted with an actionable error -- so an
+/// operator hits a clear message at startup instead of a cryptic slot-creation
+/// failure later, deep in replication setup.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_replication_slot_capacity_rejects_exhausted_server() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let port = common::get_random_port()?;
+            let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+
+            let pool = common::get_postgres_connection_pool(port, None).await?;
+
+            // A fresh server has capacity.
+            ensure_replication_slot_capacity(&pool)
+                .await
+                .map_err(|e| anyhow::anyhow!("fresh server should have slot capacity: {e}"))?;
+
+            // Fill every remaining replication slot.
+            let conn = pool
+                .connect_direct()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let max: i64 = conn
+                .conn
+                .query_one(
+                    "SELECT current_setting('max_replication_slots')::bigint",
+                    &[],
+                )
+                .await?
+                .get(0);
+            let used: i64 = conn
+                .conn
+                .query_one("SELECT count(*)::bigint FROM pg_replication_slots", &[])
+                .await?
+                .get(0);
+            for i in used..max {
+                conn.conn
+                    .query(
+                        "SELECT pg_create_logical_replication_slot($1, 'pgoutput')",
+                        &[&format!("cap_test_{i}")],
+                    )
+                    .await?;
+            }
+
+            // Now exhausted -> the pre-flight must reject with an actionable error.
+            let err = ensure_replication_slot_capacity(&pool)
+                .await
+                .expect_err("exhausted server should be rejected");
+            let message = err.to_string();
+            anyhow::ensure!(
+                message.contains("max_replication_slots")
+                    && message.contains("pg_drop_replication_slot"),
+                "expected an actionable slot-capacity error, got: {message}"
             );
 
             Ok(())

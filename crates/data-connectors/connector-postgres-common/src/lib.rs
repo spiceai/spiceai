@@ -55,6 +55,11 @@ pub enum Error {
     MissingReplicationPrivilege { role: String },
 
     #[snafu(display(
+        "Cannot start CDC catalog acceleration: PostgreSQL has no free replication slots ({used} of {max} in use; `max_replication_slots` = {max}). Drop an unused slot (inspect `pg_replication_slots`, then `SELECT pg_drop_replication_slot('<slot_name>');`), or raise `max_replication_slots` and restart PostgreSQL. Docs: https://spiceai.org/docs/components/data-connectors/postgres"
+    ))]
+    ReplicationSlotsExhausted { used: i64, max: i64 },
+
+    #[snafu(display(
         "PostgreSQL table {schema}.{table} was not found. It may have been dropped after catalog discovery; it will be retried on the next refresh. Docs: https://spiceai.org/docs/components/data-connectors/postgres"
     ))]
     TableNotFound { schema: String, table: String },
@@ -406,6 +411,41 @@ pub async fn wal_sender_timeout_ms(pool: &PostgresConnectionPool) -> Result<i64>
         .await
         .context(QueryFailedSnafu)?;
     Ok(row.get(0))
+}
+
+/// Ensure the server can create at least one more replication slot -- i.e. the
+/// current slot count is below `max_replication_slots`.
+///
+/// CDC catalog acceleration needs one shared slot; creating it on a server whose
+/// `max_replication_slots` is already exhausted otherwise fails deep in the
+/// replication setup with a cryptic error. Checking up front turns that into an
+/// actionable [`Error::ReplicationSlotsExhausted`] naming the fix.
+///
+/// The caller should skip this when the catalog's slot *already exists* (it will
+/// be reused, not created, so no capacity is consumed) -- see
+/// `AcceleratedCatalogProvider::ensure_catalog_slot_available`.
+///
+/// # Errors
+///
+/// Returns an error if a connection can't be obtained from `pool`, the query
+/// fails, or the server has no free replication slots.
+pub async fn ensure_replication_slot_capacity(pool: &PostgresConnectionPool) -> Result<()> {
+    let conn = pool.connect_direct().await.context(ConnectionFailedSnafu)?;
+    // `current_setting('max_replication_slots')` is text (e.g. "10"); cast to
+    // bigint to compare against the live slot count.
+    let row = conn
+        .conn
+        .query_one(
+            "SELECT (SELECT count(*) FROM pg_catalog.pg_replication_slots)::bigint, \
+             current_setting('max_replication_slots')::bigint",
+            &[],
+        )
+        .await
+        .context(QueryFailedSnafu)?;
+    let used: i64 = row.get(0);
+    let max: i64 = row.get(1);
+    ensure!(used < max, ReplicationSlotsExhaustedSnafu { used, max });
+    Ok(())
 }
 
 /// A table's `PostgreSQL` `REPLICA IDENTITY` mode -- the per-table property that
@@ -869,5 +909,17 @@ mod tests {
         assert!(role.contains("replication"), "{role}");
         assert!(role.contains("ALTER ROLE"), "{role}");
         assert!(role.contains("https://spiceai.org/docs"), "{role}");
+
+        let exhausted = Error::ReplicationSlotsExhausted { used: 10, max: 10 }.to_string();
+        assert!(exhausted.contains("10 of 10 in use"), "{exhausted}");
+        assert!(exhausted.contains("max_replication_slots"), "{exhausted}");
+        assert!(
+            exhausted.contains("pg_drop_replication_slot"),
+            "{exhausted}"
+        );
+        assert!(
+            exhausted.contains("https://spiceai.org/docs"),
+            "{exhausted}"
+        );
     }
 }
