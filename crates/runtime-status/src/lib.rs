@@ -48,6 +48,24 @@ pub enum RuntimeReadyState {
     OnRegistration,
 }
 
+/// Why a readiness wait returned.
+///
+/// Every `wait_for_*` helper races the awaited status against the runtime's
+/// shutdown token, so a wait always returns — but only [`WaitOutcome::Reached`]
+/// means the status was actually observed. Callers that go on to do work must
+/// check this: treating [`WaitOutcome::ShuttingDown`] as ready would start work
+/// (a refresh, a checkpoint, a scheduler ack) on a runtime that is tearing down.
+#[must_use]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitOutcome {
+    /// The awaited status was observed.
+    Reached,
+    /// The runtime began shutting down before the awaited status was observed
+    /// (or the status tracker itself was dropped, which only happens at
+    /// teardown). The awaited status was never reached.
+    ShuttingDown,
+}
+
 /// Per-component state stored in the `statuses` map.
 ///
 /// The `notifier` is created lazily the first time a caller subscribes via
@@ -433,42 +451,60 @@ impl RuntimeStatus {
         }
     }
 
-    /// Internal helper to wait for a component to become ready.
-    async fn wait_for_component_ready(&self, component_name: &str) {
+    /// Waits until a component's status satisfies `is_satisfied`, or the runtime
+    /// starts shutting down — whichever happens first.
+    async fn wait_for_component_status(
+        &self,
+        component_name: &str,
+        is_satisfied: impl Fn(&ComponentStatus) -> bool,
+    ) -> WaitOutcome {
         let mut receiver = self.get_or_create_notifier(component_name);
 
         loop {
-            // Check current value (handles already-ready case)
-            if *receiver.borrow() == ComponentStatus::Ready {
-                return;
+            // Check the current value first, so an already-satisfied component
+            // returns without awaiting anything.
+            if is_satisfied(&receiver.borrow()) {
+                return WaitOutcome::Reached;
             }
 
-            // Wait for next change; return if channel closed (runtime shutting down)
-            if receiver.changed().await.is_err() {
-                return;
+            // `mark_shutdown` cancels the shutdown token but does NOT close the
+            // per-component watch channels — their senders live in the `statuses`
+            // map, which the still-alive tracker owns and never removes from — so
+            // without racing the token a component that never reaches its target
+            // status parks this task forever. `watch::Receiver::changed` is
+            // cancel-safe, so losing the race drops no status change.
+            tokio::select! {
+                changed = receiver.changed() => {
+                    if changed.is_err() {
+                        // The only sender was dropped, i.e. the tracker itself is
+                        // gone: the awaited status can never arrive.
+                        return WaitOutcome::ShuttingDown;
+                    }
+                }
+                () = self.shutdown_token.cancelled() => return WaitOutcome::ShuttingDown,
             }
         }
+    }
+
+    /// Internal helper to wait for a component to become ready.
+    async fn wait_for_component_ready(&self, component_name: &str) -> WaitOutcome {
+        self.wait_for_component_status(component_name, |status| *status == ComponentStatus::Ready)
+            .await
     }
 
     /// Waits for a component to leave the `Initializing` state — used by
     /// callers that only need the component registered, not fully ready.
-    async fn wait_for_component_registered(&self, component_name: &str) {
-        let mut receiver = self.get_or_create_notifier(component_name);
-
-        loop {
-            if !matches!(*receiver.borrow(), ComponentStatus::Initializing) {
-                return;
-            }
-            if receiver.changed().await.is_err() {
-                return;
-            }
-        }
+    async fn wait_for_component_registered(&self, component_name: &str) -> WaitOutcome {
+        self.wait_for_component_status(component_name, |status| {
+            !matches!(status, ComponentStatus::Initializing)
+        })
+        .await
     }
 
     /// Waits for a dataset to become ready.
-    pub async fn wait_for_dataset_ready(&self, dataset: &TableReference) {
+    pub async fn wait_for_dataset_ready(&self, dataset: &TableReference) -> WaitOutcome {
         let component_name = format!("dataset:{dataset}");
-        self.wait_for_component_ready(&component_name).await;
+        self.wait_for_component_ready(&component_name).await
     }
 
     /// Waits for a dataset to be registered (any status other than
@@ -476,76 +512,83 @@ impl RuntimeStatus {
     /// provider to exist, not for the dataset to be fully loaded — e.g.
     /// scheduler-side partition discovery, where waiting for `Ready`
     /// would deadlock because `Ready` is gated on executor data loads.
-    pub async fn wait_for_dataset_registered(&self, dataset: &TableReference) {
+    pub async fn wait_for_dataset_registered(&self, dataset: &TableReference) -> WaitOutcome {
         let component_name = format!("dataset:{dataset}");
-        self.wait_for_component_registered(&component_name).await;
+        self.wait_for_component_registered(&component_name).await
     }
 
     /// Waits for a model to become ready.
-    pub async fn wait_for_model_ready(&self, model_name: &str) {
+    pub async fn wait_for_model_ready(&self, model_name: &str) -> WaitOutcome {
         let component_name = format!("model:{model_name}");
-        self.wait_for_component_ready(&component_name).await;
+        self.wait_for_component_ready(&component_name).await
     }
 
     /// Waits for a catalog to become ready.
-    pub async fn wait_for_catalog_ready(&self, catalog_name: &str) {
+    pub async fn wait_for_catalog_ready(&self, catalog_name: &str) -> WaitOutcome {
         let component_name = format!("catalog:{catalog_name}");
-        self.wait_for_component_ready(&component_name).await;
+        self.wait_for_component_ready(&component_name).await
     }
 
     /// Waits for a tool to become ready.
-    pub async fn wait_for_tool_ready(&self, tool_name: &str) {
+    pub async fn wait_for_tool_ready(&self, tool_name: &str) -> WaitOutcome {
         let component_name = format!("tool:{tool_name}");
-        self.wait_for_component_ready(&component_name).await;
+        self.wait_for_component_ready(&component_name).await
     }
 
     /// Waits for a tool catalog to become ready.
-    pub async fn wait_for_tool_catalog_ready(&self, catalog_name: &str) {
+    pub async fn wait_for_tool_catalog_ready(&self, catalog_name: &str) -> WaitOutcome {
         let component_name = format!("tool_catalog:{catalog_name}");
-        self.wait_for_component_ready(&component_name).await;
+        self.wait_for_component_ready(&component_name).await
     }
 
     /// Waits for an LLM to become ready.
-    pub async fn wait_for_llm_ready(&self, model_name: &str) {
+    pub async fn wait_for_llm_ready(&self, model_name: &str) -> WaitOutcome {
         let component_name = format!("llm:{model_name}");
-        self.wait_for_component_ready(&component_name).await;
+        self.wait_for_component_ready(&component_name).await
     }
 
     /// Waits for an embedding model to become ready.
-    pub async fn wait_for_embedding_ready(&self, model_name: &str) {
+    pub async fn wait_for_embedding_ready(&self, model_name: &str) -> WaitOutcome {
         let component_name = format!("embedding:{model_name}");
-        self.wait_for_component_ready(&component_name).await;
+        self.wait_for_component_ready(&component_name).await
     }
 
     /// Waits for a view to become ready.
-    pub async fn wait_for_view_ready(&self, view_name: &TableReference) {
+    pub async fn wait_for_view_ready(&self, view_name: &TableReference) -> WaitOutcome {
         let component_name = format!("view:{view_name}");
-        self.wait_for_component_ready(&component_name).await;
+        self.wait_for_component_ready(&component_name).await
     }
 
     /// Waits for a worker to become ready.
-    pub async fn wait_for_worker_ready(&self, worker_name: &str) {
+    pub async fn wait_for_worker_ready(&self, worker_name: &str) -> WaitOutcome {
         let component_name = format!("worker:{worker_name}");
-        self.wait_for_component_ready(&component_name).await;
+        self.wait_for_component_ready(&component_name).await
     }
 
     /// Waits for a cluster node to become ready.
-    pub async fn wait_for_cluster_ready(&self, node_name: &str) {
+    pub async fn wait_for_cluster_ready(&self, node_name: &str) -> WaitOutcome {
         let component_name = format!("cluster:{node_name}");
-        self.wait_for_component_ready(&component_name).await;
+        self.wait_for_component_ready(&component_name).await
     }
 
     /// Waits for the entire runtime to be ready (all registered components have been ready at least once).
     ///
     /// This polls the `is_ready()` status at a regular interval until the runtime is ready.
     /// If the runtime is already ready, this returns immediately.
-    pub async fn wait_for_ready(&self) {
+    ///
+    /// Returns [`WaitOutcome::ShuttingDown`] instead of polling forever once
+    /// shutdown starts: `is_ready()` reports `false` for the rest of the process
+    /// lifetime from that point, so the poll could never succeed.
+    pub async fn wait_for_ready(&self) -> WaitOutcome {
         const POLL_INTERVAL: Duration = Duration::from_millis(100);
         loop {
             if self.is_ready() {
-                return;
+                return WaitOutcome::Reached;
             }
-            tokio::time::sleep(POLL_INTERVAL).await;
+            tokio::select! {
+                () = tokio::time::sleep(POLL_INTERVAL) => {}
+                () = self.shutdown_token.cancelled() => return WaitOutcome::ShuttingDown,
+            }
         }
     }
 }
@@ -555,6 +598,11 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    /// How long a shutdown-aware wait gets before the test calls it hung. Only an
+    /// upper bound on a wake-up that should be immediate — before the fix these
+    /// waits never returned at all, so any finite bound fails on the old code.
+    const SHUTDOWN_WAIT_BOUND: Duration = Duration::from_secs(5);
 
     #[test]
     fn test_get_component_status() {
@@ -691,7 +739,10 @@ mod tests {
         status.update_dataset(&dataset, ComponentStatus::Ready);
 
         // Should return immediately
-        status.wait_for_dataset_ready(&dataset).await;
+        assert_eq!(
+            status.wait_for_dataset_ready(&dataset).await,
+            WaitOutcome::Reached
+        );
     }
 
     #[tokio::test]
@@ -711,7 +762,10 @@ mod tests {
         });
 
         // Wait for ready
-        status.wait_for_dataset_ready(&dataset).await;
+        assert_eq!(
+            status.wait_for_dataset_ready(&dataset).await,
+            WaitOutcome::Reached
+        );
     }
 
     #[tokio::test]
@@ -728,7 +782,10 @@ mod tests {
             status_clone.update_dataset(&dataset_clone, ComponentStatus::Ready);
         });
 
-        status.wait_for_dataset_ready(&dataset).await;
+        assert_eq!(
+            status.wait_for_dataset_ready(&dataset).await,
+            WaitOutcome::Reached
+        );
     }
 
     #[tokio::test]
@@ -754,8 +811,14 @@ mod tests {
         // Set ready - both should wake up
         status.update_dataset(&dataset, ComponentStatus::Ready);
 
-        handle1.await.expect("task 1 should complete");
-        handle2.await.expect("task 2 should complete");
+        assert_eq!(
+            handle1.await.expect("task 1 should complete"),
+            WaitOutcome::Reached
+        );
+        assert_eq!(
+            handle2.await.expect("task 2 should complete"),
+            WaitOutcome::Reached
+        );
     }
 
     #[tokio::test]
@@ -775,7 +838,143 @@ mod tests {
         });
 
         // Wait indefinitely
-        status.wait_for_dataset_ready(&dataset).await;
+        assert_eq!(
+            status.wait_for_dataset_ready(&dataset).await,
+            WaitOutcome::Reached
+        );
+    }
+
+    /// A component wait must return once shutdown starts, even though the
+    /// component never reaches `Ready`: `mark_shutdown` cancels the shutdown
+    /// token but leaves the per-component watch channel open, so a wait that only
+    /// awaited `changed()` parked forever.
+    #[tokio::test]
+    async fn test_wait_for_dataset_ready_returns_on_shutdown() {
+        let status = RuntimeStatus::new();
+        let dataset = TableReference::bare("never_ready");
+
+        status.update_dataset(&dataset, ComponentStatus::Initializing);
+
+        let waiter = {
+            let status = Arc::clone(&status);
+            let dataset = dataset.clone();
+            tokio::spawn(async move { status.wait_for_dataset_ready(&dataset).await })
+        };
+
+        status.mark_shutdown();
+
+        let outcome = tokio::time::timeout(SHUTDOWN_WAIT_BOUND, waiter)
+            .await
+            .expect("wait_for_dataset_ready should return once shutdown starts")
+            .expect("waiter task should not panic");
+        assert_eq!(outcome, WaitOutcome::ShuttingDown);
+        // The component is still Initializing, so the caller must be told the
+        // status was never reached rather than being allowed to proceed.
+        assert_eq!(
+            status.get_component_status("dataset:never_ready"),
+            Some(ComponentStatus::Initializing)
+        );
+    }
+
+    /// Same for the registered-only wait, whose loop had the same shape.
+    #[tokio::test]
+    async fn test_wait_for_dataset_registered_returns_on_shutdown() {
+        let status = RuntimeStatus::new();
+        let dataset = TableReference::bare("never_registered");
+
+        status.update_dataset(&dataset, ComponentStatus::Initializing);
+
+        let waiter = {
+            let status = Arc::clone(&status);
+            let dataset = dataset.clone();
+            tokio::spawn(async move { status.wait_for_dataset_registered(&dataset).await })
+        };
+
+        status.mark_shutdown();
+
+        let outcome = tokio::time::timeout(SHUTDOWN_WAIT_BOUND, waiter)
+            .await
+            .expect("wait_for_dataset_registered should return once shutdown starts")
+            .expect("waiter task should not panic");
+        assert_eq!(outcome, WaitOutcome::ShuttingDown);
+    }
+
+    /// A wait entered *after* shutdown has already started must return without
+    /// awaiting a status change that can never come.
+    #[tokio::test]
+    async fn test_wait_for_dataset_ready_returns_when_already_shut_down() {
+        let status = RuntimeStatus::new();
+        let dataset = TableReference::bare("never_ready");
+
+        status.update_dataset(&dataset, ComponentStatus::Initializing);
+        status.mark_shutdown();
+
+        let outcome =
+            tokio::time::timeout(SHUTDOWN_WAIT_BOUND, status.wait_for_dataset_ready(&dataset))
+                .await
+                .expect("wait_for_dataset_ready should return immediately when already shut down");
+        assert_eq!(outcome, WaitOutcome::ShuttingDown);
+    }
+
+    /// A component that is already `Ready` when shutdown has started still
+    /// reports `Reached` — shutdown only reports the status it prevented.
+    #[tokio::test]
+    async fn test_wait_for_dataset_ready_after_shutdown_still_reports_ready_component() {
+        let status = RuntimeStatus::new();
+        let dataset = TableReference::bare("ready_dataset");
+
+        status.update_dataset(&dataset, ComponentStatus::Ready);
+        status.mark_shutdown();
+
+        assert_eq!(
+            status.wait_for_dataset_ready(&dataset).await,
+            WaitOutcome::Reached
+        );
+    }
+
+    /// `wait_for_ready` polls `is_ready()`, which returns `false` for the rest of
+    /// the process once shutdown starts — so without racing the shutdown token it
+    /// busy-polled forever.
+    #[tokio::test]
+    async fn test_wait_for_ready_returns_on_shutdown() {
+        let status = RuntimeStatus::new();
+        let dataset = TableReference::bare("never_ready");
+
+        status.update_dataset(&dataset, ComponentStatus::Initializing);
+        assert!(!status.is_ready());
+
+        let waiter = {
+            let status = Arc::clone(&status);
+            tokio::spawn(async move { status.wait_for_ready().await })
+        };
+
+        status.mark_shutdown();
+
+        let outcome = tokio::time::timeout(SHUTDOWN_WAIT_BOUND, waiter)
+            .await
+            .expect("wait_for_ready should return once shutdown starts")
+            .expect("waiter task should not panic");
+        assert_eq!(outcome, WaitOutcome::ShuttingDown);
+    }
+
+    /// Shutdown must not be the only way out: a wait still blocks while the
+    /// runtime is running and not yet ready.
+    #[tokio::test]
+    async fn test_wait_for_ready_still_blocks_while_not_ready() {
+        let status = RuntimeStatus::new();
+        let dataset = TableReference::bare("slow_dataset");
+
+        status.update_dataset(&dataset, ComponentStatus::Initializing);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), status.wait_for_ready())
+                .await
+                .is_err(),
+            "wait_for_ready should still block while the runtime is running and not ready"
+        );
+
+        status.update_dataset(&dataset, ComponentStatus::Ready);
+        assert_eq!(status.wait_for_ready().await, WaitOutcome::Reached);
     }
 
     #[tokio::test]
