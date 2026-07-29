@@ -18,8 +18,7 @@ use std::{sync::Arc, time::SystemTime};
 
 use crate::{
     accelerated_table::{
-        DataRetentionFilter, Retention, refresh,
-        refresh_task::{collect_indexes_from_provider, indexes_from_federated},
+        DataRetentionFilter, Retention, refresh, refresh_task::collect_all_indexes,
     },
     component::dataset::TimeFormat,
     datafusion::{
@@ -86,28 +85,6 @@ fn warm_delete_target(index: &Arc<dyn Index + Send + Sync>) -> Arc<dyn Index + S
         return Arc::clone(compound.primary()) as Arc<dyn Index + Send + Sync>;
     }
     Arc::clone(index)
-}
-
-/// Collects every index attached to this dataset, from both sides of the accelerated table.
-///
-/// An external-store vector/search index (e.g. S3 Vectors, Elasticsearch) is only ever attached
-/// via `IndexedTableProvider` on the *federated/read* side (`EmbeddingConnector::wrap_table` wraps
-/// the source connector, not the accelerator) — `collect_indexes_from_provider(accelerator)` alone
-/// finds nothing for these, so retention would silently skip their warm-index cleanup. The
-/// `DuckDB` vector engine is the opposite: it wraps the *accelerator* itself
-/// (`wrap_accelerator_with_duckdb_vector_indexes`), not the federated side. Both are checked here,
-/// deduplicating by pointer identity (mirroring `collect_indexes_from_provider`'s own dedup) in
-/// case an index is ever reachable through both paths.
-fn collect_all_indexes(
-    accelerator: &Arc<dyn TableProvider>,
-    federated: &FederatedTable,
-) -> Vec<Arc<dyn Index + Send + Sync>> {
-    let mut seen = std::collections::HashSet::new();
-    collect_indexes_from_provider(Arc::clone(accelerator))
-        .into_iter()
-        .chain(indexes_from_federated(federated))
-        .filter(|index| seen.insert(Arc::as_ptr(index).cast::<()>()))
-        .collect()
 }
 
 pub(crate) async fn apply_retention_filters_once(

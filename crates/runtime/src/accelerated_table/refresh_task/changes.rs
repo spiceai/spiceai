@@ -15,7 +15,7 @@ limitations under the License.
 */
 use super::DatasetMetricLabels;
 use super::RefreshTask;
-use super::collect_indexes_from_provider;
+use super::{collect_all_indexes, indexes_from_federated};
 use crate::accelerated_table::refresh::Refresh;
 use crate::accelerated_table::refresh_task::deletion::{
     build_batch_delete_expr_from_change_batch, build_pk_only_batch_from_change_batch,
@@ -2939,12 +2939,15 @@ impl RefreshTask {
                 if handled_by_cayenne_cdc_path {
                     // Cayenne's fast CDC-delete path bypasses `TableProvider::delete_from`
                     // entirely, so it never reaches `IndexedTableProvider::delete_from`'s
-                    // index-aware handling — drive index deletion explicitly here instead.
-                    // Best-effort: an index failure is logged, not propagated, so it can't
-                    // block the (already-applied) accelerator-side delete above.
+                    // index-aware handling on either side — drive index deletion explicitly
+                    // here instead, across both the accelerator and federated sides (an
+                    // external-store vector/search index, e.g. S3 Vectors, is attached only
+                    // on the federated side; see `collect_all_indexes`). Best-effort: an index
+                    // failure is logged, not propagated, so it can't block the (already-applied)
+                    // accelerator-side delete above.
                     if let Some(keys) = build_pk_only_batch_from_change_batch(change_batch, chunk)?
                     {
-                        for index in collect_indexes_from_provider(Arc::clone(&self.accelerator)) {
+                        for index in collect_all_indexes(&self.accelerator, &self.federated) {
                             if let Err(e) = index.delete_by_keys(keys.clone()).await {
                                 tracing::error!(
                                     "Index '{}' failed to delete entries for a CDC delete via the Cayenne fast path (best-effort, continuing): {e}",
@@ -2964,6 +2967,24 @@ impl RefreshTask {
                         .await
                         .map_err(find_datafusion_root)
                         .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+
+                    // `self.accelerator.delete_from` above already drives any
+                    // `IndexedTableProvider` wrapping the accelerator itself (e.g. the DuckDB
+                    // vector engine) through its own index-aware handling. It cannot reach an
+                    // index attached only on the federated side (e.g. S3 Vectors, Elasticsearch)
+                    // — that's a distinct `TableProvider` chain — so drive those explicitly here.
+                    // Best-effort: logged, not propagated.
+                    if let Some(keys) = build_pk_only_batch_from_change_batch(change_batch, chunk)?
+                    {
+                        for index in indexes_from_federated(&self.federated) {
+                            if let Err(e) = index.delete_by_keys(keys.clone()).await {
+                                tracing::error!(
+                                    "Index '{}' failed to delete entries for a CDC delete (best-effort, continuing): {e}",
+                                    index.name()
+                                );
+                            }
+                        }
+                    }
                 }
                 wrote = true;
             }

@@ -246,6 +246,27 @@ pub(crate) fn indexes_from_federated(
     collect_indexes_from_provider(root)
 }
 
+/// Collects every index attached to this dataset, from both sides of the accelerated table.
+///
+/// An external-store vector/search index (e.g. S3 Vectors, Elasticsearch) is only ever attached
+/// via `IndexedTableProvider` on the *federated/read* side (`EmbeddingConnector::wrap_table` wraps
+/// the source connector, not the accelerator) — `collect_indexes_from_provider(accelerator)` alone
+/// finds nothing for these. The `DuckDB` vector engine is the opposite: it wraps the *accelerator*
+/// itself (`wrap_accelerator_with_duckdb_vector_indexes`), not the federated side. Both are checked
+/// here, deduplicating by pointer identity (mirroring `collect_indexes_from_provider`'s own dedup)
+/// in case an index is ever reachable through both paths.
+pub(crate) fn collect_all_indexes(
+    accelerator: &Arc<dyn datafusion::catalog::TableProvider>,
+    federated: &FederatedTable,
+) -> Vec<Arc<dyn runtime_datafusion_index::Index + Send + Sync>> {
+    let mut seen = std::collections::HashSet::new();
+    collect_indexes_from_provider(Arc::clone(accelerator))
+        .into_iter()
+        .chain(indexes_from_federated(federated))
+        .filter(|index| seen.insert(Arc::as_ptr(index).cast::<()>()))
+        .collect()
+}
+
 pub struct RefreshTaskBuilder {
     runtime_status: Arc<status::RuntimeStatus>,
     dataset_name: TableReference,
