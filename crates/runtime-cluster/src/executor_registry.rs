@@ -38,6 +38,7 @@ use snafu::prelude::*;
 use tokio::sync::{RwLock, mpsc};
 
 use crate::correlated::{CorrelatedResponses, CorrelationError, send_correlated};
+use crate::metadata::normalized_table_name;
 use crate::{PartitionStore, PartitionValue, executor_selection, metrics};
 
 /// Error type for executor registry operations.
@@ -271,8 +272,14 @@ pub struct ExecutorRegistry {
     /// broadcast, so its in-memory view is complete; it is re-populated by the
     /// executors' next refresh after a scheduler restart. Read at query-planning
     /// time to size the coordinator's per-executor federated scans.
+    ///
+    /// Keyed by [`normalized_table_name`] (the same canonical form the partition
+    /// store uses) so a report recorded from an executor's fully-qualified table
+    /// reference matches the bare `TableScan` reference the query planner looks
+    /// up with — a raw `TableReference` key hashes `Bare{t}` ≠ `Full{c,s,t}` and
+    /// would miss on every lookup.
     executor_statistics:
-        Arc<parking_lot::RwLock<HashMap<TableReference, HashMap<String, ExecutorTableStatistics>>>>,
+        Arc<parking_lot::RwLock<HashMap<String, HashMap<String, ExecutorTableStatistics>>>>,
 
     /// Append-only log of DDL SQL statements applied to the cluster.
     ddl_log: Arc<RwLock<DdlLog>>,
@@ -327,14 +334,14 @@ impl ExecutorRegistry {
     /// onto a (possibly projected) leaf scan by name.
     pub fn record_executor_statistics(
         &self,
-        table: TableReference,
+        table: &TableReference,
         executor_id: String,
         statistics: Statistics,
         column_names: Vec<String>,
     ) {
         self.executor_statistics
             .write()
-            .entry(table)
+            .entry(normalized_table_name(table))
             .or_default()
             .insert(
                 executor_id,
@@ -356,9 +363,23 @@ impl ExecutorRegistry {
     ) -> HashMap<String, ExecutorTableStatistics> {
         self.executor_statistics
             .read()
-            .get(table)
+            .get(&normalized_table_name(table))
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Returns `true` once at least one executor has reported statistics for
+    /// `table`. Used to gate a distributed table's query-readiness on having
+    /// the row-count statistics needed to size the coordinator's joins — the
+    /// report may itself carry unknown stats (the executor always reports per
+    /// served table), so this signals "we have heard from an executor", not
+    /// "the stats are usable".
+    #[must_use]
+    pub fn has_statistics_for(&self, table: &TableReference) -> bool {
+        self.executor_statistics
+            .read()
+            .get(&normalized_table_name(table))
+            .is_some_and(|per_executor| !per_executor.is_empty())
     }
 
     /// Returns the scheduler's `node_id` if one was provided at construction.
@@ -755,6 +776,34 @@ pub(crate) fn flight_sql_table_provider(
 /// Uses the given [`PartitionStore`] to look up partition metadata, checks readiness (both an
 /// active connection and a `FlightSQL` client) via the `executors` map, selects a minimal
 /// executor set, and returns `(FlightSQL provider, partition values)` pairs.
+/// Projects the `executor_id`'s reported statistics for `table` onto `schema`,
+/// warning when no usable plan statistics (a known `num_rows`) are available for
+/// this leaf. Absent row counts prevent `DataFusion`'s cost-based join-side swap
+/// (`should_swap_join_order`), so a distributed plan can end up buffering the
+/// large side of a hash join — worth surfacing rather than silently degrading.
+fn stamp_executor_statistics(
+    executor_statistics: &HashMap<String, ExecutorTableStatistics>,
+    executor_id: &str,
+    table: &TableReference,
+    schema: &SchemaRef,
+) -> Option<Statistics> {
+    let statistics = executor_statistics
+        .get(executor_id)
+        .map(|ets| ets.projected_onto(schema));
+    if statistics
+        .as_ref()
+        .and_then(|s| s.num_rows.get_value())
+        .is_none()
+    {
+        tracing::warn!(
+            table = %table,
+            executor = %executor_id,
+            "No plan statistics retrieved from executor for table {table:?}; distributed join sizing may be degraded"
+        );
+    }
+    statistics
+}
+
 pub(crate) fn get_partitions_from_store(
     partition_store: &PartitionStore,
     executors: &HashMap<String, (&ExecutorConnection, &FlightSqlClient)>,
@@ -782,13 +831,17 @@ pub(crate) fn get_partitions_from_store(
         if let Some(node_id) = node_id {
             metrics::record_query_executor_count(node_id, 1);
         }
+        // Stamp the chosen executor's reported stats onto this single leaf scan
+        // so the coordinator can size joins even on this no-partition-metadata
+        // fallback path (previously this passed `None`, silently degrading plans).
+        let statistics = stamp_executor_statistics(executor_statistics, executor_id, table, schema);
         return vec![(
             flight_sql_table_provider(
                 executor_id,
                 (*client).clone(),
                 table,
                 Arc::clone(schema),
-                None,
+                statistics,
             ),
             Vec::new(),
         )];
@@ -871,9 +924,8 @@ pub(crate) fn get_partitions_from_store(
             // coordinator's planner can size joins. Project the reported per-column
             // stats onto the leaf's (possibly projected) schema by name, carrying
             // num_rows and per-column min/max.
-            let statistics = executor_statistics
-                .get(&executor_id)
-                .map(|ets| ets.projected_onto(schema));
+            let statistics =
+                stamp_executor_statistics(executor_statistics, &executor_id, table, schema);
             let provider = flight_sql_table_provider(
                 &executor_id,
                 (*client).clone(),
@@ -896,7 +948,7 @@ pub struct FederatedPartitionProvider {
     flight_sql_clients: Arc<RwLock<HashMap<String, FlightSqlClient>>>,
     partition_store: Arc<PartitionStore>,
     executor_statistics:
-        Arc<parking_lot::RwLock<HashMap<TableReference, HashMap<String, ExecutorTableStatistics>>>>,
+        Arc<parking_lot::RwLock<HashMap<String, HashMap<String, ExecutorTableStatistics>>>>,
     node_id: Option<Arc<str>>,
 }
 
@@ -939,7 +991,7 @@ impl TablePartitionProvider for FederatedPartitionProvider {
         let executor_statistics = self
             .executor_statistics
             .read()
-            .get(table)
+            .get(&normalized_table_name(table))
             .cloned()
             .unwrap_or_default();
 
@@ -1038,6 +1090,46 @@ mod tests {
 
         assert_eq!(executors.len(), 2);
         assert_eq!(executors, vec!["executor-1", "executor-3"]);
+    }
+
+    #[tokio::test]
+    async fn unknown_statistics_report_still_marks_table_as_having_statistics() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        // Mirrors the decode-failure fallback in `handle_executor_statistics`: a
+        // malformed/forward-incompatible report is recorded as unknown statistics
+        // rather than dropped, so `has_statistics_for` flips `true` and the
+        // readiness gate can open. Dropping it would leave the table stuck out of
+        // `Ready` forever (and could hang /v1/ready).
+        let registry = make_registry().await;
+        let table = TableReference::bare("orders");
+
+        assert!(
+            !registry.has_statistics_for(&table),
+            "no report recorded yet"
+        );
+
+        registry.record_executor_statistics(
+            &table,
+            "executor-1".to_string(),
+            Statistics::new_unknown(&Schema::empty()),
+            Vec::new(),
+        );
+
+        assert!(
+            registry.has_statistics_for(&table),
+            "an unknown-statistics report must still count so table readiness can proceed"
+        );
+
+        // It also reads back safely: projecting onto a real leaf schema yields
+        // absent row count and unknown per-column stats — no panic, no bogus
+        // cardinalities fed to the planner.
+        let snapshot = registry.executor_statistics_snapshot(&table);
+        let entry = snapshot.get("executor-1").expect("recorded entry present");
+        let leaf: SchemaRef = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let projected = entry.projected_onto(&leaf);
+        assert_eq!(projected.num_rows, Precision::Absent);
+        assert_eq!(projected.column_statistics.len(), 1);
     }
 
     fn dummy_flight_sql_client() -> FlightSqlClient {
