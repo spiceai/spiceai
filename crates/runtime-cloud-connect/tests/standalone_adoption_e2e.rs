@@ -1030,7 +1030,7 @@ async fn apply_spicepod_hot_applies_and_persists() {
             result.payload
         );
     };
-    let meta: Value = serde_json::from_str(&json).unwrap();
+let meta: Value = serde_json::from_str(&json).expect("parse ApplySpicepod JSON payload");
     assert_eq!(meta["applied"], true);
     assert_eq!(meta["reload"], "hot");
 
