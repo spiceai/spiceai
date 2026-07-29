@@ -6824,12 +6824,9 @@ impl CayenneTableProvider {
     /// Build a bloom existence filter over `keyset`'s keys.
     ///
     /// Sized for the conversion-time key count with 4× growth headroom
-    /// (~10 bits/key at 4× the keys; later inserts degrade the false-positive
-    /// rate gradually, and a false positive is only a redundant tombstone under
-    /// upsert), capped at `max_bytes`. A full-budget bloom would spend hundreds
-    /// of bits per key — gigabytes for large tables — on margin no consumer
-    /// needs, and that allocation lands mid-ingest when the exact keyset first
-    /// outgrows the budget.
+    /// (~10 bits/key at 4×), capped at `max_bytes`. The bloom cannot grow, so
+    /// later inserts degrade the false-positive rate gradually; a false
+    /// positive is only a redundant tombstone under upsert.
     fn bloom_from_keyset(keyset: &CachedPkKeyset, max_bytes: usize) -> PkBloom {
         let mut bloom = PkBloom::with_expected_keys(keyset.len().saturating_mul(4), max_bytes);
         for key in keyset.rows() {
