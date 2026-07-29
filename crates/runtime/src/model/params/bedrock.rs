@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,31 +14,68 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use util::concat_arrays;
+use std::collections::HashMap;
 
-use super::{COMMON_MODEL_PARAMETERS_WITH_DEPRECATED, PARAM_WITH_DEPRE_LEN};
-use crate::parameters::ParameterSpec;
+use runtime_parameters::TypedParams;
+use secrecy::SecretString;
 
-pub(crate) const BEDROCK_PARAMETERS: [ParameterSpec; 8] = [
-    ParameterSpec::runtime("aws_access_key_id")
-        .description("The AWS access key ID to use for Bedrock models")
-        .secret(),
-    ParameterSpec::runtime("aws_secret_access_key")
-        .description("The AWS secret access key to use for Bedrock models")
-        .secret(),
-    ParameterSpec::runtime("aws_session_token")
-        .description("The AWS session token to use for Bedrock models.")
-        .secret(),
-    ParameterSpec::runtime("aws_region").description("The AWS region to use for Bedrock models."),
-    ParameterSpec::runtime("aws_iam_role_source")
-        .description("IAM role credential source. 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables.")
-        .one_of(&["auto", "metadata", "env"]),
-    ParameterSpec::component("guardrail_identifier").description("Identifier for the guardrail. Pattern: `(([a-z0-9]+) | (arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:guardrail/[a-z0-9]+))`. Length: 0-2048."),
-    ParameterSpec::component("guardrail_version").description("Guardrail version. Pattern: `(([1-9][0-9]{0,7})|(DRAFT))`"),
-    ParameterSpec::component("trace").description("Trace behavior for the guardrail. Valid values: `enabled`, `disabled`, `enabled_full`").one_of(&["enabled", "disabled", "enabled_full"]),
-];
-pub const PARAMETERS: &[ParameterSpec] =
-    &concat_arrays::<ParameterSpec, 8, PARAM_WITH_DEPRE_LEN, { 8 + PARAM_WITH_DEPRE_LEN }>(
-        BEDROCK_PARAMETERS,
-        COMMON_MODEL_PARAMETERS_WITH_DEPRECATED,
-    );
+/// Parameters for `from: bedrock` chat models.
+#[derive(TypedParams)]
+#[params(
+    prefix = "bedrock",
+    passthrough = crate::model::params::common::PREFIXED_COMMON,
+    emit_specs
+)]
+pub struct BedrockModelParams {
+    /// The AWS access key ID to use for Bedrock models.
+    #[param(runtime, autoload_secret)]
+    pub aws_access_key_id: Option<SecretString>,
+    /// The AWS secret access key to use for Bedrock models.
+    #[param(runtime, autoload_secret)]
+    pub aws_secret_access_key: Option<SecretString>,
+    /// The AWS session token to use for Bedrock models.
+    #[param(runtime, autoload_secret)]
+    pub aws_session_token: Option<SecretString>,
+    /// The AWS region to use for Bedrock models.
+    #[param(runtime)]
+    pub aws_region: Option<String>,
+    /// IAM role credential source. 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables.
+    #[param(runtime, one_of = ["auto", "metadata", "env"])]
+    pub aws_iam_role_source: Option<String>,
+    /// Identifier for the guardrail.
+    pub guardrail_identifier: Option<String>,
+    /// Guardrail version.
+    pub guardrail_version: Option<String>,
+    /// Trace behavior for the guardrail. Valid values: `enabled`, `disabled`, `enabled_full`.
+    #[param(one_of = ["enabled", "disabled", "enabled_full"])]
+    pub trace: Option<String>,
+}
+
+impl BedrockModelParams {
+    /// Builds the AWS-credential map consumed by
+    /// [`crate::model::util::create_bedrock_client`]. Keys mirror the historical
+    /// runtime params so credential resolution is unchanged.
+    #[must_use]
+    pub fn runtime_params(&self) -> HashMap<String, SecretString> {
+        let mut params = HashMap::new();
+        if let Some(value) = &self.aws_access_key_id {
+            params.insert("aws_access_key_id".to_string(), value.clone());
+        }
+        if let Some(value) = &self.aws_secret_access_key {
+            params.insert("aws_secret_access_key".to_string(), value.clone());
+        }
+        if let Some(value) = &self.aws_session_token {
+            params.insert("aws_session_token".to_string(), value.clone());
+        }
+        if let Some(value) = &self.aws_region {
+            params.insert("aws_region".to_string(), SecretString::from(value.clone()));
+        }
+        if let Some(value) = &self.aws_iam_role_source {
+            params.insert(
+                "aws_iam_role_source".to_string(),
+                SecretString::from(value.clone()),
+            );
+        }
+        params
+    }
+}

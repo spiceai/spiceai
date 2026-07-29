@@ -25,8 +25,18 @@ limitations under the License.
 //!
 //! # Attributes
 //!
-//! Container: `#[params(prefix = "openai")]` (required) — the component prefix
-//! applied to every field key unless the field is marked `runtime`.
+//! Container `#[params(...)]` keys:
+//! - `prefix = "openai"` (required) — the component prefix applied to every field
+//!   key unless the field is marked `runtime`.
+//! - `passthrough = <PATH>` — a `&'static [runtime_parameters::typed::PassthroughParam]`
+//!   of keys the component accepts but does not bind to a field. They are consumed
+//!   (so they never trip the unknown-key warning), folded into the typo-suggestion
+//!   candidate set, and deprecation-warned when present. Used for large shared
+//!   groups whose values are read elsewhere off the raw params map (e.g. the
+//!   OpenAI-compatible chat-completion overrides every model provider accepts).
+//! - `emit_specs` — also generate an inherent
+//!   `pub fn parameter_specs() -> Vec<runtime_parameters::ParameterSpec>` describing
+//!   the fields (and any `passthrough` table) for JSON-schema generation.
 //!
 //! Field `#[param(...)]` keys:
 //! - `runtime` — the spicepod key is unprefixed (parity with `ParameterSpec::runtime`).
@@ -38,6 +48,8 @@ limitations under the License.
 //!   `SecretString` or `Option<SecretString>`.
 //! - `parse_with = path` — custom parser `fn(&str) -> Result<T, impl Display>`
 //!   used instead of `FromStr`.
+//! - `one_of = ["a", "b"]` — allowed values, surfaced by `emit_specs` schema
+//!   generation only; runtime validation remains the field type's `FromStr`.
 //!
 //! Field semantics derived from the type: `Option<T>` fields are optional; all
 //! other fields are required (missing yields an error naming the user-facing,
@@ -71,6 +83,9 @@ struct FieldSpec {
     default: Option<String>,
     parse_with: Option<syn::Path>,
     doc: String,
+    /// Allowed values, carried only for schema generation (`#[param(one_of = [...])]`).
+    /// Runtime validation is the field type's `FromStr`.
+    one_of: Vec<String>,
     /// `Some(note)` when the field carries `#[deprecated]`; empty note for the bare form.
     deprecated: Option<String>,
 }
@@ -107,7 +122,11 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         ));
     }
 
-    let prefix = parse_prefix(input)?;
+    let ContainerAttrs {
+        prefix,
+        passthrough,
+        emit_specs,
+    } = parse_container(input)?;
 
     let Data::Struct(data) = &input.data else {
         return Err(syn::Error::new(
@@ -149,6 +168,77 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let field_idents: Vec<&syn::Ident> = specs.iter().map(|s| &s.ident).collect();
     let expect_deprecated = any_deprecated.then(|| quote! { #[expect(deprecated)] });
 
+    // Leftover-key warning. With a passthrough table the known-key set is built
+    // at runtime (the field literals plus the passthrough table's prefixed
+    // keys, which the table consumes); without one it stays the compile-time
+    // literal list so existing derivers generate byte-identical code.
+    let leftover = if let Some(path) = &passthrough {
+        quote! {
+            let mut __known: ::std::vec::Vec<::std::string::String> =
+                ::std::vec![ #( ::std::string::ToString::to_string(#known_keys) ),* ];
+            __known.extend(::runtime_parameters::typed::consume_passthrough(
+                component_name,
+                &mut params,
+                #prefix,
+                #path,
+            ));
+            let __known_refs: ::std::vec::Vec<&str> =
+                __known.iter().map(::std::string::String::as_str).collect();
+            ::runtime_parameters::typed::warn_leftover_keys(
+                component_name,
+                &params,
+                &__known_refs,
+                #prefix,
+            );
+        }
+    } else {
+        quote! {
+            ::runtime_parameters::typed::warn_leftover_keys(
+                component_name,
+                &params,
+                &[#(#known_keys),*],
+                #prefix,
+            );
+        }
+    };
+
+    let specs_impl = emit_specs.then(|| {
+        let spec_pushes = specs.iter().map(field_spec_tokens);
+        let passthrough_specs = passthrough.as_ref().map(|path| {
+            quote! {
+                for __p in #path {
+                    let mut __s = if __p.prefixed {
+                        ::runtime_parameters::ParameterSpec::component(__p.name)
+                    } else {
+                        ::runtime_parameters::ParameterSpec::runtime(__p.name)
+                    };
+                    if !__p.description.is_empty() {
+                        __s = __s.description(__p.description);
+                    }
+                    if let ::std::option::Option::Some(__note) = __p.deprecated {
+                        __s = __s.deprecated(__note);
+                    }
+                    specs.push(__s);
+                }
+            }
+        });
+        quote! {
+            impl #struct_ident {
+                /// Parameter specifications for this component, generated from the
+                /// struct's fields (and any `passthrough` table). Used only for
+                /// schema generation; runtime validation lives in `try_from_params`.
+                #[must_use]
+                pub fn parameter_specs() -> ::std::vec::Vec<::runtime_parameters::ParameterSpec> {
+                    let mut specs: ::std::vec::Vec<::runtime_parameters::ParameterSpec> =
+                        ::std::vec::Vec::new();
+                    #(#spec_pushes)*
+                    #passthrough_specs
+                    specs
+                }
+            }
+        }
+    });
+
     Ok(quote! {
         #expect_deprecated
         impl ::runtime_parameters::typed::TypedParams for #struct_ident {
@@ -167,16 +257,48 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 >,
             ) -> ::std::result::Result<Self, ::runtime_parameters::typed::ParamsError> {
                 #(#field_stmts)*
-                ::runtime_parameters::typed::warn_leftover_keys(
-                    component_name,
-                    &params,
-                    &[#(#known_keys),*],
-                    #prefix,
-                );
+                #leftover
                 ::std::result::Result::Ok(Self { #(#field_idents),* })
             }
         }
+
+        #specs_impl
     })
+}
+
+/// Emits a `specs.push(ParameterSpec::...);` statement for one field
+/// (schema generation only).
+fn field_spec_tokens(spec: &FieldSpec) -> proc_macro2::TokenStream {
+    let name = spec.name();
+    let ctor = if spec.runtime {
+        quote! { ::runtime_parameters::ParameterSpec::runtime(#name) }
+    } else {
+        quote! { ::runtime_parameters::ParameterSpec::component(#name) }
+    };
+    let mut builder = ctor;
+    if !spec.optional && spec.default.is_none() {
+        builder = quote! { #builder.required() };
+    }
+    if !spec.doc.is_empty() {
+        let doc = &spec.doc;
+        builder = quote! { #builder.description(#doc) };
+    }
+    if let Some(default) = &spec.default {
+        builder = quote! { #builder.default(#default) };
+    }
+    if spec.autoload_secret {
+        builder = quote! { #builder.secret() };
+    }
+    if !spec.one_of.is_empty() {
+        let values = &spec.one_of;
+        builder = quote! { #builder.one_of(&[#(#values),*]) };
+    }
+    if let Some(note) = &spec.deprecated
+        && !note.is_empty()
+    {
+        builder = quote! { #builder.deprecated(#note) };
+    }
+    quote! { specs.push(#builder); }
 }
 
 /// Generates the statements producing one `let <field> = ...;` binding.
@@ -304,8 +426,22 @@ fn expand_field(
     })
 }
 
-fn parse_prefix(input: &DeriveInput) -> syn::Result<String> {
+/// Parsed `#[params(...)]` container attribute.
+struct ContainerAttrs {
+    prefix: String,
+    /// `#[params(passthrough = <PATH>)]` — a `&'static [PassthroughParam]` of
+    /// accepted-but-unbound keys (consumed, folded into typo suggestions, and
+    /// deprecation-warned).
+    passthrough: Option<syn::Path>,
+    /// `#[params(emit_specs)]` — also generate an inherent
+    /// `parameter_specs() -> Vec<ParameterSpec>` for schema generation.
+    emit_specs: bool,
+}
+
+fn parse_container(input: &DeriveInput) -> syn::Result<ContainerAttrs> {
     let mut prefix = None;
+    let mut passthrough = None;
+    let mut emit_specs = false;
     for attr in &input.attrs {
         if !attr.path().is_ident("params") {
             continue;
@@ -315,16 +451,30 @@ fn parse_prefix(input: &DeriveInput) -> syn::Result<String> {
                 let lit: syn::LitStr = meta.value()?.parse()?;
                 prefix = Some(lit.value());
                 Ok(())
+            } else if meta.path.is_ident("passthrough") {
+                passthrough = Some(meta.value()?.parse()?);
+                Ok(())
+            } else if meta.path.is_ident("emit_specs") {
+                emit_specs = true;
+                Ok(())
             } else {
-                Err(meta.error("unsupported #[params(...)] key; expected `prefix`"))
+                Err(meta.error(
+                    "unsupported #[params(...)] key; expected one of \
+                     `prefix`, `passthrough`, `emit_specs`",
+                ))
             }
         })?;
     }
-    prefix.ok_or_else(|| {
+    let prefix = prefix.ok_or_else(|| {
         syn::Error::new(
             input.ident.span(),
             "TypedParams requires #[params(prefix = \"...\")]",
         )
+    })?;
+    Ok(ContainerAttrs {
+        prefix,
+        passthrough,
+        emit_specs,
     })
 }
 
@@ -347,6 +497,7 @@ fn parse_field(field: &syn::Field) -> syn::Result<FieldSpec> {
         default: None,
         parse_with: None,
         doc: String::new(),
+        one_of: Vec::new(),
         deprecated: None,
     };
 
@@ -379,10 +530,20 @@ fn parse_field(field: &syn::Field) -> syn::Result<FieldSpec> {
                     spec.default = Some(lit.value());
                 } else if meta.path.is_ident("parse_with") {
                     spec.parse_with = Some(meta.value()?.parse()?);
+                } else if meta.path.is_ident("one_of") {
+                    // `one_of = ["a", "b", ...]` — a bracketed list of string literals,
+                    // carried through to schema generation only.
+                    let value = meta.value()?;
+                    let content;
+                    syn::bracketed!(content in value);
+                    let values = syn::punctuated::Punctuated::<syn::LitStr, syn::Token![,]>::parse_terminated(
+                        &content,
+                    )?;
+                    spec.one_of = values.into_iter().map(|s| s.value()).collect();
                 } else {
                     return Err(meta.error(
                         "unsupported #[param(...)] key; expected one of \
-                         `runtime`, `autoload_secret`, `rename`, `alias`, `default`, `parse_with`",
+                         `runtime`, `autoload_secret`, `rename`, `alias`, `default`, `parse_with`, `one_of`",
                     ));
                 }
                 Ok(())
@@ -555,6 +716,60 @@ mod tests {
             out.contains("The OpenAI organization ID."),
             "doc hint missing: {out}"
         );
+    }
+
+    #[test]
+    fn passthrough_generates_consume_call_and_runtime_known_keys() {
+        let input: DeriveInput = parse_quote! {
+            #[params(prefix = "openai", passthrough = crate::common::OPENAI_COMMON)]
+            struct P {
+                #[param(autoload_secret)]
+                api_key: Option<SecretString>,
+            }
+        };
+        let out = expand_str(&input).expect("valid struct should expand");
+        assert!(out.contains("consume_passthrough"), "expansion: {out}");
+        assert!(
+            out.contains("crate :: common :: OPENAI_COMMON"),
+            "expansion: {out}"
+        );
+    }
+
+    #[test]
+    fn emit_specs_generates_parameter_specs_fn() {
+        let input: DeriveInput = parse_quote! {
+            #[params(prefix = "openai", emit_specs)]
+            struct P {
+                /// The OpenAI API key.
+                #[param(autoload_secret)]
+                api_key: Option<SecretString>,
+                #[param(runtime, default = "https://api.openai.com/v1")]
+                endpoint: String,
+                #[param(default = "tier1", one_of = ["free", "tier1"])]
+                usage_tier: String,
+            }
+        };
+        let out = expand_str(&input).expect("valid struct should expand");
+        assert!(out.contains("fn parameter_specs"), "expansion: {out}");
+        // secret from autoload_secret, description from doc, one_of carried through.
+        assert!(out.contains(". secret ()"), "expansion: {out}");
+        assert!(out.contains("The OpenAI API key."), "expansion: {out}");
+        assert!(out.contains("one_of"), "expansion: {out}");
+        // A required (non-Option, no default) field would be `.required()`; here all
+        // fields are optional or defaulted, so no `.required()` is emitted.
+        assert!(!out.contains(". required ()"), "expansion: {out}");
+    }
+
+    #[test]
+    fn without_emit_specs_no_parameter_specs_fn() {
+        let input: DeriveInput = parse_quote! {
+            #[params(prefix = "openai")]
+            struct P { api_key: Option<SecretString> }
+        };
+        let out = expand_str(&input).expect("valid struct should expand");
+        assert!(!out.contains("fn parameter_specs"), "expansion: {out}");
+        // No passthrough → keep the compile-time literal known-key list.
+        assert!(!out.contains("consume_passthrough"), "expansion: {out}");
     }
 
     #[test]

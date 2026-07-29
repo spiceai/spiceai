@@ -22,10 +22,9 @@ limitations under the License.
 
 use runtime::dataaccelerator::DATA_ACCELERATOR_REGISTRATIONS;
 use runtime::dataconnector::DATA_CONNECTOR_REGISTRATIONS;
-use runtime::model::params::{
-    anthropic, azure, bedrock, databricks, file, google, huggingface, openai, spiceai, xai,
-};
+use runtime::model::params::get_params_spec;
 use runtime_parameters::ParameterSpec;
+use spicepod::component::model::ModelSource;
 
 // Force linkage of all data connector modules by referencing their factory types.
 // Without these references, the linker may not include the modules and their
@@ -209,61 +208,62 @@ pub fn collect_catalog_connectors() -> Vec<CatalogConnectorSchema> {
 
 /// Collects schema information from all model sources.
 ///
-/// Model sources define their parameters in `crates/runtime/src/model/params/`.
-/// This function enumerates them directly to avoid adding schema-generation-only
-/// code to the runtime.
+/// Model sources define their parameters as `#[derive(TypedParams)]` structs in
+/// `crates/runtime/src/model/params/`; `get_params_spec` regenerates the
+/// `ParameterSpec` list from each struct, keeping the struct the single source
+/// of truth for both runtime deserialization and schema.
 #[must_use]
 pub fn collect_model_sources() -> Vec<ModelSourceSchema> {
     vec![
         ModelSourceSchema {
             name: "openai",
             prefix: "openai",
-            parameters: openai::PARAMETERS,
+            parameters: get_params_spec(&ModelSource::OpenAi),
         },
         ModelSourceSchema {
             name: "azure",
             prefix: "azure",
-            parameters: azure::PARAMETERS,
+            parameters: get_params_spec(&ModelSource::Azure),
         },
         ModelSourceSchema {
             name: "file",
             prefix: "file",
-            parameters: file::PARAMETERS,
+            parameters: get_params_spec(&ModelSource::File),
         },
         ModelSourceSchema {
             name: "databricks",
             prefix: "databricks",
-            parameters: databricks::PARAMETERS,
+            parameters: get_params_spec(&ModelSource::Databricks),
         },
         ModelSourceSchema {
             name: "huggingface",
             prefix: "huggingface",
-            parameters: huggingface::PARAMETERS,
+            parameters: get_params_spec(&ModelSource::HuggingFace),
         },
         ModelSourceSchema {
             name: "anthropic",
             prefix: "anthropic",
-            parameters: anthropic::PARAMETERS,
+            parameters: get_params_spec(&ModelSource::Anthropic),
         },
         ModelSourceSchema {
             name: "xai",
             prefix: "xai",
-            parameters: xai::PARAMETERS,
+            parameters: get_params_spec(&ModelSource::Xai),
         },
         ModelSourceSchema {
             name: "bedrock",
             prefix: "bedrock",
-            parameters: bedrock::PARAMETERS,
+            parameters: get_params_spec(&ModelSource::Bedrock),
         },
         ModelSourceSchema {
             name: "google",
             prefix: "google",
-            parameters: google::PARAMETERS,
+            parameters: get_params_spec(&ModelSource::Google),
         },
         ModelSourceSchema {
             name: "spiceai",
             prefix: "spiceai",
-            parameters: spiceai::PARAMETERS,
+            parameters: get_params_spec(&ModelSource::SpiceAI),
         },
     ]
 }
