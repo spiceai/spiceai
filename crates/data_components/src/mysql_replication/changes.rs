@@ -53,8 +53,8 @@ pub(super) struct MemberLayout {
 }
 
 /// Decode one commit's buffered rows events for one member into a
-/// [`ChangeBatch`]: every event through [`buffer_rows_event`] (which records
-/// the per-row op metrics as it decodes), then one Arrow build.
+/// [`ChangeBatch`]: every event through the row decoder (which records the
+/// per-row op metrics as it decodes), then one Arrow build.
 ///
 /// # Errors
 ///

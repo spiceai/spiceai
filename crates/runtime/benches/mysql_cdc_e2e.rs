@@ -192,7 +192,7 @@ fn replay_envelopes(binlog: &[u8], cap: usize) -> Vec<ChangeEnvelope> {
         primary_keys: order_line_primary_keys(),
         layout: order_line_layout(),
     };
-    replay_binlog_envelopes(binlog, &table, Some(cap)).expect("replay parses")
+    replay_binlog_envelopes(binlog, &table, cap).expect("replay parses")
 }
 
 fn main() {

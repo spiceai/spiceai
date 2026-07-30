@@ -22,7 +22,6 @@ limitations under the License.
 //! the apply path exactly as in production while position tracking stays out
 //! of the measurement.
 
-use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
@@ -76,7 +75,7 @@ impl CommitChange for ReplayCommit {
 pub fn replay_binlog_envelopes(
     binlog: &[u8],
     table: &ReplayTable,
-    max_bytes: Option<usize>,
+    max_bytes: usize,
 ) -> Result<Vec<ChangeEnvelope>, String> {
     if binlog.len() < BINLOG_FILE_MAGIC_LEN {
         return Err("binlog image shorter than the file magic".to_string());
@@ -85,7 +84,7 @@ pub fn replay_binlog_envelopes(
     // assumes whole events and panics (upstream unwrap) on a sliced tail, so
     // walk the event headers (event size lives at offset 9) to find a clean
     // boundary first.
-    let cap = max_bytes.unwrap_or(binlog.len()).min(binlog.len());
+    let cap = max_bytes.min(binlog.len());
     let mut limit = BINLOG_FILE_MAGIC_LEN;
     while let Some(header) = binlog.get(limit..limit + EVENT_HEADER_LEN) {
         let size = u32::from_le_bytes(
@@ -118,7 +117,7 @@ pub fn replay_binlog_envelopes(
     let mut envelopes: Vec<ChangeEnvelope> = Vec::new();
     // Route state, mirroring the pump: the current TableMap snapshot for the
     // replayed table and the buffered rows events of the open transaction.
-    let mut route: Option<(u64, Arc<TableMapEvent<'static>>)> = None;
+    let mut route: Option<(u64, TableMapEvent<'static>)> = None;
     let mut txn: Vec<RowsEventData<'static>> = Vec::new();
 
     // A truncated trailing event (mid-write capture / byte cap) reads as
@@ -132,7 +131,7 @@ pub fn replay_binlog_envelopes(
             EventData::TableMapEvent(tme) => {
                 if tme.database_name() == table.database && tme.table_name() == table.table {
                     let tme = tme.into_owned();
-                    route = Some((tme.table_id(), Arc::new(tme)));
+                    route = Some((tme.table_id(), tme));
                 }
             }
             EventData::RowsEvent(rows) => {
@@ -171,9 +170,6 @@ pub fn replay_binlog_envelopes(
             },
             _ => {}
         }
-        if io.is_empty() {
-            break;
-        }
     }
     Ok(envelopes)
 }
@@ -182,7 +178,7 @@ pub fn replay_binlog_envelopes(
 /// materialized envelope, exactly as the pump's `deliver_commit` does.
 fn flush_commit(
     txn: &mut Vec<RowsEventData<'static>>,
-    route: Option<&(u64, Arc<TableMapEvent<'static>>)>,
+    route: Option<&(u64, TableMapEvent<'static>)>,
     table: &ReplayTable,
     member_layout: &MemberLayout,
     metrics: &MetricsCollector,

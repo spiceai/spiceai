@@ -1254,7 +1254,7 @@ struct Route {
     key: MemberKey,
     member: Arc<MemberHandle>,
     slot: Arc<AckSlot>,
-    tme: Arc<TableMapEvent<'static>>,
+    tme: TableMapEvent<'static>,
     layout: Arc<MemberLayout>,
 }
 
@@ -1593,8 +1593,8 @@ async fn run_pump(source: Arc<SharedSource>) {
                         }
                     }
                     // Snapshot the columns + the (possibly just-adopted) layout so
-                    // a deferred decode uses exactly the layout valid now, even if
-                    // a later ALTER swaps the member's layout `Arc`.
+                    // the decode at commit uses exactly the layout valid now, even
+                    // if a later ALTER swaps the member's layout `Arc`.
                     let layout = {
                         let g = lock(&member.layout);
                         Arc::clone(&g)
@@ -1614,7 +1614,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                         )).await;
                         continue 'recv;
                     }
-                    let tme = Arc::new(tme.into_owned());
+                    let tme = tme.into_owned();
                     routes.insert(
                         table_id,
                         Route {
