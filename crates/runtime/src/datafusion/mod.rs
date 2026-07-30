@@ -151,7 +151,7 @@ pub use runtime_datafusion::param_utils;
 pub mod pg_catalog;
 #[cfg(not(windows))]
 pub mod planner;
-pub mod refresh_sql;
+pub use runtime_datafusion::refresh_sql;
 pub mod request_context_extension;
 pub use runtime_datafusion::retention_sql;
 pub mod schema;

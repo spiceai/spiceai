@@ -17091,6 +17091,7 @@ dependencies = [
  "datafusion",
  "datafusion-catalog",
  "datafusion-datasource",
+ "datafusion-expr",
  "datafusion-federation",
  "datafusion-optimizer-rules",
  "datafusion-pruning",
