@@ -84,6 +84,13 @@ pub enum Error {
         "First data point for metric {metric} has no value and therefore is not valid for establishing schema"
     ))]
     FirstMetricDataPointHasNoValue { metric: String },
+
+    #[snafu(display(
+        "Failed to ingest OpenTelemetry metric {metric}: its dataset has duplicate columns ({columns}), \
+        so no export for this metric can be written. Drop and recreate the dataset for {metric} to resume ingest. \
+        See: https://spiceai.org/docs/features/observability"
+    ))]
+    ExistingMetricSchemaHasDuplicateColumns { metric: String, columns: String },
 }
 
 const VALUE_COLUMN_NAME: &str = "value";
@@ -330,27 +337,74 @@ impl MetricsService for Service {
     }
 }
 
+/// Number of data points carried by `data`, used to account for rejected points. Data types
+/// without a batch builder report 0, since none of their points are ever read.
+fn data_point_count(data: &Data) -> u64 {
+    match data {
+        Data::Gauge(gauge) => gauge.data_points.len() as u64,
+        Data::Sum(sum) => sum.data_points.len() as u64,
+        Data::Histogram(histogram) => histogram.data_points.len() as u64,
+        _ => 0,
+    }
+}
+
+/// Column names appearing more than once in `schema`, each reported once in first-seen order.
+///
+/// Arrow permits duplicate field names, so a metric table seeded by an older runtime can hold
+/// two columns of the same name. A rebuilt batch always carries one column per name, so such a
+/// stored schema can never match the batch positionally — and `write_data`'s `verify_schema` is
+/// exact-positional, so every export is rejected for as long as the table exists.
+fn duplicate_column_names(schema: &Schema) -> Vec<String> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut duplicates: Vec<String> = Vec::new();
+    for field in schema.fields() {
+        let name = field.name().as_str();
+        if !seen.insert(name) && !duplicates.iter().any(|dup| dup == name) {
+            duplicates.push(name.to_string());
+        }
+    }
+    duplicates
+}
+
 pub fn metric_data_to_record_batch(
     metric: &str,
     data: &Data,
     existing_schema: Option<&Schema>,
 ) -> (Result<RecordBatch>, u64) {
-    match data {
-        Data::Gauge(gauge) => (
-            number_data_points_to_record_batch(metric, &gauge.data_points, existing_schema),
-            gauge.data_points.len() as u64,
-        ),
-        Data::Sum(sum) => (
-            number_data_points_to_record_batch(metric, &sum.data_points, existing_schema),
-            sum.data_points.len() as u64,
-        ),
-        Data::Histogram(histogram) => (
-            histogram_data_points_to_record_batch(metric, &histogram.data_points, existing_schema),
-            histogram.data_points.len() as u64,
-        ),
-        // TODO: Support other metric data types (ExponentialHistogram, Summary)
-        _ => (UnsupportedMetricDataTypeSnafu.fail(), 0),
+    let data_points_count = data_point_count(data);
+
+    // A stored schema with duplicate columns is unwritable rather than merely mismatched, and
+    // no export can repair it. Report it up front, naming the columns and the remedy, instead
+    // of letting each export fail deep in the write path with a positional schema mismatch.
+    if let Some(existing) = existing_schema {
+        let duplicates = duplicate_column_names(existing);
+        if !duplicates.is_empty() {
+            return (
+                ExistingMetricSchemaHasDuplicateColumnsSnafu {
+                    metric: metric.to_string(),
+                    columns: duplicates.join(", "),
+                }
+                .fail(),
+                data_points_count,
+            );
+        }
     }
+
+    let record_batch = match data {
+        Data::Gauge(gauge) => {
+            number_data_points_to_record_batch(metric, &gauge.data_points, existing_schema)
+        }
+        Data::Sum(sum) => {
+            number_data_points_to_record_batch(metric, &sum.data_points, existing_schema)
+        }
+        Data::Histogram(histogram) => {
+            histogram_data_points_to_record_batch(metric, &histogram.data_points, existing_schema)
+        }
+        // TODO: Support other metric data types (ExponentialHistogram, Summary)
+        _ => UnsupportedMetricDataTypeSnafu.fail(),
+    };
+
+    (record_batch, data_points_count)
 }
 
 /// Human-readable name of a metric's data type, for diagnostics/logging.
@@ -1380,5 +1434,103 @@ mod tests {
             .downcast_ref::<Float64Array>()
             .expect("value keeps the metric's own type");
         assert!((values.value(0) - 1.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn duplicate_column_names_reports_each_name_once_in_first_seen_order() {
+        let clean = Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Float64, true),
+            Field::new("host", DataType::Utf8, true),
+        ]);
+        assert!(
+            duplicate_column_names(&clean).is_empty(),
+            "a schema with unique names has no duplicates"
+        );
+
+        // `region` appears three times and `host` twice: each is reported once, ordered by the
+        // position of its first occurrence.
+        let duplicated = Schema::new(vec![
+            Field::new("region", DataType::Utf8, true),
+            Field::new("host", DataType::Utf8, true),
+            Field::new("region", DataType::Int64, true),
+            Field::new(VALUE_COLUMN_NAME, DataType::Float64, true),
+            Field::new("host", DataType::Boolean, true),
+            Field::new("region", DataType::Utf8, true),
+        ]);
+        assert_eq!(
+            duplicate_column_names(&duplicated),
+            vec!["region".to_string(), "host".to_string()]
+        );
+    }
+
+    /// A histogram table seeded by a runtime that emitted an attribute alongside the
+    /// same-named value column holds two `count` columns. No rebuilt batch can ever match it
+    /// positionally, so the export must fail with an error naming the metric, the duplicated
+    /// column, and the remedy — not be dropped with only a warning.
+    #[test]
+    fn histogram_with_duplicate_stored_value_column_is_rejected_with_actionable_error() {
+        let stored = Schema::new(vec![
+            Field::new(COUNT_COLUMN_NAME, DataType::UInt64, true),
+            Field::new(SUM_COLUMN_NAME, DataType::Float64, true),
+            Field::new(TIME_UNIX_NANO_COLUMN_NAME, DataType::UInt64, true),
+            // The attribute that the older ingest path re-added after the value column.
+            Field::new(COUNT_COLUMN_NAME, DataType::Utf8, true),
+        ]);
+        let data = Data::Histogram(Histogram {
+            data_points: vec![
+                histogram_data_point(1, Some(1.0), None, None, vec![1], vec![], vec![]),
+                histogram_data_point(2, Some(2.0), None, None, vec![2], vec![], vec![]),
+            ],
+            aggregation_temporality: 0,
+        });
+
+        let (result, count) = metric_data_to_record_batch("latency", &data, Some(&stored));
+        assert_eq!(
+            count, 2,
+            "every data point in the export must be counted as rejected"
+        );
+        let err = result.expect_err("a duplicate stored column must be rejected");
+        assert!(
+            matches!(
+                &err,
+                Error::ExistingMetricSchemaHasDuplicateColumns { metric, columns }
+                    if metric == "latency" && columns == COUNT_COLUMN_NAME
+            ),
+            "unexpected error: {err}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("latency") && message.contains("Drop and recreate"),
+            "error must name the metric and the remedy: {message}"
+        );
+    }
+
+    /// The same corruption on an ordinary dimension: two `host` columns collapse to one when the
+    /// attribute schema is seeded, so the batch is narrower than the table. Detection must not be
+    /// limited to the metric's value columns.
+    #[test]
+    fn gauge_with_duplicate_stored_dimension_is_rejected() {
+        let stored = Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Float64, true),
+            Field::new(TIME_UNIX_NANO_COLUMN_NAME, DataType::UInt64, true),
+            Field::new(START_TIME_UNIX_NANO_COLUMN_NAME, DataType::UInt64, true),
+            Field::new("host", DataType::Utf8, true),
+            Field::new("host", DataType::Int64, true),
+        ]);
+        let data = Data::Gauge(opentelemetry_proto::tonic::metrics::v1::Gauge {
+            data_points: vec![number_data_point(1.0, vec![string_attribute("host", "a")])],
+        });
+
+        let (result, count) = metric_data_to_record_batch("svc", &data, Some(&stored));
+        assert_eq!(count, 1);
+        let err = result.expect_err("a duplicate stored dimension must be rejected");
+        assert!(
+            matches!(
+                &err,
+                Error::ExistingMetricSchemaHasDuplicateColumns { metric, columns }
+                    if metric == "svc" && columns == "host"
+            ),
+            "unexpected error: {err}"
+        );
     }
 }
