@@ -165,11 +165,13 @@ fn should_include_otel_location(is_release_build: bool, verbosity: &LogVerbosity
 /// It is added *alongside* the terminal `fmt` layer, so normal logging is
 /// unchanged. The same `task_history` exclusion as the console layer is
 /// applied so span-only records don't pollute the log tail.
-fn cloud_connect_log_capture_layer<S>() -> Option<Box<dyn Layer<S> + Send + Sync>>
+fn cloud_connect_log_capture_layer<S>(
+    cloud_connect_flag: bool,
+) -> Option<Box<dyn Layer<S> + Send + Sync>>
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
-    if !crate::cloud_connect::is_configured() {
+    if !crate::cloud_connect::is_configured(cloud_connect_flag) {
         return None;
     }
     let ring = crate::log_capture::install(crate::log_capture::DEFAULT_CAPACITY);
@@ -189,6 +191,7 @@ pub(crate) async fn init_tracing(
     config: Option<&TracingConfig>,
     df: Arc<DataFusion>,
     verbosity: LogVerbosity,
+    cloud_connect_flag: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let include_otel_location = should_include_otel_location(!cfg!(debug_assertions), &verbosity);
     let filter: EnvFilter = verbosity.into();
@@ -205,7 +208,7 @@ pub(crate) async fn init_tracing(
                         metadata.target() != "task_history"
                     })),
             )
-            .with(cloud_connect_log_capture_layer());
+            .with(cloud_connect_log_capture_layer(cloud_connect_flag));
 
         tracing::subscriber::set_global_default(subscriber)?;
 
@@ -227,7 +230,7 @@ pub(crate) async fn init_tracing(
                     metadata.target() != "task_history"
                 })),
         )
-        .with(cloud_connect_log_capture_layer());
+        .with(cloud_connect_log_capture_layer(cloud_connect_flag));
 
     tracing::subscriber::set_global_default(subscriber)?;
     LogTracer::init()?;
