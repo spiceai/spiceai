@@ -614,9 +614,21 @@ mod tests {
         let (checkpoint, pool) = create_in_memory_duckdb_checkpoint();
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
 
-        // Stand in for the exclusive phase of a file swap.
+        // Stand in for the exclusive phase of a file swap. The guard lives on its
+        // own thread, both because a real swap holds it off the async runtime and
+        // so no lock guard is held across an `.await` here.
         let write_gate = pool.write_gate();
-        let swap_guard = write_gate.write().unwrap_or_else(PoisonError::into_inner);
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let swap = std::thread::spawn(move || {
+            let guard = write_gate.write().unwrap_or_else(PoisonError::into_inner);
+            held_tx.send(()).expect("the test should await the gate");
+            release_rx.recv().expect("the test should release the gate");
+            drop(guard);
+        });
+        held_rx
+            .recv()
+            .expect("the swap thread should take the write gate exclusively");
 
         let checkpointing = tokio::spawn(async move { checkpoint.checkpoint(&schema, None).await });
 
@@ -642,7 +654,10 @@ mod tests {
 
         // Releasing the gate lets the checkpoint finish, proving it really was
         // blocked on the gate and not skipped.
-        drop(swap_guard);
+        release_tx
+            .send(())
+            .expect("the swap thread should still be holding the gate");
+        swap.join().expect("the swap thread should not panic");
         checkpointing
             .await
             .expect("the checkpoint task should not panic")
