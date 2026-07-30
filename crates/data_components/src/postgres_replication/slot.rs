@@ -245,6 +245,24 @@ async fn ensure_slot(
     //   * Some(lsn) lsn>0 — normal resume from the durable checkpoint.
     match read_slot_confirmed_flush(client, &params.slot_name).await? {
         Some(confirmed_flush_lsn) if confirmed_flush_lsn != 0 => {
+            // An accelerator that boots empty is about to re-snapshot the whole
+            // table, so every byte of WAL between the pre-restart checkpoint and
+            // that snapshot is redundant -- after a long outage, that is the
+            // entire downtime, decoded and applied only to be overwritten by the
+            // snapshot. Skip it by moving the slot forward first.
+            if let Some(advanced_lsn) = advance_slot_for_rebootstrap(client, params).await {
+                return Ok(SlotInfo {
+                    slot_name: params.slot_name.clone(),
+                    publication_name: params.publication_name.clone(),
+                    consistent_lsn: advanced_lsn,
+                    snapshot_name: None,
+                    generated_columns: Vec::new(),
+                    // The old history is gone, so this slot carries none for any
+                    // member -- the same contract as a slot created this process.
+                    created_fresh: true,
+                });
+            }
+
             tracing::info!(
                 slot = %params.slot_name,
                 publication = %params.publication_name,
@@ -326,6 +344,152 @@ async fn ensure_slot(
         generated_columns: Vec::new(),
         created_fresh: true,
     })
+}
+
+/// SQLSTATE `55006` (`object_in_use`) — the slot is still held by an active
+/// walsender, so it cannot be advanced or dropped.
+const SQLSTATE_OBJECT_IN_USE_ADVANCE: &str = "55006";
+/// SQLSTATE `42883` (`undefined_function`) — `pg_replication_slot_advance` is
+/// `PostgreSQL` 11+. On an older server the advance is simply skipped.
+const SQLSTATE_UNDEFINED_FUNCTION: &str = "42883";
+
+/// Move `params.slot_name` forward to the current WAL position, for a member
+/// that is about to re-snapshot anyway, and return the LSN streaming should
+/// start from. `None` means "do not advance" — the caller resumes from
+/// `confirmed_flush_lsn` exactly as before.
+///
+/// The win is skipping *re-delivery*: after an outage the slot's checkpoint can
+/// be hours behind, and every one of those changes would be decoded and applied
+/// only to be overwritten by the snapshot. Advancing sets `confirmed_flush_lsn`
+/// to the current position so `START_REPLICATION` never re-reads them. Note that
+/// `restart_lsn` — what actually governs WAL *retention* on the source — trails
+/// `confirmed_flush_lsn` and catches up on subsequent slot activity rather than
+/// immediately, so this is not a prompt way to release retained WAL (dropping
+/// the slot at shutdown is; see [`drop_slot_after_shutdown`]).
+///
+/// # Why this is safe
+///
+/// Streaming must start at an LSN **at or before** the bootstrap snapshot's
+/// visibility point. Undershooting only replays WAL the snapshot already
+/// covers, which the primary-key upsert absorbs; overshooting would silently
+/// skip changes. This reads `pg_current_wal_lsn()` and advances *before* the
+/// caller opens its `REPEATABLE READ` bootstrap transaction (`ensure_slot` runs
+/// inside setup, which strictly precedes bootstrap), so the snapshot is always
+/// taken at or after the returned LSN.
+///
+/// # Why both gate conditions are required
+///
+/// * `ephemeral_accelerator` — the accelerator starts empty, so the snapshot
+///   reconstructs the entire table. There is no pre-existing accelerator state
+///   for the upsert to merge into, and therefore no rows deleted at the source
+///   during the outage that could survive it. A *durable* accelerator fails this:
+///   its snapshot merges into existing rows, so discarding the WAL that carried
+///   the deletes would leave them behind.
+/// * `snapshot_on_resume` — a snapshot is definitely going to run. Advancing
+///   without one would skip WAL with nothing to fill the gap.
+///
+/// On a shared slot the advance discards history for every member;
+/// [`super::Error::SharedSlotDurabilityMismatch`] keeps a durable member off such
+/// a slot in the first place.
+async fn advance_slot_for_rebootstrap(
+    client: &tokio_postgres::Client,
+    params: &ReplicationParams,
+) -> Option<u64> {
+    if !should_fast_forward(params.ephemeral_accelerator, params.snapshot_on_resume) {
+        return None;
+    }
+
+    // Read the target BEFORE advancing (and before the caller's bootstrap
+    // transaction), so the snapshot can only ever be at or after it.
+    let target = match current_wal_lsn(client).await {
+        Ok(lsn) => lsn,
+        Err(e) => {
+            tracing::warn!(
+                slot = %params.slot_name,
+                "could not read the current WAL position to fast-forward the replication slot; \
+                 resuming from the existing checkpoint and replaying the backlog instead: {e}"
+            );
+            return None;
+        }
+    };
+
+    match slot_advance(client, &params.slot_name, target).await {
+        Ok(end_lsn) => {
+            tracing::info!(
+                slot = %params.slot_name,
+                advanced_to = %format_lsn(end_lsn),
+                "Fast-forwarded the replication slot past the accumulated backlog: this \
+                 accelerator starts empty and re-snapshots on every start, so the skipped WAL \
+                 would only have been overwritten by the snapshot"
+            );
+            Some(end_lsn)
+        }
+        Err(e) => {
+            // Every failure falls back to a plain resume, which is exactly the
+            // previous behavior: correct, just slower.
+            let sqlstate = match &e {
+                super::Error::SetupExec { source } => {
+                    source.as_db_error().map(|db| db.code().code().to_string())
+                }
+                _ => None,
+            };
+            match sqlstate.as_deref() {
+                // A later member joining a slot the pump is already streaming.
+                // Nothing to fast-forward past -- the slot is current.
+                Some(SQLSTATE_OBJECT_IN_USE_ADVANCE) => tracing::debug!(
+                    slot = %params.slot_name,
+                    "replication slot is active; skipping the fast-forward"
+                ),
+                Some(SQLSTATE_UNDEFINED_FUNCTION) => tracing::debug!(
+                    slot = %params.slot_name,
+                    "pg_replication_slot_advance is unavailable (PostgreSQL 11+); \
+                     resuming from the existing checkpoint"
+                ),
+                _ => tracing::warn!(
+                    slot = %params.slot_name,
+                    "could not fast-forward the replication slot; resuming from the existing \
+                     checkpoint and replaying the backlog instead: {e}"
+                ),
+            }
+            None
+        }
+    }
+}
+
+/// Whether skipping the backlog is safe. Both conditions are load-bearing — see
+/// [`advance_slot_for_rebootstrap`] for why neither alone is sufficient.
+const fn should_fast_forward(ephemeral_accelerator: bool, snapshot_on_resume: bool) -> bool {
+    ephemeral_accelerator && snapshot_on_resume
+}
+
+/// The server's current WAL insert position.
+async fn current_wal_lsn(client: &tokio_postgres::Client) -> Result<u64> {
+    let row = client
+        .query_one("SELECT pg_current_wal_lsn()::text", &[])
+        .await
+        .context(SetupExecSnafu)?;
+    parse_lsn(&row.get::<_, String>(0))
+}
+
+/// `pg_replication_slot_advance`, returning the position the server actually
+/// moved to — it may stop short of `target`, and that value (never `target`) is
+/// what streaming must start from.
+async fn slot_advance(
+    client: &tokio_postgres::Client,
+    slot_name: &str,
+    target: u64,
+) -> Result<u64> {
+    // Both arguments are cast explicitly: the function takes (name, pg_lsn), and
+    // binding Rust `String`s without the casts leaves parameter-type inference to
+    // resolve `text` against those, which fails.
+    let row = client
+        .query_one(
+            "SELECT end_lsn::text FROM pg_replication_slot_advance($1::name, $2::pg_lsn)",
+            &[&slot_name, &format_lsn(target)],
+        )
+        .await
+        .context(SetupExecSnafu)?;
+    parse_lsn(&row.get::<_, String>(0))
 }
 
 /// SQLSTATE 42710 (`duplicate_object`) from `pg_create_logical_replication_slot`
@@ -771,6 +935,36 @@ fn quote_ident(ident: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Skipping the backlog discards WAL, so the gate is the safety boundary.
+    /// Each condition is asserted to be individually necessary: a wrong `true`
+    /// here silently drops changes that nothing else will replace.
+    #[test]
+    fn fast_forward_requires_an_empty_accelerator_and_a_guaranteed_snapshot() {
+        // ephemeral + will snapshot: the snapshot rebuilds the whole table, so
+        // the skipped WAL is redundant.
+        assert!(should_fast_forward(true, true));
+
+        // Durable accelerator with the snapshot forced via
+        // `initial_snapshot: always`. Its snapshot upserts into rows that
+        // already exist, so discarding the WAL that carried the source's
+        // deletes would leave them behind in the accelerator.
+        assert!(!should_fast_forward(false, true));
+
+        // Empty accelerator but no snapshot will run
+        // (`initial_snapshot: disabled`) -- skipping WAL leaves the gap unfilled.
+        assert!(!should_fast_forward(true, false));
+
+        assert!(!should_fast_forward(false, false));
+    }
+
+    /// The advance target is bound as `pg_lsn`, so it must round-trip through
+    /// the exact textual form Postgres accepts.
+    #[test]
+    fn advance_target_renders_as_a_pg_lsn_literal() {
+        let target = parse_lsn("1B/4E300F8").expect("parse");
+        assert_eq!(format_lsn(target), "1B/4E300F8");
+    }
 
     #[test]
     fn lsn_round_trip() {
