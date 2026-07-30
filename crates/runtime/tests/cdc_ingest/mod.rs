@@ -22,6 +22,8 @@ limitations under the License.
 #![cfg(feature = "debezium")]
 #![allow(clippy::expect_used)]
 
+mod search;
+
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
