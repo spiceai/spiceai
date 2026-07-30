@@ -6907,7 +6907,9 @@ impl CayenneTableProvider {
     ///
     /// Probing at the write — not at table creation — keeps reuse paths
     /// safe: `create_table` is create-or-reuse, and an empty install over
-    /// existing rows would turn conflict validation into duplicates. Any
+    /// existing rows would turn conflict validation into duplicates. The
+    /// emptiness proof therefore covers every place a live row can sit:
+    /// mem-tier, inlined, any snapshot's manifest, and the cold tier. Any
     /// doubt (unreadable listing) keeps the lazy rebuild. Probes once per
     /// cache lifetime; `clear_cached_pk_keyset` re-arms it, so a delete-all's
     /// next write re-installs. Both call sites hold the per-table write
@@ -6924,11 +6926,11 @@ impl CayenneTableProvider {
             return;
         }
         let table_id = &self.table_metadata.table_id;
-        match self
-            .catalog
-            .get_snapshot_files(table_id, &self.current_snapshot_id())
-            .await
-        {
+        // Every snapshot's manifest, not just the current one:
+        // `checkpoint_mem_tier` registers its snapshot as protected without
+        // repointing `current_snapshot_id`, so a fully checkpointed table has
+        // an empty current manifest while holding all its rows.
+        match self.catalog.get_all_snapshot_files(table_id).await {
             Ok(files) if files.is_empty() => {}
             _ => return,
         }
@@ -6966,6 +6968,10 @@ impl CayenneTableProvider {
             return false;
         }
         if self.sharded_pk_keyset_cache.lock().is_some() {
+            return false;
+        }
+        // A registered protected snapshot means rows outside the current manifest.
+        if !self.protected_snapshots.load().is_empty() {
             return false;
         }
         self.mem_tier.is_empty() && self.inlined_row_count.load(Ordering::Acquire) == 0
@@ -30398,6 +30404,61 @@ mod tests {
         assert!(
             provider.pk_keyset_cache.lock().is_none(),
             "probe must refuse to install over a non-empty table"
+        );
+        assert!(provider.sharded_pk_keyset_cache.lock().is_none());
+    }
+
+    /// A re-armed probe must refuse a table whose rows are durable in a
+    /// protected snapshot: `checkpoint_mem_tier` registers its snapshot as
+    /// protected without repointing `current_snapshot_id`, so the current
+    /// manifest is empty while the corpus is fully durable. An empty install
+    /// there false-negates the next upsert of an existing key, leaving two
+    /// live rows for one PK.
+    #[tokio::test]
+    async fn probe_refuses_a_table_whose_rows_live_in_a_protected_snapshot() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let (provider, _catalog, _tmp) =
+            create_memory_mode_upsert_table("warm_probe_protected", Arc::clone(&runtime_env)).await;
+
+        // Seed rows through the tier and checkpoint them durable.
+        let no_deletions = OnConflictDeletions::default();
+        let seed = int64_id_batch(&[1, 2, 3]);
+        let seed_bytes = seed.get_array_memory_size() as u64;
+        provider
+            .append_to_mem_tier(vec![seed], &no_deletions, seed_bytes, 0)
+            .await
+            .expect("seed append");
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("seed checkpoint");
+
+        // The corpus is durable but NOT in the current snapshot's manifest.
+        assert!(provider.mem_tier.tier().load().is_empty(), "tier drained");
+        assert!(
+            !provider.protected_snapshot_ids().is_empty(),
+            "the checkpoint registers its snapshot as protected"
+        );
+        assert!(
+            provider
+                .catalog
+                .get_snapshot_files(
+                    &provider.table_metadata.table_id,
+                    &provider.current_snapshot_id()
+                )
+                .await
+                .expect("current manifest")
+                .is_empty(),
+            "the current snapshot's manifest is empty"
+        );
+        assert_eq!(scan_sorted_ids(&provider).await, vec![1, 2, 3]);
+
+        // Re-arm the probe the way the fold/refresh paths do.
+        provider.clear_cached_pk_keyset();
+        provider.maybe_install_warm_pk_caches().await;
+        assert!(
+            provider.pk_keyset_cache.lock().is_none(),
+            "probe must refuse: rows are durable in a protected snapshot"
         );
         assert!(provider.sharded_pk_keyset_cache.lock().is_none());
     }
