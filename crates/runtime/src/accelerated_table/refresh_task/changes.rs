@@ -1916,9 +1916,10 @@ impl RefreshTask {
             Vec::with_capacity(envelopes.len());
         let mut batches: Vec<ChangeBatch> = Vec::with_capacity(envelopes.len());
         // Time the deferred-batch build loop: for sources that defer the decode
-        // (MySQL binlog rows), each envelope pays a `spawn_blocking` round-trip
-        // here — a per-envelope cost otherwise invisible between the recv_wait
-        // and coalesce stage timers.
+        // (Postgres pgoutput rows), each envelope pays a `spawn_blocking`
+        // round-trip here — a per-envelope cost otherwise invisible between the
+        // recv_wait and coalesce stage timers. Sources that deliver materialized
+        // batches skip the offload (`ChangeEnvelope::into_parts_offloaded`).
         let decode_start = Instant::now();
         for env in envelopes {
             // Build the (possibly deferred) batch here, on the per-dataset apply

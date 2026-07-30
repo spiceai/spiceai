@@ -22,7 +22,6 @@ limitations under the License.
 //! the apply path exactly as in production while position tracking stays out
 //! of the measurement.
 
-
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use mysql_common::binlog::EventStreamReader;
