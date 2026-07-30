@@ -178,7 +178,9 @@ impl HashicorpVaultParams {
 const DEFAULT_DATA_TTL: Duration = Duration::from_mins(1);
 /// Negative-cache TTL for confirmed-missing paths (404).
 const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(10);
-/// Default request timeout when none is configured.
+/// Mirrors the `#[param(default = "10")]` on `request_timeout` above, for
+/// tests asserting the parsed default.
+#[cfg(test)]
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default mount path for the Kubernetes service-account token, matching
 /// Vault's own default expectation.
@@ -1205,7 +1207,7 @@ mod tests {
         assert_eq!(AuthMethod::from_str("token"), Ok(AuthMethod::Token));
         // Unknown values are now rejected (the typed field's FromStr replaces
         // the old one_of validation), rather than silently falling back.
-        assert!(AuthMethod::from_str("garbage").is_err());
+        AuthMethod::from_str("garbage").expect_err("garbage should be rejected as an unknown auth method");
     }
 
     #[test]
