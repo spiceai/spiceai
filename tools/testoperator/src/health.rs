@@ -85,6 +85,15 @@ pub(crate) struct EndpointStats {
     refused_count: u64,
     /// Samples that answered with a non-2xx status.
     status_count: u64,
+    /// Wall-clock time spent waiting on over-budget samples.
+    ///
+    /// A stall suppresses its own sample rate — one 3s timeout is recorded where
+    /// [`SAMPLE_INTERVAL`] would otherwise have produced 30 samples — so the
+    /// percentiles understate it badly: an endpoint down for 60s of a 600s run is
+    /// 10% of wall-clock but under 0.5% of samples, so p99 still reads healthy.
+    /// Each breaching sample's latency *is* the time spent waiting, so summing
+    /// them measures the outage independently of how few samples it produced.
+    time_over_budget: Duration,
     pub(crate) max_latency: Duration,
     pub(crate) last_error: Option<String>,
 }
@@ -98,10 +107,13 @@ impl EndpointStats {
             self.max_latency = latency;
         }
 
-        if latency > ERROR_LATENCY {
-            self.error_count = self.error_count.saturating_add(1);
-        } else if latency > LATENCY_THRESHOLD {
-            self.warn_count = self.warn_count.saturating_add(1);
+        if latency > LATENCY_THRESHOLD {
+            self.time_over_budget = self.time_over_budget.saturating_add(latency);
+            if latency > ERROR_LATENCY {
+                self.error_count = self.error_count.saturating_add(1);
+            } else {
+                self.warn_count = self.warn_count.saturating_add(1);
+            }
         }
 
         if let Some((kind, reason)) = &sample.failure {
@@ -258,14 +270,18 @@ impl HealthCheckReport {
                     stats.status_count
                 );
             }
+            // Report the time spent over budget alongside the counts: it is the one
+            // figure a stall cannot hide from, since it does not depend on how many
+            // samples the stall allowed through.
+            let over_budget_secs = stats.time_over_budget.as_secs_f64();
             if stats.error_count > 0 {
                 println!(
-                    "  ERROR: {endpoint} exceeded {error_ms}ms on {} sample(s) (max {max_ms:.0}ms) — the HTTP server stalls under load",
+                    "  ERROR: {endpoint} exceeded {error_ms}ms on {} sample(s) (max {max_ms:.0}ms); {over_budget_secs:.1}s spent over the {warn_ms}ms budget — the HTTP server stalls under load",
                     stats.error_count
                 );
             } else if stats.warn_count > 0 {
                 println!(
-                    "  WARNING: {endpoint} exceeded {warn_ms}ms on {} sample(s) (max {max_ms:.0}ms)",
+                    "  WARNING: {endpoint} exceeded {warn_ms}ms on {} sample(s) (max {max_ms:.0}ms); {over_budget_secs:.1}s spent over budget",
                     stats.warn_count
                 );
             }
@@ -380,18 +396,53 @@ fn breach_log_line(
     }
 }
 
+/// Samples one endpoint on a fixed cadence until cancelled.
+///
+/// One task per endpoint, rather than one task probing both: a hung endpoint holds
+/// its own sampler for up to [`PROBE_TIMEOUT`], and sharing a task would stall the
+/// other endpoint's cadence with it — biasing its percentiles and undercounting its
+/// breaches for a fault that isn't its own.
+async fn sample_endpoint(
+    client: reqwest::Client,
+    endpoint: &'static str,
+    stats: Arc<Mutex<BTreeMap<&'static str, EndpointStats>>>,
+    token: CancellationToken,
+) {
+    // A fixed interval keeps the cadence independent of probe latency; `Delay`
+    // avoids the catch-up burst a slow probe would otherwise trigger.
+    let mut ticker = tokio::time::interval(SAMPLE_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            () = token.cancelled() => return,
+            _ = ticker.tick() => {}
+        }
+
+        // Abandon an in-flight probe on cancellation rather than waiting out the
+        // timeout, so shutdown is prompt even against a hung endpoint.
+        let sample = tokio::select! {
+            () = token.cancelled() => return,
+            sample = probe(&client, endpoint) => sample,
+        };
+
+        if let Some(entry) = stats.lock().get_mut(endpoint) {
+            entry.record_sample(&sample);
+        }
+    }
+}
+
 pub(crate) struct HealthMonitor {
     cancel_token: CancellationToken,
-    /// Shared with the sampling task so a report can be taken mid-run, without
+    /// Shared with the sampling tasks so a report can be taken mid-run, without
     /// stopping the monitor.
     stats: Arc<Mutex<BTreeMap<&'static str, EndpointStats>>>,
-    task: Option<tokio::task::JoinHandle<()>>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl HealthMonitor {
     pub(crate) fn spawn() -> anyhow::Result<Self> {
         let cancel_token = CancellationToken::new();
-        let task_token = cancel_token.clone();
 
         let client = reqwest::Client::builder()
             .timeout(PROBE_TIMEOUT)
@@ -404,47 +455,23 @@ impl HealthMonitor {
                 .map(|ep| (ep, EndpointStats::default()))
                 .collect(),
         ));
-        let task_stats = Arc::clone(&stats);
 
-        let task = tokio::spawn(async move {
-            // A fixed interval keeps the sample cadence independent of probe latency;
-            // `Delay` avoids the catch-up burst a slow probe would otherwise trigger.
-            let mut ticker = tokio::time::interval(SAMPLE_INTERVAL);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-            loop {
-                tokio::select! {
-                    () = task_token.cancelled() => return,
-                    _ = ticker.tick() => {}
-                }
-
-                // Probe both endpoints concurrently: in sequence, a stalled /health
-                // delays the next /v1/ready sample by up to PROBE_TIMEOUT, biasing
-                // its percentiles and undercounting its breaches.
-                let samples = tokio::select! {
-                    () = task_token.cancelled() => return,
-                    samples = futures::future::join(
-                        probe(&client, HEALTH_ENDPOINT),
-                        probe(&client, READY_ENDPOINT),
-                    ) => samples,
-                };
-
-                let mut guard = task_stats.lock();
-                for (endpoint, sample) in
-                    [(HEALTH_ENDPOINT, &samples.0), (READY_ENDPOINT, &samples.1)]
-                {
-                    if let Some(entry) = guard.get_mut(endpoint) {
-                        entry.record_sample(sample);
-                    }
-                }
-                drop(guard);
-            }
-        });
+        let tasks = ENDPOINTS
+            .into_iter()
+            .map(|endpoint| {
+                tokio::spawn(sample_endpoint(
+                    client.clone(),
+                    endpoint,
+                    Arc::clone(&stats),
+                    cancel_token.clone(),
+                ))
+            })
+            .collect();
 
         Ok(Self {
             cancel_token,
             stats,
-            task: Some(task),
+            tasks,
         })
     }
 
@@ -458,28 +485,25 @@ impl HealthMonitor {
 
     pub(crate) async fn stop(mut self) -> anyhow::Result<HealthCheckReport> {
         self.cancel_token.cancel();
-        let Some(task) = self.task.take() else {
-            return Ok(HealthCheckReport::default());
-        };
 
-        match task.await {
-            // The sampling task has joined, so the stats are uniquely owned — take
-            // them rather than cloning a map that is about to be dropped.
-            Ok(()) => Ok(HealthCheckReport {
-                endpoints: std::mem::take(&mut *self.stats.lock()),
-            }),
-            Err(err) => {
-                Err(anyhow::anyhow!(err)
-                    .context("Health monitor task did not complete successfully"))
-            }
+        for task in std::mem::take(&mut self.tasks) {
+            task.await
+                .map_err(|err| anyhow::anyhow!(err))
+                .context("Health monitor task did not complete successfully")?;
         }
+
+        // Every sampler has joined, so the stats are uniquely owned — take them
+        // rather than cloning a map that is about to be dropped.
+        Ok(HealthCheckReport {
+            endpoints: std::mem::take(&mut *self.stats.lock()),
+        })
     }
 }
 
 impl Drop for HealthMonitor {
     fn drop(&mut self) {
         self.cancel_token.cancel();
-        if let Some(task) = self.task.take() {
+        for task in std::mem::take(&mut self.tasks) {
             task.abort();
         }
     }
@@ -614,6 +638,54 @@ mod tests {
             .insert("/v1/ready", EndpointStats::default());
 
         report.print_latency_summary("test");
+    }
+
+    /// A probe that never returns is cut off by `PROBE_TIMEOUT` and must be
+    /// recorded as a timeout, not silently dropped. Its cost is measured in
+    /// `time_over_budget`, which — unlike the percentiles — does not depend on how
+    /// few samples the stall let through.
+    #[test]
+    fn a_probe_that_never_returns_is_recorded_as_a_timeout() {
+        let mut stats = EndpointStats::default();
+        let timeout = (FailureKind::Timeout, "operation timed out".to_string());
+
+        // 20 consecutive timeouts: a minute of hung endpoint at a 3s timeout.
+        for _ in 0..20 {
+            stats.record_sample(&failed(super::PROBE_TIMEOUT, FailureKind::Timeout));
+        }
+        // Interleaved healthy traffic, at the 10Hz cadence the stall suppressed.
+        for _ in 0..5_400 {
+            stats.record_sample(&healthy(Duration::from_millis(1)));
+        }
+
+        assert_eq!(stats.timeout_count, 20);
+        assert_eq!(stats.error_count, 20, "a 3s timeout is error-level");
+        assert_eq!(stats.max_latency, super::PROBE_TIMEOUT);
+        assert_eq!(
+            stats.time_over_budget,
+            Duration::from_mins(1),
+            "20 x 3s of hung endpoint"
+        );
+
+        // The endpoint was down for 60s of a 600s window — 10% of wall-clock — but
+        // the stall only produced 0.37% of the samples, so p99 reports a healthy
+        // 1ms. Only the far tail sees it at all. This gap between "10% of the run"
+        // and "invisible at p99" is why time_over_budget is reported beside them.
+        let sorted = crate::stats::sorted_ms(&stats.latencies_ms);
+        assert!(
+            crate::stats::percentile(&sorted, 0.99) < 2.0,
+            "p99 cannot see a stall that suppressed its own sample rate"
+        );
+        assert!(
+            (crate::stats::percentile(&sorted, 0.999) - 3_000.0).abs() < f64::EPSILON,
+            "only the 0.1% tail reaches the timeout samples"
+        );
+
+        assert!(
+            breach_log_line("/health", super::PROBE_TIMEOUT, Some(&timeout))
+                .is_some_and(|line| line.starts_with("ERROR:")),
+            "each hung probe is logged as it happens"
+        );
     }
 
     #[test]
