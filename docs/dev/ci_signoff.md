@@ -56,9 +56,9 @@ make signoff          # targeted crate lint + tests → full lint + unit tests, 
 ```
 
 `make signoff` first diffs the branch against `trunk`. If that diff has no
-Rust-affecting files (`.rs`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain*`,
-`.cargo/*`), Rust lint/build/unit tests are skipped and the sign-off status is
-still posted (docs/YAML/script-only changes — and for a branch in this
+Rust-affecting files ([the list below](#branches-with-no-rust-changes-are-fast-tracked)),
+Rust lint/build/unit tests are skipped and the sign-off status is
+still posted (docs/YAML-only changes — and for a branch in this
 repository **Attestation** fast-tracks the PR anyway, so you don't need to run
 this at all; the fast-track is same-repo only, so a docs-only PR from a fork
 still needs a maintainer sign-off). Otherwise it maps changed files to workspace
@@ -139,17 +139,38 @@ requiring a sign-off.
 
 ### Branches with no Rust changes are fast-tracked
 
-A pull request whose diff contains no `.rs`, `Cargo.toml`/`Cargo.lock`,
-`rust-toolchain*`, or `.cargo/` paths passes **Attestation** automatically. Those
-are exactly the branches `make signoff` skips every Rust check for, so requiring
-it would attest a run that did no work. Docs, workflow YAML, spicepods, and
-scripts all land here. Renames are checked on both sides, so moving a `.rs` file
-to a non-Rust path still requires a sign-off, and a diff at GitHub's 3000-file
-listing cap is treated as unknown rather than assumed clean. Same-repo only, like
-the other fast-tracks.
+A pull request whose diff contains no Rust-affecting path passes **Attestation**
+automatically. Those are exactly the branches `make signoff` skips every Rust
+check for, so requiring it would attest a run that did no work. Docs, workflow
+YAML, and spicepods land here. Renames are checked on both sides, so moving a
+`.rs` file to a non-Rust path still requires a sign-off, and a diff at GitHub's
+3000-file listing cap is treated as unknown rather than assumed clean. Same-repo
+only, like the other fast-tracks.
+
+Rust-affecting means Rust sources, the Cargo/toolchain config, **and the config
+files the gate itself reads**:
+
+- `*.rs`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain[.toml]`, `.cargo/`
+- `.ci/clippy.toml` (the config `make lint-rust` uses via `CLIPPY_CONF_DIR`) and
+  the root `clippy.toml`; `[.]rustfmt.toml`
+- `.config/nextest.toml` — retries, slow-test timeouts, test groups
+- `layers.toml`, `scripts/check_crate_layers.py`, and
+  `scripts/check_rust_gate_paths.py` — the no-compile guards it runs
+- the root `Makefile` — it holds every `-Dclippy::…` flag the gate enforces
 
 The merge queue still runs the full suite on the merged result — its
 `check_changes` gate applies the same reasoning there.
+
+Three lists encode that set: `RUST_AFFECTING_PATH_PATTERN` in `scripts/signoff`,
+`rustAffecting` in `.github/workflows/pr.yml` (which must classify the same
+paths), and the `code_changes` filter in `.github/actions/check-code-changes`
+(a deliberate superset — it is the shared "did any code change" default, so it
+also gates integration and E2E, and it only has to *cover* the set). A path
+missing from all three lands on trunk having never been linted, built, or
+tested, so `make lint-rust` runs `scripts/check_rust_gate_paths.py`. It derives
+what must be gated from what the `lint-rust` recipe reads and from the tracked
+config-file names, rather than from a list someone has to remember, and fails
+when the three drift. Change them together.
 
 ### Dependabot bumps are fast-tracked
 

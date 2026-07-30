@@ -514,14 +514,19 @@ impl ClusterService for ClusterServiceImpl {
         let local_sql = rewrite_task_history_sql(&request.sql)
             .map_err(|e| Status::invalid_argument(format!("Invalid task history query: {e}")))?;
 
-        // Execute the query against local_task_history
+        // Always run under the strict read-only validator: GetTaskHistory is a
+        // cluster-internal fan-in for observability, not a general SQL surface.
+        // Without this gate, a peer could smuggle DDL/DML that merely *mentions*
+        // task_history (e.g. `INSERT INTO writable SELECT * FROM runtime.task_history`)
+        // and execute it with the scheduler's full DataFusion context.
         let query_result = self
             .datafusion
             .query_builder(&local_sql)
+            .read_only(true)
             .build()
             .run()
             .await
-            .map_err(|e| Status::internal(format!("Failed to execute query: {e}")))?;
+            .map_err(|e| map_task_history_query_error(&e))?;
 
         // Collect all record batches
         let batches: Vec<RecordBatch> = query_result
@@ -939,7 +944,7 @@ async fn handle_executor_message(
             handle_partitions_loaded(executor_id, loaded, datafusion).await;
         }
         ExecutorMessage::ExecutorStatistics(stats_msg) => {
-            handle_executor_statistics(executor_id, stats_msg, datafusion);
+            handle_executor_statistics(executor_id, stats_msg, datafusion).await;
         }
         ExecutorMessage::Shutdown(shutdown) => {
             let reason = if shutdown.reason.is_empty() {
@@ -994,8 +999,11 @@ async fn notify_scheduler_executor_shutdown(
 
 /// Records a per-table [`ExecutorStatistics`] report into the scheduler's
 /// in-memory `ExecutorRegistry`, where it's read at query-planning time to size
-/// the coordinator's per-executor federated scans. Decoupled from readiness.
-fn handle_executor_statistics(
+/// the coordinator's per-executor federated scans. Also re-evaluates the
+/// table's readiness: `evaluate_table_readiness` gates `Ready` on the first
+/// stats report, so a table whose partitions loaded before its stats arrived
+/// flips to `Ready` here rather than waiting for the next periodic sweep.
+async fn handle_executor_statistics(
     executor_id: &str,
     msg: &runtime_proto::ExecutorStatistics,
     datafusion: &DataFusion,
@@ -1007,15 +1015,37 @@ fn handle_executor_statistics(
         Arc::<str>::clone(&resolved.schema),
         Arc::<str>::clone(&resolved.table),
     );
-    let stats = runtime_cluster::decode_statistics(&msg.statistics);
-    if let (Some(stats), Some(registry)) = (stats, datafusion.executor_registry()) {
-        registry.record_executor_statistics(
-            table,
-            executor_id.to_string(),
-            stats,
-            msg.column_names.clone(),
+    let Some(registry) = datafusion.executor_registry() else {
+        return;
+    };
+
+    // A malformed or forward-incompatible payload decodes to `None`. Record an
+    // explicit unknown-statistics entry rather than dropping the report: since
+    // `evaluate_table_readiness` gates `Ready` on `has_statistics_for`,
+    // silently dropping it would leave the table stuck out of `Ready` forever
+    // (and could hang /v1/ready) with no signal. Recording unknown stats still
+    // lets the coordinator observe that this executor reported for the table;
+    // the planner then treats its slice as unknown-cardinality — the same as a
+    // deliberate unknown report from the executor.
+    let (statistics, column_names) = if let Some(statistics) =
+        runtime_cluster::decode_statistics(&msg.statistics)
+    {
+        (statistics, msg.column_names.clone())
+    } else {
+        tracing::warn!(
+            table = %table,
+            executor = %executor_id,
+            "Failed to decode executor statistics report ({} bytes); recording unknown statistics so the table can still become Ready",
+            msg.statistics.len()
         );
-    }
+        (
+            datafusion::common::Statistics::new_unknown(&arrow::datatypes::Schema::empty()),
+            Vec::new(),
+        )
+    };
+
+    registry.record_executor_statistics(&table, executor_id.to_string(), statistics, column_names);
+    evaluate_table_readiness(datafusion, &table).await;
 }
 
 /// Records a `PartitionsLoaded` ack from an executor and, if all assigned
@@ -1161,6 +1191,24 @@ pub(crate) async fn evaluate_table_readiness(datafusion: &DataFusion, table: &Ta
     };
 
     if tracker.is_table_loaded(table, &metadata, datafusion).await {
+        // Gate readiness on having received at least one executor statistics
+        // report for this table. Distributed query plans need the reported
+        // row-count statistics to size joins (so DataFusion's cost-based swap
+        // builds the small side of a hash join rather than the large one); a
+        // table marked `Ready` before stats arrive can plan a query that
+        // exhausts the memory pool. The executor always reports per served
+        // table (unknown stats when unavailable — see
+        // `local_executor_table_statistics`), so a loaded table can't hang
+        // here. Only gates distributed mode: single-node has no registry.
+        if let Some(registry) = datafusion.executor_registry()
+            && !registry.has_statistics_for(table)
+        {
+            tracing::debug!(
+                table = %table,
+                "All assigned partitions loaded but awaiting first executor statistics report before marking Ready"
+            );
+            return;
+        }
         tracing::info!(
             table = %table,
             "All assigned partitions loaded; marking dataset Ready"
@@ -1345,6 +1393,49 @@ fn expandable_secret_keys(app: &App) -> HashMap<String, HashSet<String>> {
     }
 }
 
+/// Maps a task-history query execution error to a gRPC status.
+///
+/// Read-only validator failures (DDL/DML/COPY/etc.) become
+/// [`Status::permission_denied`] so callers can distinguish policy rejections
+/// from unexpected internal failures.
+fn map_task_history_query_error(e: &crate::datafusion::query::Error) -> Status {
+    // Classify on the underlying DataFusion message, not `Error`'s Display —
+    // `UnableToExecuteQuery` already prefixes with "Failed to execute query: ",
+    // and re-wrapping that string would double the prefix and couple the
+    // mutation classifier to wrapper formatting.
+    let underlying = match e {
+        crate::datafusion::query::Error::UnableToExecuteQuery { source }
+        | crate::datafusion::query::Error::UnableToCreateMemoryStream { source }
+        | crate::datafusion::query::Error::UnableToCollectResults { source }
+        | crate::datafusion::query::Error::BindingParameters { source } => source.to_string(),
+        other => other.to_string(),
+    };
+
+    // Prefer PermissionDenied for any mutation rejection so cluster peers get a
+    // clear policy signal rather than a 500-class Internal. The read-only
+    // validator is the primary gate; the general operations validator can also
+    // reject writes first (e.g. internal datasets) with a different message.
+    if is_task_history_mutation_rejection(&underlying) {
+        Status::permission_denied(format!(
+            "Task history queries are read-only and cannot mutate data: {underlying}"
+        ))
+    } else {
+        // `Error`'s Display already formats `UnableToExecuteQuery` as
+        // "Failed to execute query: …"; use it as-is to avoid a second prefix.
+        Status::internal(e.to_string())
+    }
+}
+
+fn is_task_history_mutation_rejection(message: &str) -> bool {
+    message.contains("read-only SQL context")
+        || message.contains("INSERT operations are not allowed")
+        || message.contains("DELETE operations are not allowed")
+        || message.contains("UPDATE operations are not allowed")
+        || message.contains("COPY operations are not allowed")
+        || message.contains("DDL operation")
+        || message.contains("are not allowed in read-only")
+}
+
 /// Rewrites a task history SQL query to use `local_task_history` instead of `task_history`.
 ///
 /// This function parses the SQL, validates it references the expected table, and rewrites
@@ -1498,6 +1589,22 @@ mod tests {
                 task_history_table,
             )
             .expect("local task history table should be registered");
+
+        // Writable sink used by read-only mutation tests: INSERT INTO sink
+        // SELECT FROM task_history must still be denied by the read-only gate
+        // even though the target table is individually writable.
+        let sink = Arc::new(
+            MemTable::try_new(Arc::clone(&task_history_schema), vec![vec![]])
+                .expect("empty sink table should be created"),
+        );
+        let sink_ref = TableReference::bare("task_history_sink");
+        datafusion
+            .ctx
+            .register_table(sink_ref.clone(), sink)
+            .expect("sink table should be registered");
+        datafusion
+            .mark_dataset_writable(&sink_ref)
+            .expect("sink table should be marked writable");
 
         let store: Arc<dyn object_store::ObjectStore> =
             Arc::new(object_store::memory::InMemory::new());
@@ -1779,6 +1886,136 @@ mod tests {
             .expect("second task history request should also succeed");
 
         shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn get_task_history_allows_select() {
+        let service = make_test_service().await;
+        let response = service
+            .get_task_history(Request::new(GetTaskHistoryRequest {
+                sql: format!(
+                    "SELECT trace_id FROM \"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\""
+                ),
+            }))
+            .await
+            .expect("SELECT against task_history must succeed under read-only");
+        // Empty MemTable still produces a valid response (possibly empty IPC).
+        let _ = response.into_inner().arrow_ipc;
+    }
+
+    #[tokio::test]
+    async fn get_task_history_rejects_insert_into_writable_from_task_history() {
+        let service = make_test_service().await;
+        // Target is a writable non-system table so the operations validator
+        // would allow the INSERT; the read-only gate must still reject it.
+        let err = service
+            .get_task_history(Request::new(GetTaskHistoryRequest {
+                sql: format!(
+                    "INSERT INTO task_history_sink \
+                     SELECT * FROM \"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\""
+                ),
+            }))
+            .await
+            .expect_err("INSERT into writable sink must be rejected by read-only GetTaskHistory");
+
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(
+            err.message().contains("read-only"),
+            "unexpected message: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn get_task_history_rejects_delete() {
+        let service = make_test_service().await;
+        let err = service
+            .get_task_history(Request::new(GetTaskHistoryRequest {
+                sql: format!(
+                    "DELETE FROM \"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\""
+                ),
+            }))
+            .await
+            .expect_err("DELETE must be rejected by read-only GetTaskHistory");
+
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(
+            err.message().contains("read-only") || err.message().contains("not allowed"),
+            "unexpected message: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn get_task_history_rejects_ddl_over_task_history_select() {
+        let service = make_test_service().await;
+        // CREATE VIEW ... AS SELECT FROM task_history passes the rewrite gate
+        // (references task_history) but is DDL and must be rejected.
+        let err = service
+            .get_task_history(Request::new(GetTaskHistoryRequest {
+                sql: format!(
+                    "CREATE VIEW \"{SPICE_RUNTIME_SCHEMA}\".\"leaked\" AS \
+                     SELECT * FROM \"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\""
+                ),
+            }))
+            .await
+            .expect_err("DDL must be rejected by read-only GetTaskHistory");
+
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(
+            err.message().contains("read-only") || err.message().contains("DDL"),
+            "unexpected message: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn map_task_history_query_error_classifies_read_only() {
+        let e = crate::datafusion::query::Error::UnableToExecuteQuery {
+            source: datafusion::error::DataFusionError::Plan(
+                "INSERT operations are not allowed in read-only SQL context.".to_string(),
+            ),
+        };
+        let status = map_task_history_query_error(&e);
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert!(status.message().contains("read-only"));
+        // Underlying Plan text only — no Error Display wrapper re-prefixed.
+        assert!(
+            !status
+                .message()
+                .contains("Failed to execute query: Failed to execute query:"),
+            "must not double-prefix Display: {}",
+            status.message()
+        );
+    }
+
+    #[test]
+    fn map_task_history_query_error_keeps_other_failures_internal() {
+        let e = crate::datafusion::query::Error::UnableToExecuteQuery {
+            source: datafusion::error::DataFusionError::Internal(
+                "something unexpected".to_string(),
+            ),
+        };
+        let status = map_task_history_query_error(&e);
+        assert_eq!(status.code(), tonic::Code::Internal);
+        // Error Display already includes "Failed to execute query: " once.
+        assert!(
+            status.message().starts_with("Failed to execute query:"),
+            "unexpected message: {}",
+            status.message()
+        );
+        assert!(
+            !status
+                .message()
+                .contains("Failed to execute query: Failed to execute query:"),
+            "must not double-prefix Display: {}",
+            status.message()
+        );
+        assert!(
+            status.message().contains("something unexpected"),
+            "unexpected message: {}",
+            status.message()
+        );
     }
 
     #[test]
