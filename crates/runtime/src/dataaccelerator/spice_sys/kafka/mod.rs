@@ -40,6 +40,7 @@ use super::{
 use crate::{component::dataset::Dataset, dataaccelerator::spice_sys::OpenOption};
 pub(super) use data_components::kafka::KafkaMetadata;
 use data_components::kafka::KafkaOffset;
+use std::sync::Arc;
 
 const KAFKA_TABLE_NAME: &str = "spice_sys_kafka";
 const KAFKA_OFFSETS_TABLE_NAME: &str = "spice_sys_kafka_offsets";
@@ -56,7 +57,7 @@ mod turso;
 pub struct KafkaSys {
     dataset_name: String,
     acceleration_connection: AccelerationConnection,
-    schema_ensured: OffsetSchemaState,
+    schema_ensured: Arc<OffsetSchemaState>,
 }
 
 impl KafkaSys {
@@ -66,18 +67,31 @@ impl KafkaSys {
             dataset_name: dataset.name.to_string(),
             acceleration_connection: acceleration_connection(dataset, registry, open_option)
                 .await?,
-            schema_ensured: OffsetSchemaState::default(),
+            schema_ensured: Arc::default(),
         })
     }
 
     #[cfg_attr(
-        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        not(any(
+            feature = "sqlite",
+            feature = "duckdb",
+            feature = "postgres-accel",
+            feature = "turso"
+        )),
         expect(clippy::unused_async)
     )]
     pub async fn get(&self) -> Result<Option<KafkaMetadata>> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => self.get_duckdb(pool),
+            AccelerationConnection::DuckDB(pool) => {
+                let pool = Arc::clone(pool);
+                let dataset_name = self.dataset_name.clone();
+                let schema_ensured = Arc::clone(&self.schema_ensured);
+                super::spawn_duckdb_blocking(move || {
+                    Self::get_duckdb(&dataset_name, &schema_ensured, &pool)
+                })
+                .await
+            }
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.get_postgres(pool).await,
             #[cfg(feature = "sqlite")]
@@ -97,13 +111,27 @@ impl KafkaSys {
     }
 
     #[cfg_attr(
-        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        not(any(
+            feature = "sqlite",
+            feature = "duckdb",
+            feature = "postgres-accel",
+            feature = "turso"
+        )),
         expect(clippy::unused_async)
     )]
     pub async fn upsert(&self, metadata: &KafkaMetadata) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => self.upsert_duckdb(pool, metadata),
+            AccelerationConnection::DuckDB(pool) => {
+                let pool = Arc::clone(pool);
+                let dataset_name = self.dataset_name.clone();
+                let schema_ensured = Arc::clone(&self.schema_ensured);
+                let metadata = metadata.clone();
+                super::spawn_duckdb_blocking(move || {
+                    Self::upsert_duckdb(&dataset_name, &schema_ensured, &pool, &metadata)
+                })
+                .await
+            }
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.upsert_postgres(pool, metadata).await,
             #[cfg(feature = "sqlite")]
@@ -123,13 +151,27 @@ impl KafkaSys {
     }
 
     #[cfg_attr(
-        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        not(any(
+            feature = "sqlite",
+            feature = "duckdb",
+            feature = "postgres-accel",
+            feature = "turso"
+        )),
         expect(clippy::unused_async)
     )]
     pub async fn upsert_offsets(&self, offsets: &[KafkaOffset]) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => self.upsert_offsets_duckdb(pool, offsets),
+            AccelerationConnection::DuckDB(pool) => {
+                let pool = Arc::clone(pool);
+                let dataset_name = self.dataset_name.clone();
+                let schema_ensured = Arc::clone(&self.schema_ensured);
+                let offsets = offsets.to_vec();
+                super::spawn_duckdb_blocking(move || {
+                    Self::upsert_offsets_duckdb(&dataset_name, &schema_ensured, &pool, &offsets)
+                })
+                .await
+            }
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => {
                 self.upsert_offsets_postgres(pool, offsets).await
@@ -158,7 +200,7 @@ impl KafkaSys {
 
     fn deserialize_schema(schema_json: &str) -> Result<SchemaRef> {
         let schema: Schema = serde_json::from_str(schema_json).map_err(Error::external)?;
-        Ok(std::sync::Arc::new(schema))
+        Ok(Arc::new(schema))
     }
 
     fn schema_needs_ensure(&self) -> bool {

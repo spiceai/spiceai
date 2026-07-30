@@ -212,6 +212,41 @@ impl Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Runs a synchronous `DuckDB` sidecar operation on the blocking pool.
+///
+/// Every `spice_sys` `DuckDB` helper takes the connection pool's write gate, and a
+/// `duckdb_on_full_refresh: replace_file` refresh holds that gate **exclusively**
+/// while it copies every co-resident table into the staging file and checkpoints it.
+/// That window scales with the size of the *other* datasets sharing the file, so
+/// waiting on the gate from an async worker parks the whole worker — including
+/// `/health`, which Kubernetes uses to decide the pod is dead — for seconds to
+/// minutes.
+///
+/// The helpers themselves are also plain blocking `DuckDB` I/O, so they belong here
+/// regardless of the gate; `DuckDbBlobCheckpointStore` and the accelerator's
+/// `drop_table`/`evolve_table_schema` already do exactly this.
+#[cfg(feature = "duckdb")]
+async fn spawn_duckdb_blocking<T, F>(f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(Error::external)?
+}
+
+/// [`spawn_duckdb_blocking`] for the read paths that report a failure as `None`
+/// rather than as an error.
+#[cfg(any(feature = "mongodb", feature = "mysql"))]
+async fn spawn_duckdb_blocking_opt<T, F>(f: F) -> Option<T>
+where
+    F: FnOnce() -> Option<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f).await.ok().flatten()
+}
+
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum OpenOption {
     CreateIfNotExists,

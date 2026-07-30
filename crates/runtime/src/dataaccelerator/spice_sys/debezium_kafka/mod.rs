@@ -41,6 +41,7 @@ use crate::{
     dataconnector::debezium::DebeziumKafkaMetadata,
 };
 use data_components::kafka::KafkaOffset;
+use std::sync::Arc;
 
 const DEBEZIUM_KAFKA_TABLE_NAME: &str = "spice_sys_debezium_kafka";
 const DEBEZIUM_KAFKA_OFFSETS_TABLE_NAME: &str = "spice_sys_debezium_kafka_offsets";
@@ -57,7 +58,7 @@ mod turso;
 pub struct DebeziumKafkaSys {
     dataset_name: String,
     acceleration_connection: AccelerationConnection,
-    schema_ensured: OffsetSchemaState,
+    schema_ensured: Arc<OffsetSchemaState>,
 }
 
 impl DebeziumKafkaSys {
@@ -67,14 +68,22 @@ impl DebeziumKafkaSys {
             dataset_name: dataset.name.to_string(),
             acceleration_connection: acceleration_connection(dataset, registry, open_option)
                 .await?,
-            schema_ensured: OffsetSchemaState::default(),
+            schema_ensured: Arc::default(),
         })
     }
 
     pub(crate) async fn get(&self) -> Result<Option<DebeziumKafkaMetadata>> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => self.get_duckdb(pool),
+            AccelerationConnection::DuckDB(pool) => {
+                let pool = Arc::clone(pool);
+                let dataset_name = self.dataset_name.clone();
+                let schema_ensured = Arc::clone(&self.schema_ensured);
+                super::spawn_duckdb_blocking(move || {
+                    Self::get_duckdb(&dataset_name, &schema_ensured, &pool)
+                })
+                .await
+            }
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.get_postgres(pool).await,
             #[cfg(feature = "sqlite")]
@@ -96,7 +105,16 @@ impl DebeziumKafkaSys {
     pub(crate) async fn upsert(&self, metadata: &DebeziumKafkaMetadata) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => self.upsert_duckdb(pool, metadata),
+            AccelerationConnection::DuckDB(pool) => {
+                let pool = Arc::clone(pool);
+                let dataset_name = self.dataset_name.clone();
+                let schema_ensured = Arc::clone(&self.schema_ensured);
+                let metadata = metadata.clone();
+                super::spawn_duckdb_blocking(move || {
+                    Self::upsert_duckdb(&dataset_name, &schema_ensured, &pool, &metadata)
+                })
+                .await
+            }
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.upsert_postgres(pool, metadata).await,
             #[cfg(feature = "sqlite")]
@@ -118,7 +136,16 @@ impl DebeziumKafkaSys {
     pub(crate) async fn upsert_offsets(&self, offsets: &[KafkaOffset]) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => self.upsert_offsets_duckdb(pool, offsets),
+            AccelerationConnection::DuckDB(pool) => {
+                let pool = Arc::clone(pool);
+                let dataset_name = self.dataset_name.clone();
+                let schema_ensured = Arc::clone(&self.schema_ensured);
+                let offsets = offsets.to_vec();
+                super::spawn_duckdb_blocking(move || {
+                    Self::upsert_offsets_duckdb(&dataset_name, &schema_ensured, &pool, &offsets)
+                })
+                .await
+            }
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => {
                 self.upsert_offsets_postgres(pool, offsets).await

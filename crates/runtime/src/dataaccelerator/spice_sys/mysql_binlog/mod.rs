@@ -114,16 +114,26 @@ impl MySqlBinlogSys {
     }
 
     #[cfg_attr(
-        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        not(any(
+            feature = "sqlite",
+            feature = "duckdb",
+            feature = "postgres-accel",
+            feature = "turso"
+        )),
         expect(
             clippy::unused_async,
-            reason = "async only when an async accelerator backend is compiled in; DuckDB helpers are synchronous"
+            reason = "async only when an accelerator backend is compiled in; with none, every arm errors immediately"
         )
     )]
     pub async fn get(&self) -> Option<MySqlBinlogCheckpoint> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => self.get_duckdb(pool),
+            AccelerationConnection::DuckDB(pool) => {
+                let pool = std::sync::Arc::clone(pool);
+                let dataset_name = self.dataset_name.clone();
+                super::spawn_duckdb_blocking_opt(move || Self::get_duckdb(&dataset_name, &pool))
+                    .await
+            }
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.get_postgres(pool).await,
             #[cfg(feature = "sqlite")]
@@ -178,10 +188,15 @@ impl MySqlBinlogSys {
     }
 
     #[cfg_attr(
-        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        not(any(
+            feature = "sqlite",
+            feature = "duckdb",
+            feature = "postgres-accel",
+            feature = "turso"
+        )),
         expect(
             clippy::unused_async,
-            reason = "async only when an async accelerator backend is compiled in; DuckDB helpers are synchronous"
+            reason = "async only when an accelerator backend is compiled in; with none, every arm errors immediately"
         )
     )]
     async fn upsert_once(
@@ -199,7 +214,15 @@ impl MySqlBinlogSys {
     ) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => self.upsert_duckdb(pool, checkpoint),
+            AccelerationConnection::DuckDB(pool) => {
+                let pool = std::sync::Arc::clone(pool);
+                let dataset_name = self.dataset_name.clone();
+                let checkpoint = checkpoint.clone();
+                super::spawn_duckdb_blocking(move || {
+                    Self::upsert_duckdb(&dataset_name, &pool, &checkpoint)
+                })
+                .await
+            }
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.upsert_postgres(pool, checkpoint).await,
             #[cfg(feature = "sqlite")]
@@ -219,16 +242,26 @@ impl MySqlBinlogSys {
     }
 
     #[cfg_attr(
-        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        not(any(
+            feature = "sqlite",
+            feature = "duckdb",
+            feature = "postgres-accel",
+            feature = "turso"
+        )),
         expect(
             clippy::unused_async,
-            reason = "async only when an async accelerator backend is compiled in; DuckDB helpers are synchronous"
+            reason = "async only when an accelerator backend is compiled in; with none, every arm errors immediately"
         )
     )]
     pub async fn delete(&self) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => self.delete_duckdb(pool),
+            AccelerationConnection::DuckDB(pool) => {
+                let pool = std::sync::Arc::clone(pool);
+                let dataset_name = self.dataset_name.clone();
+                super::spawn_duckdb_blocking(move || Self::delete_duckdb(&dataset_name, &pool))
+                    .await
+            }
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.delete_postgres(pool).await,
             #[cfg(feature = "sqlite")]
