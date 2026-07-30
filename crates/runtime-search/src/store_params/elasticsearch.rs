@@ -16,12 +16,13 @@ limitations under the License.
 
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
-use elasticsearch::ClientOptions;
+use elasticsearch::{Client, ClientOptions, Elasticsearch};
 use runtime_parameters::TypedParams;
 use search::index::elasticsearch::ElasticsearchIndexWriteOptions;
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 
 /// Vector similarity metric for Elasticsearch kNN search (the `similarity` of
 /// the `dense_vector` mapping).
@@ -121,36 +122,32 @@ pub struct ElasticsearchVectorParams {
     pub spill_writes: Option<bool>,
 }
 
-impl ElasticSearchVectorParams {
-    pub fn client() -> Result<Arc<dyn Elasticsearch>, Box<dyn std::error::Error + Send + Sync>> {
-        Arc::new(
+impl ElasticsearchVectorParams {
+    /// Build an Elasticsearch HTTP client from these connection params, applying the
+    /// configured timeout and retry options.
+    pub fn client(
+        &self,
+    ) -> Result<Arc<dyn Elasticsearch>, Box<dyn std::error::Error + Send + Sync>> {
+        let opts = build_client_options(
+            self.client_timeout,
+            self.connect_timeout,
+            self.max_retries,
+            self.retry_initial_backoff,
+        );
+        Ok(Arc::new(
             Client::new_with_options(
-                endpoint,
+                &self.endpoint,
                 self.user.as_ref().map(ExposeSecret::expose_secret),
                 self.pass.as_ref().map(ExposeSecret::expose_secret),
-                self.build_client_options()?,
+                &opts,
             )
-            .boxed()?,
-        );
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?,
+        ))
     }
 
-    fn build_client_options(&self) -> ClientOptions {
-        let mut opts = ClientOptions::default();
-        if let Some(ref d) = self.client_timeout {
-            opts.request_timeout = d.clone();
-        }
-        if let Some(ref d) = self.connect_timeout {
-            opts.connect_timeout = d.clone();
-        }
-        if let Some(ref n) = self.max_retries {
-            opts.retry.max_retries = n.clone();
-        }
-        if let Some(ref d) = self.retry_initial_backoff {
-            opts.retry.initial_backoff = d.clone();
-        }
-        opts
-    }
-
+    /// Reject params that require infrastructure the Elasticsearch vector engine does not
+    /// yet support (per-partition index routing, spill queues), so misconfigurations fail
+    /// loudly instead of being silently ignored.
     pub fn validate(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if self.partition_by.is_some() {
             return Err(Box::<dyn std::error::Error + Send + Sync>::from(
@@ -162,6 +159,7 @@ impl ElasticSearchVectorParams {
                 "`spill_writes` is not yet supported for the Elasticsearch vector engine.",
             ));
         }
+        Ok(())
     }
 }
 
@@ -216,24 +214,6 @@ pub struct ElasticsearchFtsParams {
     pub force_merge_segments: Option<u32>,
 }
 
-impl ElasticsearchFtsParams {
-    pub fn build_client_options(&self) -> ClientOptions {
-        let mut opts = ClientOptions::default();
-        if let Some(ref d) = self.client_timeout {
-            opts.request_timeout = d.clone();
-        }
-        if let Some(ref d) = self.connect_timeout {
-            opts.connect_timeout = d.clone();
-        }
-        if let Some(ref n) = self.max_retries {
-            opts.retry.max_retries = n.clone();
-        }
-        if let Some(ref d) = self.retry_initial_backoff {
-            opts.retry.initial_backoff = d.clone();
-        }
-        opts
-    }
-}
 /// Resolved Elasticsearch FTS configuration: typed parameters plus the
 /// dataset-dependent index name.
 #[derive(Clone)]

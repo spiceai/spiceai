@@ -307,6 +307,14 @@ pub enum Error {
     AcceleratedTableInvalidChanges { dataset_name: String },
 
     #[snafu(display(
+        "Failed to register dataset {dataset_name} ({connector}): durable write-back needs a source that can apply a delivered row in one atomic step, and the {connector} connector cannot yet. Delivering as a separate delete and insert lets the deleted state echo back over CDC, which can silently drop a committed write. Remove 'on_conflict' to keep writes on the accelerator, or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+    ))]
+    DurableWriteBackUnsupportedBySource {
+        dataset_name: String,
+        connector: String,
+    },
+
+    #[snafu(display(
         "An accelerated table has invalid configuration: {source}. Update the configuration and retry. For details, visit: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
     ))]
     InvalidAccelerationConfiguration {
@@ -1935,15 +1943,9 @@ impl Runtime {
     }
 }
 
-#[must_use]
-pub fn spice_data_base_path() -> String {
-    let Ok(working_dir) = std::env::current_dir() else {
-        return ".".to_string();
-    };
-
-    let base_folder = working_dir.join(".spice/data");
-    base_folder.to_str().unwrap_or(".").to_string()
-}
+// Moved to `data-accelerator-api` (so the accelerator builder can name the data
+// directory without an upward dependency); re-exported here for path compatibility.
+pub use data_accelerator_api::spice_data_base_path;
 
 #[cfg(any(feature = "duckdb", feature = "sqlite", feature = "turso"))]
 #[expect(clippy::result_large_err)]

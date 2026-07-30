@@ -24,14 +24,13 @@ use std::sync::Arc;
 use arrow_schema::{DataType, SchemaRef};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
-use elasticsearch::{Client, Elasticsearch};
+use elasticsearch::Elasticsearch;
 use search::generation::util::get_primary_keys;
 use search::index::chunking::{CHUNKED_INDEX_CHUNK_KEY, ChunkedSearchIndex};
 pub(crate) use search::index::elasticsearch::{
     ElasticsearchIndex, ElasticsearchIndexWriteMaintenance,
 };
 use search::metadata::{MetadataColumn, MetadataColumns};
-use secrecy::ExposeSecret;
 use spicepod::{
     param::Params,
     semantic::{Column, ColumnLevelEmbeddingConfig, MetadataType},
@@ -42,8 +41,7 @@ use tokio::sync::RwLock;
 use crate::model::EmbeddingModelStore;
 use runtime_parameters::typed::TypedParams as _;
 use runtime_search::store_params::elasticsearch::{
-    ElasticsearchVectorParams, EsDistanceMetric, build_client_options, build_write_options,
-    merge_index_settings,
+    ElasticsearchVectorParams, EsDistanceMetric, build_write_options, merge_index_settings,
 };
 use runtime_secrets::{Secrets, get_params_with_secrets};
 
@@ -61,11 +59,21 @@ pub async fn try_from_table(
     secrets: Arc<RwLock<Secrets>>,
 ) -> Result<ElasticsearchIndex, Box<dyn std::error::Error + Send + Sync>> {
     let inner_schema = index_schema;
-    let primary_keys = derive_primary_keys(index_schema, &config)?;
+    let chunked = config.chunking.as_ref().is_some_and(|c| c.enabled);
+    let primary_key = derive_primary_keys(&inner_schema, inner_table_provider, ds_name, &config)?;
 
-    // we should use
     let params = get_store_params(vector_store_config, Arc::clone(&secrets)).await?;
-    let () = params.validate()?;
+
+    // Surface explicit "not yet supported" errors for params that require significant new
+    // infrastructure (per-partition index routing / spill queues). Better to fail loudly
+    // than silently ignore the config.
+    params.validate()?;
+    if !vector_store_config.partition_by.is_empty() {
+        return Err(Box::<dyn std::error::Error + Send + Sync>::from(
+            "`partition_by` is not yet supported for the Elasticsearch vector engine. Remove the parameter or use the S3 Vectors engine for partitioned workloads.",
+        ));
+    }
+
     let client = params.client()?;
 
     let es_index = params.index.clone().unwrap_or_else(|| {
@@ -594,13 +602,20 @@ pub(crate) async fn ensure_index_with_text_mapping(
     }
 }
 
+/// Resolve the primary key fields for the Elasticsearch index: configured `row_ids` or
+/// the table's derived primary keys, normalized (`LargeUtf8` → `Utf8` to match what the
+/// Elasticsearch HTTP client returns) and, when chunking is enabled, augmented with the
+/// chunk key so the warm in-memory index can fall back onto Elasticsearch.
 fn derive_primary_keys(
-    inner_schema: Schema,
+    inner_schema: &Schema,
+    inner_table_provider: &Arc<dyn TableProvider>,
+    ds_name: &TableReference,
     config: &ColumnLevelEmbeddingConfig,
 ) -> Result<Vec<arrow_schema::Field>, Box<dyn std::error::Error + Send + Sync>> {
-    let primary_keys: Vec<String> = match config.row_ids {
+    let primary_keys: Vec<String> = match &config.row_ids {
         Some(row_ids) => row_ids.clone(),
-        None => get_primary_keys(inner_table_provider).boxed()?,
+        None => get_primary_keys(inner_table_provider)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?,
     };
 
     if primary_keys.is_empty() {

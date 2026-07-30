@@ -444,6 +444,28 @@ impl Acceleration {
         self
     }
 
+    /// Returns whether this configuration resolves to durable federated
+    /// write-back: a Cayenne `write_mode: write_back` dataset that declares an
+    /// `on_conflict` key and is CDC-fed (`refresh_mode: changes`).
+    ///
+    /// Such a dataset marks every committed write's primary keys so a delivery
+    /// worker can reconcile them to the federated source. Delivery mutates the
+    /// source, so the source connector must advertise a delivery primitive that
+    /// cannot lose the write; callers gate on
+    /// `DataConnector::supports_durable_write_back_delivery` and reject the
+    /// dataset at registration otherwise.
+    ///
+    /// This is the single source of truth for the condition: both the
+    /// registration gate and the Cayenne provider that turns the marking on
+    /// call it, so the check and the behavior cannot drift apart.
+    #[must_use]
+    pub fn resolves_to_durable_write_back(&self) -> bool {
+        self.engine == Engine::Cayenne
+            && self.write_mode == spicepod_acceleration::WriteMode::WriteBack
+            && !self.on_conflict.is_empty()
+            && self.refresh_mode == Some(RefreshMode::Changes)
+    }
+
     /// Returns whether Arrow `hash_index` is enabled for primary key upserts or indexes.
     #[must_use]
     pub fn is_hash_index_enabled(&self) -> bool {
@@ -1176,5 +1198,93 @@ mod tests {
         acceleration
             .validate_primary_key(&schema_with(&["marker_id", "value"]))
             .expect("primary key column present, so validation passes");
+    }
+
+    /// The exact configuration that turns durable federated write-back on.
+    fn durable_write_back_acceleration() -> Acceleration {
+        let mut on_conflict = HashMap::new();
+        on_conflict.insert(
+            ColumnReference::try_from("id").expect("valid column reference"),
+            OnConflictBehavior::Upsert(UpsertOptions::default()),
+        );
+        Acceleration {
+            engine: Engine::Cayenne,
+            write_mode: spicepod_acceleration::WriteMode::WriteBack,
+            on_conflict,
+            refresh_mode: Some(RefreshMode::Changes),
+            ..Acceleration::default()
+        }
+    }
+
+    #[test]
+    fn durable_write_back_is_recognized() {
+        assert!(durable_write_back_acceleration().resolves_to_durable_write_back());
+    }
+
+    /// Every conjunct must be load-bearing: if dropping one still reports
+    /// durable write-back, the registration gate would fire on datasets that
+    /// never mark keys (or, worse, stay silent on ones that do).
+    #[test]
+    fn every_condition_is_required_for_durable_write_back() {
+        let not_cayenne = Acceleration {
+            engine: Engine::DuckDB,
+            ..durable_write_back_acceleration()
+        };
+        assert!(
+            !not_cayenne.resolves_to_durable_write_back(),
+            "only the Cayenne provider marks dirty keys for delivery"
+        );
+
+        let not_write_back = Acceleration {
+            write_mode: spicepod_acceleration::WriteMode::WriteThrough,
+            ..durable_write_back_acceleration()
+        };
+        assert!(
+            !not_write_back.resolves_to_durable_write_back(),
+            "write-through commits to the source directly, with no delivery worker"
+        );
+
+        let no_on_conflict = Acceleration {
+            on_conflict: HashMap::new(),
+            ..durable_write_back_acceleration()
+        };
+        assert!(
+            !no_on_conflict.resolves_to_durable_write_back(),
+            "without on_conflict there is no key to reconcile"
+        );
+
+        for refresh_mode in [
+            RefreshMode::Disabled,
+            RefreshMode::Full,
+            RefreshMode::Append,
+            RefreshMode::Caching,
+            RefreshMode::Snapshot,
+        ] {
+            let not_changes = Acceleration {
+                refresh_mode: Some(refresh_mode),
+                ..durable_write_back_acceleration()
+            };
+            assert!(
+                !not_changes.resolves_to_durable_write_back(),
+                "{refresh_mode:?} is not CDC-fed, so no delivery worker runs"
+            );
+        }
+
+        let unset_refresh_mode = Acceleration {
+            refresh_mode: None,
+            ..durable_write_back_acceleration()
+        };
+        assert!(
+            !unset_refresh_mode.resolves_to_durable_write_back(),
+            "an unset refresh_mode is not 'changes'"
+        );
+    }
+
+    #[test]
+    fn a_default_acceleration_is_not_durable_write_back() {
+        assert!(
+            !Acceleration::default().resolves_to_durable_write_back(),
+            "the gate must not fire on ordinary datasets"
+        );
     }
 }

@@ -429,9 +429,40 @@ impl CayenneContext {
     }
 
     /// Check if sorting is enabled.
+    ///
+    /// True for BOTH user-configured and inference-derived sort columns, because
+    /// every caller that asks this question is asking "will the rewrite produce
+    /// a globally sorted snapshot?" — which is a property of the write, not of
+    /// who chose the key. Callers deciding *precedence* (which key to sort by)
+    /// must use [`Self::sort_columns_are_authoritative`] instead.
     #[must_use]
     pub fn has_sort_columns(&self) -> bool {
         !self.config.sort_columns.is_empty()
+    }
+
+    /// Whether [`Self::sort_columns`] is an operator statement of intent rather
+    /// than a schema-inference guess.
+    ///
+    /// Only an authoritative sort order may shadow the hot filter columns
+    /// observed on scans. An inferred order (the `PostgreSQL` CDC default, which
+    /// resolves to the primary key) ranks *below* those observations, so the
+    /// default-on adaptive layout can correct the guess.
+    #[must_use]
+    pub fn sort_columns_are_authoritative(&self) -> bool {
+        !self.config.sort_columns.is_empty()
+            && self.config.sort_columns_origin == crate::metadata::SortColumnsOrigin::User
+    }
+
+    /// Sort columns that schema inference supplied, if any — the lowest-priority
+    /// rung of the layout precedence chain (below observed filter columns).
+    /// Empty when the sort order is user-configured or absent.
+    #[must_use]
+    pub fn inferred_sort_columns(&self) -> &[String] {
+        if self.config.sort_columns_origin == crate::metadata::SortColumnsOrigin::Inferred {
+            &self.config.sort_columns
+        } else {
+            &[]
+        }
     }
 
     /// Get the configured intra-write shard-key columns. Empty = derive the

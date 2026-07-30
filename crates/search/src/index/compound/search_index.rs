@@ -61,6 +61,19 @@ impl CompoundSearchIndex {
             read_mode,
         })
     }
+
+    /// The tier reads and writes are served from first.
+    #[must_use]
+    pub fn primary(&self) -> &Arc<dyn SearchIndex> {
+        &self.primary
+    }
+
+    /// The tier reads fall back to (in [`CompoundReadMode::FallbackToSecondary`]) and every
+    /// write also reaches.
+    #[must_use]
+    pub fn secondary(&self) -> &Arc<dyn SearchIndex> {
+        &self.secondary
+    }
 }
 
 #[async_trait]
@@ -104,6 +117,12 @@ impl Index for CompoundSearchIndex {
             self.secondary.on_write_complete()
         );
         primary_result.and(secondary_result)
+    }
+
+    fn write_complete_failure_is_fatal(&self) -> bool {
+        // Either half failing to finalize leaves this compound index stale.
+        self.primary.write_complete_failure_is_fatal()
+            || self.secondary.write_complete_failure_is_fatal()
     }
 
     fn as_any(&self) -> &dyn Any {

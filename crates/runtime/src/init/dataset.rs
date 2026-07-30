@@ -23,11 +23,12 @@ use crate::dataaccelerator::spice_sys::caching_engine::CachingEngineSys;
 use crate::init::dataset_initialization::DatasetInitialization;
 use crate::{
     AcceleratedTableInvalidChangesSnafu, AcceleratorEngineNotAvailableSnafu,
-    AcceleratorInitializationFailedSnafu, Error, FullTextSearchRequiresAccelerationSnafu,
-    LogErrors, OdbcNotInstalledSnafu, PermanentDatasetFailureSnafu, Result, Runtime,
-    UnableToAttachDataConnectorSnafu, UnableToBuildDatasetSnafu,
-    UnableToCreateAcceleratedTableSnafu, UnableToInitializeDataConnectorSnafu,
-    UnableToLoadDatasetConnectorSnafu, UnknownDataConnectorSnafu,
+    AcceleratorInitializationFailedSnafu, DurableWriteBackUnsupportedBySourceSnafu, Error,
+    FullTextSearchRequiresAccelerationSnafu, LogErrors, OdbcNotInstalledSnafu,
+    PermanentDatasetFailureSnafu, Result, Runtime, UnableToAttachDataConnectorSnafu,
+    UnableToBuildDatasetSnafu, UnableToCreateAcceleratedTableSnafu,
+    UnableToInitializeDataConnectorSnafu, UnableToLoadDatasetConnectorSnafu,
+    UnknownDataConnectorSnafu,
     accelerated_table::AcceleratedTable,
     component::dataset::{
         Dataset,
@@ -766,6 +767,26 @@ impl Runtime {
         {
             let err = AcceleratedTableInvalidChangesSnafu {
                 dataset_name: ds.name.to_string(),
+            }
+            .build();
+            warn_spaced!(spaced_tracer, "{}{err}", "");
+            return Err(err);
+        }
+
+        // Durable write-back delivers each committed row to the source. Unless
+        // the connector can do that atomically, delivery has to emulate an
+        // upsert as a standalone delete plus a separate insert — and because the
+        // accelerator is CDC-fed from that same source, the delete echoes back
+        // and erases the committed row. A failure between the two legs then
+        // leaves the write gone from both sides with nothing reported. Refuse
+        // the dataset instead of accepting a config that can lose data.
+        if let Some(acceleration) = &ds.acceleration
+            && acceleration.resolves_to_durable_write_back()
+            && !data_connector.supports_durable_write_back_delivery()
+        {
+            let err = DurableWriteBackUnsupportedBySourceSnafu {
+                dataset_name: ds.name.to_string(),
+                connector: source.clone(),
             }
             .build();
             warn_spaced!(spaced_tracer, "{}{err}", "");
