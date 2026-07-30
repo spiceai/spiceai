@@ -93,6 +93,14 @@ pub enum Error {
     },
 }
 
+/// Parse a dataset's `retention_sql` into the `DELETE` predicate to apply and
+/// the parsed statement it came from.
+///
+/// # Errors
+///
+/// Returns an error if `retention_sql` is not a single `DELETE` statement, targets
+/// a table other than `expected_table`, omits a `WHERE` clause, or has a `WHERE`
+/// expression that cannot be planned against `schema`.
 pub fn parse_retention_sql(
     expected_table: &TableReference,
     retention_sql: &str,

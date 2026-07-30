@@ -236,8 +236,15 @@ macro_rules! ensure_no_expr {
     };
 }
 
-/// Parse and validate a refresh SQL string, returning both a structured `RefreshSQL` and the
-/// validated schema. This replaces the old `validate_refresh_sql` which only returned a schema.
+/// Parse and validate a refresh SQL string, returning both a structured
+/// [`RefreshSQL`] and the schema the projection yields.
+///
+/// # Errors
+///
+/// Returns an error if `refresh_sql` is not a single `SELECT` statement, selects
+/// from a table other than `expected_table`, projects a column absent from
+/// `source_schema`, or uses a construct the refresh path cannot honor (`GROUP BY`,
+/// a non-column projection, or an unsupported `LIMIT` clause).
 pub fn parse_refresh_sql(
     expected_table: TableReference,
     refresh_sql: &str,
