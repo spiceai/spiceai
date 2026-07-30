@@ -507,8 +507,8 @@ mod tests {
     macro_rules! candle_console_output {
         ($verbosity:expr) => {{
             let probe = ProbeWriter::default();
-            let filter: EnvFilter = $verbosity.into();
-            let subscriber = tracing_subscriber::registry().with(filter).with(
+            let env_filter: EnvFilter = $verbosity.into();
+            let subscriber = tracing_subscriber::registry().with(env_filter).with(
                 fmt::layer()
                     .with_ansi(false)
                     .with_writer(probe.clone())
