@@ -506,8 +506,8 @@ mod tests {
 
     #[test]
     fn test_endpoint_context_filter() -> Result<(), String> {
-        let regex =
-            regex::Regex::new(super::ENDPOINT_CONTEXT_FILTER_PATTERN).map_err(|e| format!("{e}"))?;
+        let regex = regex::Regex::new(super::ENDPOINT_CONTEXT_FILTER_PATTERN)
+            .map_err(|e| format!("{e}"))?;
         let replacement = super::ENDPOINT_CONTEXT_FILTER_REPLACEMENT;
 
         // Dremio: grpc URL plus a username, comma-separated.
@@ -521,8 +521,7 @@ mod tests {
 
         // Spark Connect: `sc://` with a user_id and cluster id, semicolon-separated.
         let input = "VirtualExecutionPlan name=spark compute_context=sc://dbc-workspace.example.invalid:443/;user_id=svc-account;x-databricks-cluster-id=0000-000000-abcdefgh;use_ssl=true base_sql=SELECT `l_orderkey` FROM `lineitem`";
-        let expected =
-            "VirtualExecutionPlan name=spark compute_context=<CONNECTION> base_sql=SELECT `l_orderkey` FROM `lineitem`";
+        let expected = "VirtualExecutionPlan name=spark compute_context=<CONNECTION> base_sql=SELECT `l_orderkey` FROM `lineitem`";
         assert_eq!(regex.replace_all(input, replacement), expected);
 
         // Spice Cloud: https URL with org and app.
