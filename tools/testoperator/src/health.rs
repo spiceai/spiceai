@@ -128,6 +128,12 @@ impl EndpointStats {
         &self.latencies_ms
     }
 
+    /// Every sample over [`LATENCY_THRESHOLD`], including the error-level ones —
+    /// [`Self::warn_count`] alone covers only the band up to [`ERROR_LATENCY`].
+    pub(crate) fn over_budget_count(&self) -> u64 {
+        self.warn_count.saturating_add(self.error_count)
+    }
+
     /// Records a latency sample, classified as a live probe would, so tests in
     /// other modules can build a populated report.
     #[cfg(test)]
@@ -423,6 +429,9 @@ mod tests {
         assert_eq!(stats.warn_count, 2, "126ms and 500ms are warn-level");
         assert_eq!(stats.error_count, 1, "only 501ms is error-level");
         assert_eq!(stats.failure_count, 3, "every over-budget sample counts");
+        // The reported over-budget total must include the error-level sample,
+        // otherwise it under-counts against its own ">125ms" label.
+        assert_eq!(stats.over_budget_count(), 3);
         assert_eq!(stats.max_latency, Duration::from_millis(501));
         assert_eq!(stats.latencies_ms().len(), 5);
     }
