@@ -39,36 +39,35 @@ use crate::dataset::{
 static SCHEMA_EVOLUTION_METER: std::sync::LazyLock<opentelemetry::metrics::Meter> =
     std::sync::LazyLock::new(|| opentelemetry::global::meter("schema_evolution"));
 
-pub static SCHEMA_EVOLUTION_DETECTED: std::sync::LazyLock<
-    opentelemetry::metrics::Counter<u64>,
-> = std::sync::LazyLock::new(|| {
-    SCHEMA_EVOLUTION_METER
+pub static SCHEMA_EVOLUTION_DETECTED: std::sync::LazyLock<opentelemetry::metrics::Counter<u64>> =
+    std::sync::LazyLock::new(|| {
+        SCHEMA_EVOLUTION_METER
         .u64_counter("schema_evolution_detected")
         .with_description(
             "Schema changes detected between an incoming source schema and the stored/accelerator schema.",
         )
         .build()
-});
+    });
 
-pub static SCHEMA_EVOLUTION_APPLIED: std::sync::LazyLock<
-    opentelemetry::metrics::Counter<u64>,
-> = std::sync::LazyLock::new(|| {
-    SCHEMA_EVOLUTION_METER
-        .u64_counter("schema_evolution_applied")
-        .with_description("Schema evolutions applied to the accelerator or cached source schema.")
-        .build()
-});
+pub static SCHEMA_EVOLUTION_APPLIED: std::sync::LazyLock<opentelemetry::metrics::Counter<u64>> =
+    std::sync::LazyLock::new(|| {
+        SCHEMA_EVOLUTION_METER
+            .u64_counter("schema_evolution_applied")
+            .with_description(
+                "Schema evolutions applied to the accelerator or cached source schema.",
+            )
+            .build()
+    });
 
-pub static SCHEMA_EVOLUTION_FAILED: std::sync::LazyLock<
-    opentelemetry::metrics::Counter<u64>,
-> = std::sync::LazyLock::new(|| {
-    SCHEMA_EVOLUTION_METER
+pub static SCHEMA_EVOLUTION_FAILED: std::sync::LazyLock<opentelemetry::metrics::Counter<u64>> =
+    std::sync::LazyLock::new(|| {
+        SCHEMA_EVOLUTION_METER
         .u64_counter("schema_evolution_failed")
         .with_description(
             "Schema changes that were not applied: incompatible, blocked by policy, or requiring a restart.",
         )
         .build()
-});
+    });
 
 pub fn schema_evolution_labels(
     dataset: &str,

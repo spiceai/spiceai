@@ -17066,6 +17066,7 @@ dependencies = [
  "arrow",
  "arrow-schema",
  "arrow_tools",
+ "clap",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
