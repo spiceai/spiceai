@@ -344,6 +344,10 @@ mod tests {
         let acceleration = spicepod_catalog::CatalogAcceleration {
             engine: spicepod_catalog::CatalogAccelerationEngine::Cayenne,
             refresh_mode: spicepod_catalog::CatalogRefreshMode::Changes,
+            mode: spicepod::acceleration::Mode::File,
+            params: Some(spicepod::param::Params::from_string_map(
+                [("cayenne_file_path".to_string(), "/data".to_string())].into(),
+            )),
         };
 
         let builder = CatalogBuilder::try_from(spicepod_catalog(&[], &[], Some(acceleration)))
@@ -352,6 +356,17 @@ mod tests {
         let mapped = builder.acceleration.expect("acceleration should be mapped");
         assert_eq!(mapped.engine, CatalogAccelerationEngine::Cayenne);
         assert_eq!(mapped.refresh_mode, CatalogRefreshMode::Changes);
+        // `mode` and `params` must survive the mapping -- dropping either would
+        // silently downgrade a durable catalog acceleration to in-memory.
+        assert_eq!(
+            mapped.mode,
+            runtime_component::dataset::acceleration::Mode::File
+        );
+        assert_eq!(
+            mapped.params.get("cayenne_file_path").map(String::as_str),
+            Some("/data")
+        );
+        assert!(mapped.is_durable());
     }
 
     #[test]
@@ -359,6 +374,10 @@ mod tests {
         let acceleration = spicepod_catalog::CatalogAcceleration {
             engine: spicepod_catalog::CatalogAccelerationEngine::Cayenne,
             refresh_mode: spicepod_catalog::CatalogRefreshMode::Changes,
+            mode: spicepod::acceleration::Mode::File,
+            params: Some(spicepod::param::Params::from_string_map(
+                [("cayenne_file_path".to_string(), "/data".to_string())].into(),
+            )),
         };
         let mut catalog = spicepod_catalog(&[], &[], Some(acceleration));
         catalog.from = "mysql".to_string();

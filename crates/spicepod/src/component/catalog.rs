@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{WithDependsOn, access::AccessMode, is_default};
-use crate::{metric::Metrics, param::Params};
+use crate::{acceleration::Mode, metric::Metrics, param::Params};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -128,7 +128,7 @@ impl WithDependsOn<Catalog> for Catalog {
 /// Deliberately excludes per-table-only concepts (`primary_key`,
 /// `on_conflict`, `indexes`, per-table overrides) — those remain exclusively
 /// on a dataset's own `acceleration` block.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct CatalogAcceleration {
@@ -138,6 +138,24 @@ pub struct CatalogAcceleration {
     /// Required and explicit: there is no catalog-level default, since the
     /// only supported value today is `changes` (CDC).
     pub refresh_mode: CatalogRefreshMode,
+
+    /// Storage mode applied to every table this catalog accelerates, with the
+    /// same meaning as a dataset's `acceleration.mode`.
+    ///
+    /// Defaults to `memory`, which is **not durable**: the accelerator starts
+    /// empty on every restart and each table re-runs its initial snapshot from
+    /// the source. Use a file mode (with `params.cayenne_file_path`) to keep the
+    /// acceleration across restarts and resume from the replication slot instead
+    /// of re-snapshotting.
+    #[serde(default)]
+    pub mode: Mode,
+
+    /// Engine parameters applied to every table this catalog accelerates (e.g.
+    /// `cayenne_file_path`), with the same meaning as a dataset's
+    /// `acceleration.params`. Each table gets its own subdirectory under a
+    /// configured `cayenne_file_path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Params>,
 }
 
 /// Accelerator engine used for catalog-wide acceleration. Only `cayenne` is
@@ -195,6 +213,56 @@ mod tests {
             .expect("acceleration should be present");
         assert_eq!(acceleration.engine, CatalogAccelerationEngine::Cayenne);
         assert_eq!(acceleration.refresh_mode, CatalogRefreshMode::Changes);
+        // Back-compat: an acceleration block that names no mode is in-memory,
+        // exactly as before `mode` was accepted here.
+        assert_eq!(acceleration.mode, Mode::Memory);
+        assert_eq!(acceleration.params, None);
+    }
+
+    #[test]
+    fn test_catalog_acceleration_parses_mode_and_params() {
+        let catalog = parse(
+            "
+                from: pg
+                name: my_pg
+                acceleration:
+                  engine: cayenne
+                  refresh_mode: changes
+                  mode: file
+                  params:
+                    cayenne_file_path: /data
+            ",
+        );
+        let acceleration = catalog
+            .acceleration
+            .expect("acceleration should be present");
+        assert_eq!(acceleration.mode, Mode::File);
+        assert_eq!(
+            acceleration
+                .params
+                .expect("params should be present")
+                .as_string_map()
+                .get("cayenne_file_path")
+                .map(String::as_str),
+            Some("/data")
+        );
+    }
+
+    #[test]
+    fn test_catalog_acceleration_rejects_unknown_mode() {
+        let result = yaml::from_str::<Catalog>(
+            "
+                from: pg
+                name: my_pg
+                acceleration:
+                  refresh_mode: changes
+                  mode: on_disk
+            ",
+        );
+        assert!(
+            result.is_err(),
+            "an unrecognized mode must fail rather than silently fall back to memory"
+        );
     }
 
     #[test]

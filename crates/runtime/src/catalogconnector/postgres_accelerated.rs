@@ -30,6 +30,12 @@ limitations under the License.
 //! one replication connection and one publication instead of each opening
 //! its own — WAL is decoded once for the whole catalog, not once per table.
 //!
+//! The catalog's `acceleration.mode` and `acceleration.params` are applied
+//! uniformly to every table. The default `mode: memory` holds the acceleration
+//! only in RAM, so each table re-runs its initial snapshot on every start; a
+//! file mode (with `params.cayenne_file_path`) persists it and resumes from the
+//! shared slot instead. `new` warns when the configured mode is not durable.
+//!
 //! Each table is accelerated according to its `PostgreSQL` `REPLICA IDENTITY`
 //! (see `classify_replica_identity`): `DEFAULT` + primary key and `USING INDEX`
 //! (keyed by the nominated unique index) replicate normally; `FULL` + primary
@@ -50,6 +56,14 @@ limitations under the License.
 //! while its dataset is still bootstrapping — `AcceleratedSchemaProvider`
 //! reports it as not-yet-present rather than serving reads through the
 //! source.
+//!
+//! The synthesized datasets are registered under the default catalog but hidden
+//! from its listings (`DataFusion::hide_dataset_from_listings`): a user reaches
+//! each table as `{catalog}.{schema}.{table}`, so listing the registration names
+//! too would show every accelerated table twice, the second time under a name
+//! that isn't part of the catalog's interface. They remain resolvable by name —
+//! that is how `AcceleratedSchemaProvider` serves them — and still appear in
+//! logs, component status, and metrics.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -74,7 +88,8 @@ use globset::GlobSet;
 use parking_lot::RwLock;
 use snafu::prelude::*;
 use spicepod::acceleration::{
-    Acceleration as SpicepodAcceleration, OnConflictBehavior, RefreshMode as SpicepodRefreshMode,
+    Acceleration as SpicepodAcceleration, Mode as SpicepodMode, OnConflictBehavior,
+    RefreshMode as SpicepodRefreshMode,
 };
 use spicepod::component::dataset::Dataset as SpicepodDataset;
 use spicepod::param::Params;
@@ -116,34 +131,52 @@ fn table_is_selected(
     included && !excluded
 }
 
-/// Hex-encodes `s` so the result contains only `[0-9a-f]` -- always a valid
-/// SQL identifier word, regardless of what characters `s` itself contains.
-fn hex_encode(s: &str) -> String {
+/// Escapes one `PostgreSQL` identifier into a component of a synthesized dataset
+/// name, so the joined result is always a valid SQL identifier word and no two
+/// distinct `(catalog, schema, table)` triples can encode to the same string.
+///
+/// The encoding keeps ordinary names readable — `orders` escapes to itself — and
+/// is unambiguous because a *single* `_` never appears inside a component:
+///
+///   * `_`                          -> `__`
+///   * any other non-`[A-Za-z0-9]`  -> `_x{byte:02x}` (per UTF-8 byte)
+///   * everything else              -> verbatim
+///
+/// A lone `_` therefore only ever occurs as the separator between components,
+/// which is what rules out the `("a_b", "c")` vs. `("a", "b_c")` collision that
+/// plain concatenation admits.
+fn escape_name_component(s: &str) -> String {
     use std::fmt::Write;
     s.bytes()
-        .fold(String::with_capacity(s.len() * 2), |mut out, b| {
-            let _ = write!(out, "{b:02x}");
+        .fold(String::with_capacity(s.len()), |mut out, b| {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' => out.push(char::from(b)),
+                b'_' => out.push_str("__"),
+                other => {
+                    let _ = write!(out, "_x{other:02x}");
+                }
+            }
             out
         })
 }
 
 /// A sanitized, collision-safe internal name for the per-table dataset
-/// synthesized for `catalog_name.schema_name.table_name`. Never exposed to
-/// users directly — they query the table through the catalog's own
-/// namespace; this is only the registration key under the default catalog.
+/// synthesized for `catalog_name.schema_name.table_name`.
 ///
-/// Catalog/schema/table names discovered from `PostgreSQL` can contain any
-/// character a quoted identifier allows (e.g. `-`, spaces), which plain
-/// concatenation would carry into a name `validate_identifier` rejects. Each
-/// component is hex-encoded so the result is always a valid identifier and
-/// component boundaries can't collide (a hex-encoded segment can't itself
-/// contain the `_` separator).
+/// Users don't query this name — they reach the table through the catalog's own
+/// namespace, and `refresh` hides the dataset from `spice.data` listings — but it
+/// is not invisible either: it appears in logs, component status, metric
+/// attributes, and (under a file mode) as the table's directory beneath
+/// `cayenne_file_path`. So it is escaped rather than hex-encoded, which
+/// keeps the common case legible (`__catalog_accel_pg_cdc_public_orders`) while
+/// still tolerating any character a quoted `PostgreSQL` identifier allows (`-`,
+/// spaces, dots, non-ASCII) — see [`escape_name_component`].
 fn synthesized_dataset_name(catalog_name: &str, schema_name: &str, table_name: &str) -> String {
     format!(
         "__catalog_accel_{}_{}_{}",
-        hex_encode(catalog_name),
-        hex_encode(schema_name),
-        hex_encode(table_name)
+        escape_name_component(catalog_name),
+        escape_name_component(schema_name),
+        escape_name_component(table_name)
     )
 }
 
@@ -415,6 +448,14 @@ pub struct AcceleratedCatalogProvider {
     /// this catalog, so WAL is decoded once by one shared connection rather
     /// than once per table.
     slot_name: String,
+    /// Storage mode written onto every synthesized dataset's acceleration block
+    /// (the catalog's `acceleration.mode`). `Memory` -- the default -- is fully
+    /// in-RAM, so every table re-snapshots from the source on each restart; a
+    /// file mode persists and resumes from the shared slot instead.
+    acceleration_mode: SpicepodMode,
+    /// Accelerator params written onto every synthesized dataset's acceleration
+    /// block (the catalog's `acceleration.params`, e.g. `cayenne_file_path`).
+    acceleration_params: HashMap<String, String>,
     include: Option<Arc<GlobSet>>,
     exclude: Option<Arc<GlobSet>>,
     schemas: RwLock<HashMap<String, Arc<AcceleratedSchemaProvider>>>,
@@ -453,6 +494,30 @@ impl AcceleratedCatalogProvider {
         let mut dataset_params = catalog.params.clone();
         dataset_params.extend(catalog.dataset_params.clone());
 
+        // Absent only on a path that never accelerates (the connector builds this
+        // provider solely when `acceleration` is set); defaulting keeps `new`
+        // total rather than making callers unwrap.
+        let (acceleration_mode, acceleration_params) = catalog.acceleration.as_ref().map_or_else(
+            || (SpicepodMode::default(), HashMap::new()),
+            |acceleration| (acceleration.mode.into(), acceleration.params.clone()),
+        );
+
+        // `mode: memory` (the default) and `mode: file_create` both start empty
+        // on every boot. That is a supported configuration, not an error -- but
+        // it is easy to configure by accident and its cost is invisible until a
+        // restart, so state it once at startup rather than letting an operator
+        // discover it as apparent data loss.
+        if catalog
+            .acceleration
+            .as_ref()
+            .is_some_and(|acceleration| !acceleration.is_durable())
+        {
+            tracing::warn!(
+                "Catalog '{}': acceleration `mode: {acceleration_mode}` does not persist across restarts -- the acceleration starts empty on every start, so every accelerated table re-runs its initial snapshot from the source each time. Set `acceleration.mode: file` with `acceleration.params.cayenne_file_path` to keep the acceleration across restarts and resume from the replication slot instead. Docs: {DOCS_URL}",
+                catalog.name,
+            );
+        }
+
         Self {
             catalog_name: catalog.name.clone(),
             pool,
@@ -460,6 +525,8 @@ impl AcceleratedCatalogProvider {
             app: catalog.app(),
             dataset_params,
             slot_name,
+            acceleration_mode,
+            acceleration_params,
             include: catalog.include.clone().map(Arc::new),
             exclude: catalog.exclude.clone().map(Arc::new),
             schemas: RwLock::new(HashMap::new()),
@@ -633,6 +700,13 @@ impl AcceleratedCatalogProvider {
         spicepod_ds.acceleration = Some(SpicepodAcceleration {
             engine: Some(CAYENNE_ENGINE.to_string()),
             refresh_mode: Some(SpicepodRefreshMode::Changes),
+            // The catalog's storage mode and accelerator params apply uniformly
+            // to every table it accelerates. Under a file mode each table lands
+            // in its own directory beneath `cayenne_file_path`, named for the
+            // dataset (see `synthesized_dataset_name`).
+            mode: self.acceleration_mode.clone(),
+            params: (!self.acceleration_params.is_empty())
+                .then(|| Params::from_string_map(self.acceleration_params.clone())),
             primary_key: Some(key_ref.clone()),
             on_conflict: HashMap::from([(key_ref, OnConflictBehavior::Upsert)]),
             ..SpicepodAcceleration::default()
@@ -904,6 +978,13 @@ impl RefreshableCatalogProvider for AcceleratedCatalogProvider {
         let mut schemas = HashMap::new();
         for (schema_name, plan) in plans {
             for (table_name, dataset_name, kind, dataset) in plan.to_spawn {
+                // Hide before spawning, so the dataset is never listed in
+                // `spice.data` even briefly: users reach these tables through
+                // this catalog's own namespace, and listing them would duplicate
+                // every accelerated table under a registration name that is not
+                // part of the catalog's interface. Lookup by name is unaffected,
+                // which is how `AcceleratedSchemaProvider` still resolves them.
+                self.runtime.df.hide_dataset_from_listings(&dataset_name);
                 self.spawned.write().insert(
                     (schema_name.clone(), table_name),
                     SpawnedTable { dataset_name, kind },
@@ -1035,6 +1116,21 @@ mod tests {
         // name `validate_identifier` rejects.
         let name = synthesized_dataset_name("my-catalog", "my schema", "my-table");
         crate::component::validate_identifier(&name).expect("should be a valid identifier");
+
+        // Non-ASCII is escaped per UTF-8 byte, so it stays a valid identifier.
+        let unicode = synthesized_dataset_name("cat", "public", "ürders");
+        crate::component::validate_identifier(&unicode).expect("should be a valid identifier");
+    }
+
+    #[test]
+    fn test_synthesized_dataset_name_is_readable_for_ordinary_identifiers() {
+        // The name shows up in logs, status, metric attributes and -- under a
+        // file mode -- as the table's directory under `cayenne_file_path`, so
+        // the common all-alphanumeric case must stay legible.
+        assert_eq!(
+            synthesized_dataset_name("pg_cdc", "public", "order_items"),
+            "__catalog_accel_pg__cdc_public_order__items"
+        );
     }
 
     #[test]
@@ -1048,12 +1144,37 @@ mod tests {
 
         // A naive "join with '_'" scheme collides here: schema="a_b",
         // table="c" and schema="a", table="b_c" both naively join to
-        // "a_b_c". Hex-encoding each component before joining rules this
-        // out, since a hex-encoded segment can never contain the `_`
-        // separator itself.
+        // "a_b_c". Doubling `_` inside each component rules this out: a lone
+        // `_` then only ever appears as the separator between components.
         let shifted_left = synthesized_dataset_name("cat", "a_b", "c");
         let shifted_right = synthesized_dataset_name("cat", "a", "b_c");
         assert_ne!(shifted_left, shifted_right);
+
+        // The same shift, but with the escape sequence itself in the input --
+        // a table literally named `x61` must not collide with the escaping of
+        // some other character.
+        assert_ne!(
+            synthesized_dataset_name("cat", "public", "_x61"),
+            synthesized_dataset_name("cat", "public", "a"),
+        );
+    }
+
+    #[test]
+    fn test_escape_name_component_is_injective_over_awkward_identifiers() {
+        // Every distinct input must produce a distinct component; a collision
+        // here means two source tables share one accelerated dataset, and one
+        // silently serves the other's rows.
+        let inputs = [
+            "", "a", "A", "_", "__", "a_", "_a", "a_b", "ab", "a-b", "a b", "a.b", "a_x62", "x62",
+            "_x62", "ürders", "0", "_0",
+        ];
+        let mut seen = HashMap::new();
+        for input in inputs {
+            let escaped = escape_name_component(input);
+            if let Some(previous) = seen.insert(escaped.clone(), input) {
+                panic!("{input:?} and {previous:?} both escape to {escaped:?}");
+            }
+        }
     }
 
     fn globset(patterns: &[&str]) -> GlobSet {

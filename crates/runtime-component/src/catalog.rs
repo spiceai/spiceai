@@ -16,18 +16,36 @@ limitations under the License.
 
 use globset::GlobSet;
 use spicepod::component::catalog as spicepod_catalog;
+use spicepod::param::Params;
 use std::collections::HashMap;
 
 use crate::access::AccessMode;
+use crate::dataset::acceleration::Mode;
 use crate::find_first_delimiter;
 
 /// Acceleration configuration for an entire catalog. See
 /// [`spicepod_catalog::CatalogAcceleration`] for the user-facing schema this
 /// mirrors.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CatalogAcceleration {
     pub engine: CatalogAccelerationEngine,
     pub refresh_mode: CatalogRefreshMode,
+    /// Storage mode applied to every table the catalog accelerates. `Memory`
+    /// (the default) is not durable across restarts.
+    pub mode: Mode,
+    /// Engine parameters applied to every table the catalog accelerates.
+    pub params: HashMap<String, String>,
+}
+
+impl CatalogAcceleration {
+    /// Whether the acceleration this catalog applies to its tables survives a
+    /// process restart. `Memory` is fully in-RAM and `FileCreate` truncates on
+    /// startup, so both start empty every boot -- each table then re-runs its
+    /// initial snapshot instead of resuming from the replication slot.
+    #[must_use]
+    pub fn is_durable(&self) -> bool {
+        matches!(self.mode, Mode::File | Mode::FileUpdate)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -64,6 +82,12 @@ impl From<spicepod_catalog::CatalogAcceleration> for CatalogAcceleration {
         CatalogAcceleration {
             engine: acceleration.engine.into(),
             refresh_mode: acceleration.refresh_mode.into(),
+            mode: acceleration.mode.into(),
+            params: acceleration
+                .params
+                .as_ref()
+                .map(Params::as_string_map)
+                .unwrap_or_default(),
         }
     }
 }

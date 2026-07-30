@@ -164,6 +164,7 @@ pub mod tool_udf;
 pub mod udf;
 pub mod udtf;
 
+pub use runtime_datafusion::schema_provider::SpiceSchemaProvider;
 pub use runtime_datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 
 pub const SPICE_RUNTIME_SCHEMA: &str = "runtime";
@@ -1013,6 +1014,35 @@ impl DataFusion {
 
     pub fn accelerator_engine_registry(&self) -> Arc<AcceleratorEngineRegistry> {
         Arc::clone(&self.accelerator_engine_registry)
+    }
+
+    /// Omit `dataset_name` from listings of the default schema (`SHOW TABLES`,
+    /// `information_schema`, [`Self::get_user_table_names`], …) while leaving it
+    /// resolvable by name.
+    ///
+    /// For datasets the runtime synthesizes on a user's behalf and addresses only
+    /// internally — see [`SpiceSchemaProvider::hide_table`]. Safe to call before
+    /// the dataset is registered, which is how callers avoid a window where it is
+    /// briefly listed.
+    ///
+    /// A no-op (logged) if the default schema is not a [`SpiceSchemaProvider`];
+    /// failing to hide a table must not fail the component registering it.
+    pub fn hide_dataset_from_listings(&self, dataset_name: &str) {
+        let hidden = self
+            .schema(SPICE_DEFAULT_SCHEMA)
+            .and_then(|schema| {
+                // `Any` is a supertrait of `SchemaProvider`, so this downcasts
+                // the trait object directly (see `sync_table`).
+                schema
+                    .downcast_ref::<SpiceSchemaProvider>()
+                    .map(|provider| provider.hide_table(dataset_name.to_string()))
+            })
+            .is_some();
+        if !hidden {
+            tracing::debug!(
+                "could not hide internal dataset '{dataset_name}' from table listings: the default schema is not a SpiceSchemaProvider"
+            );
+        }
     }
 
     /// The query-admission semaphore when `runtime.query.max_concurrent_queries`
