@@ -987,9 +987,8 @@ fn build_http_client(config: &HashicorpVaultConfig) -> Result<Client> {
         let pem = std::fs::read(ca_path).context(UnableToReadCaCertSnafu {
             path: path_display.clone(),
         })?;
-        let cert = reqwest::tls::Certificate::from_pem(&pem).context(InvalidCaCertSnafu {
-            path: path_display,
-        })?;
+        let cert = reqwest::tls::Certificate::from_pem(&pem)
+            .context(InvalidCaCertSnafu { path: path_display })?;
         builder = builder.add_root_certificate(cert);
     }
     builder.build().context(ClientBuildSnafu)
