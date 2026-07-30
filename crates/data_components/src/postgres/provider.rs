@@ -64,8 +64,9 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub use connector_postgres_common::{
     ReplicaIdentityOutcome, ReplicationSlotStatus, SkipReason, ViewRelation,
-    check_cdc_prerequisites, classify_replica_identity, list_schemas, list_tables, list_views,
-    primary_key_columns, replica_identity, replication_slot_status, wal_sender_timeout_ms,
+    check_cdc_prerequisites, classify_replica_identity, ensure_replication_slot_capacity,
+    list_schemas, list_tables, list_views, primary_key_columns, replica_identity,
+    replication_slot_status, wal_sender_timeout_ms,
 };
 
 /// A single foreign key constraint discovered from `information_schema`.
