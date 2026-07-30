@@ -59,8 +59,9 @@ use app::App;
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
 use data_components::postgres::provider::{
-    ReplicaIdentityOutcome, check_cdc_prerequisites, classify_replica_identity, list_schemas,
-    list_tables, list_views, replica_identity, replication_slot_status, wal_sender_timeout_ms,
+    ReplicaIdentityOutcome, check_cdc_prerequisites, classify_replica_identity,
+    ensure_replication_slot_capacity, list_schemas, list_tables, list_views, replica_identity,
+    replication_slot_status, wal_sender_timeout_ms,
 };
 use data_components::postgres_replication::config::catalog_slot_name;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
@@ -388,9 +389,13 @@ const SLOT_RELEASE_GRACE: Duration = Duration::from_secs(5);
 /// Fallback wait budget when `wal_sender_timeout` is `0` (disabled), since then
 /// the server won't time out a dropped consumer on its own.
 const SLOT_WAIT_BUDGET_WHEN_TIMEOUT_DISABLED: Duration = Duration::from_secs(90);
-/// Upper bound on the slot-availability wait so a very large `wal_sender_timeout`
-/// can't hang catalog startup indefinitely.
-const SLOT_WAIT_BUDGET_CAP: Duration = Duration::from_mins(3);
+/// Absolute safety ceiling on the slot-availability wait. The wait is normally
+/// the server's `wal_sender_timeout` (+ [`SLOT_RELEASE_GRACE`]) so we wait
+/// exactly as long as `PostgreSQL` takes to release a dead consumer's slot; this
+/// only bounds a pathologically large (or misconfigured) `wal_sender_timeout` so
+/// catalog startup can't hang for an unreasonable time. The default 60s
+/// `wal_sender_timeout` is far under this.
+const SLOT_WAIT_BUDGET_CAP: Duration = Duration::from_mins(10);
 /// How often to re-poll the slot's activity while waiting for it to free.
 const SLOT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -470,9 +475,11 @@ impl AcceleratedCatalogProvider {
     /// same catalog resolves to the *same* slot -- and `PostgreSQL` permits only
     /// one consumer per slot. So:
     ///
-    ///   - slot absent -> return; the per-table replication path creates it;
+    ///   - slot absent -> a new slot will be created, so first check the server
+    ///     has capacity ([`ensure_replication_slot_capacity`]) and fail loudly if
+    ///     `max_replication_slots` is exhausted; otherwise return;
     ///   - slot present but inactive -> return; it is reused (a restart/reschedule
-    ///     resumes from its `restart_lsn`, no re-snapshot);
+    ///     resumes from its `restart_lsn`, no re-snapshot), so no capacity is used;
     ///   - slot present and active -> another consumer holds it. But a fast
     ///     self-restart after an ungraceful exit can *also* see the slot active
     ///     (the server keeps the dead consumer's slot active until
@@ -486,10 +493,15 @@ impl AcceleratedCatalogProvider {
     async fn ensure_catalog_slot_available(
         &self,
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Size the wait from the server's wal_sender_timeout: that is how long it
-        // keeps a crashed consumer's slot marked active, so waiting that long
-        // (plus a grace) lets a self-restart reclaim its own slot before we treat
-        // it as taken. `0` disables the timeout, so fall back to a fixed window.
+        // Size the wait from the server's wal_sender_timeout: that is how long
+        // PostgreSQL keeps a crashed consumer's slot marked active before its
+        // walsender exits and the slot is released. Wait exactly that long (plus
+        // a small grace for the server to actually clear the flag) so a legitimate
+        // hand-off -- a fast self-restart, or a rolling deploy whose predecessor
+        // is still shutting down -- reclaims the slot before we treat it as taken
+        // by a live consumer. `0` disables the timeout, so fall back to a fixed
+        // window; [`SLOT_WAIT_BUDGET_CAP`] only bounds a pathologically large
+        // value so startup can't hang.
         let timeout_ms = wal_sender_timeout_ms(&self.pool)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
@@ -499,6 +511,19 @@ impl AcceleratedCatalogProvider {
                 .min(SLOT_WAIT_BUDGET_CAP)
         } else {
             SLOT_WAIT_BUDGET_WHEN_TIMEOUT_DISABLED
+        };
+        // Human-readable derivation of `budget`, for the wait log.
+        let wait_basis = if timeout_ms > 0 {
+            format!(
+                "wal_sender_timeout {}s + {}s grace",
+                timeout_ms / 1000,
+                SLOT_RELEASE_GRACE.as_secs(),
+            )
+        } else {
+            format!(
+                "wal_sender_timeout disabled, {}s fallback",
+                SLOT_WAIT_BUDGET_WHEN_TIMEOUT_DISABLED.as_secs(),
+            )
         };
 
         let start = tokio::time::Instant::now();
@@ -513,15 +538,24 @@ impl AcceleratedCatalogProvider {
                 .await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
             match status {
-                // Absent (will be created) or present-but-inactive (safe to reuse).
-                None => return Ok(()),
+                // Absent: a new slot will be created for this catalog, so verify
+                // the server has capacity now -- an exhausted `max_replication_slots`
+                // otherwise fails later, deep in replication setup, with a cryptic
+                // error instead of an actionable one at startup.
+                None => {
+                    ensure_replication_slot_capacity(&self.pool)
+                        .await
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                    return Ok(());
+                }
+                // Present but inactive: reused, not created -- no capacity consumed.
                 Some(status) if !status.active => return Ok(()),
                 Some(status) => {
+                    let active_consumer = status.active_pid.map_or_else(
+                        || "an unknown backend".to_string(),
+                        |pid| format!("PID {pid}"),
+                    );
                     if tokio::time::Instant::now() >= deadline {
-                        let active_consumer = status.active_pid.map_or_else(
-                            || "an unknown backend".to_string(),
-                            |pid| format!("PID {pid}"),
-                        );
                         return Err(Box::new(SlotInUseError {
                             catalog: self.catalog_name.clone(),
                             slot_name: self.slot_name.clone(),
@@ -531,17 +565,20 @@ impl AcceleratedCatalogProvider {
                     }
                     if warned {
                         tracing::debug!(
-                            "Catalog '{}': replication slot '{}' still active; continuing to wait (up to {}s total).",
+                            "Catalog '{}': replication slot '{}' still in use by {}; continuing to wait (up to {}s total).",
                             self.catalog_name,
                             self.slot_name,
+                            active_consumer,
                             budget.as_secs(),
                         );
                     } else {
                         tracing::warn!(
-                            "Catalog '{}': replication slot '{}' is currently active; waiting up to {}s for it to free (a previous instance may still be shutting down) before failing.",
+                            "Catalog '{}': replication slot '{}' is currently in use by {} -- a previous instance may still be shutting down. Waiting up to {}s ({}) for the slot to be released before failing.",
                             self.catalog_name,
                             self.slot_name,
+                            active_consumer,
                             budget.as_secs(),
+                            wait_basis,
                         );
                         warned = true;
                     }

@@ -887,7 +887,7 @@ async fn handle_executor_message(
             handle_partitions_loaded(executor_id, loaded, datafusion).await;
         }
         ExecutorMessage::ExecutorStatistics(stats_msg) => {
-            handle_executor_statistics(executor_id, stats_msg, datafusion);
+            handle_executor_statistics(executor_id, stats_msg, datafusion).await;
         }
         ExecutorMessage::Shutdown(shutdown) => {
             let reason = if shutdown.reason.is_empty() {
@@ -942,8 +942,11 @@ async fn notify_scheduler_executor_shutdown(
 
 /// Records a per-table [`ExecutorStatistics`] report into the scheduler's
 /// in-memory `ExecutorRegistry`, where it's read at query-planning time to size
-/// the coordinator's per-executor federated scans. Decoupled from readiness.
-fn handle_executor_statistics(
+/// the coordinator's per-executor federated scans. Also re-evaluates the
+/// table's readiness: `evaluate_table_readiness` gates `Ready` on the first
+/// stats report, so a table whose partitions loaded before its stats arrived
+/// flips to `Ready` here rather than waiting for the next periodic sweep.
+async fn handle_executor_statistics(
     executor_id: &str,
     msg: &runtime_proto::ExecutorStatistics,
     datafusion: &DataFusion,
@@ -955,15 +958,37 @@ fn handle_executor_statistics(
         Arc::<str>::clone(&resolved.schema),
         Arc::<str>::clone(&resolved.table),
     );
-    let stats = runtime_cluster::decode_statistics(&msg.statistics);
-    if let (Some(stats), Some(registry)) = (stats, datafusion.executor_registry()) {
-        registry.record_executor_statistics(
-            table,
-            executor_id.to_string(),
-            stats,
-            msg.column_names.clone(),
+    let Some(registry) = datafusion.executor_registry() else {
+        return;
+    };
+
+    // A malformed or forward-incompatible payload decodes to `None`. Record an
+    // explicit unknown-statistics entry rather than dropping the report: since
+    // `evaluate_table_readiness` gates `Ready` on `has_statistics_for`,
+    // silently dropping it would leave the table stuck out of `Ready` forever
+    // (and could hang /v1/ready) with no signal. Recording unknown stats still
+    // lets the coordinator observe that this executor reported for the table;
+    // the planner then treats its slice as unknown-cardinality — the same as a
+    // deliberate unknown report from the executor.
+    let (statistics, column_names) = if let Some(statistics) =
+        runtime_cluster::decode_statistics(&msg.statistics)
+    {
+        (statistics, msg.column_names.clone())
+    } else {
+        tracing::warn!(
+            table = %table,
+            executor = %executor_id,
+            "Failed to decode executor statistics report ({} bytes); recording unknown statistics so the table can still become Ready",
+            msg.statistics.len()
         );
-    }
+        (
+            datafusion::common::Statistics::new_unknown(&arrow::datatypes::Schema::empty()),
+            Vec::new(),
+        )
+    };
+
+    registry.record_executor_statistics(&table, executor_id.to_string(), statistics, column_names);
+    evaluate_table_readiness(datafusion, &table).await;
 }
 
 /// Records a `PartitionsLoaded` ack from an executor and, if all assigned
@@ -1109,6 +1134,24 @@ pub(crate) async fn evaluate_table_readiness(datafusion: &DataFusion, table: &Ta
     };
 
     if tracker.is_table_loaded(table, &metadata, datafusion).await {
+        // Gate readiness on having received at least one executor statistics
+        // report for this table. Distributed query plans need the reported
+        // row-count statistics to size joins (so DataFusion's cost-based swap
+        // builds the small side of a hash join rather than the large one); a
+        // table marked `Ready` before stats arrive can plan a query that
+        // exhausts the memory pool. The executor always reports per served
+        // table (unknown stats when unavailable — see
+        // `local_executor_table_statistics`), so a loaded table can't hang
+        // here. Only gates distributed mode: single-node has no registry.
+        if let Some(registry) = datafusion.executor_registry()
+            && !registry.has_statistics_for(table)
+        {
+            tracing::debug!(
+                table = %table,
+                "All assigned partitions loaded but awaiting first executor statistics report before marking Ready"
+            );
+            return;
+        }
         tracing::info!(
             table = %table,
             "All assigned partitions loaded; marking dataset Ready"

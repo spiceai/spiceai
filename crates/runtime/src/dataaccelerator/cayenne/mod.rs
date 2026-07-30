@@ -61,7 +61,6 @@ use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, Refres
 use crate::dataaccelerator::cayenne::s3::{S3_PARAMETERS, S3_PARAMS_LEN};
 use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed};
 use crate::parameters::ParameterSpec;
-use crate::register_data_accelerator;
 use crate::spice_data_base_path;
 use runtime_acceleration::snapshot::{AccelerationEngine, AccelerationLayout};
 use runtime_datafusion_index::{Index, IndexedTableProvider};
@@ -3948,7 +3947,7 @@ fn encode_identifier_hex(value: &str) -> String {
     encoded
 }
 
-register_data_accelerator!(Engine::Cayenne, CayenneAccelerator);
+data_accelerator_api::register_data_accelerator!(Engine::Cayenne, CayenneAccelerator);
 
 /// Normalize a raw `cayenne_tuning` value: trim + lowercase, mapping `auto`/`adaptive`
 /// through unchanged and any *other* value to `Some("auto")` (the documented default).

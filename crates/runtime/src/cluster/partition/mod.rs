@@ -153,7 +153,10 @@ pub fn get_partition_filter_exprs(
 /// assignments — see `init::dataset`), so this goes through the generic table
 /// provider rather than a `PartitionTableProvider`.
 ///
-/// Best-effort: returns `None` when no statistics are available.
+/// Returns `None` only when the table has no local provider; when the provider
+/// exists but no aggregate/footer statistics are available yet, returns
+/// *unknown* statistics (`num_rows` `Absent`) so the executor still emits a
+/// per-table report to the coordinator.
 ///
 /// [`Statistics`]: datafusion::common::Statistics
 pub(crate) async fn local_executor_table_statistics(
@@ -194,8 +197,17 @@ pub(crate) async fn local_executor_table_statistics(
         return Some(((*stats).clone(), column_names));
     }
 
-    tracing::debug!(table = %table, "No local statistics available for executor table");
-    None
+    // Provider exists but no usable aggregate/footer stats yet. Report *unknown*
+    // stats rather than nothing so the coordinator still receives a per-table
+    // report: this lets it gate query-readiness on "heard from the executor"
+    // (see `ExecutorRegistry::has_statistics_for`) without a table that can't
+    // produce stats hanging `/v1/ready` forever. The coordinator logs a warning
+    // when the reported stats are unusable for join sizing.
+    tracing::debug!(table = %table, "No local statistics available for executor table; reporting unknown stats");
+    Some((
+        datafusion::common::Statistics::new_unknown(&schema),
+        column_names,
+    ))
 }
 
 /// Rewrite each integer column's reported max to the effective max
