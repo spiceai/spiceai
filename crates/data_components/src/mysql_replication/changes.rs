@@ -35,7 +35,7 @@ limitations under the License.
 use arrow::datatypes::SchemaRef;
 use mysql_async::binlog::events::{RowsEventData, TableMapEvent};
 
-use super::binlog::buffer_rows_event;
+use super::binlog::{TableMapRowDecoder, buffer_rows_event, buffer_rows_event_fast};
 use super::metrics::MetricsCollector;
 use super::rows::{TransactionBuffer, build_change_batch};
 use super::setup::TableLayout;
@@ -73,16 +73,61 @@ pub(super) fn decode_events_to_batch(
     metrics: &MetricsCollector,
 ) -> super::Result<ChangeBatch> {
     let mut buffer = TransactionBuffer::new();
+    // Prefer the prepared value-only decoder (per-`TableMapEvent` cached column
+    // schema); fall back to the `mysql_common` walk when it cannot be built for
+    // this table map. Both paths record per-row op metrics as they decode.
+    let decoder = match TableMapRowDecoder::try_new(tme) {
+        Ok(decoder) => Some(decoder),
+        Err(e) => {
+            warn_decoder_fallback_once(tme, &e);
+            None
+        }
+    };
     for event in events {
-        buffer_rows_event(
-            event,
-            tme,
-            &layout.layout,
-            &layout.pk_source_indexes,
-            &mut buffer,
-            metrics,
-        )?;
+        match &decoder {
+            Some(decoder) => buffer_rows_event_fast(
+                event,
+                decoder,
+                &layout.layout,
+                &layout.pk_source_indexes,
+                &mut buffer,
+                metrics,
+            ),
+            None => buffer_rows_event(
+                event,
+                tme,
+                &layout.layout,
+                &layout.pk_source_indexes,
+                &mut buffer,
+                metrics,
+            ),
+        }?;
     }
     build_change_batch(schema, primary_keys, &layout.column_map, &buffer.changes)
         .map(|b| b.with_source_commit_ts_ms(source_commit_ts_ms))
+}
+
+/// Warn — once per (database, table) for the process lifetime — that the
+/// prepared row decoder cannot be built and every transaction on this table
+/// is decoding through the ~7× slower `mysql_common` walk. Decode runs per
+/// committed transaction, so warning unconditionally would repeat this
+/// hundreds of times per second on a busy table; a sustained fallback is a
+/// per-table condition (its table map doesn't change between commits), so one
+/// line carries all the signal.
+fn warn_decoder_fallback_once(tme: &TableMapEvent<'_>, error: &super::Error) {
+    static WARNED: std::sync::LazyLock<
+        parking_lot::Mutex<std::collections::HashSet<(String, String)>>,
+    > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
+    let key = (
+        tme.database_name().to_string(),
+        tme.table_name().to_string(),
+    );
+    if WARNED.lock().insert(key) {
+        tracing::warn!(
+            database = %tme.database_name(),
+            table = %tme.table_name(),
+            error = %error,
+            "prepared row decoder unavailable for this table; MySQL CDC changes keep applying correctly through the slower mysql_common row walk (logged once per table)"
+        );
+    }
 }

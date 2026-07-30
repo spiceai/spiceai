@@ -819,7 +819,10 @@ impl TableProvider for EmbeddingTable {
         embedding_fields.retain(|f| !base_field_names.contains(f.name()));
         base_fields.append(&mut embedding_fields);
 
-        let mut schema = Schema::new(base_fields);
+        // Carry the base table's schema-level metadata. Spicepod table metadata is
+        // enriched onto the base table (see `table_provider_with_spicepod_metadata`),
+        // so rebuilding with an empty metadata map would drop it.
+        let mut schema = Schema::new_with_metadata(base_fields, base_schema.metadata().clone());
 
         schema::set_computed_columns_meta(&mut schema, &computed_columns_meta);
 

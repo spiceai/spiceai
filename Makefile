@@ -95,9 +95,16 @@ else
     NEXTEST_CARGO_PROFILE := --cargo-profile dev
 endif
 
+# `libnfs` binds a system library, and on a modern glibc its generated bindings
+# carry a layout assertion for a type the headers only forward-declare, so the
+# crate fails to compile at all (spiceai/spiceai#12130). `lint-rust` already
+# excludes it via `_LINT_WORKSPACE_FLAGS`; excluding it here too keeps both halves
+# of the gate agreeing on which crates need system libraries, so a sign-off on
+# such a host fails only for reasons in the branch under test. The crate has no
+# unit tests of its own.
 .PHONY: nextest
 nextest:
-	@cargo nextest run --all --lib $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
+	@cargo nextest run --all --exclude libnfs --lib $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
 	@cargo nextest run -p cayenne --tests $(NEXTEST_CARGO_PROFILE)
 
 # Unit tests for named packages — the fail-fast pre-check scripts/signoff runs on
@@ -180,6 +187,8 @@ lint-rust:
 	cargo fmt $(_FMT_FLAGS) -- --check
 	## Crate-layering guard (fast, no compile): no crate may depend on a higher tier. See docs/dev/crate_layering.md
 	python3 scripts/check_crate_layers.py
+	## Rust-gate path-list guard (fast, no compile): the sign-off, Attestation, and merge-queue path lists must agree. See docs/dev/ci_signoff.md
+	python3 scripts/check_rust_gate_paths.py
 	## All except metal, cuda, nfs (nfs requires system libnfs library)
 	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going $(_LINT_TARGET_FLAGS) $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
 		-Dwarnings \

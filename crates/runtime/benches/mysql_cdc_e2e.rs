@@ -21,9 +21,9 @@ limitations under the License.
 //! decode + coalesce + upsert validate + mem-tier write, everything
 //! downstream of the network.
 //!
-//! Fixture: set `CHBENCH_BINLOG` to a binlog file captured from a CH-benCH
+//! Fixture: set `MYSQL_BINLOG_REPLAY_FILE` to a binlog file captured from a CH-benCH
 //! `MySQL` source (the `chbench.order_line` table must appear in it). The arm
-//! replays the first `CHBENCH_BINLOG_BENCH_BYTES` (default 64 MiB) and reports
+//! replays the first `MYSQL_BINLOG_REPLAY_BENCH_BYTES` (default 64 MiB) and reports
 //! bytes/second of binlog processed — the end-to-end yardstick for CDC
 //! throughput work (see `docs/mysql-cdc-sf1000-root-cause.md` in
 //! `tools/chbench-driver`).
@@ -196,15 +196,15 @@ fn replay_envelopes(binlog: &[u8], cap: usize) -> Vec<ChangeEnvelope> {
 }
 
 fn main() {
-    let Some(path) = std::env::var_os("CHBENCH_BINLOG") else {
+    let Some(path) = std::env::var_os("MYSQL_BINLOG_REPLAY_FILE") else {
         eprintln!(
-            "mysql_cdc_e2e: set CHBENCH_BINLOG to a captured CH-benCH binlog file \
+            "mysql_cdc_e2e: set MYSQL_BINLOG_REPLAY_FILE to a captured CH-benCH binlog file \
              (see docs in tools/chbench-driver); skipping"
         );
         return;
     };
     let binlog = std::fs::read(&path).expect("read binlog file");
-    let cap: usize = std::env::var("CHBENCH_BINLOG_BENCH_BYTES")
+    let cap: usize = std::env::var("MYSQL_BINLOG_REPLAY_BENCH_BYTES")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_BENCH_BYTES)

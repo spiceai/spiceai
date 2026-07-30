@@ -17,7 +17,7 @@ expression: formatted
 | VAL_NVARCHAR2          | Utf8                 | YES         |
 | VAL_CLOB               | LargeUtf8            | YES         |
 | VAL_NCLOB              | LargeUtf8            | YES         |
-| VAL_DATE               | Date32               | YES         |
+| VAL_DATE               | Timestamp(s)         | YES         |
 | VAL_TIMESTAMP          | Timestamp(ns)        | YES         |
 | VAL_TIMESTAMP_TZ       | Timestamp(ns, "UTC") | YES         |
 | VAL_TIMESTAMP_LOCAL_TZ | Timestamp(s, "UTC")  | YES         |

@@ -61,10 +61,13 @@ iceberg-datafusion.workspace = true
 indexmap.workspace = true
 logos.workspace = true
 mysql_async = { workspace = true, optional = true }
-# Binlog-file replay (mysql_replication::replay): the file-image reader
-# (EventStreamReader) is not re-exported by mysql_async. Version matches the
-# mysql_async pin so this adds no extra compilation unit.
+# Value-only row-image parsing (mysql_replication::binlog::TableMapRowDecoder)
+# needs `ParseBuf`, and binlog-file replay (mysql_replication::replay) needs the
+# file-image reader (EventStreamReader); neither is re-exported by mysql_async.
+# The version matches the mysql_async pin so this adds no extra compilation unit.
 mysql_common = { version = "0.35.5", default-features = false, features = ["binlog"], optional = true }
+# Included-column bitmaps in mysql_common's rows-event API are bitvec slices.
+bitvec = { version = "1", optional = true }
 num_cpus = "1.16"
 object_store = { workspace = true }
 opendal.workspace = true
@@ -158,6 +161,7 @@ mssql-kerberos-unix = ["tiberius?/integrated-auth-gssapi"]
 mysql = [
     "dep:mysql_async",
     "dep:mysql_common",
+    "dep:bitvec",
     "datafusion-table-providers/mysql",
     "datafusion-table-providers/mysql-federation",
 ]
@@ -237,6 +241,11 @@ required-features = ["bench", "kafka"]
 harness = false
 name = "pgoutput_decode"
 required-features = ["postgres"]
+
+[[bench]]
+harness = false
+name = "mysql_binlog_replay"
+required-features = ["mysql"]
 
 [lints]
 workspace = true

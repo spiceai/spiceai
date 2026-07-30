@@ -69,6 +69,11 @@ impl DuckDbBlobCheckpointStore {
         table: &str,
         data: &str,
     ) -> Result<(), BoxedError> {
+        let write_gate = pool.write_gate();
+        let _write_guard = write_gate
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let mut db_conn = Arc::clone(pool).connect_sync()?;
         let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)?
             .get_underlying_conn_mut();
@@ -91,6 +96,13 @@ impl DuckDbBlobCheckpointStore {
         dataset_name: &str,
         table: &str,
     ) -> Result<Option<BlobCheckpoint>, BoxedError> {
+        // This read path creates the sidecar table below, so it is a writer to
+        // the shared acceleration file and takes the pool's write gate.
+        let write_gate = pool.write_gate();
+        let _write_guard = write_gate
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let mut db_conn = Arc::clone(pool).connect_sync()?;
         let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)?
             .get_underlying_conn_mut();
