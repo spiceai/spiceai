@@ -194,7 +194,12 @@ async fn run_staleness_probe(
         }
     }
 
-    Ok(build_report(samples, &discarded, probe_table_names, max_reasonable_gap))
+    Ok(build_report(
+        samples,
+        &discarded,
+        probe_table_names,
+        max_reasonable_gap,
+    ))
 }
 
 /// Query `MAX(_bench_ts)` from Spice via Flight SQL, returning microseconds since epoch.
@@ -394,6 +399,9 @@ mod tests {
         let stock = &r.tables["stock"];
         assert_eq!(stock.samples, 2);
         assert_eq!(stock.discarded, 3);
-        assert!(stock.p99 < cap, "measured p99 must not be replaced by the cap");
+        assert!(
+            stock.p99 < cap,
+            "measured p99 must not be replaced by the cap"
+        );
     }
 }
