@@ -56,9 +56,9 @@ make signoff          # targeted crate lint + tests → full lint + unit tests, 
 ```
 
 `make signoff` first diffs the branch against `trunk`. If that diff has no
-Rust-affecting files (`.rs`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain*`,
-`.cargo/*`), Rust lint/build/unit tests are skipped and the sign-off status is
-still posted (docs/YAML/script-only changes — and for a branch in this
+Rust-affecting files ([the list below](#branches-with-no-rust-changes-are-fast-tracked)),
+Rust lint/build/unit tests are skipped and the sign-off status is
+still posted (docs/YAML-only changes — and for a branch in this
 repository **Attestation** fast-tracks the PR anyway, so you don't need to run
 this at all; the fast-track is same-repo only, so a docs-only PR from a fork
 still needs a maintainer sign-off). Otherwise it maps changed files to workspace
@@ -139,17 +139,38 @@ requiring a sign-off.
 
 ### Branches with no Rust changes are fast-tracked
 
-A pull request whose diff contains no `.rs`, `Cargo.toml`/`Cargo.lock`,
-`rust-toolchain*`, or `.cargo/` paths passes **Attestation** automatically. Those
-are exactly the branches `make signoff` skips every Rust check for, so requiring
-it would attest a run that did no work. Docs, workflow YAML, spicepods, and
-scripts all land here. Renames are checked on both sides, so moving a `.rs` file
-to a non-Rust path still requires a sign-off, and a diff at GitHub's 3000-file
-listing cap is treated as unknown rather than assumed clean. Same-repo only, like
-the other fast-tracks.
+A pull request whose diff contains no Rust-affecting path passes **Attestation**
+automatically. Those are exactly the branches `make signoff` skips every Rust
+check for, so requiring it would attest a run that did no work. Docs, workflow
+YAML, and spicepods land here. Renames are checked on both sides, so moving a
+`.rs` file to a non-Rust path still requires a sign-off, and a diff at GitHub's
+3000-file listing cap is treated as unknown rather than assumed clean. Same-repo
+only, like the other fast-tracks.
+
+Rust-affecting means Rust sources, the Cargo/toolchain config, **and the config
+files the gate itself reads**:
+
+- `*.rs`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain[.toml]`, `.cargo/`
+- `.ci/clippy.toml` (the config `make lint-rust` uses via `CLIPPY_CONF_DIR`) and
+  the root `clippy.toml`; `[.]rustfmt.toml`
+- `.config/nextest.toml` — retries, slow-test timeouts, test groups
+- `layers.toml`, `scripts/check_crate_layers.py`, and
+  `scripts/check_rust_gate_paths.py` — the no-compile guards it runs
+- the root `Makefile` — it holds every `-Dclippy::…` flag the gate enforces
 
 The merge queue still runs the full suite on the merged result — its
 `check_changes` gate applies the same reasoning there.
+
+Three lists encode that set: `RUST_AFFECTING_PATH_PATTERN` in `scripts/signoff`,
+`rustAffecting` in `.github/workflows/pr.yml` (which must classify the same
+paths), and the `code_changes` filter in `.github/actions/check-code-changes`
+(a deliberate superset — it is the shared "did any code change" default, so it
+also gates integration and E2E, and it only has to *cover* the set). A path
+missing from all three lands on trunk having never been linted, built, or
+tested, so `make lint-rust` runs `scripts/check_rust_gate_paths.py`. It derives
+what must be gated from what the `lint-rust` recipe reads and from the tracked
+config-file names, rather than from a list someone has to remember, and fails
+when the three drift. Change them together.
 
 ### Dependabot bumps are fast-tracked
 
@@ -190,28 +211,22 @@ scripts/signoff status        # does HEAD have its own sign-off?
 scripts/signoff --help        # full usage
 ```
 
-### Remote sign-off (lab SSH host or self-hosted runner)
+### Remote sign-off (self-hosted runner)
 
-When you can't (or don't want to) run the checks on your machine:
+When you can't (or don't want to) run the checks on your machine, dispatch the
+**Remote Sign-off** GitHub Actions workflow on a self-hosted runner:
 
 ```bash
 make signoff-remote                 # current branch
-```
-
-`make signoff-remote` first probes lab hosts over SSH (`192.168.1.100`,
-`192.168.1.101` by default; override with `SIGNOFF_SSH_HOSTS`). The first host
-that answers and has a Git checkout at `$HOME/dev/spice2` is used: it fetches
-your pushed branch into that clone and runs `scripts/signoff -f` there (same
-checks and Rust-skip behavior as local). Override the remote path with an
-absolute path only: `SIGNOFF_SSH_REPO=/absolute/path` (`~` is not expanded).
-
-If no SSH host is usable, it falls back to dispatching the **Remote Sign-off**
-GitHub Actions workflow on a self-hosted runner:
-
-```bash
+# equivalent to:
 gh workflow run signoff.yml -f branch=<your-branch>
 gh run watch --workflow signoff.yml
 ```
+
+Sign-off runs only where it is accountable: your machine, or the Actions
+runner. It deliberately never SSHes into ad-hoc hosts — the LAN lab boxes
+double as benchmark machines, and a workspace build there mid-run silently
+corrupts the measurement.
 
 The Actions workflow:
 
@@ -273,7 +288,7 @@ merge queue is still the real gate.
 | Stage | Trigger | Checks |
 | --- | --- | --- |
 | Local | `make signoff` | skip Rust if no Rust-affecting files in the branch diff; else targeted `make lint-rust PACKAGES=… FEATURES=…` + `make nextest-packages PACKAGES=… FEATURES=…` (features from the workspace resolve), full `make lint-rust`, `make build-cli-dev nextest` |
-| Remote | `make signoff-remote` | same checks via lab SSH (`$HOME/dev/spice2` on 192.168.1.100/101) if reachable, else self-hosted `signoff.yml`; posts `signoff` |
+| Remote | `make signoff-remote` | same checks via the self-hosted `signoff.yml` workflow; posts `signoff` |
 | Pull request | `pull_request` | **Attestation** (validates the sign-off, or auto-passes a branch with no Rust-affecting files, a pure revert, or a single-commit Dependabot bump) + PR hygiene; merge-queue check names report lightweight skipped/passthrough results |
 | Merge queue | `merge_group` | the full required suite (below) + advisory niche checks |
 

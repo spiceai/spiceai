@@ -15,9 +15,8 @@
 #   4. CLI build + unit tests (make build-cli-dev nextest)
 #   5. Post signoff status + re-run Attestation if needed
 #
-# Prefer lab SSH when available (make signoff-remote probes 192.168.1.100/101
-# for a Git $HOME/dev/spice2 first). This workflow is the fallback when no SSH
-# host works:
+# This workflow is the only remote sign-off path (never SSH to ad-hoc hosts —
+# the LAN lab boxes double as benchmark machines):
 #   make signoff-remote
 #   gh workflow run signoff.yml -f branch=<your-branch>
 #   gh workflow run signoff.yml -f branch=<your-branch> -f skip_targeted_lint=true
