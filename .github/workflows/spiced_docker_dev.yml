@@ -155,9 +155,11 @@ jobs:
 
       - name: Set cargo features
         id: set_cargo_features
+        env:
+          VARIANT: ${{ inputs.variant }}
+          ADDITIONAL_FEATURES: ${{ inputs.additional_features }}
         run: |
-          variant="${{ inputs.variant }}"
-          if [ "$variant" = "models" ]; then
+          if [ "$VARIANT" = "models" ]; then
             features="release,models,spicebench"
           else
             features="release,spicebench"
@@ -165,10 +167,16 @@ jobs:
 
           # Append optional extras (comma-separated). Trim whitespace and
           # collapse empty segments so "postgres, duckdb," → "postgres,duckdb".
-          additional="${{ inputs.additional_features }}"
-          if [ -n "$additional" ]; then
-            cleaned=$(printf '%s' "$additional" | tr -d '[:space:]' | sed 's/,\+/,/g; s/^,//; s/,$//')
+          if [ -n "$ADDITIONAL_FEATURES" ]; then
+            cleaned=$(printf '%s' "$ADDITIONAL_FEATURES" | tr -d '[:space:]' | sed 's/,\+/,/g; s/^,//; s/,$//')
             if [ -n "$cleaned" ]; then
+              # Cargo feature names are identifiers; reject anything else so a
+              # hostile dispatch input cannot inject shell metacharacters into
+              # later build steps that expand CARGO_FEATURES.
+              if ! printf '%s' "$cleaned" | grep -Eq '^[A-Za-z0-9_,-]+$'; then
+                echo "additional_features contains invalid characters: ${cleaned}" >&2
+                exit 1
+              fi
               features="${features},${cleaned}"
             fi
           fi
