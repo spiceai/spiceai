@@ -267,6 +267,13 @@ impl Index for DuckDBVectorIndex {
         let index = self.clone();
         let ctx = ctx.clone();
         tokio::task::spawn_blocking(move || {
+            // Writers acquire the pool's write gate (before the connection
+            // checkout) so index creation cannot race a database file swap.
+            let write_gate = ctx.pool.write_gate();
+            let _write_guard = write_gate
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+
             let mut db_conn = Arc::clone(&ctx.pool)
                 .connect_sync()
                 .map_err(to_execution_error)?;
