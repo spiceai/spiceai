@@ -41,7 +41,9 @@ use cayenne::metadata::{CreateTableOptions, VortexConfig};
 use cayenne::{CayenneCatalog, CayenneTableProvider, MetadataCatalog};
 use criterion::{Criterion, Throughput};
 use data_components::cdc::{ChangeEnvelope, ChangesStream, StreamError};
-use data_components::mysql_replication::replay::{ReplayTable, replay_binlog_envelopes};
+use data_components::mysql_replication::replay::{
+    ReplayTable, replay_binlog_envelopes, replay_binlog_envelopes_with,
+};
 use data_components::mysql_replication::setup::{SourceColumn, TableLayout};
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
@@ -185,14 +187,27 @@ fn make_refresh_task(fixture: &CayenneFixture) -> RefreshTask {
 /// ceiling when pump-side decode runs concurrently on its own task, as in
 /// production.
 fn replay_envelopes(binlog: &[u8], cap: usize) -> Vec<ChangeEnvelope> {
-    let table = ReplayTable {
+    replay_binlog_envelopes(binlog, &order_line_replay_table(), cap).expect("replay parses")
+}
+
+fn order_line_replay_table() -> ReplayTable {
+    ReplayTable {
         database: "chbench".to_string(),
         table: "order_line".to_string(),
         schema: order_line_schema(),
         primary_keys: order_line_primary_keys(),
         layout: order_line_layout(),
-    };
-    replay_binlog_envelopes(binlog, &table, cap).expect("replay parses")
+    }
+}
+
+/// Depth of the channel between the replay producer and the apply consumer,
+/// mirroring `cdc_prefetch_buffer`. Overridable so a sweep can show where the
+/// pipeline stops being producer- or consumer-bound.
+fn prefetch_depth() -> usize {
+    std::env::var("MYSQL_BINLOG_REPLAY_PREFETCH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(128)
 }
 
 fn main() {
@@ -203,7 +218,7 @@ fn main() {
         );
         return;
     };
-    let binlog = std::fs::read(&path).expect("read binlog file");
+    let binlog = Arc::new(std::fs::read(&path).expect("read binlog file"));
     let cap: usize = std::env::var("MYSQL_BINLOG_REPLAY_BENCH_BYTES")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -226,6 +241,7 @@ fn main() {
     drop(probe);
 
     let rt = TokioRuntime::new().expect("tokio runtime");
+
     let mut criterion = Criterion::default().configure_from_args();
     let mut group = criterion.benchmark_group("mysql_cdc_e2e");
     group.sample_size(10);
@@ -253,6 +269,58 @@ fn main() {
                     )
                     .await
                     .expect("start_changes_stream");
+                    black_box(fixture);
+                });
+            },
+            criterion::BatchSize::PerIteration,
+        );
+    });
+
+    // The number that matters: replay and apply running concurrently through a
+    // bounded channel, exactly as the pump feeds a per-dataset consumer. Timing
+    // covers both, so this reports the pipeline's real rate rather than
+    // `min(producer, consumer)` inferred from the two stages measured apart.
+    let depth = prefetch_depth();
+    group.bench_function("order_line_e2e", |b| {
+        b.iter_batched(
+            || {
+                let table_name = format!("ol_bench_{}", uuid::Uuid::now_v7());
+                rt.block_on(make_cayenne_fixture(&table_name))
+            },
+            |fixture| {
+                rt.block_on(async {
+                    let (tx, rx) = tokio::sync::mpsc::channel(depth);
+                    let producer_binlog = Arc::clone(&binlog);
+                    let producer = tokio::task::spawn_blocking(move || {
+                        replay_binlog_envelopes_with(
+                            &producer_binlog,
+                            &order_line_replay_table(),
+                            cap,
+                            |envelope| {
+                                // Full channel ⇒ the consumer is the slow side;
+                                // blocking here is the backpressure the pump sees.
+                                tx.blocking_send(Ok(envelope))
+                                    .map_err(|_| "consumer dropped the stream".to_string())
+                            },
+                        )
+                    });
+                    let task = make_refresh_task(&fixture);
+                    let stream: ChangesStream =
+                        tokio_stream::wrappers::ReceiverStream::new(rx).boxed();
+                    let refresh = Arc::new(RwLock::new(Refresh::default()));
+                    task.start_changes_stream(
+                        refresh,
+                        stream,
+                        None,
+                        None,
+                        Arc::new(AtomicBool::new(false)),
+                    )
+                    .await
+                    .expect("start_changes_stream");
+                    producer
+                        .await
+                        .expect("producer task")
+                        .expect("replay parses");
                     black_box(fixture);
                 });
             },

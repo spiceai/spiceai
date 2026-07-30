@@ -76,6 +76,32 @@ pub fn replay_binlog_envelopes(
     table: &ReplayTable,
     max_bytes: usize,
 ) -> Result<Vec<ChangeEnvelope>, String> {
+    let mut envelopes = Vec::new();
+    replay_binlog_envelopes_with(binlog, table, max_bytes, |envelope| {
+        envelopes.push(envelope);
+        Ok(())
+    })?;
+    Ok(envelopes)
+}
+
+/// [`replay_binlog_envelopes`], but handing each envelope to `emit` as it is
+/// decoded instead of collecting them. Lets a caller overlap the replay with
+/// whatever consumes the envelopes — the pipelining the live pump and its
+/// per-dataset consumers get for free.
+///
+/// # Errors
+///
+/// Returns a message when the file image is malformed, an event fails to parse
+/// or decode, or `emit` fails.
+pub fn replay_binlog_envelopes_with<F>(
+    binlog: &[u8],
+    table: &ReplayTable,
+    max_bytes: usize,
+    mut emit: F,
+) -> Result<(), String>
+where
+    F: FnMut(ChangeEnvelope) -> Result<(), String>,
+{
     if binlog.len() < BINLOG_FILE_MAGIC_LEN {
         return Err("binlog image shorter than the file magic".to_string());
     }
@@ -113,7 +139,6 @@ pub fn replay_binlog_envelopes(
     let mut reader = EventStreamReader::new(BinlogVersion::Version4);
     let mut io = &binlog[BINLOG_FILE_MAGIC_LEN..limit];
 
-    let mut envelopes: Vec<ChangeEnvelope> = Vec::new();
     // Route state, mirroring the pump: the current TableMap snapshot for the
     // replayed table and the buffered rows events of the open transaction.
     let mut route: Option<(u64, TableMapEvent<'static>)> = None;
@@ -158,7 +183,7 @@ pub fn replay_binlog_envelopes(
                     &member_layout,
                     &metrics,
                     event_timestamp,
-                    &mut envelopes,
+                    &mut emit,
                 )?;
             }
             EventData::QueryEvent(query) => match classify_query(&query.query()) {
@@ -170,7 +195,7 @@ pub fn replay_binlog_envelopes(
                         &member_layout,
                         &metrics,
                         event_timestamp,
-                        &mut envelopes,
+                        &mut emit,
                     )?;
                 }
                 // BEGIN opens a fresh transaction; any other statement (DDL,
@@ -180,20 +205,24 @@ pub fn replay_binlog_envelopes(
             _ => {}
         }
     }
-    Ok(envelopes)
+    Ok(())
 }
 
 /// Decode the open transaction's buffered events for the replayed table into a
-/// materialized envelope, exactly as the pump's `deliver_commit` does.
-fn flush_commit(
+/// materialized envelope, exactly as the pump's `deliver_commit` does, and hand
+/// it to `emit`.
+fn flush_commit<F>(
     txn: &mut Vec<RowsEventData<'static>>,
     route: Option<&(u64, TableMapEvent<'static>)>,
     table: &ReplayTable,
     member_layout: &MemberLayout,
     metrics: &MetricsCollector,
     event_timestamp: u32,
-    envelopes: &mut Vec<ChangeEnvelope>,
-) -> Result<(), String> {
+    emit: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(ChangeEnvelope) -> Result<(), String>,
+{
     let events = std::mem::take(txn);
     if events.is_empty() {
         return Ok(());
@@ -211,6 +240,6 @@ fn flush_commit(
         metrics,
     )
     .map_err(|e| format!("decode committed transaction: {e}"))?;
-    envelopes.push(ChangeEnvelope::new(Box::new(ReplayCommit), batch, false));
+    emit(ChangeEnvelope::new(Box::new(ReplayCommit), batch, false))?;
     Ok(())
 }
