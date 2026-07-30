@@ -16,7 +16,7 @@ limitations under the License.
 use std::collections::HashSet;
 
 use datafusion::sql::TableReference;
-use spicepod::semantic::{Column, FullTextSearchConfig, IndexStore};
+use spicepod::semantic::{Column, FullTextSearchConfig, IndexStore, StemmingLanguage};
 
 use crate::dataset::FullTextSearchDatasetConfig;
 
@@ -28,7 +28,7 @@ pub fn full_text_search_config(
 ) -> Option<FullTextSearchDatasetConfig> {
     let (search_fields_and_primary_key_overrides, indexes): (
         Vec<(String, Option<Vec<String>>)>,
-        Vec<(IndexStore, Option<String>)>,
+        Vec<(IndexStore, Option<String>, StemmingLanguage)>,
     ) = columns
         .iter()
         .filter_map(|c| {
@@ -37,6 +37,7 @@ pub fn full_text_search_config(
                 row_ids,
                 index_store,
                 index_directory,
+                language,
                 ..
             }) = &c.full_text_search
             else {
@@ -46,7 +47,7 @@ pub fn full_text_search_config(
             if index_store.is_some_and(|is| is == IndexStore::Memory) && index_directory.is_some() {
                 tracing::warn!("Table '{name}' column '{}' has `index_store: memory` but also sets `index_directory`. These options are mutually exclusive. Defaulting to `index_store: memory`.", c.name);
             }
-            Some(((c.name.clone(), row_ids.clone()), (index_store.unwrap_or_default(), index_directory.clone())))
+            Some(((c.name.clone(), row_ids.clone()), (index_store.unwrap_or_default(), index_directory.clone(), language.unwrap_or_default())))
         })
         .unzip();
     let (search_fields, primary_key_overrides): (Vec<String>, Vec<Option<Vec<String>>>) =
@@ -87,7 +88,7 @@ pub fn full_text_search_config(
 
     let index_paths: HashSet<String> = indexes
         .iter()
-        .filter_map(|(_, directory)| directory.clone())
+        .filter_map(|(_, directory, _)| directory.clone())
         .collect();
     let index_path_len = index_paths.len();
     let index_path: Option<String> = index_paths.into_iter().next();
@@ -100,10 +101,21 @@ pub fn full_text_search_config(
         );
     }
 
-    let index_store = if indexes.iter().any(|(store, _)| *store == IndexStore::File) {
+    let index_store = if indexes.iter().any(|(store, _, _)| *store == IndexStore::File) {
         IndexStore::File
     } else {
         IndexStore::Memory
+    };
+
+    // Tantivy's tokenizer is schema-wide, not per-column: if any FTS column on this table
+    // requests stemming, apply it across the whole index (mirrors `index_store` above).
+    let language = if indexes
+        .iter()
+        .any(|(_, _, language)| *language == StemmingLanguage::English)
+    {
+        StemmingLanguage::English
+    } else {
+        StemmingLanguage::None
     };
 
     Some(FullTextSearchDatasetConfig {
@@ -111,5 +123,6 @@ pub fn full_text_search_config(
         index_path,
         search_fields,
         primary_key: first_pks.unwrap_or_default(),
+        language,
     })
 }

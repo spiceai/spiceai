@@ -296,6 +296,12 @@ pub struct FullTextSearchConfig {
     /// Optional engine parameters for this text search column.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Params>,
+
+    /// Stemming language applied to full-text search tokenization (e.g. "running" matches
+    /// "run"). Defaults to `none` (exact token matching, current behavior) to preserve
+    /// backwards compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<StemmingLanguage>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
@@ -316,6 +322,27 @@ impl Display for IndexStore {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum StemmingLanguage {
+    /// Exact token matching (Tantivy's `default` tokenizer). Current, back-compat-preserving
+    /// behavior.
+    #[default]
+    None,
+    /// English Snowball/Porter2 stemming (Tantivy's built-in `en_stem` tokenizer).
+    English,
+}
+
+impl Display for StemmingLanguage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => write!(f, "none"),
+            Self::English => write!(f, "english"),
+        }
+    }
+}
+
 impl FullTextSearchConfig {
     #[must_use]
     pub fn disabled() -> Self {
@@ -326,6 +353,7 @@ impl FullTextSearchConfig {
             index_directory: None,
             engine: None,
             params: None,
+            language: Some(StemmingLanguage::default()),
         }
     }
 
@@ -338,6 +366,7 @@ impl FullTextSearchConfig {
             index_directory: None,
             engine: None,
             params: None,
+            language: Some(StemmingLanguage::default()),
         }
     }
 
@@ -354,6 +383,14 @@ impl FullTextSearchConfig {
                 row_ids: Some(vec![row_id.to_string()]),
                 ..self
             }
+        }
+    }
+
+    #[must_use]
+    pub fn with_language(self, language: StemmingLanguage) -> Self {
+        FullTextSearchConfig {
+            language: Some(language),
+            ..self
         }
     }
 }

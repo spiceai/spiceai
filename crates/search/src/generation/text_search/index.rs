@@ -49,6 +49,23 @@ use crate::index::SearchIndex;
 pub static MEMORY_BUDGET_FOR_INDEX_WRITER: usize = 150 * 1024 * 1024;
 pub static INDEX_UNIQUE_FIELD_NAME: &str = "__spice.unique_field";
 
+/// Tantivy's built-in no-op tokenizer name (lowercasing only, no stemming).
+pub static DEFAULT_TOKENIZER_NAME: &str = "default";
+/// Tantivy's built-in English Snowball-stemmed tokenizer name.
+pub static EN_STEM_TOKENIZER_NAME: &str = "en_stem";
+
+/// Equivalent to [`tantivy::schema::TEXT`], but naming `tokenizer_name` (which must be
+/// registered in the index's [`tantivy::tokenizer::TokenizerManager`]) instead of always
+/// defaulting to [`DEFAULT_TOKENIZER_NAME`]. `TextFieldIndexing::default()`'s `IndexRecordOption`
+/// is `Basic` (no positions), so this must set `WithFreqsAndPositions` explicitly to match `TEXT`
+/// and keep phrase queries working.
+fn tokenized_text_options(tokenizer_name: &str) -> tantivy::schema::TextOptions {
+    let indexing = tantivy::schema::TextFieldIndexing::default()
+        .set_index_option(tantivy::schema::IndexRecordOption::WithFreqsAndPositions)
+        .set_tokenizer(tokenizer_name);
+    tantivy::schema::TextOptions::default().set_indexing_options(indexing)
+}
+
 /// The fraction of a tantivy segment's documents that may be superseded/deleted, but
 /// still physically present, before the segment is rewritten by a merge.
 ///
@@ -238,12 +255,38 @@ impl FullTextDatabaseIndex {
         directory: Option<PathBuf>,
         store_field: &[String],
     ) -> Result<Self, super::Error> {
+        Self::try_new_with_tokenizer(
+            inner,
+            search_fields,
+            primary_key_override,
+            directory,
+            store_field,
+            DEFAULT_TOKENIZER_NAME,
+        )
+    }
+
+    /// Like [`Self::try_new`], but indexes and queries `search_fields` using `tokenizer_name`
+    /// (a name registered in Tantivy's [`tantivy::tokenizer::TokenizerManager`], e.g.
+    /// [`DEFAULT_TOKENIZER_NAME`] or [`EN_STEM_TOKENIZER_NAME`]) instead of always defaulting to
+    /// [`DEFAULT_TOKENIZER_NAME`]. Query-side tokenization (both the primary `QueryParser` path
+    /// and the bag-of-words fallback in [`super::parse_query_literal`]) automatically resolves
+    /// the same per-field tokenizer from the index's `TokenizerManager`, so this one setting
+    /// keeps indexing and querying consistent without further plumbing.
+    pub fn try_new_with_tokenizer(
+        inner: Arc<dyn TableProvider>,
+        search_fields: Vec<String>,
+        primary_key_override: Option<Vec<String>>,
+        directory: Option<PathBuf>,
+        store_field: &[String],
+        tokenizer_name: &str,
+    ) -> Result<Self, super::Error> {
         let pks = Self::validate_primary_key(&inner, primary_key_override)?;
         let tantivy_schema = Self::create_tantivy_schema(
             &inner,
             search_fields.as_slice(),
             pks.as_slice(),
             store_field,
+            tokenizer_name,
         )?;
 
         let index = if let Some(path) = directory {
@@ -530,6 +573,7 @@ impl FullTextDatabaseIndex {
         search_fields: &[String],
         primary_key: &[String],
         store_field: &[String],
+        tokenizer_name: &str,
     ) -> Result<tantivy::schema::Schema, super::Error> {
         let schema = base_table.schema();
         let mut schema_builder = tantivy::schema::Schema::builder();
@@ -550,7 +594,7 @@ impl FullTextDatabaseIndex {
         }
 
         for s in search_fields {
-            let mut text_opts = tantivy::schema::TEXT;
+            let mut text_opts = tokenized_text_options(tokenizer_name);
             if store_field.contains(s) || primary_key.contains(s) {
                 text_opts = text_opts | tantivy::schema::STORED;
             }
