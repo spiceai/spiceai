@@ -559,8 +559,8 @@ struct MemberHandle {
     primary_keys: Vec<String>,
     /// Immutable decode layout behind an `Arc` swapped on a compatible ALTER
     /// (see [`adopt_current_layout`]). The pump clones the current `Arc` into a
-    /// route at `TableMapEvent` time, so a snapshot handed downstream to
-    /// [`MysqlChangeRows`] can never be mutated out from under a deferred decode.
+    /// route at `TableMapEvent` time, so the snapshot a commit decodes against
+    /// is never mutated out from under it.
     layout: Mutex<Arc<MemberLayout>>,
     sender: mpsc::Sender<std::result::Result<ChangeEnvelope, StreamError>>,
     metrics: Arc<MetricsCollector>,
@@ -1247,9 +1247,9 @@ async fn member_fatal(source: &Arc<SharedSource>, key: &MemberKey, message: Stri
 }
 
 /// One resolved route for a `table_id` on the current connection. `tme` and
-/// `layout` are the immutable snapshots taken at `TableMapEvent` install, so a
-/// deferred [`MysqlChangeRows`] decodes against exactly the layout that was
-/// valid when its rows were written.
+/// `layout` are the immutable snapshots taken at `TableMapEvent` install, so
+/// each commit decodes against exactly the layout that was valid when its rows
+/// were written.
 struct Route {
     key: MemberKey,
     member: Arc<MemberHandle>,
@@ -1405,8 +1405,8 @@ async fn run_pump(source: Arc<SharedSource>) {
         // the dump re-sends rotate + TableMap events). Keyed by the server's
         // `table_id`: a trusted server-assigned integer with no HashDoS surface,
         // so `FxHashMap` (a fast u64 hash) is preferred over std's SipHash. `txn`
-        // buffers OWNED raw row payloads per table; the tuple decode + Arrow
-        // build run off the pump in `MysqlChangeRows::build`.
+        // buffers owned raw row payloads per table until the commit, where
+        // `deliver_commit` decodes them into ready batches.
         let mut routes: FxHashMap<u64, Route> = FxHashMap::default();
         let mut txn: FxHashMap<u64, Vec<RowsEventData<'static>>> = FxHashMap::default();
         let mut txn_open = false;
@@ -1634,11 +1634,11 @@ async fn run_pump(source: Arc<SharedSource>) {
                     if !route.slot.has(STREAMING) {
                         continue 'recv;
                     }
-                    // Hot path: buffer the OWNED raw payload only — no tuple decode,
-                    // no Arrow build, no layout lock, no per-row metrics here. The
-                    // decode runs later on the per-dataset consumer in
-                    // `MysqlChangeRows::build`; a malformed row then faults only
-                    // that dataset's stream, never the shared pump.
+                    // Hot path: buffer the owned raw payload only — no tuple decode,
+                    // no Arrow build, no layout lock, no per-row metrics per event.
+                    // The decode runs once per commit in `deliver_commit`, where a
+                    // malformed row is member-fatal and so faults only that
+                    // dataset's stream, never the shared pump.
                     txn.entry(table_id)
                         .or_default()
                         .push(rows_data.into_owned());
@@ -1801,11 +1801,10 @@ fn rotate_target(rotate: &RotateEvent<'_>) -> Option<BinlogPosition> {
 
 /// Deliver a committed transaction's buffered rows to their members, then
 /// credit idle streaming members up to the commit position. The decode +
-/// Arrow build run HERE, on the pump, so members receive ready batches
+/// Arrow build run on the pump, so members receive ready batches
 /// ([`ChangeEnvelope::new`]) and their consumers spend the apply loop on
-/// accelerator writes instead of serializing the (dominant) `MySQL` rows-event
-/// decode with them — see the [`super::changes`] module docs for why this
-/// differs from the deferred Postgres shape.
+/// accelerator writes rather than serializing the dominant `MySQL` rows-event
+/// decode with them — see [`super::changes`] for the cross-engine rationale.
 async fn deliver_commit(
     source: &Arc<SharedSource>,
     routes: &FxHashMap<u64, Route>,
@@ -1838,9 +1837,8 @@ async fn deliver_commit(
         record_watermark(&member.metrics, event_timestamp);
         member.metrics.inc_transaction();
         let is_ready = crate::cdc::source_commit_within_ready_lag(commit_ts, member.ready_lag);
-        // A decode failure faults only this member (the same isolation the
-        // deferred build's per-dataset `StreamError` gave), attributed here
-        // where the failing table map and layout snapshot are in hand.
+        // A decode failure faults only this member, attributed here where the
+        // failing table map and layout snapshot are in hand.
         let batch = match decode_events_to_batch(
             &member.schema,
             &member.primary_keys,

@@ -18,19 +18,16 @@ limitations under the License.
 //!
 //! The pump decodes each commit's buffered rows events into a ready
 //! [`ChangeBatch`] before delivery ([`super::shared`]'s `deliver_commit`), the
-//! shape [`crate::cdc::ChangeEnvelope::new`] carries. Unlike Postgres — whose
-//! per-message pgoutput decode is cheap enough to defer to the per-dataset
-//! consumer ([`crate::postgres_replication::changes::PgChangeRows`]) — a
-//! `MySQL` rows-event decode is the dominant cost of a change build, and
-//! deferring it serializes that cost with the accelerator write on the
-//! consumer, starving the write path (measured at 73–81 % of the CDC apply
-//! loop on SF1000 CH-benCH runs). Decoding on the pump pipelines it with the
-//! consumer's writes instead; the pump's must-deliver backpressure already
-//! paces it by the slowest member either way.
+//! shape [`crate::cdc::ChangeEnvelope::new`] carries. A `MySQL` rows-event
+//! decode dominates the cost of a change build — 73–81 % of the CDC apply loop
+//! on SF1000 CH-benCH runs — so decoding here pipelines it with the consumer's
+//! accelerator writes instead of serializing the two, while the pump's
+//! must-deliver backpressure still paces delivery by the slowest member.
+//! (Postgres defers its cheaper per-message pgoutput decode to the per-dataset
+//! consumer, [`crate::postgres_replication::changes::PgChangeRows`].)
 //!
 //! A row-decode failure is member-fatal (`member_fatal`), so one malformed
-//! table still faults only its own dataset's stream, exactly as the deferred
-//! build's per-dataset `StreamError` did.
+//! table faults only its own dataset's stream.
 
 use arrow::datatypes::SchemaRef;
 use mysql_async::binlog::events::{RowsEventData, TableMapEvent};
