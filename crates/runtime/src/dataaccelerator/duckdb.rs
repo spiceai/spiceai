@@ -29,7 +29,7 @@ use crate::{
     },
     make_spice_data_directory,
     parameters::ParameterSpec,
-    register_data_accelerator, spice_data_base_path,
+    spice_data_base_path,
 };
 use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
@@ -1934,7 +1934,7 @@ fn validate_unique_index_batches(
     Ok(())
 }
 
-register_data_accelerator!(Engine::DuckDB, DuckDBAccelerator);
+data_accelerator_api::register_data_accelerator!(Engine::DuckDB, DuckDBAccelerator);
 
 fn normalize_schema_for_duckdb(cmd: &mut CreateExternalTable) -> datafusion::common::Result<()> {
     use datafusion::common::ToDFSchema;
