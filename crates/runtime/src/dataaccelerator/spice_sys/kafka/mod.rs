@@ -202,12 +202,4 @@ impl KafkaSys {
         let schema: Schema = serde_json::from_str(schema_json).map_err(Error::external)?;
         Ok(Arc::new(schema))
     }
-
-    fn schema_needs_ensure(&self) -> bool {
-        self.schema_ensured.needs_ensure()
-    }
-
-    fn mark_schema_ensured(&self) {
-        self.schema_ensured.mark_ensured();
-    }
 }

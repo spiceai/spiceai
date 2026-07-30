@@ -167,12 +167,4 @@ impl DebeziumKafkaSys {
             _ => Err(Error::NoAccelerationConnection),
         }
     }
-
-    fn schema_needs_ensure(&self) -> bool {
-        self.schema_ensured.needs_ensure()
-    }
-
-    fn mark_schema_ensured(&self) {
-        self.schema_ensured.mark_ensured();
-    }
 }
