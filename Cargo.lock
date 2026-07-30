@@ -1128,7 +1128,7 @@ dependencies = [
 [[package]]
 name = "async-openai"
 version = "0.32.0"
-source = "git+https://github.com/spiceai/async-openai?rev=526bdd24d569c2082624daff2b2859d03960dd5b#526bdd24d569c2082624daff2b2859d03960dd5b"
+source = "git+https://github.com/spiceai/async-openai?rev=6bda5533dd118afcf80aa6f5ef59ad35277627a7#6bda5533dd118afcf80aa6f5ef59ad35277627a7"
 dependencies = [
  "async-openai-macros",
  "backoff",
@@ -1156,7 +1156,7 @@ dependencies = [
 [[package]]
 name = "async-openai-macros"
 version = "0.1.1"
-source = "git+https://github.com/spiceai/async-openai?rev=526bdd24d569c2082624daff2b2859d03960dd5b#526bdd24d569c2082624daff2b2859d03960dd5b"
+source = "git+https://github.com/spiceai/async-openai?rev=6bda5533dd118afcf80aa6f5ef59ad35277627a7#6bda5533dd118afcf80aa6f5ef59ad35277627a7"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5897,6 +5897,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "data-accelerator-api"
+version = "2.2.0-unstable"
+dependencies = [
+ "arrow",
+ "arrow_tools",
+ "async-trait",
+ "datafusion",
+ "datafusion-table-providers",
+ "futures",
+ "linkme",
+ "paste",
+ "runtime-acceleration",
+ "runtime-parameters",
+ "runtime-secrets",
+ "runtime-table-partition",
+ "secrecy",
+ "snafu",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "data-connector-api"
+version = "2.2.0-unstable"
+dependencies = [
+ "globset",
+ "runtime-component",
+ "snafu",
+]
+
+[[package]]
 name = "data-encoding"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5926,6 +5957,7 @@ dependencies = [
  "bb8",
  "bb8-oracle",
  "bigdecimal",
+ "bitvec",
  "brotli",
  "bytes",
  "chrono",
@@ -5959,6 +5991,7 @@ dependencies = [
  "insta",
  "logos",
  "mysql_async",
+ "mysql_common",
  "native-tls",
  "num_cpus",
  "object_store 0.13.2",
@@ -16666,6 +16699,8 @@ dependencies = [
  "criterion 0.7.0",
  "csv",
  "dashmap",
+ "data-accelerator-api",
+ "data-connector-api",
  "data_components",
  "dataformat-json",
  "datafusion",
@@ -16966,6 +17001,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "chrono",
+ "cloud-connect-crypto",
  "dirs",
  "gethostname",
  "pem",

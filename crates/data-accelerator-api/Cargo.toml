@@ -1,0 +1,31 @@
+[package]
+name = "data-accelerator-api"
+description = "The DataAccelerator trait, accelerator registry, and the shared table-provider seams accelerators build on. Sits below `runtime` so accelerator engines (and the AcceleratedTable machinery) can implement/consume the contract without depending on the orchestrator."
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+arrow.workspace = true
+arrow_tools = { path = "../arrow_tools" }
+async-trait.workspace = true
+datafusion.workspace = true
+datafusion-table-providers = { workspace = true }
+futures.workspace = true
+linkme.workspace = true
+paste.workspace = true
+runtime-acceleration = { path = "../runtime-acceleration" }
+runtime-secrets = { path = "../runtime-secrets", default-features = false }
+runtime-parameters = { path = "../runtime-parameters" }
+runtime-table-partition = { path = "../runtime-table-partition" }
+secrecy.workspace = true
+snafu.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
