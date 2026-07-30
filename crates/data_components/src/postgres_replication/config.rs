@@ -97,11 +97,12 @@ pub struct ReplicationParams {
     /// (per-dataset generated) slot names keep the dedicated per-dataset
     /// stream.
     pub shared: bool,
-    /// Capacity of each shared-slot member's bounded delivery channel (envelopes).
+    /// Capacity of each shared-slot member's bounded coalescing mailbox
+    /// (envelopes).
     /// Only consulted on the shared path ([`super::shared`]); the per-dataset
-    /// stream does not use it. A member's channel sits in front of the
-    /// accelerator's much larger prefetch buffer, so too small a value turns one
-    /// member's transient stall into slot-wide head-of-line blocking. Defaults to
+    /// stream does not use it. Adjacent compatible transactions can share one
+    /// envelope, so this bounds published envelope count rather than source
+    /// transaction count. Defaults to
     /// [`super::shared::DEFAULT_MEMBER_CHANNEL_CAPACITY`].
     pub member_channel_capacity: usize,
 

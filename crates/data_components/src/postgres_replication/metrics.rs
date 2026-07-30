@@ -84,13 +84,13 @@ pub struct MetricsCollector {
     /// authoritative per-slot backlog and show grouping. Set at (shared) attach.
     slot_name: RwLock<Option<String>>,
     /// Cumulative seconds the shared-slot pump spent blocked trying to deliver
-    /// committed changes into this member's channel because its sink was not
+    /// committed changes into this member's mailbox because its sink was not
     /// draining. Non-zero means downstream backpressure stalled the pump (and
     /// therefore every other member on the slot); the server connection itself
     /// stays alive throughout. Only ever set for shared-slot datasets.
     member_send_stalled_seconds_total: AtomicU64,
     /// Cumulative microseconds the shared-slot pump spent `await`ing this
-    /// member's bounded channel while delivering committed changes. Unlike
+    /// member's bounded mailbox while delivering committed changes. Unlike
     /// `member_send_stalled_seconds_total` (which only ticks after a full
     /// `MEMBER_SEND_STALL_WARN` interval elapses), this accrues the *full*
     /// per-commit wait, including sub-second waits. The pump already subtracts
@@ -99,6 +99,32 @@ pub struct MetricsCollector {
     /// this counter exports the subtracted amount so the waterfall can attribute
     /// it to apply back-pressure rather than lose it. Only set for shared slots.
     member_send_wait_micros_total: AtomicU64,
+    /// Envelopes the shared-slot pump published to this member as distinct
+    /// units of work. Compared against `wal_transactions_total` (source
+    /// transactions), the ratio is the coalescing factor the accelerator's apply
+    /// loop actually sees. Only set for shared slots.
+    member_envelopes_delivered_total: AtomicU64,
+    /// Source transactions folded into an envelope the pump was still holding,
+    /// before it crossed the member boundary at all.
+    member_envelope_eager_merges_total: AtomicU64,
+    /// Source transactions folded into an envelope already sitting unclaimed in
+    /// this member's mailbox. This is the back-pressure-driven half of
+    /// coalescing: it rises when the sink is not keeping up, which is exactly
+    /// when collapsing envelopes matters. Split from
+    /// `member_envelope_eager_merges_total` so the two stages can be attributed
+    /// separately.
+    member_envelope_mailbox_merges_total: AtomicU64,
+    /// Times a transaction could NOT be folded into this member's unclaimed
+    /// mailbox tail because a configured bound refused it — the per-envelope row
+    /// limit or the mailbox byte budget — rather than because the envelopes were
+    /// not foldable at all. The mailbox bounds ship deliberately low (folding is
+    /// a back-pressure absorber, not a throughput lever), so a persistently
+    /// rising value here alongside a rising
+    /// `member_envelope_mailbox_merges_total` is the evidence that raising
+    /// `SPICE_POSTGRES_CDC_MAX_BACKPRESSURE_ROWS_PER_ENVELOPE` /
+    /// `SPICE_POSTGRES_CDC_MAX_MAILBOX_BYTES` would absorb more. A flat zero
+    /// means the bounds are not binding and there is nothing to tune.
+    member_mailbox_coalesce_limited_total: AtomicU64,
 
     // Shared-slot membership liveness. `member_attached` is `1` while this
     // dataset is an attached member of its shared replication slot and `0` once
@@ -272,13 +298,37 @@ impl MetricsCollector {
             .fetch_add(secs, Ordering::Relaxed);
     }
     /// Add microseconds the shared-slot pump spent `await`ing this member's
-    /// channel during commit delivery (shared slot). The pump subtracts the
+    /// mailbox during commit delivery (shared slot). The pump subtracts the
     /// same amount from `reader_processing_micros_total` at the source, so that
     /// counter stays decode-only; this exports the subtracted wait for
     /// attribution.
     pub fn add_member_send_wait_micros(&self, us: u64) {
         self.member_send_wait_micros_total
             .fetch_add(us, Ordering::Relaxed);
+    }
+    /// Count an envelope published to this member as its own unit of work
+    /// (shared slot).
+    pub fn inc_envelope_delivered(&self) {
+        self.member_envelopes_delivered_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    /// Count a source transaction folded into an envelope the pump was still
+    /// holding back (shared slot).
+    pub fn inc_envelope_merged_eager(&self) {
+        self.member_envelope_eager_merges_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    /// Count a source transaction folded into an unclaimed envelope already in
+    /// this member's mailbox (shared slot).
+    pub fn inc_envelope_merged_mailbox(&self) {
+        self.member_envelope_mailbox_merges_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    /// Count a fold refused by a configured mailbox bound (shared slot) — the
+    /// signal that raising that bound would coalesce more.
+    pub fn inc_mailbox_coalesce_limited(&self) {
+        self.member_mailbox_coalesce_limited_total
+            .fetch_add(1, Ordering::Relaxed);
     }
     pub fn inc_reconnect(&self) {
         self.replication_reconnects_total
@@ -495,6 +545,34 @@ impl Metrics {
     pub fn member_send_wait_micros_total(&self) -> u64 {
         self.collector
             .member_send_wait_micros_total
+            .load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn member_envelopes_delivered_total(&self) -> u64 {
+        self.collector
+            .member_envelopes_delivered_total
+            .load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn member_envelope_eager_merges_total(&self) -> u64 {
+        self.collector
+            .member_envelope_eager_merges_total
+            .load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn member_envelope_mailbox_merges_total(&self) -> u64 {
+        self.collector
+            .member_envelope_mailbox_merges_total
+            .load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn member_mailbox_coalesce_limited_total(&self) -> u64 {
+        self.collector
+            .member_mailbox_coalesce_limited_total
             .load(Ordering::Relaxed)
     }
 }
