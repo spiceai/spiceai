@@ -23,6 +23,8 @@ limitations under the License.
 use test_framework::anyhow::{self, Context};
 use test_framework::opentelemetry::KeyValue;
 
+use crate::stats::percentile;
+
 /// Slack (bytes) below which authoritative per-slot retained WAL counts as "drained"
 /// — ~1 WAL segment of padding, since `confirmed_flush_lsn` trails the WAL head by up
 /// to a segment even when fully caught up.
@@ -414,118 +416,6 @@ pub(super) fn emit_cayenne_read_amp_percentiles(metrics: &crate::spiced_metrics:
     println!();
 }
 
-/// Emits the under-load latency distribution of the `/health` and `/v1/ready`
-/// probes sampled by [`crate::health::HealthMonitor`].
-///
-/// These are the endpoints a Kubernetes liveness/readiness probe hits, served by a
-/// Tokio runtime kept separate from query execution so they stay responsive under
-/// load. When that isolation breaks the probes time out and Kubernetes restarts the
-/// container, so the tail (p99.9/max) and the failure counts matter more than the
-/// median.
-pub(super) fn emit_probe_latency_summary(report: &crate::health::HealthCheckReport) {
-    if report.endpoints.is_empty() {
-        return;
-    }
-
-    let warn_ms = crate::health::LATENCY_THRESHOLD.as_millis();
-    let error_ms = crate::health::ERROR_LATENCY.as_millis();
-    let warn_label = format!(">{warn_ms}ms");
-    let error_label = format!(">{error_ms}ms");
-
-    println!("\n=== Liveness / Readiness Probes (under load) ===");
-    println!(
-        "  {:<12} {:>8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>8} {:>8} {:>9} {:>8}",
-        "endpoint",
-        "samples",
-        "p50",
-        "p90",
-        "p99",
-        "p99.9",
-        "max",
-        warn_label,
-        error_label,
-        "timeouts",
-        "refused"
-    );
-
-    // Format each cell before padding it: a `{:>10.1}ms` width applies to the
-    // number alone, skewing the columns once a value reaches four digits.
-    let cell = |values: &[f64], q: f64| format!("{:.1}ms", percentile(values, q));
-
-    for (endpoint, stats) in &report.endpoints {
-        let mut values = stats.latencies_ms().to_vec();
-        if values.is_empty() {
-            // Same columns as a populated row, so the table stays aligned.
-            println!(
-                "  {endpoint:<12} {:>8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>8} {:>8} {:>9} {:>8}",
-                0,
-                "-",
-                "-",
-                "-",
-                "-",
-                "-",
-                stats.over_budget_count(),
-                stats.error_count,
-                stats.timeout_count,
-                stats.refused_count,
-            );
-            continue;
-        }
-        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-        println!(
-            "  {endpoint:<12} {:>8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>8} {:>8} {:>9} {:>8}",
-            values.len(),
-            cell(&values, 0.50),
-            cell(&values, 0.90),
-            cell(&values, 0.99),
-            cell(&values, 0.999),
-            cell(&values, 1.00),
-            stats.over_budget_count(),
-            stats.error_count,
-            stats.timeout_count,
-            stats.refused_count,
-        );
-    }
-
-    // Name each failure mode in the same terms a Kubernetes probe event reports it,
-    // so a run that reproduces the symptom says so outright.
-    for (endpoint, stats) in &report.endpoints {
-        let max_ms = stats.max_latency.as_secs_f64() * 1_000.0;
-
-        if stats.timeout_count > 0 {
-            println!(
-                "  ERROR: {endpoint} never responded on {} sample(s) — the same failure a Kubernetes probe reports as 'context deadline exceeded'",
-                stats.timeout_count
-            );
-        }
-        if stats.refused_count > 0 {
-            println!(
-                "  ERROR: {endpoint} refused the connection on {} sample(s) — the same failure a Kubernetes probe reports as 'connection refused'",
-                stats.refused_count
-            );
-        }
-        if stats.status_count > 0 {
-            println!(
-                "  ERROR: {endpoint} answered with a non-2xx status on {} sample(s) — a Kubernetes probe counts these as failed",
-                stats.status_count
-            );
-        }
-        if stats.error_count > 0 {
-            println!(
-                "  ERROR: {endpoint} exceeded {error_ms}ms on {} sample(s) (max {max_ms:.0}ms) — the HTTP server stalls under load",
-                stats.error_count
-            );
-        } else if stats.warn_count > 0 {
-            println!(
-                "  WARNING: {endpoint} exceeded {warn_ms}ms on {} sample(s) (max {max_ms:.0}ms)",
-                stats.warn_count
-            );
-        }
-    }
-    println!();
-}
-
 /// Emits Cayenne compaction metrics scraped from spiced's `/metrics` endpoint,
 /// reported per `table` and compaction `kind`
 pub(super) fn emit_cayenne_compaction_metrics(metrics: &crate::spiced_metrics::SpicedMetrics) {
@@ -685,19 +575,6 @@ fn compaction_duration_percentiles_per_table_kind(
         );
     }
     out
-}
-
-/// Nearest-rank percentile `q` (0.0–1.0) of a sorted, non-empty slice.
-#[expect(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
-)]
-fn percentile(sorted: &[f64], q: f64) -> f64 {
-    let idx = (((sorted.len() as f64) * q).ceil() as usize)
-        .saturating_sub(1)
-        .min(sorted.len() - 1);
-    sorted[idx]
 }
 
 /// Clamps a non-negative float metric value to `u64` for gauge recording.
@@ -1198,29 +1075,4 @@ fn histogram_quantile(bounds: &[(f64, f64)], q: f64) -> f64 {
         lower_cum = cum;
     }
     bounds.last().map_or(0.0, |&(le, _)| le)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::emit_probe_latency_summary;
-    use crate::health::{EndpointStats, HealthCheckReport};
-    use std::time::Duration;
-
-    /// An endpoint with no samples must render without panicking: [`percentile`]
-    /// indexes `len - 1`, which underflows on an empty series.
-    #[test]
-    fn probe_latency_summary_renders_a_mix_of_healthy_slow_and_empty_endpoints() {
-        let mut healthy = EndpointStats::default();
-        for ms in [1, 2, 2, 3, 4, 130, 260, 600, 1_400] {
-            healthy.record_latency_for_test(Duration::from_millis(ms));
-        }
-
-        let mut report = HealthCheckReport::default();
-        report.endpoints.insert("/health", healthy);
-        report
-            .endpoints
-            .insert("/v1/ready", EndpointStats::default());
-
-        emit_probe_latency_summary(&report);
-    }
 }

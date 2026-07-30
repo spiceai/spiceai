@@ -299,6 +299,8 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
         None => None,
     };
 
+    probe_snapshot.print_latency_summary("under load");
+
     // 7. Report analytical query metrics.
     let mut failures: Vec<String> = Vec::new();
     let mut query_summary_rows: Vec<reporting::QuerySummaryRow> = Vec::new();
@@ -392,8 +394,6 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
             eprintln!("OLTP task join error: {e}");
         }
     }
-
-    reporting::emit_probe_latency_summary(&probe_snapshot);
 
     // 9. Report data freshness and replication metrics.
     match staleness_result {

@@ -39,12 +39,12 @@ const SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 //
 // A sample past this budget counts as a health-check failure and is logged as a WARNING.
 const LATENCY_THRESHOLD_MS: u64 = 125;
-pub(crate) const LATENCY_THRESHOLD: Duration = Duration::from_millis(LATENCY_THRESHOLD_MS);
+const LATENCY_THRESHOLD: Duration = Duration::from_millis(LATENCY_THRESHOLD_MS);
 
 /// 4x the latency budget — logged as an ERROR. Kubernetes fails a probe that
 /// overruns its `timeoutSeconds` (1s by default) and restarts the container after
 /// enough consecutive failures, so this fires while there is still headroom.
-pub(crate) const ERROR_LATENCY: Duration = Duration::from_millis(LATENCY_THRESHOLD_MS * 4);
+const ERROR_LATENCY: Duration = Duration::from_millis(LATENCY_THRESHOLD_MS * 4);
 
 /// Well above [`ERROR_LATENCY`]: a tighter timeout truncates every slow sample to
 /// the same value, hiding the latency tail.
@@ -75,16 +75,16 @@ pub(crate) struct EndpointStats {
     latencies_ms: Vec<f64>,
     pub(crate) failure_count: u64,
     /// Samples slower than [`LATENCY_THRESHOLD`] but within [`ERROR_LATENCY`].
-    pub(crate) warn_count: u64,
+    warn_count: u64,
     /// Samples slower than [`ERROR_LATENCY`].
-    pub(crate) error_count: u64,
+    error_count: u64,
     /// Samples that hit [`PROBE_TIMEOUT`] — the analog of a kubelet
     /// `context deadline exceeded` probe event.
-    pub(crate) timeout_count: u64,
+    timeout_count: u64,
     /// Samples that could not connect — the analog of `connection refused`.
-    pub(crate) refused_count: u64,
+    refused_count: u64,
     /// Samples that answered with a non-2xx status.
-    pub(crate) status_count: u64,
+    status_count: u64,
     pub(crate) max_latency: Duration,
     pub(crate) last_error: Option<String>,
 }
@@ -123,24 +123,10 @@ impl EndpointStats {
         }
     }
 
-    /// Per-sample latencies in milliseconds, in sample order.
-    pub(crate) fn latencies_ms(&self) -> &[f64] {
-        &self.latencies_ms
-    }
-
     /// Every sample over [`LATENCY_THRESHOLD`], including the error-level ones —
     /// [`Self::warn_count`] alone covers only the band up to [`ERROR_LATENCY`].
-    pub(crate) fn over_budget_count(&self) -> u64 {
+    fn over_budget_count(&self) -> u64 {
         self.warn_count.saturating_add(self.error_count)
-    }
-
-    /// Records a latency sample, classified as a live probe would, so tests in
-    /// other modules can build a populated report.
-    #[cfg(test)]
-    pub(crate) fn record_latency_for_test(&mut self, latency: Duration) {
-        let failure = (latency > LATENCY_THRESHOLD)
-            .then(|| (FailureKind::Latency, "latency budget".to_string()));
-        self.record_sample(&ProbeSample { latency, failure });
     }
 }
 
@@ -177,6 +163,114 @@ impl HealthCheckReport {
                 parts.join(" | ")
             ))
         }
+    }
+
+    /// Prints the probe latency distribution, one row per endpoint.
+    ///
+    /// `phase` labels the window the report covers (e.g. "under load").
+    ///
+    /// These are the endpoints a Kubernetes liveness/readiness probe hits, served
+    /// by a Tokio runtime kept separate from query execution so they stay
+    /// responsive under load. When that isolation breaks the probes time out and
+    /// Kubernetes restarts the container, so the tail (p99.9/max) and the failure
+    /// counts matter more than the median.
+    pub(crate) fn print_latency_summary(&self, phase: &str) {
+        if self.endpoints.is_empty() {
+            return;
+        }
+
+        let warn_ms = LATENCY_THRESHOLD.as_millis();
+        let error_ms = ERROR_LATENCY.as_millis();
+
+        println!("\n=== Liveness / Readiness Probes ({phase}) ===");
+        println!(
+            "  {:<12} {:>8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>8} {:>8} {:>9} {:>8}",
+            "endpoint",
+            "samples",
+            "p50",
+            "p90",
+            "p99",
+            "p99.9",
+            "max",
+            format!(">{warn_ms}ms"),
+            format!(">{error_ms}ms"),
+            "timeouts",
+            "refused"
+        );
+
+        for (endpoint, stats) in &self.endpoints {
+            // Latency cells carry their unit, so format each before padding it: a
+            // `{:>10.1}ms` width applies to the number alone and skews the columns
+            // once a value reaches four digits. An endpoint with no samples shows
+            // dashes rather than a `0.0ms` that would read as a measurement.
+            let cells: Vec<String> = if stats.latencies_ms.is_empty() {
+                vec!["-".to_string(); 5]
+            } else {
+                let sorted = crate::stats::sorted_ms(&stats.latencies_ms);
+                let mut cells: Vec<String> = [0.50, 0.90, 0.99, 0.999]
+                    .into_iter()
+                    .map(|q| format!("{:.1}ms", crate::stats::percentile(&sorted, q)))
+                    .collect();
+                // Read max from the tracked field rather than deriving it a second
+                // way, so it can't disagree with the max in the lines below.
+                cells.push(format!(
+                    "{:.1}ms",
+                    stats.max_latency.as_secs_f64() * 1_000.0
+                ));
+                cells
+            };
+
+            println!(
+                "  {endpoint:<12} {:>8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>8} {:>8} {:>9} {:>8}",
+                stats.latencies_ms.len(),
+                cells[0],
+                cells[1],
+                cells[2],
+                cells[3],
+                cells[4],
+                stats.over_budget_count(),
+                stats.error_count,
+                stats.timeout_count,
+                stats.refused_count,
+            );
+        }
+
+        // Name each failure mode in the same terms a Kubernetes probe event reports
+        // it, so a run that reproduces the symptom says so outright.
+        for (endpoint, stats) in &self.endpoints {
+            let max_ms = stats.max_latency.as_secs_f64() * 1_000.0;
+
+            if stats.timeout_count > 0 {
+                println!(
+                    "  ERROR: {endpoint} never responded on {} sample(s) — the same failure a Kubernetes probe reports as 'context deadline exceeded'",
+                    stats.timeout_count
+                );
+            }
+            if stats.refused_count > 0 {
+                println!(
+                    "  ERROR: {endpoint} refused the connection on {} sample(s) — the same failure a Kubernetes probe reports as 'connection refused'",
+                    stats.refused_count
+                );
+            }
+            if stats.status_count > 0 {
+                println!(
+                    "  ERROR: {endpoint} answered with a non-2xx status on {} sample(s) — a Kubernetes probe counts these as failed",
+                    stats.status_count
+                );
+            }
+            if stats.error_count > 0 {
+                println!(
+                    "  ERROR: {endpoint} exceeded {error_ms}ms on {} sample(s) (max {max_ms:.0}ms) — the HTTP server stalls under load",
+                    stats.error_count
+                );
+            } else if stats.warn_count > 0 {
+                println!(
+                    "  WARNING: {endpoint} exceeded {warn_ms}ms on {} sample(s) (max {max_ms:.0}ms)",
+                    stats.warn_count
+                );
+            }
+        }
+        println!();
     }
 }
 
@@ -369,7 +463,11 @@ impl HealthMonitor {
         };
 
         match task.await {
-            Ok(()) => Ok(self.snapshot()),
+            // The sampling task has joined, so the stats are uniquely owned — take
+            // them rather than cloning a map that is about to be dropped.
+            Ok(()) => Ok(HealthCheckReport {
+                endpoints: std::mem::take(&mut *self.stats.lock()),
+            }),
             Err(err) => {
                 Err(anyhow::anyhow!(err)
                     .context("Health monitor task did not complete successfully"))
@@ -389,7 +487,7 @@ impl Drop for HealthMonitor {
 
 #[cfg(test)]
 mod tests {
-    use super::{EndpointStats, FailureKind, ProbeSample, breach_log_line};
+    use super::{EndpointStats, FailureKind, HealthCheckReport, ProbeSample, breach_log_line};
     use std::time::Duration;
 
     fn healthy(latency: Duration) -> ProbeSample {
@@ -433,7 +531,7 @@ mod tests {
         // otherwise it under-counts against its own ">125ms" label.
         assert_eq!(stats.over_budget_count(), 3);
         assert_eq!(stats.max_latency, Duration::from_millis(501));
-        assert_eq!(stats.latencies_ms().len(), 5);
+        assert_eq!(stats.latencies_ms.len(), 5);
     }
 
     #[test]
@@ -497,6 +595,27 @@ mod tests {
         );
     }
 
+    /// An endpoint with no samples must render alongside populated ones without
+    /// panicking, and every row must carry the same column count.
+    #[test]
+    fn latency_summary_renders_healthy_slow_and_empty_endpoints() {
+        let mut populated = EndpointStats::default();
+        for ms in [1, 2, 2, 3, 4] {
+            populated.record_sample(&healthy(Duration::from_millis(ms)));
+        }
+        for ms in [130, 260, 600, 1_400] {
+            populated.record_sample(&slow(Duration::from_millis(ms)));
+        }
+
+        let mut report = HealthCheckReport::default();
+        report.endpoints.insert("/health", populated);
+        report
+            .endpoints
+            .insert("/v1/ready", EndpointStats::default());
+
+        report.print_latency_summary("test");
+    }
+
     #[test]
     fn healthy_samples_record_no_failures() {
         let mut stats = EndpointStats::default();
@@ -508,6 +627,6 @@ mod tests {
         assert_eq!(stats.warn_count, 0);
         assert_eq!(stats.error_count, 0);
         assert!(stats.last_error.is_none());
-        assert_eq!(stats.latencies_ms().len(), 10);
+        assert_eq!(stats.latencies_ms.len(), 10);
     }
 }
