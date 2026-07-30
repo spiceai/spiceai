@@ -330,7 +330,7 @@ async fn get_spiceai_table_provider(
     dataset.access = AccessMode::ReadWrite;
     dataset.replication = Some(Replication { enabled: true });
 
-    let params = ConnectorParamsBuilder::new(name.into(), (&dataset).into())
+    let params = ConnectorParamsBuilder::for_dataset(name.into(), &dataset)
         .build(secrets, io_runtime)
         .await
         .context(UnableToCreateDataConnectorSnafu)?;
