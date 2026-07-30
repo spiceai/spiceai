@@ -28,6 +28,8 @@ fundu.workspace = true
 futures.workspace = true
 object_store.workspace = true
 opentelemetry.workspace = true
+runtime-datafusion = { path = "../runtime-datafusion" }
+runtime-query-engine = { path = "../runtime-query-engine" }
 telemetry = { path = "../telemetry" }
 runtime-parameters = { path = "../runtime-parameters" }
 runtime-object-store = { path = "../runtime-object-store" }

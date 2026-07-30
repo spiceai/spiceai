@@ -148,6 +148,7 @@ runtime-search = { path = "../runtime-search" }
 runtime-tools = { path = "../runtime-tools" }
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
+runtime-resources = { path = "../runtime-resources" }
 runtime-object-store = { path = "../runtime-object-store" }
 runtime-parameters = { path = "../runtime-parameters" }
 runtime-proto = { path = "../runtime-proto" }

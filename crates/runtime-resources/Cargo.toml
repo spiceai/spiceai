@@ -1,0 +1,19 @@
+[package]
+description = "Host and container resource introspection for the Spice runtime: cgroup-aware memory totals and process usage monitoring."
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "runtime-resources"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+parking_lot.workspace = true
+sysinfo.workspace = true
+tracing.workspace = true
+util = { path = "../util" }
+
+[lints]
+workspace = true

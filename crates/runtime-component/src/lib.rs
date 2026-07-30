@@ -320,3 +320,4 @@ mod tests {
             .expect_err("should error parsing identifier");
     }
 }
+pub mod schema_evolution;
