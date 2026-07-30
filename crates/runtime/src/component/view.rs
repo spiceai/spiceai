@@ -150,13 +150,24 @@ impl TryFrom<spicepod_view::View> for ViewBuilder {
 
         // verify that the acceleration configuration is fully supported
         if let Some(acc) = &acceleration {
-            if acc.refresh_mode.is_some()
-                && acc.refresh_mode != Some(acceleration::RefreshMode::Full)
-            {
-                return Err(crate::Error::AcceleratedViewInvalidConfiguration {
-                    view_name: view.name,
-                    reason: "Only 'refresh_mode: full' is supported".to_string(),
-                });
+            match acc.refresh_mode {
+                None | Some(acceleration::RefreshMode::Full) => {}
+                Some(acceleration::RefreshMode::Append) => {
+                    if view.time_column.is_none() {
+                        return Err(crate::Error::AcceleratedViewInvalidConfiguration {
+                            view_name: view.name,
+                            reason: "'refresh_mode: append' requires 'time_column' to be set"
+                                .to_string(),
+                        });
+                    }
+                }
+                Some(_) => {
+                    return Err(crate::Error::AcceleratedViewInvalidConfiguration {
+                        view_name: view.name,
+                        reason: "Only 'refresh_mode: full' or 'refresh_mode: append' is supported"
+                            .to_string(),
+                    });
+                }
             }
 
             if acc.refresh_sql.is_some() {
@@ -300,5 +311,78 @@ impl ViewBuilder {
             runtime,
             app,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spicepod::acceleration::{
+        Acceleration as SpicepodAcceleration, RefreshMode as SpicepodRefreshMode,
+    };
+
+    fn view_with_acceleration(acceleration: SpicepodAcceleration) -> spicepod_view::View {
+        let mut view = spicepod_view::View::new("my_view".to_string());
+        view.sql = Some("SELECT id, created_at FROM my_dataset".to_string());
+        view.acceleration = Some(acceleration);
+        view
+    }
+
+    #[test]
+    fn append_refresh_mode_requires_time_column() {
+        let mut view = view_with_acceleration(SpicepodAcceleration {
+            enabled: true,
+            refresh_mode: Some(SpicepodRefreshMode::Append),
+            ..SpicepodAcceleration::default()
+        });
+        view.time_column = None;
+
+        let err = ViewBuilder::try_from(view)
+            .err()
+            .expect("append without time_column should fail");
+        assert!(
+            err.to_string().contains("time_column"),
+            "error should mention time_column, got: {err}"
+        );
+    }
+
+    #[test]
+    fn append_refresh_mode_with_time_column_succeeds() {
+        let mut view = view_with_acceleration(SpicepodAcceleration {
+            enabled: true,
+            refresh_mode: Some(SpicepodRefreshMode::Append),
+            ..SpicepodAcceleration::default()
+        });
+        view.time_column = Some("created_at".to_string());
+
+        ViewBuilder::try_from(view).expect("append with time_column should succeed");
+    }
+
+    #[test]
+    fn changes_refresh_mode_is_rejected() {
+        let view = view_with_acceleration(SpicepodAcceleration {
+            enabled: true,
+            refresh_mode: Some(SpicepodRefreshMode::Changes),
+            ..SpicepodAcceleration::default()
+        });
+
+        let err = ViewBuilder::try_from(view)
+            .err()
+            .expect("refresh_mode: changes should be rejected");
+        assert!(
+            err.to_string().contains("full") && err.to_string().contains("append"),
+            "error should name the supported modes, got: {err}"
+        );
+    }
+
+    #[test]
+    fn full_refresh_mode_succeeds_without_time_column() {
+        let view = view_with_acceleration(SpicepodAcceleration {
+            enabled: true,
+            refresh_mode: Some(SpicepodRefreshMode::Full),
+            ..SpicepodAcceleration::default()
+        });
+
+        ViewBuilder::try_from(view).expect("refresh_mode: full should succeed");
     }
 }
