@@ -159,6 +159,25 @@ pub enum Error {
         dataset: String,
         param: &'static str,
     },
+
+    #[snafu(display(
+        "Dataset `{dataset}` cannot share replication slot `{slot}`: its accelerator {joining}, \
+         but the dataset that opened the slot has one that {existing}. A shared slot has a single \
+         lifetime for every dataset on it — it is released when Spice shuts down, and its WAL \
+         history is discarded when re-bootstrapping, but only when every dataset's accelerator \
+         starts empty. Mixing the two would silently drop changes for the persistent one. Give \
+         this dataset its own `pg_replication_slot`, or use the same acceleration `mode` for \
+         every dataset sharing this slot. \
+         See: https://spiceai.org/docs/components/data-connectors/postgres"
+    ))]
+    SharedSlotDurabilityMismatch {
+        dataset: String,
+        slot: String,
+        /// Pre-rendered so the message needs no conditional formatting, e.g.
+        /// "does not survive a restart".
+        joining: &'static str,
+        existing: &'static str,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

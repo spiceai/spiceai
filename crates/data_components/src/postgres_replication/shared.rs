@@ -1307,9 +1307,6 @@ struct SharedSource {
     /// Tables whose member detached during this pump's lifetime; a rejoin is
     /// resumed via held-floor replay instead of a snapshot.
     detached: Mutex<HashSet<MemberKey>>,
-    /// Whether the slot should be dropped when the pump stops for runtime
-    /// shutdown (see [`SharedSource::note_member_durability`]).
-    drop_slot_on_shutdown: AtomicBool,
 }
 
 impl SharedSource {
@@ -1325,26 +1322,6 @@ impl SharedSource {
             dead: AtomicBool::new(false),
             slot_created_fresh: AtomicBool::new(false),
             detached: Mutex::new(HashSet::new()),
-            // Starts `true` and is only ever cleared, by the first member whose
-            // accelerator is durable (see `note_member_durability`).
-            drop_slot_on_shutdown: AtomicBool::new(true),
-        }
-    }
-
-    /// Fold a joining member's accelerator durability into the slot's shutdown
-    /// policy: the shared slot is dropped on shutdown only while *every* member
-    /// that has ever joined it was non-persistent.
-    ///
-    /// One durable member is enough to veto the drop, permanently. That member
-    /// resumes from the slot's `confirmed_flush_lsn` on the next start, and a
-    /// dropped slot would send it down the fresh-slot path instead: its snapshot
-    /// would upsert over accelerator state that already exists, so rows deleted
-    /// at the source while Spice was down would survive in the accelerator. The
-    /// veto is monotonic (`false` is never unset) so the answer does not depend
-    /// on which members happen to still be attached when the pump stops.
-    fn note_member_durability(&self, params: &ReplicationParams) {
-        if !params.ephemeral_accelerator {
-            self.drop_slot_on_shutdown.store(false, Ordering::Release);
         }
     }
 
@@ -1576,6 +1553,23 @@ async fn attach_member(
         });
     }
 
+    // Accelerator durability is not a connection parameter, but it *is* a
+    // property of the slot rather than of one member: the slot is released on
+    // shutdown, and its history discarded when re-bootstrapping, only when every
+    // member's accelerator starts empty. A durable member on such a slot resumes
+    // from a `confirmed_flush_lsn` that is no longer backed by retained WAL, so
+    // it would silently serve a gap. Reject the combination instead -- the two
+    // members want incompatible slot lifetimes, and separate slots give each
+    // what it needs.
+    if params.ephemeral_accelerator != source.params.ephemeral_accelerator {
+        return Err(Error::SharedSlotDurabilityMismatch {
+            dataset: dataset_name,
+            slot: source.key.slot_name.clone(),
+            joining: durability_description(params.ephemeral_accelerator),
+            existing: durability_description(source.params.ephemeral_accelerator),
+        });
+    }
+
     if let Some(existing) = source.member(&member_key) {
         if existing.sender.is_closed() {
             // The previous subscription's receiver is gone (dataset reload,
@@ -1590,10 +1584,6 @@ async fn attach_member(
             });
         }
     }
-
-    // Recorded before any DDL, so a member whose setup then fails has still
-    // vetoed the shutdown drop if its accelerator is durable.
-    source.note_member_durability(&params);
 
     // Slot + publication DDL (idempotent, retried on transient errors).
     let setup = slot::setup_shared_member(&source.params, &schema_name, &table_name).await?;
@@ -1741,6 +1731,17 @@ async fn attach_member(
     Ok(Box::pin(head.chain(receiver)))
 }
 
+/// Render a member's accelerator durability for
+/// [`Error::SharedSlotDurabilityMismatch`], which describes both sides of the
+/// disagreement in one sentence.
+fn durability_description(ephemeral: bool) -> &'static str {
+    if ephemeral {
+        "starts empty on every restart (an in-memory or truncate-on-startup acceleration `mode`)"
+    } else {
+        "persists across restarts (a file-backed acceleration `mode`)"
+    }
+}
+
 /// Compare connection-level params of a joining member against the shared
 /// source's. Returns the name of the first mismatched parameter, never its
 /// value — passwords and certificate paths must not leak into error messages.
@@ -1808,12 +1809,17 @@ fn finish_pump(source: &Arc<SharedSource>) {
 }
 
 /// Drop the shared slot when the pump stops for runtime shutdown and no member
-/// ever needed it to survive (see [`SharedSource::note_member_durability`]).
+/// needs it to survive.
+///
+/// Reading the source's own params is authoritative for every member: a member
+/// whose accelerator durability disagrees is rejected at join time with
+/// [`Error::SharedSlotDurabilityMismatch`], so all members of a live slot share
+/// this value.
 ///
 /// Best-effort and time-bounded — shutdown never blocks on the source, and a
 /// surviving slot costs retained WAL, not correctness.
 async fn drop_slot_if_ephemeral(source: &Arc<SharedSource>) {
-    if source.drop_slot_on_shutdown.load(Ordering::Acquire) {
+    if source.params.ephemeral_accelerator {
         slot::drop_slot_after_shutdown(&source.params).await;
     }
 }
@@ -3097,47 +3103,38 @@ mod tests {
         }
     }
 
-    /// The shutdown drop is vetoed by a single durable member, permanently and
-    /// regardless of join order -- dropping a slot a durable accelerator resumes
-    /// from would send it down the fresh-slot path, where its snapshot upserts
-    /// over existing state and rows deleted at the source while Spice was down
-    /// would survive in the accelerator.
+    /// The two durabilities must render as distinguishable prose -- the mismatch
+    /// error states both sides in one sentence, and identical (or vague) text
+    /// would leave an operator unable to tell which dataset to move.
     #[test]
-    fn one_durable_member_vetoes_the_shutdown_slot_drop() {
-        let ephemeral = ReplicationParams {
-            ephemeral_accelerator: true,
-            ..test_params()
-        };
-        let durable = ReplicationParams {
-            ephemeral_accelerator: false,
-            ..test_params()
-        };
+    fn durability_descriptions_distinguish_the_two_cases() {
+        let ephemeral = durability_description(true);
+        let durable = durability_description(false);
+        assert_ne!(ephemeral, durable);
+        assert!(ephemeral.contains("starts empty"), "{ephemeral}");
+        assert!(durable.contains("persists across restarts"), "{durable}");
+        // Both name the setting an operator would actually change.
+        assert!(ephemeral.contains("`mode`"), "{ephemeral}");
+        assert!(durable.contains("`mode`"), "{durable}");
+    }
 
-        let all_ephemeral =
-            SharedSource::new(SourceKey::from_params(&ephemeral), ephemeral.clone());
-        all_ephemeral.note_member_durability(&ephemeral);
-        all_ephemeral.note_member_durability(&ephemeral);
-        assert!(
-            all_ephemeral.drop_slot_on_shutdown.load(Ordering::Acquire),
-            "a slot whose every member re-snapshots anyway should not be left retaining WAL"
-        );
+    /// The mismatch error must name the slot and describe both accelerators, so
+    /// an operator can tell which dataset to move without reading the source.
+    #[test]
+    fn durability_mismatch_error_is_actionable() {
+        let message = Error::SharedSlotDurabilityMismatch {
+            dataset: "orders".to_string(),
+            slot: "spice_shared".to_string(),
+            joining: durability_description(false),
+            existing: durability_description(true),
+        }
+        .to_string();
 
-        // Durable member last...
-        let durable_last = SharedSource::new(SourceKey::from_params(&ephemeral), ephemeral.clone());
-        durable_last.note_member_durability(&ephemeral);
-        durable_last.note_member_durability(&durable);
-        assert!(!durable_last.drop_slot_on_shutdown.load(Ordering::Acquire));
-
-        // ...and durable member first, then an ephemeral one that must not
-        // re-enable the drop.
-        let durable_first =
-            SharedSource::new(SourceKey::from_params(&ephemeral), ephemeral.clone());
-        durable_first.note_member_durability(&durable);
-        durable_first.note_member_durability(&ephemeral);
-        assert!(
-            !durable_first.drop_slot_on_shutdown.load(Ordering::Acquire),
-            "the veto must be monotonic, not last-writer-wins"
-        );
+        assert!(message.contains("orders"), "{message}");
+        assert!(message.contains("spice_shared"), "{message}");
+        assert!(message.contains("pg_replication_slot"), "{message}");
+        assert!(message.contains("acceleration `mode`"), "{message}");
+        assert!(message.contains("https://spiceai.org/docs"), "{message}");
     }
 
     type MemberProbe = (
