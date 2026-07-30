@@ -44,7 +44,7 @@ use runtime::{Runtime, auth::EndpointAuth, config::Config};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use spicepod::{
-    acceleration::{Acceleration, Mode},
+    acceleration::{Acceleration, Mode, ZeroResultsAction},
     component::embeddings::Embeddings,
     fts::FtsStore,
     param::ParamValue,
@@ -61,6 +61,8 @@ use std::{
 use super::models::sort_json_keys;
 #[cfg(feature = "s3_vectors")]
 use crate::search::s3_vectors::prepare_for_aws_tests;
+#[cfg(feature = "s3_vectors")]
+use crate::utils::verify_env_secret_exists;
 use crate::{
     DEFAULT_TRACING_MODELS, configure_test_datafusion, init_tracing,
     models::{create_api_bindings_config, http_post, search::replace_s3_vector_index_names},
@@ -114,6 +116,9 @@ enum AccelerationOptions {
     DuckDb,
     DuckDbFile,
     Cayenne,
+    /// Cayenne acceleration with `on_zero_results: use_source`, so a warm search
+    /// tier that returns nothing falls through to the external vector engine index.
+    CayenneWithZeroResults,
 }
 
 impl fmt::Display for AccelerationOptions {
@@ -124,6 +129,7 @@ impl fmt::Display for AccelerationOptions {
             AccelerationOptions::DuckDb => "duckdb",
             AccelerationOptions::DuckDbFile => "duckdb_file",
             AccelerationOptions::Cayenne => "cayenne",
+            AccelerationOptions::CayenneWithZeroResults => "cayenne_with_zero_results",
         };
         write!(f, "{s}")
     }
@@ -132,8 +138,9 @@ impl fmt::Display for AccelerationOptions {
 impl AccelerationOptions {
     /// Converts to Spicepod [`Acceleration`] configuration.
     ///
-    /// `unique_id` enables accelerations to set unique filepaths, when needed.
-    fn to_acceleration(&self, unique_id: &str) -> Acceleration {
+    /// `unique_id` enables accelerations to set unique filepaths, when needed. `table_name` is the
+    /// accelerated dataset name, used to build `refresh_sql` for the zero-results fallback variant.
+    fn to_acceleration(&self, unique_id: &str, table_name: &str) -> Acceleration {
         match self {
             AccelerationOptions::NoAcceleration => Acceleration {
                 enabled: false,
@@ -159,25 +166,47 @@ impl AccelerationOptions {
                 )]))),
                 ..Default::default()
             },
-            AccelerationOptions::Cayenne => Acceleration {
-                enabled: true,
-                engine: Some("cayenne".to_string()),
-                mode: Mode::File,
-                params: Some(spicepod::param::Params::from_string_map(HashMap::from([
-                    (
-                        "cayenne_metadata_dir".to_string(),
-                        format!(".spice/metadata/cayenne_acceleration_{unique_id}/"),
-                    ),
-                    (
-                        "cayenne_file_path".to_string(),
-                        format!(".spice/data/cayenne_acceleration_{unique_id}/"),
-                    ),
-                ]))),
-                ..Default::default()
-            },
+            AccelerationOptions::Cayenne | AccelerationOptions::CayenneWithZeroResults => {
+                let with_zero_results = matches!(self, AccelerationOptions::CayenneWithZeroResults);
+                Acceleration {
+                    enabled: true,
+                    engine: Some("cayenne".to_string()),
+                    mode: Mode::File,
+                    // `CayenneWithZeroResults` opts the warm tier into falling through to the
+                    // external vector engine index when it returns no results, and refreshes zero
+                    // rows so the warm tier stays empty and every search takes that fallback path.
+                    on_zero_results: if with_zero_results {
+                        ZeroResultsAction::UseSource
+                    } else {
+                        ZeroResultsAction::default()
+                    },
+                    refresh_sql: with_zero_results
+                        .then(|| format!("SELECT * FROM {table_name} LIMIT 0")),
+                    params: Some(spicepod::param::Params::from_string_map(HashMap::from([
+                        (
+                            "cayenne_metadata_dir".to_string(),
+                            format!(".spice/metadata/cayenne_acceleration_{unique_id}/"),
+                        ),
+                        (
+                            "cayenne_file_path".to_string(),
+                            format!(".spice/data/cayenne_acceleration_{unique_id}/"),
+                        ),
+                    ]))),
+                    ..Default::default()
+                }
+            }
         }
     }
 }
+
+/// Name of the environment variable holding the ARN of the long-lived, pre-seeded S3 Vectors index
+/// that [`VectorEngineOptions::S3VectorsFallback`] targets.
+///
+/// The index must be created and populated out of band (the zero-row acceleration writes nothing),
+/// and it is referenced by ARN precisely because an ARN-identified index is never created or
+/// written to by the runtime — so the persisted vectors survive across runs for the warm-tier
+/// fallback to read.
+const S3_VECTORS_FALLBACK_ARN_ENV: &str = "AWS_S3_VECTORS_FALLBACK_INDEX_ARN";
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -185,6 +214,9 @@ enum VectorEngineOptions {
     NoVectorEngine,
     DuckDb,
     S3Vectors,
+    /// S3 Vectors backed by a long-lived, never-deleted index, used to exercise the warm-tier
+    /// fallback path: when the warm tier is empty, searches fall through to this persisted index.
+    S3VectorsFallback,
 }
 
 impl fmt::Display for VectorEngineOptions {
@@ -193,6 +225,7 @@ impl fmt::Display for VectorEngineOptions {
             VectorEngineOptions::NoVectorEngine => "no_vector_engine",
             VectorEngineOptions::DuckDb => "duckdb",
             VectorEngineOptions::S3Vectors => "s3_vectors",
+            VectorEngineOptions::S3VectorsFallback => "s3_vectors_fallback",
         };
         write!(f, "{s}")
     }
@@ -210,15 +243,9 @@ impl VectorEngineOptions {
                 engine: Some("duckdb".to_string()),
                 ..Default::default()
             },
-            VectorEngineOptions::S3Vectors => VectorStore {
-                enabled: true,
-                engine: Some("s3_vectors".to_string()),
-                params: Some(spicepod::param::Params::from_string_map(HashMap::from([
+            VectorEngineOptions::S3Vectors | VectorEngineOptions::S3VectorsFallback => {
+                let mut params = HashMap::from([
                     ("s3_vectors_aws_region".to_string(), "us-east-2".to_string()),
-                    (
-                        "s3_vectors_bucket".to_string(),
-                        "spice-ci-tests-s3-vectors".to_string(),
-                    ),
                     (
                         "s3_vectors_aws_access_key_id".to_string(),
                         "${ env:AWS_S3_VECTORS_KEY }".to_string(),
@@ -227,9 +254,34 @@ impl VectorEngineOptions {
                         "s3_vectors_aws_secret_access_key".to_string(),
                         "${ env:AWS_S3_VECTORS_SECRET }".to_string(),
                     ),
-                ]))),
-                ..Default::default()
-            },
+                ]);
+                match self {
+                    // The fallback engine targets a pre-seeded index by ARN. `s3_vectors_arn` is
+                    // mutually exclusive with `s3_vectors_bucket`/`s3_vectors_index`, and an
+                    // ARN-identified index is never created or written to by the runtime — so the
+                    // zero-row acceleration leaves the persisted vectors intact to fall back on.
+                    VectorEngineOptions::S3VectorsFallback => {
+                        params.insert(
+                            "s3_vectors_arn".to_string(),
+                            format!("${{ env:{S3_VECTORS_FALLBACK_ARN_ENV} }}"),
+                        );
+                    }
+                    // The per-permutation index name is injected by the caller
+                    // (`test_megascience_permutations`); only the bucket is fixed here.
+                    _ => {
+                        params.insert(
+                            "s3_vectors_bucket".to_string(),
+                            "spice-ci-tests-s3-vectors".to_string(),
+                        );
+                    }
+                }
+                VectorStore {
+                    enabled: true,
+                    engine: Some("s3_vectors".to_string()),
+                    params: Some(spicepod::param::Params::from_string_map(params)),
+                    ..Default::default()
+                }
+            }
         }
     }
 }
@@ -302,7 +354,8 @@ async fn test_megascience_permutations(
     #[values(
         VectorEngineOptions::NoVectorEngine,
         VectorEngineOptions::DuckDb,
-        VectorEngineOptions::S3Vectors
+        VectorEngineOptions::S3Vectors,
+        VectorEngineOptions::S3VectorsFallback
     )]
     vector_engine: VectorEngineOptions,
     #[values(TextEngineOptions::NoTextEngine, TextEngineOptions::Elasticsearch)]
@@ -312,7 +365,8 @@ async fn test_megascience_permutations(
         AccelerationOptions::Arrow,
         AccelerationOptions::DuckDb,
         AccelerationOptions::DuckDbFile,
-        AccelerationOptions::Cayenne
+        AccelerationOptions::Cayenne,
+        AccelerationOptions::CayenneWithZeroResults
     )]
     acceleration_opt: AccelerationOptions,
     #[values(
@@ -357,7 +411,8 @@ async fn test_megascience_permutations(
     slug.hash(&mut z);
     std::fs::create_dir_all(spice_data_base_path()).expect("failed to create spice data base path");
     let unique_id = z.finish().to_string();
-    let acceleration = acceleration_opt.to_acceleration(&unique_id);
+    let acceleration =
+        acceleration_opt.to_acceleration(&unique_id, table_option.table_to_search_on());
 
     let mut app = AppBuilder::new(slug);
     let (views, datasets) = table_option.to_tables();
@@ -365,8 +420,10 @@ async fn test_megascience_permutations(
     // Prepare vector store for AWS tests if needed.
     let mut vector_store = vector_engine.to_vector_store();
 
-    // Update vector store params with dynamic values as needed.
-    if vector_store.engine.as_deref() == Some("s3_vectors")
+    // Give the (non-fallback) S3 Vectors engine a unique per-permutation index name so parallel
+    // runs don't clobber each other. The fallback engine deliberately keeps the ARN-identified,
+    // long-lived index it set in `to_vector_store`, so a prior run's vectors remain to fall back to.
+    if matches!(vector_engine, VectorEngineOptions::S3Vectors)
         && let Some(params) = vector_store.params.as_mut()
     {
         params.data.insert(
@@ -380,10 +437,28 @@ async fn test_megascience_permutations(
             )),
         );
     }
+    // The fallback engine reads a pre-seeded index identified by ARN. Fail fast with an actionable
+    // message if that ARN wasn't supplied, rather than surfacing an opaque secret-resolution error
+    // once the runtime tries to load the vector store.
     #[cfg(feature = "s3_vectors")]
-    prepare_for_aws_tests(&vector_store, vector_store.enabled)
-        .await
-        .expect("could not prepare vector store for tests");
+    if matches!(vector_engine, VectorEngineOptions::S3VectorsFallback) {
+        verify_env_secret_exists(S3_VECTORS_FALLBACK_ARN_ENV)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "S3VectorsFallback requires the {S3_VECTORS_FALLBACK_ARN_ENV} environment variable to point at a pre-seeded S3 Vectors index ARN: {e}"
+                )
+            });
+    }
+    // The fallback engine reuses a long-lived index across runs, so it is never pre-deleted;
+    // every other engine starts each test from a clean index.
+    #[cfg(feature = "s3_vectors")]
+    prepare_for_aws_tests(
+        &vector_store,
+        vector_store.enabled && !matches!(vector_engine, VectorEngineOptions::S3VectorsFallback),
+    )
+    .await
+    .expect("could not prepare vector store for tests");
 
     // Start Elasticsearch Docker container if needed, and get the endpoint URL.
     // The container is kept alive for the duration of the test then dropped.
@@ -474,6 +549,34 @@ fn validate_combination(
     table_option: &megascience::TableOptions,
     column_config: &megascience::ColumnConfigOptions,
 ) -> Result<(), String> {
+    // The warm-tier fallback path is exercised by exactly one pairing: `CayenneWithZeroResults`
+    // acceleration (an enabled warm tier whose `on_zero_results` falls through) over the
+    // `S3VectorsFallback` engine (a long-lived index that survives across runs, so the fallback has
+    // data to return). Bind the two to each other, and to a single table/column/text combination,
+    // so the pairing stays one deterministic permutation.
+    let fallback_acceleration = matches!(
+        acceleration_opt,
+        AccelerationOptions::CayenneWithZeroResults
+    );
+    let fallback_vector = matches!(vector_engine, VectorEngineOptions::S3VectorsFallback);
+    if fallback_acceleration || fallback_vector {
+        if fallback_acceleration != fallback_vector {
+            return Err(
+                "CayenneWithZeroResults and S3VectorsFallback are only tested together".to_string(),
+            );
+        }
+        if !matches!(table_option, megascience::TableOptions::Dataset)
+            || !matches!(column_config, megascience::ColumnConfigOptions::Basic)
+            || !matches!(text_engine, TextEngineOptions::NoTextEngine)
+        {
+            return Err(
+                "S3 Vectors fallback is tested only on the dataset/basic/no-text-engine combination"
+                    .to_string(),
+            );
+        }
+        return Ok(());
+    }
+
     if matches!(
         (&table_option, &acceleration_opt),
         (
