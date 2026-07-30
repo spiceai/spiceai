@@ -113,6 +113,19 @@ fail()  { echo "${NO} $*" >&2; exit 1; }
 # Prefix each non-empty line of stdin with "$1" (for indented list output).
 bullet() { local prefix="$1" line; while IFS= read -r line; do [[ -n "$line" ]] && echo "${prefix}${line}"; done; }
 
+# True when "$1" holds at least one character that is not a tab, newline, CR, or
+# space — i.e. the string carries content rather than only separators.
+#
+# This replaces `[[ -n "${var//[$'\t\n\r ']/}" ]]`. That expansion is quadratic
+# or worse in bash 3.2 (still /bin/bash on macOS, which `#!/usr/bin/env bash`
+# resolves to), so applying it to a branch's changed-file list — ~107 KB for a
+# 900-file diff — takes hours: measured 1.8s at 3 KB, 14s at 6 KB, 91s at 12 KB,
+# extrapolating to ~11h at 107 KB. A glob match short-circuits on the first
+# content character instead, and stays fast (~20ms at 107 KB) even in the
+# all-whitespace worst case, where it has to scan the whole string.
+readonly SIGNOFF_SEPARATORS=$'\t\n\r '
+has_content() { [[ "$1" == *[!$SIGNOFF_SEPARATORS]* ]]; }
+
 # --- preconditions -----------------------------------------------------------
 
 # Detect Git first so colocated JJ repositories retain the existing Git behavior.
@@ -379,7 +392,7 @@ packages_for_changed_files() {
   local files
   # Read paths first — the program below reads metadata from stdin.
   files=$(cat)
-  [[ -n "${files//[$'\t\n\r ']/}" ]] || return 0
+  has_content "$files" || return 0
 
   # Metadata streams over stdin rather than the environment: it is ~700 KB
   # against a 1 MiB ARG_MAX covering argv plus the whole environment of exec(),
@@ -445,14 +458,14 @@ changed_workspace_packages() {
     info "Could not list changed files vs ${LINT_BASE_BRANCH} — skipping targeted pre-lint"
     return 0
   fi
-  if [[ -z "${files//[$'\t\n\r ']/}" ]]; then
+  if ! has_content "$files"; then
     debug "no changed files vs ${LINT_BASE_BRANCH}"
     return 0
   fi
   debug "changed files:"$'\n'"$files"
 
   packages=$(printf '%s\n' "$files" | packages_for_changed_files) || true
-  if [[ -z "${packages//[$'\t\n\r ']/}" ]]; then
+  if ! has_content "$packages"; then
     debug "no workspace packages in the changed files"
     return 0
   fi
@@ -476,7 +489,7 @@ changed_workspace_packages() {
 # list to drift.
 workspace_features_for_packages() {
   local packages="$1"
-  [[ -n "${packages//[$'\t\n\r ']/}" ]] || return 0
+  has_content "$packages" || return 0
   command -v python3 >/dev/null 2>&1 || return 0
 
   # A resolve carrying dependencies is ~10 MB here, an order of magnitude past
@@ -514,8 +527,8 @@ print(",".join(features))
 # first. Prints the kept features, or nothing when none survive.
 features_for_packages() {
   local features="$1" packages="$2"
-  [[ -n "${features//[$'\t\n\r ']/}" ]] || return 0
-  [[ -n "${packages//[$'\t\n\r ']/}" ]] || return 0
+  has_content "$features" || return 0
+  has_content "$packages" || return 0
 
   awk -v feats="$features" -v pkgs="$packages" 'BEGIN {
     n = split(pkgs, selected, /[ \t\n]+/)
@@ -541,7 +554,7 @@ features_for_packages() {
 # the targeted tests; the full run still covers them).
 packages_with_lib_targets() {
   local packages="$1"
-  [[ -n "${packages//[$'\t\n\r ']/}" ]] || return 0
+  has_content "$packages" || return 0
   command -v python3 >/dev/null 2>&1 || return 0
 
   # Metadata streams in over stdin rather than an environment variable: this
@@ -616,11 +629,19 @@ branch_has_rust_changes() {
     debug "could not list changed files — assuming Rust changes (will run checks)"
     return 0
   fi
-  if [[ -z "${files//[$'\t\n\r ']/}" ]]; then
+  if ! has_content "$files"; then
     debug "no changed files vs ${LINT_BASE_BRANCH} — no Rust changes"
     return 1
   fi
-  if printf '%s\n' "$files" | grep -qE "$RUST_AFFECTING_PATH_PATTERN"; then
+  # Feed grep a here-string rather than a pipe: `grep -q` exits at the first
+  # match, and once "$files" exceeds the 64 KB pipe buffer that closes the pipe
+  # while the writer still has data, so the writer dies of SIGPIPE and
+  # `set -o pipefail` reports the whole pipeline as failed (status 141). This
+  # function would then answer "no Rust changes" for a branch that does change
+  # .rs files, and sign-off would skip lint/build/tests and still post success —
+  # it needs a large diff whose first matching path lands early, which is why it
+  # survived on smaller branches. Same hazard as the `| head -n1` note below.
+  if grep -qE "$RUST_AFFECTING_PATH_PATTERN" <<<"$files"; then
     debug "Rust-affecting files present — will run Rust checks"
     return 0
   fi
@@ -644,7 +665,7 @@ run_targeted_tests() {
   fi
 
   test_packages=$(packages_with_lib_targets "$packages" || true)
-  if [[ -z "${test_packages//[$'\t\n\r ']/}" ]]; then
+  if ! has_content "$test_packages"; then
     debug "no changed packages with a library target — skipping targeted unit tests"
     append_step_summary "### Targeted unit tests"$'\n'"Skipped (no changed packages with a library target)."$'\n'
     return 0

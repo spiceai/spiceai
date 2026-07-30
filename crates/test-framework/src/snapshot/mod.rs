@@ -25,6 +25,24 @@ pub const CAYENNE_PATH_FILTER_REPLACEMENT: &str = "$1/<CAYENNE_PATH>.vortex";
 const VORTEX_RANGE_FILTER_PATTERN: &str = r"(\.vortex):\d+\.\.\d+";
 const VORTEX_RANGE_FILTER_REPLACEMENT: &str = "$1:<RANGE>";
 
+/// Redact the per-environment connection context that federated connectors embed
+/// in their physical plan (`VirtualExecutionPlan … compute_context=host=…`). The
+/// host/port/db/user string is connection metadata, not plan structure, so leaving
+/// it in the snapshot makes the explain check pass only against the exact endpoint
+/// the snapshot was captured on. Normalizing it to a constant token lets identical
+/// plans compare equal regardless of which host/db they ran against.
+///
+/// `,port=\d+` anchors the match, and each field forbids spaces (`[^, ]+`) so the
+/// match cannot run past the connection context into the pushed-down SQL — critical
+/// because a trailing field such as `user=root` is followed only by a space before
+/// `base_sql=`, and that SQL may contain no comma to otherwise stop a greedy match.
+/// `db`/`user` and the trailing comma are optional to cover connectors that omit
+/// fields (e.g. `MySQL` has no trailing comma, `PostgreSQL` renders `host=Tcp("…")`
+/// and a trailing comma).
+const CONNECTION_CONTEXT_FILTER_PATTERN: &str =
+    r"compute_context=host=[^, ]+,port=\d+(?:,db=[^, ]+)?(?:,user=[^, ]+)?,?";
+const CONNECTION_CONTEXT_FILTER_REPLACEMENT: &str = "compute_context=<CONNECTION>";
+
 /// Queries temporarily excluded from explain-plan snapshot validation because their
 /// plans are not yet stable enough to snapshot deterministically.
 const EXPLAIN_SNAPSHOT_SKIP_LIST: &[&str] = &["chbench_q5"];
@@ -44,6 +62,10 @@ fn build_explain_filters(temp_dir: &std::path::Path) -> Vec<(String, &'static st
         (path_filter_pattern, "/data"),
         (CAYENNE_PATH_FILTER_PATTERN.to_string(), CAYENNE_PATH_FILTER_REPLACEMENT),
         (VORTEX_RANGE_FILTER_PATTERN.to_string(), VORTEX_RANGE_FILTER_REPLACEMENT),
+        (
+            CONNECTION_CONTEXT_FILTER_PATTERN.to_string(),
+            CONNECTION_CONTEXT_FILTER_REPLACEMENT,
+        ),
         (r"required_guarantees=\[[^\]]*\]".to_string(), "required_guarantees=[N]"),
         (r"partition_sizes=\[[^\]]*\]".to_string(), "partition_sizes=[<redacted>]"),
         (r"file_groups=\{(\d+ groups?): [^}]+\}".to_string(), "file_groups={$1: [<redacted>]}"),
@@ -427,6 +449,39 @@ mod tests {
 
         let result = super::sort_partitioned_union_children(input);
         assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_connection_context_filter() -> Result<(), String> {
+        let regex = regex::Regex::new(super::CONNECTION_CONTEXT_FILTER_PATTERN)
+            .map_err(|e| format!("{e}"))?;
+        let replacement = super::CONNECTION_CONTEXT_FILTER_REPLACEMENT;
+
+        // PostgreSQL: host wrapped in Tcp("…") with a trailing comma before base_sql.
+        let input = r#"VirtualExecutionPlan name=postgres compute_context=host=Tcp("benchmarking-postgres-rw.dataplatform.svc.cluster.local"),port=5432,db=tpch_accelerated,user=postgres, base_sql=SELECT "l_orderkey" FROM "lineitem""#;
+        let expected = r#"VirtualExecutionPlan name=postgres compute_context=<CONNECTION> base_sql=SELECT "l_orderkey" FROM "lineitem""#;
+        assert_eq!(regex.replace_all(input, replacement), expected);
+
+        // A different PostgreSQL host/db must redact to the identical token.
+        let input = r#"VirtualExecutionPlan name=postgres compute_context=host=Tcp("localhost"),port=5433,db=tpch,user=alice, base_sql=SELECT "l_orderkey" FROM "lineitem""#;
+        assert_eq!(regex.replace_all(input, replacement), expected);
+
+        // MySQL: bare host, no trailing comma before base_sql.
+        let input = "VirtualExecutionPlan name=mysql compute_context=host=benchmark-mysql.dataplatform.svc.cluster.local,port=3306,db=tpch_sf1,user=root base_sql=SELECT `l_orderkey` FROM `lineitem`";
+        let expected = "VirtualExecutionPlan name=mysql compute_context=<CONNECTION> base_sql=SELECT `l_orderkey` FROM `lineitem`";
+        assert_eq!(regex.replace_all(input, replacement), expected);
+
+        // Idempotent: an already-redacted snapshot is left unchanged.
+        let input =
+            "VirtualExecutionPlan name=postgres compute_context=<CONNECTION> base_sql=SELECT 1";
+        assert_eq!(regex.replace_all(input, replacement), input);
+
+        // The anchor `,port=\d+` prevents the greedy host match from consuming the
+        // pushed-down SQL when there is no connection context to redact.
+        let input = "DuckSqlExec compute_context=./data/tpch.db sql=SELECT a, b FROM t";
+        assert_eq!(regex.replace_all(input, replacement), input);
+
+        Ok(())
     }
 
     #[test]
