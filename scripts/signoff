@@ -629,7 +629,12 @@ branch_has_rust_changes() {
     debug "no changed files vs ${LINT_BASE_BRANCH} — no Rust changes"
     return 1
   fi
-  if printf '%s\n' "$files" | grep -qE "$RUST_AFFECTING_PATH_PATTERN"; then
+  # Herestring, not `printf '%s\n' "$files" | grep -q`: under `set -o pipefail`,
+  # `grep -q` exits at its first match and closes the pipe, printf takes SIGPIPE
+  # (141), and that becomes the pipeline's status — so a changed-file list large
+  # enough to outlive grep's early exit reads as "no match" and the entire Rust
+  # gate is silently skipped while the sign-off still posts.
+  if grep -qE "$RUST_AFFECTING_PATH_PATTERN" <<<"$files"; then
     debug "Rust-affecting files present — will run Rust checks"
     return 0
   fi
@@ -1149,12 +1154,17 @@ find_signoff_ssh_host() {
   hosts="${SIGNOFF_SSH_HOSTS:-$DEFAULT_SIGNOFF_SSH_HOSTS}"
   remote_repo=$(signoff_ssh_repo_or_default)
 
+  # The probe runs under the remote user's LOGIN shell (ssh with a command
+  # string), which may be fish — fish rejects POSIX `name=value` assignments,
+  # so keep the command assignment-free and rely only on `test` and `&&`,
+  # which POSIX shells and fish share. (The sign-off payload itself is immune:
+  # run_signoff_via_ssh invokes `bash -s` explicitly.)
+  # Require .git (file or dir) — matches run_signoff_via_ssh Git-only support.
   if [[ -n "$remote_repo" ]]; then
     # Path already charset-validated; embed as a single-quoted remote literal.
-    # Require .git (file or dir) — matches run_signoff_via_ssh Git-only support.
-    probe_cmd="repo='${remote_repo}'; test -d \"\$repo\" && test -e \"\$repo/.git\""
+    probe_cmd="test -d '${remote_repo}' && test -e '${remote_repo}/.git'"
   else
-    probe_cmd='repo="$HOME/dev/spice2"; test -d "$repo" && test -e "$repo/.git"'
+    probe_cmd='test -d "$HOME/dev/spice2" && test -e "$HOME/dev/spice2/.git"'
   fi
 
   for host in $hosts; do
