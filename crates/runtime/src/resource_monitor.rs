@@ -66,6 +66,35 @@ fn get_container_memory_limit() -> Option<u64> {
 
     None
 }
+/// Resident set size of this process in bytes, or `None` where unavailable.
+///
+/// Reads `VmRSS` from `/proc/self/status`: one small read, already in kB, safe
+/// on a 2s sampling interval. Constructing a sysinfo `System` per sample (as
+/// the load-time memory warning does) refreshes far more state than a gauge
+/// needs.
+#[must_use]
+pub fn process_resident_memory_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        let kb: u64 = status
+            .lines()
+            .find(|l| l.starts_with("VmRSS:"))?
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()?;
+        Some(kb.saturating_mul(1024))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut system = System::new();
+        let pid = sysinfo::Pid::from_u32(std::process::id());
+        system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+        system.process(pid).map(sysinfo::Process::memory)
+    }
+}
+
 /// Returns the total available memory in bytes.
 ///
 /// For containerized deployments, returns the container memory limit from cgroup.
