@@ -47,8 +47,7 @@ pub(crate) fn calculate_ndcg<S: ::std::hash::BuildHasher>(
             // score; NDCG is position-weighted, so results must be sorted by score
             // (descending) before computing gain, or the ranking quality it measures is lost.
             let mut scored_docs: Vec<(&String, &f64)> = ranked_results.iter().collect();
-            scored_docs
-                .sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
+            scored_docs.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
             let relevance_scores: Vec<f64> = scored_docs
                 .into_iter()
                 .map(|(doc_id, _)| f64::from(*relevance.get(doc_id).unwrap_or(&0)))
