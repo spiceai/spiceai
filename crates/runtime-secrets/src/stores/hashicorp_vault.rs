@@ -1207,7 +1207,8 @@ mod tests {
         assert_eq!(AuthMethod::from_str("token"), Ok(AuthMethod::Token));
         // Unknown values are now rejected (the typed field's FromStr replaces
         // the old one_of validation), rather than silently falling back.
-        AuthMethod::from_str("garbage").expect_err("garbage should be rejected as an unknown auth method");
+        AuthMethod::from_str("garbage")
+            .expect_err("garbage should be rejected as an unknown auth method");
     }
 
     #[test]
