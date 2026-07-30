@@ -167,7 +167,7 @@ jobs:
           # collapse empty segments so "postgres, duckdb," → "postgres,duckdb".
           additional="${{ inputs.additional_features }}"
           if [ -n "$additional" ]; then
-            cleaned=$(echo "$additional" | tr -d '[:space:]' | sed 's/,\+/,/g; s/^,//; s/,$//')
+            cleaned=$(printf '%s' "$additional" | tr -d '[:space:]' | sed 's/,\+/,/g; s/^,//; s/,$//')
             if [ -n "$cleaned" ]; then
               features="${features},${cleaned}"
             fi
