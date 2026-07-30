@@ -21,7 +21,7 @@ limitations under the License.
 //! using the enroll-first flow shipped for BYOC (DR-025):
 //!
 //! 1. Admin in Spice Cloud generates a single-use adoption code.
-//! 2. User runs `spice connect <code>` (or sets `SPICE_ADOPT_CODE`).
+//! 2. User runs `spice connect <code>` (or sets `SPICE_CONNECT_ADOPT_CODE`).
 //! 3. **State plane (out-of-band enroll)**: `spiced` generates an ECDSA
 //!    P-256 keypair + PKCS#10 CSR and presents the adoption code, the
 //!    CSR, and its host facts to the cloud enroll endpoint over plain

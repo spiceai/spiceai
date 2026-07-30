@@ -61,6 +61,9 @@ pub enum Error {
 
     #[snafu(display("Failed to generate enrollment key material: {source}"))]
     Enrollment { source: rcgen::Error },
+
+    #[snafu(display("Failed to generate enrollment encryption key material: {reason}"))]
+    EncKeyGeneration { reason: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -101,6 +104,19 @@ pub struct Identity {
     /// Unix timestamp (seconds) after which the identity cert is no
     /// longer accepted by the server. `0` means "unknown / unbounded".
     pub not_after_unix: u64,
+    /// PEM-encoded PKCS#8 X25519 encryption private key. The cloud
+    /// HPKE-seals secret payloads to the matching public key; this key
+    /// unseals them. Kept local (never sent). Unlike the identity keypair
+    /// it is NOT rotated on renewal — the renew exchange carries no
+    /// channel to re-pin it. Defaulted (empty) so identity files written
+    /// before this field existed still load.
+    #[serde(default)]
+    pub enc_private_key_pem: String,
+    /// PEM-encoded SPKI (RFC 8410) X25519 encryption public key, as sent
+    /// to the cloud in the enroll request (`enc_pubkey_pem`). Defaulted so
+    /// older identity files still load.
+    #[serde(default)]
+    pub enc_public_key_pem: String,
 }
 
 impl Identity {
@@ -199,21 +215,26 @@ impl IdentityStore {
         }
     }
 
-    /// Generate fresh enrollment material: an ECDSA P-256 keypair and a
-    /// PKCS#10 CSR for it, all PEM-encoded. Called before the cloud
-    /// enroll request — and again before every renewal, since each
-    /// renewal rotates the keypair — so the client proves possession of
-    /// its key (the CSR self-signature) before the cloud CA issues the
-    /// leaf certificate.
+    /// Generate fresh enrollment material: an ECDSA P-256 identity keypair
+    /// with a PKCS#10 CSR for it, plus an X25519 encryption keypair, all
+    /// PEM-encoded. Called before the cloud enroll request — and again
+    /// before every renewal, since each renewal rotates the identity
+    /// keypair — so the client proves possession of its key (the CSR
+    /// self-signature) before the cloud CA issues the leaf certificate.
+    /// (Renewal ignores the fresh encryption keypair: the enrolled one is
+    /// carried over, since the renew exchange cannot re-pin it.)
     ///
     /// The CSR carries a stable common name and a `clientAuth` extended
     /// key usage so the issued leaf is directly usable as an mTLS client
-    /// certificate.
+    /// certificate. The encryption public key is sent at enroll
+    /// (`enc_pubkey_pem`, RFC 8410 SPKI) for the cloud to HPKE-seal secret
+    /// payloads to.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Enrollment`] if key generation or CSR
-    /// serialization fails.
+    /// serialization fails, or [`Error::EncKeyGeneration`] if the
+    /// encryption keypair cannot be generated or encoded.
     pub fn generate_enrollment() -> Result<EnrollmentMaterial> {
         let key_pair = KeyPair::generate().context(EnrollmentSnafu)?;
         let private_key_pem = key_pair.serialize_pem();
@@ -232,12 +253,34 @@ impl IdentityStore {
             .context(EnrollmentSnafu)?;
         let csr_pem = csr.pem().context(EnrollmentSnafu)?;
 
+        let (enc_private_key_pem, enc_public_key_pem) = generate_enc_keypair_pem()?;
+
         Ok(EnrollmentMaterial {
             private_key_pem,
             public_key_pem,
             csr_pem,
+            enc_private_key_pem,
+            enc_public_key_pem,
         })
     }
+}
+
+/// Generate an X25519 encryption keypair, returning `(private PKCS#8 PEM,
+/// public SPKI PEM)` — the RFC 8410 encodings the cloud expects in
+/// `enc_pubkey_pem` and that later unseal HPKE payloads locally. Delegates
+/// to `cloud-connect-crypto`, the single source of the sealed-secret wire
+/// crypto, so the keypair enrolled here is byte-compatible with the suite
+/// the cloud seals against.
+fn generate_enc_keypair_pem() -> Result<(String, String)> {
+    let keypair = cloud_connect_crypto::EncryptionKeypair::generate().map_err(|source| {
+        Error::EncKeyGeneration {
+            reason: source.to_string(),
+        }
+    })?;
+    Ok((
+        keypair.to_pkcs8_pem().to_string(),
+        keypair.public_key_spki_pem(),
+    ))
 }
 
 /// Freshly-generated enrollment material returned by
@@ -250,6 +293,13 @@ pub struct EnrollmentMaterial {
     pub private_key_pem: String,
     pub public_key_pem: String,
     pub csr_pem: String,
+    /// X25519 encryption private key (PKCS#8 PEM); persisted into the
+    /// [`Identity`] at enroll, ignored on renewal (the enrolled key is
+    /// carried over).
+    pub enc_private_key_pem: String,
+    /// X25519 encryption public key (RFC 8410 SPKI PEM); sent as the
+    /// enroll request's `enc_pubkey_pem`.
+    pub enc_public_key_pem: String,
 }
 
 #[cfg(unix)]
@@ -392,7 +442,34 @@ mod tests {
                 .to_string(),
             gateway_addr: "gateway.test.spice.ai:7320".to_string(),
             not_after_unix: 0,
+            enc_private_key_pem:
+                "-----BEGIN PRIVATE KEY-----\nMOCKENC\n-----END PRIVATE KEY-----\n".to_string(),
+            enc_public_key_pem: "-----BEGIN PUBLIC KEY-----\nMOCKENC\n-----END PUBLIC KEY-----\n"
+                .to_string(),
         }
+    }
+
+    #[test]
+    fn enrollment_enc_keypair_is_valid_rfc8410() {
+        let material = IdentityStore::generate_enrollment().expect("generate material");
+
+        // The PEMs must carry the standard RFC 8410 encodings.
+        let private = pem::parse(&material.enc_private_key_pem).expect("private PEM parses");
+        assert_eq!(private.tag(), "PRIVATE KEY");
+        let public = pem::parse(&material.enc_public_key_pem).expect("public PEM parses");
+        assert_eq!(public.tag(), "PUBLIC KEY");
+
+        // Round-trip through the sealed-secret crypto crate (the consumer
+        // of this key material): the persisted PKCS#8 must load and derive
+        // the same public SPKI PEM that enrollment advertised to the cloud.
+        let keypair =
+            cloud_connect_crypto::EncryptionKeypair::from_pkcs8_pem(&material.enc_private_key_pem)
+                .expect("persisted PKCS#8 must load in cloud-connect-crypto");
+        assert_eq!(
+            keypair.public_key_spki_pem(),
+            material.enc_public_key_pem,
+            "advertised SPKI must match the key derived from the private PKCS#8"
+        );
     }
 
     #[test]

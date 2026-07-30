@@ -18,6 +18,7 @@ async-trait = { workspace = true }
 # the same crypto backend rcgen generates the keypair with (see the rcgen
 # entry below), so the PKCS#8 we persist always round-trips.
 aws-lc-rs = "1"
+cloud-connect-crypto = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
 dirs = "6"

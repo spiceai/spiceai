@@ -60,7 +60,7 @@ use tonic::Streaming;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 
 use crate::config::CloudConnectConfig;
-use crate::enroll::{EnrollClient, InstanceFacts, RENEWAL_GRACE};
+use crate::enroll::{EnrollClient, RENEWAL_GRACE};
 use crate::handlers::RuntimeHandle;
 use crate::heartbeat::{build_heartbeat, build_telemetry, now_unix};
 use crate::identity::{Identity, IdentityStore};
@@ -234,14 +234,27 @@ impl ClientDriver {
                 Ok(()) => {
                     *backoff = MIN_BACKOFF;
                 }
-                Err(err) if err.is_authoritative_rejection() => {
-                    // The cloud authoritatively rejected the code — it is dead
-                    // (invalid, already consumed, or expired): discard the
-                    // staged file so a restart does not re-send it, and exit
-                    // with an actionable message.
+                Err(err) if err.is_credential_rejection() => {
+                    // The cloud rejected the code itself — it is dead
+                    // (invalid or already consumed): discard the staged file
+                    // so a restart does not re-send it, and exit with an
+                    // actionable message.
                     self.discard_pending_code().await;
                     tracing::error!(
                         "Cloud Connect: enrollment with {} was rejected: {err}; exiting cloud-connect. Mint a new adoption code in the Spice Cloud portal, run `spice connect <code>`, and restart spiced. See: https://spiceai.org/docs",
+                        self.config.enroll_endpoint
+                    );
+                    return CredentialStep::Exit;
+                }
+                Err(err) if err.is_authoritative_rejection() => {
+                    // Rejected for a reason other than the code (expired
+                    // code, or app-attachment validation: no such app,
+                    // attach conflict, app limit). The code was NOT consumed
+                    // — keep the staged file so a corrected configuration
+                    // (e.g. a fixed SPICE_CONNECT_ADOPT_APP_NAME) can still
+                    // redeem it, and exit with the server's reason.
+                    tracing::error!(
+                        "Cloud Connect: enrollment with {} was rejected: {err}; exiting cloud-connect. The adoption code was not consumed — fix the reported problem and restart spiced. See: https://spiceai.org/docs",
                         self.config.enroll_endpoint
                     );
                     return CredentialStep::Exit;
@@ -352,27 +365,14 @@ impl ClientDriver {
         client: &EnrollClient,
         code: &str,
     ) -> Result<(), enroll::Error> {
-        let material = IdentityStore::generate_enrollment().map_err(|source| {
-            enroll::Error::ProofOfPossession {
-                reason: format!("failed to generate enrollment key material: {source}"),
-            }
-        })?;
-        let facts = InstanceFacts::gather(&self.config.runtime_version);
-        let outcome = client.enroll(code, &material, &facts).await?;
-
-        let identity = Identity {
-            identifier: outcome.instance_id,
-            identity_cert_pem: outcome.identity_cert_pem,
-            private_key_pem: material.private_key_pem,
-            public_key_pem: material.public_key_pem,
-            ca_bundle_pem: outcome.ca_bundle_pem,
-            gateway_addr: outcome.gateway_addr,
-            not_after_unix: outcome.not_after_unix,
-        };
+        let (identity, app_name) = enroll::acquire_identity(client, code, &self.config).await?;
         self.persist_identity(&identity).await;
         tracing::info!(
-            "Cloud Connect: enrolled as {} (gateway {}); identity stored at {}",
+            "Cloud Connect: enrolled as {}{} (gateway {}); identity stored at {}",
             identity.identifier,
+            app_name
+                .map(|app| format!(" attached to app {app}"))
+                .unwrap_or_default(),
             identity.gateway_addr,
             self.config.identity_path.display()
         );
@@ -411,6 +411,11 @@ impl ClientDriver {
             ca_bundle_pem: current.ca_bundle_pem,
             gateway_addr: current.gateway_addr,
             not_after_unix: outcome.not_after_unix,
+            // The encryption keypair is NOT rotated on renewal: the renew
+            // exchange carries no channel to re-pin a new public key, and
+            // the cloud keeps sealing secrets to the enrolled one.
+            enc_private_key_pem: current.enc_private_key_pem,
+            enc_public_key_pem: current.enc_public_key_pem,
         };
         // The cloud has already pinned the new public key: even if
         // persistence fails, the rotated identity must be used in memory
@@ -1194,6 +1199,8 @@ mod tests {
             ca_bundle_pem: String::new(),
             gateway_addr: "gateway.test:7320".to_string(),
             not_after_unix,
+            enc_private_key_pem: String::new(),
+            enc_public_key_pem: String::new(),
         }
     }
 
