@@ -22,7 +22,11 @@ use std::{collections::HashMap, sync::Arc};
 use super::embeddings::table::EmbeddingTable;
 use crate::candidate::vector::ChunkedNonIndexVectorGeneration;
 use crate::candidate::vector_udtf::VectorUDTFGeneration;
-use crate::error::{DataFusionSnafu, Error, FormattingSnafu, Result, SearchPipelineSnafu};
+use crate::error::{
+    AdditionalColumnNotFoundSnafu, CannotSearchDatasetSnafu, DataFusionSnafu, Error,
+    FormattingSnafu, Result, SearchPipelineSnafu,
+};
+use snafu::ensure;
 use crate::table_provider_explorer::TableProviderExplorer;
 
 pub const SPICE_DEFAULT_CATALOG: &str = "spice";
@@ -110,19 +114,7 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
     async fn user_tables_that_can_search(&self) -> Result<Vec<TableReference>> {
         let mut searchable_tables = Vec::new();
         for t in self.df.get_user_table_names() {
-            if self
-                .embedding_columns_from_table(&t)
-                .await
-                .is_some_and(|cols| !cols.is_empty())
-            {
-                searchable_tables.push(t);
-                continue;
-            }
-            if self
-                .full_text_search_candidates(&t)
-                .await
-                .is_some_and(|fts_res| fts_res.is_ok_and(|c| !c.is_empty()))
-            {
+            if self.table_can_search(&t).await {
                 searchable_tables.push(t);
             }
         }
@@ -227,6 +219,16 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
         }
 
         Some(Ok(vec![]))
+    }
+
+    async fn table_can_search(&self, tbl: &TableReference) -> bool {
+        self.embedding_columns_from_table(tbl)
+            .await
+            .is_some_and(|cols| !cols.is_empty())
+            || self
+                .full_text_search_candidates(tbl)
+                .await
+                .is_some_and(|res| res.is_ok_and(|c| !c.is_empty()))
     }
 
     fn get_vector_index(
@@ -377,21 +379,12 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
             })?;
 
             if explicit_datasets_requested {
-                let embedding_columns = self.embedding_columns_from_table(tbl).await;
-                let fts_candidates = self.full_text_search_candidates(tbl).await;
-
-                let has_search_capability = embedding_columns
-                    .as_ref()
-                    .is_some_and(|cols| !cols.is_empty())
-                    || fts_candidates
-                        .as_ref()
-                        .is_some_and(|res| res.as_ref().is_ok_and(|c| !c.is_empty()));
-
-                if !has_search_capability {
-                    return Err(Error::CannotSearchDataset {
-                        data_source: tbl.clone(),
-                    });
-                }
+                ensure!(
+                    self.table_can_search(tbl).await,
+                    CannotSearchDatasetSnafu {
+                        data_source: tbl.clone()
+                    }
+                );
             }
 
             let schema = table_provider.schema();
@@ -405,18 +398,20 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
                                 .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
                     });
 
-                if col_applies && schema.column_with_name(&col.name).is_none() {
-                    let available_columns = schema
-                        .fields()
-                        .iter()
-                        .map(|f| f.name().as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    return Err(Error::AdditionalColumnNotFound {
-                        column: col.name.clone(),
-                        data_source: tbl.clone(),
-                        available_columns,
-                    });
+                if col_applies {
+                    ensure!(
+                        schema.column_with_name(&col.name).is_some(),
+                        AdditionalColumnNotFoundSnafu {
+                            column: col.name.clone(),
+                            data_source: tbl.clone(),
+                            available_columns: schema
+                                .fields()
+                                .iter()
+                                .map(|f| f.name().as_str())
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        }
+                    );
                 }
             }
         }
