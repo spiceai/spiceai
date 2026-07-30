@@ -367,7 +367,6 @@ impl PgChangeRows {
         relation: Arc<Relation>,
         raw: Vec<bytes::Bytes>,
         source_commit_ts_ms: Option<i64>,
-        streaming: bool,
     ) -> Self {
         // Computed once here (per commit-per-relation) so the metadata accessors
         // are O(1): the consumer calls them on the coalescing/metric hot path,
@@ -397,10 +396,20 @@ impl PgChangeRows {
             relation,
             raw_chunks: vec![raw],
             source_commit_ts_ms,
-            streaming,
+            streaming: false,
             row_hint,
             byte_len,
         }
+    }
+
+    /// Mark these rows as coming from a streamed (pgoutput v2+) transaction, so
+    /// [`ChangeRows::build`] decodes them in streaming mode (stripping the
+    /// subtransaction-xid prefix). Non-streamed rows leave it `false` (the
+    /// default from [`Self::new`]). `try_append` never merges across this flag.
+    #[must_use]
+    pub fn with_streaming(mut self, streaming: bool) -> Self {
+        self.streaming = streaming;
+        self
     }
 
     /// Append a compatible committed transaction without decoding or moving
@@ -3310,7 +3319,7 @@ mod raw_decode_tests {
             row: tuple(&["2", "b"]),
         });
 
-        let raw_changes = decode_raw_changes(&rel, &raw, false).expect("raw decode");
+        let raw_changes = decode_raw_changes(&rel, &raw).expect("raw decode");
         // insert + (delete-old-key + upsert-new) + delete
         assert_eq!(
             raw_changes.len(),
@@ -3346,7 +3355,7 @@ mod raw_decode_tests {
             row: TupleData { columns: vec![] },
         });
 
-        let raw_changes = decode_raw_changes(&rel, &raw, false).expect("raw decode");
+        let raw_changes = decode_raw_changes(&rel, &raw).expect("raw decode");
         // A non-PK update is a single upsert row (no delete-of-old-key).
         assert_eq!(
             raw_changes.len(),
@@ -3422,6 +3431,31 @@ mod raw_decode_tests {
     }
 
     #[test]
+    fn streamed_and_non_streamed_do_not_merge() {
+        // A large streamed (pgoutput v2+) transaction and small non-streamed ones
+        // for the same table interleave. Their raw bytes have different framing
+        // (the streamed side carries a subxid prefix), so a single `streaming`
+        // flag could not decode a merged `raw_chunks` — `try_append` must decline
+        // even though schema + relation pointers match.
+        let (sch, rel) = (schema(), relation());
+        let mut streamed = PgChangeRows::new(
+            Arc::clone(&sch),
+            Arc::clone(&rel),
+            vec![raw_insert(&["1", "a"])],
+            Some(100),
+        )
+        .with_streaming(true);
+        let non_streamed = PgChangeRows::new(sch, rel, vec![raw_insert(&["2", "b"])], Some(200));
+
+        let returned = streamed.try_append(non_streamed);
+        assert!(
+            returned.is_some(),
+            "a streamed and a non-streamed envelope must never coalesce"
+        );
+        assert_eq!(streamed.num_rows_hint(), 1);
+    }
+
+    #[test]
     fn structurally_identical_but_distinct_generations_decline_the_merge() {
         // Compatibility is decided by pointer, so a relation rebuilt from
         // scratch declines the merge even though it compares equal field for
@@ -3462,7 +3496,7 @@ mod raw_decode_tests {
     #[test]
     fn pgchangerows_metadata_is_answered_without_decoding() {
         // is_empty is exact; num_rows_hint is an upper bound (+1 per UPDATE).
-        let empty = PgChangeRows::new(schema(), relation(), vec![], Some(7), false);
+        let empty = PgChangeRows::new(schema(), relation(), vec![], Some(7));
         assert!(empty.is_empty());
         assert_eq!(empty.num_rows_hint(), 0);
 
@@ -3474,7 +3508,6 @@ mod raw_decode_tests {
                 raw_update(&["1", "a"], &["2", "b"]),
             ],
             Some(7),
-            false,
         );
         assert!(!rows.is_empty());
         // 2 messages + 1 (the UPDATE may split) = 3 upper bound; actual after

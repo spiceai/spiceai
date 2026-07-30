@@ -240,9 +240,8 @@ impl WorkerState {
         // stream in-progress transactions instead of spilling its reorder buffer
         // to disk. `binary 'true'` is only appended when requested; omitting it
         // preserves the historical text-format wire for text consumers.
-        let mut options = format!(
-            "proto_version '{proto}', publication_names '{publication}', messages 'true'"
-        );
+        let mut options =
+            format!("proto_version '{proto}', publication_names '{publication}', messages 'true'");
         if proto >= 2 {
             options.push_str(", streaming 'true'");
         }
@@ -990,7 +989,10 @@ mod tests {
         assert_eq!(parse_server_major("16.2"), Some(16));
         assert_eq!(parse_server_major("17"), Some(17));
         assert_eq!(parse_server_major("16beta1"), Some(16));
-        assert_eq!(parse_server_major("16.2 (Debian 16.2-1.pgdg120+2)"), Some(16));
+        assert_eq!(
+            parse_server_major("16.2 (Debian 16.2-1.pgdg120+2)"),
+            Some(16)
+        );
         assert_eq!(parse_server_major("9.6.24"), Some(9));
         assert_eq!(parse_server_major(""), None);
         assert_eq!(parse_server_major("unknown"), None);

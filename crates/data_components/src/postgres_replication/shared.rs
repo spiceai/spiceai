@@ -2323,8 +2323,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                                 }
                                 // Removing this txn may let the ack floor advance.
                                 source.ack.set_open_floor(oldest_open_begin(&open_txns));
-                                commit_watermark =
-                                    Some(client::pg_epoch_to_system_time(commit_ts));
+                                commit_watermark = Some(client::pg_epoch_to_system_time(commit_ts));
                                 client.update_applied_lsn(Lsn(source.ack.flush_lsn()));
                                 should_flush = true;
                             }
@@ -3240,8 +3239,8 @@ async fn deliver_commit(
             Arc::clone(rel),
             raw,
             commit_ts_ms,
-            streaming,
-        );
+        )
+        .with_streaming(streaming);
         member.metrics.inc_transaction();
         // Lag-based readiness: this WAL envelope marks the dataset Ready only if
         // its source commit time is within the member's `ready_lag` of now, i.e.

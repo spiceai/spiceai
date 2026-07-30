@@ -501,10 +501,7 @@ fn decode_stream_start(buf: &mut Bytes) -> Result<DecodedMessage> {
     );
     let xid = buf.get_u32();
     let first_segment = buf.get_u8() == 1;
-    Ok(DecodedMessage::StreamStart {
-        xid,
-        first_segment,
-    })
+    Ok(DecodedMessage::StreamStart { xid, first_segment })
 }
 
 fn decode_stream_commit(buf: &mut Bytes) -> Result<DecodedMessage> {
@@ -770,7 +767,9 @@ mod tests {
         ));
 
         assert!(matches!(
-            decoder.decode(Bytes::from(vec![b'E'])).expect("stream stop"),
+            decoder
+                .decode(Bytes::from(vec![b'E']))
+                .expect("stream stop"),
             DecodedMessage::StreamStop
         ));
 
