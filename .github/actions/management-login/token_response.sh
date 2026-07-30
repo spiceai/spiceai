@@ -42,6 +42,15 @@ if ! token="$(printf '%s' "$body" | jq -er '.access_token // empty' 2>/dev/null)
   fail "$token_url returned HTTP $http_status with no 'access_token' field."
 fi
 
+# OAuth 2.0 specifies 'access_token' as a string. `jq -r` renders a number,
+# array or object as text just the same, so without this the action would
+# export something that is not a credential and the failure would only surface
+# later as an opaque 401.
+token_type="$(printf '%s' "$body" | jq -r '.access_token | type' 2>/dev/null || echo unknown)"
+if [ "$token_type" != "string" ]; then
+  fail "$token_url returned an 'access_token' of JSON type $token_type, not a string."
+fi
+
 # An empty token must never be exported: the management API tests skip
 # themselves when the token variable is unset, so exporting one would turn this
 # into a green run with no tests.

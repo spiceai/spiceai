@@ -125,6 +125,20 @@ assert_rejected "a multi-line access_token is refused" \
   200 '{"access_token":"tok-abc\ninjected=1"}' \
   'multiple lines'
 
+# `jq -r` renders any JSON scalar or container as text, so a non-string
+# access_token would otherwise be exported as though it were a credential.
+assert_rejected "a numeric access_token is refused" \
+  200 '{"access_token":12345}' \
+  'number' 'not a string'
+
+assert_rejected "an object access_token is refused" \
+  200 '{"access_token":{"jwt":"tok-abc"}}' \
+  'object' 'not a string'
+
+assert_rejected "an array access_token is refused" \
+  200 '{"access_token":["tok-abc"]}' \
+  'array' 'not a string'
+
 assert_rejected "a non-JSON body reports the status and its size" \
   502 '<html><body>Bad Gateway</body></html>' \
   '502' 'non-JSON' 'chars'

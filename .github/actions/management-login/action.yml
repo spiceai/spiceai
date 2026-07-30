@@ -44,6 +44,17 @@ runs:
           exit 1
         fi
 
+        # The name is appended to $GITHUB_ENV as NAME=value, so one carrying a
+        # newline would inject further environment entries into every remaining
+        # step. The token value is already checked for this in
+        # token_response.sh; the name needs the same guarantee.
+        case "$ENV_NAME" in
+          '' | *[!A-Za-z0-9_]* | [0-9]*)
+            echo "::error::Management login: 'env-name' must be a variable name matching [A-Za-z_][A-Za-z0-9_]*." >&2
+            exit 1
+            ;;
+        esac
+
         # An unset repository secret interpolates to an empty string, so this is
         # what a missing secret looks like from inside the action.
         if [ -z "$CLIENT_ID" ] || [ -z "$CLIENT_SECRET" ]; then
