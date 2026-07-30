@@ -25,11 +25,17 @@ limitations under the License.
 //! `CloudConnect` is **disabled by default**. It activates only if one of
 //! the following is true at boot:
 //!
-//! 1. `$SPICE_CONFIG_DIR/identity.json` exists.
-//! 2. `SPICE_ADOPT_CODE` env var is set.
-//! 3. `$SPICE_CONFIG_DIR/pending-adopt-code` file exists.
+//! 1. The `--cloud-connect` flag was passed.
+//! 2. `$SPICE_CONFIG_DIR/identity.json` exists.
+//! 3. `SPICE_CONNECT_ADOPT_CODE` env var is set.
+//! 4. `$SPICE_CONFIG_DIR/pending-adopt-code` file exists.
 //!
 //! If none of the above is true, this module never opens a connection.
+//! `--cloud-connect` forces the client on but cannot conjure a credential:
+//! with no identity and no code it logs an actionable warning and the
+//! runtime continues unmanaged. Conversely its absence keeps the
+//! signal-based activation, so instances enrolled before the flag existed
+//! keep connecting after an upgrade.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -53,19 +59,24 @@ use crate::log_capture::LogRingBuffer;
 const DEFAULT_POD_LOG_TAIL_LINES: usize = 500;
 
 /// Cheap probe for whether Spice Cloud Connect is configured for this
-/// instance, using the same signals as [`maybe_start`]: an on-disk identity,
-/// a staged pending adoption code, or the `SPICE_ADOPT_CODE` env var.
+/// instance, using the same signals as [`maybe_start`]: the explicit
+/// `--cloud-connect` flag, an on-disk identity, a staged pending adoption
+/// code, or the `SPICE_CONNECT_ADOPT_CODE` env var.
 ///
 /// Called from `init_tracing` (before [`maybe_start`]) to decide whether to
 /// install the log-capture layer. It runs in the same process — hence the
 /// same working directory — as [`maybe_start`], so both resolve the config
 /// directory identically. This is a lightweight existence check; it does not
 /// read or validate the files (that happens in `maybe_start`).
-pub(crate) fn is_configured() -> bool {
+pub(crate) fn is_configured(cloud_connect_flag: bool) -> bool {
+    if cloud_connect_flag {
+        return true;
+    }
     let config_dir = CloudConnectConfig::default_config_dir();
     config_dir.join(IDENTITY_FILE).exists()
         || config_dir.join(PENDING_ADOPT_CODE_FILE).exists()
-        || std::env::var_os("SPICE_ADOPT_CODE").is_some_and(|v| !v.is_empty())
+        || std::env::var_os(runtime_cloud_connect::config::ADOPT_CODE_ENV)
+            .is_some_and(|v| !v.is_empty())
 }
 
 /// Read the optional `cloud-endpoint` override file written by
@@ -94,7 +105,16 @@ fn build_config(runtime_version: &str) -> CloudConnectConfig {
 /// Start the Cloud Connect client if any of the opt-in conditions are
 /// met. The returned `Option<CloudConnect>` is `None` when `CloudConnect`
 /// is disabled — which is the default for vanilla OSS installs.
-pub async fn maybe_start(runtime_version: &str, runtime: Arc<Runtime>) -> Option<CloudConnect> {
+///
+/// `cloud_connect_flag` is the explicit `--cloud-connect` opt-in: it forces
+/// the client on, but with no identity and no adoption code there is
+/// nothing to connect with — that case logs an actionable warning (instead
+/// of the silent debug skip) and the runtime continues unmanaged.
+pub async fn maybe_start(
+    runtime_version: &str,
+    runtime: Arc<Runtime>,
+    cloud_connect_flag: bool,
+) -> Option<CloudConnect> {
     let config = build_config(runtime_version);
 
     // Quick sanity probe — if no identity AND no adoption code, skip.
@@ -114,10 +134,20 @@ pub async fn maybe_start(runtime_version: &str, runtime: Arc<Runtime>) -> Option
         }
     };
     if !has_identity && config.adoption_code.is_none() {
-        tracing::debug!(
-            "Spice Cloud Connect: disabled (no identity at {} and no adoption code)",
-            config.identity_path.display()
-        );
+        if cloud_connect_flag {
+            tracing::warn!(
+                "Spice Cloud Connect: --cloud-connect was passed but no identity exists at {} and no adoption code is available; \
+                 the runtime is NOT connected to Spice Cloud. Run `spice connect <code>` with a code from the Spice Cloud portal, \
+                 or set {} and restart. See: https://spiceai.org/docs",
+                config.identity_path.display(),
+                runtime_cloud_connect::config::ADOPT_CODE_ENV
+            );
+        } else {
+            tracing::debug!(
+                "Spice Cloud Connect: disabled (no identity at {} and no adoption code)",
+                config.identity_path.display()
+            );
+        }
         return None;
     }
 

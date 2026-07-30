@@ -54,7 +54,7 @@ All contributions come through pull requests. To submit a proposed change, we re
    - Code changes require tests
 1. Update relevant documentation for the change
 1. Commit and push your branch
-1. Run `make signoff` to attest your change — it skips Rust lint/build/tests when the branch has no Rust-affecting files (`.rs`, Cargo/toolchain config), otherwise target-lints changed crates then full lint + unit tests, and records a sign-off on the exact commit you pushed (or `make signoff-remote` to run the same checks on a lab SSH host or self-hosted runner; see [CI Sign-off](/docs/dev/ci_signoff.md))
+1. Run `make signoff` to attest your change — it skips Rust lint/build/tests when the branch has no Rust-affecting files (`.rs`, Cargo/toolchain config), otherwise target-lints changed crates then full lint + unit tests, and records a sign-off on the exact commit you pushed (or `make signoff-remote` to run the same checks on a self-hosted GitHub Actions runner; see [CI Sign-off](/docs/dev/ci_signoff.md))
 1. Open a PR. A single **Attestation** check validates your sign-off; that plus a review is what adds the PR to the merge queue, where the full test suite runs as the required gate
 1. A maintainer of the project will be assigned, and you can expect a review within a few days
 
