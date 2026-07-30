@@ -123,28 +123,28 @@ $(DUCKDB):
 	curl -fsSL --retry 3 -o ./tmp/bin/duckdb.zip "https://github.com/duckdb/duckdb/releases/download/$(DUCKDB_VERSION)/$$ASSET"
 	@unzip -oq ./tmp/bin/duckdb.zip -d ./tmp/bin
 	@rm -f ./tmp/bin/duckdb.zip
-	@chmod +x $(DUCKDB)
-	@$(DUCKDB) --version
+	@chmod +x "$(DUCKDB)"
+	@"$(DUCKDB)" --version
 
 tpch-fleet-gen: $(DUCKDB)
 	@# Check if DBGEN_SCALE is set, else default to 1
 	$(eval DBGEN_SCALE ?= 1)
-	@mkdir -p $(TPCH_FLEET_DIR)
-	@rm -f $(TPCH_FLEET_DIR)/*.tbl $(TPCH_FLEET_DIR)/gen.duckdb $(TPCH_FLEET_DIR)/gen.duckdb.wal
+	@mkdir -p "$(TPCH_FLEET_DIR)"
+	@rm -f "$(TPCH_FLEET_DIR)"/*.tbl "$(TPCH_FLEET_DIR)/gen.duckdb" "$(TPCH_FLEET_DIR)/gen.duckdb.wal"
 	@echo "Generating TPC-H scale factor $(DBGEN_SCALE)..."
-	@$(DUCKDB) $(TPCH_FLEET_DIR)/gen.duckdb -c "INSTALL tpch; LOAD tpch; CALL dbgen(sf=$(DBGEN_SCALE));" > /dev/null
+	@"$(DUCKDB)" "$(TPCH_FLEET_DIR)/gen.duckdb" -c "INSTALL tpch; LOAD tpch; CALL dbgen(sf=$(DBGEN_SCALE));" > /dev/null
 	@# QUOTE '' disables CSV quoting so no field is ever wrapped, and the trailing
 	@# empty column reproduces dbgen's trailing '|'; the result is byte-compatible
 	@# with dbgen's .tbl format, so every *-load target reads it unchanged. Tables
 	@# are dropped as they are written to bound peak disk at the larger scales.
 	@for table in region nation customer supplier part partsupp orders lineitem; do \
 		echo "Writing $$table.tbl..."; \
-		$(DUCKDB) $(TPCH_FLEET_DIR)/gen.duckdb -c "\
+		"$(DUCKDB)" "$(TPCH_FLEET_DIR)/gen.duckdb" -c "\
 			COPY (SELECT *, '' FROM $$table) TO '$(TPCH_FLEET_DIR)/$$table.tbl' (FORMAT CSV, DELIMITER '|', HEADER false, QUOTE ''); \
 			DROP TABLE $$table; \
 			CHECKPOINT;" > /dev/null || exit 1; \
 	done
-	@rm -f $(TPCH_FLEET_DIR)/gen.duckdb $(TPCH_FLEET_DIR)/gen.duckdb.wal
+	@rm -f "$(TPCH_FLEET_DIR)/gen.duckdb" "$(TPCH_FLEET_DIR)/gen.duckdb.wal"
 	@echo "Test data generated successfully in $(TPCH_FLEET_DIR) - pass TPCH_DATA_DIR=$(TPCH_FLEET_DIR) to the load targets."
 
 # Default value for DB_NAME
@@ -166,7 +166,7 @@ pg-load:
 	@mkdir -p ./tmp
 	@for table in region nation customer supplier part partsupp orders lineitem; do \
 		echo "Loading $$table..."; \
-		sed 's/|$$//' $(TPCH_DATA_DIR)/$$table.tbl > ./tmp/$$table.tbl; \
+		sed 's/|$$//' "$(TPCH_DATA_DIR)/$$table.tbl" > ./tmp/$$table.tbl; \
 		psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "\\copy $$table FROM './tmp/$$table.tbl' CSV DELIMITER '|';"; \
 	done
 	@echo "Benchmark dataset has been successfully loaded to $(DB_NAME) database"
@@ -262,7 +262,7 @@ mysql-load:
 	@mkdir -p ./tmp
 	@for table in region nation customer supplier part partsupp orders lineitem; do \
 		echo "Loading $$table..."; \
-		sed 's/|$$//' $(TPCH_DATA_DIR)/$$table.tbl > ./tmp/$$table.tbl; \
+		sed 's/|$$//' "$(TPCH_DATA_DIR)/$$table.tbl" > ./tmp/$$table.tbl; \
 		mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) --local-infile=1 $(DB_NAME) -e "LOAD DATA LOCAL INFILE './tmp/$$table.tbl' INTO TABLE $$table FIELDS TERMINATED BY '|' LINES TERMINATED BY '\n';"; \
 	done
 	@echo "Benchmark dataset has been successfully loaded to '$(DB_NAME)' database."
@@ -352,7 +352,7 @@ file-tpch-init:
 	@mkdir -p ./tmp
 	@for table in region nation customer supplier part partsupp orders lineitem; do \
 		echo "Preparing $$table..."; \
-		cp $(TPCH_DATA_DIR)/$$table.tbl ./tmp/$$table.csv; \
+		cp "$(TPCH_DATA_DIR)/$$table.tbl" ./tmp/$$table.csv; \
 		python ./tpch_file.py ./tmp/$$table; \
 		rm ./tmp/$$table.csv; \
 	done
@@ -409,7 +409,7 @@ mssql-init:
 
 mssql-load:
 	@for table in region nation customer supplier part partsupp orders lineitem; do \
-		cp $(TPCH_DATA_DIR)/$$table.tbl ./mssql-tpch/data/$$table.tbl; \
+		cp "$(TPCH_DATA_DIR)/$$table.tbl" ./mssql-tpch/data/$$table.tbl; \
 	done
 	chmod 755 ./mssql-tpch/data
 	sqlcmd -U $(DB_USER) -P $(DB_PASS) -S $(DB_HOST) -d $(DB_NAME) -i ./mssql-tpch/insert.sql
