@@ -158,7 +158,7 @@ impl AsyncWrite for MaybeTlsStream {
 /// - TLS handshake failure
 /// - Certificate verification failure (for VerifyCa/VerifyFull)
 /// - Invalid certificate/key files
-pub(crate) async fn maybe_upgrade_to_tls(
+pub async fn maybe_upgrade_to_tls(
     mut tcp: TcpStream,
     tls: &TlsConfig,
     host: &str,

@@ -182,7 +182,7 @@ impl ManagedTokioRuntimeBuilder {
 /// # Errors
 ///
 /// Returns [`Error::TaskExecution`] if the task is cancelled or panics before producing a result.
-async fn spawn_task_and_collect_results<F>(fut: F, tokio_handle: &Handle) -> Result<F::Output>
+pub async fn spawn_task_and_collect_results<F>(fut: F, tokio_handle: &Handle) -> Result<F::Output>
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,

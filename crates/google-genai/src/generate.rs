@@ -113,7 +113,7 @@ pub struct GenerateContentResponse {
     pub usage_metadata: Option<UsageMetadata>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    prompt_feedback: Option<PromptFeedback>,
+    pub prompt_feedback: Option<PromptFeedback>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_version: Option<String>,
@@ -126,10 +126,10 @@ pub struct GenerateContentResponse {
 #[serde(rename_all = "camelCase")]
 pub struct PromptFeedback {
     #[serde(skip_serializing_if = "Option::is_none")]
-    block_reason: Option<String>,
+    pub block_reason: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    safety_ratings: Option<Vec<crate::types::SafetyRating>>,
+    pub safety_ratings: Option<Vec<crate::types::SafetyRating>>,
 }
 
 impl Client {

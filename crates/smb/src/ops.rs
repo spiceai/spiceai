@@ -50,9 +50,9 @@ pub struct FileHandle {
     client: Arc<SmbClient>,
     tree_id: u32,
     file_id: [u8; 16],
-    meta: ObjectMeta,
-    file_size: u64,
-    max_chunk: u32,
+    pub meta: ObjectMeta,
+    pub file_size: u64,
+    pub max_chunk: u32,
 }
 
 impl ShareSession {
@@ -1022,7 +1022,7 @@ pub struct ObjectInfo {
     pub key: String,
     pub size: u64,
     pub last_modified: u64,
-    etag: String,
+    pub etag: String,
 }
 
 #[derive(Debug, Clone, Default)]

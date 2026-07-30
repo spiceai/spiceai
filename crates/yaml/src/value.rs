@@ -115,7 +115,7 @@ impl Number {
         clippy::cast_sign_loss,
         reason = "explicit conversion with bounds checking"
     )]
-    fn as_u64(&self) -> Option<u64> {
+    pub fn as_u64(&self) -> Option<u64> {
         match self {
             Number::PosInt(n) => Some(*n),
             Number::NegInt(n) => (*n).try_into().ok(),
@@ -136,7 +136,7 @@ impl Number {
         clippy::cast_possible_truncation,
         reason = "explicit conversion with bounds checking"
     )]
-    fn as_i64(&self) -> Option<i64> {
+    pub fn as_i64(&self) -> Option<i64> {
         match self {
             Number::PosInt(n) => (*n).try_into().ok(),
             Number::NegInt(n) => Some(*n),
@@ -153,7 +153,7 @@ impl Number {
     /// Returns the number as f64.
     #[must_use]
     #[expect(clippy::cast_precision_loss, reason = "intentional conversion to f64")]
-    fn as_f64(&self) -> f64 {
+    pub fn as_f64(&self) -> f64 {
         match self {
             Number::PosInt(n) => *n as f64,
             Number::NegInt(n) => *n as f64,
@@ -226,13 +226,13 @@ impl Value {
 
     /// Returns true if the value is a boolean.
     #[must_use]
-    fn is_bool(&self) -> bool {
+    pub fn is_bool(&self) -> bool {
         matches!(self, Value::Bool(_))
     }
 
     /// Returns true if the value is a number.
     #[must_use]
-    fn is_number(&self) -> bool {
+    pub fn is_number(&self) -> bool {
         matches!(self, Value::Number(_))
     }
 
@@ -265,7 +265,7 @@ impl Value {
 
     /// If the value is a number, returns it. Otherwise returns None.
     #[must_use]
-    fn as_number(&self) -> Option<&Number> {
+    pub fn as_number(&self) -> Option<&Number> {
         match self {
             Value::Number(n) => Some(n),
             _ => None,
@@ -344,7 +344,7 @@ impl Value {
 
     /// Mutably index into a YAML sequence or mapping.
     #[must_use]
-    fn get_mut<I: Index>(&mut self, index: I) -> Option<&mut Value> {
+    pub fn get_mut<I: Index>(&mut self, index: I) -> Option<&mut Value> {
         index.index_into_mut(self)
     }
 }

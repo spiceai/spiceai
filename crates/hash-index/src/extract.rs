@@ -100,16 +100,6 @@ impl<T: PrimitiveKey> PrimitiveKeyExtractor<T> {
 
         Ok(Self { array: typed_array })
     }
-
-    /// Creates from a raw array reference.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the array type is not supported.
-    pub fn from_array(array: &ArrayRef) -> Result<Self> {
-        let typed_array = T::downcast(array)?;
-        Ok(Self { array: typed_array })
-    }
 }
 
 impl<T: PrimitiveKey> KeyExtractor for PrimitiveKeyExtractor<T> {
@@ -474,7 +464,6 @@ impl KeyExtractor for BinaryKeyExtractor {
 /// This handles multi-column primary keys by converting them to a
 /// comparable byte representation.
 pub struct RowConverterKeyExtractor {
-    converter: Arc<RowConverter>,
     rows: arrow_row::Rows,
     /// The key arrays for null checking - a row is null if ANY key column is null
     key_arrays: Vec<ArrayRef>,
@@ -516,49 +505,7 @@ impl RowConverterKeyExtractor {
             .convert_columns(&key_arrays)
             .map_err(|e| Error::Arrow { source: e })?;
 
-        Ok(Self {
-            converter: Arc::new(converter),
-            rows,
-            key_arrays,
-        })
-    }
-
-    /// Creates with a pre-existing converter.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any column is not found.
-    pub fn with_converter(
-        converter: Arc<RowConverter>,
-        batch: &RecordBatch,
-        columns: &[String],
-    ) -> Result<Self> {
-        let schema = batch.schema();
-        let key_arrays: Vec<ArrayRef> = columns
-            .iter()
-            .map(|col| {
-                let idx = schema.index_of(col).map_err(|_| Error::KeyColumnNotFound {
-                    column: col.clone(),
-                })?;
-                Ok(Arc::clone(batch.column(idx)))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let rows = converter
-            .convert_columns(&key_arrays)
-            .map_err(|e| Error::Arrow { source: e })?;
-
-        Ok(Self {
-            converter,
-            rows,
-            key_arrays,
-        })
-    }
-
-    /// Returns a reference to the row converter for reuse.
-    #[must_use]
-    pub fn converter(&self) -> Arc<RowConverter> {
-        Arc::clone(&self.converter)
+        Ok(Self { rows, key_arrays })
     }
 
     /// Checks if any key column has a null value at the given row.

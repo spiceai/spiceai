@@ -282,7 +282,7 @@ pub(crate) fn encode_negotiate_request(buf: &mut BytesMut, client_guid: &[u8; 16
 
 #[derive(Debug)]
 pub struct NegotiateResponse {
-    security_mode: u16,
+    pub(crate) security_mode: u16,
     pub(crate) dialect_revision: u16,
     pub(crate) max_transact_size: u32,
     pub(crate) max_read_size: u32,
@@ -487,7 +487,7 @@ pub(crate) fn encode_close_request_ex(buf: &mut BytesMut, file_id: &[u8; 16], po
 #[derive(Debug, Clone)]
 pub struct CloseResponse {
     pub(crate) last_write_time: u64,
-    file_size: u64,
+    pub(crate) file_size: u64,
 }
 
 #[must_use]

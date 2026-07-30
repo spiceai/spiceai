@@ -64,7 +64,7 @@ impl SslMode {
     /// Returns `true` if this mode requires TLS (won't fall back to plain).
     #[inline]
     #[must_use]
-    pub(crate) fn requires_tls(&self) -> bool {
+    pub fn requires_tls(&self) -> bool {
         !matches!(self, SslMode::Disable | SslMode::Prefer)
     }
 
@@ -505,7 +505,7 @@ impl ReplicationConfig {
     /// the directory containing the `PostgreSQL` Unix socket file.
     #[inline]
     #[must_use]
-    pub(crate) fn is_unix_socket(&self) -> bool {
+    pub fn is_unix_socket(&self) -> bool {
         self.host.starts_with('/')
     }
 
@@ -515,7 +515,7 @@ impl ReplicationConfig {
     ///
     /// Panics if `host` does not start with `/` (i.e. `is_unix_socket()` is false).
     #[must_use]
-    pub(crate) fn unix_socket_path(&self) -> std::path::PathBuf {
+    pub fn unix_socket_path(&self) -> std::path::PathBuf {
         assert!(
             self.is_unix_socket(),
             "unix_socket_path() called but host is not a socket directory: {:?}",

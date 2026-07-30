@@ -174,7 +174,7 @@ impl SessionStore {
 
     /// Remove a session; returns `true` if it existed.
     #[must_use]
-    fn remove_session(&self, session_id: &str) -> bool {
+    pub fn remove_session(&self, session_id: &str) -> bool {
         let removed = self.sessions.remove(session_id).is_some();
         self.sessions.run_pending_tasks();
         removed
@@ -182,7 +182,7 @@ impl SessionStore {
 
     /// Number of active sessions.
     #[must_use]
-    fn session_count(&self) -> usize {
+    pub fn session_count(&self) -> usize {
         usize::try_from(self.sessions.entry_count()).unwrap_or(0)
     }
 }

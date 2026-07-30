@@ -60,6 +60,7 @@ pub(crate) fn hmac_md5(key: &[u8], data: &[u8]) -> [u8; 16] {
 
 /// Compute SHA-256 digest.
 #[must_use]
+#[cfg(test)]
 fn sha256(data: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(data);
@@ -101,7 +102,7 @@ pub(crate) fn random_bytes(buf: &mut [u8]) {
 
 /// Encode bytes as lowercase hex string.
 #[must_use]
-pub(crate) fn hex_encode(bytes: &[u8]) -> String {
+pub fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(bytes.len() * 2);
     for &b in bytes {

@@ -1058,7 +1058,7 @@ impl HashIndex {
     }
 
     /// Returns true if empty.
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 

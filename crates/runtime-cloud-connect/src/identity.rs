@@ -246,6 +246,10 @@ impl IdentityStore {
 /// successful enroll/renew, persisted into the [`Identity`] alongside the
 /// signed leaf; the CSR is sent in the HTTP enroll (or renew) request.
 #[derive(Debug, Clone)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "all fields intentionally share the _pem suffix; they hold distinct PEM-encoded cryptographic materials"
+)]
 pub struct EnrollmentMaterial {
     pub(crate) private_key_pem: String,
     pub(crate) public_key_pem: String,

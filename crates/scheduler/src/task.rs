@@ -58,7 +58,7 @@ impl TaskRequest {
     }
 
     #[must_use]
-    pub(crate) fn clears_queue(mut self) -> Self {
+    pub fn clears_queue(mut self) -> Self {
         self.clear_queue = true;
         self
     }

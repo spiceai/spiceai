@@ -157,7 +157,7 @@ impl Scheduler<Running> {
         self.state.schedules.read().await.clone()
     }
 
-    async fn stop(self) {
+    pub async fn stop(self) {
         let cancellation_token = Arc::clone(&self.state.cancellation_token);
         cancellation_token.cancel();
 
@@ -214,7 +214,7 @@ impl Scheduler<Running> {
     /// - If the schedule with the specified name does not exist.
     /// - If the request channel fails to start.
     /// - If a submission channel is not found for the schedule.
-    async fn add_trigger_for_schedule(
+    pub async fn add_trigger_for_schedule(
         &self,
         schedule_name: Arc<str>,
         request_channel: Arc<RwLock<dyn TaskRequestChannel>>,

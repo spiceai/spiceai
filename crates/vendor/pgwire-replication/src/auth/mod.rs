@@ -51,4 +51,4 @@
 pub mod scram;
 
 #[cfg(feature = "scram")]
-pub(crate) use scram::ScramClient;
+pub use scram::ScramClient;

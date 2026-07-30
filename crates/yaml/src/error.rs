@@ -53,13 +53,13 @@ impl Location {
 
     /// Get the line number (1-indexed).
     #[must_use]
-    fn line(&self) -> usize {
+    pub fn line(&self) -> usize {
         self.line
     }
 
     /// Get the column number (1-indexed).
     #[must_use]
-    fn column(&self) -> usize {
+    pub fn column(&self) -> usize {
         self.column
     }
 }

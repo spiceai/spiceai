@@ -90,7 +90,7 @@ impl BloomFilter {
     ///
     /// This is useful as a placeholder; it will always return `true` from `might_contain`.
     #[must_use]
-    pub(crate) const fn empty() -> Self {
+    pub const fn empty() -> Self {
         Self {
             bits: Vec::new(),
             num_hashes: 0,
@@ -100,13 +100,13 @@ impl BloomFilter {
 
     /// Returns true if the bloom filter is empty (has no capacity).
     #[must_use]
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.bits.is_empty()
     }
 
     /// Returns the number of bits in the bloom filter.
     #[must_use]
-    pub(crate) fn num_bits(&self) -> usize {
+    pub fn num_bits(&self) -> usize {
         self.num_bits
     }
 
@@ -197,14 +197,14 @@ pub struct BatchBloomFilter {
 impl BatchBloomFilter {
     /// Creates a new batch bloom filter.
     #[must_use]
-    fn new(expected_items: usize) -> Self {
+    pub(crate) fn new(expected_items: usize) -> Self {
         Self {
             inner: BloomFilter::new(expected_items),
         }
     }
 
     /// Inserts multiple hashes into the bloom filter.
-    fn insert_batch(&mut self, hashes: &[u64]) {
+    pub(crate) fn insert_batch(&mut self, hashes: &[u64]) {
         for &hash in hashes {
             self.inner.insert(hash);
         }
@@ -214,7 +214,7 @@ impl BatchBloomFilter {
     ///
     /// Returns a vector of booleans indicating which hashes might be present.
     #[must_use]
-    fn might_contain_batch(&self, hashes: &[u64]) -> Vec<bool> {
+    pub(crate) fn might_contain_batch(&self, hashes: &[u64]) -> Vec<bool> {
         hashes
             .iter()
             .map(|&h| self.inner.might_contain(h))
@@ -225,7 +225,7 @@ impl BatchBloomFilter {
     ///
     /// This is useful for batch lookups where you want to skip definitely-missing keys.
     #[must_use]
-    fn filter_candidates(&self, hashes: &[u64]) -> Vec<u64> {
+    pub(crate) fn filter_candidates(&self, hashes: &[u64]) -> Vec<u64> {
         hashes
             .iter()
             .copied()

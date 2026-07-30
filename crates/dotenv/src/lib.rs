@@ -106,7 +106,7 @@ pub fn from_filename_iter<P: AsRef<Path>>(filename: P) -> Result<Iter> {
 ///
 /// Calls [`std::env::set_var`]: the caller must guarantee that no other
 /// thread is reading or writing the process environment concurrently.
-unsafe fn from_path<P: AsRef<Path>>(path: P) -> Result<()> {
+pub unsafe fn from_path<P: AsRef<Path>>(path: P) -> Result<()> {
     // SAFETY: upheld by the caller.
     unsafe { load(from_path_iter(path)?) }
 }

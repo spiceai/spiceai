@@ -11,7 +11,7 @@ use std::str::FromStr;
 
 /// Error returned when parsing an invalid LSN string.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParseLsnError(String);
+pub struct ParseLsnError(pub String);
 
 impl fmt::Display for ParseLsnError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -86,14 +86,14 @@ impl Lsn {
     /// Returns the raw 64-bit value.
     #[inline]
     #[must_use]
-    pub(crate) fn as_u64(self) -> u64 {
+    pub fn as_u64(self) -> u64 {
         self.0
     }
 
     /// Create an LSN from a raw 64-bit value.
     #[inline]
     #[must_use]
-    pub(crate) fn from_u64(value: u64) -> Self {
+    pub fn from_u64(value: u64) -> Self {
         Lsn(value)
     }
 }

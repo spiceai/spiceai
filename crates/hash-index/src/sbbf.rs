@@ -104,13 +104,13 @@ impl SplitBlockBloomFilter {
 
     /// Number of items this filter was sized for at the design FPR.
     #[must_use]
-    fn capacity(&self) -> usize {
+    pub(crate) fn capacity(&self) -> usize {
         self.blocks.len() * 256 / BITS_PER_ITEM
     }
 
     /// Memory used by the bit array, in bytes.
     #[must_use]
-    fn memory_usage_bytes(&self) -> usize {
+    pub(crate) fn memory_usage_bytes(&self) -> usize {
         self.blocks.len() * size_of::<Block>()
     }
 
