@@ -25,7 +25,7 @@ use crate::{Runtime, dataaccelerator::AccelerationSource};
 
 use super::{
     dataset::{
-        Dataset, ReadyState,
+        Dataset, ReadyState, TimeFormat,
         acceleration::{self, Acceleration},
     },
     validate_identifier,
@@ -73,6 +73,8 @@ impl std::fmt::Debug for View {
             .field("sql", &self.sql)
             .field("metadata", &self.metadata)
             .field("columns", &self.columns)
+            .field("time_column", &self.time_column)
+            .field("time_format", &self.time_format)
             .field("acceleration", &self.acceleration)
             .field("ready_state", &self.ready_state)
             .field("vectors", &self.vectors)
@@ -113,6 +115,8 @@ pub struct ViewBuilder {
     pub sql: String,
     pub metadata: HashMap<String, String>,
     pub columns: Vec<Column>,
+    pub time_column: Option<String>,
+    pub time_format: Option<TimeFormat>,
     pub acceleration: Option<acceleration::Acceleration>,
     pub ready_state: ReadyState,
     pub vectors: Option<VectorStore>,
@@ -168,6 +172,8 @@ impl TryFrom<spicepod_view::View> for ViewBuilder {
             sql,
             metadata,
             columns: view.columns,
+            time_column: view.time_column,
+            time_format: view.time_format.map(TimeFormat::from),
             acceleration,
             ready_state: ReadyState::from(view.ready_state),
             vectors: view.vectors,
@@ -216,7 +222,7 @@ impl AccelerationSource for View {
     }
 
     fn time_column(&self) -> Option<&str> {
-        None
+        self.time_column.as_deref()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -267,6 +273,8 @@ impl ViewBuilder {
             sql,
             metadata: HashMap::default(),
             columns: vec![],
+            time_column: None,
+            time_format: None,
             acceleration: None,
             ready_state: ReadyState::default(),
             vectors: None,
@@ -282,6 +290,8 @@ impl ViewBuilder {
                 sql: Arc::from(self.sql),
                 metadata: self.metadata,
                 columns: self.columns,
+                time_column: self.time_column,
+                time_format: self.time_format,
                 acceleration: self.acceleration,
                 ready_state: self.ready_state,
                 vectors: self.vectors,

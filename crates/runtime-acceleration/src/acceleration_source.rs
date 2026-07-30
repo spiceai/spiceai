@@ -45,7 +45,8 @@ pub trait AccelerationSource: Send + Sync {
     fn name(&self) -> &TableReference;
 
     /// Returns the time column name if configured, None otherwise.
-    /// Views always return None as they don't support time-based append mode.
+    /// Both datasets and views expose this so the warm-tier / acceleration
+    /// data-window logic (e.g. retention) can derive time-based properties.
     fn time_column(&self) -> Option<&str>;
 
     /// Returns a reference to `Any` for downcasting

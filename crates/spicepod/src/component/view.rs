@@ -21,7 +21,11 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{Nameable, WithDependsOn, dataset::ReadyState, is_default};
+use super::{
+    Nameable, WithDependsOn,
+    dataset::{ReadyState, TimeFormat},
+    is_default,
+};
 use crate::{
     acceleration::Acceleration, metadata::metadata_value_to_string, param::Params,
     semantic::Column, vector::VectorStore,
@@ -48,6 +52,18 @@ pub struct View {
     /// Reference to a SQL file that describes a view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sql_ref: Option<String>,
+
+    /// Name of the column that carries the row's time value. Lets the
+    /// acceleration / warm-tier data-window logic derive time-based
+    /// properties (e.g. retention) for the view, mirroring datasets. For
+    /// append data this should be at least creation-based; for
+    /// mutating/change data it should be at least last-updated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_column: Option<String>,
+
+    /// Encoding of `time_column`'s values (e.g. `timestamp`, `unix_seconds`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_format: Option<TimeFormat>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acceleration: Option<Acceleration>,
@@ -82,6 +98,8 @@ impl View {
             columns: vec![],
             sql: None,
             sql_ref: None,
+            time_column: None,
+            time_format: None,
             acceleration: None,
             ready_state: ReadyState::default(),
             depends_on: Vec::default(),
@@ -138,6 +156,8 @@ impl WithDependsOn<View> for View {
             columns: self.columns.clone(),
             sql: self.sql.clone(),
             sql_ref: self.sql_ref.clone(),
+            time_column: self.time_column.clone(),
+            time_format: self.time_format.clone(),
             acceleration: self.acceleration.clone(),
             ready_state: self.ready_state,
             vectors: self.vectors.clone(),
@@ -178,5 +198,30 @@ sql: SELECT body FROM docs
 ";
         let view: View = yaml::from_str(yaml).expect("view should deserialize");
         assert!(view.params.is_none());
+    }
+
+    #[test]
+    fn deserializes_time_column_and_format() {
+        // `time_format` uses the same case-insensitive parsing as datasets.
+        let yaml = r"
+name: my_view
+sql: SELECT body, created_at FROM docs
+time_column: created_at
+time_format: ISO8601
+";
+        let view: View = yaml::from_str(yaml).expect("view should deserialize");
+        assert_eq!(view.time_column.as_deref(), Some("created_at"));
+        assert_eq!(view.time_format, Some(TimeFormat::ISO8601));
+    }
+
+    #[test]
+    fn time_fields_default_to_none_when_absent() {
+        let yaml = r"
+name: my_view
+sql: SELECT body FROM docs
+";
+        let view: View = yaml::from_str(yaml).expect("view should deserialize");
+        assert!(view.time_column.is_none());
+        assert!(view.time_format.is_none());
     }
 }
