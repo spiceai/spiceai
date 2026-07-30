@@ -693,18 +693,15 @@ pub async fn drop_slot_after_shutdown(params: &ReplicationParams) {
 
     let deadline = tokio::time::Instant::now() + DROP_SLOT_BUDGET;
     loop {
-        let error = match client
+        let Err(error) = client
             .execute("SELECT pg_drop_replication_slot($1)", &[&params.slot_name])
             .await
-        {
-            Ok(_) => {
-                tracing::info!(
-                    slot = %params.slot_name,
-                    "dropped the replication slot on shutdown (non-persistent accelerator; the slot has no resume value and would otherwise retain WAL on the source)"
-                );
-                break;
-            }
-            Err(e) => e,
+        else {
+            tracing::info!(
+                slot = %params.slot_name,
+                "dropped the replication slot on shutdown (non-persistent accelerator; the slot has no resume value and would otherwise retain WAL on the source)"
+            );
+            break;
         };
 
         match error.as_db_error().map(|db| db.code().code()) {

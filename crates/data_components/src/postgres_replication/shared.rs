@@ -3113,7 +3113,8 @@ mod tests {
             ..test_params()
         };
 
-        let all_ephemeral = SharedSource::new(SourceKey::from_params(&ephemeral), ephemeral.clone());
+        let all_ephemeral =
+            SharedSource::new(SourceKey::from_params(&ephemeral), ephemeral.clone());
         all_ephemeral.note_member_durability(&ephemeral);
         all_ephemeral.note_member_durability(&ephemeral);
         assert!(
@@ -3129,7 +3130,8 @@ mod tests {
 
         // ...and durable member first, then an ephemeral one that must not
         // re-enable the drop.
-        let durable_first = SharedSource::new(SourceKey::from_params(&ephemeral), ephemeral.clone());
+        let durable_first =
+            SharedSource::new(SourceKey::from_params(&ephemeral), ephemeral.clone());
         durable_first.note_member_durability(&durable);
         durable_first.note_member_durability(&ephemeral);
         assert!(

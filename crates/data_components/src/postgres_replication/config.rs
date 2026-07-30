@@ -785,6 +785,7 @@ TXTE85+Or9IUwDI9543jsyCvuQ8=
             publication_name: "pub".to_string(),
             initial_snapshot: true,
             snapshot_on_resume: false,
+            ephemeral_accelerator: false,
             temporary_slot: false,
             status_interval: Duration::from_secs(5),
             ready_lag: Duration::from_secs(2),
