@@ -99,7 +99,7 @@ const INTERNAL_COMPONENTS: &[&str] = &[
 ];
 
 const OFF_FILTERS: &str = "reqwest_retry::middleware=off,opentelemetry=warn,opentelemetry_sdk=off,delta_kernel::log_segment=off,delta_kernel::listed_log_files=off,aws_config::imds::region=off,aws_config::meta::credentials::chain=off,tower::buffer=off,h2::codec=off";
-const OFF_UNLESS_VERY_VERBOSE_FILTERS: &str = "datafusion_datasource::source=off,datafusion_optimizer::utils=off,datafusion_optimizer::optimizer=off,datafusion::physical_planner=off,tantivy=warn";
+const OFF_UNLESS_VERY_VERBOSE_FILTERS: &str = "datafusion_datasource::source=off,datafusion_optimizer::utils=off,datafusion_optimizer::optimizer=off,datafusion::physical_planner=off,tantivy=warn,text_embeddings_backend_candle=error";
 
 fn specific_env_filter(filter: &str) -> String {
     format!("{OFF_FILTERS},{filter}")
@@ -462,6 +462,111 @@ impl SpanExporter for OtelExportMultiplexer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    /// Sink for a probe subscriber's console output, so a test can assert on
+    /// what the `fmt` layer actually wrote.
+    #[derive(Clone, Default)]
+    struct ProbeWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl ProbeWriter {
+        fn contents(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("probe buffer poisoned")).into_owned()
+        }
+    }
+
+    impl std::io::Write for ProbeWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("probe buffer poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for ProbeWriter {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Emits a `WARN` and an `ERROR` event on the `text_embeddings_backend_candle`
+    /// target through a subscriber assembled the way `init_tracing` assembles it —
+    /// the `EnvFilter` for `$verbosity` in front of the console `fmt` layer — and
+    /// evaluates to everything that reached the console.
+    ///
+    /// A macro rather than a function because `tracing` bakes the event target into
+    /// a `static` callsite, so it cannot be passed in as a value; each expansion
+    /// then also gets its own callsite, which keeps the process-wide callsite
+    /// interest cache from carrying one verbosity's verdict into the next.
+    macro_rules! candle_console_output {
+        ($verbosity:expr) => {{
+            let probe = ProbeWriter::default();
+            let env_filter: EnvFilter = $verbosity.into();
+            let subscriber = tracing_subscriber::registry().with(env_filter).with(
+                fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(probe.clone())
+                    .with_filter(filter::filter_fn(|metadata| {
+                        metadata.target() != "task_history"
+                    })),
+            );
+
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::warn!(
+                    target: "text_embeddings_backend_candle",
+                    "the config.json contains hidden_act=gelu"
+                );
+                tracing::error!(
+                    target: "text_embeddings_backend_candle",
+                    "could not load model weights"
+                );
+            });
+
+            probe.contents()
+        }};
+    }
+
+    #[test]
+    fn candle_gelu_notice_is_hidden_unless_very_verbose() {
+        let default = candle_console_output!(LogVerbosity::Default);
+        assert!(
+            !default.contains("hidden_act=gelu"),
+            "default verbosity should drop the candle GeLU notice, got: {default}"
+        );
+        assert!(
+            default.contains("could not load model weights"),
+            "default verbosity must still surface candle errors, got: {default}"
+        );
+
+        let verbose = candle_console_output!(LogVerbosity::Verbose);
+        assert!(
+            !verbose.contains("hidden_act=gelu"),
+            "verbose should drop the candle GeLU notice, got: {verbose}"
+        );
+        assert!(
+            verbose.contains("could not load model weights"),
+            "verbose must still surface candle errors, got: {verbose}"
+        );
+
+        let very_verbose = candle_console_output!(LogVerbosity::VeryVerbose);
+        assert!(
+            very_verbose.contains("hidden_act=gelu"),
+            "very verbose should reveal the candle GeLU notice, got: {very_verbose}"
+        );
+        assert!(
+            very_verbose.contains("could not load model weights"),
+            "very verbose must still surface candle errors, got: {very_verbose}"
+        );
+    }
 
     #[test]
     fn returns_very_verbose_if_flag_set() {
