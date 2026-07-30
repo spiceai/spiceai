@@ -5919,6 +5919,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "data-connector-api"
+version = "2.2.0-unstable"
+dependencies = [
+ "globset",
+ "runtime-component",
+ "snafu",
+]
+
+[[package]]
 name = "data-encoding"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -16691,6 +16700,7 @@ dependencies = [
  "csv",
  "dashmap",
  "data-accelerator-api",
+ "data-connector-api",
  "data_components",
  "dataformat-json",
  "datafusion",
