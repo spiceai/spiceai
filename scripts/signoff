@@ -50,7 +50,8 @@
 #
 # Targeted pre-lint always diffs against trunk (not configurable).
 # When the branch has no Rust-affecting changes vs trunk (.rs, Cargo.toml,
-# Cargo.lock, rust-toolchain*, .cargo/*), Rust lint/build/tests are skipped
+# Cargo.lock, rust-toolchain*, .cargo/*, clippy/rustfmt/nextest/layers config,
+# the lint guards, the root Makefile), Rust lint/build/tests are skipped
 # (both local and remote); the sign-off status is still posted.
 #
 # Remote alternative to local `make signoff`:
@@ -605,9 +606,14 @@ post_commit_status() {
 
 # --- commands ----------------------------------------------------------------
 
+# Paths that can change what cargo/clippy/fmt/nextest do — Rust sources, the
+# Cargo/toolchain config, and the config files the gate itself reads. Keep in
+# sync with `rustAffecting` in .github/workflows/pr.yml and covered by the
+# check-code-changes filter; `scripts/check_rust_gate_paths.py` enforces both,
+# and docs/dev/ci_signoff.md explains why each path is here.
+RUST_AFFECTING_PATH_PATTERN='(\.rs$|(^|/)Cargo\.(toml|lock)$|(^|/)rust-toolchain(\.toml)?$|(^|/)\.cargo/|(^|/)\.?(clippy|rustfmt)\.toml$|(^|/)nextest\.toml$|(^|/)layers\.toml$|^scripts/check_(crate_layers|rust_gate_paths)\.py$|^Makefile$)'
+
 # True when the branch delta vs trunk can affect Rust lint/build/tests.
-# Matches .rs sources plus Cargo/toolchain config that can break those gates:
-#   *.rs, Cargo.toml, Cargo.lock, rust-toolchain[.toml], .cargo/*
 # Prints nothing. Exit 0 = has Rust-affecting changes (or unknown — run checks).
 # Exit 1 = no such paths in the changed set → safe to skip.
 # Unknown (diff unavailable) returns 0 so we never skip when we can't tell.
@@ -623,9 +629,7 @@ branch_has_rust_changes() {
     debug "no changed files vs ${LINT_BASE_BRANCH} — no Rust changes"
     return 1
   fi
-  # Paths that can change what cargo/clippy/fmt/nextest do (not docs/scripts alone).
-  if printf '%s\n' "$files" | grep -qE \
-      '(\.rs$|(^|/)Cargo\.(toml|lock)$|(^|/)rust-toolchain(\.toml)?$|(^|/)\.cargo/)'; then
+  if printf '%s\n' "$files" | grep -qE "$RUST_AFFECTING_PATH_PATTERN"; then
     debug "Rust-affecting files present — will run Rust checks"
     return 0
   fi
@@ -700,7 +704,9 @@ run_checks() {
   # expensive lint/build/test gate. Unknown diffs fall through and run checks.
   if [[ -n "$revision" ]] && ! branch_has_rust_changes "$revision"; then
     info "No Rust-affecting files changed vs ${LINT_BASE_BRANCH} — skipping Rust lint, build, and unit tests"
-    append_step_summary "### Rust checks"$'\n'"Skipped (no \`.rs\` / Cargo / rust-toolchain / \`.cargo/\` files in the branch diff vs \`${LINT_BASE_BRANCH}\`)."$'\n'
+    # Name the pattern rather than a subset of what it matches: the two drift apart
+    # every time a path is added to the gate.
+    append_step_summary "### Rust checks"$'\n'"Skipped (nothing in the branch diff vs \`${LINT_BASE_BRANCH}\` matches \`RUST_AFFECTING_PATH_PATTERN\` in \`scripts/signoff\`)."$'\n'
     SIGNOFF_CHECK_SUMMARY="no Rust changes (lint/test skipped)"
     return 0
   fi
@@ -1295,7 +1301,9 @@ Maintainers:
 
 Checks (when verify is on):
   0. If the branch has no Rust-affecting files vs trunk (.rs, Cargo.toml/lock,
-     rust-toolchain*, .cargo/*) → skip Rust lint/build/tests (still posts status)
+     rust-toolchain*, .cargo/*, clippy/rustfmt/nextest/layers config, the lint
+     guards, the root Makefile) → skip Rust lint/build/tests (still posts
+     status)
   1. Targeted lint of crates touched by this branch vs trunk
      (make lint-rust PACKAGES="…") — fail-fast feedback
   2. Targeted unit tests for those crates (make nextest-packages PACKAGES="…")

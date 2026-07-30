@@ -1128,7 +1128,7 @@ dependencies = [
 [[package]]
 name = "async-openai"
 version = "0.32.0"
-source = "git+https://github.com/spiceai/async-openai?rev=526bdd24d569c2082624daff2b2859d03960dd5b#526bdd24d569c2082624daff2b2859d03960dd5b"
+source = "git+https://github.com/spiceai/async-openai?rev=6bda5533dd118afcf80aa6f5ef59ad35277627a7#6bda5533dd118afcf80aa6f5ef59ad35277627a7"
 dependencies = [
  "async-openai-macros",
  "backoff",
@@ -1156,7 +1156,7 @@ dependencies = [
 [[package]]
 name = "async-openai-macros"
 version = "0.1.1"
-source = "git+https://github.com/spiceai/async-openai?rev=526bdd24d569c2082624daff2b2859d03960dd5b#526bdd24d569c2082624daff2b2859d03960dd5b"
+source = "git+https://github.com/spiceai/async-openai?rev=6bda5533dd118afcf80aa6f5ef59ad35277627a7#6bda5533dd118afcf80aa6f5ef59ad35277627a7"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5897,6 +5897,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "data-accelerator-api"
+version = "2.2.0-unstable"
+dependencies = [
+ "arrow",
+ "arrow_tools",
+ "async-trait",
+ "datafusion",
+ "datafusion-table-providers",
+ "futures",
+ "linkme",
+ "paste",
+ "runtime-acceleration",
+ "runtime-parameters",
+ "runtime-secrets",
+ "runtime-table-partition",
+ "secrecy",
+ "snafu",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "data-encoding"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5926,6 +5948,7 @@ dependencies = [
  "bb8",
  "bb8-oracle",
  "bigdecimal",
+ "bitvec",
  "brotli",
  "bytes",
  "chrono",
@@ -5959,6 +5982,7 @@ dependencies = [
  "insta",
  "logos",
  "mysql_async",
+ "mysql_common",
  "native-tls",
  "num_cpus",
  "object_store 0.13.2",
@@ -6853,7 +6877,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=ccdc1aaae359b9b4066fd4fbad19638b9176d5fa#ccdc1aaae359b9b4066fd4fbad19638b9176d5fa"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=1b83cbf0e131fc30e53663ed519f077a5ee65917#1b83cbf0e131fc30e53663ed519f077a5ee65917"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -7441,11 +7465,10 @@ checksum = "ab23e69df104e2fd85ee63a533a22d2132ef5975dc6b36f9f3e5a7305e4a8ed7"
 
 [[package]]
 name = "duckdb"
-version = "1.10503.1"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=4387e69564d85a411802e0782bc503b53577c50d#4387e69564d85a411802e0782bc503b53577c50d"
+version = "1.10505.0"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=7229b20daf24765c84d294c52cf4b4165ca79073#7229b20daf24765c84d294c52cf4b4165ca79073"
 dependencies = [
  "arrow",
- "calamine",
  "cast",
  "comfy-table",
  "fallible-iterator 0.3.0",
@@ -7455,7 +7478,6 @@ dependencies = [
  "num",
  "num-integer",
  "r2d2",
- "rust_decimal",
  "strum 0.27.2",
 ]
 
@@ -8775,7 +8797,7 @@ dependencies = [
  "libc",
  "log",
  "rustversion",
- "windows-link 0.1.3",
+ "windows-link 0.2.1",
  "windows-result 0.4.1",
 ]
 
@@ -11075,16 +11097,16 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "libduckdb-sys"
-version = "1.10503.1"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=4387e69564d85a411802e0782bc503b53577c50d#4387e69564d85a411802e0782bc503b53577c50d"
+version = "1.10505.0"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=7229b20daf24765c84d294c52cf4b4165ca79073#7229b20daf24765c84d294c52cf4b4165ca79073"
 dependencies = [
  "cc",
  "flate2",
  "pkg-config",
- "reqwest 0.12.24",
  "serde",
  "serde_json",
  "tar",
+ "ureq 3.3.0",
  "vcpkg",
  "zip 6.0.0",
 ]
@@ -16668,6 +16690,7 @@ dependencies = [
  "criterion 0.7.0",
  "csv",
  "dashmap",
+ "data-accelerator-api",
  "data_components",
  "dataformat-json",
  "datafusion",

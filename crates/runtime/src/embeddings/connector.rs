@@ -55,6 +55,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use runtime_search::embeddings::table::EmbeddingTable;
+use runtime_search::embeddings::warm_index_on_zero_results;
 
 pub struct EmbeddingConnector {
     inner_connector: Arc<dyn DataConnector>,
@@ -121,11 +122,7 @@ impl EmbeddingConnector {
                 });
             }
 
-            let on_zero_results = dataset
-                .acceleration
-                .as_ref()
-                .map(|acceleration| acceleration.on_zero_results.clone())
-                .unwrap_or_default();
+            let on_zero_results = warm_index_on_zero_results(dataset.acceleration.as_ref());
 
             let mut provider = Arc::clone(&inner_table_provider);
             for (effective_vector_store, columns) in vector_index_groups(vector_engine, dataset) {
@@ -138,7 +135,7 @@ impl EmbeddingConnector {
                     dataset.params.get("file_format").map(String::as_str),
                     provider,
                     &effective_vector_store,
-                    &on_zero_results,
+                    on_zero_results,
                 )
                 .await
                 .map_err(|e| {
