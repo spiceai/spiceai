@@ -363,7 +363,7 @@ mod tests {
         // Regression: a run whose order_line had 51 of 51 samples discarded
         // reported worst P99 over the OTHER six tables - the aggregate improved
         // as the slowest table got worse.
-        let cap = Duration::from_secs(1800);
+        let cap = Duration::from_mins(30);
         let r = report(
             &[("customer", &[10_000_000]), ("order_line", &[])],
             &[("order_line", 51)],
@@ -384,17 +384,17 @@ mod tests {
         let r = report(
             &[("customer", &[5_000_000]), ("idle_table", &[])],
             &[],
-            Duration::from_secs(1800),
+            Duration::from_mins(30),
         );
         assert_eq!(r.tables["idle_table"].p99, Duration::ZERO);
-        assert_eq!(r.worst_p99, Duration::from_micros(5_000_000));
+        assert_eq!(r.worst_p99, Duration::from_secs(5));
     }
 
     #[test]
     fn a_partially_censored_table_keeps_its_measured_percentiles() {
         // Kept samples still carry the p99; the discard count is reported
         // alongside rather than replacing the measurement.
-        let cap = Duration::from_secs(1800);
+        let cap = Duration::from_mins(30);
         let r = report(&[("stock", &[1_000_000, 2_000_000])], &[("stock", 3)], cap);
         let stock = &r.tables["stock"];
         assert_eq!(stock.samples, 2);
