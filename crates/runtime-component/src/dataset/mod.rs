@@ -30,7 +30,7 @@ use snafu::prelude::*;
 use spicepod::{
     component::{dataset as spicepod_dataset, embeddings::ColumnEmbeddingConfig},
     metric::Metrics,
-    semantic::{Column, IndexStore, StemmingLanguage},
+    semantic::{Column, IndexStore},
     vector::VectorStore,
 };
 use std::{collections::HashMap, fmt::Display, str::FromStr, sync::Arc, time::Duration};
@@ -754,5 +754,4 @@ pub struct FullTextSearchDatasetConfig {
     pub index_path: Option<String>,
     pub search_fields: Vec<String>,
     pub primary_key: Vec<String>,
-    pub language: StemmingLanguage,
 }

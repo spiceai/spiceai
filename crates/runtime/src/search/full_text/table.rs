@@ -17,7 +17,7 @@ use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use runtime_datafusion_index::{Index, IndexedTableProvider};
 use snafu::ResultExt;
-use spicepod::semantic::{Column, IndexStore, MetadataType, StemmingLanguage};
+use spicepod::semantic::{Column, IndexStore, MetadataType};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -26,17 +26,7 @@ use crate::component::column::full_text_search_config;
 use crate::component::dataset::FullTextSearchDatasetConfig;
 use crate::make_spice_data_sub_directory;
 
-use search::generation::text_search::index::{
-    DEFAULT_TOKENIZER_NAME, EN_STEM_TOKENIZER_NAME, FullTextDatabaseIndex,
-};
-
-/// Resolves a spicepod [`StemmingLanguage`] to the Tantivy tokenizer name that implements it.
-fn tokenizer_name_for_language(language: StemmingLanguage) -> &'static str {
-    match language {
-        StemmingLanguage::None => DEFAULT_TOKENIZER_NAME,
-        StemmingLanguage::English => EN_STEM_TOKENIZER_NAME,
-    }
-}
+use search::generation::text_search::index::FullTextDatabaseIndex;
 
 /// Builds (but does not register) a [`FullTextDatabaseIndex`] over `inner_table_provider`.
 ///
@@ -67,7 +57,6 @@ pub(crate) fn build_full_text_database_index(
         index_path,
         search_fields,
         primary_key,
-        language,
     }) = full_text_search_config(columns, tbl)
     else {
         return Err(Box::from(format!(
@@ -109,13 +98,12 @@ pub(crate) fn build_full_text_database_index(
         derived_store_fields.as_slice()
     };
 
-    FullTextDatabaseIndex::try_new_with_tokenizer(
+    FullTextDatabaseIndex::try_new(
         inner_table_provider,
         search_fields,
         Some(primary_key),
         directory,
         store_fields,
-        tokenizer_name_for_language(language),
     )
     .boxed()
 }
