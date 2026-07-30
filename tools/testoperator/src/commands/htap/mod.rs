@@ -274,6 +274,10 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     //    after OLTP stops. Stopping the scraper here gives accurate under-load values.
     let spiced_metrics =
         super::process_spiced_metrics(metrics_scraper, test_args.common.metrics, &[]).await;
+    // Snapshot the probe latencies for the same reason, while OLTP is still running:
+    // the monitor keeps sampling through the post-drain gate below, and that idle
+    // window would dilute the under-load percentiles.
+    let probe_snapshot = health_monitor.snapshot();
     // Stop the source-PG stats scraper at the same point (under load), so its view
     // aligns with the spiced-side scrape window.
     let pg_stats = match pg_stats_scraper {
@@ -388,6 +392,8 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
             eprintln!("OLTP task join error: {e}");
         }
     }
+
+    reporting::emit_probe_latency_summary(&probe_snapshot);
 
     // 9. Report data freshness and replication metrics.
     match staleness_result {

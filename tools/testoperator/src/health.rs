@@ -16,8 +16,11 @@ limitations under the License.
 
 use std::{
     collections::BTreeMap,
+    sync::Arc,
     time::{Duration, Instant},
 };
+
+use parking_lot::Mutex;
 
 use crate::metrics;
 
@@ -33,25 +36,105 @@ const SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 
 // Use a large latency threshold for health endpoints as latency can spike when the CPU is fully utilized during
 // intensive benchmark runs. This reduces noise from false positives. See <https://github.com/spiceai/spiceai/issues/7766>
-const LATENCY_THRESHOLD: Duration = Duration::from_millis(125);
+//
+// A sample past this budget counts as a health-check failure and is logged as a WARNING.
+const LATENCY_THRESHOLD_MS: u64 = 125;
+pub(crate) const LATENCY_THRESHOLD: Duration = Duration::from_millis(LATENCY_THRESHOLD_MS);
+
+/// 4x the latency budget — logged as an ERROR. Kubernetes fails a probe that
+/// overruns its `timeoutSeconds` (1s by default) and restarts the container after
+/// enough consecutive failures, so this fires while there is still headroom.
+pub(crate) const ERROR_LATENCY: Duration = Duration::from_millis(LATENCY_THRESHOLD_MS * 4);
+
+/// Well above [`ERROR_LATENCY`]: a tighter timeout truncates every slow sample to
+/// the same value, hiding the latency tail.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Why a probe sample counted as a failure. Kept distinct because they point at
+/// different faults: a timeout means the HTTP server accepted the connection but
+/// could not answer, a refusal means it is not accepting connections at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureKind {
+    Timeout,
+    Refused,
+    Transport,
+    Status,
+    Latency,
+}
+
+/// One completed probe of a single endpoint.
+struct ProbeSample {
+    latency: Duration,
+    /// `None` when the endpoint answered 2xx within [`LATENCY_THRESHOLD`].
+    failure: Option<(FailureKind, String)>,
+}
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct EndpointStats {
+    /// Latency of every sample, for percentiles. Unsorted; callers sort a copy.
+    latencies_ms: Vec<f64>,
     pub(crate) failure_count: u64,
+    /// Samples slower than [`LATENCY_THRESHOLD`] but within [`ERROR_LATENCY`].
+    pub(crate) warn_count: u64,
+    /// Samples slower than [`ERROR_LATENCY`].
+    pub(crate) error_count: u64,
+    /// Samples that hit [`PROBE_TIMEOUT`] — the analog of a kubelet
+    /// `context deadline exceeded` probe event.
+    pub(crate) timeout_count: u64,
+    /// Samples that could not connect — the analog of `connection refused`.
+    pub(crate) refused_count: u64,
+    /// Samples that answered with a non-2xx status.
+    pub(crate) status_count: u64,
     pub(crate) max_latency: Duration,
     pub(crate) last_error: Option<String>,
 }
 
 impl EndpointStats {
-    fn record_sample(&mut self, latency: Duration, failure: Option<String>) {
+    fn record_sample(&mut self, sample: &ProbeSample) {
+        let latency = sample.latency;
+        self.latencies_ms.push(latency.as_secs_f64() * 1_000.0);
+
         if latency > self.max_latency {
             self.max_latency = latency;
         }
 
-        if let Some(reason) = failure {
-            self.failure_count = self.failure_count.saturating_add(1);
-            self.last_error = Some(reason);
+        if latency > ERROR_LATENCY {
+            self.error_count = self.error_count.saturating_add(1);
+        } else if latency > LATENCY_THRESHOLD {
+            self.warn_count = self.warn_count.saturating_add(1);
         }
+
+        if let Some((kind, reason)) = &sample.failure {
+            self.failure_count = self.failure_count.saturating_add(1);
+            self.last_error = Some(reason.clone());
+
+            match kind {
+                FailureKind::Timeout => {
+                    self.timeout_count = self.timeout_count.saturating_add(1);
+                }
+                FailureKind::Refused => {
+                    self.refused_count = self.refused_count.saturating_add(1);
+                }
+                FailureKind::Status => {
+                    self.status_count = self.status_count.saturating_add(1);
+                }
+                FailureKind::Transport | FailureKind::Latency => {}
+            }
+        }
+    }
+
+    /// Per-sample latencies in milliseconds, in sample order.
+    pub(crate) fn latencies_ms(&self) -> &[f64] {
+        &self.latencies_ms
+    }
+
+    /// Records a latency sample, classified as a live probe would, so tests in
+    /// other modules can build a populated report.
+    #[cfg(test)]
+    pub(crate) fn record_latency_for_test(&mut self, latency: Duration) {
+        let failure = (latency > LATENCY_THRESHOLD)
+            .then(|| (FailureKind::Latency, "latency budget".to_string()));
+        self.record_sample(&ProbeSample { latency, failure });
     }
 }
 
@@ -91,9 +174,114 @@ impl HealthCheckReport {
     }
 }
 
+/// Probes one endpoint once, recording the latency metric and logging any
+/// threshold breach. Logs here, not under the stats lock, to keep I/O out of the
+/// critical section.
+async fn probe(client: &reqwest::Client, endpoint: &'static str) -> ProbeSample {
+    let url = format!("{HTTP_BASE_URL}{endpoint}");
+    let start = Instant::now();
+    let response = client.get(&url).send().await;
+    let latency = start.elapsed();
+    let latency_ms = latency.as_secs_f64() * 1_000.0;
+
+    let failure = match response {
+        Ok(response) => {
+            if response.status().is_success() {
+                if latency > LATENCY_THRESHOLD {
+                    Some((
+                        FailureKind::Latency,
+                        format!(
+                            "latency {latency_ms:.1}ms exceeded {}ms budget",
+                            LATENCY_THRESHOLD.as_secs_f64() * 1_000.0
+                        ),
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                Some((FailureKind::Status, format!("status {}", response.status())))
+            }
+        }
+        Err(error) => {
+            let kind = if error.is_timeout() {
+                FailureKind::Timeout
+            } else if error.is_connect() {
+                FailureKind::Refused
+            } else {
+                FailureKind::Transport
+            };
+            Some((kind, error.to_string()))
+        }
+    };
+
+    metrics::HEALTH_LATENCY.record(
+        latency_ms,
+        &[
+            KeyValue::new("endpoint", endpoint),
+            KeyValue::new(
+                "status",
+                if failure.is_some() {
+                    "failure"
+                } else {
+                    "success"
+                },
+            ),
+        ],
+    );
+
+    // Log the breach as it is observed, so a stall is visible in the run log at the
+    // moment it happens rather than only in the end-of-run summary.
+    if let Some(line) = breach_log_line(endpoint, latency_ms, failure.as_ref()) {
+        eprintln!("{line}");
+    }
+
+    ProbeSample { latency, failure }
+}
+
+/// One log line per breaching sample: `ERROR` for a failed request or one past
+/// [`ERROR_LATENCY`], `WARNING` for a response that overran [`LATENCY_THRESHOLD`].
+/// `None` when the sample is within budget.
+fn breach_log_line(
+    endpoint: &str,
+    latency_ms: f64,
+    failure: Option<&(FailureKind, String)>,
+) -> Option<String> {
+    let error_ms = ERROR_LATENCY.as_secs_f64() * 1_000.0;
+    let warn_ms = LATENCY_THRESHOLD.as_secs_f64() * 1_000.0;
+
+    match failure {
+        // An unanswered request is a failed probe however fast it failed — a
+        // refused connection returns in microseconds.
+        Some((FailureKind::Timeout | FailureKind::Refused | FailureKind::Transport, reason)) => {
+            Some(format!(
+                "ERROR: probe {endpoint} failed after {latency_ms:.1}ms: {reason}"
+            ))
+        }
+        Some((FailureKind::Status, reason)) => Some(format!(
+            "ERROR: probe {endpoint} returned {reason} after {latency_ms:.1}ms"
+        )),
+        _ => {
+            if latency_ms > error_ms {
+                Some(format!(
+                    "ERROR: probe {endpoint} took {latency_ms:.1}ms (> {error_ms:.0}ms budget)"
+                ))
+            } else if latency_ms > warn_ms {
+                Some(format!(
+                    "WARNING: probe {endpoint} took {latency_ms:.1}ms (> {warn_ms:.0}ms budget)"
+                ))
+            } else {
+                None
+            }
+        }
+    }
+}
+
 pub(crate) struct HealthMonitor {
     cancel_token: CancellationToken,
-    task: Option<tokio::task::JoinHandle<HealthCheckReport>>,
+    /// Shared with the sampling task so a report can be taken mid-run, without
+    /// stopping the monitor.
+    stats: Arc<Mutex<BTreeMap<&'static str, EndpointStats>>>,
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl HealthMonitor {
@@ -102,78 +290,66 @@ impl HealthMonitor {
         let task_token = cancel_token.clone();
 
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(200))
+            .timeout(PROBE_TIMEOUT)
             .build()
             .context("Failed to create health monitor HTTP client")?;
 
-        let task = tokio::spawn(async move {
-            let mut stats: BTreeMap<&'static str, EndpointStats> = ENDPOINTS
+        let stats: Arc<Mutex<BTreeMap<&'static str, EndpointStats>>> = Arc::new(Mutex::new(
+            ENDPOINTS
                 .into_iter()
                 .map(|ep| (ep, EndpointStats::default()))
-                .collect();
+                .collect(),
+        ));
+        let task_stats = Arc::clone(&stats);
+
+        let task = tokio::spawn(async move {
+            // A fixed interval keeps the sample cadence independent of probe latency;
+            // `Delay` avoids the catch-up burst a slow probe would otherwise trigger.
+            let mut ticker = tokio::time::interval(SAMPLE_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
             loop {
-                for endpoint in ENDPOINTS {
-                    if task_token.is_cancelled() {
-                        return HealthCheckReport { endpoints: stats };
-                    }
-
-                    let url = format!("{HTTP_BASE_URL}{endpoint}");
-                    let start = Instant::now();
-                    let response = client.get(&url).send().await;
-                    let latency = start.elapsed();
-                    let latency_ms = latency.as_secs_f64() * 1_000.0;
-
-                    let failure_reason = match response {
-                        Ok(response) => {
-                            if !response.status().is_success() {
-                                Some(format!("status {}", response.status()))
-                            } else if latency > LATENCY_THRESHOLD {
-                                Some(format!(
-                                    "latency {}ms exceeded {}ms budget",
-                                    latency.as_secs_f64() * 1_000.0,
-                                    LATENCY_THRESHOLD.as_secs_f64() * 1_000.0
-                                ))
-                            } else {
-                                None
-                            }
-                        }
-                        Err(error) => Some(error.to_string()),
-                    };
-
-                    metrics::HEALTH_LATENCY.record(
-                        latency_ms,
-                        &[
-                            KeyValue::new("endpoint", endpoint),
-                            KeyValue::new(
-                                "status",
-                                if failure_reason.is_some() {
-                                    "failure"
-                                } else {
-                                    "success"
-                                },
-                            ),
-                        ],
-                    );
-
-                    if let Some(entry) = stats.get_mut(endpoint) {
-                        entry.record_sample(latency, failure_reason);
-                    }
-                }
-
                 tokio::select! {
-                    () = task_token.cancelled() => {
-                        return HealthCheckReport { endpoints: stats };
-                    }
-                    () = tokio::time::sleep(SAMPLE_INTERVAL) => {}
+                    () = task_token.cancelled() => return,
+                    _ = ticker.tick() => {}
                 }
+
+                // Probe both endpoints concurrently: in sequence, a stalled /health
+                // delays the next /v1/ready sample by up to PROBE_TIMEOUT, biasing
+                // its percentiles and undercounting its breaches.
+                let samples = tokio::select! {
+                    () = task_token.cancelled() => return,
+                    samples = futures::future::join(
+                        probe(&client, HEALTH_ENDPOINT),
+                        probe(&client, READY_ENDPOINT),
+                    ) => samples,
+                };
+
+                let mut guard = task_stats.lock();
+                for (endpoint, sample) in
+                    [(HEALTH_ENDPOINT, &samples.0), (READY_ENDPOINT, &samples.1)]
+                {
+                    if let Some(entry) = guard.get_mut(endpoint) {
+                        entry.record_sample(sample);
+                    }
+                }
+                drop(guard);
             }
         });
 
         Ok(Self {
             cancel_token,
+            stats,
             task: Some(task),
         })
+    }
+
+    /// Report of everything sampled so far, leaving the monitor running, so a
+    /// caller can scope a report to one phase of a run.
+    pub(crate) fn snapshot(&self) -> HealthCheckReport {
+        HealthCheckReport {
+            endpoints: self.stats.lock().clone(),
+        }
     }
 
     pub(crate) async fn stop(mut self) -> anyhow::Result<HealthCheckReport> {
@@ -183,7 +359,7 @@ impl HealthMonitor {
         };
 
         match task.await {
-            Ok(report) => Ok(report),
+            Ok(()) => Ok(self.snapshot()),
             Err(err) => {
                 Err(anyhow::anyhow!(err)
                     .context("Health monitor task did not complete successfully"))
@@ -198,5 +374,115 @@ impl Drop for HealthMonitor {
         if let Some(task) = self.task.take() {
             task.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EndpointStats, FailureKind, ProbeSample, breach_log_line};
+    use std::time::Duration;
+
+    fn healthy(latency: Duration) -> ProbeSample {
+        ProbeSample {
+            latency,
+            failure: None,
+        }
+    }
+
+    fn slow(latency: Duration) -> ProbeSample {
+        ProbeSample {
+            latency,
+            failure: Some((FailureKind::Latency, "latency budget".to_string())),
+        }
+    }
+
+    fn failed(latency: Duration, kind: FailureKind) -> ProbeSample {
+        ProbeSample {
+            latency,
+            failure: Some((kind, "probe failed".to_string())),
+        }
+    }
+
+    #[test]
+    fn latency_buckets_split_at_the_budget_and_its_4x_error_threshold() {
+        let mut stats = EndpointStats::default();
+
+        // Fast, then either side of the 125ms budget and the 500ms error threshold.
+        // Everything past the budget also counts as a failure, so those arrive as `slow`.
+        stats.record_sample(&healthy(Duration::from_millis(1)));
+        stats.record_sample(&healthy(Duration::from_millis(125)));
+        stats.record_sample(&slow(Duration::from_millis(126)));
+        stats.record_sample(&slow(Duration::from_millis(500)));
+        stats.record_sample(&slow(Duration::from_millis(501)));
+
+        // Exactly at a threshold is not a breach of it: 125ms is not > 125ms.
+        assert_eq!(stats.warn_count, 2, "126ms and 500ms are warn-level");
+        assert_eq!(stats.error_count, 1, "only 501ms is error-level");
+        assert_eq!(stats.failure_count, 3, "every over-budget sample counts");
+        assert_eq!(stats.max_latency, Duration::from_millis(501));
+        assert_eq!(stats.latencies_ms().len(), 5);
+    }
+
+    #[test]
+    fn failure_kinds_are_counted_separately() {
+        let mut stats = EndpointStats::default();
+
+        stats.record_sample(&failed(Duration::from_secs(3), FailureKind::Timeout));
+        stats.record_sample(&failed(Duration::from_micros(200), FailureKind::Refused));
+        stats.record_sample(&failed(Duration::from_millis(5), FailureKind::Status));
+        stats.record_sample(&failed(Duration::from_millis(5), FailureKind::Transport));
+
+        assert_eq!(stats.timeout_count, 1);
+        assert_eq!(stats.refused_count, 1);
+        assert_eq!(stats.status_count, 1);
+        assert_eq!(stats.failure_count, 4, "every kind counts as a failure");
+        // A refused connection fails in microseconds, so it is not a latency breach.
+        assert_eq!(stats.error_count, 1, "only the 3s timeout is error-level");
+        assert_eq!(stats.warn_count, 0, "5ms failures are not latency breaches");
+    }
+
+    #[test]
+    fn every_breaching_sample_produces_a_log_line() {
+        let timeout = (FailureKind::Timeout, "operation timed out".to_string());
+        let refused = (FailureKind::Refused, "connection refused".to_string());
+
+        assert_eq!(breach_log_line("/health", 4.0, None), None, "within budget");
+
+        let warning = breach_log_line("/health", 168.4, None).expect("over the 125ms budget");
+        assert!(
+            warning.starts_with("WARNING: probe /health took 168.4ms"),
+            "{warning}"
+        );
+
+        let error = breach_log_line("/health", 1_402.7, None).expect("over the 500ms threshold");
+        assert!(
+            error.starts_with("ERROR: probe /health took 1402.7ms"),
+            "{error}"
+        );
+
+        let timed_out =
+            breach_log_line("/health", 3_001.2, Some(&timeout)).expect("request failed");
+        assert!(timed_out.contains("operation timed out"), "{timed_out}");
+
+        // Fast enough to clear every latency threshold, but still a failed probe.
+        let refused = breach_log_line("/v1/ready", 0.2, Some(&refused)).expect("request failed");
+        assert!(
+            refused.starts_with("ERROR: probe /v1/ready failed"),
+            "{refused}"
+        );
+    }
+
+    #[test]
+    fn healthy_samples_record_no_failures() {
+        let mut stats = EndpointStats::default();
+        for _ in 0..10 {
+            stats.record_sample(&healthy(Duration::from_millis(2)));
+        }
+
+        assert_eq!(stats.failure_count, 0);
+        assert_eq!(stats.warn_count, 0);
+        assert_eq!(stats.error_count, 0);
+        assert!(stats.last_error.is_none());
+        assert_eq!(stats.latencies_ms().len(), 10);
     }
 }
