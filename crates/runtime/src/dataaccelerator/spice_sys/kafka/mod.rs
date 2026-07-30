@@ -42,6 +42,9 @@ pub(super) use data_components::kafka::KafkaMetadata;
 use data_components::kafka::KafkaOffset;
 use std::sync::Arc;
 
+#[cfg(feature = "duckdb")]
+use super::retry_on_write_conflict;
+
 const KAFKA_TABLE_NAME: &str = "spice_sys_kafka";
 const KAFKA_OFFSETS_TABLE_NAME: &str = "spice_sys_kafka_offsets";
 
@@ -58,6 +61,21 @@ pub struct KafkaSys {
     dataset_name: String,
     acceleration_connection: AccelerationConnection,
     schema_ensured: Arc<OffsetSchemaState>,
+    /// Serializes this instance's own `DuckDB` sidecar writes.
+    ///
+    /// `DuckDB` resolves concurrent writes to one row optimistically — the loser
+    /// gets `Conflict on update!` instead of waiting — and the sidecar writers hold
+    /// the pool's write gate with `read()`, so they do not exclude each other. Two
+    /// commits for the same dataset therefore conflict rather than queue. Before the
+    /// writes moved to the blocking pool, the async worker serialized them by
+    /// accident; this keeps that ordering on purpose, so a burst of commits for one
+    /// dataset still resolves to the max offset instead of failing.
+    ///
+    /// Scoped to one instance: writers for different datasets key on distinct rows
+    /// and do not conflict. `retry_on_write_conflict` still covers contention this
+    /// lock cannot see.
+    #[cfg(feature = "duckdb")]
+    duckdb_write_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl KafkaSys {
@@ -68,6 +86,8 @@ impl KafkaSys {
             acceleration_connection: acceleration_connection(dataset, registry, open_option)
                 .await?,
             schema_ensured: Arc::default(),
+            #[cfg(feature = "duckdb")]
+            duckdb_write_lock: Arc::default(),
         })
     }
 
@@ -127,6 +147,7 @@ impl KafkaSys {
                 let dataset_name = self.dataset_name.clone();
                 let schema_ensured = Arc::clone(&self.schema_ensured);
                 let metadata = metadata.clone();
+                let _serialized = self.duckdb_write_lock.lock().await;
                 super::spawn_duckdb_blocking(move || {
                     Self::upsert_duckdb(&dataset_name, &schema_ensured, &pool, &metadata)
                 })
@@ -167,8 +188,15 @@ impl KafkaSys {
                 let dataset_name = self.dataset_name.clone();
                 let schema_ensured = Arc::clone(&self.schema_ensured);
                 let offsets = offsets.to_vec();
-                super::spawn_duckdb_blocking(move || {
-                    Self::upsert_offsets_duckdb(&dataset_name, &schema_ensured, &pool, &offsets)
+                let _serialized = self.duckdb_write_lock.lock().await;
+                retry_on_write_conflict(&dataset_name, || {
+                    let pool = Arc::clone(&pool);
+                    let dataset_name = dataset_name.clone();
+                    let schema_ensured = Arc::clone(&schema_ensured);
+                    let offsets = offsets.clone();
+                    super::spawn_duckdb_blocking(move || {
+                        Self::upsert_offsets_duckdb(&dataset_name, &schema_ensured, &pool, &offsets)
+                    })
                 })
                 .await
             }
