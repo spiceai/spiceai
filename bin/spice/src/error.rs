@@ -72,6 +72,11 @@ pub enum Error {
     #[snafu(display("Invalid HTTP response: {message}"))]
     InvalidResponse { message: String },
 
+    /// A Spicepod registry failed to serve a pod. The message is already fully formed, so it is
+    /// displayed verbatim rather than blamed on the user's argument.
+    #[snafu(display("{message}"))]
+    Registry { message: String },
+
     /// Failed to read/write configuration
     #[snafu(display("Failed to {operation} configuration at {}: {source}", path.display()))]
     ConfigIo {
