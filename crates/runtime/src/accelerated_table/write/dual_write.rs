@@ -59,7 +59,6 @@ use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::accelerated_table::refresh;
-use crate::dataaccelerator::cayenne::CayennePartitionCreator;
 use crate::dataaccelerator::upsert_dedup::UpsertDedupTableProvider;
 use crate::dataupdate::StreamingDataUpdateExecutionPlan;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
@@ -514,11 +513,7 @@ pub(crate) fn extract_cayenne_write_target(
     }
 
     if let Some(partitioned) = table_provider.downcast_ref::<PartitionTableProvider>()
-        && partitioned
-            .creator()
-            .as_any()
-            .downcast_ref::<CayennePartitionCreator>()
-            .is_some()
+        && partitioned.creator().accepts_direct_partition_writes()
     {
         return Some(CayenneWriteTarget::Partitioned(Arc::clone(table_provider)));
     }
