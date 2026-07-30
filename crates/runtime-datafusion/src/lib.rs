@@ -27,6 +27,7 @@ pub mod optimizer_rule;
 pub mod param_utils;
 pub mod query_cancel_registry;
 pub mod schema_provider;
+pub mod session_config;
 
 pub use runtime_query_engine::allowlist;
 pub use runtime_query_engine::query_engine;
