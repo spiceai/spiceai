@@ -35,6 +35,12 @@ use search::metadata::MetadataColumns;
 /// [`ZeroResultsAction::UseSource`] falls back to the engine index, while
 /// [`ZeroResultsAction::ReturnEmpty`] serves the (possibly empty) in-memory result as-is.
 ///
+/// `on_zero_results` is `None` when the table has no enabled acceleration. The in-memory
+/// index starts empty on every process start and is only ever filled by the acceleration
+/// write path, so without acceleration nothing hydrates it — serving reads from it would
+/// narrow searches to whatever rows happened to be scanned since startup, or to nothing
+/// at all. The engine index is then returned unchanged.
+///
 /// The warm index is an optimization: when a compatible in-memory index cannot be built
 /// (e.g. the engine's distance metric has no in-memory equivalent), the engine index is
 /// returned unchanged and a warning is logged — a dataset that works without a warm
@@ -54,11 +60,17 @@ pub fn with_memory_warm_index(
     embed_udf: &Arc<ScalarUDF>,
     model_name: &String,
     metric: &str,
-    on_zero_results: &ZeroResultsAction,
+    on_zero_results: Option<&ZeroResultsAction>,
 ) -> Arc<dyn VectorIndex> {
     let read_mode = match on_zero_results {
-        ZeroResultsAction::ReturnEmpty => CompoundReadMode::PrimaryOnly,
-        ZeroResultsAction::UseSource => CompoundReadMode::FallbackToSecondary,
+        Some(ZeroResultsAction::ReturnEmpty) => CompoundReadMode::PrimaryOnly,
+        Some(ZeroResultsAction::UseSource) => CompoundReadMode::FallbackToSecondary,
+        None => {
+            tracing::debug!(
+                "Not adding an in-memory warm vector index for table {tbl}: the table is not accelerated, so nothing would populate it. Searches will be served by the vector engine directly."
+            );
+            return engine_index;
+        }
     };
 
     let memory_metric = match MemoryDistanceMetric::try_from(metric) {
@@ -248,7 +260,7 @@ mod tests {
             &noop_embed_udf(),
             &"model".to_string(),
             "cosine",
-            &ZeroResultsAction::UseSource,
+            Some(&ZeroResultsAction::UseSource),
         );
         assert!(
             index
@@ -256,6 +268,31 @@ mod tests {
                 .downcast_ref::<CompoundVectorIndex>()
                 .is_some(),
             "the engine index should be wrapped in a CompoundVectorIndex"
+        );
+    }
+
+    /// Regression test for #12101: nothing writes to a warm index for a table without
+    /// acceleration, so wrapping the engine index in a compound would serve searches from an
+    /// index that is empty (or holds only whatever rows a scan happened to write since
+    /// startup) instead of from the vector engine.
+    #[test]
+    fn warm_index_is_skipped_without_acceleration() {
+        let index = with_memory_warm_index(
+            &TableReference::bare("tbl"),
+            pretend_index(3),
+            MetadataColumns::none(),
+            Arc::new(NoopEmbed),
+            &noop_embed_udf(),
+            &"model".to_string(),
+            "cosine",
+            None,
+        );
+        assert!(
+            index
+                .as_any()
+                .downcast_ref::<PretendVectorIndex>()
+                .is_some(),
+            "a table without acceleration must keep the engine index unchanged"
         );
     }
 
@@ -269,7 +306,7 @@ mod tests {
             &noop_embed_udf(),
             &"model".to_string(),
             "cosine",
-            &ZeroResultsAction::UseSource,
+            Some(&ZeroResultsAction::UseSource),
         );
         assert_eq!(
             use_source
@@ -289,7 +326,7 @@ mod tests {
             &noop_embed_udf(),
             &"model".to_string(),
             "cosine",
-            &ZeroResultsAction::ReturnEmpty,
+            Some(&ZeroResultsAction::ReturnEmpty),
         );
         assert_eq!(
             return_empty
@@ -312,7 +349,7 @@ mod tests {
             &noop_embed_udf(),
             &"model".to_string(),
             "hyperbolic",
-            &ZeroResultsAction::UseSource,
+            Some(&ZeroResultsAction::UseSource),
         );
         assert!(
             index
@@ -334,7 +371,7 @@ mod tests {
             &noop_embed_udf(),
             &"model".to_string(),
             "cosine",
-            &ZeroResultsAction::UseSource,
+            Some(&ZeroResultsAction::UseSource),
         );
         assert!(
             index

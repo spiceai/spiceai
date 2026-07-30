@@ -27,14 +27,14 @@
 //! # Example
 //!
 //! ```no_run
-//! use pgwire_replication::config::TlsConfig;
+//! use pgwire_replication::config::{CaCertificate, TlsConfig};
 //! use pgwire_replication::tls::rustls::{maybe_upgrade_to_tls, MaybeTlsStream};
 //! use tokio::net::TcpStream;
 //! use std::path::PathBuf;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let tls_config = TlsConfig::verify_full(Some(PathBuf::new()))
+//!     let tls_config = TlsConfig::verify_full(Some(CaCertificate::Path(PathBuf::new())))
 //!         .with_sni_hostname("db.example.com");
 //!
 //!     let tcp_stream = TcpStream::connect(("db.example.com", 5432)).await?;
@@ -58,7 +58,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::{client::TlsStream, TlsConnector};
 
-use crate::config::{SslMode, TlsConfig};
+use crate::config::{CaCertificate, SslMode, TlsConfig};
 use crate::error::{PgWireError, Result};
 use crate::protocol::framing::write_ssl_request;
 
@@ -288,30 +288,33 @@ fn build_root_store(tls: &TlsConfig) -> Result<RootCertStore> {
 
     let mut roots = RootCertStore::empty();
 
-    if let Some(path) = &tls.ca_pem_path {
+    if let Some(ca) = &tls.ca {
         // Load custom CA certificates
         use rustls::pki_types::pem::PemObject;
 
-        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(path)
-            .map_err(|e| {
-                PgWireError::Tls(format!(
-                    "TLS config error: failed to open CA PEM '{}': {e}",
-                    path.display()
-                ))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| {
-                PgWireError::Tls(format!(
-                    "TLS config error: failed to parse CA PEM '{}': {e}",
-                    path.display()
-                ))
-            })?;
+        let source = ca.describe();
+        let certs: Vec<CertificateDer<'static>> = match ca {
+            CaCertificate::Path(path) => CertificateDer::pem_file_iter(path)
+                .map_err(|e| {
+                    PgWireError::Tls(format!(
+                        "TLS config error: failed to open CA PEM '{source}': {e}"
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>(),
+            CaCertificate::Pem(pem) => {
+                CertificateDer::pem_slice_iter(pem).collect::<std::result::Result<Vec<_>, _>>()
+            }
+        }
+        .map_err(|e| {
+            PgWireError::Tls(format!(
+                "TLS config error: failed to parse CA PEM '{source}': {e}"
+            ))
+        })?;
 
         let (added, _ignored) = roots.add_parsable_certificates(certs);
         if added == 0 {
             return Err(PgWireError::Tls(format!(
-                "TLS config error: no valid CA certificates found in '{}'",
-                path.display()
+                "TLS config error: no valid CA certificates found in '{source}'"
             )));
         }
     } else {
@@ -535,7 +538,7 @@ mod tests {
     #[test]
     fn missing_ca_file_gives_clear_error() {
         let tls = TlsConfig {
-            ca_pem_path: Some("/nonexistent/ca.pem".into()),
+            ca: Some(CaCertificate::Path("/nonexistent/ca.pem".into())),
             ..Default::default()
         };
 
@@ -550,7 +553,7 @@ mod tests {
     fn empty_ca_file_gives_clear_error() {
         let f = NamedTempFile::new().expect("should succeed");
         let tls = TlsConfig {
-            ca_pem_path: Some(f.path().to_path_buf()),
+            ca: Some(CaCertificate::Path(f.path().to_path_buf())),
             ..Default::default()
         };
 
@@ -558,6 +561,69 @@ mod tests {
             .expect_err("should error")
             .to_string();
         assert!(err.contains("no valid CA certificates"));
+    }
+
+    /// Self-signed CA (`CN=Spice Replication Test CA`, `CA:TRUE`) used to prove a
+    /// PEM bundle becomes a real trust anchor. Expires in 2126.
+    const TEST_CA_PEM: &[u8] = b"-----BEGIN CERTIFICATE-----
+MIIC4DCCAcigAwIBAgIJAODHR+uzOPBvMA0GCSqGSIb3DQEBCwUAMCQxIjAgBgNV
+BAMMGVNwaWNlIFJlcGxpY2F0aW9uIFRlc3QgQ0EwIBcNMjYwNzI4MDU0MDQ0WhgP
+MjEyNjA3MDQwNTQwNDRaMCQxIjAgBgNVBAMMGVNwaWNlIFJlcGxpY2F0aW9uIFRl
+c3QgQ0EwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCzoou00DrTAevF
+RZ6+PFmSBUhzZXsABQFztlPigZzJ1m8hnja66hnkWKyIid9DcitnjkWgtQZCVxm6
+s05tM6QAy5lI2wlfWD7hQi+yIWKv2dcVuD/J4hWPjmG5a5VtRAInV0yBymkCRI6Z
+68JYfvKh+Rku1y6H3dUfNm8dxCbo589L1U8ucJqlQv9Iy/X7Lze+pj2JFU/L1g3t
+k/5ziVgJjdh3VetrHkU1YOiHRPFsqXOxXc2lpzUjd23QR3FfkZkVgLUfEvPWHRSf
+xipaPFhllw9WUWEl6bVqAGO0btPO1OKKqBlIcizf2YO2+lFs/o0e7bApGzI3l5HP
+VZr/e6ZLAgMBAAGjEzARMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQAD
+ggEBACC1XMNpbA+172MQks9R7cqRY5I0HObJRX3dpIsOqrm3EUcHMt9kx7QrO1Af
+gzAWC0ZNHppeU/cuq9ZKZQiFrSmr5fKtXzsxkvgLYRCFO+ZCKZl9k3z9j0AQbTPR
+klJa4bo2SS6WbmoATimD6e0moT++neRIDx7MlijtWB8grfhuH7yFN9xoTRDgdYBU
+KLeFNAIi+S5cVzUwjMiOQnmljphKSRoQnihpA/c6WAVAN3VqMdoPpfmR2pTi7rio
+38busw0nt/y+JCVWzNDr/i5f3mvNi5SaHZ5PTOVnocyMUw+ysx5eQOrJwrirW9XD
+TXTE85+Or9IUwDI9543jsyCvuQ8=
+-----END CERTIFICATE-----
+";
+
+    #[test]
+    fn inline_ca_pem_is_loaded_into_the_root_store() {
+        let pem = TEST_CA_PEM.to_vec();
+
+        let inline = TlsConfig {
+            ca: Some(CaCertificate::Pem(pem.clone())),
+            ..Default::default()
+        };
+        let from_pem = build_root_store(&inline).expect("inline PEM should build a root store");
+        assert!(
+            !from_pem.is_empty(),
+            "inline PEM must contribute trust anchors"
+        );
+
+        // The same bytes on disk must yield the same anchors — inline and path
+        // are two spellings of one CA bundle, not two trust policies.
+        let mut f = NamedTempFile::new().expect("should succeed");
+        f.write_all(&pem).expect("should write");
+        let from_path = build_root_store(&TlsConfig {
+            ca: Some(CaCertificate::Path(f.path().to_path_buf())),
+            ..Default::default()
+        })
+        .expect("path should build a root store");
+        assert_eq!(from_pem.len(), from_path.len());
+    }
+
+    #[test]
+    fn inline_ca_pem_that_is_not_a_certificate_is_rejected() {
+        let tls = TlsConfig {
+            ca: Some(CaCertificate::Pem(b"not a certificate".to_vec())),
+            ..Default::default()
+        };
+
+        let err = build_root_store(&tls)
+            .expect_err("garbage inline PEM must not be accepted")
+            .to_string();
+        assert!(err.contains("CA PEM") || err.contains("no valid CA certificates"));
+        // The failure must name the source without echoing the content.
+        assert!(err.contains("inline PEM content"));
     }
 
     #[test]
