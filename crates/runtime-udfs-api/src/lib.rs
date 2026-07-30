@@ -153,7 +153,17 @@ pub fn json_function_names() -> &'static [String] {
     static NAMES: LazyLock<Vec<String>> = LazyLock::new(|| {
         let mut ctx = SessionContext::new();
         let existing: HashSet<_> = ctx.state().scalar_functions().keys().cloned().collect();
-        let _ = datafusion_functions_json::register_all(&mut ctx);
+        // A failure here would yield an incomplete list, and this list is a
+        // *deny*-list: a missing name federates instead of being blocked, so the
+        // source is asked to evaluate a function it does not have. Registration
+        // into a context created a line above cannot actually fail, so make that
+        // assumption loud rather than silent.
+        if let Err(error) = datafusion_functions_json::register_all(&mut ctx) {
+            debug_assert!(false, "registering the JSON functions failed: {error}");
+            tracing::error!(
+                "Failed to enumerate the JSON functions for the federation deny-list ({error}). JSON functions may be pushed down to sources that cannot evaluate them."
+            );
+        }
         ctx.state()
             .scalar_functions()
             .keys()

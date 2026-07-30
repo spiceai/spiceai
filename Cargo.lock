@@ -17486,6 +17486,7 @@ dependencies = [
  "datafusion-table-providers",
  "linkme",
  "parking_lot",
+ "tracing",
 ]
 
 [[package]]

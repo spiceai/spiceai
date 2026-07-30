@@ -34,10 +34,12 @@ use datafusion::prelude::SessionContext;
 use datafusion_table_providers::util::supported_functions::FunctionSupport;
 use parking_lot::RwLock;
 #[cfg(feature = "models")]
-use runtime_datafusion_udfs::{
-    ai::{AI_UDF_NAME, Ai},
-    embed::{self, EMBED_UDF_NAME},
-};
+use runtime_datafusion_udfs::{ai::Ai, embed};
+// The UDF *names* are no longer part of any production path here — each function
+// registers its own deny-list entry — but both test modules still assert against
+// them, so they are imported for tests only.
+#[cfg(all(test, feature = "models"))]
+use runtime_datafusion_udfs::{ai::AI_UDF_NAME, embed::EMBED_UDF_NAME};
 use runtime_query_engine::query_engine::QueryEngine;
 use runtime_search::full_text_udtf::TextSearchTableFunc;
 use runtime_search::rerank::{RERANK_UDTF_NAME, RerankTableFunc};
