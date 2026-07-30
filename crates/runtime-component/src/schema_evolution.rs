@@ -69,6 +69,7 @@ pub static SCHEMA_EVOLUTION_FAILED: std::sync::LazyLock<opentelemetry::metrics::
         .build()
     });
 
+#[must_use]
 pub fn schema_evolution_labels(
     dataset: &str,
     kind: &'static str,
