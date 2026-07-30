@@ -187,6 +187,7 @@ pub struct LeasedBucketMetrics {
     pub lease_refresh_errors_total: AtomicU64,
 }
 
+#[cfg(test)]
 impl LeasedBucketMetrics {
     #[must_use]
     pub fn lease_granted(&self) -> u64 {
@@ -294,7 +295,8 @@ impl LeasedBucket {
         })
     }
 
-    pub fn metrics(&self) -> Arc<LeasedBucketMetrics> {
+    #[cfg(test)]
+    pub(crate) fn metrics(&self) -> Arc<LeasedBucketMetrics> {
         Arc::clone(&self.metrics)
     }
 

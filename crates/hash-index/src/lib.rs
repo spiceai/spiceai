@@ -54,7 +54,9 @@ mod sbbf;
 #[cfg(test)]
 mod tests;
 
-pub use bloom::{BatchBloomFilter, BloomFilter};
+#[cfg(test)]
+pub(crate) use bloom::BatchBloomFilter;
+pub use bloom::BloomFilter;
 pub use index::{
     HashIndex, HashIndexBuilder, InsertResult, NUM_SHARDS, PrehashedBuildHasher, PrehashedHasher,
     RowLocation, XxHash3BuildHasher, XxHash3Hasher, hash_key, hash_key_128, hash_key_bytes,

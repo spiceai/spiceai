@@ -100,9 +100,10 @@ pub(crate) fn random_bytes(buf: &mut [u8]) {
     rand::fill(buf);
 }
 
-/// Encode bytes as lowercase hex string.
+/// Encode bytes as lowercase hex string. Only used in tests.
 #[must_use]
-pub fn hex_encode(bytes: &[u8]) -> String {
+#[cfg(test)]
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(bytes.len() * 2);
     for &b in bytes {

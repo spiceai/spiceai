@@ -226,13 +226,15 @@ impl Value {
 
     /// Returns true if the value is a boolean.
     #[must_use]
-    pub fn is_bool(&self) -> bool {
+    #[cfg(test)]
+    fn is_bool(&self) -> bool {
         matches!(self, Value::Bool(_))
     }
 
     /// Returns true if the value is a number.
     #[must_use]
-    pub fn is_number(&self) -> bool {
+    #[cfg(test)]
+    fn is_number(&self) -> bool {
         matches!(self, Value::Number(_))
     }
 
@@ -344,7 +346,8 @@ impl Value {
 
     /// Mutably index into a YAML sequence or mapping.
     #[must_use]
-    pub fn get_mut<I: Index>(&mut self, index: I) -> Option<&mut Value> {
+    #[cfg(test)]
+    fn get_mut<I: Index>(&mut self, index: I) -> Option<&mut Value> {
         index.index_into_mut(self)
     }
 }

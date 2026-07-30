@@ -25,7 +25,9 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{Result, channel::TaskRequestChannel, schedule::Schedule, task::TaskRequest};
+#[cfg(test)]
+use crate::channel::TaskRequestChannel;
+use crate::{Result, schedule::Schedule, task::TaskRequest};
 
 pub struct NotStarted {
     schedules: Vec<Arc<Schedule>>,
@@ -157,6 +159,7 @@ impl Scheduler<Running> {
         self.state.schedules.read().await.clone()
     }
 
+    #[cfg(test)]
     pub async fn stop(self) {
         let cancellation_token = Arc::clone(&self.state.cancellation_token);
         cancellation_token.cancel();
@@ -214,6 +217,7 @@ impl Scheduler<Running> {
     /// - If the schedule with the specified name does not exist.
     /// - If the request channel fails to start.
     /// - If a submission channel is not found for the schedule.
+    #[cfg(test)]
     pub async fn add_trigger_for_schedule(
         &self,
         schedule_name: Arc<str>,

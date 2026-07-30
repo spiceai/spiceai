@@ -35,7 +35,8 @@ pub struct ManualRequestChannel {
 
 impl ManualRequestChannel {
     #[must_use]
-    pub fn new(rx: tokio::sync::mpsc::Receiver<Option<Arc<TaskRequest>>>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new(rx: tokio::sync::mpsc::Receiver<Option<Arc<TaskRequest>>>) -> Self {
         Self {
             cancellation: None,
             reset: None,

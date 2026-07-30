@@ -89,8 +89,9 @@ impl BloomFilter {
     /// Creates an empty bloom filter with zero capacity.
     ///
     /// This is useful as a placeholder; it will always return `true` from `might_contain`.
+    #[cfg(test)]
     #[must_use]
-    pub const fn empty() -> Self {
+    pub(crate) const fn empty() -> Self {
         Self {
             bits: Vec::new(),
             num_hashes: 0,
@@ -99,14 +100,16 @@ impl BloomFilter {
     }
 
     /// Returns true if the bloom filter is empty (has no capacity).
+    #[cfg(test)]
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.bits.is_empty()
     }
 
     /// Returns the number of bits in the bloom filter.
+    #[cfg(test)]
     #[must_use]
-    pub fn num_bits(&self) -> usize {
+    pub(crate) fn num_bits(&self) -> usize {
         self.num_bits
     }
 
@@ -189,11 +192,13 @@ impl BloomFilter {
 /// A bloom filter optimized for batch operations.
 ///
 /// This variant pre-computes bit indices for faster batch checking.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct BatchBloomFilter {
     inner: BloomFilter,
 }
 
+#[cfg(test)]
 impl BatchBloomFilter {
     /// Creates a new batch bloom filter.
     #[must_use]
@@ -245,6 +250,7 @@ impl BatchBloomFilter {
     }
 }
 
+#[cfg(test)]
 impl From<BloomFilter> for BatchBloomFilter {
     fn from(inner: BloomFilter) -> Self {
         Self { inner }

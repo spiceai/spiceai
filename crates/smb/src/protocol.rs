@@ -282,7 +282,6 @@ pub(crate) fn encode_negotiate_request(buf: &mut BytesMut, client_guid: &[u8; 16
 
 #[derive(Debug)]
 pub struct NegotiateResponse {
-    pub(crate) security_mode: u16,
     pub(crate) dialect_revision: u16,
     pub(crate) max_transact_size: u32,
     pub(crate) max_read_size: u32,
@@ -294,14 +293,13 @@ pub(crate) fn decode_negotiate_response(body: &[u8]) -> Option<NegotiateResponse
     if body.len() < 40 {
         return None;
     }
-    let security_mode = (&body[2..4]).get_u16_le();
+    let _ = (&body[2..4]).get_u16_le(); // security_mode: never used, but consumed for correct wire parsing
     let dialect_revision = (&body[4..6]).get_u16_le();
     let max_transact_size = (&body[28..32]).get_u32_le();
     let max_read_size = (&body[32..36]).get_u32_le();
     let max_write_size = (&body[36..40]).get_u32_le();
 
     Some(NegotiateResponse {
-        security_mode,
         dialect_revision,
         max_transact_size,
         max_read_size,
@@ -487,7 +485,6 @@ pub(crate) fn encode_close_request_ex(buf: &mut BytesMut, file_id: &[u8; 16], po
 #[derive(Debug, Clone)]
 pub struct CloseResponse {
     pub(crate) last_write_time: u64,
-    pub(crate) file_size: u64,
 }
 
 #[must_use]
@@ -496,11 +493,8 @@ pub(crate) fn decode_close_response(body: &[u8]) -> Option<CloseResponse> {
         return None;
     }
     let last_write_time = u64::from_le_bytes(body[24..32].try_into().ok()?);
-    let file_size = u64::from_le_bytes(body[48..56].try_into().ok()?);
-    Some(CloseResponse {
-        last_write_time,
-        file_size,
-    })
+    let _ = u64::from_le_bytes(body[48..56].try_into().ok()?); // file_size: never used, but consumed for correct wire parsing
+    Some(CloseResponse { last_write_time })
 }
 
 // ── Read ────────────────────────────────────────────────────────────────────
@@ -895,7 +889,6 @@ mod tests {
         body[48..56].copy_from_slice(&4096u64.to_le_bytes());
         let resp = decode_close_response(&body).expect("test fixture");
         assert_eq!(resp.last_write_time, 999);
-        assert_eq!(resp.file_size, 4096);
     }
 
     #[test]

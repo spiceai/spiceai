@@ -11,7 +11,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{future::Future, sync::Arc};
+use std::sync::Arc;
 
 use snafu::prelude::*;
 use tokio::{runtime::Handle, sync::Notify};
@@ -177,26 +177,27 @@ impl ManagedTokioRuntimeBuilder {
     }
 }
 
-/// Spawns a task on the provided Tokio runtime and collects its result.
-///
-/// # Errors
-///
-/// Returns [`Error::TaskExecution`] if the task is cancelled or panics before producing a result.
-pub async fn spawn_task_and_collect_results<F>(fut: F, tokio_handle: &Handle) -> Result<F::Output>
-where
-    F: Future + Send + 'static,
-    F::Output: Send + 'static,
-{
-    let join_handle = tokio_handle.spawn(fut);
-    match join_handle.await {
-        Ok(result) => Ok(result),
-        Err(_) => Err(Error::TaskExecution),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Spawns a task on the provided Tokio runtime and collects its result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::TaskExecution`] if the task is cancelled or panics before producing a result.
+    async fn spawn_task_and_collect_results<F>(fut: F, tokio_handle: &Handle) -> Result<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let join_handle = tokio_handle.spawn(fut);
+        match join_handle.await {
+            Ok(result) => Ok(result),
+            Err(_) => Err(Error::TaskExecution),
+        }
+    }
+
     use std::time::Duration;
     use tokio::task::JoinSet;
     use tokio::time::sleep;

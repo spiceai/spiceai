@@ -36,7 +36,8 @@ pub struct IntervalRequestChannel {
 
 impl IntervalRequestChannel {
     #[must_use]
-    pub fn new(interval: u64) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new(interval: u64) -> Self {
         Self {
             cancellation: None,
             task_completion: None,

@@ -58,6 +58,7 @@ impl TaskRequest {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn clears_queue(mut self) -> Self {
         self.clear_queue = true;
         self
