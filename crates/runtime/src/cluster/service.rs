@@ -62,7 +62,7 @@ use runtime_proto::{
     executor_control_message::Message as ExecutorMessage,
     scheduler_control_message::Message as SchedulerMessage,
 };
-use runtime_secrets::{Secrets, iter_secret_references};
+use runtime_secrets::{SECRETS, Secrets, iter_secret_references};
 use secrecy::ExposeSecret;
 use std::collections::{HashMap, HashSet};
 use std::task::{Context, Poll};
@@ -411,7 +411,7 @@ impl ClusterService for ClusterServiceImpl {
         };
         let allowed_keys = expandable_secret_keys(&app);
 
-        if !allowed_keys.contains(request.key.as_str()) {
+        let Some(allowed_stores) = allowed_keys.get(request.key.as_str()) else {
             tracing::warn!(
                 executor_id = %request.executor_id,
                 key = %request.key,
@@ -423,7 +423,7 @@ impl ClusterService for ClusterServiceImpl {
                 "Unable to expand secret {}",
                 request.key
             )));
-        }
+        };
 
         tracing::debug!(
             "ExpandSecret: expanding secret {} for executor {}",
@@ -432,10 +432,20 @@ impl ClusterService for ClusterServiceImpl {
         );
 
         let secrets = self.secrets.read().await;
-        let Some(value) = secrets
-            .get_secret(&request.key)
-            .await
-            .map_err(|e| Status::internal(format!("Failed to get secret: {e}")))?
+        // A reference through the `secrets:` sentinel keeps its normal
+        // "search every configured store in precedence order" resolution; a
+        // reference scoped to a specific store (e.g. `${ env:KEY }`) is
+        // restricted to that store, so a same-named key in an unrelated
+        // store can't answer in its place.
+        let lookup = if allowed_stores.contains(SECRETS) {
+            secrets.get_secret(&request.key).await
+        } else {
+            secrets
+                .get_secret_from_stores(&request.key, allowed_stores)
+                .await
+        };
+        let Some(value) =
+            lookup.map_err(|e| Status::internal(format!("Failed to get secret: {e}")))?
         else {
             tracing::error!(target: "task_history", "Secret not found");
             return Err(Status::invalid_argument(format!(
@@ -1298,23 +1308,39 @@ fn encode_batches_to_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>, arrow::erro
     Ok(buffer)
 }
 
-/// Collects the set of secret keys the cluster may expand via [`ExpandSecret`].
+/// Collects, for each secret key the cluster may expand via [`ExpandSecret`],
+/// the set of store names it was referenced through.
 ///
 /// Keys are taken from every `${ store:key }` reference in the serialized app
-/// definition (datasets, catalogs, models, tools, runtime auth, snapshots, …).
-/// Only these keys are eligible for expansion; arbitrary host/env/vault keys
-/// that the spicepod never references are denied.
+/// definition (datasets, catalogs, models, tools, runtime auth, snapshots, …);
+/// a key the spicepod never references is absent from the map and therefore
+/// denied. The per-key store set lets the `expand_secret` handler honor the
+/// store a reference named — e.g. `${ env:KEY }` may only expand from
+/// `env` — instead of an unscoped search across every configured store, which
+/// could return an unrelated, same-named secret from a different store than
+/// the spicepod referenced. A key reached via the `${ secrets:KEY }` sentinel
+/// keeps its normal "any configured store" semantics: its store set contains
+/// [`SECRETS`].
 ///
-/// Serialization failure fails closed (empty set) so a broken app cannot
+/// Serialization failure fails closed (empty map) so a broken app cannot
 /// open the expansion surface.
-fn expandable_secret_keys(app: &App) -> HashSet<String> {
+fn expandable_secret_keys(app: &App) -> HashMap<String, HashSet<String>> {
     match serde_json::to_string(app) {
-        Ok(json) => iter_secret_references(&json).map(|r| r.key).collect(),
+        Ok(json) => {
+            let mut allowed: HashMap<String, HashSet<String>> = HashMap::new();
+            for reference in iter_secret_references(&json) {
+                allowed
+                    .entry(reference.key)
+                    .or_default()
+                    .insert(reference.store);
+            }
+            allowed
+        }
         Err(e) => {
             tracing::error!(
                 "Failed to serialize app while building ExpandSecret allowlist: {e}. Denying all secret expansion."
             );
-            HashSet::new()
+            HashMap::new()
         }
     }
 }
@@ -1537,12 +1563,14 @@ mod tests {
     fn expandable_secret_keys_collects_dataset_refs() {
         let app = app_with_secret_ref("pg_pass", "${ secrets:PG_PASS }");
         let keys = expandable_secret_keys(&app);
-        assert!(
-            keys.contains("PG_PASS"),
-            "expected PG_PASS in allowlist, got {keys:?}"
+        let stores = keys.get("PG_PASS");
+        assert_eq!(
+            stores.map(|s| s.contains(SECRETS)),
+            Some(true),
+            "expected PG_PASS allowlisted via the `secrets` sentinel, got {keys:?}"
         );
         assert!(
-            !keys.contains("AWS_SECRET_ACCESS_KEY"),
+            !keys.contains_key("AWS_SECRET_ACCESS_KEY"),
             "unreferenced keys must not be allowlisted"
         );
     }
@@ -1601,6 +1629,43 @@ mod tests {
         );
         // Must not leak the secret value in the error.
         assert!(!err.message().contains("should-not-leak"));
+    }
+
+    #[tokio::test]
+    async fn expand_secret_store_scoped_reference_ignores_other_stores() {
+        // The spicepod references `${ env:API_KEY }` — a store-scoped
+        // reference, not the `secrets:` sentinel. A higher-precedence
+        // `vault` store happens to define an unrelated secret under the
+        // same key name; ExpandSecret must resolve from `env` (the store
+        // the reference named) and must never return `vault`'s value in
+        // its place.
+        let app = app_with_secret_ref("api_key", "${ env:API_KEY }");
+        let mut secrets = Secrets::new();
+        secrets.register_store(
+            "vault",
+            Arc::new(FakeSecretStore(HashMap::from([(
+                "API_KEY".to_string(),
+                "wrong-store-value".to_string(),
+            )]))),
+        );
+        secrets.register_store(
+            "env",
+            Arc::new(FakeSecretStore(HashMap::from([(
+                "API_KEY".to_string(),
+                "correct-store-value".to_string(),
+            )]))),
+        );
+        let service = make_test_service_with(Some(app), secrets, true).await;
+
+        let response = service
+            .expand_secret(Request::new(ExpandSecretRequest {
+                executor_id: "executor-1".to_string(),
+                key: "API_KEY".to_string(),
+            }))
+            .await
+            .expect("store-scoped key referenced by the app should expand");
+
+        assert_eq!(response.into_inner().value, "correct-store-value");
     }
 
     #[tokio::test]
