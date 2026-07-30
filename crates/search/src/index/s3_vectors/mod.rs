@@ -521,8 +521,8 @@ pub fn s3_vectors_primary_key_cast(primary_key: &[Field]) -> Vec<Expr> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_openai::types::embeddings::EmbeddingInput;
     use datafusion::scalar::ScalarValue;
+    use llms::embeddings::EmbeddingInput;
     use s3_vectors::{
         CreateIndexInput, CreateVectorBucketInput, DataType as S3DataType, DistanceMetric,
         S3Vectors, mock::MockClient,
@@ -535,6 +535,10 @@ mod tests {
     impl Embed for NoopEmbed {
         async fn embed(&self, _input: EmbeddingInput) -> llms::embeddings::Result<Vec<Vec<f32>>> {
             Ok(vec![])
+        }
+
+        fn size(&self) -> i32 {
+            3
         }
     }
 
