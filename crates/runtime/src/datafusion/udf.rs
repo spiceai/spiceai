@@ -50,6 +50,11 @@ use runtime_search::udtf::{TEXT_SEARCH_UDTF_NAME, VECTOR_SEARCH_UDTF_NAME};
 use runtime_secrets::{ExposeSecret, get_params_with_secrets};
 #[cfg(not(feature = "models"))]
 const EMBED_UDF_NAME: &str = "embed";
+// `runtime-datafusion-udfs` gates its `embed` module on `models`, so without that
+// feature the name has no registration there — but `embed` must still be denied,
+// so register it here alongside the fallback constant.
+#[cfg(not(feature = "models"))]
+runtime_udfs_api::register_spice_function!(EMBED_SPICE_FUNCTION_FALLBACK, EMBED_UDF_NAME);
 use runtime_datafusion_udfs::{
     alias::ScalarUDFAlias,
     assert::Assert,
@@ -66,6 +71,11 @@ use runtime_datafusion_udfs::{
 use serde_json::Value;
 use spicepod::component::function::{Function, FunctionKind, Volatility};
 use util::in_tracing_context_async;
+
+// `rand` is a Spice alias over DataFusion's `RandomFunc`, registered by
+// `register_core_scalar_udfs` below, so its deny-list entry is declared here
+// rather than in a UDF crate.
+runtime_udfs_api::register_spice_function!(RAND_SPICE_FUNCTION, "rand");
 
 /// Register core scalar UDFs that have no runtime dependencies.
 ///
@@ -939,6 +949,29 @@ fn json_functions() -> Vec<String> {
         .filter(|&k| !existing.contains(k))
         .cloned()
         .collect()
+}
+
+#[cfg(test)]
+mod deny_list_registration_tests {
+    //! A `register_spice_function!` entry is a `linkme` static, so it is dropped
+    //! if its crate is not linked — and a missing entry fails silently by making
+    //! the function federatable. This asserts the link-time set still matches the
+    //! set `denied_spice_function_names` builds by hand, so a lost registration
+    //! fails here instead of in a query against a remote source.
+
+    #[test]
+    fn link_time_registry_matches_the_hand_written_deny_list() {
+        let mut expected: Vec<String> = super::denied_spice_function_names();
+        let mut actual: Vec<String> = runtime_udfs_api::spice_function_names();
+        expected.sort();
+        expected.dedup();
+        actual.sort();
+        actual.dedup();
+        assert_eq!(
+            expected, actual,
+            "the link-time Spice function registry drifted from the hand-written deny-list"
+        );
+    }
 }
 
 #[cfg(test)]
