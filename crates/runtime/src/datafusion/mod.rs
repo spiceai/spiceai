@@ -153,7 +153,7 @@ pub mod pg_catalog;
 pub mod planner;
 pub mod refresh_sql;
 pub mod request_context_extension;
-pub mod retention_sql;
+pub use runtime_datafusion::retention_sql;
 pub mod schema;
 pub mod secrets_context_extension;
 pub mod table;

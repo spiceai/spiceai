@@ -17102,6 +17102,7 @@ dependencies = [
  "parking_lot",
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
+ "runtime-object-store",
  "runtime-query-engine",
  "runtime-request-context",
  "search",

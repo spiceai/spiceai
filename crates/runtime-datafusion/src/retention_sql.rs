@@ -28,8 +28,8 @@ use snafu::prelude::*;
 use sqlparser::ast::Statement as SQLStatement;
 use tokio::runtime::Handle;
 
-use crate::datafusion::builder::get_df_default_config;
-use crate::datafusion::error::format_datafusion_error;
+use crate::error::format_datafusion_error;
+use crate::session_config::get_df_default_config;
 use runtime_object_store::registry::default_runtime_env;
 
 #[derive(Clone, Debug)]
