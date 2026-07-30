@@ -119,11 +119,21 @@ pub fn replay_binlog_envelopes(
     let mut route: Option<(u64, TableMapEvent<'static>)> = None;
     let mut txn: Vec<RowsEventData<'static>> = Vec::new();
 
-    // A truncated trailing event (mid-write capture / byte cap) reads as
-    // `Ok(None)`/`Err` and ends the replay at the last complete transaction.
-    while let Ok(Some(event)) = reader.read(&mut io) {
+    // The slice ends on an event boundary, so `Ok(None)` is the clean end of
+    // the capped range. A parse error means the capture is malformed: fail
+    // rather than return a short replay, which would silently understate the
+    // bytes a bench claims to have processed.
+    while let Some(event) = reader
+        .read(&mut io)
+        .map_err(|e| format!("binlog event parse: {e}"))?
+    {
         let event_timestamp = event.header().timestamp();
-        let Ok(Some(data)) = event.read_data() else {
+        // `Ok(None)` is an event carrying no data we route (a rotate, a format
+        // description, …); an error is a malformed event and must not be skipped.
+        let Some(data) = event
+            .read_data()
+            .map_err(|e| format!("binlog event data: {e}"))?
+        else {
             continue;
         };
         match data {

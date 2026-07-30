@@ -1839,15 +1839,24 @@ async fn deliver_commit(
         let is_ready = crate::cdc::source_commit_within_ready_lag(commit_ts, member.ready_lag);
         // A decode failure faults only this member, attributed here where the
         // failing table map and layout snapshot are in hand.
-        let batch = match decode_events_to_batch(
-            &member.schema,
-            &member.primary_keys,
-            layout,
-            tme,
-            &events,
-            commit_ts,
-            &member.metrics,
-        ) {
+        //
+        // `block_in_place`: the decode is CPU-bound with no await inside, and a
+        // large transaction can hold it well past the ~100µs an async task may
+        // occupy a worker. This task also drives the socket read and idle-member
+        // credits for every member on the dump, so handing the worker's other
+        // tasks to a sibling keeps the runtime moving — and keeps the source
+        // from resetting the dump connection on `net_write_timeout`.
+        let batch = match tokio::task::block_in_place(|| {
+            decode_events_to_batch(
+                &member.schema,
+                &member.primary_keys,
+                layout,
+                tme,
+                &events,
+                commit_ts,
+                &member.metrics,
+            )
+        }) {
             Ok(batch) => batch,
             Err(e) => {
                 member.metrics.inc_decode_error();
