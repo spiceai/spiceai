@@ -651,6 +651,84 @@ async fn create_logical_slot(
     Ok((consistent_lsn, lsn_str))
 }
 
+/// Total time [`drop_slot_after_shutdown`] will spend waiting for the server to
+/// mark a just-released slot inactive. `PostgreSQL` clears the flag within
+/// milliseconds of the walsender exiting; this only covers scheduling jitter,
+/// and is deliberately short so a slow or unreachable source cannot stall a
+/// graceful shutdown.
+const DROP_SLOT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+/// How often to retry the drop while the server still reports the slot active.
+const DROP_SLOT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+/// SQLSTATE `55006` (`object_in_use`) — the slot is still marked active because
+/// the walsender we just disconnected has not fully exited yet.
+const SQLSTATE_OBJECT_IN_USE: &str = "55006";
+/// SQLSTATE `42704` (`undefined_object`) — the slot is already gone.
+const SQLSTATE_UNDEFINED_OBJECT: &str = "42704";
+
+/// Drop `params.slot_name` on graceful shutdown, for a stream whose accelerator
+/// does not survive a restart (see [`ReplicationParams::ephemeral_accelerator`]).
+///
+/// Such a slot has no resume value — the accelerator boots empty and re-snapshots
+/// — but left behind it keeps pinning WAL on the source for as long as Spice is
+/// down. Dropping it releases that WAL immediately.
+///
+/// Best-effort by construction: shutdown must not block on the source, and a slot
+/// that survives (ungraceful exit, unreachable server, insufficient privilege)
+/// costs only retained WAL, never correctness — the next start re-snapshots
+/// either way. Every failure is therefore logged, not propagated.
+///
+/// Call only *after* the replication connection has been dropped; `PostgreSQL`
+/// refuses to drop a slot an active walsender still holds.
+pub async fn drop_slot_after_shutdown(params: &ReplicationParams) {
+    let (client, connection_task) = match connect_setup(params).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::warn!(
+                slot = %params.slot_name,
+                "could not connect to drop the replication slot on shutdown; it will keep retaining WAL on the source until dropped manually: {e}"
+            );
+            return;
+        }
+    };
+
+    let deadline = tokio::time::Instant::now() + DROP_SLOT_BUDGET;
+    loop {
+        let error = match client
+            .execute("SELECT pg_drop_replication_slot($1)", &[&params.slot_name])
+            .await
+        {
+            Ok(_) => {
+                tracing::info!(
+                    slot = %params.slot_name,
+                    "dropped the replication slot on shutdown (non-persistent accelerator; the slot has no resume value and would otherwise retain WAL on the source)"
+                );
+                break;
+            }
+            Err(e) => e,
+        };
+
+        match error.as_db_error().map(|db| db.code().code()) {
+            // Already gone (a concurrent drop, or the slot was temporary).
+            Some(SQLSTATE_UNDEFINED_OBJECT) => break,
+            // The walsender has not finished exiting; retry within the budget.
+            Some(SQLSTATE_OBJECT_IN_USE) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(DROP_SLOT_POLL_INTERVAL).await;
+            }
+            _ => {
+                tracing::warn!(
+                    slot = %params.slot_name,
+                    "could not drop the replication slot on shutdown; it will keep retaining WAL on the source until dropped manually (DROP: `SELECT pg_drop_replication_slot('{}')`): {error}",
+                    params.slot_name,
+                );
+                break;
+            }
+        }
+    }
+
+    drop(client);
+    connection_task.abort();
+}
+
 /// Parses a Postgres LSN string like "16/B374D848" into a u64.
 /// Errors on malformed input rather than defaulting to 0, because 0 is also
 /// the "server decides" sentinel downstream — silently coercing invalid input

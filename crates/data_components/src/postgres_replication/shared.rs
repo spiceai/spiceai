@@ -1307,6 +1307,9 @@ struct SharedSource {
     /// Tables whose member detached during this pump's lifetime; a rejoin is
     /// resumed via held-floor replay instead of a snapshot.
     detached: Mutex<HashSet<MemberKey>>,
+    /// Whether the slot should be dropped when the pump stops for runtime
+    /// shutdown (see [`SharedSource::note_member_durability`]).
+    drop_slot_on_shutdown: AtomicBool,
 }
 
 impl SharedSource {
@@ -1322,6 +1325,26 @@ impl SharedSource {
             dead: AtomicBool::new(false),
             slot_created_fresh: AtomicBool::new(false),
             detached: Mutex::new(HashSet::new()),
+            // Starts `true` and is only ever cleared, by the first member whose
+            // accelerator is durable (see `note_member_durability`).
+            drop_slot_on_shutdown: AtomicBool::new(true),
+        }
+    }
+
+    /// Fold a joining member's accelerator durability into the slot's shutdown
+    /// policy: the shared slot is dropped on shutdown only while *every* member
+    /// that has ever joined it was non-persistent.
+    ///
+    /// One durable member is enough to veto the drop, permanently. That member
+    /// resumes from the slot's `confirmed_flush_lsn` on the next start, and a
+    /// dropped slot would send it down the fresh-slot path instead: its snapshot
+    /// would upsert over accelerator state that already exists, so rows deleted
+    /// at the source while Spice was down would survive in the accelerator. The
+    /// veto is monotonic (`false` is never unset) so the answer does not depend
+    /// on which members happen to still be attached when the pump stops.
+    fn note_member_durability(&self, params: &ReplicationParams) {
+        if !params.ephemeral_accelerator {
+            self.drop_slot_on_shutdown.store(false, Ordering::Release);
         }
     }
 
@@ -1568,6 +1591,10 @@ async fn attach_member(
         }
     }
 
+    // Recorded before any DDL, so a member whose setup then fails has still
+    // vetoed the shutdown drop if its accelerator is durable.
+    source.note_member_durability(&params);
+
     // Slot + publication DDL (idempotent, retried on transient errors).
     let setup = slot::setup_shared_member(&source.params, &schema_name, &table_name).await?;
     if setup.slot.created_fresh {
@@ -1780,6 +1807,17 @@ fn finish_pump(source: &Arc<SharedSource>) {
     }
 }
 
+/// Drop the shared slot when the pump stops for runtime shutdown and no member
+/// ever needed it to survive (see [`SharedSource::note_member_durability`]).
+///
+/// Best-effort and time-bounded — shutdown never blocks on the source, and a
+/// surviving slot costs retained WAL, not correctness.
+async fn drop_slot_if_ephemeral(source: &Arc<SharedSource>) {
+    if source.drop_slot_on_shutdown.load(Ordering::Acquire) {
+        slot::drop_slot_after_shutdown(&source.params).await;
+    }
+}
+
 /// Atomically decide whether the pump should exit because every member has
 /// detached. Takes the same `setup_lock` that `attach_member` holds while
 /// registering, so a subscriber can never register on a source that is
@@ -1891,6 +1929,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                 "runtime shutdown; releasing shared replication connection and slot"
             );
             finish_pump(&source);
+            drop_slot_if_ephemeral(&source).await;
             return;
         }
         source.reap_closed_members();
@@ -2001,6 +2040,9 @@ async fn run_pump(source: Arc<SharedSource>) {
                 );
                 drop(client);
                 finish_pump(&source);
+                // After `drop(client)`: Postgres refuses to drop a slot its
+                // walsender still holds.
+                drop_slot_if_ephemeral(&source).await;
                 return;
             }
             if source.restart_requested.swap(false, Ordering::AcqRel) {
@@ -3044,6 +3086,7 @@ mod tests {
             publication_name: "pub".to_string(),
             initial_snapshot: true,
             snapshot_on_resume: false,
+            ephemeral_accelerator: false,
             temporary_slot: false,
             status_interval: std::time::Duration::from_secs(5),
             bootstrap_batch_size: 8192,
@@ -3052,6 +3095,47 @@ mod tests {
             pg_output_format: crate::postgres_replication::PgOutputFormat::Binary,
             ready_lag: crate::cdc::DEFAULT_READY_LAG,
         }
+    }
+
+    /// The shutdown drop is vetoed by a single durable member, permanently and
+    /// regardless of join order -- dropping a slot a durable accelerator resumes
+    /// from would send it down the fresh-slot path, where its snapshot upserts
+    /// over existing state and rows deleted at the source while Spice was down
+    /// would survive in the accelerator.
+    #[test]
+    fn one_durable_member_vetoes_the_shutdown_slot_drop() {
+        let ephemeral = ReplicationParams {
+            ephemeral_accelerator: true,
+            ..test_params()
+        };
+        let durable = ReplicationParams {
+            ephemeral_accelerator: false,
+            ..test_params()
+        };
+
+        let all_ephemeral = SharedSource::new(SourceKey::from_params(&ephemeral), ephemeral.clone());
+        all_ephemeral.note_member_durability(&ephemeral);
+        all_ephemeral.note_member_durability(&ephemeral);
+        assert!(
+            all_ephemeral.drop_slot_on_shutdown.load(Ordering::Acquire),
+            "a slot whose every member re-snapshots anyway should not be left retaining WAL"
+        );
+
+        // Durable member last...
+        let durable_last = SharedSource::new(SourceKey::from_params(&ephemeral), ephemeral.clone());
+        durable_last.note_member_durability(&ephemeral);
+        durable_last.note_member_durability(&durable);
+        assert!(!durable_last.drop_slot_on_shutdown.load(Ordering::Acquire));
+
+        // ...and durable member first, then an ephemeral one that must not
+        // re-enable the drop.
+        let durable_first = SharedSource::new(SourceKey::from_params(&ephemeral), ephemeral.clone());
+        durable_first.note_member_durability(&durable);
+        durable_first.note_member_durability(&ephemeral);
+        assert!(
+            !durable_first.drop_slot_on_shutdown.load(Ordering::Acquire),
+            "the veto must be monotonic, not last-writer-wins"
+        );
     }
 
     type MemberProbe = (

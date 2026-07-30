@@ -79,6 +79,23 @@ pub struct ReplicationParams {
     /// the WAL overlap from `confirmed_flush_lsn` replays idempotently via
     /// the PK upsert. `initial_snapshot: false` still disables all snapshots.
     pub snapshot_on_resume: bool,
+    /// `true` when the dataset's accelerator does not survive a process restart
+    /// (the same condition that forces [`Self::snapshot_on_resume`]).
+    ///
+    /// Such a slot has no resume value across restarts — the accelerator boots
+    /// empty and re-snapshots regardless — while a slot left behind keeps
+    /// pinning WAL on the source for as long as Spice is down, which can fill
+    /// the primary's disk. So the shared-slot pump drops the slot on graceful
+    /// shutdown (see `slot::drop_slot_after_shutdown`) — it is the only path
+    /// that observes `cdc::shutdown_epoch`; a per-dataset generated slot still
+    /// outlives the process. An ungraceful exit likewise leaves the slot behind.
+    /// Either way the cost is WAL retention, never correctness, because
+    /// `snapshot_on_resume` re-snapshots on the next start regardless.
+    ///
+    /// Distinct from `snapshot_on_resume`, which a *durable* accelerator can
+    /// also set via `pg_replication_initial_snapshot: always` — dropping that
+    /// slot would be wrong.
+    pub ephemeral_accelerator: bool,
     pub temporary_slot: bool,
     pub status_interval: Duration,
     /// Lag-based readiness threshold: the dataset is marked Ready once its
@@ -129,6 +146,7 @@ impl std::fmt::Debug for ReplicationParams {
             .field("publication_name", &self.publication_name)
             .field("initial_snapshot", &self.initial_snapshot)
             .field("snapshot_on_resume", &self.snapshot_on_resume)
+            .field("ephemeral_accelerator", &self.ephemeral_accelerator)
             .field("temporary_slot", &self.temporary_slot)
             .field("status_interval", &self.status_interval)
             .field("bootstrap_batch_size", &self.bootstrap_batch_size)
