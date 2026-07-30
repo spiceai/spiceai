@@ -1915,37 +1915,53 @@ impl RefreshTask {
         let mut committers: Vec<Box<dyn cdc::CommitChange + Send + Sync>> =
             Vec::with_capacity(envelopes.len());
         let mut batches: Vec<ChangeBatch> = Vec::with_capacity(envelopes.len());
-        // Time the deferred-batch build loop: for sources that defer the decode
-        // (MySQL binlog rows), each envelope pays a `spawn_blocking` round-trip
-        // here — a per-envelope cost otherwise invisible between the recv_wait
-        // and coalesce stage timers.
+        // Build the whole drained burst in ONE blocking section, off the
+        // source's shared read/route path, rather than one `spawn_blocking`
+        // round-trip per envelope. For sources that defer the decode (Postgres
+        // pgoutput rows) `into_parts_offloaded` dispatched to the blocking pool
+        // and awaited once per envelope — N handoffs for a burst of N. The decode
+        // work is identical; only the per-envelope dispatch collapses.
+        // `block_in_place` runs it inline in a single section, so a materialized
+        // envelope (e.g. MySQL, decoded on the pump) stays a no-op `into_parts`
+        // with no dispatch at all — unlike a single `spawn_blocking`, which would
+        // add one to that hot path. The apply task runs on the multi-threaded
+        // data runtime, so `block_in_place` is valid here.
+        //
+        // A deferred build can fail on per-row value typing that only surfaces at
+        // build time (e.g. an unmergeable unchanged-TOAST column under REPLICA
+        // IDENTITY DEFAULT); treat it as a terminal error for this dataset,
+        // mirroring the eager path's pump-side fatal. `collect` into a `Result`
+        // discards the whole burst at the first failure — the envelopes built
+        // before it are dropped without acking, exactly as the previous
+        // per-envelope loop dropped its collected committers, and the source
+        // re-streams from `confirmed_flush` on reconnect.
         let decode_start = Instant::now();
-        for env in envelopes {
-            // Build the (possibly deferred) batch here, on the per-dataset apply
-            // task — off the source's shared read/route path. A deferred build
-            // can fail on per-row value typing that only surfaces at build time
-            // (e.g. an unmergeable unchanged-TOAST column under REPLICA IDENTITY
-            // DEFAULT); treat it as a terminal error for this dataset, mirroring
-            // the eager path's pump-side fatal. Committers collected so far are
-            // dropped without acking, so the source re-streams on reconnect.
-            let (committer, batch, _is_ready) = match env.into_parts_offloaded().await {
-                Ok(parts) => parts,
-                Err(e) => {
-                    let error_message = format!(
-                        "Failed to build CDC change batch for {}: {e}",
-                        context.dataset_name,
-                    );
-                    tracing::error!("{error_message}");
-                    self.set_refresh_status(
-                        context.refresh_sql,
-                        status::ComponentStatus::error_with_message(error_message),
-                    )
-                    .await;
-                    return false;
+        let built = tokio::task::block_in_place(|| {
+            envelopes
+                .into_iter()
+                .map(cdc::ChangeEnvelope::into_parts)
+                .collect::<Result<Vec<_>, _>>()
+        });
+        match built {
+            Ok(parts) => {
+                for (committer, batch, _is_ready) in parts {
+                    committers.push(committer);
+                    batches.push(batch);
                 }
-            };
-            committers.push(committer);
-            batches.push(batch);
+            }
+            Err(e) => {
+                let error_message = format!(
+                    "Failed to build CDC change batch for {}: {e}",
+                    context.dataset_name,
+                );
+                tracing::error!("{error_message}");
+                self.set_refresh_status(
+                    context.refresh_sql,
+                    status::ComponentStatus::error_with_message(error_message),
+                )
+                .await;
+                return false;
+            }
         }
         record_cdc_fixed_cost(context.metric_labels, "decode", decode_start);
 
