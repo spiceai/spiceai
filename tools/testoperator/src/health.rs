@@ -192,7 +192,7 @@ async fn probe(client: &reqwest::Client, endpoint: &'static str) -> ProbeSample 
                         FailureKind::Latency,
                         format!(
                             "latency {latency_ms:.1}ms exceeded {}ms budget",
-                            LATENCY_THRESHOLD.as_secs_f64() * 1_000.0
+                            LATENCY_THRESHOLD.as_millis()
                         ),
                     ))
                 } else {
@@ -231,7 +231,7 @@ async fn probe(client: &reqwest::Client, endpoint: &'static str) -> ProbeSample 
 
     // Log the breach as it is observed, so a stall is visible in the run log at the
     // moment it happens rather than only in the end-of-run summary.
-    if let Some(line) = breach_log_line(endpoint, latency_ms, failure.as_ref()) {
+    if let Some(line) = breach_log_line(endpoint, latency, failure.as_ref()) {
         eprintln!("{line}");
     }
 
@@ -241,13 +241,17 @@ async fn probe(client: &reqwest::Client, endpoint: &'static str) -> ProbeSample 
 /// One log line per breaching sample: `ERROR` for a failed request or one past
 /// [`ERROR_LATENCY`], `WARNING` for a response that overran [`LATENCY_THRESHOLD`].
 /// `None` when the sample is within budget.
+///
+/// Compares `Duration`s, as [`EndpointStats::record_sample`] does, so a logged
+/// severity always agrees with the counter it increments.
 fn breach_log_line(
     endpoint: &str,
-    latency_ms: f64,
+    latency: Duration,
     failure: Option<&(FailureKind, String)>,
 ) -> Option<String> {
-    let error_ms = ERROR_LATENCY.as_secs_f64() * 1_000.0;
-    let warn_ms = LATENCY_THRESHOLD.as_secs_f64() * 1_000.0;
+    let latency_ms = latency.as_secs_f64() * 1_000.0;
+    let error_ms = ERROR_LATENCY.as_millis();
+    let warn_ms = LATENCY_THRESHOLD.as_millis();
 
     match failure {
         // An unanswered request is a failed probe however fast it failed — a
@@ -261,13 +265,13 @@ fn breach_log_line(
             "ERROR: probe {endpoint} returned {reason} after {latency_ms:.1}ms"
         )),
         _ => {
-            if latency_ms > error_ms {
+            if latency > ERROR_LATENCY {
                 Some(format!(
-                    "ERROR: probe {endpoint} took {latency_ms:.1}ms (> {error_ms:.0}ms budget)"
+                    "ERROR: probe {endpoint} took {latency_ms:.1}ms (> {error_ms}ms budget)"
                 ))
-            } else if latency_ms > warn_ms {
+            } else if latency > LATENCY_THRESHOLD {
                 Some(format!(
-                    "WARNING: probe {endpoint} took {latency_ms:.1}ms (> {warn_ms:.0}ms budget)"
+                    "WARNING: probe {endpoint} took {latency_ms:.1}ms (> {warn_ms}ms budget)"
                 ))
             } else {
                 None
@@ -446,26 +450,38 @@ mod tests {
         let timeout = (FailureKind::Timeout, "operation timed out".to_string());
         let refused = (FailureKind::Refused, "connection refused".to_string());
 
-        assert_eq!(breach_log_line("/health", 4.0, None), None, "within budget");
+        let ms = Duration::from_millis;
 
-        let warning = breach_log_line("/health", 168.4, None).expect("over the 125ms budget");
+        assert_eq!(
+            breach_log_line("/health", ms(4), None),
+            None,
+            "within budget"
+        );
+        assert_eq!(
+            breach_log_line("/health", ms(125), None),
+            None,
+            "exactly at the budget is not a breach of it"
+        );
+
+        let warning = breach_log_line("/health", ms(126), None).expect("over the 125ms budget");
         assert!(
-            warning.starts_with("WARNING: probe /health took 168.4ms"),
+            warning.starts_with("WARNING: probe /health took 126.0ms"),
             "{warning}"
         );
 
-        let error = breach_log_line("/health", 1_402.7, None).expect("over the 500ms threshold");
+        let error = breach_log_line("/health", ms(1_402), None).expect("over the 500ms threshold");
         assert!(
-            error.starts_with("ERROR: probe /health took 1402.7ms"),
+            error.starts_with("ERROR: probe /health took 1402.0ms"),
             "{error}"
         );
 
-        let timed_out =
-            breach_log_line("/health", 3_001.2, Some(&timeout)).expect("request failed");
+        let timed_out = breach_log_line("/health", ms(3_001), Some(&timeout)).expect("failed");
+
         assert!(timed_out.contains("operation timed out"), "{timed_out}");
 
         // Fast enough to clear every latency threshold, but still a failed probe.
-        let refused = breach_log_line("/v1/ready", 0.2, Some(&refused)).expect("request failed");
+        let refused = breach_log_line("/v1/ready", Duration::from_micros(200), Some(&refused))
+            .expect("failed");
         assert!(
             refused.starts_with("ERROR: probe /v1/ready failed"),
             "{refused}"

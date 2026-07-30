@@ -455,9 +455,19 @@ pub(super) fn emit_probe_latency_summary(report: &crate::health::HealthCheckRepo
     for (endpoint, stats) in &report.endpoints {
         let mut values = stats.latencies_ms().to_vec();
         if values.is_empty() {
+            // Same columns as a populated row, so the table stays aligned.
             println!(
-                "  {endpoint:<12} {:>8} {:>10} {:>10} {:>10} {:>10} {:>10}",
-                0, "-", "-", "-", "-", "-"
+                "  {endpoint:<12} {:>8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>8} {:>8} {:>9} {:>8}",
+                0,
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                stats.warn_count,
+                stats.error_count,
+                stats.timeout_count,
+                stats.refused_count,
             );
             continue;
         }
