@@ -20,8 +20,8 @@ use crate::model::EmbeddingModelStore;
 use crate::secrets::Secrets;
 use datafusion::datasource::TableProvider;
 use datafusion::{prelude::SessionContext, sql::TableReference};
-#[cfg(feature = "models")]
-use runtime_datafusion_udfs::embed::EMBED_UDF_NAME;
+#[cfg(feature = "elasticsearch")]
+use runtime_datafusion_udfs::EMBED_UDF_NAME;
 use spicepod::vector::VectorStore;
 use std::sync::Arc;
 use tokio::sync::RwLock;
