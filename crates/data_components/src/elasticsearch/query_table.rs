@@ -617,7 +617,9 @@ fn build_array_from_hits(
                 TimeUnit::Microsecond => {
                     build_timestamp_array!(TimestampMicrosecondArray, values, tz)
                 }
-                TimeUnit::Nanosecond => build_timestamp_array!(TimestampNanosecondArray, values, tz),
+                TimeUnit::Nanosecond => {
+                    build_timestamp_array!(TimestampNanosecondArray, values, tz)
+                }
             };
             Ok(arr)
         }
@@ -704,9 +706,11 @@ fn parse_datetime_to_nanos(s: &str) -> Option<i64> {
 /// Parse a `_source` value into an Arrow `Date32` (days since the Unix epoch).
 fn parse_date32(v: &serde_json::Value) -> Option<i32> {
     if let Some(s) = v.as_str() {
-        let date = NaiveDate::parse_from_str(s, "%Y-%m-%d")
-            .ok()
-            .or_else(|| DateTime::parse_from_rfc3339(s).ok().map(|dt| dt.date_naive()))?;
+        let date = NaiveDate::parse_from_str(s, "%Y-%m-%d").ok().or_else(|| {
+            DateTime::parse_from_rfc3339(s)
+                .ok()
+                .map(|dt| dt.date_naive())
+        })?;
         let epoch = NaiveDate::from_ymd_opt(1970, 1, 1)?;
         return i32::try_from((date - epoch).num_days()).ok();
     }
@@ -747,11 +751,14 @@ fn build_int32_fixed_size_list_array(
                 )));
             }
             for val in arr {
-                let n = val.as_i64().and_then(|n| i32::try_from(n).ok()).ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "FixedSizeList field '{field_name}' contains a non-Int32 element"
-                    ))
-                })?;
+                let n = val
+                    .as_i64()
+                    .and_then(|n| i32::try_from(n).ok())
+                    .ok_or_else(|| {
+                        DataFusionError::Execution(format!(
+                            "FixedSizeList field '{field_name}' contains a non-Int32 element"
+                        ))
+                    })?;
                 flat_values.push(n);
             }
             null_mask.push(true);
@@ -1465,10 +1472,11 @@ mod tests {
             .as_any()
             .downcast_ref::<Date64Array>()
             .expect("date64 column");
-        let expected = chrono::NaiveDateTime::parse_from_str("2024-01-15T10:30:00", "%Y-%m-%dT%H:%M:%S")
-            .expect("valid datetime literal")
-            .and_utc()
-            .timestamp_millis();
+        let expected =
+            chrono::NaiveDateTime::parse_from_str("2024-01-15T10:30:00", "%Y-%m-%dT%H:%M:%S")
+                .expect("valid datetime literal")
+                .and_utc()
+                .timestamp_millis();
         assert_eq!(col.value(0), expected);
     }
 
@@ -1548,8 +1556,8 @@ mod tests {
             true,
         )]));
         let hits = vec![make_hit(json!({"amount": "1.23"}))];
-        let err = hits_to_record_batch(&hits, &schema)
-            .expect_err("decimal decode should be unsupported");
+        let err =
+            hits_to_record_batch(&hits, &schema).expect_err("decimal decode should be unsupported");
         assert!(
             matches!(err, DataFusionError::NotImplemented(_)),
             "expected NotImplemented, got {err:?}"

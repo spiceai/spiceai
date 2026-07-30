@@ -61,90 +61,15 @@ pub async fn try_from_table(
     secrets: Arc<RwLock<Secrets>>,
 ) -> Result<ElasticsearchIndex, Box<dyn std::error::Error + Send + Sync>> {
     let inner_schema = index_schema;
-    let primary_keys: Vec<String> = match config.row_ids.clone() {
-        Some(row_ids) => row_ids,
-        None => get_primary_keys(inner_table_provider)
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?,
-    };
+    let primary_keys = derive_primary_keys(index_schema, &config)?;
 
-    if primary_keys.is_empty() {
-        return Err(Box::<dyn std::error::Error + Send + Sync>::from(format!(
-            "Failed to resolve primary key columns for dataset {ds_name}: no primary key columns were configured or derived."
-        )));
-    }
-
-    // Normalize LargeUtf8 → Utf8 for primary key fields: the Elasticsearch HTTP client
-    // always returns string data as Arrow Utf8 (StringArray), so the schema must match.
-    let primary_key: Vec<_> = primary_keys
-        .iter()
-        .map(|c| {
-            let (_, f) = inner_schema.column_with_name(c.as_str()).ok_or_else(|| {
-                Box::<dyn std::error::Error + Send + Sync>::from(format!(
-                    "Failed to configure primary key for dataset {ds_name}: column '{c}' does not exist in the dataset schema."
-                ))
-            })?;
-            if f.data_type() == &DataType::LargeUtf8 {
-                Ok(arrow_schema::Field::new(
-                    f.name(),
-                    DataType::Utf8,
-                    f.is_nullable(),
-                ))
-            } else {
-                Ok(f.clone())
-            }
-        })
-        .collect::<Result<Vec<_>, Box<dyn std::error::Error + Send + Sync>>>()?;
-
-    // When chunking is enabled the index gains an extra `_spice.chunk_id` primary-key field
-    // (one row per chunk). Augmenting the primary key here — rather than patching it in the
-    // caller after `source_schema` and the mapping are built — makes the chunk key flow into
-    // the returned index, `source_schema` (so `knn_hits_to_batch` extracts it from `_source`),
-    // and the Elasticsearch mapping, keeping the chunked and non-chunked paths uniform.
-    let chunked = config.chunking.as_ref().is_some_and(|c| c.enabled);
-    let primary_key = if chunked {
-        ChunkedSearchIndex::augment_primary_key(primary_key)
-    } else {
-        primary_key
-    };
-
+    // we should use
     let params = get_store_params(vector_store_config, Arc::clone(&secrets)).await?;
-
-    // Surface explicit "not yet supported" errors for params that require
-    // significant new infrastructure (per-partition index routing / spill
-    // queues). Better to fail loudly than silently ignore the config.
-    if params.partition_by.is_some() || !vector_store_config.partition_by.is_empty() {
-        return Err(Box::<dyn std::error::Error + Send + Sync>::from(
-            "`partition_by` is not yet supported for the Elasticsearch vector engine. Remove the parameter or use the S3 Vectors engine for partitioned workloads.",
-        ));
-    }
-    if params.spill_writes == Some(true) {
-        return Err(Box::<dyn std::error::Error + Send + Sync>::from(
-            "`spill_writes` is not yet supported for the Elasticsearch vector engine.",
-        ));
-    }
-
-    let endpoint = params.endpoint.as_deref().ok_or_else(|| {
-        Box::<dyn std::error::Error + Send + Sync>::from(
-            "Missing required parameter 'endpoint' for Elasticsearch vector engine.",
-        )
-    })?;
-
-    let user = params.user.as_ref().map(ExposeSecret::expose_secret);
-    let pass = params.pass.as_ref().map(ExposeSecret::expose_secret);
-
-    let client_options = build_client_options(
-        params.client_timeout,
-        params.connect_timeout,
-        params.max_retries,
-        params.retry_initial_backoff,
-    );
-    let client: Arc<dyn Elasticsearch> = Arc::new(
-        Client::new_with_options(endpoint, user, pass, &client_options)
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?,
-    );
+    let () = params.validate()?;
+    let client = params.client()?;
 
     let es_index = params.index.clone().unwrap_or_else(|| {
-        format!("{}-{}-{}", ds_name, column, config.model)
+        format!("{ds_name}-{column}-{}", config.model)
             .to_lowercase()
             .chars()
             .map(|c| {
@@ -269,7 +194,11 @@ pub async fn try_from_table(
     // append it explicitly when chunked. Without it in `source_schema`, `knn_hits_to_batch`
     // could not extract `_spice.chunk_id` from `_source` and would null-fill a non-nullable
     // field.
-    if chunked && !source_fields.iter().any(|f| f.name() == CHUNKED_INDEX_CHUNK_KEY) {
+    if chunked
+        && !source_fields
+            .iter()
+            .any(|f| f.name() == CHUNKED_INDEX_CHUNK_KEY)
+    {
         source_fields.push(Arc::new(arrow_schema::Field::new(
             CHUNKED_INDEX_CHUNK_KEY,
             DataType::UInt64,
@@ -662,5 +591,50 @@ pub(crate) async fn ensure_index_with_text_mapping(
         }
         Err(e) if is_index_already_exists_error(&e) => Ok(()),
         Err(e) => Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
+    }
+}
+
+fn derive_primary_keys(
+    inner_schema: Schema,
+    config: &ColumnLevelEmbeddingConfig,
+) -> Result<Vec<arrow_schema::Field>, Box<dyn std::error::Error + Send + Sync>> {
+    let primary_keys: Vec<String> = match config.row_ids {
+        Some(row_ids) => row_ids.clone(),
+        None => get_primary_keys(inner_table_provider).boxed()?,
+    };
+
+    if primary_keys.is_empty() {
+        return Err(Box::<dyn std::error::Error + Send + Sync>::from(format!(
+            "Failed to resolve primary key columns for dataset {ds_name}: no primary key columns were configured or derived."
+        )));
+    }
+
+    // Normalize LargeUtf8 → Utf8 for primary key fields: the Elasticsearch HTTP client
+    // always returns string data as Arrow Utf8 (StringArray), so the schema must match.
+    let primary_key: Vec<_> = primary_keys
+        .iter()
+        .map(|c| {
+            let (_, f) = inner_schema.column_with_name(c.as_str()).ok_or_else(|| {
+                Box::<dyn std::error::Error + Send + Sync>::from(format!(
+                    "Failed to configure primary key for dataset {ds_name}: column '{c}' does not exist in the dataset schema."
+                ))
+            })?;
+            if f.data_type() == &DataType::LargeUtf8 {
+                Ok(arrow_schema::Field::new(
+                    f.name(),
+                    DataType::Utf8,
+                    f.is_nullable(),
+                ))
+            } else {
+                Ok(f.clone())
+            }
+        })
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error + Send + Sync>>>()?;
+
+    let chunked = config.chunking.as_ref().is_some_and(|c| c.enabled);
+    if chunked {
+        Ok(ChunkedSearchIndex::augment_primary_key(primary_key))
+    } else {
+        Ok(primary_key)
     }
 }

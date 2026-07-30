@@ -1056,8 +1056,10 @@ mod write_maintenance_tests {
             DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, false)), 2),
             false,
         );
-        let metadata_columns: MetadataColumns =
-            vec![MetadataColumn::NonFilterable(Arc::new(offset_field.clone()))].into();
+        let metadata_columns: MetadataColumns = vec![MetadataColumn::NonFilterable(Arc::new(
+            offset_field.clone(),
+        ))]
+        .into();
 
         let source_schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),

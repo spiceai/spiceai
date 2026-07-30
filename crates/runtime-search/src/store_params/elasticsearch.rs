@@ -67,7 +67,7 @@ impl FromStr for EsDistanceMetric {
 #[params(prefix = "elasticsearch")]
 pub struct ElasticsearchVectorParams {
     /// Elasticsearch cluster URL (e.g., `https://localhost:9200`).
-    pub endpoint: Option<String>,
+    pub endpoint: String,
     /// Username for Elasticsearch authentication.
     #[param(autoload_secret)]
     pub user: Option<SecretString>,
@@ -121,6 +121,50 @@ pub struct ElasticsearchVectorParams {
     pub spill_writes: Option<bool>,
 }
 
+impl ElasticSearchVectorParams {
+    pub fn client() -> Result<Arc<dyn Elasticsearch>, Box<dyn std::error::Error + Send + Sync>> {
+        Arc::new(
+            Client::new_with_options(
+                endpoint,
+                self.user.as_ref().map(ExposeSecret::expose_secret),
+                self.pass.as_ref().map(ExposeSecret::expose_secret),
+                self.build_client_options()?,
+            )
+            .boxed()?,
+        );
+    }
+
+    fn build_client_options(&self) -> ClientOptions {
+        let mut opts = ClientOptions::default();
+        if let Some(ref d) = self.client_timeout {
+            opts.request_timeout = d.clone();
+        }
+        if let Some(ref d) = self.connect_timeout {
+            opts.connect_timeout = d.clone();
+        }
+        if let Some(ref n) = self.max_retries {
+            opts.retry.max_retries = n.clone();
+        }
+        if let Some(ref d) = self.retry_initial_backoff {
+            opts.retry.initial_backoff = d.clone();
+        }
+        opts
+    }
+
+    pub fn validate(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.partition_by.is_some() {
+            return Err(Box::<dyn std::error::Error + Send + Sync>::from(
+                "`partition_by` is not yet supported for the Elasticsearch vector engine. Remove the parameter or use the S3 Vectors engine for partitioned workloads.",
+            ));
+        }
+        if self.spill_writes == Some(true) {
+            return Err(Box::<dyn std::error::Error + Send + Sync>::from(
+                "`spill_writes` is not yet supported for the Elasticsearch vector engine.",
+            ));
+        }
+    }
+}
+
 /// Typed parameters for Elasticsearch full-text search, deserialized from
 /// `full_text_search.params` after secret resolution.
 ///
@@ -172,6 +216,24 @@ pub struct ElasticsearchFtsParams {
     pub force_merge_segments: Option<u32>,
 }
 
+impl ElasticsearchFtsParams {
+    pub fn build_client_options(&self) -> ClientOptions {
+        let mut opts = ClientOptions::default();
+        if let Some(ref d) = self.client_timeout {
+            opts.request_timeout = d.clone();
+        }
+        if let Some(ref d) = self.connect_timeout {
+            opts.connect_timeout = d.clone();
+        }
+        if let Some(ref n) = self.max_retries {
+            opts.retry.max_retries = n.clone();
+        }
+        if let Some(ref d) = self.retry_initial_backoff {
+            opts.retry.initial_backoff = d.clone();
+        }
+        opts
+    }
+}
 /// Resolved Elasticsearch FTS configuration: typed parameters plus the
 /// dataset-dependent index name.
 #[derive(Clone)]
