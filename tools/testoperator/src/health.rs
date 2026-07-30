@@ -85,15 +85,6 @@ pub(crate) struct EndpointStats {
     refused_count: u64,
     /// Samples that answered with a non-2xx status.
     status_count: u64,
-    /// Wall-clock time spent waiting on over-budget samples.
-    ///
-    /// A stall suppresses its own sample rate — one 3s timeout is recorded where
-    /// [`SAMPLE_INTERVAL`] would otherwise have produced 30 samples — so the
-    /// percentiles understate it badly: an endpoint down for 60s of a 600s run is
-    /// 10% of wall-clock but under 0.5% of samples, so p99 still reads healthy.
-    /// Each breaching sample's latency *is* the time spent waiting, so summing
-    /// them measures the outage independently of how few samples it produced.
-    time_over_budget: Duration,
     pub(crate) max_latency: Duration,
     pub(crate) last_error: Option<String>,
 }
@@ -107,13 +98,10 @@ impl EndpointStats {
             self.max_latency = latency;
         }
 
-        if latency > LATENCY_THRESHOLD {
-            self.time_over_budget = self.time_over_budget.saturating_add(latency);
-            if latency > ERROR_LATENCY {
-                self.error_count = self.error_count.saturating_add(1);
-            } else {
-                self.warn_count = self.warn_count.saturating_add(1);
-            }
+        if latency > ERROR_LATENCY {
+            self.error_count = self.error_count.saturating_add(1);
+        } else if latency > LATENCY_THRESHOLD {
+            self.warn_count = self.warn_count.saturating_add(1);
         }
 
         if let Some((kind, reason)) = &sample.failure {
@@ -270,18 +258,14 @@ impl HealthCheckReport {
                     stats.status_count
                 );
             }
-            // Report the time spent over budget alongside the counts: it is the one
-            // figure a stall cannot hide from, since it does not depend on how many
-            // samples the stall allowed through.
-            let over_budget_secs = stats.time_over_budget.as_secs_f64();
             if stats.error_count > 0 {
                 println!(
-                    "  ERROR: {endpoint} exceeded {error_ms}ms on {} sample(s) (max {max_ms:.0}ms); {over_budget_secs:.1}s spent over the {warn_ms}ms budget — the HTTP server stalls under load",
+                    "  ERROR: {endpoint} exceeded {error_ms}ms on {} sample(s) (max {max_ms:.0}ms) — the HTTP server stalls under load",
                     stats.error_count
                 );
             } else if stats.warn_count > 0 {
                 println!(
-                    "  WARNING: {endpoint} exceeded {warn_ms}ms on {} sample(s) (max {max_ms:.0}ms); {over_budget_secs:.1}s spent over budget",
+                    "  WARNING: {endpoint} exceeded {warn_ms}ms on {} sample(s) (max {max_ms:.0}ms)",
                     stats.warn_count
                 );
             }
@@ -640,10 +624,8 @@ mod tests {
         report.print_latency_summary("test");
     }
 
-    /// A probe that never returns is cut off by `PROBE_TIMEOUT` and must be
-    /// recorded as a timeout, not silently dropped. Its cost is measured in
-    /// `time_over_budget`, which — unlike the percentiles — does not depend on how
-    /// few samples the stall let through.
+    /// A probe that never returns is cut off by `PROBE_TIMEOUT` and must be counted
+    /// as a timeout and logged, not silently dropped.
     #[test]
     fn a_probe_that_never_returns_is_recorded_as_a_timeout() {
         let mut stats = EndpointStats::default();
@@ -661,24 +643,14 @@ mod tests {
         assert_eq!(stats.timeout_count, 20);
         assert_eq!(stats.error_count, 20, "a 3s timeout is error-level");
         assert_eq!(stats.max_latency, super::PROBE_TIMEOUT);
-        assert_eq!(
-            stats.time_over_budget,
-            Duration::from_mins(1),
-            "20 x 3s of hung endpoint"
-        );
-
-        // The endpoint was down for 60s of a 600s window — 10% of wall-clock — but
-        // the stall only produced 0.37% of the samples, so p99 reports a healthy
-        // 1ms. Only the far tail sees it at all. This gap between "10% of the run"
-        // and "invisible at p99" is why time_over_budget is reported beside them.
+        // Each hung probe is logged as it happens, which is what makes the outage
+        // visible: a stall suppresses its own sample rate (one sample per 3s
+        // timeout), so it stays a small fraction of samples and p99 reads healthy.
+        // Read the timeout count and the per-sample ERROR lines, not the percentiles.
         let sorted = crate::stats::sorted_ms(&stats.latencies_ms);
         assert!(
             crate::stats::percentile(&sorted, 0.99) < 2.0,
             "p99 cannot see a stall that suppressed its own sample rate"
-        );
-        assert!(
-            (crate::stats::percentile(&sorted, 0.999) - 3_000.0).abs() < f64::EPSILON,
-            "only the 0.1% tail reaches the timeout samples"
         );
 
         assert!(
