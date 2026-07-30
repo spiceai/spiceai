@@ -9842,8 +9842,25 @@ impl CayenneTableProvider {
         //    serialized by `write_lock`, so no concurrent apply observes a stale
         //    figure.)
         if !validated_keys.is_empty()
-            && let Some(index) = self.sharded_pk_keyset_cache.lock().as_ref()
+            && let Some(index) = self.sharded_pk_keyset_cache.lock().as_mut()
         {
+            // This recompute is also the budget's ENFORCEMENT point for the
+            // sharded index: the under-lock inserts run uncapped, so without a
+            // degrade here the exact keysets grow with every distinct key ever
+            // written and the configured budget is only reported, never applied.
+            // Same trade as the cold rebuild's over-budget path - existence
+            // answers become "maybe", never "wrongly no".
+            let max_bytes = self.context.pk_keyset_cache_max_bytes();
+            let resident = index.approx_bytes();
+            if resident > max_bytes {
+                tracing::warn!(
+                    table = %self.table_name(),
+                    resident_bytes = resident,
+                    budget_bytes = max_bytes,
+                    "sharded PK keyset exceeded its byte budget; degrading to bounded per-shard blooms (existence checks stay sound; per-key sequences and captured positions are dropped until the next rebuild)"
+                );
+                index.degrade_to_bloom(max_bytes);
+            }
             self.table_memory.set_keyset_bytes(index.approx_bytes());
         }
 
