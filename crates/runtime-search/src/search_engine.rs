@@ -502,8 +502,9 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
         } else {
             tracing::trace!("Search cache is disabled");
             (self.search(req).await?, CacheStatus::CacheDisabled)
-        })
-    }
+    })
+}
+
 
     pub async fn search(&self, req: &SearchRequest) -> Result<VectorSearchResult> {
         let SearchRequest {
