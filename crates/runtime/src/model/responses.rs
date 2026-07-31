@@ -168,18 +168,23 @@ async fn construct_model(
 
     let model = match source {
         ModelSource::OpenAi => {
-            let p = typed_params::<OpenAiModelParams>(component, params, source, secrets).await?;
+            let p = typed_params::<OpenAiModelParams>(component, params, source.clone(), secrets)
+                .await?;
             openai(model_id, params, &p)
         }
         ModelSource::Azure => {
-            let p = typed_params::<AzureModelParams>(component, params, source, secrets).await?;
+            let p = typed_params::<AzureModelParams>(component, params, source.clone(), secrets)
+                .await?;
             azure(model_id, component.name.as_str(), &p)
         }
         ModelSource::Xai => {
-            let p = typed_params::<XaiModelParams>(component, params, source, secrets).await?;
+            let p =
+                typed_params::<XaiModelParams>(component, params, source.clone(), secrets).await?;
             xai(model_id.as_deref(), &p)
         }
-        _ => Err(LlmError::ResponsesNotSupported { from: source }),
+        _ => Err(LlmError::ResponsesNotSupported {
+            from: source.clone(),
+        }),
     }?;
 
     let system_prompt = match component.params.get("system_prompt") {

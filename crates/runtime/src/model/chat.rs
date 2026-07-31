@@ -164,7 +164,8 @@ pub async fn construct_model(
         #[cfg(feature = "models")]
         ModelSource::HuggingFace => {
             let p =
-                typed_params::<HuggingFaceModelParams>(component, params, source, secrets).await?;
+                typed_params::<HuggingFaceModelParams>(component, params, source.clone(), secrets)
+                    .await?;
             huggingface(model_id, component, &p).await
         }
         #[cfg(not(feature = "models"))]
@@ -173,7 +174,8 @@ pub async fn construct_model(
         }),
         #[cfg(feature = "models")]
         ModelSource::File => {
-            let p = typed_params::<FileModelParams>(component, params, source, secrets).await?;
+            let p =
+                typed_params::<FileModelParams>(component, params, source.clone(), secrets).await?;
             file(component, &p).await
         }
         #[cfg(not(feature = "models"))]
@@ -182,33 +184,40 @@ pub async fn construct_model(
         }),
         ModelSource::Anthropic => {
             let p =
-                typed_params::<AnthropicModelParams>(component, params, source, secrets).await?;
+                typed_params::<AnthropicModelParams>(component, params, source.clone(), secrets)
+                    .await?;
             anthropic(model_id.as_deref(), &p)
         }
         ModelSource::Google => {
-            let p = typed_params::<GoogleModelParams>(component, params, source, secrets).await?;
+            let p = typed_params::<GoogleModelParams>(component, params, source.clone(), secrets)
+                .await?;
             google(model_id.as_deref(), &p)
         }
         ModelSource::Azure => {
-            let p = typed_params::<AzureModelParams>(component, params, source, secrets).await?;
+            let p = typed_params::<AzureModelParams>(component, params, source.clone(), secrets)
+                .await?;
             azure(model_id, component.name.as_str(), &p)
         }
         ModelSource::Xai => {
-            let p = typed_params::<XaiModelParams>(component, params, source, secrets).await?;
+            let p =
+                typed_params::<XaiModelParams>(component, params, source.clone(), secrets).await?;
             xai(model_id.as_deref(), &p)
         }
         ModelSource::OpenAi => {
-            let p = typed_params::<OpenAiModelParams>(component, params, source, secrets).await?;
+            let p = typed_params::<OpenAiModelParams>(component, params, source.clone(), secrets)
+                .await?;
             openai(model_id, params, &p)
         }
         ModelSource::Databricks => {
             let p =
-                typed_params::<DatabricksModelParams>(component, params, source, secrets).await?;
+                typed_params::<DatabricksModelParams>(component, params, source.clone(), secrets)
+                    .await?;
             databricks(model_id, &p, Arc::clone(&token_registry)).await
         }
         #[cfg(feature = "bedrock")]
         ModelSource::Bedrock => {
-            let p = typed_params::<BedrockModelParams>(component, params, source, secrets).await?;
+            let p = typed_params::<BedrockModelParams>(component, params, source.clone(), secrets)
+                .await?;
             bedrock(model_id, &p).await
         }
         #[cfg(not(feature = "bedrock"))]
@@ -216,7 +225,8 @@ pub async fn construct_model(
             from: "bedrock".into(),
         }),
         ModelSource::SpiceAI => {
-            let p = typed_params::<SpiceAiModelParams>(component, params, source, secrets).await?;
+            let p = typed_params::<SpiceAiModelParams>(component, params, source.clone(), secrets)
+                .await?;
             spiceai(model_id, &p)
         }
     }?;
