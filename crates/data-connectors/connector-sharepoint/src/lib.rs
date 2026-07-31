@@ -710,7 +710,7 @@ impl DataConnectorFactory for SharepointFactory {
     ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let io_runtime = params.io_runtime.clone();
-            let runtime = params.runtime.clone().map(Arc::unwrap_or_clone);
+            let runtime = params.runtime().map(Arc::unwrap_or_clone);
             let connector = Sharepoint::new(params.parameters, io_runtime, runtime).await?;
             Ok(Arc::new(connector) as Arc<dyn DataConnector>)
         })

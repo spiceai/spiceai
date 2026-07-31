@@ -282,9 +282,10 @@ impl DataConnectorFactory for S3Factory {
                 }
             }
 
+            let runtime = params.runtime().map(Arc::unwrap_or_clone);
             let s3 = S3 {
                 params: params.parameters,
-                runtime: params.runtime.map(Arc::unwrap_or_clone),
+                runtime,
                 tokio_io_runtime: params.io_runtime,
             };
             Ok(Arc::new(s3) as Arc<dyn DataConnector>)

@@ -56,7 +56,7 @@ pub enum SwapError {
 /// included because a nullable↔non-nullable change is observable to
 /// downstream planners (e.g. join key handling, predicate evaluation).
 #[must_use]
-pub(crate) fn schemas_compatible(candidate: &Schema, expected: &Schema) -> bool {
+pub fn schemas_compatible(candidate: &Schema, expected: &Schema) -> bool {
     if candidate.fields().len() != expected.fields().len() {
         return false;
     }
@@ -135,7 +135,7 @@ impl SwappableTableProvider {
     /// an `Arc` so it can be threaded directly to call sites expecting
     /// `Arc<dyn TableProvider>`.
     #[must_use]
-    pub(crate) fn new(inner: Arc<dyn TableProvider>) -> Arc<Self> {
+    pub fn new(inner: Arc<dyn TableProvider>) -> Arc<Self> {
         let cached_schema = inner.schema();
         let cached_table_type = inner.table_type();
         let cached_constraints = inner.constraints().cloned();
@@ -153,7 +153,7 @@ impl SwappableTableProvider {
     /// [`std::sync::PoisonError::into_inner`]: a previous panic in another
     /// thread holding the lock does not propagate here.
     #[must_use]
-    pub(crate) fn current(&self) -> Arc<dyn TableProvider> {
+    pub fn current(&self) -> Arc<dyn TableProvider> {
         Arc::clone(
             &self
                 .inner
@@ -171,7 +171,12 @@ impl SwappableTableProvider {
     ///
     /// Lock poisoning is recovered transparently via
     /// [`std::sync::PoisonError::into_inner`].
-    pub(crate) fn swap(&self, new_inner: Arc<dyn TableProvider>) -> Result<(), SwapError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SwapError::SchemaMismatch`] if the new provider's schema is incompatible
+    /// with the cached schema.
+    pub fn swap(&self, new_inner: Arc<dyn TableProvider>) -> Result<(), SwapError> {
         if !schemas_compatible(new_inner.schema().as_ref(), self.cached_schema.as_ref()) {
             return Err(SwapError::SchemaMismatch);
         }

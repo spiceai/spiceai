@@ -152,9 +152,10 @@ impl DataConnectorFactory for GoogleCloudStorageFactory {
                 validator.validate(&mut params).await?;
             }
 
+            let runtime = params.runtime().map(Arc::unwrap_or_clone);
             let gcs = GoogleCloudStorage {
                 params: params.parameters,
-                runtime: params.runtime.map(Arc::unwrap_or_clone),
+                runtime,
                 tokio_io_runtime: params.io_runtime,
             };
             Ok(Arc::new(gcs) as Arc<dyn DataConnector>)

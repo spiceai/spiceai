@@ -31,7 +31,6 @@ use std::{any::Any, sync::Arc};
 use crate::{
     component::dataset::acceleration::Engine,
     datafusion::udf::deny_spice_functions_for_postgres_table_providers, parameters::ParameterSpec,
-    register_data_accelerator,
 };
 
 use super::{AccelerationSource, DataAccelerator, upsert_dedup};
@@ -199,4 +198,4 @@ impl DataAccelerator for PostgresAccelerator {
     }
 }
 
-register_data_accelerator!(Engine::PostgreSQL, PostgresAccelerator);
+data_accelerator_api::register_data_accelerator!(Engine::PostgreSQL, PostgresAccelerator);

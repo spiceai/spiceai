@@ -19,7 +19,7 @@ limitations under the License.
 //! These types are re-exported from `dataaccelerator` so existing import paths
 //! remain unchanged.
 
-use crate::component::dataset::acceleration::Engine;
+use runtime_acceleration::Engine;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 
@@ -35,7 +35,7 @@ pub struct AcceleratorEngineRegistry {
 
 impl AcceleratorEngineRegistry {
     #[must_use]
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             accelerator_engine_registry: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -50,7 +50,7 @@ impl AcceleratorEngineRegistry {
         }
     }
 
-    pub(crate) async fn register_accelerator_engine(
+    pub async fn register_accelerator_engine(
         &self,
         engine: Engine,
         accelerator_engine: Arc<dyn DataAccelerator>,
@@ -67,14 +67,14 @@ impl AcceleratorEngineRegistry {
         }
     }
 
-    pub(crate) async fn register_all(&self) {
+    pub async fn register_all(&self) {
         for registration in DATA_ACCELERATOR_REGISTRATIONS {
             self.register_accelerator_engine(registration.engine, (registration.constructor)())
                 .await;
         }
     }
 
-    pub(crate) async fn unregister_all(&self) {
+    pub async fn unregister_all(&self) {
         let mut registry = self.accelerator_engine_registry.write().await;
         // Shutdown each accelerator before clearing the registry
         for (engine, accelerator) in registry.drain() {

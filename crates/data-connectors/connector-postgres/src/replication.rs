@@ -49,7 +49,7 @@ use secrecy::SecretString;
 const DEFAULT_STATUS_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_BOOTSTRAP_BATCH_SIZE: usize = 8192;
 const MAX_BOOTSTRAP_BATCH_SIZE: usize = 1_048_576;
-// Upper bound on the configurable shared-slot member channel capacity. Matches
+// Upper bound on the configurable shared-slot member mailbox capacity. Matches
 // the bootstrap-batch ceiling — a bounded, backpressure-preserving queue in
 // front of the accelerator prefetch, not an unbounded buffer.
 const MAX_MEMBER_CHANNEL_CAPACITY: usize = 1_048_576;
@@ -407,7 +407,7 @@ const METRICS: &[MetricSpec] = &[
     )
     .description(
         "Cumulative seconds the shared-slot pump spent blocked delivering committed \
-         changes into this dataset's channel because its sink was not draining \
+         changes into this dataset's mailbox because its sink was not draining \
          (downstream backpressure). The server replication connection stays alive \
          throughout; a rising value indicates a slow apply loop stalling the shared \
          pump. Only reported for datasets on a shared (explicitly-named) slot.",
@@ -433,7 +433,7 @@ const METRICS: &[MetricSpec] = &[
     )
     .description(
         "Cumulative microseconds the shared-slot pump spent awaiting this dataset's \
-         delivery channel while applying committed changes. Unlike \
+         delivery mailbox while applying committed changes. Unlike \
          member_send_stalled_seconds_total, this accrues the full per-commit wait \
          (including sub-second waits). The pump subtracts this wait from \
          reader_processing_micros_total at the source, so that counter stays \
@@ -441,6 +441,59 @@ const METRICS: &[MetricSpec] = &[
          Only meaningful for datasets on a shared slot; dedicated-slot datasets will export 0.",
     )
     .unit("us")
+    .auto_register(),
+    MetricSpec::new(
+        "replication_member_envelopes_delivered_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description(
+        "Change envelopes the shared-slot pump delivered to this dataset as distinct units \
+         of work. Divide replication_wal_transactions_total by this to get the coalescing \
+         factor the accelerator's apply loop actually sees: adjacent transactions for the \
+         same table are folded into one envelope, so this counter rises more slowly than \
+         the transaction count. Only reported for datasets on a shared (explicitly-named) \
+         slot.",
+    )
+    .auto_register(),
+    MetricSpec::new(
+        "replication_member_envelope_eager_merges_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description(
+        "Committed transactions folded into an envelope the shared-slot pump was still \
+         holding back, before it crossed into this dataset's delivery mailbox. Paired with \
+         member_envelope_mailbox_merges_total, this attributes envelope reduction between \
+         the pump's short hold and mailbox back-pressure. Only reported for datasets on a \
+         shared (explicitly-named) slot.",
+    )
+    .auto_register(),
+    MetricSpec::new(
+        "replication_member_envelope_mailbox_merges_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description(
+        "Committed transactions folded into an envelope already sitting unclaimed in this \
+         dataset's delivery mailbox. This is the back-pressure-driven half of coalescing: \
+         it rises when the sink is not keeping up, which is when collapsing envelopes \
+         matters most, so a rising value alongside a flat \
+         member_send_stalled_seconds_total means back-pressure is being absorbed rather \
+         than stalling the slot. Only reported for datasets on a shared (explicitly-named) \
+         slot.",
+    )
+    .auto_register(),
+    MetricSpec::new(
+        "replication_member_mailbox_coalesce_limited_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description(
+        "Times a committed transaction could not be folded into this dataset's unclaimed \
+         delivery-mailbox tail because a configured bound refused it, rather than because the \
+         changes were not foldable. The mailbox bounds ship deliberately low, since mailbox \
+         folding absorbs back-pressure rather than adding throughput. A value that stays at 0 \
+         means the bounds never bind and there is nothing to tune; a rising value alongside a \
+         rising member_envelope_mailbox_merges_total is the evidence that raising them would \
+         absorb more. Only reported for datasets on a shared (explicitly-named) slot.",
+    )
     .auto_register(),
 ];
 
@@ -598,6 +651,26 @@ impl MetricsProvider for PostgresMetricsProvider {
             "replication_member_send_wait_micros_total" => {
                 Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
                     instrument.observe(m.member_send_wait_micros_total(), &attributes);
+                })))
+            }
+            "replication_member_envelopes_delivered_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.member_envelopes_delivered_total(), &attributes);
+                })))
+            }
+            "replication_member_envelope_eager_merges_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.member_envelope_eager_merges_total(), &attributes);
+                })))
+            }
+            "replication_member_envelope_mailbox_merges_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.member_envelope_mailbox_merges_total(), &attributes);
+                })))
+            }
+            "replication_member_mailbox_coalesce_limited_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.member_mailbox_coalesce_limited_total(), &attributes);
                 })))
             }
             _ => None,

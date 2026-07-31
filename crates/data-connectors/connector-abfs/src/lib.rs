@@ -231,9 +231,10 @@ impl DataConnectorFactory for AzureBlobFSFactory {
                 validator.validate(&mut params).await?;
             }
 
+            let runtime = params.runtime().map(Arc::unwrap_or_clone);
             let azure = AzureBlobFS {
                 params: params.parameters,
-                runtime: params.runtime.map(Arc::unwrap_or_clone),
+                runtime,
                 tokio_io_runtime: params.io_runtime,
             };
             Ok(Arc::new(azure) as Arc<dyn DataConnector>)

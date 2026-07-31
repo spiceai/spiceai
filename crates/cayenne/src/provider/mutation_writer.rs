@@ -309,6 +309,10 @@ impl<'a> AppendMutationWriter<'a> {
         write_guard: OwnedMutexGuard<()>,
     ) -> Result<CayenneCdcWrite> {
         self.table.ensure_no_incomplete_write().await?;
+        // Empty-table probe: on the very first write of a freshly-created
+        // table, install warm empty PK caches so the initial load maintains
+        // them and the first upsert never pays the full cold index scan.
+        self.table.maybe_install_warm_pk_caches().await;
         let write_start = Instant::now();
 
         let pending_pk_deletions = !self.table.pk_deletion_strategy().is_position_based()

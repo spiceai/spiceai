@@ -26,7 +26,7 @@ use crate::{
     datafusion::udf::deny_spice_functions_for_table_providers,
     make_spice_data_directory,
     parameters::ParameterSpec,
-    register_data_accelerator, spice_data_base_path,
+    spice_data_base_path,
 };
 use arrow::datatypes::DataType;
 use async_trait::async_trait;
@@ -733,7 +733,7 @@ fn arrow_type_to_sqlite_ddl(data_type: &DataType) -> Result<String, Error> {
     Ok(ddl)
 }
 
-register_data_accelerator!(Engine::Sqlite, SqliteAccelerator);
+data_accelerator_api::register_data_accelerator!(Engine::Sqlite, SqliteAccelerator);
 
 #[cfg(test)]
 mod tests {

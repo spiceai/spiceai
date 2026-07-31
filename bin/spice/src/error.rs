@@ -72,6 +72,11 @@ pub enum Error {
     #[snafu(display("Invalid HTTP response: {message}"))]
     InvalidResponse { message: String },
 
+    /// A Spicepod registry failed to serve a pod. The message is already fully formed, so it is
+    /// displayed verbatim rather than blamed on the user's argument.
+    #[snafu(display("{message}"))]
+    Registry { message: String },
+
     /// Failed to read/write configuration
     #[snafu(display("Failed to {operation} configuration at {}: {source}", path.display()))]
     ConfigIo {
@@ -140,6 +145,10 @@ pub enum Error {
     /// Local I/O failure for the Cloud Connect / adoption flow.
     #[snafu(display("Cloud Connect I/O error: {message}"))]
     CloudConnectIo { message: String },
+
+    /// Enrollment against the Spice Cloud control plane failed.
+    #[snafu(display("Failed to enroll with Spice Cloud: {message}"))]
+    CloudConnectEnroll { message: String },
 }
 
 /// Check an HTTP response status and return an appropriate error for non-success responses.
