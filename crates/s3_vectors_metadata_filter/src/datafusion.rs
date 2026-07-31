@@ -85,12 +85,13 @@ pub fn convert_datafusion_filters_to_s3_vectors(
         // Single filter - convert directly
         convert_expr_to_filter(&filters[0])
     } else {
-        // Multiple filters - combine with AND
+        // Multiple filters - combine with AND only when every filter converts faithfully.
         let mut and_filters = Vec::new();
         for filter in filters {
-            if let Some(expr) = convert_expr_to_filter_expression(filter)? {
-                and_filters.push(expr);
-            }
+            let Some(expr) = convert_expr_to_filter_expression(filter)? else {
+                return Ok(None);
+            };
+            and_filters.push(expr);
         }
 
         if and_filters.is_empty() {
@@ -219,8 +220,7 @@ fn convert_logical_and(left: &Expr, right: &Expr) -> DataFusionResult<Option<Fil
             };
             Ok(Some(FilterExpression::Logical(logical_op)))
         }
-        (Some(expr), None) | (None, Some(expr)) => Ok(Some(expr)),
-        (None, None) => Ok(None),
+        _ => Ok(None),
     }
 }
 
@@ -237,8 +237,7 @@ fn convert_logical_or(left: &Expr, right: &Expr) -> DataFusionResult<Option<Filt
             };
             Ok(Some(FilterExpression::Logical(logical_op)))
         }
-        (Some(expr), None) | (None, Some(expr)) => Ok(Some(expr)),
-        (None, None) => Ok(None),
+        _ => Ok(None),
     }
 }
 
@@ -721,6 +720,36 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn partial_logical_and_conversion_returns_none() {
+        let supported = binary_expr(col("genre"), Operator::Eq, lit("drama"));
+        let unsupported = binary_expr(col("year"), Operator::Plus, lit(1));
+        let expr = binary_expr(supported, Operator::And, unsupported);
+
+        let result = convert_datafusion_filters_to_s3_vectors(&[expr])
+            .expect("partial logical AND conversion should not fail");
+
+        assert!(
+            result.is_none(),
+            "a partially converted AND predicate must not be pushed down"
+        );
+    }
+
+    #[test]
+    fn partial_logical_or_conversion_returns_none() {
+        let supported = binary_expr(col("genre"), Operator::Eq, lit("drama"));
+        let unsupported = binary_expr(col("year"), Operator::Plus, lit(1));
+        let expr = binary_expr(supported, Operator::Or, unsupported);
+
+        let result = convert_datafusion_filters_to_s3_vectors(&[expr])
+            .expect("partial logical OR conversion should not fail");
+
+        assert!(
+            result.is_none(),
+            "a partially converted OR predicate must not be pushed down"
+        );
     }
 
     #[test]
