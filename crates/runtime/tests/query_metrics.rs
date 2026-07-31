@@ -36,6 +36,7 @@ const EXPECTED_QUERY_METRICS: &[&str] = &[
     "query_duration_ms",
     "query_execution_duration_ms",
     "query_executions",
+    "query_failures",
     "query_returned_rows",
     "query_returned_bytes",
 ];
@@ -91,6 +92,13 @@ async fn query_metrics_are_reported_when_task_history_is_disabled() {
         rows += batch.expect("batch to stream without error").num_rows();
     }
     assert_eq!(rows, 1, "SELECT 1 returns a single row");
+
+    // `query_failures` is recorded on the error path, on its own meter.
+    let failed = QueryBuilder::new("SELECT * FROM does_not_exist", rt.datafusion())
+        .build()
+        .run()
+        .await;
+    assert!(failed.is_err(), "a query on a missing table must fail");
 
     let reported: HashSet<String> = registry
         .gather()
