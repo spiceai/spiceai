@@ -120,11 +120,11 @@ tier = "foundation"
 runtime = "runtime"
 # Config-only component specs (DatasetSpec/CatalogSpec/ViewSpec + their config
 # submodules) carved out of the `runtime` crate body. It names nothing from
-# `runtime` (no Arc<Runtime>/App/secrets/datafusion), so it compiles in parallel
-# with `runtime` rather than inside it. Kept in the `runtime` tier alongside the
-# other runtime-* crates; its own deps are all shared-utility/foundation, so it
-# could equally sit in shared-utility.
-runtime-component = "runtime"
+# `runtime` (no Arc<Runtime>/App/secrets/datafusion) and its own deps are all
+# shared-utility/foundation, so it sits below `runtime` — which is what lets the
+# interface crates a connector needs (data-connector-api) name a component's
+# configuration without pulling in the orchestrator.
+runtime-component = "shared-utility"
 # Extensions that sit above the runtime crate (depend on `runtime`).
 spice-cloud = "extension"
 tpc-extension = "extension"
