@@ -1795,6 +1795,8 @@ fn attach_query_tracker_to_stream(
     let mut num_records = 0u64;
     let mut num_output_bytes = 0u64;
 
+    // Only the task history row reads the captured output preview.
+    let capture_task_history = tracker.task_history_enabled;
     let mut captured_output = "[]".to_string(); // default to empty preview
 
     let inner_span = span.clone();
@@ -1804,7 +1806,7 @@ fn attach_query_tracker_to_stream(
             match &batch_result {
                 Ok(batch) => {
                     // Create a truncated output for the query history table on first batch.
-                    if num_records == 0 {
+                    if capture_task_history && num_records == 0 {
                         captured_output = write_to_json_string(&[batch.slice(0, batch.num_rows().min(3))]).unwrap_or_default();
                     }
 
