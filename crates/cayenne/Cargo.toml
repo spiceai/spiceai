@@ -8,6 +8,7 @@ repository = "https://github.com/spiceai/spiceai"
 version.workspace = true
 
 [dependencies]
+cpu-budget = { path = "../cpu-budget" }
 arc-swap = { workspace = true }
 arrow = { workspace = true }
 arrow_tools = { path = "../arrow_tools" }

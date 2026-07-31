@@ -1,0 +1,5 @@
+---
+source: crates/cpu-budget/src/lib.rs
+expression: "detected.overcommit_warning().expect(\"warns\")"
+---
+Detected 18 CPUs, but this container's cgroup CPU share implies ~4 cores and no CPU quota is set. spiced is sizing its thread pools for 18 cores, which over-commits the CPU this container is entitled to. Set `runtime.cpu.cores` (or SPICE_CPU_CORES) to the container's CPU request. See: https://spiceai.org/docs/reference/spicepod#runtimecpu

@@ -830,9 +830,16 @@ impl DataFusionBuilder {
                 );
             }
         } else {
+            // DataFusion's own default is `available_parallelism()`, which reads
+            // a cgroup CPU quota and otherwise reports the node's cores — so a
+            // pod with a CPU request and no limit would fan every query out
+            // across the whole node. Size from the CPU budget instead, which is
+            // the same number wherever detection was already correct.
+            let target_partitions = cpu_budget::cpu_budget().target_partitions();
+            config = config.with_target_partitions(target_partitions);
             tracing::info!(
-                effective = config.options().execution.target_partitions,
-                "runtime.query.target_partitions not set; using DataFusion default"
+                target_partitions,
+                "runtime.query.target_partitions not set; sized from the CPU budget"
             );
         }
 

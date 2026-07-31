@@ -538,7 +538,13 @@ impl Ai {
 #[cfg(test)]
 // Allow various lints in test code for simplicity and readability.
 // Test code prioritizes clarity over strict lint compliance.
-#[expect(clippy::clone_on_ref_ptr, clippy::uninlined_format_args)]
+#[expect(
+    clippy::clone_on_ref_ptr,
+    clippy::uninlined_format_args,
+    // Test fixtures pick a concurrency for the mock model; nothing here is
+    // sized from spiced's CPU entitlement.
+    clippy::disallowed_methods
+)]
 mod tests {
     use super::*;
     use arrow_schema::{DataType, Field};

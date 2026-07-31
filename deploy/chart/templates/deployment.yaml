@@ -72,6 +72,23 @@ spec:
             ]
           {{- end }}
           env:
+            {{- if (((.Values.resources).requests).cpu) }}
+            # Size spiced's thread pools, query fan-out, and accelerator
+            # concurrency for the CPU this pod requested. Without this, a pod
+            # with a CPU request and no CPU limit has no cgroup quota, so the
+            # runtime detects — and sizes for — the whole node.
+            #
+            # Guarded on the request being set: `resourceFieldRef` against an
+            # unset request falls back to node allocatable, which is exactly the
+            # over-sizing this avoids. `divisor: 1m` yields millicores; without
+            # a divisor Kubernetes rounds up to whole cores.
+            - name: SPICE_CPU_CORES
+              valueFrom:
+                resourceFieldRef:
+                  containerName: spiceai
+                  resource: requests.cpu
+                  divisor: 1m
+            {{- end }}
             {{- if .Values.additionalEnv }}
             {{- .Values.additionalEnv | toYaml | nindent 12 }}
             {{- end }}

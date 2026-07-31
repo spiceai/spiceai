@@ -580,6 +580,10 @@ pub fn generate(dir: &Path, warehouses: usize, seed: Option<u64>) -> Result<Vec<
     // one worker thread per shard. Generation has no shared state across
     // warehouses (each derives its own RNG from `base_seed ^ warehouse_id`),
     // so this is embarrassingly parallel.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a host-local data-generation tool, not spiced: it should use the whole machine it runs on, not spiced's CPU entitlement"
+    )]
     let threads = std::thread::available_parallelism()
         .map_or(4, std::num::NonZeroUsize::get)
         .min(warehouses.max(1));

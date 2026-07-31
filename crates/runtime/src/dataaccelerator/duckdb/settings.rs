@@ -156,3 +156,61 @@ impl DuckDBSetting for TimeZone {
         DuckDBSettingScope::Local
     }
 }
+
+/// `DuckDB` setting for the size of this instance's own thread pool.
+///
+/// `DuckDB` otherwise sizes it from the host core count, so every `DuckDB`
+/// instance in a CPU-constrained container spins up a node-sized pool alongside
+/// the runtime's — the same over-commitment `cpu-budget` exists to prevent, and
+/// exactly analogous to the `memory_limit` problem the coordinated accelerator
+/// memory budget already solves.
+///
+/// Unconditional-with-override: an explicit `duckdb_threads` on the dataset
+/// wins, otherwise the runtime's CPU budget applies. Unlike `memory_limit`,
+/// this is safe to apply to an instance a sibling dataset also configures —
+/// the derived value is the same for every dataset in the process.
+///
+/// Type: UBIGINT, Default: the host core count.
+///
+/// See: <https://duckdb.org/docs/stable/configuration/overview>
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Threads;
+
+impl DuckDBSetting for Threads {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn setting_name(&self) -> &'static str {
+        "threads"
+    }
+
+    fn get_value(&self, options: &std::collections::HashMap<String, String>) -> Option<String> {
+        Some(
+            options
+                .get(self.setting_name())
+                .cloned()
+                .unwrap_or_else(|| cpu_budget::cpu_budget().duckdb_threads().to_string()),
+        )
+    }
+
+    fn scope(&self) -> DuckDBSettingScope {
+        DuckDBSettingScope::Global
+    }
+
+    fn validate(&self, value: &str) -> Result<(), Error> {
+        // DuckDB rejects `threads = 0`; surface the operator's typo here rather
+        // than as an opaque DuckDB error at table-creation time.
+        match value.parse::<u64>() {
+            Ok(threads) if threads > 0 => Ok(()),
+            _ => Err(Error::DbConnectionError {
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "Invalid duckdb_threads value '{value}'. Must be a positive integer. Leave it unset to size DuckDB's thread pool from the runtime's CPU budget (runtime.cpu.cores)."
+                    ),
+                )),
+            }),
+        }
+    }
+}

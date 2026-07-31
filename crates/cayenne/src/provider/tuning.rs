@@ -626,18 +626,20 @@ pub(crate) fn sample_mem_pressure(stats: &IngestStats) {
 // ---------------------------------------------------------------------------
 
 /// Sample process-wide CPU busy-fraction into the global [`CPU_PRESSURE_MILLI`]:
-/// cgroup v2 `cpu.stat` `usage_usec` (v1 `cpuacct.usage` fallback), as a delta
-/// busy-fraction `Δusage / (Δwall × cores)`. Needs the previous sample; a too-close
-/// interval (< 0.5 s) is skipped so a double-call can't divide by ~0. Called on the
-/// background tick. Linux-only; elsewhere a no-op (pressure stays unknown → the CPU
-/// rule is inert). Process-global because CPU is shared across all per-table loops.
+/// cgroup v2 `cpu.stat` `usage_usec` (v1 `cpuacct.usage` fallback), divided by the
+/// runtime's CPU *entitlement* rather than the host's core count — on a 4-core
+/// entitlement misread as 18 cores a fully saturated process reports ~0.22, and the
+/// controller then makes CPU-stealing moves believing CPU is idle. Needs the previous
+/// sample; a too-close interval (< 0.5 s) is skipped so a double-call can't divide by
+/// ~0. Called on the background tick. Linux-only; elsewhere a no-op (pressure stays
+/// unknown → the CPU rule is inert). Process-global because CPU is shared across all
+/// per-table loops.
 #[cfg(target_os = "linux")]
 pub(crate) fn sample_cpu_pressure() {
     let Some(now_usage) = cgroup_cpu_usage_usec() else {
         return;
     };
     let now = Instant::now();
-    let cores = cpu_cores_f64();
     let mut prev = CPU_PREV_SAMPLE.lock();
     match *prev {
         Some((prev_usage, prev_at)) => {
@@ -645,9 +647,11 @@ pub(crate) fn sample_cpu_pressure() {
             // Skip samples < 0.5 s apart: a tiny denominator makes the ratio noisy
             // (two ticks can fire close together on a multi-table host). Keep `prev`
             // and wait for a wider window.
-            if wall_secs >= 0.5 && cores > 0.0 {
+            if wall_secs >= 0.5 {
                 let busy_secs = u64_to_f64(now_usage.saturating_sub(prev_usage)) / 1_000_000.0;
-                store_cpu_pressure(busy_secs / (wall_secs * cores));
+                store_cpu_pressure(
+                    cpu_budget::cpu_budget().cpu_busy_fraction(busy_secs, wall_secs),
+                );
                 *prev = Some((now_usage, now));
             }
         }
@@ -670,12 +674,6 @@ fn store_cpu_pressure(frac: f64) {
     if let Some(milli) = pressure_to_milli(frac) {
         CPU_PRESSURE_MILLI.store(milli, Ordering::Relaxed);
     }
-}
-
-#[cfg(target_os = "linux")]
-fn cpu_cores_f64() -> f64 {
-    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-    u64_to_f64(u64::try_from(cores).unwrap_or(1))
 }
 
 /// Cumulative CPU usage in microseconds — cgroup v2 `cpu.stat` `usage_usec`, then

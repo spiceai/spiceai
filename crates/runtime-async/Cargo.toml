@@ -14,7 +14,7 @@ futures.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 tokio-util.workspace = true
 snafu.workspace = true
-num_cpus.workspace = true
+cpu-budget = { path = "../cpu-budget" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

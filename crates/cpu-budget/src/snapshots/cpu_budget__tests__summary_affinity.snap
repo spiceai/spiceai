@@ -1,0 +1,5 @@
+---
+source: crates/cpu-budget/src/lib.rs
+expression: detected.summary_line()
+---
+CPU budget: 18 cores (source: detected CPUs; host reports 18) → 18 main worker threads, 17 per dedicated runtime pool, 18 target partitions

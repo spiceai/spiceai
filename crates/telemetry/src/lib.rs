@@ -412,6 +412,23 @@ pub fn track_hash_index_lookup_rows(rows: u64, dimensions: &[KeyValue]) {
 /// just parked" signal — require the `tokio_unstable` cfg at build time
 /// (`RUSTFLAGS="--cfg tokio_unstable"`); without it only the stable gauges register, so
 /// default and CI builds are unaffected.
+/// Registers the `spiced_cpu_budget_cores` gauge, so a mis-sized deployment is
+/// greppable across a fleet rather than diagnosed pod-by-pod. `source` is
+/// `CpuSource::as_str` — the rung of the detection ladder the value came from.
+/// Like [`register_tokio_runtime_metrics`], the binary MUST call this once
+/// AFTER `init_metrics` has installed the Prometheus meter.
+///
+/// Takes plain scalars rather than the budget itself: `telemetry` is a
+/// foundation crate and does not depend on `cpu-budget`.
+pub fn register_cpu_budget_metrics(cores: u64, source: &'static str) {
+    let _ = global::meter("cpu_budget")
+        .u64_observable_gauge("spiced_cpu_budget_cores")
+        .with_description("CPU cores the runtime sizes itself for, and where that value came from.")
+        .with_unit("{cpu}")
+        .with_callback(move |obs| obs.observe(cores, &[KeyValue::new("source", source)]))
+        .build();
+}
+
 pub fn register_tokio_runtime_metrics(handles: Vec<(&'static str, tokio::runtime::Handle)>) {
     if handles.is_empty() {
         return;

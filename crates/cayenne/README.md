@@ -180,7 +180,7 @@ Backends translate the `MetastoreValue` enum (`Integer | Text | Bool | Blob | Nu
 
 - **`SqliteMetastore`** (`metastore/sqlite.rs`): default; `tokio-rusqlite` with WAL mode, `synchronous=NORMAL`, `cache_size=-262144` (~256 MB, sized by `cayenne_metastore_cache_mb`), `temp_store=memory`, foreign keys on, and a 30-second `busy_timeout` (`cayenne_metastore_busy_timeout_ms`). PRAGMA configuration retries up to 5 times with exponential-ish backoff (10/25/50/100/200 ms) when the database is briefly locked at open.
 
-  A round-robin connection **pool** of K independent connections is created lazily on first use (`K = min(available_parallelism, 32)`, falling back to 4 when `available_parallelism()` errors, with a floor of 2). Pool acquisition tries each slot starting at the round-robin index and returns the first one with a free `tokio::sync::Mutex`, falling back to an awaited lock on the starting slot. SQLite WAL mode allows concurrent readers and serializes writers at the engine level; the pool primarily lifts read-side concurrency for metadata-heavy workloads where every scan pays multiple metastore reads. `begin_transaction` holds an `OwnedMutexGuard` on one pool slot for the full transaction lifetime.
+  A round-robin connection **pool** of K independent connections is created lazily on first use (`K = min(cpu_budget().cores(), 32)`, with a floor of 2). Pool acquisition tries each slot starting at the round-robin index and returns the first one with a free `tokio::sync::Mutex`, falling back to an awaited lock on the starting slot. SQLite WAL mode allows concurrent readers and serializes writers at the engine level; the pool primarily lifts read-side concurrency for metadata-heavy workloads where every scan pays multiple metastore reads. `begin_transaction` holds an `OwnedMutexGuard` on one pool slot for the full transaction lifetime.
 
 - **`TursoMetastore`** (`metastore/turso.rs`): optional, gated on the `turso` feature. libSQL/Turso backend with a fixed `K = 16` pool. Uses `BEGIN CONCURRENT` for MVCC-backed concurrent writers; the journal mode is set to the libSQL MVCC literal at connection open. Same 30-second `busy_timeout`.
 
@@ -276,7 +276,7 @@ pub struct VortexConfig {
     pub compression_strategy: CompressionStrategy,  // default Btrblocks
 
     // Writer concurrency
-    pub upload_concurrency: usize,            // default available_parallelism()
+    pub upload_concurrency: usize,            // default cpu_budget().cores()
     pub write_concurrency: Option<usize>,     // None = session target_partitions; the sort-and-rewrite compaction path pins to 1 regardless of this setting
 
     // Compaction
@@ -454,7 +454,7 @@ Tiered small-files compaction picks the smallest eligible file tier whose total 
 Triggered by:
 
 - **Inline post-write trigger** (`schedule_post_write_compaction`): `tokio::spawn` with an `AcqRel` dedup flag so at most one inline pass is queued per table.
-- **Background compactor** (`BackgroundCompactor`): per-table periodic task gated by a shared per-accelerator semaphore (`Semaphore::new(available_parallelism())`).
+- **Background compactor** (`BackgroundCompactor`): per-table periodic task gated by a shared per-accelerator semaphore (`Semaphore::new(cpu_budget().cores())`).
 - **Inline memtable flush** (`checkpoint_inlined_data_if_memtable_pressure_exceeded`): drains `cayenne_inlined_data` into a Vortex file when cumulative rows / segments / IPC bytes exceed `inline_flush_max_*`.
 
 All compaction triggers `try_lock` the table write lock and skip if a writer is active. The compaction lock itself serializes concurrent compaction passes so write-driven and background-driven runs cannot overlap.
@@ -573,7 +573,7 @@ The runtime accelerator (`runtime/src/dataaccelerator/cayenne/mod.rs`) recognize
 | `cayenne_compression_strategy`                   | `btrblocks` or `zstd`.                                                                                                      | `btrblocks`                                                               |
 | `cayenne_delta_encoding`                         | Delta-write encoding level: `auto` (default), `none`, or an explicit level `0`–`10` (`7`+ is full). Tunes per-write delta encoding. | `auto`                                                            |
 | `cayenne_pk_conflict_detection`                  | `auto` or `none`.                                                                                                           | `auto`                                                                    |
-| `cayenne_upload_concurrency`                     | Concurrent multipart upload fan-out.                                                                                        | `available_parallelism()`                                                 |
+| `cayenne_upload_concurrency`                     | Concurrent multipart upload fan-out.                                                                                        | `cpu_budget().cores()`                                                    |
 | `cayenne_write_concurrency`                      | Writer partition override for unsorted ingests. The sort-and-rewrite compaction path always writes serially.                | `target_partitions`                                                       |
 | `cayenne_compaction_trigger_files`               | Small-tier file count trigger.                                                                                              | small = 4, otherwise = 8                                                  |
 | `cayenne_compaction_trigger_protected_snapshots` | Protected-snapshot count trigger.                                                                                           | small = 4, otherwise = 8                                                  |
