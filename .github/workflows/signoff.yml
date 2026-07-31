@@ -37,9 +37,13 @@
 # PR/run lookups) at the fork instead of this repo.
 #
 # scripts/signoff and the setup-* composite actions below are also saved to
-# .trusted-ci/ from this repo *before* the fork's commit is checked out, and
-# every later step references those copies (steps.resolve.outputs.actions_dir
-# / signoff_bin) rather than the working tree. Otherwise a fork PR could ship
+# .trusted-ci/ from this repo *before* any fork commit is checked out, and
+# every later step references those copies (literal `.trusted-ci/...` paths)
+# rather than the working tree. This runs unconditionally, not just for fork
+# PRs, so every step downstream has one fixed path to depend on instead of
+# branching on is_fork — `uses:` can't read a step output (the `steps`
+# context isn't available there), so a per-case path chosen at runtime
+# isn't an option. Otherwise a fork PR could ship
 # its own scripts/signoff that unconditionally posts "success", or a setup-*
 # action that exfiltrates this job's secrets — i.e. it could rig the very
 # checks meant to validate it. What's still (necessarily) untrusted: the
@@ -169,22 +173,13 @@ jobs:
 
           if [[ "$checkout_repo" == "$BASE_REPO" ]]; then
             is_fork=false
-            actions_dir="./.github/actions"
-            signoff_bin="scripts/signoff"
           else
             is_fork=true
-            # Point at copies saved by "Save trusted CI helpers (fork PR)"
-            # below, taken from this repo before the fork checkout overlays
-            # the working tree — see that step for why.
-            actions_dir="./.trusted-ci/actions"
-            signoff_bin=".trusted-ci/signoff"
           fi
 
           echo "checkout_repo=${checkout_repo}" >> "$GITHUB_OUTPUT"
           echo "checkout_ref=${checkout_ref}" >> "$GITHUB_OUTPUT"
           echo "is_fork=${is_fork}" >> "$GITHUB_OUTPUT"
-          echo "actions_dir=${actions_dir}" >> "$GITHUB_OUTPUT"
-          echo "signoff_bin=${signoff_bin}" >> "$GITHUB_OUTPUT"
           echo "Triggered by: ${{ github.actor }}"
           echo "Targeted pre-lint base: trunk (fixed)"
 
@@ -219,21 +214,22 @@ jobs:
           # GH_TOKEN instead, so this doesn't affect them.
           persist-credentials: false
 
-      - name: Save trusted CI helpers (fork PR)
+      - name: Save trusted CI helpers
         # scripts/signoff decides pass/fail and posts the sign-off status;
         # the setup-* composite actions below run with this job's secrets in
-        # scope (sccache/MinIO creds, etc.). Once the next step overlays the
-        # fork's commit onto the working tree, those paths would resolve to
-        # whatever the fork shipped instead — e.g. a fork could ship a
-        # scripts/signoff that unconditionally posts "success" regardless of
-        # whether checks passed, or a setup-rust action that exfiltrates
-        # secrets. Copying them out now, from this repo's checkout, and
-        # pointing later steps (via steps.resolve.outputs.actions_dir /
-        # signoff_bin) at these copies keeps the checks/decision/status-post
-        # logic trusted even though the code being built/linted/tested is the
-        # fork's. This directory is untracked, so the fork checkout below
-        # (which only touches tracked paths) leaves it alone.
-        if: steps.resolve.outputs.is_fork == 'true'
+        # scope (sccache/MinIO creds, etc.). For a fork PR, the next step
+        # overlays the fork's commit onto the working tree, so those paths
+        # would otherwise resolve to whatever the fork shipped — e.g. a fork
+        # could ship a scripts/signoff that unconditionally posts "success"
+        # regardless of whether checks passed, or a setup-rust action that
+        # exfiltrates secrets. Copying them out now, from this repo's
+        # checkout, and pointing every later step at these copies keeps the
+        # checks/decision/status-post logic trusted even though the code
+        # being built/linted/tested may be the fork's. Unconditional (not
+        # just for forks) so every later step has one fixed path regardless
+        # of is_fork — see the top-of-file comment. This directory is
+        # untracked, so the fork checkout below (which only touches tracked
+        # paths) leaves it alone.
         run: |
           set -euo pipefail
           mkdir -p .trusted-ci
@@ -271,10 +267,10 @@ jobs:
           echo "merge-base with origin/trunk: $(git merge-base HEAD origin/trunk 2>/dev/null | cut -c1-12 || echo 'n/a (API fallback)')"
 
       - name: Set up Rust
-        uses: ${{ steps.resolve.outputs.actions_dir }}/setup-rust
+        uses: ./.trusted-ci/actions/setup-rust
 
       - name: Set up Nextest
-        uses: ${{ steps.resolve.outputs.actions_dir }}/setup-nextest
+        uses: ./.trusted-ci/actions/setup-nextest
 
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
@@ -288,25 +284,25 @@ jobs:
           region: us-west-1
 
       - name: Set up sccache
-        uses: ${{ steps.resolve.outputs.actions_dir }}/setup-sccache
+        uses: ./.trusted-ci/actions/setup-sccache
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
 
       - name: Install Protoc
-        uses: ${{ steps.resolve.outputs.actions_dir }}/install-protoc
+        uses: ./.trusted-ci/actions/install-protoc
 
       - name: Set up make
-        uses: ${{ steps.resolve.outputs.actions_dir }}/setup-make
+        uses: ./.trusted-ci/actions/setup-make
 
       - name: Set up cc
-        uses: ${{ steps.resolve.outputs.actions_dir }}/setup-cc
+        uses: ./.trusted-ci/actions/setup-cc
 
       - name: Sign off
         # -f: Actions checkouts have no @{push} upstream tracking, so the local
         # clean/pushed guards would otherwise refuse to run. The branch ref was
         # just checked out from origin, so HEAD is exactly the remote tip.
-        run: ${{ steps.resolve.outputs.signoff_bin }} -f
+        run: .trusted-ci/signoff -f
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
