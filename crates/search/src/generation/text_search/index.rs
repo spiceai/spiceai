@@ -29,7 +29,9 @@ use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder};
 use runtime_datafusion_index::Index;
 use snafu::ResultExt;
 use tantivy::merge_policy::LogMergePolicy;
-use tantivy::schema::{DocParsingError, SchemaBuilder};
+use tantivy::schema::{
+    DocParsingError, IndexRecordOption, SchemaBuilder, TextFieldIndexing, TextOptions,
+};
 use tantivy::{TantivyDocument, TantivyError};
 use tokio::sync::Mutex;
 
@@ -48,6 +50,18 @@ use crate::index::SearchIndex;
 /// significantly improving bulk-indexing throughput.
 pub static MEMORY_BUDGET_FOR_INDEX_WRITER: usize = 150 * 1024 * 1024;
 pub static INDEX_UNIQUE_FIELD_NAME: &str = "__spice.unique_field";
+
+/// Tantivy's built-in English Snowball-stemmed tokenizer.
+static EN_STEM_TOKENIZER_NAME: &str = "en_stem";
+
+/// A [`TextOptions`] for [`tantivy::schema::TEXT`] with [`EN_STEM_TOKENIZER_NAME`] tokenization.
+fn tokenized_text_options() -> TextOptions {
+    TextOptions::default().set_indexing_options(
+        TextFieldIndexing::default()
+            .set_index_option(IndexRecordOption::WithFreqsAndPositions)
+            .set_tokenizer(EN_STEM_TOKENIZER_NAME),
+    )
+}
 
 /// The fraction of a tantivy segment's documents that may be superseded/deleted, but
 /// still physically present, before the segment is rewritten by a merge.
@@ -599,7 +613,7 @@ impl FullTextDatabaseIndex {
         }
 
         for s in search_fields {
-            let mut text_opts = tantivy::schema::TEXT;
+            let mut text_opts = tokenized_text_options();
             if store_field.contains(s) || primary_key.contains(s) {
                 text_opts = text_opts | tantivy::schema::STORED;
             }
