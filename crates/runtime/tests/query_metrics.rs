@@ -19,6 +19,7 @@ limitations under the License.
 //! This needs its own test binary: the metric handles are `LazyLock`s over
 //! `global::meter(..)`, so an instrument first touched before the
 //! `MeterProvider` is installed binds to the no-op meter for the whole process.
+//! Keep it to a single test so the install order holds under `cargo test` too.
 
 use std::collections::HashSet;
 
