@@ -36,12 +36,17 @@ pub enum SearchDatasetArg {
     #[value(name = "quora_retrieval")]
     #[serde(rename = "quora_retrieval")]
     QuoraRetrieval,
+    /// MTEB `MIRACLRetrieval` English (`https://huggingface.co/datasets/mteb/MIRACLRetrieval_en_top_250_only_w_correct-v2/`).
+    #[value(name = "miracl_en_retrieval")]
+    #[serde(rename = "miracl_en_retrieval")]
+    MiraclEnRetrieval,
 }
 
 impl std::fmt::Display for SearchDatasetArg {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SearchDatasetArg::QuoraRetrieval => write!(f, "quora_retrieval"),
+            SearchDatasetArg::MiraclEnRetrieval => write!(f, "miracl_en_retrieval"),
         }
     }
 }

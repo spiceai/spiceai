@@ -26,7 +26,10 @@ use test_framework::{
     spicetest::search::{SearchConfig, SearchResult},
 };
 
-use super::mteb_quora;
+use super::mteb;
+
+const QUORA_RETRIEVAL_REPOSITORY: &str = "mteb/QuoraRetrieval_test_top_250_only_w_correct-v2";
+const MIRACL_EN_RETRIEVAL_REPOSITORY: &str = "mteb/MIRACLRetrieval_en_top_250_only_w_correct-v2";
 
 /// The search benchmark dataset to run against. Each variant owns its own dataset
 /// preparation, search-config construction, relevance-judgment loading, and result
@@ -34,12 +37,14 @@ use super::mteb_quora;
 /// threading a new string through `search/mod.rs`.
 pub(crate) enum SearchDataset {
     QuoraRetrieval,
+    MiraclEnRetrieval,
 }
 
 impl From<SearchDatasetArg> for SearchDataset {
     fn from(arg: SearchDatasetArg) -> Self {
         match arg {
             SearchDatasetArg::QuoraRetrieval => SearchDataset::QuoraRetrieval,
+            SearchDatasetArg::MiraclEnRetrieval => SearchDataset::MiraclEnRetrieval,
         }
     }
 }
@@ -48,12 +53,18 @@ impl SearchDataset {
     pub(crate) fn name(&self) -> &'static str {
         match self {
             SearchDataset::QuoraRetrieval => "quora_retrieval",
+            SearchDataset::MiraclEnRetrieval => "miracl_en_retrieval",
         }
     }
 
     pub(crate) async fn prepare(&self, spicepod_dir: &Path) -> anyhow::Result<()> {
         match self {
-            SearchDataset::QuoraRetrieval => mteb_quora::prepare_dataset(spicepod_dir).await,
+            SearchDataset::QuoraRetrieval => {
+                mteb::prepare_dataset(QUORA_RETRIEVAL_REPOSITORY, spicepod_dir).await
+            }
+            SearchDataset::MiraclEnRetrieval => {
+                mteb::prepare_dataset(MIRACL_EN_RETRIEVAL_REPOSITORY, spicepod_dir).await
+            }
         }
     }
 
@@ -63,8 +74,8 @@ impl SearchDataset {
         search_limit: Option<usize>,
     ) -> anyhow::Result<SearchConfig> {
         match self {
-            SearchDataset::QuoraRetrieval => {
-                mteb_quora::init_search_config(spiced_instance, search_limit).await
+            SearchDataset::QuoraRetrieval | SearchDataset::MiraclEnRetrieval => {
+                mteb::init_search_config(spiced_instance, search_limit).await
             }
         }
     }
@@ -74,8 +85,8 @@ impl SearchDataset {
         spiced_instance: &SpicedInstance,
     ) -> anyhow::Result<HashMap<String, HashMap<String, i32>>> {
         match self {
-            SearchDataset::QuoraRetrieval => {
-                mteb_quora::get_query_relevance_data(spiced_instance).await
+            SearchDataset::QuoraRetrieval | SearchDataset::MiraclEnRetrieval => {
+                mteb::get_query_relevance_data(spiced_instance).await
             }
         }
     }
@@ -85,7 +96,9 @@ impl SearchDataset {
         search: &BTreeMap<String, SearchResult>,
     ) -> HashMap<String, HashMap<String, f64>> {
         match self {
-            SearchDataset::QuoraRetrieval => mteb_quora::transform_search_results_for_eval(search),
+            SearchDataset::QuoraRetrieval | SearchDataset::MiraclEnRetrieval => {
+                mteb::transform_search_results_for_eval(search)
+            }
         }
     }
 }

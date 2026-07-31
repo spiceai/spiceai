@@ -783,4 +783,26 @@ tests:
             serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
         assert_eq!(serialized["benchmark_dataset"], "quora_retrieval");
     }
+
+    #[test]
+    fn test_miracl_en_search_section_deserialization() {
+        let yaml = "
+tests:
+  search:
+    spicepod_path: test/spicepods/search/mteb/miracl_en/full_text_search-duckdb[file].yaml
+    runner_type: spiceai-dev-runners
+    benchmark_dataset: miracl_en_retrieval
+    ready_wait: 1800
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+
+        assert!(matches!(
+            test_file.tests.search[0].benchmark_dataset,
+            SearchDatasetArg::MiraclEnRetrieval
+        ));
+        let serialized =
+            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
+        assert_eq!(serialized["benchmark_dataset"], "miracl_en_retrieval");
+    }
 }

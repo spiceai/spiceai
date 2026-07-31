@@ -28,14 +28,17 @@ use test_framework::{
     spicetest::search::{SearchConfig, SearchRequest, SearchResult},
 };
 
-/// The `QuoraRetrieval` MTEB dataset is a benchmark dataset used for evaluating retrieval models.
-/// It consists of 177,163 rows and 1000 test queries.
-/// `https://huggingface.co/datasets/mteb/QuoraRetrieval_test_top_250_only_w_correct-v2/`
+/// Shared logic for MTEB retrieval datasets published in the
+/// `mteb/*_top_250_only_w_correct-v2` Hugging Face layout. Every repository in that family has
+/// the same three files: `corpus/test-*.parquet` and `queries/test-*.parquet` with `_id` and
+/// `text` string columns, and `data/test-*.parquet` relevance judgments with `query-id`,
+/// `corpus-id`, and `score` columns.
 ///
-/// Prepares the MTEB `QuoraRetrieval` dataset by downloading required files from Hugging Face
-/// and copying them into the specified `spicepod_dir` directory.
-pub(crate) async fn prepare_dataset(spicepod_dir: &Path) -> anyhow::Result<()> {
-    println!("Preparing MTEB QuoraRetrieval dataset...");
+/// Downloads the dataset files for `hf_repo` (e.g.
+/// `mteb/QuoraRetrieval_test_top_250_only_w_correct-v2`) from Hugging Face and copies them into
+/// the specified `spicepod_dir` directory.
+pub(crate) async fn prepare_dataset(hf_repo: &str, spicepod_dir: &Path) -> anyhow::Result<()> {
+    println!("Preparing MTEB dataset {hf_repo}...");
 
     let corpus_dest = spicepod_dir.join("corpus.parquet");
     let queries_dest = spicepod_dir.join("queries.parquet");
@@ -52,10 +55,7 @@ pub(crate) async fn prepare_dataset(spicepod_dir: &Path) -> anyhow::Result<()> {
             anyhow::anyhow!("Failed to initialize api to download huggingface dataset: {e}")
         })?;
 
-    let repo = Repo::new(
-        "datasets/mteb/QuoraRetrieval_test_top_250_only_w_correct-v2".to_string(),
-        RepoType::Model,
-    );
+    let repo = Repo::new(format!("datasets/{hf_repo}"), RepoType::Model);
 
     let api_repo = hf_api.repo(repo);
 

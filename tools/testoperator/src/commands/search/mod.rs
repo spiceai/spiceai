@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 mod dataset;
-mod mteb_quora;
+mod mteb;
 use self::dataset::SearchDataset;
 use super::{duration_millis_between, get_app_and_start_request};
 use crate::{args::SearchTestArgs, health::HealthMonitor};
