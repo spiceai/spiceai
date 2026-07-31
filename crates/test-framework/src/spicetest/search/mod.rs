@@ -203,7 +203,7 @@ impl SpiceTest<Completed> {
     {
         let transformed_results = transform(&self.state.search_results);
         // Matches MTEB's methodology of evaluating retrieval quality at rank cutoff 10.
-        Ok(calculate_retrieval_metrics(qrels, &transformed_results, 10))
+        calculate_retrieval_metrics(qrels, &transformed_results, 10)
     }
 }
 
