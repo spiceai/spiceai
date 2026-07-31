@@ -79,7 +79,7 @@ pub struct CloudConnectConfig {
     pub enroll_endpoint: String,
 
     /// Optional explicit gateway (stream) endpoint override, e.g.
-    /// `https://connect.aws.spiceai.io:7320`. When `None` (the default),
+    /// `https://connect.aws.spiceai.io:443`. When `None` (the default),
     /// the stream connects to the `gateway_addr` returned by the enroll
     /// response and persisted in the identity. Mainly for tests and
     /// self-hosted control planes.
