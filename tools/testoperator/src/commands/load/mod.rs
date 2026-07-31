@@ -44,6 +44,9 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
             "Concurrency should be greater than 1 for a load test"
         ));
     }
+    // Surface a bad --client-connections/--connection-count combination now,
+    // not after the ready-wait.
+    super::resolve_client_connection_count(&args.test_args, args.test_args.common.concurrency)?;
 
     // Warn if api_key is set but not connecting to an external instance
     if args.api_key.is_some() && !args.test_args.common.is_external_instance() {
@@ -133,6 +136,17 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     // Create the appropriate query executor based on args
     let executor = super::create_query_executor(&args.test_args, &spiced_instance).await?;
 
+    // With `--client-connections per-client`/`pooled`, the concurrent clients
+    // spread across dedicated connections, reused across the warm-up,
+    // baseline, and load phases. Empty in the default `shared` mode.
+    let client_executors = super::create_client_executors(
+        &args.test_args,
+        &spiced_instance,
+        args.test_args.common.concurrency,
+    )
+    .await?;
+    super::announce_connection_topology(&client_executors, args.test_args.common.concurrency);
+
     // warm up run
     println!("Performing warm up");
 
@@ -143,6 +157,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
             .with_parallel_count(args.test_args.common.concurrency)
             .with_end_condition(EndCondition::QuerySetCompleted(1))
             .with_query_executor(executor.clone())
+            .with_query_executors(client_executors.clone())
             .with_validate(args.test_args.validate),
     )
     .await?;
@@ -171,6 +186,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
             .with_parallel_count(args.test_args.common.concurrency)
             .with_end_condition(EndCondition::Duration(baseline_duration))
             .with_query_executor(executor.clone())
+            .with_query_executors(client_executors.clone())
             .with_validate(args.test_args.validate),
     )
     .await?;
@@ -216,6 +232,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         .with_parallel_count(args.test_args.common.concurrency)
         .with_end_condition(load_end_condition)
         .with_query_executor(executor)
+        .with_query_executors(client_executors)
         .with_query_duration_threshold(args.test_args.mark_query_failed_if_exceeds)
         .with_validate(args.test_args.validate);
 

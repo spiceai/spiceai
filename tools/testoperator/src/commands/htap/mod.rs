@@ -70,6 +70,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
              Use '--query-set chbench' or run 'testoperator run bench' for other query sets."
         );
     }
+    super::ensure_shared_client_connections(test_args, "htap")?;
 
     // Always enable the metrics endpoint in HTAP mode for replication metrics.
     if !test_args.common.scrape_spiced_metrics {

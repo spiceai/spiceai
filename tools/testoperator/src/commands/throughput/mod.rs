@@ -37,6 +37,9 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
             "Concurrency should be greater than 1 for a throughput test"
         ));
     }
+    // Surface a bad --client-connections/--connection-count combination now,
+    // not after the ready-wait.
+    super::resolve_client_connection_count(args, args.common.concurrency)?;
 
     let (app, spiced_instance, system_adapter_session) = if args.common.is_system_adapter() {
         let app = load_app(&args.common).await?;
@@ -102,13 +105,21 @@ async fn run_inner(
     // throughput test
     println!("Running throughput test");
 
+    // With `--client-connections per-client`/`pooled`, the concurrent clients
+    // spread across dedicated connections; the baseline above intentionally
+    // stays on the shared executor (it runs a single client).
+    let client_executors =
+        super::create_client_executors(args, &spiced_instance, args.common.concurrency).await?;
+    super::announce_connection_topology(&client_executors, args.common.concurrency);
+
     let (_query_set, test_builder) = super::build_test_with_validation(
         args,
         &app,
         NotStarted::new()
             .with_parallel_count(args.common.concurrency)
             .with_end_condition(EndCondition::QuerySetCompleted(2))
-            .with_query_executor(executor),
+            .with_query_executor(executor)
+            .with_query_executors(client_executors),
     )
     .await?;
 

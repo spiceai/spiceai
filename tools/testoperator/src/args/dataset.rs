@@ -114,6 +114,38 @@ pub struct DatasetTestArgs {
     /// Useful for identifying slow queries that should be treated as failures in metrics.
     #[arg(long, value_parser = parse_duration)]
     pub(crate) mark_query_failed_if_exceeds: Option<std::time::Duration>,
+
+    /// How concurrent clients connect to spiced: `shared` multiplexes every client
+    /// over one connection; `per-client` opens a dedicated connection per client,
+    /// matching a fleet of independent clients (use for connection-scale load tests);
+    /// `pooled` shares a fixed number of connections (see `--connection-count`),
+    /// simulating client machines that each run a thread pool over one connection.
+    #[arg(long, value_enum, default_value = "shared")]
+    pub(crate) client_connections: ClientConnectionsArg,
+
+    /// Number of connections for `--client-connections pooled` — one per simulated
+    /// client machine. The `--concurrency` clients are distributed evenly across
+    /// them (e.g. concurrency 12800 over 100 connections simulates 100 machines,
+    /// each a 128-thread pool multiplexing one connection).
+    #[arg(long, required_if_eq("client_connections", "pooled"))]
+    pub(crate) connection_count: Option<usize>,
+}
+
+/// How concurrent test clients connect to the spiced endpoint under test.
+#[derive(Clone, Copy, ValueEnum, Debug, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientConnectionsArg {
+    /// All clients share one connection (gRPC channel for Flight, one HTTP pool),
+    /// multiplexing queries over it.
+    #[default]
+    Shared,
+    /// Every client opens its own connection, so concurrency N exercises N real
+    /// connections on the server.
+    PerClient,
+    /// Clients share `--connection-count` connections round-robin: concurrency
+    /// X*Y with connection count X simulates X client machines, each running a
+    /// Y-thread pool over its own connection.
+    Pooled,
 }
 
 #[derive(Clone, ValueEnum, Debug, Deserialize, Serialize)]
