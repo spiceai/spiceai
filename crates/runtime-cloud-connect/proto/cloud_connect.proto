@@ -141,6 +141,7 @@ message ClientMessage {
     EventLog event = 5;
     AdoptAck adopt_ack = 6;
     SecretsKey secrets_key = 7;
+    ExportMetrics export_metrics = 8;
   }
 }
 
@@ -170,15 +171,14 @@ message ControlMessage {
     Pause pause = 13;
     ApplySecrets apply_secrets = 14;
     DeleteSecrets delete_secrets = 15;
-    QueryMetrics query_metrics = 16;
   }
 
   // Correlates the eventual `CommandResult`. Empty for an unsolicited
   // message that expects no reply.
-  string command_id = 17;
+  string command_id = 16;
   // The workload the command addresses, for the commands that address one.
   // Absent for a standalone instance, which is the workload.
-  WorkloadRef target = 18;
+  WorkloadRef target = 17;
 }
 
 // Addresses a workload inside a cluster instance. `kind` is a Kubernetes
@@ -414,14 +414,20 @@ message SecretPayload {
   map<string, bytes> string_data = 1;
 }
 
-// Operator-only (reserved). QueryMetrics proxies a PromQL range query to the
-// Prometheus deployed alongside the operator in the customer cluster, so the
-// control plane can serve monitoring charts without reaching customer
-// infrastructure directly. The operator returns the Prometheus query_range
-// JSON response verbatim in CommandResult.payload.json.
-message QueryMetrics {
-  string promql = 1;
-  google.protobuf.Timestamp start = 2;
-  google.protobuf.Timestamp end = 3;
-  string step = 4;
+// Pushes metrics from the runtime to the control plane.
+//
+// Unsolicited: the runtime exports on its own cadence rather than answering a
+// command, so this rides on ClientMessage with no command_id and draws no
+// CommandResult. Nothing emits it yet.
+//
+// `otlp_request` is a serialized
+// `opentelemetry.proto.collector.metrics.v1.ExportMetricsServiceRequest` in
+// protobuf binary encoding — byte-for-byte what an OTLP/gRPC exporter sends —
+// so the control plane can hand it to an OTLP pipeline without transcoding.
+// Carried as bytes rather than an imported message so this contract does not
+// pin a version of the OpenTelemetry protos, and so the runtime can forward
+// what its exporter already produced instead of re-encoding it.
+message ExportMetrics {
+  string identifier = 1;
+  bytes otlp_request = 2;
 }

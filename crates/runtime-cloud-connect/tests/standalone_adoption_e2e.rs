@@ -470,11 +470,13 @@ impl CloudConnect for GatewayServer {
                             captured.lock().await.audits.push(event);
                         }
                     }
-                    // A standalone runtime announces no per-connection
-                    // encryption key, so this never arrives. The arm is spelled
-                    // out rather than wildcarded so a new client message still
-                    // has to be accounted for here.
+                    // Neither of these is emitted yet: a standalone runtime
+                    // announces no per-connection encryption key, and nothing
+                    // pushes OTLP metrics. The arms are spelled out rather than
+                    // wildcarded so a new client message still has to be
+                    // accounted for here.
                     Some(proto::client_message::Body::SecretsKey(_)) => {}
+                    Some(proto::client_message::Body::ExportMetrics(_)) => {}
                     None => break,
                 }
             }
