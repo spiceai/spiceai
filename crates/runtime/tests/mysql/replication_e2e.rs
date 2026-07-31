@@ -749,8 +749,12 @@ async fn mysql_scalar_i64(pool: &mysql_async::Pool, sql: &str) -> Result<i64, an
         .ok_or_else(|| anyhow!("no rows from source query `{sql}`"))
 }
 
-/// Apply `rounds` updates to every row, incrementing `update_count` each time.
-async fn apply_updates(pool: &mysql_async::Pool, rounds: i64) -> Result<(), anyhow::Error> {
+/// Bump every `repl_counters` row `rounds` times, one statement per row so each
+/// update is its own transaction. `MySQL` emits one envelope per transaction per
+/// table, so single-row transactions give the pump many envelopes to coalesce; a
+/// set-based `UPDATE` per round would produce a fraction of them and lose the
+/// overlap this test depends on.
+async fn bump_counter_rows(pool: &mysql_async::Pool, rounds: i64) -> Result<(), anyhow::Error> {
     for round in 0..rounds {
         for id in 1..=RECONNECT_ROWS {
             exec(
@@ -766,18 +770,17 @@ async fn apply_updates(pool: &mysql_async::Pool, rounds: i64) -> Result<(), anyh
     Ok(())
 }
 
-/// Killing the dump connection mid-stream makes the pump reconnect and resume
-/// from the shared minimum position, so every change it had delivered but not
-/// yet durably applied is re-sent. Re-applying an *older* image of a row it has
-/// already advanced past would leave the accelerator silently stale: the row
-/// count still matches, and only an aggregate over an incrementing column
-/// reveals it. This drives that path against a table where every update is
-/// countable, so convergence is exact or the test fails.
+/// Killing the dump connection mid-stream forces the pump to resume from its ack
+/// floor, the one moment updates can go missing. Changes delivered but not yet
+/// durably applied are re-sent from that floor: if the floor has advanced past
+/// them they are lost, and if a re-sent older image lands over a newer one the
+/// row goes stale. Both leave the row count correct, so only an aggregate sees
+/// them — every update here is worth `+1`, which makes the final `SUM` exact, and
+/// `MIN` catches one row left behind even if another offsets the sum.
 ///
-/// Coalescing is pinned wide (prefetch and envelope caps at their maxima, plus a
-/// linger) because that is the configuration a `stock` content divergence was
-/// first seen under at SF1000 — a wide burst is where several versions of one
-/// primary key end up in a single write.
+/// Coalescing is pinned wide so the consumer is holding a batch of not-yet-durable
+/// updates when the kill lands, and because it is the configuration the SF1000
+/// `stock` divergence appeared under.
 #[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn mysql_binlog_replication_survives_a_dump_reconnect_cayenne() -> Result<(), anyhow::Error> {
@@ -862,12 +865,12 @@ async fn mysql_binlog_replication_survives_a_dump_reconnect_cayenne() -> Result<
             let dump_thread = wait_for_binlog_dump_thread(&pool).await?;
 
             let half = RECONNECT_UPDATES_PER_ROW / 2;
-            apply_updates(&pool, half).await?;
+            bump_counter_rows(&pool, half).await?;
 
             // Kill the dump connection mid-stream, then keep writing so the
             // replay window overlaps live traffic.
             exec(&pool, &format!("KILL {dump_thread}")).await?;
-            apply_updates(&pool, RECONNECT_UPDATES_PER_ROW - half).await?;
+            bump_counter_rows(&pool, RECONNECT_UPDATES_PER_ROW - half).await?;
             wait_for_dump_thread_change(&pool, dump_thread).await?;
 
             // Every update is worth exactly +1, so the source total is the
@@ -941,11 +944,11 @@ const TYPES_SEED: &[&str] = &[
         'abcd', 'varbinary', 'tiny', 'blob', 'medium', 'long',
         'tinytext', 'text', b'101010101', 'beta', 'x,z', '{"k": 7}')"#,
     // The signed minimum and unsigned maximum at each width. `c_big_u` stops at
-    // i64::MAX; see the note on the test.
+    // i64::MAX and `c_time` at the end of the day; see the note on the test.
     r"INSERT INTO repl_types VALUES (2,
         -128, 255, -32768, 65535, -8388608, 16777215, -2147483648, 4294967295,
         -9223372036854775808, 9223372036854775807, 0, 0, -9999.99, -99999999999.99999999,
-        '1000-01-01', '-838:59:59.000', '1000-01-01 00:00:00.000000',
+        '1000-01-01', '23:59:59.999', '1000-01-01 00:00:00.000000',
         '1970-01-02 00:00:01.000', 1901,
         '', '', '', '',
         '\0\0\0\0', '', '', '', '', '', '', '',
@@ -1020,6 +1023,17 @@ const TYPES_CHECKS: &[(&str, i64)] = &[
         1,
     ),
     ("SELECT CAST(c_year AS BIGINT) FROM types WHERE t_id = 1", 2026),
+    // `TIME` as nanoseconds since midnight, which is exact and independent of
+    // how either engine formats the value: 12:34:56.789 and the last
+    // millisecond of the day.
+    (
+        "SELECT CAST(c_time AS BIGINT) FROM types WHERE t_id = 1",
+        45_296_789_000_000,
+    ),
+    (
+        "SELECT CAST(c_time AS BIGINT) FROM types WHERE t_id = 2",
+        86_399_999_000_000,
+    ),
     // Strings: the 1-byte and 2-byte VARCHAR length prefixes, and a multi-byte
     // charset where character count and byte count differ.
     (
@@ -1035,27 +1049,38 @@ const TYPES_CHECKS: &[(&str, i64)] = &[
         1,
     ),
     ("SELECT count(*) FROM types WHERE c_char = 'char'", 1),
-    // Every blob length width (1, 2, 3 and 4 byte prefixes). `octet_length`
-    // rather than `character_length`, since these arrive as binary.
+    // Every blob length width (1, 2, 3 and 4 byte prefixes), plus the binary
+    // string types. A misread length prefix changes the bytes, so comparing the
+    // value covers the prefix too. The cast normalizes `Binary`, `LargeBinary`,
+    // `Utf8` and `LargeUtf8`, which is how the four widths and the binary flag
+    // land in Arrow; every value here is ASCII, so the cast is exact.
     (
-        "SELECT CAST(octet_length(c_tinyblob) AS BIGINT) FROM types WHERE t_id = 1",
-        4,
+        "SELECT count(*) FROM types WHERE CAST(c_tinyblob AS VARCHAR) = 'tiny'",
+        1,
     ),
     (
-        "SELECT CAST(octet_length(c_blob) AS BIGINT) FROM types WHERE t_id = 1",
-        4,
+        "SELECT count(*) FROM types WHERE CAST(c_blob AS VARCHAR) = 'blob'",
+        1,
     ),
     (
-        "SELECT CAST(octet_length(c_medblob) AS BIGINT) FROM types WHERE t_id = 1",
-        6,
+        "SELECT count(*) FROM types WHERE CAST(c_medblob AS VARCHAR) = 'medium'",
+        1,
     ),
     (
-        "SELECT CAST(octet_length(c_longblob) AS BIGINT) FROM types WHERE t_id = 1",
-        4,
+        "SELECT count(*) FROM types WHERE CAST(c_longblob AS VARCHAR) = 'long'",
+        1,
     ),
     (
-        "SELECT CAST(octet_length(c_bin) AS BIGINT) FROM types WHERE t_id = 1",
-        4,
+        "SELECT count(*) FROM types WHERE CAST(c_bin AS VARCHAR) = 'abcd'",
+        1,
+    ),
+    (
+        "SELECT count(*) FROM types WHERE CAST(c_varbin AS VARCHAR) = 'varbinary'",
+        1,
+    ),
+    (
+        "SELECT count(*) FROM types WHERE CAST(c_tinytext AS VARCHAR) = 'tinytext'",
+        1,
     ),
     ("SELECT count(*) FROM types WHERE c_text = 'text'", 1),
     // Values resolved from table-map metadata rather than the wire type: the
@@ -1078,10 +1103,13 @@ const TYPES_CHECKS: &[(&str, i64)] = &[
 /// capture happens to contain — CH-benCH has no unsigned, blob, `BIT`, `ENUM`,
 /// `SET` or `JSON` column — so this is what pins the wire format for the rest.
 ///
-/// `c_big_u` deliberately stops at `i64::MAX`: the accelerator column is a
-/// signed 64-bit integer, so a larger `BIGINT UNSIGNED` has nowhere to go. What
-/// the decoder should do there is a separate question from whether it decodes
-/// the types it can represent.
+/// Two columns stop short of MySQL's range on purpose, because the Arrow type
+/// cannot hold it and what the decoder *should* do there is a separate question
+/// from whether it decodes the types it can represent: `c_big_u` stops at
+/// `i64::MAX`, and `c_time` at the end of the day, since `Time64` is a
+/// time-of-day while `MySQL` `TIME` spans ±838 hours. Negative `TIME` is
+/// rejected with a structured error, covered by `negative_time_errors` in
+/// `data_components::mysql_replication::rows`.
 #[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn mysql_binlog_replication_decodes_every_column_type_cayenne() -> Result<(), anyhow::Error> {
