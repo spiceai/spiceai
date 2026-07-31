@@ -199,7 +199,7 @@ jobs:
 
   test_openai_model:
     name: 'openai model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
-    timeout-minutes: 5
+    timeout-minutes: 10
     runs-on: ${{ matrix.target.runner }}
     needs:
       - build
@@ -259,16 +259,19 @@ jobs:
           fi
 
       - name: Test the expect scripts driving the REPLs
-        run: |
-          ./test/models/expect_test.sh
+        env:
+          SPICE_REPL_TIMEOUT_SECONDS: 60
+        run: ./test/models/expect_test.sh
 
       - name: Test vector search
-        run: |
-          ./test/models/search_01.exp
+        env:
+          SPICE_REPL_TIMEOUT_SECONDS: 30
+        run: ./test/models/search_01.exp
 
       - name: Test chat
-        run: |
-          ./test/models/chat_01.exp
+        env:
+          SPICE_REPL_TIMEOUT_SECONDS: 60
+        run: ./test/models/chat_01.exp
 
       - name: Stop spice and check logs
         if: always()
@@ -349,16 +352,19 @@ jobs:
           fi
 
       - name: Test the expect scripts driving the REPLs
-        run: |
-          ./test/models/expect_test.sh
+        env:
+          SPICE_REPL_TIMEOUT_SECONDS: 60
+        run: ./test/models/expect_test.sh
 
       - name: Test vector search
-        run: |
-          ./test/models/search_01.exp
+        env:
+          SPICE_REPL_TIMEOUT_SECONDS: 30
+        run: ./test/models/search_01.exp
 
       - name: Test chat
-        run: |
-          ./test/models/chat_01_simple.exp
+        env:
+          SPICE_REPL_TIMEOUT_SECONDS: 60
+        run: ./test/models/chat_01_simple.exp
 
       - name: Stop spice and check logs
         if: always()

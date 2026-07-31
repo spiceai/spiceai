@@ -205,6 +205,31 @@ assert_status 0
 assert_reports 'REACHED THE END'
 assert_silent_about 'no longer running'
 
+# CI can give live model operations a longer deadline without slowing down the
+# stand-in tests. Invalid values must fail before a REPL is spawned.
+helper_case 'uses a configured response timeout' '
+set ::env(SPICE_REPL_TIMEOUT_SECONDS) 17
+if {[repl_timeout 5] != 17} {
+    send_user "WRONG TIMEOUT\n"
+    exit 1
+}
+send_user "CONFIGURED TIMEOUT USED\n"
+exit 0
+'
+assert_status 0
+assert_reports 'CONFIGURED TIMEOUT USED'
+assert_silent_about 'WRONG TIMEOUT'
+
+helper_case 'rejects an invalid response timeout' '
+set ::env(SPICE_REPL_TIMEOUT_SECONDS) invalid
+repl_timeout 5
+send_user "REACHED THE END\n"
+exit 0
+'
+assert_status 2
+assert_reports 'SPICE_REPL_TIMEOUT_SECONDS must be a positive integer'
+assert_silent_about 'REACHED THE END'
+
 # ---------------------------------------------------------------------------
 # The E2E scripts themselves, driven against a stand-in `spice`
 # ---------------------------------------------------------------------------

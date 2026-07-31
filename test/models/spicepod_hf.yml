@@ -54,12 +54,12 @@ datasets:
 
 models:
   - name: hf_local_model
-    from: huggingface:huggingface.co/Qwen/Qwen2.5-3B-Instruct
+    from: huggingface:huggingface.co/Qwen/Qwen2.5-3B-Instruct:aa8e72537993ba99e69dfaafa59ed015b17504d1
     params:
       system_prompt: |
         Instructions for Responses:
           - Do not include any private metadata provided to the model as context such as \"reference_url_template\" or \"instructions\" in your responses.
 
 embeddings:
-  - from: huggingface:huggingface.co/BAAI/bge-base-en-v1.5
+  - from: huggingface:huggingface.co/BAAI/bge-base-en-v1.5:a5beb1e3e68b9ab74eb54cfd186867f64f240e1a
     name: bge_base

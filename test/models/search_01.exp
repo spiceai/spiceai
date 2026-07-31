@@ -3,7 +3,7 @@
 source [file join [file dirname [info script]] repl_helpers.exp]
 
 # spiced runtime response timeout
-set timeout 5
+set timeout [repl_timeout 5]
 
 spawn spice search
 
@@ -29,7 +29,7 @@ proc perform_search {search_term expected_term} {
             repl_died "Searching for \"$search_term\""
         }
         timeout {
-            send_user "Timeout waiting for expected response\n"
+            send_user "Timeout waiting for search results for \"$search_term\" after $timeout seconds\n"
             exit 1
         }
     }
@@ -46,7 +46,7 @@ proc expect_search_prompt {} {
             repl_died "Waiting for the search prompt"
         }
         timeout {
-            send_user "Timeout waiting for search prompt\n"
+            send_user "Timeout waiting for search prompt after $timeout seconds\n"
             exit 1
         }
     }

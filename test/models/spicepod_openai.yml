@@ -53,7 +53,7 @@ datasets:
         use: openai_embeddings
 
 models:
-  - from: openai:gpt-4o-mini
+  - from: openai:gpt-4o-mini-2024-07-18
     name: openai-gpt
     params:
       spice_tools: auto

@@ -3,9 +3,9 @@
 source [file join [file dirname [info script]] repl_helpers.exp]
 
 # Runtime response timeout
-set timeout 30
+set timeout [repl_timeout 30]
 
-spawn spice chat
+spawn spice chat --temperature 0
 
 proc chat {message}  {
     global timeout
@@ -26,7 +26,7 @@ proc chat {message}  {
             repl_died "Waiting for the response to \"$message\""
         }
         timeout {
-            send_user "Timeout waiting for expected response\n"
+            send_user "Timeout waiting for the response to \"$message\" after $timeout seconds\n"
             exit 1
         }
     }
@@ -43,7 +43,7 @@ expect {
         repl_died "Waiting for the initial chat prompt"
     }
     timeout {
-        send_user "Timeout waiting for initial chat prompt\n"
+        send_user "Timeout waiting for initial chat prompt after $timeout seconds\n"
         exit 1
     }
 }

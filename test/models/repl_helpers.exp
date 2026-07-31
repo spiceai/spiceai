@@ -11,6 +11,21 @@
 # Every `expect` block in these scripts therefore needs an `eof` branch calling
 # `repl_died`, and every `send` goes through `repl_send`.
 
+# Returns the configured response timeout, or the script-specific default.
+proc repl_timeout {default_timeout} {
+    if {![info exists ::env(SPICE_REPL_TIMEOUT_SECONDS)]} {
+        return $default_timeout
+    }
+
+    set configured_timeout $::env(SPICE_REPL_TIMEOUT_SECONDS)
+    if {![string is integer -strict $configured_timeout] || $configured_timeout <= 0} {
+        send_user "SPICE_REPL_TIMEOUT_SECONDS must be a positive integer, got \"$configured_timeout\"\n"
+        exit 2
+    }
+
+    return $configured_timeout
+}
+
 # Renders text passed to `repl_send` for a diagnostic message.
 proc repl_render {text} {
     return [string map [list "\r" "" "\x03" "<Ctrl-C>"] $text]
