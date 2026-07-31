@@ -475,8 +475,10 @@ impl CloudConnect for GatewayServer {
                     // pushes OTLP metrics. The arms are spelled out rather than
                     // wildcarded so a new client message still has to be
                     // accounted for here.
-                    Some(proto::client_message::Body::SecretsKey(_)) => {}
-                    Some(proto::client_message::Body::ExportMetrics(_)) => {}
+                    Some(
+                        proto::client_message::Body::SecretsKey(_)
+                        | proto::client_message::Body::ExportMetrics(_),
+                    ) => {}
                     None => break,
                 }
             }
