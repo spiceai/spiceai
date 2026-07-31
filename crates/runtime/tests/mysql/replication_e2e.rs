@@ -51,8 +51,7 @@ use tokio::time::sleep;
 
 use crate::mysql::common;
 use crate::utils::{
-    register_test_connectors, run_query, runtime_ready_check, test_request_context,
-    wait_until_true,
+    register_test_connectors, run_query, runtime_ready_check, test_request_context, wait_until_true,
 };
 use crate::{configure_test_datafusion, init_tracing};
 
@@ -873,19 +872,22 @@ async fn mysql_binlog_replication_survives_a_dump_reconnect_cayenne() -> Result<
 
             // Every update is worth exactly +1, so the source total is the
             // yardstick: a stale image winning anywhere leaves Spice short.
-            let expected_total =
-                mysql_scalar_i64(
-                    &pool,
-                    "SELECT CAST(SUM(update_count) AS SIGNED) FROM repl_counters",
-                )
-                .await?;
+            let expected_total = mysql_scalar_i64(
+                &pool,
+                "SELECT CAST(SUM(update_count) AS SIGNED) FROM repl_counters",
+            )
+            .await?;
             assert_eq!(
                 expected_total,
                 RECONNECT_ROWS * RECONNECT_UPDATES_PER_ROW,
                 "the workload must have applied every update on the source"
             );
-            wait_for_scalar_i64(&rt, "SELECT SUM(update_count) FROM counters", expected_total)
-                .await?;
+            wait_for_scalar_i64(
+                &rt,
+                "SELECT SUM(update_count) FROM counters",
+                expected_total,
+            )
+            .await?;
             assert_eq!(
                 scalar_i64(&rt, "SELECT min(update_count) FROM counters").await?,
                 RECONNECT_UPDATES_PER_ROW,
@@ -963,9 +965,18 @@ const TYPES_CHECKS: &[(&str, i64)] = &[
     // Signed columns keep their sign; unsigned columns above the signed range
     // are the case that silently corrupts if the table map's signedness block
     // is ever misread.
-    ("SELECT CAST(c_tiny AS BIGINT) FROM types WHERE t_id = 1", -12),
-    ("SELECT CAST(c_tiny_u AS BIGINT) FROM types WHERE t_id = 1", 200),
-    ("SELECT CAST(c_small_u AS BIGINT) FROM types WHERE t_id = 1", 60000),
+    (
+        "SELECT CAST(c_tiny AS BIGINT) FROM types WHERE t_id = 1",
+        -12,
+    ),
+    (
+        "SELECT CAST(c_tiny_u AS BIGINT) FROM types WHERE t_id = 1",
+        200,
+    ),
+    (
+        "SELECT CAST(c_small_u AS BIGINT) FROM types WHERE t_id = 1",
+        60000,
+    ),
     (
         "SELECT CAST(c_medium_u AS BIGINT) FROM types WHERE t_id = 1",
         16_000_000,
@@ -978,8 +989,14 @@ const TYPES_CHECKS: &[(&str, i64)] = &[
         "SELECT CAST(c_big AS BIGINT) FROM types WHERE t_id = 1",
         -5_000_000_000,
     ),
-    ("SELECT CAST(c_tiny AS BIGINT) FROM types WHERE t_id = 2", -128),
-    ("SELECT CAST(c_tiny_u AS BIGINT) FROM types WHERE t_id = 2", 255),
+    (
+        "SELECT CAST(c_tiny AS BIGINT) FROM types WHERE t_id = 2",
+        -128,
+    ),
+    (
+        "SELECT CAST(c_tiny_u AS BIGINT) FROM types WHERE t_id = 2",
+        255,
+    ),
     (
         "SELECT CAST(c_medium_u AS BIGINT) FROM types WHERE t_id = 2",
         16_777_215,
@@ -1020,7 +1037,10 @@ const TYPES_CHECKS: &[(&str, i64)] = &[
         "SELECT count(*) FROM types WHERE c_ts = TIMESTAMP '2026-07-30 12:34:56.123'",
         1,
     ),
-    ("SELECT CAST(c_year AS BIGINT) FROM types WHERE t_id = 1", 2026),
+    (
+        "SELECT CAST(c_year AS BIGINT) FROM types WHERE t_id = 1",
+        2026,
+    ),
     // `TIME` as nanoseconds since midnight, which is exact and independent of
     // how either engine formats the value: 12:34:56.789 and the last
     // millisecond of the day.
@@ -1042,10 +1062,7 @@ const TYPES_CHECKS: &[(&str, i64)] = &[
         "SELECT CAST(character_length(c_utf) AS BIGINT) FROM types WHERE t_id = 1",
         7,
     ),
-    (
-        "SELECT count(*) FROM types WHERE c_varchar = 'varchar'",
-        1,
-    ),
+    ("SELECT count(*) FROM types WHERE c_varchar = 'varchar'", 1),
     ("SELECT count(*) FROM types WHERE c_char = 'char'", 1),
     // Every blob length width (1, 2, 3 and 4 byte prefixes), plus the binary
     // string types. A misread length prefix changes the bytes, so comparing the
@@ -1087,7 +1104,10 @@ const TYPES_CHECKS: &[(&str, i64)] = &[
     ("SELECT count(*) FROM types WHERE c_enum = 'beta'", 1),
     ("SELECT count(*) FROM types WHERE c_enum = 'alpha'", 1),
     ("SELECT count(*) FROM types WHERE c_set = 'x,z'", 1),
-    ("SELECT CAST(c_bit AS BIGINT) FROM types WHERE t_id = 1", 341),
+    (
+        "SELECT CAST(c_bit AS BIGINT) FROM types WHERE t_id = 1",
+        341,
+    ),
     // The all-NULL row: every nullable column is NULL, and the primary key is
     // still readable.
     ("SELECT count(c_tiny) FROM types", 2),
@@ -1170,11 +1190,7 @@ async fn mysql_binlog_replication_decodes_every_column_type_cayenne() -> Result<
             // so waiting on it here covers the whole list settling.
             wait_for_scalar_i64(&rt, TYPES_CHECKS[0].0, TYPES_CHECKS[0].1).await?;
             for (sql, expected) in TYPES_CHECKS {
-                assert_eq!(
-                    scalar_i64(&rt, sql).await?,
-                    *expected,
-                    "snapshot: `{sql}`"
-                );
+                assert_eq!(scalar_i64(&rt, sql).await?, *expected, "snapshot: `{sql}`");
             }
 
             // Then the same values again through the binlog INSERT path.
