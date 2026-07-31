@@ -29,7 +29,9 @@ use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder};
 use runtime_datafusion_index::Index;
 use snafu::ResultExt;
 use tantivy::merge_policy::LogMergePolicy;
-use tantivy::schema::{DocParsingError, SchemaBuilder};
+use tantivy::schema::{
+    DocParsingError, IndexRecordOption, SchemaBuilder, TextFieldIndexing, TextOptions,
+};
 use tantivy::{TantivyDocument, TantivyError};
 use tokio::sync::Mutex;
 
@@ -48,6 +50,18 @@ use crate::index::SearchIndex;
 /// significantly improving bulk-indexing throughput.
 pub static MEMORY_BUDGET_FOR_INDEX_WRITER: usize = 150 * 1024 * 1024;
 pub static INDEX_UNIQUE_FIELD_NAME: &str = "__spice.unique_field";
+
+/// Tantivy's built-in English Snowball-stemmed tokenizer.
+static EN_STEM_TOKENIZER_NAME: &str = "en_stem";
+
+/// A [`TextOptions`] for [`tantivy::schema::TEXT`] with [`EN_STEM_TOKENIZER_NAME`] tokenization.
+fn tokenized_text_options() -> TextOptions {
+    TextOptions::default().set_indexing_options(
+        TextFieldIndexing::default()
+            .set_index_option(IndexRecordOption::WithFreqsAndPositions)
+            .set_tokenizer(EN_STEM_TOKENIZER_NAME),
+    )
+}
 
 /// The fraction of a tantivy segment's documents that may be superseded/deleted, but
 /// still physically present, before the segment is rewritten by a merge.
@@ -141,6 +155,12 @@ impl Index for FullTextDatabaseIndex {
             return Err(DataFusionError::External(Box::new(e)));
         }
         Ok(batches)
+    }
+
+    async fn delete_by_keys(&self, keys: RecordBatch) -> Result<(), DataFusionError> {
+        self.delete_terms_for(&keys)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))
     }
 
     fn write_complete_failure_is_fatal(&self) -> bool {
@@ -430,6 +450,49 @@ impl FullTextDatabaseIndex {
         })
     }
 
+    /// Deletes every document whose primary key matches a row of `keys` — the tantivy
+    /// counterpart of `update_index`'s delete-then-insert, minus the insert.
+    async fn delete_terms_for(&self, keys: &RecordBatch) -> Result<(), super::Error> {
+        let rb = if self.primary_key.len() > 1 {
+            vec![with_json_subset_column(
+                keys,
+                &self.primary_key,
+                INDEX_UNIQUE_FIELD_NAME,
+            )
+            .context(InvalidIndexingSnafu {
+                context: "An error occurred creating the unique column for the full text search index".to_string(),
+            })?]
+        } else {
+            vec![keys.clone()]
+        };
+
+        let index_schema = self.reader.searcher().schema().clone();
+        let terms_to_delete = self.existing_terms_to_delete(&index_schema, &rb)?;
+        if terms_to_delete.is_empty() {
+            return Ok(());
+        }
+
+        let mut index_writer = self.writer.lock().await;
+        for t in terms_to_delete {
+            index_writer.delete_term(t);
+        }
+        let commit_result = index_writer
+            .commit()
+            .context(FailedToInsertDataIntoIndexSnafu);
+        if let Err(e) = &commit_result {
+            tracing::warn!("Rolling back index writer after failed delete commit: {e}");
+            if let Err(rb_err) = index_writer.rollback() {
+                tracing::error!("Failed to rollback index writer: {rb_err}");
+            }
+        }
+        drop(index_writer);
+        commit_result?;
+
+        self.reader.reload().boxed().context(InvalidIndexingSnafu {
+            context: "Deleted from full-text index, but failed to update search path to reference the latest commit. Queries may still return deleted rows until the next update.".to_string(),
+        })
+    }
+
     #[must_use]
     pub fn as_arc_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
         self
@@ -550,7 +613,7 @@ impl FullTextDatabaseIndex {
         }
 
         for s in search_fields {
-            let mut text_opts = tantivy::schema::TEXT;
+            let mut text_opts = tokenized_text_options();
             if store_field.contains(s) || primary_key.contains(s) {
                 text_opts = text_opts | tantivy::schema::STORED;
             }

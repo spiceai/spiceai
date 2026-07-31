@@ -43,6 +43,22 @@ const CONNECTION_CONTEXT_FILTER_PATTERN: &str =
     r"compute_context=host=[^, ]+,port=\d+(?:,db=[^, ]+)?(?:,user=[^, ]+)?,?";
 const CONNECTION_CONTEXT_FILTER_REPLACEMENT: &str = "compute_context=<CONNECTION>";
 
+/// The same normalization for connectors that render their compute context as an
+/// endpoint URL rather than `host=…,port=…`, which the pattern above cannot match:
+///
+/// - Dremio — `url=grpc://<host>:<port>,username=<user>`
+/// - Spark Connect — `sc://<host>:<port>/;user_id=<user>;x-databricks-cluster-id=…`
+/// - Spice Cloud — `url=https://<host>,username=…,org=…,app=…`
+///
+/// Each of these embeds a host, a port, and often a username or workspace/cluster
+/// identifier, so an otherwise-identical plan compares unequal across environments —
+/// a renamed service, a different workspace, or a dev versus prod endpoint. None of
+/// them contains whitespace, and every one is followed by a space before the next
+/// plan field (`base_sql=`), so matching a non-whitespace run is bounded by the field
+/// itself and cannot reach into the pushed-down SQL.
+const ENDPOINT_CONTEXT_FILTER_PATTERN: &str = r"compute_context=(?:url=|sc://)\S+";
+const ENDPOINT_CONTEXT_FILTER_REPLACEMENT: &str = CONNECTION_CONTEXT_FILTER_REPLACEMENT;
+
 /// Queries temporarily excluded from explain-plan snapshot validation because their
 /// plans are not yet stable enough to snapshot deterministically.
 const EXPLAIN_SNAPSHOT_SKIP_LIST: &[&str] = &["chbench_q5"];
@@ -65,6 +81,10 @@ fn build_explain_filters(temp_dir: &std::path::Path) -> Vec<(String, &'static st
         (
             CONNECTION_CONTEXT_FILTER_PATTERN.to_string(),
             CONNECTION_CONTEXT_FILTER_REPLACEMENT,
+        ),
+        (
+            ENDPOINT_CONTEXT_FILTER_PATTERN.to_string(),
+            ENDPOINT_CONTEXT_FILTER_REPLACEMENT,
         ),
         (r"required_guarantees=\[[^\]]*\]".to_string(), "required_guarantees=[N]"),
         (r"partition_sizes=\[[^\]]*\]".to_string(), "partition_sizes=[<redacted>]"),
@@ -479,6 +499,51 @@ mod tests {
         // The anchor `,port=\d+` prevents the greedy host match from consuming the
         // pushed-down SQL when there is no connection context to redact.
         let input = "DuckSqlExec compute_context=./data/tpch.db sql=SELECT a, b FROM t";
+        assert_eq!(regex.replace_all(input, replacement), input);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_endpoint_context_filter() -> Result<(), String> {
+        let regex = regex::Regex::new(super::ENDPOINT_CONTEXT_FILTER_PATTERN)
+            .map_err(|e| format!("{e}"))?;
+        let replacement = super::ENDPOINT_CONTEXT_FILTER_REPLACEMENT;
+
+        // Dremio: grpc URL plus a username, comma-separated.
+        let input = "VirtualExecutionPlan name=dremio compute_context=url=grpc://dremio-client.example.internal:32010,username=bench base_sql=SELECT \"l_orderkey\" FROM \"lineitem\"";
+        let expected = "VirtualExecutionPlan name=dremio compute_context=<CONNECTION> base_sql=SELECT \"l_orderkey\" FROM \"lineitem\"";
+        assert_eq!(regex.replace_all(input, replacement), expected);
+
+        // A different Dremio endpoint and user must redact to the identical token.
+        let input = "VirtualExecutionPlan name=dremio compute_context=url=grpc://localhost:32010,username=dev base_sql=SELECT \"l_orderkey\" FROM \"lineitem\"";
+        assert_eq!(regex.replace_all(input, replacement), expected);
+
+        // Spark Connect: `sc://` with a user_id and cluster id, semicolon-separated.
+        let input = "VirtualExecutionPlan name=spark compute_context=sc://dbc-workspace.example.invalid:443/;user_id=svc-account;x-databricks-cluster-id=0000-000000-abcdefgh;use_ssl=true base_sql=SELECT `l_orderkey` FROM `lineitem`";
+        let expected = "VirtualExecutionPlan name=spark compute_context=<CONNECTION> base_sql=SELECT `l_orderkey` FROM `lineitem`";
+        assert_eq!(regex.replace_all(input, replacement), expected);
+
+        // Spice Cloud: https URL with org and app.
+        let input = "VirtualExecutionPlan name=spiceai compute_context=url=https://flight.spiceai.io,username=,org=spiceai,app=benchmark base_sql=SELECT 1";
+        let expected =
+            "VirtualExecutionPlan name=spiceai compute_context=<CONNECTION> base_sql=SELECT 1";
+        assert_eq!(regex.replace_all(input, replacement), expected);
+
+        // Idempotent: an already-redacted snapshot is left unchanged.
+        let input =
+            "VirtualExecutionPlan name=dremio compute_context=<CONNECTION> base_sql=SELECT 1";
+        assert_eq!(regex.replace_all(input, replacement), input);
+
+        // Local compute contexts carry no endpoint and must not be redacted.
+        let input = "DuckSqlExec compute_context=./data/tpch.db sql=SELECT a, b FROM t";
+        assert_eq!(regex.replace_all(input, replacement), input);
+        let input = "SqliteExec compute_context=:memory: sql=SELECT a FROM t";
+        assert_eq!(regex.replace_all(input, replacement), input);
+
+        // The `host=` form stays the other pattern's job; this one must not half-match
+        // it and leave a partially-redacted context behind.
+        let input = "VirtualExecutionPlan name=mysql compute_context=host=db,port=3306,db=tpch,user=root base_sql=SELECT 1";
         assert_eq!(regex.replace_all(input, replacement), input);
 
         Ok(())

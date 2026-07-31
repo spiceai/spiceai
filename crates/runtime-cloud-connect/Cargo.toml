@@ -27,6 +27,8 @@ gethostname = { workspace = true }
 # private key and CSR are held as PEM; the signer takes raw DER bytes).
 pem = { workspace = true }
 prost = { workspace = true }
+# `google.protobuf.Timestamp`, which every time-valued field on the wire uses.
+prost-types = "0.14"
 rand = { workspace = true }
 # Client-side keypair + PKCS#10 CSR generation for the enrollment flow.
 # Pin the aws_lc_rs backend (matching `crates/runtime`, which forces it via
