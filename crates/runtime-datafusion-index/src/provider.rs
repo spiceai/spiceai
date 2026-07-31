@@ -161,7 +161,42 @@ impl TableProvider for IndexedTableProvider {
         state: &dyn Session,
         filters: Vec<Expr>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.underlying.delete_from(state, filters).await
+        // Resolve each attached index's matching keys against `self.underlying`'s *current*
+        // (pre-delete) rows first — there's nothing left to resolve once they're gone. The
+        // accelerator-table delete below remains authoritative and runs first: only after it
+        // succeeds do we best-effort delete the previously-resolved keys from each index. This
+        // way a failed/partial row delete never leaves an index missing entries for rows that
+        // were never actually removed. A resolve failure just skips that index's cleanup this
+        // round (self-heals via full refresh); it never blocks the row delete.
+        let mut resolved_keys = Vec::with_capacity(self.indexes.len());
+        for index in &self.indexes {
+            match index
+                .resolve_delete_keys(&self.underlying, state, filters.clone())
+                .await
+            {
+                Ok(Some(keys)) => resolved_keys.push((index, keys)),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::error!(
+                        "Index '{}' failed to resolve entries for a table delete (skipping its cleanup this round): {e}",
+                        index.name()
+                    );
+                }
+            }
+        }
+
+        let result = self.underlying.delete_from(state, filters).await?;
+
+        for (index, keys) in resolved_keys {
+            if let Err(e) = index.delete_by_keys(keys).await {
+                tracing::error!(
+                    "Index '{}' failed to delete entries for a table delete (best-effort, continuing): {e}",
+                    index.name()
+                );
+            }
+        }
+
+        Ok(result)
     }
 
     async fn update(

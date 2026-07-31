@@ -59,9 +59,6 @@ limitations under the License.
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::doc_markdown,
-    clippy::struct_field_names,
-    clippy::items_after_statements,
-    clippy::too_many_lines,
     reason = "integration-test harness — readability over lint strictness"
 )]
 
@@ -251,16 +248,19 @@ async fn mock_enroll(
         return error_json(StatusCode::BAD_REQUEST, "Malformed CSR");
     };
     *mock.pinned_point.lock().await = Some(point);
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "instance_id": ASSIGNED_ID,
-            "identity_cert_pem": leaf_pem,
-            "ca_bundle_pem": mock.ca.ca_cert_pem,
-            "gateway_addr": mock.gateway_addr,
-            "not_after": mock.not_after(),
-        })),
-    )
+    let mut response = serde_json::json!({
+        "instance_id": ASSIGNED_ID,
+        "identity_cert_pem": leaf_pem,
+        "ca_bundle_pem": mock.ca.ca_cert_pem,
+        "gateway_addr": mock.gateway_addr,
+        "not_after": mock.not_after(),
+    });
+    // Attach-at-connect: the real cloud validates and attaches; the mock
+    // echoes the requested app back, matching the response contract.
+    if let Some(app_name) = body["app_name"].as_str() {
+        response["app_name"] = serde_json::Value::String(app_name.to_string());
+    }
+    (StatusCode::OK, Json(response))
 }
 
 async fn mock_renew(
@@ -623,6 +623,8 @@ impl Harness {
             config_dir,
             adoption_code,
             pending_adopt_code_path: None,
+            adopt_app_name: None,
+            adopt_create_app: false,
             runtime_version: "v0.0.0-e2e".to_string(),
             // Sub-second cadences keep the suite fast while still exercising
             // the periodic frame paths.
@@ -754,6 +756,13 @@ async fn enrollment_issues_identity_and_streams_over_mtls() {
             .contains("CERTIFICATE REQUEST"),
         "enroll must carry a PKCS#10 CSR"
     );
+    assert!(
+        body["enc_pubkey_pem"]
+            .as_str()
+            .unwrap()
+            .contains("BEGIN PUBLIC KEY"),
+        "enroll must carry the X25519 encryption public key (SPKI PEM)"
+    );
     assert_eq!(body["instance"]["fingerprint"].as_str().unwrap().len(), 64);
     assert_eq!(body["instance"]["runtime_version"], "v0.0.0-e2e");
 
@@ -765,6 +774,11 @@ async fn enrollment_issues_identity_and_streams_over_mtls() {
     assert!(identity.ca_bundle_pem.contains("BEGIN CERTIFICATE"));
     assert_eq!(identity.gateway_addr, harness.cloud.gateway_addr);
     assert!(identity.not_after_unix > 0, "leaf expiry must be recorded");
+    assert!(
+        identity.enc_private_key_pem.contains("PRIVATE KEY")
+            && identity.enc_public_key_pem.contains("PUBLIC KEY"),
+        "the X25519 encryption keypair must be persisted with the identity"
+    );
     // That the signed leaf genuinely chains to the CA is proved
     // operationally: the gateway REQUIRES client certs chaining to it, so
     // the observed mTLS Hello (in `enroll`) implies a valid chain.
@@ -784,6 +798,232 @@ async fn enrollment_issues_identity_and_streams_over_mtls() {
     assert!(ok, "mTLS Hello must carry identifier + empty credential");
 
     handle.shutdown().await;
+}
+
+/// The `spice connect` enroll-and-exit contract: a one-shot `enroll_now`
+/// issues and persists the identity with no client running (no gateway
+/// connection), discards the staged pending-code file, and a later
+/// `CloudConnect::start` with **no adoption code** connects using the
+/// persisted identity — enroll and run as two separate steps.
+#[tokio::test]
+async fn one_shot_enroll_then_separate_run_connects_with_stored_identity() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+
+    // Stage the code the way `spice connect` does.
+    let pending_path = dir.path().join("pending-adopt-code");
+    std::fs::write(&pending_path, ADOPTION_CODE).unwrap();
+
+    let mut config = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        Some(ADOPTION_CODE.to_string()),
+        Duration::from_hours(12),
+    );
+    config.pending_adopt_code_path = Some(pending_path.clone());
+
+    // Phase 1: one-shot enroll — no client task, no stream.
+    let outcome = runtime_cloud_connect::enroll::enroll_now(&config)
+        .await
+        .expect("one-shot enroll succeeds");
+    assert_eq!(outcome.identity.identifier, ASSIGNED_ID);
+    assert_eq!(outcome.app_name, None, "no attachment was requested");
+    assert!(
+        config.identity_path.exists(),
+        "identity must be persisted by the one-shot enroll"
+    );
+    assert!(
+        !pending_path.exists(),
+        "the staged code must be discarded once consumed"
+    );
+    let captured_after_enroll = Arc::clone(&harness.gateway.captured);
+    let hellos = with_captured!(captured_after_enroll, c => c.hellos.len());
+    assert_eq!(hellos, 0, "one-shot enroll must not connect to the gateway");
+
+    // Phase 2: a separate start with NO adoption code connects with the
+    // stored identity.
+    let run_config = harness.config(
+        config.identity_path.clone(),
+        dir.path().to_path_buf(),
+        None,
+        Duration::from_hours(12),
+    );
+    let (runtime, _rt_state) = E2eRuntime::new();
+    let handle = runtime_cloud_connect::CloudConnect::start(run_config, runtime)
+        .await
+        .expect("start")
+        .expect("enabled with stored identity");
+    let captured = Arc::clone(&harness.gateway.captured);
+    let connected = wait_until_async(Duration::from_secs(10), || {
+        let captured = Arc::clone(&captured);
+        async move {
+            captured
+                .lock()
+                .await
+                .hellos
+                .iter()
+                .any(|(h, mtls)| h.identifier == ASSIGNED_ID && *mtls)
+        }
+    })
+    .await;
+    assert!(
+        connected,
+        "the runtime must connect with the persisted identity"
+    );
+    assert_eq!(
+        harness.cloud.enroll_requests.lock().await.len(),
+        1,
+        "the run phase must reuse the identity, not enroll again"
+    );
+    handle.shutdown().await;
+}
+
+/// An authoritative cloud rejection of a one-shot enroll burns the staged
+/// code file (a dead code must not be re-presented by a later `spiced`
+/// start) and persists no identity.
+#[tokio::test]
+async fn one_shot_enroll_discards_staged_code_on_rejection() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+    let pending_path = dir.path().join("pending-adopt-code");
+    std::fs::write(&pending_path, "SPICE-ADOPT-DEADD-BEEFF").unwrap();
+
+    let mut config = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        // Not registered with the cloud mock — rejected as unknown/consumed.
+        Some("SPICE-ADOPT-DEADD-BEEFF".to_string()),
+        Duration::from_hours(12),
+    );
+    config.pending_adopt_code_path = Some(pending_path.clone());
+
+    let err = runtime_cloud_connect::enroll::enroll_now(&config)
+        .await
+        .expect_err("an unknown code must be rejected");
+    assert!(
+        err.is_authoritative_rejection(),
+        "a 4xx cloud rejection is authoritative: {err}"
+    );
+    assert!(
+        !pending_path.exists(),
+        "a dead code must not stay staged for retry"
+    );
+    assert!(
+        !config.identity_path.exists(),
+        "no identity may be persisted on a rejected enroll"
+    );
+}
+
+/// Attach-at-connect: `adopt_app_name`/`adopt_create_app` ride the enroll
+/// request (`app_name`/`create_app` on the wire, omitted when unset) and
+/// the response's attached app comes back in the outcome.
+#[tokio::test]
+async fn one_shot_enroll_carries_app_attachment() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+
+    let mut config = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        Some(ADOPTION_CODE.to_string()),
+        Duration::from_hours(12),
+    );
+    config.adopt_app_name = Some("e2e-app".to_string());
+    config.adopt_create_app = true;
+
+    let outcome = runtime_cloud_connect::enroll::enroll_now(&config)
+        .await
+        .expect("enroll with attachment succeeds");
+    assert_eq!(outcome.app_name.as_deref(), Some("e2e-app"));
+
+    let requests = harness.cloud.enroll_requests.lock().await.clone();
+    assert_eq!(requests.len(), 1, "exactly one enroll request");
+    assert_eq!(requests[0]["app_name"], "e2e-app");
+    assert_eq!(requests[0]["create_app"], true);
+}
+
+/// `create_app` is meaningless without an app to name, so it must never
+/// reach the wire alone — an invalid enroll request. Reachable by setting
+/// `SPICE_CONNECT_ADOPT_CREATE` with no `SPICE_CONNECT_ADOPT_APP_NAME`
+/// (the `--create` flag pair is guarded by clap, the env pair is not).
+#[tokio::test]
+async fn one_shot_enroll_omits_create_app_without_app_name() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+
+    let mut config = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        Some(ADOPTION_CODE.to_string()),
+        Duration::from_hours(12),
+    );
+    config.adopt_app_name = None;
+    config.adopt_create_app = true;
+
+    let outcome = runtime_cloud_connect::enroll::enroll_now(&config)
+        .await
+        .expect("enroll succeeds unattached");
+    assert_eq!(outcome.app_name, None, "nothing was attached");
+
+    let requests = harness.cloud.enroll_requests.lock().await.clone();
+    assert_eq!(requests.len(), 1, "exactly one enroll request");
+    assert!(
+        requests[0].get("app_name").is_none(),
+        "no app name was configured"
+    );
+    assert!(
+        requests[0].get("create_app").is_none(),
+        "create_app must not ride without app_name"
+    );
+}
+
+/// A persistence failure lands *after* the cloud consumed the code to issue
+/// the identity, so the staged copy is spent: it must be discarded, not left
+/// for `status` to report as redeemable and a later `spiced` start to
+/// re-present for a 401.
+#[tokio::test]
+async fn one_shot_enroll_discards_staged_code_when_identity_cannot_persist() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+    let pending_path = dir.path().join("pending-adopt-code");
+    std::fs::write(&pending_path, ADOPTION_CODE).unwrap();
+
+    // The identity's parent is a regular file, so the directory for it
+    // cannot be created and the issued identity cannot be written.
+    let blocker = dir.path().join("blocker");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+
+    let mut config = harness.config(
+        blocker.join("identity.json"),
+        dir.path().to_path_buf(),
+        Some(ADOPTION_CODE.to_string()),
+        Duration::from_hours(12),
+    );
+    config.pending_adopt_code_path = Some(pending_path.clone());
+
+    let err = runtime_cloud_connect::enroll::enroll_now(&config)
+        .await
+        .expect_err("an unwritable identity path must fail the enroll");
+    assert!(
+        matches!(
+            err,
+            runtime_cloud_connect::enroll::EnrollNowError::Persist { .. }
+        ),
+        "expected a persistence failure, got: {err}"
+    );
+    assert!(
+        !err.is_authoritative_rejection(),
+        "a local persistence failure is not a cloud rejection"
+    );
+    assert!(
+        !pending_path.exists(),
+        "the code was consumed to issue the identity, so it must not stay staged"
+    );
+    assert_eq!(
+        harness.cloud.enroll_requests.lock().await.len(),
+        1,
+        "the code was presented exactly once"
+    );
 }
 
 #[tokio::test]
