@@ -974,12 +974,24 @@ const TYPES_CHECKS: &[(&str, i64)] = &[
         200,
     ),
     (
+        "SELECT CAST(c_small AS BIGINT) FROM types WHERE t_id = 1",
+        -1234,
+    ),
+    (
         "SELECT CAST(c_small_u AS BIGINT) FROM types WHERE t_id = 1",
         60000,
     ),
     (
+        "SELECT CAST(c_medium AS BIGINT) FROM types WHERE t_id = 1",
+        -8_000_000,
+    ),
+    (
         "SELECT CAST(c_medium_u AS BIGINT) FROM types WHERE t_id = 1",
         16_000_000,
+    ),
+    (
+        "SELECT CAST(c_int AS BIGINT) FROM types WHERE t_id = 1",
+        -70000,
     ),
     (
         "SELECT CAST(c_int_u AS BIGINT) FROM types WHERE t_id = 1",
@@ -988,6 +1000,15 @@ const TYPES_CHECKS: &[(&str, i64)] = &[
     (
         "SELECT CAST(c_big AS BIGINT) FROM types WHERE t_id = 1",
         -5_000_000_000,
+    ),
+    // Floats scaled to an integer, which is exact for these values.
+    (
+        "SELECT CAST(c_float * 2 AS BIGINT) FROM types WHERE t_id = 1",
+        3,
+    ),
+    (
+        "SELECT CAST(c_double * 4 AS BIGINT) FROM types WHERE t_id = 1",
+        9,
     ),
     (
         "SELECT CAST(c_tiny AS BIGINT) FROM types WHERE t_id = 2",
@@ -998,8 +1019,24 @@ const TYPES_CHECKS: &[(&str, i64)] = &[
         255,
     ),
     (
+        "SELECT CAST(c_small AS BIGINT) FROM types WHERE t_id = 2",
+        -32768,
+    ),
+    (
+        "SELECT CAST(c_small_u AS BIGINT) FROM types WHERE t_id = 2",
+        65535,
+    ),
+    (
+        "SELECT CAST(c_medium AS BIGINT) FROM types WHERE t_id = 2",
+        -8_388_608,
+    ),
+    (
         "SELECT CAST(c_medium_u AS BIGINT) FROM types WHERE t_id = 2",
         16_777_215,
+    ),
+    (
+        "SELECT CAST(c_int AS BIGINT) FROM types WHERE t_id = 2",
+        -2_147_483_648,
     ),
     (
         "SELECT CAST(c_int_u AS BIGINT) FROM types WHERE t_id = 2",
@@ -1117,8 +1154,8 @@ const TYPES_CHECKS: &[(&str, i64)] = &[
 ];
 
 /// Every `MySQL` column type through the binlog decode path, checked against a
-/// real server. Each value is asserted from the snapshot, again after a binlog
-/// INSERT, and again after an UPDATE rewrites every column.
+/// real server. Each value is asserted from the snapshot and again after a
+/// binlog INSERT, then an UPDATE covers the before/after row images.
 ///
 /// Two columns stop short of MySQL's range because the Arrow type cannot hold
 /// it: `c_big_u` at `i64::MAX`, and `c_time` at the end of the day, since
@@ -1208,8 +1245,8 @@ async fn mysql_binlog_replication_decodes_every_column_type_cayenne() -> Result<
                 );
             }
 
-            // An UPDATE rewrites every column, so the before/after images of a
-            // wide row are decoded too, not just inserts.
+            // An UPDATE carries a full before and after image of the row, so
+            // changing a few columns still decodes every column twice.
             exec(
                 &pool,
                 "UPDATE repl_types SET c_tiny = 7, c_big_u = 42, c_varchar = 'updated', \
