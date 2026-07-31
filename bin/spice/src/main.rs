@@ -783,6 +783,7 @@ fn machine_error_code(error: &spice::error::Error) -> &'static str {
         spice::error::Error::ModelNotFound { .. } => "model_not_found",
         spice::error::Error::NoModelsConfigured => "no_models_configured",
         spice::error::Error::CloudConnectIo { .. } => "cloud_connect_io",
+        spice::error::Error::CloudConnectEnroll { .. } => "cloud_connect_enroll",
     }
 }
 
