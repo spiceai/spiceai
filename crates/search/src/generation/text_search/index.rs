@@ -143,6 +143,12 @@ impl Index for FullTextDatabaseIndex {
         Ok(batches)
     }
 
+    async fn delete_by_keys(&self, keys: RecordBatch) -> Result<(), DataFusionError> {
+        self.delete_terms_for(&keys)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))
+    }
+
     fn write_complete_failure_is_fatal(&self) -> bool {
         // Documents are only searchable once the tantivy writer commits them, and
         // staged-but-uncommitted documents are discarded. A finalize that fails to
@@ -427,6 +433,49 @@ impl FullTextDatabaseIndex {
 
         self.reader.reload().boxed().context(InvalidIndexingSnafu {
             context: "Data successfully written to full-text index, but failed to update search path to reference the latest commit. Queries will be served from previous revision until the next update.".to_string(),
+        })
+    }
+
+    /// Deletes every document whose primary key matches a row of `keys` — the tantivy
+    /// counterpart of `update_index`'s delete-then-insert, minus the insert.
+    async fn delete_terms_for(&self, keys: &RecordBatch) -> Result<(), super::Error> {
+        let rb = if self.primary_key.len() > 1 {
+            vec![with_json_subset_column(
+                keys,
+                &self.primary_key,
+                INDEX_UNIQUE_FIELD_NAME,
+            )
+            .context(InvalidIndexingSnafu {
+                context: "An error occurred creating the unique column for the full text search index".to_string(),
+            })?]
+        } else {
+            vec![keys.clone()]
+        };
+
+        let index_schema = self.reader.searcher().schema().clone();
+        let terms_to_delete = self.existing_terms_to_delete(&index_schema, &rb)?;
+        if terms_to_delete.is_empty() {
+            return Ok(());
+        }
+
+        let mut index_writer = self.writer.lock().await;
+        for t in terms_to_delete {
+            index_writer.delete_term(t);
+        }
+        let commit_result = index_writer
+            .commit()
+            .context(FailedToInsertDataIntoIndexSnafu);
+        if let Err(e) = &commit_result {
+            tracing::warn!("Rolling back index writer after failed delete commit: {e}");
+            if let Err(rb_err) = index_writer.rollback() {
+                tracing::error!("Failed to rollback index writer: {rb_err}");
+            }
+        }
+        drop(index_writer);
+        commit_result?;
+
+        self.reader.reload().boxed().context(InvalidIndexingSnafu {
+            context: "Deleted from full-text index, but failed to update search path to reference the latest commit. Queries may still return deleted rows until the next update.".to_string(),
         })
     }
 
