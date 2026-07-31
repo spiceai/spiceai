@@ -168,7 +168,18 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
                     ));
                 }
             }
-            _ => {
+            TestType::Search => {
+                for search in &test_file.tests.search {
+                    tests_to_dispatch.push((
+                        path,
+                        serde_json::json!(WorkflowArgs {
+                            specific_args: search.clone(),
+                            spiced_commit: spiced_commit.clone(),
+                        }),
+                    ));
+                }
+            }
+            TestType::DataConsistency => {
                 println!("Test type {test_type} not supported for dispatching");
             }
         }
