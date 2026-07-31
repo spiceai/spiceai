@@ -23,7 +23,10 @@ pub use secrecy::ExposeSecret;
 use secrecy::SecretString;
 use snafu::prelude::*;
 use spicepod::component::secret::Secret as SpicepodSecret;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use stores::env::EnvSecretStoreBuilder;
 use tokio::sync::RwLock;
 
@@ -333,9 +336,57 @@ impl Secrets {
     /// Returns the last store error when every consulted store failed and none
     /// returned a healthy "not found".
     pub async fn get_secret(&self, key: &str) -> AnyErrorResult<Option<SecretString>> {
+        self.get_secret_from(key, |_| true).await
+    }
+
+    /// Gets a secret key, consulting only stores named in `allowed_stores`, in
+    /// the registry's precedence order.
+    ///
+    /// A `${ store:key }` reference names a specific store, but a caller that
+    /// only has the key — e.g. cluster `ExpandSecret`, whose RPC request
+    /// carries no store — can't otherwise honor that scoping: an unscoped
+    /// [`Self::get_secret`] would let a same-named key in an unrelated store
+    /// answer in its place. Restricting the search to the referenced store(s)
+    /// closes that gap.
+    ///
+    /// # Errors
+    ///
+    /// Returns the last store error when every consulted (allowed) store
+    /// failed and none returned a healthy "not found".
+    pub async fn get_secret_from_stores(
+        &self,
+        key: &str,
+        allowed_stores: &HashSet<String>,
+    ) -> AnyErrorResult<Option<SecretString>> {
+        self.get_secret_from(key, |store_name| allowed_stores.contains(store_name))
+            .await
+    }
+
+    /// Shared precedence-order walk behind [`Self::get_secret`] and
+    /// [`Self::get_secret_from_stores`].
+    ///
+    /// A store that errors is logged and skipped so one unhealthy store (an
+    /// expired Vault token, a network blip) cannot mask a key that a
+    /// lower-precedence store can resolve:
+    ///
+    /// - A store returns the value → `Ok(Some(value))`, as before.
+    /// - No value, but at least one store answered healthily (`Ok(None)`) →
+    ///   `Ok(None)`; the key was not found in any healthy store. An erroring
+    ///   store might still hold it — each skipped failure is logged so that
+    ///   outcome stays diagnosable.
+    /// - Every consulted store errored → the last error, so a total outage is
+    ///   reported as an error rather than silently as "not found".
+    async fn get_secret_from(
+        &self,
+        key: &str,
+        allow: impl Fn(&str) -> bool,
+    ) -> AnyErrorResult<Option<SecretString>> {
         let mut last_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
         let mut any_healthy = false;
         for (store_name, store) in &self.stores {
+            if !allow(store_name) {
+                continue;
+            }
             match store.get_secret(key).await {
                 Ok(Some(secret)) => return Ok(Some(secret)),
                 Ok(None) => any_healthy = true,
