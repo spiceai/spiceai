@@ -21,7 +21,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use arrow_schema::{DataType, SchemaRef};
+use arrow_schema::{DataType, Schema, SchemaRef};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use elasticsearch::Elasticsearch;

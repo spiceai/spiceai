@@ -20,7 +20,7 @@ use crate::model::EmbeddingModelStore;
 use crate::secrets::Secrets;
 use datafusion::datasource::TableProvider;
 use datafusion::{prelude::SessionContext, sql::TableReference};
-#[cfg(feature = "models")]
+#[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
 use runtime_datafusion_udfs::embed::EMBED_UDF_NAME;
 use spicepod::vector::VectorStore;
 use std::sync::Arc;
@@ -446,7 +446,7 @@ async fn wrap_table_as_index_elasticsearch(
             None => (columns.to_vec(), inner_table_provider.schema()),
         };
 
-        let mut es_index = super::elasticsearch::try_from_table(
+        let es_index = super::elasticsearch::try_from_table(
             tbl,
             column.clone(),
             config.clone(),
