@@ -807,7 +807,7 @@ mod connect {
             "instance_id": "inst_cli_test",
             "identity_cert_pem": "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
             "ca_bundle_pem": "-----BEGIN CERTIFICATE-----\nBBBB\n-----END CERTIFICATE-----\n",
-            "gateway_addr": "127.0.0.1:7320",
+            "gateway_addr": "127.0.0.1:443",
             "not_after": "2030-01-01T00:00:00Z",
         })
         .to_string()
@@ -943,7 +943,7 @@ mod connect {
             "instance_id": "inst_cli_test",
             "identity_cert_pem": "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
             "ca_bundle_pem": "",
-            "gateway_addr": "127.0.0.1:7320",
+            "gateway_addr": "127.0.0.1:443",
             "not_after": "2030-01-01T00:00:00Z",
             "app_name": "edge-app",
         })
