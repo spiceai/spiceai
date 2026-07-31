@@ -770,12 +770,11 @@ async fn bump_counter_rows(pool: &mysql_async::Pool, rounds: i64) -> Result<(), 
     Ok(())
 }
 
-/// Killing the dump connection mid-stream forces the pump to resume from its ack
-/// floor, the one moment updates can go missing. Changes delivered but not yet
-/// durably applied are re-sent from that floor: if the floor has advanced past
-/// them they are lost, and if a re-sent older image lands over a newer one the
-/// row goes stale. Both leave the row count correct, so only an aggregate sees
-/// them — every update here is worth `+1`, which makes the final `SUM` exact, and
+/// Killing the dump connection mid-stream makes the pump resume from its ack
+/// floor and re-send everything delivered but not yet durably applied. An update
+/// past the floor is lost, and a re-sent older image landing over a newer one
+/// leaves the row stale — both keep the row count correct, so only an aggregate
+/// detects them. Every update is worth `+1`, making the final `SUM` exact, and
 /// `MIN` catches one row left behind even if another offsets the sum.
 ///
 /// Coalescing is pinned wide so the consumer is holding a batch of not-yet-durable
@@ -1098,15 +1097,12 @@ const TYPES_CHECKS: &[(&str, i64)] = &[
 ];
 
 /// Every `MySQL` column type through the binlog decode path, checked against a
-/// real server. Benchmark-driven checks only cover the types their workload
-/// happens to use, which leaves unsigned, blob, `BIT`, `ENUM`, `SET` and `JSON`
-/// unexercised — so this is what pins the wire format for those.
+/// real server. Each value is asserted from the snapshot, again after a binlog
+/// INSERT, and again after an UPDATE rewrites every column.
 ///
-/// Two columns stop short of MySQL's range on purpose, because the Arrow type
-/// cannot hold it and what the decoder *should* do there is a separate question
-/// from whether it decodes the types it can represent: `c_big_u` stops at
-/// `i64::MAX`, and `c_time` at the end of the day, since `Time64` is a
-/// time-of-day while `MySQL` `TIME` spans ±838 hours. Negative `TIME` is
+/// Two columns stop short of MySQL's range because the Arrow type cannot hold
+/// it: `c_big_u` at `i64::MAX`, and `c_time` at the end of the day, since
+/// `Time64` is a time-of-day while `TIME` spans ±838 hours. Negative `TIME` is
 /// rejected with a structured error, covered by `negative_time_errors` in
 /// `data_components::mysql_replication::rows`.
 #[cfg(not(target_os = "windows"))]
