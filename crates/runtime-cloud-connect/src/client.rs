@@ -1322,7 +1322,7 @@ mod tests {
             private_key_pem: String::new(),
             public_key_pem: String::new(),
             ca_bundle_pem: String::new(),
-            gateway_addr: "gateway.test:7320".to_string(),
+            gateway_addr: "gateway.test:443".to_string(),
             not_after_unix,
             enc_private_key_pem: String::new(),
             enc_public_key_pem: String::new(),

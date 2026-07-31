@@ -453,7 +453,7 @@ mod tests {
                 .to_string(),
             ca_bundle_pem: "-----BEGIN CERTIFICATE-----\nMOCKCA\n-----END CERTIFICATE-----\n"
                 .to_string(),
-            gateway_addr: "gateway.test.spice.ai:7320".to_string(),
+            gateway_addr: "gateway.test.spice.ai:443".to_string(),
             not_after_unix: None,
             enc_private_key_pem:
                 "-----BEGIN PRIVATE KEY-----\nMOCKENC\n-----END PRIVATE KEY-----\n".to_string(),
