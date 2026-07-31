@@ -18,6 +18,7 @@ limitations under the License.
 pub mod aws_secrets_manager;
 #[cfg(feature = "azure-keyvault")]
 pub mod azure_keyvault;
+pub mod cloud_delivered;
 pub mod env;
 #[cfg(feature = "hashicorp_vault")]
 pub mod hashicorp_vault;

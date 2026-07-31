@@ -244,6 +244,8 @@ mod tests {
             not_after_unix: None,
             enc_private_key_pem: String::new(),
             enc_public_key_pem: String::new(),
+            enc_previous_private_key_pem: String::new(),
+            cache_key_b64: String::new(),
         };
         let mut pem = String::new();
         pem.push_str(identity.identity_cert_pem.trim_end());

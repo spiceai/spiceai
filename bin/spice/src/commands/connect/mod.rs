@@ -750,6 +750,7 @@ async fn print_status(config_dir: &Path, endpoint: Option<&str>) -> Result<()> {
             println!("  gateway:     {}", id.gateway_addr);
         }
         println!("  expiry:      {expiry}");
+        print_delivered_secrets(config_dir);
         print_service_for_dir(config_dir);
         // An identity that reads as expired on a host whose clock is wrong is
         // not actually expired — measure before the operator goes chasing a
@@ -816,6 +817,34 @@ async fn print_status(config_dir: &Path, endpoint: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Report the delivered secrets held in the local cache.
+///
+/// Reads only the cache's plaintext header, so this works without the key and
+/// **cannot** print a value. Names are what diagnose the common failure: a
+/// component referencing a secret the last deployment did not deliver.
+fn print_delivered_secrets(config_dir: &Path) {
+    let path = config_dir.join(runtime_cloud_connect::secret_cache::SECRET_CACHE_FILE);
+    let Some(header) = runtime_cloud_connect::secret_cache::read_header(&path) else {
+        if path.exists() {
+            println!(
+                "  secrets:     cache present but unreadable — deploy the app to re-deliver them"
+            );
+        } else {
+            println!("  secrets:     none delivered yet — deploy the app to deliver them");
+        }
+        return;
+    };
+    if header.names.is_empty() {
+        println!("  secrets:     none (the last deployment delivered no secrets)");
+        return;
+    }
+    println!(
+        "  secrets:     {} delivered: {}",
+        header.names.len(),
+        header.names.join(", ")
+    );
+}
+
 /// Report the service installed for this instance directory, when there is one.
 fn print_service_for_dir(config_dir: &Path) {
     let instance_dir = instance_dir_for(config_dir);
@@ -858,6 +887,7 @@ async fn remove_identity(
     let identity_path = config_dir.join(IDENTITY_FILE);
     let pending_path = config_dir.join(PENDING_ADOPT_CODE_FILE);
     let endpoint_path = config_dir.join(CLOUD_ENDPOINT_FILE);
+    let cache_path = config_dir.join(runtime_cloud_connect::secret_cache::SECRET_CACHE_FILE);
     let instance_dir = instance_dir_for(config_dir);
 
     let identity = runtime_cloud_connect::identity::IdentityStore::load_optional(&identity_path)
@@ -869,8 +899,9 @@ async fn remove_identity(
     let had_identity = identity.is_some();
     let had_pending = pending_path.exists();
     let had_endpoint = endpoint_path.exists();
+    let had_cache = cache_path.exists();
 
-    if !had_identity && !had_pending && !had_endpoint && unit.is_none() {
+    if !had_identity && !had_pending && !had_endpoint && !had_cache && unit.is_none() {
         println!("Spice Cloud Connect: nothing to remove.");
         return Ok(());
     }
@@ -886,6 +917,12 @@ async fn remove_identity(
         println!("  directory: {}", instance_dir.display());
         if had_identity {
             println!("  identity:  {} (deleted)", identity_path.display());
+        }
+        if had_cache {
+            println!(
+                "  secrets:   {} (deleted — the app's delivered secrets)",
+                cache_path.display()
+            );
         }
         if !confirm("Continue?")? {
             println!(
@@ -917,7 +954,20 @@ async fn remove_identity(
         None => None,
     };
 
+    // Before the identity: the cache holds the app's secrets and the identity
+    // holds the only key that opens them, so deleting the key first would leave
+    // an unopenable file that still has to be removed. Deleting the secrets
+    // first means an interrupted `remove` never leaves them behind.
+    if had_cache {
+        runtime_cloud_connect::secret_cache::remove(&cache_path).map_err(|e| {
+            Error::CloudConnectIo {
+                message: format!("remove the delivered-secrets cache: {e}"),
+            }
+        })?;
+    }
+
     if had_identity {
+        // Clearing this also destroys the cache key, which is only in this file.
         runtime_cloud_connect::identity::IdentityStore::clear(&identity_path).map_err(|e| {
             Error::CloudConnectIo {
                 message: format!("clear identity: {e}"),

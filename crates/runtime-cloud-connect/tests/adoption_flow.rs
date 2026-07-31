@@ -147,6 +147,7 @@ impl RuntimeHandle for CapturedRuntime {
         &self,
         config_dir: &std::path::Path,
         spicepod_yaml: &str,
+        _delivered_secrets: Option<runtime_cloud_connect::sealed_secrets::DeliveredSecrets>,
     ) -> Result<serde_json::Value, CommandError> {
         let path = config_dir.join(runtime_cloud_connect::config::CLOUD_MANAGED_SPICEPOD_FILE);
         std::fs::create_dir_all(config_dir).map_err(|e| CommandError::failed(e.to_string()))?;
@@ -462,6 +463,7 @@ async fn apply_spicepod_writes_file_and_acks() {
         body: Some(proto::control_message::Body::ApplySpicepod(
             proto::ApplySpicepod {
                 spicepod_yaml: yaml.to_string(),
+                sealed_secret_payload: None,
             },
         )),
     };
@@ -483,6 +485,8 @@ async fn apply_spicepod_writes_file_and_acks() {
         not_after_unix: None,
         enc_private_key_pem: String::new(),
         enc_public_key_pem: String::new(),
+        enc_previous_private_key_pem: String::new(),
+        cache_key_b64: String::new(),
     };
     IdentityStore::store(&identity_path, &identity).unwrap();
 

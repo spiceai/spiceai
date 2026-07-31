@@ -263,6 +263,13 @@ struct RenewRequest<'a> {
     cert_pem: &'a str,
     csr_pem: &'a str,
     pop_sig: &'a str,
+    /// The rotated X25519 encryption public key (RFC 8410 SPKI PEM).
+    ///
+    /// Required, not optional: the cloud rotates the pinned encryption key in
+    /// the same atomic update as the identity key, so a renewal that omitted it
+    /// would be rejected — and an encryption key that never rotated would
+    /// outlive the identity it belongs to.
+    enc_pubkey_pem: &'a str,
 }
 
 /// Wire shape of a successful renew response.
@@ -402,6 +409,11 @@ impl EnrollClient {
     /// current leaf and the current-key proof-of-possession signature over
     /// the new CSR. Works within the grace window even when the presented
     /// leaf is already expired.
+    ///
+    /// `material` also carries the freshly-generated X25519 encryption key: its
+    /// public half rides this request so the cloud re-pins both keys in one
+    /// atomic update, and the caller installs the private half as current while
+    /// retaining the outgoing one for a single rotation.
     pub(crate) async fn renew(
         &self,
         current: &Identity,
@@ -412,6 +424,7 @@ impl EnrollClient {
             cert_pem: &current.identity_cert_pem,
             csr_pem: &material.csr_pem,
             pop_sig: &pop_sig,
+            enc_pubkey_pem: &material.enc_public_key_pem,
         };
         let wire: RenewResponseWire = self.post_json(&self.renew_url, &request).await?;
         let not_after_unix = parse_not_after(&self.renew_url, &wire.not_after)?;
@@ -544,7 +557,14 @@ pub(crate) async fn acquire_identity(
         not_after_unix: Some(outcome.not_after_unix),
         enc_private_key_pem: material.enc_private_key_pem,
         enc_public_key_pem: material.enc_public_key_pem,
+        // A fresh enrollment has no prior key to retain.
+        enc_previous_private_key_pem: String::new(),
+        // Minted below so an identity always leaves enrollment able to write
+        // its delivered-secrets cache.
+        cache_key_b64: String::new(),
     };
+    let mut identity = identity;
+    identity.ensure_cache_key();
     Ok((identity, registration))
 }
 

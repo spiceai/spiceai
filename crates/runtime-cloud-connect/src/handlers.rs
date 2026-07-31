@@ -279,6 +279,14 @@ pub trait RuntimeHandle: Send + Sync + 'static {
 
     /// Apply a cloud-managed spicepod to disk and trigger a reload.
     ///
+    /// `delivered_secrets` carries the app secrets that rode the same dispatch,
+    /// already opened (see [`crate::sealed_secrets`]). They arrive *with* the
+    /// spicepod rather than in a separate command because applying is a
+    /// restart: secrets that landed afterwards would arrive after the components
+    /// that referenced them had already tried to load. `None` means the
+    /// deployment carried none, which is distinct from an empty map — an app
+    /// whose secrets were all removed.
+    ///
     /// The default implementation writes the YAML to
     /// `config_dir/spicepod-cloud-managed.yml` via `tokio::fs` so the
     /// filesystem write does not block the runtime worker thread. It
@@ -291,11 +299,28 @@ pub trait RuntimeHandle: Send + Sync + 'static {
     /// runtime is still serving the previous configuration. Adapters
     /// that can hot-reload (or that synchronously trigger a restart)
     /// should override this and return `applied: true`.
+    ///
+    /// The default **refuses** a deployment that carries secrets rather than
+    /// writing the spicepod and dropping them: an adapter that cannot apply
+    /// secrets would otherwise report success and then fail every referencing
+    /// component with a missing-parameter error that names nothing.
     async fn apply_spicepod(
         &self,
         config_dir: &Path,
         spicepod_yaml: &str,
+<<<<<<< HEAD
     ) -> Result<serde_json::Value, CommandError> {
+=======
+        delivered_secrets: Option<crate::sealed_secrets::DeliveredSecrets>,
+    ) -> Result<serde_json::Value, String> {
+        if delivered_secrets.is_some_and(|secrets| !secrets.is_empty()) {
+            return Err(
+                "this runtime adapter cannot apply control-plane-delivered secrets; the spicepod \
+                 was NOT written. Implement RuntimeHandle::apply_spicepod to accept them."
+                    .to_string(),
+            );
+        }
+>>>>>>> caf63077ed (feat: add secrets support)
         let path = config_dir.join(crate::config::CLOUD_MANAGED_SPICEPOD_FILE);
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)

@@ -57,6 +57,8 @@ pub mod enroll;
 pub mod handlers;
 pub mod identity;
 pub mod release;
+pub mod sealed_secrets;
+pub mod secret_cache;
 
 mod client;
 mod fingerprint;

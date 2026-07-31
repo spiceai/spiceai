@@ -5533,7 +5533,9 @@ version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
 dependencies = [
+ "getrandom 0.4.2",
  "hybrid-array",
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -17000,10 +17002,12 @@ dependencies = [
  "aws-lc-rs",
  "axum",
  "base64 0.22.1",
+ "chacha20poly1305",
  "chrono",
  "cloud-connect-crypto",
  "dirs",
  "gethostname",
+ "getrandom 0.3.4",
  "pem",
  "prost",
  "prost-types",
@@ -17022,6 +17026,7 @@ dependencies = [
  "tonic-prost",
  "tonic-prost-build",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -17392,6 +17397,7 @@ dependencies = [
  "indexmap 2.14.0",
  "keyring",
  "logos",
+ "parking_lot",
  "percent-encoding",
  "rand 0.10.1",
  "reqwest 0.13.4",
@@ -17404,6 +17410,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "zeroize",
 ]
 
 [[package]]
