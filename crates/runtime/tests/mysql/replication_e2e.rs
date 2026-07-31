@@ -1145,6 +1145,14 @@ const TYPES_CHECKS: &[(&str, i64)] = &[
         "SELECT CAST(c_bit AS BIGINT) FROM types WHERE t_id = 1",
         341,
     ),
+    // JSON arrives as `JSONB` and is decoded to text, so the content has to be
+    // checked, not just its presence. The empty array is compared exactly; the
+    // object is matched on key and value, since `MySQL` chooses the spacing.
+    (r"SELECT count(*) FROM types WHERE c_json = '[]'", 1),
+    (
+        r#"SELECT count(*) FROM types WHERE c_json LIKE '{%"k"%7%}'"#,
+        1,
+    ),
     // The all-NULL row: every nullable column is NULL, and the primary key is
     // still readable.
     ("SELECT count(c_tiny) FROM types", 2),
@@ -1273,6 +1281,35 @@ async fn mysql_binlog_replication_decodes_every_column_type_cayenne() -> Result<
                 .await?,
                 300,
                 "a two-byte-length VARCHAR must survive an update"
+            );
+            // The rest of the columns the UPDATE touched, so an update applied
+            // partially or not at all cannot pass.
+            assert_eq!(
+                scalar_i64(
+                    &rt,
+                    "SELECT CAST(c_big_u AS BIGINT) FROM types WHERE t_id = 1"
+                )
+                .await?,
+                42,
+                "an updated BIGINT UNSIGNED must carry its new value"
+            );
+            assert_eq!(
+                scalar_i64(
+                    &rt,
+                    "SELECT count(*) FROM types WHERE c_varchar = 'updated'"
+                )
+                .await?,
+                1,
+                "an updated VARCHAR must carry its new value"
+            );
+            assert_eq!(
+                scalar_i64(
+                    &rt,
+                    "SELECT CAST(c_dec * 100 AS BIGINT) FROM types WHERE t_id = 1"
+                )
+                .await?,
+                100,
+                "an updated DECIMAL must keep its scale"
             );
 
             // And a DELETE, whose row image is the full before-image.
