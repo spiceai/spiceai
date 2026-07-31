@@ -104,12 +104,12 @@ async fn process_single_batch(
         .schema()
         .column_with_name(index.embedded_column.as_str())
     else {
-        tracing::warn!(
-            "Cannot write to '{}' index, data does not have column '{}'.",
-            index.name(),
-            index.embedded_column
-        );
-        return Ok(record);
+        return write_util::ColumnNotFoundSnafu {
+            index: index.name().to_string(),
+            column: index.embedded_column.clone(),
+        }
+        .fail()
+        .map_err(Error::from);
     };
 
     let embedding_vectors = embed_column(
