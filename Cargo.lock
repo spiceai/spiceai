@@ -18143,6 +18143,7 @@ dependencies = [
  "runtime-datafusion-udfs",
  "runtime-query-engine",
  "runtime-table-partition",
+ "s3_vectors",
  "serde",
  "serde_json",
  "snafu",
