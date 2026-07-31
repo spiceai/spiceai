@@ -77,7 +77,7 @@ use rcgen::{
     ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, PublicKeyData as _, SanType,
 };
 use runtime_cloud_connect::config::CloudConnectConfig;
-use runtime_cloud_connect::handlers::RuntimeHandle;
+use runtime_cloud_connect::handlers::{Capability, CommandError, RuntimeHandle};
 use runtime_cloud_connect::identity::IdentityStore;
 use runtime_cloud_connect::proto;
 use runtime_cloud_connect::proto::cloud_connect_server::{CloudConnect, CloudConnectServer};
@@ -395,8 +395,14 @@ impl GatewayServer {
     }
 }
 
-fn ctrl(body: proto::control_message::Body) -> proto::ControlMessage {
-    proto::ControlMessage { body: Some(body) }
+/// A command the client must answer with a `CommandResult` correlated by
+/// `command_id`. The id lives on the envelope, not on the command.
+fn ctrl_id(command_id: &str, body: proto::control_message::Body) -> proto::ControlMessage {
+    proto::ControlMessage {
+        command_id: command_id.to_string(),
+        target: None,
+        body: Some(body),
+    }
 }
 
 #[async_trait]
@@ -479,15 +485,19 @@ impl CloudConnect for GatewayServer {
                         captured.lock().await.telemetry.push(t);
                     }
                     Some(proto::client_message::Body::Event(event)) => {
-                        if event.kind == "audit" {
+                        if event.event_type == "audit" {
                             captured.lock().await.audits.push(event);
                         }
                     }
-                    // A standalone runtime announces no per-connection
-                    // encryption key, so this never arrives. The arm is spelled
-                    // out rather than wildcarded so a new client message still
-                    // has to be accounted for here.
-                    Some(proto::client_message::Body::SecretsKey(_)) => {}
+                    // Neither of these is emitted yet: a standalone runtime
+                    // announces no per-connection encryption key, and nothing
+                    // pushes OTLP metrics. The arms are spelled out rather than
+                    // wildcarded so a new client message still has to be
+                    // accounted for here.
+                    Some(
+                        proto::client_message::Body::SecretsKey(_)
+                        | proto::client_message::Body::ExportMetrics(_),
+                    ) => {}
                     None => break,
                 }
             }
@@ -556,6 +566,10 @@ impl E2eRuntime {
 
 #[async_trait]
 impl RuntimeHandle for E2eRuntime {
+    fn supports(&self, capability: Capability) -> bool {
+        capability == Capability::ApplySpicepod
+    }
+
     async fn active_datasets(&self) -> u32 {
         2
     }
@@ -567,16 +581,16 @@ impl RuntimeHandle for E2eRuntime {
         &self,
         config_dir: &Path,
         spicepod_yaml: &str,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, CommandError> {
         // Persist to the canonical path and report a hot apply, mirroring the
         // spiced adapter's observable result envelope.
         let path = config_dir.join(runtime_cloud_connect::config::CLOUD_MANAGED_SPICEPOD_FILE);
         tokio::fs::create_dir_all(config_dir)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| CommandError::failed(e.to_string()))?;
         tokio::fs::write(&path, spicepod_yaml)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| CommandError::failed(e.to_string()))?;
         self.state.lock().await.applied_spicepod = Some((path.clone(), spicepod_yaml.to_string()));
         Ok(serde_json::json!({
             "path": path.display().to_string(),
@@ -793,7 +807,10 @@ async fn enrollment_issues_identity_and_streams_over_mtls() {
     assert!(identity.private_key_pem.contains("PRIVATE KEY"));
     assert!(identity.ca_bundle_pem.contains("BEGIN CERTIFICATE"));
     assert_eq!(identity.gateway_addr, harness.cloud.gateway_addr);
-    assert!(identity.not_after_unix > 0, "leaf expiry must be recorded");
+    assert!(
+        identity.not_after_unix.is_some_and(|secs| secs > 0),
+        "leaf expiry must be recorded"
+    );
     assert!(
         identity.enc_private_key_pem.contains("PRIVATE KEY")
             && identity.enc_public_key_pem.contains("PUBLIC KEY"),
@@ -803,19 +820,22 @@ async fn enrollment_issues_identity_and_streams_over_mtls() {
     // operationally: the gateway REQUIRES client certs chaining to it, so
     // the observed mTLS Hello (in `enroll`) implies a valid chain.
 
-    // The stream Hello names the instance with an empty credential and no
-    // CSR — enrollment moved out-of-band.
+    // The stream Hello names the instance and carries no credential of its
+    // own — enrollment moved out-of-band, and mTLS is the authN.
     let captured = Arc::clone(&harness.gateway.captured);
     let ok = with_captured!(captured, c => {
         c.hellos.iter().any(|(h, mtls)| {
             h.identifier == ASSIGNED_ID
                 && *mtls
-                && h.credential.is_empty()
-                && h.csr_pem.is_empty()
-                && h.kind == proto::InstanceKind::Standalone as i32
+                && h.instance_kind == proto::InstanceKind::Standalone as i32
+                && h.protocol_version == runtime_cloud_connect::PROTOCOL_VERSION
+                && h.capabilities == vec!["apply_spicepod".to_string()]
         })
     });
-    assert!(ok, "mTLS Hello must carry identifier + empty credential");
+    assert!(
+        ok,
+        "mTLS Hello must name the instance and announce its protocol version + capabilities"
+    );
 
     handle.shutdown().await;
 }
@@ -1235,9 +1255,10 @@ async fn identity_is_reused_across_restart_over_mtls() {
         async move {
             let c = captured.lock().await;
             c.hellos.len() > hellos_before
-                && c.hellos.iter().skip(hellos_before).any(|(h, mtls)| {
-                    h.identifier == ASSIGNED_ID && *mtls && h.credential.is_empty()
-                })
+                && c.hellos
+                    .iter()
+                    .skip(hellos_before)
+                    .any(|(h, mtls)| h.identifier == ASSIGNED_ID && *mtls)
         }
     })
     .await;
@@ -1282,21 +1303,28 @@ async fn heartbeat_and_telemetry_cadence() {
 
     // The frames carry the enrolled identifier and the runtime counters.
     let (hb_ok, tel_ok) = with_captured!(captured, c => {
-        let hb_ok = c
-            .heartbeats
-            .iter()
-            .any(|h| h.identifier == ASSIGNED_ID && h.active_datasets == 2 && h.status == "online");
+        let hb_ok = c.heartbeats.iter().any(|h| {
+            h.identifier == ASSIGNED_ID
+                && h.active_datasets == 2
+                && h.active_models == 1
+                // This handle cannot report status, so it must leave the phase
+                // unspecified rather than inventing an "online".
+                && h.phase == proto::RuntimePhase::Unspecified as i32
+        });
         let tel_ok = c.telemetry.iter().any(|t| {
             t.identifier == ASSIGNED_ID
-                && t.metrics.contains_key("datasets_active")
-                && t.window_end_unix >= t.window_start_unix
+                // The dataset/model counters ride on the Heartbeat and only
+                // there; the telemetry map is for everything else.
+                && !t.metrics.contains_key("datasets_active")
+                && !t.metrics.contains_key("models_active")
+                && t.window_end.map(|ts| ts.seconds) >= t.window_start.map(|ts| ts.seconds)
         });
         (hb_ok, tel_ok)
     });
     assert!(hb_ok, "a heartbeat must carry the identifier + counters");
     assert!(
         tel_ok,
-        "a telemetry frame must carry billing-shaped metrics"
+        "a telemetry frame must carry a well-ordered window and no heartbeat counters"
     );
 
     handle.shutdown().await;
@@ -1316,9 +1344,9 @@ async fn apply_spicepod_hot_applies_and_persists() {
     let (handle, _identity) = enroll(&harness, &config, runtime).await;
 
     let yaml = "version: v2\nkind: Spicepod\nname: e2e-cloud-managed\n";
-    harness.gateway.outbound.lock().await.push_back(ctrl(
+    harness.gateway.outbound.lock().await.push_back(ctrl_id(
+        "cmd-apply",
         proto::control_message::Body::ApplySpicepod(proto::ApplySpicepod {
-            command_id: "cmd-apply".to_string(),
             spicepod_yaml: yaml.to_string(),
         }),
     ));
@@ -1344,8 +1372,19 @@ async fn apply_spicepod_hot_applies_and_persists() {
         .find(|r| r.command_id == "cmd-apply")
         .cloned())
     .expect("apply result");
-    assert!(result.success, "apply must succeed: {}", result.error);
-    let meta: Value = serde_json::from_str(&result.payload_json).unwrap();
+    assert_eq!(
+        result.code,
+        proto::ResultCode::Ok as i32,
+        "apply must succeed: {}",
+        result.message
+    );
+    let Some(proto::command_result::Payload::Json(json)) = result.payload else {
+        panic!(
+            "ApplySpicepod must answer with a JSON payload, got {:?}",
+            result.payload
+        );
+    };
+    let meta: Value = serde_json::from_str(&json).expect("parse ApplySpicepod JSON payload");
     assert_eq!(meta["applied"], true);
     assert_eq!(meta["reload"], "hot");
 
@@ -1404,9 +1443,7 @@ async fn reconnects_over_mtls_after_disconnect() {
             c.stream_count >= 2
                 && c.hellos
                     .iter()
-                    .filter(|(h, mtls)| {
-                        h.identifier == ASSIGNED_ID && *mtls && h.credential.is_empty()
-                    })
+                    .filter(|(h, mtls)| h.identifier == ASSIGNED_ID && *mtls)
                     .count()
                     >= 2
         }
@@ -1542,14 +1579,10 @@ async fn remove_clears_identity_and_exits() {
     assert!(identity_path.exists(), "identity present after enrollment");
 
     // Server issues Remove.
-    harness
-        .gateway
-        .outbound
-        .lock()
-        .await
-        .push_back(ctrl(proto::control_message::Body::Remove(proto::Remove {
-            command_id: "cmd-remove".to_string(),
-        })));
+    harness.gateway.outbound.lock().await.push_back(ctrl_id(
+        "cmd-remove",
+        proto::control_message::Body::Remove(proto::Remove {}),
+    ));
 
     // The client clears identity.json and the cloud-connect task exits; spiced
     // itself (here, the runtime handle) is untouched.
@@ -1565,7 +1598,7 @@ async fn remove_clears_identity_and_exits() {
                 .await
                 .results
                 .iter()
-                .any(|r| r.command_id == "cmd-remove" && r.success)
+                .any(|r| r.command_id == "cmd-remove" && r.code == proto::ResultCode::Ok as i32)
         }
     })
     .await;

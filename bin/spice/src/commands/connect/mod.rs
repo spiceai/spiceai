@@ -739,11 +739,10 @@ async fn print_status(config_dir: &Path, endpoint: Option<&str>) -> Result<()> {
         })?;
 
     if let Some(id) = identity {
-        let expiry = if id.not_after_unix == 0 {
-            "unbounded".to_string()
-        } else {
-            format!("unix={} (expired={})", id.not_after_unix, id.is_expired())
-        };
+        let expiry = id.not_after_unix.map_or_else(
+            || "unbounded".to_string(),
+            |secs| format!("unix={secs} (expired={})", id.is_expired()),
+        );
         println!("Spice Cloud Connect: adopted");
         println!("  identifier:  {}", id.identifier);
         println!("  identity:    {}", identity_path.display());
