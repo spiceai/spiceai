@@ -73,10 +73,13 @@ else
 	NEXTEST_CARGO_PROFILE := --cargo-profile dev
 endif
 
+# The `query_metrics` test binary is listed explicitly because `--lib` skips it:
+# it needs its own process to control the OTel meter-provider install order.
 .PHONY: nextest
 nextest:
 	@cargo nextest run --all --lib $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
 	@cargo nextest run -p cayenne --tests $(NEXTEST_CARGO_PROFILE)
+	@cargo nextest run -p runtime --test query_metrics $(NEXTEST_CARGO_PROFILE)
 
 # Also update .github/workflows/integration.yml with changes to this target
 .PHONY: test-integration
