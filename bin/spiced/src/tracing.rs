@@ -161,7 +161,7 @@ fn should_include_otel_location(is_release_build: bool, verbosity: &LogVerbosity
 /// is not configured for this instance.
 ///
 /// When present, the layer mirrors console output into a bounded in-memory
-/// ring buffer (ANSI stripped) that the `GetPodLogs` control message reads.
+/// ring buffer (ANSI stripped) that the `GetLogs` control message reads.
 /// It is added *alongside* the terminal `fmt` layer, so normal logging is
 /// unchanged. The same `task_history` exclusion as the console layer is
 /// applied so span-only records don't pollute the log tail.

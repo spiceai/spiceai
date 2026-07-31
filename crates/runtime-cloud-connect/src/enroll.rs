@@ -413,7 +413,7 @@ pub(crate) async fn acquire_identity(
         public_key_pem: material.public_key_pem,
         ca_bundle_pem: outcome.ca_bundle_pem,
         gateway_addr: outcome.gateway_addr,
-        not_after_unix: outcome.not_after_unix,
+        not_after_unix: Some(outcome.not_after_unix),
         enc_private_key_pem: material.enc_private_key_pem,
         enc_public_key_pem: material.enc_public_key_pem,
     };

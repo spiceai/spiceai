@@ -16,7 +16,7 @@ limitations under the License.
 
 //! In-memory ring buffer of recent log lines, fed by a `tracing` layer.
 //!
-//! This exists so Spice Cloud Connect can answer a `GetPodLogs` control
+//! This exists so Spice Cloud Connect can answer a `GetLogs` control
 //! message: a standalone `spiced` has no pod / kube API to read logs from,
 //! so it serves the most recent lines of its own log output instead. The
 //! capture layer is installed alongside — never in place of — the terminal
@@ -141,14 +141,14 @@ impl<'a> MakeWriter<'a> for LogRingBuffer {
 
 /// Install the process-global ring buffer (idempotent) and return a handle.
 /// Called from `init_tracing` only when Cloud Connect is configured, so the
-/// capture layer's `MakeWriter` and the later `GetPodLogs` reader share one
+/// capture layer's `MakeWriter` and the later `GetLogs` reader share one
 /// buffer.
 pub(crate) fn install(capacity: usize) -> LogRingBuffer {
     CAPTURE.get_or_init(|| LogRingBuffer::new(capacity)).clone()
 }
 
 /// Return the installed ring buffer, if `install` has run. The Cloud Connect
-/// runtime handle uses this to serve `GetPodLogs`.
+/// runtime handle uses this to serve `GetLogs`.
 pub(crate) fn handle() -> Option<LogRingBuffer> {
     CAPTURE.get().cloned()
 }
