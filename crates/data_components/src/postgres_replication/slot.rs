@@ -479,13 +479,14 @@ async fn slot_advance(
     slot_name: &str,
     target: u64,
 ) -> Result<u64> {
+    let target_lsn = format_lsn(target);
     // Both arguments are cast explicitly: the function takes (name, pg_lsn), and
     // binding Rust `String`s without the casts leaves parameter-type inference to
     // resolve `text` against those, which fails.
     let row = client
         .query_one(
             "SELECT end_lsn::text FROM pg_replication_slot_advance($1::name, $2::pg_lsn)",
-            &[&slot_name, &format_lsn(target)],
+            &[&slot_name, &target_lsn],
         )
         .await
         .context(SetupExecSnafu)?;
