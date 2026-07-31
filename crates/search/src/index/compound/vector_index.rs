@@ -19,15 +19,19 @@ use std::{any::Any, sync::Arc};
 use arrow::array::RecordBatch;
 use arrow_schema::Field;
 use async_trait::async_trait;
-use datafusion::{error::DataFusionError, logical_expr::LogicalPlan};
+use datafusion::{
+    error::{DataFusionError, Result as DataFusionResult},
+    logical_expr::LogicalPlan,
+};
 use futures::future::try_join_all;
 use runtime_datafusion_index::Index;
 
 use crate::index::{SearchIndex, VectorIndex};
 
 use super::{
-    CompoundReadMode, Error, compound_on_write_start, compound_required_columns, compound_write,
-    fallback::fallback_on_empty_plan, validate_compatibility,
+    CompoundReadMode, Error, compound_delete_by_keys, compound_on_write_start,
+    compound_required_columns, compound_write, fallback::fallback_on_empty_plan,
+    validate_compatibility,
 };
 
 /// A [`VectorIndex`] counterpart of [`super::CompoundSearchIndex`]: writes through to two
@@ -75,6 +79,11 @@ impl CompoundVectorIndex {
             secondary,
             read_mode,
         }
+    }
+
+    #[must_use]
+    pub fn primary(&self) -> &Arc<dyn VectorIndex> {
+        &self.primary
     }
 
     #[must_use]
@@ -153,6 +162,10 @@ impl Index for CompoundVectorIndex {
             self.secondary.on_write_complete()
         );
         primary_result.and(secondary_result)
+    }
+
+    async fn delete_by_keys(&self, keys: RecordBatch) -> DataFusionResult<()> {
+        compound_delete_by_keys(self.primary.as_ref(), self.secondary.as_ref(), keys).await
     }
 
     fn write_complete_failure_is_fatal(&self) -> bool {

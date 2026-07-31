@@ -20,6 +20,7 @@ limitations under the License.
 //! with the Spice search pipeline, enabling hybrid search via `vector_search`,
 //! `text_search`, and `rrf` UDTFs.
 
+mod delete;
 mod write;
 
 use std::any::Any;
@@ -473,6 +474,11 @@ impl Index for ElasticsearchIndex {
             .on_write_complete(self.client.as_ref(), &self.es_index)
             .await
     }
+
+    async fn delete_by_keys(&self, keys: RecordBatch) -> Result<(), DataFusionError> {
+        let key_columns: Vec<String> = self.primary_key.iter().map(|f| f.name().clone()).collect();
+        delete::delete_by_keys(self.client.as_ref(), &self.es_index, &key_columns, &keys).await
+    }
 }
 
 impl ElasticsearchIndex {
@@ -715,6 +721,11 @@ impl Index for ElasticsearchTextIndex {
             .on_write_complete(self.client.as_ref(), &self.es_index)
             .await
     }
+
+    async fn delete_by_keys(&self, keys: RecordBatch) -> Result<(), DataFusionError> {
+        let key_columns: Vec<String> = self.primary_key.iter().map(|f| f.name().clone()).collect();
+        delete::delete_by_keys(self.client.as_ref(), &self.es_index, &key_columns, &keys).await
+    }
 }
 
 #[cfg(test)]
@@ -836,6 +847,13 @@ mod write_maintenance_tests {
             &self,
             _: &str,
             _: &[(Option<String>, serde_json::Value)],
+        ) -> elasticsearch::Result<serde_json::Value> {
+            unimplemented!()
+        }
+        async fn delete_by_query(
+            &self,
+            _: &str,
+            _: &serde_json::Value,
         ) -> elasticsearch::Result<serde_json::Value> {
             unimplemented!()
         }

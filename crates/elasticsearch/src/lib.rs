@@ -568,6 +568,24 @@ impl Client {
         })
         .await
     }
+
+    /// Delete every document matching `query` via `POST /<index>/_delete_by_query`.
+    pub async fn delete_by_query(
+        &self,
+        index: &str,
+        query: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let url = format!("{}/{}/_delete_by_query", self.base_url, index);
+        let body = serde_json::json!({ "query": query });
+        let resp = self
+            .auth(self.http.post(&url))
+            .json(&body)
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+        let resp = check_status(resp).await?;
+        resp.json().await.context(JsonParseSnafu)
+    }
 }
 
 async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response> {
@@ -653,6 +671,11 @@ pub trait Elasticsearch: std::fmt::Debug + Send + Sync {
         index: &str,
         docs: &[(Option<String>, serde_json::Value)],
     ) -> Result<serde_json::Value>;
+    async fn delete_by_query(
+        &self,
+        index: &str,
+        query: &serde_json::Value,
+    ) -> Result<serde_json::Value>;
 }
 
 #[async_trait::async_trait]
@@ -736,5 +759,13 @@ impl Elasticsearch for Client {
         docs: &[(Option<String>, serde_json::Value)],
     ) -> Result<serde_json::Value> {
         self.bulk_index(index, docs).await
+    }
+
+    async fn delete_by_query(
+        &self,
+        index: &str,
+        query: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        Client::delete_by_query(self, index, query).await
     }
 }
