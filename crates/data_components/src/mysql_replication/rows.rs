@@ -235,9 +235,14 @@ pub fn normalize_binlog_value(column: &SourceColumn, value: BinlogValue<'_>) -> 
 fn sign_extend_mediumint(column: &SourceColumn, value: &BinlogValue<'_>) -> Option<Value> {
     const SIGN_BIT: i64 = 1 << 23;
     const WIDTH: i64 = 1 << 24;
+    const MEDIUMINT: &str = "mediumint";
+    const UNSIGNED: &str = "unsigned";
 
     let ty = column.column_type.as_str();
-    if !ty.starts_with("mediumint") || ty.contains("unsigned") {
+    let is_mediumint = ty
+        .get(..MEDIUMINT.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(MEDIUMINT));
+    if !is_mediumint || contains_ignore_ascii_case(ty, UNSIGNED) {
         return None;
     }
     let raw = match value {
@@ -248,6 +253,15 @@ fn sign_extend_mediumint(column: &SourceColumn, value: &BinlogValue<'_>) -> Opti
     (SIGN_BIT..WIDTH)
         .contains(&raw)
         .then(|| Value::Int(raw - WIDTH))
+}
+
+/// ASCII-case-insensitive substring test. `COLUMN_TYPE` casing is not
+/// guaranteed, and this runs per value per row, so it avoids allocating.
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 /// Build a [`ChangeBatch`] from decoded changes, typing the `data` struct to
@@ -1131,6 +1145,19 @@ mod tests {
         assert_eq!(got, Value::Int(8_388_607));
 
         column.column_type = "mediumint(8) unsigned".to_string();
+        let got = normalize_binlog_value(&column, BinlogValue::Value(Value::Int(16_777_215)))
+            .expect("normalizes");
+        assert_eq!(got, Value::Int(16_777_215));
+
+        // COLUMN_TYPE casing is not guaranteed. Missing the type would restore
+        // the corruption; missing `unsigned` would invent it on a column that
+        // legitimately owns the whole 24-bit range.
+        column.column_type = "MEDIUMINT(9)".to_string();
+        let got = normalize_binlog_value(&column, BinlogValue::Value(Value::Int(8_777_216)))
+            .expect("normalizes");
+        assert_eq!(got, Value::Int(-8_000_000));
+
+        column.column_type = "MEDIUMINT(8) UNSIGNED".to_string();
         let got = normalize_binlog_value(&column, BinlogValue::Value(Value::Int(16_777_215)))
             .expect("normalizes");
         assert_eq!(got, Value::Int(16_777_215));
