@@ -16,9 +16,11 @@ limitations under the License.
 
 use super::{ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
 use crate::accelerated_table::refresh_task::changes::{
-    CdcSchemaEvolution, SCHEMA_EVOLUTION_APPLIED, SCHEMA_EVOLUTION_DETECTED,
-    SCHEMA_EVOLUTION_FAILED, install_cdc_schema_evolution, schema_evolution_labels,
-    widening_plan_kind,
+    CdcSchemaEvolution, install_cdc_schema_evolution,
+};
+use crate::schema_evolution::{
+    SCHEMA_EVOLUTION_APPLIED, SCHEMA_EVOLUTION_DETECTED, SCHEMA_EVOLUTION_FAILED,
+    schema_evolution_labels, widening_plan_kind,
 };
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::component::dataset::{Dataset, OnSchemaChange};
