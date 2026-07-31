@@ -70,10 +70,27 @@ impl MemoryVectorStore {
     ) -> Result<(), DataFusionError> {
         debug_assert_eq!(batch.num_rows(), keys.len());
 
-        let new_keys: HashSet<&str> = keys.iter().map(String::as_str).collect();
+        self.delete_by_keys(&keys)?;
+        if batch.num_rows() > 0 {
+            self.batches.push(StoredBatch { batch, keys });
+        }
+        Ok(())
+    }
+
+    /// Remove every stored row whose formatted primary key appears in `keys`.
+    pub(crate) fn delete_by_keys(&mut self, keys: &[String]) -> Result<(), DataFusionError> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+
+        let delete_keys: HashSet<&str> = keys.iter().map(String::as_str).collect();
         let mut retained = Vec::with_capacity(self.batches.len() + 1);
         for stored in self.batches.drain(..) {
-            if !stored.keys.iter().any(|k| new_keys.contains(k.as_str())) {
+            if !stored
+                .keys
+                .iter()
+                .any(|key| delete_keys.contains(key.as_str()))
+            {
                 // No overlap — keep the batch untouched (zero-copy).
                 retained.push(stored);
                 continue;
@@ -81,7 +98,7 @@ impl MemoryVectorStore {
             let mask: BooleanArray = stored
                 .keys
                 .iter()
-                .map(|k| Some(!new_keys.contains(k.as_str())))
+                .map(|key| Some(!delete_keys.contains(key.as_str())))
                 .collect();
             let filtered = filter_record_batch(&stored.batch, &mask)
                 .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
@@ -91,15 +108,12 @@ impl MemoryVectorStore {
             let kept_keys = stored
                 .keys
                 .into_iter()
-                .filter(|k| !new_keys.contains(k.as_str()))
+                .filter(|key| !delete_keys.contains(key.as_str()))
                 .collect::<Vec<_>>();
             retained.push(StoredBatch {
                 batch: filtered,
                 keys: kept_keys,
             });
-        }
-        if batch.num_rows() > 0 {
-            retained.push(StoredBatch { batch, keys });
         }
         self.batches = retained;
         Ok(())
