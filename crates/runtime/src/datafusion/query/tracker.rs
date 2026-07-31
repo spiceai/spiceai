@@ -55,10 +55,10 @@ impl QueryTracker {
         tracing::debug!("Query finished with error: {error_message}; code: {error_code}",);
         self.error_message = Some(error_message);
         self.error_code = Some(error_code);
-        self.finish(request_context, &Arc::from(""));
+        self.finish(request_context, "");
     }
 
-    pub fn finish(mut self, request_context: &RequestContext, captured_output: &Arc<str>) {
+    pub fn finish(mut self, request_context: &RequestContext, captured_output: &str) {
         let query_duration = self.query_duration_timer.elapsed();
         let query_execution_duration = self.query_execution_duration_timer.elapsed();
 
