@@ -1009,14 +1009,10 @@ impl RefreshableCatalogProvider for AcceleratedCatalogProvider {
             // the providers of every table already loaded, so replacing it on a
             // periodic refresh would drop them and make ready tables vanish
             // until their datasets happened to reload.
-            let provider = self
-                .schemas
-                .read()
-                .get(&schema_name)
-                .map_or_else(
-                    || Arc::new(AcceleratedSchemaProvider::default()),
-                    Arc::clone,
-                );
+            let provider = self.schemas.read().get(&schema_name).map_or_else(
+                || Arc::new(AcceleratedSchemaProvider::default()),
+                Arc::clone,
+            );
             *provider.tables.write() = plan.tables;
 
             for (table_name, dataset_name, kind, dataset) in plan.to_spawn {
@@ -1347,10 +1343,7 @@ mod tests {
         assert!(schema.table("orders").await.expect("lookup").is_none());
 
         schema
-            .install(
-                &TableReference::bare("__catalog_accel_x"),
-                empty_provider(),
-            )
+            .install(&TableReference::bare("__catalog_accel_x"), empty_provider())
             .expect("install");
 
         assert!(schema.table_exist("orders"));
@@ -1370,10 +1363,7 @@ mod tests {
             .write()
             .insert("__catalog_accel_x".to_string(), "orders".to_string());
         schema
-            .install(
-                &TableReference::bare("__catalog_accel_x"),
-                empty_provider(),
-            )
+            .install(&TableReference::bare("__catalog_accel_x"), empty_provider())
             .expect("install");
 
         // What `refresh()` does to a reused provider: replace the table map.
@@ -1402,7 +1392,10 @@ mod tests {
 
         let schema = AcceleratedSchemaProvider::default();
         schema
-            .install(&TableReference::bare("__catalog_accel_missing"), empty_provider())
+            .install(
+                &TableReference::bare("__catalog_accel_missing"),
+                empty_provider(),
+            )
             .expect("install must not fail the dataset that produced the provider");
 
         assert!(schema.table_names().is_empty());
