@@ -4,11 +4,18 @@
 
 all: tpch-gen pg-load
 
-tpch-init:
+# Directory the *-load targets read TPC-H .tbl files from. dbgen writes its output
+# next to the binary, so that is the default; tpch-fleet-gen writes to
+# $(TPCH_FLEET_DIR) instead, so a caller using it must pass TPCH_DATA_DIR to match.
+TPCH_DATA_DIR ?= tpch-kit/dbgen
+
+tpch-clone:
 	@if [ ! -d "tpch-kit" ]; then \
 		git clone https://github.com/spiceai/tpch-kit.git; \
 		cd tpch-kit && git checkout 319892381ff1213ca794d449c04c5a31f2252d57; \
 	fi
+
+tpch-init: tpch-clone
 	@OS=`uname`; \
 	if [ -z "$(MACHINE)" ]; then \
 		if [ "$$OS" = "Linux" ]; then \
@@ -75,6 +82,71 @@ tpch-gen: tpch-init
 
 	@echo "Test data and queries generated successfully."
 
+# tpch-fleet-gen generates the same TPC-H dataset the rest of the benchmark fleet
+# runs on - s3://spiceai-public-datasets/tpch and the hosted MySQL, Iceberg, Glue,
+# Databricks, Snowflake and Spice Cloud copies - which is what
+# crates/test-framework/src/queries/validation/tpch/*.csv holds the expected
+# answers for. That dataset comes from DuckDB's tpch extension, and DuckDB's
+# generator disagrees with tpch-kit's dbgen on the free-text columns (c_address,
+# s_address, and every *_comment): keys, numerics, dates and even the string
+# lengths are identical, but the characters differ. That changes 4 of the 22 TPC-H
+# answers - Q2 and Q20 (s_address), Q10 (c_address), and Q13, whose predicate reads
+# o_comment - so a Postgres database seeded with dbgen data fails result validation
+# on exactly those four queries no matter how correct the engine under test is.
+# dbgen is the officially correct generator (its output matches the TPC-supplied
+# answers in tpch-kit's dbgen/answers/); the fleet's dataset is the one that
+# diverges, tracked separately in #12137. Until that is resolved, seeding from the
+# same generator the answers were produced with is what makes a result mismatch
+# mean a real bug.
+#
+# Data only - qgen/tpch_queries.sql still comes from tpch-gen.
+# Example: DBGEN_SCALE=1 make tpch-fleet-gen
+TPCH_FLEET_DIR ?= ./tmp/fleet
+
+# Pinned so the generated dataset cannot drift with whatever duckdb happens to be
+# on PATH. v1.5.4's output was verified row-for-row identical to the fleet dataset
+# across all 8 tables (0 rows differing in either direction, 6,001,215 lineitem
+# rows). Override DUCKDB to use an already-installed CLI.
+DUCKDB_VERSION ?= v1.5.4
+DUCKDB ?= ./tmp/bin/duckdb
+
+$(DUCKDB):
+	@mkdir -p ./tmp/bin
+	@OS=`uname`; ARCH=`uname -m`; \
+	case "$$OS/$$ARCH" in \
+		Linux/x86_64) ASSET=duckdb_cli-linux-amd64.zip ;; \
+		Linux/aarch64 | Linux/arm64) ASSET=duckdb_cli-linux-arm64.zip ;; \
+		Darwin/*) ASSET=duckdb_cli-osx-universal.zip ;; \
+		*) echo "No DuckDB CLI release asset for $$OS/$$ARCH - install duckdb and re-run with DUCKDB=\`command -v duckdb\`"; exit 1 ;; \
+	esac; \
+	echo "Downloading DuckDB CLI $(DUCKDB_VERSION) ($$ASSET)..."; \
+	curl -fsSL --retry 3 -o ./tmp/bin/duckdb.zip "https://github.com/duckdb/duckdb/releases/download/$(DUCKDB_VERSION)/$$ASSET"
+	@unzip -oq ./tmp/bin/duckdb.zip -d ./tmp/bin
+	@rm -f ./tmp/bin/duckdb.zip
+	@chmod +x "$(DUCKDB)"
+	@"$(DUCKDB)" --version
+
+tpch-fleet-gen: $(DUCKDB)
+	@# Check if DBGEN_SCALE is set, else default to 1
+	$(eval DBGEN_SCALE ?= 1)
+	@mkdir -p "$(TPCH_FLEET_DIR)"
+	@rm -f "$(TPCH_FLEET_DIR)"/*.tbl "$(TPCH_FLEET_DIR)/gen.duckdb" "$(TPCH_FLEET_DIR)/gen.duckdb.wal"
+	@echo "Generating TPC-H scale factor $(DBGEN_SCALE)..."
+	@"$(DUCKDB)" "$(TPCH_FLEET_DIR)/gen.duckdb" -c "INSTALL tpch; LOAD tpch; CALL dbgen(sf=$(DBGEN_SCALE));" > /dev/null
+	@# QUOTE '' disables CSV quoting so no field is ever wrapped, and the trailing
+	@# empty column reproduces dbgen's trailing '|'; the result is byte-compatible
+	@# with dbgen's .tbl format, so every *-load target reads it unchanged. Tables
+	@# are dropped as they are written to bound peak disk at the larger scales.
+	@for table in region nation customer supplier part partsupp orders lineitem; do \
+		echo "Writing $$table.tbl..."; \
+		"$(DUCKDB)" "$(TPCH_FLEET_DIR)/gen.duckdb" -c "\
+			COPY (SELECT *, '' FROM $$table) TO '$(TPCH_FLEET_DIR)/$$table.tbl' (FORMAT CSV, DELIMITER '|', HEADER false, QUOTE ''); \
+			DROP TABLE $$table; \
+			CHECKPOINT;" > /dev/null || exit 1; \
+	done
+	@rm -f "$(TPCH_FLEET_DIR)/gen.duckdb" "$(TPCH_FLEET_DIR)/gen.duckdb.wal"
+	@echo "Test data generated successfully in $(TPCH_FLEET_DIR) - pass TPCH_DATA_DIR=$(TPCH_FLEET_DIR) to the load targets."
+
 # Default value for DB_NAME
 DB_NAME ?= tpch
 
@@ -91,9 +163,10 @@ pg-init:
 
 # Example: DB_HOST=localhost DB_PORT=5432 DB_USER=postgres DB_NAME=tpch make pg-load
 pg-load:
+	@mkdir -p ./tmp
 	@for table in region nation customer supplier part partsupp orders lineitem; do \
 		echo "Loading $$table..."; \
-		sed 's/|$$//' tpch-kit/dbgen/$$table.tbl > ./tmp/$$table.tbl; \
+		sed 's/|$$//' "$(TPCH_DATA_DIR)/$$table.tbl" > ./tmp/$$table.tbl; \
 		psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "\\copy $$table FROM './tmp/$$table.tbl' CSV DELIMITER '|';"; \
 	done
 	@echo "Benchmark dataset has been successfully loaded to $(DB_NAME) database"
@@ -189,7 +262,7 @@ mysql-load:
 	@mkdir -p ./tmp
 	@for table in region nation customer supplier part partsupp orders lineitem; do \
 		echo "Loading $$table..."; \
-		sed 's/|$$//' tpch-kit/dbgen/$$table.tbl > ./tmp/$$table.tbl; \
+		sed 's/|$$//' "$(TPCH_DATA_DIR)/$$table.tbl" > ./tmp/$$table.tbl; \
 		mysql -h$(DB_HOST) -u$(DB_USER) -p$(DB_PASS) -P$(DB_PORT) --local-infile=1 $(DB_NAME) -e "LOAD DATA LOCAL INFILE './tmp/$$table.tbl' INTO TABLE $$table FIELDS TERMINATED BY '|' LINES TERMINATED BY '\n';"; \
 	done
 	@echo "Benchmark dataset has been successfully loaded to '$(DB_NAME)' database."
@@ -279,7 +352,7 @@ file-tpch-init:
 	@mkdir -p ./tmp
 	@for table in region nation customer supplier part partsupp orders lineitem; do \
 		echo "Preparing $$table..."; \
-		cp tpch-kit/dbgen/$$table.tbl ./tmp/$$table.csv; \
+		cp "$(TPCH_DATA_DIR)/$$table.tbl" ./tmp/$$table.csv; \
 		python ./tpch_file.py ./tmp/$$table; \
 		rm ./tmp/$$table.csv; \
 	done
@@ -336,7 +409,7 @@ mssql-init:
 
 mssql-load:
 	@for table in region nation customer supplier part partsupp orders lineitem; do \
-		cp tpch-kit/dbgen/$$table.tbl ./mssql-tpch/data/$$table.tbl; \
+		cp "$(TPCH_DATA_DIR)/$$table.tbl" ./mssql-tpch/data/$$table.tbl; \
 	done
 	chmod 755 ./mssql-tpch/data
 	sqlcmd -U $(DB_USER) -P $(DB_PASS) -S $(DB_HOST) -d $(DB_NAME) -i ./mssql-tpch/insert.sql
