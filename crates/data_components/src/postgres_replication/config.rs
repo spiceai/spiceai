@@ -79,7 +79,6 @@ pub struct ReplicationParams {
     /// the WAL overlap from `confirmed_flush_lsn` replays idempotently via
     /// the PK upsert. `initial_snapshot: false` still disables all snapshots.
     pub snapshot_on_resume: bool,
-    pub temporary_slot: bool,
     pub status_interval: Duration,
     /// Lag-based readiness threshold: the dataset is marked Ready once its
     /// replication lag (now minus the newest applied commit's source time)
@@ -129,7 +128,6 @@ impl std::fmt::Debug for ReplicationParams {
             .field("publication_name", &self.publication_name)
             .field("initial_snapshot", &self.initial_snapshot)
             .field("snapshot_on_resume", &self.snapshot_on_resume)
-            .field("temporary_slot", &self.temporary_slot)
             .field("status_interval", &self.status_interval)
             .field("bootstrap_batch_size", &self.bootstrap_batch_size)
             .field("shared", &self.shared)
@@ -767,7 +765,6 @@ TXTE85+Or9IUwDI9543jsyCvuQ8=
             publication_name: "pub".to_string(),
             initial_snapshot: true,
             snapshot_on_resume: false,
-            temporary_slot: false,
             status_interval: Duration::from_secs(5),
             ready_lag: Duration::from_secs(2),
             bootstrap_batch_size: 1024,
