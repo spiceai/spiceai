@@ -466,6 +466,7 @@ impl HashIndexBuilder {
 
     /// Enables or disables the bloom filter.
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn with_bloom_filter(mut self, enabled: bool) -> Self {
         self.use_bloom_filter = enabled;
         self
@@ -1022,6 +1023,7 @@ impl HashIndex {
 
     /// Creates a new hash index with bloom filter enabled.
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn with_bloom_filter(key_columns: Vec<String>, expected_items: usize) -> Self {
         let per_shard = (expected_items / NUM_SHARDS).max(16);
         let shards: Vec<Shard> = (0..NUM_SHARDS).map(|_| Shard::new(per_shard)).collect();
@@ -1036,6 +1038,7 @@ impl HashIndex {
 
     /// Creates a builder for constructing a hash index.
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn builder(key_columns: Vec<String>) -> HashIndexBuilder {
         HashIndexBuilder::new(key_columns)
     }
@@ -1048,6 +1051,7 @@ impl HashIndex {
     }
 
     /// Returns the key columns.
+    #[cfg(test)]
     pub(crate) fn key_columns(&self) -> &[String] {
         &self.key_columns
     }
@@ -1063,6 +1067,7 @@ impl HashIndex {
     }
 
     /// Returns true if bloom filter is enabled.
+    #[cfg(test)]
     pub(crate) fn has_bloom_filter(&self) -> bool {
         self.bloom.is_some()
     }
@@ -1104,6 +1109,7 @@ impl HashIndex {
 
     /// Checks if index might contain hash (bloom filter only).
     #[inline]
+    #[cfg(test)]
     pub(crate) fn might_contain(&self, hash: u64) -> bool {
         let hash = normalize_hash(hash);
         match &self.bloom {
@@ -1114,6 +1120,7 @@ impl HashIndex {
 
     /// Checks if index contains hash.
     #[inline]
+    #[cfg(test)]
     pub(crate) fn contains(&self, hash: u64) -> bool {
         self.get_by_hash(hash).is_some()
     }
@@ -1250,6 +1257,7 @@ impl HashIndex {
     /// # Errors
     ///
     /// Returns an error if key extraction fails for any batch, or if indices overflow u32.
+    #[cfg(test)]
     pub(crate) fn add_batches(
         &self,
         partition_idx: u32,

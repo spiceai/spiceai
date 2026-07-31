@@ -220,6 +220,7 @@ impl std::hash::Hash for Value {
 impl Value {
     /// Returns true if the value is null.
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn is_null(&self) -> bool {
         matches!(self, Value::Null)
     }
@@ -246,6 +247,7 @@ impl Value {
 
     /// Returns true if the value is a sequence.
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn is_sequence(&self) -> bool {
         matches!(self, Value::Sequence(_))
     }
@@ -276,18 +278,21 @@ impl Value {
 
     /// If the value is a u64, returns it. Otherwise returns None.
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn as_u64(&self) -> Option<u64> {
         self.as_number().and_then(Number::as_u64)
     }
 
     /// If the value is representable as i64, returns it. Otherwise returns None.
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn as_i64(&self) -> Option<i64> {
         self.as_number().and_then(Number::as_i64)
     }
 
     /// If the value is a number, returns it as f64. Otherwise returns None.
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn as_f64(&self) -> Option<f64> {
         self.as_number().map(Number::as_f64)
     }

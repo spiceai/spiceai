@@ -60,6 +60,7 @@ pub trait KeyExtractor: Send + Sync {
     /// Extracts the key at the given row index.
     ///
     /// Returns `None` if the key is null.
+    #[cfg(test)]
     fn extract_key(&self, row: usize) -> Option<Self::Key>;
 
     /// Computes the hash for the key at the given row index.
@@ -111,6 +112,7 @@ impl<T: PrimitiveKey> KeyExtractor for PrimitiveKeyExtractor<T> {
     }
 
     #[inline]
+    #[cfg(test)]
     fn extract_key(&self, row: usize) -> Option<Self::Key> {
         if T::is_null(&self.array, row) {
             None
@@ -306,6 +308,7 @@ impl KeyExtractor for Utf8KeyExtractor {
     }
 
     #[inline]
+    #[cfg(test)]
     fn extract_key(&self, row: usize) -> Option<Self::Key> {
         if self.array.is_null(row) {
             None
@@ -422,6 +425,7 @@ impl KeyExtractor for BinaryKeyExtractor {
     }
 
     #[inline]
+    #[cfg(test)]
     fn extract_key(&self, row: usize) -> Option<Self::Key> {
         if self.array.is_null(row) {
             None
@@ -525,6 +529,7 @@ impl KeyExtractor for RowConverterKeyExtractor {
     }
 
     #[inline]
+    #[cfg(test)]
     fn extract_key(&self, row: usize) -> Option<Self::Key> {
         // A composite key is null if ANY of its constituent columns is null
         if self.is_null(row) {

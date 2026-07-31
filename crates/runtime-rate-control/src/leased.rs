@@ -193,31 +193,6 @@ impl LeasedBucketMetrics {
     pub fn lease_granted(&self) -> u64 {
         self.lease_granted.load(Ordering::Relaxed)
     }
-
-    #[must_use]
-    pub fn cluster_budget_remaining(&self) -> u64 {
-        self.cluster_budget_remaining.load(Ordering::Relaxed)
-    }
-
-    #[must_use]
-    pub fn last_lease_acquire_micros(&self) -> u64 {
-        self.last_lease_acquire_micros.load(Ordering::Relaxed)
-    }
-
-    #[must_use]
-    pub fn lease_acquire_conflicts_total(&self) -> u64 {
-        self.lease_acquire_conflicts_total.load(Ordering::Relaxed)
-    }
-
-    #[must_use]
-    pub fn fail_closed_total(&self) -> u64 {
-        self.fail_closed_total.load(Ordering::Relaxed)
-    }
-
-    #[must_use]
-    pub fn lease_refresh_errors_total(&self) -> u64 {
-        self.lease_refresh_errors_total.load(Ordering::Relaxed)
-    }
 }
 
 #[derive(Debug)]

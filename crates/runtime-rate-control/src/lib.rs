@@ -49,7 +49,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 mod leased;
 
-use leased::{LeasedBucket, LeasedBucketConfig, LeasedBucketMetrics};
+#[cfg(test)]
+use leased::LeasedBucketMetrics;
+use leased::{LeasedBucket, LeasedBucketConfig};
 
 const DEFAULT_PERSISTED_INSTANCE_TTL: Duration = Duration::from_secs(90);
 
