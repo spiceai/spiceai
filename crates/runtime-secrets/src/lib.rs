@@ -1417,8 +1417,8 @@ params:
                 assert_eq!(cfg.secret_name, "my-secret");
                 assert_eq!(cfg.region.as_deref(), Some("eu-west-2"));
                 assert_eq!(
-                    cfg.endpoint_url.as_ref().map(url::Url::as_str),
-                    Some("https://localhost:4566")
+                    cfg.endpoint_url,
+                    Some(url::Url::parse("https://localhost:4566").expect("valid endpoint URL"))
                 );
             }
             _ => panic!("expected AwsSecretsManager variant"),
@@ -1529,8 +1529,8 @@ params:
             super::SecretStoreType::AwsSecretsManager(cfg) => {
                 assert_eq!(cfg.region.as_deref(), Some("ap-south-1"));
                 assert_eq!(
-                    cfg.endpoint_url.as_ref().map(url::Url::as_str),
-                    Some("https://localhost:4566")
+                    cfg.endpoint_url,
+                    Some(url::Url::parse("https://localhost:4566").expect("valid endpoint URL"))
                 );
             }
             _ => panic!("expected AwsSecretsManager variant"),
