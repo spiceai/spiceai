@@ -112,16 +112,20 @@ async fn run_inner(
         super::create_client_executors(args, &spiced_instance, args.common.concurrency).await?;
     super::announce_connection_topology(&client_executors, args.common.concurrency);
 
-    let (_query_set, test_builder) = super::build_test_with_validation(
-        args,
-        &app,
-        NotStarted::new()
-            .with_parallel_count(args.common.concurrency)
-            .with_end_condition(EndCondition::QuerySetCompleted(2))
-            .with_query_executor(executor)
-            .with_query_executors(client_executors),
-    )
-    .await?;
+    let mut builder = NotStarted::new()
+        .with_parallel_count(args.common.concurrency)
+        .with_end_condition(EndCondition::QuerySetCompleted(2));
+    if client_executors.is_empty() {
+        builder = builder.with_query_executor(executor);
+    } else {
+        // Drop the shared executor before the measured phase. The baseline ran
+        // on it, so its connection is established; holding it here would leave
+        // the server with N+1 connections for a test that asked for N.
+        drop(executor);
+        builder = builder.with_query_executors(client_executors);
+    }
+
+    let (_query_set, test_builder) = super::build_test_with_validation(args, &app, builder).await?;
 
     let throughput_test = SpiceTest::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)
