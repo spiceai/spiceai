@@ -44,13 +44,13 @@ pub fn supports_filter_expr(columns: &[String], filter: &Expr) -> bool {
                     // Recurse into children to validate sub-expressions.
                     return Ok(TreeNodeRecursion::Continue);
                 }
-                DFOperator::Eq
-                | DFOperator::NotEq
-                | DFOperator::Lt
-                | DFOperator::LtEq
-                | DFOperator::Gt
-                | DFOperator::GtEq => {
-                    supports_column_ref(columns, &binary.left) && is_literal(&binary.right)
+                DFOperator::Eq | DFOperator::NotEq => {
+                    supports_column_ref(columns, &binary.left)
+                        && is_supported_primitive_literal(&binary.right)
+                }
+                DFOperator::Lt | DFOperator::LtEq | DFOperator::Gt | DFOperator::GtEq => {
+                    supports_column_ref(columns, &binary.left)
+                        && is_supported_numeric_literal(&binary.right)
                 }
                 _ => false,
             },
@@ -128,13 +128,51 @@ fn supports_in_list(columns: &[String], in_list: &datafusion::logical_expr::expr
         return false;
     }
 
-    // Check that all items in the list are literals
-    in_list.list.iter().all(is_literal)
+    // S3 Vectors requires a non-empty array of primitive metadata values.
+    !in_list.list.is_empty() && in_list.list.iter().all(is_supported_primitive_literal)
 }
 
-/// Checks if an expression is a literal value
-fn is_literal(expr: &Expr) -> bool {
-    matches!(expr, Expr::Literal(..))
+/// Checks whether an expression is a primitive literal supported by S3 Vectors.
+fn is_supported_primitive_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(scalar, _) => is_supported_primitive_scalar(scalar),
+        _ => false,
+    }
+}
+
+/// Checks whether an expression is a numeric literal supported by S3 Vectors range filters.
+fn is_supported_numeric_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(scalar, _) => is_supported_numeric_scalar(scalar),
+        _ => false,
+    }
+}
+
+/// Checks whether a scalar can be represented as an S3 Vectors primitive metadata value.
+fn is_supported_primitive_scalar(scalar: &ScalarValue) -> bool {
+    matches!(
+        scalar,
+        ScalarValue::Boolean(Some(_))
+            | ScalarValue::Utf8(Some(_))
+            | ScalarValue::LargeUtf8(Some(_))
+    ) || is_supported_numeric_scalar(scalar)
+}
+
+/// Checks whether a scalar can be represented as a finite S3 Vectors numeric metadata value.
+fn is_supported_numeric_scalar(scalar: &ScalarValue) -> bool {
+    match scalar {
+        ScalarValue::Int8(Some(_))
+        | ScalarValue::Int16(Some(_))
+        | ScalarValue::Int32(Some(_))
+        | ScalarValue::Int64(Some(_))
+        | ScalarValue::UInt8(Some(_))
+        | ScalarValue::UInt16(Some(_))
+        | ScalarValue::UInt32(Some(_))
+        | ScalarValue::UInt64(Some(_)) => true,
+        ScalarValue::Float32(Some(value)) => value.is_finite(),
+        ScalarValue::Float64(Some(value)) => value.is_finite(),
+        _ => false,
+    }
 }
 
 /// Converts a single `DataFusion` Expr to a `MetadataFilter`
@@ -721,6 +759,53 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_filter_pushdown_requires_supported_operator_literal_pairs() {
+        let columns = vec!["category".to_string(), "year".to_string()];
+
+        let numeric_range = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(col("year")),
+            Operator::GtEq,
+            Box::new(lit(ScalarValue::Int64(Some(2020)))),
+        ));
+        assert!(supports_filter_expr(&columns, &numeric_range));
+
+        let string_range = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(col("category")),
+            Operator::Gt,
+            Box::new(lit("m")),
+        ));
+        assert!(!supports_filter_expr(&columns, &string_range));
+
+        let null_equality = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(col("category")),
+            Operator::Eq,
+            Box::new(lit(ScalarValue::Utf8(None))),
+        ));
+        assert!(!supports_filter_expr(&columns, &null_equality));
+
+        let non_finite_range = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(col("year")),
+            Operator::Lt,
+            Box::new(lit(ScalarValue::Float64(Some(f64::NAN)))),
+        ));
+        assert!(!supports_filter_expr(&columns, &non_finite_range));
+
+        let empty_in_list = Expr::InList(datafusion::logical_expr::expr::InList::new(
+            Box::new(col("category")),
+            vec![],
+            false,
+        ));
+        assert!(!supports_filter_expr(&columns, &empty_in_list));
+
+        let null_in_list = Expr::InList(datafusion::logical_expr::expr::InList::new(
+            Box::new(col("category")),
+            vec![lit(ScalarValue::Utf8(None))],
+            false,
+        ));
+        assert!(!supports_filter_expr(&columns, &null_in_list));
     }
 
     #[test]
