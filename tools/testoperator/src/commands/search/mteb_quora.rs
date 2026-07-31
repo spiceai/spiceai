@@ -75,15 +75,18 @@ pub(crate) async fn prepare_dataset(spicepod_dir: &Path) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to download huggingface file: {e}"))?;
 
     // Copy files to spicepod directory with new names
-    std::fs::copy(&data_path, &corpus_dest)
+    tokio::fs::copy(&data_path, &corpus_dest)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to copy corpus file: {e}"))?;
     println!("Corpus data saved to: {}", corpus_dest.display());
 
-    std::fs::copy(&test_queries_path, &queries_dest)
+    tokio::fs::copy(&test_queries_path, &queries_dest)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to copy queries file: {e}"))?;
     println!("Queries data saved to: {}", queries_dest.display());
 
-    std::fs::copy(&scores_path, &data_dest)
+    tokio::fs::copy(&scores_path, &data_dest)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to copy data file: {e}"))?;
     println!("Data saved to: {}", data_dest.display());
 
