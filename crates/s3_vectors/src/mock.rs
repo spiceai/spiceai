@@ -73,6 +73,7 @@ pub struct MockData {
     pub quota_limits: HashMap<String, usize>,  // Configurable quota limits per index
     pub list_indexes_calls: HashMap<String, usize>, // bucket -> call count
     pub create_index_calls: usize,
+    pub get_vector_bucket_calls: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -125,6 +126,16 @@ impl MockClient {
         data.create_index_calls
     }
 
+    /// Get the total call count for `get_vector_bucket`
+    #[must_use]
+    pub fn get_vector_bucket_call_count(&self) -> usize {
+        let data = match self.data.lock() {
+            Ok(lock) => lock,
+            Err(e) => e.into_inner(),
+        };
+        data.get_vector_bucket_calls
+    }
+
     /// Reset all call counts
     pub fn reset_call_counts(&self) {
         let mut data = match self.data.lock() {
@@ -133,6 +144,7 @@ impl MockClient {
         };
         data.list_indexes_calls.clear();
         data.create_index_calls = 0;
+        data.get_vector_bucket_calls = 0;
     }
 }
 
@@ -276,6 +288,11 @@ impl S3Vectors for MockClient {
         &self,
         _input: &GetVectorBucketInput,
     ) -> Result<GetVectorBucketOutput, SdkError<GetVectorBucketError>> {
+        let mut data = match self.data.lock() {
+            Ok(lock) => lock,
+            Err(e) => e.into_inner(),
+        };
+        data.get_vector_bucket_calls += 1;
         Ok(GetVectorBucketOutput::builder().build())
     }
 
