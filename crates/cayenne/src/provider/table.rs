@@ -4345,7 +4345,10 @@ impl CayenneTableProvider {
     pub(crate) async fn ensure_snapshot_dir_exists(
         snapshot_dir: &std::path::Path,
     ) -> std::io::Result<()> {
-        if !snapshot_dir.exists() {
+        // `tokio::fs::try_exists`, not `Path::exists`: this runs on every write
+        // (see `write_to_snapshot`), and on the network-attached storage tier a
+        // cold `stat` can take milliseconds — long enough to stall a Tokio worker.
+        if !tokio::fs::try_exists(snapshot_dir).await? {
             // Capture the parent before creation so we can sync it afterwards.
             let parent = snapshot_dir.parent().map(std::path::Path::to_path_buf);
             tokio::fs::create_dir_all(snapshot_dir).await?;
@@ -6035,11 +6038,7 @@ impl CayenneTableProvider {
         snapshot_id: &str,
         sequence_number: i64,
     ) -> CatalogResult<()> {
-        let is_s3 = self.table_metadata.path.starts_with("s3://");
-        if !is_s3 {
-            let snapshot_dir = self.snapshot_dir_path_for(snapshot_id);
-            Self::sync_snapshot_dir(&snapshot_dir).await?;
-        }
+        self.sync_local_snapshot_dir(snapshot_id).await?;
 
         self.catalog
             .set_snapshot_sequence(&self.table_metadata.table_id, snapshot_id, sequence_number)
@@ -6050,6 +6049,40 @@ impl CayenneTableProvider {
 
     fn pk_deletion_snapshot(&self) -> PkDeletionSnapshot {
         pk_deletion_snapshot_for_strategy(&self.pk_deletion_strategy)
+    }
+
+    /// Materialize this table's snapshot directory, if the table lives on a
+    /// local filesystem.
+    ///
+    /// A no-op on an object store: there are no directories, and the prefix
+    /// springs into existence with its first object.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory cannot be created.
+    pub(crate) async fn ensure_local_snapshot_dir(&self, snapshot_id: &str) -> Result<()> {
+        if self.table_metadata.path.starts_with("s3://") {
+            return Ok(());
+        }
+        Self::ensure_snapshot_dir_exists(&self.snapshot_dir_path_for(snapshot_id)).await?;
+        Ok(())
+    }
+
+    /// Take the durability barrier on this table's snapshot directory, if the
+    /// table lives on a local filesystem — the fsync that must precede any
+    /// catalog write making the snapshot visible.
+    ///
+    /// A no-op on an object store: there are no directories, and an object is
+    /// durable on PUT ack.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory cannot be synced.
+    pub(crate) async fn sync_local_snapshot_dir(&self, snapshot_id: &str) -> CatalogResult<()> {
+        if self.table_metadata.path.starts_with("s3://") {
+            return Ok(());
+        }
+        Self::sync_snapshot_dir(&self.snapshot_dir_path_for(snapshot_id)).await
     }
 
     /// Write a stream of record batches to a specific snapshot directory.
@@ -6088,6 +6121,26 @@ impl CayenneTableProvider {
     ) -> Result<(u64, usize, Arc<ColumnStatsAccumulator>)> {
         use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
         use std::time::Instant;
+
+        // Materialize the snapshot directory before the write, unconditionally.
+        // The Vortex sink creates it lazily when it writes its first file, so a
+        // write that carries no rows produces no files and no directory — and
+        // any caller that afterwards fsyncs the snapshot
+        // (`record_written_snapshot_sequence` → `sync_local_snapshot_dir`) then
+        // fails with `NotFound`, or records a catalog entry for a snapshot that
+        // has nothing on disk. Creating it here makes "a snapshot the catalog can
+        // reference always has a directory" a property of the write itself rather
+        // than a `rows == 0` guard repeated at each call site, and does not
+        // depend on the sink's lazy-creation behavior holding. It also makes the
+        // new directory's own dirent durable (`ensure_snapshot_dir_exists` syncs
+        // the parent), which the sink-created path never did. Callers that
+        // pre-create the directory pay only a `stat` — the helper short-circuits
+        // when it already exists.
+        //
+        // Ahead of the encode-permit acquisition below: this is pure metadata I/O
+        // that needs no permit, and holding the process-global budget across it
+        // would stall other tables' encodes for the duration.
+        self.ensure_local_snapshot_dir(snapshot_id).await?;
 
         // Bound aggregate encode concurrency across all tables. Per-table
         // `cayenne_write_concurrency` is sized in isolation (a conservative unset
@@ -6393,6 +6446,12 @@ impl CayenneTableProvider {
         target_size_bytes: usize,
         schema: &SchemaRef,
     ) -> Result<(usize, Arc<ColumnStatsAccumulator>)> {
+        // Materialize the shared snapshot directory once, before fanning out.
+        // Every `write_to_snapshot` below targets the SAME directory, so without
+        // this each would race to create it and each would fsync the parent — N
+        // redundant syncs per checkpoint drain. This leaves them a `stat` each.
+        self.ensure_local_snapshot_dir(snapshot_id).await?;
+
         let mut handles = Vec::with_capacity(units.len());
         for unit in units {
             // A shallow writer clone (all Arc fields) so the encode can run on its
@@ -31630,6 +31689,148 @@ mod tests {
             "conflicting id=1 must reflect the staged value"
         );
         assert_eq!(got.get(&3).map(String::as_str), Some("carol"));
+    }
+
+    /// A stream carrying no batches, for the zero-row write paths.
+    fn empty_stream(schema: &SchemaRef) -> SendableRecordBatchStream {
+        Box::pin(datafusion::physical_plan::EmptyRecordBatchStream::new(
+            Arc::clone(schema),
+        ))
+    }
+
+    /// The snapshot directory names present on disk for this table, sorted.
+    fn snapshot_dir_names(provider: &CayenneTableProvider) -> Vec<String> {
+        let table_root = std::path::Path::new(provider.table_path()).join(provider.table_id());
+        let Ok(entries) = std::fs::read_dir(&table_root) else {
+            // No table root yet — no snapshot directories either.
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .map(|entry| entry.expect("table root entry"))
+            .filter(|entry| entry.file_type().expect("entry file type").is_dir())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Regression test for spiceai/spiceai#12208: a staged upsert that carries
+    /// no rows must commit as a successful no-op.
+    ///
+    /// The Vortex sink creates the snapshot directory lazily on its first file,
+    /// so a zero-row write produced no directory at all, and `commit` →
+    /// `record_written_snapshot_sequence` fsync'd a path that did not exist —
+    /// failing with `NotFound`. Nothing upstream bounds this row count: the
+    /// stream is whatever the caller's `INSERT` produced.
+    #[tokio::test]
+    async fn zero_row_staged_upsert_commits_as_a_successful_noop() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, schema) = build_staged_upsert_provider(&ctx, "su_zero_row").await;
+
+        insert_batch(&provider, id_name_batch(&schema, &[1], &["alice"])).await;
+        assert_eq!(scan_sorted_ids(&provider).await, vec![1]);
+
+        let token = provider.transaction_write_token().await;
+        let staged = provider
+            .begin_staged_upsert_occ(token, empty_stream(&schema), 1)
+            .await
+            .expect("begin zero-row staged upsert");
+        assert_eq!(staged.row_count(), 0);
+
+        let rows = staged
+            .commit(std::collections::HashSet::new(), true)
+            .await
+            .expect("zero-row staged upsert must commit as a no-op");
+        assert_eq!(rows, 0);
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            vec![1],
+            "a zero-row staged upsert must not change visible data"
+        );
+
+        // The table must remain fully writable afterwards.
+        let token = provider.transaction_write_token().await;
+        provider
+            .begin_staged_upsert_occ(
+                token,
+                single_batch_stream(id_name_batch(&schema, &[2], &["bob"])),
+                1,
+            )
+            .await
+            .expect("begin staged upsert after the no-op")
+            .commit(std::collections::HashSet::new(), true)
+            .await
+            .expect("commit staged upsert after the no-op");
+        assert_eq!(scan_sorted_ids(&provider).await, vec![1, 2]);
+    }
+
+    /// The invariant behind the fix, asserted directly: a write materializes its
+    /// snapshot directory whether or not it carries rows, so no later fsync or
+    /// publish can reference a directory the Vortex sink never created.
+    #[tokio::test]
+    async fn zero_row_write_still_materializes_its_snapshot_directory() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, schema) = build_staged_upsert_provider(&ctx, "su_zero_row_dir").await;
+
+        let before = snapshot_dir_names(&provider);
+        let token = provider.transaction_write_token().await;
+        let staged = provider
+            .begin_staged_upsert_occ(token, empty_stream(&schema), 1)
+            .await
+            .expect("begin zero-row staged upsert");
+        let after = snapshot_dir_names(&provider);
+
+        let added = after.iter().filter(|dir| !before.contains(dir)).count();
+        assert_eq!(
+            added, 1,
+            "a zero-row staged write must materialize exactly one snapshot directory (before: {before:?}, after: {after:?})"
+        );
+
+        // The fused (multi-table transaction) path takes the same directory
+        // barrier the non-transactional publish takes, so it must accept the
+        // zero-row staged snapshot too.
+        let prepared = staged
+            .prepare_commit()
+            .await
+            .expect("prepare_commit must accept a zero-row staged snapshot");
+        assert_eq!(prepared.row_count(), 0);
+    }
+
+    /// The checkpoint paths fsync their new snapshot directory unconditionally.
+    /// They are guarded from the zero-row shape only by a distant invariant
+    /// (`filter_inlined_batch_for_deletions` returns `None` for a zero-row
+    /// batch, so a non-empty `Vec<RecordBatch>` implies a non-zero row count) —
+    /// pin the *observable* contract here so a change to that coupling shows up
+    /// as a test failure rather than as an `IoError` in the field.
+    #[tokio::test]
+    async fn checkpointing_an_empty_table_registers_no_snapshot() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, _schema) =
+            build_staged_upsert_provider(&ctx, "su_empty_checkpoint").await;
+
+        let before = snapshot_dir_names(&provider);
+
+        let inlined = provider
+            .checkpoint_inlined_data()
+            .await
+            .expect("inline checkpoint of an empty table must succeed");
+        assert_eq!(inlined, 0);
+
+        let mem_tier = provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("mem-tier checkpoint of an empty table must succeed");
+        assert_eq!(mem_tier, 0);
+
+        assert_eq!(
+            snapshot_dir_names(&provider),
+            before,
+            "checkpointing an empty table must register no new snapshot"
+        );
+        assert!(
+            scan_sorted_ids(&provider).await.is_empty(),
+            "checkpointing an empty table must leave it empty"
+        );
     }
 
     /// Crash-recovery exactly-once (correctness item #5, gates promotion past
