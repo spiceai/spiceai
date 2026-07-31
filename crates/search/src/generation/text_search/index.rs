@@ -29,7 +29,9 @@ use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder};
 use runtime_datafusion_index::Index;
 use snafu::ResultExt;
 use tantivy::merge_policy::LogMergePolicy;
-use tantivy::schema::{DocParsingError, SchemaBuilder};
+use tantivy::schema::{
+    DocParsingError, IndexRecordOption, SchemaBuilder, TextFieldIndexing, TextOptions,
+};
 use tantivy::{TantivyDocument, TantivyError};
 use tokio::sync::Mutex;
 
@@ -49,18 +51,16 @@ use crate::index::SearchIndex;
 pub static MEMORY_BUDGET_FOR_INDEX_WRITER: usize = 150 * 1024 * 1024;
 pub static INDEX_UNIQUE_FIELD_NAME: &str = "__spice.unique_field";
 
-/// Tantivy's built-in English Snowball-stemmed tokenizer name (e.g. "running" matches "run").
+/// Tantivy's built-in English Snowball-stemmed tokenizer.
 static EN_STEM_TOKENIZER_NAME: &str = "en_stem";
 
-/// Equivalent to [`tantivy::schema::TEXT`], but tokenized with [`EN_STEM_TOKENIZER_NAME`]
-/// instead of Tantivy's non-stemming `default` tokenizer. `TextFieldIndexing::default()`'s
-/// `IndexRecordOption` is `Basic` (no positions), so this must set `WithFreqsAndPositions`
-/// explicitly to match `TEXT` and keep phrase queries working.
-fn tokenized_text_options() -> tantivy::schema::TextOptions {
-    let indexing = tantivy::schema::TextFieldIndexing::default()
-        .set_index_option(tantivy::schema::IndexRecordOption::WithFreqsAndPositions)
-        .set_tokenizer(EN_STEM_TOKENIZER_NAME);
-    tantivy::schema::TextOptions::default().set_indexing_options(indexing)
+/// A [`TextOptions`] for [`tantivy::schema::TEXT`] with [`EN_STEM_TOKENIZER_NAME`] tokenization.
+fn tokenized_text_options() -> TextOptions {
+    TextOptions::default().set_indexing_options(
+        TextFieldIndexing::default()
+            .set_index_option(IndexRecordOption::WithFreqsAndPositions)
+            .set_tokenizer(EN_STEM_TOKENIZER_NAME),
+    )
 }
 
 /// The fraction of a tantivy segment's documents that may be superseded/deleted, but
