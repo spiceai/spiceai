@@ -877,10 +877,15 @@ pub async fn drop_slot_after_shutdown(params: &ReplicationParams) {
                 tokio::time::sleep(DROP_SLOT_POLL_INTERVAL).await;
             }
             _ => {
+                // `pg_error_detail` rather than `{error}`: tokio_postgres renders
+                // a server error as the opaque string "db error", which would
+                // leave this line -- the only diagnostic an operator gets for a
+                // slot still retaining WAL -- with nothing actionable in it.
                 tracing::warn!(
                     slot = %params.slot_name,
-                    "could not drop the replication slot on shutdown; it will keep retaining WAL on the source until dropped manually (DROP: `SELECT pg_drop_replication_slot('{}')`): {error}",
+                    "could not drop the replication slot on shutdown; it will keep retaining WAL on the source until dropped manually (DROP: `SELECT pg_drop_replication_slot('{}')`): {}",
                     params.slot_name,
+                    super::pg_error_detail(&error),
                 );
                 break;
             }
