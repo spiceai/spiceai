@@ -47,12 +47,6 @@ pub fn ca_certificate_from_param(value: &str) -> CaCertificate {
 ///
 /// Built by the connector from spicepod params; see
 /// `connector-postgres::lib::replication_params_from_connector_params`.
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "each bool mirrors an independent user-facing parameter (or a derived \
-              accelerator property); folding them into enums would obscure the 1:1 \
-              mapping to spicepod params"
-)]
 #[derive(Clone)]
 pub struct ReplicationParams {
     pub host: String,
