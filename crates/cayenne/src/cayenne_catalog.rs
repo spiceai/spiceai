@@ -22,7 +22,7 @@ use super::metadata::{
     InlinedDelete, PartitionMetadata, PkConflictDetection, SnapshotFile, SnapshotFileStatistics,
     TableMetadata, TableStatistics,
 };
-use super::metastore::sqlite::SqliteMetastore;
+use super::metastore::sqlite::{SqliteMetastore, is_memory_db_path};
 #[cfg(feature = "turso")]
 use super::metastore::turso::TursoMetastore;
 use super::metastore::{
@@ -1752,48 +1752,58 @@ impl MetadataCatalog for CayenneCatalog {
     }
 
     async fn init(&self) -> CatalogResult<()> {
-        // Create database directory if it doesn't exist
+        // Create database directory if it doesn't exist.
+        //
+        // In-memory databases (Cayenne `mode: memory`, connection string
+        // `sqlite://file:/cayenne-mem-N?vfs=memdb`) have no backing file, so
+        // there is no parent directory to create — and `Path::parent()` of that
+        // path is the bare scheme component `file:`, so creating it would leave
+        // a stray, empty `file:` directory in the process working directory
+        // (#11922). Skip directory setup entirely for them, matching the guard
+        // in `SqliteMetastore::open_connection`.
         let db_path = self.db_path();
-        let db_dir =
-            Path::new(db_path)
-                .parent()
-                .ok_or_else(|| CatalogError::InvalidDatabasePath {
-                    path: db_path.to_string(),
-                })?;
+        if !is_memory_db_path(db_path) {
+            let db_dir =
+                Path::new(db_path)
+                    .parent()
+                    .ok_or_else(|| CatalogError::InvalidDatabasePath {
+                        path: db_path.to_string(),
+                    })?;
 
-        if !db_dir.exists() {
-            tokio::fs::create_dir_all(db_dir).await?;
+            if !db_dir.exists() {
+                tokio::fs::create_dir_all(db_dir).await?;
 
-            // Best-effort sync of the parent directory so the db_dir entry
-            // itself is durable on local FS before we proceed to create the
-            // catalog DB file and initialize its schema.
-            //
-            // We keep this best-effort (with warning on failure) rather than
-            // fatal because:
-            // - Catalog DB directory creation is a one-time initialization
-            //   event (not a hot write path).
-            // - It is immediately followed by DB file creation and schema
-            //   initialization, which provide strong content durability.
-            // - The parent directory is frequently a stable, operator-
-            //   managed volume root (e.g., K8s PersistentVolume) where
-            //   directory entry durability is already handled at a higher
-            //   level.
-            //
-            // This is still the right thing to do for consistency with the
-            // uniform durability contract used for all per-table mutable
-            // data paths, and it gives operators a clear warning if
-            // something unusual happens on a fresh deployment.
-            if let Some(parent) = db_dir.parent() {
-                let parent = parent.to_path_buf();
-                if let Err(e) = tokio::task::spawn_blocking(move || {
-                    std::fs::File::open(&parent).and_then(|f| f.sync_all())
-                })
-                .await
-                {
-                    tracing::warn!(
-                        "Failed to sync parent of catalog DB directory {} (subsequent DB writes will still be durable; directory entry may not survive crash): {e}",
-                        db_dir.display()
-                    );
+                // Best-effort sync of the parent directory so the db_dir entry
+                // itself is durable on local FS before we proceed to create the
+                // catalog DB file and initialize its schema.
+                //
+                // We keep this best-effort (with warning on failure) rather than
+                // fatal because:
+                // - Catalog DB directory creation is a one-time initialization
+                //   event (not a hot write path).
+                // - It is immediately followed by DB file creation and schema
+                //   initialization, which provide strong content durability.
+                // - The parent directory is frequently a stable, operator-
+                //   managed volume root (e.g., K8s PersistentVolume) where
+                //   directory entry durability is already handled at a higher
+                //   level.
+                //
+                // This is still the right thing to do for consistency with the
+                // uniform durability contract used for all per-table mutable
+                // data paths, and it gives operators a clear warning if
+                // something unusual happens on a fresh deployment.
+                if let Some(parent) = db_dir.parent() {
+                    let parent = parent.to_path_buf();
+                    if let Err(e) = tokio::task::spawn_blocking(move || {
+                        std::fs::File::open(&parent).and_then(|f| f.sync_all())
+                    })
+                    .await
+                    {
+                        tracing::warn!(
+                            "Failed to sync parent of catalog DB directory {} (subsequent DB writes will still be durable; directory entry may not survive crash): {e}",
+                            db_dir.display()
+                        );
+                    }
                 }
             }
         }
@@ -8120,6 +8130,105 @@ mod tests {
         // Snapshot pointer advanced.
         let table = catalog
             .get_table("in_txn_parity")
+            .await
+            .expect("Failed to get table after commit");
+        assert_eq!(table.current_snapshot_id, new_snapshot_id);
+
+        // Cleanup.
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// Issue #11477 — at an unbounded cutoff, `commit_compaction_fenced_in_txn`
+    /// clears every tombstone (matching the wholesale
+    /// [`CayenneCatalog::commit_compaction_in_txn`]) while still clearing ONLY
+    /// the named protected snapshots.
+    ///
+    /// This is the shape the position-delete full rewrite commits with: it holds
+    /// `write_lock` for its whole pass so no tombstone can survive it, but the
+    /// mem-tier checkpoint can still publish a protected snapshot the scan never
+    /// folded in — and deleting that row here loses its rows durably.
+    #[tokio::test]
+    async fn test_commit_compaction_fenced_unbounded_cutoff_retains_unfolded_snapshots() {
+        let test_db = format!(
+            "sqlite://./.test_fenced_unbounded_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let table_id =
+            setup_table_with_delete_file(&catalog, "fenced_unbounded", "/tmp/fenced_unbounded")
+                .await;
+
+        // Two protected snapshots the rewrite folded in, and one published after
+        // its scan (the racing checkpoint).
+        let folded: Vec<String> = vec![
+            uuid::Uuid::now_v7().to_string(),
+            uuid::Uuid::now_v7().to_string(),
+        ];
+        let late = uuid::Uuid::now_v7().to_string();
+        for (idx, id) in folded.iter().chain(std::iter::once(&late)).enumerate() {
+            let seq = i64::try_from(idx).expect("test index fits in i64") + 1;
+            catalog
+                .set_snapshot_sequence(&table_id, id, seq)
+                .await
+                .expect("Failed to register protected snapshot");
+        }
+
+        let new_snapshot_id = uuid::Uuid::now_v7().to_string();
+        let mut tx = catalog
+            .begin_transaction()
+            .await
+            .expect("Failed to begin transaction");
+        catalog
+            .commit_compaction_fenced_in_txn(
+                &mut *tx,
+                &table_id,
+                &new_snapshot_id,
+                i64::MAX,
+                &folded,
+            )
+            .await
+            .expect("commit_compaction_fenced_in_txn failed");
+        tx.commit()
+            .await
+            .expect("Failed to commit caller transaction");
+
+        // An unbounded cutoff clears every tombstone, exactly as the wholesale
+        // variant does.
+        let delete_files = catalog
+            .get_table_delete_files(&table_id)
+            .await
+            .expect("Failed to get delete files after commit");
+        assert!(
+            delete_files.is_empty(),
+            "an unbounded cutoff must clear every delete file"
+        );
+
+        // Only the folded protected snapshots are cleared.
+        let sequences = catalog
+            .get_all_snapshot_sequences(&table_id)
+            .await
+            .expect("Failed to read snapshot sequences");
+        assert!(
+            sequences.contains_key(&late),
+            "DATA LOSS: the protected snapshot published after the scan was cleared; \
+             remaining ids: {:?}",
+            sequences.keys().collect::<Vec<_>>()
+        );
+        for id in &folded {
+            assert!(
+                !sequences.contains_key(id),
+                "folded snapshot {id} must be cleared"
+            );
+        }
+
+        // Snapshot pointer advanced.
+        let table = catalog
+            .get_table("fenced_unbounded")
             .await
             .expect("Failed to get table after commit");
         assert_eq!(table.current_snapshot_id, new_snapshot_id);

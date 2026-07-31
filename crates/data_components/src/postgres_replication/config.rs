@@ -16,11 +16,32 @@ limitations under the License.
 
 //! Replication parameters derived from connector params + environment.
 
-use std::path::PathBuf;
 use std::time::Duration;
 
-use pgwire_replication::PgOutputFormat;
+use pgwire_replication::{CaCertificate, PgOutputFormat};
 use secrecy::{ExposeSecret, SecretString};
+
+/// Interpret a user-supplied `pg_sslrootcert` value as either PEM content or a
+/// path to a PEM file.
+///
+/// A CA bundle is just as often injected as a configuration value — an
+/// orchestrator secret, an environment variable — as it is mounted as a file, so
+/// both spellings must verify identically. The two are told apart by content, on
+/// the PEM armor: anything containing a `BEGIN CERTIFICATE` block is PEM, and
+/// everything else is a path. Detecting on the armor rather than on the shape of
+/// the string (length, newlines, a leading `/`) keeps every value that is a path
+/// today still a path.
+///
+/// Content arriving through a channel that does not survive real newlines (a
+/// single-line environment variable, a JSON string pasted verbatim) carries them
+/// as the two characters `\` and `n`; those are restored before parsing.
+#[must_use]
+pub fn ca_certificate_from_param(value: &str) -> CaCertificate {
+    if value.contains("-----BEGIN CERTIFICATE-----") {
+        return CaCertificate::Pem(value.replace("\\n", "\n").into_bytes());
+    }
+    CaCertificate::Path(value.into())
+}
 
 /// Parameters for a single dataset's replication stream.
 ///
@@ -40,9 +61,10 @@ pub struct ReplicationParams {
     pub password: SecretString,
     pub database: String,
     pub sslmode: SslMode,
-    /// Optional path to a PEM-encoded CA certificate bundle. Only used when
-    /// `sslmode` is `VerifyCa` or `VerifyFull`.
-    pub sslrootcert: Option<PathBuf>,
+    /// Optional PEM-encoded CA certificate bundle, either inline or by path (see
+    /// [`ca_certificate_from_param`]). Only used when `sslmode` is `VerifyCa` or
+    /// `VerifyFull`.
+    pub sslrootcert: Option<CaCertificate>,
 
     pub slot_name: String,
     pub publication_name: String,
@@ -75,11 +97,12 @@ pub struct ReplicationParams {
     /// (per-dataset generated) slot names keep the dedicated per-dataset
     /// stream.
     pub shared: bool,
-    /// Capacity of each shared-slot member's bounded delivery channel (envelopes).
+    /// Capacity of each shared-slot member's bounded coalescing mailbox
+    /// (envelopes).
     /// Only consulted on the shared path ([`super::shared`]); the per-dataset
-    /// stream does not use it. A member's channel sits in front of the
-    /// accelerator's much larger prefetch buffer, so too small a value turns one
-    /// member's transient stall into slot-wide head-of-line blocking. Defaults to
+    /// stream does not use it. Adjacent compatible transactions can share one
+    /// envelope, so this bounds published envelope count rather than source
+    /// transaction count. Defaults to
     /// [`super::shared::DEFAULT_MEMBER_CHANNEL_CAPACITY`].
     pub member_channel_capacity: usize,
 
@@ -243,6 +266,12 @@ impl SslMode {
 ///
 /// which keeps the final identifier under the limit.
 const PG_IDENTIFIER_MAX_BYTES: usize = 63;
+
+/// Reserved by `PostgreSQL` for the conflict-detection replication slot
+/// (`CONFLICT_DETECTION_SLOT` in `src/include/replication/slot.h`). Rejected
+/// the same way as `ReplicationSlotValidateNameInternal(..., allow_reserved_name=false)`.
+const CONFLICT_DETECTION_SLOT: &str = "pg_conflict_detection";
+
 const SLOT_PREFIX: &str = "spice_";
 const SLOT_HASH_LEN: usize = 8;
 const DATASET_HASH_LEN: usize = 6;
@@ -252,6 +281,50 @@ const SLOT_DATASET_PORTION_MAX: usize =
 /// Max sanitized-dataset bytes for a publication name: 63 − (6 + 1 + 6 + 1 + 3) = 46.
 const PUB_DATASET_PORTION_MAX: usize =
     PG_IDENTIFIER_MAX_BYTES - SLOT_PREFIX.len() - 1 - DATASET_HASH_LEN - 1 - 3;
+
+/// Validates a `PostgreSQL` replication slot name.
+///
+/// Mirrors `ReplicationSlotValidateNameInternal` in `PostgreSQL` `slot.c`:
+/// names must match `[a-z0-9_]{1,NAMEDATALEN-1}` (`NAMEDATALEN` is 64, so at
+/// most 63 bytes) and must not be the reserved conflict-detection slot
+/// (`pg_conflict_detection`).
+///
+/// # Errors
+///
+/// Returns a short reason suitable for prefixing with the user-facing parameter
+/// name, for example: parameter `pg_replication_slot` must be …
+pub fn validate_replication_slot_name(name: &str) -> Result<(), String> {
+    // Postgres uses `strlen` (byte length). Slot names are ASCII-only when
+    // valid, so byte length equals char length for accepted names; reject
+    // overlong UTF-8 by bytes the same way the server would.
+    if name.is_empty() {
+        return Err(format!(
+            "must be 1 to {PG_IDENTIFIER_MAX_BYTES} bytes matching [a-z0-9_], got {name:?}"
+        ));
+    }
+    if name.len() > PG_IDENTIFIER_MAX_BYTES {
+        return Err(format!(
+            "must be at most {PG_IDENTIFIER_MAX_BYTES} bytes, got {} bytes in {name:?}",
+            name.len()
+        ));
+    }
+    if let Some(invalid) = name
+        .chars()
+        .find(|c| !matches!(c, 'a'..='z' | '0'..='9' | '_'))
+    {
+        return Err(format!(
+            "must contain only lowercase letters, numbers, and underscores ([a-z0-9_]), \
+             found invalid character {invalid:?} in {name:?}"
+        ));
+    }
+    if name == CONFLICT_DETECTION_SLOT {
+        return Err(format!(
+            "must not use the reserved name {CONFLICT_DETECTION_SLOT:?} \
+             (reserved by PostgreSQL for conflict detection)"
+        ));
+    }
+    Ok(())
+}
 
 /// Build a default slot name:
 /// `spice_{sanitized_dataset}_{dataset_suffix}_{instance_suffix}`.
@@ -333,6 +406,46 @@ pub fn default_publication_name(dataset_name: &str) -> String {
     let dataset_hash = xxh3_short_hash_prefix(dataset_name, DATASET_HASH_LEN);
     let dataset = truncate_to_bytes(&sanitize(dataset_name), PUB_DATASET_PORTION_MAX);
     format!("{SLOT_PREFIX}{dataset}_{dataset_hash}_pub")
+}
+
+/// Slot-name prefix for a CDC-accelerated catalog's single shared replication
+/// slot. Distinct from the per-dataset `spice_` prefix so a catalog slot and a
+/// same-named dataset slot can never collide, and so catalog slots stay
+/// greppable.
+const CATALOG_SLOT_PREFIX: &str = "spice_catalog_";
+
+/// Max sanitized-catalog-name bytes in a catalog slot name:
+/// 63 − (14 prefix + 1 separator + 6 hash) = 42.
+const CATALOG_SLOT_NAME_PORTION_MAX: usize =
+    PG_IDENTIFIER_MAX_BYTES - CATALOG_SLOT_PREFIX.len() - 1 - DATASET_HASH_LEN;
+
+/// Build the shared replication-slot name for a CDC-accelerated catalog:
+/// `spice_catalog_{sanitized_catalog}_{catalog_hash}`.
+///
+/// Unlike [`default_slot_name`], this is derived PURELY from the catalog name
+/// with **no instance component**, which makes it:
+///
+///   - deterministic and stable -- the same catalog name always yields the same
+///     slot name, so a restart (or a reschedule of the catalog onto a different
+///     node) recomputes the identical name and *reuses* the existing replication
+///     slot rather than orphaning it and re-snapshotting from scratch;
+///   - independent of the Spice instance/host -- two nodes configured with the
+///     same catalog resolve to the same slot name. Since `PostgreSQL` permits
+///     only one consumer per slot, the catalog acceleration path fails loudly at
+///     startup when the slot is already actively held by another consumer (see
+///     `AcceleratedCatalogProvider::refresh`), rather than silently competing for
+///     it. No slot identity is persisted by Spice: the name is a pure function of
+///     the catalog name, and the durable state is the `PostgreSQL` slot itself.
+///
+/// `catalog_hash` is a short hash of the *full* catalog name so two long names
+/// that share a truncated sanitized prefix still produce distinct slot names.
+/// The sanitized portion is truncated to keep the identifier within Postgres'
+/// 63-byte limit.
+#[must_use]
+pub fn catalog_slot_name(catalog_name: &str) -> String {
+    let catalog_hash = xxh3_short_hash_prefix(catalog_name, DATASET_HASH_LEN);
+    let catalog = truncate_to_bytes(&sanitize(catalog_name), CATALOG_SLOT_NAME_PORTION_MAX);
+    format!("{CATALOG_SLOT_PREFIX}{catalog}_{catalog_hash}")
 }
 
 /// Truncate an ASCII identifier to at most `max_bytes` bytes. Our `sanitize`
@@ -472,19 +585,25 @@ impl ReplicationParams {
         }
         // verify-full: both chain and hostname checked (native-tls default).
 
-        if let Some(ca_path) = &self.sslrootcert {
-            // Async I/O — this method is called from Tokio runtime threads
-            // during setup/bootstrap; std::fs::read would block the reactor.
-            let pem_bytes = tokio::fs::read(ca_path)
-                .await
-                .map_err(|e| TlsConfigError::ReadCa {
-                    path: ca_path.clone(),
-                    source: e,
-                })?;
-            let certs = parse_pem_certificates(ca_path, &pem_bytes)?;
+        if let Some(ca) = &self.sslrootcert {
+            let source = ca.describe();
+            let pem_bytes = match ca {
+                // Async I/O — this method is called from Tokio runtime threads
+                // during setup/bootstrap; std::fs::read would block the reactor.
+                CaCertificate::Path(path) => {
+                    std::borrow::Cow::Owned(tokio::fs::read(path).await.map_err(|e| {
+                        TlsConfigError::ReadCa {
+                            source_label: source.clone(),
+                            source: e,
+                        }
+                    })?)
+                }
+                CaCertificate::Pem(pem) => std::borrow::Cow::Borrowed(pem.as_slice()),
+            };
+            let certs = parse_pem_certificates(&source, &pem_bytes)?;
             if certs.is_empty() {
                 return Err(TlsConfigError::EmptyCaBundle {
-                    path: ca_path.clone(),
+                    source_label: source,
                 });
             }
             for cert in certs {
@@ -498,22 +617,26 @@ impl ReplicationParams {
 }
 
 /// Errors raised while assembling TLS configuration from `ReplicationParams`.
+/// The `source_label` fields name where the CA came from — a path, or
+/// `inline PEM content (N bytes)` — never the certificate itself, which is
+/// kilobytes of base64 that would swamp a single-line log record.
 #[derive(Debug)]
 pub enum TlsConfigError {
     ReadCa {
-        path: PathBuf,
+        source_label: String,
         source: std::io::Error,
     },
     ParseCa {
+        source_label: String,
         source: native_tls::Error,
     },
     /// `BEGIN CERTIFICATE` marker with no matching `END CERTIFICATE`.
     TruncatedPem {
-        path: PathBuf,
+        source_label: String,
     },
-    /// `sslrootcert` supplied but file contained zero parseable certificates.
+    /// `sslrootcert` supplied but it contained zero parseable certificates.
     EmptyCaBundle {
-        path: PathBuf,
+        source_label: String,
     },
     BuildConnector(native_tls::Error),
 }
@@ -521,25 +644,31 @@ pub enum TlsConfigError {
 impl std::fmt::Display for TlsConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TlsConfigError::ReadCa { path, source } => {
+            TlsConfigError::ReadCa {
+                source_label,
+                source,
+            } => {
                 write!(
                     f,
-                    "failed to read sslrootcert at {}: {source}",
-                    path.display()
+                    "failed to read sslrootcert from {source_label}: {source}"
                 )
             }
-            TlsConfigError::ParseCa { source } => {
-                write!(f, "failed to parse sslrootcert PEM: {source}")
+            TlsConfigError::ParseCa {
+                source_label,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to parse sslrootcert PEM from {source_label}: {source}"
+                )
             }
-            TlsConfigError::TruncatedPem { path } => write!(
+            TlsConfigError::TruncatedPem { source_label } => write!(
                 f,
-                "sslrootcert at {} has a BEGIN CERTIFICATE block without a matching END marker",
-                path.display()
+                "sslrootcert from {source_label} has a BEGIN CERTIFICATE block without a matching END marker"
             ),
-            TlsConfigError::EmptyCaBundle { path } => write!(
+            TlsConfigError::EmptyCaBundle { source_label } => write!(
                 f,
-                "sslrootcert at {} contains no parseable CA certificates",
-                path.display()
+                "sslrootcert from {source_label} contains no parseable CA certificates"
             ),
             TlsConfigError::BuildConnector(source) => {
                 write!(f, "failed to build native-tls connector: {source}")
@@ -552,7 +681,7 @@ impl std::error::Error for TlsConfigError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             TlsConfigError::ReadCa { source, .. } => Some(source),
-            TlsConfigError::ParseCa { source } | TlsConfigError::BuildConnector(source) => {
+            TlsConfigError::ParseCa { source, .. } | TlsConfigError::BuildConnector(source) => {
                 Some(source)
             }
             TlsConfigError::TruncatedPem { .. } | TlsConfigError::EmptyCaBundle { .. } => None,
@@ -566,7 +695,7 @@ impl std::error::Error for TlsConfigError {
 /// parsed so far — the alternative would leave operators thinking their CA
 /// bundle is loaded when it isn't.
 fn parse_pem_certificates(
-    path: &std::path::Path,
+    source_label: &str,
     pem: &[u8],
 ) -> std::result::Result<Vec<native_tls::Certificate>, TlsConfigError> {
     let mut certs = Vec::new();
@@ -575,13 +704,16 @@ fn parse_pem_certificates(
         let tail = &remaining[begin..];
         let Some(end_rel) = find_subslice(tail, b"-----END CERTIFICATE-----") else {
             return Err(TlsConfigError::TruncatedPem {
-                path: path.to_path_buf(),
+                source_label: source_label.to_string(),
             });
         };
         let end = begin + end_rel + b"-----END CERTIFICATE-----".len();
         let block = &remaining[begin..end];
-        let cert = native_tls::Certificate::from_pem(block)
-            .map_err(|source| TlsConfigError::ParseCa { source })?;
+        let cert =
+            native_tls::Certificate::from_pem(block).map_err(|source| TlsConfigError::ParseCa {
+                source_label: source_label.to_string(),
+                source,
+            })?;
         certs.push(cert);
         remaining = &remaining[end..];
     }
@@ -595,6 +727,193 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Self-signed CA (`CN=Spice Replication Test CA`, `CA:TRUE`), expiring in
+    /// 2126. Real DER so `native_tls` actually accepts it as a trust anchor —
+    /// a placeholder string would make these tests pass for the wrong reason.
+    const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIC4DCCAcigAwIBAgIJAODHR+uzOPBvMA0GCSqGSIb3DQEBCwUAMCQxIjAgBgNV
+BAMMGVNwaWNlIFJlcGxpY2F0aW9uIFRlc3QgQ0EwIBcNMjYwNzI4MDU0MDQ0WhgP
+MjEyNjA3MDQwNTQwNDRaMCQxIjAgBgNVBAMMGVNwaWNlIFJlcGxpY2F0aW9uIFRl
+c3QgQ0EwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCzoou00DrTAevF
+RZ6+PFmSBUhzZXsABQFztlPigZzJ1m8hnja66hnkWKyIid9DcitnjkWgtQZCVxm6
+s05tM6QAy5lI2wlfWD7hQi+yIWKv2dcVuD/J4hWPjmG5a5VtRAInV0yBymkCRI6Z
+68JYfvKh+Rku1y6H3dUfNm8dxCbo589L1U8ucJqlQv9Iy/X7Lze+pj2JFU/L1g3t
+k/5ziVgJjdh3VetrHkU1YOiHRPFsqXOxXc2lpzUjd23QR3FfkZkVgLUfEvPWHRSf
+xipaPFhllw9WUWEl6bVqAGO0btPO1OKKqBlIcizf2YO2+lFs/o0e7bApGzI3l5HP
+VZr/e6ZLAgMBAAGjEzARMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQAD
+ggEBACC1XMNpbA+172MQks9R7cqRY5I0HObJRX3dpIsOqrm3EUcHMt9kx7QrO1Af
+gzAWC0ZNHppeU/cuq9ZKZQiFrSmr5fKtXzsxkvgLYRCFO+ZCKZl9k3z9j0AQbTPR
+klJa4bo2SS6WbmoATimD6e0moT++neRIDx7MlijtWB8grfhuH7yFN9xoTRDgdYBU
+KLeFNAIi+S5cVzUwjMiOQnmljphKSRoQnihpA/c6WAVAN3VqMdoPpfmR2pTi7rio
+38busw0nt/y+JCVWzNDr/i5f3mvNi5SaHZ5PTOVnocyMUw+ysx5eQOrJwrirW9XD
+TXTE85+Or9IUwDI9543jsyCvuQ8=
+-----END CERTIFICATE-----
+";
+
+    /// `verify-full` params — the strictest mode, and the one that actually
+    /// consults `sslrootcert`. A weaker mode would build a connector even with
+    /// the CA ignored, which is exactly the vacuity this fix is about.
+    fn verify_full_params(sslrootcert: Option<CaCertificate>) -> ReplicationParams {
+        ReplicationParams {
+            host: "localhost".to_string(),
+            port: 5432,
+            user: "u".to_string(),
+            password: SecretString::from(String::new()),
+            database: "db".to_string(),
+            sslmode: SslMode::VerifyFull,
+            sslrootcert,
+            slot_name: "slot".to_string(),
+            publication_name: "pub".to_string(),
+            initial_snapshot: true,
+            snapshot_on_resume: false,
+            temporary_slot: false,
+            status_interval: Duration::from_secs(5),
+            ready_lag: Duration::from_secs(2),
+            bootstrap_batch_size: 1024,
+            shared: false,
+            member_channel_capacity: 16,
+            pg_output_format: PgOutputFormat::Binary,
+        }
+    }
+
+    #[test]
+    fn a_value_carrying_pem_armor_is_inline_content_everything_else_is_a_path() {
+        assert_eq!(
+            ca_certificate_from_param(TEST_CA_PEM),
+            CaCertificate::Pem(TEST_CA_PEM.as_bytes().to_vec())
+        );
+
+        // Every spelling that works as a path today must stay a path.
+        for path in [
+            "/etc/ssl/pg-ca.pem",
+            "ca.pem",
+            "./certs/ca.crt",
+            "/var/run/secrets/ca-bundle",
+            "C:\\certs\\ca.pem",
+        ] {
+            assert_eq!(
+                ca_certificate_from_param(path),
+                CaCertificate::Path(path.into()),
+                "{path} must be treated as a filesystem path"
+            );
+        }
+    }
+
+    #[test]
+    fn escaped_newlines_in_inline_pem_are_restored() {
+        let single_line = TEST_CA_PEM.replace('\n', "\\n");
+        assert!(!single_line.contains('\n'));
+
+        let CaCertificate::Pem(pem) = ca_certificate_from_param(&single_line) else {
+            panic!("armored content must be detected as inline PEM");
+        };
+        assert_eq!(pem, TEST_CA_PEM.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn native_tls_connector_trusts_an_inline_pem_ca() {
+        let params = verify_full_params(Some(ca_certificate_from_param(TEST_CA_PEM)));
+
+        let connector = params
+            .native_tls_connector()
+            .await
+            .expect("inline PEM CA must be accepted");
+        assert!(
+            connector.is_some(),
+            "verify-full must produce a TLS connector"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_tls_connector_trusts_a_ca_read_from_a_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ca.pem");
+        tokio::fs::write(&path, TEST_CA_PEM)
+            .await
+            .expect("write CA fixture");
+
+        let param = path.to_str().expect("utf-8 path");
+        let params = verify_full_params(Some(ca_certificate_from_param(param)));
+        assert!(matches!(params.sslrootcert, Some(CaCertificate::Path(_))));
+
+        let connector = params
+            .native_tls_connector()
+            .await
+            .expect("CA path must keep working");
+        assert!(
+            connector.is_some(),
+            "verify-full must produce a TLS connector"
+        );
+    }
+
+    /// `MakeTlsConnector` is not `Debug`, so `expect_err` is unavailable.
+    async fn tls_error(ca: CaCertificate, must_fail: &str) -> TlsConfigError {
+        match verify_full_params(Some(ca)).native_tls_connector().await {
+            Ok(_) => panic!("{must_fail}"),
+            Err(e) => e,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_ca_that_is_neither_readable_nor_pem_is_a_hard_error() {
+        // Not armored, so it is a path — and it does not exist. Verification
+        // must fail rather than fall back to no trust anchor.
+        let missing = tls_error(
+            ca_certificate_from_param("/nonexistent/spice-test-ca.pem"),
+            "an unreadable CA path must not be ignored",
+        )
+        .await;
+        assert!(matches!(missing, TlsConfigError::ReadCa { .. }));
+        assert!(
+            missing
+                .to_string()
+                .contains("/nonexistent/spice-test-ca.pem")
+        );
+
+        // Armored but not a certificate: detected as inline PEM, then rejected.
+        let garbage = tls_error(
+            CaCertificate::Pem(
+                b"-----BEGIN CERTIFICATE-----\nnot base64\n-----END CERTIFICATE-----\n".to_vec(),
+            ),
+            "unparseable inline PEM must not be ignored",
+        )
+        .await;
+        assert!(matches!(garbage, TlsConfigError::ParseCa { .. }));
+
+        // Truncated armor is caught rather than silently yielding zero anchors.
+        let truncated = tls_error(
+            CaCertificate::Pem(b"-----BEGIN CERTIFICATE-----\nMIIC\n".to_vec()),
+            "truncated inline PEM must not be ignored",
+        )
+        .await;
+        assert!(matches!(truncated, TlsConfigError::TruncatedPem { .. }));
+    }
+
+    #[test]
+    fn errors_and_debug_output_never_echo_inline_certificate_content() {
+        let ca = ca_certificate_from_param(TEST_CA_PEM);
+        let body = "MIIC4DCCAcigAwIBAgIJAODHR";
+
+        assert!(!ca.describe().contains(body));
+        assert!(!format!("{ca:?}").contains(body));
+        assert!(!format!("{:?}", verify_full_params(Some(ca.clone()))).contains(body));
+
+        let label = ca.describe();
+        for err in [
+            TlsConfigError::TruncatedPem {
+                source_label: label.clone(),
+            },
+            TlsConfigError::EmptyCaBundle {
+                source_label: label,
+            },
+        ] {
+            let rendered = err.to_string();
+            assert!(!rendered.contains(body), "error leaked PEM content");
+            assert!(rendered.contains("inline PEM content"));
+            assert!(!rendered.contains('\n'), "error must stay single-line");
+        }
+    }
 
     #[test]
     fn sanitize_replaces_non_alnum() {
@@ -721,5 +1040,136 @@ mod tests {
         let b = format!("{shared_prefix}_beta");
         assert_ne!(default_slot_name(&a), default_slot_name(&b));
         assert_ne!(default_publication_name(&a), default_publication_name(&b));
+    }
+
+    #[test]
+    fn catalog_slot_name_is_deterministic_and_instance_independent() {
+        // A catalog slot name is a pure function of the catalog name -- it reads
+        // no instance id / hostname / env at all -- so it is identical on every
+        // call, which is exactly what lets a restart (or a reschedule onto a
+        // different node) recompute the same name and reuse the existing slot.
+        let a = catalog_slot_name("my_pg");
+        let b = catalog_slot_name("my_pg");
+        assert_eq!(a, b);
+        assert!(a.starts_with("spice_catalog_my_pg_"), "got {a}");
+    }
+
+    #[test]
+    fn catalog_slot_name_omits_the_instance_suffix() {
+        // The whole point of PR-3: unlike `default_slot_name` (which folds in an
+        // 8-hex instance hash so two instances get different slots), the catalog
+        // slot name carries NO instance component, so it does not end in the
+        // instance hash `default_slot_name` appends.
+        let catalog = catalog_slot_name("orders");
+        let dataset = default_slot_name("orders");
+        // Different from the per-dataset slot, and using the dedicated
+        // `spice_catalog_` prefix rather than the per-dataset `spice_` format.
+        // (`spice_catalog_` does start with `spice_`, so a `!starts_with(SLOT_PREFIX)`
+        // check would be wrong -- the distinguishing property is the catalog prefix.)
+        assert_ne!(catalog, dataset);
+        assert!(catalog.starts_with(CATALOG_SLOT_PREFIX), "got {catalog}");
+        // The per-dataset slot ends in the 8-hex instance hash; the catalog slot
+        // ends in a 6-hex catalog-name hash and has no instance component.
+        let catalog_suffix = catalog.rsplit_once('_').expect("has a suffix").1;
+        assert_eq!(catalog_suffix.len(), DATASET_HASH_LEN, "got {catalog}");
+    }
+
+    #[test]
+    fn catalog_slot_name_is_unique_per_catalog() {
+        assert_ne!(catalog_slot_name("one"), catalog_slot_name("two"));
+        // Truncation-collision guard: two long names sharing a truncated prefix
+        // still differ via the full-name hash.
+        let shared = "a".repeat(60);
+        assert_ne!(
+            catalog_slot_name(&format!("{shared}_alpha")),
+            catalog_slot_name(&format!("{shared}_beta"))
+        );
+    }
+
+    #[test]
+    fn catalog_slot_name_sanitizes_and_stays_within_postgres_limit() {
+        // Special characters are sanitized to `_`, and even a pathologically long
+        // catalog name stays within Postgres' 63-byte identifier limit.
+        let sanitized = catalog_slot_name("my-catalog.name");
+        assert!(
+            !sanitized.contains('-') && !sanitized.contains('.'),
+            "{sanitized}"
+        );
+
+        let long = catalog_slot_name(&"c".repeat(300));
+        assert!(
+            long.len() <= PG_IDENTIFIER_MAX_BYTES,
+            "catalog slot `{long}` exceeds {PG_IDENTIFIER_MAX_BYTES} bytes: {}",
+            long.len()
+        );
+        // The publication derived from it must also fit.
+        assert!(publication_name_for_slot(&long).len() <= PG_IDENTIFIER_MAX_BYTES);
+    }
+
+    #[test]
+    fn validate_replication_slot_name_accepts_valid_names() {
+        for name in [
+            "a",
+            "spice_users",
+            "slot_1",
+            "9leading_digit_ok",
+            "a_b_c_012",
+            &"x".repeat(PG_IDENTIFIER_MAX_BYTES),
+        ] {
+            assert!(
+                validate_replication_slot_name(name).is_ok(),
+                "expected {name:?} to be valid"
+            );
+        }
+    }
+
+    // Mirrors ReplicationSlotValidateNameInternal in PostgreSQL slot.c
+    // (empty / too long / invalid char / reserved name).
+    #[test]
+    fn validate_replication_slot_name_rejects_postgres_invalid() {
+        assert!(
+            validate_replication_slot_name("")
+                .expect_err("empty")
+                .contains("must be 1 to")
+        );
+        let too_long = "a".repeat(PG_IDENTIFIER_MAX_BYTES + 1);
+        assert!(
+            validate_replication_slot_name(&too_long)
+                .expect_err("too long")
+                .contains("must be at most")
+        );
+        let hyphen_err =
+            validate_replication_slot_name("scp-onboarding-realtime-analytics-prod-us-east-1")
+                .expect_err("hyphen");
+        assert!(
+            hyphen_err.contains("invalid character '-'"),
+            "unexpected: {hyphen_err}"
+        );
+        for (name, needle) in [
+            ("MySlot", "invalid character 'M'"),
+            ("slot.name", "invalid character '.'"),
+            ("slot/name", "invalid character '/'"),
+            ("slot name", "invalid character ' '"),
+            (CONFLICT_DETECTION_SLOT, "reserved name"),
+        ] {
+            let err = validate_replication_slot_name(name).expect_err(name);
+            assert!(
+                err.contains(needle),
+                "for {name:?}: expected {needle:?} in {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_slot_names_pass_postgres_validation() {
+        for dataset in ["users", "public.orders", "my-dataset", "9leading", ""] {
+            let slot = default_slot_name(dataset);
+            validate_replication_slot_name(&slot)
+                .unwrap_or_else(|e| panic!("default slot `{slot}` for {dataset:?} invalid: {e}"));
+        }
+        let long = "a".repeat(120);
+        let slot = default_slot_name(&long);
+        validate_replication_slot_name(&slot)
+            .unwrap_or_else(|e| panic!("truncated default slot `{slot}` invalid: {e}"));
     }
 }

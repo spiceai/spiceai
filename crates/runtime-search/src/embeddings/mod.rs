@@ -19,15 +19,34 @@ limitations under the License.
 pub mod common;
 pub mod execution_plan;
 pub mod table;
+#[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
+pub mod warm_index;
 
 use std::sync::Arc;
 
 use chunking::{Chunker, ChunkingConfig};
 use llms::embeddings::{Embed, Error as EmbedError};
+use runtime_acceleration::acceleration::{Acceleration, ZeroResultsAction};
 use std::collections::HashMap;
 use tokio::sync::RwLock;
 
 pub type EmbeddingModelStore = HashMap<String, Arc<dyn Embed>>;
+
+/// The read behavior a warm search tier should be built with for a table with this
+/// `acceleration`, as `warm_index::with_memory_warm_index` takes it.
+///
+/// `None` — no warm tier at all — when the table has no enabled acceleration: a warm tier
+/// starts empty on every process start and is filled by the acceleration write path, so
+/// without acceleration nothing hydrates it and serving searches from it would narrow
+/// results to whatever rows a scan happened to write, or to nothing at all.
+#[must_use]
+pub fn warm_index_on_zero_results(
+    acceleration: Option<&Acceleration>,
+) -> Option<&ZeroResultsAction> {
+    acceleration
+        .filter(|acceleration| acceleration.enabled)
+        .map(|acceleration| &acceleration.on_zero_results)
+}
 
 pub async fn construct_chunker(
     model_name: &str,
@@ -41,4 +60,42 @@ pub async fn construct_chunker(
         });
     };
     embed_model.chunker(chunk_config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for #12101: the acceleration write path is the only thing that fills a
+    /// warm search tier, so an absent or disabled acceleration must yield no warm tier at all.
+    #[test]
+    fn on_zero_results_is_none_without_an_enabled_acceleration() {
+        assert_eq!(
+            warm_index_on_zero_results(None),
+            None,
+            "a table with no acceleration must get no warm tier"
+        );
+
+        let disabled = Acceleration {
+            enabled: false,
+            on_zero_results: ZeroResultsAction::UseSource,
+            ..Acceleration::default()
+        };
+        assert_eq!(
+            warm_index_on_zero_results(Some(&disabled)),
+            None,
+            "a disabled acceleration must get no warm tier"
+        );
+
+        let enabled = Acceleration {
+            enabled: true,
+            on_zero_results: ZeroResultsAction::UseSource,
+            ..Acceleration::default()
+        };
+        assert_eq!(
+            warm_index_on_zero_results(Some(&enabled)),
+            Some(&ZeroResultsAction::UseSource),
+            "an enabled acceleration passes its on_zero_results through"
+        );
+    }
 }

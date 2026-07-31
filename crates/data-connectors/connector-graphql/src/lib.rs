@@ -13,12 +13,16 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+#![allow(clippy::missing_errors_doc)]
 
-use async_trait::async_trait;
-use data_components::graphql::{
-    self, builder::GraphQLClientBuilder, client::GraphQLClient,
-    provider::GraphQLTableProviderBuilder,
+//! GraphQL data connector for Spice.ai runtime.
+
+pub mod graphql;
+
+use crate::graphql::{
+    builder::GraphQLClientBuilder, client::GraphQLClient, provider::GraphQLTableProviderBuilder,
 };
+use async_trait::async_trait;
 use data_components::rate_limit::RateLimiter;
 use datafusion::datasource::TableProvider;
 use runtime::component::dataset::Dataset;
@@ -106,11 +110,9 @@ impl DataConnectorFactory for GraphQLFactory {
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let runtime_rate_control_params =
-                params.app.as_ref().map(|app| app.runtime.params.clone());
+            let runtime_rate_control_params = params.app().map(|app| app.runtime.params.clone());
             let rate_control_registry = params
-                .runtime
-                .as_ref()
+                .runtime()
                 .map_or_else(http_rate_control::global_registry, |runtime| {
                     runtime.http_rate_control_registry()
                 });

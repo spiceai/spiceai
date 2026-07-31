@@ -19,11 +19,57 @@ use runtime::{
     Runtime,
     component::dataset::{Dataset, builder::DatasetBuilder},
     datasets_health_monitor::DatasetsHealthMonitor,
+    status::ComponentStatus,
 };
 use spicepod::component::dataset::CheckAvailability;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
-use crate::utils::register_test_connectors;
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use async_trait::async_trait;
+use datafusion::catalog::Session;
+use datafusion::datasource::{TableProvider, TableType};
+use datafusion::error::{DataFusionError, Result as DataFusionResult};
+use datafusion::logical_expr::Expr;
+use datafusion::physical_plan::{ExecutionPlan, empty::EmptyExec};
+use datafusion::sql::TableReference;
+
+use crate::utils::{register_test_connectors, wait_until_true};
+
+/// A [`TableProvider`] whose `scan` fails while `fail` is set — used to simulate
+/// a source going unavailable and then recovering, without any external system.
+#[derive(Debug)]
+struct ToggleableProvider {
+    schema: SchemaRef,
+    fail: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl TableProvider for ToggleableProvider {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        _projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(DataFusionError::Execution(
+                "simulated source outage".to_string(),
+            ));
+        }
+        Ok(Arc::new(EmptyExec::new(Arc::clone(&self.schema))))
+    }
+}
 
 async fn get_test_dataset_with_check_availability_disabled() -> Result<Dataset, anyhow::Error> {
     let file_path = if std::fs::exists("./tests/file/datatypes.parquet")? {
@@ -126,6 +172,113 @@ async fn dataset_check_availability_register_skipped_when_accelerated() -> Resul
     // Check that monitored_datasets is empty
     let monitored_datasets = monitor.monitored_datasets.lock().await;
     assert!(monitored_datasets.is_empty());
+
+    Ok(())
+}
+
+/// End-to-end: a non-accelerated dataset whose source becomes unavailable is
+/// moved to `Error` status by the availability monitor within its configured
+/// `check_availability_interval`, and returns to `Ready` once the source
+/// recovers. This is what `GET /v1/datasets?status=true` reports.
+#[tokio::test]
+async fn availability_monitor_marks_dataset_error_on_source_outage() -> Result<(), anyhow::Error> {
+    register_test_connectors().await;
+
+    let app = AppBuilder::new("availability_status_test").build();
+    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+    let df = rt.datafusion();
+    let status = df.runtime_status();
+
+    // Register a toggleable provider under the dataset name so the monitor's
+    // connectivity probe (a `scan(.., LIMIT 1)`) resolves to it.
+    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+    let fail = Arc::new(AtomicBool::new(false));
+    let table_ref = TableReference::bare("toggle_source");
+    df.ctx
+        .register_table(
+            table_ref.clone(),
+            Arc::new(ToggleableProvider {
+                schema: Arc::clone(&schema),
+                fail: Arc::clone(&fail),
+            }),
+        )
+        .expect("register toggleable provider");
+
+    // Build a non-accelerated dataset with a short (1s) availability interval.
+    let mut spicepod_dataset = spicepod::component::dataset::Dataset::new("sink", "toggle_source");
+    spicepod_dataset.check_availability_interval = Some("1s".to_string());
+    let dataset: Dataset = DatasetBuilder::try_from(spicepod_dataset)?
+        .with_app(Arc::new(
+            AppBuilder::new("availability_status_test").build(),
+        ))
+        .with_runtime(Arc::clone(&rt))
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build dataset: {e}"))?;
+    assert_eq!(
+        dataset.check_availability_interval,
+        Some(Duration::from_secs(1))
+    );
+
+    // Simulate the dataset having loaded successfully (its healthy state).
+    status.update_dataset(&table_ref, ComponentStatus::Ready);
+
+    let monitor = DatasetsHealthMonitor::new(Arc::clone(&df));
+    monitor
+        .register_dataset(&dataset)
+        .await
+        .expect("register dataset for monitoring");
+    monitor.start();
+
+    // Source is reachable: the dataset stays Ready across a couple of intervals.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        status.get_dataset_status(&table_ref),
+        Some(ComponentStatus::Ready),
+        "dataset must stay Ready while the source is reachable"
+    );
+
+    // Source goes down -> the next probe must move the dataset to Error.
+    fail.store(true, Ordering::SeqCst);
+    let became_error = wait_until_true(Duration::from_secs(15), || {
+        let status = Arc::clone(&status);
+        let table_ref = table_ref.clone();
+        async move {
+            status
+                .get_dataset_status(&table_ref)
+                .is_some_and(|s| s.is_error())
+        }
+    })
+    .await;
+    assert!(
+        became_error,
+        "dataset should be Error within a few intervals after the source becomes unavailable"
+    );
+    // The error surfaces the source failure to the user.
+    let err_status = status.get_dataset_status(&table_ref).expect("status");
+    assert!(
+        err_status
+            .error_message()
+            .is_some_and(|m| m.contains("simulated source outage")),
+        "error status should carry the underlying source error, got {err_status:?}"
+    );
+
+    // Source recovers -> the dataset returns to Ready.
+    fail.store(false, Ordering::SeqCst);
+    let recovered = wait_until_true(Duration::from_secs(15), || {
+        let status = Arc::clone(&status);
+        let table_ref = table_ref.clone();
+        async move {
+            matches!(
+                status.get_dataset_status(&table_ref),
+                Some(ComponentStatus::Ready)
+            )
+        }
+    })
+    .await;
+    assert!(
+        recovered,
+        "dataset should return to Ready after the source recovers"
+    );
 
     Ok(())
 }

@@ -32,11 +32,14 @@ use crate::accelerated_table::{self, AcceleratedTable};
 use crate::changes::{Indexes, index_change_envelope};
 use crate::component::{
     ComponentInitialization,
-    dataset::{Dataset, acceleration::RefreshMode},
+    dataset::{
+        Dataset,
+        acceleration::{RefreshMode, ZeroResultsAction},
+    },
 };
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 use crate::federated_table::FederatedTable;
-use crate::search::full_text::table::add_elasticsearch_fts_to_table;
+use crate::search::full_text::table::add_compound_fts_to_table;
 use crate::search::util::find_concrete_table_provider;
 use runtime_metrics::component::MetricsProvider;
 use runtime_parameters::typed::TypedParams as _;
@@ -152,15 +155,21 @@ impl DataConnector for ElasticsearchFullTextConnector {
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let inner = self.inner_connector.read_provider(dataset).await?;
-        add_elasticsearch_fts_to_table(inner, &dataset.columns, &dataset.name, &self.fts_params)
-            .await
-            .map(|idx| Arc::new(idx) as Arc<dyn TableProvider>)
-            .map_err(|e| DataConnectorError::InvalidConfiguration {
-                dataconnector: dataset.source().to_string(),
-                message: e.to_string(),
-                connector_component: dataset.into(),
-                source: e,
-            })
+        add_compound_fts_to_table(
+            inner,
+            &dataset.columns,
+            &dataset.name,
+            &self.fts_params,
+            &on_zero_results(dataset),
+        )
+        .await
+        .map(|idx| Arc::new(idx) as Arc<dyn TableProvider>)
+        .map_err(|e| DataConnectorError::InvalidConfiguration {
+            dataconnector: dataset.source().to_string(),
+            message: e.to_string(),
+            connector_component: dataset.into(),
+            source: e,
+        })
     }
 
     async fn read_write_provider(
@@ -169,11 +178,12 @@ impl DataConnector for ElasticsearchFullTextConnector {
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         match self.inner_connector.read_write_provider(dataset).await {
             Some(Ok(inner)) => Some(
-                add_elasticsearch_fts_to_table(
+                add_compound_fts_to_table(
                     inner,
                     &dataset.columns,
                     &dataset.name,
                     &self.fts_params,
+                    &on_zero_results(dataset),
                 )
                 .await
                 .map(|idx| Arc::new(idx) as Arc<dyn TableProvider>)
@@ -245,6 +255,10 @@ impl DataConnector for ElasticsearchFullTextConnector {
         self.inner_connector.supports_changes_stream()
     }
 
+    fn supports_durable_write_back_delivery(&self) -> bool {
+        self.inner_connector.supports_durable_write_back_delivery()
+    }
+
     fn changes_stream(
         &self,
         federated_table: Arc<FederatedTable>,
@@ -262,4 +276,15 @@ impl DataConnector for ElasticsearchFullTextConnector {
     fn append_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
         self.with_indexed_stream(federated_table, |inner, table| inner.append_stream(table))
     }
+}
+
+/// The dataset's configured `on_zero_results` acceleration setting, defaulting to
+/// [`ZeroResultsAction::ReturnEmpty`] when no acceleration is configured. Drives the compound
+/// full-text index's read mode: whether an empty warm-tier result falls back to Elasticsearch.
+fn on_zero_results(dataset: &Dataset) -> ZeroResultsAction {
+    dataset
+        .acceleration
+        .as_ref()
+        .map(|acceleration| acceleration.on_zero_results.clone())
+        .unwrap_or_default()
 }

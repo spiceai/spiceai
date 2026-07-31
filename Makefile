@@ -10,7 +10,7 @@ build-cli:
 
 .PHONY: build-cli-dev
 build-cli-dev:
-	cargo build -p spice
+	cargo build $(CARGO_PROFILE) -p spice
 
 .PHONY: build-spiced
 build-spiced:
@@ -84,18 +84,42 @@ signoff-remote:
 test:
 	@cargo test --all --lib
 
+# Indent these with spaces, never a tab: this block follows the `test` recipe, so
+# a tab-indented line is parsed as another command in that recipe instead of an
+# assignment — which both breaks `make test` and silently empties the variable.
 ifdef RUST_PROFILE
     CARGO_PROFILE := --profile $(RUST_PROFILE)
-	NEXTEST_CARGO_PROFILE := --cargo-profile $(RUST_PROFILE)
+    NEXTEST_CARGO_PROFILE := --cargo-profile $(RUST_PROFILE)
 else
-	CARGO_PROFILE := --profile dev
-	NEXTEST_CARGO_PROFILE := --cargo-profile dev
+    CARGO_PROFILE := --profile dev
+    NEXTEST_CARGO_PROFILE := --cargo-profile dev
 endif
 
+# `libnfs` binds a system library, and on a modern glibc its generated bindings
+# carry a layout assertion for a type the headers only forward-declare, so the
+# crate fails to compile at all (spiceai/spiceai#12130). `lint-rust` already
+# excludes it via `_LINT_WORKSPACE_FLAGS`; excluding it here too keeps both halves
+# of the gate agreeing on which crates need system libraries, so a sign-off on
+# such a host fails only for reasons in the branch under test. The crate has no
+# unit tests of its own.
 .PHONY: nextest
 nextest:
-	@cargo nextest run --all --lib $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
+	@cargo nextest run --all --exclude libnfs --lib $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
 	@cargo nextest run -p cayenne --tests $(NEXTEST_CARGO_PROFILE)
+
+# Unit tests for named packages — the fail-fast pre-check scripts/signoff runs on
+# the crates a branch touched, before the full workspace gate. Same lib-only
+# scope and profile as `nextest`, so its test binaries carry into that run.
+# Callers must filter out packages without a library target: `--lib` is a fatal
+# `no library targets found` on bin-only crates.
+# --no-tests=pass because a scoped selection legitimately covers crates with no
+# unit tests (29 workspace libraries have none). nextest exits 4 on "no tests to
+# run" by default, which would abort the sign-off for a branch that only touched
+# one of them; the full `nextest` run still gates the workspace.
+.PHONY: nextest-packages
+nextest-packages:
+	@test -n "$(strip $(PACKAGES))" || { echo 'nextest-packages requires PACKAGES="crate1 crate2"' >&2; exit 1; }
+	@cargo nextest run --no-tests=pass $(_LINT_PKG_FLAGS) --lib $(_FEATURES_FLAGS) $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
 
 # Also update .github/workflows/integration.yml with changes to this target
 .PHONY: test-integration
@@ -163,6 +187,8 @@ lint-rust:
 	cargo fmt $(_FMT_FLAGS) -- --check
 	## Crate-layering guard (fast, no compile): no crate may depend on a higher tier. See docs/dev/crate_layering.md
 	python3 scripts/check_crate_layers.py
+	## Rust-gate path-list guard (fast, no compile): the sign-off, Attestation, and merge-queue path lists must agree. See docs/dev/ci_signoff.md
+	python3 scripts/check_rust_gate_paths.py
 	## All except metal, cuda, nfs (nfs requires system libnfs library)
 	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going $(_LINT_TARGET_FLAGS) $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
 		-Dwarnings \

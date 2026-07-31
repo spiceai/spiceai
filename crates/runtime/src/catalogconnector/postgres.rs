@@ -21,7 +21,7 @@ limitations under the License.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
 use crate::catalogconnector::postgres_accelerated::{
-    AcceleratedCatalogProvider, NoEligibleTablesError,
+    AcceleratedCatalogProvider, NoEligibleTablesError, SlotInUseError,
 };
 use crate::{Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams};
 use async_trait::async_trait;
@@ -139,11 +139,18 @@ impl CatalogConnector for PostgresCatalog {
             };
 
         catalog_provider.refresh().await.map_err(|e| {
-            // A catalog with zero eligible tables is a configuration problem
-            // that retrying can't resolve (discovery is one-shot), so surface it
-            // as a permanent configuration error -- catalog load stops with an
-            // ERROR status instead of retrying the empty discovery forever.
-            if e.downcast_ref::<NoEligibleTablesError>().is_some() {
+            // Two classes of permanent (non-retryable) configuration problem,
+            // surfaced as a terminal ERROR status instead of retried forever:
+            //   - zero eligible tables: this is the *initial* refresh, so failing
+            //     it means the catalog never registers and never gets a periodic
+            //     refresh -- fixing the source/filters then requires a restart, so
+            //     surface it loudly rather than starting an empty catalog; and
+            //   - the catalog's replication slot already actively held by another
+            //     live consumer after the bounded wait (running two instances
+            //     against one catalog is a misconfiguration, not a transient).
+            if e.downcast_ref::<NoEligibleTablesError>().is_some()
+                || e.downcast_ref::<SlotInUseError>().is_some()
+            {
                 super::Error::InvalidConfiguration {
                     connector: PREFIX.to_string(),
                     connector_component: connector_component.clone(),

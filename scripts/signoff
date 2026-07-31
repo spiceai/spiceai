@@ -38,28 +38,22 @@
 #                     statuses, "via remote" description, GitHub step summary
 #   SIGNOFF_DEBUG     Set to any value for verbose debug logging
 #   SIGNOFF_SKIP_TARGETED_LINT  Set to any value to skip the branch-scoped pre-lint
-#   SIGNOFF_SSH_HOSTS Space-separated hosts for make signoff-remote (default:
-#                     192.168.1.100 192.168.1.101). First host that answers SSH
-#                     and has a Git checkout at $HOME/dev/spice2 is used;
-#                     otherwise falls back to GHA.
-#   SIGNOFF_SSH_REPO  Absolute path to the spice2 Git checkout on the SSH host
-#                     (default: $HOME/dev/spice2 on the remote). Must start with
-#                     / — ~ and relative paths are not expanded through SSH argv.
+#   SIGNOFF_SKIP_TARGETED_TESTS Set to any value to skip the branch-scoped unit
+#                     tests that run after the pre-lint
 #
 # Targeted pre-lint always diffs against trunk (not configurable).
 # When the branch has no Rust-affecting changes vs trunk (.rs, Cargo.toml,
-# Cargo.lock, rust-toolchain*, .cargo/*), Rust lint/build/tests are skipped
+# Cargo.lock, rust-toolchain*, .cargo/*, clippy/rustfmt/nextest/layers config,
+# the lint guards, the root Makefile), Rust lint/build/tests are skipped
 # (both local and remote); the sign-off status is still posted.
 #
-# Remote alternative to local `make signoff`:
-#   make signoff-remote                  # SSH to a lab host if available, else GHA
+# Remote alternative to local `make signoff` (both dispatch GitHub Actions):
+#   make signoff-remote
 #   gh workflow run signoff.yml -f branch=<branch>
 
 set -euo pipefail
 
-readonly VERSION="1.3.0"
-# Default LAN lab hosts for `signoff remote` (SSH path). Overridable via env.
-readonly DEFAULT_SIGNOFF_SSH_HOSTS="192.168.1.100 192.168.1.101"
+readonly VERSION="1.4.0"
 # Fixed, not configurable: it must match the hardcoded context the Attestation
 # workflow (pr.yml) looks for, so an env override would silently break the gate.
 readonly STATUS_CONTEXT="signoff"
@@ -118,6 +112,19 @@ fail()  { echo "${NO} $*" >&2; exit 1; }
 
 # Prefix each non-empty line of stdin with "$1" (for indented list output).
 bullet() { local prefix="$1" line; while IFS= read -r line; do [[ -n "$line" ]] && echo "${prefix}${line}"; done; }
+
+# True when "$1" holds at least one character that is not a tab, newline, CR, or
+# space — i.e. the string carries content rather than only separators.
+#
+# This replaces `[[ -n "${var//[$'\t\n\r ']/}" ]]`. That expansion is quadratic
+# or worse in bash 3.2 (still /bin/bash on macOS, which `#!/usr/bin/env bash`
+# resolves to), so applying it to a branch's changed-file list — ~107 KB for a
+# 900-file diff — takes hours: measured 1.8s at 3 KB, 14s at 6 KB, 91s at 12 KB,
+# extrapolating to ~11h at 107 KB. A glob match short-circuits on the first
+# content character instead, and stays fast (~20ms at 107 KB) even in the
+# all-whitespace worst case, where it has to scan the whole string.
+readonly SIGNOFF_SEPARATORS=$'\t\n\r '
+has_content() { [[ "$1" == *[!$SIGNOFF_SEPARATORS]* ]]; }
 
 # --- preconditions -----------------------------------------------------------
 
@@ -382,29 +389,31 @@ packages_for_changed_files() {
     return 1
   fi
 
-  local metadata files
-  # Read paths first — a heredoc would otherwise consume stdin for the program.
+  local files
+  # Read paths first — the program below reads metadata from stdin.
   files=$(cat)
-  [[ -n "${files//[$'\t\n\r ']/}" ]] || return 0
+  has_content "$files" || return 0
 
-  # Keep stderr so cargo's own error (missing rustc, bad manifest, …) is visible.
-  metadata=$(cargo metadata --no-deps --format-version 1) \
-    || fail "cargo metadata failed — is this a Cargo workspace?"
-
-  # Paths + metadata via env (heredoc is the program source, not stdin data).
-  # Use a different env name than the readonly shell constant — bash rejects
-  # VAR=value command when VAR is readonly, even if the value is unchanged.
-  CHANGED_FILES="$files" PACKAGES_METADATA="$metadata" \
-    SIGNOFF_LINT_EXCLUDED="$LINT_EXCLUDED_PACKAGES" python3 <<'PY'
-import json, os
+  # Metadata streams over stdin rather than the environment: it is ~700 KB
+  # against a 1 MiB ARG_MAX covering argv plus the whole environment of exec(),
+  # and once the workspace outgrows that headroom python3 would stop starting
+  # and the targeted pre-lint would silently vanish. The changed-file list is a
+  # branch diff, small enough to stay in the environment. Keep cargo's stderr so
+  # its own error (missing rustc, bad manifest, …) stays visible.
+  cargo metadata --no-deps --format-version 1 \
+    | CHANGED_FILES="$files" SIGNOFF_LINT_EXCLUDED="$LINT_EXCLUDED_PACKAGES" python3 -c '
+import json, os, sys
 from pathlib import Path
 
-meta = json.loads(os.environ["PACKAGES_METADATA"])
+try:
+    meta = json.load(sys.stdin)
+except ValueError:
+    raise SystemExit("cargo metadata failed — is this a Cargo workspace?")
 excluded = set(os.environ.get("SIGNOFF_LINT_EXCLUDED", "").split())
 workspace_root = Path(meta["workspace_root"]).resolve()
 
 # Longest package root first so nested members (connector-postgres) win over
-# a parent path if both ever appeared (they shouldn't for exclusive members).
+# a parent path if both ever appeared (they should not for exclusive members).
 packages = []
 for p in meta["packages"]:
     name = p["name"]
@@ -434,7 +443,7 @@ for raw in os.environ["CHANGED_FILES"].splitlines():
 
 for name in sorted(found):
     print(name)
-PY
+'
 }
 
 # Resolve workspace packages touched by the current branch vs trunk. Prints a
@@ -449,20 +458,134 @@ changed_workspace_packages() {
     info "Could not list changed files vs ${LINT_BASE_BRANCH} — skipping targeted pre-lint"
     return 0
   fi
-  if [[ -z "${files//[$'\t\n\r ']/}" ]]; then
+  if ! has_content "$files"; then
     debug "no changed files vs ${LINT_BASE_BRANCH}"
     return 0
   fi
   debug "changed files:"$'\n'"$files"
 
   packages=$(printf '%s\n' "$files" | packages_for_changed_files) || true
-  if [[ -z "${packages//[$'\t\n\r ']/}" ]]; then
+  if ! has_content "$packages"; then
     debug "no workspace packages in the changed files"
     return 0
   fi
 
   # Collapse newlines → spaces for `make PACKAGES=…`.
   echo "$packages" | tr '\n' ' ' | sed 's/[[:space:]]*$//'
+}
+
+# Feature set each named package carries in a full workspace resolve, formatted
+# for `--features` and package-qualified so multi-package selections stay
+# unambiguous.
+#
+# Without this a scoped `-p <crate>` run gets that crate's *own* defaults, which
+# is not what the workspace build produces: `runtime` declares 54 features and no
+# `default`, so `cargo clippy -p runtime` compiles it with zero features — a
+# configuration no real build ever produces, because `spiced`'s defaults unify 35
+# features into `runtime` across the workspace. The targeted steps would lint and
+# test different code than the gate, which is both the false-failure class that
+# SIGNOFF_SKIP_TARGETED_LINT exists to dodge and a guaranteed cache miss.
+# Deriving the set from the resolve keeps the two in step with no hand-maintained
+# list to drift.
+workspace_features_for_packages() {
+  local packages="$1"
+  has_content "$packages" || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+
+  # A resolve carrying dependencies is ~10 MB here, an order of magnitude past
+  # ARG_MAX, so it can only reach python over stdin.
+  cargo metadata --format-version 1 2>/dev/null | python3 -c '
+import json, sys
+
+try:
+    meta = json.load(sys.stdin)
+except ValueError:
+    raise SystemExit(0)
+
+wanted = set(sys.argv[1].split())
+# Match on workspace members only: a dependency can share a name with a member.
+members = set(meta.get("workspace_members", []))
+names = {p["id"]: p["name"] for p in meta["packages"]}
+
+features = []
+for node in meta.get("resolve", {}).get("nodes", []):
+    if node["id"] not in members or names.get(node["id"]) not in wanted:
+        continue
+    name = names[node["id"]]
+    # `default` is already on -- nothing here passes --no-default-features.
+    features.extend(
+        f"{name}/{feat}" for feat in sorted(node["features"]) if feat != "default"
+    )
+print(",".join(features))
+' "$packages" || return 0
+}
+
+# Narrow a package-qualified feature list (`pkg/feat,…`) to the given packages.
+# Cargo rejects a feature naming a package outside the `-p` selection outright
+# ("the package 'x' does not contain this feature: y/z"), so any caller that
+# builds a subset of the packages the features were resolved for has to filter
+# first. Prints the kept features, or nothing when none survive.
+features_for_packages() {
+  local features="$1" packages="$2"
+  has_content "$features" || return 0
+  has_content "$packages" || return 0
+
+  awk -v feats="$features" -v pkgs="$packages" 'BEGIN {
+    n = split(pkgs, selected, /[ \t\n]+/)
+    for (i = 1; i <= n; i++) if (selected[i] != "") keep[selected[i]] = 1
+
+    m = split(feats, entries, /,/)
+    out = ""
+    for (i = 1; i <= m; i++) {
+      slash = index(entries[i], "/")
+      if (slash == 0) continue
+      if (substr(entries[i], 1, slash - 1) in keep) {
+        out = (out == "" ? entries[i] : out "," entries[i])
+      }
+    }
+    print out
+  }'
+}
+
+# Filter a space-separated package list to those with a library target. The
+# unit-test gate is lib-only, and `--lib` is a fatal `no library targets found`
+# on bin-only crates (spice, testoperator, …). Prints the filtered list, or
+# nothing when none qualify or the metadata is unavailable (caller then skips
+# the targeted tests; the full run still covers them).
+packages_with_lib_targets() {
+  local packages="$1"
+  has_content "$packages" || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+
+  # Metadata streams in over stdin rather than an environment variable: this
+  # workspace's `cargo metadata` output is ~700 KB against a 1 MiB ARG_MAX on
+  # macOS, and that cap covers argv plus the whole environment of exec(). Once
+  # the workspace outgrows the remaining headroom, python3 would stop starting
+  # at all and the targeted tests would silently disappear. That forces
+  # `python3 -c` over the heredoc used elsewhere here, since stdin is now data.
+  # The package list stays in argv — it is a handful of crate names.
+  cargo metadata --no-deps --format-version 1 2>/dev/null | python3 -c '
+import json, sys
+
+try:
+    meta = json.load(sys.stdin)
+except ValueError:
+    # cargo metadata failed or produced nothing: print no packages, so the
+    # caller skips the targeted tests instead of showing a decode traceback.
+    raise SystemExit(0)
+
+candidates = set(sys.argv[1].split())
+# A proc-macro crate lib target is what `--lib` selects for it, so it counts.
+LIB_KINDS = {"lib", "rlib", "proc-macro"}
+
+with_lib = sorted(
+    p["name"]
+    for p in meta["packages"]
+    if p["name"] in candidates
+    and any(LIB_KINDS & set(t["kind"]) for t in p["targets"])
+)
+print(" ".join(with_lib))
+' "$packages" || return 0
 }
 
 # Append a short markdown section to the GitHub Actions job summary (no-op
@@ -487,9 +610,14 @@ post_commit_status() {
 
 # --- commands ----------------------------------------------------------------
 
+# Paths that can change what cargo/clippy/fmt/nextest do — Rust sources, the
+# Cargo/toolchain config, and the config files the gate itself reads. Keep in
+# sync with `rustAffecting` in .github/workflows/pr.yml and covered by the
+# check-code-changes filter; `scripts/check_rust_gate_paths.py` enforces both,
+# and docs/dev/ci_signoff.md explains why each path is here.
+RUST_AFFECTING_PATH_PATTERN='(\.rs$|(^|/)Cargo\.(toml|lock)$|(^|/)rust-toolchain(\.toml)?$|(^|/)\.cargo/|(^|/)\.?(clippy|rustfmt)\.toml$|(^|/)nextest\.toml$|(^|/)layers\.toml$|^scripts/check_(crate_layers|rust_gate_paths)\.py$|^Makefile$)'
+
 # True when the branch delta vs trunk can affect Rust lint/build/tests.
-# Matches .rs sources plus Cargo/toolchain config that can break those gates:
-#   *.rs, Cargo.toml, Cargo.lock, rust-toolchain[.toml], .cargo/*
 # Prints nothing. Exit 0 = has Rust-affecting changes (or unknown — run checks).
 # Exit 1 = no such paths in the changed set → safe to skip.
 # Unknown (diff unavailable) returns 0 so we never skip when we can't tell.
@@ -501,18 +629,62 @@ branch_has_rust_changes() {
     debug "could not list changed files — assuming Rust changes (will run checks)"
     return 0
   fi
-  if [[ -z "${files//[$'\t\n\r ']/}" ]]; then
+  if ! has_content "$files"; then
     debug "no changed files vs ${LINT_BASE_BRANCH} — no Rust changes"
     return 1
   fi
-  # Paths that can change what cargo/clippy/fmt/nextest do (not docs/scripts alone).
-  if printf '%s\n' "$files" | grep -qE \
-      '(\.rs$|(^|/)Cargo\.(toml|lock)$|(^|/)rust-toolchain(\.toml)?$|(^|/)\.cargo/)'; then
+  # Feed grep a here-string rather than a pipe: `grep -q` exits at the first
+  # match, and once "$files" exceeds the 64 KB pipe buffer that closes the pipe
+  # while the writer still has data, so the writer dies of SIGPIPE and
+  # `set -o pipefail` reports the whole pipeline as failed (status 141). This
+  # function would then answer "no Rust changes" for a branch that does change
+  # .rs files, and sign-off would skip lint/build/tests and still post success —
+  # it needs a large diff whose first matching path lands early, which is why it
+  # survived on smaller branches. Same hazard as the `| head -n1` note below.
+  if grep -qE "$RUST_AFFECTING_PATH_PATTERN" <<<"$files"; then
     debug "Rust-affecting files present — will run Rust checks"
     return 0
   fi
   debug "no Rust-affecting files in changed set — can skip Rust lint/build/tests"
   return 1
+}
+
+# Unit tests for the packages a branch touched, run before the full workspace
+# lint. A broken test in the crate you just edited is the likeliest failure, and
+# it would otherwise surface only after the longest step in the gate.
+# Bin-only packages are dropped (see packages_with_lib_targets); everything the
+# targeted run skips is still covered by the full `nextest` run later.
+run_targeted_tests() {
+  local packages="$1"
+  local features="${2:-}"
+  local test_packages
+
+  if [[ -n "${SIGNOFF_SKIP_TARGETED_TESTS:-}" ]]; then
+    info "SIGNOFF_SKIP_TARGETED_TESTS set — skipping targeted unit tests"
+    return 0
+  fi
+
+  test_packages=$(packages_with_lib_targets "$packages" || true)
+  if ! has_content "$test_packages"; then
+    debug "no changed packages with a library target — skipping targeted unit tests"
+    append_step_summary "### Targeted unit tests"$'\n'"Skipped (no changed packages with a library target)."$'\n'
+    return 0
+  fi
+
+  # The features were resolved for the full changed set, which can name crates
+  # dropped just above. Naming a feature for a package outside the `-p`
+  # selection is a hard cargo error ("the package 'x' does not contain this
+  # feature: y/z"), so a branch touching a library crate and a bin-only one
+  # (runtime + testoperator) would fail the run outright.
+  features=$(features_for_packages "$features" "$test_packages")
+
+  info "Targeted unit tests for changed packages: ${test_packages}"
+  info "  (make nextest-packages PACKAGES=\"${test_packages}\")"
+  append_step_summary "### Targeted unit tests"$'\n'"Packages: \`${test_packages}\`"$'\n'
+  # Explicit `|| return` so failures short-circuit even when the caller has
+  # temporarily disabled `set -e` (see cmd_signoff).
+  make nextest-packages PACKAGES="$test_packages" FEATURES="$features" || return $?
+  info "Targeted unit tests passed."
 }
 
 # Run the same fast checks the old PR build ran: lint + build + unit tests.
@@ -522,8 +694,15 @@ branch_has_rust_changes() {
 # Fail-fast order:
 #   0. Skip all Rust work when the branch has no Rust-affecting files vs trunk
 #   1. Targeted lint on packages touched by the branch (fast feedback)
-#   2. Full workspace lint (the real gate)
-#   3. CLI build + unit tests
+#   2. Targeted unit tests for those packages (fast feedback)
+#   3. Full workspace lint (the real gate)
+#   4. CLI build + unit tests
+#
+# Steps 1-2 cover the crate you actually edited before step 3, the longest step,
+# so its likeliest failures surface in minutes instead of at the end. They build
+# it with the features the workspace resolves for it, so they exercise the same
+# code the gate will rather than a scoped-only configuration;
+# SIGNOFF_SKIP_TARGETED_LINT and SIGNOFF_SKIP_TARGETED_TESTS opt out.
 #
 # Sets SIGNOFF_CHECK_SUMMARY (short phrase for the commit-status description).
 # Output streams straight to the terminal — call this bare, never `$(run_checks)`,
@@ -531,12 +710,15 @@ branch_has_rust_changes() {
 run_checks() {
   local revision="${1:-}"
   local packages=""
+  local features=""
 
   # Non-Rust-only changes (docs, YAML, scripts, …): still attest, but skip the
   # expensive lint/build/test gate. Unknown diffs fall through and run checks.
   if [[ -n "$revision" ]] && ! branch_has_rust_changes "$revision"; then
     info "No Rust-affecting files changed vs ${LINT_BASE_BRANCH} — skipping Rust lint, build, and unit tests"
-    append_step_summary "### Rust checks"$'\n'"Skipped (no \`.rs\` / Cargo / rust-toolchain / \`.cargo/\` files in the branch diff vs \`${LINT_BASE_BRANCH}\`)."$'\n'
+    # Name the pattern rather than a subset of what it matches: the two drift apart
+    # every time a path is added to the gate.
+    append_step_summary "### Rust checks"$'\n'"Skipped (nothing in the branch diff vs \`${LINT_BASE_BRANCH}\` matches \`RUST_AFFECTING_PATH_PATTERN\` in \`scripts/signoff\`)."$'\n'
     SIGNOFF_CHECK_SUMMARY="no Rust changes (lint/test skipped)"
     return 0
   fi
@@ -546,16 +728,26 @@ run_checks() {
   fi
 
   if [[ -n "$packages" ]]; then
+    # Build these crates the way the workspace builds them, not the way they
+    # build alone — see workspace_features_for_packages. An empty result (no
+    # python3, cargo metadata unavailable) falls back to package defaults, which
+    # is the old behavior rather than a hard failure.
+    features=$(workspace_features_for_packages "$packages" || true)
     info "Targeted pre-lint for changed packages: ${packages}"
-    info "  (make lint-rust PACKAGES=\"${packages}\" FEATURES=)"
+    if [[ -n "$features" ]]; then
+      info "  (workspace-resolved features: $(printf '%s' "$features" | tr ',' '\n' | wc -l | tr -d ' '))"
+      debug "targeted features: ${features}"
+    else
+      info "  (no resolved features available — falling back to package defaults)"
+    fi
     append_step_summary "### Targeted pre-lint"$'\n'"Packages: \`${packages}\`"$'\n'
-    # Package defaults only — workspace features (models, …) are not valid on
-    # every crate. FEATURES= clears any user-exported FEATURES so the Makefile
-    # does not reintroduce a workspace-only set. Full lint below still uses the
-    # complete feature set. Explicit `|| return` so failures short-circuit even
+    # FEATURES is set explicitly so a user-exported value cannot reintroduce a
+    # workspace-only set. Explicit `|| return` so failures short-circuit even
     # when the caller has temporarily disabled `set -e` (see cmd_signoff).
-    make lint-rust PACKAGES="$packages" FEATURES= || return $?
-    info "Targeted pre-lint passed — running full workspace lint…"
+    make lint-rust PACKAGES="$packages" FEATURES="$features" || return $?
+    info "Targeted pre-lint passed."
+    run_targeted_tests "$packages" "$features" || return $?
+    info "Running full workspace lint…"
   else
     info "No changed workspace packages detected (or targeted lint skipped) — running full workspace lint…"
     append_step_summary "### Targeted pre-lint"$'\n'"Skipped (no changed workspace packages, or unavailable base/diff)."$'\n'
@@ -566,8 +758,14 @@ run_checks() {
   # the full gate; empty values leave the Makefile on its workspace defaults.
   make lint-rust PACKAGES= FEATURES= || return $?
 
-  info "Building the CLI and running unit tests (make build-cli nextest)…"
-  make build-cli nextest || return $?
+  # build-cli-dev, not build-cli: the release CLI build shares no artifacts with
+  # the profile the lint and test passes just warmed, so it recompiles its whole
+  # graph (~590 crates, DataFusion and Arrow among them) to prove the binary
+  # links. The merge queue's required `Build (release profile)` job builds the
+  # CLI, spiced, and the release install for real, so release-only breakage is
+  # still caught before trunk.
+  info "Building the CLI and running unit tests (make build-cli-dev nextest)…"
+  make build-cli-dev nextest || return $?
 
   SIGNOFF_CHECK_SUMMARY="lint+test passed"
 }
@@ -937,111 +1135,12 @@ cmd_install() {
   echo "${OK} '${TARGET_BRANCH}' now requires developer sign-off + the full merge-queue suite."
 }
 
-# Validate SIGNOFF_SSH_REPO (optional override). Empty → default $HOME/dev/spice2
-# on the remote. Absolute path only (/…); tight charset so it is safe in ssh argv.
-# ~ and relative paths are rejected — they are not expanded through SSH argv.
-signoff_ssh_repo_or_default() {
-  local remote_repo="${SIGNOFF_SSH_REPO:-}"
-  if [[ -z "$remote_repo" ]]; then
-    echo ""
-    return 0
-  fi
-  [[ "$remote_repo" == /* ]] \
-    || fail "SIGNOFF_SSH_REPO must be an absolute path starting with / (got: '${remote_repo}')"
-  [[ "$remote_repo" =~ ^[A-Za-z0-9._/-]+$ ]] \
-    || fail "SIGNOFF_SSH_REPO contains unsafe characters: '${remote_repo}'"
-  echo "$remote_repo"
-}
-
-# Probe SIGNOFF_SSH_HOSTS (default lab IPs) for BatchMode SSH + a spice2 Git checkout.
-# Only Git is accepted (run_signoff_via_ssh requires git); a bare .jj workspace
-# would pass a looser probe and then fail the sign-off itself.
-# Prints the first usable host to stdout; status messages go to stderr via info.
-# Exit 0 with a host, or 1 if none are usable.
-find_signoff_ssh_host() {
-  local hosts host remote_repo probe_cmd
-  hosts="${SIGNOFF_SSH_HOSTS:-$DEFAULT_SIGNOFF_SSH_HOSTS}"
-  remote_repo=$(signoff_ssh_repo_or_default)
-
-  if [[ -n "$remote_repo" ]]; then
-    # Path already charset-validated; embed as a single-quoted remote literal.
-    # Require .git (file or dir) — matches run_signoff_via_ssh Git-only support.
-    probe_cmd="repo='${remote_repo}'; test -d \"\$repo\" && test -e \"\$repo/.git\""
-  else
-    probe_cmd='repo="$HOME/dev/spice2"; test -d "$repo" && test -e "$repo/.git"'
-  fi
-
-  for host in $hosts; do
-    # Hostnames/IPs only — keep the charset tight so ssh argv stays safe.
-    if [[ ! "$host" =~ ^[A-Za-z0-9._-]+$ ]]; then
-      info "  ${NO} skipping invalid SSH host name: '${host}'"
-      continue
-    fi
-    info "Probing SSH connectivity to ${host}…"
-    # BatchMode: never prompt for a password. Short connect timeout so offline
-    # hosts don't stall the developer. stdin from /dev/null so ssh can't eat
-    # a surrounding heredoc or pipe.
-    if ssh -o BatchMode=yes -o ConnectTimeout=1 -o ConnectionAttempts=1 \
-        -o StrictHostKeyChecking=accept-new \
-        "$host" "$probe_cmd" </dev/null 2>/dev/null; then
-      info "  ${OK} ${host} reachable and spice2 repo present"
-      echo "$host"
-      return 0
-    fi
-    info "  ${NO} ${host} unavailable or missing spice2 repo"
-  done
-  return 1
-}
-
-# SSH into a lab host, check out the pushed branch in its spice2 clone, and run
-# scripts/signoff -f there (same attestation as local; -f because checkout -B
-# leaves no @{push} tracking). Branch must already be on origin.
-run_signoff_via_ssh() {
-  local host="$1" branch="$2"
-  local remote_repo
-  remote_repo=$(signoff_ssh_repo_or_default)
-
-  info "Running sign-off via SSH on ${host}:${remote_repo:-\$HOME/dev/spice2} (branch ${branch})…"
-  # Remote command is `bash -s -- <branch> <repo-or-empty>`; the heredoc is
-  # stdin for bash -s. Branch is charset-validated in cmd_remote; repo is an
-  # absolute path or empty (→ $HOME/dev/spice2 on the remote).
-  # shellcheck disable=SC2029 # intentional: host/branch/repo are validated
-  ssh -o BatchMode=yes -o ConnectTimeout=1 -o ConnectionAttempts=1 \
-    -o StrictHostKeyChecking=accept-new \
-    -o ServerAliveInterval=30 -o ServerAliveCountMax=120 \
-    "$host" bash -s -- "$branch" "$remote_repo" <<'REMOTE'
-set -euo pipefail
-branch="$1"
-# Empty $2 → default lab checkout path on this host.
-if [[ -n "${2:-}" ]]; then
-  repo="$2"
-else
-  repo="${HOME}/dev/spice2"
-fi
-cd "$repo" || { echo "✗ cannot cd to ${repo}" >&2; exit 1; }
-
-if command -v git >/dev/null 2>&1 && git rev-parse --show-toplevel >/dev/null 2>&1; then
-  echo "Fetching origin/${branch} into ${repo}…"
-  git fetch --no-tags origin "+refs/heads/${branch}:refs/remotes/origin/${branch}" \
-    || { echo "✗ fetch failed — is '${branch}' pushed to origin?" >&2; exit 1; }
-  # -f discards any dirty local state on the lab machine; HEAD matches origin.
-  git checkout -f -B "$branch" "origin/${branch}"
-  git reset --hard "origin/${branch}"
-  echo "HEAD is now $(git rev-parse --short HEAD) on ${branch}"
-  # -f: no @{push} after checkout -B; tree matches origin tip we just fetched.
-  exec ./scripts/signoff -f
-fi
-
-echo "✗ ${repo} is not a Git checkout (SSH remote sign-off requires Git)" >&2
-exit 1
-REMOTE
-}
-
-# Dispatch remote sign-off for the current branch (Git or JJ).
-# Prefer a LAN SSH host with ~/dev/spice2 (lab machines); fall back to the
-# GitHub Actions Remote Sign-off workflow when no host is reachable.
+# Dispatch remote sign-off for the current branch (Git or JJ) on the GitHub
+# Actions Remote Sign-off workflow. Deliberately never SSH: ad-hoc hosts run
+# unaccountable checks, and the LAN lab boxes double as benchmark machines —
+# a workspace build there mid-run silently corrupts the measurement.
 # Branch names are validated to a safe charset so they cannot break shell
-# quoting, the SSH remote script, or the workflow input parser.
+# quoting or the workflow input parser.
 cmd_remote() {
   require_tools
 
@@ -1078,16 +1177,10 @@ cmd_remote() {
     fail "refusing to dispatch Remote Sign-off for invalid branch name: '${branch}'"
   fi
 
-  local host
-  if host=$(find_signoff_ssh_host); then
-    run_signoff_via_ssh "$host" "$branch"
-    return
-  fi
-
   local repo
   repo=$(repo_slug) || fail "could not resolve GitHub repo for workflow dispatch"
 
-  info "No SSH sign-off host available — dispatching GitHub Actions Remote Sign-off for ${branch} on ${repo}…"
+  info "Dispatching GitHub Actions Remote Sign-off for ${branch} on ${repo}…"
   # --repo so non-colocated JJ workspaces (no .git) still resolve the remote;
   # --raw-field avoids shell re-quoting pitfalls; the branch was validated above.
   gh workflow run signoff.yml --repo "$repo" --raw-field "branch=${branch}" \
@@ -1101,7 +1194,7 @@ scripts/signoff ${VERSION} — local CI attestation for Spice.ai
 
 Developers:
   make signoff                 Run lint + unit tests, then sign off on HEAD
-  make signoff-remote          SSH lab host if available, else GHA Remote Sign-off
+  make signoff-remote          Dispatch GHA Remote Sign-off for the current branch
   scripts/signoff remote       Same as make signoff-remote (Git + JJ)
   scripts/signoff -f           Sign off even with a dirty/unpushed tree
   scripts/signoff --no-verify  Sign off without running checks (honor system)
@@ -1115,20 +1208,27 @@ Maintainers:
 
 Checks (when verify is on):
   0. If the branch has no Rust-affecting files vs trunk (.rs, Cargo.toml/lock,
-     rust-toolchain*, .cargo/*) → skip Rust lint/build/tests (still posts status)
+     rust-toolchain*, .cargo/*, clippy/rustfmt/nextest/layers config, the lint
+     guards, the root Makefile) → skip Rust lint/build/tests (still posts
+     status)
   1. Targeted lint of crates touched by this branch vs trunk
      (make lint-rust PACKAGES="…") — fail-fast feedback
-  2. Full workspace lint (make lint-rust)
-  3. CLI build + unit tests (make build-cli nextest)
+  2. Targeted unit tests for those crates (make nextest-packages PACKAGES="…")
+  3. Full workspace lint (make lint-rust)
+  4. CLI build + unit tests (make build-cli-dev nextest)
 
-  Set SIGNOFF_SKIP_TARGETED_LINT=1 to skip step 1.
+  Steps 1-2 pass the features each crate resolves to in a workspace build, not
+  the crate's own defaults — a scoped build of a crate that declares no
+  'default' (runtime) would otherwise compile with no features at all.
+
+  Set SIGNOFF_SKIP_TARGETED_LINT=1 to skip step 1, SIGNOFF_SKIP_TARGETED_TESTS=1
+  to skip step 2 (both trade an extra compile of those crates for early failure).
   Remote runs (.github/workflows/signoff.yml) set SIGNOFF_REMOTE_RUN and use
   the GitHub compare API when the clone is too shallow for merge-base.
 
-  make signoff-remote probes SIGNOFF_SSH_HOSTS (default: ${DEFAULT_SIGNOFF_SSH_HOSTS})
-  for SSH + a Git checkout at \$HOME/dev/spice2, checks out the pushed branch
-  there, and runs signoff. If no host is usable, it falls back to dispatching
-  signoff.yml on GitHub Actions.
+  make signoff-remote dispatches signoff.yml on GitHub Actions (self-hosted
+  runner) for the current branch. Sign-off runs only where it is accountable:
+  this machine, or the runner — never ad-hoc SSH hosts.
 
 The sign-off is a '${STATUS_CONTEXT}' commit status bound to the exact commit you
 pushed. Sign off again after any code change or manual conflict resolution. The

@@ -20,7 +20,7 @@ limitations under the License.
 //!
 //! - **Legacy / metadata listing**: `from: sharepoint:me/root` or
 //!   `from: sharepoint:driveId:{id}/path:{path}`. Returns a
-//!   [`data_components::sharepoint::table::SharepointTableProvider`] — one
+//!   [`crate::sharepoint::table::SharepointTableProvider`] — one
 //!   row per drive item with optional file-content column. Good for PDF/PPTX
 //!   metadata workflows where each row represents a document.
 //!
@@ -36,15 +36,18 @@ limitations under the License.
     clippy::doc_markdown,
     reason = "prose-frequent identifiers (SharePoint, DataFusion, OneDrive) are clearer without backticks"
 )]
+#![allow(clippy::missing_errors_doc)]
 
-use async_trait::async_trait;
-use data_components::sharepoint::auth::{SharepointAuth, saml::SamlBearerConfig};
-use data_components::sharepoint::client::SharepointClient;
-use data_components::sharepoint::object_store::{
+pub mod sharepoint;
+
+use crate::sharepoint::auth::{SharepointAuth, saml::SamlBearerConfig};
+use crate::sharepoint::client::SharepointClient;
+use crate::sharepoint::object_store::{
     ConflictBehavior, DriveKind, SharepointObjectStore, SharepointObjectStoreConfig,
 };
-use data_components::sharepoint::table::SharepointTableProvider;
-use data_components::sharepoint::url::DriveRef;
+use crate::sharepoint::table::SharepointTableProvider;
+use crate::sharepoint::url::DriveRef;
+use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use document_parse::DocumentParser;
@@ -93,7 +96,7 @@ pub enum Error {
 
     #[snafu(display("Failed to build GraphClient: {source}"))]
     AuthBuild {
-        source: data_components::sharepoint::auth::Error,
+        source: crate::sharepoint::auth::Error,
     },
 
     #[snafu(display(
@@ -354,16 +357,18 @@ fn store_fingerprint(
     // Use the effective scope — same default applied by SharepointAuth — so
     // a dataset with no scope param and one explicitly setting the default
     // scope hash identically and are not rejected as a false-positive collision.
-    let effective_scope = params.get("scope").expose().ok().map_or(
-        data_components::sharepoint::auth::DEFAULT_SCOPE,
-        |s| {
-            if s.is_empty() {
-                data_components::sharepoint::auth::DEFAULT_SCOPE
-            } else {
-                s
-            }
-        },
-    );
+    let effective_scope =
+        params
+            .get("scope")
+            .expose()
+            .ok()
+            .map_or(crate::sharepoint::auth::DEFAULT_SCOPE, |s| {
+                if s.is_empty() {
+                    crate::sharepoint::auth::DEFAULT_SCOPE
+                } else {
+                    s
+                }
+            });
     effective_scope.hash(&mut h);
     drive_kind.map(|k| format!("{k:?}")).hash(&mut h);
     config.conflict_behavior.hash(&mut h);
@@ -476,15 +481,14 @@ fn parse_object_store_components(
             connector_component: ConnectorComponent::from(dataset),
             source: Box::new(e),
         })?;
-    let sp_url =
-        data_components::sharepoint::url::SharepointUrl::from_url(&store_url).map_err(|e| {
-            DataConnectorError::InvalidConfiguration {
-                dataconnector: CONNECTOR_NAME.to_string(),
-                message: format!("{e}"),
-                connector_component: ConnectorComponent::from(dataset),
-                source: Box::new(e),
-            }
-        })?;
+    let sp_url = crate::sharepoint::url::SharepointUrl::from_url(&store_url).map_err(|e| {
+        DataConnectorError::InvalidConfiguration {
+            dataconnector: CONNECTOR_NAME.to_string(),
+            message: format!("{e}"),
+            connector_component: ConnectorComponent::from(dataset),
+            source: Box::new(e),
+        }
+    })?;
     let kind = match sp_url.drive {
         DriveRef::Me => None,
         DriveRef::Drive(_) => Some(DriveKind::Drives),
@@ -706,7 +710,7 @@ impl DataConnectorFactory for SharepointFactory {
     ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let io_runtime = params.io_runtime.clone();
-            let runtime = params.runtime.clone().map(Arc::unwrap_or_clone);
+            let runtime = params.runtime().map(Arc::unwrap_or_clone);
             let connector = Sharepoint::new(params.parameters, io_runtime, runtime).await?;
             Ok(Arc::new(connector) as Arc<dyn DataConnector>)
         })
@@ -909,7 +913,7 @@ impl ListingTableConnector for SharepointListingConnector {
         // Validate scheme, authority kind, and structure via SharepointUrl::from_url
         // so unsupported authority kinds (e.g. sharepoint://unknown/...) fail here
         // with a clear error rather than later during store construction.
-        data_components::sharepoint::url::SharepointUrl::from_url(&parsed).map_err(|e| {
+        crate::sharepoint::url::SharepointUrl::from_url(&parsed).map_err(|e| {
             DataConnectorError::InvalidConfiguration {
                 dataconnector: CONNECTOR_NAME.to_string(),
                 message: format!("{e}"),

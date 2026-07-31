@@ -61,13 +61,11 @@ use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, Refres
 use crate::dataaccelerator::cayenne::s3::{S3_PARAMETERS, S3_PARAMS_LEN};
 use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed};
 use crate::parameters::ParameterSpec;
-use crate::register_data_accelerator;
 use crate::spice_data_base_path;
 use runtime_acceleration::snapshot::{AccelerationEngine, AccelerationLayout};
 use runtime_datafusion_index::{Index, IndexedTableProvider};
 use search::index::native_vector::NativeVectorIndex;
 use spicepod::acceleration as spicepod_acceleration;
-use spicepod::acceleration::WriteMode;
 
 /// Metadata key to identify the accelerator type in the schema metadata.
 const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
@@ -646,6 +644,45 @@ fn warn_if_low_disk_blocking(label: &str, path: &str) {
         percent_free = available.saturating_mul(100) / total,
         "Cayenne {label} volume is low on free space. Under memory pressure the in-memory CDC tier spills here; if it fills, ingestion fails. Free space or point the acceleration at a larger volume."
     );
+}
+
+/// Default read-current freshness (bounded staleness), in ms, for a READ-ONLY Cayenne
+/// CDC replica (`access: read` + `refresh_mode: changes`). Such a replica's data
+/// streams in only via CDC and is eventually-consistent by design, so a scan need not
+/// be read-your-writes; serving a recently-built `ScanView` within this lag lets
+/// concurrent analytical scans share one build (the demand cache's reuse lever) while
+/// staying far inside the freshness SLO. Every other table uses 0 (read-your-writes):
+/// read-write datasets, and read-only NON-CDC tables (full-refresh/snapshot/append),
+/// which must reflect their last refresh immediately and can still take a direct
+/// `delete_from` via the accelerator. 1 s is a conservative bounded-staleness default,
+/// far inside the freshness SLO; tune as the A/B data lands.
+const DEFAULT_READ_ONLY_SCAN_FRESHNESS_MS: u64 = 1000;
+
+/// The read-current lag applied to a READ-ONLY Cayenne CDC replica:
+/// [`DEFAULT_READ_ONLY_SCAN_FRESHNESS_MS`], overridable via the
+/// `CAYENNE_SCAN_VIEW_FRESHNESS_MS` environment variable (a process-wide operational
+/// knob, not per-table data config, so it stays out of `configuration_matches`).
+/// Setting it to `0` opts CDC replicas back into read-your-writes (the A/B no-reuse
+/// baseline). Never affects any other table, which always uses 0.
+///
+/// Parsed once into a process-global `LazyLock`: the env var is a process-wide knob, so
+/// caching avoids re-parsing on every provider/partition construction AND emits the
+/// invalid-value warning at most once (rather than per construction).
+fn read_only_scan_freshness() -> std::time::Duration {
+    static READ_ONLY_SCAN_FRESHNESS: LazyLock<std::time::Duration> = LazyLock::new(|| {
+        let ms = match std::env::var("CAYENNE_SCAN_VIEW_FRESHNESS_MS") {
+            Err(_) => DEFAULT_READ_ONLY_SCAN_FRESHNESS_MS,
+            // A set-but-invalid value is a misconfiguration; warn (don't silently
+            // swallow it) before falling back, mirroring `parse_env_u64`. `{raw:?}`
+            // escapes control characters so untrusted input cannot inject log lines.
+            Ok(raw) => raw.trim().parse::<u64>().unwrap_or_else(|_| {
+                tracing::warn!("Ignoring invalid CAYENNE_SCAN_VIEW_FRESHNESS_MS={raw:?}: expected a non-negative integer (milliseconds); using default {DEFAULT_READ_ONLY_SCAN_FRESHNESS_MS} ms.");
+                DEFAULT_READ_ONLY_SCAN_FRESHNESS_MS
+            }),
+        };
+        std::time::Duration::from_millis(ms)
+    });
+    *READ_ONLY_SCAN_FRESHNESS
 }
 
 fn apply_refresh_mode_defaults(
@@ -1351,6 +1388,22 @@ impl CayenneAccelerator {
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .collect();
+            }
+
+            // Provenance of the sort order. Schema inference sets this to
+            // `inferred` when it fills `cayenne_sort_columns` itself; an operator
+            // who configured the sort order explicitly leaves it absent, which
+            // defaults to `user` (authoritative). Only an authoritative order may
+            // shadow the hot filter columns observed on scans — see
+            // `SortColumnsOrigin`. Unrecognized values fall back to the
+            // conservative `user`, which preserves pre-existing behavior.
+            if let Some(origin) = acceleration
+                .params
+                .get("cayenne_sort_columns_origin")
+                .or_else(|| acceleration.params.get("sort_columns_origin"))
+                && origin.trim().eq_ignore_ascii_case("inferred")
+            {
+                config.sort_columns_origin = cayenne::metadata::SortColumnsOrigin::Inferred;
             }
 
             // Parse shard key columns (the hash-clustering key for intra-write
@@ -2072,18 +2125,46 @@ impl CayenneAccelerator {
         // (on_conflict with a non-`changes` refresh forces AcceleratorOnly). When
         // so configured, every committed write durably marks its PKs so the
         // delivery worker reconciles them to the federated source.
-        let durable_write_back = source.acceleration().is_some_and(|acceleration| {
-            acceleration.write_mode == WriteMode::WriteBack
-                && !acceleration.on_conflict.is_empty()
-                && acceleration.refresh_mode == Some(RefreshMode::Changes)
-        });
+        // `resolves_to_durable_write_back` is shared with the registration gate
+        // that requires the source connector to advertise a safe delivery
+        // primitive, so marking can never be switched on for a dataset the gate
+        // would have rejected.
+        let durable_write_back = source
+            .acceleration()
+            .is_some_and(Acceleration::resolves_to_durable_write_back);
+
+        // Default per-scan freshness. Bounded staleness is only in-contract for a
+        // read-only CDC *replica* (`refresh_mode: changes`): its data streams in
+        // continuously and is eventually-consistent by design, so a read tolerates a
+        // bounded lag — and there the demand cache's cross-query reuse lever pays off
+        // (concurrent analytical scans share one build). Read-only alone is NOT enough:
+        // a full-refresh / snapshot / append table is expected to reflect its last
+        // refresh immediately (refresh-then-query reads its own writes), and a read-only
+        // table can still take direct `delete_from`/DML via the accelerator — so serving
+        // a pre-mutation view there is a stale (wrong) result. Any table we cannot prove
+        // is a read-only CDC replica therefore uses 0 = read-your-writes, so a scan
+        // always sees the latest state. (A read-write dataset requires BOTH a ReadWrite
+        // API key and `access: read_write`.)
+        let is_cdc_replica = source
+            .acceleration()
+            .is_some_and(|acceleration| acceleration.refresh_mode == Some(RefreshMode::Changes));
+        let default_scan_freshness = match source
+            .as_any()
+            .downcast_ref::<crate::component::dataset::Dataset>()
+        {
+            Some(dataset) if is_cdc_replica && !dataset.access().allows_write() => {
+                read_only_scan_freshness()
+            }
+            _ => std::time::Duration::ZERO,
+        };
 
         // Create CayenneTableProvider with object store for S3 Express One Zone
         let mut builder = CayenneTableProviderBuilder::new(catalog, runtime_env)
             .with_context(context)
             .with_retention_filters(retention_filters)
             .with_maintained_aggregates(maintained_aggregate_specs)
-            .with_durable_write_back(durable_write_back);
+            .with_durable_write_back(durable_write_back)
+            .with_default_scan_freshness(default_scan_freshness);
         if let Some(retention_builder) = time_retention_filter_builder {
             builder = builder.with_time_retention_filter_builder(retention_builder);
         }
@@ -2187,6 +2268,10 @@ impl CayenneAccelerator {
 
         tracing::debug!("create_cayenne_table_provider: table {table_name} created successfully");
         let provider = Arc::new(cayenne_table);
+        // Initialize the demand scan-view cache (weak self-reference for its
+        // `spawn_blocking` builds + the periodic eviction sweep that releases idle
+        // cached views' pinned snapshot dirs for GC). Must run once, after `Arc::new`.
+        provider.init_scan_view_cache();
         // Publish the real, in-use compaction semaphore for the occupancy gauges
         // (idempotent across the fleet — every table shares this one semaphore).
         publish_compaction_semaphore_for_metrics(
@@ -2374,8 +2459,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    62,
-    { S3_PARAMS_LEN + 62 },
+    63,
+    { S3_PARAMS_LEN + 63 },
 >(
     S3_PARAMETERS,
     [
@@ -2447,6 +2532,9 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Physical-GC cadence and orphan grace for superseded datalake objects: the background sweep runs about this often and deletes an object no longer referenced by the manifest only once it has been observed orphaned for at least this long (so an in-flight scan has a full interval to finish). Default: 300000 (5min)."),
         ParameterSpec::component("sort_columns")
             .description("Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id')."),
+        ParameterSpec::component("sort_columns_origin")
+            .description("Provenance of 'sort_columns'. Normally set by schema inference rather than by hand: 'user' (the default when absent) means the sort order was configured explicitly and is authoritative, while 'inferred' means schema inference filled it from the source's declared order (the primary key, for most CDC tables), which is a guess and is outranked by the filter columns actually observed on scans, so the adaptive layout can cluster for the real workload. Setting it explicitly is supported and is useful for reproducing the inferred configuration in a benchmark or test.")
+            .one_of(&["user", "inferred"]),
         ParameterSpec::component("shard_key_columns")
             .description("Comma-separated list of columns to hash-cluster rows by during intra-write sharding (the parallel encode fan-out), e.g. 'tenant_id'. When unset, the shard key derives from the primary key (PK-hash clustering); tables without a primary key shard round-robin. Schema inference fills this from the source's declared partition/shard key when the user leaves it unset. Ignored for sorted tables: sort_columns forces a single serial writer."),
         ParameterSpec::component("compression_strategy")
@@ -3700,6 +3788,7 @@ impl PartitionCreator for CayennePartitionCreator {
 
         let partition_provider = Arc::new(cayenne_table);
         partition_provider.spawn_background_compaction(Arc::clone(&self.compaction_semaphore));
+        partition_provider.init_scan_view_cache();
         Ok(Partition {
             partition_values,
             table_provider: partition_provider,
@@ -3797,6 +3886,7 @@ impl PartitionCreator for CayennePartitionCreator {
 
             let partition_provider = Arc::new(cayenne_table);
             partition_provider.spawn_background_compaction(Arc::clone(&self.compaction_semaphore));
+            partition_provider.init_scan_view_cache();
             result.push(Partition {
                 partition_values,
                 table_provider: partition_provider,
@@ -3857,7 +3947,7 @@ fn encode_identifier_hex(value: &str) -> String {
     encoded
 }
 
-register_data_accelerator!(Engine::Cayenne, CayenneAccelerator);
+data_accelerator_api::register_data_accelerator!(Engine::Cayenne, CayenneAccelerator);
 
 /// Normalize a raw `cayenne_tuning` value: trim + lowercase, mapping `auto`/`adaptive`
 /// through unchanged and any *other* value to `Some("auto")` (the documented default).

@@ -16,38 +16,50 @@ limitations under the License.
 
 //! Integration tests for the Spice Cloud Connect client driver.
 //!
-//! These spin up an in-process tonic server that speaks the
-//! `spice.cloud.v1.CloudConnect` protocol on a free TCP port, then
-//! exercise:
+//! These spin up an in-process axum server that mocks the cloud enroll
+//! endpoint (`/v1/cloud-connect/enroll`) plus an in-process tonic server
+//! that speaks the `spice.cloud.v1.CloudConnect` protocol (the gateway),
+//! then exercise:
 //!
-//! - First-contact adoption: Hello with code → server sends Adopt →
-//!   client persists identity, replies with AdoptAck + CommandResult.
+//! - Out-of-band enrollment: adoption code + CSR + host facts → HTTP
+//!   enroll → identity persisted (with the issued gateway address) → the
+//!   gRPC stream opens against the gateway with the assigned identifier
+//!   and an empty credential; a subsequent `Adopt` marker is acknowledged
+//!   with `AdoptAck` + a successful `CommandResult`.
+//! - Permanent enroll rejection (consumed/expired code): the driver
+//!   discards the staged code and exits without creating an identity.
 //! - `ApplySpicepod` round-trip: server sends ApplySpicepod → client
 //!   writes the YAML to disk and replies with success.
 
 #![expect(
     clippy::unwrap_used,
+    clippy::expect_used,
     clippy::doc_markdown,
     clippy::struct_field_names,
-    clippy::items_after_statements,
     reason = "integration-test harness — readability over lint strictness"
 )]
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
 use runtime_cloud_connect::config::CloudConnectConfig;
 use runtime_cloud_connect::handlers::RuntimeHandle;
 use runtime_cloud_connect::identity::IdentityStore;
 use runtime_cloud_connect::proto;
 use runtime_cloud_connect::proto::cloud_connect_server::{CloudConnect, CloudConnectServer};
+use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
+
+const ADOPTION_CODE: &str = "SPICE-ADOPT-AAAAA-BBBBB";
+const ASSIGNED_ID: &str = "inst_unit_test";
 
 #[derive(Default)]
 struct CapturedState {
@@ -140,7 +152,7 @@ impl RuntimeHandle for CapturedRuntime {
     }
 }
 
-async fn spawn_server(mock: MockServer) -> std::net::SocketAddr {
+async fn spawn_server(mock: MockServer) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local_addr");
     let svc = CloudConnectServer::new(mock);
@@ -156,41 +168,123 @@ async fn spawn_server(mock: MockServer) -> std::net::SocketAddr {
     addr
 }
 
+// --------------------------------------------------------------------------
+// Mock cloud enroll endpoint (plain HTTP; the enroll contract is HTTPS in
+// production, which is reqwest's standard path and not under test here).
+// --------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct EnrollMockState {
+    /// Captured request bodies, in arrival order.
+    requests: Arc<Mutex<Vec<Value>>>,
+    /// `gateway_addr` returned on success.
+    gateway_addr: String,
+    /// When set, every request is rejected with this (status, error).
+    reject: Option<(u16, &'static str)>,
+}
+
+fn not_after_in(hours: i64) -> String {
+    (chrono::Utc::now() + chrono::Duration::hours(hours)).to_rfc3339()
+}
+
+async fn enroll_handler(
+    State(state): State<EnrollMockState>,
+    Json(body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    state.requests.lock().await.push(body);
+    if let Some((status, error)) = state.reject {
+        return (
+            StatusCode::from_u16(status).expect("valid status"),
+            Json(serde_json::json!({ "error": error })),
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "instance_id": ASSIGNED_ID,
+            "identity_cert_pem":
+                "-----BEGIN CERTIFICATE-----\nUNIT-TEST\n-----END CERTIFICATE-----\n",
+            "ca_bundle_pem":
+                "-----BEGIN CERTIFICATE-----\nUNIT-TEST-CA\n-----END CERTIFICATE-----\n",
+            "gateway_addr": state.gateway_addr,
+            "not_after": not_after_in(24),
+        })),
+    )
+}
+
+/// Serve the mock enroll endpoint on an ephemeral port; returns its address
+/// and the captured request log.
+async fn spawn_enroll_server(
+    gateway_addr: String,
+    reject: Option<(u16, &'static str)>,
+) -> (SocketAddr, Arc<Mutex<Vec<Value>>>) {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let state = EnrollMockState {
+        requests: Arc::clone(&requests),
+        gateway_addr,
+        reject,
+    };
+    let app = Router::new()
+        .route("/v1/cloud-connect/enroll", post(enroll_handler))
+        .with_state(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind http");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (addr, requests)
+}
+
+fn enroll_config(
+    enroll_addr: SocketAddr,
+    dir: &std::path::Path,
+    pending_code_path: Option<PathBuf>,
+) -> CloudConnectConfig {
+    CloudConnectConfig {
+        enroll_endpoint: format!("http://{enroll_addr}"),
+        // No override: the stream must connect to the gateway_addr issued
+        // by the enroll response (http:// scheme because insecure=true).
+        gateway_endpoint: None,
+        ca_cert_pem: None,
+        insecure: true,
+        identity_path: dir.join("identity.json"),
+        config_dir: dir.to_path_buf(),
+        adoption_code: Some(ADOPTION_CODE.to_string()),
+        pending_adopt_code_path: pending_code_path,
+        adopt_app_name: None,
+        adopt_create_app: false,
+        runtime_version: "v0.0.0-test".to_string(),
+        heartbeat_interval: Duration::from_secs(30),
+        telemetry_interval: Duration::from_mins(1),
+        renewal_lead: Duration::from_mins(1),
+    }
+}
+
 #[tokio::test]
-async fn first_contact_adoption_persists_identity_and_acks() {
+async fn out_of_band_enroll_persists_identity_and_connects() {
     let dir = tempfile::tempdir().unwrap();
     let identity_path = dir.path().join("identity.json");
+    let pending_path = dir.path().join("pending-adopt-code");
+    std::fs::write(&pending_path, ADOPTION_CODE).expect("stage pending code");
 
-    // Server script: send a single Adopt command after Hello.
+    // Gateway mock: send an Adopt trust/marker after Hello (the portal
+    // admin clicked Adopt). Post-DR-025 it carries no certificate.
     let adopt_cmd = proto::ControlMessage {
         body: Some(proto::control_message::Body::Adopt(proto::Adopt {
             command_id: "cmd-adopt-1".to_string(),
-            assigned_identifier: "inst_unit_test".to_string(),
-            identity_cert_pem:
-                "-----BEGIN CERTIFICATE-----\nUNIT-TEST\n-----END CERTIFICATE-----\n".to_string(),
+            assigned_identifier: ASSIGNED_ID.to_string(),
+            identity_cert_pem: String::new(),
             not_after_unix: 0,
-            ca_bundle_pem: "-----BEGIN CERTIFICATE-----\nUNIT-TEST-CA\n-----END CERTIFICATE-----\n"
-                .to_string(),
+            ca_bundle_pem: String::new(),
         })),
     };
     let mock = MockServer::new(vec![adopt_cmd]);
     let mock_state = Arc::clone(&mock.state);
-    let addr = spawn_server(mock).await;
+    let gateway_addr = spawn_server(mock).await;
 
-    let endpoint = format!("http://{addr}");
+    let (enroll_addr, enroll_requests) = spawn_enroll_server(gateway_addr.to_string(), None).await;
 
-    let config = CloudConnectConfig {
-        endpoint,
-        ca_cert_pem: None,
-        insecure: true,
-        identity_path: identity_path.clone(),
-        config_dir: dir.path().to_path_buf(),
-        adoption_code: Some("SPICE-ADOPT-AAAA-BBBB".to_string()),
-        pending_adopt_code_path: None,
-        runtime_version: "v0.0.0-test".to_string(),
-        heartbeat_interval: Duration::from_secs(30),
-        telemetry_interval: Duration::from_mins(1),
-    };
+    let config = enroll_config(enroll_addr, dir.path(), Some(pending_path.clone()));
 
     let runtime: Arc<dyn RuntimeHandle> =
         Arc::new(runtime_cloud_connect::handlers::NoopRuntimeHandle);
@@ -199,7 +293,7 @@ async fn first_contact_adoption_persists_identity_and_acks() {
         .expect("start")
         .expect("started");
 
-    // Wait for adoption to settle.
+    // Wait for enrollment to persist the identity.
     let mut adopted = false;
     for _ in 0..50 {
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -213,19 +307,51 @@ async fn first_contact_adoption_persists_identity_and_acks() {
     let identity = IdentityStore::load_optional(&identity_path)
         .expect("load identity")
         .expect("identity present");
-    assert_eq!(identity.identifier, "inst_unit_test");
+    assert_eq!(identity.identifier, ASSIGNED_ID);
     assert!(identity.identity_cert_pem.contains("UNIT-TEST"));
     assert!(identity.public_key_pem.contains("PUBLIC KEY"));
-    // The CA bundle from Adopt is persisted for later mTLS reconnects.
+    assert!(identity.private_key_pem.contains("PRIVATE KEY"));
+    assert_eq!(identity.gateway_addr, gateway_addr.to_string());
     assert!(
         identity.ca_bundle_pem.contains("UNIT-TEST-CA"),
-        "adopt ca_bundle_pem should be persisted into identity.json"
+        "enroll ca_bundle_pem should be persisted into identity.json"
     );
+    assert!(identity.not_after_unix > 0, "not_after must be parsed");
+
+    // The enroll request carried the contract shape: adoption_code +
+    // csr_pem + host facts nested under `instance`.
+    let requests = enroll_requests.lock().await.clone();
+    assert_eq!(requests.len(), 1, "exactly one enroll request");
+    let body = &requests[0];
+    assert_eq!(body["adoption_code"], ADOPTION_CODE);
+    assert!(
+        body["csr_pem"]
+            .as_str()
+            .unwrap()
+            .contains("CERTIFICATE REQUEST"),
+        "enroll must carry a PKCS#10 CSR"
+    );
+    let instance = &body["instance"];
+    assert_eq!(instance["fingerprint"].as_str().unwrap().len(), 64);
+    assert!(!instance["hostname"].as_str().unwrap().is_empty());
+    assert!(!instance["os"].as_str().unwrap().is_empty());
+    assert!(!instance["arch"].as_str().unwrap().is_empty());
+    assert_eq!(instance["runtime_version"], "v0.0.0-test");
+
+    // The staged single-use code is discarded after the cloud consumed it.
+    let mut code_discarded = false;
+    for _ in 0..50 {
+        if !pending_path.exists() {
+            code_discarded = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(code_discarded, "pending code must be removed after enroll");
 
     // Server should have received the Hello, AdoptAck, and a successful
-    // CommandResult. The CommandResult lands last, so poll for it (rather than
-    // sleeping a fixed duration) to avoid flakiness on slow CI, mirroring the
-    // `adopted` wait above.
+    // CommandResult. The CommandResult lands last, so poll for it (rather
+    // than sleeping a fixed duration) to avoid flakiness on slow CI.
     let mut result_seen = false;
     for _ in 0..60 {
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -239,25 +365,19 @@ async fn first_contact_adoption_persists_identity_and_acks() {
     let s = mock_state.lock().await;
     let hello = s.last_hello.clone().expect("server saw Hello");
     assert_eq!(hello.kind, proto::InstanceKind::Standalone as i32);
+    // Enroll-first contract: by the time the stream opens, the identity is
+    // held — the Hello names the instance and carries no credential/CSR
+    // (the client certificate is the authN; certless contact is gone).
+    assert_eq!(hello.identifier, ASSIGNED_ID);
     assert!(
-        hello.identifier.is_empty(),
-        "first hello has empty identifier"
+        hello.credential.is_empty(),
+        "Hello must carry an empty credential (identity is the client cert)"
     );
-    assert_eq!(hello.credential, "SPICE-ADOPT-AAAA-BBBB");
-    // Ordering fix: the enrollment Hello proves key possession up front —
-    // it carries the PKCS#10 CSR and the agent public key *before* the
-    // control plane issues the leaf certificate.
-    assert!(
-        hello.csr_pem.contains("CERTIFICATE REQUEST"),
-        "enrollment Hello must carry a PKCS#10 CSR"
-    );
-    assert!(
-        hello.agent_pubkey_pem.contains("PUBLIC KEY"),
-        "enrollment Hello must carry the agent public key"
-    );
+    assert!(hello.csr_pem.is_empty(), "Hello carries no CSR");
+    assert!(hello.agent_pubkey_pem.is_empty(), "Hello carries no pubkey");
 
     let ack = s.last_adopt_ack.clone().expect("server saw AdoptAck");
-    assert_eq!(ack.identifier, "inst_unit_test");
+    assert_eq!(ack.identifier, ASSIGNED_ID);
     assert!(ack.identity_pubkey_pem.contains("PUBLIC KEY"));
 
     let result = s.last_result.clone().expect("server saw CommandResult");
@@ -269,23 +389,57 @@ async fn first_contact_adoption_persists_identity_and_acks() {
 }
 
 #[tokio::test]
+async fn enroll_rejection_discards_code_and_exits_without_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let identity_path = dir.path().join("identity.json");
+    let pending_path = dir.path().join("pending-adopt-code");
+    std::fs::write(&pending_path, ADOPTION_CODE).expect("stage pending code");
+
+    // The cloud authoritatively rejects the code (single-use, already
+    // consumed). No gateway is involved.
+    let (enroll_addr, enroll_requests) =
+        spawn_enroll_server(String::new(), Some((401, "Adoption code already used"))).await;
+
+    let config = enroll_config(enroll_addr, dir.path(), Some(pending_path.clone()));
+    let runtime: Arc<dyn RuntimeHandle> =
+        Arc::new(runtime_cloud_connect::handlers::NoopRuntimeHandle);
+    let handle = runtime_cloud_connect::CloudConnect::start(config, runtime)
+        .await
+        .expect("start")
+        .expect("started");
+
+    // The permanent rejection removes the staged (dead) code so a restart
+    // does not replay it.
+    let mut code_discarded = false;
+    for _ in 0..50 {
+        if !pending_path.exists() {
+            code_discarded = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        code_discarded,
+        "a permanently-rejected code must be discarded"
+    );
+
+    // No identity was created, and no retry was attempted (401 is
+    // authoritative — retrying a consumed code cannot succeed).
+    assert!(!identity_path.exists(), "no identity on rejection");
+    assert_eq!(
+        enroll_requests.lock().await.len(),
+        1,
+        "permanent rejection must not be retried"
+    );
+
+    handle.shutdown().await;
+}
+
+#[tokio::test]
 async fn apply_spicepod_writes_file_and_acks() {
     let dir = tempfile::tempdir().unwrap();
     let identity_path = dir.path().join("identity.json");
     let config_dir = dir.path().to_path_buf();
-
-    // Pre-seed identity so the client connects in identity mode. The
-    // transport is insecure (h2c) here, so the cert/key PEMs are never used
-    // for a real handshake — this test isolates the ApplySpicepod dispatch.
-    let identity = runtime_cloud_connect::identity::Identity {
-        identifier: "inst_pre_adopted".to_string(),
-        identity_cert_pem: "PRE-ADOPTED-CERT".to_string(),
-        private_key_pem: "PRE-ADOPTED-KEY".to_string(),
-        public_key_pem: "PRE-ADOPTED-PUB".to_string(),
-        ca_bundle_pem: String::new(),
-        not_after_unix: 0,
-    };
-    IdentityStore::store(&identity_path, &identity).unwrap();
 
     let yaml = "name: cloud-managed\n";
     let apply_cmd = proto::ControlMessage {
@@ -300,23 +454,44 @@ async fn apply_spicepod_writes_file_and_acks() {
     let mock_state = Arc::clone(&mock.state);
     let addr = spawn_server(mock).await;
 
+    // Pre-seed identity so the client connects in identity mode, pointing
+    // its issued gateway_addr at the mock. The transport is insecure (h2c)
+    // here, so the cert/key PEMs are never used for a real handshake —
+    // this test isolates the ApplySpicepod dispatch.
+    let identity = runtime_cloud_connect::identity::Identity {
+        identifier: "inst_pre_adopted".to_string(),
+        identity_cert_pem: "PRE-ADOPTED-CERT".to_string(),
+        private_key_pem: "PRE-ADOPTED-KEY".to_string(),
+        public_key_pem: "PRE-ADOPTED-PUB".to_string(),
+        ca_bundle_pem: String::new(),
+        gateway_addr: addr.to_string(),
+        not_after_unix: 0,
+        enc_private_key_pem: String::new(),
+        enc_public_key_pem: String::new(),
+    };
+    IdentityStore::store(&identity_path, &identity).unwrap();
+
     let captured = Arc::new(Mutex::new(None));
     let runtime: Arc<dyn RuntimeHandle> = Arc::new(CapturedRuntime {
         applied: Arc::clone(&captured),
     });
 
-    let endpoint = format!("http://{addr}");
     let config = CloudConnectConfig {
-        endpoint,
+        // Never contacted: the identity is pre-seeded and unbounded.
+        enroll_endpoint: "http://127.0.0.1:9".to_string(),
+        gateway_endpoint: None,
         ca_cert_pem: None,
         insecure: true,
         identity_path: identity_path.clone(),
         config_dir: config_dir.clone(),
         adoption_code: None,
         pending_adopt_code_path: None,
+        adopt_app_name: None,
+        adopt_create_app: false,
         runtime_version: "v0.0.0-test".to_string(),
         heartbeat_interval: Duration::from_secs(30),
         telemetry_interval: Duration::from_mins(1),
+        renewal_lead: Duration::from_hours(12),
     };
 
     let handle = runtime_cloud_connect::CloudConnect::start(config, runtime)
@@ -357,14 +532,14 @@ async fn apply_spicepod_writes_file_and_acks() {
     let s = mock_state.lock().await;
     let hello = s.last_hello.clone().expect("server saw Hello");
     assert_eq!(hello.identifier, "inst_pre_adopted");
-    // Reconnect contract: identity is proven by the client cert, so the
-    // reconnect Hello carries the identifier with an EMPTY credential (and no
-    // CSR — that is enrollment-only).
+    // Stream contract: identity is proven by the client cert, so the Hello
+    // carries the identifier with an EMPTY credential (and no CSR — CSRs
+    // only travel in the out-of-band enroll/renew HTTP requests).
     assert!(
         hello.credential.is_empty(),
-        "reconnect Hello must carry an empty credential (mTLS proves identity)"
+        "Hello must carry an empty credential (mTLS proves identity)"
     );
-    assert!(hello.csr_pem.is_empty(), "reconnect Hello carries no CSR");
+    assert!(hello.csr_pem.is_empty(), "Hello carries no CSR");
 
     let result = s.last_result.clone().expect("server saw CommandResult");
     assert_eq!(result.command_id, "cmd-apply-1");

@@ -139,10 +139,11 @@ pub struct CayenneContext {
 /// batch.
 pub(crate) const DEFAULT_PK_KEYSET_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
 
-/// Hard ceiling on the configurable PK keyset cache budget. The budget doubles as
-/// the bloom allocation size (`PkBloom::with_byte_budget`), so an out-of-range or
-/// typo'd `cayenne_pk_keyset_cache_mb` must not be able to request a
-/// near-`usize::MAX` allocation. Matches the auto-default's 8 GiB ceiling.
+/// Hard ceiling on the configurable PK keyset cache budget. The budget bounds
+/// the exact keyset's resident growth (and caps the right-sized conversion
+/// blooms), so an out-of-range or typo'd `cayenne_pk_keyset_cache_mb` must not
+/// be able to request a near-`usize::MAX` allocation. Matches the
+/// auto-default's 8 GiB ceiling.
 pub(crate) const PK_KEYSET_CACHE_MAX_CONFIGURABLE_BYTES: usize = 8 * 1024 * 1024 * 1024;
 
 impl CayenneContext {
@@ -429,9 +430,40 @@ impl CayenneContext {
     }
 
     /// Check if sorting is enabled.
+    ///
+    /// True for BOTH user-configured and inference-derived sort columns, because
+    /// every caller that asks this question is asking "will the rewrite produce
+    /// a globally sorted snapshot?" — which is a property of the write, not of
+    /// who chose the key. Callers deciding *precedence* (which key to sort by)
+    /// must use [`Self::sort_columns_are_authoritative`] instead.
     #[must_use]
     pub fn has_sort_columns(&self) -> bool {
         !self.config.sort_columns.is_empty()
+    }
+
+    /// Whether [`Self::sort_columns`] is an operator statement of intent rather
+    /// than a schema-inference guess.
+    ///
+    /// Only an authoritative sort order may shadow the hot filter columns
+    /// observed on scans. An inferred order (the `PostgreSQL` CDC default, which
+    /// resolves to the primary key) ranks *below* those observations, so the
+    /// default-on adaptive layout can correct the guess.
+    #[must_use]
+    pub fn sort_columns_are_authoritative(&self) -> bool {
+        !self.config.sort_columns.is_empty()
+            && self.config.sort_columns_origin == crate::metadata::SortColumnsOrigin::User
+    }
+
+    /// Sort columns that schema inference supplied, if any — the lowest-priority
+    /// rung of the layout precedence chain (below observed filter columns).
+    /// Empty when the sort order is user-configured or absent.
+    #[must_use]
+    pub fn inferred_sort_columns(&self) -> &[String] {
+        if self.config.sort_columns_origin == crate::metadata::SortColumnsOrigin::Inferred {
+            &self.config.sort_columns
+        } else {
+            &[]
+        }
     }
 
     /// Get the configured intra-write shard-key columns. Empty = derive the

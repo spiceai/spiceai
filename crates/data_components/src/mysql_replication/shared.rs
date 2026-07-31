@@ -73,8 +73,13 @@ limitations under the License.
 //! not classify) is adopted only if the freshly-fetched source layout matches
 //! the event's column count ([`super::binlog::adopt_current_layout`]), else
 //! member-fatal; the count-match guard makes replaying pre-change row images
-//! self-fatal rather than mis-decoded. A durable pre-adopt/replay-boundary
-//! checkpoint machinery is intentionally *not* implemented in v1. Instead,
+//! self-fatal rather than mis-decoded. Because a fetched layout describes the
+//! source *now* rather than the event being decoded, every routed `TableMap` is
+//! additionally checked against the column types the event itself carries
+//! ([`super::binlog::layout_event_mismatch`]), which is what catches a
+//! same-column-count reorder adopted from ahead of the stream. A durable
+//! pre-adopt/replay-boundary checkpoint machinery is intentionally *not*
+//! implemented in v1. Instead,
 //! safety across a detach/rejoin is guaranteed structurally: every (re)subscribe
 //! re-resolves the start position from the member's own sidecar and re-checks
 //! its persisted layout fingerprint against the current source layout, so a
@@ -94,7 +99,7 @@ use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use futures::{StreamExt, stream};
 use mysql_async::Conn;
-use mysql_async::binlog::events::{EventData, RowsEventData, TableMapEvent};
+use mysql_async::binlog::events::{EventData, RotateEvent, RowsEventData, TableMapEvent};
 use rustc_hash::FxHashMap;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -102,8 +107,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use super::binlog::{
     AdoptedLayout, MIN_VALID_EVENT_POS, QueryKind, StatementKind, adopt_current_layout,
     classify_query, classify_statement, commit_ts_ms, compute_pk_source_indexes,
-    log_transient_reconnect, open_binlog_stream, purged_position_error, readiness_heartbeat,
-    record_watermark,
+    layout_event_mismatch, log_transient_reconnect, open_binlog_stream, purged_position_error,
+    readiness_heartbeat, record_watermark,
 };
 use super::changes::{MemberLayout, MysqlChangeRows};
 use super::config::{BinlogPosition, ReplicationParams};
@@ -940,6 +945,48 @@ async fn attach_member(
     Ok(Box::pin(head.chain(ReceiverStream::new(receiver))))
 }
 
+/// Whether a persisted checkpoint can be restored against the live source, or
+/// must be discarded because the source no longer contains it (a reset,
+/// purge, or a different/rebuilt server). Pure so the reset-detection decision
+/// is unit-testable without a live `MySQL` — the caller supplies the live
+/// source state it fetched.
+#[derive(Debug, PartialEq, Eq)]
+enum CheckpointVerdict {
+    /// The checkpoint is consistent with the current source; resume from it.
+    Resume,
+    /// The source no longer contains the checkpoint; apply
+    /// `invalid_checkpoint_behavior`. Carries the operator-facing reason.
+    Unresumable(&'static str),
+}
+
+/// GTID verdict: the persisted executed set must be a subset of the source's
+/// current `@@gtid_executed`. A `RESET MASTER`, a rebuilt server (fresh
+/// `server_uuid`), or a different source reports a set that no longer contains
+/// the checkpoint — resuming would position `COM_BINLOG_DUMP_GTID` from a set
+/// the server cannot honor and silently serve pre-reset data.
+fn gtid_checkpoint_verdict(persisted: &GtidSet, source_executed: &GtidSet) -> CheckpointVerdict {
+    if persisted.is_subset_of(source_executed) {
+        CheckpointVerdict::Resume
+    } else {
+        CheckpointVerdict::Unresumable(
+            "the source's GTID history diverged from the checkpoint (RESET MASTER, a rebuilt server, or a different source); its executed set no longer contains the persisted position",
+        )
+    }
+}
+
+/// File+offset verdict: the persisted binlog file must still be present in the
+/// source's binary log index. A purge, or a reset whose binlog numbering
+/// restarted below the checkpoint's file, drops it.
+fn file_checkpoint_verdict(persisted_file_present: bool) -> CheckpointVerdict {
+    if persisted_file_present {
+        CheckpointVerdict::Resume
+    } else {
+        CheckpointVerdict::Unresumable(
+            "the persisted binlog file is no longer present on the source (purged, or a reset restarted binlog numbering)",
+        )
+    }
+}
+
 /// Resolve a fresh (non-rejoin) member's start position, applying
 /// `invalid_checkpoint_behavior` per member. Returns
 /// `(floor, gtid_seed, snapshotting)`. `gtid_seed` is the executed GTID set to
@@ -1019,7 +1066,25 @@ async fn resolve_start_position(
                                          (corrupt or incomplete)"),
                         };
                         match parsed {
-                            Ok(set) => Some((persisted.position, set)),
+                            Ok(set) => {
+                                // Validate the checkpoint is still real on THIS source:
+                                // its executed set must be a subset of the source's current `@@gtid_executed`.
+                                let source_executed =
+                                    super::setup::fetch_executed_gtid_set(conn).await?;
+                                match gtid_checkpoint_verdict(&set, &source_executed) {
+                                    CheckpointVerdict::Resume => Some((persisted.position, set)),
+                                    CheckpointVerdict::Unresumable(reason) => {
+                                        apply_invalid_checkpoint(
+                                            params,
+                                            position_store,
+                                            dataset_name,
+                                            reason,
+                                        )
+                                        .await?;
+                                        None
+                                    }
+                                }
+                            }
                             Err(reason) => {
                                 apply_invalid_checkpoint(
                                     params,
@@ -1033,17 +1098,21 @@ async fn resolve_start_position(
                         }
                     }
                     CursorType::File => {
-                        if super::setup::binlog_file_exists(conn, &persisted.position.file).await? {
-                            Some((persisted.position, GtidSet::new()))
-                        } else {
-                            apply_invalid_checkpoint(
-                                params,
-                                position_store,
-                                dataset_name,
-                                "binlog purged",
-                            )
-                            .await?;
-                            None
+                        let present =
+                            super::setup::binlog_file_exists(conn, &persisted.position.file)
+                                .await?;
+                        match file_checkpoint_verdict(present) {
+                            CheckpointVerdict::Resume => Some((persisted.position, GtidSet::new())),
+                            CheckpointVerdict::Unresumable(reason) => {
+                                apply_invalid_checkpoint(
+                                    params,
+                                    position_store,
+                                    dataset_name,
+                                    reason,
+                                )
+                                .await?;
+                                None
+                            }
                         }
                     }
                 }
@@ -1053,7 +1122,16 @@ async fn resolve_start_position(
     };
 
     if let Some((position, gtid_seed)) = resume {
-        tracing::info!(dataset = %dataset_name, position = %position, gtid = %use_gtid, "shared mysql binlog: resuming from persisted position");
+        // Report the cursor actually used. In GTID mode the pump ignores
+        // file+offset and positions purely from the executed set
+        // (`start_binlog_stream`), so logging `position=file:offset` there is
+        // misleading — surface the GTID set instead. File+offset positioning
+        // logs the file:offset it truly resumes from.
+        if use_gtid {
+            tracing::info!(dataset = %dataset_name, gtid_set = %gtid_seed, "shared mysql binlog: resuming from persisted GTID position");
+        } else {
+            tracing::info!(dataset = %dataset_name, position = %position, "shared mysql binlog: resuming from persisted file+offset position");
+        }
         return Ok((position, gtid_seed, false));
     }
 
@@ -1099,11 +1177,14 @@ async fn apply_invalid_checkpoint(
 ) -> Result<()> {
     match params.invalid_position_behavior {
         InvalidCheckpointBehavior::Error => super::StalePositionSnafu {
+            // `reason` describes the actual condition (layout/schema drift, a
+            // purged binlog file, or a GTID-history divergence/reset) — surface
+            // it verbatim rather than a fixed explanation, since this helper now
+            // covers all three.
             message: format!(
-                "cannot resume mysql binlog for {dataset_name} ({reason}). Replaying against the \
-                 current source layout would mis-map columns. Set \
-                 `mysql_replication_invalid_checkpoint_behavior: restart` to drop the saved \
-                 position and re-snapshot the table."
+                "cannot resume mysql binlog for {dataset_name}: {reason}. Resuming could serve \
+                 incorrect data. Set `mysql_replication_invalid_checkpoint_behavior: restart` to \
+                 drop the saved position and re-snapshot the table."
             ),
         }
         .fail(),
@@ -1275,7 +1356,13 @@ async fn run_pump(source: Arc<SharedSource>) {
             Ok(stream) => {
                 backoff.reset();
                 if reconnect_attempts > 0 {
-                    tracing::info!(connection = %connection, attempts = reconnect_attempts, position = %resume, "shared mysql binlog connection resumed");
+                    // In GTID mode the dump repositions from the shared executed
+                    // set, not `resume` (the file+offset floor) — report the set.
+                    if use_gtid {
+                        tracing::info!(connection = %connection, attempts = reconnect_attempts, gtid_set = %resume_gtid, "shared mysql binlog connection resumed");
+                    } else {
+                        tracing::info!(connection = %connection, attempts = reconnect_attempts, position = %resume, "shared mysql binlog connection resumed");
+                    }
                     reconnect_attempts = 0;
                 }
                 // Connection starts at the shared min (<= every held member's
@@ -1410,7 +1497,9 @@ async fn run_pump(source: Arc<SharedSource>) {
             };
 
             let header = event.header();
-            let event_end_pos = u64::from(header.log_pos());
+            // Offset within `current_file` this event advances the stream to. A
+            // real `ROTATE` rewrites both together (see [`rotate_target`]).
+            let mut event_end_pos = u64::from(header.log_pos());
             let event_timestamp = header.timestamp();
             let data = match event.read_data() {
                 Ok(data) => data,
@@ -1423,8 +1512,14 @@ async fn run_pump(source: Arc<SharedSource>) {
 
             match data {
                 Some(EventData::RotateEvent(rotate)) => {
-                    if !rotate.is_fake() {
-                        current_file = rotate.name().into_owned();
+                    // Take BOTH the file and the offset from the event: its
+                    // header offset belongs to the file being closed, so keeping
+                    // `event_end_pos` here would credit idle members a position
+                    // the newly opened file will not reach for a long time. See
+                    // [`rotate_target`].
+                    if let Some(target) = rotate_target(&rotate) {
+                        current_file = target.file;
+                        event_end_pos = target.pos;
                     }
                 }
                 Some(EventData::TableMapEvent(tme)) => {
@@ -1504,6 +1599,21 @@ async fn run_pump(source: Arc<SharedSource>) {
                         let g = lock(&member.layout);
                         Arc::clone(&g)
                     };
+                    // Every decode is routed from here, so this is the one place
+                    // that can check the layout against the event describing the
+                    // row images it will decode. A layout adopted from
+                    // `information_schema` reflects the source *now*, which under
+                    // lag can be a later DDL than the events in flight (#11764);
+                    // fail this member closed rather than scramble its columns.
+                    if let Some(mismatch) = layout_event_mismatch(&layout.layout, &tme) {
+                        member.metrics.inc_schema_mismatch_error();
+                        routes.remove(&table_id);
+                        member_fatal(&source, &mkey, format!(
+                            "source table {}.{} does not match the shape of the changes being replicated: column {} (position {}) is `{}` in the table definition but the change events carry a different type there. This happens when the source applies more than one ALTER TABLE while replication is behind, so the table definition read for the first one already reflects the second. Let replication catch up before the next schema change, then re-bootstrap by setting `mysql_replication_invalid_checkpoint_behavior: restart`.",
+                            mkey.0, mkey.1, mismatch.column, mismatch.ordinal, mismatch.source_type
+                        )).await;
+                        continue 'recv;
+                    }
                     let tme = Arc::new(tme.into_owned());
                     routes.insert(
                         table_id,
@@ -1674,6 +1784,21 @@ fn current_file_pos(file: &str) -> BinlogPosition {
     BinlogPosition::new(file.to_string(), 0)
 }
 
+/// Where a `ROTATE` event repositions the shared stream, or `None` for the fake
+/// rotate the server sends at the head of a dump (which opens no new file).
+///
+/// `ROTATE` is the one event whose header offset does **not** belong to the file
+/// it names: `log_pos` is the end of the event in the file being *closed*, while
+/// the payload names the file being *opened* and the offset to resume reading at
+/// (normally 4, just past the magic number). Pairing the new name with the
+/// closing file's offset yields a coordinate far beyond anything the new file
+/// holds — an idle member credited there has every later commit in that file
+/// suppressed by [`AckSlot::already_committed`], silently and for as long as the
+/// new file stays smaller than the old one (#12042).
+fn rotate_target(rotate: &RotateEvent<'_>) -> Option<BinlogPosition> {
+    (!rotate.is_fake()).then(|| BinlogPosition::new(rotate.name(), rotate.position()))
+}
+
 /// Deliver a committed transaction's buffered rows to their members, then
 /// credit idle streaming members up to the commit position. The pump does the
 /// O(1)-per-table work only (route lookup, watermark, transaction count, commit
@@ -1735,7 +1860,14 @@ async fn deliver_commit(
             is_ready,
         );
         slot.deliver(commit_pos);
-        match deliver_to_member(&member.sender, Ok(envelope), shutdown_epoch).await {
+        match deliver_to_member(
+            &member.sender,
+            Ok(envelope),
+            shutdown_epoch,
+            &member.dataset_name,
+        )
+        .await
+        {
             DeliverOutcome::Sent => {}
             DeliverOutcome::ReceiverGone => {
                 source.detach_member(key, "changes stream receiver dropped", true);
@@ -1819,7 +1951,14 @@ async fn handle_statement(
                     is_ready,
                 );
                 slot.deliver(&commit_pos);
-                match deliver_to_member(&member.sender, Ok(envelope), shutdown_epoch).await {
+                match deliver_to_member(
+                    &member.sender,
+                    Ok(envelope),
+                    shutdown_epoch,
+                    &member.dataset_name,
+                )
+                .await
+                {
                     DeliverOutcome::Sent => {}
                     DeliverOutcome::ReceiverGone => {
                         source.detach_member(&mkey, "changes stream receiver dropped", true);
@@ -1895,8 +2034,10 @@ async fn deliver_to_member(
     sender: &mpsc::Sender<std::result::Result<ChangeEnvelope, StreamError>>,
     envelope: std::result::Result<ChangeEnvelope, StreamError>,
     shutdown_epoch: u64,
+    dataset: &str,
 ) -> DeliverOutcome {
     let mut pending = envelope;
+    let mut stalled_for = Duration::ZERO;
     loop {
         match sender.send_timeout(pending, MEMBER_SEND_STALL_WARN).await {
             Ok(()) => return DeliverOutcome::Sent,
@@ -1905,7 +2046,8 @@ async fn deliver_to_member(
                 if crate::cdc::shutdown_epoch() != shutdown_epoch {
                     return DeliverOutcome::ShutdownAbandon;
                 }
-                tracing::warn!(stalled_for = ?MEMBER_SEND_STALL_WARN, "shared mysql binlog member sink is not draining; the pump is waiting to deliver committed changes");
+                stalled_for += MEMBER_SEND_STALL_WARN;
+                tracing::warn!(dataset = %dataset, stalled_for = ?stalled_for, "shared mysql binlog member sink is not draining; the pump is waiting to deliver committed changes");
                 pending = returned;
             }
         }
@@ -2219,6 +2361,120 @@ mod tests {
         BinlogPosition::new(file, p)
     }
 
+    const SRC_A: &str = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
+    const SRC_B: &str = "5d1c0d8c-71ca-11e1-9e33-c80aa9429999";
+
+    fn gtids(raw: &str) -> GtidSet {
+        GtidSet::parse(raw).expect("parse gtid set")
+    }
+
+    #[test]
+    fn gtid_checkpoint_resumes_when_subset_of_source() {
+        // Normal restart: the source kept the checkpoint's history and grew.
+        let checkpoint = gtids(&format!("{SRC_A}:1-100"));
+        let source = gtids(&format!("{SRC_A}:1-150"));
+        assert_eq!(
+            gtid_checkpoint_verdict(&checkpoint, &source),
+            CheckpointVerdict::Resume
+        );
+        // An empty checkpoint (gtid_mode = ON, zero txns applied) always resumes.
+        assert_eq!(
+            gtid_checkpoint_verdict(&GtidSet::new(), &source),
+            CheckpointVerdict::Resume
+        );
+    }
+
+    #[test]
+    fn gtid_checkpoint_unresumable_after_reset_or_divergence() {
+        let checkpoint = gtids(&format!("{SRC_A}:1-100"));
+
+        // RESET MASTER / rebuilt server: source executed set under a new UUID.
+        let rebuilt = gtids(&format!("{SRC_B}:1-3"));
+        assert!(matches!(
+            gtid_checkpoint_verdict(&checkpoint, &rebuilt),
+            CheckpointVerdict::Unresumable(_)
+        ));
+
+        // Freshly reset GTID server with zero transactions applied.
+        let empty_source = GtidSet::new();
+        assert!(matches!(
+            gtid_checkpoint_verdict(&checkpoint, &empty_source),
+            CheckpointVerdict::Unresumable(_)
+        ));
+
+        // Divergence: same UUID, but the source is behind the checkpoint.
+        let behind = gtids(&format!("{SRC_A}:1-50"));
+        assert!(matches!(
+            gtid_checkpoint_verdict(&checkpoint, &behind),
+            CheckpointVerdict::Unresumable(_)
+        ));
+    }
+
+    #[test]
+    fn file_checkpoint_verdict_tracks_presence() {
+        assert_eq!(file_checkpoint_verdict(true), CheckpointVerdict::Resume);
+        // Purged, or a reset that restarted binlog numbering below the file.
+        assert!(matches!(
+            file_checkpoint_verdict(false),
+            CheckpointVerdict::Unresumable(_)
+        ));
+    }
+
+    /// A real `ROTATE` closing `binlog.000041` at ~1 GiB and opening
+    /// `binlog.000042`: the stream continues at offset 4 of the *new* file, not
+    /// at the *closed* file's end offset (which the event header carries).
+    #[test]
+    fn rotate_targets_the_new_files_resume_offset() {
+        let rotate = RotateEvent::new(4, &b"binlog.000042"[..]);
+        assert_eq!(
+            rotate_target(&rotate),
+            Some(pos("binlog.000042", 4)),
+            "a rotate must reposition to the offset its payload names"
+        );
+    }
+
+    #[test]
+    fn a_fake_rotate_does_not_reposition_the_stream() {
+        // The artificial rotate at the head of a dump opens no new file.
+        let rotate = RotateEvent::new(0, &b"binlog.000042"[..]);
+        assert_eq!(rotate_target(&rotate), None);
+    }
+
+    /// Regression test for #12042.
+    ///
+    /// The pump credits idle streaming members the coordinate each event
+    /// advances the stream to. When a `ROTATE` contributed the *closing* file's
+    /// end offset under the *opening* file's name, an idle member's committed
+    /// floor jumped ~1 GiB past the new file's real offsets and `deliver_commit`
+    /// then dropped every following transaction as `already_committed` — with no
+    /// error, no detach, and no backpressure warning, for the rest of the run.
+    #[test]
+    fn a_rotate_credit_does_not_suppress_the_new_files_commits() {
+        let ack = AckTable::default();
+        let member = key("tpcc", "warehouse");
+        // An idle member caught up to the end of the file about to be closed.
+        ack.register(&member, pos("binlog.000041", 1_073_741_800), false);
+        ack.promote_ready_members();
+
+        let rotate = RotateEvent::new(4, &b"binlog.000042"[..]);
+        let target = rotate_target(&rotate).expect("a real rotate repositions the stream");
+        ack.credit_idle(&target, None);
+
+        assert_eq!(
+            ack.committed(&member),
+            Some(pos("binlog.000042", 4)),
+            "the credit must land at the new file's start"
+        );
+
+        // The first transaction of the newly opened file must still be delivered.
+        let next_commit = pos("binlog.000042", 1_182);
+        let slot = ack.slot(&member).expect("registered member has a slot");
+        assert!(
+            !slot.already_committed(&next_commit),
+            "commit at {next_commit} was suppressed as already-applied, so its rows are lost"
+        );
+    }
+
     #[test]
     fn flush_position_is_min_across_members() {
         let ack = AckTable::default();
@@ -2463,6 +2719,7 @@ mod tests {
             &sender,
             Err(StreamError::External("x".to_string())),
             crate::cdc::shutdown_epoch(),
+            "test_dataset",
         )
         .await;
         assert!(matches!(outcome, DeliverOutcome::ReceiverGone));

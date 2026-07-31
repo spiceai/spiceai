@@ -93,6 +93,9 @@ datasets:
       pg_db: myapp
       pg_sslmode: verify-full      # or: disable | prefer | require | verify-ca
       pg_sslrootcert: /etc/ssl/pg-ca.pem   # optional; omit to use system root CAs
+      # `pg_sslrootcert` also accepts the PEM content itself, so a CA held in a
+      # secret store needs no file on disk:
+      #   pg_sslrootcert: ${secrets:pg_ca_pem}
     acceleration:
       enabled: true
       engine: duckdb           # or: sqlite | postgres | cayenne | arrow

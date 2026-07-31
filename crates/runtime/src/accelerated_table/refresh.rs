@@ -571,7 +571,10 @@ fn validate_time_partition_format(
         | arrow::datatypes::DataType::Float16
         | arrow::datatypes::DataType::Float32
         | arrow::datatypes::DataType::Float64 => {
-            if time_format != TimeFormat::UnixSeconds && time_format != TimeFormat::UnixMillis {
+            if time_format != TimeFormat::UnixSeconds
+                && time_format != TimeFormat::UnixMillis
+                && time_format != TimeFormat::UnixNanos
+            {
                 invalid = true;
             }
         }
@@ -1107,7 +1110,14 @@ impl Refresher {
                 let refresh_clone = Arc::clone(&self.refresh);
 
                 tokio::spawn(async move {
-                    runtime_status_clone.wait_for_ready().await;
+                    // A shutdown before readiness means the initial load never
+                    // completed — checkpointing a partial accelerator would
+                    // publish it as a complete snapshot.
+                    if runtime_status_clone.wait_for_ready().await
+                        == crate::status::WaitOutcome::ShuttingDown
+                    {
+                        return;
+                    }
                     if !bootstrap_status.is_bootstrapped() {
                         let refresh_sql = refresh_clone
                             .read()
@@ -2326,6 +2336,7 @@ mod tests {
         for format in [
             TimeFormat::UnixSeconds,
             TimeFormat::UnixMillis,
+            TimeFormat::UnixNanos,
             TimeFormat::Timestamp,
             TimeFormat::Timestamptz,
             TimeFormat::Date,
@@ -2370,6 +2381,7 @@ mod tests {
         for format in [
             TimeFormat::UnixMillis,
             TimeFormat::UnixSeconds,
+            TimeFormat::UnixNanos,
             TimeFormat::Timestamptz,
             TimeFormat::ISO8601,
             TimeFormat::Date,
@@ -2395,6 +2407,7 @@ mod tests {
         for format in [
             TimeFormat::UnixMillis,
             TimeFormat::UnixSeconds,
+            TimeFormat::UnixNanos,
             TimeFormat::Timestamp,
             TimeFormat::ISO8601,
             TimeFormat::Date,
@@ -2429,7 +2442,11 @@ mod tests {
 
     #[test]
     fn test_validate_time_column_when_unix_timestamp_match() {
-        for format in [TimeFormat::UnixMillis, TimeFormat::UnixSeconds] {
+        for format in [
+            TimeFormat::UnixMillis,
+            TimeFormat::UnixSeconds,
+            TimeFormat::UnixNanos,
+        ] {
             let refresh = Refresh::new(RefreshMode::Full)
                 .time_column("time".to_string())
                 .time_format(format);
@@ -2498,6 +2515,7 @@ mod tests {
         for format in [
             TimeFormat::UnixMillis,
             TimeFormat::UnixSeconds,
+            TimeFormat::UnixNanos,
             TimeFormat::Timestamp,
             TimeFormat::Timestamptz,
             TimeFormat::ISO8601,

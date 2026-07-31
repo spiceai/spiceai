@@ -14,64 +14,70 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Full standalone-adoption end-to-end suite for Spice Cloud Connect.
+//! Full standalone-adoption end-to-end suite for Spice Cloud Connect
+//! (enroll-first model, DR-025).
 //!
-//! Unlike `adoption_flow.rs` / `run_query.rs` (which run over an insecure
-//! h2c channel and script a mock), this suite stands up a **real TLS** tonic
-//! control server backed by a throwaway CA that actually **signs the client's
-//! CSR**, and drives the real [`runtime_cloud_connect::CloudConnect`] client
-//! through the whole lifecycle:
+//! Unlike `adoption_flow.rs` (which runs the gateway over an insecure h2c
+//! channel and returns canned enroll responses), this suite
+//! stands up the full split control plane:
 //!
-//! 1. `enrollment` — adoption-code `Hello` carrying a CSR + public key, the
-//!    server signs the CSR and returns the leaf + CA bundle in `Adopt`, the
-//!    client persists the identity (leaf + key + ca bundle) to `identity.json`.
-//! 2. `identity_reuse_across_restart` — a fresh client with no adoption code
-//!    loads the persisted identity and reconnects over **mTLS** (leaf as the
-//!    client certificate, empty credential).
-//! 3. `heartbeat_and_telemetry_cadence` — the driver emits `Heartbeat` and
-//!    `Telemetry` frames on their configured cadences.
-//! 4. `run_query` — read-only dispatch with row/byte caps and an audit
-//!    `EventLog` carrying the SHA-256 of the SQL (never the SQL itself).
+//! - a **cloud mock** (axum, HTTP): `/v1/cloud-connect/enroll` atomically
+//!   consumes single-use adoption codes and **signs the client's CSR** with
+//!   a throwaway CA; `/v1/cloud-connect/renew` verifies the current-key
+//!   proof-of-possession signature and re-issues over the new CSR
+//!   (rotating the pinned key);
+//! - a **gateway** (real TLS tonic server) that **requires mTLS** — the
+//!   post-DR-025 gateway holds no CA and rejects certless connections —
+//!   and multiplexes control commands.
+//!
+//! The suite drives the real [`runtime_cloud_connect::CloudConnect`]
+//! client through the whole lifecycle:
+//!
+//! 1. `enrollment` — out-of-band HTTP enroll (code + CSR + host facts) →
+//!    identity (leaf + key + CA bundle + gateway addr) persisted →
+//!    mTLS stream to the gateway with the assigned identifier.
+//! 2. `single-use codes` — a consumed code is rejected and never retried.
+//! 3. `identity_reuse_across_restart` — a fresh client with no adoption
+//!    code loads the persisted identity and reconnects over mTLS.
+//! 4. `heartbeat_and_telemetry_cadence` — periodic frames on their
+//!    configured cadences.
 //! 5. `apply_spicepod` — the YAML is written and hot-applied.
-//! 6. `reconnect_over_mtls` — after the server drops the stream, the client
-//!    reconnects, presenting its client certificate, and the reconnect `Hello`
-//!    carries the identifier with an empty credential.
-//! 7. `forget` — the server sends `Forget`, the client clears `identity.json`
-//!    and the cloud-connect task exits while the (simulated) runtime stays up.
+//! 6. `reconnect_over_mtls` — after the server drops the stream, the
+//!    client reconnects, presenting its client certificate again.
+//! 7. `renewal` — a short-lived leaf triggers the renewal loop: a fresh
+//!    keypair + CSR + PoP signature against `/renew`, and the rotated
+//!    identity is persisted.
+//! 8. `forget` — the server sends `Forget`, the client clears
+//!    `identity.json` and the cloud-connect task exits while the
+//!    (simulated) runtime stays up.
 //!
-//! Determinism: no fixed sleeps for correctness — every wait polls a captured
-//! condition with a bounded timeout. Heartbeat / telemetry cadences are set to
-//! sub-second values via the config so the suite runs in a couple of seconds.
+//! Determinism: no fixed sleeps for correctness — every wait polls a
+//! captured condition with a bounded timeout. Heartbeat / telemetry
+//! cadences are sub-second via the config so the suite runs in seconds.
 
 #![expect(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::doc_markdown,
-    clippy::struct_field_names,
-    clippy::items_after_statements,
-    clippy::too_many_lines,
     reason = "integration-test harness — readability over lint strictness"
 )]
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use arrow::array::{Int64Array, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::ipc::reader::StreamReader;
-use arrow::ipc::writer::StreamWriter;
-use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
+use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+use base64::Engine as _;
 use rcgen::{
     BasicConstraints, CertificateParams, CertificateSigningRequestParams, DnType,
-    ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, SanType,
+    ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, PublicKeyData as _, SanType,
 };
 use runtime_cloud_connect::config::CloudConnectConfig;
-use runtime_cloud_connect::handlers::{QueryResult, RuntimeHandle};
+use runtime_cloud_connect::handlers::RuntimeHandle;
 use runtime_cloud_connect::identity::IdentityStore;
 use runtime_cloud_connect::proto;
 use runtime_cloud_connect::proto::cloud_connect_server::{CloudConnect, CloudConnectServer};
@@ -82,24 +88,25 @@ use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::transport::{Certificate, Identity as TonicIdentity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
 
-const ADOPTION_CODE: &str = "SPICE-ADOPT-E2E1-E2E2";
+const ADOPTION_CODE: &str = "SPICE-ADOPT-E2E11-E2E22";
 const ASSIGNED_ID: &str = "inst_e2e_standalone";
 
 // --------------------------------------------------------------------------
-// Throwaway PKI: a CA that signs the server cert AND the client CSRs.
+// Throwaway PKI: a CA that signs the gateway's server cert AND the client
+// CSRs presented to the cloud mock (standing in for the cloud KMS CA).
 // --------------------------------------------------------------------------
 
 /// Ensure a process-wide rustls crypto provider is installed. tonic's server
 /// builds its `ServerConfig` off the process default, which panics if none is
-/// set; the client falls back to `ring` on its own. Idempotent.
+/// set. Idempotent.
 fn ensure_crypto_provider() {
     let _ = rustls::crypto::CryptoProvider::install_default(
         rustls::crypto::aws_lc_rs::default_provider(),
     );
 }
 
-/// A minimal issuing CA plus a server leaf it signed. Stands in for the dp's
-/// FileCa/DevCa issuer. `issuer` is retained to sign client CSRs on demand.
+/// A minimal issuing CA plus a server leaf it signed. `issuer` is retained
+/// to sign client CSRs on demand.
 struct TestCa {
     ca_cert_pem: String,
     server_cert_pem: String,
@@ -129,7 +136,7 @@ impl TestCa {
         let mut srv_params = CertificateParams::default();
         srv_params
             .distinguished_name
-            .push(DnType::CommonName, "spice-test-control-plane");
+            .push(DnType::CommonName, "spice-test-gateway");
         srv_params.subject_alt_names = vec![
             SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             SanType::DnsName("localhost".try_into().expect("dns san")),
@@ -151,28 +158,196 @@ impl TestCa {
         }
     }
 
-    /// Sign a client-submitted PKCS#10 CSR, returning the leaf PEM. `from_pem`
-    /// verifies the CSR's self-signature, so this only succeeds if the client
-    /// genuinely holds the private key it enrolled with.
-    fn sign_csr(&self, csr_pem: &str) -> Result<String, rcgen::Error> {
+    /// Sign a client-submitted PKCS#10 CSR, returning the leaf PEM plus the
+    /// requester's P-256 public key point (for later PoP verification).
+    /// `from_pem` verifies the CSR's self-signature, so this only succeeds
+    /// if the client genuinely holds the private key it enrolled with.
+    fn sign_csr(&self, csr_pem: &str) -> Result<(String, Vec<u8>), rcgen::Error> {
         let csr = CertificateSigningRequestParams::from_pem(csr_pem)?;
+        let point = p256_point(csr.public_key.der_bytes());
         let leaf = csr.signed_by(&self.issuer)?;
-        Ok(leaf.pem())
+        Ok((leaf.pem(), point))
     }
 }
 
+/// Extract the uncompressed P-256 point (0x04 || X || Y, 65 bytes) from a
+/// public-key DER blob — works whether the input is a full SPKI or the raw
+/// BIT STRING payload, since the point is always the suffix.
+fn p256_point(der: &[u8]) -> Vec<u8> {
+    assert!(der.len() >= 65, "public key DER too short for P-256");
+    der[der.len() - 65..].to_vec()
+}
+
 // --------------------------------------------------------------------------
-// Control server: real tonic CloudConnect/Stream over TLS with optional mTLS.
+// Cloud mock: HTTP enroll + renew (state plane), backed by the TestCa.
+// --------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct CloudMock {
+    ca: Arc<TestCa>,
+    /// `gateway_addr` (host:port) handed out in enroll responses.
+    gateway_addr: String,
+    /// Validity (seconds) of issued leaves, as reported in `not_after`.
+    leaf_validity_secs: i64,
+    /// Unconsumed adoption codes; enroll consumes atomically.
+    codes: Arc<Mutex<HashSet<String>>>,
+    /// The public key pinned at the last enroll/renew — the only key whose
+    /// PoP signature authorizes a rotation (mirrors the cloud's pinning).
+    pinned_point: Arc<Mutex<Option<Vec<u8>>>>,
+    enroll_requests: Arc<Mutex<Vec<Value>>>,
+    renew_requests: Arc<Mutex<Vec<Value>>>,
+}
+
+impl CloudMock {
+    fn new(ca: Arc<TestCa>, gateway_addr: String, leaf_validity_secs: i64) -> Self {
+        let mut codes = HashSet::new();
+        codes.insert(ADOPTION_CODE.to_string());
+        Self {
+            ca,
+            gateway_addr,
+            leaf_validity_secs,
+            codes: Arc::new(Mutex::new(codes)),
+            pinned_point: Arc::new(Mutex::new(None)),
+            enroll_requests: Arc::new(Mutex::new(Vec::new())),
+            renew_requests: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn not_after(&self) -> String {
+        (chrono::Utc::now() + chrono::Duration::seconds(self.leaf_validity_secs)).to_rfc3339()
+    }
+}
+
+fn error_json(status: StatusCode, message: &str) -> (StatusCode, Json<Value>) {
+    (status, Json(serde_json::json!({ "error": message })))
+}
+
+async fn mock_enroll(
+    State(mock): State<CloudMock>,
+    Json(body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    mock.enroll_requests.lock().await.push(body.clone());
+
+    let Some(code) = body["adoption_code"].as_str() else {
+        return error_json(StatusCode::BAD_REQUEST, "Validation error");
+    };
+    // Atomic consume: a code redeems exactly once.
+    if !mock.codes.lock().await.remove(code) {
+        return error_json(StatusCode::UNAUTHORIZED, "Adoption code already used");
+    }
+    let Some(csr_pem) = body["csr_pem"].as_str() else {
+        return error_json(StatusCode::BAD_REQUEST, "Validation error");
+    };
+    // Host facts are NOT NULL registry columns.
+    for field in ["fingerprint", "hostname", "os", "arch", "runtime_version"] {
+        if body["instance"][field].as_str().is_none_or(str::is_empty) {
+            return error_json(StatusCode::BAD_REQUEST, "Validation error");
+        }
+    }
+    let Ok((leaf_pem, point)) = mock.ca.sign_csr(csr_pem) else {
+        return error_json(StatusCode::BAD_REQUEST, "Malformed CSR");
+    };
+    *mock.pinned_point.lock().await = Some(point);
+    let mut response = serde_json::json!({
+        "instance_id": ASSIGNED_ID,
+        "identity_cert_pem": leaf_pem,
+        "ca_bundle_pem": mock.ca.ca_cert_pem,
+        "gateway_addr": mock.gateway_addr,
+        "not_after": mock.not_after(),
+    });
+    // Attach-at-connect: the real cloud validates and attaches; the mock
+    // echoes the requested app back, matching the response contract.
+    if let Some(app_name) = body["app_name"].as_str() {
+        response["app_name"] = serde_json::Value::String(app_name.to_string());
+    }
+    (StatusCode::OK, Json(response))
+}
+
+async fn mock_renew(
+    State(mock): State<CloudMock>,
+    Json(body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    mock.renew_requests.lock().await.push(body.clone());
+
+    let (Some(cert_pem), Some(csr_pem), Some(pop_sig)) = (
+        body["cert_pem"].as_str(),
+        body["csr_pem"].as_str(),
+        body["pop_sig"].as_str(),
+    ) else {
+        return error_json(StatusCode::BAD_REQUEST, "Validation error");
+    };
+    if cert_pem.is_empty() || csr_pem.is_empty() || pop_sig.is_empty() {
+        return error_json(StatusCode::BAD_REQUEST, "Validation error");
+    }
+
+    // Current-key proof-of-possession against the PINNED key (a cert is not
+    // a secret; only the currently-pinned key may rotate the identity).
+    let pinned = mock.pinned_point.lock().await.clone();
+    let Some(pinned_point) = pinned else {
+        return error_json(
+            StatusCode::UNAUTHORIZED,
+            "Current-key proof-of-possession failed",
+        );
+    };
+    let Ok(signature) = base64::engine::general_purpose::STANDARD.decode(pop_sig) else {
+        return error_json(
+            StatusCode::UNAUTHORIZED,
+            "Current-key proof-of-possession failed",
+        );
+    };
+    let Ok(csr_der) = pem::parse(csr_pem) else {
+        return error_json(StatusCode::BAD_REQUEST, "Malformed CSR");
+    };
+    let verifier = aws_lc_rs::signature::UnparsedPublicKey::new(
+        &aws_lc_rs::signature::ECDSA_P256_SHA256_ASN1,
+        pinned_point,
+    );
+    if verifier.verify(csr_der.contents(), &signature).is_err() {
+        return error_json(
+            StatusCode::UNAUTHORIZED,
+            "Current-key proof-of-possession failed",
+        );
+    }
+
+    // Re-issue over the CSR's NEW key and pin it (the rotation).
+    let Ok((leaf_pem, point)) = mock.ca.sign_csr(csr_pem) else {
+        return error_json(StatusCode::BAD_REQUEST, "Malformed CSR");
+    };
+    *mock.pinned_point.lock().await = Some(point);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "identity_cert_pem": leaf_pem,
+            "not_after": (chrono::Utc::now() + chrono::Duration::hours(24)).to_rfc3339(),
+        })),
+    )
+}
+
+/// Serve the cloud mock on an ephemeral port; returns its address.
+async fn spawn_cloud_mock(mock: CloudMock) -> SocketAddr {
+    let app = Router::new()
+        .route("/v1/cloud-connect/enroll", post(mock_enroll))
+        .route("/v1/cloud-connect/renew", post(mock_renew))
+        .with_state(mock);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind http");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    addr
+}
+
+// --------------------------------------------------------------------------
+// Gateway: real tonic CloudConnect/Stream over TLS with REQUIRED mTLS
+// (post-DR-025 the gateway rejects certless connections).
 // --------------------------------------------------------------------------
 
 #[derive(Default)]
 struct Captured {
     /// Number of streams opened by the client (reconnect counter).
     stream_count: u32,
-    /// The enrollment Hello (the one carrying a CSR).
-    enroll_hello: Option<proto::Hello>,
-    /// Reconnect Hellos and whether the client presented a cert (mTLS) on them.
-    reconnect_hellos: Vec<(proto::Hello, bool)>,
+    /// Hellos and whether the client presented a cert (mTLS) on them.
+    hellos: Vec<(proto::Hello, bool)>,
     adopt_acks: Vec<proto::AdoptAck>,
     results: Vec<proto::CommandResult>,
     heartbeats: Vec<proto::Heartbeat>,
@@ -181,24 +356,22 @@ struct Captured {
 }
 
 #[derive(Clone)]
-struct ControlServer {
-    ca: Arc<TestCa>,
+struct GatewayServer {
     captured: Arc<Mutex<Captured>>,
     /// Commands the server should push to the client on the current stream.
     /// Drained by a per-stream forwarder, so tests can enqueue at any time.
     outbound: Arc<Mutex<VecDeque<proto::ControlMessage>>>,
-    /// When set, the server closes the stream right after handling the
-    /// enrollment Hello + Adopt — used to force an mTLS reconnect.
-    drop_after_enroll: Arc<AtomicBool>,
+    /// When set, the server closes the FIRST stream right after its Hello —
+    /// used to force a reconnect.
+    drop_first_stream: Arc<AtomicBool>,
 }
 
-impl ControlServer {
-    fn new(ca: Arc<TestCa>) -> Self {
+impl GatewayServer {
+    fn new() -> Self {
         Self {
-            ca,
             captured: Arc::new(Mutex::new(Captured::default())),
             outbound: Arc::new(Mutex::new(VecDeque::new())),
-            drop_after_enroll: Arc::new(AtomicBool::new(false)),
+            drop_first_stream: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -207,14 +380,8 @@ fn ctrl(body: proto::control_message::Body) -> proto::ControlMessage {
     proto::ControlMessage { body: Some(body) }
 }
 
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
 #[async_trait]
-impl CloudConnect for ControlServer {
+impl CloudConnect for GatewayServer {
     type StreamStream = ReceiverStream<Result<proto::ControlMessage, Status>>;
 
     async fn stream(
@@ -222,73 +389,40 @@ impl CloudConnect for ControlServer {
         request: Request<Streaming<proto::ClientMessage>>,
     ) -> Result<Response<Self::StreamStream>, Status> {
         // Presence of client certs proves the transport is mutually
-        // authenticated on this stream (the reconnect path).
+        // authenticated on this stream (the TLS config also *requires* it).
         let has_client_cert = request.peer_certs().is_some_and(|certs| !certs.is_empty());
 
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel::<Result<proto::ControlMessage, Status>>(32);
 
-        let ca = Arc::clone(&self.ca);
         let captured = Arc::clone(&self.captured);
         let outbound = Arc::clone(&self.outbound);
-        let drop_after_enroll = Arc::clone(&self.drop_after_enroll);
+        let drop_first_stream = Arc::clone(&self.drop_first_stream);
 
-        captured.lock().await.stream_count += 1;
+        let stream_index = {
+            let mut c = captured.lock().await;
+            c.stream_count += 1;
+            c.stream_count
+        };
 
         tokio::spawn(async move {
             let mut forwarder: Option<tokio::task::JoinHandle<()>> = None;
             while let Ok(Some(msg)) = inbound.message().await {
                 match msg.body {
                     Some(proto::client_message::Body::Hello(hello)) => {
-                        let is_enrollment = !hello.csr_pem.is_empty();
-                        if is_enrollment {
-                            captured.lock().await.enroll_hello = Some(hello.clone());
-                            // Validate the adoption code, then sign the CSR and
-                            // hand back the leaf + issuing-CA bundle.
-                            if hello.credential != ADOPTION_CODE {
-                                let _ = tx
-                                    .send(Err(Status::unauthenticated("bad adoption code")))
-                                    .await;
-                                return;
+                        captured
+                            .lock()
+                            .await
+                            .hellos
+                            .push((hello.clone(), has_client_cert));
+
+                        // Force a reconnect by closing the first stream right
+                        // after its Hello (dropping the outbound sender).
+                        if stream_index == 1 && drop_first_stream.load(Ordering::SeqCst) {
+                            if let Some(f) = forwarder.take() {
+                                f.abort();
                             }
-                            match ca.sign_csr(&hello.csr_pem) {
-                                Ok(leaf) => {
-                                    let adopt = proto::Adopt {
-                                        command_id: "cmd-adopt".to_string(),
-                                        assigned_identifier: ASSIGNED_ID.to_string(),
-                                        identity_cert_pem: leaf,
-                                        not_after_unix: now_unix() + 86_400 * 365,
-                                        ca_bundle_pem: ca.ca_cert_pem.clone(),
-                                    };
-                                    if tx
-                                        .send(Ok(ctrl(proto::control_message::Body::Adopt(adopt))))
-                                        .await
-                                        .is_err()
-                                    {
-                                        return;
-                                    }
-                                }
-                                Err(err) => {
-                                    let _ = tx
-                                        .send(Err(Status::invalid_argument(format!(
-                                            "CSR rejected: {err}"
-                                        ))))
-                                        .await;
-                                    return;
-                                }
-                            }
-                            // When drop_after_enroll is set we force an mTLS
-                            // reconnect by closing this stream, but not here: the
-                            // close is triggered deterministically from the
-                            // AdoptAck arm below (the client sends AdoptAck only
-                            // after it has persisted its identity), rather than
-                            // guessing at a fixed sleep.
-                        } else {
-                            captured
-                                .lock()
-                                .await
-                                .reconnect_hellos
-                                .push((hello.clone(), has_client_cert));
+                            return;
                         }
 
                         // Start forwarding queued commands on this stream.
@@ -315,18 +449,6 @@ impl CloudConnect for ControlServer {
                     }
                     Some(proto::client_message::Body::AdoptAck(ack)) => {
                         captured.lock().await.adopt_acks.push(ack);
-                        // The client sends AdoptAck only after it has persisted
-                        // its identity, so this is the deterministic moment to
-                        // force an mTLS reconnect: close the stream by returning
-                        // (dropping the outbound sender). Abort the command
-                        // forwarder first so its cloned sender doesn't hold the
-                        // stream open and defeat the disconnect.
-                        if drop_after_enroll.load(Ordering::SeqCst) {
-                            if let Some(f) = forwarder.take() {
-                                f.abort();
-                            }
-                            return;
-                        }
                     }
                     Some(proto::client_message::Body::Result(result)) => {
                         captured.lock().await.results.push(result);
@@ -342,6 +464,11 @@ impl CloudConnect for ControlServer {
                             captured.lock().await.audits.push(event);
                         }
                     }
+                    // A standalone runtime announces no per-connection
+                    // encryption key, so this never arrives. The arm is spelled
+                    // out rather than wildcarded so a new client message still
+                    // has to be accounted for here.
+                    Some(proto::client_message::Body::SecretsKey(_)) => {}
                     None => break,
                 }
             }
@@ -354,23 +481,21 @@ impl CloudConnect for ControlServer {
     }
 }
 
-/// Bind an ephemeral TLS port and serve the control server on it. Returns the
-/// bound address; the server runs until the returned task is dropped (i.e. the
-/// test ends).
-async fn spawn_tls_server(server: ControlServer) -> SocketAddr {
+/// Bind an ephemeral TLS port and serve the gateway on it. Client
+/// certificates are REQUIRED — a certless connection fails the handshake,
+/// as on the real post-DR-025 gateway.
+async fn spawn_gateway(server: GatewayServer, ca: &TestCa) -> SocketAddr {
     ensure_crypto_provider();
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
 
     let tls = ServerTlsConfig::new()
         .identity(TonicIdentity::from_pem(
-            server.ca.server_cert_pem.clone(),
-            server.ca.server_key_pem.clone(),
+            ca.server_cert_pem.clone(),
+            ca.server_key_pem.clone(),
         ))
-        // Verify client certs against the CA when presented, but do not
-        // require them: the enrollment stream connects server-auth only.
-        .client_ca_root(Certificate::from_pem(server.ca.ca_cert_pem.clone()))
-        .client_auth_optional(true);
+        .client_ca_root(Certificate::from_pem(ca.ca_cert_pem.clone()))
+        .client_auth_optional(false);
 
     let svc = CloudConnectServer::new(server);
     tokio::spawn(async move {
@@ -386,50 +511,28 @@ async fn spawn_tls_server(server: ControlServer) -> SocketAddr {
 
 // --------------------------------------------------------------------------
 // A realistic runtime handle (mirrors the spiced adapter's observable
-// behavior: Arrow-IPC results with row/byte caps, spicepod-to-disk apply).
+// behavior: spicepod-to-disk apply).
 // --------------------------------------------------------------------------
-
-/// Test constant caps, mirroring the spiced adapter's shape.
-const HARD_ROW_CAP: usize = 1_000;
-const BYTE_BUDGET: usize = 64 * 1024;
 
 #[derive(Default)]
 struct E2eRuntimeState {
-    last_sql: Option<String>,
-    last_max_rows: Option<u32>,
     applied_spicepod: Option<(std::path::PathBuf, String)>,
 }
 
 struct E2eRuntime {
     state: Arc<Mutex<E2eRuntimeState>>,
-    /// Number of rows the fabricated table "contains" — the source of
-    /// truncation when it exceeds the effective cap.
-    source_rows: usize,
 }
 
 impl E2eRuntime {
-    fn new(source_rows: usize) -> (Arc<Self>, Arc<Mutex<E2eRuntimeState>>) {
+    fn new() -> (Arc<Self>, Arc<Mutex<E2eRuntimeState>>) {
         let state = Arc::new(Mutex::new(E2eRuntimeState::default()));
         (
             Arc::new(Self {
                 state: Arc::clone(&state),
-                source_rows,
             }),
             state,
         )
     }
-}
-
-fn encode_ipc(schema: &Schema, batches: &[RecordBatch]) -> Vec<u8> {
-    let mut buf = Vec::new();
-    {
-        let mut w = StreamWriter::try_new(&mut buf, schema).expect("ipc writer");
-        for b in batches {
-            w.write(b).expect("ipc write");
-        }
-        w.finish().expect("ipc finish");
-    }
-    buf
 }
 
 #[async_trait]
@@ -439,75 +542,6 @@ impl RuntimeHandle for E2eRuntime {
     }
     async fn active_models(&self) -> u32 {
         1
-    }
-
-    async fn execute_sql(&self, sql: &str, max_rows: u32) -> Result<QueryResult, String> {
-        {
-            let mut st = self.state.lock().await;
-            st.last_sql = Some(sql.to_string());
-            st.last_max_rows = Some(max_rows);
-        }
-
-        // Read-only surface: cloud-originated RunQuery must never mutate the
-        // runtime. The real enforcement lives in the spiced adapter
-        // (`query_builder(...).read_only(true)`); here we simulate its
-        // rejection so the boundary behavior (sanitized error + audit) is
-        // exercised end-to-end.
-        let verb = sql.split_whitespace().next().unwrap_or("");
-        if verb.eq_ignore_ascii_case("insert")
-            || verb.eq_ignore_ascii_case("update")
-            || verb.eq_ignore_ascii_case("delete")
-            || verb.eq_ignore_ascii_case("create")
-            || verb.eq_ignore_ascii_case("drop")
-        {
-            return Err(format!("read-only: refusing to execute `{sql}`"));
-        }
-
-        // Row cap: min(requested, hard). max_rows == 0 means "server default";
-        // treat it as the hard cap here.
-        let effective = if max_rows == 0 {
-            HARD_ROW_CAP
-        } else {
-            (max_rows as usize).min(HARD_ROW_CAP)
-        };
-        let mut row_truncated = false;
-        let emit = if self.source_rows > effective {
-            row_truncated = true;
-            effective
-        } else {
-            self.source_rows
-        };
-
-        let schema = Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("label", DataType::Utf8, false),
-        ]);
-        let ids: Vec<i64> = (0..i64::try_from(emit).expect("emit row count fits in i64")).collect();
-        let labels: Vec<String> = (0..emit).map(|i| format!("row-{i}")).collect();
-        let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-        let batch = RecordBatch::try_new(
-            Arc::new(schema.clone()),
-            vec![
-                Arc::new(Int64Array::from(ids)),
-                Arc::new(StringArray::from(label_refs)),
-            ],
-        )
-        .expect("batch");
-
-        // Byte budget: a coarse secondary guard. If the encoded stream would
-        // exceed the budget, drop the batch (schema-only) and flag truncation.
-        let full = encode_ipc(&schema, std::slice::from_ref(&batch));
-        let (arrow_ipc, row_count, byte_truncated) = if full.len() > BYTE_BUDGET {
-            (encode_ipc(&schema, &[]), 0, true)
-        } else {
-            (full, emit as u64, false)
-        };
-
-        Ok(QueryResult {
-            arrow_ipc,
-            row_count,
-            truncated: row_truncated || byte_truncated,
-        })
     }
 
     async fn apply_spicepod(
@@ -534,32 +568,70 @@ impl RuntimeHandle for E2eRuntime {
 }
 
 // --------------------------------------------------------------------------
-// Client config + polling helpers.
+// Harness: cloud mock + gateway + client config + polling helpers.
 // --------------------------------------------------------------------------
 
-fn tls_config(
-    addr: SocketAddr,
-    ca: &TestCa,
-    identity_path: std::path::PathBuf,
-    config_dir: std::path::PathBuf,
-    adoption_code: Option<String>,
-) -> CloudConnectConfig {
-    CloudConnectConfig {
-        endpoint: format!("https://127.0.0.1:{}", addr.port()),
-        // Pin the test CA so server verification is hermetic (no dependence on
-        // the host's native trust store). Also mirrors the dev/self-hosted
-        // control-plane path.
-        ca_cert_pem: Some(ca.ca_cert_pem.clone()),
-        insecure: false,
-        identity_path,
-        config_dir,
-        adoption_code,
-        pending_adopt_code_path: None,
-        runtime_version: "v0.0.0-e2e".to_string(),
-        // Sub-second cadences keep the suite fast while still exercising the
-        // periodic frame paths.
-        heartbeat_interval: Duration::from_millis(150),
-        telemetry_interval: Duration::from_millis(250),
+/// A fully-wired split control plane: the cloud mock (HTTP) and the
+/// gateway (mTLS gRPC), sharing one throwaway CA.
+struct Harness {
+    ca: Arc<TestCa>,
+    cloud: CloudMock,
+    cloud_addr: SocketAddr,
+    gateway: GatewayServer,
+}
+
+impl Harness {
+    /// Stand up the gateway + cloud mock. `leaf_validity_secs` controls the
+    /// `not_after` the cloud reports on enroll (short values trigger the
+    /// renewal loop quickly).
+    async fn new(leaf_validity_secs: i64) -> Self {
+        let ca = Arc::new(TestCa::new());
+        let gateway = GatewayServer::new();
+        let gateway_addr = spawn_gateway(gateway.clone(), &ca).await;
+        let cloud = CloudMock::new(
+            Arc::clone(&ca),
+            gateway_addr.to_string(),
+            leaf_validity_secs,
+        );
+        let cloud_addr = spawn_cloud_mock(cloud.clone()).await;
+        Self {
+            ca,
+            cloud,
+            cloud_addr,
+            gateway,
+        }
+    }
+
+    fn config(
+        &self,
+        identity_path: std::path::PathBuf,
+        config_dir: std::path::PathBuf,
+        adoption_code: Option<String>,
+        renewal_lead: Duration,
+    ) -> CloudConnectConfig {
+        CloudConnectConfig {
+            enroll_endpoint: format!("http://{}", self.cloud_addr),
+            // No override: the stream must connect to the gateway_addr the
+            // enroll response issued (persisted in the identity).
+            gateway_endpoint: None,
+            // Pin the test CA so gateway verification is hermetic (no
+            // dependence on the host's native trust store). The identity's
+            // ca_bundle_pem (returned by enroll) pins the same root.
+            ca_cert_pem: Some(self.ca.ca_cert_pem.clone()),
+            insecure: false,
+            identity_path,
+            config_dir,
+            adoption_code,
+            pending_adopt_code_path: None,
+            adopt_app_name: None,
+            adopt_create_app: false,
+            runtime_version: "v0.0.0-e2e".to_string(),
+            // Sub-second cadences keep the suite fast while still exercising
+            // the periodic frame paths.
+            heartbeat_interval: Duration::from_millis(150),
+            telemetry_interval: Duration::from_millis(250),
+            renewal_lead,
+        }
     }
 }
 
@@ -611,9 +683,10 @@ macro_rules! with_captured {
     }};
 }
 
-/// Drive enrollment to completion and return the loaded identity.
+/// Drive enrollment to completion (identity persisted + mTLS Hello observed
+/// by the gateway) and return the loaded identity.
 async fn enroll(
-    server: &ControlServer,
+    harness: &Harness,
     config: &CloudConnectConfig,
     runtime: Arc<dyn RuntimeHandle>,
 ) -> (
@@ -626,18 +699,25 @@ async fn enroll(
         .expect("started");
 
     let identity_path = config.identity_path.clone();
-    let adopted = wait_until(Duration::from_secs(10), || identity_path.exists()).await;
-    assert!(adopted, "identity.json must be written within 10s");
+    let enrolled = wait_until(Duration::from_secs(10), || identity_path.exists()).await;
+    assert!(enrolled, "identity.json must be written within 10s");
 
-    // Wait for the AdoptAck to be observed server-side so the handshake is
+    // Wait for the gateway to observe the mTLS Hello so the handshake is
     // fully settled before the test proceeds.
-    let captured = Arc::clone(&server.captured);
-    let acked = wait_until_async(Duration::from_secs(5), || {
+    let captured = Arc::clone(&harness.gateway.captured);
+    let connected = wait_until_async(Duration::from_secs(10), || {
         let captured = Arc::clone(&captured);
-        async move { !captured.lock().await.adopt_acks.is_empty() }
+        async move {
+            captured
+                .lock()
+                .await
+                .hellos
+                .iter()
+                .any(|(h, mtls)| h.identifier == ASSIGNED_ID && *mtls)
+        }
     })
     .await;
-    assert!(acked, "server must observe AdoptAck within 5s");
+    assert!(connected, "gateway must observe the mTLS Hello within 10s");
 
     let identity = IdentityStore::load_optional(&identity_path)
         .expect("load identity")
@@ -650,108 +730,404 @@ async fn enroll(
 // --------------------------------------------------------------------------
 
 #[tokio::test]
-async fn enrollment_signs_csr_and_persists_identity() {
-    let ca = Arc::new(TestCa::new());
-    let server = ControlServer::new(Arc::clone(&ca));
-    let addr = spawn_tls_server(server.clone()).await;
-
+async fn enrollment_issues_identity_and_streams_over_mtls() {
+    let harness = Harness::new(24 * 60 * 60).await;
     let dir = tempfile::tempdir().unwrap();
-    let config = tls_config(
-        addr,
-        &ca,
+    let config = harness.config(
         dir.path().join("identity.json"),
         dir.path().to_path_buf(),
         Some(ADOPTION_CODE.to_string()),
+        Duration::from_hours(12),
     );
 
-    let (runtime, _rt_state) = E2eRuntime::new(0);
-    let (handle, identity) = enroll(&server, &config, runtime).await;
+    let (runtime, _rt_state) = E2eRuntime::new();
+    let (handle, identity) = enroll(&harness, &config, runtime).await;
 
-    // The enrollment Hello carried the CSR + public key BEFORE the cert was
-    // issued (the ordering fix).
-    let captured = Arc::clone(&server.captured);
-    let hello =
-        with_captured!(captured, c => c.enroll_hello.clone()).expect("server saw enrollment Hello");
-    assert_eq!(hello.kind, proto::InstanceKind::Standalone as i32);
+    // The enroll request carried the out-of-band contract: adoption code +
+    // CSR + host facts under `instance` — no bearer token field.
+    let requests = harness.cloud.enroll_requests.lock().await.clone();
+    assert_eq!(requests.len(), 1, "exactly one enroll request");
+    let body = &requests[0];
+    assert_eq!(body["adoption_code"], ADOPTION_CODE);
     assert!(
-        hello.identifier.is_empty(),
-        "pending Hello has no identifier"
+        body["csr_pem"]
+            .as_str()
+            .unwrap()
+            .contains("CERTIFICATE REQUEST"),
+        "enroll must carry a PKCS#10 CSR"
     );
-    assert_eq!(hello.credential, ADOPTION_CODE);
     assert!(
-        hello.csr_pem.contains("CERTIFICATE REQUEST"),
-        "Hello must carry a PKCS#10 CSR"
+        body["enc_pubkey_pem"]
+            .as_str()
+            .unwrap()
+            .contains("BEGIN PUBLIC KEY"),
+        "enroll must carry the X25519 encryption public key (SPKI PEM)"
     );
-    assert!(hello.agent_pubkey_pem.contains("PUBLIC KEY"));
+    assert_eq!(body["instance"]["fingerprint"].as_str().unwrap().len(), 64);
+    assert_eq!(body["instance"]["runtime_version"], "v0.0.0-e2e");
 
-    // The persisted identity binds the server-signed leaf to the client key,
-    // and the issuing-CA bundle was captured for mTLS reconnects.
+    // The persisted identity binds the cloud-signed leaf to the client key
+    // and captured the issued CA bundle + gateway address.
     assert_eq!(identity.identifier, ASSIGNED_ID);
     assert!(identity.identity_cert_pem.contains("BEGIN CERTIFICATE"));
     assert!(identity.private_key_pem.contains("PRIVATE KEY"));
     assert!(identity.ca_bundle_pem.contains("BEGIN CERTIFICATE"));
+    assert_eq!(identity.gateway_addr, harness.cloud.gateway_addr);
+    assert!(identity.not_after_unix > 0, "leaf expiry must be recorded");
     assert!(
-        identity.not_after_unix > now_unix(),
-        "leaf must be unexpired"
+        identity.enc_private_key_pem.contains("PRIVATE KEY")
+            && identity.enc_public_key_pem.contains("PUBLIC KEY"),
+        "the X25519 encryption keypair must be persisted with the identity"
     );
-    // That the signed leaf genuinely chains to the pinned CA bundle is proved
-    // operationally by the mTLS reconnect tests below: if it did not chain, the
-    // server's `client_ca_root` verification would reject the handshake.
+    // That the signed leaf genuinely chains to the CA is proved
+    // operationally: the gateway REQUIRES client certs chaining to it, so
+    // the observed mTLS Hello (in `enroll`) implies a valid chain.
 
-    // AdoptAck echoed the enrolled public key so the server can pin it.
-    let ack = with_captured!(captured, c => c.adopt_acks.first().cloned()).expect("adopt ack");
-    assert_eq!(ack.identifier, ASSIGNED_ID);
-    assert_eq!(ack.identity_pubkey_pem, identity.public_key_pem);
+    // The stream Hello names the instance with an empty credential and no
+    // CSR — enrollment moved out-of-band.
+    let captured = Arc::clone(&harness.gateway.captured);
+    let ok = with_captured!(captured, c => {
+        c.hellos.iter().any(|(h, mtls)| {
+            h.identifier == ASSIGNED_ID
+                && *mtls
+                && h.credential.is_empty()
+                && h.csr_pem.is_empty()
+                && h.kind == proto::InstanceKind::Standalone as i32
+        })
+    });
+    assert!(ok, "mTLS Hello must carry identifier + empty credential");
 
     handle.shutdown().await;
 }
 
+/// The `spice connect` enroll-and-exit contract: a one-shot `enroll_now`
+/// issues and persists the identity with no client running (no gateway
+/// connection), discards the staged pending-code file, and a later
+/// `CloudConnect::start` with **no adoption code** connects using the
+/// persisted identity — enroll and run as two separate steps.
 #[tokio::test]
-async fn identity_is_reused_across_restart_over_mtls() {
-    let ca = Arc::new(TestCa::new());
-    let server = ControlServer::new(Arc::clone(&ca));
-    let addr = spawn_tls_server(server.clone()).await;
-
+async fn one_shot_enroll_then_separate_run_connects_with_stored_identity() {
+    let harness = Harness::new(24 * 60 * 60).await;
     let dir = tempfile::tempdir().unwrap();
-    let identity_path = dir.path().join("identity.json");
 
-    // First boot: enroll with the adoption code.
-    let enroll_cfg = tls_config(
-        addr,
-        &ca,
-        identity_path.clone(),
+    // Stage the code the way `spice connect` does.
+    let pending_path = dir.path().join("pending-adopt-code");
+    std::fs::write(&pending_path, ADOPTION_CODE).unwrap();
+
+    let mut config = harness.config(
+        dir.path().join("identity.json"),
         dir.path().to_path_buf(),
         Some(ADOPTION_CODE.to_string()),
+        Duration::from_hours(12),
     );
-    let (runtime, _s) = E2eRuntime::new(0);
-    let (handle, _identity) = enroll(&server, &enroll_cfg, runtime).await;
-    handle.shutdown().await; // simulate process stop; identity.json persists.
+    config.pending_adopt_code_path = Some(pending_path.clone());
 
-    // Second boot: NO adoption code — the client must load the persisted
-    // identity and reconnect over mTLS, presenting its client certificate.
-    let reuse_cfg = tls_config(
-        addr,
-        &ca,
-        identity_path.clone(),
+    // Phase 1: one-shot enroll — no client task, no stream.
+    let outcome = runtime_cloud_connect::enroll::enroll_now(&config)
+        .await
+        .expect("one-shot enroll succeeds");
+    assert_eq!(outcome.identity.identifier, ASSIGNED_ID);
+    assert_eq!(outcome.app_name, None, "no attachment was requested");
+    assert!(
+        config.identity_path.exists(),
+        "identity must be persisted by the one-shot enroll"
+    );
+    assert!(
+        !pending_path.exists(),
+        "the staged code must be discarded once consumed"
+    );
+    let captured_after_enroll = Arc::clone(&harness.gateway.captured);
+    let hellos = with_captured!(captured_after_enroll, c => c.hellos.len());
+    assert_eq!(hellos, 0, "one-shot enroll must not connect to the gateway");
+
+    // Phase 2: a separate start with NO adoption code connects with the
+    // stored identity.
+    let run_config = harness.config(
+        config.identity_path.clone(),
         dir.path().to_path_buf(),
         None,
+        Duration::from_hours(12),
     );
-    let (runtime2, _s2) = E2eRuntime::new(0);
-    let handle2 = runtime_cloud_connect::CloudConnect::start(reuse_cfg, runtime2)
+    let (runtime, _rt_state) = E2eRuntime::new();
+    let handle = runtime_cloud_connect::CloudConnect::start(run_config, runtime)
         .await
         .expect("start")
-        .expect("started (identity mode)");
-
-    let captured = Arc::clone(&server.captured);
-    let reconnected = wait_until_async(Duration::from_secs(10), || {
+        .expect("enabled with stored identity");
+    let captured = Arc::clone(&harness.gateway.captured);
+    let connected = wait_until_async(Duration::from_secs(10), || {
         let captured = Arc::clone(&captured);
         async move {
             captured
                 .lock()
                 .await
-                .reconnect_hellos
+                .hellos
                 .iter()
                 .any(|(h, mtls)| h.identifier == ASSIGNED_ID && *mtls)
+        }
+    })
+    .await;
+    assert!(
+        connected,
+        "the runtime must connect with the persisted identity"
+    );
+    assert_eq!(
+        harness.cloud.enroll_requests.lock().await.len(),
+        1,
+        "the run phase must reuse the identity, not enroll again"
+    );
+    handle.shutdown().await;
+}
+
+/// An authoritative cloud rejection of a one-shot enroll burns the staged
+/// code file (a dead code must not be re-presented by a later `spiced`
+/// start) and persists no identity.
+#[tokio::test]
+async fn one_shot_enroll_discards_staged_code_on_rejection() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+    let pending_path = dir.path().join("pending-adopt-code");
+    std::fs::write(&pending_path, "SPICE-ADOPT-DEADD-BEEFF").unwrap();
+
+    let mut config = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        // Not registered with the cloud mock — rejected as unknown/consumed.
+        Some("SPICE-ADOPT-DEADD-BEEFF".to_string()),
+        Duration::from_hours(12),
+    );
+    config.pending_adopt_code_path = Some(pending_path.clone());
+
+    let err = runtime_cloud_connect::enroll::enroll_now(&config)
+        .await
+        .expect_err("an unknown code must be rejected");
+    assert!(
+        err.is_authoritative_rejection(),
+        "a 4xx cloud rejection is authoritative: {err}"
+    );
+    assert!(
+        !pending_path.exists(),
+        "a dead code must not stay staged for retry"
+    );
+    assert!(
+        !config.identity_path.exists(),
+        "no identity may be persisted on a rejected enroll"
+    );
+}
+
+/// Attach-at-connect: `adopt_app_name`/`adopt_create_app` ride the enroll
+/// request (`app_name`/`create_app` on the wire, omitted when unset) and
+/// the response's attached app comes back in the outcome.
+#[tokio::test]
+async fn one_shot_enroll_carries_app_attachment() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+
+    let mut config = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        Some(ADOPTION_CODE.to_string()),
+        Duration::from_hours(12),
+    );
+    config.adopt_app_name = Some("e2e-app".to_string());
+    config.adopt_create_app = true;
+
+    let outcome = runtime_cloud_connect::enroll::enroll_now(&config)
+        .await
+        .expect("enroll with attachment succeeds");
+    assert_eq!(outcome.app_name.as_deref(), Some("e2e-app"));
+
+    let requests = harness.cloud.enroll_requests.lock().await.clone();
+    assert_eq!(requests.len(), 1, "exactly one enroll request");
+    assert_eq!(requests[0]["app_name"], "e2e-app");
+    assert_eq!(requests[0]["create_app"], true);
+}
+
+/// `create_app` is meaningless without an app to name, so it must never
+/// reach the wire alone — an invalid enroll request. Reachable by setting
+/// `SPICE_CONNECT_ADOPT_CREATE` with no `SPICE_CONNECT_ADOPT_APP_NAME`
+/// (the `--create` flag pair is guarded by clap, the env pair is not).
+#[tokio::test]
+async fn one_shot_enroll_omits_create_app_without_app_name() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+
+    let mut config = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        Some(ADOPTION_CODE.to_string()),
+        Duration::from_hours(12),
+    );
+    config.adopt_app_name = None;
+    config.adopt_create_app = true;
+
+    let outcome = runtime_cloud_connect::enroll::enroll_now(&config)
+        .await
+        .expect("enroll succeeds unattached");
+    assert_eq!(outcome.app_name, None, "nothing was attached");
+
+    let requests = harness.cloud.enroll_requests.lock().await.clone();
+    assert_eq!(requests.len(), 1, "exactly one enroll request");
+    assert!(
+        requests[0].get("app_name").is_none(),
+        "no app name was configured"
+    );
+    assert!(
+        requests[0].get("create_app").is_none(),
+        "create_app must not ride without app_name"
+    );
+}
+
+/// A persistence failure lands *after* the cloud consumed the code to issue
+/// the identity, so the staged copy is spent: it must be discarded, not left
+/// for `status` to report as redeemable and a later `spiced` start to
+/// re-present for a 401.
+#[tokio::test]
+async fn one_shot_enroll_discards_staged_code_when_identity_cannot_persist() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+    let pending_path = dir.path().join("pending-adopt-code");
+    std::fs::write(&pending_path, ADOPTION_CODE).unwrap();
+
+    // The identity's parent is a regular file, so the directory for it
+    // cannot be created and the issued identity cannot be written.
+    let blocker = dir.path().join("blocker");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+
+    let mut config = harness.config(
+        blocker.join("identity.json"),
+        dir.path().to_path_buf(),
+        Some(ADOPTION_CODE.to_string()),
+        Duration::from_hours(12),
+    );
+    config.pending_adopt_code_path = Some(pending_path.clone());
+
+    let err = runtime_cloud_connect::enroll::enroll_now(&config)
+        .await
+        .expect_err("an unwritable identity path must fail the enroll");
+    assert!(
+        matches!(
+            err,
+            runtime_cloud_connect::enroll::EnrollNowError::Persist { .. }
+        ),
+        "expected a persistence failure, got: {err}"
+    );
+    assert!(
+        !err.is_authoritative_rejection(),
+        "a local persistence failure is not a cloud rejection"
+    );
+    assert!(
+        !pending_path.exists(),
+        "the code was consumed to issue the identity, so it must not stay staged"
+    );
+    assert_eq!(
+        harness.cloud.enroll_requests.lock().await.len(),
+        1,
+        "the code was presented exactly once"
+    );
+}
+
+#[tokio::test]
+async fn adoption_code_is_single_use() {
+    let harness = Harness::new(24 * 60 * 60).await;
+
+    // First machine redeems the code.
+    let dir1 = tempfile::tempdir().unwrap();
+    let config1 = harness.config(
+        dir1.path().join("identity.json"),
+        dir1.path().to_path_buf(),
+        Some(ADOPTION_CODE.to_string()),
+        Duration::from_hours(12),
+    );
+    let (runtime1, _s1) = E2eRuntime::new();
+    let (handle1, _identity) = enroll(&harness, &config1, runtime1).await;
+    handle1.shutdown().await;
+
+    // A replay of the consumed code is rejected (401) and never retried;
+    // no identity is created.
+    let dir2 = tempfile::tempdir().unwrap();
+    let identity_path2 = dir2.path().join("identity.json");
+    let config2 = harness.config(
+        identity_path2.clone(),
+        dir2.path().to_path_buf(),
+        Some(ADOPTION_CODE.to_string()),
+        Duration::from_hours(12),
+    );
+    let (runtime2, _s2) = E2eRuntime::new();
+    let handle2 = runtime_cloud_connect::CloudConnect::start(config2, runtime2)
+        .await
+        .expect("start")
+        .expect("started");
+
+    // The replayed enroll arrives at the cloud mock...
+    let cloud = harness.cloud.clone();
+    let replay_seen = wait_until_async(Duration::from_secs(5), || {
+        let cloud = cloud.clone();
+        async move { cloud.enroll_requests.lock().await.len() >= 2 }
+    })
+    .await;
+    assert!(replay_seen, "the replayed enroll must reach the cloud");
+
+    // ...is rejected, and the rejection is terminal: give the driver a
+    // moment and confirm no identity appeared and no retry was sent.
+    let retried = wait_until_async(Duration::from_secs(2), || {
+        let cloud = cloud.clone();
+        async move { cloud.enroll_requests.lock().await.len() > 2 }
+    })
+    .await;
+    assert!(!retried, "a consumed code must not be retried");
+    assert!(
+        !identity_path2.exists(),
+        "no identity may be issued for a consumed code"
+    );
+
+    handle2.shutdown().await;
+}
+
+#[tokio::test]
+async fn identity_is_reused_across_restart_over_mtls() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+    let identity_path = dir.path().join("identity.json");
+
+    // First boot: enroll with the adoption code.
+    let enroll_cfg = harness.config(
+        identity_path.clone(),
+        dir.path().to_path_buf(),
+        Some(ADOPTION_CODE.to_string()),
+        Duration::from_hours(12),
+    );
+    let (runtime, _s) = E2eRuntime::new();
+    let (handle, _identity) = enroll(&harness, &enroll_cfg, runtime).await;
+    handle.shutdown().await; // simulate process stop; identity.json persists.
+
+    let captured = Arc::clone(&harness.gateway.captured);
+    let hellos_before = with_captured!(captured, c => c.hellos.len());
+
+    // Second boot: NO adoption code — the client must load the persisted
+    // identity and reconnect over mTLS, presenting its client certificate,
+    // without touching the enroll endpoint again.
+    let enrolls_before = harness.cloud.enroll_requests.lock().await.len();
+    let reuse_cfg = harness.config(
+        identity_path.clone(),
+        dir.path().to_path_buf(),
+        None,
+        Duration::from_hours(12),
+    );
+    let (runtime2, _s2) = E2eRuntime::new();
+    let handle2 = runtime_cloud_connect::CloudConnect::start(reuse_cfg, runtime2)
+        .await
+        .expect("start")
+        .expect("started (identity mode)");
+
+    let captured = Arc::clone(&harness.gateway.captured);
+    let reconnected = wait_until_async(Duration::from_secs(10), || {
+        let captured = Arc::clone(&captured);
+        async move {
+            let c = captured.lock().await;
+            c.hellos.len() > hellos_before
+                && c.hellos.iter().skip(hellos_before).any(|(h, mtls)| {
+                    h.identifier == ASSIGNED_ID && *mtls && h.credential.is_empty()
+                })
         }
     })
     .await;
@@ -759,38 +1135,31 @@ async fn identity_is_reused_across_restart_over_mtls() {
         reconnected,
         "restarted client must reconnect over mTLS with its identifier"
     );
-
-    // And the reconnect Hello carries an empty credential (client cert authN).
-    let ok = with_captured!(captured, c => {
-        c.reconnect_hellos
-            .iter()
-            .any(|(h, mtls)| h.identifier == ASSIGNED_ID && *mtls && h.credential.is_empty())
-    });
-    assert!(ok, "reconnect Hello must have an empty credential");
+    assert_eq!(
+        harness.cloud.enroll_requests.lock().await.len(),
+        enrolls_before,
+        "identity reuse must not re-enroll"
+    );
 
     handle2.shutdown().await;
 }
 
 #[tokio::test]
 async fn heartbeat_and_telemetry_cadence() {
-    let ca = Arc::new(TestCa::new());
-    let server = ControlServer::new(Arc::clone(&ca));
-    let addr = spawn_tls_server(server.clone()).await;
-
+    let harness = Harness::new(24 * 60 * 60).await;
     let dir = tempfile::tempdir().unwrap();
-    let config = tls_config(
-        addr,
-        &ca,
+    let config = harness.config(
         dir.path().join("identity.json"),
         dir.path().to_path_buf(),
         Some(ADOPTION_CODE.to_string()),
+        Duration::from_hours(12),
     );
-    let (runtime, _s) = E2eRuntime::new(0);
-    let (handle, _identity) = enroll(&server, &config, runtime).await;
+    let (runtime, _s) = E2eRuntime::new();
+    let (handle, _identity) = enroll(&harness, &config, runtime).await;
 
     // With a 150ms heartbeat and 250ms telemetry cadence, several of each must
     // arrive within a couple of seconds.
-    let captured = Arc::clone(&server.captured);
+    let captured = Arc::clone(&harness.gateway.captured);
     let enough = wait_until_async(Duration::from_secs(5), || {
         let captured = Arc::clone(&captured);
         async move {
@@ -801,7 +1170,7 @@ async fn heartbeat_and_telemetry_cadence() {
     .await;
     assert!(enough, "expected >=3 heartbeats and >=2 telemetry frames");
 
-    // The frames carry the adopted identifier and the runtime counters.
+    // The frames carry the enrolled identifier and the runtime counters.
     let (hb_ok, tel_ok) = with_captured!(captured, c => {
         let hb_ok = c
             .heartbeats
@@ -824,163 +1193,27 @@ async fn heartbeat_and_telemetry_cadence() {
 }
 
 #[tokio::test]
-async fn run_query_read_only_caps_and_audit() {
-    let ca = Arc::new(TestCa::new());
-    let server = ControlServer::new(Arc::clone(&ca));
-    let addr = spawn_tls_server(server.clone()).await;
-
-    let dir = tempfile::tempdir().unwrap();
-    let config = tls_config(
-        addr,
-        &ca,
-        dir.path().join("identity.json"),
-        dir.path().to_path_buf(),
-        Some(ADOPTION_CODE.to_string()),
-    );
-    // The fabricated table has more rows than the requested cap, so the
-    // result must come back truncated.
-    let (runtime, rt_state) = E2eRuntime::new(50);
-    let (handle, _identity) = enroll(&server, &config, runtime).await;
-
-    // (a) A read-only SELECT with a row cap below the source size.
-    server
-        .outbound
-        .lock()
-        .await
-        .push_back(ctrl(proto::control_message::Body::RunQuery(
-            proto::RunQuery {
-                command_id: "cmd-select".to_string(),
-                sql: "SELECT id, label FROM t".to_string(),
-                max_rows: 10,
-            },
-        )));
-
-    let captured = Arc::clone(&server.captured);
-    let got = wait_until_async(Duration::from_secs(5), || {
-        let captured = Arc::clone(&captured);
-        async move {
-            let c = captured.lock().await;
-            c.results.iter().any(|r| r.command_id == "cmd-select")
-                && c.audits.iter().any(|e| e.event_json.contains("cmd-select"))
-        }
-    })
-    .await;
-    assert!(got, "RunQuery result + audit must arrive within 5s");
-
-    // The runtime received the raw max_rows the control plane requested.
-    assert_eq!(rt_state.lock().await.last_max_rows, Some(10));
-
-    let result = with_captured!(captured, c => c
-        .results
-        .iter()
-        .find(|r| r.command_id == "cmd-select")
-        .cloned())
-    .expect("select result");
-    assert!(result.success, "select must succeed: {}", result.error);
-
-    // Metadata rides in payload_json; tabular data is native Arrow IPC.
-    let meta: Value = serde_json::from_str(&result.payload_json).expect("meta json");
-    assert_eq!(meta["row_count"], 10, "row cap applied");
-    assert_eq!(meta["truncated"], true, "source exceeded the cap");
-    let reader =
-        StreamReader::try_new(std::io::Cursor::new(result.result_arrow_ipc.clone()), None).unwrap();
-    let rows: usize = reader.map(|b| b.unwrap().num_rows()).sum();
-    assert_eq!(rows, 10, "Arrow IPC carries exactly the capped rows");
-
-    // The audit EventLog carries the SHA-256 of the SQL — never the SQL text.
-    let audit = with_captured!(captured, c => c
-        .audits
-        .iter()
-        .find(|e| e.event_json.contains("cmd-select"))
-        .cloned())
-    .expect("select audit");
-    assert_eq!(audit.identifier, ASSIGNED_ID);
-    let ap: Value = serde_json::from_str(&audit.event_json).unwrap();
-    assert_eq!(ap["action"], "run_query");
-    assert_eq!(ap["success"], true);
-    assert_eq!(ap["row_count"], 10);
-    assert_eq!(ap["truncated"], true);
-    let sql_hash = ap["sql_hash"].as_str().unwrap();
-    assert_eq!(sql_hash.len(), 64, "sha256 hex digest");
-    assert!(
-        !audit.event_json.contains("SELECT"),
-        "audit must not leak SQL"
-    );
-
-    // (b) A mutating statement must be rejected (read-only surface) and the
-    // failure audited without leaking the statement.
-    server
-        .outbound
-        .lock()
-        .await
-        .push_back(ctrl(proto::control_message::Body::RunQuery(
-            proto::RunQuery {
-                command_id: "cmd-write".to_string(),
-                sql: "DELETE FROM secrets WHERE id = 1".to_string(),
-                max_rows: 0,
-            },
-        )));
-
-    let got_err = wait_until_async(Duration::from_secs(5), || {
-        let captured = Arc::clone(&captured);
-        async move {
-            captured
-                .lock()
-                .await
-                .results
-                .iter()
-                .any(|r| r.command_id == "cmd-write")
-        }
-    })
-    .await;
-    assert!(got_err, "write result must arrive within 5s");
-
-    let werr = with_captured!(captured, c => c
-        .results
-        .iter()
-        .find(|r| r.command_id == "cmd-write")
-        .cloned())
-    .expect("write result");
-    assert!(!werr.success, "mutating statement must be rejected");
-    assert!(
-        !werr.error.contains("secrets"),
-        "sanitized error must not echo the SQL: {}",
-        werr.error
-    );
-
-    handle.shutdown().await;
-}
-
-#[tokio::test]
 async fn apply_spicepod_hot_applies_and_persists() {
-    let ca = Arc::new(TestCa::new());
-    let server = ControlServer::new(Arc::clone(&ca));
-    let addr = spawn_tls_server(server.clone()).await;
-
+    let harness = Harness::new(24 * 60 * 60).await;
     let dir = tempfile::tempdir().unwrap();
-    let config = tls_config(
-        addr,
-        &ca,
+    let config = harness.config(
         dir.path().join("identity.json"),
         dir.path().to_path_buf(),
         Some(ADOPTION_CODE.to_string()),
+        Duration::from_hours(12),
     );
-    let (runtime, rt_state) = E2eRuntime::new(0);
-    let (handle, _identity) = enroll(&server, &config, runtime).await;
+    let (runtime, rt_state) = E2eRuntime::new();
+    let (handle, _identity) = enroll(&harness, &config, runtime).await;
 
     let yaml = "version: v2\nkind: Spicepod\nname: e2e-cloud-managed\n";
-    server
-        .outbound
-        .lock()
-        .await
-        .push_back(ctrl(proto::control_message::Body::ApplySpicepod(
-            proto::ApplySpicepod {
-                command_id: "cmd-apply".to_string(),
-                spicepod_yaml: yaml.to_string(),
-            },
-        )));
+    harness.gateway.outbound.lock().await.push_back(ctrl(
+        proto::control_message::Body::ApplySpicepod(proto::ApplySpicepod {
+            command_id: "cmd-apply".to_string(),
+            spicepod_yaml: yaml.to_string(),
+        }),
+    ));
 
-    let captured = Arc::clone(&server.captured);
+    let captured = Arc::clone(&harness.gateway.captured);
     let applied = wait_until_async(Duration::from_secs(5), || {
         let captured = Arc::clone(&captured);
         async move {
@@ -1021,46 +1254,51 @@ async fn apply_spicepod_hot_applies_and_persists() {
 
 #[tokio::test]
 async fn reconnects_over_mtls_after_disconnect() {
-    let ca = Arc::new(TestCa::new());
-    let server = ControlServer::new(Arc::clone(&ca));
-    // Force the server to drop the enrollment stream right after Adopt so the
-    // client must reconnect — this time over mTLS.
-    server.drop_after_enroll.store(true, Ordering::SeqCst);
-    let addr = spawn_tls_server(server.clone()).await;
+    let harness = Harness::new(24 * 60 * 60).await;
+    // Force the gateway to drop the first stream right after its Hello so
+    // the client must reconnect.
+    harness
+        .gateway
+        .drop_first_stream
+        .store(true, Ordering::SeqCst);
 
     let dir = tempfile::tempdir().unwrap();
-    let config = tls_config(
-        addr,
-        &ca,
+    let config = harness.config(
         dir.path().join("identity.json"),
         dir.path().to_path_buf(),
         Some(ADOPTION_CODE.to_string()),
+        Duration::from_hours(12),
     );
-    let (runtime, _s) = E2eRuntime::new(0);
+    let (runtime, _s) = E2eRuntime::new();
 
     let handle = runtime_cloud_connect::CloudConnect::start(config.clone(), runtime)
         .await
         .expect("start")
         .expect("started");
 
-    // The identity is persisted from the (soon-dropped) enrollment stream.
+    // The identity is persisted by the out-of-band enroll regardless of the
+    // (soon-dropped) first stream.
     let identity_path = config.identity_path.clone();
     assert!(
         wait_until(Duration::from_secs(10), || identity_path.exists()).await,
         "identity must persist before the reconnect"
     );
 
-    // After the drop + backoff, the client reconnects with its identifier over
-    // a mutually-authenticated stream.
-    let captured = Arc::clone(&server.captured);
+    // After the drop + backoff, the client reconnects with its identifier
+    // over a second mutually-authenticated stream — without re-enrolling.
+    let captured = Arc::clone(&harness.gateway.captured);
     let reconnected = wait_until_async(Duration::from_secs(15), || {
         let captured = Arc::clone(&captured);
         async move {
             let c = captured.lock().await;
             c.stream_count >= 2
-                && c.reconnect_hellos.iter().any(|(h, mtls)| {
-                    h.identifier == ASSIGNED_ID && *mtls && h.credential.is_empty()
-                })
+                && c.hellos
+                    .iter()
+                    .filter(|(h, mtls)| {
+                        h.identifier == ASSIGNED_ID && *mtls && h.credential.is_empty()
+                    })
+                    .count()
+                    >= 2
         }
     })
     .await;
@@ -1068,31 +1306,134 @@ async fn reconnects_over_mtls_after_disconnect() {
         reconnected,
         "client must reopen a second, mutually-authenticated stream"
     );
+    assert_eq!(
+        harness.cloud.enroll_requests.lock().await.len(),
+        1,
+        "reconnect must not re-enroll"
+    );
+
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn renewal_rotates_keypair_and_persists() {
+    // Issue a leaf that "expires" in 5s with a 2s renewal lead: renewal
+    // becomes due ~3s after enrollment, exercising the ~12h loop at test
+    // speed. (The rcgen-signed cert itself is valid longer — the client
+    // schedules from the reported not_after, which is what's under test.)
+    let harness = Harness::new(5).await;
+    let dir = tempfile::tempdir().unwrap();
+    let identity_path = dir.path().join("identity.json");
+    let config = harness.config(
+        identity_path.clone(),
+        dir.path().to_path_buf(),
+        Some(ADOPTION_CODE.to_string()),
+        Duration::from_secs(2),
+    );
+    let (runtime, _s) = E2eRuntime::new();
+
+    // Start the client directly (not via the `enroll` helper): the
+    // pre-rotation identity must be snapshotted as soon as it lands on
+    // disk, before the renewal timer can fire and overwrite it.
+    let handle = runtime_cloud_connect::CloudConnect::start(config, runtime)
+        .await
+        .expect("start")
+        .expect("started");
+    assert!(
+        wait_until(Duration::from_secs(10), || identity_path.exists()).await,
+        "identity.json must be written within 10s"
+    );
+    let enrolled_identity = IdentityStore::load_optional(&identity_path)
+        .expect("load identity")
+        .expect("identity present");
+    assert_eq!(enrolled_identity.identifier, ASSIGNED_ID);
+
+    // The renewal request must arrive and be verified (the mock rejects any
+    // PoP signature that does not verify against the pinned key).
+    let cloud = harness.cloud.clone();
+    let renewed = wait_until_async(Duration::from_secs(15), || {
+        let cloud = cloud.clone();
+        async move { !cloud.renew_requests.lock().await.is_empty() }
+    })
+    .await;
+    assert!(renewed, "a renewal must be attempted within 15s");
+
+    // The renew request carried the standard contract shape.
+    let renew_body = harness.cloud.renew_requests.lock().await[0].clone();
+    assert_eq!(
+        renew_body["cert_pem"].as_str().unwrap(),
+        enrolled_identity.identity_cert_pem,
+        "renew presents the current leaf"
+    );
+    assert!(
+        renew_body["csr_pem"]
+            .as_str()
+            .unwrap()
+            .contains("CERTIFICATE REQUEST"),
+        "renew carries a fresh CSR"
+    );
+    assert!(
+        !renew_body["pop_sig"].as_str().unwrap().is_empty(),
+        "renew carries the current-key proof-of-possession"
+    );
+
+    // The rotated identity is persisted: new keypair, new leaf, later
+    // expiry; identifier / CA bundle / gateway address unchanged.
+    let rotated = wait_until(Duration::from_secs(10), || {
+        IdentityStore::load_optional(&identity_path)
+            .ok()
+            .flatten()
+            .is_some_and(|id| id.public_key_pem != enrolled_identity.public_key_pem)
+    })
+    .await;
+    assert!(rotated, "the rotated identity must be persisted within 10s");
+
+    let renewed_identity = IdentityStore::load_optional(&identity_path)
+        .expect("load identity")
+        .expect("identity present");
+    assert_eq!(renewed_identity.identifier, enrolled_identity.identifier);
+    assert_ne!(
+        renewed_identity.private_key_pem, enrolled_identity.private_key_pem,
+        "every renewal rotates the keypair"
+    );
+    assert_ne!(
+        renewed_identity.identity_cert_pem, enrolled_identity.identity_cert_pem,
+        "a new leaf is issued"
+    );
+    assert!(
+        renewed_identity.not_after_unix > enrolled_identity.not_after_unix,
+        "the renewed leaf expires later"
+    );
+    assert_eq!(
+        renewed_identity.gateway_addr, enrolled_identity.gateway_addr,
+        "the gateway address is preserved across renewal"
+    );
+    assert_eq!(
+        renewed_identity.ca_bundle_pem, enrolled_identity.ca_bundle_pem,
+        "the CA bundle is preserved across renewal"
+    );
 
     handle.shutdown().await;
 }
 
 #[tokio::test]
 async fn forget_clears_identity_and_exits() {
-    let ca = Arc::new(TestCa::new());
-    let server = ControlServer::new(Arc::clone(&ca));
-    let addr = spawn_tls_server(server.clone()).await;
-
+    let harness = Harness::new(24 * 60 * 60).await;
     let dir = tempfile::tempdir().unwrap();
     let identity_path = dir.path().join("identity.json");
-    let config = tls_config(
-        addr,
-        &ca,
+    let config = harness.config(
         identity_path.clone(),
         dir.path().to_path_buf(),
         Some(ADOPTION_CODE.to_string()),
+        Duration::from_hours(12),
     );
-    let (runtime, _s) = E2eRuntime::new(0);
-    let (handle, _identity) = enroll(&server, &config, runtime).await;
+    let (runtime, _s) = E2eRuntime::new();
+    let (handle, _identity) = enroll(&harness, &config, runtime).await;
     assert!(identity_path.exists(), "identity present after enrollment");
 
     // Server issues Forget.
-    server
+    harness
+        .gateway
         .outbound
         .lock()
         .await
@@ -1105,7 +1446,7 @@ async fn forget_clears_identity_and_exits() {
     let cleared = wait_until(Duration::from_secs(5), || !identity_path.exists()).await;
     assert!(cleared, "Forget must remove identity.json");
 
-    let captured = Arc::clone(&server.captured);
+    let captured = Arc::clone(&harness.gateway.captured);
     let acked = wait_until_async(Duration::from_secs(5), || {
         let captured = Arc::clone(&captured);
         async move {

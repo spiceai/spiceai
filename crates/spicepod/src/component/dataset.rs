@@ -40,6 +40,7 @@ pub enum TimeFormat {
     Timestamptz,
     UnixSeconds,
     UnixMillis,
+    UnixNanos,
     #[serde(rename = "ISO8601")]
     ISO8601,
     Date,
@@ -56,6 +57,7 @@ impl<'de> serde::Deserialize<'de> for TimeFormat {
             "timestamptz" => Ok(TimeFormat::Timestamptz),
             "unix_seconds" => Ok(TimeFormat::UnixSeconds),
             "unix_millis" => Ok(TimeFormat::UnixMillis),
+            "unix_nanos" => Ok(TimeFormat::UnixNanos),
             "iso8601" => Ok(TimeFormat::ISO8601),
             "date" => Ok(TimeFormat::Date),
             _ => Err(serde::de::Error::unknown_variant(
@@ -65,6 +67,7 @@ impl<'de> serde::Deserialize<'de> for TimeFormat {
                     "timestamptz",
                     "unix_seconds",
                     "unix_millis",
+                    "unix_nanos",
                     "ISO8601",
                     "date",
                 ],
@@ -233,6 +236,16 @@ pub struct Dataset {
     /// and report metrics. Dataset availability is only checked if the dataset is not accelerated.
     #[serde(default, skip_serializing_if = "is_default")]
     pub check_availability: CheckAvailability,
+
+    /// How often the runtime probes the (non-accelerated) source backing this
+    /// dataset to confirm it is still reachable. Accepts a duration string
+    /// (e.g. `60s`, `5m`). Availability monitoring is **opt-in**: leave this
+    /// unset and the dataset is not monitored. Only applies to non-accelerated
+    /// datasets with `check_availability: auto`. When a probe fails the dataset
+    /// is marked `Error` (visible via `GET /v1/datasets?status=true`) until a
+    /// later probe succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_availability_interval: Option<String>,
 }
 
 impl Nameable for Dataset {
@@ -268,6 +281,7 @@ impl Dataset {
             vectors: None,
             full_text_search: None,
             check_availability: CheckAvailability::default(),
+            check_availability_interval: None,
         }
     }
 
@@ -358,6 +372,7 @@ impl WithDependsOn<Dataset> for Dataset {
             vectors: self.vectors.clone(),
             full_text_search: self.full_text_search.clone(),
             check_availability: self.check_availability,
+            check_availability_interval: self.check_availability_interval.clone(),
         }
     }
 }
@@ -439,6 +454,8 @@ struct DatasetDeserializer {
     full_text_search: Option<FtsStore>,
     #[serde(default, skip_serializing_if = "is_default")]
     check_availability: CheckAvailability,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    check_availability_interval: Option<String>,
 }
 
 #[expect(deprecated)]
@@ -492,6 +509,7 @@ impl TryFrom<DatasetDeserializer> for Dataset {
             vectors: deserializer.vectors,
             full_text_search: deserializer.full_text_search,
             check_availability: deserializer.check_availability,
+            check_availability_interval: deserializer.check_availability_interval,
         })
     }
 }
@@ -531,6 +549,27 @@ mod check_availability_tests {
         ";
         let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
         assert_eq!(dataset.check_availability, CheckAvailability::Auto);
+    }
+
+    #[test]
+    fn test_check_availability_interval_unset_by_default() {
+        let yaml = r"
+            name: test
+            from: file://test.csv
+        ";
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.check_availability_interval, None);
+    }
+
+    #[test]
+    fn test_check_availability_interval_parsed_from_config() {
+        let yaml = r"
+            name: test
+            from: file://test.csv
+            check_availability_interval: 30s
+        ";
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.check_availability_interval.as_deref(), Some("30s"));
     }
 }
 
@@ -707,6 +746,15 @@ mod tests {
         ";
         let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
         assert_eq!(dataset.time_format, Some(TimeFormat::UnixMillis));
+
+        // Mixed case Unix_Nanos
+        let yaml = r"
+            name: test
+            from: test
+            time_format: Unix_Nanos
+        ";
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.time_format, Some(TimeFormat::UnixNanos));
 
         // Mixed case Timestamptz
         let yaml = r"

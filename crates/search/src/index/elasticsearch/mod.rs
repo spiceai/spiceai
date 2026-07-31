@@ -103,6 +103,10 @@ pub struct ElasticsearchIndex {
     /// Dimensionality of the embedding vectors.
     pub dims: i32,
 
+    /// The Elasticsearch `dense_vector` similarity the index was created with
+    /// (`cosine` | `l2_norm` | `dot_product` | `max_inner_product`).
+    pub similarity: String,
+
     /// Full source schema for extracting fields from Elasticsearch results.
     pub source_schema: SchemaRef,
 

@@ -55,6 +55,11 @@ pub enum Error {
     MissingReplicationPrivilege { role: String },
 
     #[snafu(display(
+        "Cannot start CDC catalog acceleration: PostgreSQL has no free replication slots ({used} of {max} in use; `max_replication_slots` = {max}). Drop an unused slot (inspect `pg_replication_slots`, then `SELECT pg_drop_replication_slot('<slot_name>');`), or raise `max_replication_slots` and restart PostgreSQL. Docs: https://spiceai.org/docs/components/data-connectors/postgres"
+    ))]
+    ReplicationSlotsExhausted { used: i64, max: i64 },
+
+    #[snafu(display(
         "PostgreSQL table {schema}.{table} was not found. It may have been dropped after catalog discovery; it will be retried on the next refresh. Docs: https://spiceai.org/docs/components/data-connectors/postgres"
     ))]
     TableNotFound { schema: String, table: String },
@@ -172,6 +177,74 @@ pub async fn list_tables(
     Ok(names)
 }
 
+/// A view-like relation that cannot be CDC-accelerated, paired with a
+/// human-readable label for the kind of relation it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewRelation {
+    /// The relation name.
+    pub name: String,
+    /// A human-readable label for its `pg_class.relkind` (`view`,
+    /// `materialized view`, or `foreign table`).
+    pub kind: &'static str,
+}
+
+/// Query `pg_catalog.pg_class` for the view-like relations (views `v`,
+/// materialized views `m`, foreign tables `f`) in `schema_name` -- exactly the
+/// relations [`list_tables`] with `include_views = false` deliberately omits
+/// because they cannot be primary-keyed or CDC-accelerated.
+///
+/// The accelerated catalog uses this to *warn* that these relations will not be
+/// replicated, rather than dropping them silently. Uses the same
+/// `has_table_privilege` filter as [`list_tables`] so it never names a relation
+/// the current role cannot read.
+///
+/// # Errors
+///
+/// Returns an error if a connection can't be obtained from `pool`, or the
+/// query fails.
+pub async fn list_views(
+    pool: &PostgresConnectionPool,
+    schema_name: &str,
+) -> Result<Vec<ViewRelation>> {
+    let conn = pool.connect_direct().await.context(ConnectionFailedSnafu)?;
+
+    // 'v' = view, 'm' = materialized view, 'f' = foreign table -- the view-like
+    // relations `list_tables` omits. Bound to a named slice and passed by
+    // reference, matching `list_tables`' relkind pattern.
+    let relkinds: &[&str] = &["v", "m", "f"];
+    let rows = conn
+        .conn
+        .query(
+            "SELECT c.relname, c.relkind::text FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 \
+             AND c.relkind::text = ANY($2) \
+             AND pg_catalog.has_table_privilege(c.oid, 'SELECT') \
+             ORDER BY c.relname",
+            &[&schema_name, &relkinds],
+        )
+        .await
+        .context(QueryFailedSnafu)?;
+
+    let views: Vec<ViewRelation> = rows
+        .iter()
+        .map(|row| {
+            let name: String = row.get(0);
+            let relkind: String = row.get(1);
+            let kind = match relkind.as_str() {
+                "m" => "materialized view",
+                "f" => "foreign table",
+                // "v" and any forward-compatibility surprise map to the generic
+                // label; the query only ever returns v/m/f.
+                _ => "view",
+            };
+            ViewRelation { name, kind }
+        })
+        .collect();
+
+    Ok(views)
+}
+
 /// Query `pg_catalog` for the primary-key columns of `schema_name.table_name`,
 /// in key order. Empty when the table has no primary key.
 ///
@@ -269,6 +342,109 @@ pub async fn check_cdc_prerequisites(pool: &PostgresConnectionPool) -> Result<()
     let can_replicate: bool = row.get(1);
     ensure!(can_replicate, MissingReplicationPrivilegeSnafu { role });
 
+    Ok(())
+}
+
+/// The activity status of a `PostgreSQL` replication slot, read from
+/// `pg_catalog.pg_replication_slots`. `active` is true while a consumer holds
+/// the slot; `active_pid` is that consumer's backend PID when the server exposes
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicationSlotStatus {
+    pub active: bool,
+    pub active_pid: Option<i32>,
+}
+
+/// Look up the status of the replication slot named `slot_name`, returning `None`
+/// if no such slot exists on the server.
+///
+/// Used by CDC catalog acceleration to decide, before it starts streaming,
+/// whether a slot with its deterministic name is already **actively** held by
+/// another consumer (fail loudly) versus merely present-and-inactive (safe to
+/// reuse on restart) versus absent (create fresh).
+///
+/// # Errors
+///
+/// Returns an error if a connection can't be obtained from `pool`, or the
+/// query fails.
+pub async fn replication_slot_status(
+    pool: &PostgresConnectionPool,
+    slot_name: &str,
+) -> Result<Option<ReplicationSlotStatus>> {
+    let conn = pool.connect_direct().await.context(ConnectionFailedSnafu)?;
+    let rows = conn
+        .conn
+        .query(
+            "SELECT active, active_pid FROM pg_catalog.pg_replication_slots WHERE slot_name = $1",
+            &[&slot_name],
+        )
+        .await
+        .context(QueryFailedSnafu)?;
+    Ok(rows.first().map(|row| ReplicationSlotStatus {
+        active: row.get(0),
+        active_pid: row.get(1),
+    }))
+}
+
+/// The server's `wal_sender_timeout` in milliseconds (`0` means disabled).
+///
+/// This bounds how long `PostgreSQL` keeps a slot marked `active` after its
+/// consumer's connection drops ungracefully, so the catalog acceleration path
+/// uses it to size how long it waits for a stale slot to free (e.g. after its
+/// own crash-restart) before deciding another live consumer holds it and failing
+/// loudly.
+///
+/// # Errors
+///
+/// Returns an error if a connection can't be obtained from `pool`, or the
+/// query fails.
+pub async fn wal_sender_timeout_ms(pool: &PostgresConnectionPool) -> Result<i64> {
+    let conn = pool.connect_direct().await.context(ConnectionFailedSnafu)?;
+    // `pg_settings.setting` for `wal_sender_timeout` is expressed in
+    // milliseconds (its `unit` is `ms`), so `::bigint` yields the raw ms value.
+    let row = conn
+        .conn
+        .query_one(
+            "SELECT setting::bigint FROM pg_catalog.pg_settings WHERE name = 'wal_sender_timeout'",
+            &[],
+        )
+        .await
+        .context(QueryFailedSnafu)?;
+    Ok(row.get(0))
+}
+
+/// Ensure the server can create at least one more replication slot -- i.e. the
+/// current slot count is below `max_replication_slots`.
+///
+/// CDC catalog acceleration needs one shared slot; creating it on a server whose
+/// `max_replication_slots` is already exhausted otherwise fails deep in the
+/// replication setup with a cryptic error. Checking up front turns that into an
+/// actionable [`Error::ReplicationSlotsExhausted`] naming the fix.
+///
+/// The caller should skip this when the catalog's slot *already exists* (it will
+/// be reused, not created, so no capacity is consumed) -- see
+/// `AcceleratedCatalogProvider::ensure_catalog_slot_available`.
+///
+/// # Errors
+///
+/// Returns an error if a connection can't be obtained from `pool`, the query
+/// fails, or the server has no free replication slots.
+pub async fn ensure_replication_slot_capacity(pool: &PostgresConnectionPool) -> Result<()> {
+    let conn = pool.connect_direct().await.context(ConnectionFailedSnafu)?;
+    // `current_setting('max_replication_slots')` is text (e.g. "10"); cast to
+    // bigint to compare against the live slot count.
+    let row = conn
+        .conn
+        .query_one(
+            "SELECT (SELECT count(*) FROM pg_catalog.pg_replication_slots)::bigint, \
+             current_setting('max_replication_slots')::bigint",
+            &[],
+        )
+        .await
+        .context(QueryFailedSnafu)?;
+    let used: i64 = row.get(0);
+    let max: i64 = row.get(1);
+    ensure!(used < max, ReplicationSlotsExhaustedSnafu { used, max });
     Ok(())
 }
 
@@ -733,5 +909,17 @@ mod tests {
         assert!(role.contains("replication"), "{role}");
         assert!(role.contains("ALTER ROLE"), "{role}");
         assert!(role.contains("https://spiceai.org/docs"), "{role}");
+
+        let exhausted = Error::ReplicationSlotsExhausted { used: 10, max: 10 }.to_string();
+        assert!(exhausted.contains("10 of 10 in use"), "{exhausted}");
+        assert!(exhausted.contains("max_replication_slots"), "{exhausted}");
+        assert!(
+            exhausted.contains("pg_drop_replication_slot"),
+            "{exhausted}"
+        );
+        assert!(
+            exhausted.contains("https://spiceai.org/docs"),
+            "{exhausted}"
+        );
     }
 }

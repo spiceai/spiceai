@@ -29,7 +29,7 @@ use async_stream::try_stream;
 use data_components::cdc::{ChangesStream, InitialSnapshotMode, StreamError};
 use data_components::postgres_replication::{
     PgOutputFormat, ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams,
-    ReplicationStreamInput, SchemaEvolutionPolicy, config, start_replication_stream_with_policy,
+    ReplicationStreamInput, SchemaEvolutionPolicy, config, start_replication_stream,
 };
 use datafusion::sql::TableReference;
 use futures::StreamExt;
@@ -49,7 +49,7 @@ use secrecy::SecretString;
 const DEFAULT_STATUS_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_BOOTSTRAP_BATCH_SIZE: usize = 8192;
 const MAX_BOOTSTRAP_BATCH_SIZE: usize = 1_048_576;
-// Upper bound on the configurable shared-slot member channel capacity. Matches
+// Upper bound on the configurable shared-slot member mailbox capacity. Matches
 // the bootstrap-batch ceiling — a bounded, backpressure-preserving queue in
 // front of the accelerator prefetch, not an unbounded buffer.
 const MAX_MEMBER_CHANNEL_CAPACITY: usize = 1_048_576;
@@ -230,9 +230,10 @@ pub fn build_changes_stream(
             schema_name,
             table_name,
             metrics,
+            policy: schema_evolution_policy,
         };
 
-        let mut inner = start_replication_stream_with_policy(input, schema_evolution_policy);
+        let mut inner = start_replication_stream(input);
         while let Some(item) = inner.next().await {
             yield item?;
         }
@@ -406,7 +407,7 @@ const METRICS: &[MetricSpec] = &[
     )
     .description(
         "Cumulative seconds the shared-slot pump spent blocked delivering committed \
-         changes into this dataset's channel because its sink was not draining \
+         changes into this dataset's mailbox because its sink was not draining \
          (downstream backpressure). The server replication connection stays alive \
          throughout; a rising value indicates a slow apply loop stalling the shared \
          pump. Only reported for datasets on a shared (explicitly-named) slot.",
@@ -432,7 +433,7 @@ const METRICS: &[MetricSpec] = &[
     )
     .description(
         "Cumulative microseconds the shared-slot pump spent awaiting this dataset's \
-         delivery channel while applying committed changes. Unlike \
+         delivery mailbox while applying committed changes. Unlike \
          member_send_stalled_seconds_total, this accrues the full per-commit wait \
          (including sub-second waits). The pump subtracts this wait from \
          reader_processing_micros_total at the source, so that counter stays \
@@ -440,6 +441,59 @@ const METRICS: &[MetricSpec] = &[
          Only meaningful for datasets on a shared slot; dedicated-slot datasets will export 0.",
     )
     .unit("us")
+    .auto_register(),
+    MetricSpec::new(
+        "replication_member_envelopes_delivered_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description(
+        "Change envelopes the shared-slot pump delivered to this dataset as distinct units \
+         of work. Divide replication_wal_transactions_total by this to get the coalescing \
+         factor the accelerator's apply loop actually sees: adjacent transactions for the \
+         same table are folded into one envelope, so this counter rises more slowly than \
+         the transaction count. Only reported for datasets on a shared (explicitly-named) \
+         slot.",
+    )
+    .auto_register(),
+    MetricSpec::new(
+        "replication_member_envelope_eager_merges_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description(
+        "Committed transactions folded into an envelope the shared-slot pump was still \
+         holding back, before it crossed into this dataset's delivery mailbox. Paired with \
+         member_envelope_mailbox_merges_total, this attributes envelope reduction between \
+         the pump's short hold and mailbox back-pressure. Only reported for datasets on a \
+         shared (explicitly-named) slot.",
+    )
+    .auto_register(),
+    MetricSpec::new(
+        "replication_member_envelope_mailbox_merges_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description(
+        "Committed transactions folded into an envelope already sitting unclaimed in this \
+         dataset's delivery mailbox. This is the back-pressure-driven half of coalescing: \
+         it rises when the sink is not keeping up, which is when collapsing envelopes \
+         matters most, so a rising value alongside a flat \
+         member_send_stalled_seconds_total means back-pressure is being absorbed rather \
+         than stalling the slot. Only reported for datasets on a shared (explicitly-named) \
+         slot.",
+    )
+    .auto_register(),
+    MetricSpec::new(
+        "replication_member_mailbox_coalesce_limited_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description(
+        "Times a committed transaction could not be folded into this dataset's unclaimed \
+         delivery-mailbox tail because a configured bound refused it, rather than because the \
+         changes were not foldable. The mailbox bounds ship deliberately low, since mailbox \
+         folding absorbs back-pressure rather than adding throughput. A value that stays at 0 \
+         means the bounds never bind and there is nothing to tune; a rising value alongside a \
+         rising member_envelope_mailbox_merges_total is the evidence that raising them would \
+         absorb more. Only reported for datasets on a shared (explicitly-named) slot.",
+    )
     .auto_register(),
 ];
 
@@ -599,6 +653,26 @@ impl MetricsProvider for PostgresMetricsProvider {
                     instrument.observe(m.member_send_wait_micros_total(), &attributes);
                 })))
             }
+            "replication_member_envelopes_delivered_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.member_envelopes_delivered_total(), &attributes);
+                })))
+            }
+            "replication_member_envelope_eager_merges_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.member_envelope_eager_merges_total(), &attributes);
+                })))
+            }
+            "replication_member_envelope_mailbox_merges_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.member_envelope_mailbox_merges_total(), &attributes);
+                })))
+            }
+            "replication_member_mailbox_coalesce_limited_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.member_mailbox_coalesce_limited_total(), &attributes);
+                })))
+            }
             _ => None,
         }
     }
@@ -630,20 +704,17 @@ fn replication_params_from_connector_params(
     params: &Parameters,
     dataset_name: &str,
 ) -> std::result::Result<ReplicationParams, String> {
-    let host = required_string(params, "host")?;
-    let port = optional_parse::<u16>(params, "port", 5432, "a port number (0-65535)")?;
-    let user = required_string(params, "user")?;
-    // Optional, mirroring the connection pool (`pg_pass` is `.secret()` but not
-    // `.required()`): the replication connection uses the same credentials as
-    // the bootstrap/pool connection against the same server, so a source that
-    // accepts a passwordless connection (e.g. `trust` auth) must not be forced
-    // to set `pg_pass` here when bootstrap already connected without one.
-    let password_str = optional_string(params, "pass").unwrap_or_default();
-    let database = required_string(params, "db")?;
-    let sslmode =
-        config::SslMode::from_str_strict(optional_string(params, "sslmode").as_deref())
-            .map_err(|reason| format!("parameter `{}` {reason}", params.user_param("sslmode")))?;
-    let sslrootcert = optional_string(params, "sslrootcert").map(std::path::PathBuf::from);
+    // Same override rule / parser as `PostgresConnectionPool` (see
+    // `crate::connection`): `pg_connection_string` wins over discrete
+    // `pg_host`/`pg_user`/`pg_db`/…; discrete `pg_sslmode` / `pg_sslrootcert`
+    // still override values embedded in the connection string.
+    let identity = crate::connection::connection_identity_from_params(params)?;
+    let sslmode = config::SslMode::from_str_strict(identity.sslmode.as_deref())
+        .map_err(|reason| format!("parameter `{}` {reason}", params.user_param("sslmode")))?;
+    let sslrootcert = identity
+        .sslrootcert
+        .as_deref()
+        .map(config::ca_certificate_from_param);
 
     // An explicitly-named slot is shareable: every dataset on the same
     // connection naming the same slot is multiplexed onto one replication
@@ -654,6 +725,12 @@ fn replication_params_from_connector_params(
     let shared = explicit_slot.is_some();
     let (slot_name, publication_name) = match explicit_slot {
         Some(slot) => {
+            config::validate_replication_slot_name(&slot).map_err(|reason| {
+                format!(
+                    "parameter `{}` {reason}",
+                    params.user_param("replication_slot")
+                )
+            })?;
             let publication = optional_string(params, "publication")
                 .unwrap_or_else(|| config::publication_name_for_slot(&slot));
             (slot, publication)
@@ -692,11 +769,11 @@ fn replication_params_from_connector_params(
     )?;
 
     Ok(ReplicationParams {
-        host,
-        port,
-        user,
-        password: SecretString::from(password_str),
-        database,
+        host: identity.host,
+        port: identity.port,
+        user: identity.user,
+        password: SecretString::from(identity.password),
+        database: identity.database,
         sslmode,
         sslrootcert,
         slot_name,
@@ -714,13 +791,6 @@ fn replication_params_from_connector_params(
         // still handles types Postgres emits as text.
         pg_output_format: PgOutputFormat::Binary,
     })
-}
-
-fn required_string(params: &Parameters, key: &str) -> std::result::Result<String, String> {
-    match params.get(key).expose() {
-        ExposedParamLookup::Present(v) => Ok(v.to_string()),
-        ExposedParamLookup::Absent(name) => Err(format!("missing required parameter `{name}`")),
-    }
 }
 
 fn optional_string(params: &Parameters, key: &str) -> Option<String> {
@@ -851,6 +921,7 @@ fn parse_initial_snapshot(params: &Parameters) -> std::result::Result<(bool, boo
 /// Parses an optional value via `FromStr`. An absent or empty value uses
 /// `default`; a parse failure is reported with the user-facing parameter name
 /// and `expected` description rather than silently substituting the default.
+#[cfg(test)]
 fn optional_parse<T>(
     params: &Parameters,
     key: &str,
@@ -926,6 +997,7 @@ fn extract_primary_keys(provider: &Arc<dyn datafusion::datasource::TableProvider
 #[cfg(test)]
 mod tests {
     use super::*;
+    use data_components::postgres_replication::CaCertificate;
 
     fn params_with_bootstrap_batch_size(value: &str) -> Parameters {
         Parameters::new(
@@ -948,6 +1020,144 @@ mod tests {
 
     fn empty_params() -> Parameters {
         Parameters::new(vec![], "pg", crate::PARAMETERS)
+    }
+
+    /// Self-signed CA (`CN=Spice Replication Test CA`, `CA:TRUE`), expiring in 2126.
+    const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIC4DCCAcigAwIBAgIJAODHR+uzOPBvMA0GCSqGSIb3DQEBCwUAMCQxIjAgBgNV
+BAMMGVNwaWNlIFJlcGxpY2F0aW9uIFRlc3QgQ0EwIBcNMjYwNzI4MDU0MDQ0WhgP
+MjEyNjA3MDQwNTQwNDRaMCQxIjAgBgNVBAMMGVNwaWNlIFJlcGxpY2F0aW9uIFRl
+c3QgQ0EwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCzoou00DrTAevF
+RZ6+PFmSBUhzZXsABQFztlPigZzJ1m8hnja66hnkWKyIid9DcitnjkWgtQZCVxm6
+s05tM6QAy5lI2wlfWD7hQi+yIWKv2dcVuD/J4hWPjmG5a5VtRAInV0yBymkCRI6Z
+68JYfvKh+Rku1y6H3dUfNm8dxCbo589L1U8ucJqlQv9Iy/X7Lze+pj2JFU/L1g3t
+k/5ziVgJjdh3VetrHkU1YOiHRPFsqXOxXc2lpzUjd23QR3FfkZkVgLUfEvPWHRSf
+xipaPFhllw9WUWEl6bVqAGO0btPO1OKKqBlIcizf2YO2+lFs/o0e7bApGzI3l5HP
+VZr/e6ZLAgMBAAGjEzARMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQAD
+ggEBACC1XMNpbA+172MQks9R7cqRY5I0HObJRX3dpIsOqrm3EUcHMt9kx7QrO1Af
+gzAWC0ZNHppeU/cuq9ZKZQiFrSmr5fKtXzsxkvgLYRCFO+ZCKZl9k3z9j0AQbTPR
+klJa4bo2SS6WbmoATimD6e0moT++neRIDx7MlijtWB8grfhuH7yFN9xoTRDgdYBU
+KLeFNAIi+S5cVzUwjMiOQnmljphKSRoQnihpA/c6WAVAN3VqMdoPpfmR2pTi7rio
+38busw0nt/y+JCVWzNDr/i5f3mvNi5SaHZ5PTOVnocyMUw+ysx5eQOrJwrirW9XD
+TXTE85+Or9IUwDI9543jsyCvuQ8=
+-----END CERTIFICATE-----
+";
+
+    /// A complete connection, so parsing reaches `sslrootcert` instead of
+    /// aborting on a missing required parameter.
+    fn params_with_sslrootcert(value: &str) -> Parameters {
+        Parameters::new(
+            vec![
+                ("host".to_string(), SecretString::from("pg.internal")),
+                ("user".to_string(), SecretString::from("spice")),
+                ("db".to_string(), SecretString::from("myapp")),
+                ("sslmode".to_string(), SecretString::from("verify-full")),
+                ("sslrootcert".to_string(), SecretString::from(value)),
+            ],
+            "pg",
+            crate::PARAMETERS,
+        )
+    }
+
+    /// `pg_sslrootcert` is documented as accepting a path *or* inline PEM
+    /// content, and a CA injected as a secret arrives as content. Both spellings
+    /// must reach the replication stream as a usable trust anchor.
+    #[test]
+    fn inline_pem_sslrootcert_reaches_replication_params_as_content() {
+        let repl =
+            replication_params_from_connector_params(&params_with_sslrootcert(TEST_CA_PEM), "hits")
+                .expect("inline PEM sslrootcert should parse");
+
+        assert_eq!(repl.sslmode, config::SslMode::VerifyFull);
+        assert_eq!(
+            repl.sslrootcert,
+            Some(CaCertificate::Pem(TEST_CA_PEM.as_bytes().to_vec())),
+            "inline PEM must not be reinterpreted as a filesystem path"
+        );
+    }
+
+    #[test]
+    fn inline_pem_sslrootcert_survives_a_single_line_secret() {
+        let repl = replication_params_from_connector_params(
+            &params_with_sslrootcert(&TEST_CA_PEM.replace('\n', "\\n")),
+            "hits",
+        )
+        .expect("single-line inline PEM sslrootcert should parse");
+
+        assert_eq!(
+            repl.sslrootcert,
+            Some(CaCertificate::Pem(TEST_CA_PEM.as_bytes().to_vec()))
+        );
+    }
+
+    #[test]
+    fn path_sslrootcert_reaches_replication_params_as_a_path() {
+        let repl = replication_params_from_connector_params(
+            &params_with_sslrootcert("/etc/ssl/pg-ca.pem"),
+            "hits",
+        )
+        .expect("sslrootcert path should parse");
+
+        assert_eq!(
+            repl.sslrootcert,
+            Some(CaCertificate::Path("/etc/ssl/pg-ca.pem".into()))
+        );
+    }
+
+    // Regression for #11994: CDC must honor `pg_connection_string` the same way
+    // as the federated read pool (libpq key=value; default sslmode verify-full).
+    #[test]
+    fn connection_string_flows_into_replication_params() {
+        let params = Parameters::new(
+            vec![
+                (
+                    "connection_string".to_string(),
+                    SecretString::from(
+                        "host=db.internal port=5433 dbname=csdb user=csuser password=secret",
+                    ),
+                ),
+                ("host".to_string(), SecretString::from("ignored")),
+            ],
+            "pg",
+            crate::PARAMETERS,
+        );
+        let repl = replication_params_from_connector_params(&params, "hits")
+            .expect("valid connection_string should parse");
+        assert_eq!(repl.host, "db.internal");
+        assert_eq!(repl.port, 5433);
+        assert_eq!(repl.user, "csuser");
+        assert_eq!(repl.database, "csdb");
+        assert_eq!(repl.sslmode, config::SslMode::VerifyFull);
+        assert_eq!(
+            secrecy::ExposeSecret::expose_secret(&repl.password),
+            "secret"
+        );
+    }
+
+    #[test]
+    fn uri_connection_string_flows_into_replication_params() {
+        let params = Parameters::new(
+            vec![
+                (
+                    "connection_string".to_string(),
+                    SecretString::from("postgresql://csuser:secret@db.internal:5433/csdb"),
+                ),
+                ("host".to_string(), SecretString::from("ignored")),
+            ],
+            "pg",
+            crate::PARAMETERS,
+        );
+        let repl = replication_params_from_connector_params(&params, "hits")
+            .expect("URI connection_string should parse for CDC");
+        assert_eq!(repl.host, "db.internal");
+        assert_eq!(repl.port, 5433);
+        assert_eq!(repl.user, "csuser");
+        assert_eq!(repl.database, "csdb");
+        assert_eq!(repl.sslmode, config::SslMode::VerifyFull);
+        assert_eq!(
+            secrecy::ExposeSecret::expose_secret(&repl.password),
+            "secret"
+        );
     }
 
     #[test]
@@ -1147,5 +1357,42 @@ mod tests {
                     "parameter `pg_replication_bootstrap_batch_size` must be a positive integer, got \"many\""
                 )
         );
+    }
+
+    fn replication_connection_params(slot: Option<&str>) -> Parameters {
+        let mut entries = vec![
+            ("host".to_string(), SecretString::from("localhost")),
+            ("user".to_string(), SecretString::from("spice")),
+            ("db".to_string(), SecretString::from("spice")),
+        ];
+        if let Some(slot) = slot {
+            entries.push(("replication_slot".to_string(), SecretString::from(slot)));
+        }
+        Parameters::new(entries, "pg", crate::PARAMETERS)
+    }
+
+    #[test]
+    fn replication_params_rejects_invalid_slot_name() {
+        let params =
+            replication_connection_params(Some("scp-onboarding-realtime-analytics-prod-us-east-1"));
+        let err = replication_params_from_connector_params(&params, "hits")
+            .expect_err("hyphenated slot must be rejected");
+        assert!(
+            err.starts_with("parameter `pg_replication_slot` must contain only lowercase"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains("invalid character '-'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn replication_params_accepts_valid_explicit_slot_name() {
+        let params = replication_connection_params(Some("spice_hits_cdc"));
+        let parsed = replication_params_from_connector_params(&params, "hits")
+            .expect("valid slot must parse");
+        assert_eq!(parsed.slot_name, "spice_hits_cdc");
+        assert!(parsed.shared);
     }
 }

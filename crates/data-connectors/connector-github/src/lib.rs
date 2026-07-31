@@ -15,6 +15,7 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
+use crate::github::{GithubFilesTableProvider, GithubRestClient};
 use crate::members::MembersTableArgs;
 use crate::pull_requests::PullRequestCommentType;
 use arrow::array::{Array, RecordBatch};
@@ -22,17 +23,14 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use chrono::{SecondsFormat, TimeZone, Utc, offset::LocalResult};
 use commits::{CommitsTableArgs, CommitsTableProvider};
-use data_components::graphql::client::UnnestBehavior;
-use data_components::{
-    github::{self, GithubFilesTableProvider, GithubRestClient},
-    graphql::{
-        self, FilterPushdownResult, GraphQLContext,
-        builder::GraphQLClientBuilder,
-        client::{GraphQLClient, GraphQLQuery, PaginationParameters},
-        provider::{GraphQLTableProvider, GraphQLTableProviderBuilder},
-    },
-    rate_limit::RateLimiter,
+use connector_graphql::graphql::client::UnnestBehavior;
+use connector_graphql::graphql::{
+    self, FilterPushdownResult, GraphQLContext,
+    builder::GraphQLClientBuilder,
+    client::{GraphQLClient, GraphQLQuery, PaginationParameters},
+    provider::{GraphQLTableProvider, GraphQLTableProviderBuilder},
 };
+use data_components::rate_limit::RateLimiter;
 use datafusion::{
     common::Column,
     datasource::TableProvider,
@@ -69,6 +67,8 @@ use runtime::dataconnector::{
     DataConnectorResult, NewDataConnectorResult,
 };
 use runtime::parameters::{ParameterSpec, Parameters};
+
+pub mod github;
 
 mod commits;
 mod issues;
@@ -854,7 +854,7 @@ impl DataConnectorFactory for GithubFactory {
             None
         } else {
             match resolve_runtime_github_concurrent_connections_limit(
-                params.app.as_deref(),
+                params.app().as_deref(),
                 &connector_component,
             ) {
                 Ok(value) => value,
@@ -1905,6 +1905,7 @@ mod tests {
     };
     use runtime::Runtime;
     use runtime::component::dataset::builder::DatasetBuilder;
+    use runtime::dataconnector::parameters::RuntimeConnectorContext;
     use runtime::dataconnector::{
         ConnectorComponent, ConnectorParams, DataConnectorError, DataConnectorFactory,
     };
@@ -1969,8 +1970,7 @@ mod tests {
             parameters,
             unsupported_type_action: None,
             component: ConnectorComponent::from(&dataset),
-            app: Some(app),
-            runtime: Some(runtime),
+            context: Some(Arc::new(RuntimeConnectorContext::new(app, runtime))),
             io_runtime: tokio::runtime::Handle::current(),
         }
     }

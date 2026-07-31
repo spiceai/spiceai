@@ -413,6 +413,19 @@ impl VectorSearchTableFunc {
             );
         }
 
+        // Compound (writethrough) vector indexes: an in-memory warm index paired with a
+        // vector engine index. Registered instead of the engine's concrete index, so
+        // this arm is what discovers a warm-wrapped engine index.
+        if let Some((compound_indexes, _)) =
+            find_index_in_table_provider::<search::index::compound::CompoundVectorIndex>(tbl)
+        {
+            vector_indexes.extend(
+                compound_indexes
+                    .into_iter()
+                    .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>),
+            );
+        }
+
         if vector_indexes.is_empty() {
             return Ok(None);
         }

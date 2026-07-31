@@ -53,15 +53,17 @@ limitations under the License.
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use app::App;
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
 use data_components::postgres::provider::{
-    ReplicaIdentityOutcome, check_cdc_prerequisites, classify_replica_identity, list_schemas,
-    list_tables, replica_identity,
+    ReplicaIdentityOutcome, check_cdc_prerequisites, classify_replica_identity,
+    ensure_replication_slot_capacity, list_schemas, list_tables, list_views, replica_identity,
+    replication_slot_status, wal_sender_timeout_ms,
 };
-use data_components::postgres_replication::config::default_slot_name;
+use data_components::postgres_replication::config::catalog_slot_name;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use datafusion::common::TableReference;
 use datafusion::common::utils::quote_identifier;
@@ -92,6 +94,15 @@ const REPLICATION_SLOT_PARAM: &str = "pg_replication_slot";
 /// Accelerator engine name written onto every synthesized per-table dataset.
 /// Matches `CatalogAccelerationEngine`'s only variant.
 const CAYENNE_ENGINE: &str = "cayenne";
+
+/// Docs link appended to every user-facing warning and error this module emits
+/// (the skip warning, the REPLICA IDENTITY FULL warning, the view "not
+/// replicated" warning, and the no-eligible-tables error), so each points at the
+/// same actionable reference (see item D of #11850: standardize messages on
+/// "primary key" / "REPLICA IDENTITY FULL / USING INDEX" and always include a
+/// docs link). The purely informational USING INDEX acceleration line is not a
+/// warning/error and omits it.
+const DOCS_URL: &str = "https://spiceai.org/docs/components/data-connectors/postgres";
 
 fn table_is_selected(
     schema_name: &str,
@@ -203,6 +214,11 @@ struct AccelerationSummary {
     full: usize,
     skipped: usize,
     excluded: usize,
+    /// View-like relations (views, materialized views, foreign tables) selected
+    /// by `include`/`exclude` that cannot be CDC-accelerated. Not counted among
+    /// the discovered *tables* -- reported separately so a view produces a
+    /// "not replicated" warning instead of being dropped silently (#11911).
+    views_not_replicated: usize,
 }
 
 impl AccelerationSummary {
@@ -219,6 +235,14 @@ impl AccelerationSummary {
         self.primary_key + self.unique_index + self.full
     }
 
+    /// Total *tables* discovery looked at: accelerated (any kind) + skipped for
+    /// lacking a usable replica identity + excluded by filters. Excludes
+    /// view-like relations, which aren't tables. Used for the "0 of N discovered
+    /// tables" fail-loud message.
+    fn discovered_tables(&self) -> usize {
+        self.accelerated_total() + self.skipped + self.excluded
+    }
+
     /// Fold another schema's summary into this one.
     fn add(&mut self, other: &Self) {
         self.primary_key += other.primary_key;
@@ -226,13 +250,28 @@ impl AccelerationSummary {
         self.full += other.full;
         self.skipped += other.skipped;
         self.excluded += other.excluded;
+        self.views_not_replicated += other.views_not_replicated;
     }
 
     /// The single startup summary line, naming the shared slot and breaking the
-    /// accelerated count down by acceleration kind.
+    /// accelerated count down by acceleration kind. Closes with a note on the
+    /// discovery scope: `refresh()` re-runs on the catalog's periodic interval,
+    /// so a table *added* to a selected schema later is picked up and accelerated
+    /// on the next refresh -- but schema changes to existing tables and
+    /// renamed/dropped tables are not tracked (documented non-goals).
     fn summary_message(&self, catalog_name: &str, slot_name: &str) -> String {
+        // Only mention views when there are some, so the common (view-free) case
+        // stays terse.
+        let views_clause = if self.views_not_replicated > 0 {
+            format!(
+                " {} view(s)/materialized view(s)/foreign table(s) not replicated (see warnings);",
+                self.views_not_replicated
+            )
+        } else {
+            String::new()
+        };
         format!(
-            "Catalog '{catalog_name}': accelerating {} table(s) via CDC ({} via primary key, {} via REPLICA IDENTITY USING INDEX, {} via REPLICA IDENTITY FULL; shared replication slot '{slot_name}'); {} table(s) excluded by include/exclude filters; {} table(s) skipped (no usable replica identity -- see warnings).",
+            "Catalog '{catalog_name}': accelerating {} table(s) via CDC ({} via primary key, {} via REPLICA IDENTITY USING INDEX, {} via REPLICA IDENTITY FULL; shared replication slot '{slot_name}'); {} table(s) excluded by include/exclude filters; {} table(s) skipped (no usable replica identity -- see warnings);{views_clause} tables added to these schema(s) later are picked up on the periodic catalog refresh; schema changes to existing tables, and renamed or dropped tables, are not tracked.",
             self.accelerated_total(),
             self.primary_key,
             self.unique_index,
@@ -260,6 +299,10 @@ impl AccelerationSummary {
             .record(count_as_u64(self.skipped), &category("skipped"));
         runtime_metrics::catalogs::ACCELERATION_TABLES
             .record(count_as_u64(self.excluded), &category("excluded"));
+        runtime_metrics::catalogs::ACCELERATION_TABLES.record(
+            count_as_u64(self.views_not_replicated),
+            &category("views_not_replicated"),
+        );
 
         let kind = |k: AccelerationKind, n: usize| {
             runtime_metrics::catalogs::ACCELERATION_TABLES_BY_KIND.record(
@@ -287,20 +330,74 @@ struct SpawnedTable {
 }
 
 /// Discovery found no CDC-eligible table in the catalog. A hard, actionable
-/// startup error (see [`AcceleratedCatalogProvider::refresh`]): catalog
-/// discovery is one-shot (tables added after startup are a documented non-goal),
-/// so an empty result is a configuration problem to surface, not an empty
-/// catalog to register silently. `postgres.rs` maps this to a permanent
-/// configuration error.
+/// startup error (see [`AcceleratedCatalogProvider::refresh`]): failing the
+/// *initial* refresh means the catalog never registers -- and so never gets a
+/// periodic refresh to reconsider -- so an empty result is a configuration
+/// problem to surface, not an empty catalog to register silently. `postgres.rs`
+/// maps this to a permanent configuration error.
 #[derive(Debug, Snafu)]
 #[snafu(display(
-    "Catalog '{catalog}': no tables are eligible for CDC acceleration ({excluded} excluded by include/exclude filters, {skipped} skipped for lacking a usable REPLICA IDENTITY). Give each table a usable CDC key -- a primary key (which REPLICA IDENTITY DEFAULT or FULL then keys on), or a UNIQUE NOT NULL index set as REPLICA IDENTITY USING INDEX -- and ensure the catalog's `include`/`exclude` patterns match them. Note that REPLICA IDENTITY FULL without a primary key is still skipped. Docs: https://spiceai.org/docs/components/data-connectors/postgres"
+    "Catalog '{catalog}': 0 of {discovered} discovered table(s) are eligible for CDC acceleration ({skipped} have no primary key or usable REPLICA IDENTITY; {excluded} excluded by include/exclude filters).{views_note} Give each table a usable CDC key -- a primary key (which REPLICA IDENTITY DEFAULT or FULL then keys on), or a UNIQUE NOT NULL index set as REPLICA IDENTITY USING INDEX -- and ensure the catalog's `include`/`exclude` patterns match them. Note that REPLICA IDENTITY FULL without a primary key is still skipped. Docs: {DOCS_URL}"
 ))]
 pub(crate) struct NoEligibleTablesError {
     catalog: String,
+    /// Total tables looked at (skipped + excluded here, since accelerated is 0).
+    /// Excludes view-like relations, which aren't tables -- so a schema of only
+    /// views yields `0 of 0`; `views_note` then explains where those relations
+    /// went (see [`AcceleratedCatalogProvider::refresh`]).
+    discovered: usize,
     excluded: usize,
     skipped: usize,
+    /// Pre-rendered so the `Display` needs no conditional formatting: a leading-
+    /// space sentence naming any view-like relations found (so a `0 of 0`
+    /// only-views case isn't confusing), or empty when there were none.
+    views_note: String,
 }
+
+/// The catalog's deterministic replication slot is already actively held by
+/// another consumer. Because the slot name is derived purely from the catalog
+/// (see [`catalog_slot_name`]) and `PostgreSQL` permits a single consumer per
+/// slot, this means a second Spice instance (or process) is already streaming
+/// this catalog's changes. Surfaced only after a bounded wait (see
+/// [`AcceleratedCatalogProvider::ensure_catalog_slot_available`]) that already
+/// absorbs the legitimate hand-off cases -- a fast self-restart, or a rolling
+/// deploy whose predecessor is shutting down -- by giving the server up to
+/// `wal_sender_timeout` to release a now-dead consumer's slot. If a *live*
+/// consumer still holds it past that window, `postgres.rs` maps this to a
+/// permanent configuration error (terminal ERROR status, no retry loop): running
+/// two instances against one catalog is a misconfiguration to surface loudly,
+/// not to silently keep retrying.
+#[derive(Debug, Snafu)]
+#[snafu(display(
+    "Catalog '{catalog}': replication slot '{slot_name}' is already in use by {active_consumer} after waiting {waited_secs}s. Another Spice instance (or process) is already streaming this catalog's changes -- PostgreSQL permits only one consumer per replication slot. Ensure only one Spice instance accelerates this catalog, or stop the other consumer. Docs: https://spiceai.org/docs/components/data-connectors/postgres"
+))]
+pub(crate) struct SlotInUseError {
+    catalog: String,
+    slot_name: String,
+    /// Pre-rendered so the `Display` string needs no `Option` formatting, e.g.
+    /// `"PID 1234"` or `"an unknown backend"`.
+    active_consumer: String,
+    waited_secs: u64,
+}
+
+/// How long to wait, beyond the server's `wal_sender_timeout`, for a slot that a
+/// crashed consumer still holds `active` to be released before concluding a
+/// different live consumer owns it. `PostgreSQL` frees the slot within
+/// milliseconds of the walsender exiting (at ~`wal_sender_timeout`), so this is
+/// a small buffer for scheduling/poll granularity, not a second full timeout.
+const SLOT_RELEASE_GRACE: Duration = Duration::from_secs(5);
+/// Fallback wait budget when `wal_sender_timeout` is `0` (disabled), since then
+/// the server won't time out a dropped consumer on its own.
+const SLOT_WAIT_BUDGET_WHEN_TIMEOUT_DISABLED: Duration = Duration::from_secs(90);
+/// Absolute safety ceiling on the slot-availability wait. The wait is normally
+/// the server's `wal_sender_timeout` (+ [`SLOT_RELEASE_GRACE`]) so we wait
+/// exactly as long as `PostgreSQL` takes to release a dead consumer's slot; this
+/// only bounds a pathologically large (or misconfigured) `wal_sender_timeout` so
+/// catalog startup can't hang for an unreasonable time. The default 60s
+/// `wal_sender_timeout` is far under this.
+const SLOT_WAIT_BUDGET_CAP: Duration = Duration::from_mins(10);
+/// How often to re-poll the slot's activity while waiting for it to free.
+const SLOT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// A catalog provider that CDC-accelerates every table it discovers (subject
 /// to `include`/`exclude`), holding its own `PostgreSQL` connection directly
@@ -347,7 +444,7 @@ impl std::fmt::Debug for AcceleratedCatalogProvider {
 impl AcceleratedCatalogProvider {
     #[must_use]
     pub fn new(catalog: &Catalog, pool: Arc<PostgresConnectionPool>) -> Self {
-        let slot_name = default_slot_name(&catalog.name);
+        let slot_name = catalog_slot_name(&catalog.name);
 
         // Seed from the catalog's connection params, then let `dataset_params`
         // override -- the same precedence other catalog connectors use (e.g.
@@ -367,6 +464,127 @@ impl AcceleratedCatalogProvider {
             exclude: catalog.exclude.clone().map(Arc::new),
             schemas: RwLock::new(HashMap::new()),
             spawned: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Fail loudly, before spawning anything, if this catalog's deterministic
+    /// replication slot is already **actively** held by another consumer.
+    ///
+    /// Because [`catalog_slot_name`] derives the slot name purely from the
+    /// catalog (no instance component), a second Spice instance pointed at the
+    /// same catalog resolves to the *same* slot -- and `PostgreSQL` permits only
+    /// one consumer per slot. So:
+    ///
+    ///   - slot absent -> a new slot will be created, so first check the server
+    ///     has capacity ([`ensure_replication_slot_capacity`]) and fail loudly if
+    ///     `max_replication_slots` is exhausted; otherwise return;
+    ///   - slot present but inactive -> return; it is reused (a restart/reschedule
+    ///     resumes from its `restart_lsn`, no re-snapshot), so no capacity is used;
+    ///   - slot present and active -> another consumer holds it. But a fast
+    ///     self-restart after an ungraceful exit can *also* see the slot active
+    ///     (the server keeps the dead consumer's slot active until
+    ///     `wal_sender_timeout`), so we poll for a bounded window sized from the
+    ///     server's `wal_sender_timeout` before concluding a *different* live
+    ///     consumer owns it and returning [`SlotInUseError`].
+    ///
+    /// Only meaningful before this catalog owns the slot; callers guard on
+    /// "nothing spawned yet" so a periodic refresh never trips over *our own*
+    /// active slot.
+    async fn ensure_catalog_slot_available(
+        &self,
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Size the wait from the server's wal_sender_timeout: that is how long
+        // PostgreSQL keeps a crashed consumer's slot marked active before its
+        // walsender exits and the slot is released. Wait exactly that long (plus
+        // a small grace for the server to actually clear the flag) so a legitimate
+        // hand-off -- a fast self-restart, or a rolling deploy whose predecessor
+        // is still shutting down -- reclaims the slot before we treat it as taken
+        // by a live consumer. `0` disables the timeout, so fall back to a fixed
+        // window; [`SLOT_WAIT_BUDGET_CAP`] only bounds a pathologically large
+        // value so startup can't hang.
+        let timeout_ms = wal_sender_timeout_ms(&self.pool)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        let budget = if timeout_ms > 0 {
+            Duration::from_millis(u64::try_from(timeout_ms).unwrap_or(u64::MAX))
+                .saturating_add(SLOT_RELEASE_GRACE)
+                .min(SLOT_WAIT_BUDGET_CAP)
+        } else {
+            SLOT_WAIT_BUDGET_WHEN_TIMEOUT_DISABLED
+        };
+        // Human-readable derivation of `budget`, for the wait log.
+        let wait_basis = if timeout_ms > 0 {
+            format!(
+                "wal_sender_timeout {}s + {}s grace",
+                timeout_ms / 1000,
+                SLOT_RELEASE_GRACE.as_secs(),
+            )
+        } else {
+            format!(
+                "wal_sender_timeout disabled, {}s fallback",
+                SLOT_WAIT_BUDGET_WHEN_TIMEOUT_DISABLED.as_secs(),
+            )
+        };
+
+        let start = tokio::time::Instant::now();
+        let deadline = start + budget;
+        // Warn only once, when the wait begins -- the loop re-polls every
+        // `SLOT_POLL_INTERVAL`, so warning each iteration would emit up to
+        // hundreds of lines during a full conflict window. Subsequent polls log
+        // at debug.
+        let mut warned = false;
+        loop {
+            let status = replication_slot_status(&self.pool, &self.slot_name)
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            match status {
+                // Absent: a new slot will be created for this catalog, so verify
+                // the server has capacity now -- an exhausted `max_replication_slots`
+                // otherwise fails later, deep in replication setup, with a cryptic
+                // error instead of an actionable one at startup.
+                None => {
+                    ensure_replication_slot_capacity(&self.pool)
+                        .await
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                    return Ok(());
+                }
+                // Present but inactive: reused, not created -- no capacity consumed.
+                Some(status) if !status.active => return Ok(()),
+                Some(status) => {
+                    let active_consumer = status.active_pid.map_or_else(
+                        || "an unknown backend".to_string(),
+                        |pid| format!("PID {pid}"),
+                    );
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(Box::new(SlotInUseError {
+                            catalog: self.catalog_name.clone(),
+                            slot_name: self.slot_name.clone(),
+                            active_consumer,
+                            waited_secs: start.elapsed().as_secs(),
+                        }));
+                    }
+                    if warned {
+                        tracing::debug!(
+                            "Catalog '{}': replication slot '{}' still in use by {}; continuing to wait (up to {}s total).",
+                            self.catalog_name,
+                            self.slot_name,
+                            active_consumer,
+                            budget.as_secs(),
+                        );
+                    } else {
+                        tracing::warn!(
+                            "Catalog '{}': replication slot '{}' is currently in use by {} -- a previous instance may still be shutting down. Waiting up to {}s ({}) for the slot to be released before failing.",
+                            self.catalog_name,
+                            self.slot_name,
+                            active_consumer,
+                            budget.as_secs(),
+                            wait_basis,
+                        );
+                        warned = true;
+                    }
+                    tokio::time::sleep(SLOT_POLL_INTERVAL).await;
+                }
+            }
         }
     }
 
@@ -507,7 +725,7 @@ impl AcceleratedCatalogProvider {
                     ReplicaIdentityOutcome::Skip { reason } => {
                         summary.skipped += 1;
                         tracing::warn!(
-                            "Catalog '{}': skipping table {table_path}: {}. Exclude it via the catalog's `include`/`exclude` patterns to suppress this warning.",
+                            "Catalog '{}': skipping table {table_path}: {}. Exclude it via the catalog's `include`/`exclude` patterns to suppress this warning. Docs: {DOCS_URL}",
                             self.catalog_name,
                             reason.explanation(),
                         );
@@ -524,7 +742,7 @@ impl AcceleratedCatalogProvider {
                     }
                     ReplicaIdentityOutcome::AccelerateFullReplicaIdentity { key } => {
                         tracing::warn!(
-                            "Catalog '{}': accelerating table {table_path} with REPLICA IDENTITY FULL (keyed by ({})) -- heavier than DEFAULT/USING INDEX: PostgreSQL logs the full old-row image on every UPDATE/DELETE. Prefer a primary key or USING INDEX where possible.",
+                            "Catalog '{}': accelerating table {table_path} with REPLICA IDENTITY FULL (keyed by ({})) -- heavier than DEFAULT/USING INDEX: PostgreSQL logs the full old-row image on every UPDATE/DELETE. Prefer a primary key or USING INDEX where possible. Docs: {DOCS_URL}",
                             self.catalog_name,
                             key.join(", "),
                         );
@@ -547,6 +765,39 @@ impl AcceleratedCatalogProvider {
             };
 
             tables.insert(table_name, dataset_name);
+        }
+
+        // View-like relations (views, materialized views, foreign tables) can't
+        // be CDC-accelerated. Rather than dropping them silently, warn once per
+        // selected relation that it won't be replicated (#11911 tracks adding
+        // support). `include`/`exclude` suppress the warning the same way they do
+        // for skipped tables. These are counted separately from the discovered
+        // *tables* -- a view is neither accelerated, skipped-for-replica-identity,
+        // nor a filtered-out table.
+        let views = list_views(&self.pool, schema_name)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        for view in views {
+            if !table_is_selected(
+                schema_name,
+                &view.name,
+                self.include.as_deref(),
+                self.exclude.as_deref(),
+            ) {
+                continue;
+            }
+            summary.views_not_replicated += 1;
+            let view_path = format!(
+                "{}.{}",
+                quote_identifier(schema_name),
+                quote_identifier(&view.name)
+            );
+            tracing::warn!(
+                "Catalog '{}': {} {view_path} is not replicated -- {}s cannot be CDC-accelerated (no REPLICA IDENTITY). It is absent from the accelerated catalog; query it through a non-accelerated catalog or dataset instead. Exclude it via the catalog's `include`/`exclude` patterns to suppress this warning. Docs: {DOCS_URL}",
+                self.catalog_name,
+                view.kind,
+                view.kind,
+            );
         }
 
         Ok(SchemaPlan {
@@ -589,6 +840,16 @@ impl RefreshableCatalogProvider for AcceleratedCatalogProvider {
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
+        // Before this catalog owns its shared slot, fail loudly if another live
+        // consumer already holds it (its deterministic name means a second Spice
+        // instance would otherwise silently compete for the single-consumer
+        // slot). Guarded to the pre-ownership window -- once we've spawned our own
+        // datasets, the slot is active because *we* hold it, so a periodic refresh
+        // must not re-run this check and trip over ourselves.
+        if self.spawned.read().is_empty() {
+            self.ensure_catalog_slot_available().await?;
+        }
+
         let schema_names = list_schemas(&self.pool)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
@@ -607,18 +868,32 @@ impl RefreshableCatalogProvider for AcceleratedCatalogProvider {
             plans.push((schema_name.clone(), plan));
         }
 
-        // Fail loudly when nothing is eligible: catalog discovery is one-shot
-        // (auto-detecting tables added after startup is a documented non-goal),
-        // so an empty result is a configuration problem to surface -- not an
-        // empty catalog to register silently. Returned before spawning or
-        // swapping `self.schemas`, so a later refresh that transiently sees zero
-        // leaves any previously-registered schemas intact. `postgres.rs` maps
-        // this to a permanent configuration error (ERROR status, no retry loop).
+        // Fail loudly when nothing is eligible: an empty result is a
+        // configuration problem to surface, not an empty catalog to register
+        // silently. Returned before spawning or swapping `self.schemas`, so a
+        // *later* periodic refresh that transiently sees zero leaves any
+        // previously-registered schemas intact. On the *initial* refresh,
+        // `postgres.rs` maps this to a permanent configuration error (ERROR
+        // status, catalog never registers -- see `NoEligibleTablesError`).
         if summary.accelerated_total() == 0 {
+            // When the only relations in scope are view-like (a `0 of 0`
+            // discovered-tables case), say so explicitly -- otherwise the message
+            // reads as an empty schema when in fact views/matviews/foreign tables
+            // were found and simply can't be CDC-accelerated.
+            let views_note = if summary.views_not_replicated > 0 {
+                format!(
+                    " {} view-like relation(s) (views/materialized views/foreign tables) were found in scope but cannot be CDC-accelerated.",
+                    summary.views_not_replicated
+                )
+            } else {
+                String::new()
+            };
             return Err(Box::new(NoEligibleTablesError {
                 catalog: self.catalog_name.clone(),
+                discovered: summary.discovered_tables(),
                 excluded: summary.excluded,
                 skipped: summary.skipped,
+                views_note,
             }));
         }
 
@@ -890,6 +1165,7 @@ mod tests {
             full: 3,
             skipped: 4,
             excluded: 5,
+            views_not_replicated: 6,
         };
         let b = AccelerationSummary {
             primary_key: 10,
@@ -897,6 +1173,7 @@ mod tests {
             full: 30,
             skipped: 40,
             excluded: 50,
+            views_not_replicated: 60,
         };
         a.add(&b);
         assert_eq!(
@@ -907,6 +1184,7 @@ mod tests {
                 full: 33,
                 skipped: 44,
                 excluded: 55,
+                views_not_replicated: 66,
             }
         );
     }
@@ -920,6 +1198,23 @@ mod tests {
             ..AccelerationSummary::default()
         };
         assert_eq!(summary.accelerated_total(), 0);
+        // Discovered tables count skipped + excluded (accelerated is 0 here);
+        // views are NOT tables and don't inflate the discovered count.
+        assert_eq!(summary.discovered_tables(), 5);
+    }
+
+    #[test]
+    fn discovered_tables_excludes_views() {
+        let summary = AccelerationSummary {
+            primary_key: 2,
+            unique_index: 1,
+            full: 1,
+            skipped: 3,
+            excluded: 2,
+            views_not_replicated: 10,
+        };
+        // 4 accelerated + 3 skipped + 2 excluded = 9; the 10 views don't count.
+        assert_eq!(summary.discovered_tables(), 9);
     }
 
     #[test]
@@ -930,6 +1225,7 @@ mod tests {
             full: 1,
             skipped: 2,
             excluded: 3,
+            views_not_replicated: 5,
         };
         let message = summary.summary_message("my_pg", "spice_my_pg_slot");
         assert!(message.contains("my_pg"), "{message}");
@@ -946,19 +1242,63 @@ mod tests {
         assert!(message.contains("1 via REPLICA IDENTITY FULL"), "{message}");
         assert!(message.contains("3 table(s) excluded"), "{message}");
         assert!(message.contains("2 table(s) skipped"), "{message}");
+        assert!(message.contains("5 view(s)"), "views clause: {message}");
+        // The discovery-scope note is stated in the summary.
+        assert!(
+            message.contains("picked up on the periodic catalog refresh"),
+            "discovery-scope note: {message}"
+        );
+    }
+
+    #[test]
+    fn summary_message_omits_views_clause_when_none() {
+        let summary = AccelerationSummary {
+            primary_key: 1,
+            ..AccelerationSummary::default()
+        };
+        let message = summary.summary_message("my_pg", "slot");
+        assert!(!message.contains("not replicated"), "{message}");
+        // The discovery-scope note is unconditional.
+        assert!(
+            message.contains("picked up on the periodic catalog refresh"),
+            "{message}"
+        );
     }
 
     #[test]
     fn no_eligible_tables_error_is_actionable_with_docs_link() {
         let err = NoEligibleTablesError {
             catalog: "my_pg".to_string(),
+            discovered: 5,
             excluded: 3,
             skipped: 2,
+            views_note: String::new(),
         }
         .to_string();
         assert!(err.contains("my_pg"), "{err}");
-        assert!(err.contains("no tables are eligible"), "{err}");
+        // "0 of N discovered" shape from the spec example (#11850).
+        assert!(err.contains("0 of 5 discovered"), "{err}");
+        assert!(err.contains("2 have no primary key"), "{err}");
+        assert!(err.contains("3 excluded"), "{err}");
         assert!(err.contains("REPLICA IDENTITY"), "{err}");
+        assert!(err.contains("USING INDEX"), "{err}");
         assert!(err.contains("https://spiceai.org/docs"), "{err}");
+    }
+
+    #[test]
+    fn no_eligible_tables_error_notes_view_like_relations_when_present() {
+        // The only-views case: 0 of 0 discovered *tables*, but view-like
+        // relations were found -- the message must explain that so it doesn't
+        // read as an empty schema.
+        let err = NoEligibleTablesError {
+            catalog: "my_pg".to_string(),
+            discovered: 0,
+            excluded: 0,
+            skipped: 0,
+            views_note: " 3 view-like relation(s) (views/materialized views/foreign tables) were found in scope but cannot be CDC-accelerated.".to_string(),
+        }
+        .to_string();
+        assert!(err.contains("0 of 0 discovered"), "{err}");
+        assert!(err.contains("3 view-like relation(s)"), "{err}");
     }
 }
