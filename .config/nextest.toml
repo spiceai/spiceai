@@ -28,10 +28,7 @@ filter = 'binary(=mutation_property_test) | binary(=cdc_compaction_delete_race_t
 test-group = 'cayenne-property-tests'
 retries = 0
 
-# Same reasoning for the MySQL CDC convergence tests: they assert the accelerator
-# ends up identical to the source after a dump reconnect, and after decoding
-# every column type. A retry that happens to pass would hide the lost-update
-# class of bug they exist to catch.
+# Same reasoning for the MySQL CDC convergence tests: a retry that passes hides a lost update.
 [[profile.default.overrides]]
 filter = 'test(=mysql::replication_e2e::mysql_binlog_replication_survives_a_dump_reconnect_cayenne) | test(=mysql::replication_e2e::mysql_binlog_replication_decodes_every_column_type_cayenne)'
 retries = 0
