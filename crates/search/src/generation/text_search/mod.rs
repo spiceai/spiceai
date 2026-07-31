@@ -152,6 +152,26 @@ pub enum Error {
 
     #[snafu(display("Temporarily failed to access full text search index"))]
     TemporarilyFailedToAccessSearchIndex {},
+
+    #[snafu(display(
+        "Failed to open the full text search index at '{path}': it was created without the column(s) {} that are now configured for search. \
+        Delete '{path}' so the index is rebuilt from the dataset, or set 'index_path' to a new directory. \
+        See: https://spiceai.org/docs/features/search/full-text-search",
+        columns.join(", ")
+    ))]
+    PersistedIndexMissingColumns { path: String, columns: Vec<String> },
+
+    #[snafu(display(
+        "Failed to open the full text search index at '{path}': column '{column}' is indexed as {persisted} but is now configured as {configured}. \
+        Delete '{path}' so the index is rebuilt from the dataset, or set 'index_path' to a new directory. \
+        See: https://spiceai.org/docs/features/search/full-text-search"
+    ))]
+    PersistedIndexColumnChanged {
+        path: String,
+        column: String,
+        persisted: String,
+        configured: String,
+    },
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 

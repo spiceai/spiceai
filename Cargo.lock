@@ -18149,6 +18149,7 @@ dependencies = [
  "serde_json",
  "snafu",
  "tantivy",
+ "tempfile",
  "tokio",
  "tracing",
  "util",
