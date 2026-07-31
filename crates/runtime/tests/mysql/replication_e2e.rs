@@ -1166,7 +1166,7 @@ const TYPES_CHECKS: &[(&str, i64)] = &[
 /// real server. Each value is asserted from the snapshot and again after a
 /// binlog INSERT, then an UPDATE covers the before/after row images.
 ///
-/// Two columns stop short of MySQL's range because the Arrow type cannot hold
+/// Two columns stop short of `MySQL`'s range because the Arrow type cannot hold
 /// it: `c_big_u` at `i64::MAX`, and `c_time` at the end of the day, since
 /// `Time64` is a time-of-day while `TIME` spans ±838 hours. Negative `TIME` is
 /// rejected with a structured error, covered by `negative_time_errors` in
