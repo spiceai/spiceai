@@ -1269,9 +1269,7 @@ mod tests {
             Ok(AuthMethod::WorkloadIdentity)
         );
         assert_eq!(AuthMethod::from_str("cli"), Ok(AuthMethod::Cli));
-        // Unknown values are now rejected (the typed field's FromStr replaces
-        // the old one_of validation), rather than silently falling back.
-        assert!(AuthMethod::from_str("bogus").is_err());
+        AuthMethod::from_str("bogus").expect_err("Unknown auth method values are rejected");
     }
 
     #[test]
