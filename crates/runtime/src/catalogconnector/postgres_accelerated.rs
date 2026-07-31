@@ -57,13 +57,17 @@ limitations under the License.
 //! reports it as not-yet-present rather than serving reads through the
 //! source.
 //!
-//! The synthesized datasets are registered under the default catalog but hidden
-//! from its listings (`DataFusion::hide_dataset_from_listings`): a user reaches
-//! each table as `{catalog}.{schema}.{table}`, so listing the registration names
-//! too would show every accelerated table twice, the second time under a name
-//! that isn't part of the catalog's interface. They remain resolvable by name —
-//! that is how `AcceleratedSchemaProvider` serves them — and still appear in
-//! logs, component status, and metrics.
+//! Each synthesized dataset declares a [`crate::datafusion::DatasetPlacement`]
+//! before it is loaded, so the dataset lifecycle installs its table provider
+//! into this catalog's own [`AcceleratedSchemaProvider`] rather than the default
+//! catalog. A user therefore reaches each table only as
+//! `{catalog}.{schema}.{table}`; the synthesized registration name is never
+//! queryable, and the catalog owns its providers the same way every other
+//! catalog connector's schema provider does.
+//!
+//! The datasets are otherwise completely ordinary — status, metrics, health
+//! monitoring, retry and the refresh loop are all keyed on the dataset name and
+//! are unaffected by where the provider lands.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -163,14 +167,20 @@ fn escape_name_component(s: &str) -> String {
 /// A sanitized, collision-safe internal name for the per-table dataset
 /// synthesized for `catalog_name.schema_name.table_name`.
 ///
-/// Users don't query this name — they reach the table through the catalog's own
-/// namespace, and `refresh` hides the dataset from `spice.data` listings — but it
-/// is not invisible either: it appears in logs, component status, metric
-/// attributes, and (under a file mode) as the table's directory beneath
-/// `cayenne_file_path`. So it is escaped rather than hex-encoded, which
-/// keeps the common case legible (`__catalog_accel_pg_cdc_public_orders`) while
-/// still tolerating any character a quoted `PostgreSQL` identifier allows (`-`,
-/// spaces, dots, non-ASCII) — see [`escape_name_component`].
+/// This name is never queryable: the dataset's provider is installed into the
+/// catalog's own schema provider rather than the default catalog (see
+/// [`AcceleratedSchemaProvider`]), so users only ever reach the table as
+/// `{catalog}.{schema}.{table}`.
+///
+/// It is still visible, and still has to be unique and stable. It appears in
+/// logs, component status (`dataset:<name>`), and metric attributes, and under a
+/// file mode it is the table's directory beneath `cayenne_file_path` — so two
+/// tables colliding here would share a status key and a data directory, and a
+/// name that changed between restarts would orphan the acceleration on disk.
+/// Hence escaping rather than hex-encoding: the common case stays legible
+/// (`__catalog_accel_pg__cdc_public_orders`) while any character a quoted
+/// `PostgreSQL` identifier allows (`-`, spaces, dots, non-ASCII) still round-trips
+/// into a valid identifier — see [`escape_name_component`].
 fn synthesized_dataset_name(catalog_name: &str, schema_name: &str, table_name: &str) -> String {
     format!(
         "__catalog_accel_{}_{}_{}",
