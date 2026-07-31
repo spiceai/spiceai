@@ -77,8 +77,8 @@ pub struct Identity {
     /// PEM-encoded X.509 leaf certificate the cloud KMS CA signed from
     /// the client's CSR (enroll response `identity_cert_pem`). On every
     /// gateway connection this leaf (with `private_key_pem`) is presented
-    /// as the TLS client certificate — it *is* the credential, so the
-    /// `Hello.credential` is always empty.
+    /// as the TLS client certificate — it *is* the credential, which is why
+    /// the `Hello` carries none.
     pub identity_cert_pem: String,
     /// PEM-encoded PKCS#8 private key for the current keypair. Kept
     /// local (never sent); pairs with `identity_cert_pem` for mTLS and
@@ -101,9 +101,12 @@ pub struct Identity {
     /// code).
     #[serde(default)]
     pub gateway_addr: String,
-    /// Unix timestamp (seconds) after which the identity cert is no
-    /// longer accepted by the server. `0` means "unknown / unbounded".
-    pub not_after_unix: u64,
+    /// Unix timestamp (seconds) after which the identity cert is no longer
+    /// accepted by the server. `None` when the server issued no expiry —
+    /// carried as presence rather than a `0` sentinel so "unbounded" and
+    /// "expires at the epoch" stay distinguishable.
+    #[serde(default, deserialize_with = "deserialize_not_after")]
+    pub not_after_unix: Option<u64>,
     /// PEM-encoded PKCS#8 X25519 encryption private key. The cloud
     /// HPKE-seals secret payloads to the matching public key; this key
     /// unseals them. Kept local (never sent). Unlike the identity keypair
@@ -119,22 +122,32 @@ pub struct Identity {
     pub enc_public_key_pem: String,
 }
 
+/// Read the persisted `not_after_unix`, mapping a missing, null, or `0` value
+/// to "no expiry" so identity files written before the field carried presence
+/// keep their meaning.
+fn deserialize_not_after<'de, D>(deserializer: D) -> std::result::Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<u64>::deserialize(deserializer)?.filter(|seconds| *seconds != 0))
+}
+
 impl Identity {
-    /// Returns `true` if `not_after_unix` is in the past relative to the
-    /// system clock. Returns `false` if `not_after_unix == 0`.
+    /// Returns `true` if the identity has an expiry that is in the past
+    /// relative to the system clock. An identity with no expiry never expires.
     #[must_use]
     pub fn is_expired(&self) -> bool {
-        if self.not_after_unix == 0 {
+        let Some(not_after) = self.not_after_unix else {
             return false;
-        }
+        };
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        // Treat the cert as expired *at* `not_after_unix`, not only strictly
-        // after it: the field is defined as the timestamp after which the
-        // server no longer accepts the credential, so the boundary second
-        // should already be considered past the NotAfter limit.
-        now >= self.not_after_unix
+        // Treat the cert as expired *at* `not_after`, not only strictly after
+        // it: the field is defined as the timestamp after which the server no
+        // longer accepts the credential, so the boundary second should
+        // already be considered past the NotAfter limit.
+        now >= not_after
     }
 }
 
@@ -441,7 +454,7 @@ mod tests {
             ca_bundle_pem: "-----BEGIN CERTIFICATE-----\nMOCKCA\n-----END CERTIFICATE-----\n"
                 .to_string(),
             gateway_addr: "gateway.test.spice.ai:7320".to_string(),
-            not_after_unix: 0,
+            not_after_unix: None,
             enc_private_key_pem:
                 "-----BEGIN PRIVATE KEY-----\nMOCKENC\n-----END PRIVATE KEY-----\n".to_string(),
             enc_public_key_pem: "-----BEGIN PUBLIC KEY-----\nMOCKENC\n-----END PUBLIC KEY-----\n"
@@ -586,15 +599,36 @@ mod tests {
     }
 
     #[test]
-    fn is_expired_handles_zero_as_unbounded() {
+    fn is_expired_handles_absent_expiry_as_unbounded() {
         let identity = sample_identity();
         assert!(!identity.is_expired());
     }
 
     #[test]
+    fn load_reads_the_legacy_zero_expiry_as_unbounded() {
+        // `0` used to be the in-band "unknown / unbounded" sentinel; a file
+        // still carrying it must not be read as "expired at the epoch".
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        let legacy = r#"{
+            "identifier": "inst_legacy",
+            "identity_cert_pem": "CERT",
+            "private_key_pem": "KEY",
+            "public_key_pem": "PUB",
+            "not_after_unix": 0
+        }"#;
+        std::fs::write(&path, legacy).expect("write legacy identity");
+        let loaded = IdentityStore::load_optional(&path)
+            .expect("load")
+            .expect("present");
+        assert_eq!(loaded.not_after_unix, None);
+        assert!(!loaded.is_expired());
+    }
+
+    #[test]
     fn is_expired_detects_past_timestamp() {
         let mut identity = sample_identity();
-        identity.not_after_unix = 1;
+        identity.not_after_unix = Some(1);
         assert!(identity.is_expired());
     }
 
@@ -607,7 +641,7 @@ mod tests {
             .map(|d| d.as_secs())
             .expect("system clock after unix epoch");
         let mut identity = sample_identity();
-        identity.not_after_unix = now;
+        identity.not_after_unix = Some(now);
         assert!(identity.is_expired());
     }
 
@@ -618,7 +652,7 @@ mod tests {
             .map(|d| d.as_secs())
             .expect("system clock after unix epoch");
         let mut identity = sample_identity();
-        identity.not_after_unix = now + 3600;
+        identity.not_after_unix = Some(now + 3600);
         assert!(!identity.is_expired());
     }
 }

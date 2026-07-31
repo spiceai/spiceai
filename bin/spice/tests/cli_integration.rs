@@ -825,7 +825,7 @@ mod connect {
             .stdout(predicate::str::contains("SPICE-ADOPT"))
             .stdout(predicate::str::contains("Spice Cloud"))
             .stdout(predicate::str::contains("status"))
-            .stdout(predicate::str::contains("forget"));
+            .stdout(predicate::str::contains("remove"));
     }
 
     /// The enroll-and-exit contract: `spice connect <CODE>` completes the
@@ -1107,24 +1107,24 @@ mod connect {
         );
     }
 
-    /// `spice connect forget` with no prior state should be a no-op.
+    /// `spice connect remove` with no prior state should be a no-op.
     #[test]
-    fn test_connect_forget_when_nothing_to_clear() {
+    fn test_connect_remove_when_nothing_to_clear() {
         let dir = TempDir::new().expect("create temp config dir");
         let mut cmd = spice_cmd();
         cmd.env("SPICE_CONFIG_DIR", dir.path())
             .arg("connect")
-            .arg("forget")
+            .arg("remove")
             .assert()
             .success()
-            .stdout(predicate::str::contains("nothing to forget"));
+            .stdout(predicate::str::contains("nothing to remove"));
     }
 
-    /// `spice connect forget` after a connect whose enroll could not reach
+    /// `spice connect remove` after a connect whose enroll could not reach
     /// the cloud (staged code retained) should clear the pending file.
     #[cfg(unix)]
     #[test]
-    fn test_connect_forget_clears_pending_code() {
+    fn test_connect_remove_clears_pending_code() {
         let dir = TempDir::new().expect("create temp config dir");
         let config_dir = dir.path();
         let home = TempDir::new().expect("create temp home");
@@ -1150,7 +1150,7 @@ mod connect {
         spice_cmd()
             .env("SPICE_CONFIG_DIR", config_dir)
             .arg("connect")
-            .arg("forget")
+            .arg("remove")
             .assert()
             .success()
             .stdout(predicate::str::contains("identity cleared"));

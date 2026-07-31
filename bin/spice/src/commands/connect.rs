@@ -31,7 +31,7 @@ limitations under the License.
 //!    (identity issued and persisted, registry row created), prints the
 //!    next steps, and returns — it does not start `spiced`. Start the
 //!    runtime with `spiced --cloud-connect` (or install it as a service)
-//!    to bring the instance online. `status`/`forget` inspect and clear
+//!    to bring the instance online. `status`/`remove` inspect and clear
 //!    the local state.
 //!
 //! 2. **Deprecated pod-add behavior**: when the argument is a Spicepod
@@ -63,10 +63,10 @@ use runtime_cloud_connect::config::{CloudConnectConfig, IDENTITY_FILE, PENDING_A
                                           runtime with `spiced --cloud-connect`
                                           to bring the instance online.
   spice connect status                    Show the current enrollment state.
-  spice connect forget                    Clear the local identity on disk.
+  spice connect remove                    Clear the local identity on disk.
                                           A running `spiced` keeps its
                                           in-memory identity until it is
-                                          restarted or the cloud sends a Forget
+                                          restarted or the cloud sends a Remove
                                           command (a mere stream drop just
                                           reconnects with the same identity),
                                           so restart spiced to stop remote
@@ -83,7 +83,7 @@ EXAMPLES
   spice connect SPICE-ADOPT-7K2PX-9XYZ2-A1B2C-D3E4F
   spice connect SPICE-ADOPT-7K2PX-9XYZ2-A1B2C-D3E4F --dir /opt/edge-1
   spice connect status
-  spice connect forget
+  spice connect remove
 
 Docs: https://spiceai.org/docs"#
 )]
@@ -110,7 +110,7 @@ pub struct ConnectArgs {
     /// identity and staged adoption code) lives under `<dir>/.spice`.
     /// Defaults to the current directory; resolved to an absolute path at
     /// enroll time. `SPICE_CONFIG_DIR` overrides the derived `.spice`
-    /// location entirely. Applies to enrollment, `status`, and `forget`.
+    /// location entirely. Applies to enrollment, `status`, and `remove`.
     #[arg(long, value_name = "PATH", global = true)]
     pub dir: Option<PathBuf>,
 
@@ -138,7 +138,7 @@ pub enum ConnectCommand {
 
     /// Clear the local Spice Cloud Connect identity. spiced will
     /// continue running unmanaged after the next restart.
-    Forget,
+    Remove,
 }
 
 /// Execute the `spice connect` command.
@@ -196,7 +196,7 @@ pub async fn execute(ctx: &RuntimeContext, args: ConnectArgs) -> Result<()> {
 fn execute_subcommand(cmd: &ConnectCommand, config_dir: &Path) -> Result<()> {
     match cmd {
         ConnectCommand::Status => print_status(config_dir),
-        ConnectCommand::Forget => forget_identity(config_dir),
+        ConnectCommand::Remove => remove_identity(config_dir),
     }
 }
 
@@ -230,7 +230,7 @@ async fn enroll_instance(
 
     // If the user did NOT pass `--endpoint`, remove any previous override
     // so the next `spiced` start doesn't silently re-use a stale endpoint
-    // from an earlier connect. A `forget` also clears this file, but
+    // from an earlier connect. A `remove` also clears this file, but
     // re-staging without `--endpoint` is the more common case.
     if endpoint.is_none()
         && let Err(e) = std::fs::remove_file(&endpoint_path)
@@ -374,11 +374,10 @@ fn print_status(config_dir: &Path) -> Result<()> {
         })?;
 
     if let Some(id) = identity {
-        let expiry = if id.not_after_unix == 0 {
-            "unbounded".to_string()
-        } else {
-            format!("unix={} (expired={})", id.not_after_unix, id.is_expired())
-        };
+        let expiry = id.not_after_unix.map_or_else(
+            || "unbounded".to_string(),
+            |secs| format!("unix={secs} (expired={})", id.is_expired()),
+        );
         println!("Spice Cloud Connect: adopted");
         println!("  identifier:  {}", id.identifier);
         println!("  identity:    {}", identity_path.display());
@@ -412,7 +411,7 @@ fn print_status(config_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn forget_identity(config_dir: &Path) -> Result<()> {
+fn remove_identity(config_dir: &Path) -> Result<()> {
     let identity_path = config_dir.join(IDENTITY_FILE);
     let pending_path = config_dir.join(PENDING_ADOPT_CODE_FILE);
     let endpoint_path = config_dir.join("cloud-endpoint");
@@ -453,7 +452,7 @@ fn forget_identity(config_dir: &Path) -> Result<()> {
             "Spice Cloud Connect identity cleared. Run `spice connect <SPICE-ADOPT-...>` to re-adopt."
         );
     } else {
-        println!("Spice Cloud Connect: nothing to forget.");
+        println!("Spice Cloud Connect: nothing to remove.");
     }
     Ok(())
 }
