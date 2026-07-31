@@ -139,23 +139,31 @@ fn table_is_selected(
 /// name, so the joined result is always a valid SQL identifier word and no two
 /// distinct `(catalog, schema, table)` triples can encode to the same string.
 ///
-/// The encoding keeps ordinary names readable — `orders` escapes to itself — and
-/// is unambiguous because a *single* `_` never appears inside a component:
+/// The encoding keeps ordinary names readable — `orders` escapes to itself:
 ///
-///   * `_`                          -> `__`
+///   * `_`                          -> `_u`
 ///   * any other non-`[A-Za-z0-9]`  -> `_x{byte:02x}` (per UTF-8 byte)
 ///   * everything else              -> verbatim
 ///
-/// A lone `_` therefore only ever occurs as the separator between components,
-/// which is what rules out the `("a_b", "c")` vs. `("a", "b_c")` collision that
-/// plain concatenation admits.
+/// Every `_` an encoded component contains is therefore followed by `u` or `x`,
+/// so **`__` can never occur inside one**. Joining components with `__` (see
+/// [`synthesized_dataset_name`]) is what makes the whole name injective: the
+/// first `__` is always the first separator, so the split — and hence the
+/// original triple — is uniquely recoverable.
+///
+/// Escaping `_` as `__` and separating with a single `_` would *not* be
+/// injective, even though a lone `_` never appears inside a component: the
+/// separator is the same character as the doubled one, so boundaries shift.
+/// `("x", "_y")` and `("x_", "y")` both encode to `x___y`. Two source tables
+/// would then share one dataset name, one component-status key, and one data
+/// directory — see the regression test.
 fn escape_name_component(s: &str) -> String {
     use std::fmt::Write;
     s.bytes()
         .fold(String::with_capacity(s.len()), |mut out, b| {
             match b {
                 b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' => out.push(char::from(b)),
-                b'_' => out.push_str("__"),
+                b'_' => out.push_str("_u"),
                 other => {
                     let _ = write!(out, "_x{other:02x}");
                 }
@@ -182,8 +190,11 @@ fn escape_name_component(s: &str) -> String {
 /// `PostgreSQL` identifier allows (`-`, spaces, dots, non-ASCII) still round-trips
 /// into a valid identifier — see [`escape_name_component`].
 fn synthesized_dataset_name(catalog_name: &str, schema_name: &str, table_name: &str) -> String {
+    // Components are joined with `__`, which no encoded component can contain
+    // (see `escape_name_component`) -- that, not the escaping alone, is what
+    // makes the name injective.
     format!(
-        "__catalog_accel_{}_{}_{}",
+        "__catalog_accel_{}__{}__{}",
         escape_name_component(catalog_name),
         escape_name_component(schema_name),
         escape_name_component(table_name)
@@ -1161,8 +1172,53 @@ mod tests {
         // the common all-alphanumeric case must stay legible.
         assert_eq!(
             synthesized_dataset_name("pg_cdc", "public", "order_items"),
-            "__catalog_accel_pg__cdc_public_order__items"
+            "__catalog_accel_pg_ucdc__public__order_uitems"
         );
+    }
+
+    /// Regression: escaping `_` as `__` and separating with a single `_` was
+    /// NOT injective, because the separator was the same character as the
+    /// doubled one, so a `_` at a component boundary shifted the split.
+    /// `("x", "_y")` and `("x_", "y")` both produced `..._x___y`, which would
+    /// give two source tables one dataset name, one component-status key and
+    /// one data directory.
+    #[test]
+    fn test_synthesized_dataset_name_survives_underscores_at_component_boundaries() {
+        assert_ne!(
+            synthesized_dataset_name("cat", "x", "_y"),
+            synthesized_dataset_name("cat", "x_", "y"),
+        );
+        assert_ne!(
+            synthesized_dataset_name("cat", "x_", "_y"),
+            synthesized_dataset_name("cat", "x", "__y"),
+        );
+        assert_ne!(
+            synthesized_dataset_name("cat_", "x", "y"),
+            synthesized_dataset_name("cat", "_x", "y"),
+        );
+    }
+
+    /// Brute-force the property the whole scheme rests on, rather than trusting
+    /// the argument for it: over every triple drawn from a set of adversarial
+    /// components (empty, underscores in every position, the escape sequences
+    /// themselves, non-ASCII), no two distinct triples may share a name.
+    #[test]
+    fn test_synthesized_dataset_name_is_injective_over_adversarial_triples() {
+        let parts = [
+            "", "a", "_", "__", "___", "a_", "_a", "a_b", "ab", "a__b", "u", "_u", "x61", "_x61",
+            "a_u", "a_x61", "-", " ", ".", "ü",
+        ];
+        let mut seen: HashMap<String, (&str, &str, &str)> = HashMap::new();
+        for c in parts {
+            for s in parts {
+                for t in parts {
+                    let name = synthesized_dataset_name(c, s, t);
+                    if let Some(prev) = seen.insert(name.clone(), (c, s, t)) {
+                        panic!("{:?} and {:?} both encode to {name:?}", (c, s, t), prev);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
