@@ -42,6 +42,11 @@ use std::sync::LazyLock;
 use datafusion::prelude::SessionContext;
 use datafusion_table_providers::util::supported_functions::{FunctionRestriction, FunctionSupport};
 use linkme::distributed_slice;
+
+/// Re-exported so [`register_spice_function!`] can name it as `$crate::linkme`.
+/// Without this, every crate invoking the macro would need its own `linkme`
+/// dependency just to satisfy the expansion.
+pub use linkme;
 use parking_lot::RwLock;
 
 /// A Spice-defined function name that a remote backend cannot be assumed to
@@ -88,7 +93,7 @@ pub static SPICE_FUNCTION_REGISTRATIONS: [SpiceFunctionRegistration] = [..];
 #[macro_export]
 macro_rules! register_spice_function {
     ($static_name:ident, $name:expr) => {
-        #[linkme::distributed_slice($crate::SPICE_FUNCTION_REGISTRATIONS)]
+        #[$crate::linkme::distributed_slice($crate::SPICE_FUNCTION_REGISTRATIONS)]
         pub static $static_name: $crate::SpiceFunctionRegistration =
             $crate::SpiceFunctionRegistration::new(|| $name);
     };
