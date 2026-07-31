@@ -779,8 +779,7 @@ async fn bump_counter_rows(pool: &mysql_async::Pool, rounds: i64) -> Result<(), 
 /// `MIN` catches one row left behind even if another offsets the sum.
 ///
 /// Coalescing is pinned wide so the consumer is holding a batch of not-yet-durable
-/// updates when the kill lands, and because it is the configuration the SF1000
-/// `stock` divergence appeared under.
+/// updates when the kill lands.
 #[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn mysql_binlog_replication_survives_a_dump_reconnect_cayenne() -> Result<(), anyhow::Error> {
@@ -1099,9 +1098,9 @@ const TYPES_CHECKS: &[(&str, i64)] = &[
 ];
 
 /// Every `MySQL` column type through the binlog decode path, checked against a
-/// real server. The bench-based equivalence gate only sees whatever types its
-/// capture happens to contain — CH-benCH has no unsigned, blob, `BIT`, `ENUM`,
-/// `SET` or `JSON` column — so this is what pins the wire format for the rest.
+/// real server. Benchmark-driven checks only cover the types their workload
+/// happens to use, which leaves unsigned, blob, `BIT`, `ENUM`, `SET` and `JSON`
+/// unexercised — so this is what pins the wire format for those.
 ///
 /// Two columns stop short of MySQL's range on purpose, because the Arrow type
 /// cannot hold it and what the decoder *should* do there is a separate question
