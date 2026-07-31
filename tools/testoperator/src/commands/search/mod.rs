@@ -146,16 +146,16 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
         mteb_quora::transform_search_results_for_eval(results)
     })?;
 
-    let metrics: QueryMetrics<_, _> = test.collect(TestType::Search)?.with_run_metric(
-        SearchRunMetric::new(
-            rps,
-            p95,
-            retrieval_metrics.ndcg,
-            retrieval_metrics.recall,
-            retrieval_metrics.mrr,
-            retrieval_metrics.precision,
-        ),
-    );
+    let metrics: QueryMetrics<_, _> =
+        test.collect(TestType::Search)?
+            .with_run_metric(SearchRunMetric::new(
+                rps,
+                p95,
+                retrieval_metrics.ndcg,
+                retrieval_metrics.recall,
+                retrieval_metrics.mrr,
+                retrieval_metrics.precision,
+            ));
 
     let mut spiced_instance = test.end()?;
     let memory_usage = match memory_readings {

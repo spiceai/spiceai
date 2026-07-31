@@ -190,7 +190,9 @@ pub static SCORE: LazyLock<Gauge<f64>> = LazyLock::new(|| {
 pub static SEARCH_RECALL: LazyLock<Gauge<f64>> = LazyLock::new(|| {
     meter()
         .f64_gauge("search_recall")
-        .with_description("Recall@k: fraction of all relevant documents found within top k search results.")
+        .with_description(
+            "Recall@k: fraction of all relevant documents found within top k search results.",
+        )
         .with_unit("ratio")
         .build()
 });

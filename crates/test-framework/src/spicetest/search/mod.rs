@@ -304,7 +304,10 @@ impl ExtendedMetrics for SearchRunMetric {
             Builder::Float64(Float64Builder::new()),
         );
         builders.insert("score".to_string(), Builder::Float64(Float64Builder::new()));
-        builders.insert("recall".to_string(), Builder::Float64(Float64Builder::new()));
+        builders.insert(
+            "recall".to_string(),
+            Builder::Float64(Float64Builder::new()),
+        );
         builders.insert("mrr".to_string(), Builder::Float64(Float64Builder::new()));
         builders.insert(
             "precision".to_string(),

@@ -132,14 +132,22 @@ fn recall_at_k<S: ::std::hash::BuildHasher>(
     if total_relevant == 0 {
         return 0.0;
     }
-    let retrieved_relevant = ranked_relevance.iter().take(k).filter(|&&rel| rel > 0.0).count();
+    let retrieved_relevant = ranked_relevance
+        .iter()
+        .take(k)
+        .filter(|&&rel| rel > 0.0)
+        .count();
     retrieved_relevant as f64 / total_relevant as f64
 }
 
 /// Fraction of the top k ranked results that are relevant.
 #[expect(clippy::cast_precision_loss)]
 fn precision_at_k(ranked_relevance: &[f64], k: usize) -> f64 {
-    let retrieved_relevant = ranked_relevance.iter().take(k).filter(|&&rel| rel > 0.0).count();
+    let retrieved_relevant = ranked_relevance
+        .iter()
+        .take(k)
+        .filter(|&&rel| rel > 0.0)
+        .count();
     retrieved_relevant as f64 / k as f64
 }
 
@@ -212,7 +220,11 @@ mod tests {
         // All 6 relevant docs are retrieved within the top 6, and the top-ranked
         // result is relevant.
         let metrics = calculate_retrieval_metrics(&qrels, &results, 6);
-        assert!((metrics.recall - 1.0).abs() < 1e-9, "recall = {}", metrics.recall);
+        assert!(
+            (metrics.recall - 1.0).abs() < 1e-9,
+            "recall = {}",
+            metrics.recall
+        );
         assert!(
             (metrics.precision - 1.0).abs() < 1e-9,
             "precision = {}",
@@ -227,7 +239,11 @@ mod tests {
 
         // Only the top 3 of 6 relevant docs are within the cutoff.
         let metrics = calculate_retrieval_metrics(&qrels, &results, 3);
-        assert!((metrics.recall - 0.5).abs() < 1e-9, "recall@3 = {}", metrics.recall);
+        assert!(
+            (metrics.recall - 0.5).abs() < 1e-9,
+            "recall@3 = {}",
+            metrics.recall
+        );
         assert!(
             (metrics.precision - 1.0).abs() < 1e-9,
             "precision@3 = {}",
@@ -238,10 +254,7 @@ mod tests {
 
     #[test]
     fn mrr_finds_first_relevant_result_past_top_rank() {
-        let qrels = HashMap::from([(
-            "q1".to_string(),
-            HashMap::from([("doc2".to_string(), 1)]),
-        )]);
+        let qrels = HashMap::from([("q1".to_string(), HashMap::from([("doc2".to_string(), 1)]))]);
 
         // doc2 is the only relevant document, ranked 3rd by score.
         let results = HashMap::from([(
@@ -259,7 +272,11 @@ mod tests {
             "expected MRR@3 = 1/3 for a relevant doc at rank 3, got {}",
             metrics.mrr
         );
-        assert!((metrics.recall - 1.0).abs() < 1e-9, "recall@3 = {}", metrics.recall);
+        assert!(
+            (metrics.recall - 1.0).abs() < 1e-9,
+            "recall@3 = {}",
+            metrics.recall
+        );
         assert!(
             (metrics.precision - (1.0 / 3.0)).abs() < 1e-9,
             "precision@3 = {}",
