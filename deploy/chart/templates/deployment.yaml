@@ -82,6 +82,12 @@ spec:
             # unset request falls back to node allocatable, which is exactly the
             # over-sizing this avoids. `divisor: 1m` yields millicores; without
             # a divisor Kubernetes rounds up to whole cores.
+            #
+            # The parenthesised `(((.Values.resources).requests).cpu)` is Helm's
+            # nil-safe deep access (Helm 3+, which `apiVersion: v2` already
+            # requires): each step yields nil rather than erroring when the map
+            # above it is absent. `resources` is commented out in values.yaml by
+            # default, so that path is the common one, not an edge case.
             - name: SPICE_CPU_CORES
               valueFrom:
                 resourceFieldRef:
