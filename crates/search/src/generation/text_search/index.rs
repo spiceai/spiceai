@@ -699,7 +699,10 @@ fn parse_json_array(
 mod tests {
 
     use super::*;
-    use arrow::{array::record_batch, util::pretty::pretty_format_batches};
+    use arrow::{
+        array::{Array, StringArray, record_batch},
+        util::pretty::pretty_format_batches,
+    };
     use arrow_schema::{ArrowError, Schema};
     use datafusion::datasource::{MemTable, TableProvider};
     use futures::{StreamExt, TryStreamExt};
@@ -907,6 +910,87 @@ mod tests {
             .expect("Failed to collect search results");
 
         format!("{}", pretty_format_batches(&rb).expect("failed to format"))
+    }
+
+    // Regression test for #12228.
+    #[tokio::test]
+    async fn test_search_preserves_all_nullable_stored_columns() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("title", DataType::Utf8, false),
+                Field::new("subtitle", DataType::Utf8, true),
+                Field::new("body", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(arrow::array::Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["first title", "second title"])),
+                Arc::new(StringArray::from(vec![None::<&str>, None])),
+                Arc::new(StringArray::from(vec![
+                    "matching body one",
+                    "matching body two",
+                ])),
+            ],
+        )
+        .expect("Failed to create test batch");
+        let table = Arc::new(
+            MemTable::try_new(batch.schema(), vec![vec![batch.clone()]])
+                .expect("Failed to create test table"),
+        );
+        let index = FullTextDatabaseIndex::try_new(
+            table,
+            vec!["body".to_string()],
+            Some(vec!["id".to_string()]),
+            None,
+            &[
+                "title".to_string(),
+                "subtitle".to_string(),
+                "body".to_string(),
+            ],
+        )
+        .expect("Failed to create FullTextDatabaseIndex");
+        index
+            .compute_index(vec![batch])
+            .await
+            .expect("failed to compute_index");
+
+        let search_index = index
+            .full_text_search_field_index("body")
+            .expect("Failed to create FullTextSearchFieldIndex");
+        let batches = search_index
+            .search("matching".to_string(), &[], 100)
+            .await
+            .expect("Failed to search")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("Failed to collect search results");
+
+        assert_eq!(batches.len(), 1, "expected one result page");
+        let result = &batches[0];
+        assert_eq!(result.schema(), search_index.result_schema());
+        let titles = result
+            .column_by_name("title")
+            .expect("result schema must retain title")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("title must retain its Utf8 type");
+        let subtitles = result
+            .column_by_name("subtitle")
+            .expect("result schema must retain subtitle")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("subtitle must retain its Utf8 type");
+        let bodies = result
+            .column_by_name("body")
+            .expect("result schema must retain body")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("body must retain its Utf8 type");
+        assert!(titles.iter().any(|title| title == Some("first title")));
+        assert!(bodies.iter().any(|body| body == Some("matching body one")));
+        assert_eq!(subtitles.null_count(), 2);
+        assert!(subtitles.is_null(0));
+        assert!(subtitles.is_null(1));
     }
 
     #[tokio::test]

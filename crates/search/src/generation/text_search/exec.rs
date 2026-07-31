@@ -12,7 +12,7 @@ limitations under the License.
 */
 use std::{fmt::Formatter, sync::Arc};
 
-use arrow::{datatypes::SchemaRef, error::ArrowError};
+use arrow::{array::RecordBatch, datatypes::SchemaRef, error::ArrowError};
 use async_stream::stream;
 use datafusion::{
     error::{DataFusionError, Result as DataFusionResult},
@@ -125,18 +125,26 @@ impl ExecutionPlan for FullTextSearchExec {
                         match item {
                             Err(e) => yield Err(e),
                             Ok(rb) => {
-                                // Apply projection. Must return in the order it exists in
-                                // `self.schema()`, not in the record batch. Use
-                                // `Schema::index_of` instead of cloning all field names
-                                // and doing a linear search per projected column.
+                                // Apply projection in the declared schema order. A missing
+                                // field is a corrupt result page, not a column to omit: omitting
+                                // it shifts every following column by position.
                                 let rb_schema = rb.schema();
-                                let proj: Vec<usize> = schema
+                                let proj = schema
                                     .fields()
                                     .iter()
-                                    .filter_map(|f| rb_schema.index_of(f.name()).ok())
-                                    .collect();
+                                    .map(|f| rb_schema.index_of(f.name()).map_err(DataFusionError::from))
+                                    .collect::<DataFusionResult<Vec<_>>>();
 
-                                yield rb.project(proj.as_slice()).map_err(DataFusionError::from)
+                                match proj {
+                                    Ok(proj) => {
+                                        let projected = rb.project(proj.as_slice()).map_err(DataFusionError::from);
+                                        yield projected.and_then(|projected| {
+                                            RecordBatch::try_new(Arc::clone(&schema), projected.columns().to_vec())
+                                                .map_err(DataFusionError::from)
+                                        });
+                                    }
+                                    Err(e) => yield Err(e),
+                                }
                             }
                         }
                     }
