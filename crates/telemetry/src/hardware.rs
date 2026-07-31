@@ -483,12 +483,12 @@ fn parse_cgroup_v1_cpu_quota(quota_str: &str, period_str: &str) -> Option<usize>
 
 /// Detects the total memory available in bytes.
 ///
-/// For containerized deployments, returns the container memory limit from cgroup.
-/// For bare-metal deployments, returns the system's total memory.
+/// Returns the effective cgroup memory limit when one binds anywhere on the
+/// process's cgroup path (containers, systemd `MemoryMax`, capped slices);
+/// otherwise the system's total memory.
 fn detect_total_memory() -> u64 {
-    // Prefer container memory limit if available
-    if let Some(container_memory) = get_container_memory_limit() {
-        return container_memory;
+    if let Some(limit) = cgroup_memory_limit() {
+        return limit;
     }
 
     // Fall back to system memory
@@ -520,12 +520,6 @@ pub fn cgroup_memory_limit() -> Option<u64> {
 
     // Try cgroup v1 (Docker, older K8s)
     get_cgroup_v1_memory_limit()
-}
-
-/// Attempts to read container memory limit from cgroup v2 or v1.
-/// Returns None if not in a container or if the limit cannot be read.
-fn get_container_memory_limit() -> Option<u64> {
-    cgroup_memory_limit()
 }
 
 /// Reads memory limit from cgroup v2: the minimum `memory.max` along the
