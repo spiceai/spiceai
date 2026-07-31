@@ -142,11 +142,18 @@ pub struct CatalogAcceleration {
     /// Storage mode applied to every table this catalog accelerates, with the
     /// same meaning as a dataset's `acceleration.mode`.
     ///
-    /// Defaults to `memory`, which is **not durable**: the accelerator starts
-    /// empty on every restart and each table re-runs its initial snapshot from
-    /// the source. Use a file mode (with `params.cayenne_file_path`) to keep the
-    /// acceleration across restarts and resume from the replication slot instead
-    /// of re-snapshotting.
+    /// Defaults to `memory`, which is **not durable**: nothing is written to
+    /// disk, so the accelerator starts empty on every restart and each table
+    /// re-runs its initial snapshot from the source. Use a file mode (with
+    /// `params.cayenne_file_path`) to keep the acceleration across restarts and
+    /// resume from the replication slot instead of re-snapshotting.
+    ///
+    /// Not to be confused with `params.cayenne_cdc_durability: memory`, which
+    /// keeps a *file-backed* acceleration and only defers its durable write —
+    /// CDC changes buffer in RAM but still drain to disk. `mode` decides whether
+    /// the acceleration is persisted at all; `cayenne_cdc_durability` decides
+    /// when. For RAM-speed writes that survive a restart, use a file `mode`
+    /// together with `cayenne_cdc_durability: memory`.
     #[serde(default)]
     pub mode: Mode,
 

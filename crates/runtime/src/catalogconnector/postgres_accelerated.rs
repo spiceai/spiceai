@@ -507,13 +507,20 @@ impl AcceleratedCatalogProvider {
         // it is easy to configure by accident and its cost is invisible until a
         // restart, so state it once at startup rather than letting an operator
         // discover it as apparent data loss.
+        //
+        // The message names `cayenne_cdc_durability` too, because that is the
+        // setting operators reach for when they mean "buffer writes in RAM":
+        // `mode` decides whether the acceleration exists on disk at all, while
+        // `cayenne_cdc_durability` only defers the durable write of a file-backed
+        // one. Choosing `mode: memory` for the throughput of the second is the
+        // most likely way to arrive here by accident.
         if catalog
             .acceleration
             .as_ref()
             .is_some_and(|acceleration| !acceleration.is_durable())
         {
             tracing::warn!(
-                "Catalog '{}': acceleration `mode: {acceleration_mode}` does not persist across restarts -- the acceleration starts empty on every start, so every accelerated table re-runs its initial snapshot from the source each time. Set `acceleration.mode: file` with `acceleration.params.cayenne_file_path` to keep the acceleration across restarts and resume from the replication slot instead. Docs: {DOCS_URL}",
+                "Catalog '{}': acceleration `mode: {acceleration_mode}` does not persist across restarts -- nothing is written to disk, so the acceleration starts empty and every table re-runs its initial snapshot from the source on every start. Set `acceleration.mode: file` with `acceleration.params.cayenne_file_path` to keep the acceleration across restarts and resume from the replication slot instead. If the goal was to keep CDC writes off the disk hot path rather than to discard them, use a file mode with `acceleration.params.cayenne_cdc_durability: memory`, which buffers in RAM but still drains to durable storage. Docs: {DOCS_URL}",
                 catalog.name,
             );
         }
@@ -977,27 +984,41 @@ impl RefreshableCatalogProvider for AcceleratedCatalogProvider {
         // registration can no longer be left partially applied.
         let mut schemas = HashMap::new();
         for (schema_name, plan) in plans {
+            // Reuse this schema's existing provider when there is one. It owns
+            // the providers of every table already loaded, so replacing it on a
+            // periodic refresh would drop them and make ready tables vanish
+            // until their datasets happened to reload.
+            let provider = self
+                .schemas
+                .read()
+                .get(&schema_name)
+                .map_or_else(
+                    || Arc::new(AcceleratedSchemaProvider::default()),
+                    Arc::clone,
+                );
+            *provider.tables.write() = plan.tables;
+
             for (table_name, dataset_name, kind, dataset) in plan.to_spawn {
-                // Hide before spawning, so the dataset is never listed in
-                // `spice.data` even briefly: users reach these tables through
-                // this catalog's own namespace, and listing them would duplicate
-                // every accelerated table under a registration name that is not
-                // part of the catalog's interface. Lookup by name is unaffected,
-                // which is how `AcceleratedSchemaProvider` still resolves them.
-                self.runtime.df.hide_dataset_from_listings(&dataset_name);
+                // Declare where the provider belongs *before* spawning, so the
+                // dataset is never briefly registered under the default catalog:
+                // users reach these tables through this catalog's own namespace,
+                // and the synthesized registration name is not part of its
+                // interface.
+                provider
+                    .dataset_to_table
+                    .write()
+                    .insert(dataset_name.clone(), table_name.clone());
+                self.runtime.df.set_dataset_placement(
+                    &TableReference::bare(dataset_name.clone()),
+                    Arc::clone(&provider) as Arc<dyn crate::datafusion::DatasetPlacement>,
+                );
                 self.spawned.write().insert(
                     (schema_name.clone(), table_name),
                     SpawnedTable { dataset_name, kind },
                 );
                 tokio::spawn(Arc::clone(&self.runtime).load_synthesized_dataset(Arc::new(dataset)));
             }
-            schemas.insert(
-                schema_name,
-                Arc::new(AcceleratedSchemaProvider {
-                    runtime: Arc::clone(&self.runtime),
-                    tables: RwLock::new(plan.tables),
-                }),
-            );
+            schemas.insert(schema_name, provider);
         }
 
         {
@@ -1029,11 +1050,25 @@ impl CatalogProvider for AcceleratedCatalogProvider {
     }
 }
 
-/// A schema provider whose tables are all CDC-accelerated via a synthesized
-/// dataset (`table_name` -> the dataset's registration name).
+/// A schema provider that owns the accelerated tables of one schema, the same
+/// way every other catalog connector's schema provider owns its own
+/// `TableProvider`s.
+///
+/// `tables` maps the source table name to the name of the dataset synthesized
+/// for it; `providers` holds each table's provider once its dataset finishes
+/// loading and the dataset lifecycle installs it here (see
+/// [`DatasetPlacement`]). A table that is discovered but still bootstrapping is
+/// present in `tables` and absent from `providers`, which is exactly the
+/// "not yet queryable" state.
+#[derive(Default)]
 struct AcceleratedSchemaProvider {
-    runtime: Arc<Runtime>,
     tables: RwLock<HashMap<String, String>>,
+    /// `table_name` -> its accelerated provider. Keyed by the *source* table
+    /// name, since that is what `SchemaProvider` is asked for.
+    providers: RwLock<HashMap<String, Arc<dyn TableProvider>>>,
+    /// Reverse index (`dataset name` -> `table name`) so an install, which
+    /// arrives keyed by dataset name, can find the table it belongs to.
+    dataset_to_table: RwLock<HashMap<String, String>>,
 }
 
 impl std::fmt::Debug for AcceleratedSchemaProvider {
@@ -1051,57 +1086,44 @@ impl SchemaProvider for AcceleratedSchemaProvider {
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        let dataset_name = {
-            let guard = self.tables.read();
-            match guard.get(name) {
-                Some(dataset_name) => dataset_name.clone(),
-                None => return Ok(None),
-            }
-        };
-
-        // Not yet registered (dataset still bootstrapping) simply reads as
-        // "table not found" -- no federated stand-in during bootstrap. Any
-        // other failure (e.g. a registration inconsistency) is logged so
-        // it's not indistinguishable from an in-progress bootstrap.
-        match self
-            .runtime
-            .df
-            .get_accelerated_table_provider(&dataset_name)
-            .await
-        {
-            Ok(provider) => Ok(Some(provider)),
-            Err(e) => {
-                tracing::debug!(
-                    "Accelerated table '{dataset_name}' not yet available (table '{name}'): {e}"
-                );
-                Ok(None)
-            }
-        }
+        // A discovered-but-still-bootstrapping table is absent from `providers`
+        // and so reads as "table not found" -- deliberately no federated
+        // stand-in during bootstrap.
+        Ok(self.providers.read().get(name).map(Arc::clone))
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        let dataset_name = {
-            let guard = self.tables.read();
-            match guard.get(name) {
-                Some(dataset_name) => dataset_name.clone(),
-                None => return false,
-            }
-        };
+        // Mirrors `table()`: a table exists once its provider is installed, not
+        // merely once it is discovered. Reporting `true` on discovery alone
+        // would let `DataFusion::normalize_table_reference` resolve a table
+        // whose `table()` returns `None`, which then fails as "not found" at
+        // query time -- and could shadow a ready same-named table in another
+        // schema during that window.
+        self.providers.read().contains_key(name)
+    }
+}
 
-        // Mirror `table()`: report the table as existing only once its
-        // synthesized dataset is actually registered and queryable, not
-        // merely discovered. Returning `true` on discovery alone would let a
-        // still-bootstrapping table (whose `table()` returns `Ok(None)`) be
-        // resolved by `DataFusion::normalize_table_reference` and then fail
-        // as "not found" at query time -- and could shadow a ready same-named
-        // table in another schema/catalog during that window.
-        // `get_table_sync` resolves the synthesized dataset in the default
-        // catalog synchronously and flips to `Some` at the same registration
-        // point `get_accelerated_table_provider` begins succeeding.
-        self.runtime
-            .df
-            .get_table_sync(&TableReference::bare(dataset_name))
-            .is_some()
+impl crate::datafusion::DatasetPlacement for AcceleratedSchemaProvider {
+    /// Take ownership of a synthesized dataset's provider instead of letting it
+    /// be registered under the default catalog.
+    fn install(
+        &self,
+        name: &TableReference,
+        provider: Arc<dyn TableProvider>,
+    ) -> crate::datafusion::Result<()> {
+        let dataset_name = name.to_string();
+        let Some(table_name) = self.dataset_to_table.read().get(&dataset_name).cloned() else {
+            // The catalog registers the placement before spawning the dataset,
+            // so an install for an unknown dataset means the two have gone out
+            // of sync. Dropping the provider silently would leave the table
+            // permanently unqueryable with no explanation.
+            tracing::error!(
+                "Accelerated catalog received a table provider for unknown dataset '{dataset_name}'; the table it belongs to will not be queryable. Report a bug: https://github.com/spiceai/spiceai/issues"
+            );
+            return Ok(());
+        };
+        self.providers.write().insert(table_name, provider);
+        Ok(())
     }
 }
 
@@ -1228,6 +1250,97 @@ mod tests {
             Some(&include),
             Some(&exclude)
         ));
+    }
+
+    fn empty_provider() -> Arc<dyn TableProvider> {
+        Arc::new(datafusion::datasource::empty::EmptyTable::new(Arc::new(
+            datafusion::arrow::datatypes::Schema::empty(),
+        )))
+    }
+
+    /// The schema provider owns its tables outright -- the same contract every
+    /// other catalog connector's schema provider has. A discovered table is not
+    /// queryable until its synthesized dataset finishes loading and installs a
+    /// provider here; reporting it earlier would let it resolve and then fail as
+    /// "not found" at query time.
+    #[tokio::test]
+    async fn a_table_is_queryable_only_once_its_provider_is_installed() {
+        use crate::datafusion::DatasetPlacement;
+
+        let schema = AcceleratedSchemaProvider::default();
+        *schema.tables.write() =
+            HashMap::from([("orders".to_string(), "__catalog_accel_x".to_string())]);
+        schema
+            .dataset_to_table
+            .write()
+            .insert("__catalog_accel_x".to_string(), "orders".to_string());
+
+        // Discovered, still bootstrapping: listed, but not yet resolvable.
+        assert_eq!(schema.table_names(), vec!["orders".to_string()]);
+        assert!(!schema.table_exist("orders"));
+        assert!(schema.table("orders").await.expect("lookup").is_none());
+
+        schema
+            .install(
+                &TableReference::bare("__catalog_accel_x"),
+                empty_provider(),
+            )
+            .expect("install");
+
+        assert!(schema.table_exist("orders"));
+        assert!(schema.table("orders").await.expect("lookup").is_some());
+    }
+
+    /// A periodic refresh rebuilds the per-schema table map, but must not
+    /// discard providers already installed -- doing so would make every ready
+    /// table vanish until its dataset happened to reload.
+    #[tokio::test]
+    async fn refreshing_the_table_map_keeps_installed_providers() {
+        use crate::datafusion::DatasetPlacement;
+
+        let schema = AcceleratedSchemaProvider::default();
+        schema
+            .dataset_to_table
+            .write()
+            .insert("__catalog_accel_x".to_string(), "orders".to_string());
+        schema
+            .install(
+                &TableReference::bare("__catalog_accel_x"),
+                empty_provider(),
+            )
+            .expect("install");
+
+        // What `refresh()` does to a reused provider: replace the table map.
+        *schema.tables.write() = HashMap::from([
+            ("orders".to_string(), "__catalog_accel_x".to_string()),
+            ("items".to_string(), "__catalog_accel_y".to_string()),
+        ]);
+
+        assert!(
+            schema.table("orders").await.expect("lookup").is_some(),
+            "an already-loaded table must survive a re-plan"
+        );
+        assert!(
+            !schema.table_exist("items"),
+            "a newly discovered table is not queryable until its provider lands"
+        );
+    }
+
+    /// An install for a dataset the schema does not know about means the
+    /// placement registry and the table map have diverged. Dropping the provider
+    /// silently would leave that table permanently unqueryable with nothing in
+    /// the logs, so the mismatch is surfaced instead.
+    #[tokio::test]
+    async fn an_install_for_an_unknown_dataset_is_not_silently_dropped() {
+        use crate::datafusion::DatasetPlacement;
+
+        let schema = AcceleratedSchemaProvider::default();
+        schema
+            .install(&TableReference::bare("__catalog_accel_missing"), empty_provider())
+            .expect("install must not fail the dataset that produced the provider");
+
+        assert!(schema.table_names().is_empty());
+        assert!(schema.providers.read().is_empty());
     }
 
     #[test]
