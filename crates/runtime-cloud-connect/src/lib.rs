@@ -21,7 +21,7 @@ limitations under the License.
 //! using the enroll-first flow shipped for BYOC (DR-025):
 //!
 //! 1. Admin in Spice Cloud generates a single-use adoption code.
-//! 2. User runs `spice connect <code>` (or sets `SPICE_ADOPT_CODE`).
+//! 2. User runs `spice connect <code>` (or sets `SPICE_CONNECT_ADOPT_CODE`).
 //! 3. **State plane (out-of-band enroll)**: `spiced` generates an ECDSA
 //!    P-256 keypair + PKCS#10 CSR and presents the adoption code, the
 //!    CSR, and its host facts to the cloud enroll endpoint over plain
@@ -84,8 +84,18 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 pub use config::CloudConnectConfig;
-pub use handlers::RuntimeHandle;
+pub use handlers::{
+    Capability, CommandError, RestartMode, RuntimeHandle, RuntimePhase, StatusReport,
+};
 pub use identity::{Identity, IdentityStore};
+
+/// Revision of the `spice.cloud.v1` contract this client implements,
+/// announced in `Hello.protocol_version`.
+///
+/// Bump it when the contract gains a command, field, or enum variant a peer
+/// can only use once it knows the other side has it; the package name changes
+/// only for a break this number cannot bridge.
+pub const PROTOCOL_VERSION: u32 = 1;
 
 use shutdown::Shutdown;
 

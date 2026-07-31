@@ -5919,6 +5919,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "data-connector-api"
+version = "2.2.0-unstable"
+dependencies = [
+ "globset",
+ "runtime-component",
+ "snafu",
+]
+
+[[package]]
 name = "data-encoding"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -16691,6 +16700,7 @@ dependencies = [
  "csv",
  "dashmap",
  "data-accelerator-api",
+ "data-connector-api",
  "data_components",
  "dataformat-json",
  "datafusion",
@@ -16991,10 +17001,12 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "chrono",
+ "cloud-connect-crypto",
  "dirs",
  "gethostname",
  "pem",
  "prost",
+ "prost-types",
  "rand 0.10.1",
  "rcgen",
  "reqwest 0.13.4",
@@ -18132,6 +18144,7 @@ dependencies = [
  "runtime-datafusion-udfs",
  "runtime-query-engine",
  "runtime-table-partition",
+ "s3_vectors",
  "serde",
  "serde_json",
  "snafu",
@@ -20329,6 +20342,7 @@ dependencies = [
  "hf-hub",
  "insta",
  "itertools 0.14.0",
+ "parking_lot",
  "rand 0.10.1",
  "reqwest 0.13.4",
  "serde",
