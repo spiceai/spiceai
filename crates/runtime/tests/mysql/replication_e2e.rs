@@ -736,7 +736,8 @@ async fn wait_for_dump_thread_change(
         Ok(())
     } else {
         Err(anyhow!(
-            "timed out waiting for the pump to reconnect; dump thread is still {previous}"
+            "timed out waiting for a dump thread other than {previous}; \
+             the pump either never reconnected or has no dump thread at all"
         ))
     }
 }

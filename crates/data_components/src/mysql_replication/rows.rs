@@ -157,7 +157,7 @@ impl Default for TransactionBuffer {
 ///   - JSON arrives as raw `JSONB` → its JSON text (done by the
 ///     `BinlogValue → Value` conversion itself).
 ///   - A signed `MEDIUMINT` arrives zero-extended from three bytes → its
-///     negative value (see [`sign_extend_mediumint`]).
+///     negative value (see `sign_extend_mediumint`).
 ///
 /// Everything else passes through unchanged.
 pub fn normalize_binlog_value(column: &SourceColumn, value: BinlogValue<'_>) -> Result<Value> {
