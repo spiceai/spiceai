@@ -154,7 +154,7 @@ pub enum Error {
     TemporarilyFailedToAccessSearchIndex {},
 
     #[snafu(display(
-        "Failed to open the full text search index at '{path}': it was created without the column(s) {} that are now configured for search. \
+        "Failed to open the full text search index at '{path}': it was created without the column(s) {} that the index is now configured to hold. \
         Delete '{path}' so the index is rebuilt from the dataset, or set 'index_path' to a new directory. \
         See: https://spiceai.org/docs/features/search/full-text-search",
         columns.join(", ")
@@ -176,11 +176,19 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 impl Error {
+    /// Whether the operator caused the failure and can fix it from their own configuration.
+    ///
+    /// The persisted-index mismatches qualify: the index on disk and the spicepod disagree,
+    /// and the message names the directory to delete or repoint. They surface while the
+    /// dataset loads rather than from a query, so nothing maps them to a status code today.
     #[must_use]
     pub fn is_user_error(&self) -> bool {
         matches!(
             self,
-            Error::InvalidTextSearchQueryError { .. } | Error::TextSearchIndexMissingColummn { .. }
+            Error::InvalidTextSearchQueryError { .. }
+                | Error::TextSearchIndexMissingColummn { .. }
+                | Error::PersistedIndexMissingColumns { .. }
+                | Error::PersistedIndexColumnChanged { .. }
         )
     }
 }

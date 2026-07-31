@@ -1669,6 +1669,10 @@ mod tests {
             message.contains(&directory.path().display().to_string()),
             "the error must name the index directory to delete, got: {message}"
         );
+        assert!(
+            error.is_user_error(),
+            "a persisted index the configuration no longer matches is fixable from the spicepod"
+        );
     }
 
     // Regression test for #12274.
@@ -1693,6 +1697,10 @@ mod tests {
         assert!(
             message.contains("(untokenized)") && message.contains("(tokenized)"),
             "the error must say how the column's indexing changed, got: {message}"
+        );
+        assert!(
+            error.is_user_error(),
+            "a persisted index the configuration no longer matches is fixable from the spicepod"
         );
     }
 
