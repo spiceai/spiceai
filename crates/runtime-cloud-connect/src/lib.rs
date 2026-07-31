@@ -84,8 +84,18 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 pub use config::CloudConnectConfig;
-pub use handlers::RuntimeHandle;
+pub use handlers::{
+    Capability, CommandError, RestartMode, RuntimeHandle, RuntimePhase, StatusReport,
+};
 pub use identity::{Identity, IdentityStore};
+
+/// Revision of the `spice.cloud.v1` contract this client implements,
+/// announced in `Hello.protocol_version`.
+///
+/// Bump it when the contract gains a command, field, or enum variant a peer
+/// can only use once it knows the other side has it; the package name changes
+/// only for a break this number cannot bridge.
+pub const PROTOCOL_VERSION: u32 = 1;
 
 use shutdown::Shutdown;
 
