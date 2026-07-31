@@ -125,6 +125,10 @@ pub struct ElasticsearchVectorParams {
 impl ElasticsearchVectorParams {
     /// Build an Elasticsearch HTTP client from these connection params, applying the
     /// configured timeout and retry options.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client fails to construct (e.g. an invalid endpoint URL).
     pub fn client(
         &self,
     ) -> Result<Arc<dyn Elasticsearch>, Box<dyn std::error::Error + Send + Sync>> {
@@ -148,6 +152,11 @@ impl ElasticsearchVectorParams {
     /// Reject params that require infrastructure the Elasticsearch vector engine does not
     /// yet support (per-partition index routing, spill queues), so misconfigurations fail
     /// loudly instead of being silently ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `partition_by` or `spill_writes` is set, since neither is
+    /// supported yet for the Elasticsearch vector engine.
     pub fn validate(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if self.partition_by.is_some() {
             return Err(Box::<dyn std::error::Error + Send + Sync>::from(
