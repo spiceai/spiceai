@@ -20,9 +20,20 @@ use crate::model::EmbeddingModelStore;
 use crate::secrets::Secrets;
 use datafusion::datasource::TableProvider;
 use datafusion::{prelude::SessionContext, sql::TableReference};
-#[cfg(feature = "models")]
+// `models` decides how the UDF name is spelled — the authoritative constant when
+// `runtime_datafusion_udfs::embed` is compiled, a local copy otherwise — but only the
+// `s3_vectors` and `elasticsearch` index builders below consume it. Both arms therefore
+// have to be gated on that consumer set as well, or the name is an unused import (with
+// `models`) or dead code (without it) whenever neither index is compiled in.
+#[cfg(all(
+    feature = "models",
+    any(feature = "s3_vectors", feature = "elasticsearch")
+))]
 use runtime_datafusion_udfs::embed::EMBED_UDF_NAME;
-#[cfg(not(feature = "models"))]
+#[cfg(all(
+    not(feature = "models"),
+    any(feature = "s3_vectors", feature = "elasticsearch")
+))]
 const EMBED_UDF_NAME: &str = "embed";
 use spicepod::vector::VectorStore;
 use std::sync::Arc;
