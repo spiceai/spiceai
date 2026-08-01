@@ -97,6 +97,7 @@ use opentelemetry::metrics::{Counter, Meter};
 use serde_json::Value;
 
 pub const FLATTEN_JSON_UDTF_NAME: &str = "flatten_json";
+runtime_udfs_api::register_spice_function!(FLATTEN_JSON_SPICE_FUNCTION, FLATTEN_JSON_UDTF_NAME);
 
 const DEFAULT_MAX_DEPTH: usize = 64;
 const DEFAULT_MAX_ROWS: usize = 1_000_000;
