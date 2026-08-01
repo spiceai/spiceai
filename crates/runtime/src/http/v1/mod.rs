@@ -376,7 +376,8 @@ fn transaction_error_to_response(error: TransactionError) -> Response {
 
 /// Classifies a query error for HTTP status mapping: client-initiated
 /// cancellation maps to 499 Client Closed Request, a `runtime.query.timeout`
-/// expiry maps to 504 Gateway Timeout, everything else falls through to
+/// expiry maps to 504 Gateway Timeout, a memory-pool refusal maps to 503
+/// Service Unavailable, everything else falls through to
 /// [`status_for_sql_error`].
 #[derive(Clone, Copy)]
 enum SqlErrorKind {
@@ -385,7 +386,7 @@ enum SqlErrorKind {
     Timeout,
     /// The query engine refused the query for want of memory. Carried
     /// separately so it can be logged as the operator-actionable condition it
-    /// is; it maps to the same status as [`SqlErrorKind::General`].
+    /// is and answered with a retriable status.
     ResourcesExhausted,
 }
 
@@ -435,8 +436,8 @@ fn single_line(message: &str) -> std::borrow::Cow<'_, str> {
 }
 
 /// Maps a query error message to an HTTP response, distinguishing cancellation
-/// (499 Client Closed Request) and query timeout (504 Gateway Timeout) from
-/// other errors.
+/// (499 Client Closed Request), query timeout (504 Gateway Timeout) and
+/// resource exhaustion (503 Service Unavailable) from other errors.
 ///
 /// Resource exhaustion is logged at `warn`, everything else at `debug`. A
 /// malformed query is the client's problem and would only be noise in the
@@ -454,11 +455,15 @@ fn sql_error_response(message: String, kind: SqlErrorKind) -> Response {
     let status = match kind {
         SqlErrorKind::Cancellation => StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
         SqlErrorKind::Timeout => StatusCode::GATEWAY_TIMEOUT,
-        // `ResourcesExhausted` deliberately shares `General`'s status. 400 is a
-        // poor fit for a server-capacity condition — Flight reports the same
-        // failure as the retriable `RESOURCE_EXHAUSTED` — but changing it is a
-        // client-visible contract change, tracked in #12283.
-        SqlErrorKind::General | SqlErrorKind::ResourcesExhausted => status_for_sql_error(&message),
+        // A refusal for want of memory is the runtime's own capacity condition,
+        // not a malformed request: 4xx tells intermediaries the client is at
+        // fault and the request should not be retried, so a load balancer keeps
+        // routing to a saturated pod and a client that retries on 5xx surfaces
+        // a hard failure for a query that would likely succeed on another
+        // replica. Flight already reports the same failure as the retriable
+        // `RESOURCE_EXHAUSTED`.
+        SqlErrorKind::ResourcesExhausted => StatusCode::SERVICE_UNAVAILABLE,
+        SqlErrorKind::General => status_for_sql_error(&message),
     };
     (status, message).into_response()
 }
@@ -825,9 +830,9 @@ mod tests {
     }
 
     /// A memory-pool refusal has to be told apart from the cancellation and
-    /// timeout kinds so it can be logged at `warn`, and it must keep the status
-    /// the general path already returned — the status question is a separate,
-    /// client-visible decision.
+    /// timeout kinds so it can be logged at `warn` and answered with a status
+    /// that intermediaries read as retriable. A plain execution failure stays
+    /// on 400: only the capacity condition moves.
     #[test]
     fn sql_error_response_classifies_resource_exhaustion() {
         let exhausted = datafusion::error::DataFusionError::ResourcesExhausted(
@@ -841,7 +846,7 @@ mod tests {
             exhausted.to_string(),
             SqlErrorKind::of_datafusion_error(&exhausted),
         );
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         // Execution commonly wraps the pool error before it reaches the handler.
         let wrapped = datafusion::error::DataFusionError::Context(
@@ -854,13 +859,42 @@ mod tests {
             SqlErrorKind::of_datafusion_error(&wrapped),
             SqlErrorKind::ResourcesExhausted
         ));
+        let wrapped_response = sql_error_response(
+            wrapped.to_string(),
+            SqlErrorKind::of_datafusion_error(&wrapped),
+        );
+        assert_eq!(
+            wrapped_response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a wrapped pool refusal must reach the same status as a bare one"
+        );
 
-        // A plain execution failure must stay on the quiet path.
+        // A plain execution failure must stay on the quiet path, and on 400.
         let general = datafusion::error::DataFusionError::Execution("boom".to_string());
         assert!(matches!(
             SqlErrorKind::of_datafusion_error(&general),
             SqlErrorKind::General
         ));
+        let general_response = sql_error_response(
+            general.to_string(),
+            SqlErrorKind::of_datafusion_error(&general),
+        );
+        assert_eq!(
+            general_response.status(),
+            StatusCode::BAD_REQUEST,
+            "only the capacity condition moves off 400"
+        );
+
+        // A read-only rejection keeps its 403 rather than being swept into the
+        // capacity status.
+        let read_only = datafusion::error::DataFusionError::Execution(
+            "Insert not allowed in a read-only SQL context".to_string(),
+        );
+        let read_only_response = sql_error_response(
+            read_only.to_string(),
+            SqlErrorKind::of_datafusion_error(&read_only),
+        );
+        assert_eq!(read_only_response.status(), StatusCode::FORBIDDEN);
     }
 
     /// `TrackConsumersPool` writes its breakdown as `"… (across reservations)
@@ -904,7 +938,7 @@ mod tests {
         // Collapsing is for the log only: the body the caller reads is the
         // engine's own message, newlines and all.
         let response = sql_error_response(message.to_string(), SqlErrorKind::ResourcesExhausted);
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
             .await
             .expect("the error response body must be readable");
