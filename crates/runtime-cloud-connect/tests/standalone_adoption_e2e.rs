@@ -1358,6 +1358,8 @@ async fn apply_spicepod_delivers_double_sealed_secrets() {
     use cloud_connect_crypto::{RecipientKey, SealLayer, SecretAddress};
     use prost::Message as _;
 
+    const COMMAND_ID: &str = "cmd-apply-secrets";
+
     let harness = Harness::new(24 * 60 * 60).await;
     let dir = tempfile::tempdir().unwrap();
     let identity_path = dir.path().join("identity.json");
@@ -1409,7 +1411,6 @@ async fn apply_spicepod_delivers_double_sealed_secrets() {
     };
 
     // Outer: the gateway seals that opaque envelope to the announced key.
-    const COMMAND_ID: &str = "cmd-apply-secrets";
     let outer_aad = SecretAddress::standalone(ASSIGNED_ID, &session.key_id)
         .expect("outer address")
         .outer_aad(COMMAND_ID)
