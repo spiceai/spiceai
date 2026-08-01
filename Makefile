@@ -102,10 +102,13 @@ endif
 # of the gate agreeing on which crates need system libraries, so a sign-off on
 # such a host fails only for reasons in the branch under test. The crate has no
 # unit tests of its own.
+# The `query_metrics` test binary is listed explicitly because `--lib` skips it:
+# it needs its own process to control the OTel meter-provider install order.
 .PHONY: nextest
 nextest:
 	@cargo nextest run --all --exclude libnfs --lib $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
 	@cargo nextest run -p cayenne --tests $(NEXTEST_CARGO_PROFILE)
+	@cargo nextest run -p runtime --test query_metrics $(NEXTEST_CARGO_PROFILE)
 
 # Unit tests for named packages — the fail-fast pre-check scripts/signoff runs on
 # the crates a branch touched, before the full workspace gate. Same lib-only

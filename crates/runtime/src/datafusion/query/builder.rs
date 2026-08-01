@@ -155,23 +155,22 @@ impl QueryBuilder {
 
     #[must_use]
     pub fn build(self) -> Query {
-        let tracker = if self.df.task_history_enabled {
-            Some(QueryTracker {
-                schema: None,
-                query_duration_secs: None,
-                query_execution_duration_secs: None,
-                rows_produced: 0,
-                results_cache_hit: None,
-                is_accelerated: None,
-                error_message: None,
-                error_code: None,
-                query_duration_timer: Instant::now(),
-                query_execution_duration_timer: Instant::now(),
-                datasets: Arc::new(HashSet::default()),
-            })
-        } else {
-            None
-        };
+        // The tracker is the only emitter of the query metrics, so it is always
+        // built — `runtime.task_history.enabled` only controls what it reports.
+        let tracker = Some(QueryTracker {
+            task_history_enabled: self.df.task_history_enabled,
+            schema: None,
+            query_duration_secs: None,
+            query_execution_duration_secs: None,
+            rows_produced: 0,
+            results_cache_hit: None,
+            is_accelerated: None,
+            error_message: None,
+            error_code: None,
+            query_duration_timer: Instant::now(),
+            query_execution_duration_timer: Instant::now(),
+            datasets: Arc::new(HashSet::default()),
+        });
 
         let query_method = match self.method {
             SqlOrPlan::Sql(sql) => QueryMethod::Text {
@@ -197,5 +196,56 @@ impl QueryBuilder {
             read_only: self.read_only,
             results_cache_mode: self.results_cache_mode,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::runtime::Handle;
+
+    use crate::{
+        dataaccelerator::AcceleratorEngineRegistry, datafusion::builder::DataFusionBuilder,
+        status::RuntimeStatus,
+    };
+
+    use super::{DataFusion, QueryBuilder};
+    use std::sync::Arc;
+
+    fn datafusion_with_task_history(enabled: bool) -> Arc<DataFusion> {
+        Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .with_task_history(enabled)
+            .build(),
+        )
+    }
+
+    /// Query metrics are emitted from `QueryTracker::finish`, so the tracker must
+    /// be built even when task history is disabled. End-to-end coverage:
+    /// `crates/runtime/tests/query_metrics.rs`.
+    #[tokio::test]
+    async fn tracker_is_built_when_task_history_is_disabled() {
+        let query = QueryBuilder::new("SELECT 1", datafusion_with_task_history(false)).build();
+
+        let tracker = query
+            .tracker
+            .expect("tracker must be built when task history is disabled");
+        assert!(
+            !tracker.task_history_enabled,
+            "tracker must not write task history rows when it is disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn tracker_writes_task_history_when_enabled() {
+        let query = QueryBuilder::new("SELECT 1", datafusion_with_task_history(true)).build();
+
+        let tracker = query
+            .tracker
+            .expect("tracker must be built when task history is enabled");
+        assert!(tracker.task_history_enabled);
     }
 }
