@@ -215,6 +215,9 @@ candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "6
 candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "6ee27a4d621a3470cbf83596722c16de7cf97f12", package = "candle-nn" } # branch: spiceai
 candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "6ee27a4d621a3470cbf83596722c16de7cf97f12", package = "candle-transformers" } # branch: spiceai
 charset = "0.1.5"
+# AEAD for the at-rest delivered-secrets cache. Already in the tree via `hpke`,
+# which uses the same primitive for the sealed-secret wire format.
+chacha20poly1305 = "0.11"
 chrono = "0.4.44"
 clap = { version = "4.5.60", features = ["derive", "env"] }
 clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0.2.2", features = [

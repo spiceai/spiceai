@@ -409,7 +409,7 @@ impl ClientDriver {
         })?;
         let outcome = client.renew(&current, &material).await?;
 
-        let rotated = Identity {
+        let mut rotated = Identity {
             identifier: current.identifier,
             identity_cert_pem: outcome.identity_cert_pem,
             private_key_pem: material.private_key_pem,
@@ -418,22 +418,29 @@ impl ClientDriver {
             ca_bundle_pem: current.ca_bundle_pem,
             gateway_addr: current.gateway_addr,
             not_after_unix: Some(outcome.not_after_unix),
-            // The app attribution is not part of the credential and /renew
-            // does not re-send it, so it rides across the rotation unchanged.
+            // The app attribution is not credential material and /renew does not
+            // re-send it, so it rides across the rotation unchanged.
             app_id: current.app_id,
-            // The encryption keypair is NOT rotated on renewal: the renew
-            // exchange carries no channel to re-pin a new public key, and
-            // the cloud keeps sealing secrets to the enrolled one.
+            // Rotated just below, which also retains the outgoing key.
             enc_private_key_pem: current.enc_private_key_pem,
             enc_public_key_pem: current.enc_public_key_pem,
+            enc_previous_private_key_pem: current.enc_previous_private_key_pem,
+            // Local and deliberately never rotated: the cache must stay
+            // readable across every identity rotation.
+            cache_key_b64: current.cache_key_b64,
         };
+        // The renew request already carried this public key, so the cloud has
+        // re-pinned it. Retain the outgoing private key for exactly one
+        // rotation: a payload sealed moments before this point is still
+        // addressed to it and cannot be re-sealed in flight.
+        rotated.rotate_encryption_key(material.enc_private_key_pem, material.enc_public_key_pem);
         // The cloud has already pinned the new public key: even if
         // persistence fails, the rotated identity must be used in memory
         // (the old key can no longer renew). `persist_identity` logs the
         // failure; the next successful renewal re-attempts the write.
         self.persist_identity(&rotated).await;
         tracing::info!(
-            "Cloud Connect: identity renewed for {} (keypair rotated, valid until {})",
+            "Cloud Connect: identity renewed for {} (identity and encryption keypairs rotated, valid until {})",
             rotated.identifier,
             rotated
                 .not_after_unix
@@ -553,6 +560,47 @@ impl ClientDriver {
 
         let mut server_stream: Streaming<proto::ControlMessage> = response.into_inner();
         tracing::info!("Cloud Connect: stream established to {endpoint}");
+
+        // Announce a per-connection encryption key. The gateway seals the
+        // control plane's already-sealed secret envelope to this key before
+        // dispatching it, so recorded ciphertext stays undecryptable even if the
+        // persisted enrolled key is later compromised. A session that announces
+        // no key receives no secrets at all — so failing to generate one is a
+        // "no secrets this session" degradation, not a reason to drop the stream
+        // and lose every other command with it.
+        let session_key = match cloud_connect_crypto::EncryptionKeypair::generate() {
+            Ok(keypair) => {
+                let announcement = proto::SecretsKey {
+                    key_id: keypair.key_id().to_string(),
+                    kem_id: cloud_connect_crypto::KEM_ID,
+                    kdf_id: cloud_connect_crypto::KDF_ID,
+                    aead_id: cloud_connect_crypto::AEAD_ID,
+                    public_key: keypair.public_key().to_vec(),
+                };
+                if tx
+                    .send(proto::ClientMessage {
+                        body: Some(proto::client_message::Body::SecretsKey(announcement)),
+                    })
+                    .await
+                    .is_err()
+                {
+                    return Ok(ExitReason::Disconnected);
+                }
+                tracing::debug!(
+                    "Cloud Connect: announced per-connection secrets key {}",
+                    keypair.key_id()
+                );
+                Some(Arc::new(keypair))
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "Cloud Connect: could not generate a per-connection secrets key ({err}); \
+                     this session cannot receive delivered secrets. Deployments still apply, and \
+                     any cached secrets remain in effect."
+                );
+                None
+            }
+        };
 
         // Spawn the periodic heartbeat, metrics, and telemetry tasks. They emit
         // through the same outbound channel. The identifier is shared by RwLock
@@ -690,7 +738,7 @@ impl ClientDriver {
                     match next {
                         Ok(Some(msg)) => {
                             if let Some(reason) = self
-                                .dispatch(&tx, msg, &identifier)
+                                .dispatch(&tx, msg, &identifier, session_key.as_deref())
                                 .await
                             {
                                 break reason;
@@ -751,6 +799,7 @@ impl ClientDriver {
         tx: &mpsc::Sender<proto::ClientMessage>,
         msg: proto::ControlMessage,
         live_identifier: &Arc<RwLock<String>>,
+        session_key: Option<&cloud_connect_crypto::EncryptionKeypair>,
     ) -> Option<ExitReason> {
         let command_id = msg.command_id;
         let Some(body) = msg.body else {
@@ -803,37 +852,8 @@ impl ClientDriver {
                     .supported(tx, &command_id, Capability::ApplySpicepod, name)
                     .await
                 {
-                    // Logged on arrival, before the apply can fail: the app id
-                    // rides this command and nothing else carries it, so whether
-                    // one arrived is the first thing to know when metrics are
-                    // being withheld.
-                    if cmd.app_id.is_empty() {
-                        tracing::warn!(
-                            command_id = %command_id,
-                            yaml_bytes = cmd.spicepod_yaml.len(),
-                            "Cloud Connect: ApplySpicepod received with no app id; metrics stay withheld because nothing can attribute them. The control plane sends this only if the instance is attached to an app and the api is new enough to forward it"
-                        );
-                    } else {
-                        tracing::info!(
-                            command_id = %command_id,
-                            app_id = %cmd.app_id,
-                            yaml_bytes = cmd.spicepod_yaml.len(),
-                            "Cloud Connect: ApplySpicepod received"
-                        );
-                    }
-                    let result = self
-                        .runtime
-                        .apply_spicepod(&self.config.config_dir, &cmd.spicepod_yaml, &cmd.app_id)
+                    self.handle_apply_spicepod(tx, &command_id, cmd, session_key)
                         .await;
-                    match &result {
-                        Ok(_) => {
-                            tracing::info!(command_id = %command_id, "Cloud Connect: ApplySpicepod applied");
-                        }
-                        Err(err) => {
-                            tracing::warn!(command_id = %command_id, "Cloud Connect: ApplySpicepod failed: {err}");
-                        }
-                    }
-                    reply_with_json(tx, &command_id, result).await;
                 }
             }
             proto::control_message::Body::UpgradeRuntime(cmd) => {
@@ -933,6 +953,134 @@ impl ClientDriver {
         );
         send_unsupported(tx, command_id, &self.runtime.unsupported_reason(capability)).await;
         false
+    }
+
+    /// Handle an `ApplySpicepod`, opening any secrets that rode with it.
+    ///
+    /// A payload that fails to open **fails the whole command**: the spicepod is
+    /// not written and the components that referenced those secrets are left on
+    /// the previous configuration rather than started without them. Applying the
+    /// spicepod and dropping the secrets would report success and then fail
+    /// every referencing component with a missing-parameter error naming
+    /// nothing.
+    async fn handle_apply_spicepod(
+        &mut self,
+        tx: &mpsc::Sender<proto::ClientMessage>,
+        command_id: &str,
+        cmd: proto::ApplySpicepod,
+        session_key: Option<&cloud_connect_crypto::EncryptionKeypair>,
+    ) {
+        // Logged on arrival, before anything can fail: the app id rides this
+        // command and nothing else carries it, so whether one arrived is the
+        // first thing to know when metrics are being withheld.
+        if cmd.app_id.is_empty() {
+            tracing::warn!(
+                command_id,
+                yaml_bytes = cmd.spicepod_yaml.len(),
+                "Cloud Connect: ApplySpicepod received with no app id; metrics stay withheld because nothing can attribute them. The control plane sends one only if the instance is attached to an app and the api is new enough to forward it"
+            );
+        } else {
+            tracing::info!(
+                command_id,
+                app_id = %cmd.app_id,
+                yaml_bytes = cmd.spicepod_yaml.len(),
+                "Cloud Connect: ApplySpicepod received"
+            );
+        }
+
+        let delivered = match cmd.sealed_secret_payload.as_ref() {
+            None => None,
+            Some(payload) => match self
+                .open_delivered_secrets(payload, command_id, session_key)
+                .await
+            {
+                Ok(secrets) => Some(secrets),
+                Err(message) => {
+                    // FAILED, not UNSUPPORTED: opening can succeed on a later
+                    // attempt (the control plane re-seals to the rotated key),
+                    // so the control plane should be free to retry.
+                    send_failed(tx, command_id, &message).await;
+                    return;
+                }
+            },
+        };
+
+        let result = self
+            .runtime
+            .apply_spicepod(
+                &self.config.config_dir,
+                &cmd.spicepod_yaml,
+                &cmd.app_id,
+                delivered,
+            )
+            .await;
+        match &result {
+            Ok(_) => tracing::info!(command_id, "Cloud Connect: ApplySpicepod applied"),
+            Err(err) => {
+                tracing::warn!(command_id, "Cloud Connect: ApplySpicepod failed: {err}");
+            }
+        }
+        reply_with_json(tx, command_id, result).await;
+    }
+
+    /// Open a delivered payload against this instance's keys, returning a
+    /// caller-facing message on failure. Never includes key or secret material.
+    async fn open_delivered_secrets(
+        &mut self,
+        payload: &proto::SealedSecretPayload,
+        command_id: &str,
+        session_key: Option<&cloud_connect_crypto::EncryptionKeypair>,
+    ) -> std::result::Result<crate::sealed_secrets::DeliveredSecrets, String> {
+        let identity = self.identity.clone().ok_or_else(|| {
+            "no identity is held, so delivered secrets cannot be opened".to_string()
+        })?;
+        let keyring = identity
+            .encryption_keyring()
+            .map_err(|err| format!("delivered secrets could not be opened: {err}"))?;
+
+        let opened = crate::sealed_secrets::open_delivered(
+            payload,
+            &identity.identifier,
+            command_id,
+            session_key,
+            &keyring,
+        )
+        .map_err(|err| err.to_string())?;
+
+        // The *current* key opening a payload proves the control plane is
+        // sealing to the rotated key, so nothing in flight can still be
+        // addressed to the retained one. Retiring it here is what stops a
+        // superseded private key lingering on disk indefinitely. A payload that
+        // opened with the previous key deliberately does not retire it.
+        if crate::sealed_secrets::opened_with_current(&opened.inner_key_id, &keyring) {
+            let mut updated = identity;
+            if updated.retire_previous_enc_key() {
+                let path = self.config.identity_path.clone();
+                let to_store = updated.clone();
+                self.identity = Some(updated);
+                // Best-effort: a failed write only means the superseded key
+                // stays on disk until the next successful one.
+                if let Err(err) = tokio::task::spawn_blocking(move || {
+                    IdentityStore::store(&path, &to_store)
+                })
+                .await
+                .map_err(|join| format!("identity persistence task panicked: {join}"))
+                .and_then(|result| result.map_err(|err| err.to_string()))
+                {
+                    tracing::warn!(
+                        "Cloud Connect: could not persist the retirement of the previous encryption key: {err}"
+                    );
+                }
+            }
+        }
+
+        // Count only — a name is safe to log, a value never is, and the count is
+        // enough to tell "secrets arrived" from "none did".
+        tracing::info!(
+            "Cloud Connect: opened {} delivered secret(s) for this deployment",
+            opened.secrets.len()
+        );
+        Ok(opened.secrets)
     }
 
     async fn handle_adopt(
@@ -1434,6 +1582,8 @@ mod tests {
             not_after_unix,
             enc_private_key_pem: String::new(),
             enc_public_key_pem: String::new(),
+            enc_previous_private_key_pem: String::new(),
+            cache_key_b64: String::new(),
             app_id: None,
         }
     }

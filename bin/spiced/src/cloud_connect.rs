@@ -54,6 +54,12 @@ use runtime_cloud_connect::handlers::{
     Capability, CommandError, RuntimeHandle, RuntimePhase, StatusReport,
 };
 use runtime_cloud_connect::{CloudConnect, identity::IdentityStore};
+// Reached through the `runtime` re-export rather than a direct dependency, the
+// same way `runtime::status` is.
+use runtime::secrets::stores::cloud_delivered::{
+    CLOUD_DELIVERED_STORE, CloudDeliveredSecretStore,
+};
+use runtime_cloud_connect::identity::CacheKey;
 
 use crate::log_capture::LogRingBuffer;
 
@@ -105,6 +111,50 @@ fn build_config(runtime_version: &str) -> CloudConnectConfig {
     config
 }
 
+/// The delivered-secrets store and its cache key, restored from local state.
+///
+/// Built and installed **before** the runtime loads its components, because
+/// component initialization is what resolves `${ secrets:… }`: a store
+/// registered afterwards would arrive after every referencing component had
+/// already failed. The Cloud Connect *client* still starts after loading (see
+/// [`maybe_start`]) — only the local restore has to be early.
+pub struct DeliveredSecretsState {
+    store: Arc<CloudDeliveredSecretStore>,
+}
+
+/// Register the delivered-secrets store on `runtime` and restore the last
+/// delivered set from the local cache.
+///
+/// Call this before `load_components()`. Returns `None` when Cloud Connect is
+/// not configured for this instance, in which case nothing is registered — a
+/// vanilla OSS install gains no store and reads no files.
+///
+/// Deliberately local-only: the key lives in `identity.json` and the payload in
+/// the config dir, so a restart restores its secrets with the gateway
+/// unreachable. That is the property the local cache key buys.
+pub async fn restore_delivered_secrets(
+    runtime_version: &str,
+    runtime: &Arc<Runtime>,
+    cloud_connect_flag: bool,
+) -> Option<DeliveredSecretsState> {
+    if !is_configured(cloud_connect_flag) {
+        return None;
+    }
+    let config = build_config(runtime_version);
+
+    // Registered as a built-in so `${ secrets:NAME }` reaches it with nothing
+    // declared in the spicepod, it sits below every user-declared store, and a
+    // spicepod reload cannot clear it.
+    let store = Arc::new(CloudDeliveredSecretStore::new());
+    runtime.secrets().write().await.register_builtin_store(
+        CLOUD_DELIVERED_STORE,
+        Arc::clone(&store) as Arc<dyn runtime::secrets::SecretStore>,
+    );
+
+    load_cached_secrets(&config, &store);
+    Some(DeliveredSecretsState { store })
+}
+
 /// Start the Cloud Connect client if any of the opt-in conditions are
 /// met. The returned `Option<CloudConnect>` is `None` when `CloudConnect`
 /// is disabled — which is the default for vanilla OSS installs.
@@ -118,6 +168,7 @@ pub async fn maybe_start(
     runtime: Arc<Runtime>,
     cloud_connect_flag: bool,
     metrics: Option<MetricsReader>,
+    delivered_secrets: Option<DeliveredSecretsState>,
 ) -> Option<CloudConnect> {
     let config = build_config(runtime_version);
 
@@ -181,12 +232,38 @@ pub async fn maybe_start(
             "Spice Cloud Connect: the stored identity names no app; metrics are withheld until a deploy names one"
         ),
     }
+
+    // Installed before `load_components()` by `restore_delivered_secrets`, so
+    // the cached secrets were already in place when components resolved their
+    // references. `None` only if that call was skipped, in which case a
+    // deployment can still deliver secrets to this process — they just will not
+    // have been available at startup.
+    let delivered_store = match delivered_secrets {
+        Some(state) => state.store,
+        None => {
+            tracing::debug!(
+                "Spice Cloud Connect: no delivered-secrets store was installed before component load; registering one now"
+            );
+            let store = Arc::new(CloudDeliveredSecretStore::new());
+            runtime.secrets().write().await.register_builtin_store(
+                CLOUD_DELIVERED_STORE,
+                Arc::clone(&store) as Arc<dyn runtime::secrets::SecretStore>,
+            );
+            load_cached_secrets(&config, &store);
+            store
+        }
+    };
+
+    // The cache key is read from the identity on each write, not captured here:
+    // an instance enrolling in this very process has no identity yet.
+    let identity_path = config.identity_path.clone();
     let handle: Arc<dyn RuntimeHandle> = Arc::new(SpicedRuntimeHandle::new(
         runtime,
         logs,
         metrics,
         persisted_app_id,
-        config.identity_path.clone(),
+        delivered_store,
+        identity_path,
     ));
 
     match CloudConnect::start(config, handle).await {
@@ -197,6 +274,53 @@ pub async fn maybe_start(
                 "Spice Cloud Connect: failed to start (continuing without cloud management): {err}"
             );
             None
+        }
+    }
+}
+
+/// Load the delivered-secrets cache into `store`.
+///
+/// The key lives in `identity.json`, so both halves come from local state and
+/// this never contacts the control plane — which is the property that lets a
+/// restart succeed while the gateway is down.
+///
+/// Every failure is a degradation, never fatal: an unreadable, corrupt,
+/// wrong-key, or unknown-version cache is discarded with an actionable warning
+/// and the instance comes up with no delivered secrets, which one deployment
+/// restores. Crashing here would make a corrupt file unbootable.
+fn load_cached_secrets(config: &CloudConnectConfig, store: &CloudDeliveredSecretStore) {
+    let Some(key) = IdentityStore::load_optional(&config.identity_path)
+        .ok()
+        .flatten()
+        .and_then(|identity| identity.cache_key())
+    else {
+        // No identity yet (a first boot that will enroll below), or one that
+        // predates the cache key. Either way there is nothing to restore.
+        return;
+    };
+
+    let path = config
+        .config_dir
+        .join(runtime_cloud_connect::secret_cache::SECRET_CACHE_FILE);
+    match runtime_cloud_connect::secret_cache::read(&path, &key) {
+        Ok(Some(cached)) => {
+            // Names only.
+            tracing::info!(
+                "Spice Cloud Connect: restored {} delivered secret(s) from the local cache: {}",
+                cached.names().len(),
+                cached.names().join(", ")
+            );
+            store.replace(cached.into_values());
+        }
+        Ok(None) => {
+            tracing::debug!(
+                "Spice Cloud Connect: no delivered-secrets cache at {}; components referencing \
+                 delivered secrets wait for the first deployment",
+                path.display()
+            );
+        }
+        Err(err) => {
+            tracing::warn!("Spice Cloud Connect: {err}");
         }
     }
 }
@@ -231,15 +355,25 @@ struct SpicedRuntimeHandle {
     /// but matches no app dashboard, so exporting one spends the backend's quota
     /// to produce something nothing can read.
     ///
-    /// In memory only — a restart loses it and the instance stays quiet until the
-    /// next deploy. Guarded by a std mutex held only for the brief read/write,
-    /// never across `.await`.
+    /// Mirrored into the identity file so a restart keeps exporting; seeded from
+    /// there at startup. Guarded by a std mutex held only for the brief
+    /// read/write, never across `.await`.
     app_id: Mutex<Option<String>>,
-    /// Where the app id is persisted, so it survives a restart. Same file the
-    /// credential lives in; writes are serialized by the store.
-    identity_path: PathBuf,
     /// Pending-restart state accumulated across `apply_spicepod` calls.
     restart: RestartState,
+    /// Secrets the control plane delivered with a deployment. Registered as a
+    /// built-in store so `${ secrets:NAME }` resolves them with nothing declared
+    /// in the spicepod, and so a spicepod reload cannot drop them.
+    delivered_secrets: Arc<CloudDeliveredSecretStore>,
+    /// Where the identity lives — and with it the local cache key and the app
+    /// this instance's metrics are attributed to.
+    ///
+    /// Both are read from here on each use rather than captured at startup,
+    /// because an instance enrolling *in this process* has no identity yet when
+    /// the handle is built: capturing then would leave the cache permanently
+    /// unwritable on a first boot, which is precisely the case the cache exists
+    /// for.
+    identity_path: PathBuf,
 }
 
 impl SpicedRuntimeHandle {
@@ -248,6 +382,7 @@ impl SpicedRuntimeHandle {
         logs: Option<LogRingBuffer>,
         metrics: Option<MetricsReader>,
         app_id: Option<String>,
+        delivered_secrets: Arc<CloudDeliveredSecretStore>,
         identity_path: PathBuf,
     ) -> Self {
         Self {
@@ -255,8 +390,45 @@ impl SpicedRuntimeHandle {
             logs,
             metrics,
             app_id: Mutex::new(app_id),
-            identity_path,
             restart: RestartState::default(),
+            delivered_secrets,
+            identity_path,
+        }
+    }
+
+    /// The local delivered-secrets cache key, read fresh from `identity.json`.
+    ///
+    /// `None` when there is no identity yet, or it predates the cache key — in
+    /// both cases the cache is unavailable, which costs a redeploy after a
+    /// restart rather than the deployment.
+    fn cache_key(&self) -> Option<CacheKey> {
+        IdentityStore::load_optional(&self.identity_path)
+            .ok()
+            .flatten()
+            .and_then(|identity| identity.cache_key())
+    }
+
+    /// Persist the delivered secrets so the restart every deployment performs
+    /// comes back up with them, without a control-plane round trip.
+    ///
+    /// Best-effort by design: the secrets are already applied to this running
+    /// instance, so a cache failure costs a redeploy after the next restart
+    /// rather than the deployment. It is reported in the command result so the
+    /// operator is not left to discover it at restart time.
+    fn cache_delivered_secrets(
+        &self,
+        config_dir: &Path,
+        secrets: &runtime_cloud_connect::sealed_secrets::DeliveredSecrets,
+    ) -> Option<String> {
+        let key = self.cache_key()?;
+        let path = config_dir.join(runtime_cloud_connect::secret_cache::SECRET_CACHE_FILE);
+        // No deployment version to record yet — the dispatch does not carry one.
+        match runtime_cloud_connect::secret_cache::write(&path, &key, "", secrets) {
+            Ok(()) => None,
+            Err(err) => {
+                tracing::warn!("Spice Cloud Connect: could not cache delivered secrets: {err}");
+                Some(err.to_string())
+            }
         }
     }
 
@@ -420,6 +592,7 @@ impl RuntimeHandle for SpicedRuntimeHandle {
         config_dir: &Path,
         spicepod_yaml: &str,
         app_id: &str,
+        delivered_secrets: Option<runtime_cloud_connect::sealed_secrets::DeliveredSecrets>,
     ) -> Result<serde_json::Value, CommandError> {
         // Recorded before staging, and independently of whether staging succeeds:
         // which app this instance belongs to is a fact about the deploy's target,
@@ -467,6 +640,23 @@ impl RuntimeHandle for SpicedRuntimeHandle {
             }
         }
         self.persist_app_id(app_id).await;
+
+        // Install the delivered secrets BEFORE the spicepod is validated and
+        // applied: `AppBuilder::build_from_path` and `apply_app` both resolve
+        // `${ secrets:… }` references, so secrets installed afterwards would
+        // arrive after the components that needed them had already failed.
+        let mut cache_error = None;
+        let delivered_names = match delivered_secrets {
+            None => None,
+            Some(secrets) => {
+                let names: Vec<String> = secrets.keys().cloned().collect();
+                cache_error = self.cache_delivered_secrets(config_dir, &secrets);
+                // Replaces the whole set: an app whose secrets were removed
+                // must stop resolving them.
+                self.delivered_secrets.replace(secrets);
+                Some(names)
+            }
+        };
 
         let (new_app, path) = stage_cloud_managed_spicepod(config_dir, spicepod_yaml).await?;
 
@@ -525,6 +715,9 @@ impl RuntimeHandle for SpicedRuntimeHandle {
             "models": models,
             "catalogs": catalogs,
             "views": views,
+            // Names only — a delivered value never leaves this process.
+            "delivered_secrets": delivered_names,
+            "secrets_cache_error": cache_error,
         }))
     }
 
@@ -645,6 +838,23 @@ impl RuntimeHandle for SpicedRuntimeHandle {
                 "errors": errors,
                 "restart_pending": restart_pending,
                 "restart_pending_sections": restart_pending_sections,
+                // Names only, never values — this document reaches the portal and
+                // the command log. The count and the names are what let an operator
+                // tell "the deployment delivered no secrets" apart from "the
+                // component's reference is misspelled".
+                "delivered_secrets": self.delivered_secrets.names(),
+                "delivered_secrets_available": !self.delivered_secrets.is_empty(),
+                // Whether a restart will still have them. Without a cache key the
+                // secrets are memory-only, so the next restart needs a redeploy —
+                // status says so rather than failing mutely later.
+                "delivered_secrets_persisted": self.cache_key().is_some(),
+                // The app exported metrics are attributed to. Absent means the
+                // instance is exporting nothing, which is otherwise invisible.
+                "metrics_app_id": self
+                    .app_id
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
             })),
         )
     }

@@ -1233,6 +1233,64 @@ mod connect {
         assert!(!config_dir.join("pending-adopt-code").exists());
     }
 
+    /// `remove` must delete the delivered-secrets cache: it holds the app's
+    /// credentials, and leaving it on a released host leaves them there.
+    #[cfg(unix)]
+    #[test]
+    fn test_connect_remove_deletes_the_delivered_secrets_cache() {
+        let dir = TempDir::new().expect("create temp config dir");
+        let config_dir = dir.path();
+        let cache = config_dir.join("secrets-cache.json");
+        // Shape does not matter here — `remove` deletes the file, it does not
+        // open it (the key it would need is in the identity it also deletes).
+        std::fs::write(&cache, r#"{"format_version":1}"#).expect("stage a cache");
+
+        spice_cmd()
+            .env("SPICE_CONFIG_DIR", config_dir)
+            .arg("connect")
+            .arg("remove")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("identity cleared"));
+
+        assert!(
+            !cache.exists(),
+            "the delivered-secrets cache must not survive a remove"
+        );
+    }
+
+    /// `status` reports which secrets were delivered, by name, from the cache's
+    /// plaintext header — and never a value, since it holds no key.
+    #[cfg(unix)]
+    #[test]
+    fn test_connect_status_reports_delivered_secret_names() {
+        let dir = TempDir::new().expect("create temp config dir");
+        let config_dir = dir.path();
+        let home = TempDir::new().expect("create temp home");
+        install_fake_spiced(home.path());
+        let (endpoint, server) = spawn_one_shot_http(200, &enroll_ok_body());
+
+        spice_cmd()
+            .env("HOME", home.path())
+            .env("SPICE_CONFIG_DIR", config_dir)
+            .arg("connect")
+            .arg("SPICE-ADOPT-AAAAA-BBBBB")
+            .arg("--endpoint")
+            .arg(&endpoint)
+            .assert()
+            .success();
+        server.join().expect("mock served the enroll request");
+
+        // No cache yet: status says so rather than staying silent about it.
+        spice_cmd()
+            .env("SPICE_CONFIG_DIR", config_dir)
+            .arg("connect")
+            .arg("status")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("none delivered yet"));
+    }
+
     /// The success output names every fact the operator needs next: the org,
     /// the instance id, the attachment state, the declared region, and both
     /// continuations (install a service, or run in the foreground).

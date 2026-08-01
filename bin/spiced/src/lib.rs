@@ -874,6 +874,20 @@ pub async fn run(args: Args) -> Result<()> {
         Box::pin(cloned_rt.start_servers(args.runtime, tls_config, endpoint_auth)).await
     });
 
+    // Restore control-plane-delivered secrets from the local cache and register
+    // their store BEFORE loading components. Component initialization is what
+    // resolves `${ secrets:… }`, so a store installed after this point would
+    // arrive too late for every component that referenced one — and since a
+    // deployment applies by restarting, that is the normal path, not an edge
+    // case. Local files only, no control-plane round trip, so this neither
+    // blocks nor fails when the gateway is unreachable.
+    let delivered_secrets = cloud_connect::restore_delivered_secrets(
+        env!("CARGO_PKG_VERSION"),
+        &rt,
+        cloud_connect_flag,
+    )
+    .await;
+
     let mut components_loaded = false;
     tokio::select! {
         () = Arc::clone(&rt).load_components() => { components_loaded = true; },
@@ -894,6 +908,7 @@ pub async fn run(args: Args) -> Result<()> {
             Arc::clone(&rt),
             cloud_connect_flag,
             cloud_connect_metrics,
+            delivered_secrets,
         )
         .await
     } else {

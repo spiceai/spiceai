@@ -372,6 +372,10 @@ struct Captured {
     heartbeats: Vec<proto::Heartbeat>,
     telemetry: Vec<proto::Telemetry>,
     audits: Vec<proto::EventLog>,
+    /// Per-connection encryption keys the client announced. The gateway seals
+    /// delivered secrets to these, so a session that announced none receives
+    /// none.
+    secrets_keys: Vec<proto::SecretsKey>,
 }
 
 #[derive(Clone)]
@@ -495,9 +499,14 @@ impl CloudConnect for GatewayServer {
                     // wildcarded so a new client message still has to be
                     // accounted for here.
                     Some(
-                        proto::client_message::Body::SecretsKey(_)
-                        | proto::client_message::Body::ExportMetrics(_),
+                        proto::client_message::Body::ExportMetrics(_),
                     ) => {}
+                    // Announced once per stream, immediately after the Hello:
+                    // the gateway needs it to seal the outer layer of any
+                    // secrets it dispatches on this session.
+                    Some(proto::client_message::Body::SecretsKey(key)) => {
+                        captured.lock().await.secrets_keys.push(key);
+                    }
                     None => break,
                 }
             }
@@ -547,6 +556,9 @@ async fn spawn_gateway(server: GatewayServer, ca: &TestCa) -> SocketAddr {
 struct E2eRuntimeState {
     /// The path, spicepod, and app id of the last apply.
     applied_spicepod: Option<(std::path::PathBuf, String, String)>,
+    /// Names of the secrets delivered with the last applied spicepod, never
+    /// values. `None` when the deployment carried no payload at all.
+    delivered_secret_names: Option<Vec<String>>,
 }
 
 struct E2eRuntime {
@@ -583,7 +595,13 @@ impl RuntimeHandle for E2eRuntime {
         config_dir: &Path,
         spicepod_yaml: &str,
         app_id: &str,
+        delivered_secrets: Option<runtime_cloud_connect::sealed_secrets::DeliveredSecrets>,
     ) -> Result<Value, CommandError> {
+        // Record the delivered names (never values) so a test can assert the
+        // payload reached the runtime adapter.
+        self.state.lock().await.delivered_secret_names = delivered_secrets
+            .as_ref()
+            .map(|secrets| secrets.keys().cloned().collect());
         // Persist to the canonical path and report a hot apply, mirroring the
         // spiced adapter's observable result envelope.
         let path = config_dir.join(runtime_cloud_connect::config::CLOUD_MANAGED_SPICEPOD_FILE);
@@ -1334,6 +1352,185 @@ async fn heartbeat_and_telemetry_cadence() {
     handle.shutdown().await;
 }
 
+/// The delivery path end to end: the client announces a per-connection key, the
+/// (mock) gateway double-seals a payload to it exactly as the real one does, and
+/// the opened secrets reach the runtime adapter alongside the spicepod.
+#[tokio::test]
+async fn apply_spicepod_delivers_double_sealed_secrets() {
+    use cloud_connect_crypto::{RecipientKey, SealLayer, SecretAddress};
+    use prost::Message as _;
+
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+    let identity_path = dir.path().join("identity.json");
+    let config = harness.config(
+        identity_path.clone(),
+        dir.path().to_path_buf(),
+        Some(ADOPTION_CODE.to_string()),
+        Duration::from_hours(12),
+    );
+    let (runtime, rt_state) = E2eRuntime::new();
+    let (handle, identity) = enroll(&harness, &config, runtime).await;
+
+    // The session key the client announced — the gateway's outer recipient.
+    let captured = Arc::clone(&harness.gateway.captured);
+    let announced = wait_until_async(Duration::from_secs(5), || {
+        let captured = Arc::clone(&captured);
+        async move { !captured.lock().await.secrets_keys.is_empty() }
+    })
+    .await;
+    assert!(
+        announced,
+        "the client must announce a per-connection secrets key, or it can receive no secrets"
+    );
+    let session = with_captured!(captured, c => c.secrets_keys[0].clone());
+    assert_eq!(session.kem_id, cloud_connect_crypto::KEM_ID);
+    assert_eq!(session.aead_id, cloud_connect_crypto::AEAD_ID);
+
+    // Inner: the control plane seals to the instance's *enrolled* key.
+    let enrolled_pub = cloud_connect_crypto::EncryptionKeypair::from_pkcs8_pem(
+        &identity.enc_private_key_pem,
+    )
+    .expect("enrolled key parses");
+    let plaintext = proto::SecretPayload {
+        string_data: [("openai_key".to_string(), b"sk-e2e".to_vec())]
+            .into_iter()
+            .collect(),
+    }
+    .encode_to_vec();
+    let inner_aad = SecretAddress::standalone(ASSIGNED_ID, enrolled_pub.key_id())
+        .expect("inner address")
+        .inner_aad();
+    let inner_sealed = RecipientKey::from_public_key(enrolled_pub.public_key())
+        .expect("inner recipient")
+        .seal(SealLayer::Inner, &plaintext, &inner_aad)
+        .expect("inner seal");
+    let inner = proto::SealedSecretPayload {
+        key_id: enrolled_pub.key_id().to_string(),
+        enc: inner_sealed.enc,
+        ciphertext: inner_sealed.ciphertext,
+    };
+
+    // Outer: the gateway seals that opaque envelope to the announced key.
+    const COMMAND_ID: &str = "cmd-apply-secrets";
+    let outer_aad = SecretAddress::standalone(ASSIGNED_ID, &session.key_id)
+        .expect("outer address")
+        .outer_aad(COMMAND_ID)
+        .expect("outer aad");
+    let outer_sealed = RecipientKey::from_announcement(
+        &session.key_id,
+        session.kem_id,
+        session.kdf_id,
+        session.aead_id,
+        &session.public_key,
+    )
+    .expect("outer recipient")
+    .seal(SealLayer::Outer, &inner.encode_to_vec(), &outer_aad)
+    .expect("outer seal");
+
+    let yaml = "version: v2\nkind: Spicepod\nname: e2e-secrets\n";
+    harness.gateway.outbound.lock().await.push_back(ctrl_id(
+        COMMAND_ID,
+        proto::control_message::Body::ApplySpicepod(proto::ApplySpicepod {
+            spicepod_yaml: yaml.to_string(),
+            sealed_secret_payload: Some(proto::SealedSecretPayload {
+                key_id: session.key_id.clone(),
+                enc: outer_sealed.enc,
+                ciphertext: outer_sealed.ciphertext,
+            }),
+        }),
+    ));
+
+    let captured = Arc::clone(&harness.gateway.captured);
+    let succeeded = wait_until_async(Duration::from_secs(5), || {
+        let captured = Arc::clone(&captured);
+        async move {
+            captured
+                .lock()
+                .await
+                .results
+                .iter()
+                .any(|r| r.command_id == COMMAND_ID && r.code == proto::ResultCode::Ok as i32)
+        }
+    })
+    .await;
+    assert!(succeeded, "the delivery must be applied, not refused");
+
+    // The opened names reached the adapter; the value never leaves the process.
+    let names = rt_state.lock().await.delivered_secret_names.clone();
+    assert_eq!(
+        names,
+        Some(vec!["openai_key".to_string()]),
+        "the opened secrets must reach the runtime adapter with the spicepod"
+    );
+
+    // No result payload may carry a secret value.
+    let payloads = with_captured!(captured, c => c
+        .results
+        .iter()
+        .map(|r| format!("{:?} {}", r.payload, r.message))
+        .collect::<Vec<_>>());
+    assert!(
+        payloads.iter().all(|p| !p.contains("sk-e2e")),
+        "no command result may echo a delivered secret value: {payloads:?}"
+    );
+
+    handle.shutdown().await;
+}
+
+/// A payload the session key cannot open must fail the whole command — the
+/// spicepod is not applied, rather than applied without the secrets it needs.
+#[tokio::test]
+async fn apply_spicepod_refuses_an_unopenable_payload() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+    let config = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        Some(ADOPTION_CODE.to_string()),
+        Duration::from_hours(12),
+    );
+    let (runtime, rt_state) = E2eRuntime::new();
+    let (handle, _identity) = enroll(&harness, &config, runtime).await;
+
+    // Garbage addressed to a key this session never announced.
+    harness.gateway.outbound.lock().await.push_back(ctrl_id(
+        "cmd-bad-secrets",
+        proto::control_message::Body::ApplySpicepod(proto::ApplySpicepod {
+            spicepod_yaml: "version: v2\nkind: Spicepod\nname: nope\n".to_string(),
+            sealed_secret_payload: Some(proto::SealedSecretPayload {
+                key_id: "0000000000000000".to_string(),
+                enc: vec![0_u8; 32],
+                ciphertext: vec![0_u8; 64],
+            }),
+        }),
+    ));
+
+    let captured = Arc::clone(&harness.gateway.captured);
+    let failed = wait_until_async(Duration::from_secs(5), || {
+        let captured = Arc::clone(&captured);
+        async move {
+            captured
+                .lock()
+                .await
+                .results
+                .iter()
+                .any(|r| {
+                    r.command_id == "cmd-bad-secrets" && r.code != proto::ResultCode::Ok as i32
+                })
+        }
+    })
+    .await;
+    assert!(failed, "an unopenable payload must fail the command");
+
+    assert!(
+        rt_state.lock().await.applied_spicepod.is_none(),
+        "the spicepod must NOT be applied when its secrets could not be opened"
+    );
+
+    handle.shutdown().await;
+}
+
 #[tokio::test]
 async fn apply_spicepod_hot_applies_and_persists() {
     let harness = Harness::new(24 * 60 * 60).await;
@@ -1352,6 +1549,7 @@ async fn apply_spicepod_hot_applies_and_persists() {
         "cmd-apply",
         proto::control_message::Body::ApplySpicepod(proto::ApplySpicepod {
             spicepod_yaml: yaml.to_string(),
+            sealed_secret_payload: None,
             app_id: "4002".to_string(),
         }),
     ));
@@ -1512,6 +1710,10 @@ async fn renewal_rotates_keypair_and_persists() {
     })
     .await;
     assert!(renewed, "a renewal must be attempted within 15s");
+    assert!(
+        !enrolled_identity.cache_key_b64.is_empty(),
+        "enrollment must mint a local secrets-cache key"
+    );
 
     // The renew request carried the standard contract shape.
     let renew_body = harness.cloud.renew_requests.lock().await[0].clone();
@@ -1526,6 +1728,17 @@ async fn renewal_rotates_keypair_and_persists() {
             .unwrap()
             .contains("CERTIFICATE REQUEST"),
         "renew carries a fresh CSR"
+    );
+    // The encryption key rotates in the SAME request as the identity key, so
+    // the cloud re-pins both in one atomic update. The endpoint requires the
+    // field, so omitting it would fail every renewal.
+    let renewed_enc_pubkey = renew_body["enc_pubkey_pem"]
+        .as_str()
+        .expect("renew must carry the rotated encryption public key");
+    assert!(renewed_enc_pubkey.contains("PUBLIC KEY"));
+    assert_ne!(
+        renewed_enc_pubkey, enrolled_identity.enc_public_key_pem,
+        "the renewal must mint a FRESH encryption keypair, not re-send the enrolled one"
     );
     assert!(
         !renew_body["pop_sig"].as_str().unwrap().is_empty(),
@@ -1550,6 +1763,35 @@ async fn renewal_rotates_keypair_and_persists() {
     assert_ne!(
         renewed_identity.private_key_pem, enrolled_identity.private_key_pem,
         "every renewal rotates the keypair"
+    );
+    assert_ne!(
+        renewed_identity.enc_private_key_pem, enrolled_identity.enc_private_key_pem,
+        "the encryption key rotates with the identity key"
+    );
+    assert_eq!(
+        renewed_identity.enc_previous_private_key_pem, enrolled_identity.enc_private_key_pem,
+        "the outgoing encryption key must be retained for one rotation, so a payload sealed just \
+         before the rotation still opens"
+    );
+    assert_eq!(
+        renewed_identity.cache_key_b64, enrolled_identity.cache_key_b64,
+        "the local cache key must NOT rotate, or the cache is stranded every ~12h"
+    );
+    // Both keys are reachable for an open; the current one is the rotated key.
+    let keyring = renewed_identity
+        .encryption_keyring()
+        .expect("the rotated identity yields a keyring");
+    assert!(
+        keyring
+            .select(
+                cloud_connect_crypto::EncryptionKeypair::from_pkcs8_pem(
+                    &enrolled_identity.enc_private_key_pem
+                )
+                .expect("pre-rotation key parses")
+                .key_id()
+            )
+            .is_some(),
+        "the pre-rotation key must still be selectable by its key id"
     );
     assert_ne!(
         renewed_identity.identity_cert_pem, enrolled_identity.identity_cert_pem,
