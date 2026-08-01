@@ -411,6 +411,20 @@ impl SqlErrorKind {
     }
 }
 
+/// Folds a query error message onto one line so it logs as a single record.
+///
+/// A memory-pool refusal carries a newline-separated list of the top memory
+/// consumers, and a multi-line record breaks the line-oriented collectors that
+/// scrape these logs. The response body keeps the original formatting — only
+/// the logged copy is folded.
+fn single_line(message: &str) -> std::borrow::Cow<'_, str> {
+    if message.contains(['\n', '\r']) {
+        std::borrow::Cow::Owned(message.split_whitespace().collect::<Vec<_>>().join(" "))
+    } else {
+        std::borrow::Cow::Borrowed(message)
+    }
+}
+
 /// Maps a query error message to an HTTP response, distinguishing cancellation
 /// (499 Client Closed Request) and query timeout (504 Gateway Timeout) from
 /// other errors.
@@ -422,10 +436,11 @@ impl SqlErrorKind {
 /// separate tokio runtime and stays green throughout, so nothing else raises
 /// the condition at the default verbosity.
 fn sql_error_response(message: String, kind: SqlErrorKind) -> Response {
+    let logged = single_line(&message);
     if matches!(kind, SqlErrorKind::ResourcesExhausted) {
-        tracing::warn!("Query refused, out of memory: {message}");
+        tracing::warn!("Query refused, out of memory: {logged}");
     } else {
-        tracing::debug!("Error executing query: {message}");
+        tracing::debug!("Error executing query: {logged}");
     }
     let status = match kind {
         SqlErrorKind::Cancellation => StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
@@ -837,6 +852,47 @@ mod tests {
             SqlErrorKind::of_datafusion_error(&general),
             SqlErrorKind::General
         ));
+    }
+
+    /// The memory pool's refusal spans several lines — the message that reaches
+    /// `sql_error_response` embeds the top-consumers table — so the logged copy
+    /// has to be folded onto one line for line-oriented log collectors.
+    #[test]
+    fn resource_exhaustion_message_logs_on_one_line() {
+        let message = concat!(
+            "Resources exhausted: Additional allocation failed for HashJoinInput[135] ",
+            "with top memory consumers (across reservations) as:\n",
+            "  HashJoinInput[135]#12(can spill: false) consumed 1.0 GB, peak 1.0 GB,\n",
+            "  ExternalSorter[3]#9(can spill: true) consumed 512.0 MB, peak 600.0 MB.\n",
+            "Error: Failed to allocate additional 256.0 MB for HashJoinInput[135]"
+        );
+
+        let folded = single_line(message);
+        assert!(
+            !folded.contains(['\n', '\r']),
+            "the logged message must be one line, got: {folded}"
+        );
+        assert!(
+            folded.contains("consumed 1.0 GB, peak 1.0 GB, ExternalSorter[3]"),
+            "folding must join the lines, not drop them: {folded}"
+        );
+        assert!(
+            folded.ends_with("Failed to allocate additional 256.0 MB for HashJoinInput[135]"),
+            "the tail of the message must survive: {folded}"
+        );
+
+        // A single-line message is passed through untouched — including its
+        // interior spacing — and without allocating.
+        let plain = "Resources exhausted:  out of memory";
+        assert!(matches!(
+            single_line(plain),
+            std::borrow::Cow::Borrowed(kept) if kept == plain
+        ));
+
+        // Folding is confined to the log record: the response still classifies
+        // the same way off the original, unfolded message.
+        let response = sql_error_response(message.to_string(), SqlErrorKind::ResourcesExhausted);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
