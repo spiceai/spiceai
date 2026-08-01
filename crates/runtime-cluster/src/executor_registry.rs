@@ -212,7 +212,9 @@ impl ExecutorTableStatistics {
     /// This lets the coordinator's planner estimate join/aggregate cardinalities
     /// from the executor's column min/max even when the leaf scan is projected.
     ///
-    /// Every value is downgraded to [`Precision::Inexact`]. The registry holds an
+    /// Every value the executor actually reported is downgraded to
+    /// [`Precision::Inexact`]; a value it did not report stays
+    /// [`Precision::Absent`]. The registry holds an
     /// asynchronous snapshot — executors rebroadcast on a 45s timer (plus a
     /// debounced write-completion nudge), so the executor's data has moved on by
     /// the time the coordinator plans against it. `Precision::Exact` is a
