@@ -1435,6 +1435,7 @@ async fn apply_spicepod_delivers_double_sealed_secrets() {
                 enc: outer_sealed.enc,
                 ciphertext: outer_sealed.ciphertext,
             }),
+            app_id: String::new(),
         }),
     ));
 
@@ -1500,6 +1501,7 @@ async fn apply_spicepod_refuses_an_unopenable_payload() {
                 enc: vec![0_u8; 32],
                 ciphertext: vec![0_u8; 64],
             }),
+            app_id: String::new(),
         }),
     ));
 
