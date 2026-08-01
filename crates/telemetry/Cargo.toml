@@ -33,3 +33,6 @@ util = { path = "../util", features = ["datafusion"] }
 
 [features]
 anonymous_telemetry = []
+
+[dev-dependencies]
+tempfile.workspace = true
