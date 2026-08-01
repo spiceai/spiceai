@@ -2285,10 +2285,8 @@ async fn create_scheduler_server(
 fn cluster_service_endpoint(
     endpoint_url: String,
     grpc_client: &ClusterGrpcClientConfig,
-) -> crate::Result<Endpoint> {
-    let endpoint = Endpoint::from_shared(endpoint_url)
-        .boxed()
-        .context(FailedToStartClusterExecutorSnafu)?;
+) -> std::result::Result<Endpoint, tonic::transport::Error> {
+    let endpoint = Endpoint::from_shared(endpoint_url)?;
     Ok(endpoint
         // Bound connect so a unreachable/misconfigured scheduler fails the
         // executor startup future instead of hanging until the harness ready
@@ -2312,7 +2310,9 @@ async fn create_cluster_service_client(
     grpc_client: &ClusterGrpcClientConfig,
 ) -> crate::Result<ClusterServiceClient<Channel>> {
     let endpoint_url = scheduler_url.to_string();
-    let mut endpoint = cluster_service_endpoint(endpoint_url.clone(), grpc_client)?;
+    let mut endpoint = cluster_service_endpoint(endpoint_url.clone(), grpc_client)
+        .boxed()
+        .context(FailedToStartClusterExecutorSnafu)?;
     if let Some(tls_config) = client_tls_config {
         endpoint = endpoint
             .tls_config(tls_config)
