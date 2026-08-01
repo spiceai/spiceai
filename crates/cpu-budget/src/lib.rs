@@ -17,14 +17,24 @@ limitations under the License.
 //! How many CPUs `spiced` is entitled to, and every sizing decision derived from
 //! that.
 //!
-//! `std::thread::available_parallelism` and `num_cpus::get` read the cgroup CPU
-//! *quota* and otherwise fall back to `sched_getaffinity` — the node's core
-//! count. A Kubernetes pod that sets `resources.requests.cpu` with no
-//! `resources.limits.cpu` has no quota, so both report the node. Sizing thread
-//! pools, query fan-out, and accelerator concurrency from that over-commits the
-//! CPU the pod is entitled to, and — worse — feeds a wrong denominator to the
-//! Cayenne tuner's CPU busy-fraction, which then concludes CPU is idle while the
-//! process is saturated.
+//! `spiced` derived that count in fourteen separate places, each calling
+//! `std::thread::available_parallelism` or `num_cpus::get` directly, with no way
+//! to override it and no record of where the number came from. One of those
+//! sites fed a control loop: the Cayenne tuner divided its CPU busy-fraction by
+//! the detected core count, so a runtime sized for more cores than it can use
+//! reports itself idle while saturated.
+//!
+//! Detection itself is unchanged — with nothing configured this resolves to the
+//! same value `available_parallelism` returned (a cgroup quota, capped by
+//! `sched_getaffinity`). What is new is that the value has one owner, a named
+//! source, and an explicit override for deployments the host cannot describe.
+//!
+//! Detection deliberately reads only a cgroup CPU *quota*, never a CPU *share*.
+//! Under Kubernetes the kubelet derives the share from `requests.cpu`, but a
+//! request is a scheduling floor, not a ceiling: a burstable pod is entitled to
+//! every idle core on its node, and sizing from the request would take that
+//! away. An operator who wants the runtime sized to the request says so
+//! explicitly with `runtime.cpu.cores`.
 //!
 //! This crate owns both halves of the fix: [`HostReadings`] +
 //! [`CpuBudget::resolve`] decide the entitlement, and the methods on
@@ -82,9 +92,6 @@ pub enum CpuSource {
     Configured,
     /// A cgroup CPU quota (v2 `cpu.max`, v1 `cpu.cfs_quota_us`).
     CgroupQuota,
-    /// A Kubernetes cgroup CPU share (v2 `cpu.weight`, v1 `cpu.shares`), which
-    /// the kubelet derives from `requests.cpu`.
-    CgroupShares,
     /// `sched_getaffinity` — the cores the process may run on.
     Affinity,
     /// Nothing could be determined; one core.
@@ -98,7 +105,6 @@ impl CpuSource {
         match self {
             Self::Configured => "configured",
             Self::CgroupQuota => "cgroup_quota",
-            Self::CgroupShares => "cgroup_shares",
             Self::Affinity => "affinity",
             Self::Fallback => "fallback",
         }
@@ -147,14 +153,9 @@ impl CpuConfig {
 pub struct HostReadings {
     /// `sched_getaffinity` / `available_parallelism`.
     pub affinity_cores: usize,
-    /// Millicores implied by a cgroup CPU quota.
+    /// Millicores implied by a cgroup CPU quota (`limits.cpu`). `None` when no
+    /// quota is set, which includes every burstable pod.
     pub quota_millicores: Option<u64>,
-    /// The cgroup CPU share, normalized to v1 units.
-    pub shares: Option<cgroup::CpuShares>,
-    /// Running under a kubelet-managed cgroup.
-    pub in_kubernetes: bool,
-    /// Running inside a container of any flavour.
-    pub in_container: bool,
 }
 
 impl HostReadings {
@@ -165,15 +166,10 @@ impl HostReadings {
         reason = "the one sanctioned detection site: `clippy.toml` forbids this everywhere else so a call site cannot size itself from the node's cores"
     )]
     pub fn detect() -> Self {
-        let in_kubernetes = cgroup::in_kubernetes();
         Self {
             affinity_cores: std::thread::available_parallelism()
                 .map_or(1, std::num::NonZeroUsize::get),
             quota_millicores: detect_quota_millicores(),
-            shares: detect_shares(),
-            in_kubernetes,
-            // `in_kubernetes` implies a container; short-circuit the extra reads.
-            in_container: in_kubernetes || cgroup::in_container(),
         }
     }
 }
@@ -193,17 +189,6 @@ fn detect_quota_millicores() -> Option<u64> {
     )
 }
 
-fn detect_shares() -> Option<cgroup::CpuShares> {
-    if let Some(path) = cgroup::v2_file_path("cpu.weight")
-        && let Ok(contents) = std::fs::read_to_string(&path)
-        && let Some(shares) = cgroup::parse_weight(&contents)
-    {
-        return Some(shares);
-    }
-    let path = cgroup::v1_file_path("cpu", "cpu.shares")?;
-    cgroup::parse_shares(&std::fs::read_to_string(path).ok()?)
-}
-
 /// The process-wide CPU entitlement and every sizing decision derived from it.
 #[derive(Debug, Clone)]
 pub struct CpuBudget {
@@ -215,9 +200,6 @@ pub struct CpuBudget {
     setting: Option<&'static str>,
     /// What `sched_getaffinity` saw, for the startup log.
     detected_cores: usize,
-    /// The entitlement the cgroup CPU share implies, when that share carries
-    /// information. Drives the over-commitment warning.
-    shares_implied_millicores: Option<u64>,
 }
 
 impl CpuBudget {
@@ -226,17 +208,22 @@ impl CpuBudget {
     /// The ladder, first hit wins:
     ///
     /// 1. an explicit `cores` value -> [`CpuSource::Configured`]
-    /// 2. a cgroup CPU quota -> [`CpuSource::CgroupQuota`] (today's effective
-    ///    behaviour, so quota'd deployments see no change)
-    /// 3. a **Kubernetes** cgroup CPU share -> [`CpuSource::CgroupShares`]
-    /// 4. `sched_getaffinity` -> [`CpuSource::Affinity`]
-    /// 5. one core -> [`CpuSource::Fallback`]
+    /// 2. a cgroup CPU quota (`limits.cpu`) -> [`CpuSource::CgroupQuota`]
+    /// 3. `sched_getaffinity` -> [`CpuSource::Affinity`]
+    /// 4. one core -> [`CpuSource::Fallback`]
     ///
-    /// Step 3 is gated on Kubernetes and can never raise the value above step 4.
-    /// Outside Kubernetes a CPU share is a *relative* scheduling weight with an
-    /// ambiguous default — systemd's default `CPUWeight` of 100 inverts to ≈2.5
-    /// cores, so trusting it would size an unconstrained bare-metal `spiced` for
-    /// 2.5 cores instead of 64.
+    /// With nothing configured this resolves to exactly what
+    /// `available_parallelism` already returned — quota capped by affinity — so
+    /// a deployment that sets no CPU configuration is sized identically before
+    /// and after this crate existed. What changes is only that the value now has
+    /// one owner, a named source, and an override.
+    ///
+    /// A cgroup CPU *share* is deliberately not consulted. The kubelet derives
+    /// it from `requests.cpu`, which is a scheduling floor rather than a
+    /// ceiling: a pod with a request and no limit is entitled to burst across
+    /// every idle core on its node, and inferring a limit from the request would
+    /// silently remove that. Operators who want the runtime sized to the request
+    /// set `runtime.cpu.cores` (or `SPICE_CPU_CORES`) explicitly.
     ///
     /// # Errors
     ///
@@ -247,11 +234,6 @@ impl CpuBudget {
         let affinity_millicores = u64::try_from(detected_cores)
             .unwrap_or(u64::MAX)
             .saturating_mul(1000);
-
-        let shares_implied_millicores = host
-            .shares
-            .filter(|s| s.is_meaningful())
-            .map(cgroup::CpuShares::millicores);
 
         let configured = match &cfg.cores {
             Some((value, setting)) => parse_cpu_quantity(value)
@@ -266,12 +248,13 @@ impl CpuBudget {
         let (millicores, source, setting) = if let Some((millicores, setting)) = configured {
             (millicores, CpuSource::Configured, Some(setting))
         } else if let Some(quota) = host.quota_millicores {
-            (quota.max(1), CpuSource::CgroupQuota, None)
-        } else if let Some(implied) = shares_implied_millicores.filter(|_| host.in_kubernetes) {
-            // Never above what the process may actually run on.
+            // Capped by affinity: a quota wider than the cores the process may
+            // run on cannot be used, and `available_parallelism` already takes
+            // the minimum of the two. Without the cap a `--cpus=100` container
+            // on a 16-core host would size itself for 100 cores.
             (
-                implied.min(affinity_millicores),
-                CpuSource::CgroupShares,
+                quota.max(1).min(affinity_millicores),
+                CpuSource::CgroupQuota,
                 None,
             )
         } else if host.affinity_cores > 0 {
@@ -288,10 +271,6 @@ impl CpuBudget {
             source,
             setting,
             detected_cores,
-            shares_implied_millicores: host
-                .shares
-                .filter(|s| s.is_meaningful() && !s.is_default && host.in_container)
-                .map(cgroup::CpuShares::millicores),
         })
     }
 
@@ -317,9 +296,8 @@ impl CpuBudget {
         Ok(())
     }
 
-    /// Log the effective budget, every value derived from it, and — where it
-    /// applies — the over-commitment warning. Call once, before anything is
-    /// sized.
+    /// Log the effective budget and every value derived from it. Call once,
+    /// before anything is sized.
     ///
     /// The derived values are logged as their own line because the headline
     /// summary names only the three an operator recognizes. Every consumer's
@@ -329,9 +307,6 @@ impl CpuBudget {
     pub fn log_summary(&self) {
         tracing::info!("{}", self.summary_line());
         tracing::info!("{}", self.derived_sizing_line());
-        if let Some(warning) = self.overcommit_warning() {
-            tracing::warn!("{warning}");
-        }
     }
 
     /// Every quantity this budget derives, paired with the consumer it sizes.
@@ -399,7 +374,6 @@ impl CpuBudget {
         let origin = match self.source {
             CpuSource::Configured => self.setting.unwrap_or(CpuConfig::SPICEPOD_SETTING),
             CpuSource::CgroupQuota => "cgroup CPU quota",
-            CpuSource::CgroupShares => "cgroup CPU share, i.e. the pod's requests.cpu",
             CpuSource::Affinity => "detected CPUs",
             CpuSource::Fallback => "fallback",
         };
@@ -413,39 +387,6 @@ impl CpuBudget {
             dedicated = self.dedicated_runtime_worker_threads(),
             partitions = self.target_partitions(),
         )
-    }
-
-    /// The warning for a container whose CPU share implies a materially smaller
-    /// entitlement than the one being sized for — the request-without-limit
-    /// deployment outside Kubernetes, where the share is real but cannot be
-    /// trusted automatically.
-    ///
-    /// `None` when the budget already sizes from the share or from explicit
-    /// configuration, when the share is the cgroup default (systemd and a plain
-    /// `docker run` both leave it there, so it means nothing), or when the two
-    /// values agree.
-    #[must_use]
-    pub fn overcommit_warning(&self) -> Option<String> {
-        if matches!(self.source, CpuSource::Configured | CpuSource::CgroupShares) {
-            return None;
-        }
-        let implied = self.shares_implied_millicores?;
-        // "Materially below": at most half the entitlement being used, so a
-        // rounding difference never warns.
-        if implied.saturating_mul(2) > self.millicores {
-            return None;
-        }
-        Some(format!(
-            "Detected {detected} CPUs, but this container's cgroup CPU share implies ~{implied} \
-             and no CPU quota is set. spiced is sizing its thread pools for {effective}, which \
-             over-commits the CPU this container is entitled to. Set `{spicepod}` (or \
-             {env}) to the container's CPU request. See: {DOCS_URL}",
-            detected = self.detected_cores,
-            implied = format_millicores(implied),
-            effective = format_millicores(self.millicores),
-            spicepod = CpuConfig::SPICEPOD_SETTING,
-            env = CpuConfig::ENV_SETTING,
-        ))
     }
 
     // ---- the entitlement ----
@@ -615,7 +556,6 @@ pub fn cpu_budget() -> &'static CpuBudget {
             source: CpuSource::Fallback,
             setting: None,
             detected_cores: 1,
-            shares_implied_millicores: None,
         })
     })
 }
@@ -693,18 +633,10 @@ mod tests {
         CpuBudget::resolve(&CpuConfig::default(), &host(cores)).expect("detection cannot fail")
     }
 
-    fn kubernetes_shares(affinity_cores: usize, request_millicores: u64) -> HostReadings {
-        let shares = (request_millicores * 1024 / 1000).max(cgroup::FLOOR_SHARES);
+    fn quota(affinity_cores: usize, quota_millicores: u64) -> HostReadings {
         HostReadings {
             affinity_cores,
-            shares: Some(cgroup::CpuShares {
-                shares,
-                is_default: shares == cgroup::DEFAULT_SHARES,
-                is_floor: shares <= cgroup::FLOOR_SHARES,
-            }),
-            in_kubernetes: true,
-            in_container: true,
-            ..HostReadings::default()
+            quota_millicores: Some(quota_millicores),
         }
     }
 
@@ -789,22 +721,46 @@ mod tests {
         assert_eq!(sub_core.cores(), 1);
     }
 
-    #[test]
-    fn quota_beats_shares_beats_affinity() {
-        let mut readings = kubernetes_shares(18, 4000);
-        readings.quota_millicores = Some(2000);
-        let quota = CpuBudget::resolve(&CpuConfig::default(), &readings).expect("valid");
-        assert_eq!(quota.source(), CpuSource::CgroupQuota);
-        assert_eq!(quota.cores(), 2);
-
-        let shares =
-            CpuBudget::resolve(&CpuConfig::default(), &kubernetes_shares(18, 4000)).expect("valid");
-        assert_eq!(shares.source(), CpuSource::CgroupShares);
-        assert_eq!(shares.cores(), 4);
-    }
-
     /// The bottom of the ladder: nothing detectable at all still yields a usable
     /// one-core budget rather than a zero-thread pool.
+    #[test]
+    fn quota_beats_affinity_and_is_capped_by_it() {
+        // A quota narrower than the host: the quota wins.
+        let b = CpuBudget::resolve(&CpuConfig::default(), &quota(18, 4000)).expect("valid");
+        assert_eq!(b.source(), CpuSource::CgroupQuota);
+        assert_eq!(b.cores(), 4);
+
+        // A quota WIDER than the cores the process may run on is capped, because
+        // `available_parallelism` already took the minimum of the two — not
+        // capping would size a `--cpus=100` container for 100 cores.
+        let wide = CpuBudget::resolve(&CpuConfig::default(), &quota(16, 100_000)).expect("valid");
+        assert_eq!(wide.cores(), 16);
+    }
+
+    /// The behaviour this crate must NOT change: a pod with `requests.cpu` and
+    /// no `limits.cpu` has no quota, and is entitled to burst across every idle
+    /// core on its node. Detection must therefore report the node, exactly as
+    /// `available_parallelism` did — inferring a ceiling from the request would
+    /// silently take that headroom away.
+    #[test]
+    fn a_request_without_a_limit_still_sizes_for_the_whole_node() {
+        let burstable = HostReadings {
+            affinity_cores: 64,
+            quota_millicores: None, // requests.cpu set, limits.cpu unset
+        };
+        let budget = CpuBudget::resolve(&CpuConfig::default(), &burstable).expect("valid");
+        assert_eq!(budget.source(), CpuSource::Affinity);
+        assert_eq!(budget.cores(), 64);
+        assert_eq!(budget.target_partitions(), 64);
+
+        // ...and an operator who wants it sized to the request says so.
+        let pinned =
+            CpuBudget::resolve(&CpuConfig::from_sources(None, Some("4"), None), &burstable)
+                .expect("valid");
+        assert_eq!(pinned.source(), CpuSource::Configured);
+        assert_eq!(pinned.cores(), 4);
+    }
+
     #[test]
     fn nothing_detectable_falls_back_to_one_core() {
         let budget = CpuBudget::resolve(&CpuConfig::default(), &host(0)).expect("valid");
@@ -812,96 +768,6 @@ mod tests {
         assert_eq!(budget.cores(), 1);
         assert_eq!(budget.main_runtime_worker_threads(), 1);
         assert_eq!(budget.dedicated_runtime_worker_threads(), 1);
-    }
-
-    #[test]
-    fn shares_are_ignored_outside_kubernetes() {
-        let mut readings = kubernetes_shares(18, 4000);
-        readings.in_kubernetes = false;
-        let budget = CpuBudget::resolve(&CpuConfig::default(), &readings).expect("valid");
-        assert_eq!(budget.source(), CpuSource::Affinity);
-        assert_eq!(budget.cores(), 18);
-    }
-
-    #[test]
-    fn shares_never_exceed_the_affinity_count() {
-        let budget = CpuBudget::resolve(&CpuConfig::default(), &kubernetes_shares(4, 32_000))
-            .expect("valid");
-        assert_eq!(budget.source(), CpuSource::CgroupShares);
-        assert_eq!(budget.cores(), 4);
-    }
-
-    #[test]
-    fn a_pod_with_no_cpu_request_falls_through_to_affinity() {
-        // The kubelet floor (`shares = 2`) is what a best-effort or
-        // memory-only-request pod gets; it must keep node-sized behaviour.
-        let budget =
-            CpuBudget::resolve(&CpuConfig::default(), &kubernetes_shares(18, 0)).expect("valid");
-        assert_eq!(budget.source(), CpuSource::Affinity);
-        assert_eq!(budget.cores(), 18);
-    }
-
-    #[test]
-    fn one_core_requests_are_honoured_in_kubernetes() {
-        // `shares == 1024` is also cgroup v1's *default*, but under a confirmed
-        // kubelet cgroup it unambiguously means `requests.cpu: 1`.
-        let budget =
-            CpuBudget::resolve(&CpuConfig::default(), &kubernetes_shares(18, 1000)).expect("valid");
-        assert_eq!(budget.source(), CpuSource::CgroupShares);
-        assert_eq!(budget.cores(), 1);
-    }
-
-    #[test]
-    fn overcommit_warning_fires_only_for_a_non_default_container_share() {
-        // The issue's repro: `docker run --cpu-shares=4096` on an 18-core host,
-        // no quota, not Kubernetes.
-        let mut docker = kubernetes_shares(18, 4000);
-        docker.in_kubernetes = false;
-        let budget = CpuBudget::resolve(&CpuConfig::default(), &docker).expect("valid");
-        let warning = budget
-            .overcommit_warning()
-            .expect("a 4-core share against 18 detected cores must warn");
-        assert!(warning.contains("18 CPUs"), "{warning}");
-        assert!(warning.contains("SPICE_CPU_CORES"), "{warning}");
-
-        // systemd's default CPUWeight, and a plain `docker run`, leave the
-        // cgroup default in place — it means nothing, so it must not warn.
-        let mut default_share = docker.clone();
-        default_share.shares = Some(cgroup::CpuShares {
-            shares: cgroup::DEFAULT_SHARES,
-            is_default: true,
-            is_floor: false,
-        });
-        assert!(
-            CpuBudget::resolve(&CpuConfig::default(), &default_share)
-                .expect("valid")
-                .overcommit_warning()
-                .is_none()
-        );
-
-        // Bare metal: a share outside a container is a scheduling weight.
-        let mut bare_metal = docker.clone();
-        bare_metal.in_container = false;
-        assert!(
-            CpuBudget::resolve(&CpuConfig::default(), &bare_metal)
-                .expect("valid")
-                .overcommit_warning()
-                .is_none()
-        );
-
-        // Already sizing from the share, or from explicit configuration.
-        assert!(
-            CpuBudget::resolve(&CpuConfig::default(), &kubernetes_shares(18, 4000))
-                .expect("valid")
-                .overcommit_warning()
-                .is_none()
-        );
-        assert!(
-            CpuBudget::resolve(&CpuConfig::from_sources(Some("4"), None, None), &docker)
-                .expect("valid")
-                .overcommit_warning()
-                .is_none()
-        );
     }
 
     #[test]
@@ -969,19 +835,16 @@ mod tests {
         );
 
         insta::assert_snapshot!(
-            "summary_cgroup_shares",
-            CpuBudget::resolve(&CpuConfig::default(), &kubernetes_shares(18, 4000))
+            "summary_cgroup_quota",
+            CpuBudget::resolve(&CpuConfig::default(), &quota(18, 4000))
                 .expect("valid")
                 .summary_line()
         );
-
-        let mut docker = kubernetes_shares(18, 4000);
-        docker.in_kubernetes = false;
-        let detected = CpuBudget::resolve(&CpuConfig::default(), &docker).expect("valid");
-        insta::assert_snapshot!("summary_affinity", detected.summary_line());
         insta::assert_snapshot!(
-            "warning_overcommit",
-            detected.overcommit_warning().expect("warns")
+            "summary_affinity",
+            CpuBudget::resolve(&CpuConfig::default(), &host(18))
+                .expect("valid")
+                .summary_line()
         );
     }
 

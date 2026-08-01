@@ -1,5 +1,0 @@
----
-source: crates/cpu-budget/src/lib.rs
-expression: "CpuBudget::resolve(&CpuConfig::default(),\n&kubernetes_shares(18, 4000)).expect(\"valid\").summary_line()"
----
-CPU budget: 4 cores (source: cgroup CPU share, i.e. the pod's requests.cpu; host reports 18) → 4 main worker threads, 3 per dedicated runtime pool, 4 target partitions
