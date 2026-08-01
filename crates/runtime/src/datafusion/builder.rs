@@ -1422,7 +1422,10 @@ fn effective_query_memory_limit(memory_limit: Option<u64>, cayenne_active: bool)
         };
         let default_limit = total_memory.saturating_mul(percent) / 100;
 
-        tracing::debug!(
+        // INFO, not debug: this is the derived query-pool size every other
+        // budget is carved from, and an operator reconciling the memory gauges
+        // against resident memory needs it without re-running at debug level.
+        tracing::info!(
             cayenne_active,
             "No query memory limit specified, defaulting to {percent}% of total memory: {}",
             util::human_readable_bytes(default_limit as usize)
