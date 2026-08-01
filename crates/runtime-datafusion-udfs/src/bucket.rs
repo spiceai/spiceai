@@ -87,6 +87,7 @@ impl Default for Bucket {
     }
 }
 pub static BUCKET_SCALAR_UDF_NAME: &str = "bucket";
+runtime_udfs_api::register_spice_function!(BUCKET_SPICE_FUNCTION, BUCKET_SCALAR_UDF_NAME);
 impl Bucket {
     #[must_use]
     pub fn new() -> Self {
