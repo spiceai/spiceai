@@ -1,0 +1,78 @@
+---
+source: tools/testoperator/src/commands/schema/mod.rs
+description: "Schema tables for mysql[catalog]"
+---
++---------------+-------------------------------+-------------------------+------------+
+| table_catalog | table_schema                  | table_name              | table_type |
++---------------+-------------------------------+-------------------------+------------+
+| mysql         | information_schema            | columns                 | VIEW       |
+| mysql         | information_schema            | df_settings             | VIEW       |
+| mysql         | information_schema            | parameters              | VIEW       |
+| mysql         | information_schema            | routines                | VIEW       |
+| mysql         | information_schema            | schemata                | VIEW       |
+| mysql         | information_schema            | tables                  | VIEW       |
+| mysql         | information_schema            | views                   | VIEW       |
+| mysql         | mysql_innodb_cluster_metadata | async_cluster_members   | BASE TABLE |
+| mysql         | mysql_innodb_cluster_metadata | async_cluster_views     | BASE TABLE |
+| mysql         | mysql_innodb_cluster_metadata | clusters                | BASE TABLE |
+| mysql         | mysql_innodb_cluster_metadata | clusterset_members      | BASE TABLE |
+| mysql         | mysql_innodb_cluster_metadata | clusterset_views        | BASE TABLE |
+| mysql         | mysql_innodb_cluster_metadata | clustersets             | BASE TABLE |
+| mysql         | mysql_innodb_cluster_metadata | instances               | BASE TABLE |
+| mysql         | mysql_innodb_cluster_metadata | router_rest_accounts    | BASE TABLE |
+| mysql         | mysql_innodb_cluster_metadata | routers                 | BASE TABLE |
+| mysql         | mysql_innodb_cluster_metadata | routing_guidelines      | BASE TABLE |
+| mysql         | mysql_innodb_cluster_metadata | schema_version          | BASE TABLE |
+| mysql         | mysql_innodb_cluster_metadata | v2_ar_clusters          | BASE TABLE |
+| mysql         | mysql_innodb_cluster_metadata | v2_ar_members           | BASE TABLE |
+| mysql         | mysql_innodb_cluster_metadata | v2_clusters             | BASE TABLE |
+| mysql         | mysql_innodb_cluster_metadata | v2_cs_clustersets       | BASE TABLE |
+| mysql         | mysql_innodb_cluster_metadata | v2_cs_members           | BASE TABLE |
+| mysql         | mysql_innodb_cluster_metadata | v2_cs_router_options    | BASE TABLE |
+| mysql         | mysql_innodb_cluster_metadata | v2_gr_clusters          | BASE TABLE |
+| mysql         | mysql_innodb_cluster_metadata | v2_instances            | BASE TABLE |
+| mysql         | mysql_innodb_cluster_metadata | v2_router_options       | BASE TABLE |
+| mysql         | mysql_innodb_cluster_metadata | v2_router_rest_accounts | BASE TABLE |
+| mysql         | mysql_innodb_cluster_metadata | v2_routers              | BASE TABLE |
+| mysql         | mysql_innodb_cluster_metadata | v2_this_instance        | BASE TABLE |
+| mysql         | tpcds_sf1                     | call_center             | BASE TABLE |
+| mysql         | tpcds_sf1                     | catalog_page            | BASE TABLE |
+| mysql         | tpcds_sf1                     | catalog_returns         | BASE TABLE |
+| mysql         | tpcds_sf1                     | catalog_sales           | BASE TABLE |
+| mysql         | tpcds_sf1                     | customer                | BASE TABLE |
+| mysql         | tpcds_sf1                     | customer_address        | BASE TABLE |
+| mysql         | tpcds_sf1                     | customer_demographics   | BASE TABLE |
+| mysql         | tpcds_sf1                     | date_dim                | BASE TABLE |
+| mysql         | tpcds_sf1                     | household_demographics  | BASE TABLE |
+| mysql         | tpcds_sf1                     | income_band             | BASE TABLE |
+| mysql         | tpcds_sf1                     | inventory               | BASE TABLE |
+| mysql         | tpcds_sf1                     | item                    | BASE TABLE |
+| mysql         | tpcds_sf1                     | promotion               | BASE TABLE |
+| mysql         | tpcds_sf1                     | reason                  | BASE TABLE |
+| mysql         | tpcds_sf1                     | ship_mode               | BASE TABLE |
+| mysql         | tpcds_sf1                     | store                   | BASE TABLE |
+| mysql         | tpcds_sf1                     | store_returns           | BASE TABLE |
+| mysql         | tpcds_sf1                     | store_sales             | BASE TABLE |
+| mysql         | tpcds_sf1                     | time_dim                | BASE TABLE |
+| mysql         | tpcds_sf1                     | warehouse               | BASE TABLE |
+| mysql         | tpcds_sf1                     | web_page                | BASE TABLE |
+| mysql         | tpcds_sf1                     | web_returns             | BASE TABLE |
+| mysql         | tpcds_sf1                     | web_sales               | BASE TABLE |
+| mysql         | tpcds_sf1                     | web_site                | BASE TABLE |
+| mysql         | tpch_sf1                      | customer                | BASE TABLE |
+| mysql         | tpch_sf1                      | lineitem                | BASE TABLE |
+| mysql         | tpch_sf1                      | nation                  | BASE TABLE |
+| mysql         | tpch_sf1                      | orders                  | BASE TABLE |
+| mysql         | tpch_sf1                      | part                    | BASE TABLE |
+| mysql         | tpch_sf1                      | partsupp                | BASE TABLE |
+| mysql         | tpch_sf1                      | region                  | BASE TABLE |
+| mysql         | tpch_sf1                      | supplier                | BASE TABLE |
+| spice         | information_schema            | columns                 | VIEW       |
+| spice         | information_schema            | df_settings             | VIEW       |
+| spice         | information_schema            | parameters              | VIEW       |
+| spice         | information_schema            | routines                | VIEW       |
+| spice         | information_schema            | schemata                | VIEW       |
+| spice         | information_schema            | tables                  | VIEW       |
+| spice         | information_schema            | views                   | VIEW       |
+| spice         | runtime                       | task_history            | BASE TABLE |
++---------------+-------------------------------+-------------------------+------------+
