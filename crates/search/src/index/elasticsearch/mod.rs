@@ -477,7 +477,14 @@ impl Index for ElasticsearchIndex {
 
     async fn delete_by_keys(&self, keys: RecordBatch) -> Result<(), DataFusionError> {
         let key_columns: Vec<String> = self.primary_key.iter().map(|f| f.name().clone()).collect();
-        delete::delete_by_keys(self.client.as_ref(), &self.es_index, &key_columns, &keys).await
+        delete::delete_by_keys(
+            self.client.as_ref(),
+            &self.es_index,
+            &self.primary_key,
+            &key_columns,
+            &keys,
+        )
+        .await
     }
 }
 
@@ -724,7 +731,14 @@ impl Index for ElasticsearchTextIndex {
 
     async fn delete_by_keys(&self, keys: RecordBatch) -> Result<(), DataFusionError> {
         let key_columns: Vec<String> = self.primary_key.iter().map(|f| f.name().clone()).collect();
-        delete::delete_by_keys(self.client.as_ref(), &self.es_index, &key_columns, &keys).await
+        delete::delete_by_keys(
+            self.client.as_ref(),
+            &self.es_index,
+            &self.primary_key,
+            &key_columns,
+            &keys,
+        )
+        .await
     }
 }
 
