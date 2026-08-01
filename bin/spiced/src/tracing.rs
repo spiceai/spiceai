@@ -737,8 +737,11 @@ mod tests {
             })
         });
 
+        // A deadlock guard, not a wait: the channel is already closed, so the
+        // stream terminates on the buffered events. Keep it short so a
+        // regression that leaves the stream open fails fast.
         let published: Vec<String> =
-            tokio::time::timeout(std::time::Duration::from_secs(10), events.collect())
+            tokio::time::timeout(std::time::Duration::from_secs(1), events.collect())
                 .await
                 .expect("the progress stream must end when its span closes");
         assert_eq!(
