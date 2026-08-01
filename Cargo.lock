@@ -20143,6 +20143,7 @@ dependencies = [
  "sha2 0.10.9",
  "snafu",
  "sysinfo 0.38.4",
+ "tempfile",
  "tokio",
  "tracing",
  "util",
