@@ -388,7 +388,9 @@ impl DatasetTestArgs {
              connection topology; drop --client-connections"
         );
         anyhow::ensure!(
-            fleet.clients >= 1 && fleet.connections_per_client >= 1 && fleet.queries_per_client >= 1,
+            fleet.clients >= 1
+                && fleet.connections_per_client >= 1
+                && fleet.queries_per_client >= 1,
             "--clients, --connections-per-client and --queries-per-client must each be at least 1"
         );
         Ok(())
