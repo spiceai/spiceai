@@ -32,14 +32,15 @@ use test_framework::{
 };
 
 pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
-    if args.common.concurrency < 2 {
+    // Surface a bad connection-topology combination now, not after the
+    // ready-wait.
+    args.validate_fleet()?;
+    let concurrency = args.effective_concurrency();
+    if concurrency < 2 {
         return Err(anyhow::anyhow!(
             "Concurrency should be greater than 1 for a throughput test"
         ));
     }
-    // Surface a bad --client-connections/--connection-count combination now,
-    // not after the ready-wait.
-    super::resolve_client_connection_count(args, args.common.concurrency)?;
 
     let (app, spiced_instance, system_adapter_session) = if args.common.is_system_adapter() {
         let app = load_app(&args.common).await?;
@@ -105,15 +106,15 @@ async fn run_inner(
     // throughput test
     println!("Running throughput test");
 
-    // With `--client-connections per-client`/`pooled`, the concurrent clients
-    // spread across dedicated connections; the baseline above intentionally
-    // stays on the shared executor (it runs a single client).
+    // The measured phase drives the requested connection topology; the baseline
+    // above intentionally stays on the shared executor (it runs a single client).
+    let concurrency = args.effective_concurrency();
     let client_executors =
-        super::create_client_executors(args, &spiced_instance, args.common.concurrency).await?;
-    super::announce_connection_topology(&client_executors, args.common.concurrency);
+        super::create_client_executors(args, &spiced_instance, concurrency).await?;
+    super::announce_connection_topology(args, concurrency);
 
     let mut builder = NotStarted::new()
-        .with_parallel_count(args.common.concurrency)
+        .with_parallel_count(concurrency)
         .with_end_condition(EndCondition::QuerySetCompleted(2));
     if client_executors.is_empty() {
         builder = builder.with_query_executor(executor);
