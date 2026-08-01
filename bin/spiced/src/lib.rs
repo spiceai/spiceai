@@ -699,7 +699,7 @@ pub async fn run(args: Args) -> Result<()> {
 
     if needs_metrics {
         // Resolve secrets in OTEL exporter headers before initializing metrics
-        let resolved_otel_headers = if let Some(config) = otel_config {
+        let otel_export = if let Some(config) = otel_config {
             let mut resolved = std::collections::HashMap::new();
             let secrets = rt.secrets();
             let secrets_guard = secrets.read().await;
@@ -710,9 +710,9 @@ pub async fn run(args: Args) -> Result<()> {
                 resolved.insert(key.clone(), resolved_value.expose_secret().to_string());
             }
             drop(secrets_guard);
-            resolved
+            Some((config, resolved))
         } else {
-            std::collections::HashMap::new()
+            None
         };
 
         // Pre-build resource attributes from `runtime.telemetry.properties`.
@@ -737,8 +737,7 @@ pub async fn run(args: Args) -> Result<()> {
         init_metrics(
             &rt.datafusion(),
             prometheus_registry.clone(),
-            otel_config,
-            resolved_otel_headers,
+            otel_export,
             metrics_reader,
             cloud_connect_metrics.clone(),
             resource_attributes,
@@ -1006,11 +1005,11 @@ async fn build_app(args: &Args) -> Result<(Option<Arc<App>>, Option<app::Error>)
 ///   metrics over the control stream even when neither `--metrics` nor
 ///   `otel_exporter` is configured — this subsumes the former
 ///   `init_cluster_metrics_only` path.
-/// - **OTEL push exporter** (`otel_config` is `Some` and enabled): enabled
+/// - **OTEL push exporter** (`otel_export` is `Some` and enabled): enabled
 ///   purely by `runtime.telemetry.otel_exporter` in `spicepod.yaml`. No
 ///   command-line flag is required; works standalone or alongside the other
-///   sinks. `resolved_otel_headers` must already have secret templates
-///   resolved by the caller.
+///   sinks. The headers paired with the config must already have secret
+///   templates resolved by the caller.
 ///
 /// Caller is expected to short-circuit (not invoke this fn) when none of the
 /// three sources is configured — otherwise an empty `MeterProvider` would be
@@ -1018,8 +1017,10 @@ async fn build_app(args: &Args) -> Result<(Option<Arc<App>>, Option<app::Error>)
 fn init_metrics(
     df: &Arc<DataFusion>,
     registry: Option<prometheus::Registry>,
-    otel_config: Option<&app::spicepod::component::runtime::OtelExporterConfig>,
-    resolved_otel_headers: std::collections::HashMap<String, String>,
+    otel_export: Option<(
+        &app::spicepod::component::runtime::OtelExporterConfig,
+        std::collections::HashMap<String, String>,
+    )>,
     metrics_reader: Option<runtime::metrics_reader::MetricsReader>,
     cloud_connect_metrics: Option<runtime::metrics_reader::MetricsReader>,
     resource_attributes: Vec<KeyValue>,
@@ -1109,8 +1110,8 @@ fn init_metrics(
     }
 
     // Case 3: OTEL push exporter
-    if let Some(config) = otel_config {
-        match create_otel_reader(config, resolved_otel_headers) {
+    if let Some((config, resolved_headers)) = otel_export {
+        match create_otel_reader(config, resolved_headers) {
             Ok(otel_reader) => {
                 provider_builder = provider_builder.with_reader(otel_reader);
                 let protocol = if config.is_http() { "http" } else { "grpc" };

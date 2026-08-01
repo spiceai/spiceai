@@ -221,14 +221,15 @@ pub async fn maybe_start(
     // `GetLogs`. `None` if capture wasn't installed — the handler then
     // reports logs as unavailable rather than returning an empty blob.
     let logs = crate::log_capture::handle();
-    match &persisted_app_id {
-        Some(app_id) => tracing::debug!(
+    if let Some(app_id) = &persisted_app_id {
+        tracing::debug!(
             app_id,
             "Spice Cloud Connect: metrics attribution restored from the stored identity"
-        ),
-        None => tracing::debug!(
+        );
+    } else {
+        tracing::debug!(
             "Spice Cloud Connect: the stored identity names no app; metrics are withheld until a deploy names one"
-        ),
+        );
     }
 
     // Installed before `load_components()` by `restore_delivered_secrets`, so
@@ -236,20 +237,19 @@ pub async fn maybe_start(
     // references. `None` only if that call was skipped, in which case a
     // deployment can still deliver secrets to this process — they just will not
     // have been available at startup.
-    let delivered_store = match delivered_secrets {
-        Some(state) => state.store,
-        None => {
-            tracing::debug!(
-                "Spice Cloud Connect: no delivered-secrets store was installed before component load; registering one now"
-            );
-            let store = Arc::new(CloudDeliveredSecretStore::new());
-            runtime.secrets().write().await.register_builtin_store(
-                CLOUD_DELIVERED_STORE,
-                Arc::clone(&store) as Arc<dyn runtime::secrets::SecretStore>,
-            );
-            load_cached_secrets(&config, &store);
-            store
-        }
+    let delivered_store = if let Some(state) = delivered_secrets {
+        state.store
+    } else {
+        tracing::debug!(
+            "Spice Cloud Connect: no delivered-secrets store was installed before component load; registering one now"
+        );
+        let store = Arc::new(CloudDeliveredSecretStore::new());
+        runtime.secrets().write().await.register_builtin_store(
+            CLOUD_DELIVERED_STORE,
+            Arc::clone(&store) as Arc<dyn runtime::secrets::SecretStore>,
+        );
+        load_cached_secrets(&config, &store);
+        store
     };
 
     // The cache key is read from the identity on each write, not captured here:
@@ -606,14 +606,15 @@ impl RuntimeHandle for SpicedRuntimeHandle {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
-            match held {
-                Some(held) => tracing::warn!(
+            if let Some(held) = held {
+                tracing::warn!(
                     app_id = %held,
                     "Cloud Connect: ApplySpicepod carried no app id; keeping the one already recorded, so metrics stay attributed"
-                ),
-                None => tracing::warn!(
+                );
+            } else {
+                tracing::warn!(
                     "Cloud Connect: ApplySpicepod carried no app id and none was recorded before, so metrics stay withheld. Either this instance is attached to no app, or the api that dispatched the deploy does not yet forward the app id"
-                ),
+                );
             }
         } else {
             let previous = self
