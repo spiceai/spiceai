@@ -1,0 +1,31 @@
+---
+source: tools/testoperator/src/commands/schema/mod.rs
+description: "Schema tables for spicecloud[catalog]"
+---
++---------------+--------------------+--------------+------------+
+| table_catalog | table_schema       | table_name   | table_type |
++---------------+--------------------+--------------+------------+
+| spice         | information_schema | columns      | VIEW       |
+| spice         | information_schema | df_settings  | VIEW       |
+| spice         | information_schema | parameters   | VIEW       |
+| spice         | information_schema | routines     | VIEW       |
+| spice         | information_schema | schemata     | VIEW       |
+| spice         | information_schema | tables       | VIEW       |
+| spice         | information_schema | views        | VIEW       |
+| spice         | runtime            | task_history | BASE TABLE |
+| tpch          | information_schema | columns      | VIEW       |
+| tpch          | information_schema | df_settings  | VIEW       |
+| tpch          | information_schema | parameters   | VIEW       |
+| tpch          | information_schema | routines     | VIEW       |
+| tpch          | information_schema | schemata     | VIEW       |
+| tpch          | information_schema | tables       | VIEW       |
+| tpch          | information_schema | views        | VIEW       |
+| tpch          | tpch               | customer     | BASE TABLE |
+| tpch          | tpch               | lineitem     | BASE TABLE |
+| tpch          | tpch               | nation       | BASE TABLE |
+| tpch          | tpch               | orders       | BASE TABLE |
+| tpch          | tpch               | part         | BASE TABLE |
+| tpch          | tpch               | partsupp     | BASE TABLE |
+| tpch          | tpch               | region       | BASE TABLE |
+| tpch          | tpch               | supplier     | BASE TABLE |
++---------------+--------------------+--------------+------------+
