@@ -980,7 +980,7 @@ impl ClientDriver {
                 "Cloud Connect: ApplySpicepod received with no app id; metrics stay withheld because nothing can attribute them. The control plane sends one only if the instance is attached to an app and the api is new enough to forward it"
             );
         } else {
-            tracing::info!(
+            tracing::debug!(
                 command_id,
                 app_id = %cmd.app_id,
                 yaml_bytes = cmd.spicepod_yaml.len(),
@@ -1015,7 +1015,7 @@ impl ClientDriver {
             )
             .await;
         match &result {
-            Ok(_) => tracing::info!(command_id, "Cloud Connect: ApplySpicepod applied"),
+            Ok(_) => tracing::debug!(command_id, "Cloud Connect: ApplySpicepod applied"),
             Err(err) => {
                 tracing::warn!(command_id, "Cloud Connect: ApplySpicepod failed: {err}");
             }

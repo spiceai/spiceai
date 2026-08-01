@@ -222,7 +222,7 @@ pub async fn maybe_start(
     // reports logs as unavailable rather than returning an empty blob.
     let logs = crate::log_capture::handle();
     match &persisted_app_id {
-        Some(app_id) => tracing::info!(
+        Some(app_id) => tracing::debug!(
             app_id,
             "Spice Cloud Connect: metrics attribution restored from the stored identity"
         ),
@@ -626,12 +626,12 @@ impl RuntimeHandle for SpicedRuntimeHandle {
                     app_id,
                     "Cloud Connect: ApplySpicepod re-confirmed the app metrics are attributed to"
                 ),
-                Some(previous) => tracing::info!(
+                Some(previous) => tracing::debug!(
                     app_id,
                     previous,
                     "Cloud Connect: ApplySpicepod moved this instance to a different app; metrics follow it from the next export"
                 ),
-                None => tracing::info!(
+                None => tracing::debug!(
                     app_id,
                     "Cloud Connect: metrics will be attributed to this app from the next export"
                 ),

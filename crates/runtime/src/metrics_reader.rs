@@ -147,7 +147,12 @@ impl MetricsReader {
 
         let summary = summarize(&request);
         let payload = request.encode_to_vec();
-        tracing::debug!(names = %summary.names.join(","), "Metrics export: contents");
+        tracing::debug!(
+            metrics = summary.metrics,
+            data_points = summary.data_points,
+            names = %summary.names.join(","),
+            "Metrics export: contents"
+        );
         Ok(Some(payload))
     }
 
