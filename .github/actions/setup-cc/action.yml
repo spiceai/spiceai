@@ -21,6 +21,24 @@ runs:
       shell: bash
       run: |
         brew install cmake pkg-config openssl unixodbc llvm libnfs
+        # `brew install` only warns — and still exits 0 — when a formula is already in
+        # the Cellar but unlinked, so its binaries never reach PATH. The failure then
+        # surfaces an hour later inside an unrelated crate, as a build script dying with
+        # "is `cmake` not installed?" and no error[EXXXX] to point at. Link the tools
+        # that build scripts invoke by bare name, then assert they resolve, so a stale
+        # runner fails here with a named cause. openssl and llvm are keg-only and are
+        # deliberately left unlinked; the build locates them via `brew --prefix`.
+        for tool in cmake pkg-config; do
+          brew link --overwrite "$tool" || true
+        done
+        missing=()
+        for tool in cmake pkg-config; do
+          command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+        done
+        if [ ${#missing[@]} -ne 0 ]; then
+          echo "::error::Not on PATH after 'brew install': ${missing[*]}. Run 'brew link --overwrite ${missing[*]}' on this runner."
+          exit 1
+        fi
 
     - name: Install cc (Windows)
       if: runner.os == 'Windows'

@@ -469,7 +469,7 @@ fn configure_max_message_size(
     mut flight_client: FlightClient,
     params: &ConnectorParams,
 ) -> Result<FlightClient> {
-    if let Some(app) = params.app.as_ref()
+    if let Some(app) = params.app()
         && let Some(flight) = app.runtime.flight.as_ref()
         && let Some(max_message_size) =
             flight
@@ -733,9 +733,8 @@ mod tests {
         ConnectorParams {
             parameters,
             unsupported_type_action: None,
-            component: ConnectorComponent::Dataset(Arc::new(dataset)),
-            app: None,
-            runtime: None,
+            component: ConnectorComponent::from(&dataset),
+            context: None,
             io_runtime: Handle::current(),
         }
     }
@@ -890,9 +889,9 @@ mod tests {
                 .build()
                 .expect("failed to build dataset");
 
-            crate::dataconnector::parameters::ConnectorParamsBuilder::new(
+            crate::dataconnector::parameters::ConnectorParamsBuilder::for_dataset(
                 dataset.source().into(),
-                ConnectorComponent::Dataset(Arc::new(dataset)),
+                &dataset,
             )
             .build(Arc::new(RwLock::new(Secrets::new())), Handle::current())
             .await

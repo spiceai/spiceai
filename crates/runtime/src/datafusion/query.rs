@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{fmt::Display, fmt::Write as _, sync::Arc};
+use std::{borrow::Cow, fmt::Display, fmt::Write as _, sync::Arc};
 
 use ::cache::{
     AsTableRefs, get_logical_plan_input_tables,
@@ -1795,7 +1795,10 @@ fn attach_query_tracker_to_stream(
     let mut num_records = 0u64;
     let mut num_output_bytes = 0u64;
 
-    let mut captured_output = "[]".to_string(); // default to empty preview
+    // Only the task history row reads the captured output preview, so the
+    // default costs no allocation on the path that never fills it in.
+    let capture_task_history = tracker.task_history_enabled;
+    let mut captured_output = Cow::Borrowed("[]"); // default to empty preview
 
     let inner_span = span.clone();
     let updated_stream = stream! {
@@ -1804,8 +1807,8 @@ fn attach_query_tracker_to_stream(
             match &batch_result {
                 Ok(batch) => {
                     // Create a truncated output for the query history table on first batch.
-                    if num_records == 0 {
-                        captured_output = write_to_json_string(&[batch.slice(0, batch.num_rows().min(3))]).unwrap_or_default();
+                    if capture_task_history && num_records == 0 {
+                        captured_output = Cow::Owned(write_to_json_string(&[batch.slice(0, batch.num_rows().min(3))]).unwrap_or_default());
                     }
 
                     num_output_bytes += batch.get_array_memory_size() as u64;
@@ -1822,7 +1825,9 @@ fn attach_query_tracker_to_stream(
                             e.to_string(),
                             ErrorCode::QueryExecutionError,
                         );
-                    tracing::error!(target: "task_history", parent: &inner_span, "{e}");
+                    if capture_task_history {
+                        tracing::error!(target: "task_history", parent: &inner_span, "{e}");
+                    }
                     yield batch_result;
                     return;
                 }
@@ -1836,7 +1841,7 @@ fn attach_query_tracker_to_stream(
         tracker
             .schema(schema_copy)
             .rows_produced(num_records)
-            .finish(&request_context, &Arc::from(captured_output));
+            .finish(&request_context, &captured_output);
     };
 
     Box::pin(RecordBatchStreamAdapter::new(
