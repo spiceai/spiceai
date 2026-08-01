@@ -2290,8 +2290,10 @@ fn cluster_service_endpoint(
     Ok(endpoint
         // Bound connect so a unreachable/misconfigured scheduler fails the
         // executor startup future instead of hanging until the harness ready
-        // timeout (OS TCP timeouts can exceed several minutes).
-        .connect_timeout(Duration::from_secs(30))
+        // timeout (OS TCP timeouts can exceed several minutes). The scheduler
+        // poll loop bounds its own connect from the same setting, so the two
+        // paths to the same scheduler agree.
+        .connect_timeout(Duration::from_secs(grpc_client.connect_timeout_seconds))
         .tcp_nodelay(true)
         .tcp_keepalive(Some(Duration::from_secs(
             grpc_client.tcp_keep_alive_seconds,
