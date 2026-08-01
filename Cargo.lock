@@ -16811,6 +16811,7 @@ dependencies = [
  "runtime-status",
  "runtime-table-partition",
  "runtime-tools",
+ "runtime-udfs-api",
  "rusqlite",
  "rustls",
  "s3_vectors",
@@ -17106,6 +17107,7 @@ dependencies = [
  "datafusion",
  "datafusion-catalog",
  "datafusion-datasource",
+ "datafusion-expr",
  "datafusion-federation",
  "datafusion-optimizer-rules",
  "datafusion-pruning",
@@ -17118,6 +17120,7 @@ dependencies = [
  "parking_lot",
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
+ "runtime-object-store",
  "runtime-query-engine",
  "runtime-request-context",
  "search",
@@ -17169,12 +17172,14 @@ dependencies = [
  "governor",
  "half",
  "insta",
+ "linkme",
  "llms",
  "opentelemetry",
  "reqwest 0.13.4",
  "runtime-auth",
  "runtime-rate-control",
  "runtime-request-context",
+ "runtime-udfs-api",
  "serde",
  "serde_json",
  "simsimd",
@@ -17351,6 +17356,7 @@ dependencies = [
  "futures",
  "insta",
  "itertools 0.14.0",
+ "linkme",
  "llms",
  "moka",
  "rayon",
@@ -17362,6 +17368,7 @@ dependencies = [
  "runtime-query-engine",
  "runtime-request-context",
  "runtime-secrets",
+ "runtime-udfs-api",
  "schemars 1.2.1",
  "search",
  "secrecy",
@@ -17484,6 +17491,18 @@ dependencies = [
  "util",
  "utoipa",
  "uuid 1.23.2",
+]
+
+[[package]]
+name = "runtime-udfs-api"
+version = "2.2.0-unstable"
+dependencies = [
+ "datafusion",
+ "datafusion-functions-json",
+ "datafusion-table-providers",
+ "linkme",
+ "parking_lot",
+ "tracing",
 ]
 
 [[package]]

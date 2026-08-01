@@ -151,9 +151,9 @@ pub use runtime_datafusion::param_utils;
 pub mod pg_catalog;
 #[cfg(not(windows))]
 pub mod planner;
-pub mod refresh_sql;
+pub use runtime_datafusion::refresh_sql;
 pub mod request_context_extension;
-pub mod retention_sql;
+pub use runtime_datafusion::retention_sql;
 pub mod schema;
 pub mod secrets_context_extension;
 pub mod table;
@@ -164,12 +164,10 @@ pub mod tool_udf;
 pub mod udf;
 pub mod udtf;
 
-pub use runtime_datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
-
-pub const SPICE_RUNTIME_SCHEMA: &str = "runtime";
-pub const SPICE_EVAL_SCHEMA: &str = "eval";
-pub const SPICE_METADATA_SCHEMA: &str = "metadata";
-pub const SPICE_SCP_SCHEMA: &str = "scp";
+pub use runtime_datafusion::{
+    SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_EVAL_SCHEMA, SPICE_METADATA_SCHEMA,
+    SPICE_RUNTIME_SCHEMA, SPICE_SCP_SCHEMA, is_spice_internal_dataset, is_spice_internal_schema,
+};
 
 const MAX_STREAMING_BROADCAST_BATCHES: usize = 128;
 const MAX_STREAMING_BROADCAST_ROWS: usize = 1_000_000;
@@ -4973,28 +4971,10 @@ fn partition_expr_from_table_provider(table_provider: &Arc<dyn TableProvider>) -
     None
 }
 
-#[must_use]
-pub fn is_spice_internal_dataset(dataset: &TableReference) -> bool {
-    match (dataset.catalog(), dataset.schema()) {
-        (Some(catalog), Some(schema)) => is_spice_internal_schema(catalog, schema),
-        (None, Some(schema)) => is_spice_internal_schema(SPICE_DEFAULT_CATALOG, schema),
-        _ => false,
-    }
-}
-
 // Normalizes a table reference to a full table reference with catalog, schema, and table name
 // so it can be used for comparison.
 fn resolve_table_reference(table: TableReference) -> ResolvedTableReference {
     table.resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
-}
-
-#[must_use]
-pub fn is_spice_internal_schema(catalog: &str, schema: &str) -> bool {
-    catalog == SPICE_DEFAULT_CATALOG
-        && (schema == SPICE_RUNTIME_SCHEMA
-            || schema == SPICE_METADATA_SCHEMA
-            || schema == SPICE_SCP_SCHEMA
-            || schema == SPICE_EVAL_SCHEMA)
 }
 
 impl Drop for DataFusion {
