@@ -1744,14 +1744,20 @@ impl DataFusion {
                 cayenne::update_global_mem_tier_total(dynamic);
                 // Publish what this loop already measures. These are the numbers
                 // that reconcile budget against fact: pool gauges describe what
-                // the accounting believes, the RSS gauge (sampled here too, via
-                // a blocking-safe /proc read) describes what the kernel will
-                // OOM on, and the gap between them is the off-pool memory that
-                // no budget covers - the quantity a recent OOM investigation
-                // had to reconstruct from an external sampler.
+                // the accounting believes, the RSS gauge describes what the
+                // kernel will OOM on, and the gap between them is the off-pool
+                // memory that no budget covers - the quantity a recent OOM
+                // investigation had to reconstruct from an external sampler.
                 telemetry::cayenne::track_query_memory_pool_used_bytes(pool_used, &[]);
                 telemetry::cayenne::track_compaction_memory_pool_used_bytes(compaction_used, &[]);
-                if let Some(rss) = crate::resource_monitor::process_resident_memory_bytes() {
+                // The RSS read touches the filesystem (procfs on Linux), so it
+                // goes to the blocking pool rather than this worker thread. Once
+                // per interval, off the critical path of every other task.
+                if let Ok(Some(rss)) = tokio::task::spawn_blocking(
+                    crate::resource_monitor::process_resident_memory_bytes,
+                )
+                .await
+                {
                     telemetry::track_process_resident_memory_bytes(rss, &[]);
                 }
             }

@@ -52,12 +52,17 @@ struct ResourceMonitorInner {
 fn get_container_memory_limit() -> Option<u64> {
     telemetry::hardware::cgroup_memory_limit()
 }
+
 /// Resident set size of this process in bytes, or `None` where unavailable.
 ///
-/// Reads `VmRSS` from `/proc/self/status`: one small read, already in kB, safe
-/// on a 2s sampling interval. Constructing a sysinfo `System` per sample (as
-/// the load-time memory warning does) refreshes far more state than a gauge
-/// needs.
+/// On Linux, reads `VmRSS` from `/proc/self/status` — one small read, reported
+/// in kB and scaled to bytes here. Constructing a sysinfo `System` per sample
+/// (as the load-time memory warning does) refreshes far more state than a gauge
+/// needs, so that path is the off-Linux fallback only; `sysinfo::Process::memory`
+/// returns bytes, so both arms agree on the unit.
+///
+/// This blocks (filesystem read), so async callers must run it on the blocking
+/// pool rather than a runtime worker.
 #[must_use]
 pub fn process_resident_memory_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]

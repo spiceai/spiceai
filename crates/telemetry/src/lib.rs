@@ -299,14 +299,22 @@ static PROCESS_RESIDENT_MEMORY_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
 
 /// Records the process's resident set size — the number the kernel's OOM
 /// decision is made on. Budgets and pool gauges describe intent; this describes
-/// fact, and the gap between them is the off-pool/unaccounted memory. Waiting
-/// on `meter::METER` (the root-level instrument pattern) also keeps the gauge
-/// from binding permanently to the early noop meter.
+/// fact, and the gap between them is the off-pool/unaccounted memory.
+///
+/// Resident memory is operator observability, not product-usage telemetry, so
+/// this binds to the OpenTelemetry **global** provider that `init_metrics`
+/// installs with the operator's Prometheus `/metrics` and OTLP readers — not to
+/// the anonymous-telemetry [`meter::METER`], which would never reach an
+/// operator's dashboard. The meter handle is fetched fresh rather than cached,
+/// for the reason `cayenne::operational_meter` documents: caching binds
+/// permanently to whatever provider is global at first access, so the `OnceLock`
+/// holds only the built gauge, whose construction is deferred to the first
+/// record — always after `init_metrics` on this 2s sampling path.
 pub fn track_process_resident_memory_bytes(bytes: u64, dimensions: &[KeyValue]) {
-    let Some(m) = meter::METER.get() else { return };
     PROCESS_RESIDENT_MEMORY_BYTES
         .get_or_init(|| {
-            m.u64_gauge("process_resident_memory_bytes")
+            global::meter("process")
+                .u64_gauge("process_resident_memory_bytes")
                 .with_description(
                     "Resident set size of the spiced process. Budgets and pool gauges describe intent; this describes fact, and the gap between them is the off-pool/unaccounted memory.",
                 )
@@ -1009,9 +1017,7 @@ pub mod cayenne {
         COMPACTION_MEMORY_POOL_USED_BYTES.get_or_init(|| {
             operational_meter()
                 .u64_gauge("cayenne_compaction_memory_pool_used_bytes")
-                .with_description(
-                    "Live bytes reserved in the dedicated compaction memory pool.",
-                )
+                .with_description("Live bytes reserved in the dedicated compaction memory pool.")
                 .with_unit("By")
                 .build()
         })
@@ -1021,7 +1027,6 @@ pub mod cayenne {
     pub fn track_compaction_memory_pool_used_bytes(bytes: u64, dimensions: &[KeyValue]) {
         compaction_memory_pool_used_bytes().record(bytes, dimensions);
     }
-
 
     static COMPACTION_MEMORY_EXHAUSTED: OnceLock<Counter<u64>> = OnceLock::new();
 
