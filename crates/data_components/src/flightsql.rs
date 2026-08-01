@@ -486,21 +486,28 @@ impl FlightSQLTable {
         // Project the table-level statistics onto the scan's (projected) output
         // schema so the column-statistics list lines up with the output columns.
         //
-        // When filters are pushed down to the remote scan, the stamped statistics
-        // still describe the *unfiltered* slice the executor reported (they are the
-        // whole-table row count / column bounds, not the filtered subset). Every
-        // pushdown-eligible filter is reported `Exact` (see
-        // `supports_filters_pushdown`), so DataFusion drops the coordinator-side
-        // `FilterExec` — and if the stamped `num_rows`/bounds stay `Exact`, the
-        // `aggregate_statistics` optimizer rule folds `COUNT(*)`/`MIN`/`MAX` to
-        // those unfiltered values, silently ignoring the predicate (e.g. a filtered
-        // `COUNT(*)` returns the full table count — issue #11599). Marking the
-        // statistics inexact when any filter is applied disables that fold while
-        // keeping the bounds usable for join sizing.
+        // The stamped statistics describe the *whole* slice the executor reported
+        // (its row count and column bounds), so they only stay `Exact` for a scan
+        // that returns that whole slice. Both a pushed-down filter and a
+        // pushed-down limit narrow what the remote query returns:
+        //
+        // - Every pushdown-eligible filter is reported `Exact` (see
+        //   `supports_filters_pushdown`), so DataFusion drops the coordinator-side
+        //   `FilterExec`.
+        // - `LIMIT` is emitted into the remote SQL (see `FlightSqlExec::sql`), and
+        //   `supports_limit_pushdown` lets `LimitPushdown` drop the coordinator-side
+        //   `GlobalLimitExec`.
+        //
+        // Either way, leaving `num_rows`/bounds `Exact` lets the
+        // `aggregate_statistics` optimizer rule fold `COUNT(*)`/`MIN`/`MAX` to
+        // values the scan cannot produce — silently ignoring the predicate (a
+        // filtered `COUNT(*)` returning the full table count, issue #11599) or the
+        // limit (issue #12292). Marking the statistics inexact disables that fold
+        // while keeping the bounds usable for join sizing.
         let exec = match &self.statistics {
             Some(stats) => {
                 let stats = stats.clone().project(projections);
-                let stats = if filters.is_empty() {
+                let stats = if filters.is_empty() && limit.is_none() {
                     stats
                 } else {
                     stats.to_inexact()
@@ -918,6 +925,17 @@ impl ExecutionPlan for FlightSqlExec {
             (None, None) => None,
         };
 
+        // `LimitPushdown` calls this to move a `GlobalLimitExec` into the scan and
+        // then drops it, so the limited scan becomes the only thing describing the
+        // row count. `self.statistics` describes the *unlimited* slice, so it can
+        // only stay `Exact` while there is no limit — see `create_physical_plan` for
+        // the same reasoning about pushed-down filters (issues #11599, #12292).
+        let statistics = if merged_limit.is_some() {
+            self.statistics.clone().to_inexact()
+        } else {
+            self.statistics.clone()
+        };
+
         let new_plan = FlightSqlExec {
             projected_schema: Arc::clone(&self.projected_schema),
             table_reference: self.table_reference.clone(),
@@ -929,7 +947,7 @@ impl ExecutionPlan for FlightSqlExec {
             cookie_store: Arc::clone(&self.cookie_store),
             metrics: ExecutionPlanMetricsSet::new(),
             trace_parent: self.trace_parent.clone(),
-            statistics: self.statistics.clone(),
+            statistics,
             token: self.token.clone(),
         };
 
@@ -1103,7 +1121,7 @@ pub async fn get_client_for_flight_endpoint(
 mod tests {
     use super::{FlightSqlClient, query_to_stream};
     use crate::flightsql::FlightSqlExec;
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
     use arrow_flight::{
         Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint,
@@ -1370,36 +1388,11 @@ mod tests {
     /// unfiltered scan.
     #[tokio::test]
     async fn scan_marks_stamped_statistics_inexact_when_filter_pushed() {
-        use super::FlightSQLTable;
         use datafusion::catalog::TableProvider;
         use datafusion::common::stats::Precision;
-        use datafusion::common::{ColumnStatistics, ScalarValue, Statistics};
         use datafusion::prelude::{SessionContext, col, lit};
 
-        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
-        let stats = Statistics {
-            num_rows: Precision::Exact(150_000),
-            total_byte_size: Precision::Exact(1_200_000),
-            column_statistics: vec![ColumnStatistics {
-                null_count: Precision::Exact(0),
-                max_value: Precision::Exact(ScalarValue::Int64(Some(149_999))),
-                min_value: Precision::Exact(ScalarValue::Int64(Some(0))),
-                sum_value: Precision::Absent,
-                distinct_count: Precision::Absent,
-                byte_size: Precision::Exact(1_200_000),
-            }],
-        };
-
-        let table = FlightSQLTable::create_with_schema(
-            "flightsql",
-            "executor-1",
-            lazy_client(),
-            TableReference::bare("customer"),
-            Arc::clone(&schema),
-            Arc::new(CookieStore::new()),
-        )
-        .with_statistics(Some(stats));
-
+        let table = stamped_table();
         let session = SessionContext::new().state();
 
         // No filter → stamped statistics stay exact (folding a bare COUNT(*) is correct).
@@ -1440,8 +1433,130 @@ mod tests {
         );
     }
 
+    /// Regression test for #12292, the limit twin of #11599: `LIMIT` is emitted
+    /// into the remote SQL, so a scan built with one cannot produce the stamped
+    /// slice's row count or column bounds and must not report them `Exact`.
+    #[tokio::test]
+    async fn scan_marks_stamped_statistics_inexact_when_limit_pushed() {
+        use datafusion::catalog::TableProvider;
+        use datafusion::common::stats::Precision;
+        use datafusion::prelude::SessionContext;
+
+        let table = stamped_table();
+        let session = SessionContext::new().state();
+
+        let plan = table
+            .scan(&session, None, &[], Some(10))
+            .await
+            .expect("limited scan should build");
+        let limited = plan
+            .partition_statistics(None)
+            .expect("statistics should be available");
+        assert_eq!(
+            limited.num_rows,
+            Precision::Inexact(150_000),
+            "a scan whose SQL carries LIMIT 10 must not claim an exact 150000-row count"
+        );
+        assert!(
+            matches!(
+                limited.column_statistics[0].max_value,
+                Precision::Inexact(_)
+            ),
+            "the limited scan's rows are a subset, so its bounds must be inexact too"
+        );
+    }
+
+    /// Regression test for #12292: `LimitPushdown` introduces the limit through
+    /// `with_fetch` and then drops the `GlobalLimitExec`, so the statistics the
+    /// new plan carries are the only ones left describing the row count.
+    #[tokio::test]
+    async fn with_fetch_marks_stamped_statistics_inexact() {
+        use datafusion::common::stats::Precision;
+
+        let exec = build_exec(lazy_client(), Arc::new(CookieStore::new()))
+            .with_statistics(stamped_statistics());
+
+        // No limit anywhere: the scan returns the whole stamped slice.
+        assert_eq!(
+            exec.partition_statistics(None)
+                .expect("statistics should be available")
+                .num_rows,
+            Precision::Exact(150_000),
+            "an unlimited scan must keep exact num_rows"
+        );
+
+        let limited = exec
+            .with_fetch(Some(10))
+            .expect("with_fetch should produce a plan");
+        let stats = limited
+            .partition_statistics(None)
+            .expect("statistics should be available");
+        assert_eq!(
+            stats.num_rows,
+            Precision::Inexact(150_000),
+            "a limit pushed in through with_fetch must degrade num_rows to inexact"
+        );
+        assert!(
+            matches!(stats.column_statistics[0].max_value, Precision::Inexact(_)),
+            "a limit pushed in through with_fetch must degrade column bounds too"
+        );
+
+        // `with_fetch(None)` on an unlimited scan leaves the limit unset, so the
+        // statistics stay exact.
+        let unchanged = exec
+            .with_fetch(None)
+            .expect("with_fetch should produce a plan");
+        assert_eq!(
+            unchanged
+                .partition_statistics(None)
+                .expect("statistics should be available")
+                .num_rows,
+            Precision::Exact(150_000),
+            "with_fetch(None) on an unlimited scan must not degrade statistics"
+        );
+    }
+
+    /// Schema the stamped-statistics fixtures describe.
+    fn stamped_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]))
+    }
+
+    /// A cluster leaf table carrying the statistics one executor reported for its
+    /// whole slice — the shape `get_partitions_from_store` stamps onto each leaf.
+    fn stamped_table() -> super::FlightSQLTable {
+        super::FlightSQLTable::create_with_schema(
+            "flightsql",
+            "executor-1",
+            lazy_client(),
+            TableReference::bare("customer"),
+            stamped_schema(),
+            Arc::new(CookieStore::new()),
+        )
+        .with_statistics(Some(stamped_statistics()))
+    }
+
+    /// Statistics as an executor reports them for its whole table slice: an exact
+    /// row count and exact column bounds over every row it holds.
+    fn stamped_statistics() -> datafusion::common::Statistics {
+        use datafusion::common::stats::Precision;
+        use datafusion::common::{ColumnStatistics, ScalarValue, Statistics};
+
+        Statistics {
+            num_rows: Precision::Exact(150_000),
+            total_byte_size: Precision::Exact(1_200_000),
+            column_statistics: vec![ColumnStatistics {
+                null_count: Precision::Exact(0),
+                max_value: Precision::Exact(ScalarValue::Int64(Some(149_999))),
+                min_value: Precision::Exact(ScalarValue::Int64(Some(0))),
+                sum_value: Precision::Absent,
+                distinct_count: Precision::Absent,
+                byte_size: Precision::Exact(1_200_000),
+            }],
+        }
+    }
+
     fn build_exec(client: FlightSqlClient, cookie_store: Arc<CookieStore>) -> FlightSqlExec {
-        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let schema = stamped_schema();
         FlightSqlExec::new(
             None,
             &schema,
