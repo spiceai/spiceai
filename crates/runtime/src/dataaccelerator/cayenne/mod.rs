@@ -719,8 +719,8 @@ fn apply_refresh_mode_defaults(
 /// what the CDC-shaped defaults (inline memtable, aggressive compaction triggers,
 /// `cdc_durability: memory`) are for. Also decides whether the process installs the
 /// Cayenne compaction memory carve and the in-memory CDC tier budget at all — see
-/// `builder::count_cayenne_small_write_datasets`.
-pub(crate) fn uses_small_write_refresh_profile(acceleration: &Acceleration) -> bool {
+/// `builder::count_cayenne_budget_eligible_accelerations`.
+fn uses_small_write_refresh_profile(acceleration: &Acceleration) -> bool {
     is_small_write_refresh_profile(
         acceleration.refresh_mode.unwrap_or(RefreshMode::Full),
         acceleration.refresh_check_interval,

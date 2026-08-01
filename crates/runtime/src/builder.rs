@@ -471,21 +471,8 @@ impl RuntimeBuilder {
 
         let CayenneMemoryBudgetPlan {
             cayenne_active,
-            eligible_datasets: cayenne_eligible_datasets,
             compaction_memory_fraction,
         } = plan_cayenne_memory_budgets(self.app.as_ref(), &spicepod_rt.params);
-        if cayenne_active {
-            if compaction_memory_fraction.is_some() {
-                tracing::info!(
-                    cayenne_eligible_datasets,
-                    "Reserving the Cayenne compaction memory pool and in-memory CDC tier budget: {cayenne_eligible_datasets} dataset(s) are eligible."
-                );
-            } else {
-                tracing::info!(
-                    "Cayenne compaction memory pool and in-memory CDC tier budget not reserved: no dataset is eligible for either (needs a file acceleration mode AND refresh_mode changes/caching, or append with refresh_check_interval <= 5m). The full query memory limit stays available to queries, and compaction accounts against the query pool."
-                );
-            }
-        }
 
         // Estimate the off-pool per-table Cayenne CDC cache reservation (keyset /
         // segment / coalesce / inline, summed over enabled changes-mode Cayenne
@@ -1096,34 +1083,50 @@ fn parse_usize_runtime_param(params: &HashMap<String, String>, key: &str) -> Opt
 /// against the Spicepod — the pre-init counterpart of the `AccelerationSource`
 /// trait that datasets and views both implement once components exist.
 fn cayenne_configured(app: Option<&Arc<app::App>>) -> bool {
-    app.is_some_and(|app| {
+    spicepod_accelerations(app).any(is_enabled_cayenne_acceleration)
+}
+
+/// Every `acceleration` block in the Spicepod, across datasets and views. Catalogs
+/// are excluded deliberately: they carry `CatalogAcceleration`, a separate type.
+///
+/// Enumerating component kinds by hand is required because this runs *before*
+/// initialization, against the Spicepod — the pre-init counterpart of the
+/// `AccelerationSource` trait that datasets and views both implement once
+/// components exist. Shared by [`cayenne_configured`] and
+/// [`count_cayenne_budget_eligible_accelerations`] so the two can never disagree
+/// about which components carry an acceleration.
+fn spicepod_accelerations(
+    app: Option<&Arc<app::App>>,
+) -> impl Iterator<Item = &spicepod::acceleration::Acceleration> {
+    app.into_iter().flat_map(|app| {
         app.datasets
             .iter()
             .map(|dataset| dataset.acceleration.as_ref())
             .chain(app.views.iter().map(|view| view.acceleration.as_ref()))
             .flatten()
-            .any(|accel| {
-                accel.enabled
-                    && accel
-                        .engine
-                        .as_deref()
-                        .is_some_and(|engine| engine.eq_ignore_ascii_case("cayenne"))
-            })
     })
 }
 
+/// An enabled Cayenne acceleration. The eligible set counted for the memory budgets
+/// is a subset of these, so both gates start from this one predicate.
+fn is_enabled_cayenne_acceleration(accel: &spicepod::acceleration::Acceleration) -> bool {
+    accel.enabled
+        && accel
+            .engine
+            .as_deref()
+            .is_some_and(|engine| engine.eq_ignore_ascii_case("cayenne"))
+}
+
 /// The two Cayenne memory budgets the Runtime builder decides at startup.
-pub(crate) struct CayenneMemoryBudgetPlan {
+struct CayenneMemoryBudgetPlan {
     /// Any enabled Cayenne acceleration AND dedicated thread pools. Selects the
     /// reduced Cayenne query-memory default and the spill-directory hint, which
     /// apply to every Cayenne deployment whatever its refresh mode.
-    pub cayenne_active: bool,
-    /// How many enabled Cayenne accelerations can draw on the two budgets.
-    pub eligible_datasets: usize,
+    cayenne_active: bool,
     /// Fraction of the query memory limit to carve for compaction, and the signal
     /// that installs the off-pool in-memory CDC tier budget. `None` reserves
     /// neither.
-    pub compaction_memory_fraction: Option<f64>,
+    compaction_memory_fraction: Option<f64>,
 }
 
 /// Decide whether to reserve the Cayenne compaction memory carve and the off-pool
@@ -1139,7 +1142,7 @@ pub(crate) struct CayenneMemoryBudgetPlan {
 /// interval is non-zero by default); without a carved environment it accounts
 /// against the shared query pool, exactly as it does when Cayenne is absent or
 /// dedicated thread pools are disabled.
-pub(crate) fn plan_cayenne_memory_budgets(
+fn plan_cayenne_memory_budgets(
     app: Option<&Arc<app::App>>,
     params: &HashMap<String, String>,
 ) -> CayenneMemoryBudgetPlan {
@@ -1148,16 +1151,30 @@ pub(crate) fn plan_cayenne_memory_budgets(
         Some("disabled")
     );
     let cayenne_active = cayenne_configured(app) && dedicated_thread_pools_enabled;
-    let eligible_datasets = count_cayenne_budget_eligible_accelerations(app);
-    let compaction_memory_fraction = (cayenne_active && eligible_datasets > 0).then(|| {
+    let eligible_accelerations = count_cayenne_budget_eligible_accelerations(app);
+    let compaction_memory_fraction = (cayenne_active && eligible_accelerations > 0).then(|| {
         let requested = parse_f64_runtime_param(params, CAYENNE_COMPACTION_MEMORY_FRACTION_PARAM)
             .unwrap_or(DEFAULT_COMPACTION_MEMORY_FRACTION);
         clamp_cayenne_compaction_memory_fraction(requested)
     });
 
+    // Report the decision with the eligible count, so an operator can audit the
+    // reserved budgets against the spicepod. Silent for a non-Cayenne deployment.
+    if cayenne_active {
+        if compaction_memory_fraction.is_some() {
+            tracing::info!(
+                eligible_accelerations,
+                "Reserving the Cayenne compaction memory pool and in-memory CDC tier budget: {eligible_accelerations} dataset(s) are eligible."
+            );
+        } else {
+            tracing::info!(
+                "Cayenne compaction memory pool and in-memory CDC tier budget not reserved: no dataset is eligible for either (needs a file acceleration mode AND refresh_mode changes/caching, or append with refresh_check_interval <= 5m). The full query memory limit stays available to queries, and compaction accounts against the query pool."
+            );
+        }
+    }
+
     CayenneMemoryBudgetPlan {
         cayenne_active,
-        eligible_datasets,
         compaction_memory_fraction,
     }
 }
@@ -1186,35 +1203,25 @@ pub(crate) fn plan_cayenne_memory_budgets(
 fn count_cayenne_budget_eligible_accelerations(app: Option<&Arc<app::App>>) -> usize {
     use spicepod::acceleration::Mode;
 
-    app.map_or(0, |app| {
-        app.datasets
-            .iter()
-            .map(|dataset| dataset.acceleration.as_ref())
-            .chain(app.views.iter().map(|view| view.acceleration.as_ref()))
-            .flatten()
-            .filter(|accel| {
-                accel.enabled
-                    && accel
-                        .engine
+    spicepod_accelerations(app)
+        .filter(|accel| is_enabled_cayenne_acceleration(accel))
+        .filter(|accel| {
+            matches!(accel.mode, Mode::File | Mode::FileCreate | Mode::FileUpdate)
+                && crate::dataaccelerator::cayenne::is_small_write_refresh_profile(
+                    accel
+                        .refresh_mode
+                        .clone()
+                        .map_or(ComponentRefreshMode::Full, Into::into),
+                    // Unparseable intervals are rejected later, when the acceleration
+                    // is converted; treat one as absent here rather than reserving a
+                    // budget off a value that will not load.
+                    accel
+                        .refresh_check_interval
                         .as_deref()
-                        .is_some_and(|engine| engine.eq_ignore_ascii_case("cayenne"))
-                    && matches!(accel.mode, Mode::File | Mode::FileCreate | Mode::FileUpdate)
-                    && crate::dataaccelerator::cayenne::is_small_write_refresh_profile(
-                        accel
-                            .refresh_mode
-                            .clone()
-                            .map_or(ComponentRefreshMode::Full, Into::into),
-                        // Unparseable intervals are rejected later, when the
-                        // acceleration is converted; treat one as absent here rather
-                        // than reserving a budget off a value that will not load.
-                        accel
-                            .refresh_check_interval
-                            .as_deref()
-                            .and_then(|interval| fundu::parse_duration(interval).ok()),
-                    )
-            })
-            .count()
-    })
+                        .and_then(|interval| fundu::parse_duration(interval).ok()),
+                )
+        })
+        .count()
 }
 
 /// Cayenne is not compiled on Windows (`dataaccelerator::cayenne` is gated on
@@ -2264,7 +2271,6 @@ mod test {
             full_refresh.cayenne_active,
             "a full-refresh Cayenne pod is still Cayenne-active"
         );
-        assert_eq!(full_refresh.eligible_datasets, 0);
         assert_eq!(
             full_refresh.compaction_memory_fraction, None,
             "no dataset can compact into the carve or reach the in-memory tier"
@@ -2307,7 +2313,6 @@ mod test {
             &[],
         );
         assert!(mixed.cayenne_active);
-        assert_eq!(mixed.eligible_datasets, 1);
         assert_eq!(
             mixed.compaction_memory_fraction,
             Some(DEFAULT_COMPACTION_MEMORY_FRACTION)
@@ -2345,10 +2350,6 @@ mod test {
         );
         assert!(!no_pools.cayenne_active);
         assert_eq!(no_pools.compaction_memory_fraction, None);
-        assert_eq!(
-            no_pools.eligible_datasets, 1,
-            "eligibility is independent of the thread-pool gate"
-        );
 
         let no_cayenne = plan(
             vec![("duckdb", true, Mode::File, Some(RefreshMode::Changes), None)],

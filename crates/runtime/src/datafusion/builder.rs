@@ -654,22 +654,14 @@ impl DataFusionBuilder {
         self
     }
 
-    /// Carve a dedicated compaction memory pool of `fraction` of the query
-    /// memory limit, and install the off-pool in-memory CDC tier budget. Set by
-    /// the Runtime builder only when Cayenne acceleration is configured, dedicated
-    /// thread pools are enabled, AND at least one enabled Cayenne dataset uses the
-    /// small-write refresh profile that can draw on either budget.
+    /// See [`Self::compaction_memory_fraction`].
     #[must_use]
     pub fn compaction_memory_fraction(mut self, fraction: Option<f64>) -> Self {
         self.compaction_memory_fraction = fraction;
         self
     }
 
-    /// Whether Cayenne acceleration is configured and dedicated thread pools are
-    /// enabled. Unlike [`Self::compaction_memory_fraction`] this does not require a
-    /// dataset that can use the Cayenne memory budgets: it drives the Cayenne
-    /// query-memory default split and the spill-directory hint, which apply to
-    /// every Cayenne deployment whatever its refresh mode.
+    /// See [`Self::cayenne_active`].
     #[must_use]
     pub fn cayenne_active(mut self, active: bool) -> Self {
         self.cayenne_active = active;
@@ -747,15 +739,9 @@ impl DataFusionBuilder {
             .compaction_memory_fraction
             .and_then(validate_compaction_memory_fraction);
         let cayenne_budgets_installed = compaction_memory_fraction.is_some();
-        // Any enabled Cayenne acceleration with dedicated thread pools, whatever its
-        // refresh mode. This gates the coordinated host-memory partition — a reduced
-        // query-pool default that leaves room for the off-pool Cayenne CDC caches so
-        // query_pool + compaction + tier + headroom ≤ host — and the spill-directory
-        // hint, neither of which depends on a small-write dataset existing.
-        let cayenne_active = self.cayenne_active;
         let effective_memory_limit = effective_query_memory_limit(
             self.memory_limit,
-            cayenne_active,
+            self.cayenne_active,
             self.cayenne_cdc_reservation_bytes,
             self.duckdb_query_pool_cap,
         );
@@ -840,7 +826,7 @@ impl DataFusionBuilder {
         // small, so a spill fails and the query exhausts the memory pool
         // (ResourceExhausted) instead of spilling — the SF1000 Q10/Q18 symptom.
         // Guide operators to point spill at a roomy volume.
-        if cayenne_active && self.temp_directory.is_none() {
+        if self.cayenne_active && self.temp_directory.is_none() {
             tracing::info!(
                 "Cayenne acceleration is active but runtime.query.temp_directory is unset: large analytical queries spill to the OS temp directory. If your data is on a separate volume (e.g. EBS) and the root volume is small, set runtime.query.temp_directory to a path with ample free space so large queries can spill instead of failing."
             );
