@@ -413,11 +413,11 @@ impl ClientDriver {
             ca_bundle_pem: current.ca_bundle_pem,
             gateway_addr: current.gateway_addr,
             not_after_unix: Some(outcome.not_after_unix),
-            // The encryption keypair is NOT rotated on renewal: the renew
-            // exchange carries no channel to re-pin a new public key, and
-            // the cloud keeps sealing secrets to the enrolled one.
-            enc_private_key_pem: current.enc_private_key_pem,
-            enc_public_key_pem: current.enc_public_key_pem,
+            // The encryption keypair rotates alongside the identity keypair
+            // on each renewal: the cloud pins it in the same transaction
+            // that issues the new leaf, and begins sealing secrets to it.
+            enc_private_key_pem: material.enc_private_key_pem,
+            enc_public_key_pem: material.enc_public_key_pem,
         };
         // The cloud has already pinned the new public key: even if
         // persistence fails, the rotated identity must be used in memory
