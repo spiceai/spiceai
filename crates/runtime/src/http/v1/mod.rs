@@ -411,15 +411,24 @@ impl SqlErrorKind {
     }
 }
 
-/// Folds a query error message onto one line so it logs as a single record.
+/// Collapses the control characters in a query error message so it logs as a
+/// single record.
 ///
-/// A memory-pool refusal carries a newline-separated list of the top memory
-/// consumers, and a multi-line record breaks the line-oriented collectors that
-/// scrape these logs. The response body keeps the original formatting — only
-/// the logged copy is folded.
+/// A memory-pool refusal spreads its top-consumer breakdown over several lines,
+/// and a record that breaks mid-message is one a log collector cannot group or
+/// alert on. Every control character is replaced rather than dropped, so
+/// offsets into the logged line still match the message the response carries.
+/// Only the logged copy is collapsed — the body keeps what the engine wrote —
+/// and a message with nothing to collapse is borrowed, so the common path does
+/// not allocate.
 fn single_line(message: &str) -> std::borrow::Cow<'_, str> {
-    if message.contains(['\n', '\r']) {
-        std::borrow::Cow::Owned(message.split_whitespace().collect::<Vec<_>>().join(" "))
+    if message.contains(char::is_control) {
+        std::borrow::Cow::Owned(
+            message
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect(),
+        )
     } else {
         std::borrow::Cow::Borrowed(message)
     }
@@ -854,11 +863,13 @@ mod tests {
         ));
     }
 
-    /// The memory pool's refusal spans several lines — the message that reaches
-    /// `sql_error_response` embeds the top-consumers table — so the logged copy
-    /// has to be folded onto one line for line-oriented log collectors.
-    #[test]
-    fn resource_exhaustion_message_logs_on_one_line() {
+    /// `TrackConsumersPool` writes its breakdown as `"… (across reservations)
+    /// as:\n{consumers}\nError: {msg}"`, so the message reaching
+    /// `sql_error_response` is genuinely multi-line. The log record has to stay
+    /// on one line for a collector to group it, while the response body keeps
+    /// the breakdown the caller needs to act on.
+    #[tokio::test]
+    async fn resource_exhaustion_logs_on_one_line_but_responds_in_full() {
         let message = concat!(
             "Resources exhausted: Additional allocation failed for HashJoinInput[135] ",
             "with top memory consumers (across reservations) as:\n",
@@ -867,32 +878,41 @@ mod tests {
             "Error: Failed to allocate additional 256.0 MB for HashJoinInput[135]"
         );
 
-        let folded = single_line(message);
+        let logged = single_line(message);
         assert!(
-            !folded.contains(['\n', '\r']),
-            "the logged message must be one line, got: {folded}"
+            !logged.chars().any(char::is_control),
+            "no control character may survive into the log line: {logged}"
         );
         assert!(
-            folded.contains("consumed 1.0 GB, peak 1.0 GB, ExternalSorter[3]"),
-            "folding must join the lines, not drop them: {folded}"
+            logged.contains("consumed 1.0 GB, peak 1.0 GB,   ExternalSorter[3]"),
+            "collapsing must keep the breakdown, only its line breaks: {logged}"
         );
-        assert!(
-            folded.ends_with("Failed to allocate additional 256.0 MB for HashJoinInput[135]"),
-            "the tail of the message must survive: {folded}"
+        assert_eq!(
+            logged.chars().count(),
+            message.chars().count(),
+            "each control character is replaced, never dropped, so offsets into \
+             the log line still match the message"
         );
 
-        // A single-line message is passed through untouched — including its
-        // interior spacing — and without allocating.
-        let plain = "Resources exhausted:  out of memory";
+        // A message with nothing to collapse is borrowed, not rebuilt.
+        let plain = "Resources exhausted: out of memory";
         assert!(matches!(
             single_line(plain),
             std::borrow::Cow::Borrowed(kept) if kept == plain
         ));
 
-        // Folding is confined to the log record: the response still classifies
-        // the same way off the original, unfolded message.
+        // Collapsing is for the log only: the body the caller reads is the
+        // engine's own message, newlines and all.
         let response = sql_error_response(message.to_string(), SqlErrorKind::ResourcesExhausted);
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("the error response body must be readable");
+        assert_eq!(
+            std::str::from_utf8(&body).expect("the body must be utf8"),
+            message,
+            "the response body must stay verbatim"
+        );
     }
 
     #[test]
