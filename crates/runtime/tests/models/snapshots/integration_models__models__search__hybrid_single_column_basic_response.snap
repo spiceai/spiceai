@@ -23,6 +23,18 @@ expression: "normalize_search_response(resp, round_scores)"
       "dataset": "qs",
       "matches": {
         "question": [
+          "A Mission Control Officer at Cape Canaveral makes the statement \"lift-off, T minus 50 seconds.\" How long is it before lift-off?"
+        ]
+      },
+      "primary_key": {
+        "id": 9
+      }
+    },
+    {
+      "_score": "0.01",
+      "dataset": "qs",
+      "matches": {
+        "question": [
           "How many groups of 2 are in 14?"
         ]
       },
@@ -40,18 +52,6 @@ expression: "normalize_search_response(resp, round_scores)"
       },
       "primary_key": {
         "id": 464
-      }
-    },
-    {
-      "_score": "0.01",
-      "dataset": "qs",
-      "matches": {
-        "question": [
-          "How many groups of 3 are in 18?"
-        ]
-      },
-      "primary_key": {
-        "id": 463
       }
     }
   ]

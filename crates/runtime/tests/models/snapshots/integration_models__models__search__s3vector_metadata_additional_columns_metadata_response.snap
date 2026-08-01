@@ -6,7 +6,23 @@ expression: "normalize_search_response(resp, round_scores)"
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": "0.54",
+      "_score": "0.77",
+      "data": {
+        "reference_answer": "2",
+        "source": "textbook_reasoning"
+      },
+      "dataset": "qs",
+      "matches": {
+        "answer": [
+          "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
+        ]
+      },
+      "primary_key": {
+        "id": 948
+      }
+    },
+    {
+      "_score": "0.77",
       "data": {
         "reference_answer": "7",
         "source": "textbook_reasoning"
@@ -22,7 +38,7 @@ expression: "normalize_search_response(resp, round_scores)"
       }
     },
     {
-      "_score": "0.54",
+      "_score": "0.77",
       "data": {
         "reference_answer": "-16",
         "source": "textbook_reasoning"
@@ -38,7 +54,7 @@ expression: "normalize_search_response(resp, round_scores)"
       }
     },
     {
-      "_score": "0.54",
+      "_score": "0.77",
       "data": {
         "reference_answer": "2",
         "source": "textbook_reasoning"
@@ -51,22 +67,6 @@ expression: "normalize_search_response(resp, round_scores)"
       },
       "primary_key": {
         "id": 1277
-      }
-    },
-    {
-      "_score": "0.53",
-      "data": {
-        "reference_answer": "2",
-        "source": "textbook_reasoning"
-      },
-      "dataset": "qs",
-      "matches": {
-        "answer": [
-          "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
-        ]
-      },
-      "primary_key": {
-        "id": 948
       }
     }
   ]

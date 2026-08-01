@@ -6,7 +6,22 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": "6.33",
+      "_score": "8.21",
+      "data": {
+        "question": "A Mission Control Officer at Cape Canaveral makes the statement \"lift-off, T minus 50 seconds.\" How long is it before lift-off?"
+      },
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "The statement \"T minus 50 seconds\" indicates that there are $\\boxed{50 \\text{ seconds}}$ remaining until lift-off."
+        ]
+      },
+      "primary_key": {
+        "id": 9
+      }
+    },
+    {
+      "_score": "5.99",
       "data": {
         "question": "In a group of 3 machines where 2 are faulty, what is the probability that the first two machines tested are both faulty?"
       },
@@ -21,7 +36,7 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": "6.19",
+      "_score": "5.86",
       "data": {
         "question": "State the degree of the differential equation:\n$$\ny^{\\prime \\prime} = 6x + \\sin x\n$$"
       },
