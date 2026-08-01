@@ -477,7 +477,14 @@ impl Index for ElasticsearchIndex {
 
     async fn delete_by_keys(&self, keys: RecordBatch) -> Result<(), DataFusionError> {
         let key_columns = delete::document_key_columns(&self.primary_key);
-        delete::delete_by_keys(self.client.as_ref(), &self.es_index, &key_columns, &keys).await
+        delete::delete_by_keys(
+            self.client.as_ref(),
+            &self.es_index,
+            &self.primary_key,
+            &key_columns,
+            &keys,
+        )
+        .await
     }
 
     /// `_delete_by_query` filters by field value, so a key naming only some of the indexed fields
@@ -730,7 +737,14 @@ impl Index for ElasticsearchTextIndex {
 
     async fn delete_by_keys(&self, keys: RecordBatch) -> Result<(), DataFusionError> {
         let key_columns = delete::document_key_columns(&self.primary_key);
-        delete::delete_by_keys(self.client.as_ref(), &self.es_index, &key_columns, &keys).await
+        delete::delete_by_keys(
+            self.client.as_ref(),
+            &self.es_index,
+            &self.primary_key,
+            &key_columns,
+            &keys,
+        )
+        .await
     }
 
     /// Same `_delete_by_query` addressing as [`ElasticsearchIndex`].
