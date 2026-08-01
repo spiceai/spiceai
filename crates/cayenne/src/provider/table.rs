@@ -7584,9 +7584,10 @@ impl CayenneTableProvider {
 
     /// Store the per-shard PK index back into the sharded cache after validation
     /// (the §2.3c analog of `store_cached_pk_index`). Does NOT apply the
-    /// exact->bloom byte-budget conversion: the index was already built within
-    /// budget by `build_sharded_pk_index`, and a per-apply re-check would diverge
-    /// the two cache paths. Restored BEFORE the per-shard appends so each
+    /// exact->bloom byte-budget conversion: the index was just built within budget
+    /// by `build_sharded_pk_index`, so there is nothing to convert here — the
+    /// budget is re-checked once per apply AFTER the per-shard appends have grown
+    /// it (step 6 of `validate_and_append_sharded`). Restored BEFORE the appends so each
     /// `append_to_shard` can grow its shard's existence view UNDER `locks[s]` for
     /// the just-validated/MISS keys (§5 Phase 6).
     fn store_sharded_pk_index(&self, index: ShardedPkIndex) {
@@ -10081,42 +10082,47 @@ impl CayenneTableProvider {
         //    without a degrade here the exact keysets grow with every distinct
         //    key ever written — unbounded under a workload with monotonic keys,
         //    even when the live row count is stable — and the configured budget
-        //    is only ever reported, never applied. Same over-budget handling as
-        //    the commit-path mirror in `record_pk_keys_with_location`.
+        //    is only ever reported, never applied.
+        //
+        //    Enforcement covers UPSERT tables only, and deliberately leaves a
+        //    non-upsert index resident and over budget. A bloom is unsound for
+        //    `DoNothing` (see `upsert_bloom_eligible`), and dropping the cache —
+        //    what the commit-path mirror in `record_pk_keys_with_location` does —
+        //    is not an option on THIS path: the mem-tier CDC apply never reaches
+        //    that mirror (`write_cdc_in_memory` returns before
+        //    `record_inlined_pk_keys`), so a drop here would be newly reachable
+        //    per apply, and the `DoNothing` rebuild that follows is deliberately
+        //    uncapped (`build_sharded_pk_index` passes no budget) and comes back
+        //    over budget — a full O(live rows) keyset rebuild on every apply,
+        //    silently. Reporting the true resident bytes and letting the memory
+        //    account apply back-pressure is the lesser evil; bounding a
+        //    `DoNothing` keyset needs a sound exact eviction, not a bloom.
         if !validated_keys.is_empty() {
             let mut sharded = self.sharded_pk_keyset_cache.lock();
-            let mut drop_index = false;
             // Gate on the variant, not just the tally: only an `Exact` index grows
             // per recorded key and only it can be degraded, so this fires on the
             // one transition rather than repeating every apply for an
             // already-bloomed index whose blooms sit above a very small budget.
+            let mut bytes = None;
             if let Some(index @ ShardedPkIndex::Exact(_)) = sharded.as_mut() {
                 let max_bytes = self.effective_pk_keyset_budget();
                 let resident = index.approx_bytes();
-                if resident > max_bytes {
-                    if self.upsert_bloom_eligible() {
-                        tracing::warn!(
-                            table = %self.table_name(),
-                            resident_bytes = resident,
-                            budget_bytes = max_bytes,
-                            "sharded PK keyset exceeded its byte budget; degrading to bounded per-shard blooms (existence stays sound - a false positive costs only a redundant delete and a false negative cannot occur; per-key sequences and captured positions are dropped until the next rebuild)"
-                        );
-                        index.degrade_to_blooms(max_bytes / index.shard_count().max(1));
-                    } else {
-                        // `DoNothing` needs exact existence: the bloom arm keeps
-                        // the incoming row and supersedes the prior one (upsert
-                        // semantics), and validation debug-asserts that a bloom
-                        // index implies upsert. Drop the cache instead and let the
-                        // next validation pay the lazy bounded rebuild.
-                        drop_index = true;
-                    }
+                if resident > max_bytes && self.upsert_bloom_eligible() {
+                    tracing::warn!(
+                        table = %self.table_name(),
+                        resident_bytes = resident,
+                        budget_bytes = max_bytes,
+                        "sharded PK keyset exceeded its byte budget; degrading to bounded per-shard blooms (existence stays sound - a false positive costs only a redundant delete and a false negative cannot occur; per-key sequences and captured positions are dropped until the next rebuild)"
+                    );
+                    index.degrade_to_blooms(max_bytes / index.shard_count().max(1));
+                } else {
+                    bytes = Some(resident);
                 }
             }
-            if drop_index {
-                *sharded = None;
-                self.publish_sharded_keyset_bytes(0);
-            } else if let Some(index) = sharded.as_ref() {
-                self.publish_sharded_keyset_bytes(index.approx_bytes());
+            // Recomputed after a degrade (the tally changed); reused otherwise.
+            let bytes = bytes.or_else(|| sharded.as_ref().map(ShardedPkIndex::approx_bytes));
+            if let Some(bytes) = bytes {
+                self.publish_sharded_keyset_bytes(bytes);
             }
         }
 
@@ -31335,11 +31341,14 @@ mod tests {
             .expect("table created");
         provider.maybe_install_warm_pk_caches().await;
 
-        // ~13k 8-byte keys ≈ 728 KiB accounted per cache: under the 1 MiB
-        // budget (no conversion without the split) but over the 512 KiB
-        // half-budget each cache must respect.
-        let mut keys = PkDigestSet::with_capacity(13_000);
-        for i in 0..13_000u64 {
+        // 8k 8-byte keys ≈ 750 KiB accounted per cache (96 B/entry — see
+        // `approx_pk_keyset_entry_bytes`): under the 1 MiB budget, so neither
+        // cache would convert WITHOUT the split, but over the 512 KiB
+        // half-budget each cache must respect. The window is what gives this
+        // test its teeth, so keep the count inside it if the per-entry estimate
+        // changes.
+        let mut keys = PkDigestSet::with_capacity(8_000);
+        for i in 0..8_000u64 {
             let key = crate::row_converter::Row::from_encoded(&i.to_be_bytes()).owned();
             keys.insert_with_digest(pk_digest(&key), key);
         }
@@ -31431,6 +31440,63 @@ mod tests {
         );
     }
 
+    /// Rows written past the sharded keyset's effective byte budget on an N>1
+    /// memory-CDC table, so the apply's step-6 resync sees an over-budget index.
+    ///
+    /// `ROWS` is sized against the 512 KiB half-budget at 96 accounted bytes per
+    /// 8-byte key (`entry_estimate_charges_the_digest_the_entry_struct_and_the_key`)
+    /// — ~1.5x over, so the crossing is unambiguous without processing rows the
+    /// assertions do not need. Asserts the warm install really seeded an EXACT
+    /// index, without which a "not exact any more" assertion would also pass on a
+    /// cache that was never installed.
+    async fn write_past_the_sharded_keyset_budget(
+        ctx: &SessionContext,
+        table_name: &str,
+        on_conflict: OnConflict,
+    ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
+        const ROWS: i64 = 8_000;
+
+        let (provider, catalog, tmp) = create_cdc_table_with_on_conflict(
+            table_name,
+            ctx.runtime_env(),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                cdc_mem_tier_shards: 4,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                // Halved for the sharded cache on an N>1 table, so ~512 KiB.
+                pk_keyset_cache_mb: Some(1),
+                ..VortexConfig::default()
+            },
+            on_conflict,
+        )
+        .await;
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        provider.maybe_install_warm_pk_caches().await;
+        assert!(
+            matches!(
+                provider.sharded_pk_keyset_cache.lock().as_ref(),
+                Some(ShardedPkIndex::Exact(_))
+            ),
+            "the warm install must seed an exact index for the budget to act on"
+        );
+
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch_for_range(schema, 0, ROWS)),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("sharded CDC append");
+        assert_eq!(
+            query_count_star(ctx, &provider, table_name).await,
+            ROWS,
+            "crossing the keyset budget must not drop or duplicate rows"
+        );
+        (provider, catalog, tmp)
+    }
+
     /// The sharded apply's step-6 resync is the byte budget's enforcement point
     /// for the keys `record_keys_in_shard` records: those per-shard inserts run
     /// uncapped under the publish locks, so an over-budget exact index must be
@@ -31440,39 +31506,16 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn sharded_apply_resync_degrades_an_over_budget_upsert_keyset() {
         let ctx = SessionContext::new();
-        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+        let (provider, _catalog, _tmp) = write_past_the_sharded_keyset_budget(
+            &ctx,
             "resync_degrades_over_budget_keyset",
-            ctx.runtime_env(),
-            VortexConfig {
-                cdc_durability: crate::metadata::CdcDurability::Memory,
-                cdc_mem_tier_shards: 4,
-                deletion_mode: crate::metadata::DeletionMode::Key,
-                inline_max_rows: 1024,
-                // Halved for the sharded cache on an N>1 table, so ~512 KiB — the
-                // row count below accounts well past it.
-                pk_keyset_cache_mb: Some(1),
-                ..VortexConfig::default()
-            },
+            OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            ),
         )
         .await;
-        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
-        provider.maybe_install_warm_pk_caches().await;
-        let schema = Arc::clone(&provider.table_metadata.schema);
-        assert!(
-            matches!(
-                provider.sharded_pk_keyset_cache.lock().as_ref(),
-                Some(ShardedPkIndex::Exact(_))
-            ),
-            "the warm install must start from an exact index"
-        );
-
-        let _ = provider
-            .write_cdc_append_stream(
-                single_batch_stream(id_value_batch_for_range(schema, 0, 20_000)),
-                &ctx.task_ctx(),
-            )
-            .await
-            .expect("sharded CDC append");
 
         assert!(
             matches!(
@@ -31481,56 +31524,38 @@ mod tests {
             ),
             "the resync must degrade an over-budget sharded keyset to blooms"
         );
-        assert_eq!(
-            query_count_star(&ctx, &provider, "resync_degrades_over_budget_keyset").await,
-            20_000,
-            "degrading the existence index must not drop or duplicate rows"
-        );
     }
 
-    /// A `DoNothing` table must never be degraded to blooms. The bloom existence
-    /// arm always keeps the incoming row and emits a key-based supersede for the
-    /// prior one — upsert semantics — which is why validation debug-asserts that a
-    /// bloom index implies `OnConflict::Upsert`. Over budget the resync therefore
-    /// drops the cache instead, and the next validation pays the lazy bounded
-    /// rebuild.
+    /// A non-upsert table must never be degraded to blooms: the bloom existence arm
+    /// keeps the incoming row and emits a key-based supersede for the prior one —
+    /// upsert semantics — which is why validation debug-asserts that a bloom index
+    /// implies `OnConflict::Upsert`. The resync leaves it exact and reports the true
+    /// resident bytes instead (see the step-6 comment for why it must not drop the
+    /// cache either).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn sharded_apply_resync_drops_an_over_budget_do_nothing_keyset() {
+    async fn sharded_apply_resync_leaves_an_over_budget_do_nothing_keyset_exact() {
         let ctx = SessionContext::new();
-        let (provider, _catalog, _tmp) = create_cdc_table_with_on_conflict(
-            "resync_drops_over_budget_keyset",
-            ctx.runtime_env(),
-            VortexConfig {
-                cdc_durability: crate::metadata::CdcDurability::Memory,
-                cdc_mem_tier_shards: 4,
-                deletion_mode: crate::metadata::DeletionMode::Key,
-                inline_max_rows: 1024,
-                pk_keyset_cache_mb: Some(1),
-                ..VortexConfig::default()
-            },
+        let (provider, _catalog, _tmp) = write_past_the_sharded_keyset_budget(
+            &ctx,
+            "resync_keeps_over_budget_keyset_exact",
             OnConflict::DoNothingAll,
         )
         .await;
-        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
-        provider.maybe_install_warm_pk_caches().await;
-        let schema = Arc::clone(&provider.table_metadata.schema);
 
-        let _ = provider
-            .write_cdc_append_stream(
-                single_batch_stream(id_value_batch_for_range(schema, 0, 20_000)),
-                &ctx.task_ctx(),
-            )
-            .await
-            .expect("sharded CDC append");
-
+        let resident = match provider.sharded_pk_keyset_cache.lock().as_ref() {
+            Some(index @ ShardedPkIndex::Exact(_)) => index.approx_bytes(),
+            Some(ShardedPkIndex::Bloom(_)) => {
+                panic!("a DoNothing table must never degrade to blooms")
+            }
+            None => panic!("a DoNothing table must keep its exact cache, not drop it"),
+        };
         assert!(
-            provider.sharded_pk_keyset_cache.lock().is_none(),
-            "a DoNothing table must drop its over-budget cache, never degrade it to blooms"
+            resident > provider.effective_pk_keyset_budget(),
+            "the index the resync left alone must be the over-budget one"
         );
-        assert_eq!(
-            query_count_star(&ctx, &provider, "resync_drops_over_budget_keyset").await,
-            20_000,
-            "dropping the existence index must not drop or duplicate rows"
+        assert!(
+            provider.table_memory.reserved_bytes() >= resident,
+            "an index left over budget must still be reported to the memory account"
         );
     }
 

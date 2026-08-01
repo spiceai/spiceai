@@ -952,11 +952,13 @@ impl ShardedPkIndex {
     /// insert and the per-apply `incoming_keys` set).
     ///
     /// NOTE: unlike `record_pk_keys_with_location`, this intentionally does NOT do
-    /// per-insert over-budget exact→bloom conversion. The sharded path recomputes
-    /// the keyset byte tally ONCE after all per-shard appends and enforces the
-    /// budget there ([`ShardedPkIndex::degrade_to_blooms`] at the apply's resync
-    /// step), so a single shard never converts mid-insert while its siblings are
-    /// still appending.
+    /// per-insert over-budget exact→bloom conversion — the `Exact`/`Bloom` variant
+    /// is table-global, so one shard cannot convert while its siblings are still
+    /// appending under their own publish locks. The sharded path instead recomputes
+    /// the tally ONCE after all per-shard appends and enforces the budget there
+    /// (step 6 of `validate_and_append_sharded`, via
+    /// [`ShardedPkIndex::degrade_to_blooms`]; upsert tables only, for the reasons
+    /// documented at that call site).
     pub(crate) fn record_keys_in_shard(
         &mut self,
         shard: usize,
@@ -1132,19 +1134,15 @@ mod tests {
 
     #[test]
     fn entry_estimate_charges_the_digest_the_entry_struct_and_the_key() {
-        // The budget is only as real as this estimate: one that drops the u128
-        // digest, the OwnedRow pointer, or the OCC sequence bounds the cache at
-        // a fraction of its believed size (a counting-allocator measurement
-        // puts the real cost at 1.6-3.5x a key-plus-location-only figure).
-        let key = owned_key(&key(7));
-        let floor = key.as_ref().len()
-            + std::mem::size_of::<u128>()
-            + std::mem::size_of::<super::PkKeysetEntry>();
-        assert!(
-            approx_pk_keyset_entry_bytes(&key) >= floor,
-            "estimate {} must cover at least the stored bytes {floor}",
-            approx_pk_keyset_entry_bytes(&key)
-        );
+        // Pins the figure every keyset byte budget is computed from (rationale on
+        // `approx_pk_keyset_entry_bytes`). Asserted as a concrete number rather
+        // than re-derived from the same `size_of`s the function adds, which would
+        // restate the implementation and pass no matter what it charged: on 64-bit
+        // an 8-byte key costs 8 + 16 (u128 digest) + 56 (`PkKeysetEntry`) + 16
+        // (map slot) = 96. `sharded_table_splits_the_keyset_budget_between_the_two_caches`
+        // sizes its key count against this, so changing the estimate must fail
+        // HERE rather than silently widen that test's budget window.
+        assert_eq!(approx_pk_keyset_entry_bytes(&owned_key(&key(7))), 96);
     }
 
     #[test]
