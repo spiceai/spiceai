@@ -18,6 +18,7 @@ async-trait = { workspace = true }
 # the same crypto backend rcgen generates the keypair with (see the rcgen
 # entry below), so the PKCS#8 we persist always round-trips.
 aws-lc-rs = "1"
+cloud-connect-crypto = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
 dirs = "6"
@@ -26,6 +27,8 @@ gethostname = { workspace = true }
 # private key and CSR are held as PEM; the signer takes raw DER bytes).
 pem = { workspace = true }
 prost = { workspace = true }
+# `google.protobuf.Timestamp`, which every time-valued field on the wire uses.
+prost-types = "0.14"
 rand = { workspace = true }
 # Client-side keypair + PKCS#10 CSR generation for the enrollment flow.
 # Pin the aws_lc_rs backend (matching `crates/runtime`, which forces it via

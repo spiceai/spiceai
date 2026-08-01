@@ -727,18 +727,90 @@ mod add {
 mod connect {
     use super::*;
 
-    /// Create a fake `spiced` binary under `$HOME/.spice/bin/spiced` that
-    /// exits 0 immediately. `spice connect <CODE>` now launches `spiced` in
-    /// the foreground; the stub lets the launch path run to completion
-    /// without a network install or a real, long-lived server process.
+    /// Create a fake `spiced` binary under `$HOME/.spice/bin/spiced` so the
+    /// is-runtime-installed preflight passes without a network install. The
+    /// stub records every execution by touching a marker file —
+    /// `spice connect` must enroll and exit WITHOUT starting `spiced`, and
+    /// the marker proves it.
     #[cfg(unix)]
     fn install_fake_spiced(home: &std::path::Path) {
         use std::os::unix::fs::PermissionsExt as _;
         let bin_dir = home.join(".spice").join("bin");
         fs::create_dir_all(&bin_dir).expect("create fake .spice/bin");
         let spiced = bin_dir.join("spiced");
-        fs::write(&spiced, "#!/bin/sh\nexit 0\n").expect("write fake spiced");
+        fs::write(
+            &spiced,
+            "#!/bin/sh\ntouch \"$(dirname \"$0\")/spiced-ran\"\nexit 0\n",
+        )
+        .expect("write fake spiced");
         fs::set_permissions(&spiced, fs::Permissions::from_mode(0o755)).expect("chmod fake spiced");
+    }
+
+    /// Marker the fake `spiced` touches when executed.
+    #[cfg(unix)]
+    fn spiced_ran_marker(home: &std::path::Path) -> std::path::PathBuf {
+        home.join(".spice").join("bin").join("spiced-ran")
+    }
+
+    /// Serve exactly one HTTP request on an ephemeral port from a plain-std
+    /// thread, answering with `status` and `body`. Hermetic stand-in for the
+    /// cloud enroll endpoint — no async runtime or extra dev-deps needed.
+    fn spawn_one_shot_http(status: u16, body: &str) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock listener");
+        let addr = listener.local_addr().expect("mock listener addr");
+        let body = body.to_string();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept enroll request");
+            // Read until the full headers + content-length body arrived.
+            let mut buf = Vec::new();
+            let mut tmp = [0_u8; 4096];
+            loop {
+                let n = stream.read(&mut tmp).expect("read enroll request");
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                let text = String::from_utf8_lossy(&buf);
+                if let Some(header_end) = text.find("\r\n\r\n") {
+                    let content_length = text[..header_end]
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            if name.eq_ignore_ascii_case("content-length") {
+                                value.trim().parse::<usize>().ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= header_end + 4 + content_length {
+                        break;
+                    }
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 {status} MOCK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write enroll response");
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    /// A well-formed enroll success response (the CLI does not validate the
+    /// PEM contents at enroll — the cloud signed them).
+    fn enroll_ok_body() -> String {
+        serde_json::json!({
+            "instance_id": "inst_cli_test",
+            "identity_cert_pem": "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+            "ca_bundle_pem": "-----BEGIN CERTIFICATE-----\nBBBB\n-----END CERTIFICATE-----\n",
+            "gateway_addr": "127.0.0.1:443",
+            "not_after": "2030-01-01T00:00:00Z",
+        })
+        .to_string()
     }
 
     #[test]
@@ -753,47 +825,264 @@ mod connect {
             .stdout(predicate::str::contains("SPICE-ADOPT"))
             .stdout(predicate::str::contains("Spice Cloud"))
             .stdout(predicate::str::contains("status"))
-            .stdout(predicate::str::contains("forget"));
+            .stdout(predicate::str::contains("remove"));
     }
 
-    /// `spice connect <CODE>` should stage the code at
-    /// `$SPICE_CONFIG_DIR/pending-adopt-code`, print the attaching message,
-    /// launch `spiced` (here the fast-exit stub), and the subsequent
-    /// `spice connect status` should report pending adoption.
+    /// The enroll-and-exit contract: `spice connect <CODE>` completes the
+    /// HTTPS enroll, persists `identity.json`, discards the staged code,
+    /// exits 0 — and never starts `spiced`. A subsequent
+    /// `spice connect status` reports the enrolled identity.
     #[cfg(unix)]
     #[test]
-    fn test_connect_stage_code_and_status() {
+    fn test_connect_enrolls_and_exits_without_starting_spiced() {
         let dir = TempDir::new().expect("create temp config dir");
         let config_dir = dir.path();
         let home = TempDir::new().expect("create temp home");
         install_fake_spiced(home.path());
+        let (endpoint, server) = spawn_one_shot_http(200, &enroll_ok_body());
 
-        // Stage the code and launch (the stub) spiced.
         let mut cmd = spice_cmd();
         cmd.env("HOME", home.path())
             .env("SPICE_CONFIG_DIR", config_dir)
+            .env_remove("SPICE_CLOUD_ENDPOINT")
             .arg("connect")
-            .arg("SPICE-ADOPT-AAAA-BBBB")
+            .arg("SPICE-ADOPT-AAAAA-BBBBB")
+            .arg("--endpoint")
+            .arg(&endpoint)
             .assert()
             .success()
-            .stdout(predicate::str::contains(
-                "Attaching this Spice Runtime to Spice Cloud Connect",
-            ));
+            .stdout(predicate::str::contains("Enrolled with Spice Cloud"))
+            .stdout(predicate::str::contains("inst_cli_test"))
+            .stdout(predicate::str::contains("spiced --cloud-connect"));
+        server.join().expect("mock served the enroll request");
 
-        let pending = config_dir.join("pending-adopt-code");
-        assert!(pending.exists(), "pending-adopt-code should be created");
-        let content = fs::read_to_string(&pending).expect("read pending-adopt-code");
-        assert_eq!(content, "SPICE-ADOPT-AAAA-BBBB");
+        assert!(
+            config_dir.join("identity.json").exists(),
+            "the issued identity must be persisted"
+        );
+        assert!(
+            !config_dir.join("pending-adopt-code").exists(),
+            "the consumed code must not stay staged"
+        );
+        assert!(
+            !spiced_ran_marker(home.path()).exists(),
+            "`spice connect` must not start spiced"
+        );
 
-        // Status should report pending adoption.
         let mut cmd = spice_cmd();
         cmd.env("SPICE_CONFIG_DIR", config_dir)
             .arg("connect")
             .arg("status")
             .assert()
             .success()
-            .stdout(predicate::str::contains("pending adoption"))
-            .stdout(predicate::str::contains("SPICE-ADOPT"));
+            .stdout(predicate::str::contains("adopted"))
+            .stdout(predicate::str::contains("inst_cli_test"));
+    }
+
+    /// `--dir <path>` anchors the per-instance state at `<dir>/.spice`
+    /// (when `SPICE_CONFIG_DIR` is not set), for both enroll and status.
+    #[cfg(unix)]
+    #[test]
+    fn test_connect_dir_flag_anchors_instance_state() {
+        let instance_dir = TempDir::new().expect("create temp instance dir");
+        let cwd = TempDir::new().expect("create temp cwd");
+        let home = TempDir::new().expect("create temp home");
+        install_fake_spiced(home.path());
+        let (endpoint, server) = spawn_one_shot_http(200, &enroll_ok_body());
+
+        let mut cmd = spice_cmd();
+        cmd.env("HOME", home.path())
+            .env_remove("SPICE_CONFIG_DIR")
+            .env_remove("SPICE_CLOUD_ENDPOINT")
+            .current_dir(cwd.path())
+            .arg("connect")
+            .arg("SPICE-ADOPT-AAAAA-BBBBB")
+            .arg("--dir")
+            .arg(instance_dir.path())
+            .arg("--endpoint")
+            .arg(&endpoint)
+            .assert()
+            .success();
+        server.join().expect("mock served the enroll request");
+
+        assert!(
+            instance_dir
+                .path()
+                .join(".spice")
+                .join("identity.json")
+                .exists(),
+            "identity must be anchored under <dir>/.spice"
+        );
+        assert!(
+            !cwd.path().join(".spice").exists(),
+            "the cwd must not receive instance state when --dir is passed"
+        );
+
+        let mut cmd = spice_cmd();
+        cmd.env_remove("SPICE_CONFIG_DIR")
+            .current_dir(cwd.path())
+            .arg("connect")
+            .arg("status")
+            .arg("--dir")
+            .arg(instance_dir.path())
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("adopted"));
+    }
+
+    /// `--app-name`/`--create` ride the enroll request and the attached app
+    /// from the response is reported in the success output.
+    #[cfg(unix)]
+    #[test]
+    fn test_connect_app_name_reports_attachment() {
+        let dir = TempDir::new().expect("create temp config dir");
+        let config_dir = dir.path();
+        let home = TempDir::new().expect("create temp home");
+        install_fake_spiced(home.path());
+        let body = serde_json::json!({
+            "instance_id": "inst_cli_test",
+            "identity_cert_pem": "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+            "ca_bundle_pem": "",
+            "gateway_addr": "127.0.0.1:443",
+            "not_after": "2030-01-01T00:00:00Z",
+            "app_name": "edge-app",
+        })
+        .to_string();
+        let (endpoint, server) = spawn_one_shot_http(200, &body);
+
+        let mut cmd = spice_cmd();
+        cmd.env("HOME", home.path())
+            .env("SPICE_CONFIG_DIR", config_dir)
+            .arg("connect")
+            .arg("SPICE-ADOPT-AAAAA-BBBBB")
+            .arg("--app-name")
+            .arg("edge-app")
+            .arg("--create")
+            .arg("--endpoint")
+            .arg(&endpoint)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("app:         edge-app"));
+        server.join().expect("mock served the enroll request");
+    }
+
+    /// `--create` without `--app-name` is a client-side arg error — it
+    /// never reaches the cloud.
+    #[test]
+    fn test_connect_create_requires_app_name() {
+        spice_cmd()
+            .arg("connect")
+            .arg("SPICE-ADOPT-AAAAA-BBBBB")
+            .arg("--create")
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("--app-name"));
+    }
+
+    /// A transient enroll failure (here: connection refused) keeps the
+    /// staged code so a retry — or a later `spiced --cloud-connect` start —
+    /// can redeem it, and exits non-zero with retry guidance.
+    #[cfg(unix)]
+    #[test]
+    fn test_connect_transient_failure_keeps_staged_code() {
+        let dir = TempDir::new().expect("create temp config dir");
+        let config_dir = dir.path();
+        let home = TempDir::new().expect("create temp home");
+        install_fake_spiced(home.path());
+        // An unroutable local endpoint: refused before any HTTP exchange.
+        let refused = {
+            let listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("bind throwaway listener");
+            let addr = listener.local_addr().expect("addr");
+            drop(listener);
+            format!("http://{addr}")
+        };
+
+        let mut cmd = spice_cmd();
+        cmd.env("HOME", home.path())
+            .env("SPICE_CONFIG_DIR", config_dir)
+            .arg("connect")
+            .arg("SPICE-ADOPT-AAAAA-BBBBB")
+            .arg("--endpoint")
+            .arg(&refused)
+            .assert()
+            .failure()
+            // CLI errors are emitted via `tracing::error!`, which writes to
+            // stdout under the default fmt subscriber.
+            .stdout(predicate::str::contains("not consumed"));
+
+        let pending = config_dir.join("pending-adopt-code");
+        assert!(
+            pending.exists(),
+            "a transient failure must keep the staged code for retry"
+        );
+        assert!(!config_dir.join("identity.json").exists());
+    }
+
+    /// An authoritative cloud rejection (4xx) burns the staged code — a
+    /// dead code must not be re-presented by a later start.
+    #[cfg(unix)]
+    #[test]
+    fn test_connect_rejected_code_is_discarded() {
+        let dir = TempDir::new().expect("create temp config dir");
+        let config_dir = dir.path();
+        let home = TempDir::new().expect("create temp home");
+        install_fake_spiced(home.path());
+        let (endpoint, server) =
+            spawn_one_shot_http(401, r#"{"error":"Adoption code already used"}"#);
+
+        let mut cmd = spice_cmd();
+        cmd.env("HOME", home.path())
+            .env("SPICE_CONFIG_DIR", config_dir)
+            .arg("connect")
+            .arg("SPICE-ADOPT-AAAAA-BBBBB")
+            .arg("--endpoint")
+            .arg(&endpoint)
+            .assert()
+            .failure()
+            // See above: `tracing::error!` output lands on stdout.
+            .stdout(predicate::str::contains("Mint a new adoption code"));
+        server.join().expect("mock served the enroll request");
+
+        assert!(
+            !config_dir.join("pending-adopt-code").exists(),
+            "an authoritatively rejected code must be discarded"
+        );
+        assert!(!config_dir.join("identity.json").exists());
+    }
+
+    /// An app-attachment rejection (404: no such app) is validated by the
+    /// cloud BEFORE the code is consumed — the staged code must be kept so
+    /// a corrected `--app-name` (or `--create`) can still redeem it.
+    #[cfg(unix)]
+    #[test]
+    fn test_connect_attach_rejection_keeps_code() {
+        let dir = TempDir::new().expect("create temp config dir");
+        let config_dir = dir.path();
+        let home = TempDir::new().expect("create temp home");
+        install_fake_spiced(home.path());
+        let (endpoint, server) =
+            spawn_one_shot_http(404, r#"{"error":"App 'edge-app' not found in this org"}"#);
+
+        let mut cmd = spice_cmd();
+        cmd.env("HOME", home.path())
+            .env("SPICE_CONFIG_DIR", config_dir)
+            .arg("connect")
+            .arg("SPICE-ADOPT-AAAAA-BBBBB")
+            .arg("--app-name")
+            .arg("edge-app")
+            .arg("--endpoint")
+            .arg(&endpoint)
+            .assert()
+            .failure()
+            .stdout(predicate::str::contains("not consumed"));
+        server.join().expect("mock served the enroll request");
+
+        assert!(
+            config_dir.join("pending-adopt-code").exists(),
+            "an attach rejection must keep the staged code"
+        );
+        assert!(!config_dir.join("identity.json").exists());
     }
 
     /// A malformed adoption code (right prefix, wrong shape) should be
@@ -818,41 +1107,50 @@ mod connect {
         );
     }
 
-    /// `spice connect forget` with no prior state should be a no-op.
+    /// `spice connect remove` with no prior state should be a no-op.
     #[test]
-    fn test_connect_forget_when_nothing_to_clear() {
+    fn test_connect_remove_when_nothing_to_clear() {
         let dir = TempDir::new().expect("create temp config dir");
         let mut cmd = spice_cmd();
         cmd.env("SPICE_CONFIG_DIR", dir.path())
             .arg("connect")
-            .arg("forget")
+            .arg("remove")
             .assert()
             .success()
-            .stdout(predicate::str::contains("nothing to forget"));
+            .stdout(predicate::str::contains("nothing to remove"));
     }
 
-    /// `spice connect forget` after `spice connect <CODE>` should clear
-    /// the pending file.
+    /// `spice connect remove` after a connect whose enroll could not reach
+    /// the cloud (staged code retained) should clear the pending file.
     #[cfg(unix)]
     #[test]
-    fn test_connect_forget_clears_pending_code() {
+    fn test_connect_remove_clears_pending_code() {
         let dir = TempDir::new().expect("create temp config dir");
         let config_dir = dir.path();
         let home = TempDir::new().expect("create temp home");
         install_fake_spiced(home.path());
+        let refused = {
+            let listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("bind throwaway listener");
+            let addr = listener.local_addr().expect("addr");
+            drop(listener);
+            format!("http://{addr}")
+        };
         spice_cmd()
             .env("HOME", home.path())
             .env("SPICE_CONFIG_DIR", config_dir)
             .arg("connect")
-            .arg("SPICE-ADOPT-AAAA-BBBB")
+            .arg("SPICE-ADOPT-AAAAA-BBBBB")
+            .arg("--endpoint")
+            .arg(&refused)
             .assert()
-            .success();
+            .failure();
         assert!(config_dir.join("pending-adopt-code").exists());
 
         spice_cmd()
             .env("SPICE_CONFIG_DIR", config_dir)
             .arg("connect")
-            .arg("forget")
+            .arg("remove")
             .assert()
             .success()
             .stdout(predicate::str::contains("identity cleared"));

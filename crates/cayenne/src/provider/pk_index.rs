@@ -926,46 +926,6 @@ impl ShardedPkIndex {
         }
     }
 
-    /// Convert an over-budget exact index into per-shard blooms, in place.
-    ///
-    /// This is the budget's enforcement point for the sharded path: per-shard
-    /// inserts run uncapped under the publish locks, and the apply's resync step
-    /// calls this once afterwards. Without it the exact keysets grow with every
-    /// distinct key ever written - under a workload with monotonic keys that is
-    /// unbounded, and the "budget" is only ever reported, never applied.
-    ///
-    /// Degrading to blooms is the same trade the cold rebuild makes when it
-    /// exceeds the budget: existence answers become "maybe" (false positives
-    /// cost a durable re-check; false negatives cannot occur), per-key OCC
-    /// sequences and captured positions are dropped, and deletions fall back to
-    /// key-based vectors. Every reader already handles the bloom state - a table
-    /// whose cold rebuild went over budget lives there from load.
-    ///
-    /// One-way: blooms cannot be partitioned back into keysets, so the index
-    /// stays bloom until the next rebuild. The conversion is O(keys) and runs
-    /// off-lock (serialized by the caller's write lock), a one-time cost taken
-    /// instead of unbounded growth.
-    pub(crate) fn degrade_to_bloom(&mut self, max_bytes: usize) {
-        // Guarded here, not only at the call site: a method taking a budget and
-        // ignoring it for the convert/keep decision would degrade a healthy
-        // index on any speculative call.
-        if self.approx_bytes() <= max_bytes {
-            return;
-        }
-        let Self::Exact(keysets) = self else { return };
-        let n = keysets.len().max(1);
-        let per_shard_cap = (max_bytes / n).max(64);
-        let mut blooms = Vec::with_capacity(n);
-        for keyset in std::mem::take(keysets).into_vec() {
-            let mut bloom = PkBloom::with_expected_keys(keyset.keys.len(), per_shard_cap);
-            for (key, _location) in keyset.into_entries() {
-                bloom.insert(key.as_ref());
-            }
-            blooms.push(bloom);
-        }
-        *self = Self::Bloom(blooms.into_boxed_slice());
-    }
-
     /// Approximate resident bytes across all shards, for memory accounting.
     pub(crate) fn approx_bytes(&self) -> usize {
         match self {
@@ -994,7 +954,7 @@ impl ShardedPkIndex {
     /// NOTE: unlike `record_pk_keys_with_location`, this intentionally does NOT do
     /// per-insert over-budget exact→bloom conversion. The sharded path recomputes
     /// the keyset byte tally ONCE after all per-shard appends and enforces the
-    /// budget there ([`ShardedPkIndex::degrade_to_bloom`] at the apply's resync
+    /// budget there ([`ShardedPkIndex::degrade_to_blooms`] at the apply's resync
     /// step), so a single shard never converts mid-insert while its siblings are
     /// still appending.
     pub(crate) fn record_keys_in_shard(
@@ -1031,6 +991,70 @@ impl ShardedPkIndex {
             }
         }
     }
+
+    /// Record `keys` into whichever shard each key routes to
+    /// ([`shard_of_pk`]) — the commit-path analog of
+    /// [`Self::record_keys_in_shard`], for callers whose key set is not
+    /// pre-routed (the inline/file/staging commit paths record a whole
+    /// batch's validated keys at once). Without this, keys committed off the
+    /// mem-tier path exist only in the single-keyset cache and a long-lived
+    /// sharded exact keyset false-negates them into duplicate upserts.
+    /// Existence-only inserts; the caller re-applies the byte budget once
+    /// afterwards (see [`Self::degrade_to_blooms`]).
+    pub(crate) fn record_keys(&mut self, keys: &PkDigestSet, location: &RowLocation) {
+        let n = self.shard_count();
+        match self {
+            Self::Exact(keysets) => {
+                for (digest, key) in keys.iter_with_digest() {
+                    let shard = shard_of_pk(key.as_ref(), n);
+                    if let Some(keyset) = keysets.get_mut(shard) {
+                        let _ = keyset.try_insert_with_digest(
+                            digest,
+                            key,
+                            location.clone(),
+                            usize::MAX,
+                        );
+                    }
+                }
+            }
+            Self::Bloom(blooms) => {
+                for key in keys.iter() {
+                    let shard = shard_of_pk(key.as_ref(), n);
+                    if let Some(bloom) = blooms.get_mut(shard) {
+                        bloom.insert(key.as_ref());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Convert every exact shard keyset into a byte-budgeted bloom (no-op on
+    /// an already-bloomed index). The budget backstop for the maintained
+    /// index: exact keysets grow with every recorded key, and a caller whose
+    /// running total exceeds its byte budget degrades here instead of growing
+    /// unbounded. Safe only under upsert semantics (a bloom false positive
+    /// yields a harmless redundant delete) — the caller gates on that.
+    pub(crate) fn degrade_to_blooms(&mut self, per_shard_max_bytes: usize) {
+        if let Self::Exact(keysets) = self {
+            let blooms: Vec<PkBloom> = keysets
+                .iter()
+                .map(|keyset| {
+                    // Right-size per shard: conversion-time keys with 4× growth
+                    // headroom, capped by the per-shard budget split (rationale:
+                    // `bloom_from_keyset`).
+                    let mut bloom = PkBloom::with_expected_keys(
+                        keyset.len().saturating_mul(4),
+                        per_shard_max_bytes,
+                    );
+                    for key in keyset.rows() {
+                        bloom.insert(key.as_ref());
+                    }
+                    bloom
+                })
+                .collect();
+            *self = Self::Bloom(blooms.into_boxed_slice());
+        }
+    }
 }
 
 /// Borrowed view of a [`CachedPkIndex`] handed to per-batch validation. The
@@ -1045,9 +1069,57 @@ pub(crate) enum PkExistenceRef<'a> {
 mod tests {
     use super::{
         BoundedShardedPkIndexBuilder, COLD_PK_BLOOM_PER_FILE_MAX_BYTES, CachedPkKeyset,
-        ColdPkExistence, PkBloom, PkKeysetInsertOutcome, RowLocation, ShardedPkIndex,
+        ColdPkExistence, PkBloom, PkDigestSet, PkKeysetInsertOutcome, RowLocation, ShardedPkIndex,
         approx_pk_keyset_entry_bytes, pk_digest, shard_of_pk,
     };
+
+    /// `record_keys` routes each key to its `shard_of_pk` shard, and
+    /// `degrade_to_blooms` converts over-budget exact keysets into blooms with
+    /// no false negatives — the budget backstop for the maintained index.
+    #[test]
+    fn record_keys_routes_and_degrades_to_blooms_without_false_negatives() {
+        let keysets: Vec<CachedPkKeyset> =
+            (0..4).map(|_| CachedPkKeyset::with_capacity(0)).collect();
+        let mut index = ShardedPkIndex::Exact(keysets.into_boxed_slice());
+
+        let mut keys = PkDigestSet::with_capacity(32);
+        for i in 0..32u64 {
+            let k = owned_key(&key(i));
+            keys.insert_with_digest(pk_digest(&k), k);
+        }
+        index.record_keys(&keys, &RowLocation::FileUnlocated);
+        match &index {
+            ShardedPkIndex::Exact(keysets) => {
+                let total: usize = keysets.iter().map(CachedPkKeyset::len).sum();
+                assert_eq!(total, 32, "every recorded key must land in some shard");
+                for (shard, keyset) in keysets.iter().enumerate() {
+                    for k in keyset.rows() {
+                        assert_eq!(
+                            shard_of_pk(k.as_ref(), 4),
+                            shard,
+                            "keys must be routed to their shard_of_pk shard"
+                        );
+                    }
+                }
+            }
+            ShardedPkIndex::Bloom(_) => panic!("recording alone must not degrade"),
+        }
+
+        index.degrade_to_blooms(1024);
+        match &index {
+            ShardedPkIndex::Bloom(blooms) => {
+                for i in 0..32u64 {
+                    let k = owned_key(&key(i));
+                    let shard = shard_of_pk(k.as_ref(), 4);
+                    assert!(
+                        blooms[shard].maybe_contains(k.as_ref()),
+                        "degrading must not lose any key (no false negatives)"
+                    );
+                }
+            }
+            ShardedPkIndex::Exact(_) => panic!("degrade must convert to blooms"),
+        }
+    }
     use crate::row_converter::Row;
 
     fn key(n: u64) -> [u8; 8] {
@@ -1076,53 +1148,7 @@ mod tests {
     }
 
     #[test]
-    fn an_over_budget_sharded_index_degrades_to_blooms_without_false_negatives() {
-        let mut keyset = CachedPkKeyset::with_capacity(0);
-        for n in 0..64u64 {
-            keyset.insert(owned_key(&key(n)), RowLocation::FileUnlocated);
-        }
-        let mut index = ShardedPkIndex::from_exact(keyset, 4);
-        let before = index.approx_bytes();
-
-        // A budget below residency must flip the index to blooms...
-        index.degrade_to_bloom(before / 8);
-        assert!(
-            matches!(index, ShardedPkIndex::Bloom(_)),
-            "over-budget exact index must degrade"
-        );
-        assert!(
-            index.approx_bytes() < before,
-            "blooms must be smaller than the keysets they replace"
-        );
-        // ...and every key inserted before the degrade must still answer
-        // "maybe" in its own shard: a false negative here would skip conflict
-        // validation for a live key, which is a correctness bug, not a trade.
-        for n in 0..64u64 {
-            let k = key(n);
-            let shard = shard_of_pk(&k, 4);
-            match index.existence_ref(shard) {
-                super::PkExistenceRef::Bloom(b) => {
-                    assert!(b.maybe_contains(&k), "false negative for key {n}");
-                }
-                super::PkExistenceRef::Exact(_) => panic!("expected bloom shards"),
-            }
-        }
-    }
-
-    #[test]
-    fn a_within_budget_index_is_not_degraded() {
-        let mut keyset = CachedPkKeyset::with_capacity(0);
-        keyset.insert(owned_key(&key(1)), RowLocation::FileUnlocated);
-        let mut index = ShardedPkIndex::from_exact(keyset, 2);
-        index.degrade_to_bloom(usize::MAX);
-        assert!(
-            matches!(index, ShardedPkIndex::Exact(_)),
-            "a budget that is not exceeded must leave the exact index alone"
-        );
-    }
-
-    #[test]
-fn bounded_builder_stays_exact_within_budget() {
+    fn bounded_builder_stays_exact_within_budget() {
         let mut builder = BoundedShardedPkIndexBuilder::new(4, Some(1 << 20));
         for n in 0..100u64 {
             builder.insert(owned_key(&key(n)), RowLocation::FileUnlocated);

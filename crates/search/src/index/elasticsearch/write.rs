@@ -155,7 +155,8 @@ pub async fn write(index: &ElasticsearchIndex, record: RecordBatch) -> Result<Re
     }
 
     // Extract primary key (as document _id).
-    let primary_keys = extract_primary_key(index, &record)?;
+    let primary_keys =
+        extract_primary_key_from_fields(&index.primary_key, &index.es_index, &record)?;
 
     // Build all documents in a sync block so the arrow-json encoders (which are
     // `!Send`) are dropped before any subsequent `.await`.
@@ -356,112 +357,6 @@ fn build_documents(
     }
 
     Ok(docs)
-}
-
-fn extract_primary_key(
-    index: &ElasticsearchIndex,
-    record: &RecordBatch,
-) -> Result<Vec<Option<String>>> {
-    let schema = record.schema();
-
-    match index.primary_key.as_slice() {
-        [] => Ok(vec![None; record.num_rows()]),
-        [f] => {
-            let Some((i, _)) = schema.column_with_name(f.name()) else {
-                return PrimaryKeyColumnNotFoundSnafu {
-                    index: index.es_index.clone(),
-                    column: f.name().clone(),
-                }
-                .fail();
-            };
-            let c = record.column(i);
-            if let Some(iter) = convert_string_arrow_to_iterator!(c) {
-                return Ok(iter
-                    .map(|o: Option<&str>| o.map(ToString::to_string))
-                    .collect());
-            }
-            let casted = arrow::compute::cast(c, &DataType::Utf8).context(
-                IssueWithArrowProcessingSnafu {
-                    index: index.es_index.clone(),
-                },
-            )?;
-            let iter_opt: Option<Box<dyn Iterator<Item = Option<&str>> + Send>> =
-                convert_string_arrow_to_iterator!(casted);
-            let Some(iter) = iter_opt else {
-                return Err(Error::IssueWithArrowProcessing {
-                    index: index.es_index.clone(),
-                    source: arrow::error::ArrowError::CastError(format!(
-                        "could not cast primary key column '{}' to Utf8",
-                        f.name()
-                    )),
-                });
-            };
-            Ok(iter
-                .map(|o: Option<&str>| o.map(ToString::to_string))
-                .collect())
-        }
-        fields => {
-            // Composite key: JSON-encode the projected key columns and use that string as _id.
-            let mut proj = Vec::with_capacity(fields.len());
-            for f in fields {
-                let Some((i, _)) = schema.column_with_name(f.name()) else {
-                    return PrimaryKeyColumnNotFoundSnafu {
-                        index: index.es_index.clone(),
-                        column: f.name().clone(),
-                    }
-                    .fail();
-                };
-                proj.push(i);
-            }
-            let pk = record
-                .project(&proj)
-                .context(IssueWithArrowProcessingSnafu {
-                    index: index.es_index.clone(),
-                })?;
-
-            // A row with any NULL component in a composite key has no stable
-            // identity. Mark those rows as `None` so the null-PK skip logic
-            // (which already handles single-column keys) applies here too.
-            let num_rows = pk.num_rows();
-            let mut row_is_null: Vec<bool> = vec![false; num_rows];
-            for col in pk.columns() {
-                for (i, is_null) in row_is_null.iter_mut().enumerate() {
-                    if col.is_null(i) {
-                        *is_null = true;
-                    }
-                }
-            }
-
-            let mut writer = arrow_json::ArrayWriter::new(Vec::new());
-            writer
-                .write_batches(&[&pk])
-                .context(IssueWithArrowProcessingSnafu {
-                    index: index.es_index.clone(),
-                })?;
-            writer.finish().context(IssueWithArrowProcessingSnafu {
-                index: index.es_index.clone(),
-            })?;
-
-            let values: Vec<Value> = serde_json::from_reader(writer.into_inner().as_slice())
-                .context(IssueWithJsonProcessingSnafu {
-                    index: index.es_index.clone(),
-                })?;
-            values
-                .into_iter()
-                .enumerate()
-                .map(|(i, v)| {
-                    if row_is_null.get(i).copied().unwrap_or(false) {
-                        Ok(None)
-                    } else {
-                        serde_json::to_string(&v).map(Some)
-                    }
-                })
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .context(IssueWithJsonProcessingSnafu {
-                    index: index.es_index.clone(),
-                })
-        }
-    }
 }
 
 async fn embed_column(
@@ -699,7 +594,15 @@ fn build_text_documents(
 
 /// Extract primary key strings from a record batch, parameterised on field definitions
 /// rather than an [`ElasticsearchIndex`] instance.
-fn extract_primary_key_from_fields(
+///
+/// The returned string is the document `_id` under which the row is written. A row whose
+/// key is NULL (any component, for a composite key) has no stable identity and yields
+/// `None`; such rows are skipped rather than written under a generated `_id`.
+///
+/// [`super::delete`] derives the `_id`s it deletes with this same function, so an exact-key
+/// delete addresses precisely the documents a write produced. Keep it that way: a second,
+/// parallel derivation would let the two drift and leave deletes silently matching nothing.
+pub(super) fn extract_primary_key_from_fields(
     primary_key: &[Field],
     es_index: &str,
     record: &RecordBatch,

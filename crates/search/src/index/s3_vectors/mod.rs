@@ -23,10 +23,12 @@ use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 use data_components::s3_vectors::compute_query::{CachedQueryVector, ComputeQueryVector};
 use data_components::s3_vectors::partition::{
-    S3VectorsPartitionedListTable, S3VectorsPartitionedQueryTable,
+    S3VectorsPartitionedListTable, S3VectorsPartitionedQueryTable, all_indexes_in_partition,
 };
 use data_components::s3_vectors::query_provider::S3_VECTOR_DISTANCE_NAME;
-use data_components::s3_vectors::spill::get_last_spill_index_for_virtual_index;
+use data_components::s3_vectors::spill::{
+    all_existing_spill_tables, get_last_spill_index_for_virtual_index,
+};
 use data_components::s3_vectors::{
     S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, S3VectorIdentifier, S3VectorsTable,
     list_provider::S3VectorsListTable, partition::PartitionedIndexName,
@@ -42,7 +44,7 @@ use datafusion::prelude::arrow_cast;
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_expr::{LogicalPlanBuilder, ScalarUDF, binary_expr, cast, col};
 use datafusion_functions_json::udfs::json_get_udf;
-use futures::future::try_join_all;
+use futures::future::{join_all, try_join_all};
 use llms::embeddings::Embed;
 use runtime_datafusion_index::Index;
 use runtime_table_partition::insert::partition_batch;
@@ -50,6 +52,7 @@ use snafu::ResultExt;
 
 use crate::SEARCH_SCORE_COLUMN_NAME;
 use crate::index::s3_vectors::compute_query::EmbedQuery;
+use crate::index::write_util::extract_and_format_primary_key;
 use crate::index::{SearchIndex, VectorIndex, embedding_col};
 use crate::metadata::MetadataColumns;
 use datafusion::{
@@ -382,6 +385,82 @@ impl Index for S3Vector {
             .map(|rb| async { self.write(rb).await.map_err(DataFusionError::External) });
         try_join_all(futs).await
     }
+
+    async fn delete_by_keys(&self, keys: RecordBatch) -> Result<(), DataFusionError> {
+        let key_strings: Vec<String> =
+            extract_and_format_primary_key(self.name(), &self.primary_key, &keys)
+                .map_err(|e| DataFusionError::External(Box::new(*e)))?
+                .into_iter()
+                .flatten()
+                .collect();
+
+        let tables = self.delete_target_tables().await?;
+        let num_tables = tables.len();
+
+        let results = join_all(tables.into_iter().map(|table| {
+            let key_strings = key_strings.clone();
+            async move { table.delete_by_keys(key_strings).await }
+        }))
+        .await;
+
+        let errors: Vec<String> = results
+            .into_iter()
+            .filter_map(Result::err)
+            .map(|e| e.to_string())
+            .collect();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(DataFusionError::Execution(format!(
+                "Failed to delete from {} of {num_tables} S3 Vectors index(es): {}",
+                errors.len(),
+                errors.join("; ")
+            )))
+        }
+    }
+}
+
+impl S3Vector {
+    /// Every physical S3 Vectors index a delete of `self` must reach.
+    ///
+    /// Broadcasts to every index that could hold a matching key rather than routing to the exact
+    /// one, since:
+    ///  - which spill index a key's vector landed in (see `enable_spill_writes`) depends on
+    ///    write-time AWS quota state and isn't recoverable from the key alone;
+    ///  - which partition index a key's vector landed in requires re-evaluating `partition_by`
+    ///    against the row's original data, which a resolved delete-key batch doesn't carry.
+    ///
+    /// `DeleteVectors` against a key absent from a given index is a no-op, so broadcasting is
+    /// safe — it costs one delete call per existing physical index rather than one overall.
+    ///
+    /// Mirrors the `(spill_writes, partition_by.len())` precedence used by
+    /// [`Self::query_table_provider`]/[`VectorIndex::list_table_provider`]: spill-writes takes
+    /// precedence over partitioning (a dataset combining both is only ever spill-routed for reads
+    /// too).
+    async fn delete_target_tables(&self) -> Result<Vec<S3VectorsTable>, DataFusionError> {
+        if self.spill_writes {
+            return all_existing_spill_tables(&self.table)
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)));
+        }
+
+        if !self.partition_by.is_empty() {
+            return match Arc::unwrap_or_clone(Arc::clone(&self.table.idx)) {
+                S3VectorIdentifier::IndexArn(_) => {
+                    tracing::warn!(
+                        "Partitioning is not supported when index ARN is provided. Deleting only from the base index."
+                    );
+                    Ok(vec![self.table.clone()])
+                }
+                S3VectorIdentifier::Index { .. } => {
+                    all_indexes_in_partition(&self.table, &self.embedded_column, &self.partition_by)
+                        .await
+                }
+            };
+        }
+
+        Ok(vec![self.table.clone()])
+    }
 }
 
 /// For a given data type, determine the variant within the JSON `Union(_, Sparse)` that would be populated from the associated [`datafusion_functions_json::udfs::json_get_udf`].
@@ -436,5 +515,201 @@ pub fn s3_vectors_primary_key_cast(primary_key: &[Field]) -> Vec<Expr> {
                 .alias(col_name)
             })
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::scalar::ScalarValue;
+    use llms::embeddings::EmbeddingInput;
+    use s3_vectors::{
+        CreateIndexInput, CreateVectorBucketInput, DataType as S3DataType, DistanceMetric,
+        S3Vectors, mock::MockClient,
+    };
+
+    #[derive(Debug)]
+    struct NoopEmbed;
+
+    #[async_trait]
+    impl Embed for NoopEmbed {
+        async fn embed(&self, _input: EmbeddingInput) -> llms::embeddings::Result<Vec<Vec<f32>>> {
+            Ok(vec![])
+        }
+
+        fn size(&self) -> i32 {
+            3
+        }
+    }
+
+    async fn create_index(client: &Arc<dyn S3Vectors + Send + Sync>, index_name: &str) {
+        client
+            .create_vector_bucket(
+                &CreateVectorBucketInput::builder()
+                    .vector_bucket_name("test-bucket")
+                    .build()
+                    .expect("valid input"),
+            )
+            .await
+            .ok();
+        client
+            .create_index(
+                &CreateIndexInput::builder()
+                    .index_name(index_name)
+                    .vector_bucket_name("test-bucket")
+                    .data_type(S3DataType::Float32)
+                    .dimension(3)
+                    .distance_metric(DistanceMetric::Cosine)
+                    .build()
+                    .expect("valid input"),
+            )
+            .await
+            .expect("create_index should succeed");
+    }
+
+    async fn test_s3_vector(client: Arc<dyn S3Vectors + Send + Sync>) -> S3Vector {
+        create_index(&client, "virtual-index").await;
+        let table = S3VectorsTable::try_create_new_table(
+            S3VectorIdentifier::Index {
+                bucket_name: "test-bucket".to_string(),
+                index_name: "virtual-index".to_string(),
+            },
+            client,
+            3,
+            data_components::s3_vectors::MetadataColumns::none(),
+            Some(DistanceMetric::Cosine),
+        )
+        .await
+        .expect("try_create_new_table should succeed")
+        .expect("index exists");
+
+        S3Vector::new(
+            table,
+            "embedding".to_string(),
+            vec![Field::new("id", DataType::Utf8, false)],
+            MetadataColumns::none(),
+            Arc::new(NoopEmbed) as Arc<dyn Embed>,
+            vec![],
+            100,
+        )
+    }
+
+    fn index_names(tables: &[S3VectorsTable]) -> Vec<String> {
+        tables
+            .iter()
+            .map(|t| {
+                t.idx
+                    .index_identifier_variables()
+                    .2
+                    .expect("index-backed identifier")
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn delete_target_tables_no_spill_no_partition_targets_just_the_base() {
+        let client = Arc::new(MockClient::new()) as Arc<dyn S3Vectors + Send + Sync>;
+        let index = test_s3_vector(client).await;
+
+        let tables = index
+            .delete_target_tables()
+            .await
+            .expect("should resolve targets");
+
+        assert_eq!(index_names(&tables), vec!["virtual-index".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn delete_target_tables_spill_writes_broadcasts_to_every_spill_index() {
+        let mock_client = Arc::new(MockClient::new());
+        let client = Arc::clone(&mock_client) as Arc<dyn S3Vectors + Send + Sync>;
+        let mut index = test_s3_vector(Arc::clone(&client)).await;
+        index = index.enable_spill_writes();
+
+        create_index(&client, "virtual-index-01").await;
+        create_index(&client, "virtual-index-02").await;
+
+        let tables = index
+            .delete_target_tables()
+            .await
+            .expect("should resolve targets");
+
+        assert_eq!(
+            index_names(&tables),
+            vec![
+                "virtual-index".to_string(),
+                "virtual-index-01".to_string(),
+                "virtual-index-02".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_target_tables_partitioned_broadcasts_to_every_partition_index() {
+        let client = Arc::new(MockClient::new()) as Arc<dyn S3Vectors + Send + Sync>;
+        let mut index = test_s3_vector(Arc::clone(&client)).await;
+        let column_name = "region";
+        index.partition_by = vec![col(column_name)];
+
+        for value in ["us", "eu"] {
+            let partitioned_name = PartitionedIndexName::new(
+                "virtual-index",
+                &index.embedded_column,
+                &index.partition_by,
+                &ScalarValue::from(value),
+            )
+            .expect("valid partition name")
+            .to_index_name();
+            create_index(&client, &partitioned_name).await;
+        }
+
+        let tables = index
+            .delete_target_tables()
+            .await
+            .expect("should resolve targets");
+
+        assert_eq!(
+            tables.len(),
+            2,
+            "one target per partition value written so far"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_target_tables_spill_writes_takes_precedence_over_partitioning() {
+        // Mirrors the `(spill_writes, partition_by.len())` precedence used by
+        // `query_table_provider`/`list_table_provider`: a dataset combining both is always
+        // spill-routed, never partition-routed.
+        let client = Arc::new(MockClient::new()) as Arc<dyn S3Vectors + Send + Sync>;
+        let mut index = test_s3_vector(Arc::clone(&client)).await;
+        index.partition_by = vec![col("region")];
+        index = index.enable_spill_writes();
+
+        let tables = index
+            .delete_target_tables()
+            .await
+            .expect("should resolve targets");
+
+        // No spill indexes exist and no partition indexes were ever created (since the
+        // partitioned name is never computed on this path) — spill-routing over the unpartitioned
+        // base index is the only target.
+        assert_eq!(index_names(&tables), vec!["virtual-index".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn delete_target_tables_arn_identifier_with_partitioning_falls_back_to_base() {
+        let client = Arc::new(MockClient::new()) as Arc<dyn S3Vectors + Send + Sync>;
+        let mut index = test_s3_vector(Arc::clone(&client)).await;
+        index.table = index.table.with_new_id(S3VectorIdentifier::IndexArn(
+            "arn:aws:s3vectors:us-east-1:123:index/virtual".to_string(),
+        ));
+        index.partition_by = vec![col("region")];
+
+        let tables = index
+            .delete_target_tables()
+            .await
+            .expect("ARN + partitioning must fall back, not error");
+
+        assert_eq!(tables.len(), 1);
     }
 }
