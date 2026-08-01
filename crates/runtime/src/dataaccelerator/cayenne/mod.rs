@@ -715,11 +715,29 @@ fn apply_refresh_mode_defaults(
     }
 }
 
-fn uses_small_write_refresh_profile(acceleration: &Acceleration) -> bool {
-    match acceleration.refresh_mode.unwrap_or(RefreshMode::Full) {
+/// Whether the dataset's refresh mode writes small batches continuously, which is
+/// what the CDC-shaped defaults (inline memtable, aggressive compaction triggers,
+/// `cdc_durability: memory`) are for. Also decides whether the process installs the
+/// Cayenne compaction memory carve and the in-memory CDC tier budget at all — see
+/// `builder::count_cayenne_small_write_datasets`.
+pub(crate) fn uses_small_write_refresh_profile(acceleration: &Acceleration) -> bool {
+    is_small_write_refresh_profile(
+        acceleration.refresh_mode.unwrap_or(RefreshMode::Full),
+        acceleration.refresh_check_interval,
+    )
+}
+
+/// [`uses_small_write_refresh_profile`] over the two fields it reads, for callers
+/// that hold a Spicepod acceleration rather than an initialized component one (the
+/// Runtime builder decides the Cayenne memory budgets before initialization). Both
+/// go through this so the profile rule has a single definition.
+pub(crate) fn is_small_write_refresh_profile(
+    refresh_mode: RefreshMode,
+    refresh_check_interval: Option<Duration>,
+) -> bool {
+    match refresh_mode {
         RefreshMode::Caching | RefreshMode::Changes => true,
-        RefreshMode::Append => acceleration
-            .refresh_check_interval
+        RefreshMode::Append => refresh_check_interval
             .is_some_and(|interval| interval <= APPEND_SMALL_WRITE_REFRESH_INTERVAL_THRESHOLD),
         RefreshMode::Disabled | RefreshMode::Full | RefreshMode::Snapshot => false,
     }
