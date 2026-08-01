@@ -1117,31 +1117,36 @@ fn is_enabled_cayenne_acceleration(accel: &spicepod::acceleration::Acceleration)
             .is_some_and(|engine| engine.eq_ignore_ascii_case("cayenne"))
 }
 
-/// The two Cayenne memory budgets the Runtime builder decides at startup.
+/// The Cayenne memory decisions the Runtime builder makes at startup.
 struct CayenneMemoryBudgetPlan {
     /// Any enabled Cayenne acceleration AND dedicated thread pools. Selects the
-    /// reduced Cayenne query-memory default and the spill-directory hint, which
-    /// apply to every Cayenne deployment whatever its refresh mode.
+    /// reduced Cayenne query-memory default, the spill-directory hint, and the
+    /// off-pool in-memory CDC tier budget, which apply to every Cayenne deployment
+    /// whatever its refresh mode.
     cayenne_active: bool,
-    /// Fraction of the query memory limit to carve for compaction, and the signal
-    /// that installs the off-pool in-memory CDC tier budget. `None` reserves
-    /// neither.
+    /// Fraction of the query memory limit to carve for compaction. `None` reserves
+    /// no carve.
     compaction_memory_fraction: Option<f64>,
 }
 
-/// Decide whether to reserve the Cayenne compaction memory carve and the off-pool
-/// in-memory CDC tier budget.
+/// Decide the Cayenne query-memory split and whether to carve a dedicated
+/// compaction memory pool out of the query memory limit.
 ///
-/// Both are counters rather than allocations, but the compaction carve is
-/// subtracted straight out of the query memory limit, so reserving it for a
-/// deployment that can draw on neither costs queries real budget. Reserve them only
-/// when at least one enabled Cayenne acceleration is *eligible* for both — see
-/// [`count_cayenne_budget_eligible_accelerations`].
+/// The carve is a counter, not an allocation, but it is subtracted straight out of
+/// the query memory limit, so reserving it for a deployment that cannot compact
+/// into it costs queries real budget. Carve only when at least one enabled Cayenne
+/// acceleration can — see [`count_cayenne_budget_eligible_accelerations`].
 ///
 /// Compaction itself still runs for an ineligible file-mode table (its background
 /// interval is non-zero by default); without a carved environment it accounts
 /// against the shared query pool, exactly as it does when Cayenne is absent or
 /// dedicated thread pools are disabled.
+///
+/// The off-pool in-memory CDC tier budget is deliberately NOT gated this way: it is
+/// sized from what the query pool leaves over, so installing it costs queries
+/// nothing, while omitting it removes the aggregate cap that keeps memory-mode CDC
+/// within host RAM (`try_reserve_bytes` succeeds unconditionally with no budget
+/// installed). It stays on `cayenne_active`.
 fn plan_cayenne_memory_budgets(
     app: Option<&Arc<app::App>>,
     params: &HashMap<String, String>,
@@ -1164,11 +1169,11 @@ fn plan_cayenne_memory_budgets(
         if compaction_memory_fraction.is_some() {
             tracing::info!(
                 eligible_accelerations,
-                "Reserving the Cayenne compaction memory pool and in-memory CDC tier budget: {eligible_accelerations} dataset(s) are eligible."
+                "Reserving the Cayenne compaction memory pool: {eligible_accelerations} dataset(s) can compact into it."
             );
         } else {
             tracing::info!(
-                "Cayenne compaction memory pool and in-memory CDC tier budget not reserved: no dataset is eligible for either (needs a file acceleration mode AND refresh_mode changes/caching, or append with refresh_check_interval <= 5m). The full query memory limit stays available to queries, and compaction accounts against the query pool."
+                "Cayenne compaction memory pool not reserved: no dataset can compact into it (needs a file acceleration mode AND refresh_mode changes/caching, or append with refresh_check_interval <= 5m). The full query memory limit stays available to queries, and compaction accounts against the query pool."
             );
         }
     }
@@ -1179,21 +1184,18 @@ fn plan_cayenne_memory_budgets(
     }
 }
 
-/// Count the enabled Cayenne accelerations that can draw on the compaction memory
-/// carve and the off-pool in-memory CDC tier. Zero means neither budget is
-/// reachable, so neither is installed.
+/// Count the enabled Cayenne accelerations that can compact into the carved
+/// compaction memory pool. Zero means the carve is dead weight, so it is not taken.
 ///
 /// Eligibility is file mode AND the small-write refresh profile:
 ///
 /// - **File mode.** `mode: memory` (the Spicepod default) makes the mem-tier the
 ///   permanent in-RAM store: `apply_memory_mode_overrides` zeroes
-///   `compaction_background_interval_ms` so nothing compacts, and the writer skips
-///   the process-global reserve outright (`is_memory_resident_mode()` in
-///   `mutation_writer`), leaning on the per-table byte cap instead. Both budgets are
-///   dead weight for such a table.
-/// - **Small-write refresh profile.** The same predicate that decides whether a
-///   dataset keeps `cdc_durability: memory`; off that profile it is downgraded to
-///   `File`, so the tier's `try_reserve_bytes` call site is never entered.
+///   `compaction_background_interval_ms`, so such a table never compacts at all.
+/// - **Small-write refresh profile.** The profile the compaction carve was sized
+///   for — continuous small writes producing the small files tiered compaction
+///   exists to merge. A bulk-refresh table still compacts on the default 30s
+///   interval, but against the shared query pool rather than a reserved carve.
 ///
 /// Covers views as well as datasets, matching [`cayenne_configured`]: a view carries
 /// its own `acceleration` block and runs a Cayenne tier the same way. No view can
@@ -2028,9 +2030,8 @@ mod test {
         Arc::new(builder.build())
     }
 
-    /// A Cayenne acceleration can draw on the compaction carve and the in-memory CDC
-    /// tier only when it is BOTH file-mode and on the small-write refresh profile, so
-    /// only those are counted. Views never qualify today: `ViewBuilder::try_from`
+    /// A Cayenne acceleration can compact into the carve only when it is BOTH
+    /// file-mode and on the small-write refresh profile, so only those are counted. Views never qualify today: `ViewBuilder::try_from`
     /// rejects every view refresh mode except `full`.
     #[cfg(not(windows))]
     #[test]
@@ -2121,7 +2122,7 @@ mod test {
                     0
                 ),
                 0,
-                "mode: memory can draw on neither budget ({refresh_mode:?})"
+                "mode: memory never compacts ({refresh_mode:?})"
             );
         }
 
@@ -2243,11 +2244,10 @@ mod test {
         assert_eq!(count_cayenne_budget_eligible_accelerations(None), 0);
     }
 
-    /// Regression for #12320: a Cayenne deployment with no dataset that can draw on
-    /// the Cayenne memory budgets must reserve NEITHER. The compaction carve comes
-    /// straight out of the query memory limit, and the in-memory CDC tier is
-    /// unreachable for those datasets, so reserving either only shrinks what queries
-    /// may use.
+    /// Regression for #12320: a Cayenne deployment with no dataset that can compact
+    /// must not carve a compaction memory pool. The carve comes straight out of the
+    /// query memory limit, so reserving it for a deployment that cannot use it only
+    /// shrinks what queries may reserve.
     #[cfg(not(windows))]
     #[test]
     fn cayenne_memory_budgets_are_reserved_only_for_an_eligible_dataset() {
@@ -2273,11 +2273,11 @@ mod test {
         );
         assert_eq!(
             full_refresh.compaction_memory_fraction, None,
-            "no dataset can compact into the carve or reach the in-memory tier"
+            "no dataset can compact into the carve"
         );
 
-        // The Spicepod default `mode: memory` is likewise active with nothing to
-        // reserve for, even on a CDC refresh mode.
+        // The Spicepod default `mode: memory` never compacts at all, so it carves
+        // nothing even on a CDC refresh mode.
         let memory_mode = plan(
             vec![(
                 "cayenne",
@@ -2297,7 +2297,7 @@ mod test {
         assert!(view_only.cayenne_active);
         assert_eq!(view_only.compaction_memory_fraction, None);
 
-        // One eligible dataset among ineligible siblings restores both budgets.
+        // One eligible dataset among ineligible siblings restores the carve.
         let mixed = plan(
             vec![
                 ("cayenne", true, Mode::File, Some(RefreshMode::Full), None),
@@ -2335,8 +2335,8 @@ mod test {
             Some(clamp_cayenne_compaction_memory_fraction(0.1))
         );
 
-        // Unchanged pre-existing gates: disabling dedicated thread pools drops both
-        // budgets AND `cayenne_active`, and a non-Cayenne pod was never active.
+        // Unchanged pre-existing gates: disabling dedicated thread pools drops the
+        // carve AND `cayenne_active`, and a non-Cayenne pod was never active.
         let no_pools = plan(
             vec![(
                 "cayenne",

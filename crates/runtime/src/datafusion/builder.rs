@@ -392,19 +392,20 @@ pub struct DataFusionBuilder {
     cayenne_footer_cache_mb: Option<usize>,
     /// Fraction of the query memory limit to carve into a dedicated compaction
     /// memory pool. `Some` only when [`Self::cayenne_active`] AND at least one
-    /// enabled Cayenne dataset uses the small-write refresh profile that can draw
-    /// on the carve and the in-memory CDC tier (set by the Runtime builder); `None`
-    /// leaves the full budget to queries and gives compaction no separate pool —
-    /// it then accounts against the query pool, as it does with no Cayenne at all.
-    /// Also gates the off-pool in-memory CDC tier budget, which is unreachable for
-    /// datasets off that profile.
+    /// enabled Cayenne acceleration can compact into it — a file acceleration mode
+    /// on the small-write refresh profile (set by the Runtime builder). `None`
+    /// leaves the full budget to queries and gives compaction no separate pool; it
+    /// then accounts against the query pool, as it does with no Cayenne at all.
     compaction_memory_fraction: Option<f64>,
     /// Whether any enabled Cayenne acceleration is configured AND dedicated thread
     /// pools are enabled (set by the Runtime builder). Drives the Cayenne
-    /// query-memory default split and the spill-directory hint, which apply to
-    /// every Cayenne deployment whatever its refresh mode — unlike
-    /// [`Self::compaction_memory_fraction`], which additionally requires a dataset
-    /// that can use the budgets.
+    /// query-memory default split, the spill-directory hint, and the off-pool
+    /// in-memory CDC tier budget — all of which apply to every Cayenne deployment
+    /// whatever its refresh mode. Unlike [`Self::compaction_memory_fraction`] this
+    /// does not require a dataset that can draw on the budget: an installed tier
+    /// budget costs the query pool nothing (it is sized from what the query pool
+    /// leaves over), while omitting it removes the aggregate cap that keeps
+    /// memory-mode CDC within host RAM.
     cayenne_active: bool,
     /// Estimated aggregate bytes the enabled changes-mode Cayenne tables reserve
     /// OUTSIDE the query pool (per-table keyset/segment/coalesce/inline caches),
@@ -729,16 +730,13 @@ impl DataFusionBuilder {
     pub fn build(self) -> DataFusion {
         let mut config = self.config;
         // Request a dedicated compaction memory budget when a fraction is
-        // configured. The Runtime builder sets it only when a Cayenne dataset can
-        // actually draw on it (small-write refresh profile), so its presence is
-        // also the "install the off-pool in-memory CDC tier budget" signal below.
-        // The query pool is only shrunk by the compaction carve after the dedicated
-        // compaction RuntimeEnv builds successfully; otherwise queries keep the full
-        // configured budget.
+        // configured. The Runtime builder sets it only when a Cayenne acceleration
+        // can actually compact into it. The query pool is only shrunk by the carve
+        // after the dedicated compaction RuntimeEnv builds successfully; otherwise
+        // queries keep the full configured budget.
         let compaction_memory_fraction = self
             .compaction_memory_fraction
             .and_then(validate_compaction_memory_fraction);
-        let cayenne_budgets_installed = compaction_memory_fraction.is_some();
         let effective_memory_limit = effective_query_memory_limit(
             self.memory_limit,
             self.cayenne_active,
@@ -787,7 +785,7 @@ impl DataFusionBuilder {
         // `set_compaction_runtime` installs `mem_tier_budget_bytes` instead of the
         // old, isolation-sized `get_total_memory() / 4`.
         let query_memory_pool_bytes = effective_memory_limit;
-        let mem_tier_budget_bytes = cayenne_budgets_installed.then(|| {
+        let mem_tier_budget_bytes = self.cayenne_active.then(|| {
             let total_memory = crate::resource_monitor::get_total_memory();
             let external_reservation_bytes =
                 crate::accelerator_memory_budget::duckdb_total_reservation_bytes();
