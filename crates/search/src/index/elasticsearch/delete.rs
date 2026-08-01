@@ -23,6 +23,21 @@ use serde_json::{Value, json};
 use snafu::ResultExt;
 
 use super::write;
+use crate::index::chunking::ChunkedSearchIndex;
+
+/// The columns to address documents by in [`delete_by_keys`], given an index's `primary_key`.
+///
+/// Drops the chunk key, which is only present when the index is the inner index of a
+/// [`ChunkedSearchIndex`]. There, one source row is stored as one document per chunk, and a
+/// source row is deleted (or re-chunked on upsert) as a whole — so the base key, not the
+/// chunk-keyed composite, is what identifies the documents to remove. Deleting on the base key
+/// also means the caller never has to know how many chunks a row produced.
+///
+/// For a non-chunked index the chunk key isn't in `primary_key`, so this is the full key.
+pub fn document_key_columns(primary_key: &[Field]) -> Vec<String> {
+    ChunkedSearchIndex::base_key_columns(primary_key)
+}
+
 /// Chunk size for `_delete_by_query` requests — keeps each request's `bool.should` clause count
 /// comfortably under Elasticsearch's default `indices.query.bool.max_clause_count` (1024) and
 /// request-size limits, regardless of how many keys the caller is deleting in one call.
@@ -204,6 +219,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::index::chunking::{CHUNKED_INDEX_CHUNK_KEY, ChunkedSearchIndex};
+    use arrow::array::{ArrayRef, UInt64Array};
 
     /// Records the `_delete_by_query` bodies it is asked to issue; every other trait method is
     /// an error, so a test that reaches one fails loudly rather than silently passing.
@@ -544,5 +561,91 @@ mod tests {
         .expect("delete should succeed");
 
         assert!(client.queries().is_empty());
+    }
+
+    fn id_field() -> Field {
+        Field::new("id", DataType::Int64, false)
+    }
+
+    /// A key batch carrying only the base key, as a chunked index hands it over.
+    fn base_keys(ids: &[i64]) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![id_field()])),
+            vec![Arc::new(Int64Array::from(ids.to_vec())) as ArrayRef],
+        )
+        .expect("valid batch")
+    }
+
+    #[test]
+    fn document_key_columns_leaves_a_plain_primary_key_alone() {
+        assert_eq!(document_key_columns(&[id_field()]), vec!["id".to_string()]);
+    }
+
+    #[test]
+    fn document_key_columns_drops_the_chunk_key() {
+        let chunked = ChunkedSearchIndex::augment_primary_key(vec![id_field()]);
+        assert!(chunked.iter().any(|f| f.name() == CHUNKED_INDEX_CHUNK_KEY));
+        assert_eq!(document_key_columns(&chunked), vec!["id".to_string()]);
+    }
+
+    /// The base-key query filters on the base key only, so it matches — and so deletes — every
+    /// chunk document stored under it.
+    #[test]
+    fn a_chunked_index_deletes_every_chunk_of_a_base_key() {
+        let chunked = ChunkedSearchIndex::augment_primary_key(vec![id_field()]);
+        let query = build_or_of_row_term_queries(&document_key_columns(&chunked), &base_keys(&[7]))
+            .expect("query builds")
+            .expect("non-empty batch produces a query");
+
+        let clauses = query["bool"]["should"]
+            .as_array()
+            .expect("one should clause per key row");
+        assert_eq!(clauses.len(), 1);
+        assert_eq!(
+            clauses[0]["bool"]["filter"],
+            serde_json::json!([{ "term": { "id": 7 } }]),
+            "only the base key is filtered on: {query}"
+        );
+    }
+
+    /// Why the chunk key has to be dropped: a chunked index knows the base key but not the chunk
+    /// ids under it, so a query addressing the full composite key cannot be built at all.
+    #[test]
+    fn the_full_composite_key_cannot_address_a_base_key_batch() {
+        let full: Vec<String> = ChunkedSearchIndex::augment_primary_key(vec![id_field()])
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+
+        let err = build_or_of_row_term_queries(&full, &base_keys(&[7]))
+            .expect_err("the chunk id is not in the batch");
+        assert!(
+            err.to_string().contains(CHUNKED_INDEX_CHUNK_KEY),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A chunk id that *is* present is still ignored — one delete removes the whole group.
+    #[test]
+    fn a_present_chunk_id_is_not_filtered_on() {
+        let chunked = ChunkedSearchIndex::augment_primary_key(vec![id_field()]);
+        let keys = RecordBatch::try_new(
+            Arc::new(Schema::new(chunked.clone())),
+            vec![
+                Arc::new(Int64Array::from(vec![7_i64])) as ArrayRef,
+                Arc::new(UInt64Array::from(vec![3_u64])) as ArrayRef,
+            ],
+        )
+        .expect("valid batch");
+
+        let query = build_or_of_row_term_queries(&document_key_columns(&chunked), &keys)
+            .expect("query builds")
+            .expect("non-empty batch produces a query");
+
+        assert_eq!(
+            query["bool"]["should"][0]["bool"]["filter"],
+            serde_json::json!([{ "term": { "id": 7 } }]),
+            "the chunk id must not narrow the delete: {query}"
+        );
     }
 }
