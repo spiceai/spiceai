@@ -201,11 +201,13 @@ mod tests {
         /// A body that streams `chunks` and then fails, as a query does when it
         /// is refused memory partway through producing its result.
         fn failing_after(chunks: Vec<&'static [u8]>) -> Self {
-            let mut frames: Vec<Result<Frame<&'static [u8]>, &'static str>> =
-                chunks.into_iter().map(|c| Ok(Frame::data(c))).collect();
-            frames.push(Err("resources exhausted"));
             Self {
-                frames: frames.into_iter(),
+                frames: chunks
+                    .into_iter()
+                    .map(|c| Ok(Frame::data(c)))
+                    .chain(std::iter::once(Err("resources exhausted")))
+                    .collect::<Vec<_>>()
+                    .into_iter(),
                 end_stream: false,
             }
         }
@@ -219,12 +221,11 @@ mod tests {
             mut self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
         ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-            match self.frames.next() {
-                Some(frame) => Poll::Ready(Some(frame)),
-                None => {
-                    self.end_stream = true;
-                    Poll::Ready(None)
-                }
+            if let Some(frame) = self.frames.next() {
+                Poll::Ready(Some(frame))
+            } else {
+                self.end_stream = true;
+                Poll::Ready(None)
             }
         }
 
