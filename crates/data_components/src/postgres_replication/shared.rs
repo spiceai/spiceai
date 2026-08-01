@@ -1759,9 +1759,6 @@ fn connection_params_mismatch(
     if member.sslrootcert != source.sslrootcert {
         return Some("pg_sslrootcert");
     }
-    if member.temporary_slot != source.temporary_slot {
-        return Some("pg_replication_temporary_slot");
-    }
     None
 }
 
@@ -3093,7 +3090,6 @@ mod tests {
             initial_snapshot: true,
             snapshot_on_resume: false,
             ephemeral_accelerator: false,
-            temporary_slot: false,
             status_interval: std::time::Duration::from_secs(5),
             bootstrap_batch_size: 8192,
             shared: true,

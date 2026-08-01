@@ -77,7 +77,6 @@ fn shared_params(port: u16) -> ReplicationParams {
         initial_snapshot: true,
         snapshot_on_resume: false,
         ephemeral_accelerator: false,
-        temporary_slot: false,
         status_interval: Duration::from_secs(1),
         bootstrap_batch_size: 8192,
         shared: true,

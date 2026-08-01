@@ -519,9 +519,45 @@ async fn snapshot_datasets(
     (datasets.values().map(Arc::clone).collect(), max_interval)
 }
 
+/// Attempts a probe makes before reporting a dataset unavailable.
+const CONNECTIVITY_ATTEMPTS: u32 = 2;
+
+/// Pause between probe attempts
+const CONNECTIVITY_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+/// Probes a dataset, retrying up to [`CONNECTIVITY_ATTEMPTS`] times.
+///
+/// Retrying is safe regardless of connector: the probe is a `LIMIT 1` read whose result is
+/// discarded, so replaying it has no effect beyond the read itself. The retry is deliberately
+/// not conditioned on the error kind — a transport reset is not distinguishable across every
+/// connector without connector-specific knowledge, and a genuinely unavailable dataset simply
+/// fails twice.
 async fn test_connectivity(
     table_provider: &Arc<dyn TableProvider>,
     df: Arc<DataFusion>,
+) -> std::result::Result<(), DataFusionError> {
+    let mut attempt: u32 = 1;
+    loop {
+        let err = match scan_one_row(table_provider, &df).await {
+            Ok(()) => return Ok(()),
+            Err(err) => err,
+        };
+
+        if attempt >= CONNECTIVITY_ATTEMPTS {
+            return Err(err);
+        }
+
+        tracing::debug!(
+            "Connectivity probe attempt {attempt} of {CONNECTIVITY_ATTEMPTS} failed, retrying: {err}"
+        );
+        tokio::time::sleep(CONNECTIVITY_RETRY_DELAY).await;
+        attempt += 1;
+    }
+}
+
+async fn scan_one_row(
+    table_provider: &Arc<dyn TableProvider>,
+    df: &Arc<DataFusion>,
 ) -> std::result::Result<(), DataFusionError> {
     let plan = table_provider
         .scan(&df.ctx.state(), None, &[], Some(1))

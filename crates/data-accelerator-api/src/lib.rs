@@ -47,9 +47,8 @@ use runtime_acceleration::acceleration::{self, Acceleration, IndexType, Mode};
 use runtime_acceleration::snapshot::AccelerationLayout;
 use runtime_parameters::ParameterSpec;
 use runtime_parameters::Parameters;
-use runtime_secrets::{ExposeSecret, ParamStr, Secrets};
+use runtime_secrets::{ExposeSecret, Secrets, get_params_with_secrets};
 use runtime_table_partition::expression::{PartitionedBy, partition_by_expressions};
-use secrecy::SecretString;
 use snafu::prelude::*;
 use std::path::PathBuf;
 use std::{any::Any, collections::HashMap, sync::Arc};
@@ -245,16 +244,12 @@ impl AcceleratorEngineRegistry {
             .fail()?;
         }
 
-        let cloned_secrets = Arc::clone(&secrets);
-        let secret_guard = cloned_secrets.read().await;
-        let mut params_with_secrets: HashMap<String, SecretString> = HashMap::new();
-
-        // Inject secrets from the user-supplied params.
-        // This will replace any instances of `${ store:key }` with the actual secret value.
-        for (k, v) in &acceleration_settings.params {
-            let secret = secret_guard.inject_secrets(k, ParamStr(v)).await;
-            params_with_secrets.insert(k.clone(), secret);
-        }
+        // No lock is held over the expansion: `Parameters::try_new` below
+        // takes the same lock for its autoload pass, and tokio's `RwLock` is
+        // write-preferring, so nesting the two would deadlock as soon as a
+        // writer queued between them.
+        let params_with_secrets =
+            get_params_with_secrets(Arc::clone(&secrets), &acceleration_settings.params).await;
 
         let params = Parameters::try_new(
             &format!("accelerator {}", accelerator.name()),

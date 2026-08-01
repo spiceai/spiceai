@@ -23,6 +23,7 @@ on:
           - 'append'
           - 'http-consistency'
           - 'nas'
+          - 'schema'
           - 'text-to-sql'
           - 'streaming-bench'
           - 'streaming-correctness'
@@ -180,6 +181,17 @@ jobs:
         if: ${{ steps.sched.outputs.name == 'daily-main' }}
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/clickbench/sf1 --workflow bench
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ matrix.branch }}
+
+      # Catalog-connector discovery tests. Only the dispatch configs that declare a
+      # `schema` block are dispatched, so this is the catalog spicepods.
+      - name: Dispatch Testoperator - Scheduled Schema - TPCH - SF1
+        if: ${{ steps.sched.outputs.name == 'daily-main' }}
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/tpch/sf1 --workflow schema
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}

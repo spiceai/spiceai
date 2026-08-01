@@ -47,12 +47,6 @@ pub fn ca_certificate_from_param(value: &str) -> CaCertificate {
 ///
 /// Built by the connector from spicepod params; see
 /// `connector-postgres::lib::replication_params_from_connector_params`.
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "each bool mirrors an independent user-facing parameter (or a derived \
-              accelerator property); folding them into enums would obscure the 1:1 \
-              mapping to spicepod params"
-)]
 #[derive(Clone)]
 pub struct ReplicationParams {
     pub host: String,
@@ -96,7 +90,6 @@ pub struct ReplicationParams {
     /// also set via `pg_replication_initial_snapshot: always` — dropping that
     /// slot would be wrong.
     pub ephemeral_accelerator: bool,
-    pub temporary_slot: bool,
     pub status_interval: Duration,
     /// Lag-based readiness threshold: the dataset is marked Ready once its
     /// replication lag (now minus the newest applied commit's source time)
@@ -147,7 +140,6 @@ impl std::fmt::Debug for ReplicationParams {
             .field("initial_snapshot", &self.initial_snapshot)
             .field("snapshot_on_resume", &self.snapshot_on_resume)
             .field("ephemeral_accelerator", &self.ephemeral_accelerator)
-            .field("temporary_slot", &self.temporary_slot)
             .field("status_interval", &self.status_interval)
             .field("bootstrap_batch_size", &self.bootstrap_batch_size)
             .field("shared", &self.shared)
@@ -786,7 +778,6 @@ TXTE85+Or9IUwDI9543jsyCvuQ8=
             initial_snapshot: true,
             snapshot_on_resume: false,
             ephemeral_accelerator: false,
-            temporary_slot: false,
             status_interval: Duration::from_secs(5),
             ready_lag: Duration::from_secs(2),
             bootstrap_batch_size: 1024,
