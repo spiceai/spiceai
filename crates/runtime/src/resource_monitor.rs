@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use parking_lot::RwLock;
-use std::{fs, sync::Arc};
+use std::sync::Arc;
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
 /// Monitors process resource usage and provides warnings at configurable thresholds.
@@ -41,30 +41,16 @@ struct ResourceMonitorInner {
     last_warning_threshold: u8,
 }
 
-/// Attempts to read container memory limit from cgroup v2 or v1.
-/// Returns None if not in a container or if the limit cannot be read.
+/// The effective cgroup memory limit for this process, from
+/// [`telemetry::hardware::cgroup_memory_limit`] — which walks the process's
+/// own cgroup path rather than reading the cgroup-root files, so a limit set
+/// by `systemd-run -p MemoryMax=…`, a slice, or a Kubernetes pod cgroup binds
+/// sizing exactly like a container limit does (spiceai#12179). This crate's
+/// previous copy read only `/sys/fs/cgroup/memory.max`, which exists at that
+/// path only inside a cgroup-namespaced container — on a bare host every
+/// nested limit was invisible and budgets were sized from full host RAM.
 fn get_container_memory_limit() -> Option<u64> {
-    // Try cgroup v2 first (newer container runtimes)
-    if let Ok(contents) = fs::read_to_string("/sys/fs/cgroup/memory.max")
-        && let Ok(limit) = contents.trim().parse::<u64>()
-    {
-        // "max" means no limit set
-        if limit != u64::MAX {
-            return Some(limit);
-        }
-    }
-
-    // Try cgroup v1 (Docker, older K8s)
-    if let Ok(contents) = fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
-        && let Ok(limit) = contents.trim().parse::<u64>()
-    {
-        // Very large values (like u64::MAX or close to it) typically mean no limit
-        if limit < (1u64 << 62) {
-            return Some(limit);
-        }
-    }
-
-    None
+    telemetry::hardware::cgroup_memory_limit()
 }
 /// Returns the total available memory in bytes.
 ///
@@ -108,16 +94,21 @@ impl ResourceMonitor {
         let mut system = System::new();
         system.refresh_memory();
 
-        // Prefer container memory limit if available, otherwise use system memory
+        // Prefer the cgroup memory limit if one binds, otherwise host memory.
         let container_limit = get_container_memory_limit();
+        let host_memory = system.total_memory();
         let total_memory = container_limit.unwrap_or_else(|| {
-            let system_memory = system.total_memory();
-            tracing::debug!("Using system memory limit: {} bytes", system_memory);
-            system_memory
+            tracing::debug!("Using system memory limit: {} bytes", host_memory);
+            host_memory
         });
 
-        if container_limit.is_some() {
-            tracing::debug!("Detected container memory limit: {} bytes", total_memory);
+        if let Some(limit) = container_limit {
+            // INFO, not debug: when a cap binds, every derived budget shrinks
+            // with it, and an operator debugging an OOM (or an unexpectedly
+            // small query pool) needs to see which figure sizing started from.
+            tracing::info!(
+                "Memory budgets sized from the cgroup memory limit: {limit} bytes (host total: {host_memory} bytes)"
+            );
         }
 
         Self {

@@ -483,12 +483,12 @@ fn parse_cgroup_v1_cpu_quota(quota_str: &str, period_str: &str) -> Option<usize>
 
 /// Detects the total memory available in bytes.
 ///
-/// For containerized deployments, returns the container memory limit from cgroup.
-/// For bare-metal deployments, returns the system's total memory.
+/// Returns the effective cgroup memory limit when one binds anywhere on the
+/// process's cgroup path (containers, systemd `MemoryMax`, capped slices);
+/// otherwise the system's total memory.
 fn detect_total_memory() -> u64 {
-    // Prefer container memory limit if available
-    if let Some(container_memory) = get_container_memory_limit() {
-        return container_memory;
+    if let Some(limit) = cgroup_memory_limit() {
+        return limit;
     }
 
     // Fall back to system memory
@@ -502,9 +502,17 @@ fn get_system_total_memory() -> u64 {
     system.total_memory()
 }
 
-/// Attempts to read container memory limit from cgroup v2 or v1.
-/// Returns None if not in a container or if the limit cannot be read.
-fn get_container_memory_limit() -> Option<u64> {
+/// The effective cgroup memory limit for THIS process, or `None` when no
+/// limit binds anywhere on its cgroup path.
+///
+/// Not just for containers: a bare-metal process launched under
+/// `systemd-run -p MemoryMax=…` (or inside any slice with a cap) has exactly
+/// as hard a ceiling as a container does — the OOM killer enforces it either
+/// way. Sizing budgets from host RAM while running under such a cap is how a
+/// 121 GiB host kills a process at 96 GiB (spiceai#12179), so every sizing
+/// decision should go through this, not the host total.
+#[must_use]
+pub fn cgroup_memory_limit() -> Option<u64> {
     // Try cgroup v2 first (newer container runtimes)
     if let Some(limit) = get_cgroup_v2_memory_limit() {
         return Some(limit);
@@ -514,14 +522,50 @@ fn get_container_memory_limit() -> Option<u64> {
     get_cgroup_v1_memory_limit()
 }
 
-/// Reads memory limit from cgroup v2.
+/// Reads memory limit from cgroup v2: the minimum `memory.max` along the
+/// process's cgroup path, leaf to root.
 fn get_cgroup_v2_memory_limit() -> Option<u64> {
     let cgroup_path = get_process_cgroup_v2_path()?;
     let mountpoint = get_cgroup2_mountpoint().unwrap_or_else(|| "/sys/fs/cgroup".to_string());
+    min_limit_along_path(
+        &mountpoint,
+        &cgroup_path,
+        "memory.max",
+        parse_cgroup_v2_memory_max,
+    )
+}
 
-    let path = build_cgroup_file_path(&mountpoint, &cgroup_path, "memory.max");
-    let contents = std::fs::read_to_string(&path).ok()?;
-    parse_cgroup_v2_memory_max(&contents)
+/// Walks the cgroup hierarchy from the process's own cgroup up to the
+/// mountpoint root, reading `filename` at every level, and returns the
+/// smallest limit found.
+///
+/// The walk is the point: a limit can be imposed at ANY ancestor — a systemd
+/// slice above the service, a Kubernetes pod cgroup above the container — and
+/// the kernel enforces the smallest one. Reading only the leaf (or only the
+/// root, as the runtime once did) reports "unlimited" for a process that is
+/// one allocation away from an OOM kill.
+fn min_limit_along_path(
+    mountpoint: &str,
+    cgroup_path: &str,
+    filename: &str,
+    parse: fn(&str) -> Option<u64>,
+) -> Option<u64> {
+    let mut min: Option<u64> = None;
+    let mut rel = cgroup_path.trim_matches('/').to_string();
+    loop {
+        let path = build_cgroup_file_path(mountpoint, &format!("/{rel}"), filename);
+        if let Ok(contents) = std::fs::read_to_string(&path)
+            && let Some(limit) = parse(&contents)
+        {
+            min = Some(min.map_or(limit, |m| m.min(limit)));
+        }
+        match rel.rfind('/') {
+            Some(i) => rel.truncate(i),
+            None if !rel.is_empty() => rel.clear(),
+            None => break,
+        }
+    }
+    min
 }
 
 /// Parses cgroup v2 memory.max content.
@@ -544,15 +588,18 @@ fn parse_cgroup_v2_memory_max(contents: &str) -> Option<u64> {
     Some(limit)
 }
 
-/// Reads memory limit from cgroup v1.
+/// Reads memory limit from cgroup v1: the minimum `memory.limit_in_bytes`
+/// along the process's memory-controller path, leaf to root.
 fn get_cgroup_v1_memory_limit() -> Option<u64> {
     let mem_path = get_process_cgroup_v1_path("memory")?;
     let mountpoint =
         get_cgroup_v1_mountpoint("memory").unwrap_or_else(|| "/sys/fs/cgroup/memory".to_string());
-
-    let path = build_cgroup_file_path(&mountpoint, &mem_path, "memory.limit_in_bytes");
-    let contents = std::fs::read_to_string(&path).ok()?;
-    parse_cgroup_v1_memory_limit(&contents)
+    min_limit_along_path(
+        &mountpoint,
+        &mem_path,
+        "memory.limit_in_bytes",
+        parse_cgroup_v1_memory_limit,
+    )
 }
 
 /// Parses cgroup v1 memory limit.
@@ -705,6 +752,85 @@ fn detect_metal_gpus() -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn walk_takes_the_smallest_limit_on_the_path() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let base = root.path();
+        // /a/b is the process's cgroup: leaf says "max", the slice above caps
+        // at 96G, the top level is unlimited. The effective limit is 96G.
+        std::fs::create_dir_all(base.join("a/b")).expect("mkdirs");
+        std::fs::write(base.join("a/b/memory.max"), "max\n").expect("leaf");
+        std::fs::write(base.join("a/memory.max"), "103079215104\n").expect("slice");
+        let got = min_limit_along_path(
+            &base.to_string_lossy(),
+            "/a/b",
+            "memory.max",
+            parse_cgroup_v2_memory_max,
+        );
+        assert_eq!(got, Some(103_079_215_104));
+
+        // A tighter ancestor beats a looser leaf: kernel enforces the min.
+        std::fs::write(base.join("a/b/memory.max"), "203079215104\n").expect("leaf2");
+        let got = min_limit_along_path(
+            &base.to_string_lossy(),
+            "/a/b",
+            "memory.max",
+            parse_cgroup_v2_memory_max,
+        );
+        assert_eq!(got, Some(103_079_215_104));
+    }
+
+    #[test]
+    fn walk_reads_the_mountpoint_root_for_namespaced_containers() {
+        // Inside a cgroup-namespaced container /proc/self/cgroup says "0::/"
+        // and the container's limit sits at the mountpoint root.
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(root.path().join("memory.max"), "8589934592\n").expect("root file");
+        let got = min_limit_along_path(
+            &root.path().to_string_lossy(),
+            "/",
+            "memory.max",
+            parse_cgroup_v2_memory_max,
+        );
+        assert_eq!(got, Some(8_589_934_592));
+    }
+
+    #[test]
+    fn walk_reports_none_when_nothing_binds() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let base = root.path();
+        std::fs::create_dir_all(base.join("x/y")).expect("mkdirs");
+        std::fs::write(base.join("x/y/memory.max"), "max\n").expect("leaf");
+        let got = min_limit_along_path(
+            &base.to_string_lossy(),
+            "/x/y",
+            "memory.max",
+            parse_cgroup_v2_memory_max,
+        );
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn walk_applies_v1_unlimited_threshold_per_level() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let base = root.path();
+        std::fs::create_dir_all(base.join("docker/abc")).expect("mkdirs");
+        // Leaf: v1 "unlimited" sentinel (huge); parent: a real 4G limit.
+        std::fs::write(
+            base.join("docker/abc/memory.limit_in_bytes"),
+            "9223372036854771712\n",
+        )
+        .expect("leaf");
+        std::fs::write(base.join("docker/memory.limit_in_bytes"), "4294967296\n").expect("parent");
+        let got = min_limit_along_path(
+            &base.to_string_lossy(),
+            "/docker/abc",
+            "memory.limit_in_bytes",
+            parse_cgroup_v1_memory_limit,
+        );
+        assert_eq!(got, Some(4_294_967_296));
+    }
+
     use super::*;
 
     // -------------------------------------------------------------------------
