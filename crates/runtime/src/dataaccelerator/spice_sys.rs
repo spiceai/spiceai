@@ -238,13 +238,29 @@ where
 
 /// [`spawn_duckdb_blocking`] for the read paths that report a failure as `None`
 /// rather than as an error.
+///
+/// A panic is re-raised on this task rather than reported as `None`: these reads
+/// answer "where did this dataset get to", and a `None` the caller believes means
+/// the dataset re-bootstraps from the beginning of the change stream. Running the
+/// read on the blocking pool must not turn a bug into that answer.
 #[cfg(any(feature = "mongodb", feature = "mysql"))]
 async fn spawn_duckdb_blocking_opt<T, F>(f: F) -> Option<T>
 where
     F: FnOnce() -> Option<T> + Send + 'static,
     T: Send + 'static,
 {
-    tokio::task::spawn_blocking(f).await.ok().flatten()
+    match tokio::task::spawn_blocking(f).await {
+        Ok(value) => value,
+        Err(join_error) if join_error.is_panic() => {
+            std::panic::resume_unwind(join_error.into_panic())
+        }
+        // Cancellation, i.e. the runtime is shutting down under the read. Nothing
+        // downstream can act on it, but it must not pass for "no checkpoint".
+        Err(join_error) => {
+            tracing::error!("Failed to read the sidecar checkpoint: {join_error}");
+            None
+        }
+    }
 }
 
 /// Retries for a sidecar write contending with another writer, on top of the
@@ -648,5 +664,27 @@ async fn acceleration_connection(
             engine: acceleration_settings.engine,
         }
         .fail(),
+    }
+}
+
+#[cfg(all(test, any(feature = "mongodb", feature = "mysql")))]
+mod tests {
+    #[tokio::test]
+    #[should_panic(expected = "sidecar read panicked")]
+    async fn spawn_duckdb_blocking_opt_does_not_report_a_panic_as_no_checkpoint() {
+        // `None` from a checkpoint read means "this dataset has no recorded position",
+        // which sends the connector back to the start of the change stream. A panic in
+        // the read is a bug and must not be answered that way.
+        let _: Option<()> =
+            super::spawn_duckdb_blocking_opt(|| panic!("sidecar read panicked")).await;
+    }
+
+    #[tokio::test]
+    async fn spawn_duckdb_blocking_opt_passes_through_both_outcomes() {
+        assert_eq!(super::spawn_duckdb_blocking_opt(|| Some(7)).await, Some(7));
+        assert_eq!(
+            super::spawn_duckdb_blocking_opt(|| Option::<u8>::None).await,
+            None
+        );
     }
 }
