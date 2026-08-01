@@ -1060,12 +1060,11 @@ impl ClientDriver {
                 self.identity = Some(updated);
                 // Best-effort: a failed write only means the superseded key
                 // stays on disk until the next successful one.
-                if let Err(err) = tokio::task::spawn_blocking(move || {
-                    IdentityStore::store(&path, &to_store)
-                })
-                .await
-                .map_err(|join| format!("identity persistence task panicked: {join}"))
-                .and_then(|result| result.map_err(|err| err.to_string()))
+                if let Err(err) =
+                    tokio::task::spawn_blocking(move || IdentityStore::store(&path, &to_store))
+                        .await
+                        .map_err(|join| format!("identity persistence task panicked: {join}"))
+                        .and_then(|result| result.map_err(|err| err.to_string()))
                 {
                     tracing::warn!(
                         "Cloud Connect: could not persist the retirement of the previous encryption key: {err}"

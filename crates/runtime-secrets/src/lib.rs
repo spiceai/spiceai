@@ -231,8 +231,7 @@ impl Secrets {
         let name = name.into();
         self.builtin_stores
             .retain(|(existing, _)| existing != &name);
-        self.builtin_stores
-            .push((name.clone(), Arc::clone(&store)));
+        self.builtin_stores.push((name.clone(), Arc::clone(&store)));
         self.stores.insert(name, store);
     }
 
@@ -1149,10 +1148,7 @@ mod tests {
     #[tokio::test]
     async fn a_plain_registered_store_does_not_survive_a_reload() {
         let mut secrets = super::Secrets::new();
-        secrets.register_store(
-            "scratch",
-            std::sync::Arc::new(MapStore::new(&[("k", "v")])),
-        );
+        secrets.register_store("scratch", std::sync::Arc::new(MapStore::new(&[("k", "v")])));
         secrets.load_from(&[]).await.expect("reload succeeds");
 
         assert!(

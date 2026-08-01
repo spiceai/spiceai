@@ -56,9 +56,7 @@ use runtime_cloud_connect::handlers::{
 use runtime_cloud_connect::{CloudConnect, identity::IdentityStore};
 // Reached through the `runtime` re-export rather than a direct dependency, the
 // same way `runtime::status` is.
-use runtime::secrets::stores::cloud_delivered::{
-    CLOUD_DELIVERED_STORE, CloudDeliveredSecretStore,
-};
+use runtime::secrets::stores::cloud_delivered::{CLOUD_DELIVERED_STORE, CloudDeliveredSecretStore};
 use runtime_cloud_connect::identity::CacheKey;
 
 use crate::log_capture::LogRingBuffer;

@@ -498,9 +498,7 @@ impl CloudConnect for GatewayServer {
                     // pushes OTLP metrics. The arms are spelled out rather than
                     // wildcarded so a new client message still has to be
                     // accounted for here.
-                    Some(
-                        proto::client_message::Body::ExportMetrics(_),
-                    ) => {}
+                    Some(proto::client_message::Body::ExportMetrics(_)) => {}
                     // Announced once per stream, immediately after the Hello:
                     // the gateway needs it to seal the outer layer of any
                     // secrets it dispatches on this session.
@@ -1388,10 +1386,9 @@ async fn apply_spicepod_delivers_double_sealed_secrets() {
     assert_eq!(session.aead_id, cloud_connect_crypto::AEAD_ID);
 
     // Inner: the control plane seals to the instance's *enrolled* key.
-    let enrolled_pub = cloud_connect_crypto::EncryptionKeypair::from_pkcs8_pem(
-        &identity.enc_private_key_pem,
-    )
-    .expect("enrolled key parses");
+    let enrolled_pub =
+        cloud_connect_crypto::EncryptionKeypair::from_pkcs8_pem(&identity.enc_private_key_pem)
+            .expect("enrolled key parses");
     let plaintext = proto::SecretPayload {
         string_data: [("openai_key".to_string(), b"sk-e2e".to_vec())]
             .into_iter()
@@ -1510,14 +1507,9 @@ async fn apply_spicepod_refuses_an_unopenable_payload() {
     let failed = wait_until_async(Duration::from_secs(5), || {
         let captured = Arc::clone(&captured);
         async move {
-            captured
-                .lock()
-                .await
-                .results
-                .iter()
-                .any(|r| {
-                    r.command_id == "cmd-bad-secrets" && r.code != proto::ResultCode::Ok as i32
-                })
+            captured.lock().await.results.iter().any(|r| {
+                r.command_id == "cmd-bad-secrets" && r.code != proto::ResultCode::Ok as i32
+            })
         }
     })
     .await;
