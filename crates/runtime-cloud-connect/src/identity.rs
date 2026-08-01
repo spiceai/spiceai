@@ -109,10 +109,10 @@ pub struct Identity {
     pub not_after_unix: Option<u64>,
     /// PEM-encoded PKCS#8 X25519 encryption private key. The cloud
     /// HPKE-seals secret payloads to the matching public key; this key
-    /// unseals them. Kept local (never sent). Unlike the identity keypair
-    /// it is NOT rotated on renewal — the renew exchange carries no
-    /// channel to re-pin it. Defaulted (empty) so identity files written
-    /// before this field existed still load.
+    /// unseals them. Kept local (never sent). Rotated alongside the
+    /// identity keypair on every renewal so the cloud can begin sealing
+    /// to the new key from that commit on. Defaulted (empty) so identity
+    /// files written before this field existed still load.
     #[serde(default)]
     pub enc_private_key_pem: String,
     /// PEM-encoded SPKI (RFC 8410) X25519 encryption public key, as sent
@@ -231,11 +231,11 @@ impl IdentityStore {
     /// Generate fresh enrollment material: an ECDSA P-256 identity keypair
     /// with a PKCS#10 CSR for it, plus an X25519 encryption keypair, all
     /// PEM-encoded. Called before the cloud enroll request — and again
-    /// before every renewal, since each renewal rotates the identity
-    /// keypair — so the client proves possession of its key (the CSR
-    /// self-signature) before the cloud CA issues the leaf certificate.
-    /// (Renewal ignores the fresh encryption keypair: the enrolled one is
-    /// carried over, since the renew exchange cannot re-pin it.)
+    /// before every renewal, since each renewal rotates both the identity
+    /// keypair and the encryption keypair — so the client proves possession
+    /// of its identity key (the CSR self-signature) before the cloud CA
+    /// issues the leaf certificate. The fresh X25519 keypair is sent to
+    /// the cloud on renew so it can begin sealing secrets to the new key.
     ///
     /// The CSR carries a stable common name and a `clientAuth` extended
     /// key usage so the issued leaf is directly usable as an mTLS client
@@ -307,8 +307,8 @@ pub struct EnrollmentMaterial {
     pub public_key_pem: String,
     pub csr_pem: String,
     /// X25519 encryption private key (PKCS#8 PEM); persisted into the
-    /// [`Identity`] at enroll, ignored on renewal (the enrolled key is
-    /// carried over).
+    /// [`Identity`] at enroll and on each renewal alongside the rotated
+    /// identity keypair.
     pub enc_private_key_pem: String,
     /// X25519 encryption public key (RFC 8410 SPKI PEM); sent as the
     /// enroll request's `enc_pubkey_pem`.

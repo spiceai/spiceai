@@ -1413,6 +1413,14 @@ async fn renewal_rotates_keypair_and_persists() {
         !renew_body["pop_sig"].as_str().unwrap().is_empty(),
         "renew carries the current-key proof-of-possession"
     );
+    // The cloud schema requires enc_pubkey_pem; without it renew returns 400.
+    let enc_pubkey = renew_body["enc_pubkey_pem"]
+        .as_str()
+        .expect("renew must carry enc_pubkey_pem — the cloud Zod schema requires it");
+    assert!(
+        enc_pubkey.contains("PUBLIC KEY"),
+        "renew carries an X25519 SPKI public key, got: {enc_pubkey}"
+    );
 
     // The rotated identity is persisted: new keypair, new leaf, later
     // expiry; identifier / CA bundle / gateway address unchanged.
@@ -1448,6 +1456,31 @@ async fn renewal_rotates_keypair_and_persists() {
     assert_eq!(
         renewed_identity.ca_bundle_pem, enrolled_identity.ca_bundle_pem,
         "the CA bundle is preserved across renewal"
+    );
+
+    // The encryption keypair rotates alongside the identity keypair on renewal:
+    // verify it changed and that private/public keys correspond.
+    assert_ne!(
+        renewed_identity.enc_public_key_pem, enrolled_identity.enc_public_key_pem,
+        "the encryption public key must rotate on renewal"
+    );
+    // The public key sent in the renew request is the same one persisted:
+    // sending a stale public key while persisting a new private key would
+    // break future secret delivery.
+    assert_eq!(
+        enc_pubkey, renewed_identity.enc_public_key_pem,
+        "the persisted encryption public key must match what was sent to the cloud"
+    );
+    // Round-trip: the persisted private key must derive the same public key
+    // that was sent to the cloud in the renew request.
+    let loaded_keypair = cloud_connect_crypto::EncryptionKeypair::from_pkcs8_pem(
+        &renewed_identity.enc_private_key_pem,
+    )
+    .expect("persisted encryption private key must load");
+    assert_eq!(
+        loaded_keypair.public_key_spki_pem(),
+        renewed_identity.enc_public_key_pem,
+        "persisted private key must derive the persisted public key"
     );
 
     handle.shutdown().await;
