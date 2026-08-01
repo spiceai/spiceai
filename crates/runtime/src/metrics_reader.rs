@@ -727,22 +727,6 @@ mod tests {
         let _ = reader.collect_otlp();
     }
 
-    /// Build a request with one resource carrying `attributes`.
-    fn request_with(attributes: Vec<KeyValue>) -> ExportMetricsServiceRequest {
-        use opentelemetry_proto::tonic::{
-            metrics::v1::ResourceMetrics as OtlpRM, resource::v1::Resource,
-        };
-        ExportMetricsServiceRequest {
-            resource_metrics: vec![OtlpRM {
-                resource: Some(Resource {
-                    attributes,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }],
-        }
-    }
-
     fn app_id_of(request: &ExportMetricsServiceRequest) -> Vec<String> {
         request.resource_metrics[0]
             .resource
@@ -760,7 +744,7 @@ mod tests {
 
     #[test]
     fn stamp_app_id_attaches_the_label_when_the_resource_has_none() {
-        let mut request = request_with(Vec::new());
+        let mut request = request_with(&[], &[], false);
         stamp_app_id(&mut request, "4002");
         assert_eq!(app_id_of(&request), vec!["4002".to_string()]);
     }
@@ -770,7 +754,7 @@ mod tests {
     /// series. Stamping twice must still leave exactly one, with the new value.
     #[test]
     fn stamp_app_id_replaces_rather_than_appends() {
-        let mut request = request_with(Vec::new());
+        let mut request = request_with(&[], &[], false);
         stamp_app_id(&mut request, "4002");
         stamp_app_id(&mut request, "3387");
         assert_eq!(app_id_of(&request), vec!["3387".to_string()]);
