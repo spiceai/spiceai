@@ -1,0 +1,80 @@
+---
+source: tools/testoperator/src/commands/schema/mod.rs
+description: "Schema columns for oracle[catalog]"
+---
++---------------+--------------+--------------+-----------------------+------------------+-------------------------------------------------------------------------------------------+-------------+
+| table_catalog | table_schema | table_name   | column_name           | ordinal_position | data_type                                                                                 | is_nullable |
++---------------+--------------+--------------+-----------------------+------------------+-------------------------------------------------------------------------------------------+-------------+
+| oracle_tpch   | TPCH_SF1     | CUSTOMER     | C_CUSTKEY             | 0                | Int64                                                                                     | YES         |
+| oracle_tpch   | TPCH_SF1     | CUSTOMER     | C_NAME                | 1                | Utf8                                                                                      | YES         |
+| oracle_tpch   | TPCH_SF1     | CUSTOMER     | C_ADDRESS             | 2                | Utf8                                                                                      | YES         |
+| oracle_tpch   | TPCH_SF1     | CUSTOMER     | C_NATIONKEY           | 3                | Int64                                                                                     | YES         |
+| oracle_tpch   | TPCH_SF1     | CUSTOMER     | C_PHONE               | 4                | Utf8                                                                                      | YES         |
+| oracle_tpch   | TPCH_SF1     | CUSTOMER     | C_ACCTBAL             | 5                | Decimal128(12, 2)                                                                         | YES         |
+| oracle_tpch   | TPCH_SF1     | CUSTOMER     | C_MKTSEGMENT          | 6                | Utf8                                                                                      | YES         |
+| oracle_tpch   | TPCH_SF1     | CUSTOMER     | C_COMMENT             | 7                | Utf8                                                                                      | YES         |
+| oracle_tpch   | TPCH_SF1     | LINEITEM     | L_ORDERKEY            | 0                | Int64                                                                                     | YES         |
+| oracle_tpch   | TPCH_SF1     | LINEITEM     | L_PARTKEY             | 1                | Int64                                                                                     | YES         |
+| oracle_tpch   | TPCH_SF1     | LINEITEM     | L_SUPPKEY             | 2                | Int64                                                                                     | YES         |
+| oracle_tpch   | TPCH_SF1     | LINEITEM     | L_LINENUMBER          | 3                | Int64                                                                                     | YES         |
+| oracle_tpch   | TPCH_SF1     | LINEITEM     | L_QUANTITY            | 4                | Decimal128(12, 2)                                                                         | YES         |
+| oracle_tpch   | TPCH_SF1     | LINEITEM     | L_EXTENDEDPRICE       | 5                | Decimal128(12, 2)                                                                         | YES         |
+| oracle_tpch   | TPCH_SF1     | LINEITEM     | L_DISCOUNT            | 6                | Decimal128(4, 2)                                                                          | YES         |
+| oracle_tpch   | TPCH_SF1     | LINEITEM     | L_TAX                 | 7                | Decimal128(4, 2)                                                                          | YES         |
+| oracle_tpch   | TPCH_SF1     | LINEITEM     | L_RETURNFLAG          | 8                | Utf8                                                                                      | YES         |
+| oracle_tpch   | TPCH_SF1     | LINEITEM     | L_LINESTATUS          | 9                | Utf8                                                                                      | YES         |
+| oracle_tpch   | TPCH_SF1     | LINEITEM     | L_SHIPDATE            | 10               | Timestamp(s)                                                                              | YES         |
+| oracle_tpch   | TPCH_SF1     | LINEITEM     | L_COMMITDATE          | 11               | Timestamp(s)                                                                              | YES         |
+| oracle_tpch   | TPCH_SF1     | LINEITEM     | L_RECEIPTDATE         | 12               | Timestamp(s)                                                                              | YES         |
+| oracle_tpch   | TPCH_SF1     | LINEITEM     | L_SHIPINSTRUCT        | 13               | Utf8                                                                                      | YES         |
+| oracle_tpch   | TPCH_SF1     | LINEITEM     | L_SHIPMODE            | 14               | Utf8                                                                                      | YES         |
+| oracle_tpch   | TPCH_SF1     | LINEITEM     | L_COMMENT             | 15               | Utf8                                                                                      | YES         |
+| oracle_tpch   | TPCH_SF1     | NATION       | N_NATIONKEY           | 0                | Int64                                                                                     | YES         |
+| oracle_tpch   | TPCH_SF1     | NATION       | N_NAME                | 1                | Utf8                                                                                      | YES         |
+| oracle_tpch   | TPCH_SF1     | NATION       | N_REGIONKEY           | 2                | Int64                                                                                     | YES         |
+| oracle_tpch   | TPCH_SF1     | NATION       | N_COMMENT             | 3                | Utf8                                                                                      | YES         |
+| oracle_tpch   | TPCH_SF1     | ORDERS       | O_ORDERKEY            | 0                | Int64                                                                                     | YES         |
+| oracle_tpch   | TPCH_SF1     | ORDERS       | O_CUSTKEY             | 1                | Int64                                                                                     | YES         |
+| oracle_tpch   | TPCH_SF1     | ORDERS       | O_ORDERSTATUS         | 2                | Utf8                                                                                      | YES         |
+| oracle_tpch   | TPCH_SF1     | ORDERS       | O_TOTALPRICE          | 3                | Decimal128(12, 2)                                                                         | YES         |
+| oracle_tpch   | TPCH_SF1     | ORDERS       | O_ORDERDATE           | 4                | Timestamp(s)                                                                              | YES         |
+| oracle_tpch   | TPCH_SF1     | ORDERS       | O_ORDERPRIORITY       | 5                | Utf8                                                                                      | YES         |
+| oracle_tpch   | TPCH_SF1     | ORDERS       | O_CLERK               | 6                | Utf8                                                                                      | YES         |
+| oracle_tpch   | TPCH_SF1     | ORDERS       | O_SHIPPRIORITY        | 7                | Int64                                                                                     | YES         |
+| oracle_tpch   | TPCH_SF1     | ORDERS       | O_COMMENT             | 8                | Utf8                                                                                      | YES         |
+| oracle_tpch   | TPCH_SF1     | PART         | P_COMMENT             | 0                | Utf8                                                                                      | YES         |
+| oracle_tpch   | TPCH_SF1     | PART         | P_PARTKEY             | 1                | Int64                                                                                     | YES         |
+| oracle_tpch   | TPCH_SF1     | PART         | P_NAME                | 2                | Utf8                                                                                      | YES         |
+| oracle_tpch   | TPCH_SF1     | PART         | P_MFGR                | 3                | Utf8                                                                                      | YES         |
+| oracle_tpch   | TPCH_SF1     | PART         | P_BRAND               | 4                | Utf8                                                                                      | YES         |
+| oracle_tpch   | TPCH_SF1     | PART         | P_TYPE                | 5                | Utf8                                                                                      | YES         |
+| oracle_tpch   | TPCH_SF1     | PART         | P_SIZE                | 6                | Int64                                                                                     | YES         |
+| oracle_tpch   | TPCH_SF1     | PART         | P_CONTAINER           | 7                | Utf8                                                                                      | YES         |
+| oracle_tpch   | TPCH_SF1     | PART         | P_RETAILPRICE         | 8                | Decimal128(12, 2)                                                                         | YES         |
+| oracle_tpch   | TPCH_SF1     | PARTSUPP     | PS_PARTKEY            | 0                | Int64                                                                                     | YES         |
+| oracle_tpch   | TPCH_SF1     | PARTSUPP     | PS_SUPPKEY            | 1                | Int64                                                                                     | YES         |
+| oracle_tpch   | TPCH_SF1     | PARTSUPP     | PS_AVAILQTY           | 2                | Int64                                                                                     | YES         |
+| oracle_tpch   | TPCH_SF1     | PARTSUPP     | PS_SUPPLYCOST         | 3                | Decimal128(12, 2)                                                                         | YES         |
+| oracle_tpch   | TPCH_SF1     | PARTSUPP     | PS_COMMENT            | 4                | Utf8                                                                                      | YES         |
+| oracle_tpch   | TPCH_SF1     | REGION       | R_REGIONKEY           | 0                | Int64                                                                                     | YES         |
+| oracle_tpch   | TPCH_SF1     | REGION       | R_NAME                | 1                | Utf8                                                                                      | YES         |
+| oracle_tpch   | TPCH_SF1     | REGION       | R_COMMENT             | 2                | Utf8                                                                                      | YES         |
+| oracle_tpch   | TPCH_SF1     | SUPPLIER     | S_SUPPKEY             | 0                | Int64                                                                                     | YES         |
+| oracle_tpch   | TPCH_SF1     | SUPPLIER     | S_NAME                | 1                | Utf8                                                                                      | YES         |
+| oracle_tpch   | TPCH_SF1     | SUPPLIER     | S_ADDRESS             | 2                | Utf8                                                                                      | YES         |
+| oracle_tpch   | TPCH_SF1     | SUPPLIER     | S_NATIONKEY           | 3                | Int64                                                                                     | YES         |
+| oracle_tpch   | TPCH_SF1     | SUPPLIER     | S_PHONE               | 4                | Utf8                                                                                      | YES         |
+| oracle_tpch   | TPCH_SF1     | SUPPLIER     | S_ACCTBAL             | 5                | Decimal128(12, 2)                                                                         | YES         |
+| oracle_tpch   | TPCH_SF1     | SUPPLIER     | S_COMMENT             | 6                | Utf8                                                                                      | YES         |
+| spice         | runtime      | task_history | trace_id              | 0                | Utf8                                                                                      | NO          |
+| spice         | runtime      | task_history | span_id               | 1                | Utf8                                                                                      | NO          |
+| spice         | runtime      | task_history | parent_span_id        | 2                | Utf8                                                                                      | YES         |
+| spice         | runtime      | task_history | task                  | 3                | Utf8                                                                                      | NO          |
+| spice         | runtime      | task_history | input                 | 4                | Utf8                                                                                      | NO          |
+| spice         | runtime      | task_history | captured_output       | 5                | Utf8                                                                                      | YES         |
+| spice         | runtime      | task_history | start_time            | 6                | Timestamp(ns, "UTC")                                                                      | NO          |
+| spice         | runtime      | task_history | end_time              | 7                | Timestamp(ns, "UTC")                                                                      | NO          |
+| spice         | runtime      | task_history | execution_duration_ms | 8                | Float64                                                                                   | NO          |
+| spice         | runtime      | task_history | error_message         | 9                | Utf8                                                                                      | YES         |
+| spice         | runtime      | task_history | labels                | 10               | Map("entries": non-null Struct("keys": non-null Utf8, "values": non-null Utf8), unsorted) | NO          |
++---------------+--------------+--------------+-----------------------+------------------+-------------------------------------------------------------------------------------------+-------------+
