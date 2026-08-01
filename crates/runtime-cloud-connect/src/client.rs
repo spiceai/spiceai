@@ -418,6 +418,9 @@ impl ClientDriver {
             ca_bundle_pem: current.ca_bundle_pem,
             gateway_addr: current.gateway_addr,
             not_after_unix: Some(outcome.not_after_unix),
+            // The app attribution is not part of the credential and /renew
+            // does not re-send it, so it rides across the rotation unchanged.
+            app_id: current.app_id,
             // The encryption keypair is NOT rotated on renewal: the renew
             // exchange carries no channel to re-pin a new public key, and
             // the cloud keeps sealing secrets to the enrolled one.
@@ -551,8 +554,8 @@ impl ClientDriver {
         let mut server_stream: Streaming<proto::ControlMessage> = response.into_inner();
         tracing::info!("Cloud Connect: stream established to {endpoint}");
 
-        // Spawn periodic heartbeat + telemetry tasks. They emit through
-        // the same outbound channel. The identifier is shared by RwLock
+        // Spawn the periodic heartbeat, metrics, and telemetry tasks. They emit
+        // through the same outbound channel. The identifier is shared by RwLock
         // so a `Remove` can blank it for frames still in flight on the
         // draining stream.
         let runtime = Arc::clone(&self.runtime);
@@ -578,6 +581,76 @@ impl ClientDriver {
                 };
                 if hb_tx.send(msg).await.is_err() {
                     break;
+                }
+            }
+        });
+
+        // Metrics ride the same stream but not the same delivery guarantee. The
+        // payload carries cumulative totals, so a dropped export costs a data
+        // point and no data — whereas a late heartbeat is read as an instance
+        // going away. This task therefore offers its message and moves on
+        // instead of waiting for room behind one.
+        let met_tx = tx.clone();
+        let met_runtime = Arc::clone(&runtime);
+        let met_identifier = Arc::clone(&identifier);
+        let met_interval = self.config.metrics_interval;
+        let met_handle = tokio::spawn(async move {
+            let mut ticker = time::interval(met_interval);
+            ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                // Every interval accounts for itself: one line per tick, whatever
+                // the outcome. An export path that silently stops is
+                // indistinguishable from a runtime with nothing to report, which
+                // is the failure this whole feature exists to remove.
+                let id = met_identifier.read().await.clone();
+                if id.is_empty() {
+                    tracing::debug!(
+                        "Cloud Connect: metrics export skipped — enrollment has not assigned an identifier yet, so nothing could attribute the payload"
+                    );
+                    continue;
+                }
+                let payload = match met_runtime.collect_metrics().await {
+                    Ok(Some(payload)) => payload,
+                    Ok(None) => {
+                        tracing::debug!(
+                            identifier = %id,
+                            "Cloud Connect: metrics export skipped — the runtime reported no metrics to send"
+                        );
+                        continue;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "Cloud Connect: could not collect metrics to export: {err}; skipping this interval"
+                        );
+                        continue;
+                    }
+                };
+                let bytes = payload.len();
+                let msg = proto::ClientMessage {
+                    body: Some(proto::client_message::Body::ExportMetrics(
+                        proto::ExportMetrics {
+                            identifier: id.clone(),
+                            otlp_request: payload,
+                        },
+                    )),
+                };
+                match met_tx.try_send(msg) {
+                    Ok(()) => {
+                        tracing::debug!(
+                            identifier = %id,
+                            bytes,
+                            "Cloud Connect: metrics export queued to the gateway"
+                        );
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        tracing::warn!(
+                            identifier = %id,
+                            bytes,
+                            "Cloud Connect: metrics export dropped — the outbound queue is full. The next export carries the same cumulative totals, so no data is lost"
+                        );
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
                 }
             }
         });
@@ -667,6 +740,7 @@ impl ClientDriver {
         // out-of-band exit.
         hb_handle.abort();
         tel_handle.abort();
+        met_handle.abort();
         drop(tx);
 
         Ok(exit_reason)
@@ -729,10 +803,36 @@ impl ClientDriver {
                     .supported(tx, &command_id, Capability::ApplySpicepod, name)
                     .await
                 {
+                    // Logged on arrival, before the apply can fail: the app id
+                    // rides this command and nothing else carries it, so whether
+                    // one arrived is the first thing to know when metrics are
+                    // being withheld.
+                    if cmd.app_id.is_empty() {
+                        tracing::warn!(
+                            command_id = %command_id,
+                            yaml_bytes = cmd.spicepod_yaml.len(),
+                            "Cloud Connect: ApplySpicepod received with no app id; metrics stay withheld because nothing can attribute them. The control plane sends this only if the instance is attached to an app and the api is new enough to forward it"
+                        );
+                    } else {
+                        tracing::info!(
+                            command_id = %command_id,
+                            app_id = %cmd.app_id,
+                            yaml_bytes = cmd.spicepod_yaml.len(),
+                            "Cloud Connect: ApplySpicepod received"
+                        );
+                    }
                     let result = self
                         .runtime
-                        .apply_spicepod(&self.config.config_dir, &cmd.spicepod_yaml)
+                        .apply_spicepod(&self.config.config_dir, &cmd.spicepod_yaml, &cmd.app_id)
                         .await;
+                    match &result {
+                        Ok(_) => {
+                            tracing::info!(command_id = %command_id, "Cloud Connect: ApplySpicepod applied");
+                        }
+                        Err(err) => {
+                            tracing::warn!(command_id = %command_id, "Cloud Connect: ApplySpicepod failed: {err}");
+                        }
+                    }
                     reply_with_json(tx, &command_id, result).await;
                 }
             }
@@ -1334,6 +1434,7 @@ mod tests {
             not_after_unix,
             enc_private_key_pem: String::new(),
             enc_public_key_pem: String::new(),
+            app_id: None,
         }
     }
 

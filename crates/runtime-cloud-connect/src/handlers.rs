@@ -291,10 +291,17 @@ pub trait RuntimeHandle: Send + Sync + 'static {
     /// runtime is still serving the previous configuration. Adapters
     /// that can hot-reload (or that synchronously trigger a restart)
     /// should override this and return `applied: true`.
+    ///
+    /// `app_id` is the app this instance's telemetry is attributed to. It rides
+    /// this command because the instance cannot derive it and the control plane
+    /// already knows it; an adapter that exports metrics records it here and
+    /// stamps it as `scp_app_id`. The default implementation ignores it, having
+    /// no metrics pipeline to attribute.
     async fn apply_spicepod(
         &self,
         config_dir: &Path,
         spicepod_yaml: &str,
+        _app_id: &str,
     ) -> Result<serde_json::Value, CommandError> {
         let path = config_dir.join(crate::config::CLOUD_MANAGED_SPICEPOD_FILE);
         if let Some(parent) = path.parent() {
@@ -363,6 +370,21 @@ pub trait RuntimeHandle: Send + Sync + 'static {
         Err(CommandError::unsupported(
             "GetStatus is not implemented in this build",
         ))
+    }
+
+    /// The instance's current metrics, as a serialized OTLP
+    /// `ExportMetricsServiceRequest`.
+    ///
+    /// Not a [`Capability`]: the client pushes these on its own cadence rather
+    /// than answering a command, so there is nothing to advertise or dispatch.
+    ///
+    /// `Ok(None)` means this instance has nothing to report — either it does not
+    /// export metrics at all, which is the default, it has none yet, or it has not
+    /// been told which app to attribute them to (see [`Self::apply_spicepod`]). An
+    /// `Err` means collection was attempted and failed; the two are distinct so a
+    /// permanently broken collection cannot pass for an idle runtime.
+    async fn collect_metrics(&self) -> Result<Option<Vec<u8>>, CommandError> {
+        Ok(None)
     }
 }
 

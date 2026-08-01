@@ -134,7 +134,8 @@ impl CloudConnect for MockServer {
 }
 
 struct CapturedRuntime {
-    applied: Arc<Mutex<Option<(PathBuf, String)>>>,
+    /// The config dir, spicepod, and app id of the last apply.
+    applied: Arc<Mutex<Option<(PathBuf, String, String)>>>,
 }
 
 #[async_trait]
@@ -147,11 +148,13 @@ impl RuntimeHandle for CapturedRuntime {
         &self,
         config_dir: &std::path::Path,
         spicepod_yaml: &str,
+        app_id: &str,
     ) -> Result<serde_json::Value, CommandError> {
         let path = config_dir.join(runtime_cloud_connect::config::CLOUD_MANAGED_SPICEPOD_FILE);
         std::fs::create_dir_all(config_dir).map_err(|e| CommandError::failed(e.to_string()))?;
         std::fs::write(&path, spicepod_yaml).map_err(|e| CommandError::failed(e.to_string()))?;
-        *self.applied.lock().await = Some((path.clone(), spicepod_yaml.to_string()));
+        *self.applied.lock().await =
+            Some((path.clone(), spicepod_yaml.to_string(), app_id.to_string()));
         Ok(serde_json::json!({ "path": path.display().to_string() }))
     }
 }
@@ -261,6 +264,7 @@ fn enroll_config(
         runtime_version: "v0.0.0-test".to_string(),
         heartbeat_interval: Duration::from_secs(30),
         telemetry_interval: Duration::from_mins(1),
+        metrics_interval: Duration::from_secs(30),
         renewal_lead: Duration::from_mins(1),
     }
 }
@@ -462,6 +466,7 @@ async fn apply_spicepod_writes_file_and_acks() {
         body: Some(proto::control_message::Body::ApplySpicepod(
             proto::ApplySpicepod {
                 spicepod_yaml: yaml.to_string(),
+                app_id: "4002".to_string(),
             },
         )),
     };
@@ -481,6 +486,7 @@ async fn apply_spicepod_writes_file_and_acks() {
         ca_bundle_pem: String::new(),
         gateway_addr: addr.to_string(),
         not_after_unix: None,
+        app_id: None,
         enc_private_key_pem: String::new(),
         enc_public_key_pem: String::new(),
     };
@@ -507,6 +513,7 @@ async fn apply_spicepod_writes_file_and_acks() {
         runtime_version: "v0.0.0-test".to_string(),
         heartbeat_interval: Duration::from_secs(30),
         telemetry_interval: Duration::from_mins(1),
+        metrics_interval: Duration::from_secs(30),
         renewal_lead: Duration::from_hours(12),
     };
 
@@ -528,9 +535,12 @@ async fn apply_spicepod_writes_file_and_acks() {
         "runtime should have received ApplySpicepod within 5s"
     );
 
-    let (written_path, written_yaml) = captured.lock().await.clone().unwrap();
+    let (written_path, written_yaml, written_app_id) = captured.lock().await.clone().unwrap();
     assert_eq!(written_yaml, yaml);
     assert!(written_path.exists(), "file should be on disk");
+    // The runtime has no other way to learn its app, and withholds metrics
+    // entirely until this arrives.
+    assert_eq!(written_app_id, "4002");
 
     // Server should see the CommandResult for the apply. Poll for it with a
     // bounded timeout instead of a fixed sleep so the assertion does not race
@@ -631,6 +641,7 @@ async fn unknown_command_is_nacked_rather_than_dropped() {
         ca_bundle_pem: String::new(),
         gateway_addr: addr.to_string(),
         not_after_unix: None,
+        app_id: None,
         enc_private_key_pem: String::new(),
         enc_public_key_pem: String::new(),
     };
@@ -649,6 +660,7 @@ async fn unknown_command_is_nacked_rather_than_dropped() {
         runtime_version: "v0.0.0-test".to_string(),
         heartbeat_interval: Duration::from_secs(30),
         telemetry_interval: Duration::from_mins(1),
+        metrics_interval: Duration::from_secs(30),
         renewal_lead: Duration::from_hours(12),
         adopt_app_name: None,
         adopt_create_app: false,

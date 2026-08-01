@@ -545,7 +545,8 @@ async fn spawn_gateway(server: GatewayServer, ca: &TestCa) -> SocketAddr {
 
 #[derive(Default)]
 struct E2eRuntimeState {
-    applied_spicepod: Option<(std::path::PathBuf, String)>,
+    /// The path, spicepod, and app id of the last apply.
+    applied_spicepod: Option<(std::path::PathBuf, String, String)>,
 }
 
 struct E2eRuntime {
@@ -581,6 +582,7 @@ impl RuntimeHandle for E2eRuntime {
         &self,
         config_dir: &Path,
         spicepod_yaml: &str,
+        app_id: &str,
     ) -> Result<Value, CommandError> {
         // Persist to the canonical path and report a hot apply, mirroring the
         // spiced adapter's observable result envelope.
@@ -591,7 +593,8 @@ impl RuntimeHandle for E2eRuntime {
         tokio::fs::write(&path, spicepod_yaml)
             .await
             .map_err(|e| CommandError::failed(e.to_string()))?;
-        self.state.lock().await.applied_spicepod = Some((path.clone(), spicepod_yaml.to_string()));
+        self.state.lock().await.applied_spicepod =
+            Some((path.clone(), spicepod_yaml.to_string(), app_id.to_string()));
         Ok(serde_json::json!({
             "path": path.display().to_string(),
             "applied": true,
@@ -664,6 +667,7 @@ impl Harness {
             // the periodic frame paths.
             heartbeat_interval: Duration::from_millis(150),
             telemetry_interval: Duration::from_millis(250),
+            metrics_interval: Duration::from_millis(200),
             renewal_lead,
         }
     }
@@ -1348,6 +1352,7 @@ async fn apply_spicepod_hot_applies_and_persists() {
         "cmd-apply",
         proto::control_message::Body::ApplySpicepod(proto::ApplySpicepod {
             spicepod_yaml: yaml.to_string(),
+            app_id: "4002".to_string(),
         }),
     ));
 
@@ -1389,7 +1394,7 @@ async fn apply_spicepod_hot_applies_and_persists() {
     assert_eq!(meta["reload"], "hot");
 
     // The runtime persisted the YAML to the canonical cloud-managed path.
-    let (path, written) = rt_state
+    let (path, written, app_id) = rt_state
         .lock()
         .await
         .applied_spicepod
@@ -1397,6 +1402,9 @@ async fn apply_spicepod_hot_applies_and_persists() {
         .expect("spicepod applied");
     assert_eq!(written, yaml);
     assert!(path.exists(), "spicepod file must be on disk");
+    // The app id rides the deploy: it is the only way the runtime learns which
+    // app to attribute its metrics to, and it exports none until it has one.
+    assert_eq!(app_id, "4002");
 
     handle.shutdown().await;
 }
