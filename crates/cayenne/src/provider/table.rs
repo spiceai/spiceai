@@ -10086,15 +10086,14 @@ impl CayenneTableProvider {
         if !validated_keys.is_empty() {
             let mut sharded = self.sharded_pk_keyset_cache.lock();
             let mut drop_index = false;
-            if let Some(index) = sharded.as_mut() {
+            // Gate on the variant, not just the tally: only an `Exact` index grows
+            // per recorded key and only it can be degraded, so this fires on the
+            // one transition rather than repeating every apply for an
+            // already-bloomed index whose blooms sit above a very small budget.
+            if let Some(index @ ShardedPkIndex::Exact(_)) = sharded.as_mut() {
                 let max_bytes = self.effective_pk_keyset_budget();
                 let resident = index.approx_bytes();
-                // Gate on the variant, not just the tally: only an `Exact` index
-                // grows per recorded key and only it can be degraded, so this
-                // fires on the one transition rather than repeating every apply
-                // for an already-bloomed index whose blooms sit above a very
-                // small configured budget.
-                if matches!(index, ShardedPkIndex::Exact(_)) && resident > max_bytes {
+                if resident > max_bytes {
                     if self.upsert_bloom_eligible() {
                         tracing::warn!(
                             table = %self.table_name(),
@@ -10104,10 +10103,11 @@ impl CayenneTableProvider {
                         );
                         index.degrade_to_blooms(max_bytes / index.shard_count().max(1));
                     } else {
-                        // `DoNothing` needs exactness — a bloom false positive
-                        // would wrongly drop a genuinely new row — so drop the
-                        // cache and let the next validation pay the lazy bounded
-                        // rebuild.
+                        // `DoNothing` needs exact existence: the bloom arm keeps
+                        // the incoming row and supersedes the prior one (upsert
+                        // semantics), and validation debug-asserts that a bloom
+                        // index implies upsert. Drop the cache instead and let the
+                        // next validation pay the lazy bounded rebuild.
                         drop_index = true;
                     }
                 }
@@ -31431,6 +31431,109 @@ mod tests {
         );
     }
 
+    /// The sharded apply's step-6 resync is the byte budget's enforcement point
+    /// for the keys `record_keys_in_shard` records: those per-shard inserts run
+    /// uncapped under the publish locks, so an over-budget exact index must be
+    /// degraded to per-shard blooms there. Without it the keysets grow with every
+    /// distinct key ever written — unbounded under monotonic keys even at a stable
+    /// live row count — and the configured budget is only ever reported.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sharded_apply_resync_degrades_an_over_budget_upsert_keyset() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "resync_degrades_over_budget_keyset",
+            ctx.runtime_env(),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                cdc_mem_tier_shards: 4,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                // Halved for the sharded cache on an N>1 table, so ~512 KiB — the
+                // row count below accounts well past it.
+                pk_keyset_cache_mb: Some(1),
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        provider.maybe_install_warm_pk_caches().await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        assert!(
+            matches!(
+                provider.sharded_pk_keyset_cache.lock().as_ref(),
+                Some(ShardedPkIndex::Exact(_))
+            ),
+            "the warm install must start from an exact index"
+        );
+
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch_for_range(schema, 0, 20_000)),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("sharded CDC append");
+
+        assert!(
+            matches!(
+                provider.sharded_pk_keyset_cache.lock().as_ref(),
+                Some(ShardedPkIndex::Bloom(_))
+            ),
+            "the resync must degrade an over-budget sharded keyset to blooms"
+        );
+        assert_eq!(
+            query_count_star(&ctx, &provider, "resync_degrades_over_budget_keyset").await,
+            20_000,
+            "degrading the existence index must not drop or duplicate rows"
+        );
+    }
+
+    /// A `DoNothing` table must never be degraded to blooms. The bloom existence
+    /// arm always keeps the incoming row and emits a key-based supersede for the
+    /// prior one — upsert semantics — which is why validation debug-asserts that a
+    /// bloom index implies `OnConflict::Upsert`. Over budget the resync therefore
+    /// drops the cache instead, and the next validation pays the lazy bounded
+    /// rebuild.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sharded_apply_resync_drops_an_over_budget_do_nothing_keyset() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_table_with_on_conflict(
+            "resync_drops_over_budget_keyset",
+            ctx.runtime_env(),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                cdc_mem_tier_shards: 4,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                pk_keyset_cache_mb: Some(1),
+                ..VortexConfig::default()
+            },
+            OnConflict::DoNothingAll,
+        )
+        .await;
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        provider.maybe_install_warm_pk_caches().await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch_for_range(schema, 0, 20_000)),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("sharded CDC append");
+
+        assert!(
+            provider.sharded_pk_keyset_cache.lock().is_none(),
+            "a DoNothing table must drop its over-budget cache, never degrade it to blooms"
+        );
+        assert_eq!(
+            query_count_star(&ctx, &provider, "resync_drops_over_budget_keyset").await,
+            20_000,
+            "dropping the existence index must not drop or duplicate rows"
+        );
+    }
+
     /// A table with no primary key has `pk_deletion_strategy: PositionBased`, so
     /// every delete leaves `delete_from` through the deletion-vector arm and never
     /// reaches `InlineAwareDeletionSink`. Position deletes address
@@ -38685,6 +38788,25 @@ mod tests {
         runtime_env: Arc<RuntimeEnv>,
         vortex_config: VortexConfig,
     ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
+        create_cdc_table_with_on_conflict(
+            table_name,
+            runtime_env,
+            vortex_config,
+            OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            ),
+        )
+        .await
+    }
+
+    async fn create_cdc_table_with_on_conflict(
+        table_name: &str,
+        runtime_env: Arc<RuntimeEnv>,
+        vortex_config: VortexConfig,
+        on_conflict: OnConflict,
+    ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
         use arrow::datatypes::{DataType, Field, Schema};
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -38706,11 +38828,7 @@ mod tests {
             table_name: table_name.to_string(),
             schema,
             primary_key: vec!["id".to_string()],
-            on_conflict: Some(OnConflict::Upsert(
-                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
-                    "id".to_string(),
-                ]),
-            )),
+            on_conflict: Some(on_conflict),
             base_path: data_dir,
             partition_column: None,
             vortex_config,
