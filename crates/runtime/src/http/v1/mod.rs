@@ -43,9 +43,10 @@ use crate::{
     datafusion::{
         DataFusion,
         query::{
-            Error as QueryError, QueryBuilder, TransactionError, is_cancellation_error,
-            is_timeout_error, json_array_writer, run_transaction, schema_has_union_columns,
-            transaction_statements, write_to_json_string, write_to_json_value,
+            Error as QueryError, QueryBuilder, TransactionError, error_code::ErrorCode,
+            is_cancellation_error, is_timeout_error, json_array_writer, run_transaction,
+            schema_has_union_columns, transaction_statements, write_to_json_string,
+            write_to_json_value,
         },
     },
     egress::EgressAccount,
@@ -382,6 +383,10 @@ enum SqlErrorKind {
     General,
     Cancellation,
     Timeout,
+    /// The query engine refused the query for want of memory. Carried
+    /// separately so it can be logged as the operator-actionable condition it
+    /// is; it maps to the same status as [`SqlErrorKind::General`].
+    ResourcesExhausted,
 }
 
 impl SqlErrorKind {
@@ -398,6 +403,8 @@ impl SqlErrorKind {
             Self::Cancellation
         } else if is_timeout_error(e) {
             Self::Timeout
+        } else if ErrorCode::from(e) == ErrorCode::ResourcesExhausted {
+            Self::ResourcesExhausted
         } else {
             Self::General
         }
@@ -407,12 +414,27 @@ impl SqlErrorKind {
 /// Maps a query error message to an HTTP response, distinguishing cancellation
 /// (499 Client Closed Request) and query timeout (504 Gateway Timeout) from
 /// other errors.
+///
+/// Resource exhaustion is logged at `warn`, everything else at `debug`. A
+/// malformed query is the client's problem and would only be noise in the
+/// runtime's log, but a runtime that is refusing queries for want of memory is
+/// an outage its operator cannot see any other way: `/health` is served by a
+/// separate tokio runtime and stays green throughout, so nothing else raises
+/// the condition at the default verbosity.
 fn sql_error_response(message: String, kind: SqlErrorKind) -> Response {
-    tracing::debug!("Error executing query: {message}");
+    if matches!(kind, SqlErrorKind::ResourcesExhausted) {
+        tracing::warn!("Query refused, out of memory: {message}");
+    } else {
+        tracing::debug!("Error executing query: {message}");
+    }
     let status = match kind {
         SqlErrorKind::Cancellation => StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
         SqlErrorKind::Timeout => StatusCode::GATEWAY_TIMEOUT,
-        SqlErrorKind::General => status_for_sql_error(&message),
+        // `ResourcesExhausted` deliberately shares `General`'s status. 400 is a
+        // poor fit for a server-capacity condition — Flight reports the same
+        // failure as the retriable `RESOURCE_EXHAUSTED` — but changing it is a
+        // client-visible contract change, tracked in #12283.
+        SqlErrorKind::General | SqlErrorKind::ResourcesExhausted => status_for_sql_error(&message),
     };
     (status, message).into_response()
 }
@@ -776,6 +798,45 @@ mod tests {
             SqlErrorKind::of_datafusion_error(&stream_cancel),
         );
         assert_eq!(response.status().as_u16(), 499);
+    }
+
+    /// A memory-pool refusal has to be told apart from the cancellation and
+    /// timeout kinds so it can be logged at `warn`, and it must keep the status
+    /// the general path already returned — the status question is a separate,
+    /// client-visible decision.
+    #[test]
+    fn sql_error_response_classifies_resource_exhaustion() {
+        let exhausted = datafusion::error::DataFusionError::ResourcesExhausted(
+            "Additional allocation failed for HashJoinInput[135]".to_string(),
+        );
+        assert!(matches!(
+            SqlErrorKind::of_datafusion_error(&exhausted),
+            SqlErrorKind::ResourcesExhausted
+        ));
+        let response = sql_error_response(
+            exhausted.to_string(),
+            SqlErrorKind::of_datafusion_error(&exhausted),
+        );
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Execution commonly wraps the pool error before it reaches the handler.
+        let wrapped = datafusion::error::DataFusionError::Context(
+            "Join Error".to_string(),
+            Box::new(datafusion::error::DataFusionError::ResourcesExhausted(
+                "out of memory".to_string(),
+            )),
+        );
+        assert!(matches!(
+            SqlErrorKind::of_datafusion_error(&wrapped),
+            SqlErrorKind::ResourcesExhausted
+        ));
+
+        // A plain execution failure must stay on the quiet path.
+        let general = datafusion::error::DataFusionError::Execution("boom".to_string());
+        assert!(matches!(
+            SqlErrorKind::of_datafusion_error(&general),
+            SqlErrorKind::General
+        ));
     }
 
     #[test]
