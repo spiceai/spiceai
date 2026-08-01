@@ -1551,7 +1551,21 @@ pub(crate) fn effective_query_memory_limit(
     cdc_reservation_bytes: u64,
     duckdb_query_pool_cap: Option<u64>,
 ) -> u64 {
-    memory_limit.unwrap_or_else(|| {
+    if let Some(limit) = memory_limit {
+        // An explicit limit bypasses the reservation-aware derivation below, and
+        // with it the only log line that states the projected off-pool cache
+        // reservation. Emit the projection here too: operators lowering
+        // memory_limit to curb resident memory need to see that the caches do
+        // not shrink with it - they are sized from total memory, not the pool.
+        if cayenne_active && cdc_reservation_bytes > 0 {
+            tracing::info!(
+                memory_limit = limit,
+                cdc_reservation_bytes,
+                "Explicit query memory limit set; the projected per-table Cayenne CDC cache reservation is OFF-pool and unaffected by this limit"
+            );
+        }
+        limit
+    } else {
         let total_memory = crate::resource_monitor::get_total_memory();
         let default_limit = if cayenne_active {
             // Cayenne CDC active. Base is CAYENNE_QUERY_MEMORY_PERCENT of host, leaving
@@ -1572,6 +1586,22 @@ pub(crate) fn effective_query_memory_limit(
             let floor = total_memory.saturating_mul(CAYENNE_QUERY_MEMORY_FLOOR_PERCENT) / 100;
             let default_limit = base.saturating_sub(reservation_excess).max(floor);
 
+            // The floor binding is the unfittable-configuration signal: the
+            // reservation clawback is capped at (base - floor) percent of host,
+            // and when the projected per-table reservation exceeds that, the
+            // startup commitment (pools + tier + off-pool caches) exceeds host
+            // RAM before a single row arrives. A 121.7 GiB host was OOM-killed
+            // at SF-1000 with exactly this signature, and the only trace was
+            // this line at debug level.
+            if default_limit == floor && reservation_excess > 0 {
+                tracing::warn!(
+                    cayenne_active,
+                    cdc_reservation_bytes,
+                    reservation_excess,
+                    "Cayenne CDC cache reservation exceeds what the query pool can yield: the pool is floored at {}% of memory and the projected caches do not fit beside it. Expect resident memory above the coordinated budgets; reduce per-table cache parameters or add memory. See the budget arithmetic in this log at startup.",
+                    CAYENNE_QUERY_MEMORY_FLOOR_PERCENT
+                );
+            }
             tracing::debug!(
                 cayenne_active,
                 cdc_reservation_bytes,
@@ -1611,7 +1641,7 @@ pub(crate) fn effective_query_memory_limit(
             }
             None => default_limit,
         }
-    })
+    }
 }
 
 /// 1/N of host RAM bounding the aggregate off-pool Cayenne in-memory CDC tier (the
