@@ -20,9 +20,18 @@ use crate::model::EmbeddingModelStore;
 use crate::secrets::Secrets;
 use datafusion::datasource::TableProvider;
 use datafusion::{prelude::SessionContext, sql::TableReference};
-#[cfg(feature = "models")]
+// Only the `s3_vectors` and `elasticsearch` index wrappers below look the UDF up
+// by name, so both spellings need that guard as well: without it the declaration
+// has no consumer in a build that enables neither, and `-D warnings` rejects it.
+#[cfg(all(
+    feature = "models",
+    any(feature = "s3_vectors", feature = "elasticsearch")
+))]
 use runtime_datafusion_udfs::embed::EMBED_UDF_NAME;
-#[cfg(not(feature = "models"))]
+#[cfg(all(
+    not(feature = "models"),
+    any(feature = "s3_vectors", feature = "elasticsearch")
+))]
 const EMBED_UDF_NAME: &str = "embed";
 use spicepod::vector::VectorStore;
 use std::sync::Arc;
