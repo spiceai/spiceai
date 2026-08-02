@@ -137,7 +137,11 @@ mod tests {
 
     use super::*;
 
-    #[tokio::test]
+    /// Runs on the paused clock: the property under test is that a request is emitted
+    /// one interval after the trigger, which a wall-clock reading on a loaded runner
+    /// cannot measure. `TaskRequest::created_at` is a real-clock `std::time::Instant`,
+    /// so it is bracketed against the test's own real span rather than timed.
+    #[tokio::test(start_paused = true)]
     async fn test_interval_request_channel() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Arc<TaskRequest>>(1);
 
@@ -153,12 +157,11 @@ mod tests {
 
         let channel_handle = channel.start().expect("To start request channel");
 
-        let now = Instant::now();
+        let started = Instant::now();
+        let tick = tokio::time::Instant::now();
         let request = rx.recv().await.expect("To receive request");
-        let elapsed = now.elapsed();
-        let now = Instant::now();
-        assert!(request.created_at <= now);
-        assert!(elapsed.as_millis() >= 990 && elapsed.as_millis() <= 1010);
+        assert_eq!(tick.elapsed(), Duration::from_secs(1));
+        assert!(request.created_at >= started && request.created_at <= Instant::now());
         assert!(!request.cancel_running);
 
         // next request should wait for task notification
@@ -171,13 +174,12 @@ mod tests {
             }
         }
 
-        let now = Instant::now();
+        let started = Instant::now();
+        let tick = tokio::time::Instant::now();
         task_completion.notify_one();
         let request = rx.recv().await.expect("To receive request");
-        let elapsed = now.elapsed();
-        let now = Instant::now();
-        assert!(request.created_at < now);
-        assert!(elapsed.as_millis() >= 990 && elapsed.as_millis() <= 1010);
+        assert_eq!(tick.elapsed(), Duration::from_secs(1));
+        assert!(request.created_at >= started && request.created_at <= Instant::now());
         assert!(!request.cancel_running);
 
         cancellation.cancel();
@@ -187,7 +189,8 @@ mod tests {
             .expect("To end channel");
     }
 
-    #[tokio::test]
+    /// Runs on the paused clock, for the same reason as `test_interval_request_channel`.
+    #[tokio::test(start_paused = true)]
     async fn test_multi_channel_requestors() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Arc<TaskRequest>>(1);
 
@@ -211,14 +214,14 @@ mod tests {
         let handle_two = channel_two.start().expect("To start request channel");
 
         // each channel will send a first request, resulting in two requests at the 1st second mark
-        let now = Instant::now();
+        let started = Instant::now();
+        let tick = tokio::time::Instant::now();
         let request_one = rx.recv().await.expect("To receive request");
         let request_two = rx.recv().await.expect("To receive request");
-        let elapsed = now.elapsed();
+        assert_eq!(tick.elapsed(), Duration::from_secs(1));
         let now = Instant::now();
-        assert!(request_one.created_at < now);
-        assert!(request_two.created_at < now);
-        assert!(elapsed.as_millis() >= 990 && elapsed.as_millis() <= 1010);
+        assert!(request_one.created_at >= started && request_one.created_at <= now);
+        assert!(request_two.created_at >= started && request_two.created_at <= now);
         assert!(!request_one.cancel_running);
         assert!(!request_two.cancel_running);
 
