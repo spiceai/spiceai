@@ -132,7 +132,14 @@ impl ExecutionPlan for FullTextSearchExec {
                                 let proj = schema
                                     .fields()
                                     .iter()
-                                    .map(|f| rb_schema.index_of(f.name()).map_err(DataFusionError::from))
+                                    .map(|f| {
+                                        rb_schema.index_of(f.name()).map_err(|_| {
+                                            DataFusionError::Internal(format!(
+                                                "Full text search result page is missing column '{}': expected schema {schema}, got {rb_schema}",
+                                                f.name(),
+                                            ))
+                                        })
+                                    })
                                     .collect::<DataFusionResult<Vec<_>>>();
 
                                 match proj {

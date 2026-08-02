@@ -705,6 +705,8 @@ mod tests {
     };
     use arrow_schema::{ArrowError, Schema};
     use datafusion::datasource::{MemTable, TableProvider};
+    use datafusion::physical_plan::collect;
+    use datafusion::prelude::SessionContext;
     use futures::{StreamExt, TryStreamExt};
     use runtime_datafusion_index::Index;
     use std::time::Duration;
@@ -991,6 +993,98 @@ mod tests {
         assert_eq!(subtitles.null_count(), 2);
         assert!(subtitles.is_null(0));
         assert!(subtitles.is_null(1));
+    }
+
+    // Regression test for #12228: exercises the execution path (`FullTextSearchQuery::scan`
+    // -> `FullTextSearchExec::execute`), not just `FullTextSearchFieldIndex::search`, since the
+    // reported bug was in `FullTextSearchExec`'s positional projection shifting columns.
+    #[tokio::test]
+    async fn test_search_exec_projection_does_not_shift_columns() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("title", DataType::Utf8, false),
+                Field::new("subtitle", DataType::Utf8, true),
+                Field::new("body", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(arrow::array::Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["first title", "second title"])),
+                Arc::new(StringArray::from(vec![None::<&str>, None])),
+                Arc::new(StringArray::from(vec![
+                    "matching body one",
+                    "matching body two",
+                ])),
+            ],
+        )
+        .expect("Failed to create test batch");
+        let table = Arc::new(
+            MemTable::try_new(batch.schema(), vec![vec![batch.clone()]])
+                .expect("Failed to create test table"),
+        );
+        let index = FullTextDatabaseIndex::try_new(
+            table,
+            vec!["body".to_string()],
+            Some(vec!["id".to_string()]),
+            None,
+            &[
+                "title".to_string(),
+                "subtitle".to_string(),
+                "body".to_string(),
+            ],
+        )
+        .expect("Failed to create FullTextDatabaseIndex");
+        index
+            .compute_index(vec![batch])
+            .await
+            .expect("failed to compute_index");
+
+        let search_index = Arc::new(
+            index
+                .full_text_search_field_index("body")
+                .expect("Failed to create FullTextSearchFieldIndex"),
+        );
+        let query = FullTextSearchQuery {
+            index: search_index,
+            query: "matching".to_string(),
+            pre_limit: None,
+        };
+
+        let ctx = SessionContext::new();
+        let full_schema = query.schema();
+        // Project onto a subset that skips the leading nullable `subtitle` column, so a
+        // positional (rather than name-based) projection would shift `body` into
+        // `title`'s slot -- the exact regression from #12228.
+        let projection = vec![
+            full_schema.index_of("body").expect("body in schema"),
+            full_schema.index_of("title").expect("title in schema"),
+        ];
+
+        let plan = query
+            .scan(&ctx.state(), Some(&projection), &[], None)
+            .await
+            .expect("scan should succeed");
+        let batches = collect(plan, ctx.task_ctx())
+            .await
+            .expect("execution should succeed");
+
+        assert_eq!(batches.len(), 1, "expected one result page");
+        let result = &batches[0];
+        assert_eq!(result.schema().field(0).name(), "body");
+        assert_eq!(result.schema().field(1).name(), "title");
+
+        let bodies = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("body must retain its Utf8 type");
+        let titles = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("title must retain its Utf8 type");
+        assert!(bodies.iter().any(|body| body == Some("matching body one")));
+        assert!(titles.iter().any(|title| title == Some("first title")));
     }
 
     #[tokio::test]
