@@ -57,6 +57,7 @@ use yaml::Value;
 #[cfg(feature = "anonymous_telemetry")]
 const TELEMETRY_DISABLED_SETTING_IGNORED_MESSAGE: &str = "Usage telemetry is anonymous and aggregated. In Spice.ai Open Source, setting runtime.telemetry.enabled: false in a Spicepod or passing --telemetry-enabled=false does not disable anonymous usage telemetry. To remove anonymous telemetry from an Open Source build, build from source without the anonymous_telemetry feature, or consider using Spice.ai Enterprise. Learn more at https://docs.spice.ai/docs/enterprise";
 
+pub mod crash_handler;
 #[path = "tracing.rs"]
 mod spiced_tracing;
 mod tls;

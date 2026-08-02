@@ -35,9 +35,11 @@ connector-sharepoint = { path = "../../crates/data-connectors/connector-sharepoi
 connector-smb = { path = "../../crates/data-connectors/connector-smb", optional = true }
 connector-snowflake = { path = "../../crates/data-connectors/connector-snowflake", optional = true }
 connector-spark = { path = "../../crates/data-connectors/connector-spark", optional = true }
+crash-handler.workspace = true
 event_stream = { path = "../../crates/event_stream" }
 repl = { path = "../../crates/repl" }
 futures.workspace = true
+libc = "0.2"
 mimalloc = { version = "0.1.48", optional = true }
 opentelemetry.workspace = true
 opentelemetry-http.workspace = true
