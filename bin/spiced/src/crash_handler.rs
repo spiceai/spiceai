@@ -16,48 +16,43 @@ limitations under the License.
 
 //! Fatal-signal reporting.
 //!
-//! A `SIGSEGV` is not a panic: the panic hook never runs, `RUST_BACKTRACE` has no
-//! effect, and the log simply stops mid-stream. A deployment that exits 139 therefore
-//! has no evidence of where it died. This prints one line naming the signal, the
-//! faulting address, the instruction pointer and the thread before the process dies.
-//!
-//! The instruction pointer plus the load base captured at install time make the
-//! report symbolizable from logs alone, without access to the node:
+//! A `SIGSEGV` is not a panic, so the panic hook and `RUST_BACKTRACE` never run and
+//! the log stops mid-stream: a process that exits 139 leaves no evidence of where it
+//! died. This prints one line first, carrying the instruction pointer and load base
+//! so the report is symbolizable from logs alone:
 //!
 //! ```text
-//! addr2line -e spiced -fCi $((ip - base))
+//! addr2line -e spiced -fCi <offset>
 //! ```
 //!
-//! The callback runs inside the signal handler on the crashing thread, so it must be
-//! async-signal-safe: no allocation, no locks, no `tracing`, no `println!` — any of
-//! which can deadlock if the signal arrived while that thread held the allocator or
-//! stdout lock. The line is formatted into a fixed stack buffer and emitted with a
-//! single `write(2)`.
+//! Everything here runs in the signal handler on the crashing thread and must be
+//! async-signal-safe — no allocation, no locks, no `tracing` — since the fault may
+//! have interrupted that thread mid-allocation. The line is formatted into a fixed
+//! stack buffer and emitted with one `write(2)`.
 
 use std::sync::OnceLock;
 
 /// Kept alive for the process lifetime; dropping a [`CrashHandler`] detaches it.
 static HANDLER: OnceLock<crash_handler::CrashHandler> = OnceLock::new();
 
-/// Load base of the main executable, resolved once at install time. Signal handlers
-/// cannot parse `/proc/self/maps`, and the value cannot change while we run.
+/// Resolved at install time: parsing `/proc/self/maps` is not signal-safe, and the
+/// value cannot change while the process runs.
 static LOAD_BASE: OnceLock<usize> = OnceLock::new();
 
-/// Process start, for the `uptime` field — crashes that cluster at a fixed point
-/// after startup look very different from ones that need hours of load.
+/// For the `uptime` field: crashes clustered at a fixed point after startup look
+/// very different from ones that need hours of load.
 static START: OnceLock<std::time::Instant> = OnceLock::new();
 
-/// Install fatal-signal reporting. Call once, as early in `main` as possible — before
-/// the Tokio runtime exists, so faults during startup are covered too.
+/// Install fatal-signal reporting. Call once, as early in `main` as possible, so
+/// faults during startup are covered.
 ///
-/// Failure to attach is logged and otherwise ignored: crash reporting is a diagnostic
-/// aid, and refusing to start without it would be a worse outcome than starting blind.
+/// A failure to attach is logged and ignored: refusing to start without crash
+/// reporting would be worse than starting without it.
 pub fn install() {
     let _ = START.set(std::time::Instant::now());
     let _ = LOAD_BASE.set(read_load_base().unwrap_or(0));
 
-    // SAFETY: the closure is async-signal-safe — see the module docs. It formats into
-    // a stack buffer and issues one `write(2)`.
+    // SAFETY: the closure is async-signal-safe — see the module docs.
     let event = unsafe { crash_handler::make_crash_event(on_crash) };
 
     match crash_handler::CrashHandler::attach(event) {
@@ -81,12 +76,10 @@ fn read_load_base() -> Option<usize> {
     let exe = exe.to_str()?;
     let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
     for line in maps.lines() {
-        // The load base is the mapping of the ELF at FILE OFFSET 0 — not the first
-        // executable segment, which sits at a non-zero file offset. Using the r-xp
-        // start would make `ip - base` an offset into the text segment rather than
-        // into the file, and every printed `addr2line` invocation would resolve to
-        // the wrong place. `/proc/self/maps` is address-ordered, so the first such
-        // mapping is the one to take.
+        // Take the mapping at file offset 0, not the first executable segment: the
+        // r-xp segment sits at a non-zero offset, so using it would make `ip - base`
+        // an offset into the text segment rather than into the file and every
+        // `addr2line` would resolve to the wrong place.
         //
         // Fields: <start>-<end> <perms> <file-offset> <dev> <inode> <path>
         if !line.ends_with(exe) {
@@ -150,9 +143,8 @@ fn raw_write(bytes: &[u8]) {
 }
 
 fn on_crash(cc: &crash_handler::CrashContext) -> crash_handler::CrashEventResult {
-    // Several threads can fault at once. Report only the first, so a cascade cannot
-    // loop inside the handler while the process is already dying. (The same guard
-    // appears in Zed's and Sentry's handlers, for the same reason.)
+    // Several threads can fault at once; report only the first, so a cascade cannot
+    // loop inside the handler while the process is already dying.
     static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if REPORTED
         .compare_exchange(
@@ -165,41 +157,24 @@ fn on_crash(cc: &crash_handler::CrashContext) -> crash_handler::CrashEventResult
     {
         report(cc);
     }
-    // `Handled(false)` maps to `RestorePrevious`: restore the handlers that were
-    // installed before us, rather than jumping straight to SIG_DFL.
+    // `Handled(false)` restores the handler installed before ours rather than going
+    // straight to SIG_DFL. `std` installs one during runtime init to detect stack
+    // overflow, so keeping it means a guard-page fault still prints
+    // `thread '...' has overflowed its stack` — which our line cannot distinguish
+    // from a wild pointer. On any other fault `std` installs SIG_DFL and returns, so
+    // the process still dies with the right signal.
     //
-    // This matters because `std` installs its own SIGSEGV/SIGBUS handler during
-    // runtime init — before `main`, so before us — purely to detect stack overflow.
-    // Restoring it means a guard-page fault still prints
-    // `thread '...' has overflowed its stack`, the one message that names stack
-    // exhaustion unambiguously; our line alone cannot distinguish it from a wild
-    // pointer. On any other fault `std` finds the address outside the guard page,
-    // installs SIG_DFL and returns, so the process still dies with the right signal.
-    //
-    // Consequence: a stack overflow now exits 134 (`std` aborts) rather than 139.
-    // Every other fault is unchanged. If `std` had installed nothing, the previous
-    // handler is SIG_DFL and this is identical to `Handled(true)`.
-    //
-    // No signal unblocking is needed here. For a hard fault (`si_code > 0`)
-    // crash-handler restores the handler and simply returns; the faulting instruction
-    // re-executes and is delivered again. Nothing calls `raise()`, so the signal being
-    // masked for the duration of its own handler never matters. (A hand-rolled handler
-    // that re-raises explicitly must `pthread_sigmask(SIG_UNBLOCK, ...)` first, or the
-    // re-raise sits pending forever.)
+    // A stack overflow therefore exits 134 (`std` aborts) rather than 139; every
+    // other fault is unchanged.
     crash_handler::CrashEventResult::Handled(false)
 }
 
 #[cfg(target_os = "linux")]
-/// The crashing thread's name, into a caller-provided buffer.
+/// The crashing thread's name.
 ///
-/// `prctl(PR_GET_NAME)` rather than `pthread_getname_np`: the latter is not
-/// async-signal-safe — glibc implements it by reading `/proc` through buffered stdio,
-/// so it allocates and takes locks, either of which can deadlock in a handler that
-/// interrupted the same thread mid-allocation. `PR_GET_NAME` is a single syscall that
-/// copies the kernel's `comm` for the calling thread.
-///
-/// The buffer must be at least 16 bytes: that is `TASK_COMM_LEN`, and also the cap
-/// the kernel applies when a thread name is set, so nothing is lost by the size.
+/// `prctl(PR_GET_NAME)` is one syscall; `pthread_getname_np` is not signal-safe, as
+/// glibc implements it by reading `/proc` through buffered stdio. The buffer is
+/// `TASK_COMM_LEN`, which is also the kernel's cap when a thread name is set.
 fn thread_name(buf: &mut [u8; 16]) -> usize {
     // SAFETY: PR_GET_NAME writes at most 16 bytes into the caller-owned buffer.
     unsafe {
@@ -208,8 +183,7 @@ fn thread_name(buf: &mut [u8; 16]) -> usize {
     buf.iter().position(|&b| b == 0).unwrap_or(buf.len())
 }
 
-/// Linux: the full report. `ip` and `base` make it symbolizable from logs alone, and
-/// the callback runs in the signal handler on the crashing thread, so the thread name
+/// The full report. The callback runs on the crashing thread, so the thread name
 /// identifies the pool that faulted.
 #[cfg(target_os = "linux")]
 fn report(cc: &crash_handler::CrashContext) {
@@ -221,10 +195,8 @@ fn report(cc: &crash_handler::CrashContext) {
 
     let ip = instruction_pointer(cc);
     let base = LOAD_BASE.get().copied().unwrap_or(0) as u64;
-    // The ASLR-removed offset: what `addr2line` actually wants. Emitted alongside the
-    // raw values so the operator never has to subtract two hex numbers by hand, and
-    // the printed command is directly runnable. (Bun's crash reporter encodes
-    // "addresses with ASLR removed" for the same reason.)
+    // The ASLR-removed offset is what `addr2line` wants; emitting it alongside the
+    // raw values keeps the printed command directly runnable.
     let offset = ip.saturating_sub(base);
     let uptime = START.get().map_or(0, |s| s.elapsed().as_secs());
 
@@ -258,11 +230,10 @@ fn report(cc: &crash_handler::CrashContext) {
     raw_write(&buf[..written]);
 }
 
-/// Non-Linux: a reduced report. `CrashContext` is platform-specific — on macOS it
-/// carries a Mach exception rather than a signal, and the callback runs on a dedicated
-/// handler thread, so neither the faulting instruction pointer nor the crashing
-/// thread's name is available the way it is on Linux. Deployments run Linux; this path
-/// exists so the crate builds and is minimally useful on a developer machine.
+/// A reduced report. `CrashContext` is platform-specific: on macOS it carries a Mach
+/// exception rather than a signal, and the callback runs on a dedicated handler
+/// thread, so neither the instruction pointer nor the crashing thread's name is
+/// available. Deployments run Linux; this keeps the crate usable elsewhere.
 #[cfg(not(target_os = "linux"))]
 fn report(_cc: &crash_handler::CrashContext) {
     use std::io::Write as _;
@@ -290,8 +261,8 @@ mod tests {
     /// Set in the child process to select the crashing role.
     const CHILD: &str = "SPICED_CRASH_HANDLER_TEST_CHILD";
 
-    /// The function the child faults in. `inline(never)` and `no_mangle` keep it a
-    /// distinct, named symbol so a report can be resolved back to it.
+    /// Where the child faults. `inline(never)` and `no_mangle` keep it a distinct,
+    /// named symbol so a report can be resolved back to it.
     #[inline(never)]
     #[unsafe(no_mangle)]
     extern "C" fn spiced_crash_handler_test_fault() {
@@ -303,10 +274,9 @@ mod tests {
 
     /// Install the handler, take a real fault, and assert the report reached stderr.
     ///
-    /// The process under test necessarily dies, so this re-executes its own test
-    /// binary with `CHILD` set: that run installs the handler and faults, and the
-    /// parent asserts on its output. A genuine fault (rather than a sent signal) is
-    /// what exercises the `si_code > 0` path and populates `addr` and `ip`.
+    /// The process under test necessarily dies, so this re-executes its own binary
+    /// with `CHILD` set and asserts on the child's output. A genuine fault exercises
+    /// the `si_code > 0` path and populates `addr` and `ip`; a sent signal does not.
     #[test]
     fn reports_a_fatal_signal() {
         use std::os::unix::process::ExitStatusExt as _;
