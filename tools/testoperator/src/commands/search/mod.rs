@@ -99,7 +99,9 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
 
     println!("Running search");
 
-    let config = dataset.init_search_config(&spiced_instance, Some(10)).await?;
+    let config = dataset
+        .init_search_config(&spiced_instance, Some(10))
+        .await?;
 
     // retrieve query relevance data
     let qrels = dataset.query_relevance_data(&spiced_instance).await?;
