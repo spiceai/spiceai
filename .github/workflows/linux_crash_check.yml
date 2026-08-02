@@ -1,0 +1,97 @@
+---
+name: linux crash-report check
+
+# Throwaway. No other workflow runs `spiced`'s unit tests on Linux, so the
+# Linux-only half of crash_handler.rs is compiled but never executed.
+# Branch-scoped push, because workflow_dispatch needs the file on the default
+# branch. This branch is throwaway and never merges.
+on:
+  push:
+    branches:
+      - sgrebnov/12332-linux-crash-check
+  workflow_dispatch:
+
+jobs:
+  crash_report:
+    name: crash report (linux)
+    runs-on: spiceai-dev-runners
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Cache Cargo registry
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up make
+        uses: ./.github/actions/setup-make
+
+      - name: Set up cc
+        uses: ./.github/actions/setup-cc
+
+      - name: Install protoc
+        uses: ./.github/actions/install-protoc
+
+      - name: Set up sccache
+        uses: ./.github/actions/setup-sccache
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+
+      - name: Environment
+        run: |
+          uname -a
+          cat /proc/sys/kernel/randomize_va_space || true
+
+      - name: Build the test binary
+        env:
+          CARGO_INCREMENTAL: 0
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          cargo test -p spiced --lib --no-run --message-format=json \
+            > cargo-build.json
+          # The single test executable for spiced's lib target.
+          TEST_BIN=$(jq -r 'select(.profile.test == true) | .executable' \
+            cargo-build.json | grep . | tail -1)
+          echo "TEST_BIN=$TEST_BIN" | tee -a "$GITHUB_ENV"
+          test -x "$TEST_BIN"
+
+      - name: Run the test
+        run: cargo test -p spiced --lib crash_handler -- --nocapture
+
+      # Re-run the faulting child directly so the report itself lands in the log.
+      - name: Show a real crash report
+        run: |
+          set -uo pipefail
+          SPICED_CRASH_HANDLER_TEST_CHILD=1 "$TEST_BIN" \
+            --exact crash_handler::tests::reports_a_fatal_signal --nocapture \
+            > child.out 2> report.txt
+          echo "child exit: $?"
+          echo "───────── report ─────────"
+          cat report.txt
+          echo "──────────────────────────"
+
+      # The point of the report: does the printed offset actually symbolize?
+      - name: Symbolize the offset
+        run: |
+          set -euo pipefail
+          grep -q '=== native crash ===' report.txt
+          OFFSET=$(grep -oE 'offset=0x[0-9a-f]+' report.txt | head -1 | cut -d= -f2)
+          echo "offset: $OFFSET"
+          test "$OFFSET" != "0x0"
+          addr2line -e "$TEST_BIN" -fCi "$OFFSET" | tee sym.txt
+          grep -q 'spiced_crash_handler_test_fault' sym.txt \
+            || { echo "offset did not resolve to the faulting symbol"; exit 1; }
