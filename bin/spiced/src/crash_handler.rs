@@ -103,7 +103,8 @@ fn read_load_base() -> Option<usize> {
 
 #[cfg(target_os = "linux")]
 fn signal_name(signo: u32) -> &'static str {
-    match signo as i32 {
+    // `siginfo` carries the number unsigned; libc's constants are signed.
+    match signo.cast_signed() {
         libc::SIGSEGV => "SIGSEGV",
         libc::SIGBUS => "SIGBUS",
         libc::SIGILL => "SIGILL",
@@ -114,10 +115,18 @@ fn signal_name(signo: u32) -> &'static str {
     }
 }
 
+/// RIP's index into `mcontext_t::gregs`. `crash-context` exposes the register file
+/// as a bare array with no named accessors, so the index has to be spelled out;
+/// the assertion pins it to libc's definition rather than trusting a literal.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const REG_RIP: usize = 16;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const _: () = assert!(libc::REG_RIP == 16);
+
 /// The instruction pointer at the point of the fault.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn instruction_pointer(cc: &crash_handler::CrashContext) -> u64 {
-    cc.context.uc_mcontext.rip
+    cc.context.uc_mcontext.gregs[REG_RIP].cast_unsigned()
 }
 
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
