@@ -47,3 +47,27 @@ pub static REQUESTS_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
         .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
         .build()
 });
+
+pub static RESPONSES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("http_responses")
+        .with_description(
+            "Number of HTTP responses, counted once the response body terminates. The 'outcome' \
+             label reports how it terminated ('complete', 'error', or 'incomplete'), so a \
+             streaming response that fails after its 200 head is not counted as a success.",
+        )
+        .build()
+});
+
+pub static RESPONSES_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+    METER
+        .f64_histogram("http_responses_duration_ms")
+        .with_description(
+            "End-to-end HTTP response duration, from the request arriving to the response body \
+             terminating. Unlike http_requests_duration_ms, this includes the time spent \
+             streaming the body.",
+        )
+        .with_unit("ms")
+        .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
+        .build()
+});

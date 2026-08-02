@@ -211,6 +211,19 @@ impl ExecutorTableStatistics {
     /// by name (`Absent`/unknown when the executor reported none for that column).
     /// This lets the coordinator's planner estimate join/aggregate cardinalities
     /// from the executor's column min/max even when the leaf scan is projected.
+    ///
+    /// Every value the executor actually reported is downgraded to
+    /// [`Precision::Inexact`]; a value it did not report stays
+    /// [`Precision::Absent`]. The registry holds an
+    /// asynchronous snapshot — executors rebroadcast on a 45s timer (plus a
+    /// debounced write-completion nudge), so the executor's data has moved on by
+    /// the time the coordinator plans against it. `Precision::Exact` is a
+    /// correctness contract, not a confidence hint: `aggregate_statistics` folds
+    /// `COUNT(*)`/`MIN`/`MAX` out of exact leaf statistics and substitutes them
+    /// into the result, which would answer from the stale snapshot instead of the
+    /// executor (issue #12303). Inexact keeps the values themselves, so the
+    /// cost-based sizing these reports exist for — `should_swap_join_order` and
+    /// friends read `Precision::get_value()` — is unaffected.
     #[must_use]
     pub fn projected_onto(&self, leaf_schema: &SchemaRef) -> Statistics {
         use datafusion::common::ColumnStatistics;
@@ -234,6 +247,7 @@ impl ExecutorTableStatistics {
             total_byte_size: Precision::Absent,
             column_statistics,
         }
+        .to_inexact()
     }
 }
 
@@ -1130,6 +1144,83 @@ mod tests {
         let projected = entry.projected_onto(&leaf);
         assert_eq!(projected.num_rows, Precision::Absent);
         assert_eq!(projected.column_statistics.len(), 1);
+    }
+
+    /// Regression test for #12303.
+    ///
+    /// The registry holds an asynchronous snapshot of what an executor reported
+    /// (rebroadcast on a 45s timer plus a debounced write-completion nudge), so a
+    /// reported `Exact` value describes the executor's data at report time, not at
+    /// plan time. Carrying `Exact` through to the leaf scan licenses the
+    /// `aggregate_statistics` rule to fold `COUNT(*)`/`MIN`/`MAX` into the result
+    /// from that stale snapshot. Downgrading to `Inexact` keeps the values (join
+    /// sizing reads `Precision::get_value()`) while refusing the fold.
+    #[tokio::test]
+    async fn projected_statistics_are_inexact_because_the_report_is_a_snapshot() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::common::{ColumnStatistics, ScalarValue};
+
+        let registry = make_registry().await;
+        let table = TableReference::bare("orders");
+
+        registry.record_executor_statistics(
+            &table,
+            "executor-1".to_string(),
+            Statistics {
+                num_rows: Precision::Exact(1_000_000),
+                total_byte_size: Precision::Exact(64_000_000),
+                column_statistics: vec![ColumnStatistics {
+                    null_count: Precision::Exact(0),
+                    max_value: Precision::Exact(ScalarValue::Int64(Some(1_000_000))),
+                    min_value: Precision::Exact(ScalarValue::Int64(Some(1))),
+                    distinct_count: Precision::Exact(1_000_000),
+                    ..ColumnStatistics::new_unknown()
+                }],
+            },
+            vec!["id".to_string()],
+        );
+
+        let snapshot = registry.executor_statistics_snapshot(&table);
+        let entry = snapshot.get("executor-1").expect("recorded entry present");
+        // `total` is not in the report, so it projects to unknown.
+        let leaf: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("total", DataType::Float64, true),
+        ]));
+        let projected = entry.projected_onto(&leaf);
+
+        assert_eq!(
+            projected.num_rows,
+            Precision::Inexact(1_000_000),
+            "a cached remote row count must not be Exact — aggregate_statistics would fold COUNT(*) to it"
+        );
+        assert_eq!(
+            projected.num_rows.get_value(),
+            Some(&1_000_000),
+            "the value itself must survive so the planner can still size joins"
+        );
+
+        let id = &projected.column_statistics[0];
+        assert_eq!(
+            id.min_value,
+            Precision::Inexact(ScalarValue::Int64(Some(1))),
+            "cached column bounds must not be Exact — MIN() would be folded to them"
+        );
+        assert_eq!(
+            id.max_value,
+            Precision::Inexact(ScalarValue::Int64(Some(1_000_000))),
+            "cached column bounds must not be Exact — MAX() would be folded to them"
+        );
+        assert_eq!(id.null_count, Precision::Inexact(0));
+        assert_eq!(id.distinct_count, Precision::Inexact(1_000_000));
+
+        let total = &projected.column_statistics[1];
+        assert_eq!(
+            total.min_value,
+            Precision::Absent,
+            "a column the executor did not report stays unknown"
+        );
+        assert_eq!(total.max_value, Precision::Absent);
     }
 
     fn dummy_flight_sql_client() -> FlightSqlClient {

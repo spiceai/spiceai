@@ -58,6 +58,7 @@ use utoipa::{
 #[cfg(feature = "dev")]
 use utoipa_swagger_ui::SwaggerUi;
 
+use super::response_outcome;
 use super::v1;
 use runtime_metrics::http as metrics;
 
@@ -606,7 +607,23 @@ async fn track_metrics(
     metrics::REQUESTS.add(1, &labels);
     metrics::REQUESTS_DURATION_MS.record(latency_ms, &labels);
 
-    response
+    // The metrics above describe the response *head*. For a streaming response
+    // the head is `200 OK` before the first batch exists, so a query that fails
+    // partway through would otherwise be counted as a success. Observe the end
+    // of the body as well, and report the terminal outcome and the true
+    // end-to-end duration under their own instruments so the `status` series
+    // keeps its existing meaning.
+    let (parts, body) = response.into_parts();
+    let body = axum::body::Body::new(response_outcome::OutcomeTrackedBody::new(
+        body,
+        move |outcome| {
+            labels.push(KeyValue::new("outcome", outcome.as_label()));
+            metrics::RESPONSES.add(1, &labels);
+            metrics::RESPONSES_DURATION_MS.record(start.elapsed().as_secs_f64() * 1000.0, &labels);
+        },
+    ));
+
+    axum::response::Response::from_parts(parts, body)
 }
 
 /// Build the MCP [`StreamableHttpServerConfig`] from the optional `runtime.mcp` config.
