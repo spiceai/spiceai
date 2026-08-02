@@ -168,6 +168,12 @@ impl Index for CompoundVectorIndex {
         compound_delete_by_keys(self.primary.as_ref(), self.secondary.as_ref(), keys).await
     }
 
+    fn deletes_by_partial_key(&self) -> bool {
+        // `delete_by_keys` fans out to both halves, so a partial key only clears this compound
+        // index when *both* halves act on one.
+        self.primary.deletes_by_partial_key() && self.secondary.deletes_by_partial_key()
+    }
+
     fn write_complete_failure_is_fatal(&self) -> bool {
         // Either half failing to finalize leaves this compound index stale.
         self.primary.write_complete_failure_is_fatal()

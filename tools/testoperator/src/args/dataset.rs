@@ -114,6 +114,87 @@ pub struct DatasetTestArgs {
     /// Useful for identifying slow queries that should be treated as failures in metrics.
     #[arg(long, value_parser = parse_duration)]
     pub(crate) mark_query_failed_if_exceeds: Option<std::time::Duration>,
+
+    /// How concurrent clients connect to spiced: `shared` multiplexes every client
+    /// over one connection; `per-client` opens a dedicated connection per client,
+    /// matching a fleet of independent clients (use for connection-scale load tests).
+    /// For a full client fleet, use `--clients`/`--connections-per-client`/
+    /// `--queries-per-client` instead, which model all three dimensions.
+    #[arg(long, value_enum, default_value = "shared")]
+    pub(crate) client_connections: ClientConnectionsArg,
+
+    /// Number of simulated client instances (application servers). Each holds its
+    /// own connection pool and runs its own query threads, so the three fleet
+    /// flags are set together. Total server connections are
+    /// `clients * connections-per-client`; total concurrent queries are
+    /// `clients * queries-per-client`, which supersedes `--concurrency`.
+    #[arg(
+        long,
+        requires = "connections_per_client",
+        requires = "queries_per_client"
+    )]
+    pub(crate) clients: Option<usize>,
+
+    /// Connection-pool size **within each client**. A client's query threads use
+    /// only that client's connections, exactly as an application server's pool is
+    /// private to that process.
+    #[arg(long, requires = "clients")]
+    pub(crate) connections_per_client: Option<usize>,
+
+    /// Concurrent query threads **within each client**. When this exceeds
+    /// `--connections-per-client`, the client's threads share its pooled
+    /// connections; when it is smaller, some pooled connections stay idle — both
+    /// mirror how a real pool behaves under load.
+    #[arg(long, requires = "clients")]
+    pub(crate) queries_per_client: Option<usize>,
+}
+
+/// A simulated client fleet: `clients` application instances, each holding
+/// `connections_per_client` connections and running `queries_per_client`
+/// concurrent query threads over them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fleet {
+    pub clients: usize,
+    pub connections_per_client: usize,
+    pub queries_per_client: usize,
+}
+
+impl Fleet {
+    /// Concurrent query threads across the whole fleet — the test's parallel count.
+    #[must_use]
+    pub fn total_queries(&self) -> usize {
+        self.clients * self.queries_per_client
+    }
+
+    /// Connections the server actually sees.
+    #[must_use]
+    pub fn total_connections(&self) -> usize {
+        self.clients * self.connections_per_client
+    }
+
+    /// The connection a given worker uses. Workers are laid out client-major, so
+    /// worker `w` belongs to client `w / queries_per_client`; within that client
+    /// its threads round-robin over that client's own pool and never touch
+    /// another client's connections.
+    #[must_use]
+    pub fn connection_for_worker(&self, worker: usize) -> usize {
+        let client = (worker / self.queries_per_client) % self.clients;
+        let thread = worker % self.queries_per_client;
+        client * self.connections_per_client + (thread % self.connections_per_client)
+    }
+}
+
+/// How concurrent test clients connect to the spiced endpoint under test.
+#[derive(Clone, Copy, ValueEnum, Debug, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientConnectionsArg {
+    /// All clients share one connection (gRPC channel for Flight, one HTTP pool),
+    /// multiplexing queries over it.
+    #[default]
+    Shared,
+    /// Every client opens its own connection, so concurrency N exercises N real
+    /// connections on the server.
+    PerClient,
 }
 
 #[derive(Clone, ValueEnum, Debug, Deserialize, Serialize)]
@@ -275,6 +356,45 @@ impl DatasetTestArgs {
     pub fn load_query_set(&self) -> anyhow::Result<QuerySet> {
         QuerySetLoader::load_query_set(self)
     }
+
+    /// The simulated client fleet, when the three fleet flags were given.
+    /// `clap` requires them together, so a present `clients` implies the rest.
+    #[must_use]
+    pub fn fleet(&self) -> Option<Fleet> {
+        Some(Fleet {
+            clients: self.clients?,
+            connections_per_client: self.connections_per_client?,
+            queries_per_client: self.queries_per_client?,
+        })
+    }
+
+    /// Concurrent query threads to run: the fleet's total when one is
+    /// configured, otherwise `--concurrency`.
+    #[must_use]
+    pub fn effective_concurrency(&self) -> usize {
+        self.fleet()
+            .map_or(self.common.concurrency, |f| f.total_queries())
+    }
+
+    /// Validate the fleet flags. Called at command entry so a bad combination
+    /// fails before spiced is started or waited on.
+    pub fn validate_fleet(&self) -> anyhow::Result<()> {
+        let Some(fleet) = self.fleet() else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            self.client_connections == ClientConnectionsArg::Shared,
+            "--clients/--connections-per-client/--queries-per-client already describe the \
+             connection topology; drop --client-connections"
+        );
+        anyhow::ensure!(
+            fleet.clients >= 1
+                && fleet.connections_per_client >= 1
+                && fleet.queries_per_client >= 1,
+            "--clients, --connections-per-client and --queries-per-client must each be at least 1"
+        );
+        Ok(())
+    }
 }
 
 impl QuerySetLoader for DatasetTestArgs {
@@ -389,4 +509,65 @@ fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
     #[expect(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     let millis = (num * multiplier) as u64;
     Ok(std::time::Duration::from_millis(millis))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fleet(clients: usize, connections_per_client: usize, queries_per_client: usize) -> Fleet {
+        Fleet {
+            clients,
+            connections_per_client,
+            queries_per_client,
+        }
+    }
+
+    #[test]
+    fn fleet_totals_multiply_the_right_dimensions() {
+        // 4 clients, each holding a 128-connection pool and running 32 query
+        // threads: 512 connections on the server, 128 concurrent queries.
+        let f = fleet(4, 128, 32);
+        assert_eq!(f.total_connections(), 512);
+        assert_eq!(f.total_queries(), 128);
+    }
+
+    #[test]
+    fn a_clients_threads_only_use_that_clients_pool() {
+        // 3 clients x 2 connections x 4 threads. Client i owns connections
+        // [i*2, i*2+1] and must never be handed another client's.
+        let f = fleet(3, 2, 4);
+        for worker in 0..f.total_queries() {
+            let client = worker / f.queries_per_client;
+            let conn = f.connection_for_worker(worker);
+            let owned = client * f.connections_per_client;
+            assert!(
+                (owned..owned + f.connections_per_client).contains(&conn),
+                "worker {worker} (client {client}) got connection {conn}, outside its pool"
+            );
+        }
+    }
+
+    #[test]
+    fn threads_round_robin_within_their_pool() {
+        // 1 client, 2 connections, 5 threads: threads alternate over the pool,
+        // so a pool smaller than the thread count is shared rather than grown.
+        let f = fleet(1, 2, 5);
+        let conns: Vec<usize> = (0..f.total_queries())
+            .map(|w| f.connection_for_worker(w))
+            .collect();
+        assert_eq!(conns, vec![0, 1, 0, 1, 0]);
+    }
+
+    #[test]
+    fn a_pool_larger_than_the_thread_count_leaves_connections_idle() {
+        // 1 client, 8 connections, 2 threads: only two connections ever carry a
+        // query, matching an over-provisioned pool.
+        let f = fleet(1, 8, 2);
+        let used: Vec<usize> = (0..f.total_queries())
+            .map(|w| f.connection_for_worker(w))
+            .collect();
+        assert_eq!(used, vec![0, 1]);
+        assert_eq!(f.total_connections(), 8);
+    }
 }

@@ -33,7 +33,7 @@ impl DebeziumKafkaSys {
         metadata: &DebeziumKafkaMetadata,
     ) -> Result<()> {
         ensure_debezium_kafka_tables(pool).await?;
-        self.mark_schema_ensured();
+        self.schema_ensured.mark_ensured();
 
         let mut conn = pool.connect_direct().await.map_err(Error::external)?;
         let tx = conn.conn.transaction().await.map_err(Error::external)?;
@@ -77,9 +77,9 @@ impl DebeziumKafkaSys {
         &self,
         pool: &PostgresConnectionPool,
     ) -> Result<Option<DebeziumKafkaMetadata>> {
-        if self.schema_needs_ensure() {
+        if self.schema_ensured.needs_ensure() {
             ensure_debezium_kafka_tables(pool).await?;
-            self.mark_schema_ensured();
+            self.schema_ensured.mark_ensured();
         }
         let conn = pool.connect_direct().await.map_err(Error::external)?;
         let query = format!(
@@ -119,9 +119,9 @@ impl DebeziumKafkaSys {
         pool: &PostgresConnectionPool,
         offsets: &[KafkaOffset],
     ) -> Result<()> {
-        if self.schema_needs_ensure() {
+        if self.schema_ensured.needs_ensure() {
             ensure_debezium_kafka_tables(pool).await?;
-            self.mark_schema_ensured();
+            self.schema_ensured.mark_ensured();
         }
 
         // Diagnostic-only: surface a warn log when an offset regresses.
