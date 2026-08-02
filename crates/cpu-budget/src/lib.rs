@@ -29,12 +29,15 @@ limitations under the License.
 //! `sched_getaffinity`). What is new is that the value has one owner, a named
 //! source, and an explicit override for deployments the host cannot describe.
 //!
-//! Detection deliberately reads only a cgroup CPU *quota*, never a CPU *share*.
+//! Sizing deliberately follows only a cgroup CPU *quota*, never a CPU *share*.
 //! Under Kubernetes the kubelet derives the share from `requests.cpu`, but a
 //! request is a scheduling floor, not a ceiling: a burstable pod is entitled to
 //! every idle core on its node, and sizing from the request would take that
 //! away. An operator who wants the runtime sized to the request says so
-//! explicitly with `runtime.cpu.cores`.
+//! explicitly with `runtime.cpu.cores`. The share is still *read*, so the
+//! startup log and the metrics can show the request and the limit next to the
+//! budget actually chosen — that comparison is what makes a mis-sized pod
+//! diagnosable.
 //!
 //! This crate owns both halves of the fix: [`HostReadings`] +
 //! [`CpuBudget::resolve`] decide the entitlement, and the methods on
@@ -180,33 +183,61 @@ impl HostReadings {
     }
 }
 
+/// The cgroup CPU quota, in millicores.
+///
+/// Read along the whole cgroup path rather than at the leaf — see
+/// [`cgroup::min_along_cgroup_path`] for why a quota on an ancestor is just as
+/// binding.
 fn detect_quota_millicores() -> Option<u64> {
-    if let Some(path) = cgroup::v2_file_path("cpu.max")
-        && let Ok(contents) = std::fs::read_to_string(&path)
-        && let Some(millicores) = cgroup::parse_cpu_max(&contents)
+    if let Some((mountpoint, cgroup_path)) = cgroup::v2_mount_and_path()
+        && let Some(millicores) =
+            cgroup::min_along_cgroup_path(&mountpoint, &cgroup_path, |mount, rel| {
+                let path = cgroup::cgroup_file_path(mount, rel, "cpu.max");
+                cgroup::parse_cpu_max(&std::fs::read_to_string(path).ok()?)
+            })
     {
         return Some(millicores);
     }
-    let quota = cgroup::v1_file_path("cpu", "cpu.cfs_quota_us")?;
-    let period = cgroup::v1_file_path("cpu", "cpu.cfs_period_us")?;
-    cgroup::parse_cfs_quota(
-        &std::fs::read_to_string(quota).ok()?,
-        &std::fs::read_to_string(period).ok()?,
-    )
+
+    let (mountpoint, cgroup_path) = cgroup::v1_mount_and_path("cpu")?;
+    cgroup::min_along_cgroup_path(&mountpoint, &cgroup_path, |mount, rel| {
+        let quota =
+            std::fs::read_to_string(cgroup::cgroup_file_path(mount, rel, "cpu.cfs_quota_us"))
+                .ok()?;
+        let period =
+            std::fs::read_to_string(cgroup::cgroup_file_path(mount, rel, "cpu.cfs_period_us"))
+                .ok()?;
+        cgroup::parse_cfs_quota(&quota, &period)
+    })
 }
 
 /// The `requests.cpu` behind this process's cgroup CPU share, in millicores.
 ///
 /// Reporting only. Sizing never consults it — see [`CpuBudget::resolve`].
+///
+/// Read at the leaf, unlike the quota. A share is a relative weight *among
+/// siblings at one level*, not a ceiling inherited down the tree, so the
+/// smallest value along the path would mean nothing; the container's own share
+/// is the one the kubelet derived from its `requests.cpu`.
 fn detect_request_millicores() -> Option<u64> {
-    if let Some(path) = cgroup::v2_file_path("cpu.weight")
-        && let Ok(contents) = std::fs::read_to_string(&path)
+    if let Some((mountpoint, cgroup_path)) = cgroup::v2_mount_and_path()
+        && let Ok(contents) = std::fs::read_to_string(cgroup::cgroup_file_path(
+            &mountpoint,
+            &cgroup_path,
+            "cpu.weight",
+        ))
         && let Some(millicores) = cgroup::parse_cpu_weight(&contents)
     {
         return Some(millicores);
     }
-    let shares = cgroup::v1_file_path("cpu", "cpu.shares")?;
-    cgroup::parse_cpu_shares(&std::fs::read_to_string(shares).ok()?)
+    let (mountpoint, cgroup_path) = cgroup::v1_mount_and_path("cpu")?;
+    let shares = std::fs::read_to_string(cgroup::cgroup_file_path(
+        &mountpoint,
+        &cgroup_path,
+        "cpu.shares",
+    ))
+    .ok()?;
+    cgroup::parse_cpu_shares(&shares)
 }
 
 /// Query plans admitted concurrently per core when
@@ -347,7 +378,7 @@ impl CpuBudget {
     ///
     /// These are *defaults*, not necessarily the values in force. Several are
     /// overridable by their own setting (`runtime.query.target_partitions`,
-    /// `runtime.query.max_concurrent_queries`, DuckDB's `threads`, a model's
+    /// `runtime.query.max_concurrent_queries`, `DuckDB`'s `threads`, a model's
     /// parallelism), and this runs at startup, before that configuration is
     /// resolved — some of it per dataset. A consumer that can be overridden logs
     /// the value it actually used, and where it came from, where it applies it.

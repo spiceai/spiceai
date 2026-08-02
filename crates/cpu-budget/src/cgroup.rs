@@ -118,29 +118,28 @@ pub fn parse_cpu_weight(contents: &str) -> Option<u64> {
     Some(shares.saturating_mul(1000) / SHARES_PER_CORE)
 }
 
-/// The path to `filename` in this process's cgroup v2 hierarchy, or `None` when
-/// the system is not running cgroup v2 (or is not Linux).
+/// This process's cgroup v2 mountpoint and path within the hierarchy, or `None`
+/// when the system is not running cgroup v2 (or is not Linux).
 #[must_use]
-pub fn v2_file_path(filename: &str) -> Option<String> {
+pub fn v2_mount_and_path() -> Option<(String, String)> {
     #[cfg(target_os = "linux")]
     {
         let cgroup_path = parse_proc_cgroup_v2_path(&read_to_string("/proc/self/cgroup")?)?;
         let mountpoint = read_to_string("/proc/self/mountinfo")
             .and_then(|s| parse_mountinfo_cgroup2(&s))
             .unwrap_or_else(|| "/sys/fs/cgroup".to_string());
-        Some(cgroup_file_path(&mountpoint, &cgroup_path, filename))
+        Some((mountpoint, cgroup_path))
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = filename;
         None
     }
 }
 
-/// The path to `filename` under this process's cgroup v1 `controller`
-/// hierarchy, or `None` when that controller is not mounted (or not Linux).
+/// This process's cgroup v1 mountpoint and path for `controller`, or `None` when
+/// that controller is not mounted (or is not Linux).
 #[must_use]
-pub fn v1_file_path(controller: &str, filename: &str) -> Option<String> {
+pub fn v1_mount_and_path(controller: &str) -> Option<(String, String)> {
     #[cfg(target_os = "linux")]
     {
         let cgroup_path =
@@ -148,12 +147,48 @@ pub fn v1_file_path(controller: &str, filename: &str) -> Option<String> {
         let mountpoint = read_to_string("/proc/self/mountinfo")
             .and_then(|s| parse_mountinfo_cgroup_v1(&s, controller))
             .unwrap_or_else(|| format!("/sys/fs/cgroup/{controller}"));
-        Some(cgroup_file_path(&mountpoint, &cgroup_path, filename))
+        Some((mountpoint, cgroup_path))
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (controller, filename);
+        let _ = controller;
         None
+    }
+}
+
+/// The smallest value `read_level` yields anywhere along `cgroup_path`, walking
+/// leaf to root.
+///
+/// A quota must be read along the whole path, not just at the leaf: the kernel
+/// enforces the smallest limit anywhere above the process, so a quota on an
+/// ancestor — a systemd slice above the service, the Kubernetes *pod* cgroup
+/// above the container — binds exactly as tightly as one on the leaf. Reading
+/// only the leaf reports such a process as unlimited and sizes it for the whole
+/// node.
+///
+/// `read_level` receives the mountpoint and the path relative to it, so the walk
+/// can be driven over a temporary directory in tests.
+pub fn min_along_cgroup_path<T: Ord>(
+    mountpoint: &str,
+    cgroup_path: &str,
+    read_level: impl Fn(&str, &str) -> Option<T>,
+) -> Option<T> {
+    let mut best: Option<T> = None;
+    let mut rel = cgroup_path.trim_end_matches('/').to_string();
+    loop {
+        let value = read_level(mountpoint, if rel.is_empty() { "/" } else { &rel });
+        best = match (best, value) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, b) => b,
+        };
+        if rel.is_empty() {
+            return best;
+        }
+        match rel.rfind('/') {
+            Some(0) | None => rel.clear(),
+            Some(cut) => rel.truncate(cut),
+        }
     }
 }
 
@@ -239,6 +274,50 @@ pub fn parse_mountinfo_cgroup_v1(contents: &str, controller: &str) -> Option<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A quota anywhere above the process binds it, so the walk must visit every
+    /// level and take the smallest — reading only the leaf reported a limited
+    /// process as unlimited and sized it for the whole node.
+    #[test]
+    fn a_quota_is_found_anywhere_along_the_path() {
+        let levels = |pairs: &'static [(&'static str, u64)]| {
+            move |_mount: &str, rel: &str| {
+                pairs
+                    .iter()
+                    .find(|(path, _)| *path == rel)
+                    .map(|(_, value)| *value)
+            }
+        };
+        let walk = |pairs| {
+            min_along_cgroup_path(
+                "/sys/fs/cgroup",
+                "/kubepods/pod123/container",
+                levels(pairs),
+            )
+        };
+
+        // Only the Kubernetes pod cgroup carries the quota.
+        assert_eq!(walk(&[("/kubepods/pod123", 4000)]), Some(4000));
+        // The tightest limit anywhere wins, whichever level it sits on.
+        assert_eq!(
+            walk(&[
+                ("/kubepods/pod123/container", 8000),
+                ("/kubepods/pod123", 4000),
+            ]),
+            Some(4000)
+        );
+        assert_eq!(
+            walk(&[
+                ("/kubepods/pod123/container", 2000),
+                ("/kubepods/pod123", 4000),
+            ]),
+            Some(2000)
+        );
+        // The root is part of the walk.
+        assert_eq!(walk(&[("/", 1000)]), Some(1000));
+        // Nothing anywhere means unlimited.
+        assert_eq!(walk(&[]), None);
+    }
 
     #[test]
     fn cpu_max_v2() {
