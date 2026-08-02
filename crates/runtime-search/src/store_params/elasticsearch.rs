@@ -419,7 +419,7 @@ mod tests {
         .await
         .expect("Elasticsearch vector parameters should be valid");
 
-        assert_eq!(typed.endpoint.as_deref(), Some("http://localhost:9200"));
+        assert_eq!(typed.endpoint, "http://localhost:9200");
         assert_eq!(typed.distance_metric, Some(EsDistanceMetric::L2Norm));
         assert_eq!(typed.hnsw_m, Some(16));
         assert_eq!(typed.client_timeout, Some(Duration::from_secs(30)));

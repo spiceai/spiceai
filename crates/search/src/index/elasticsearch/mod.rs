@@ -1143,16 +1143,28 @@ mod write_maintenance_tests {
         let embedding = embedding_col("content");
 
         let query = index.query_result_schema();
-        assert!(query.field_with_name(CHUNKED_INDEX_CHUNK_KEY).is_ok());
-        assert!(query.field_with_name(&offset_col).is_ok());
-        assert!(query.field_with_name(&embedding).is_ok());
-        assert!(query.field_with_name(SEARCH_SCORE_COLUMN_NAME).is_ok());
+        query
+            .field_with_name(CHUNKED_INDEX_CHUNK_KEY)
+            .expect("query schema should expose the chunk key column");
+        query
+            .field_with_name(&offset_col)
+            .expect("query schema should expose the offset column");
+        query
+            .field_with_name(&embedding)
+            .expect("query schema should expose the embedding column");
+        query
+            .field_with_name(SEARCH_SCORE_COLUMN_NAME)
+            .expect("query schema should expose the score column");
 
         let list = index.list_result_schema();
-        assert!(list.field_with_name(CHUNKED_INDEX_CHUNK_KEY).is_ok());
-        assert!(list.field_with_name(&offset_col).is_ok());
-        assert!(list.field_with_name(&embedding).is_ok());
-        assert!(list.field_with_name(SEARCH_SCORE_COLUMN_NAME).is_err());
+        list.field_with_name(CHUNKED_INDEX_CHUNK_KEY)
+            .expect("list schema should expose the chunk key column");
+        list.field_with_name(&offset_col)
+            .expect("list schema should expose the offset column");
+        list.field_with_name(&embedding)
+            .expect("list schema should expose the embedding column");
+        list.field_with_name(SEARCH_SCORE_COLUMN_NAME)
+            .expect_err("list schema should not expose the score column");
     }
 
     /// The core fallback-contract guard: a `CompoundVectorIndex` pairing an in-memory warm
