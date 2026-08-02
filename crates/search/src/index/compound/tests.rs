@@ -1127,6 +1127,7 @@ mod warm_memory {
         let events = Arc::new(Mutex::new(vec![]));
         let mut secondary = MockIndex::new("engine", &events);
         secondary.dimension = Some(DIM);
+        secondary.list_batches = vec![engine_list_batch(&[])];
         let idx = warm_compound(secondary);
 
         idx.write(input_batch(2)).await.expect("write succeeds");
