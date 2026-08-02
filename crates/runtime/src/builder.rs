@@ -444,7 +444,10 @@ impl RuntimeBuilder {
         // percent and no tier budget.
         let cayenne_configured = self.app.as_ref().is_some_and(|app| {
             app.datasets.iter().any(|dataset| {
-                dataset.acceleration.as_ref().is_some_and(is_enabled_cayenne_acceleration)
+                dataset
+                    .acceleration
+                    .as_ref()
+                    .is_some_and(is_enabled_cayenne_acceleration)
             })
         });
 

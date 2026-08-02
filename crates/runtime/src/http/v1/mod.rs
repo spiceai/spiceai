@@ -577,11 +577,10 @@ mod tests {
     /// execution failure stays on 400.
     #[test]
     fn resource_exhaustion_maps_to_service_unavailable() {
-        let exhausted: Box<dyn std::error::Error + Send + Sync> = Box::new(
-            datafusion::error::DataFusionError::ResourcesExhausted(
+        let exhausted: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(datafusion::error::DataFusionError::ResourcesExhausted(
                 "Additional allocation failed for HashJoinInput[135]".to_string(),
-            ),
-        );
+            ));
         assert!(is_resources_exhausted(exhausted.as_ref()));
 
         // Execution wraps the pool error often enough that the recursion has to
@@ -613,7 +612,12 @@ mod tests {
 
         let collapsed = single_line("top consumers:\n  HashJoinInput[135]\n  Sort[2]");
         assert!(!collapsed.contains('\n'));
-        assert_eq!(collapsed.chars().count(), "top consumers:\n  HashJoinInput[135]\n  Sort[2]".chars().count());
+        assert_eq!(
+            collapsed.chars().count(),
+            "top consumers:\n  HashJoinInput[135]\n  Sort[2]"
+                .chars()
+                .count()
+        );
     }
 
     #[test]
