@@ -1600,6 +1600,24 @@ impl DataFusion {
             memory_budget,
             "Cayenne dynamic-tuning memory budget active (cgroup-aware)"
         );
+
+        // The memory sampler runs for EVERY deployment, not just CDC ones. It owns
+        // two jobs: publishing the pool/RSS gauges that explain an OOM (#12195), and
+        // — only when an in-memory CDC tier budget exists — resizing that tier from
+        // live pool usage. The gauges are the reason it is unconditional: they are
+        // general memory observability, and a pod without a tier is no less likely
+        // to OOM. `mem_tier_budget_bytes` is `None` for such a pod, which switches
+        // off the resize half while leaving the gauges running.
+        let rt = self.ctx.runtime_env();
+        Self::spawn_mem_tier_repartition_sampler(
+            &Handle::current(),
+            Arc::downgrade(&rt.memory_pool),
+            self.compaction_runtime_env
+                .as_ref()
+                .map(|env| Arc::downgrade(&env.memory_pool)),
+            self.mem_tier_budget_bytes,
+            self.total_memory,
+        );
     }
 
     /// Set the dedicated compaction runtime for background Cayenne compaction
@@ -1678,18 +1696,6 @@ impl DataFusion {
             // reclaims it as the pool drains — never above the coordinated static
             // ceiling, so it cannot reintroduce overcommit. The critical-pressure
             // reactive spill drains the tier when the budget is lowered below resident.
-            let query_pool = Arc::downgrade(&rt.memory_pool);
-            let compaction_pool = self
-                .compaction_runtime_env
-                .as_ref()
-                .map(|env| Arc::downgrade(&env.memory_pool));
-            Self::spawn_mem_tier_repartition_sampler(
-                &tokio_handle,
-                query_pool,
-                compaction_pool,
-                mem_tier_budget_bytes,
-                total_memory,
-            );
         }
 
         if let Some(env) = &self.compaction_runtime_env {
@@ -1726,7 +1732,7 @@ impl DataFusion {
         compaction_pool: Option<
             std::sync::Weak<dyn datafusion::execution::memory_pool::MemoryPool>,
         >,
-        static_ceiling_bytes: u64,
+        static_ceiling_bytes: Option<u64>,
         total_memory: u64,
     ) {
         // Short enough to react to a query-pool spike ahead of the slower per-table
@@ -1755,14 +1761,19 @@ impl DataFusion {
                 // Same coordinated partition as the static install (one tested
                 // definition of the no-overcommit invariant), but from LIVE pool
                 // usage, and never above the static ceiling so it can't overcommit.
-                let dynamic = builder::coordinated_mem_tier_budget(
-                    total_memory,
-                    pool_used,
-                    compaction_used,
-                    crate::accelerator_memory_budget::duckdb_total_reservation_bytes(),
-                )
-                .min(static_ceiling_bytes);
-                cayenne::update_global_mem_tier_total(dynamic);
+                // Only when a tier budget exists: a pod whose Cayenne tables are all
+                // bulk-written has no tier to resize, but still needs the gauges
+                // below — they are general memory observability, not CDC-specific.
+                if let Some(ceiling) = static_ceiling_bytes {
+                    let dynamic = builder::coordinated_mem_tier_budget(
+                        total_memory,
+                        pool_used,
+                        compaction_used,
+                        crate::accelerator_memory_budget::duckdb_total_reservation_bytes(),
+                    )
+                    .min(ceiling);
+                    cayenne::update_global_mem_tier_total(dynamic);
+                }
                 // Publish what this loop already measures. These are the numbers
                 // that reconcile budget against fact: pool gauges describe what
                 // the accounting believes, the RSS gauge describes what the

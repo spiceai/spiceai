@@ -1584,11 +1584,11 @@ pub(crate) fn effective_query_memory_limit(
         // reservation. Emit the projection here too: operators lowering
         // memory_limit to curb resident memory need to see that the caches do
         // not shrink with it - they are sized from total memory, not the pool.
-        if cayenne_active && cdc_reservation_bytes > 0 {
+        if cayenne_reservation_bytes > 0 {
             tracing::info!(
                 memory_limit = limit,
-                cdc_reservation_bytes,
-                "Explicit query memory limit set; the projected per-table Cayenne CDC cache reservation is OFF-pool and unaffected by this limit"
+                cayenne_reservation_bytes,
+                "Explicit query memory limit set; the projected per-table Cayenne cache reservation is OFF-pool and unaffected by this limit"
             );
         }
         limit
@@ -1622,8 +1622,8 @@ pub(crate) fn effective_query_memory_limit(
             // this line at debug level.
             if default_limit == floor && reservation_excess > 0 {
                 tracing::warn!(
-                    cayenne_active,
-                    cdc_reservation_bytes,
+                    cayenne_cdc_active,
+                    cayenne_reservation_bytes,
                     reservation_excess,
                     "Cayenne CDC cache reservation exceeds what the query pool can yield: the pool is floored at {}% of memory and the projected caches do not fit beside it. Expect resident memory above the coordinated budgets; reduce per-table cache parameters or add memory. See the budget arithmetic in this log at startup.",
                     CAYENNE_QUERY_MEMORY_FLOOR_PERCENT
