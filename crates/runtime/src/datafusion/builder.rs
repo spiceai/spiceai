@@ -353,10 +353,22 @@ pub struct DataFusionBuilder {
     cayenne_sort_merge_memory_pool_fraction: Option<f64>,
     cayenne_footer_cache_mb: Option<usize>,
     /// Fraction of the query memory limit to carve into a dedicated compaction
-    /// memory pool. `Some` only when Cayenne acceleration is configured and
-    /// dedicated thread pools are enabled (set by the Runtime builder); `None`
-    /// leaves the full budget to queries and gives compaction no separate pool.
+    /// memory pool. `Some` only when [`Self::cayenne_active`] AND at least one
+    /// enabled Cayenne acceleration can compact into it — a file acceleration mode
+    /// on the small-write refresh profile (set by the Runtime builder). `None`
+    /// leaves the full budget to queries and gives compaction no separate pool; it
+    /// then accounts against the query pool, as it does with no Cayenne at all.
     compaction_memory_fraction: Option<f64>,
+    /// Whether any enabled Cayenne acceleration is configured AND dedicated thread
+    /// pools are enabled (set by the Runtime builder). Drives the Cayenne
+    /// query-memory default split, the spill-directory hint, and the off-pool
+    /// in-memory CDC tier budget — all of which apply to every Cayenne deployment
+    /// whatever its refresh mode. Unlike [`Self::compaction_memory_fraction`] this
+    /// does not require a dataset that can draw on the budget: an installed tier
+    /// budget costs the query pool nothing (it is sized from what the query pool
+    /// leaves over), while omitting it removes the aggregate cap that keeps
+    /// memory-mode CDC within host RAM.
+    cayenne_active: bool,
     /// Estimated aggregate bytes the enabled changes-mode Cayenne tables reserve
     /// OUTSIDE the query pool (per-table keyset/segment/coalesce/inline caches),
     /// set by the Runtime builder. When it exceeds the base host/10 headroom, the
@@ -427,6 +439,7 @@ impl DataFusionBuilder {
             cayenne_sort_merge_memory_pool_fraction: None,
             cayenne_footer_cache_mb: None,
             compaction_memory_fraction: None,
+            cayenne_active: false,
             cayenne_cdc_reservation_bytes: 0,
             duckdb_query_pool_cap: None,
             cayenne_optimizer_rules: CayenneOptimizerRules::default(),
@@ -603,12 +616,23 @@ impl DataFusionBuilder {
         self
     }
 
-    /// Carve a dedicated compaction memory pool of `fraction` of the query
-    /// memory limit. Set by the Runtime builder only when Cayenne acceleration
-    /// is configured and dedicated thread pools are enabled.
+    /// Sets the fraction of the query memory limit carved into a dedicated Cayenne
+    /// compaction pool. The Runtime builder passes `Some` only when Cayenne is active
+    /// and at least one enabled acceleration can compact into the pool; `None` leaves
+    /// the whole budget to queries and lets compaction account against the query pool.
     #[must_use]
     pub fn compaction_memory_fraction(mut self, fraction: Option<f64>) -> Self {
         self.compaction_memory_fraction = fraction;
+        self
+    }
+
+    /// Declares that this process runs at least one enabled Cayenne acceleration with
+    /// dedicated thread pools. The Runtime builder sets it, and it drives the Cayenne
+    /// query-memory default split, the spill-directory hint, and the off-pool in-memory
+    /// CDC tier budget — none of which depend on a dataset being compaction-eligible.
+    #[must_use]
+    pub fn cayenne_active(mut self, active: bool) -> Self {
+        self.cayenne_active = active;
         self
     }
 
@@ -673,20 +697,16 @@ impl DataFusionBuilder {
     pub fn build(self) -> DataFusion {
         let mut config = self.config;
         // Request a dedicated compaction memory budget when a fraction is
-        // configured (Cayenne acceleration + dedicated thread pools). Its presence
-        // is also the "Cayenne in-memory acceleration active" signal that gates the
-        // coordinated host-memory partition below: a reduced query-pool default
-        // that leaves room for the off-pool Cayenne in-memory CDC tier so
-        // query_pool + compaction + tier + headroom ≤ host. The query pool is only
-        // shrunk by the compaction carve after the dedicated compaction RuntimeEnv
-        // builds successfully; otherwise queries keep the full configured budget.
+        // configured. The Runtime builder sets it only when a Cayenne acceleration
+        // can actually compact into it. The query pool is only shrunk by the carve
+        // after the dedicated compaction RuntimeEnv builds successfully; otherwise
+        // queries keep the full configured budget.
         let compaction_memory_fraction = self
             .compaction_memory_fraction
             .and_then(validate_compaction_memory_fraction);
-        let cayenne_active = compaction_memory_fraction.is_some();
         let effective_memory_limit = effective_query_memory_limit(
             self.memory_limit,
-            cayenne_active,
+            self.cayenne_active,
             self.cayenne_cdc_reservation_bytes,
             self.duckdb_query_pool_cap,
         );
@@ -732,7 +752,7 @@ impl DataFusionBuilder {
         // `set_compaction_runtime` installs `mem_tier_budget_bytes` instead of the
         // old, isolation-sized `get_total_memory() / 4`.
         let query_memory_pool_bytes = effective_memory_limit;
-        let mem_tier_budget_bytes = cayenne_active.then(|| {
+        let mem_tier_budget_bytes = self.cayenne_active.then(|| {
             let total_memory = crate::resource_monitor::get_total_memory();
             let external_reservation_bytes =
                 crate::accelerator_memory_budget::duckdb_total_reservation_bytes();
@@ -771,7 +791,7 @@ impl DataFusionBuilder {
         // small, so a spill fails and the query exhausts the memory pool
         // (ResourceExhausted) instead of spilling — the SF1000 Q10/Q18 symptom.
         // Guide operators to point spill at a roomy volume.
-        if cayenne_active && self.temp_directory.is_none() {
+        if self.cayenne_active && self.temp_directory.is_none() {
             tracing::info!(
                 "Cayenne acceleration is active but runtime.query.temp_directory is unset: large analytical queries spill to the OS temp directory. If your data is on a separate volume (e.g. EBS) and the root volume is small, set runtime.query.temp_directory to a path with ample free space so large queries can spill instead of failing."
             );
