@@ -34,9 +34,10 @@ runs:
         # One `grep -v` per pattern rather than one joined alternation: a joined
         # pattern would need blank lines filtered out first, and an empty pattern
         # matches every line, which silently turns the check into a no-op.
+        # `--` so a pattern that starts with `-` is read as a regex, not a flag.
         while IFS= read -r pattern; do
           if [[ -n "$pattern" ]]; then
-            suspect=$(printf '%s\n' "$suspect" | grep -vE "$pattern" || true)
+            suspect=$(printf '%s\n' "$suspect" | grep -vE -- "$pattern" || true)
           fi
         done <<< "$ALLOW"
 

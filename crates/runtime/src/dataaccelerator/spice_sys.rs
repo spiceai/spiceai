@@ -290,7 +290,7 @@ where
 /// The whole source chain is walked, so it holds however deeply the caller has
 /// boxed or wrapped the error. A *panicked* task is deliberately not matched: that
 /// is a bug and must stay loud.
-pub fn is_shutdown_cancellation(error: &(dyn std::error::Error + 'static)) -> bool {
+pub(crate) fn is_shutdown_cancellation(error: &(dyn std::error::Error + 'static)) -> bool {
     std::iter::successors(Some(error), |error| std::error::Error::source(*error)).any(|error| {
         error
             .downcast_ref::<tokio::task::JoinError>()
