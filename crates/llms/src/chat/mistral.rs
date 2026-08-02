@@ -65,12 +65,26 @@ use tokio::sync::mpsc::{Receiver, Sender, channel};
 /// the same cap so enabling cache-aware scheduling does not change request parallelism.
 const LOCAL_LLM_MAX_SEQS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(4);
 
-/// Read `general.architecture` out of a GGUF header.
+/// Read `general.architecture` out of the first GGUF header that declares it.
 ///
-/// `None` when the file cannot be read or the key is absent: the value only selects an
-/// attention implementation, and the load that follows reports any real problem with the
-/// file in far more detail than a preflight could.
-async fn read_gguf_architecture(path: &Path) -> Option<String> {
+/// A model split across shards only carries the full metadata in one of them, and nothing
+/// orders the weight list, so every shard has to be tried rather than just the first.
+///
+/// `None` when no shard declares one: the value only selects an attention implementation,
+/// and the load that follows reports any real problem with the files in far more detail
+/// than a preflight could.
+async fn read_gguf_architecture(paths: &[PathBuf]) -> Option<String> {
+    for path in paths {
+        if let Some(architecture) = read_one_gguf_architecture(path).await {
+            return Some(architecture);
+        }
+    }
+    None
+}
+
+/// `general.architecture` from a single GGUF header, or `None` if it is unreadable or the
+/// key is absent (which is the normal case for the trailing shards of a split model).
+async fn read_one_gguf_architecture(path: &Path) -> Option<String> {
     let owned = path.to_path_buf();
     // Blocking file I/O, and for a large sharded model the header carries thousands of
     // tensor descriptors — keep it off the async worker.
@@ -184,8 +198,8 @@ impl MistralLlama {
         // A GGUF names its architecture in the header. Read it before building the
         // pipeline: it decides whether PagedAttention is usable at all, and logging it
         // makes a later load failure self-describing.
-        let gguf_architecture = match (extension, model_weights.first()) {
-            (Some("gguf"), Some(weight)) => read_gguf_architecture(weight).await,
+        let gguf_architecture = match extension {
+            Some("gguf") => read_gguf_architecture(model_weights).await,
             _ => None,
         };
         if let Some(architecture) = &gguf_architecture {
@@ -1078,7 +1092,7 @@ fn parse_tool_call_response(
 
 #[cfg(test)]
 mod tests {
-    use super::read_gguf_architecture;
+    use super::{read_gguf_architecture, read_one_gguf_architecture};
 
     /// Minimal GGUF v3 header carrying a single `general.architecture` string, so the
     /// preflight can be tested without a multi-gigabyte model file.
@@ -1111,19 +1125,42 @@ mod tests {
     async fn reads_the_architecture_from_a_gguf_header() {
         let path = write_temp(&gguf_header_with_architecture("glm-dsa"));
         assert_eq!(
-            read_gguf_architecture(&path).await.as_deref(),
+            read_gguf_architecture(&[path.to_path_buf()])
+                .await
+                .as_deref(),
+            Some("glm-dsa")
+        );
+    }
+
+    /// A split model declares the architecture in one shard, and nothing orders the
+    /// weight list, so a shard without it must not end the search.
+    #[tokio::test]
+    async fn finds_the_architecture_in_a_later_shard() {
+        let mut trailing_shard = Vec::new();
+        trailing_shard.extend_from_slice(b"GGUF");
+        trailing_shard.extend_from_slice(&3u32.to_le_bytes());
+        trailing_shard.extend_from_slice(&0u64.to_le_bytes());
+        trailing_shard.extend_from_slice(&0u64.to_le_bytes());
+
+        let without = write_temp(&trailing_shard);
+        let with = write_temp(&gguf_header_with_architecture("glm-dsa"));
+        assert_eq!(
+            read_gguf_architecture(&[without.to_path_buf(), with.to_path_buf()])
+                .await
+                .as_deref(),
             Some("glm-dsa")
         );
     }
 
     #[tokio::test]
     async fn returns_none_rather_than_failing_on_an_unreadable_file() {
+        // Single-file behaviour, exercised through the per-shard reader.
         // A truncated header, a file with no architecture key, and a missing path all
         // have to degrade to `None`: the value only selects an attention implementation,
         // and the load that follows reports the real problem.
         let full = gguf_header_with_architecture("glm-dsa");
         let truncated = write_temp(&full[..full.len() / 2]);
-        assert_eq!(read_gguf_architecture(&truncated).await, None);
+        assert_eq!(read_one_gguf_architecture(&truncated).await, None);
 
         let mut no_metadata = Vec::new();
         no_metadata.extend_from_slice(b"GGUF");
@@ -1131,10 +1168,10 @@ mod tests {
         no_metadata.extend_from_slice(&0u64.to_le_bytes());
         no_metadata.extend_from_slice(&0u64.to_le_bytes());
         let empty = write_temp(&no_metadata);
-        assert_eq!(read_gguf_architecture(&empty).await, None);
+        assert_eq!(read_one_gguf_architecture(&empty).await, None);
 
         assert_eq!(
-            read_gguf_architecture(std::path::Path::new("/nonexistent/spice-test-model.gguf"))
+            read_one_gguf_architecture(std::path::Path::new("/nonexistent/spice-test-model.gguf"))
                 .await,
             None
         );
