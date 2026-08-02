@@ -21,11 +21,11 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use arrow::array::Array;
 use arrow::array::{
     ArrayRef, BooleanBuilder, Float64Builder, Int64Builder, RecordBatch, StringBuilder,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use arrow::array::Array;
 use datafusion::prelude::{ParquetReadOptions, SessionContext};
 use rusqlite::{Connection, types::ValueRef};
 
@@ -236,7 +236,9 @@ fn array_value_to_sqlite(array: &dyn Array, row: usize) -> rusqlite::types::Valu
 
 /// Execute SQL on SQLite and collect results as a single `RecordBatch`.
 pub fn sqlite_query_batches(conn: &Connection, sql: &str) -> Result<Vec<RecordBatch>, String> {
-    let mut stmt = conn.prepare(sql).map_err(|e| format!("sqlite prepare: {e}"))?;
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|e| format!("sqlite prepare: {e}"))?;
     let col_count = stmt.column_count();
     if col_count == 0 {
         // DDL / empty result.
@@ -250,9 +252,7 @@ pub fn sqlite_query_batches(conn: &Connection, sql: &str) -> Result<Vec<RecordBa
         })
         .collect();
 
-    let mut rows = stmt
-        .query([])
-        .map_err(|e| format!("sqlite query: {e}"))?;
+    let mut rows = stmt.query([]).map_err(|e| format!("sqlite query: {e}"))?;
 
     // First pass: collect raw values to infer types from first non-null.
     let mut raw_rows: Vec<Vec<OwnedSqlValue>> = Vec::new();

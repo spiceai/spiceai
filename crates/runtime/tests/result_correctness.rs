@@ -103,7 +103,11 @@ fn make_dim(rows: usize) -> RecordBatch {
 
 fn micro_queries() -> Vec<Query> {
     vec![
-        Query::new("micro_count_star".into(), "SELECT COUNT(*) FROM t".into(), false),
+        Query::new(
+            "micro_count_star".into(),
+            "SELECT COUNT(*) FROM t".into(),
+            false,
+        ),
         Query::new(
             "micro_sum_value".into(),
             "SELECT SUM(value) FROM t".into(),
@@ -296,17 +300,11 @@ mod sqlite_accel {
                 }
                 values.push(match arr.data_type() {
                     arrow::datatypes::DataType::Int64 => {
-                        let a = arr
-                            .as_any()
-                            .downcast_ref::<Int64Array>()
-                            .expect("i64");
+                        let a = arr.as_any().downcast_ref::<Int64Array>().expect("i64");
                         rusqlite::types::Value::Integer(a.value(row))
                     }
                     arrow::datatypes::DataType::Utf8 => {
-                        let a = arr
-                            .as_any()
-                            .downcast_ref::<StringArray>()
-                            .expect("utf8");
+                        let a = arr.as_any().downcast_ref::<StringArray>().expect("utf8");
                         rusqlite::types::Value::Text(a.value(row).to_string())
                     }
                     other => panic!("unsupported insert type {other:?}"),
@@ -389,7 +387,9 @@ mod sqlite_accel {
                     for row in &rows_data {
                         match &row[col_i] {
                             Some(rusqlite::types::Value::Text(t)) => b.append_value(t),
-                            Some(rusqlite::types::Value::Integer(i)) => b.append_value(i.to_string()),
+                            Some(rusqlite::types::Value::Integer(i)) => {
+                                b.append_value(i.to_string())
+                            }
                             Some(rusqlite::types::Value::Real(f)) => b.append_value(f.to_string()),
                             Some(rusqlite::types::Value::Null) | None => b.append_null(),
                             Some(rusqlite::types::Value::Blob(_)) => b.append_null(),
@@ -444,10 +444,8 @@ mod sqlite_accel {
             .expect("create d");
         insert_batch(&t_table, fact.clone()).await;
         insert_batch(&d_table, dim.clone()).await;
-        let spice_tables: Vec<(String, Arc<dyn TableProvider>)> = vec![
-            ("t".into(), t_table),
-            ("d".into(), d_table),
-        ];
+        let spice_tables: Vec<(String, Arc<dyn TableProvider>)> =
+            vec![("t".into(), t_table), ("d".into(), d_table)];
 
         // Standalone rusqlite (out of Spice)
         let (_tmp, conn) = load_standalone_sqlite(&[("t", fact), ("d", dim)]);
@@ -457,10 +455,13 @@ mod sqlite_accel {
             let spice = spice_query(&spice_tables, &q.sql)
                 .await
                 .unwrap_or_else(|e| panic!("spice sql {}: {e}", q.name));
-            let standalone =
-                standalone_query(&conn, &q.sql).unwrap_or_else(|e| panic!("sqlite sql {}: {e}", q.name));
+            let standalone = standalone_query(&conn, &q.sql)
+                .unwrap_or_else(|e| panic!("sqlite sql {}: {e}", q.name));
             let status = compare(&q, &spice, &standalone);
-            eprintln!("spice-sqlite-accel vs standalone-sqlite / {} -> {status}", q.name);
+            eprintln!(
+                "spice-sqlite-accel vs standalone-sqlite / {} -> {status}",
+                q.name
+            );
             if !status.starts_with("PASS") {
                 fails.push(format!("{}: {status}", q.name));
             }
@@ -496,9 +497,12 @@ mod duckdb_accel {
         for (name, batch) in tables {
             let path = stage.path().join(format!("{name}.parquet"));
             let file = std::fs::File::create(&path).expect("parquet file");
-            let mut writer =
-                ArrowWriter::try_new(file, batch.schema(), Some(WriterProperties::builder().build()))
-                    .expect("writer");
+            let mut writer = ArrowWriter::try_new(
+                file,
+                batch.schema(),
+                Some(WriterProperties::builder().build()),
+            )
+            .expect("writer");
             writer.write(batch).expect("write");
             writer.close().expect("close");
         }
@@ -520,10 +524,7 @@ mod duckdb_accel {
 
     fn standalone_query(conn: &Connection, sql: &str) -> Result<Vec<RecordBatch>, String> {
         let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
-        let batches: Vec<RecordBatch> = stmt
-            .query_arrow([])
-            .map_err(|e| e.to_string())?
-            .collect();
+        let batches: Vec<RecordBatch> = stmt.query_arrow([]).map_err(|e| e.to_string())?.collect();
         Ok(batches)
     }
 
@@ -543,10 +544,8 @@ mod duckdb_accel {
             .expect("create d");
         insert_batch(&t_table, fact.clone()).await;
         insert_batch(&d_table, dim.clone()).await;
-        let spice_tables: Vec<(String, Arc<dyn TableProvider>)> = vec![
-            ("t".into(), t_table),
-            ("d".into(), d_table),
-        ];
+        let spice_tables: Vec<(String, Arc<dyn TableProvider>)> =
+            vec![("t".into(), t_table), ("d".into(), d_table)];
 
         let (_tmp, conn) = load_standalone_duckdb(&[("t", fact), ("d", dim)]);
 
@@ -558,7 +557,10 @@ mod duckdb_accel {
             let standalone = standalone_query(&conn, &q.sql)
                 .unwrap_or_else(|e| panic!("duckdb sql {}: {e}", q.name));
             let status = compare(&q, &spice, &standalone);
-            eprintln!("spice-duckdb-accel vs standalone-duckdb / {} -> {status}", q.name);
+            eprintln!(
+                "spice-duckdb-accel vs standalone-duckdb / {} -> {status}",
+                q.name
+            );
             if !status.starts_with("PASS") {
                 fails.push(format!("{}: {status}", q.name));
             }

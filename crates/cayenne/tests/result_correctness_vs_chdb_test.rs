@@ -167,12 +167,7 @@ async fn micro_bench_shapes_full_result_parity_vs_chdb_inner() {
     cayenne.load_batch("d", dim).await;
 
     let chdb = ChdbSession::new();
-    chdb.load_parquet(
-        "t",
-        "id Int64, name String, value Int64",
-        "id",
-        &fact_path,
-    );
+    chdb.load_parquet("t", "id Int64, name String, value Int64", "id", &fact_path);
     chdb.load_parquet("d", "id Int64, region String", "id", &dim_path);
 
     let mut results = Vec::new();
@@ -397,9 +392,7 @@ async fn sqllancer_corpus_parity_vs_chdb_inner() {
         }
         let cayenne_res = execute_cayenne(&cayenne, &q.sql).await;
         let ch_sql = sqllancer_sql_for_chdb(&q.sql);
-        let chdb_res = chdb
-            .query_csv(&ch_sql)
-            .and_then(|csv| csv_to_batches(&csv));
+        let chdb_res = chdb.query_csv(&ch_sql).and_then(|csv| csv_to_batches(&csv));
 
         let outcome = match (cayenne_res, chdb_res) {
             (Ok(c), Ok(d)) => compare_results_lenient(&q, &c, &d),
@@ -435,7 +428,8 @@ async fn sqllancer_corpus_parity_vs_chdb_inner() {
 
     // Record suite-level chDB exclusions for inventory completeness reporting.
     for e in build_inventory() {
-        if e.suite != "micro" && e.suite != "sqllancer"
+        if e.suite != "micro"
+            && e.suite != "sqllancer"
             && let Some(reason) = e.chdb_exclusion
         {
             results.push(RunResult {

@@ -114,5 +114,3 @@ pub fn assert_modes_agree_on_actual_results(
     }
     ParityOutcome::Pass
 }
-
-

@@ -161,9 +161,8 @@ fn shipped_compare_passes_on_reordered_multiset() {
     )
     .expect("right");
 
-    let result =
-        compare_query_result_batches("reorder", &[left], &[right], RowOrder::Multiset)
-            .expect("compare");
+    let result = compare_query_result_batches("reorder", &[left], &[right], RowOrder::Multiset)
+        .expect("compare");
     assert_eq!(result, QueryValidationResult::Pass);
 }
 
@@ -181,11 +180,7 @@ fn compare_results_wrapper_uses_order_by_from_sql() {
     )
     .expect("b");
 
-    let ordered = Query::new(
-        "ordered".into(),
-        "SELECT v FROM t ORDER BY v".into(),
-        false,
-    );
+    let ordered = Query::new("ordered".into(), "SELECT v FROM t ORDER BY v".into(), false);
     let unordered = Query::new("unordered".into(), "SELECT v FROM t".into(), false);
 
     // ORDER BY without LIMIT: multiset (tie order is not guaranteed).

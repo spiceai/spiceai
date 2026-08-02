@@ -727,14 +727,17 @@ fn timestamp_strings_equivalent(a: &str, b: &str) -> bool {
     /// Exactly `YYYY-MM-DD HH:MM:SS`, the prefix [`array_value_to_string`] emits
     /// for every `Timestamp` unit.
     fn is_timestamp_prefix(s: &str) -> bool {
-        let [y0, y1, y2, y3, b'-', mo0, mo1, b'-', d0, d1, b' ', h0, h1, b':', mi0, mi1, b':', s0, s1] =
-            s.as_bytes()
-        else {
-            return false;
-        };
-        [y0, y1, y2, y3, mo0, mo1, d0, d1, h0, h1, mi0, mi1, s0, s1]
-            .iter()
-            .all(|c| c.is_ascii_digit())
+        /// Literal separators at their exact offsets; `#` marks a digit slot.
+        const SHAPE: &[u8; 19] = b"####-##-## ##:##:##";
+
+        s.len() == SHAPE.len()
+            && s.bytes().zip(SHAPE).all(|(c, &want)| {
+                if want == b'#' {
+                    c.is_ascii_digit()
+                } else {
+                    c == want
+                }
+            })
     }
 
     /// Splits into the `YYYY-MM-DD HH:MM:SS` prefix and its fractional digits with
@@ -1501,9 +1504,8 @@ mod test {
         )
         .expect("right");
 
-        let result =
-            compare_query_result_batches("values", &[left], &[right], RowOrder::Multiset)
-                .expect("compare");
+        let result = compare_query_result_batches("values", &[left], &[right], RowOrder::Multiset)
+            .expect("compare");
         assert!(
             matches!(
                 result,

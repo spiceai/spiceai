@@ -75,11 +75,7 @@ pub fn write_coverage_report(path: &Path, results: &[RunResult]) -> std::io::Res
 
     writeln!(md, "## Run results").ok();
     writeln!(md).ok();
-    writeln!(
-        md,
-        "| Suite | Query | Engine pair | Status | Detail |"
-    )
-    .ok();
+    writeln!(md, "| Suite | Query | Engine pair | Status | Detail |").ok();
     writeln!(md, "|-------|-------|-------------|--------|--------|").ok();
 
     let mut pass = 0usize;

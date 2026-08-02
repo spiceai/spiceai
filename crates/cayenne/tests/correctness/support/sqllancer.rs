@@ -122,17 +122,29 @@ pub fn sqllancer_queries() -> Vec<Query> {
         // --- scans / projections ---
         q("sl_scan_t0", "SELECT c0, c1, c2, c3 FROM sqllancer_t0"),
         q("sl_scan_t1", "SELECT c0, c1, c2 FROM sqllancer_t1"),
-        q("sl_project_expr", "SELECT c0 + c1 AS s, c3 * 2.0 AS d FROM sqllancer_t0"),
+        q(
+            "sl_project_expr",
+            "SELECT c0 + c1 AS s, c3 * 2.0 AS d FROM sqllancer_t0",
+        ),
         // --- filters ---
-        q("sl_filter_eq", "SELECT c0, c1 FROM sqllancer_t0 WHERE c1 = 3"),
-        q("sl_filter_range", "SELECT c0 FROM sqllancer_t0 WHERE c0 BETWEEN 10 AND 40"),
+        q(
+            "sl_filter_eq",
+            "SELECT c0, c1 FROM sqllancer_t0 WHERE c1 = 3",
+        ),
+        q(
+            "sl_filter_range",
+            "SELECT c0 FROM sqllancer_t0 WHERE c0 BETWEEN 10 AND 40",
+        ),
         // Keep a non-null companion column so CSV null-type inference never
         // collapses the batch to Arrow `Null` when only empty fields remain.
         q(
             "sl_filter_null",
             "SELECT c0, c1, c2 FROM sqllancer_t0 WHERE c2 IS NULL",
         ),
-        q("sl_filter_not_null", "SELECT c0 FROM sqllancer_t0 WHERE c0 IS NOT NULL"),
+        q(
+            "sl_filter_not_null",
+            "SELECT c0 FROM sqllancer_t0 WHERE c0 IS NOT NULL",
+        ),
         q(
             "sl_filter_or",
             "SELECT c0, c1 FROM sqllancer_t0 WHERE c1 = 1 OR c1 = 2",
@@ -149,8 +161,14 @@ pub fn sqllancer_queries() -> Vec<Query> {
         q("sl_count_star", "SELECT COUNT(*) FROM sqllancer_t0"),
         q("sl_count_col", "SELECT COUNT(c0) FROM sqllancer_t0"),
         q("sl_sum", "SELECT SUM(c0), SUM(c1) FROM sqllancer_t0"),
-        q("sl_avg", "SELECT AVG(c3) FROM sqllancer_t0 WHERE c3 IS NOT NULL"),
-        q("sl_minmax", "SELECT MIN(c0), MAX(c0), MIN(c1), MAX(c1) FROM sqllancer_t0"),
+        q(
+            "sl_avg",
+            "SELECT AVG(c3) FROM sqllancer_t0 WHERE c3 IS NOT NULL",
+        ),
+        q(
+            "sl_minmax",
+            "SELECT MIN(c0), MAX(c0), MIN(c1), MAX(c1) FROM sqllancer_t0",
+        ),
         q(
             "sl_groupby",
             "SELECT c1, COUNT(*), SUM(c0) FROM sqllancer_t0 GROUP BY c1",
@@ -258,6 +276,5 @@ fn load_extra_queries() -> Option<Vec<Query>> {
 #[must_use]
 pub fn sqllancer_sql_for_chdb(sql: &str) -> String {
     // DataFusion `NULLS LAST` is not valid in ClickHouse — drop it.
-    sql.replace(" NULLS LAST", "")
-        .replace(" nulls last", "")
+    sql.replace(" NULLS LAST", "").replace(" nulls last", "")
 }

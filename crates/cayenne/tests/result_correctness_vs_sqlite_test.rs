@@ -84,9 +84,7 @@ async fn run_pair(
             detail: e,
         },
         (Ok(_), Err(e)) => {
-            if e.contains("syntax error")
-                || e.contains("no such function")
-                || e.contains("near \"")
+            if e.contains("syntax error") || e.contains("no such function") || e.contains("near \"")
             {
                 ParityOutcome::Excluded {
                     reason: format!("SQLite dialect/parser rejects SQL: {e}"),
@@ -214,9 +212,7 @@ async fn ssb_full_result_parity_vs_sqlite() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sqllancer_corpus_parity_vs_sqlite() {
-    use support::sqllancer::{
-        SQLLANCER_TABLES, make_t0_batch, make_t1_batch, sqllancer_queries,
-    };
+    use support::sqllancer::{SQLLANCER_TABLES, make_t0_batch, make_t1_batch, sqllancer_queries};
 
     let scratch = scratch_dir();
     std::fs::create_dir_all(&scratch).ok();

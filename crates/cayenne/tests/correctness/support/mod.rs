@@ -249,7 +249,9 @@ impl CayenneHarness {
         let schema = df.schema().as_arrow().clone();
         let schema = Arc::new(Schema::from(schema));
 
-        let table_path = self.data_path.join(format!("{table_name}_{}", mode.as_str()));
+        let table_path = self
+            .data_path
+            .join(format!("{table_name}_{}", mode.as_str()));
         std::fs::create_dir_all(&table_path).expect("table data dir");
 
         let table = Arc::new(
@@ -318,12 +320,14 @@ impl CayenneHarness {
                         continue;
                     }
                     let schema = batch.schema();
-                    let stream = Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-                        schema,
-                        futures::stream::iter(vec![
-                            Ok::<_, datafusion::error::DataFusionError>(batch),
-                        ]),
-                    ));
+                    let stream = Box::pin(
+                        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                            schema,
+                            futures::stream::iter(vec![
+                                Ok::<_, datafusion::error::DataFusionError>(batch),
+                            ]),
+                        ),
+                    );
                     let cdc = table
                         .write_cdc_append_stream(stream, &task_ctx)
                         .await

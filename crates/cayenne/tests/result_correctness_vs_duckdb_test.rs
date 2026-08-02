@@ -99,7 +99,10 @@ fn generate_tpch_parquet(out_dir: &Path, sf: f64) -> PathBuf {
     out_dir.to_path_buf()
 }
 
-fn load_duckdb_from_parquet(parquet_dir: &Path, tables: &[&str]) -> (tempfile::TempDir, Connection) {
+fn load_duckdb_from_parquet(
+    parquet_dir: &Path,
+    tables: &[&str],
+) -> (tempfile::TempDir, Connection) {
     let temp = tempfile::tempdir().expect("duckdb temp");
     let db_path = temp.path().join("parity.duckdb");
     let conn = Connection::open(&db_path).expect("duckdb open");
@@ -516,8 +519,7 @@ async fn tpcds_and_clickbench_parity_vs_duckdb() {
             name: "*".into(),
             engine_pair: "cayenne-duckdb",
             outcome: ParityOutcome::Excluded {
-                reason: "TPC-DS parquet generation produced no tables in this environment"
-                    .into(),
+                reason: "TPC-DS parquet generation produced no tables in this environment".into(),
             },
         });
     } else {
@@ -526,15 +528,9 @@ async fn tpcds_and_clickbench_parity_vs_duckdb() {
         let _keep = duck_temp;
 
         for q in get_tpcds_test_queries(None, Some(1.0)) {
-            let outcome = run_pair_with_df_baseline(
-                "tpcds",
-                &q,
-                &cayenne,
-                &duck,
-                None,
-                Some(&tpcds_dir),
-            )
-            .await;
+            let outcome =
+                run_pair_with_df_baseline("tpcds", &q, &cayenne, &duck, None, Some(&tpcds_dir))
+                    .await;
             eprintln!("tpcds/{} -> {outcome:?}", q.name);
             results.push(RunResult {
                 suite: "tpcds".into(),
@@ -559,7 +555,10 @@ async fn tpcds_and_clickbench_parity_vs_duckdb() {
                 "CLICKBENCH_HITS_PARQUET set but file missing: {}",
                 path.display()
             );
-            (path, "full SF1 hits via CLICKBENCH_HITS_PARQUET".to_string())
+            (
+                path,
+                "full SF1 hits via CLICKBENCH_HITS_PARQUET".to_string(),
+            )
         }
         None => {
             let note = format!(
@@ -586,9 +585,7 @@ async fn tpcds_and_clickbench_parity_vs_duckdb() {
     };
 
     let mut cayenne_hits = CayenneHarness::new().await;
-    cayenne_hits
-        .load_parquet_table("hits", &hits_path)
-        .await;
+    cayenne_hits.load_parquet_table("hits", &hits_path).await;
 
     let duck_temp = tempfile::tempdir().expect("duck hits");
     let duck_path = duck_temp.path().join("hits.duckdb");
@@ -600,20 +597,17 @@ async fn tpcds_and_clickbench_parity_vs_duckdb() {
     .expect("duck load hits");
 
     // DF baseline dir: register_parquet expects `{table}.parquet` beside peers.
-    let hits_baseline_dir = if hits_path.file_name().and_then(|s| s.to_str()) == Some("hits.parquet")
-    {
-        hits_path
-            .parent()
-            .expect("hits parent")
-            .to_path_buf()
-    } else {
-        // Symlink/copy into temp dir under the canonical name.
-        let link = hits_dir.path().join("hits.parquet");
-        if !link.exists() {
-            std::fs::copy(&hits_path, &link).expect("copy hits for baseline");
-        }
-        hits_dir.path().to_path_buf()
-    };
+    let hits_baseline_dir =
+        if hits_path.file_name().and_then(|s| s.to_str()) == Some("hits.parquet") {
+            hits_path.parent().expect("hits parent").to_path_buf()
+        } else {
+            // Symlink/copy into temp dir under the canonical name.
+            let link = hits_dir.path().join("hits.parquet");
+            if !link.exists() {
+                std::fs::copy(&hits_path, &link).expect("copy hits for baseline");
+            }
+            hits_dir.path().to_path_buf()
+        };
 
     eprintln!("clickbench fixture: {clickbench_fixture_note}");
 
@@ -672,9 +666,7 @@ async fn tpcds_and_clickbench_parity_vs_duckdb() {
 /// remapped to an accurate dialect/SQL-surface exclusion — never "lacks column".
 fn reclassify_schema_exclusion(outcome: ParityOutcome) -> ParityOutcome {
     match outcome {
-        ParityOutcome::EngineError { side, detail }
-            if is_missing_column_error(&detail) =>
-        {
+        ParityOutcome::EngineError { side, detail } if is_missing_column_error(&detail) => {
             ParityOutcome::Excluded {
                 reason: format!(
                     "reduced hits fixture missing column required by query ({side}): {detail}"
@@ -1040,7 +1032,9 @@ async fn chbench_sf1_load_mode_matrix_vs_duckdb() {
     let scratch = scratch_dir();
     std::fs::create_dir_all(&scratch).ok();
     let warehouses = env_f64("CAYENNE_PARITY_CHBENCH_SF", 1.0) as i64;
-    eprintln!("CH-benCHmark SF={warehouses} harness matrix: full|append|changes vs DuckDB + cross-mode");
+    eprintln!(
+        "CH-benCHmark SF={warehouses} harness matrix: full|append|changes vs DuckDB + cross-mode"
+    );
 
     let chbench_dir = scratch.join(format!("chbench_sf{warehouses}"));
     if !chbench_dir.join("order_line.parquet").exists() {

@@ -342,8 +342,8 @@ fn make_date_batch(n: usize) -> RecordBatch {
     let mut dow = 2i32;
 
     for _ in 0..n {
-        let dim = days_in_month[m]
-            + i32::from(m == 1 && y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
+        let dim =
+            days_in_month[m] + i32::from(m == 1 && y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
         let key = y * 10_000 + (m as i32 + 1) * 100 + d;
         datekey.push(key);
         date_s.push(format!("{y:04}-{:02}-{:02}", m + 1, d));
@@ -357,16 +357,18 @@ fn make_date_batch(n: usize) -> RecordBatch {
         daynuminyear.push(doy);
         monthnuminyear.push(m as i32 + 1);
         weeknuminyear.push(((doy - 1) / 7) + 1);
-        sellingseason.push(if m < 3 {
-            "Winter"
-        } else if m < 6 {
-            "Spring"
-        } else if m < 9 {
-            "Summer"
-        } else {
-            "Fall"
-        }
-        .to_string());
+        sellingseason.push(
+            if m < 3 {
+                "Winter"
+            } else if m < 6 {
+                "Spring"
+            } else if m < 9 {
+                "Summer"
+            } else {
+                "Fall"
+            }
+            .to_string(),
+        );
         lastdayinweekfl.push(i32::from(dow == 6));
         lastdayinmonthfl.push(i32::from(d == dim));
         holidayfl.push(0);
@@ -442,7 +444,13 @@ fn make_customer_batch(n: usize) -> RecordBatch {
         Field::new("c_phone", DataType::Utf8, false),
         Field::new("c_mktsegment", DataType::Utf8, false),
     ]));
-    let segs = ["AUTOMOBILE", "BUILDING", "FURNITURE", "HOUSEHOLD", "MACHINERY"];
+    let segs = [
+        "AUTOMOBILE",
+        "BUILDING",
+        "FURNITURE",
+        "HOUSEHOLD",
+        "MACHINERY",
+    ];
     let mut keys = Vec::with_capacity(n);
     let mut names = Vec::with_capacity(n);
     let mut addrs = Vec::with_capacity(n);
@@ -459,7 +467,12 @@ fn make_customer_batch(n: usize) -> RecordBatch {
         cities.push(city);
         nations.push(nation);
         regions.push(region);
-        phones.push(format!("10-{:03}-{:03}-{:04}", i % 1000, i % 1000, i % 10000));
+        phones.push(format!(
+            "10-{:03}-{:03}-{:04}",
+            i % 1000,
+            i % 1000,
+            i % 10000
+        ));
         mkt.push(segs[i % segs.len()].to_string());
     }
     RecordBatch::try_new(
@@ -503,7 +516,12 @@ fn make_supplier_batch(n: usize) -> RecordBatch {
         cities.push(city);
         nations.push(nation);
         regions.push(region);
-        phones.push(format!("20-{:03}-{:03}-{:04}", i % 1000, i % 1000, i % 10000));
+        phones.push(format!(
+            "20-{:03}-{:03}-{:04}",
+            i % 1000,
+            i % 1000,
+            i % 10000
+        ));
     }
     RecordBatch::try_new(
         schema,
@@ -662,26 +680,26 @@ fn make_lineorder_batch(
     // supp 7: UNITED ST (AMERICA).
     let seed_specs: &[(i32, i32, i32, usize)] = &[
         // (custkey, partkey, suppkey, date_idx)
-        (1, 6, 2, 400),     // Q2.1: MFGR#12 × AMERICA ~1993
+        (1, 6, 2, 400), // Q2.1: MFGR#12 × AMERICA ~1993
         (6, 6, 7, 401),
         (11, 6, 12, 402),
-        (2, 507, 4, 500),   // Q2.2: MFGR#2221 × ASIA
+        (2, 507, 4, 500), // Q2.2: MFGR#2221 × ASIA
         (7, 507, 9, 501),
         (12, 507, 14, 502),
-        (3, 507, 1, 800),   // Q2.3: MFGR#2221 × EUROPE
+        (3, 507, 1, 800), // Q2.3: MFGR#2221 × EUROPE
         (8, 507, 6, 801),
         (23, 6, 16, 1_000), // Q3.2/3.3: UNITED KI × UNITED KI
         (48, 6, 16, 1_001),
         (23, 6, 16, 2_165), // Q3.4: UK × UK × Dec1997
         (48, 6, 16, 2_166),
-        (2, 6, 4, 900),     // Q3.1: ASIA × ASIA
+        (2, 6, 4, 900), // Q3.1: ASIA × ASIA
         (7, 6, 9, 901),
-        (1, 1, 2, 1_900),   // Q4.1/4.2: AMERICA × AMERICA × MFGR#1 ~1997
-        (6, 2, 7, 1_901),   // MFGR#2
-        (1, 1, 2, 2_200),   // ~1998
+        (1, 1, 2, 1_900), // Q4.1/4.2: AMERICA × AMERICA × MFGR#1 ~1997
+        (6, 2, 7, 1_901), // MFGR#2
+        (1, 1, 2, 2_200), // ~1998
         (6, 2, 7, 2_201),
-        (1, 16, 7, 1_900),  // Q4.3: AMERICA × UNITED ST × MFGR#14 ~1997
-        (6, 16, 7, 2_200),  // ~1998
+        (1, 16, 7, 1_900), // Q4.3: AMERICA × UNITED ST × MFGR#14 ~1997
+        (6, 16, 7, 2_200), // ~1998
     ];
 
     for i in 0..n {

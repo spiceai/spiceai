@@ -79,7 +79,9 @@ pub fn duckdb_query_batches(
     conn: &duckdb::Connection,
     sql: &str,
 ) -> Result<Vec<RecordBatch>, String> {
-    let mut stmt = conn.prepare(sql).map_err(|e| format!("duckdb prepare: {e}"))?;
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|e| format!("duckdb prepare: {e}"))?;
     let batches: Vec<RecordBatch> = stmt
         .query_arrow([])
         .map_err(|e| format!("duckdb query_arrow: {e}"))?
