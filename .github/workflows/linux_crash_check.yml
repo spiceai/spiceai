@@ -70,16 +70,23 @@ jobs:
           test -x "$TEST_BIN"
 
       - name: Run the test
+        # Match the build step's env or cargo re-fingerprints and rebuilds.
+        env:
+          CARGO_INCREMENTAL: 0
         run: cargo test -p spiced --lib crash_handler -- --nocapture
 
       # Re-run the faulting child directly so the report itself lands in the log.
+      # The child is meant to die, so drop the shell's inherited `-e`.
       - name: Show a real crash report
         run: |
-          set -uo pipefail
+          set +e
           SPICED_CRASH_HANDLER_TEST_CHILD=1 "$TEST_BIN" \
             --exact crash_handler::tests::reports_a_fatal_signal --nocapture \
             > child.out 2> report.txt
-          echo "child exit: $?"
+          STATUS=$?
+          set -e
+          echo "child exit: $STATUS (139 = SIGSEGV)"
+          test "$STATUS" -eq 139
           echo "───────── report ─────────"
           cat report.txt
           echo "──────────────────────────"
