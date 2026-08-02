@@ -36,6 +36,11 @@ jobs:
     # GitHub-hosted on purpose: this is a sub-second check and must not queue
     # behind the saturated self-hosted pool.
     runs-on: ubuntu-24.04
+    # Checkout plus a local Node script against a stub API — the job reads the
+    # repository and nothing else, so it needs no write scope and no token
+    # beyond `contents`.
+    permissions:
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
