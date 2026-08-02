@@ -129,20 +129,25 @@ static PHASE: AtomicU8 = AtomicU8::new(Phase::Starting as u8);
 /// Seconds since [`START`] at which the current phase was entered.
 static PHASE_AT_S: AtomicU64 = AtomicU64::new(0);
 
-/// Records the phase the run has just entered. Cheap enough (two relaxed
-/// stores) to call from anywhere, including a hot path.
+/// Records the phase the run has just entered. Two stores, so cheap enough to
+/// call from anywhere, including a hot path.
 pub(crate) fn set_phase(phase: Phase) {
-    // Order matters: the timestamp is written first so a probe landing between
-    // the two stores reports the *old* phase with a slightly early clock,
-    // rather than the new phase with the old phase's start time — which would
-    // read as a phase that had already been running for an hour.
+    // The timestamp is written first, and the phase is *released* after it, so
+    // a reader that acquires the new phase is guaranteed to see the timestamp
+    // that goes with it. Relaxed on both would let the two stores be observed
+    // out of order, and a probe that saw the new phase with the previous
+    // phase's start time would report a phase that had already been running
+    // for an hour — the exact reading this ordering exists to prevent.
     PHASE_AT_S.store(START.elapsed().as_secs(), Ordering::Relaxed);
-    PHASE.store(phase as u8, Ordering::Relaxed);
+    PHASE.store(phase as u8, Ordering::Release);
 }
 
 /// The current phase, and how many whole seconds the run has been in it.
 pub(crate) fn phase() -> (Phase, u64) {
-    let phase = Phase::from_u8(PHASE.load(Ordering::Relaxed));
+    // Acquire pairs with the release in [`set_phase`]: seeing a phase means
+    // seeing the timestamp stored before it, so the two can never be read from
+    // different transitions.
+    let phase = Phase::from_u8(PHASE.load(Ordering::Acquire));
     let entered_at = PHASE_AT_S.load(Ordering::Relaxed);
     (phase, START.elapsed().as_secs().saturating_sub(entered_at))
 }
@@ -204,6 +209,15 @@ pub(crate) async fn serve(listen: &str) -> Option<SocketAddr> {
     // arrive.
     let _ = *START;
     println!("Liveness endpoints on http://{addr} (/health, /v1/ready)");
+    // Nothing authenticates these, so anything but loopback publishes the run's
+    // phase to whoever can reach the port. That is a legitimate choice (a
+    // container's loopback is not reachable from the harness outside it), but
+    // it should never happen without the run log saying so.
+    if !addr.ip().is_loopback() {
+        eprintln!(
+            "WARNING: liveness endpoints are unauthenticated and bound off-loopback on {addr}"
+        );
+    }
 
     tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, router()).await {
@@ -217,6 +231,18 @@ pub(crate) async fn serve(listen: &str) -> Option<SocketAddr> {
 mod tests {
     use super::{DEFAULT_LISTEN, Phase, phase, ready_response, serve, set_phase};
     use axum::http::StatusCode;
+    use std::sync::{Mutex, MutexGuard, PoisonError};
+
+    /// Held by every test that moves the phase. The phase is process-global and
+    /// the harness runs tests on several threads, so without this two of them
+    /// interleave their `set_phase` calls and each reads the other's phase.
+    static PHASE_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Takes [`PHASE_LOCK`], recovering it if an earlier test panicked while
+    /// holding it: poisoning would otherwise turn one failure into two.
+    fn phase_guard() -> MutexGuard<'static, ()> {
+        PHASE_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 
     /// The phases a run passes through, in order.
     const EVERY_PHASE: [Phase; 6] = [
@@ -271,10 +297,10 @@ mod tests {
         }
     }
 
-    /// The status/body pairing the harness keys off. Serialized against the
-    /// other tests by running in one test, since the phase is process-global.
+    /// The status/body pairing the harness keys off.
     #[test]
     fn the_ready_body_names_the_phase_and_its_status_follows_it() {
+        let _guard = phase_guard();
         set_phase(Phase::PreparingSource);
         let (status, body) = ready_response();
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -324,52 +350,65 @@ mod tests {
 
     /// The endpoints as a probe actually sees them: over HTTP, with the phase
     /// moving underneath.
-    #[tokio::test]
-    async fn the_endpoints_answer_over_http_and_track_the_phase() {
-        set_phase(Phase::PreparingSource);
-        let addr = serve("127.0.0.1:0").await.expect("bound an ephemeral port");
-        let base = format!("http://{addr}");
-        let client = reqwest::Client::new();
+    ///
+    /// A `block_on` inside a plain test rather than `#[tokio::test]`, so the
+    /// phase guard is held across the runtime call in synchronous code — an
+    /// async test would hold a `MutexGuard` across its awaits.
+    #[test]
+    fn the_endpoints_answer_over_http_and_track_the_phase() {
+        let _guard = phase_guard();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
 
-        let health = client
-            .get(format!("{base}/health"))
-            .send()
-            .await
-            .expect("health answered");
-        assert_eq!(health.status(), 200);
-        assert_eq!(health.text().await.unwrap_or_default(), "ok\n");
+        runtime.block_on(async {
+            set_phase(Phase::PreparingSource);
+            let addr = serve("127.0.0.1:0").await.expect("bound an ephemeral port");
+            let base = format!("http://{addr}");
+            let client = reqwest::Client::new();
 
-        let not_ready = client
-            .get(format!("{base}/v1/ready"))
-            .send()
-            .await
-            .expect("ready answered");
-        assert_eq!(not_ready.status(), 503, "seeding is not ready");
-        assert!(
-            not_ready
-                .text()
+            let health = client
+                .get(format!("{base}/health"))
+                .send()
                 .await
-                .unwrap_or_default()
-                .contains("phase=preparing_source")
-        );
+                .expect("health answered");
+            assert_eq!(health.status(), 200);
+            assert_eq!(health.text().await.unwrap_or_default(), "ok\n");
 
-        set_phase(Phase::Running);
-        let ready = client
-            .get(format!("{base}/v1/ready"))
-            .send()
-            .await
-            .expect("ready answered");
-        assert_eq!(ready.status(), 200, "load is being applied");
+            let not_ready = client
+                .get(format!("{base}/v1/ready"))
+                .send()
+                .await
+                .expect("ready answered");
+            assert_eq!(not_ready.status(), 503, "seeding is not ready");
+            assert!(
+                not_ready
+                    .text()
+                    .await
+                    .unwrap_or_default()
+                    .contains("phase=preparing_source")
+            );
 
-        // A path neither endpoint owns must not be answered as if it were one.
-        let unknown = client
-            .get(format!("{base}/v1/nope"))
-            .send()
-            .await
-            .expect("answered");
-        assert_eq!(unknown.status(), 404);
+            set_phase(Phase::Running);
+            let ready = client
+                .get(format!("{base}/v1/ready"))
+                .send()
+                .await
+                .expect("ready answered");
+            assert_eq!(ready.status(), 200, "load is being applied");
 
-        set_phase(Phase::Starting);
+            // A path neither endpoint owns must not be answered as if it were
+            // one.
+            let unknown = client
+                .get(format!("{base}/v1/nope"))
+                .send()
+                .await
+                .expect("answered");
+            assert_eq!(unknown.status(), 404);
+
+            set_phase(Phase::Starting);
+        });
     }
 
     #[test]
