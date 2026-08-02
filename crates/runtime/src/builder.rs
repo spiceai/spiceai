@@ -1984,19 +1984,21 @@ mod test {
         assert!(!cayenne_configured(None));
     }
 
-    /// Build a Spicepod app from `(engine, enabled, mode, refresh_mode, refresh_check_interval)`
-    /// dataset tuples, plus `cayenne_views` Cayenne-accelerated file-mode views.
+    /// One accelerated dataset for [`cayenne_budget_app`], as
+    /// `(engine, enabled, mode, refresh_mode, refresh_check_interval)`.
     #[cfg(not(windows))]
-    fn cayenne_budget_app(
-        datasets: Vec<(
-            &str,
-            bool,
-            spicepod::acceleration::Mode,
-            Option<spicepod::acceleration::RefreshMode>,
-            Option<&str>,
-        )>,
-        cayenne_views: usize,
-    ) -> Arc<app::App> {
+    type DatasetSpec<'a> = (
+        &'a str,
+        bool,
+        spicepod::acceleration::Mode,
+        Option<spicepod::acceleration::RefreshMode>,
+        Option<&'a str>,
+    );
+
+    /// Build a Spicepod app from `datasets`, plus `cayenne_views` Cayenne-accelerated
+    /// file-mode views.
+    #[cfg(not(windows))]
+    fn cayenne_budget_app(datasets: Vec<DatasetSpec<'_>>, cayenne_views: usize) -> Arc<app::App> {
         use spicepod::acceleration::{Acceleration, Mode};
         use spicepod::component::{dataset::Dataset, view::View};
 
