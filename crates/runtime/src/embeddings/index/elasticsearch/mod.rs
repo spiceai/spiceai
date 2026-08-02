@@ -518,17 +518,32 @@ fn insert_key_column_mappings(
     }
 }
 
-/// The Elasticsearch mapping for a primary-key column: exact-matchable, never analyzed.
+/// The Elasticsearch mapping for a primary-key column: exact-matchable, never analyzed, and wide
+/// enough for every value the Arrow type can hold.
+///
+/// Deliberately not [`arrow_type_to_es_mapping`], which is tuned for metadata columns and would
+/// hurt a key twice: it maps a string to analyzed `text` (unmatchable by an exact filter), and it
+/// narrows the unsigned integers to signed Elasticsearch types — `UInt32` to `integer` and
+/// `UInt64` to `long` — so a key above `i32::MAX`/`i64::MAX` would fail to index at all.
 fn key_column_es_mapping(dt: &DataType) -> serde_json::Value {
     match dt {
-        // The analyzed `text` mapping `arrow_type_to_es_mapping` gives a string cannot be matched
-        // exactly, which is the whole point here.
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
             serde_json::json!({ "type": "keyword" })
         }
-        // Every other mapping it produces (`long`, `boolean`, `date`, `keyword`, …) already
-        // indexes the value itself.
-        other => arrow_type_to_es_mapping(other),
+        // Elasticsearch's integers are signed, so each unsigned Arrow type takes the next width up
+        // and `UInt64` takes `unsigned_long` — otherwise a key above the signed maximum, which the
+        // Arrow type allows, could not be indexed.
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::UInt8 | DataType::UInt16 => {
+            serde_json::json!({ "type": "integer" })
+        }
+        DataType::Int64 | DataType::UInt32 => serde_json::json!({ "type": "long" }),
+        DataType::UInt64 => serde_json::json!({ "type": "unsigned_long" }),
+        DataType::Boolean => serde_json::json!({ "type": "boolean" }),
+        DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _) => {
+            serde_json::json!({ "type": "date" })
+        }
+        // `keyword` round-trips anything else losslessly via `_source` and stays exact-matchable.
+        _ => serde_json::json!({ "type": "keyword" }),
     }
 }
 
@@ -659,7 +674,17 @@ pub(crate) async fn ensure_index_with_text_mapping(
             tracing::info!("Created Elasticsearch FTS index '{es_index}'.");
             Ok(())
         }
-        Err(e) if is_index_already_exists_error(&e) => Ok(()),
+        // TOCTOU: another runtime instance created the index between `index_exists` and here.
+        // Apply the mapping update as the `exists` branch above would, so the key columns are
+        // mapped either way.
+        Err(e) if is_index_already_exists_error(&e) => {
+            if let Err(mapping_error) = client.put_mapping(es_index, &mapping_body).await {
+                tracing::warn!(
+                    "Elasticsearch FTS index '{es_index}' exists after concurrent creation but mapping update failed (continuing; existing mapping will be used): {mapping_error}"
+                );
+            }
+            Ok(())
+        }
         Err(e) => Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
     }
 }
@@ -744,6 +769,37 @@ mod tests {
         insert_key_column_mappings(&mut properties, &[field("id", DataType::Utf8)]);
 
         assert_eq!(properties["id"], text_mapping);
+    }
+
+    /// The metadata-column mapping narrows the unsigned integers to signed Elasticsearch types, so
+    /// reusing it for a key would stop `UInt32` keys above `i32::MAX` — which a dynamic mapping
+    /// indexes fine as `long` — from being indexed at all.
+    #[test]
+    fn an_unsigned_key_column_is_mapped_wide_enough_for_every_value() {
+        let mut properties = serde_json::Map::new();
+        insert_key_column_mappings(
+            &mut properties,
+            &[
+                field("small", DataType::UInt16),
+                field("wide", DataType::UInt32),
+                field("widest", DataType::UInt64),
+            ],
+        );
+
+        assert_eq!(properties["small"]["type"], "integer");
+        assert_eq!(
+            properties["wide"]["type"], "long",
+            "a u32 key exceeds Elasticsearch's signed `integer`"
+        );
+        assert_eq!(
+            properties["widest"]["type"], "unsigned_long",
+            "a u64 key exceeds Elasticsearch's signed `long`"
+        );
+        assert_eq!(
+            arrow_type_to_es_mapping(&DataType::UInt32)["type"],
+            "integer",
+            "the metadata mapping this deliberately does not reuse still narrows u32"
+        );
     }
 
     /// Every key column of a composite key needs mapping, not just the first.

@@ -43,6 +43,9 @@ pub fn document_key_columns(primary_key: &[Field]) -> Vec<String> {
 /// request-size limits, regardless of how many keys the caller is deleting in one call.
 const DELETE_CHUNK_ROWS: usize = 512;
 
+/// Where a user goes to fix a key column that Elasticsearch cannot match exactly.
+const ES_VECTORS_DOCS: &str = "https://spiceai.org/docs/components/vectors/elasticsearch";
+
 /// Deletes every document whose `key_columns` match a row of `keys` — an exact-key delete when
 /// `key_columns` covers every `primary_key` column, a prefix delete when it's a strict subset
 /// (the chunked-index case).
@@ -69,9 +72,9 @@ const DELETE_CHUNK_ROWS: usize = 512;
 /// key) rather than the primary key alone, since that's what the default
 /// [`runtime_datafusion_index::Index::resolve_delete_keys`] resolves against.
 ///
-/// Issues one `_delete_by_query` request per [`DELETE_CHUNK_ROWS`]-row slice of `keys` rather
-/// than a single request for the whole batch, so a large delete can't build an unbounded
-/// clause or id list.
+/// Issues one `_delete_by_query` request per [`DELETE_CHUNK_ROWS`] addressed keys rather than a
+/// single request for the whole batch, so a large delete can't build an unbounded clause or id
+/// list.
 ///
 /// Shared by [`super::ElasticsearchIndex`] and [`super::ElasticsearchTextIndex`], which both
 /// address documents the same way (client + index name + primary key columns).
@@ -90,31 +93,23 @@ pub async fn delete_by_keys(
             .iter()
             .all(|f| key_columns.iter().any(|c| c == f.name()));
 
-    // Resolved once per call rather than per request chunk: the mapping is a property of the
-    // index, not of the keys being deleted. Only the term-filter path needs it.
-    let term_fields = if addresses_whole_key || keys.num_rows() == 0 || key_columns.is_empty() {
-        Vec::new()
-    } else {
-        resolve_term_fields(client, es_index, key_columns).await?
-    };
+    if addresses_whole_key {
+        return delete_by_document_id(client, es_index, primary_key, keys).await;
+    }
+    if keys.num_rows() == 0 || key_columns.is_empty() {
+        return Ok(());
+    }
 
-    let mut offset = 0;
-    while offset < keys.num_rows() {
-        let len = DELETE_CHUNK_ROWS.min(keys.num_rows() - offset);
-        let chunk = keys.slice(offset, len);
-        offset += len;
+    // The mapping is a property of the index, not of the keys, so it is read once — and every
+    // row's key is turned into a filter clause *before* the first request goes out. A delete
+    // cannot be rolled back, so a key the 513th row cannot express must not be discovered after
+    // the first 512 rows are already gone.
+    let term_fields = resolve_term_fields(client, es_index, key_columns).await?;
+    let row_clauses = build_row_term_clauses(es_index, &term_fields, keys)?;
 
-        let query = if addresses_whole_key {
-            build_ids_query(primary_key, es_index, &chunk)?
-        } else {
-            build_or_of_row_term_queries(&term_fields, &chunk)?
-        };
-        let Some(query) = query else {
-            continue;
-        };
-
+    for chunk in row_clauses.chunks(DELETE_CHUNK_ROWS) {
         client
-            .delete_by_query(es_index, &query)
+            .delete_by_query(es_index, &or_of_row_clauses(chunk))
             .await
             .boxed()
             .map_err(DataFusionError::External)?;
@@ -123,26 +118,44 @@ pub async fn delete_by_keys(
     Ok(())
 }
 
-/// Builds `{"ids": {"values": ["<_id>", ...]}}` — the documents written for `keys`, addressed by
-/// the `_id` the write path derives for each row.
+/// Deletes the documents `keys` names by the `_id` the write path derived for each row.
+async fn delete_by_document_id(
+    client: &dyn Elasticsearch,
+    es_index: &str,
+    primary_key: &[Field],
+    keys: &RecordBatch,
+) -> DataFusionResult<()> {
+    let ids = document_ids(primary_key, es_index, keys)?;
+
+    for chunk in ids.chunks(DELETE_CHUNK_ROWS) {
+        client
+            .delete_by_query(es_index, &ids_query(chunk))
+            .await
+            .boxed()
+            .map_err(DataFusionError::External)?;
+    }
+
+    Ok(())
+}
+
+/// The `_id`s the write path derived for `keys`, as the values of an `ids` query.
 ///
 /// Rows whose key is NULL (any component, for a composite key) yield no `_id`: the write path
 /// skips them rather than writing under a generated `_id`, so there is no document to delete.
-/// Returns `None` when that leaves nothing to address, so the caller issues no request.
-fn build_ids_query(
+fn document_ids(
     primary_key: &[Field],
     es_index: &str,
     keys: &RecordBatch,
-) -> DataFusionResult<Option<Value>> {
+) -> DataFusionResult<Vec<Value>> {
     let ids = write::extract_primary_key_from_fields(primary_key, es_index, keys)
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-    let values: Vec<Value> = ids.into_iter().flatten().map(Value::String).collect();
-    if values.is_empty() {
-        return Ok(None);
-    }
+    Ok(ids.into_iter().flatten().map(Value::String).collect())
+}
 
-    Ok(Some(json!({ "ids": { "values": values } })))
+/// `{"ids": {"values": ["<_id>", ...]}}` — the documents to remove, addressed by `_id`.
+fn ids_query(ids: &[Value]) -> Value {
+    json!({ "ids": { "values": ids } })
 }
 
 /// Elasticsearch field types that index *analyzed* tokens, so an unanalyzed `term` query against
@@ -192,8 +205,15 @@ impl TermField {
 ///   sub-field cannot simply be assumed: for a key mapped `keyword` outright the bare name is the
 ///   correct one, and for analyzed text without such a sub-field there is no exact-matchable copy
 ///   at all, which is an error rather than a delete that silently removes nothing.
-/// - absent from the mapping → the bare name. Nothing has ever been indexed under it, so there is
-///   no document for the filter to match either way.
+/// - absent from the mapping, and the index maps new fields → the bare name. Nothing has ever been
+///   indexed under it, so there is no document for the filter to match either way. Under
+///   `dynamic: false` or `strict`, an absent field is *never* searchable however, so that is an
+///   error instead.
+/// - carrying a `normalizer` → an error. A normalizer applies to the `term` query's value too, so
+///   two distinct keys can collapse to one term and the delete would remove *more* rows than asked.
+///
+/// Every rejection is a `term` filter that cannot address one row's key. Erring is the
+/// conservative outcome in both directions: neither removing nothing nor removing too much.
 async fn resolve_term_fields(
     client: &dyn Elasticsearch,
     es_index: &str,
@@ -208,7 +228,7 @@ async fn resolve_term_fields(
     // `es_index` may name an alias, in which case the response is keyed by the concrete indexes
     // behind it. Sorted so a mismatch is reported the same way every time.
     let mut indexes: Vec<_> = mapping.iter().collect();
-    indexes.sort_by(|(a, _), (b, _)| a.cmp(b));
+    indexes.sort_by_key(|(name, _)| *name);
 
     key_columns
         .iter()
@@ -218,8 +238,15 @@ async fn resolve_term_fields(
             let mut resolved: Option<TermField> = None;
             for (_, index) in &indexes {
                 let candidate = match index.mappings.properties.get(column) {
-                    None => TermField::bare(column),
                     Some(field) => resolve_one_term_field(es_index, column, field)?,
+                    None if index.mappings.maps_new_fields() => TermField::bare(column),
+                    // `dynamic: false` keeps an unmapped field in `_source` and never indexes it,
+                    // so documents can carry the key while no `term` query can reach it.
+                    None => {
+                        return Err(DataFusionError::External(format!(
+                            "Failed to delete from Elasticsearch index '{es_index}': primary key column '{column}' is not in the index mapping and the index does not map new fields (dynamic is not enabled), so Elasticsearch never indexed the key and the delete would remove nothing. Add '{column}' to the index mapping as 'keyword' and reindex the existing documents. See: {ES_VECTORS_DOCS}"
+                        ).into()));
+                    }
                 };
                 match &resolved {
                     None => resolved = Some(candidate),
@@ -245,6 +272,7 @@ fn resolve_one_term_field(
 ) -> DataFusionResult<TermField> {
     let field_type = field.field_type.as_deref().unwrap_or_default();
     if !ANALYZED_FIELD_TYPES.contains(&field_type) {
+        ensure_addresses_one_value(es_index, column, column, field)?;
         return Ok(TermField {
             column: column.to_string(),
             path: column.to_string(),
@@ -267,29 +295,69 @@ fn resolve_one_term_field(
     let Some((sub_name, sub)) = candidates.first() else {
         return Err(DataFusionError::External(
             format!(
-                "Failed to delete from Elasticsearch index '{es_index}': primary key column '{column}' is mapped as '{field_type}', which indexes analyzed tokens rather than the key itself, and has no 'keyword' sub-field to match exactly against. Deleting a row would silently remove nothing. Re-create the index so '{column}' is mapped as 'keyword', or add a 'keyword' sub-field to it. See: https://spiceai.org/docs/components/vectors/elasticsearch"
+                "Failed to delete from Elasticsearch index '{es_index}': primary key column '{column}' is mapped as '{field_type}', which indexes analyzed tokens rather than the key itself, and has no 'keyword' sub-field to match exactly against. Deleting a row would silently remove nothing. Re-create the index with '{column}' mapped as 'keyword' and reindex the existing documents — adding a sub-field to the live mapping does not populate it for documents already indexed. See: {ES_VECTORS_DOCS}"
             )
             .into(),
         ));
     };
 
+    let path = format!("{column}.{sub_name}");
+    ensure_addresses_one_value(es_index, column, &path, sub)?;
+
     Ok(TermField {
         column: column.to_string(),
-        path: format!("{column}.{sub_name}"),
+        path,
         ignore_above: sub.ignore_above,
     })
 }
 
-/// Builds `{"bool": {"should": [{"bool": {"filter": [{"term": {...}}, ...]}}, ...], "minimum_should_match": 1}}`
-/// — one `should` clause (`term_fields` ANDed) per row of `keys`, rows ORed together.
-fn build_or_of_row_term_queries(
-    term_fields: &[TermField],
-    keys: &RecordBatch,
-) -> DataFusionResult<Option<Value>> {
-    if keys.num_rows() == 0 || term_fields.is_empty() {
-        return Ok(None);
+/// Rejects a resolved field whose `term` query would not address exactly the key it is given.
+///
+/// A `normalizer` is applied to the indexed value *and* to a `term` query's value, so two distinct
+/// keys can reduce to the same term — `{"term": {"id": "bar"}}` against a lowercase-normalized
+/// field also matches the row keyed `BÀR`. The `_id` path is immune because it compares the raw
+/// key, so accepting a normalized field here would make a partial-key delete remove *more* rows
+/// than the exact-key delete would: worse than the under-deletion this whole path guards against.
+fn ensure_addresses_one_value(
+    es_index: &str,
+    column: &str,
+    path: &str,
+    field: &FieldMapping,
+) -> DataFusionResult<()> {
+    if let Some(normalizer) = field.normalizer.as_deref() {
+        return Err(DataFusionError::External(
+            format!(
+                "Failed to delete from Elasticsearch index '{es_index}': primary key column '{column}' is indexed at '{path}' with normalizer '{normalizer}', which rewrites the key both when indexing and when matching, so one key can match another row's documents and the delete could remove rows it was not asked to. Re-create the index with '{column}' mapped as 'keyword' without a normalizer, and reindex the existing documents. See: {ES_VECTORS_DOCS}"
+            )
+            .into(),
+        ));
     }
 
+    // `index: false` — the value is in `_source` but has no inverted index, so no query reaches it.
+    // A declared non-filterable metadata column that is also the primary key lands here.
+    if field.index == Some(false) {
+        return Err(DataFusionError::External(
+            format!(
+                "Failed to delete from Elasticsearch index '{es_index}': primary key column '{column}' is mapped at '{path}' with index=false, so Elasticsearch stores the key without indexing it and no filter can match it — the delete would remove nothing. Declare '{column}' as filterable, or re-create the index with it mapped as an indexed 'keyword', and reindex the existing documents. See: {ES_VECTORS_DOCS}"
+            )
+            .into(),
+        ));
+    }
+
+    Ok(())
+}
+
+/// One `{"bool": {"filter": [{"term": {...}}, ...]}}` clause per row of `keys` whose key can be
+/// addressed — `term_fields` ANDed together. Rows whose key is NULL contribute no clause: the
+/// write path stored no document for them, so there is nothing to remove.
+///
+/// Every row is converted here, before any request is issued, so a key that cannot be expressed
+/// fails the whole delete rather than half of it.
+fn build_row_term_clauses(
+    es_index: &str,
+    term_fields: &[TermField],
+    keys: &RecordBatch,
+) -> DataFusionResult<Vec<Value>> {
     let arrays: Vec<_> = term_fields
         .iter()
         .map(|f| keys.column_by_name(&f.column).cloned())
@@ -306,12 +374,20 @@ fn build_or_of_row_term_queries(
         let mut terms = Vec::with_capacity(term_fields.len());
         for (term_field, array) in term_fields.iter().zip(&arrays) {
             let value = ScalarValue::try_from_array(array.as_ref(), row)?;
-            let Some(json_value) = scalar_to_term_value(&value) else {
-                // A NULL/unsupported key column can never equal anything via `term` — skip this
-                // row's clause entirely rather than emit a filter that matches everything.
+            if value.is_null() {
+                // A NULL key component has no stable identity, so the write path never stored a
+                // document under it — skip this row's clause rather than emit a filter that would
+                // match everything.
                 terms.clear();
                 break;
-            };
+            }
+            let json_value = scalar_to_term_value(&value).ok_or_else(|| {
+                DataFusionError::External(format!(
+                    "Failed to delete from Elasticsearch index '{es_index}': primary key column '{column}' has type {data_type}, which this delete cannot express as an exact-match filter, so it would remove nothing. Use a string or integer primary key for a chunked Elasticsearch index. See: {ES_VECTORS_DOCS}",
+                    column = term_field.column,
+                    data_type = value.data_type(),
+                ).into())
+            })?;
             ensure_within_ignore_above(term_field, &json_value)?;
             terms.push(json!({ "term": { term_field.path.as_str(): json_value } }));
         }
@@ -320,16 +396,17 @@ fn build_or_of_row_term_queries(
         }
     }
 
-    if row_clauses.is_empty() {
-        return Ok(None);
-    }
+    Ok(row_clauses)
+}
 
-    Ok(Some(json!({
+/// `{"bool": {"should": [<row clause>, ...], "minimum_should_match": 1}}` — the rows ORed together.
+fn or_of_row_clauses(row_clauses: &[Value]) -> Value {
+    json!({
         "bool": {
             "should": row_clauses,
             "minimum_should_match": 1
         }
-    })))
+    })
 }
 
 /// Elasticsearch does not index a `keyword` value longer than the field's `ignore_above`, so a
@@ -346,7 +423,7 @@ fn ensure_within_ignore_above(term_field: &TermField, value: &Value) -> DataFusi
     }
     Err(DataFusionError::External(
         format!(
-            "Failed to delete from Elasticsearch: primary key column '{}' has a key of {length} characters, but the index maps '{}' with ignore_above={limit}, so Elasticsearch never indexed it and the delete would remove nothing. Re-create the index mapping '{}' as 'keyword' without an 'ignore_above'. See: https://spiceai.org/docs/components/vectors/elasticsearch",
+            "Failed to delete from Elasticsearch: primary key column '{}' has a key of {length} characters, but the index maps '{}' with ignore_above={limit}, so Elasticsearch never indexed it and the delete would remove nothing. Re-create the index mapping '{}' as 'keyword' without an 'ignore_above', and reindex the existing documents. See: {ES_VECTORS_DOCS}",
             term_field.column, term_field.path, term_field.column
         )
         .into(),
@@ -588,9 +665,8 @@ mod tests {
 
         let written = write::extract_primary_key_from_fields(&primary_key, "idx", &keys)
             .expect("write path should derive ids");
-        let query = build_ids_query(&primary_key, "idx", &keys)
-            .expect("ids query should build")
-            .expect("ids query should be present");
+        let query =
+            ids_query(&document_ids(&primary_key, "idx", &keys).expect("ids should derive"));
 
         let addressed: Vec<Value> = written.into_iter().flatten().map(Value::String).collect();
         assert_eq!(query, json!({"ids": {"values": addressed}}));
@@ -893,6 +969,176 @@ mod tests {
         assert!(client.queries().is_empty());
     }
 
+    /// A `normalizer` rewrites the key when indexing *and* when matching, so `bar` matches the row
+    /// keyed `BÀR`. That makes the partial-key delete remove **more** rows than the exact-key
+    /// (`_id`) delete would — worse than the under-deletion this path exists to fix.
+    #[tokio::test]
+    async fn a_normalized_keyword_key_is_an_error_because_it_could_over_delete() {
+        let client = RecordingClient::with_properties(&[(
+            "id",
+            json!({"type": "keyword", "normalizer": "lowercase"}),
+        )]);
+        let (primary_key, key_columns) = chunked_key("id", DataType::Utf8);
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &primary_key,
+            &key_columns,
+            &string_key_batch(vec![Some("BAR")]),
+        )
+        .await
+        .expect_err("a normalized key could match another row's documents");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("normalizer 'lowercase'") && message.contains("'id'"),
+            "the error must name the normalizer and the column: {message}"
+        );
+        assert!(client.queries().is_empty());
+    }
+
+    /// The same hazard reached through a text field's `keyword` sub-field.
+    #[tokio::test]
+    async fn a_normalized_keyword_sub_field_is_also_an_error() {
+        let client = RecordingClient::with_properties(&[(
+            "id",
+            json!({
+                "type": "text",
+                "fields": { "keyword": { "type": "keyword", "normalizer": "lowercase" } },
+            }),
+        )]);
+        let (primary_key, key_columns) = chunked_key("id", DataType::Utf8);
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &primary_key,
+            &key_columns,
+            &string_key_batch(vec![Some("BAR")]),
+        )
+        .await
+        .expect_err("a normalized sub-field could match another row's documents");
+
+        assert!(err.to_string().contains("id.keyword"), "unexpected: {err}");
+    }
+
+    /// `index: false` stores the key in `_source` without an inverted index, so no filter reaches
+    /// it. A primary-key column the user declared `non-filterable` lands here.
+    #[tokio::test]
+    async fn an_unindexed_key_is_an_error() {
+        let client =
+            RecordingClient::with_properties(&[("id", json!({"type": "keyword", "index": false}))]);
+        let (primary_key, key_columns) = chunked_key("id", DataType::Utf8);
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &primary_key,
+            &key_columns,
+            &string_key_batch(vec![Some("ORDER-1024")]),
+        )
+        .await
+        .expect_err("an unindexed key cannot be matched");
+
+        assert!(
+            err.to_string().contains("index=false"),
+            "unexpected error: {err}"
+        );
+        assert!(client.queries().is_empty());
+    }
+
+    /// Under `dynamic: false` an unmapped field stays in `_source` and is never indexed, so
+    /// "absent from the mapping" no longer implies "no document carries it".
+    #[tokio::test]
+    async fn a_key_absent_from_a_non_dynamic_mapping_is_an_error() {
+        let index_mapping = serde_json::from_value(json!({
+            "mappings": { "dynamic": false, "properties": { "other": {"type": "keyword"} } }
+        }))
+        .expect("index mapping should deserialize");
+        let client = RecordingClient {
+            mapping: Some([("idx".to_string(), index_mapping)].into_iter().collect()),
+            ..Default::default()
+        };
+        let (primary_key, key_columns) = chunked_key("id", DataType::Utf8);
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &primary_key,
+            &key_columns,
+            &string_key_batch(vec![Some("ORDER-1024")]),
+        )
+        .await
+        .expect_err("an unmapped key under dynamic:false is never searchable");
+
+        assert!(
+            err.to_string().contains("does not map new fields"),
+            "unexpected error: {err}"
+        );
+        assert!(client.queries().is_empty());
+    }
+
+    /// A key type the filter cannot express is not the same thing as a NULL key: NULL means no
+    /// document was written, while an unsupported type means one was and cannot be addressed.
+    /// Conflating them turns the second into a delete that removes nothing and returns success.
+    #[tokio::test]
+    async fn an_unsupported_key_type_is_an_error_not_a_skipped_row() {
+        let client = RecordingClient::with_properties(&[("day", json!({"type": "date"}))]);
+        let keys = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("day", DataType::Date32, true)])),
+            vec![Arc::new(arrow::array::Date32Array::from(vec![19_723])) as ArrayRef],
+        )
+        .expect("date key batch should build");
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[
+                pk("day", DataType::Date32),
+                pk(CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64),
+            ],
+            &["day".to_string()],
+            &keys,
+        )
+        .await
+        .expect_err("an inexpressible key must not report a successful delete");
+
+        assert!(
+            err.to_string().contains("'day'"),
+            "the error must name the column: {err}"
+        );
+        assert!(client.queries().is_empty());
+    }
+
+    /// A delete cannot be rolled back, so a key the last row cannot express must be found before
+    /// the first request goes out — not after 512 rows have already been removed.
+    #[tokio::test]
+    async fn a_key_that_cannot_be_expressed_fails_before_any_row_is_deleted() {
+        let client = RecordingClient::with_properties(&[(
+            "id",
+            json!({"type": "keyword", "ignore_above": 8}),
+        )]);
+        // The over-long key is in the second request's slice, past the first full chunk.
+        let mut values: Vec<String> = (0..DELETE_CHUNK_ROWS).map(|i| format!("k{i}")).collect();
+        values.push("a-key-past-the-limit".to_string());
+        let keys = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, true)])),
+            vec![Arc::new(StringArray::from(values))],
+        )
+        .expect("large key batch should build");
+        let (primary_key, key_columns) = chunked_key("id", DataType::Utf8);
+
+        delete_by_keys(&client, "idx", &primary_key, &key_columns, &keys)
+            .await
+            .expect_err("the unmatchable key must fail the delete");
+
+        assert!(
+            client.queries().is_empty(),
+            "no row may be deleted when one of them cannot be addressed"
+        );
+    }
+
     /// A non-string key is exact-matchable under its own name whatever the mapping says about
     /// analysis, and carries no `ignore_above` to trip over.
     #[tokio::test]
@@ -1090,9 +1336,10 @@ mod tests {
     #[test]
     fn a_chunked_index_deletes_every_chunk_of_a_base_key() {
         let chunked = ChunkedSearchIndex::augment_primary_key(vec![id_field()]);
-        let query = build_or_of_row_term_queries(&bare_term_fields(&chunked), &base_keys(&[7]))
-            .expect("query builds")
-            .expect("non-empty batch produces a query");
+        let query = or_of_row_clauses(
+            &build_row_term_clauses("idx", &bare_term_fields(&chunked), &base_keys(&[7]))
+                .expect("clauses build"),
+        );
 
         let clauses = query["bool"]["should"]
             .as_array()
@@ -1114,7 +1361,7 @@ mod tests {
             .map(|f| TermField::bare(f.name()))
             .collect();
 
-        let err = build_or_of_row_term_queries(&full, &base_keys(&[7]))
+        let err = build_row_term_clauses("idx", &full, &base_keys(&[7]))
             .expect_err("the chunk id is not in the batch");
         assert!(
             err.to_string().contains(CHUNKED_INDEX_CHUNK_KEY),
@@ -1135,9 +1382,10 @@ mod tests {
         )
         .expect("valid batch");
 
-        let query = build_or_of_row_term_queries(&bare_term_fields(&chunked), &keys)
-            .expect("query builds")
-            .expect("non-empty batch produces a query");
+        let query = or_of_row_clauses(
+            &build_row_term_clauses("idx", &bare_term_fields(&chunked), &keys)
+                .expect("clauses build"),
+        );
 
         assert_eq!(
             query["bool"]["should"][0]["bool"]["filter"],

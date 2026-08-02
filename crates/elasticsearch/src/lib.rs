@@ -77,10 +77,35 @@ pub struct IndexMapping {
     pub mappings: Mappings,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct Mappings {
     #[serde(default)]
     pub properties: HashMap<String, FieldMapping>,
+    /// The index's `dynamic` setting — `true` (map new fields), `false` (keep them in `_source`
+    /// but leave them unindexed and unsearchable), `"strict"` (reject them), or `"runtime"`.
+    /// A JSON bool or string, so it is kept raw; [`Mappings::maps_new_fields`] interprets it.
+    #[serde(default)]
+    pub dynamic: Option<serde_json::Value>,
+}
+
+impl Mappings {
+    /// Whether a field absent from [`Self::properties`] would be indexed if a document carried it.
+    ///
+    /// `false` means an absent field is *not* searchable — a `term` query against it can never
+    /// match, even though the value is in `_source`.
+    #[must_use]
+    pub fn maps_new_fields(&self) -> bool {
+        match self.dynamic.as_ref() {
+            Some(serde_json::Value::Bool(false)) => false,
+            // `"true"`/`"false"` are also accepted as strings; `"strict"` rejects an unmapped
+            // field, while `"runtime"` maps it to a runtime field, which is searchable.
+            Some(serde_json::Value::String(dynamic)) => {
+                matches!(dynamic.as_str(), "true" | "runtime")
+            }
+            // Absent is Elasticsearch's default, `true`.
+            _ => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -97,6 +122,13 @@ pub struct FieldMapping {
     /// For `keyword` fields: values longer than this many characters are not indexed at all, so
     /// an exact-match query cannot find them.
     pub ignore_above: Option<usize>,
+    /// For `keyword` fields: a normalizer applied both when indexing and to a `term` query's
+    /// value, so two distinct values (`BÀR`, `bar`) can collapse to the same term. An exact-match
+    /// query against such a field does not address one value.
+    pub normalizer: Option<String>,
+    /// `index: false` stores the value in `_source` without an inverted index, so no query can
+    /// match on the field at all. Absent means Elasticsearch's default, `true`.
+    pub index: Option<bool>,
     /// For `dense_vector` fields.
     pub dims: Option<i64>,
     /// Similarity metric for `dense_vector` (e.g. `cosine`, `l2_norm`, `dot_product`).
