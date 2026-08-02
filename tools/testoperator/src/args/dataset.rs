@@ -166,16 +166,24 @@ impl Fleet {
         self.clients * self.queries_per_client
     }
 
-    /// Client-side connection slots across the fleet: `clients` pools of
-    /// `connections_per_client` each.
+    /// Client-side connection slots *provisioned* across the fleet: `clients`
+    /// pools of `connections_per_client` each.
     ///
-    /// This equals the connections the server sees only when one executor object
-    /// is one connection on the wire — true for the Flight executor, whose
-    /// `spiceai::Client` is a single multiplexed HTTP/2 channel however many
-    /// workers share it. It is NOT true of a `reqwest`-backed executor, where an
-    /// executor is an uncapped HTTP/1.1 pool that opens a connection per
-    /// concurrent in-flight request; [`DatasetTestArgs::validate_fleet`] rejects
-    /// that combination rather than reporting a figure it cannot establish.
+    /// This is the configured size, not a prediction of what the server will
+    /// observe, and the two coincide only under both of these:
+    ///
+    /// - One executor object is one connection on the wire. True for the Flight
+    ///   executor, whose `spiceai::Client` is a single multiplexed HTTP/2 channel
+    ///   however many workers share it. NOT true of a `reqwest`-backed executor,
+    ///   where an executor is an uncapped HTTP/1.1 pool that opens a connection
+    ///   per concurrent in-flight request; [`DatasetTestArgs::validate_fleet`]
+    ///   rejects that combination rather than reporting a figure it cannot
+    ///   establish.
+    /// - Every slot is actually exercised. [`Self::connection_for_worker`] hands a
+    ///   client's threads round-robin over that client's own pool, so a client
+    ///   touches `min(connections_per_client, queries_per_client)` of its slots; an
+    ///   over-provisioned pool leaves the remainder idle and the server sees fewer
+    ///   connections than this returns.
     #[must_use]
     pub fn total_connections(&self) -> usize {
         self.clients * self.connections_per_client
@@ -415,9 +423,11 @@ impl DatasetTestArgs {
             "--clients/--connections-per-client/--queries-per-client model a connection pool per \
              client, which needs the Flight executor: an HTTP executor (--http-clients, \
              --distributed) opens a connection per concurrent request, so \
-             --connections-per-client would not bound anything. Drop the HTTP flag, or use \
-             --client-connections per-client (one pool per query thread, which an HTTP executor \
-             does honor)"
+             --connections-per-client would not bound anything. Pick one: (1) drop \
+             --http-clients/--distributed and keep the fleet flags to run it over Flight, or (2) \
+             drop the fleet flags and pass --client-connections per-client (one pool per query \
+             thread, which an HTTP executor does honor) — the fleet flags and \
+             --client-connections describe the same topology and cannot be combined"
         );
         Ok(())
     }
