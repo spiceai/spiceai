@@ -1077,6 +1077,27 @@ impl CatalogProvider for AcceleratedCatalogProvider {
 /// [`DatasetPlacement`]). A table that is discovered but still bootstrapping is
 /// present in `tables` and absent from `providers`, which is exactly the
 /// "not yet queryable" state.
+impl AcceleratedSchemaProvider {
+    /// The provider for `name`, but only while `name` is still part of the
+    /// current plan.
+    ///
+    /// Both halves are required. `providers` alone would keep serving a table
+    /// that a later `refresh()` dropped from `tables` — because the source
+    /// dropped it, or because `include`/`exclude` now filter it out — leaving a
+    /// ghost that `table_names()` no longer lists but queries still resolve,
+    /// backed by an accelerator no longer being fed. `tables` alone would report
+    /// a discovered-but-still-bootstrapping table as present, letting
+    /// `normalize_table_reference` resolve something whose `table()` returns
+    /// `None`, which then fails as "not found" at query time and can shadow a
+    /// ready same-named table in another schema.
+    fn installed_provider(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
+        if !self.tables.read().contains_key(name) {
+            return None;
+        }
+        self.providers.read().get(name).map(Arc::clone)
+    }
+}
+
 #[derive(Default)]
 struct AcceleratedSchemaProvider {
     tables: RwLock<HashMap<String, String>>,
@@ -1103,20 +1124,11 @@ impl SchemaProvider for AcceleratedSchemaProvider {
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        // A discovered-but-still-bootstrapping table is absent from `providers`
-        // and so reads as "table not found" -- deliberately no federated
-        // stand-in during bootstrap.
-        Ok(self.providers.read().get(name).map(Arc::clone))
+        Ok(self.installed_provider(name))
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        // Mirrors `table()`: a table exists once its provider is installed, not
-        // merely once it is discovered. Reporting `true` on discovery alone
-        // would let `DataFusion::normalize_table_reference` resolve a table
-        // whose `table()` returns `None`, which then fails as "not found" at
-        // query time -- and could shadow a ready same-named table in another
-        // schema during that window.
-        self.providers.read().contains_key(name)
+        self.installed_provider(name).is_some()
     }
 }
 
@@ -1129,16 +1141,24 @@ impl crate::datafusion::DatasetPlacement for AcceleratedSchemaProvider {
         provider: Arc<dyn TableProvider>,
     ) -> crate::datafusion::Result<()> {
         let dataset_name = name.to_string();
-        let Some(table_name) = self.dataset_to_table.read().get(&dataset_name).cloned() else {
-            // The catalog registers the placement before spawning the dataset,
-            // so an install for an unknown dataset means the two have gone out
-            // of sync. Dropping the provider silently would leave the table
-            // permanently unqueryable with no explanation.
-            tracing::error!(
-                "Accelerated catalog received a table provider for unknown dataset '{dataset_name}'; the table it belongs to will not be queryable. Report a bug: https://github.com/spiceai/spiceai/issues"
-            );
-            return Ok(());
-        };
+        // The catalog registers the placement before spawning the dataset, so an
+        // install for an unknown dataset means the two have gone out of sync.
+        // Fail rather than log-and-continue: returning `Ok` here would let the
+        // lifecycle mark the dataset Ready while its provider was dropped on the
+        // floor, so the table would be permanently unqueryable and reported
+        // healthy. Failing surfaces it as a dataset error and retries.
+        let table_name = self
+            .dataset_to_table
+            .read()
+            .get(&dataset_name)
+            .cloned()
+            .ok_or_else(
+                || crate::datafusion::Error::UnableToRegisterTableToDataFusion {
+                    source: datafusion::error::DataFusionError::Internal(format!(
+                        "accelerated catalog has no table registered for dataset '{dataset_name}'"
+                    )),
+                },
+            )?;
         self.providers.write().insert(table_name, provider);
         Ok(())
     }
@@ -1391,15 +1411,48 @@ mod tests {
         use crate::datafusion::DatasetPlacement;
 
         let schema = AcceleratedSchemaProvider::default();
-        schema
-            .install(
-                &TableReference::bare("__catalog_accel_missing"),
-                empty_provider(),
-            )
-            .expect("install must not fail the dataset that produced the provider");
+        let result = schema.install(
+            &TableReference::bare("__catalog_accel_missing"),
+            empty_provider(),
+        );
 
+        assert!(
+            result.is_err(),
+            "an install with nowhere to go must fail the dataset rather than let it \
+             report Ready while its table is unqueryable"
+        );
         assert!(schema.table_names().is_empty());
         assert!(schema.providers.read().is_empty());
+    }
+
+    /// A table dropped from the plan by a later `refresh()` -- removed at the
+    /// source, or newly matched by `exclude` -- must stop resolving, not linger
+    /// as a ghost backed by an accelerator that is no longer fed.
+    #[tokio::test]
+    async fn a_table_removed_from_the_plan_stops_resolving() {
+        use crate::datafusion::DatasetPlacement;
+
+        let schema = AcceleratedSchemaProvider::default();
+        *schema.tables.write() =
+            HashMap::from([("orders".to_string(), "__catalog_accel_x".to_string())]);
+        schema
+            .dataset_to_table
+            .write()
+            .insert("__catalog_accel_x".to_string(), "orders".to_string());
+        schema
+            .install(&TableReference::bare("__catalog_accel_x"), empty_provider())
+            .expect("install");
+        assert!(schema.table_exist("orders"));
+
+        // The next refresh no longer discovers `orders`.
+        schema.tables.write().clear();
+
+        assert!(
+            !schema.table_exist("orders"),
+            "removed table must not resolve"
+        );
+        assert!(schema.table("orders").await.expect("lookup").is_none());
+        assert!(schema.table_names().is_empty());
     }
 
     #[test]
