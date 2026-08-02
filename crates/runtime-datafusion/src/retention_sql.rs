@@ -28,8 +28,8 @@ use snafu::prelude::*;
 use sqlparser::ast::Statement as SQLStatement;
 use tokio::runtime::Handle;
 
-use crate::datafusion::builder::get_df_default_config;
-use crate::datafusion::error::format_datafusion_error;
+use crate::error::format_datafusion_error;
+use crate::session_config::get_df_default_config;
 use runtime_object_store::registry::default_runtime_env;
 
 #[derive(Clone, Debug)]
@@ -93,6 +93,14 @@ pub enum Error {
     },
 }
 
+/// Parse a dataset's `retention_sql` into the `DELETE` predicate to apply and
+/// the parsed statement it came from.
+///
+/// # Errors
+///
+/// Returns an error if `retention_sql` is not a single `DELETE` statement, targets
+/// a table other than `expected_table`, omits a `WHERE` clause, or has a `WHERE`
+/// expression that cannot be planned against `schema`.
 pub fn parse_retention_sql(
     expected_table: &TableReference,
     retention_sql: &str,

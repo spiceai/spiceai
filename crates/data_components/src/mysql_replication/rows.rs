@@ -156,9 +156,15 @@ impl Default for TransactionBuffer {
 ///     list (`'a,b'`).
 ///   - JSON arrives as raw `JSONB` → its JSON text (done by the
 ///     `BinlogValue → Value` conversion itself).
+///   - A signed `MEDIUMINT` arrives zero-extended from three bytes → its
+///     negative value (see `sign_extend_mediumint`).
 ///
 /// Everything else passes through unchanged.
 pub fn normalize_binlog_value(column: &SourceColumn, value: BinlogValue<'_>) -> Result<Value> {
+    if let Some(value) = sign_extend_mediumint(column, &value) {
+        return Ok(value);
+    }
+
     if let Some(variants) = &column.enum_variants
         && let BinlogValue::Value(Value::Int(index)) = &value
     {
@@ -215,6 +221,47 @@ pub fn normalize_binlog_value(column: &SourceColumn, value: BinlogValue<'_>) -> 
             column.name
         ),
     })
+}
+
+/// Recover the sign of a `MEDIUMINT` row-image value, or `None` when `column`
+/// is not a signed `MEDIUMINT`.
+///
+/// `MEDIUMINT` is stored in three bytes, and the row-image parser widens those
+/// to 64 bits without sign extension, so `-8000000` arrives as `2^24 - 8000000`.
+/// Signedness is only recoverable from the source column definition: the table
+/// map carries it in optional metadata that `binlog_row_metadata = MINIMAL`
+/// (the default) omits. A signed `MEDIUMINT` cannot exceed `2^23 - 1`, so any
+/// value at or above `2^23` is a negative one that lost its sign.
+fn sign_extend_mediumint(column: &SourceColumn, value: &BinlogValue<'_>) -> Option<Value> {
+    const SIGN_BIT: i64 = 1 << 23;
+    const WIDTH: i64 = 1 << 24;
+    const MEDIUMINT: &str = "mediumint";
+    const UNSIGNED: &str = "unsigned";
+
+    let ty = column.column_type.as_str();
+    let is_mediumint = ty
+        .get(..MEDIUMINT.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(MEDIUMINT));
+    if !is_mediumint || contains_ignore_ascii_case(ty, UNSIGNED) {
+        return None;
+    }
+    let raw = match value {
+        BinlogValue::Value(Value::Int(v)) => *v,
+        BinlogValue::Value(Value::UInt(v)) => i64::try_from(*v).ok()?,
+        _ => return None,
+    };
+    (SIGN_BIT..WIDTH)
+        .contains(&raw)
+        .then(|| Value::Int(raw - WIDTH))
+}
+
+/// ASCII-case-insensitive substring test. `COLUMN_TYPE` casing is not
+/// guaranteed, and this runs per value per row, so it avoids allocating.
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 /// Build a [`ChangeBatch`] from decoded changes, typing the `data` struct to
@@ -1072,6 +1119,48 @@ mod tests {
             .append(&Value::Time(true, 0, 1, 0, 0, 0))
             .expect_err("negative TIME unsupported");
         assert!(err.to_string().contains("negative TIME"), "got: {err}");
+    }
+
+    #[test]
+    fn signed_mediumint_recovers_its_sign() {
+        let mut column = source_column("c_medium");
+        column.column_type = "mediumint(9)".to_string();
+
+        // -8000000 reaches us as 2^24 - 8000000, and the boundaries either side
+        // of the sign bit must land on MEDIUMINT's declared range.
+        for (raw, expected) in [
+            (8_777_216, -8_000_000),
+            (8_388_608, -8_388_608),
+            (16_777_215, -1),
+        ] {
+            let got = normalize_binlog_value(&column, BinlogValue::Value(Value::Int(raw)))
+                .expect("normalizes");
+            assert_eq!(got, Value::Int(expected), "raw {raw}");
+        }
+
+        // Positives are already correct, and an unsigned column owns the whole
+        // 24-bit range — neither may be rewritten.
+        let got = normalize_binlog_value(&column, BinlogValue::Value(Value::Int(8_388_607)))
+            .expect("normalizes");
+        assert_eq!(got, Value::Int(8_388_607));
+
+        column.column_type = "mediumint(8) unsigned".to_string();
+        let got = normalize_binlog_value(&column, BinlogValue::Value(Value::Int(16_777_215)))
+            .expect("normalizes");
+        assert_eq!(got, Value::Int(16_777_215));
+
+        // COLUMN_TYPE casing is not guaranteed. Missing the type would restore
+        // the corruption; missing `unsigned` would invent it on a column that
+        // legitimately owns the whole 24-bit range.
+        column.column_type = "MEDIUMINT(9)".to_string();
+        let got = normalize_binlog_value(&column, BinlogValue::Value(Value::Int(8_777_216)))
+            .expect("normalizes");
+        assert_eq!(got, Value::Int(-8_000_000));
+
+        column.column_type = "MEDIUMINT(8) UNSIGNED".to_string();
+        let got = normalize_binlog_value(&column, BinlogValue::Value(Value::Int(16_777_215)))
+            .expect("normalizes");
+        assert_eq!(got, Value::Int(16_777_215));
     }
 
     #[test]

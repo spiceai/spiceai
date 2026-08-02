@@ -10,6 +10,8 @@ version.workspace = true
 
 [dependencies]
 cpu-budget = { path = "../cpu-budget" }
+linkme.workspace = true
+runtime-udfs-api = { path = "../runtime-udfs-api" }
 app = { path = "../app" }
 arrow.workspace = true
 arrow-schema = { workspace = true, features = ["serde"] }

@@ -186,6 +186,31 @@ where
     )
 }
 
+/// Whether the task-history sink layer is installed, i.e. whether spans and
+/// events on the `task_history` target are persisted to the
+/// `runtime.task_history` table.
+///
+/// This is the *only* thing `runtime.task_history.enabled` governs. Every other
+/// layer is installed either way — see [`init_tracing`].
+fn task_history_sink_enabled(app: Option<&Arc<App>>) -> bool {
+    app.is_none_or(|app| app.runtime.task_history.enabled)
+}
+
+/// Republishes events on the `task_history` target to the in-memory event
+/// stream keyed by their span, which is what `/v1/chat/completions` reads to
+/// stream a completion's intermediate progress (`event_stream::get_event_stream`).
+///
+/// It shares the `task_history` target but writes no task-history row, so it is
+/// independent of `runtime.task_history.enabled`.
+fn progress_layer<S>() -> impl Layer<S>
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    event_stream::EventStreamLayer::new("progress").with_filter(filter::filter_fn(|metadata| {
+        metadata.target() == "task_history"
+    }))
+}
+
 pub(crate) async fn init_tracing(
     app: Option<&Arc<App>>,
     config: Option<&TracingConfig>,
@@ -196,33 +221,21 @@ pub(crate) async fn init_tracing(
     let include_otel_location = should_include_otel_location(!cfg!(debug_assertions), &verbosity);
     let filter: EnvFilter = verbosity.into();
 
-    if let Some(app) = app.as_ref()
-        && !app.runtime.task_history.enabled
-    {
-        let subscriber = tracing_subscriber::registry()
-            .with(filter)
-            .with(
-                fmt::layer()
-                    .with_ansi(true)
-                    .with_filter(filter::filter_fn(|metadata| {
-                        metadata.target() != "task_history"
-                    })),
-            )
-            .with(cloud_connect_log_capture_layer(cloud_connect_flag));
-
-        tracing::subscriber::set_global_default(subscriber)?;
-
-        return Ok(());
-    }
+    // One stack, one place that installs the `log` bridge. Only the
+    // task-history sink is conditional: the progress event stream and
+    // `LogTracer` serve consumers that never read the task-history table, so
+    // gating them on the same setting silently turns off dependency logging and
+    // chat progress streaming for anyone who disables the table.
+    let task_history_layer = if task_history_sink_enabled(app) {
+        Some(datafusion_task_history_tracing(df, app, config, include_otel_location).await?)
+    } else {
+        None
+    };
 
     let subscriber = tracing_subscriber::registry()
         .with(filter)
-        .with(datafusion_task_history_tracing(df, app, config, include_otel_location).await?)
-        .with(
-            event_stream::EventStreamLayer::new("progress").with_filter(filter::filter_fn(
-                |metadata| metadata.target() == "task_history",
-            )),
-        )
+        .with(task_history_layer)
+        .with(progress_layer())
         .with(
             fmt::layer()
                 .with_ansi(true)
@@ -233,6 +246,10 @@ pub(crate) async fn init_tracing(
         .with(cloud_connect_log_capture_layer(cloud_connect_flag));
 
     tracing::subscriber::set_global_default(subscriber)?;
+    // Routes `log` records — which most of the dependency graph, DataFusion
+    // included, emits instead of `tracing` — into the subscriber above. Nothing
+    // else installs a global `log` logger, so without this every one of them is
+    // discarded.
     LogTracer::init()?;
 
     Ok(())
@@ -462,6 +479,7 @@ impl SpanExporter for OtelExportMultiplexer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt as _;
     use std::sync::Mutex;
     use tracing_subscriber::fmt::MakeWriter;
 
@@ -674,5 +692,62 @@ mod tests {
         assert!(env_filter_string(&LogVerbosity::Default).contains("tantivy=warn"));
         assert!(env_filter_string(&LogVerbosity::Verbose).contains("tantivy=warn"));
         assert!(!env_filter_string(&LogVerbosity::VeryVerbose).contains("tantivy=warn"));
+    }
+
+    fn app_with_task_history(enabled: bool) -> Arc<App> {
+        let mut app = app::AppBuilder::new("tracing-test").build();
+        app.runtime.task_history.enabled = enabled;
+        Arc::new(app)
+    }
+
+    #[test]
+    fn task_history_sink_follows_only_its_own_setting() {
+        assert!(
+            task_history_sink_enabled(None),
+            "no app yet means no opt-out to honour"
+        );
+        assert!(task_history_sink_enabled(Some(&app_with_task_history(
+            true
+        ))));
+        assert!(!task_history_sink_enabled(Some(&app_with_task_history(
+            false
+        ))));
+    }
+
+    /// The chat streaming API's progress events must survive
+    /// `runtime.task_history.enabled: false`: they are read from an in-memory
+    /// stream keyed by the span, not from the task-history table. This asserts
+    /// the layer that publishes them, which [`init_tracing`] installs whatever
+    /// the setting is.
+    #[tokio::test]
+    async fn progress_layer_publishes_task_history_events_to_the_event_stream() {
+        let subscriber = tracing_subscriber::registry().with(progress_layer());
+
+        // The span is dropped with the closure, which closes the channel, so
+        // the stream below terminates on the events already buffered.
+        let events = tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!(target: "task_history", "sql_query");
+            span.in_scope(|| {
+                let events =
+                    event_stream::get_event_stream().expect("an entered span has an event stream");
+                tracing::info!(target: "task_history", progress = "loading model");
+                // Same span and same field, but not the task_history target.
+                tracing::info!(target: "spiced", progress = "not progress");
+                events
+            })
+        });
+
+        // A deadlock guard, not a wait: the channel is already closed, so the
+        // stream terminates on the buffered events. Keep it short so a
+        // regression that leaves the stream open fails fast.
+        let published: Vec<String> =
+            tokio::time::timeout(std::time::Duration::from_secs(1), events.collect())
+                .await
+                .expect("the progress stream must end when its span closes");
+        assert_eq!(
+            published,
+            vec!["loading model".to_string()],
+            "the task_history target — and only it — feeds the progress stream"
+        );
     }
 }
