@@ -503,7 +503,10 @@ pub(crate) async fn create_query_executor(
 /// * a fleet (`--clients`/`--connections-per-client`/`--queries-per-client`) —
 ///   `clients * connections_per_client` connections total, with each client's
 ///   threads confined to that client's own pool, the way an application
-///   server's pool is private to its process.
+///   server's pool is private to its process. Flight only: sharing one executor
+///   between threads is only a shared *connection* on a multiplexed HTTP/2
+///   channel, so [`DatasetTestArgs::validate_fleet`] rejects a fleet over the
+///   `reqwest`-backed executors.
 ///
 /// Connections are established lazily on each worker's first query, so building
 /// a large number up-front is cheap.
