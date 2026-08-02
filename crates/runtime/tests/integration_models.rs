@@ -35,20 +35,47 @@ pub(crate) const DEFAULT_TRACING_MODELS: Option<&str> = Some(
     "integration_models=debug,runtime=TRACE,search=TRACE,llms=TRACE,task_history=WARN,runtime::embeddings=INFO,INFO",
 );
 
+/// The CPU entitlement every test in this binary is pinned to.
+///
+/// Sizing derived from the CPU budget — `target_partitions` above all, but also
+/// worker-thread counts and encode permits — would otherwise follow the host and
+/// make explain-plan snapshots machine-dependent.
+const TEST_CPU_CORES: usize = 3;
+
 /// Modifies the `DataFusion` configuration to make test results reproducible across all machines.
 ///
-/// 1) Sets the number of `target_partitions` to 3, by default its the number of CPU cores available.
+/// 1) Pins the CPU budget, and with it `target_partitions`, to [`TEST_CPU_CORES`].
 /// 2) Disables coalesce batches and repartition joins for terser plans.
 fn configure_test_datafusion() {
+    pin_test_cpu_budget();
+
     match DEFAULT_DATAFUSION_CONFIG.write() {
         Ok(mut config) => {
-            config.options_mut().execution.target_partitions = 3;
+            config.options_mut().execution.target_partitions = TEST_CPU_CORES;
 
             config.options_mut().execution.coalesce_batches = false;
 
             config.options_mut().optimizer.repartition_joins = false;
         }
         _ => panic!("Must obtain write lock to defaults"),
+    }
+}
+
+/// Pin the process-wide CPU budget to [`TEST_CPU_CORES`].
+///
+/// Setting `target_partitions` on the default session config is not enough on its
+/// own: with `runtime.query.target_partitions` unset the session builder sizes
+/// partitions from the CPU budget, overwriting whatever the config carried. Both
+/// are pinned to the same constant so they cannot disagree.
+///
+/// Installing is idempotent by intent — the budget is a process-wide `OnceLock`
+/// and every caller asks for the same value, so each call after the first is an
+/// expected no-op rather than an error worth surfacing.
+fn pin_test_cpu_budget() {
+    let config = cpu_budget::CpuConfig::from_sources(None, None, Some(&TEST_CPU_CORES.to_string()));
+    match cpu_budget::CpuBudget::resolve(&config, &cpu_budget::HostReadings::detect()) {
+        Ok(budget) => drop(budget.install()),
+        Err(e) => panic!("{TEST_CPU_CORES} must be a valid CPU quantity: {e}"),
     }
 }
 

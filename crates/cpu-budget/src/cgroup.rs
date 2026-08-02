@@ -14,14 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! cgroup v1/v2 readers for the CPU *quota*, plus the cgroup path resolution
-//! they need.
+//! cgroup v1/v2 readers for the CPU *quota* and *share*, plus the cgroup path
+//! resolution they need.
 //!
-//! Only a quota is read. A cgroup CPU *share* (v1 `cpu.shares`, v2 `cpu.weight`)
-//! is deliberately ignored: under Kubernetes the kubelet derives it from
-//! `requests.cpu`, but a request is a scheduling floor, not a ceiling — a
-//! burstable pod is entitled to every idle core on its node, and sizing from the
-//! request would take that away. Only a quota (`limits.cpu`) is a real ceiling.
+//! Only the quota ever reaches sizing. A cgroup CPU *share* (v1 `cpu.shares`, v2
+//! `cpu.weight`) is read for reporting alone and must never enter the detection
+//! ladder: under Kubernetes the kubelet derives it from `requests.cpu`, but a
+//! request is a scheduling floor, not a ceiling — a burstable pod is entitled to
+//! every idle core on its node, and sizing from the request would take that
+//! away. Only a quota (`limits.cpu`) is a real ceiling. The share is exposed so
+//! that an operator can see the request and the limit next to the budget the
+//! runtime actually chose.
 //!
 //! Everything that interprets a file's *contents* is a pure function over a
 //! `&str`, so it is unit-testable on any platform with no live cgroup. Only the
@@ -62,6 +65,57 @@ fn quota_to_millicores(quota: u64, period: u64) -> Option<u64> {
         return None;
     }
     Some(quota.saturating_mul(1000) / period)
+}
+
+/// cgroup v1 shares that correspond to one CPU.
+const SHARES_PER_CORE: u64 = 1024;
+
+/// The share Kubernetes assigns a container with no `requests.cpu` at all. Read
+/// back as "no request expressed" rather than as a request of ~2 millicores.
+const SHARES_NO_REQUEST: u64 = 2;
+
+/// Parse cgroup v1 `cpu.shares` into the `requests.cpu` it was derived from, in
+/// millicores.
+///
+/// Reporting only — see the module docs. `None` when the value is the
+/// no-request floor or the contents are malformed.
+///
+/// The mapping is not injective: outside Kubernetes the default share is
+/// [`SHARES_PER_CORE`], which is indistinguishable from an explicit request of
+/// one CPU. Read the result as "the CPU share this cgroup carries", not as proof
+/// that an operator wrote `requests.cpu`.
+#[must_use]
+pub fn parse_cpu_shares(contents: &str) -> Option<u64> {
+    let shares: u64 = contents.trim().parse().ok()?;
+    if shares <= SHARES_NO_REQUEST {
+        return None;
+    }
+    Some(shares.saturating_mul(1000) / SHARES_PER_CORE)
+}
+
+/// Parse cgroup v2 `cpu.weight` into the `requests.cpu` it was derived from, in
+/// millicores.
+///
+/// Reporting only — see the module docs. `None` when the weight is the
+/// no-request floor or the contents are malformed.
+///
+/// Inverts the kubelet's share-to-weight conversion,
+/// `weight = 1 + ((shares - 2) * 9999) / 262142`. Container runtimes outside
+/// Kubernetes do not all use that formula, so on a plain Docker host the
+/// recovered value is approximate.
+#[must_use]
+pub fn parse_cpu_weight(contents: &str) -> Option<u64> {
+    let weight: u64 = contents.trim().parse().ok()?;
+    if weight <= 1 {
+        return None;
+    }
+    let shares = SHARES_NO_REQUEST.saturating_add(
+        weight
+            .saturating_sub(1)
+            .saturating_mul(262_142)
+            .saturating_div(9_999),
+    );
+    Some(shares.saturating_mul(1000) / SHARES_PER_CORE)
 }
 
 /// The path to `filename` in this process's cgroup v2 hierarchy, or `None` when

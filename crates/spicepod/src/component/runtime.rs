@@ -1106,9 +1106,10 @@ pub struct Query {
     /// and memory pool and starving each other under load (e.g. analytical
     /// queries alongside CDC ingestion and compaction). The permit is held for
     /// the plan's full execution and result-streaming lifetime; a results-cache
-    /// hit is never gated. Unset = unbounded (the prior behavior). A configured
-    /// value is clamped to a minimum of `1` in the runtime builder, so `0` means
-    /// one concurrent query (not unbounded).
+    /// hit is never gated.
+    ///
+    /// Unset sizes the bound from the CPU budget (four plans per core). `0` opts
+    /// out and leaves admission unbounded. Any other value is that limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent_queries: Option<usize>,
 

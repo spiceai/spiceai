@@ -1430,7 +1430,7 @@
           "minimum": 0
         },
         "max_concurrent_queries": {
-          "description": "Bounds the number of query-executing plans that may run concurrently —\nordinary queries, DDL/DML, and `EXECUTE`; lightweight session-state\nstatements (`PREPARE`/`DEALLOCATE`/`SET`) are not gated. Excess plans wait\n(admission control) rather than oversubscribing the shared query runtime\nand memory pool and starving each other under load (e.g. analytical\nqueries alongside CDC ingestion and compaction). The permit is held for\nthe plan's full execution and result-streaming lifetime; a results-cache\nhit is never gated. Unset = unbounded (the prior behavior). A configured\nvalue is clamped to a minimum of `1` in the runtime builder, so `0` means\none concurrent query (not unbounded).",
+          "description": "Bounds the number of query-executing plans that may run concurrently —\nordinary queries, DDL/DML, and `EXECUTE`; lightweight session-state\nstatements (`PREPARE`/`DEALLOCATE`/`SET`) are not gated. Excess plans wait\n(admission control) rather than oversubscribing the shared query runtime\nand memory pool and starving each other under load (e.g. analytical\nqueries alongside CDC ingestion and compaction). The permit is held for\nthe plan's full execution and result-streaming lifetime; a results-cache\nhit is never gated.\n\nUnset sizes the bound from the CPU budget (four plans per core). `0` opts\nout and leaves admission unbounded. Any other value is that limit.",
           "type": [
             "integer",
             "null"
@@ -7931,9 +7931,9 @@
           "default": "auto"
         },
         "pg_replication_temporary_slot": {
-          "description": "If true, create a temporary replication slot that is dropped when the Spice process disconnects. Default: false (durable slot).",
+          "description": "**DEPRECATED**: `pg_replication_temporary_slot` is ignored and the replication slot is always durable. A temporary slot belongs to the Postgres session that creates it, and the slot is created on the short-lived setup connection, so Postgres dropped it before START_REPLICATION could attach and the stream could never start. Remove the parameter; to stop an unused slot retaining WAL on the source, drop it with `SELECT pg_drop_replication_slot('<slot_name>')`. See: https://spiceai.org/docs/components/data-connectors/postgres\n\nIgnored. The replication slot is always durable. Remove this parameter.",
           "type": "string",
-          "default": "false"
+          "deprecated": true
         },
         "pg_replication_status_interval": {
           "description": "How often to send StandbyStatusUpdate to Postgres (e.g. '10s'). Default: 10s.",
@@ -9106,11 +9106,11 @@
           ]
         },
         "cayenne_upload_concurrency": {
-          "description": "Maximum number of concurrent file uploads when writing multiple Vortex files. 'auto' (or unset) uses available CPU parallelism. The aggregate encode concurrency across all Cayenne tables is separately bounded by a process-global budget sized to the host core count.",
+          "description": "Maximum number of concurrent file uploads when writing multiple Vortex files. 'auto' (or unset) uses the runtime's CPU budget (see `runtime.cpu.cores`). The aggregate encode concurrency across all Cayenne tables is separately bounded by a process-global budget sized from that same value.",
           "type": "string"
         },
         "cayenne_write_concurrency": {
-          "description": "Writer partition override (parallel encoders) for unsorted Cayenne ingests. 'auto' (or unset) uses a small fixed default of 4, capped at the host core count (= runtime.query.target_partitions) and the process-global encode budget — deliberately not the full core count, because each table is sized independently and the per-table values sum across tables under concurrent CDC. Raise it explicitly for a table that needs more encode parallelism.",
+          "description": "Writer partition override (parallel encoders) for unsorted Cayenne ingests. 'auto' (or unset) uses a small fixed default of 4, capped at the runtime's CPU budget (= runtime.query.target_partitions) and the process-global encode budget — deliberately not the full core count, because each table is sized independently and the per-table values sum across tables under concurrent CDC. Raise it explicitly for a table that needs more encode parallelism.",
           "type": "string"
         },
         "cayenne_compaction_trigger_files": {
