@@ -526,6 +526,47 @@ pub enum Error {
     },
 }
 
+impl Error {
+    /// Returns `true` if this error is transient and the operation may succeed
+    /// on retry. Errors that are a pure function of the Spicepod configuration
+    /// (and the engine capabilities it selects) are permanent: they resolve
+    /// only when an operator edits the configuration, so retrying them is
+    /// wasted work. Mirrors [`DataConnectorError::is_retriable`], which
+    /// classifies the same way for connector creation.
+    ///
+    /// Anything not listed stays retriable. A misclassified transient error
+    /// would leave a recoverable dataset permanently unloaded, so the default
+    /// is the conservative one.
+    #[must_use]
+    pub(crate) fn is_retriable(&self) -> bool {
+        !matches!(
+            self,
+            // Invalid `refresh_sql` / `retention_sql` in the Spicepod.
+            Self::RefreshSql { .. }
+                | Self::RetentionSql { .. }
+                // `time_column`/`time_format` disagree with the source schema.
+                | Self::InvalidTimeColumnTimeFormat { .. }
+                | Self::AppendRequiresTimeColumn { .. }
+                // Refresh-mode and snapshot settings the selected engine or
+                // connector cannot serve.
+                | Self::InvalidCachingRefreshMode { .. }
+                | Self::ConflictingStaleWhileRevalidateConfig { .. }
+                | Self::UnsupportedDistributedAccelerationEngine { .. }
+                | Self::UnsupportedStreamBatchesForBatchRefresh
+                | Self::UnsupportedRefreshCompleteForStream
+                | Self::UnsupportedSnapshotTriggerForCaching
+                | Self::UnsupportedAccelerationEngineForSnapshots
+                | Self::SnapshotRefreshModeRequiresSnapshots
+                | Self::SnapshotRefreshModeUnsupportedEngine { .. }
+                | Self::SnapshotRefreshModeReloadUnsupported { .. }
+                // Unparseable `snapshots_trigger_threshold` value.
+                | Self::InvalidSnapshotCreationInterval { .. }
+                | Self::InvalidSnapshotCreationBatches { .. }
+                | Self::SnapshotCreationBatchesShouldBePositive
+        )
+    }
+}
+
 /// Validates that the acceleration engine is supported in distributed mode.
 ///
 /// Only Arrow, `PartitionedArrow`, and Cayenne engines are supported for distributed acceleration.
