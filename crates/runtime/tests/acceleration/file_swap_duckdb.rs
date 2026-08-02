@@ -59,11 +59,18 @@ const LOAD_TIMEOUT: Duration = Duration::from_mins(1);
 /// belong to the replacement protocol and none may survive a completed
 /// replacement.
 ///
-/// A `{db}.wal` is deliberately *not* counted: it is ordinary `DuckDB` state from
-/// whatever committed most recently, so a test that writes right up to shutdown
-/// legitimately leaves one behind for the next open to replay. Only the tests
-/// that end on a completed replacement with no writes after it assert on it, via
-/// [`wal_beside`].
+/// A `{db}.wal` is deliberately *not* counted, and no test here asserts on one:
+/// after a replacement there is essentially always a WAL. The refresh writes its
+/// dataset checkpoint bookkeeping *after* the swap installs the new file, and that
+/// commit is not itself checkpointed, so it sits in a fresh WAL. `DuckDB` only
+/// removes a WAL when a checkpoint completes — including the closing instance's
+/// shutdown checkpoint — so whether one is still on disk at any point after
+/// shutdown only reflects how far teardown has progressed.
+///
+/// The invariant that a replacement yields a compact, checkpointed, WAL-free file
+/// is about the file the swap *produces*, and it is enforced where that is
+/// observable: the swap fails the write with `FileSwapWalPresent` if a WAL
+/// survives the staging file's clean detach.
 fn replacement_debris_beside(db_file: &Path) -> Result<Vec<String>, anyhow::Error> {
     let dir = db_file.parent().unwrap_or(Path::new("."));
     let Some(file_name) = db_file.file_name().and_then(|n| n.to_str()) else {
@@ -76,13 +83,6 @@ fn replacement_debris_beside(db_file: &Path) -> Result<Vec<String>, anyhow::Erro
         .map(|e| e.file_name().to_string_lossy().to_string())
         .filter(|name| name.starts_with(&generation_prefix))
         .collect())
-}
-
-/// Whether a write-ahead log sits beside `db_file`.
-fn wal_beside(db_file: &Path) -> bool {
-    let mut wal = db_file.as_os_str().to_os_string();
-    wal.push(".wal");
-    Path::new(&wal).exists()
 }
 
 /// Polls until no staging/generation debris remains beside `db_file`. Retired
@@ -895,14 +895,6 @@ async fn test_acceleration_duckdb_full_refresh_file_swap() -> Result<(), anyhow:
             rt.shutdown().await;
             drop(rt);
             wait_for_replacements_to_settle(&db_file).await?;
-
-            // Nothing writes after the final replacement here, so the file it
-            // left behind must be the checkpointed, WAL-free one it produced.
-            if wal_beside(&db_file) {
-                return Err(anyhow!(
-                    "a completed replacement must leave a checkpointed, WAL-free file"
-                ));
-            }
 
             // The swap replaced the file at the configured path with a fresh
             // generation.

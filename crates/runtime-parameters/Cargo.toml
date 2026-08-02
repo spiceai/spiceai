@@ -23,7 +23,7 @@ util = { path = "../util" }
 
 [dev-dependencies]
 async-trait.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 
 [lints]
 workspace = true

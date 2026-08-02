@@ -915,6 +915,26 @@ impl Runtime {
         table: ResolvedTableReference,
         assignments: &PartitionAssignments,
     ) -> Result<()> {
+        let table_ref = TableReference::full(
+            Arc::<str>::clone(&table.catalog),
+            Arc::<str>::clone(&table.schema),
+            Arc::<str>::clone(&table.table),
+        );
+
+        // During startup the scheduler can push an assignment before this
+        // executor has registered the table — it's still blocked in
+        // `allocate_initial_partitions` ahead of `executor_bind_app`/dataset
+        // load. Skip cleanly rather than erroring (which NACKs the scheduler and
+        // triggers retries): the table's initial snapshot reads its filters from
+        // the assignments map (see `init::dataset`) once it loads, so the
+        // partitions are applied without this path.
+        if !self.datafusion().table_exists(&table_ref) {
+            tracing::debug!(
+                "Deferring partition filter update for {table}: table not yet registered"
+            );
+            return Ok(());
+        }
+
         // This path runs only in executor partitioned mode, so the table is
         // always partition-scoped: wrap in `Some`. An empty result here means no
         // partition is assigned to this executor, which resolves to a `false`
@@ -924,11 +944,6 @@ impl Runtime {
             assignments,
         ));
 
-        let table_ref = TableReference::full(
-            Arc::<str>::clone(&table.catalog),
-            Arc::<str>::clone(&table.schema),
-            Arc::<str>::clone(&table.table),
-        );
         // Propagate the filter-update error so the caller (and the executor's
         // ack to the scheduler) sees the failure rather than just logging it.
         self.datafusion()
@@ -1943,15 +1958,9 @@ impl Runtime {
     }
 }
 
-#[must_use]
-pub fn spice_data_base_path() -> String {
-    let Ok(working_dir) = std::env::current_dir() else {
-        return ".".to_string();
-    };
-
-    let base_folder = working_dir.join(".spice/data");
-    base_folder.to_str().unwrap_or(".").to_string()
-}
+// Moved to `data-accelerator-api` (so the accelerator builder can name the data
+// directory without an upward dependency); re-exported here for path compatibility.
+pub use data_accelerator_api::spice_data_base_path;
 
 #[cfg(any(feature = "duckdb", feature = "sqlite", feature = "turso"))]
 #[expect(clippy::result_large_err)]

@@ -8,7 +8,11 @@ on:
 
 jobs:
   enforce-pull-with-spice:
-    runs-on: spiceai-macos
+    # The only step is a `node24` JavaScript action that calls the GitHub API — it needs no
+    # checkout, no build, and no macOS. A GitHub-hosted runner keeps this required check off
+    # the self-hosted pool that the darwin build and benchmark matrices contend for, so PR
+    # hygiene does not queue behind hours of heavy work.
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       pull-requests: write

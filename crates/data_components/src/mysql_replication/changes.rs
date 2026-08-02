@@ -36,7 +36,7 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, IntervalUnit, SchemaRef};
 use mysql_async::binlog::events::{RowsEventData, TableMapEvent};
 
-use super::binlog::buffer_rows_event;
+use super::binlog::{TableMapRowDecoder, buffer_rows_event, buffer_rows_event_fast};
 use super::metrics::MetricsCollector;
 use super::rows::{TransactionBuffer, build_change_batch};
 use super::setup::TableLayout;
@@ -146,19 +146,37 @@ impl ChangeRows for MysqlChangeRows {
     }
 
     fn build(self: Box<Self>) -> Result<ChangeBatch, ChangeBatchError> {
-        // Decode every buffered rows event into the transaction buffer using the
-        // SAME `buffer_rows_event` the per-dataset path uses (it records the
-        // per-row op metrics as it decodes), then build one Arrow batch.
+        // Decode every buffered rows event into the transaction buffer, then
+        // build one Arrow batch. The prepared decoder reuses table-map metadata;
+        // fall back to the `buffer_rows_event` walk when it cannot be built for
+        // this table map. Both paths record per-row op metrics as they decode.
         let mut buffer = TransactionBuffer::new();
+        let decoder = match TableMapRowDecoder::try_new(&self.tme) {
+            Ok(decoder) => Some(decoder),
+            Err(e) => {
+                warn_decoder_fallback_once(&self.tme, &e);
+                None
+            }
+        };
         for event in &self.events {
-            buffer_rows_event(
-                event,
-                &self.tme,
-                &self.layout.layout,
-                &self.layout.pk_source_indexes,
-                &mut buffer,
-                &self.metrics,
-            )
+            match &decoder {
+                Some(decoder) => buffer_rows_event_fast(
+                    event,
+                    decoder,
+                    &self.layout.layout,
+                    &self.layout.pk_source_indexes,
+                    &mut buffer,
+                    &self.metrics,
+                ),
+                None => buffer_rows_event(
+                    event,
+                    &self.tme,
+                    &self.layout.layout,
+                    &self.layout.pk_source_indexes,
+                    &mut buffer,
+                    &self.metrics,
+                ),
+            }
             .map_err(|e| ChangeBatchError::DeferredBuild {
                 message: e.to_string(),
             })?;
@@ -173,6 +191,31 @@ impl ChangeRows for MysqlChangeRows {
         .map_err(|e| ChangeBatchError::DeferredBuild {
             message: e.to_string(),
         })
+    }
+}
+
+/// Warn — once per (database, table) for the process lifetime — that the
+/// prepared row decoder cannot be built and every transaction on this table
+/// is decoding through the ~7× slower `mysql_common` walk. `build` runs per
+/// committed transaction, so warning unconditionally would repeat this
+/// hundreds of times per second on a busy table; a sustained fallback is a
+/// per-table condition (its table map doesn't change between commits), so
+/// one line carries all the signal.
+fn warn_decoder_fallback_once(tme: &TableMapEvent<'_>, error: &super::Error) {
+    static WARNED: std::sync::LazyLock<
+        parking_lot::Mutex<std::collections::HashSet<(String, String)>>,
+    > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
+    let key = (
+        tme.database_name().to_string(),
+        tme.table_name().to_string(),
+    );
+    if WARNED.lock().insert(key) {
+        tracing::warn!(
+            database = %tme.database_name(),
+            table = %tme.table_name(),
+            error = %error,
+            "prepared row decoder unavailable for this table; MySQL CDC changes keep applying correctly through the slower mysql_common row walk (logged once per table)"
+        );
     }
 }
 

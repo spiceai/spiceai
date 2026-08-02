@@ -705,7 +705,7 @@ impl QueryHandle {
             // end-of-scope here, closing the OTel span immediately.
             parent_span.in_scope(|| match error {
                 Some((msg, code)) => tracker.finish_with_error(&request_context, msg, code),
-                None => tracker.finish(&request_context, &Arc::from("")),
+                None => tracker.finish(&request_context, ""),
             });
             return;
         };
@@ -722,7 +722,7 @@ impl QueryHandle {
             // private API.
             parent_span.in_scope(|| match error {
                 Some((msg, code)) => tracker.finish_with_error(&request_context, msg, code),
-                None => tracker.finish(&request_context, &Arc::from("")),
+                None => tracker.finish(&request_context, ""),
             });
             return;
         };
@@ -832,7 +832,7 @@ impl QueryHandle {
                     Some((msg, code)) => {
                         tracker.finish_with_error(&request_context, msg, code);
                     }
-                    None => tracker.finish(&request_context, &Arc::from("")),
+                    None => tracker.finish(&request_context, ""),
                 }
             }
             .instrument(parent_span),

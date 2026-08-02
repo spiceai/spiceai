@@ -83,7 +83,11 @@ pub enum ParamsError {
 /// never names the `Secrets` type directly, so `runtime-secrets` can depend on
 /// this crate without a cycle. Used only as a generic bound (never as `dyn`),
 /// so native async-fn-in-trait is fine here.
-pub trait SecretAutoload: Send + Sync {
+///
+/// Requires `Clone` so [`autoload_secret`] can take a point-in-time snapshot
+/// before the (potentially network-bound) lookup, rather than holding the
+/// registry's read guard across the `.await` — see `Secrets::snapshot`.
+pub trait SecretAutoload: Send + Sync + Clone {
     /// Looks up an absent parameter by its (already-prefixed) key. Misses and
     /// store errors both resolve to `None` — autoload is best-effort.
     fn autoload_get(&self, key: &str) -> impl Future<Output = Option<SecretString>> + Send;
@@ -163,13 +167,19 @@ pub fn parse_param_with<T, E: Display>(
 /// Looks up an absent `#[param(autoload_secret)]` parameter in the configured
 /// secret stores by its user-facing (prefixed) key. Store errors and misses
 /// resolve to `None`.
+///
+/// Takes a point-in-time clone of `*secrets` under a brief read lock and
+/// performs the lookup against it, rather than holding the read guard across
+/// the (potentially network-bound) lookup — awaiting under the guard would
+/// stall any writer that swaps the registry.
 pub async fn autoload_secret<R: SecretAutoload>(
     secrets: &Arc<RwLock<R>>,
     component_name: &str,
     lookup_key: &str,
 ) -> Option<SecretString> {
     tracing::debug!("Attempting to autoload secret for {component_name}: {lookup_key}");
-    let secret = secrets.read().await.autoload_get(lookup_key).await;
+    let snapshot = secrets.read().await.clone();
+    let secret = snapshot.autoload_get(lookup_key).await;
     if secret.is_some() {
         tracing::debug!("Autoloading secret for {component_name}: {lookup_key}");
     }

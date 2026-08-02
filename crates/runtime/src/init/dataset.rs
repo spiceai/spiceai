@@ -1265,7 +1265,7 @@ impl Runtime {
         let source = ds.source();
         let factory = dataconnector::get_connector_factory(source).await?;
 
-        let params = ConnectorParamsBuilder::new(source.into(), ds.into())
+        let params = ConnectorParamsBuilder::for_dataset(source.into(), ds)
             .build(self.secrets(), self.tokio_io_runtime())
             .await
             .ok()?;
@@ -1296,7 +1296,7 @@ impl Runtime {
     ) -> Result<Arc<dyn DataConnector>> {
         let source = ds.source();
 
-        let params = ConnectorParamsBuilder::new(source.into(), (&ds).into())
+        let params = ConnectorParamsBuilder::for_dataset(source.into(), &ds)
             .build(self.secrets(), self.tokio_io_runtime())
             .await
             .context(UnableToInitializeDataConnectorSnafu)?;
@@ -1395,7 +1395,7 @@ impl Runtime {
                 .await
                 .context(UnableToAttachDataConnectorSnafu {
                     data_connector: source.clone(),
-                    connector_component: ConnectorComponent::from(&ds),
+                    connector_component: ConnectorComponent::from(ds.as_ref()),
                 })?;
 
             self.status
@@ -1486,7 +1486,7 @@ impl Runtime {
             .await
             .context(UnableToAttachDataConnectorSnafu {
                 data_connector: source.clone(),
-                connector_component: ConnectorComponent::from(&ds),
+                connector_component: ConnectorComponent::from(ds.as_ref()),
             })?;
 
         if notifier.is_some() {
@@ -1506,9 +1506,15 @@ impl Runtime {
                 // relying on the `Notify`-based completion handle (which is
                 // edge-triggered and can race with this spawn for fast
                 // initial refreshes).
-                runtime_status
+                // A shutdown before the dataset became ready means the initial
+                // load never finished: there is no partition state worth acking.
+                if runtime_status
                     .wait_for_dataset_ready(&dataset_table_ref)
-                    .await;
+                    .await
+                    == crate::status::WaitOutcome::ShuttingDown
+                {
+                    return;
+                }
                 // After the executor's initial load for this dataset finishes,
                 // ack the scheduler with the partition expressions we currently
                 // hold. This is the executor → scheduler readiness signal that
@@ -1800,7 +1806,7 @@ async fn update_cached_dataset_timestamps(dataset: &Dataset) {
 
     match CachingEngineSys::try_new(dataset, OpenOption::OpenExisting).await {
         Ok(caching_sys) => {
-            if let Err(e) = caching_sys.update_fetched_at() {
+            if let Err(e) = caching_sys.update_fetched_at().await {
                 tracing::warn!(
                     "Failed to update _fetched_at for cached dataset {}: {e}",
                     dataset.name

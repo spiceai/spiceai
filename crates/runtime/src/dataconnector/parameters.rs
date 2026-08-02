@@ -22,7 +22,10 @@ use datafusion_table_providers::UnsupportedTypeAction;
 use tokio::{runtime::Handle, sync::RwLock};
 
 use crate::{
-    Runtime, catalogconnector::CATALOG_CONNECTOR_FACTORY_REGISTRY, parameters::Parameters,
+    Runtime,
+    catalogconnector::CATALOG_CONNECTOR_FACTORY_REGISTRY,
+    component::{catalog::Catalog, dataset::Dataset},
+    parameters::Parameters,
 };
 use runtime_secrets::{Secrets, get_params_with_secrets};
 
@@ -44,27 +47,98 @@ pub trait Validator {
     async fn validate(&self, params: &mut ConnectorParams) -> Result<(), Self::Error>;
 }
 
+/// The runtime capabilities a data connector may reach for while it is being
+/// built, behind a handle so [`ConnectorParams`] does not name them directly.
+/// A connector's *configuration* travels separately, as the
+/// [`ConnectorComponent`] spec.
+pub trait ConnectorContext: Send + Sync {
+    /// The loaded app, for the runtime-level configuration a connector consults
+    /// (e.g. `runtime.params`).
+    fn app(&self) -> Arc<App>;
+
+    /// The live runtime, for connectors that register object stores or reach
+    /// runtime-wide registries during construction.
+    fn runtime(&self) -> Arc<Runtime>;
+}
+
+/// [`ConnectorContext`] over the app + runtime handles a component carries.
+pub struct RuntimeConnectorContext {
+    app: Arc<App>,
+    runtime: Arc<Runtime>,
+}
+
+impl RuntimeConnectorContext {
+    #[must_use]
+    pub fn new(app: Arc<App>, runtime: Arc<Runtime>) -> Self {
+        Self { app, runtime }
+    }
+}
+
+impl ConnectorContext for RuntimeConnectorContext {
+    fn app(&self) -> Arc<App> {
+        Arc::clone(&self.app)
+    }
+
+    fn runtime(&self) -> Arc<Runtime> {
+        Arc::clone(&self.runtime)
+    }
+}
+
 #[derive(Clone)]
 pub struct ConnectorParams {
     pub parameters: Parameters,
     pub unsupported_type_action: Option<UnsupportedTypeAction>,
     pub component: ConnectorComponent,
-    pub app: Option<Arc<App>>,
-    pub runtime: Option<Arc<Runtime>>,
+    /// `None` only where no runtime is attached — connector unit tests that
+    /// build params directly.
+    pub context: Option<Arc<dyn ConnectorContext>>,
     pub io_runtime: Handle,
+}
+
+impl ConnectorParams {
+    /// The loaded app, if a runtime is attached.
+    #[must_use]
+    pub fn app(&self) -> Option<Arc<App>> {
+        self.context.as_ref().map(|ctx| ctx.app())
+    }
+
+    /// The live runtime, if one is attached.
+    #[must_use]
+    pub fn runtime(&self) -> Option<Arc<Runtime>> {
+        self.context.as_ref().map(|ctx| ctx.runtime())
+    }
 }
 
 pub struct ConnectorParamsBuilder {
     connector: Arc<str>,
     component: ConnectorComponent,
+    context: Option<Arc<dyn ConnectorContext>>,
 }
 
 impl ConnectorParamsBuilder {
+    /// Parameters for a data connector serving `dataset`.
     #[must_use]
-    pub fn new(connector: Arc<str>, component: ConnectorComponent) -> Self {
+    pub fn for_dataset(connector: Arc<str>, dataset: &Dataset) -> Self {
         Self {
             connector,
-            component,
+            component: ConnectorComponent::from(dataset),
+            context: Some(Arc::new(RuntimeConnectorContext::new(
+                dataset.app(),
+                dataset.runtime(),
+            ))),
+        }
+    }
+
+    /// Parameters for a catalog connector serving `catalog`.
+    #[must_use]
+    pub fn for_catalog(connector: Arc<str>, catalog: &Catalog) -> Self {
+        Self {
+            connector,
+            component: ConnectorComponent::from(catalog),
+            context: Some(Arc::new(RuntimeConnectorContext::new(
+                catalog.app(),
+                catalog.runtime(),
+            ))),
         }
     }
 
@@ -75,7 +149,7 @@ impl ConnectorParamsBuilder {
     ) -> Result<ConnectorParams, Box<dyn std::error::Error + Send + Sync>> {
         let name = self.connector.to_string();
         let mut unsupported_type_action = None;
-        let (params, prefix, parameters, app, runtime) = match &self.component {
+        let (params, prefix, parameters) = match &self.component {
             ConnectorComponent::Catalog(catalog) => {
                 let (prefix, parameters) = {
                     let guard = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
@@ -95,8 +169,6 @@ impl ConnectorParamsBuilder {
                     get_params_with_secrets(Arc::clone(&secrets), &catalog.params).await,
                     prefix,
                     parameters,
-                    Some(catalog.app()),
-                    Some(catalog.runtime()),
                 )
             }
             ConnectorComponent::Dataset(dataset) => {
@@ -124,13 +196,7 @@ impl ConnectorParamsBuilder {
 
                 let params = get_params_with_secrets(Arc::clone(&secrets), &dataset.params).await;
 
-                (
-                    params,
-                    prefix,
-                    parameters,
-                    Some(dataset.app()),
-                    Some(dataset.runtime()),
-                )
+                (params, prefix, parameters)
             }
         };
 
@@ -147,8 +213,7 @@ impl ConnectorParamsBuilder {
             parameters,
             unsupported_type_action: unsupported_type_action.map(UnsupportedTypeAction::from),
             component: self.component,
-            app,
-            runtime,
+            context: self.context,
             io_runtime,
         })
     }

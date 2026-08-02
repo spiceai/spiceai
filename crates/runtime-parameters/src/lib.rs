@@ -157,7 +157,11 @@ impl Parameters {
             })
             .collect();
 
-        let secret_guard = secrets.read().await;
+        // Resolve against a snapshot rather than under the read guard: the
+        // autoload lookups below are network round trips for the remote
+        // stores, and a guard held across them stalls a registry swap — see
+        // `Secrets::snapshot`.
+        let secrets = Secrets::snapshot(&secrets).await;
 
         // Try to autoload secrets that might be missing from params.
         for secret_key in all_params.iter().filter(|p| p.secret) {
@@ -173,7 +177,7 @@ impl Parameters {
             if params.iter().any(|p| p.0 == secret_key.name) {
                 continue;
             }
-            let secret = secret_guard.get_secret(&secret_key_with_prefix).await;
+            let secret = secrets.get_secret(&secret_key_with_prefix).await;
             if let Ok(Some(secret)) = secret {
                 tracing::debug!(
                     "Autoloading secret for {component_name}: {secret_key_with_prefix}",
@@ -911,6 +915,68 @@ mod test {
         assert_eq!(
             result.get("service_account"),
             Some(&"/path/to/sa.json".to_string())
+        );
+    }
+
+    /// A store whose lookup parks until it is released, standing in for the
+    /// network round trip a remote secret store makes on a miss.
+    struct ParkedStore {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl runtime_secrets::SecretStore for ParkedStore {
+        async fn get_secret(&self, _key: &str) -> AnyErrorResult<Option<SecretString>> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(Some(SecretString::from("autoloaded")))
+        }
+    }
+
+    /// `try_new`'s autoload pass must not stall a registry swap, and — since
+    /// callers reach it while resolving their own params through the same lock
+    /// — must not take a second read guard that a queued writer would trap
+    /// (tokio's `RwLock` is write-preferring).
+    #[tokio::test]
+    async fn test_try_new_autoload_does_not_block_a_registry_swap() {
+        static SPECS: &[ParameterSpec] = &[ParameterSpec::component("api_key").secret()];
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+
+        let mut registry = Secrets::new();
+        registry.register_store(
+            "env",
+            Arc::new(ParkedStore {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            }),
+        );
+        let secrets = Arc::new(RwLock::new(registry));
+
+        let creation = tokio::spawn({
+            let secrets = Arc::clone(&secrets);
+            async move { Parameters::try_new("test component", vec![], "test", secrets, SPECS).await }
+        });
+
+        entered.notified().await;
+
+        drop(
+            tokio::time::timeout(std::time::Duration::from_secs(5), secrets.write())
+                .await
+                .expect("a registry swap must not wait for an in-flight autoload"),
+        );
+
+        release.notify_one();
+        let params = creation
+            .await
+            .expect("parameter task should not panic")
+            .expect("parameters should build");
+        assert_eq!(
+            Some("autoloaded"),
+            params.get("api_key").expose().ok(),
+            "the parked store should still have served the autoloaded secret"
         );
     }
 }

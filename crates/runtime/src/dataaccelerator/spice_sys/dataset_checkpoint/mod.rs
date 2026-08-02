@@ -151,10 +151,15 @@ impl DatasetCheckpoint {
     }
 
     #[cfg_attr(
-        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        not(any(
+            feature = "sqlite",
+            feature = "duckdb",
+            feature = "postgres-accel",
+            feature = "turso"
+        )),
         expect(
             clippy::unused_async,
-            reason = "async only when an async accelerator backend is compiled in; DuckDB helpers are synchronous"
+            reason = "async only when an accelerator backend is compiled in; with none, every arm errors immediately"
         )
     )]
     async fn init(connection: &AccelerationConnection) -> Result<()> {
@@ -167,7 +172,10 @@ impl DatasetCheckpoint {
         ))]
         match connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => Self::init_duckdb(pool)?,
+            AccelerationConnection::DuckDB(pool) => {
+                let pool = Arc::clone(pool);
+                super::spawn_duckdb_blocking(move || Self::init_duckdb(&pool)).await?;
+            }
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => Self::init_postgres(pool).await?,
             #[cfg(feature = "sqlite")]
@@ -187,7 +195,10 @@ impl DatasetCheckpoint {
         ))]
         match connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => Self::migrate_duckdb(pool)?,
+            AccelerationConnection::DuckDB(pool) => {
+                let pool = Arc::clone(pool);
+                super::spawn_duckdb_blocking(move || Self::migrate_duckdb(&pool)).await?;
+            }
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => Self::migrate_postgres(pool).await?,
             #[cfg(feature = "sqlite")]
@@ -240,16 +251,28 @@ impl DatasetCheckpoint {
     }
 
     #[cfg_attr(
-        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        not(any(
+            feature = "sqlite",
+            feature = "duckdb",
+            feature = "postgres-accel",
+            feature = "turso"
+        )),
         expect(
             clippy::unused_async,
-            reason = "async only when an async accelerator backend is compiled in; DuckDB helpers are synchronous"
+            reason = "async only when an accelerator backend is compiled in; with none, every arm errors immediately"
         )
     )]
     pub async fn exists(&self) -> bool {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => self.exists_duckdb(pool).ok().unwrap_or(false),
+            AccelerationConnection::DuckDB(pool) => {
+                let pool = Arc::clone(pool);
+                let dataset_name = self.dataset_name.clone();
+                super::spawn_duckdb_blocking(move || Self::exists_duckdb(&dataset_name, &pool))
+                    .await
+                    .ok()
+                    .unwrap_or(false)
+            }
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => {
                 self.exists_postgres(pool).await.ok().unwrap_or(false)
@@ -277,16 +300,28 @@ impl DatasetCheckpoint {
     }
 
     #[cfg_attr(
-        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        not(any(
+            feature = "sqlite",
+            feature = "duckdb",
+            feature = "postgres-accel",
+            feature = "turso"
+        )),
         expect(
             clippy::unused_async,
-            reason = "async only when an async accelerator backend is compiled in; DuckDB helpers are synchronous"
+            reason = "async only when an accelerator backend is compiled in; with none, every arm errors immediately"
         )
     )]
     pub async fn last_checkpoint_time(&self) -> Result<Option<SystemTime>> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => self.last_checkpoint_time_duckdb(pool),
+            AccelerationConnection::DuckDB(pool) => {
+                let pool = Arc::clone(pool);
+                let dataset_name = self.dataset_name.clone();
+                super::spawn_duckdb_blocking(move || {
+                    Self::last_checkpoint_time_duckdb(&dataset_name, &pool)
+                })
+                .await
+            }
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => {
                 self.last_checkpoint_time_postgres(pool).await
@@ -317,17 +352,36 @@ impl DatasetCheckpoint {
         expect(unused_variables)
     )]
     #[cfg_attr(
-        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        not(any(
+            feature = "sqlite",
+            feature = "duckdb",
+            feature = "postgres-accel",
+            feature = "turso"
+        )),
         expect(
             clippy::unused_async,
-            reason = "async only when an async accelerator backend is compiled in; DuckDB helpers are synchronous"
+            reason = "async only when an accelerator backend is compiled in; with none, every arm errors immediately"
         )
     )]
     pub async fn checkpoint(&self, schema: &SchemaRef, refresh_sql: Option<&str>) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => {
-                self.checkpoint_duckdb(pool, schema, refresh_sql)
+                let pool = Arc::clone(pool);
+                let dataset_name = self.dataset_name.clone();
+                let create_snapshot = self.snapshot_behavior.create_enabled();
+                let schema = Arc::clone(schema);
+                let refresh_sql = refresh_sql.map(ToOwned::to_owned);
+                super::spawn_duckdb_blocking(move || {
+                    Self::checkpoint_duckdb(
+                        &dataset_name,
+                        create_snapshot,
+                        &pool,
+                        &schema,
+                        refresh_sql.as_deref(),
+                    )
+                })
+                .await
             }
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => {
@@ -356,16 +410,26 @@ impl DatasetCheckpoint {
     }
 
     #[cfg_attr(
-        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        not(any(
+            feature = "sqlite",
+            feature = "duckdb",
+            feature = "postgres-accel",
+            feature = "turso"
+        )),
         expect(
             clippy::unused_async,
-            reason = "async only when an async accelerator backend is compiled in; DuckDB helpers are synchronous"
+            reason = "async only when an accelerator backend is compiled in; with none, every arm errors immediately"
         )
     )]
     pub async fn get_schema(&self) -> Result<Option<SchemaRef>> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => self.get_schema_duckdb(pool),
+            AccelerationConnection::DuckDB(pool) => {
+                let pool = Arc::clone(pool);
+                let dataset_name = self.dataset_name.clone();
+                super::spawn_duckdb_blocking(move || Self::get_schema_duckdb(&dataset_name, &pool))
+                    .await
+            }
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.get_schema_postgres(pool).await,
             #[cfg(feature = "sqlite")]
@@ -385,16 +449,28 @@ impl DatasetCheckpoint {
     }
 
     #[cfg_attr(
-        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        not(any(
+            feature = "sqlite",
+            feature = "duckdb",
+            feature = "postgres-accel",
+            feature = "turso"
+        )),
         expect(
             clippy::unused_async,
-            reason = "async only when an async accelerator backend is compiled in; DuckDB helpers are synchronous"
+            reason = "async only when an accelerator backend is compiled in; with none, every arm errors immediately"
         )
     )]
     pub async fn get_refresh_sql(&self) -> Result<Option<String>> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => self.get_refresh_sql_duckdb(pool),
+            AccelerationConnection::DuckDB(pool) => {
+                let pool = Arc::clone(pool);
+                let dataset_name = self.dataset_name.clone();
+                super::spawn_duckdb_blocking(move || {
+                    Self::get_refresh_sql_duckdb(&dataset_name, &pool)
+                })
+                .await
+            }
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.get_refresh_sql_postgres(pool).await,
             #[cfg(feature = "sqlite")]
@@ -415,16 +491,26 @@ impl DatasetCheckpoint {
 
     /// Deletes the checkpoint for this dataset so the next refresh treats it as a fresh table.
     #[cfg_attr(
-        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        not(any(
+            feature = "sqlite",
+            feature = "duckdb",
+            feature = "postgres-accel",
+            feature = "turso"
+        )),
         expect(
             clippy::unused_async,
-            reason = "async only when an async accelerator backend is compiled in; DuckDB helpers are synchronous"
+            reason = "async only when an accelerator backend is compiled in; with none, every arm errors immediately"
         )
     )]
     pub async fn delete(&self) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => self.delete_duckdb(pool),
+            AccelerationConnection::DuckDB(pool) => {
+                let pool = Arc::clone(pool);
+                let dataset_name = self.dataset_name.clone();
+                super::spawn_duckdb_blocking(move || Self::delete_duckdb(&dataset_name, &pool))
+                    .await
+            }
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.delete_postgres(pool).await,
             #[cfg(feature = "sqlite")]

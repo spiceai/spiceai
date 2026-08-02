@@ -21,6 +21,14 @@ inputs:
       dorny/paths-filter `filters` YAML; must define a `code_changes` group.
       Defaults to the standard repo-wide code paths.
     required: false
+    # The Rust-gate config files below (clippy/rustfmt/nextest/layers,
+    # the two lint guards) must COVER every path in RUST_AFFECTING_PATH_PATTERN
+    # (scripts/signoff). This list stays a deliberate superset — it is the shared
+    # "did any code change" default, so it also gates integration and E2E — but a
+    # Rust-gate path missing here lets the merge queue report `Rust Lint` and
+    # `Build and Test` green without running a step, so with the same path
+    # missing from the pattern it would land on trunk unchecked.
+    # scripts/check_rust_gate_paths.py pins the coverage. See docs/dev/ci_signoff.md.
     default: |
       code_changes:
         - '.github/**'
@@ -34,6 +42,23 @@ inputs:
         - 'go.mod'
         - 'go.sum'
         - 'Makefile'
+        # Dot-prefixed directories are spelled out literally rather than left to
+        # `**`, which only descends into them when picomatch runs with
+        # `dot: true` — `.ci/clippy.toml` is the config the lint gate actually
+        # reads, so it must match either way.
+        - '.ci/**'
+        - '.config/**'
+        - '.cargo/**'
+        - '**/clippy.toml'
+        - '.clippy.toml'
+        - '**/rustfmt.toml'
+        - '.rustfmt.toml'
+        - '**/nextest.toml'
+        - '**/layers.toml'
+        - 'scripts/check_crate_layers.py'
+        - 'scripts/check_rust_gate_paths.py'
+        - 'rust-toolchain'
+        - 'rust-toolchain.toml'
 
 outputs:
   relevant_changes:
