@@ -70,6 +70,10 @@ const fn get_allocator_name() -> Option<&'static str> {
 }
 
 fn main() {
+    // Before anything else, so a fault during startup is still reported. A native
+    // crash is not a panic: without this the process dies silently with exit 139.
+    spiced::crash_handler::install();
+
     let matches = spiced::Args::command().get_matches();
     let open_telemetry_deprecated =
         matches.value_source("open_telemetry_bind_address") == Some(ValueSource::CommandLine);
