@@ -10,6 +10,7 @@ version.workspace = true
 
 [dependencies]
 cpu-budget = { path = "../cpu-budget" }
+runtime-udfs-api = { path = "../runtime-udfs-api" }
 adbc_core = { workspace = true, optional = true }
 adbc_driver_manager = { workspace = true, optional = true }
 app = { path = "../app" }

@@ -476,7 +476,7 @@ impl Index for ElasticsearchIndex {
     }
 
     async fn delete_by_keys(&self, keys: RecordBatch) -> Result<(), DataFusionError> {
-        let key_columns: Vec<String> = self.primary_key.iter().map(|f| f.name().clone()).collect();
+        let key_columns = delete::document_key_columns(&self.primary_key);
         delete::delete_by_keys(
             self.client.as_ref(),
             &self.es_index,
@@ -485,6 +485,12 @@ impl Index for ElasticsearchIndex {
             &keys,
         )
         .await
+    }
+
+    /// `_delete_by_query` filters by field value, so a key naming only some of the indexed fields
+    /// removes every document matching it.
+    fn deletes_by_partial_key(&self) -> bool {
+        true
     }
 }
 
@@ -730,7 +736,7 @@ impl Index for ElasticsearchTextIndex {
     }
 
     async fn delete_by_keys(&self, keys: RecordBatch) -> Result<(), DataFusionError> {
-        let key_columns: Vec<String> = self.primary_key.iter().map(|f| f.name().clone()).collect();
+        let key_columns = delete::document_key_columns(&self.primary_key);
         delete::delete_by_keys(
             self.client.as_ref(),
             &self.es_index,
@@ -739,6 +745,11 @@ impl Index for ElasticsearchTextIndex {
             &keys,
         )
         .await
+    }
+
+    /// Same `_delete_by_query` addressing as [`ElasticsearchIndex`].
+    fn deletes_by_partial_key(&self) -> bool {
+        true
     }
 }
 

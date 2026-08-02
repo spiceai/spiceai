@@ -202,6 +202,13 @@ struct RenewRequest<'a> {
     cert_pem: &'a str,
     csr_pem: &'a str,
     pop_sig: &'a str,
+    /// The freshly-generated X25519 encryption public key (RFC 8410 SPKI
+    /// PEM). The cloud records it in the same transaction that rotates the
+    /// identity key, and seals to it from that commit on.
+    ///
+    /// Not covered by `pop_sig`, which signs the CSR DER alone — this field's
+    /// integrity rests on the server-authenticated TLS to the cloud.
+    enc_pubkey_pem: &'a str,
 }
 
 /// Wire shape of a successful renew response.
@@ -318,6 +325,7 @@ impl EnrollClient {
             cert_pem: &current.identity_cert_pem,
             csr_pem: &material.csr_pem,
             pop_sig: &pop_sig,
+            enc_pubkey_pem: &material.enc_public_key_pem,
         };
         let wire: RenewResponseWire = self.post_json(&self.renew_url, &request).await?;
         let not_after_unix = parse_not_after(&self.renew_url, &wire.not_after)?;
@@ -815,5 +823,38 @@ mod tests {
                 "https://cloud.spice.ai/v1/cloud-connect/renew"
             );
         }
+    }
+
+    #[test]
+    fn renew_request_includes_enc_pubkey_pem() {
+        // The cloud `/renew` endpoint requires `enc_pubkey_pem` (Zod schema
+        // validation in spicehq/cloud). The request must serialize all four
+        // fields — omitting it causes a 400 that blocks renewal.
+        let renew_req = RenewRequest {
+            cert_pem: "-----BEGIN CERTIFICATE-----\nMOCK\n-----END CERTIFICATE-----",
+            csr_pem: "-----BEGIN CERTIFICATE REQUEST-----\nMOCK\n-----END CERTIFICATE REQUEST-----",
+            pop_sig: "dGVzdC1zaWduYXR1cmU=",
+            enc_pubkey_pem: "-----BEGIN PUBLIC KEY-----\nMOCKENC\n-----END PUBLIC KEY-----",
+        };
+        let value = serde_json::to_value(&renew_req).expect("serialize renew request");
+
+        // All four fields must be present.
+        assert!(value.get("cert_pem").is_some(), "cert_pem must be present");
+        assert!(value.get("csr_pem").is_some(), "csr_pem must be present");
+        assert!(value.get("pop_sig").is_some(), "pop_sig must be present");
+        assert!(
+            value.get("enc_pubkey_pem").is_some(),
+            "enc_pubkey_pem must be present — the cloud schema requires it"
+        );
+
+        // Exactly four keys, no extras.
+        assert_eq!(
+            value
+                .as_object()
+                .expect("serialize produces an object")
+                .len(),
+            4,
+            "renew request must carry exactly four fields"
+        );
     }
 }

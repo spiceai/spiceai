@@ -37,7 +37,12 @@ use crate::vector_simd::{
 };
 
 pub static L2_DISTANCE_UDF_NAME: &str = "l2_distance";
+runtime_udfs_api::register_spice_function!(L2_DISTANCE_SPICE_FUNCTION, L2_DISTANCE_UDF_NAME);
 pub static L2_SQUARED_DISTANCE_UDF_NAME: &str = "l2_squared_distance";
+runtime_udfs_api::register_spice_function!(
+    L2_SQUARED_DISTANCE_SPICE_FUNCTION,
+    L2_SQUARED_DISTANCE_UDF_NAME
+);
 
 #[derive(Debug, Hash, PartialEq, Eq)]
 pub struct L2Distance {

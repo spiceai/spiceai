@@ -29,7 +29,7 @@ impl KafkaSys {
         metadata: &KafkaMetadata,
     ) -> Result<()> {
         ensure_kafka_tables(pool).await?;
-        self.mark_schema_ensured();
+        self.schema_ensured.mark_ensured();
 
         let mut conn = pool.connect_direct().await.map_err(Error::external)?;
         let tx = conn.conn.transaction().await.map_err(Error::external)?;
@@ -68,9 +68,9 @@ impl KafkaSys {
         &self,
         pool: &PostgresConnectionPool,
     ) -> Result<Option<KafkaMetadata>> {
-        if self.schema_needs_ensure() {
+        if self.schema_ensured.needs_ensure() {
             ensure_kafka_tables(pool).await?;
-            self.mark_schema_ensured();
+            self.schema_ensured.mark_ensured();
         }
         let conn = pool.connect_direct().await.map_err(Error::external)?;
         let query = format!(
@@ -103,9 +103,9 @@ impl KafkaSys {
         pool: &PostgresConnectionPool,
         offsets: &[KafkaOffset],
     ) -> Result<()> {
-        if self.schema_needs_ensure() {
+        if self.schema_ensured.needs_ensure() {
             ensure_kafka_tables(pool).await?;
-            self.mark_schema_ensured();
+            self.schema_ensured.mark_ensured();
         }
 
         // Diagnostic-only: surface a warn log when an offset regresses.
