@@ -717,9 +717,14 @@ fn apply_refresh_mode_defaults(
 
 /// Whether the dataset's refresh mode writes small batches continuously, which is
 /// what the CDC-shaped defaults (inline memtable, aggressive compaction triggers,
-/// `cdc_durability: memory`) are for. Also decides whether the process installs the
-/// Cayenne compaction memory carve and the in-memory CDC tier budget at all — see
+/// `cdc_durability: memory`) are for. Together with a file acceleration mode it also
+/// decides whether the process carves the Cayenne compaction memory pool at all — see
 /// `builder::count_cayenne_budget_eligible_accelerations`.
+///
+/// It does *not* gate the in-memory CDC tier budget, which every Cayenne deployment
+/// installs whatever its refresh mode: the carve takes bytes away from queries, so it
+/// is only worth taking when some acceleration can compact into it, whereas the tier
+/// budget is sized from what the query pool leaves over and costs queries nothing.
 fn uses_small_write_refresh_profile(acceleration: &Acceleration) -> bool {
     is_small_write_refresh_profile(
         acceleration.refresh_mode.unwrap_or(RefreshMode::Full),

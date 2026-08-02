@@ -655,14 +655,20 @@ impl DataFusionBuilder {
         self
     }
 
-    /// See [`Self::compaction_memory_fraction`].
+    /// Sets the fraction of the query memory limit carved into a dedicated Cayenne
+    /// compaction pool. The Runtime builder passes `Some` only when Cayenne is active
+    /// and at least one enabled acceleration can compact into the pool; `None` leaves
+    /// the whole budget to queries and lets compaction account against the query pool.
     #[must_use]
     pub fn compaction_memory_fraction(mut self, fraction: Option<f64>) -> Self {
         self.compaction_memory_fraction = fraction;
         self
     }
 
-    /// See [`Self::cayenne_active`].
+    /// Declares that this process runs at least one enabled Cayenne acceleration with
+    /// dedicated thread pools. The Runtime builder sets it, and it drives the Cayenne
+    /// query-memory default split, the spill-directory hint, and the off-pool in-memory
+    /// CDC tier budget — none of which depend on a dataset being compaction-eligible.
     #[must_use]
     pub fn cayenne_active(mut self, active: bool) -> Self {
         self.cayenne_active = active;

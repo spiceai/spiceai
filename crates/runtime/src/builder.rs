@@ -1169,11 +1169,11 @@ fn plan_cayenne_memory_budgets(
         if compaction_memory_fraction.is_some() {
             tracing::info!(
                 eligible_accelerations,
-                "Reserving the Cayenne compaction memory pool: {eligible_accelerations} dataset(s) can compact into it."
+                "Reserving the Cayenne compaction memory pool: {eligible_accelerations} acceleration(s) can compact into it."
             );
         } else {
             tracing::info!(
-                "Cayenne compaction memory pool not reserved: no dataset can compact into it (needs a file acceleration mode AND refresh_mode changes/caching, or append with refresh_check_interval <= 5m). The full query memory limit stays available to queries, and compaction accounts against the query pool."
+                "Cayenne compaction memory pool not reserved: no acceleration can compact into it (needs a file acceleration mode AND refresh_mode changes/caching, or append with refresh_check_interval <= 5m). Nothing is carved off for compaction, which accounts against the query pool instead; the query pool itself still follows the Cayenne default split unless runtime.query.memory_limit is set explicitly."
             );
         }
     }
