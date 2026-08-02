@@ -1824,7 +1824,7 @@ async fn update_cached_dataset_timestamps(dataset: &Dataset) {
 
     match CachingEngineSys::try_new(dataset, OpenOption::OpenExisting).await {
         Ok(caching_sys) => {
-            if let Err(e) = caching_sys.update_fetched_at() {
+            if let Err(e) = caching_sys.update_fetched_at().await {
                 tracing::warn!(
                     "Failed to update _fetched_at for cached dataset {}: {e}",
                     dataset.name

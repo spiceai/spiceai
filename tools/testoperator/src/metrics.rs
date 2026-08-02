@@ -187,6 +187,32 @@ pub static SCORE: LazyLock<Gauge<f64>> = LazyLock::new(|| {
         .build()
 });
 
+pub static SEARCH_RECALL: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    meter()
+        .f64_gauge("search_recall")
+        .with_description(
+            "Recall@k: fraction of all relevant documents found within top k search results.",
+        )
+        .with_unit("ratio")
+        .build()
+});
+
+pub static SEARCH_MRR: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    meter()
+        .f64_gauge("search_mrr")
+        .with_description("Mean Reciprocal Rank@k across search queries.")
+        .with_unit("ratio")
+        .build()
+});
+
+pub static SEARCH_PRECISION: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    meter()
+        .f64_gauge("search_precision")
+        .with_description("Precision@k: fraction of top k search results that are relevant.")
+        .with_unit("ratio")
+        .build()
+});
+
 // Text to Sql specific metrics
 // Aggregate Text to Sql specific metrics (run-level)
 pub static TEXT_TO_SQL_EXACT_MATCH_RATE: LazyLock<Gauge<f64>> = LazyLock::new(|| {
