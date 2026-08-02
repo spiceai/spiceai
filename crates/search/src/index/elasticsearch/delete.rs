@@ -107,15 +107,7 @@ pub async fn delete_by_keys(
     let term_fields = resolve_term_fields(client, es_index, key_columns).await?;
     let row_clauses = build_row_term_clauses(es_index, &term_fields, keys)?;
 
-    for chunk in row_clauses.chunks(DELETE_CHUNK_ROWS) {
-        client
-            .delete_by_query(es_index, &or_of_row_clauses(chunk))
-            .await
-            .boxed()
-            .map_err(DataFusionError::External)?;
-    }
-
-    Ok(())
+    issue_chunked_deletes(client, es_index, &row_clauses, or_of_row_clauses).await
 }
 
 /// Deletes the documents `keys` names by the `_id` the write path derived for each row.
@@ -127,12 +119,31 @@ async fn delete_by_document_id(
 ) -> DataFusionResult<()> {
     let ids = document_ids(primary_key, es_index, keys)?;
 
-    for chunk in ids.chunks(DELETE_CHUNK_ROWS) {
-        client
-            .delete_by_query(es_index, &ids_query(chunk))
+    issue_chunked_deletes(client, es_index, &ids, ids_query).await
+}
+
+/// Issues one `_delete_by_query` per [`DELETE_CHUNK_ROWS`]-item slice of `items`, `query` turning
+/// each slice into that request's query, and reads every response before moving on.
+///
+/// Both addressing paths go through here so that neither can grow a request whose response nobody
+/// checks — the defect this shape exists to prevent (#12364).
+///
+/// A response that does not account for the documents it matched stops the delete where it is: the
+/// remaining slices are not attempted, and the error says the index still holds rows the dataset
+/// does not. Continuing would remove more but report the last slice's verdict for all of them.
+async fn issue_chunked_deletes(
+    client: &dyn Elasticsearch,
+    es_index: &str,
+    items: &[Value],
+    query: impl Fn(&[Value]) -> Value,
+) -> DataFusionResult<()> {
+    for chunk in items.chunks(DELETE_CHUNK_ROWS) {
+        let response = client
+            .delete_by_query(es_index, &query(chunk))
             .await
             .boxed()
             .map_err(DataFusionError::External)?;
+        ensure_delete_applied(es_index, &response)?;
     }
 
     Ok(())
@@ -409,6 +420,137 @@ fn or_of_row_clauses(row_clauses: &[Value]) -> Value {
     })
 }
 
+/// How many `failures` entries an error names. Enough to diagnose the cause, bounded so a chunk
+/// that fails for every one of its rows cannot build an unbounded message.
+const REPORTED_DELETE_FAILURES: usize = 3;
+
+/// `_delete_by_query` answers `200` for a request that only partially applied, so the response
+/// body — not the status — says whether the documents are gone (#12364):
+///
+/// - `failures` carries the per-document rejections. The request succeeded; those deletes did not.
+/// - `version_conflicts` counts documents whose version moved between the snapshot the request
+///   scans and the delete itself, which a concurrent write over the same rows produces. The
+///   default `conflicts=abort` stops the whole operation at the first one, leaving the rest of
+///   that request's documents in place.
+/// - `timed_out` marks a search phase that did not finish, so the scan never reached every
+///   matching document.
+///
+/// Each leaves documents the caller asked to remove still searchable, which is the symptom
+/// reported for a delete that "succeeded". The response must also *be* a `_delete_by_query`
+/// response: every Elasticsearch version answers with a `failures` array, empty or not, so a body
+/// without one is not evidence that anything was deleted — the same reasoning as the write path's
+/// `errors` check on a `_bulk` response.
+fn ensure_delete_applied(es_index: &str, response: &Value) -> DataFusionResult<()> {
+    let Some(failures) = response.get("failures").and_then(Value::as_array) else {
+        return Err(delete_not_applied(
+            es_index,
+            "Elasticsearch answered the delete without a 'failures' array, so the response does not report what it removed",
+        ));
+    };
+
+    if !failures.is_empty() {
+        let reported: Vec<String> = failures
+            .iter()
+            .take(REPORTED_DELETE_FAILURES)
+            .map(describe_failure)
+            .collect();
+        return Err(delete_not_applied(
+            es_index,
+            &format!(
+                "Elasticsearch rejected {} of the documents the delete matched, so they are still in the index. First {}: {}",
+                failures.len(),
+                reported.len(),
+                reported.join("; ")
+            ),
+        ));
+    }
+
+    if let Some(reason) = response.get("canceled").and_then(Value::as_str) {
+        return Err(delete_not_applied(
+            es_index,
+            &format!(
+                "the delete was cancelled before it finished ('{reason}'), so Elasticsearch stopped short of the documents it had matched"
+            ),
+        ));
+    }
+
+    let version_conflicts = response
+        .get("version_conflicts")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if version_conflicts > 0 {
+        return Err(delete_not_applied(
+            es_index,
+            &format!(
+                "{version_conflicts} of the documents the delete matched changed while it ran, so Elasticsearch left them in the index"
+            ),
+        ));
+    }
+
+    if response.get("timed_out").and_then(Value::as_bool) == Some(true) {
+        return Err(delete_not_applied(
+            es_index,
+            "Elasticsearch timed out searching for the documents to delete, so it did not reach every matching document",
+        ));
+    }
+
+    // The counters are the backstop: whatever ended a request early — a cancellation shape this
+    // does not know, a field that arrived malformed and read as absent — shows up as fewer
+    // documents deleted than the request matched.
+    let (Some(total), Some(deleted)) = (
+        response.get("total").and_then(Value::as_u64),
+        response.get("deleted").and_then(Value::as_u64),
+    ) else {
+        return Err(delete_not_applied(
+            es_index,
+            "Elasticsearch answered the delete without both a 'total' and a 'deleted' count, so the response does not report whether it removed what it matched",
+        ));
+    };
+    if deleted < total {
+        return Err(delete_not_applied(
+            es_index,
+            &format!(
+                "Elasticsearch removed {deleted} of the {total} documents the delete matched, without reporting why the rest were left"
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+/// One `failures` entry reduced to what diagnoses it: Elasticsearch's status and the cause's type.
+///
+/// Deliberately not the whole entry. A failure carries the document's `_id` — which the write
+/// path derives from the row's primary key — and a free-form `reason` that quotes it, so
+/// stringifying the entry copies primary keys into every log line a routine version conflict
+/// produces. The callers of `delete_by_keys` log the error, so this text is operational output.
+fn describe_failure(failure: &Value) -> String {
+    let status = failure.get("status").and_then(Value::as_u64);
+    // `_delete_by_query` reports a document-level rejection under `cause` and a search-phase one
+    // under `reason`; both nest the class of failure under `type`.
+    let cause = failure
+        .get("cause")
+        .or_else(|| failure.get("reason"))
+        .and_then(|cause| cause.get("type"))
+        .and_then(Value::as_str);
+    match (status, cause) {
+        (Some(status), Some(cause)) => format!("status {status}: {cause}"),
+        (Some(status), None) => format!("status {status}"),
+        (None, Some(cause)) => cause.to_string(),
+        (None, None) => "no status or cause reported".to_string(),
+    }
+}
+
+/// The shared message for a `_delete_by_query` that answered `200` having left documents behind.
+fn delete_not_applied(es_index: &str, detail: &str) -> DataFusionError {
+    DataFusionError::External(
+        format!(
+            "Failed to delete from Elasticsearch index '{es_index}': {detail}. Search can keep returning rows the dataset no longer has until the index is back in sync — re-run the dataset refresh, and reduce writes against the index while a delete runs. See: {ES_VECTORS_DOCS}"
+        )
+        .into(),
+    )
+}
+
 /// Elasticsearch does not index a `keyword` value longer than the field's `ignore_above`, so a
 /// `term` query for such a key matches nothing. Report that rather than issue a delete that
 /// succeeds having removed the row from nowhere.
@@ -492,6 +634,8 @@ mod tests {
         queries: Mutex<Vec<Value>>,
         mapping: Option<MappingResponse>,
         get_mapping_calls: AtomicU32,
+        /// What `delete_by_query` answers with; `None` serves [`clean_delete_response`].
+        delete_response: Option<Value>,
     }
 
     impl RecordingClient {
@@ -523,12 +667,32 @@ mod tests {
             }
         }
 
+        /// Answers every `_delete_by_query` with `response` instead of a clean one.
+        fn answering(mut self, response: Value) -> Self {
+            self.delete_response = Some(response);
+            self
+        }
+
         fn queries(&self) -> Vec<Value> {
             self.queries
                 .lock()
                 .expect("queries mutex should not be poisoned")
                 .clone()
         }
+    }
+
+    /// What Elasticsearch answers for a `_delete_by_query` that applied in full — the shape the
+    /// production code reads, so a test that never sets `delete_response` still exercises it.
+    fn clean_delete_response(deleted: u64) -> Value {
+        json!({
+            "took": 1,
+            "timed_out": false,
+            "total": deleted,
+            "deleted": deleted,
+            "version_conflicts": 0,
+            "noops": 0,
+            "failures": [],
+        })
     }
 
     fn unexpected(method: &str) -> EsError {
@@ -545,7 +709,10 @@ mod tests {
                 .lock()
                 .expect("queries mutex should not be poisoned")
                 .push(query.clone());
-            Ok(json!({"deleted": 0}))
+            Ok(self
+                .delete_response
+                .clone()
+                .unwrap_or_else(|| clean_delete_response(0)))
         }
 
         async fn get_mapping(&self, _index: &str) -> EsResult<MappingResponse> {
@@ -635,6 +802,312 @@ mod tests {
             vec![json!({"ids": {"values": ["ORDER-1024", "a716-446655440000"]}})],
             "an exact-key delete must address documents by _id; a `term` filter on the key \
              column matches nothing for an analyzed string key"
+        );
+    }
+
+    /// A `_delete_by_query` that Elasticsearch answers `200` for can still have removed nothing:
+    /// per-document rejections come back in `failures` while the request itself succeeded. The
+    /// documents are still searchable, so this must not be reported as a completed delete.
+    #[tokio::test]
+    async fn per_document_failures_are_not_a_successful_delete() {
+        let client = RecordingClient::default().answering(json!({
+            "took": 4,
+            "timed_out": false,
+            "total": 2,
+            "deleted": 1,
+            "version_conflicts": 0,
+            "failures": [{
+                "index": "idx",
+                "id": "ORDER-1024",
+                "status": 409,
+                "cause": {"type": "version_conflict_engine_exception", "reason": "current version is newer"},
+            }],
+        }));
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024"), Some("ORDER-1025")]),
+        )
+        .await
+        .expect_err("a delete Elasticsearch only partly applied must not report success");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("index 'idx'") && message.contains("1 of the documents"),
+            "the error must name the index and how many were rejected: {message}"
+        );
+        assert!(
+            message.contains("version_conflict_engine_exception"),
+            "the error must carry the failure Elasticsearch reported: {message}"
+        );
+    }
+
+    /// Under the default `conflicts=abort`, a document whose version moved since the request's
+    /// snapshot stops the operation and is counted rather than deleted — reported without a
+    /// `failures` entry when an intermediary sets `conflicts=proceed`, so the counter is read too.
+    #[tokio::test]
+    async fn version_conflicts_are_not_a_successful_delete() {
+        let client = RecordingClient::default().answering(json!({
+            "timed_out": false,
+            "total": 3,
+            "deleted": 1,
+            "version_conflicts": 2,
+            "failures": [],
+        }));
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024")]),
+        )
+        .await
+        .expect_err("documents left behind by a version conflict must not report success");
+
+        assert!(
+            err.to_string().contains("2 of the documents"),
+            "the error must give the conflict count: {err}"
+        );
+    }
+
+    /// A search phase that timed out never reached every matching document, so the delete is
+    /// incomplete however many it did remove.
+    #[tokio::test]
+    async fn a_timed_out_delete_is_not_a_successful_delete() {
+        let client = RecordingClient::default().answering(json!({
+            "timed_out": true,
+            "total": 1,
+            "deleted": 1,
+            "version_conflicts": 0,
+            "failures": [],
+        }));
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024")]),
+        )
+        .await
+        .expect_err("a timed-out delete must not report success");
+
+        assert!(
+            err.to_string().contains("timed out"),
+            "the error must say the search timed out: {err}"
+        );
+    }
+
+    /// Every Elasticsearch version answers `_delete_by_query` with a `failures` array, empty or
+    /// not. A body without one does not report what was removed, so it is not evidence of a
+    /// completed delete — the same treatment `_bulk`'s missing `errors` field gets on the write
+    /// path.
+    #[tokio::test]
+    async fn a_response_that_reports_nothing_is_not_a_successful_delete() {
+        let client = RecordingClient::default().answering(json!({"acknowledged": true}));
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024")]),
+        )
+        .await
+        .expect_err("a response that does not report failures must not be read as success");
+
+        assert!(
+            err.to_string().contains("'failures'"),
+            "the error must say what the response was missing: {err}"
+        );
+    }
+
+    /// A `_delete_by_query` runs as a task that can be cancelled through the task API. The
+    /// response then reports the reason and stops short of the documents it had already matched.
+    #[tokio::test]
+    async fn a_cancelled_delete_is_not_a_successful_delete() {
+        let client = RecordingClient::default().answering(json!({
+            "timed_out": false,
+            "total": 10,
+            "deleted": 4,
+            "version_conflicts": 0,
+            "canceled": "by user request",
+            "failures": [],
+        }));
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024")]),
+        )
+        .await
+        .expect_err("a cancelled delete must not report success");
+
+        assert!(
+            err.to_string().contains("by user request"),
+            "the error must carry the cancellation reason: {err}"
+        );
+    }
+
+    /// The counters are the backstop for a partial delete this code has no named check for: fewer
+    /// documents removed than matched, with nothing in the response saying why.
+    #[tokio::test]
+    async fn removing_fewer_documents_than_matched_is_not_a_successful_delete() {
+        let client = RecordingClient::default().answering(json!({
+            "timed_out": false,
+            "total": 7,
+            "deleted": 5,
+            "version_conflicts": 0,
+            "failures": [],
+        }));
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024")]),
+        )
+        .await
+        .expect_err(
+            "a delete that removed fewer documents than it matched must not report success",
+        );
+
+        assert!(
+            err.to_string().contains("5 of the 7 documents"),
+            "the error must give both counts: {err}"
+        );
+    }
+
+    /// A response that reports no counts cannot show the delete applied, so it is not a success
+    /// either — an empty `failures` array on its own says only that nothing was *rejected*.
+    #[tokio::test]
+    async fn a_response_without_counts_is_not_a_successful_delete() {
+        let client = RecordingClient::default().answering(json!({"failures": []}));
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024")]),
+        )
+        .await
+        .expect_err("a response that reports no counts must not be read as a completed delete");
+
+        assert!(
+            err.to_string().contains("'deleted'"),
+            "the error must say what the response was missing: {err}"
+        );
+    }
+
+    /// The `_id` Elasticsearch reports a failure for is the row's primary key, and the failure's
+    /// free-form `reason` quotes it. The callers of `delete_by_keys` log the error, so neither may
+    /// reach it — a version conflict on a dataset keyed by an email address must not copy that
+    /// address into an operator's log.
+    #[tokio::test]
+    async fn a_failure_does_not_report_the_row_key() {
+        let client = RecordingClient::default().answering(json!({
+            "timed_out": false,
+            "total": 1,
+            "deleted": 0,
+            "version_conflicts": 0,
+            "failures": [{
+                "index": "idx",
+                "id": "person@example.com",
+                "status": 409,
+                "cause": {
+                    "type": "version_conflict_engine_exception",
+                    "reason": "[person@example.com]: version conflict, current version [3] is different than the one provided [2]",
+                },
+            }],
+        }));
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("person@example.com")]),
+        )
+        .await
+        .expect_err("a rejected delete must not report success");
+
+        let message = err.to_string();
+        assert!(
+            !message.contains("person@example.com"),
+            "the row's key must not reach the error: {message}"
+        );
+        assert!(
+            message.contains("status 409") && message.contains("version_conflict_engine_exception"),
+            "the error must still say what Elasticsearch rejected: {message}"
+        );
+    }
+
+    /// The partial-key path issues its own requests, so it reads its own responses — a partially
+    /// applied chunked delete is the case #12272's key-mapping fix cannot detect on its own.
+    #[tokio::test]
+    async fn a_partial_key_delete_reads_its_response_too() {
+        let client = RecordingClient::with_properties(&[("id", json!({"type": "keyword"}))])
+            .answering(json!({
+                "timed_out": false,
+                "total": 1,
+                "deleted": 0,
+                "version_conflicts": 1,
+                "failures": [],
+            }));
+        let (primary_key, key_columns) = chunked_key("id", DataType::Utf8);
+
+        delete_by_keys(
+            &client,
+            "idx",
+            &primary_key,
+            &key_columns,
+            &string_key_batch(vec![Some("ORDER-1024")]),
+        )
+        .await
+        .expect_err("the term-filter path must not report a partially applied delete as success");
+    }
+
+    /// A delete large enough to be split must stop at the request that failed: continuing would
+    /// report the last chunk's verdict for the whole batch, and the error names an index whose
+    /// remaining keys were never even attempted.
+    #[tokio::test]
+    async fn a_failed_chunk_stops_the_remaining_requests() {
+        let client = RecordingClient::default().answering(json!({
+            "timed_out": false,
+            "total": 1,
+            "deleted": 0,
+            "version_conflicts": 1,
+            "failures": [],
+        }));
+        let values: Vec<String> = (0..=DELETE_CHUNK_ROWS).map(|i| format!("k{i}")).collect();
+        let keys = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, true)])),
+            vec![Arc::new(StringArray::from(values))],
+        )
+        .expect("large key batch should build");
+
+        delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &keys,
+        )
+        .await
+        .expect_err("a chunk that did not apply must fail the delete");
+
+        assert_eq!(
+            client.queries().len(),
+            1,
+            "the second chunk must not be issued after the first one came back incomplete"
         );
     }
 
