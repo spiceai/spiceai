@@ -212,6 +212,141 @@ impl Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Runs a synchronous `DuckDB` sidecar operation on the blocking pool.
+///
+/// Every `spice_sys` `DuckDB` helper takes the connection pool's write gate, and a
+/// `duckdb_on_full_refresh: replace_file` refresh holds that gate **exclusively**
+/// while it copies every co-resident table into the staging file and checkpoints it.
+/// That window scales with the size of the *other* datasets sharing the file, so
+/// waiting on the gate from an async worker parks the whole worker — including
+/// `/health`, which Kubernetes uses to decide the pod is dead — for seconds to
+/// minutes.
+///
+/// The helpers themselves are also plain blocking `DuckDB` I/O, so they belong here
+/// regardless of the gate; `DuckDbBlobCheckpointStore` and the accelerator's
+/// `drop_table`/`evolve_table_schema` already do exactly this.
+#[cfg(feature = "duckdb")]
+async fn spawn_duckdb_blocking<T, F>(f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(Error::external)?
+}
+
+/// [`spawn_duckdb_blocking`] for the read paths that report a failure as `None`
+/// rather than as an error.
+///
+/// A panic is re-raised on this task rather than reported as `None`: these reads
+/// answer "where did this dataset get to", and a `None` the caller believes means
+/// the dataset re-bootstraps from the beginning of the change stream. Running the
+/// read on the blocking pool must not turn a bug into that answer.
+#[cfg(any(feature = "mongodb", feature = "mysql"))]
+async fn spawn_duckdb_blocking_opt<T, F>(f: F) -> Option<T>
+where
+    F: FnOnce() -> Option<T> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(value) => value,
+        Err(join_error) if join_error.is_panic() => {
+            std::panic::resume_unwind(join_error.into_panic())
+        }
+        // Cancellation, i.e. the runtime is shutting down under the read. Nothing
+        // downstream can act on it, but it must not pass for "no checkpoint".
+        Err(join_error) => {
+            tracing::error!("Failed to read the sidecar checkpoint: {join_error}");
+            None
+        }
+    }
+}
+
+/// Retries for a sidecar write contending with another writer, on top of the
+/// initial attempt. Bounded and short: paired with [`UPSERT_MAX_RETRY_DELAY`] the
+/// worst-case added latency stays well under one checkpoint/commit interval, and a
+/// persistent conflict just retries on the next interval anyway.
+#[cfg(any(feature = "kafka", feature = "debezium", feature = "mysql"))]
+pub(crate) const UPSERT_MAX_RETRIES: usize = 4;
+
+/// Per-attempt cap on the `FibonacciBackoffBuilder` delay for sidecar upsert
+/// retries. The shared Fibonacci schedule starts at 1s, far longer than a
+/// transient writer hand-off needs, so clamp each delay to keep the whole retry
+/// budget (~4 x 100ms) short relative to the commit interval.
+#[cfg(any(feature = "kafka", feature = "debezium", feature = "mysql"))]
+pub(crate) const UPSERT_MAX_RETRY_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(100);
+
+/// Whether a sidecar write failure is a transient lock/contention error worth
+/// retrying rather than surfacing.
+///
+/// Deliberately a string heuristic over the boxed engine error (rusqlite, Turso,
+/// `DuckDB`, and tokio-postgres all report contention differently), mirroring the
+/// reconnect classifier in `data_components::mysql_replication::resilience`. Slight
+/// over-matching is harmless: retries are bounded, so a misclassified non-lock error
+/// only costs a few short sleeps before it is returned unchanged.
+///
+/// The `DuckDB` markers matter because its transaction manager is optimistic — it
+/// reports a write-write conflict instead of blocking, so two sidecar writers
+/// touching the same row surface `TransactionContext Error: Conflict on update!`
+/// rather than serializing. Sidecar writers take the pool's write gate with `read()`
+/// and so do not exclude each other; only a file swap takes it exclusively.
+#[cfg(any(feature = "kafka", feature = "debezium", feature = "mysql"))]
+pub(crate) fn is_retryable_lock_error(err: &Error) -> bool {
+    const MARKERS: &[&str] = &[
+        "database is locked",
+        "database table is locked",
+        "sqlite_busy",
+        "sqlite_locked",
+        "deadlock",
+        // DuckDB's optimistic concurrency control.
+        "conflict on update",
+        "transactioncontext error",
+        "write-write conflict",
+    ];
+    let msg = err.to_string().to_ascii_lowercase();
+    MARKERS.iter().any(|marker| msg.contains(marker))
+}
+
+/// Runs a sidecar write, retrying a transient write conflict a bounded number of
+/// times.
+///
+/// `DuckDB`'s transaction manager is optimistic: two sidecar writers touching the
+/// same row get `Conflict on update!` rather than being serialized, because they
+/// hold the pool's write gate with `read()` and so do not exclude each other. The
+/// attempt is re-run rather than surfaced, matching how a contended write is handled
+/// for the binlog checkpoint.
+#[cfg(any(feature = "kafka", feature = "debezium"))]
+pub(crate) async fn retry_on_write_conflict<F, Fut>(dataset_name: &str, attempt: F) -> Result<()>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
+
+    let backoff = FibonacciBackoffBuilder::new()
+        .max_retries(Some(UPSERT_MAX_RETRIES))
+        .max_duration(Some(UPSERT_MAX_RETRY_DELAY))
+        .build();
+
+    retry(backoff, || async {
+        attempt().await.map_err(|e| {
+            if is_retryable_lock_error(&e) {
+                tracing::debug!(
+                    dataset = %dataset_name,
+                    error = %e,
+                    "sidecar offset upsert hit a transient accelerator write conflict"
+                );
+                RetryError::transient(e)
+            } else {
+                RetryError::permanent(e)
+            }
+        })
+    })
+    .await
+}
+
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum OpenOption {
     CreateIfNotExists,
@@ -529,5 +664,27 @@ async fn acceleration_connection(
             engine: acceleration_settings.engine,
         }
         .fail(),
+    }
+}
+
+#[cfg(all(test, any(feature = "mongodb", feature = "mysql")))]
+mod tests {
+    #[tokio::test]
+    #[should_panic(expected = "sidecar read panicked")]
+    async fn spawn_duckdb_blocking_opt_does_not_report_a_panic_as_no_checkpoint() {
+        // `None` from a checkpoint read means "this dataset has no recorded position",
+        // which sends the connector back to the start of the change stream. A panic in
+        // the read is a bug and must not be answered that way.
+        let _: Option<()> =
+            super::spawn_duckdb_blocking_opt(|| panic!("sidecar read panicked")).await;
+    }
+
+    #[tokio::test]
+    async fn spawn_duckdb_blocking_opt_passes_through_both_outcomes() {
+        assert_eq!(super::spawn_duckdb_blocking_opt(|| Some(7)).await, Some(7));
+        assert_eq!(
+            super::spawn_duckdb_blocking_opt(|| Option::<u8>::None).await,
+            None
+        );
     }
 }

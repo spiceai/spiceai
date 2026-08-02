@@ -280,35 +280,35 @@ async fn ensure_slot(
         None => {}
     }
 
-    let (consistent_lsn, snapshot_name) =
-        match create_logical_slot(client, &params.slot_name, params.temporary_slot).await {
-            Ok(created) => created,
-            // Lost a creation race: another consumer (a second replica, or a
-            // concurrent stream on an older build) created the slot between
-            // our catalog read and the CREATE. The slot exists now — treat it
-            // exactly like the existing-slot paths above instead of failing
-            // the dataset with "replication slot already exists".
-            Err(e) if is_duplicate_slot_error(&e) => {
-                tracing::info!(
-                    slot = %params.slot_name,
-                    "Lost replication-slot creation race; resuming from the winner's slot"
-                );
-                let confirmed = read_slot_confirmed_flush(client, &params.slot_name)
-                    .await?
-                    .unwrap_or(0);
-                return Ok(SlotInfo {
-                    slot_name: params.slot_name.clone(),
-                    publication_name: params.publication_name.clone(),
-                    consistent_lsn: confirmed,
-                    snapshot_name: None,
-                    // A raced slot with no durable checkpoint yet still needs
-                    // a bootstrap (same reasoning as the Some(0) path above).
-                    generated_columns: Vec::new(),
-                    created_fresh: confirmed == 0,
-                });
-            }
-            Err(e) => return Err(e),
-        };
+    let (consistent_lsn, snapshot_name) = match create_logical_slot(client, &params.slot_name).await
+    {
+        Ok(created) => created,
+        // Lost a creation race: another consumer (a second replica, or a
+        // concurrent stream on an older build) created the slot between
+        // our catalog read and the CREATE. The slot exists now — treat it
+        // exactly like the existing-slot paths above instead of failing
+        // the dataset with "replication slot already exists".
+        Err(e) if is_duplicate_slot_error(&e) => {
+            tracing::info!(
+                slot = %params.slot_name,
+                "Lost replication-slot creation race; resuming from the winner's slot"
+            );
+            let confirmed = read_slot_confirmed_flush(client, &params.slot_name)
+                .await?
+                .unwrap_or(0);
+            return Ok(SlotInfo {
+                slot_name: params.slot_name.clone(),
+                publication_name: params.publication_name.clone(),
+                consistent_lsn: confirmed,
+                snapshot_name: None,
+                // A raced slot with no durable checkpoint yet still needs
+                // a bootstrap (same reasoning as the Some(0) path above).
+                generated_columns: Vec::new(),
+                created_fresh: confirmed == 0,
+            });
+        }
+        Err(e) => return Err(e),
+    };
 
     tracing::info!(
         slot = %params.slot_name,
@@ -611,12 +611,23 @@ async fn read_slot_confirmed_flush(
 /// LSN to be usable from a normal (non-replication) connection afterwards for
 /// the initial snapshot query.
 ///
+/// The slot is always durable, which is a consequence of creating it here. A
+/// temporary slot is owned by the session that creates it, and this is the
+/// setup connection, which closes before the replication connection issues
+/// `START_REPLICATION` — Postgres would drop the slot in between, leaving
+/// nothing to attach to. Supporting a temporary slot would mean creating it
+/// over the replication protocol (`CREATE_REPLICATION_SLOT … TEMPORARY`),
+/// recreating it on every reconnect, and re-snapshotting every member each
+/// time, since a session-scoped slot does not survive a transient blip.
+///
 /// Returns (`consistent_lsn`, `snapshot_name`).
 async fn create_logical_slot(
     client: &tokio_postgres::Client,
     slot_name: &str,
-    temporary: bool,
 ) -> Result<(u64, String)> {
+    /// Bound as the `temporary` argument below.
+    const DURABLE_SLOT: bool = false;
+
     // `pg_create_logical_replication_slot(...)` has long returned
     // `(slot_name, lsn)` via SQL, and this query relies only on that stable
     // shape. The limitation here is not the returned columns but that the SQL
@@ -628,7 +639,7 @@ async fn create_logical_slot(
     let row = client
         .query_one(
             "SELECT slot_name, lsn::text FROM pg_create_logical_replication_slot($1, 'pgoutput', $2)",
-            &[&slot_name, &temporary],
+            &[&slot_name, &DURABLE_SLOT],
         )
         .await
         .map_err(|e| {

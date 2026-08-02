@@ -43,7 +43,7 @@ impl DebeziumKafkaSys {
         {
             let _schema_guard = pool.acquire_schema_write_lock().await;
             ensure_debezium_kafka_tables(&conn).await?;
-            self.mark_schema_ensured();
+            self.schema_ensured.mark_ensured();
         }
 
         let _schema_guard = pool.acquire_schema_read_lock().await;
@@ -82,10 +82,10 @@ impl DebeziumKafkaSys {
     ) -> Result<Option<DebeziumKafkaMetadata>> {
         let dataset_name = self.dataset_name.clone();
         let conn = pool.connect().await.map_err(Error::external)?;
-        if self.schema_needs_ensure() {
+        if self.schema_ensured.needs_ensure() {
             let _schema_guard = pool.acquire_schema_write_lock().await;
             ensure_debezium_kafka_tables(&conn).await?;
-            self.mark_schema_ensured();
+            self.schema_ensured.mark_ensured();
         }
         let query = format!(
             "SELECT consumer_group_id, topic, primary_keys, schema_fields FROM {DEBEZIUM_KAFKA_TABLE_NAME} WHERE dataset_name = ?"
@@ -124,10 +124,10 @@ impl DebeziumKafkaSys {
         offsets: &[KafkaOffset],
     ) -> Result<()> {
         let conn = pool.connect().await.map_err(Error::external)?;
-        if self.schema_needs_ensure() {
+        if self.schema_ensured.needs_ensure() {
             let _schema_guard = pool.acquire_schema_write_lock().await;
             ensure_debezium_kafka_tables(&conn).await?;
-            self.mark_schema_ensured();
+            self.schema_ensured.mark_ensured();
         }
 
         let _schema_guard = pool.acquire_schema_read_lock().await;
