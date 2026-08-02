@@ -387,10 +387,17 @@ pub struct DataFusionBuilder {
     cayenne_sort_merge_memory_pool_fraction: Option<f64>,
     cayenne_footer_cache_mb: Option<usize>,
     /// Fraction of the query memory limit to carve into a dedicated compaction
-    /// memory pool. `Some` only when Cayenne acceleration is configured and
-    /// dedicated thread pools are enabled (set by the Runtime builder); `None`
-    /// leaves the full budget to queries and gives compaction no separate pool.
+    /// memory pool. `Some` only when a Cayenne acceleration can actually compact
+    /// into it and dedicated thread pools are enabled (set by the Runtime
+    /// builder); `None` leaves the full budget to queries and gives compaction no
+    /// separate pool.
     compaction_memory_fraction: Option<f64>,
+    /// Whether any enabled Cayenne acceleration exists. Kept separate from
+    /// [`Self::compaction_memory_fraction`] because the carve is narrower: it is
+    /// only taken when something can compact into it, whereas the reduced
+    /// query-pool default and the in-memory CDC tier budget apply to every Cayenne
+    /// deployment whatever its refresh mode.
+    cayenne_active: bool,
     cayenne_optimizer_rules: CayenneOptimizerRules,
     /// Arbitrary additional analyzer rules.
     additional_analyzer_rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>,
@@ -447,6 +454,7 @@ impl DataFusionBuilder {
             cayenne_sort_merge_memory_pool_fraction: None,
             cayenne_footer_cache_mb: None,
             compaction_memory_fraction: None,
+            cayenne_active: false,
             cayenne_optimizer_rules: CayenneOptimizerRules::default(),
             additional_analyzer_rules: vec![],
             executor_registry: None,
@@ -581,11 +589,21 @@ impl DataFusionBuilder {
     }
 
     /// Carve a dedicated compaction memory pool of `fraction` of the query
-    /// memory limit. Set by the Runtime builder only when Cayenne acceleration
-    /// is configured and dedicated thread pools are enabled.
+    /// memory limit. Set by the Runtime builder only when a Cayenne acceleration
+    /// can compact into it and dedicated thread pools are enabled.
     #[must_use]
     pub fn compaction_memory_fraction(mut self, fraction: Option<f64>) -> Self {
         self.compaction_memory_fraction = fraction;
+        self
+    }
+
+    /// Whether any enabled Cayenne acceleration exists, which gates the reduced
+    /// query-pool default and the in-memory CDC tier budget. Set independently of
+    /// [`Self::compaction_memory_fraction`]: a full-refresh Cayenne deployment
+    /// takes no compaction carve but still needs both of those.
+    #[must_use]
+    pub fn cayenne_active(mut self, active: bool) -> Self {
+        self.cayenne_active = active;
         self
     }
 
@@ -660,7 +678,10 @@ impl DataFusionBuilder {
         let compaction_memory_fraction = self
             .compaction_memory_fraction
             .and_then(validate_compaction_memory_fraction);
-        let cayenne_active = compaction_memory_fraction.is_some();
+        // NOT `compaction_memory_fraction.is_some()`: the carve is only taken when
+        // an acceleration can compact into it, while the reduced query-pool default
+        // and the tier budget below apply to every Cayenne deployment.
+        let cayenne_active = self.cayenne_active;
         let effective_memory_limit =
             effective_query_memory_limit(self.memory_limit, cayenne_active);
         let compaction_memory_bytes = compaction_memory_fraction.map(|fraction| {

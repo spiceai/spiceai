@@ -435,23 +435,33 @@ impl RuntimeBuilder {
         let cayenne_optimizer_rules =
             parse_cayenne_optimizer_rules(&spicepod_rt.params, cayenne_filter_propagation_enabled);
 
-        // Carve a dedicated compaction memory pool only when Cayenne acceleration
-        // is configured (and enabled) on a dataset AND dedicated thread pools are
-        // enabled. This keeps non-Cayenne deployments at full query budget and
-        // matches the dedicated compaction runtime's "create only if Cayenne is
-        // enabled" lifecycle — the carved env is the signal spiced uses to bring
-        // up the compaction worker threads.
+        // Whether any enabled Cayenne acceleration exists at all. This is the
+        // "Cayenne in-memory acceleration active" signal: it gates the reduced
+        // query-pool default that leaves room for the off-pool in-memory CDC tier,
+        // and the tier budget itself. Every Cayenne deployment installs those
+        // whatever its refresh mode, so this stays deliberately broad — narrowing
+        // it would hand a full-refresh Cayenne deployment the non-Cayenne query
+        // percent and no tier budget.
         let cayenne_configured = self.app.as_ref().is_some_and(|app| {
             app.datasets.iter().any(|dataset| {
+                dataset.acceleration.as_ref().is_some_and(is_enabled_cayenne_acceleration)
+            })
+        });
+
+        // The compaction carve is a separate, narrower question. It is subtracted
+        // straight out of the query memory limit, so it is only worth taking when
+        // some acceleration can actually compact into it: a file acceleration mode
+        // (a `mode: memory` table sets `compaction_background_interval_ms = 0` and
+        // never compacts) AND the small-write refresh profile that produces the
+        // small files tiered compaction exists to merge.
+        let cayenne_can_compact = self.app.as_ref().is_some_and(|app| {
+            app.datasets.iter().any(|dataset| {
                 dataset.acceleration.as_ref().is_some_and(|accel| {
-                    accel.enabled
-                        && accel
-                            .engine
-                            .as_deref()
-                            .is_some_and(|engine| engine.eq_ignore_ascii_case("cayenne"))
+                    is_enabled_cayenne_acceleration(accel) && can_compact_into_carve(accel)
                 })
             })
         });
+
         let dedicated_thread_pools_enabled = !matches!(
             spicepod_rt
                 .params
@@ -459,7 +469,7 @@ impl RuntimeBuilder {
                 .map(String::as_str),
             Some("disabled")
         );
-        let compaction_memory_fraction = (cayenne_configured && dedicated_thread_pools_enabled)
+        let compaction_memory_fraction = (cayenne_can_compact && dedicated_thread_pools_enabled)
             .then(|| {
                 let requested = parse_f64_runtime_param(
                     &spicepod_rt.params,
@@ -671,6 +681,7 @@ impl RuntimeBuilder {
         .cayenne_sort_merge_memory_pool_fraction(cayenne_sort_merge_memory_pool_fraction)
         .cayenne_footer_cache_mb(cayenne_footer_cache_mb)
         .compaction_memory_fraction(compaction_memory_fraction)
+        .cayenne_active(cayenne_configured)
         .cayenne_optimizer_rules(cayenne_optimizer_rules);
 
         if let Some(DistributedNode::Scheduler {
@@ -987,6 +998,49 @@ fn parse_f64_runtime_param(params: &HashMap<String, String>, key: &str) -> Optio
     }
 }
 
+/// Whether a Spicepod acceleration is an enabled Cayenne acceleration.
+fn is_enabled_cayenne_acceleration(accel: &spicepod::acceleration::Acceleration) -> bool {
+    accel.enabled
+        && accel
+            .engine
+            .as_deref()
+            .is_some_and(|engine| engine.eq_ignore_ascii_case("cayenne"))
+}
+
+/// Whether this acceleration can compact into the carved compaction pool, and so
+/// justifies taking bytes away from the query pool for it.
+///
+/// Both halves matter. `mode: memory` is the Spicepod default and never compacts,
+/// so the refresh profile alone would still carve for the most common CDC shape;
+/// and a file-mode table on full refresh writes in bulk rather than the continuous
+/// small batches tiered compaction is for.
+///
+/// Cayenne is not compiled on Windows, so nothing there can compact.
+#[cfg(not(windows))]
+fn can_compact_into_carve(accel: &spicepod::acceleration::Acceleration) -> bool {
+    use spicepod::acceleration::Mode;
+
+    matches!(accel.mode, Mode::File | Mode::FileCreate | Mode::FileUpdate)
+        && crate::dataaccelerator::cayenne::is_small_write_refresh_profile(
+            accel.refresh_mode.clone().map_or(
+                crate::component::dataset::acceleration::RefreshMode::Full,
+                Into::into,
+            ),
+            // An unparseable interval is rejected later, when the acceleration is
+            // converted; treat it as absent here rather than reserving a budget off
+            // a value that will not load.
+            accel
+                .refresh_check_interval
+                .as_deref()
+                .and_then(|interval| fundu::parse_duration(interval).ok()),
+        )
+}
+
+#[cfg(windows)]
+fn can_compact_into_carve(_accel: &spicepod::acceleration::Acceleration) -> bool {
+    false
+}
+
 fn clamp_cayenne_compaction_memory_fraction(value: f64) -> f64 {
     let clamped = value.clamp(
         MIN_COMPACTION_MEMORY_FRACTION,
@@ -1134,6 +1188,97 @@ fn parse_cayenne_optimizer_rules(
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[cfg(not(windows))]
+    fn cayenne_accel(
+        mode: spicepod::acceleration::Mode,
+        refresh_mode: Option<spicepod::acceleration::RefreshMode>,
+        refresh_check_interval: Option<&str>,
+    ) -> spicepod::acceleration::Acceleration {
+        spicepod::acceleration::Acceleration {
+            enabled: true,
+            engine: Some("cayenne".to_string()),
+            mode,
+            refresh_mode,
+            refresh_check_interval: refresh_check_interval.map(ToString::to_string),
+            ..Default::default()
+        }
+    }
+
+    /// The carve is subtracted from the query memory limit, so it must only be
+    /// taken when something can compact into it. A file-mode dataset on full
+    /// refresh writes in bulk and never produces the small files compaction
+    /// merges, and `mode: memory` never compacts at all.
+    #[cfg(not(windows))]
+    #[test]
+    fn only_a_compacting_acceleration_justifies_the_carve() {
+        use spicepod::acceleration::{Mode, RefreshMode};
+
+        // Eligible: file mode + a small-write refresh profile.
+        assert!(can_compact_into_carve(&cayenne_accel(
+            Mode::File,
+            Some(RefreshMode::Changes),
+            None
+        )));
+        assert!(can_compact_into_carve(&cayenne_accel(
+            Mode::FileCreate,
+            Some(RefreshMode::Append),
+            Some("10s")
+        )));
+
+        // Full refresh: bulk writes, nothing to compact — this is the case that
+        // was carving query memory for an unused pool.
+        assert!(!can_compact_into_carve(&cayenne_accel(
+            Mode::File,
+            Some(RefreshMode::Full),
+            None
+        )));
+        // Refresh mode absent defaults to full.
+        assert!(!can_compact_into_carve(&cayenne_accel(
+            Mode::File,
+            None,
+            None
+        )));
+        // Memory mode never compacts, even on a small-write profile.
+        assert!(!can_compact_into_carve(&cayenne_accel(
+            Mode::Memory,
+            Some(RefreshMode::Changes),
+            None
+        )));
+        // An append interval well beyond the small-write threshold.
+        assert!(!can_compact_into_carve(&cayenne_accel(
+            Mode::File,
+            Some(RefreshMode::Append),
+            Some("1h")
+        )));
+    }
+
+    /// `cayenne_active` must stay broader than the carve: it gates the reduced
+    /// query-pool default and the in-memory CDC tier budget, which every Cayenne
+    /// deployment needs whatever its refresh mode. Deriving it from the carve
+    /// would silently hand a full-refresh Cayenne deployment the non-Cayenne
+    /// query percent and no tier budget.
+    #[cfg(not(windows))]
+    #[test]
+    fn cayenne_active_is_independent_of_the_carve() {
+        use spicepod::acceleration::{Mode, RefreshMode};
+
+        let full_refresh = cayenne_accel(Mode::File, Some(RefreshMode::Full), None);
+        assert!(is_enabled_cayenne_acceleration(&full_refresh));
+        assert!(!can_compact_into_carve(&full_refresh));
+
+        let disabled = spicepod::acceleration::Acceleration {
+            enabled: false,
+            ..cayenne_accel(Mode::File, Some(RefreshMode::Changes), None)
+        };
+        assert!(!is_enabled_cayenne_acceleration(&disabled));
+
+        let other_engine = spicepod::acceleration::Acceleration {
+            engine: Some("duckdb".to_string()),
+            ..cayenne_accel(Mode::File, Some(RefreshMode::Changes), None)
+        };
+        assert!(!is_enabled_cayenne_acceleration(&other_engine));
+    }
 
     #[test]
     fn test_parse_memory_limit() {
