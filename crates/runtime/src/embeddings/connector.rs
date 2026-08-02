@@ -891,4 +891,31 @@ mod tests {
             "an embedding table must still resolve to the source's append stream"
         );
     }
+
+    /// The `changes_stream` half of the invariant the test above pins: it has resolved
+    /// this stack since #12086, and nothing asserted it, so the arm could be dropped
+    /// without a failing test. Async and heavier than its `append_stream` twin only
+    /// because `changes_stream` takes a `Dataset`, which owns an `App` and a `Runtime`.
+    #[tokio::test]
+    async fn changes_stream_resolves_through_a_vector_scan() {
+        let spicepod_dataset =
+            spicepod::component::dataset::Dataset::new("test".to_string(), "test".to_string());
+        let app = app::AppBuilder::new("test")
+            .with_dataset(spicepod_dataset.clone())
+            .build();
+        let dataset =
+            crate::component::dataset::builder::DatasetBuilder::try_from(spicepod_dataset)
+                .expect("valid dataset builder")
+                .with_app(Arc::new(app))
+                .with_runtime(Arc::new(crate::Runtime::builder().build().await))
+                .build()
+                .expect("valid dataset");
+
+        assert!(
+            embedding_connector()
+                .changes_stream(vector_scan_over_memtable(), &dataset)
+                .is_some(),
+            "a vector scan must resolve to the source's changes stream"
+        );
+    }
 }
