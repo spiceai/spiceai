@@ -742,7 +742,6 @@ fn replication_params_from_connector_params(
         ),
     };
     let (initial_snapshot, snapshot_on_resume) = parse_initial_snapshot(params)?;
-    let temporary_slot = optional_bool(params, "replication_temporary_slot", false)?;
     let status_interval = optional_duration(
         params,
         "replication_status_interval",
@@ -780,7 +779,6 @@ fn replication_params_from_connector_params(
         publication_name,
         initial_snapshot,
         snapshot_on_resume,
-        temporary_slot,
         status_interval,
         ready_lag,
         bootstrap_batch_size,
@@ -827,39 +825,6 @@ fn optional_usize_in_range(
     }
 }
 
-/// Parses an optional boolean parameter strictly. An absent or empty value
-/// uses `default`; a recognized token maps to its boolean; anything else is
-/// rejected rather than silently falling back. Accepts `true/1/yes/y` and
-/// `false/0/no/n` (case-insensitive, surrounding whitespace trimmed).
-///
-/// The lenient predecessors collapsed every unrecognized value to `false`, so
-/// a typo'd `replication_initial_snapshot` silently skipped the bootstrap
-/// snapshot and the accelerator served only post-subscription changes —
-/// missing every pre-existing row with no error.
-fn optional_bool(
-    params: &Parameters,
-    key: &str,
-    default: bool,
-) -> std::result::Result<bool, String> {
-    let Some(raw) = optional_string(params, key) else {
-        return Ok(default);
-    };
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Ok(default);
-    }
-    match trimmed.to_ascii_lowercase().as_str() {
-        "true" | "1" | "yes" | "y" => Ok(true),
-        "false" | "0" | "no" | "n" => Ok(false),
-        _ => {
-            let user_param = params.user_param(key);
-            Err(format!(
-                "parameter `{user_param}` must be a boolean (true/false), got {raw:?}"
-            ))
-        }
-    }
-}
-
 /// Map the shared [`InitialSnapshotMode`] onto Postgres's two internal flags
 /// `(initial_snapshot, snapshot_on_resume)`:
 ///
@@ -880,8 +845,10 @@ fn snapshot_flags(mode: InitialSnapshotMode) -> (bool, bool) {
 /// [`InitialSnapshotMode::from_canonical`]) and, for backward compatibility, the
 /// legacy booleans `true|false` (mapped to `auto|disabled`).
 ///
-/// A typo is rejected rather than silently skipping the bootstrap snapshot (the
-/// same correctness concern that motivates the strict [`optional_bool`]).
+/// A typo is rejected rather than silently falling back: a lenient parse that
+/// collapsed an unrecognized value to `disabled` would skip the bootstrap
+/// snapshot, leaving the accelerator serving only post-subscription changes and
+/// missing every pre-existing row with no error.
 fn parse_initial_snapshot(params: &Parameters) -> std::result::Result<(bool, bool), String> {
     let Some(raw) = optional_string(params, "replication_initial_snapshot") else {
         return Ok(snapshot_flags(InitialSnapshotMode::Auto));
@@ -1160,65 +1127,52 @@ TXTE85+Or9IUwDI9543jsyCvuQ8=
         );
     }
 
+    /// Regression test for #12213. `pg_replication_temporary_slot` is retained
+    /// only as a deprecated spec: it must stay declared, so an operator who
+    /// still sets it is told it is ignored, and it must stay deprecated, so it
+    /// is struck through in the Spicepod schema and cannot be mistaken for a
+    /// working knob. A temporary slot is owned by the session that creates it,
+    /// and creation happens on the short-lived setup connection, so the slot
+    /// was always gone before `START_REPLICATION` ran.
     #[test]
-    fn optional_bool_recognizes_true_and_false_tokens() {
-        for v in ["true", "TRUE", "1", "yes", "Y", " true "] {
-            assert_eq!(
-                optional_bool(
-                    &params_with("replication_temporary_slot", v),
-                    "replication_temporary_slot",
-                    false
-                ),
-                Ok(true),
-                "expected {v:?} to parse as true"
-            );
-        }
-        for v in ["false", "FALSE", "0", "no", "N", " false "] {
-            assert_eq!(
-                optional_bool(
-                    &params_with("replication_temporary_slot", v),
-                    "replication_temporary_slot",
-                    true
-                ),
-                Ok(false),
-                "expected {v:?} to parse as false"
-            );
-        }
-    }
-
-    #[test]
-    fn optional_bool_uses_default_when_absent_or_empty() {
-        assert_eq!(
-            optional_bool(&empty_params(), "replication_temporary_slot", true),
-            Ok(true)
+    fn temporary_slot_parameter_is_declared_and_deprecated() {
+        let spec = crate::PARAMETERS
+            .iter()
+            .find(|p| p.name == "replication_temporary_slot")
+            .expect("the deprecated spec must remain declared so setting it is not silent");
+        assert!(
+            spec.deprecation_message.is_some(),
+            "pg_replication_temporary_slot cannot be honoured and must stay deprecated"
         );
-        assert_eq!(
-            optional_bool(&empty_params(), "replication_temporary_slot", false),
-            Ok(false)
-        );
-        assert_eq!(
-            optional_bool(
-                &params_with("replication_temporary_slot", "   "),
-                "replication_temporary_slot",
-                true
-            ),
-            Ok(true)
+        assert!(
+            spec.default.is_none(),
+            "an ignored parameter must not advertise a default"
         );
     }
 
-    // Regression for #11274: a typo'd boolean previously collapsed to `false`,
-    // silently changing behavior. It must now error loudly instead.
+    /// Setting the deprecated parameter must not fail the dataset: it is warned
+    /// about and ignored, so a pod carrying it loads and streams with a durable
+    /// slot instead of breaking at `START_REPLICATION`.
     #[test]
-    fn optional_bool_rejects_unrecognized_value() {
-        let result = optional_bool(
-            &params_with("replication_temporary_slot", "ture"),
-            "replication_temporary_slot",
-            true,
-        );
-        assert_eq!(
-            result,
-            Err("parameter `pg_replication_temporary_slot` must be a boolean (true/false), got \"ture\"".to_string())
-        );
+    fn deprecated_temporary_slot_is_accepted_and_ignored() {
+        for value in ["true", "false", "ture"] {
+            let params = Parameters::new(
+                vec![
+                    ("host".to_string(), SecretString::from("pg.internal")),
+                    ("user".to_string(), SecretString::from("spice")),
+                    ("db".to_string(), SecretString::from("myapp")),
+                    (
+                        "replication_temporary_slot".to_string(),
+                        SecretString::from(value),
+                    ),
+                ],
+                "pg",
+                crate::PARAMETERS,
+            );
+            if let Err(e) = replication_params_from_connector_params(&params, "hits") {
+                panic!("pg_replication_temporary_slot={value} must be ignored, not rejected: {e}");
+            }
+        }
     }
 
     #[test]

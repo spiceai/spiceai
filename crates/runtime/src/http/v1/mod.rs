@@ -43,9 +43,10 @@ use crate::{
     datafusion::{
         DataFusion,
         query::{
-            Error as QueryError, QueryBuilder, TransactionError, is_cancellation_error,
-            is_timeout_error, json_array_writer, run_transaction, schema_has_union_columns,
-            transaction_statements, write_to_json_string, write_to_json_value,
+            Error as QueryError, QueryBuilder, TransactionError, error_code::ErrorCode,
+            is_cancellation_error, is_timeout_error, json_array_writer, run_transaction,
+            schema_has_union_columns, transaction_statements, write_to_json_string,
+            write_to_json_value,
         },
     },
     egress::EgressAccount,
@@ -375,13 +376,18 @@ fn transaction_error_to_response(error: TransactionError) -> Response {
 
 /// Classifies a query error for HTTP status mapping: client-initiated
 /// cancellation maps to 499 Client Closed Request, a `runtime.query.timeout`
-/// expiry maps to 504 Gateway Timeout, everything else falls through to
+/// expiry maps to 504 Gateway Timeout, a memory-pool refusal maps to 503
+/// Service Unavailable, everything else falls through to
 /// [`status_for_sql_error`].
 #[derive(Clone, Copy)]
 enum SqlErrorKind {
     General,
     Cancellation,
     Timeout,
+    /// The query engine refused the query for want of memory. Carried
+    /// separately so it can be logged as the operator-actionable condition it
+    /// is and answered with a retriable status.
+    ResourcesExhausted,
 }
 
 impl SqlErrorKind {
@@ -398,20 +404,65 @@ impl SqlErrorKind {
             Self::Cancellation
         } else if is_timeout_error(e) {
             Self::Timeout
+        } else if ErrorCode::from(e) == ErrorCode::ResourcesExhausted {
+            Self::ResourcesExhausted
         } else {
             Self::General
         }
     }
 }
 
+/// Collapses the control characters in a query error message so it logs as a
+/// single record.
+///
+/// A memory-pool refusal spreads its top-consumer breakdown over several lines,
+/// and a record that breaks mid-message is one a log collector cannot group or
+/// alert on. Every control character is replaced rather than dropped, so
+/// offsets into the logged line still match the message the response carries.
+/// Only the logged copy is collapsed — the body keeps what the engine wrote —
+/// and a message with nothing to collapse is borrowed, so the common path does
+/// not allocate.
+fn single_line(message: &str) -> std::borrow::Cow<'_, str> {
+    if message.contains(char::is_control) {
+        std::borrow::Cow::Owned(
+            message
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect(),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(message)
+    }
+}
+
 /// Maps a query error message to an HTTP response, distinguishing cancellation
-/// (499 Client Closed Request) and query timeout (504 Gateway Timeout) from
-/// other errors.
+/// (499 Client Closed Request), query timeout (504 Gateway Timeout) and
+/// resource exhaustion (503 Service Unavailable) from other errors.
+///
+/// Resource exhaustion is logged at `warn`, everything else at `debug`. A
+/// malformed query is the client's problem and would only be noise in the
+/// runtime's log, but a runtime that is refusing queries for want of memory is
+/// an outage its operator cannot see any other way: `/health` is served by a
+/// separate tokio runtime and stays green throughout, so nothing else raises
+/// the condition at the default verbosity.
 fn sql_error_response(message: String, kind: SqlErrorKind) -> Response {
-    tracing::debug!("Error executing query: {message}");
+    let logged = single_line(&message);
+    if matches!(kind, SqlErrorKind::ResourcesExhausted) {
+        tracing::warn!("Query refused, out of memory: {logged}");
+    } else {
+        tracing::debug!("Error executing query: {logged}");
+    }
     let status = match kind {
         SqlErrorKind::Cancellation => StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
         SqlErrorKind::Timeout => StatusCode::GATEWAY_TIMEOUT,
+        // A refusal for want of memory is the runtime's own capacity condition,
+        // not a malformed request: 4xx tells intermediaries the client is at
+        // fault and the request should not be retried, so a load balancer keeps
+        // routing to a saturated pod and a client that retries on 5xx surfaces
+        // a hard failure for a query that would likely succeed on another
+        // replica. Flight already reports the same failure as the retriable
+        // `RESOURCE_EXHAUSTED`.
+        SqlErrorKind::ResourcesExhausted => StatusCode::SERVICE_UNAVAILABLE,
         SqlErrorKind::General => status_for_sql_error(&message),
     };
     (status, message).into_response()
@@ -776,6 +827,126 @@ mod tests {
             SqlErrorKind::of_datafusion_error(&stream_cancel),
         );
         assert_eq!(response.status().as_u16(), 499);
+    }
+
+    /// A memory-pool refusal has to be told apart from the cancellation and
+    /// timeout kinds so it can be logged at `warn` and answered with a status
+    /// that intermediaries read as retriable. A plain execution failure stays
+    /// on 400: only the capacity condition moves.
+    #[test]
+    fn sql_error_response_classifies_resource_exhaustion() {
+        let exhausted = datafusion::error::DataFusionError::ResourcesExhausted(
+            "Additional allocation failed for HashJoinInput[135]".to_string(),
+        );
+        assert!(matches!(
+            SqlErrorKind::of_datafusion_error(&exhausted),
+            SqlErrorKind::ResourcesExhausted
+        ));
+        let response = sql_error_response(
+            exhausted.to_string(),
+            SqlErrorKind::of_datafusion_error(&exhausted),
+        );
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // Execution commonly wraps the pool error before it reaches the handler.
+        let wrapped = datafusion::error::DataFusionError::Context(
+            "Join Error".to_string(),
+            Box::new(datafusion::error::DataFusionError::ResourcesExhausted(
+                "out of memory".to_string(),
+            )),
+        );
+        assert!(matches!(
+            SqlErrorKind::of_datafusion_error(&wrapped),
+            SqlErrorKind::ResourcesExhausted
+        ));
+        let wrapped_response = sql_error_response(
+            wrapped.to_string(),
+            SqlErrorKind::of_datafusion_error(&wrapped),
+        );
+        assert_eq!(
+            wrapped_response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a wrapped pool refusal must reach the same status as a bare one"
+        );
+
+        // A plain execution failure must stay on the quiet path, and on 400.
+        let general = datafusion::error::DataFusionError::Execution("boom".to_string());
+        assert!(matches!(
+            SqlErrorKind::of_datafusion_error(&general),
+            SqlErrorKind::General
+        ));
+        let general_response = sql_error_response(
+            general.to_string(),
+            SqlErrorKind::of_datafusion_error(&general),
+        );
+        assert_eq!(
+            general_response.status(),
+            StatusCode::BAD_REQUEST,
+            "only the capacity condition moves off 400"
+        );
+
+        // A read-only rejection keeps its 403 rather than being swept into the
+        // capacity status.
+        let read_only = datafusion::error::DataFusionError::Execution(
+            "Insert not allowed in a read-only SQL context".to_string(),
+        );
+        let read_only_response = sql_error_response(
+            read_only.to_string(),
+            SqlErrorKind::of_datafusion_error(&read_only),
+        );
+        assert_eq!(read_only_response.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// `TrackConsumersPool` writes its breakdown as `"… (across reservations)
+    /// as:\n{consumers}\nError: {msg}"`, so the message reaching
+    /// `sql_error_response` is genuinely multi-line. The log record has to stay
+    /// on one line for a collector to group it, while the response body keeps
+    /// the breakdown the caller needs to act on.
+    #[tokio::test]
+    async fn resource_exhaustion_logs_on_one_line_but_responds_in_full() {
+        let message = concat!(
+            "Resources exhausted: Additional allocation failed for HashJoinInput[135] ",
+            "with top memory consumers (across reservations) as:\n",
+            "  HashJoinInput[135]#12(can spill: false) consumed 1.0 GB, peak 1.0 GB,\n",
+            "  ExternalSorter[3]#9(can spill: true) consumed 512.0 MB, peak 600.0 MB.\n",
+            "Error: Failed to allocate additional 256.0 MB for HashJoinInput[135]"
+        );
+
+        let logged = single_line(message);
+        assert!(
+            !logged.chars().any(char::is_control),
+            "no control character may survive into the log line: {logged}"
+        );
+        assert!(
+            logged.contains("consumed 1.0 GB, peak 1.0 GB,   ExternalSorter[3]"),
+            "collapsing must keep the breakdown, only its line breaks: {logged}"
+        );
+        assert_eq!(
+            logged.chars().count(),
+            message.chars().count(),
+            "each control character is replaced, never dropped, so offsets into \
+             the log line still match the message"
+        );
+
+        // A message with nothing to collapse is borrowed, not rebuilt.
+        let plain = "Resources exhausted: out of memory";
+        assert!(matches!(
+            single_line(plain),
+            std::borrow::Cow::Borrowed(kept) if kept == plain
+        ));
+
+        // Collapsing is for the log only: the body the caller reads is the
+        // engine's own message, newlines and all.
+        let response = sql_error_response(message.to_string(), SqlErrorKind::ResourcesExhausted);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("the error response body must be readable");
+        assert_eq!(
+            std::str::from_utf8(&body).expect("the body must be utf8"),
+            message,
+            "the response body must stay verbatim"
+        );
     }
 
     #[test]

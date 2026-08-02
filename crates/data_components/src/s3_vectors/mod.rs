@@ -22,9 +22,9 @@ use datafusion::physical_plan::limit::GlobalLimitExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::prelude::Expr;
 use s3_vectors::{
-    BuildError, CreateIndexError, CreateVectorBucketError, DistanceMetric, Document, GetIndexError,
-    GetVectorBucketError, GetVectorsError, ListIndexesError, ListIndexesInput, PutVectorsError,
-    QueryVectorsError, S3Vectors,
+    BuildError, CreateIndexError, CreateVectorBucketError, DeleteVectorsError, DistanceMetric,
+    Document, GetIndexError, GetVectorBucketError, GetVectorsError, ListIndexesError,
+    ListIndexesInput, PutVectorsError, QueryVectorsError, S3Vectors,
 };
 use s3_vectors_metadata_filter::MetadataFilter;
 use snafu::{ResultExt as _, Snafu};
@@ -60,6 +60,9 @@ pub enum Error {
 
     #[snafu(display("Failed to write vectors to S3 Vectors. {source}"))]
     S3VectorPutVectorError { source: Box<PutVectorsError> },
+
+    #[snafu(display("Failed to delete vectors from S3 Vectors. {source}"))]
+    S3VectorDeleteVectorError { source: Box<DeleteVectorsError> },
 
     #[snafu(display("Failed to query vectors from S3 Vectors. {source}"))]
     S3VectorQueryVectorsError { source: Box<QueryVectorsError> },

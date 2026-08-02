@@ -14,11 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! `spice connect` — Spice Cloud Connect adoption flow.
+//! `spice connect` — Spice Cloud Connect enrollment flow.
 //!
 //! Two distinct use cases share this command:
 //!
-//! 1. **Cloud Connect adoption** (remote management of `spiced` from
+//! 1. **Cloud Connect enrollment** (remote management of `spiced` from
 //!    Spice Cloud). The user passes an adoption code obtained in the
 //!    Spice Cloud portal:
 //!
@@ -26,60 +26,71 @@ limitations under the License.
 //!    spice connect SPICE-ADOPT-7K2PX-9XYZ2-A1B2C-D3E4F
 //!    ```
 //!
-//!    or one of the explicit subcommands `status`/`forget`.
+//!    The command **enrolls and exits**: it stages the code, installs the
+//!    runtime if missing, completes the HTTPS enroll against the cloud
+//!    (identity issued and persisted, registry row created), prints the
+//!    next steps, and returns — it does not start `spiced`. Start the
+//!    runtime with `spiced --cloud-connect` (or install it as a service)
+//!    to bring the instance online. `status`/`remove` inspect and clear
+//!    the local state.
 //!
-//! 2. **Legacy pod-add behavior** (kept for back-compat): when the
-//!    argument is a Spicepod path on Spice.ai Cloud (e.g.
-//!    `spiceai/quickstart`), this behaves like `spice add <pod>` with
-//!    Spice.ai Cloud authentication headers.
+//! 2. **Deprecated pod-add behavior**: when the argument is a Spicepod
+//!    path on Spice.ai Cloud (e.g. `spiceai/quickstart`), this prints a
+//!    deprecation notice and behaves like `spice add <pod>` with Spice.ai
+//!    Cloud authentication headers.
 
-use std::path::PathBuf;
-use std::process::Stdio;
+use std::path::{Path, PathBuf};
 
 use crate::commands::add::{AddArgs, execute_add_or_connect};
 use crate::context::RuntimeContext;
 use crate::error::Result;
 use clap::{Args, Subcommand};
+use runtime_cloud_connect::config::{CloudConnectConfig, IDENTITY_FILE, PENDING_ADOPT_CODE_FILE};
 
 /// Arguments for the `spice connect` command.
 #[derive(Args, Debug)]
 #[command(
-    about = "Connect this instance to Spice Cloud (or add a cloud-hosted Spicepod)",
-    long_about = r#"`spice connect` has two modes:
+    about = "Enroll this host with Spice Cloud (or add a cloud-hosted Spicepod)",
+    long_about = r#"`spice connect` enrolls this host with Spice Cloud and exits.
 
-CLOUD CONNECT ADOPTION:
-  spice connect SPICE-ADOPT-XXXXX-XXXXX-XXXXX-XXXXX   Stage an adoption code so the next
-                                          `spiced` start connects to Spice Cloud
-                                          and is shown as "Pending Adoption" in
-                                          the portal.
-  spice connect status                    Show the current adoption state.
-  spice connect forget                    Clear the local identity on disk.
+  spice connect SPICE-ADOPT-XXXXX-XXXXX-XXXXX-XXXXX
+                                          Enroll with an adoption code from the
+                                          Spice Cloud portal: the identity is
+                                          issued and stored locally, the
+                                          instance appears in the portal
+                                          registry, and the command exits.
+                                          Nothing is left running — start the
+                                          runtime with `spiced --cloud-connect`
+                                          to bring the instance online.
+  spice connect status                    Show the current enrollment state.
+  spice connect remove                    Clear the local identity on disk.
                                           A running `spiced` keeps its
                                           in-memory identity until it is
-                                          restarted or the cloud sends a Forget
+                                          restarted or the cloud sends a Remove
                                           command (a mere stream drop just
                                           reconnects with the same identity),
                                           so restart spiced to stop remote
                                           management immediately.
 
-LEGACY POD-ADD BEHAVIOR:
-  spice connect <org>/<pod>               Equivalent to `spice add <org>/<pod>`
-                                          but attaches Spice.ai Cloud auth
-                                          headers so private Spicepods can be
-                                          fetched.
+Use `--dir <path>` to enroll an instance rooted at a different directory:
+per-instance state lives under `<dir>/.spice`, so multiple instances on one
+host enroll independently.
+
+DEPRECATED POD-ADD BEHAVIOR:
+  spice connect <org>/<pod>               Deprecated; use `spice add <org>/<pod>`.
 
 EXAMPLES
   spice connect SPICE-ADOPT-7K2PX-9XYZ2-A1B2C-D3E4F
+  spice connect SPICE-ADOPT-7K2PX-9XYZ2-A1B2C-D3E4F --dir /opt/edge-1
   spice connect status
-  spice connect forget
-  spice connect spiceai/quickstart
+  spice connect remove
 
 Docs: https://spiceai.org/docs"#
 )]
 pub struct ConnectArgs {
     /// Optional explicit subcommand. If absent, the first positional
-    /// argument (`target`) is inspected to decide between adoption flow
-    /// and legacy pod-add behavior.
+    /// argument (`target`) is inspected to decide between enrollment flow
+    /// and the deprecated pod-add behavior.
     #[command(subcommand)]
     pub command: Option<ConnectCommand>,
 
@@ -88,12 +99,35 @@ pub struct ConnectArgs {
     #[arg(value_name = "TARGET")]
     pub target: Option<String>,
 
-    /// Override the Spice Cloud enroll endpoint the runtime presents its
-    /// adoption code to. Defaults to `https://cloud.spice.ai`. Also
+    /// Override the Spice Cloud enroll endpoint the adoption code is
+    /// presented to. Defaults to `https://cloud.spice.ai`. Also
     /// configurable via `SPICE_CLOUD_ENDPOINT`. The gateway (stream)
     /// address is issued by the enroll response, not configured here.
     #[arg(long, value_name = "URL")]
     pub endpoint: Option<String>,
+
+    /// The instance directory: per-instance Cloud Connect state (the
+    /// identity and staged adoption code) lives under `<dir>/.spice`.
+    /// Defaults to the current directory; resolved to an absolute path at
+    /// enroll time. `SPICE_CONFIG_DIR` overrides the derived `.spice`
+    /// location entirely. Applies to enrollment, `status`, and `remove`.
+    #[arg(long, value_name = "PATH", global = true)]
+    pub dir: Option<PathBuf>,
+
+    /// Attach the instance to the existing Spice Cloud app of this name at
+    /// enroll. Fails (without consuming the code) when no such app exists —
+    /// pass --create to create it. Also configurable via
+    /// `SPICE_CONNECT_ADOPT_APP_NAME`. Omitted: the instance enrolls
+    /// unattached and is attached later in the portal.
+    #[arg(long, value_name = "NAME")]
+    pub app_name: Option<String>,
+
+    /// With --app-name: create the app when it does not exist, then attach
+    /// the instance to it. Never creates silently — an absent app without
+    /// this flag is an error. Also configurable via
+    /// `SPICE_CONNECT_ADOPT_CREATE`.
+    #[arg(long, requires = "app_name")]
+    pub create: bool,
 }
 
 /// Cloud-connect subcommands.
@@ -104,34 +138,41 @@ pub enum ConnectCommand {
 
     /// Clear the local Spice Cloud Connect identity. spiced will
     /// continue running unmanaged after the next restart.
-    Forget,
+    Remove,
 }
 
 /// Execute the `spice connect` command.
 ///
 /// # Errors
 ///
-/// Returns an error if I/O fails or the legacy pod-add path errors.
+/// Returns an error if I/O fails, the enrollment is rejected, or the
+/// deprecated pod-add path errors.
 pub async fn execute(ctx: &RuntimeContext, args: ConnectArgs) -> Result<()> {
+    let config_dir = CloudConnectConfig::resolve_config_dir(args.dir.as_deref());
+
     if let Some(cmd) = args.command {
-        return execute_subcommand(&cmd);
+        return execute_subcommand(&cmd, &config_dir);
     }
 
     let Some(target) = args.target.as_deref() else {
         // No positional argument and no subcommand — default to status
         // so that `spice connect` with no args is informative.
-        return execute_subcommand(&ConnectCommand::Status);
+        return execute_subcommand(&ConnectCommand::Status, &config_dir);
     };
 
     if runtime_cloud_connect::is_valid_adoption_code(target) {
-        return stage_adoption_code(ctx, target, args.endpoint.as_deref()).await;
+        let attach = AppAttachArgs {
+            app_name: args.app_name,
+            create: args.create,
+        };
+        return enroll_instance(ctx, target, args.endpoint.as_deref(), &config_dir, attach).await;
     }
 
     // An input that clearly looks like an adoption code but fails validation
     // is a malformed code, not a Spicepod path. Treating it as a pod path
     // produces a misleading cloud-Spicepod error and may fire a cloud pod-add
     // request for what was plainly meant to be an adoption code, so reject it
-    // explicitly instead of falling through to the legacy pod-add path.
+    // explicitly instead of falling through to the pod-add path.
     if looks_like_adoption_code(target) {
         return Err(crate::error::Error::InvalidArgument {
             message: format!(
@@ -142,41 +183,54 @@ pub async fn execute(ctx: &RuntimeContext, args: ConnectArgs) -> Result<()> {
         });
     }
 
-    // Fall back to legacy pod-add behavior.
+    // Deprecated pod-add behavior, forwarded to `spice add`.
+    eprintln!(
+        "warning: `spice connect <org>/<pod>` is deprecated and will be removed in a future release; use `spice add {target}` instead."
+    );
     let add_args = AddArgs {
         pod_path: target.to_string(),
     };
     execute_add_or_connect(ctx, add_args, true).await
 }
 
-fn execute_subcommand(cmd: &ConnectCommand) -> Result<()> {
+fn execute_subcommand(cmd: &ConnectCommand, config_dir: &Path) -> Result<()> {
     match cmd {
-        ConnectCommand::Status => print_status(),
-        ConnectCommand::Forget => forget_identity(),
+        ConnectCommand::Status => print_status(config_dir),
+        ConnectCommand::Remove => remove_identity(config_dir),
     }
 }
 
-async fn stage_adoption_code(
+/// App-attachment intent from the `--app-name` / `--create` flags.
+struct AppAttachArgs {
+    app_name: Option<String>,
+    create: bool,
+}
+
+/// Enroll this host with Spice Cloud and exit.
+///
+/// Sequence: stage the code under the config dir (so a failed or
+/// interrupted enroll can be resumed by a later `spiced` start), install
+/// the runtime if missing, complete the HTTPS enroll (identity issued and
+/// persisted, registry row created cloud-side, app attached when
+/// requested), print the next steps, and return — `spiced` is never
+/// started.
+async fn enroll_instance(
     ctx: &RuntimeContext,
     code: &str,
     endpoint: Option<&str>,
+    config_dir: &Path,
+    attach: AppAttachArgs,
 ) -> Result<()> {
-    let pending_path =
-        runtime_cloud_connect::config::CloudConnectConfig::default_pending_adopt_code_path();
-    if let Some(parent) = pending_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| crate::error::Error::CloudConnectIo {
-            message: format!("create config dir {}: {e}", parent.display()),
-        })?;
-    }
+    let pending_path = config_dir.join(PENDING_ADOPT_CODE_FILE);
+    std::fs::create_dir_all(config_dir).map_err(|e| crate::error::Error::CloudConnectIo {
+        message: format!("create config dir {}: {e}", config_dir.display()),
+    })?;
 
-    let endpoint_path = pending_path.parent().map_or_else(
-        || PathBuf::from("cloud-endpoint"),
-        |p| p.join("cloud-endpoint"),
-    );
+    let endpoint_path = config_dir.join("cloud-endpoint");
 
     // If the user did NOT pass `--endpoint`, remove any previous override
     // so the next `spiced` start doesn't silently re-use a stale endpoint
-    // from an earlier connect. A `forget` also clears this file, but
+    // from an earlier connect. A `remove` also clears this file, but
     // re-staging without `--endpoint` is the more common case.
     if endpoint.is_none()
         && let Err(e) = std::fs::remove_file(&endpoint_path)
@@ -213,45 +267,106 @@ async fn stage_adoption_code(
         });
     }
 
-    println!("Attaching this Spice Runtime to Spice Cloud Connect...");
+    println!("Enrolling this host with Spice Cloud...");
 
     ctx.ensure_local_runtime_supported()?;
 
-    // Auto-install runtime if not present
+    // Auto-install runtime if not present, so the printed next step
+    // (`spiced --cloud-connect`) works immediately after this command.
     if !ctx.is_runtime_installed() {
         tracing::info!("Spice.ai runtime is not installed. Installing now...");
         crate::commands::install::execute(ctx, &crate::commands::install::InstallArgs::default())
             .await?;
     }
 
-    // Start spiced in the foreground — inheriting stdio and forwarding
-    // signals — exactly as `spice run` does, so the user sees the runtime
-    // logs and adoption progress and can Ctrl-C to stop it. The staged
-    // adoption code drives the connection on startup.
-    let mut cmd = tokio::process::Command::from(ctx.get_run_cmd(&[], None)?);
-    cmd.stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| crate::error::Error::CloudConnectIo {
-            message: format!("Failed to start spiced: {e}"),
-        })?;
-
-    let status = crate::commands::run::run_with_signal_forwarding(&mut child).await?;
-
-    if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
+    // Complete the HTTPS enroll right here — `spiced` is never started.
+    // The CLI and the runtime ship in lockstep, so the CLI's own version
+    // stands in for the runtime version in the reported host facts.
+    let mut config =
+        CloudConnectConfig::from_env_at(env!("CARGO_PKG_VERSION"), config_dir.to_path_buf());
+    // The explicit positional code wins over any env/staged state that
+    // `from_env_at` picked up, and points at the file staged above so a
+    // consumed or dead code is discarded with it.
+    config.adoption_code = Some(code.to_string());
+    config.pending_adopt_code_path = Some(pending_path.clone());
+    if let Some(ep) = endpoint {
+        // The explicit flag wins over `SPICE_CLOUD_ENDPOINT` for this
+        // process; the `cloud-endpoint` file written above covers later
+        // `spiced` starts.
+        config.enroll_endpoint = ep.to_string();
     }
+    // Flags win over the SPICE_CONNECT_ADOPT_* env vars `from_env_at`
+    // picked up.
+    if attach.app_name.is_some() {
+        config.adopt_app_name = attach.app_name;
+    }
+    if attach.create {
+        config.adopt_create_app = true;
+    }
+
+    let outcome = match runtime_cloud_connect::enroll::enroll_now(&config).await {
+        Ok(outcome) => outcome,
+        Err(err) if err.is_credential_rejection() => {
+            // The cloud rejected the code itself (invalid or consumed);
+            // `enroll_now` already discarded the staged copy.
+            return Err(crate::error::Error::CloudConnectEnroll {
+                message: format!(
+                    "{err}. Mint a new adoption code in the Spice Cloud portal and re-run `spice connect <code>`."
+                ),
+            });
+        }
+        Err(err) if err.is_authoritative_rejection() => {
+            // Rejected for a reason other than the code — an expired code,
+            // or app-attachment validation (no such app, attach conflict,
+            // app limit). The code was NOT consumed and stays staged.
+            return Err(crate::error::Error::CloudConnectEnroll {
+                message: format!(
+                    "{err}. The adoption code was not consumed — fix the reported problem \
+                     (e.g. correct --app-name, or pass --create to create the app) and re-run `spice connect <code>`."
+                ),
+            });
+        }
+        Err(err @ runtime_cloud_connect::enroll::EnrollNowError::Persist { .. }) => {
+            // The identity was issued but could not be written; the message
+            // carries the recovery steps (the code is already consumed).
+            return Err(crate::error::Error::CloudConnectEnroll {
+                message: err.to_string(),
+            });
+        }
+        Err(err) => {
+            // Transient (transport / 5xx): the code was NOT consumed and the
+            // staged copy is kept, so both retry paths work.
+            return Err(crate::error::Error::CloudConnectEnroll {
+                message: format!(
+                    "{err}. The adoption code was not consumed — re-run `spice connect <code>` to retry, \
+                     or start `spiced --cloud-connect` to keep retrying in the background (the code stays staged at {}).",
+                    pending_path.display()
+                ),
+            });
+        }
+    };
+
+    println!("Enrolled with Spice Cloud.");
+    println!("  instance id: {}", outcome.identity.identifier);
+    println!("  identity:    {}", config.identity_path.display());
+    if !outcome.identity.gateway_addr.is_empty() {
+        println!("  gateway:     {}", outcome.identity.gateway_addr);
+    }
+    match outcome.app_name {
+        Some(ref app) => println!("  app:         {app}"),
+        None => println!("  app:         unattached — attach to an app in the Spice Cloud portal"),
+    }
+    println!();
+    println!("Nothing is running yet. Start the runtime from the instance directory to connect:");
+    println!("  spiced --cloud-connect");
+    println!("The instance shows as connected in the Spice Cloud portal once the runtime is up.");
 
     Ok(())
 }
 
-fn print_status() -> Result<()> {
-    let identity_path = runtime_cloud_connect::config::CloudConnectConfig::default_identity_path();
-    let pending_path =
-        runtime_cloud_connect::config::CloudConnectConfig::default_pending_adopt_code_path();
+fn print_status(config_dir: &Path) -> Result<()> {
+    let identity_path = config_dir.join(IDENTITY_FILE);
+    let pending_path = config_dir.join(PENDING_ADOPT_CODE_FILE);
 
     let identity = runtime_cloud_connect::identity::IdentityStore::load_optional(&identity_path)
         .map_err(|e| crate::error::Error::CloudConnectIo {
@@ -259,11 +374,10 @@ fn print_status() -> Result<()> {
         })?;
 
     if let Some(id) = identity {
-        let expiry = if id.not_after_unix == 0 {
-            "unbounded".to_string()
-        } else {
-            format!("unix={} (expired={})", id.not_after_unix, id.is_expired())
-        };
+        let expiry = id.not_after_unix.map_or_else(
+            || "unbounded".to_string(),
+            |secs| format!("unix={secs} (expired={})", id.is_expired()),
+        );
         println!("Spice Cloud Connect: adopted");
         println!("  identifier:  {}", id.identifier);
         println!("  identity:    {}", identity_path.display());
@@ -281,12 +395,12 @@ fn print_status() -> Result<()> {
             }
         })?;
         let preview = preview.trim();
-        println!("Spice Cloud Connect: pending adoption");
+        println!("Spice Cloud Connect: pending enrollment");
         println!("  pending code at: {}", pending_path.display());
         let mask = mask_code(preview);
         println!("  code (masked):   {mask}");
         println!(
-            "  start `spiced` to enroll with {} and finish adoption.",
+            "  re-run `spice connect <code>` to enroll with {}, or start `spiced --cloud-connect` to enroll in the background.",
             resolved_endpoint(&pending_path)
         );
         return Ok(());
@@ -297,14 +411,10 @@ fn print_status() -> Result<()> {
     Ok(())
 }
 
-fn forget_identity() -> Result<()> {
-    let identity_path = runtime_cloud_connect::config::CloudConnectConfig::default_identity_path();
-    let pending_path =
-        runtime_cloud_connect::config::CloudConnectConfig::default_pending_adopt_code_path();
-    let endpoint_path = pending_path.parent().map_or_else(
-        || PathBuf::from("cloud-endpoint"),
-        |p| p.join("cloud-endpoint"),
-    );
+fn remove_identity(config_dir: &Path) -> Result<()> {
+    let identity_path = config_dir.join(IDENTITY_FILE);
+    let pending_path = config_dir.join(PENDING_ADOPT_CODE_FILE);
+    let endpoint_path = config_dir.join("cloud-endpoint");
 
     let had_identity = identity_path.exists();
     let had_pending = pending_path.exists();
@@ -342,7 +452,7 @@ fn forget_identity() -> Result<()> {
             "Spice Cloud Connect identity cleared. Run `spice connect <SPICE-ADOPT-...>` to re-adopt."
         );
     } else {
-        println!("Spice Cloud Connect: nothing to forget.");
+        println!("Spice Cloud Connect: nothing to remove.");
     }
     Ok(())
 }

@@ -211,28 +211,22 @@ scripts/signoff status        # does HEAD have its own sign-off?
 scripts/signoff --help        # full usage
 ```
 
-### Remote sign-off (lab SSH host or self-hosted runner)
+### Remote sign-off (self-hosted runner)
 
-When you can't (or don't want to) run the checks on your machine:
+When you can't (or don't want to) run the checks on your machine, dispatch the
+**Remote Sign-off** GitHub Actions workflow on a self-hosted runner:
 
 ```bash
 make signoff-remote                 # current branch
-```
-
-`make signoff-remote` first probes lab hosts over SSH (`192.168.1.100`,
-`192.168.1.101` by default; override with `SIGNOFF_SSH_HOSTS`). The first host
-that answers and has a Git checkout at `$HOME/dev/spice2` is used: it fetches
-your pushed branch into that clone and runs `scripts/signoff -f` there (same
-checks and Rust-skip behavior as local). Override the remote path with an
-absolute path only: `SIGNOFF_SSH_REPO=/absolute/path` (`~` is not expanded).
-
-If no SSH host is usable, it falls back to dispatching the **Remote Sign-off**
-GitHub Actions workflow on a self-hosted runner:
-
-```bash
+# equivalent to:
 gh workflow run signoff.yml -f branch=<your-branch>
 gh run watch --workflow signoff.yml
 ```
+
+Sign-off runs only where it is accountable: your machine, or the Actions
+runner. It deliberately never SSHes into ad-hoc hosts — the LAN lab boxes
+double as benchmark machines, and a workspace build there mid-run silently
+corrupts the measurement.
 
 The Actions workflow:
 
@@ -294,7 +288,7 @@ merge queue is still the real gate.
 | Stage | Trigger | Checks |
 | --- | --- | --- |
 | Local | `make signoff` | skip Rust if no Rust-affecting files in the branch diff; else targeted `make lint-rust PACKAGES=… FEATURES=…` + `make nextest-packages PACKAGES=… FEATURES=…` (features from the workspace resolve), full `make lint-rust`, `make build-cli-dev nextest` |
-| Remote | `make signoff-remote` | same checks via lab SSH (`$HOME/dev/spice2` on 192.168.1.100/101) if reachable, else self-hosted `signoff.yml`; posts `signoff` |
+| Remote | `make signoff-remote` | same checks via the self-hosted `signoff.yml` workflow; posts `signoff` |
 | Pull request | `pull_request` | **Attestation** (validates the sign-off, or auto-passes a branch with no Rust-affecting files, a pure revert, or a single-commit Dependabot bump) + PR hygiene; merge-queue check names report lightweight skipped/passthrough results |
 | Merge queue | `merge_group` | the full required suite (below) + advisory niche checks |
 

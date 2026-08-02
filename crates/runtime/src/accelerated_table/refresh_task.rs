@@ -177,7 +177,7 @@ struct RefreshStat {
 /// or vector-scan layer is not silently missed. Kept as a plain fn (not async)
 /// so that the `HashSet<*const ()>` used for dedup never appears inside an
 /// async fn and cannot make the enclosing future non-`Send`.
-fn collect_indexes_from_provider(
+pub(crate) fn collect_indexes_from_provider(
     root: &Arc<dyn datafusion::catalog::TableProvider>,
 ) -> Vec<Arc<dyn runtime_datafusion_index::Index + Send + Sync>> {
     let mut indexes: Vec<Arc<dyn runtime_datafusion_index::Index + Send + Sync>> = Vec::new();
@@ -209,13 +209,34 @@ fn collect_indexes_from_provider(
 ///
 /// Uses `try_table_provider_sync` to avoid blocking when the federated provider is deferred
 /// (e.g. during schema evolution). If the provider is not yet available, returns an empty list.
-fn indexes_from_federated(
+pub(crate) fn indexes_from_federated(
     federated: &FederatedTable,
 ) -> Vec<Arc<dyn runtime_datafusion_index::Index + Send + Sync>> {
     let Some(root) = federated.try_table_provider_sync() else {
         return Vec::new();
     };
     collect_indexes_from_provider(&root)
+}
+
+/// Collects every index attached to this dataset, from both sides of the accelerated table.
+///
+/// An external-store vector/search index (e.g. S3 Vectors, Elasticsearch) is only ever attached
+/// via `IndexedTableProvider` on the *federated/read* side (`EmbeddingConnector::wrap_table` wraps
+/// the source connector, not the accelerator) — `collect_indexes_from_provider(accelerator)` alone
+/// finds nothing for these. The `DuckDB` vector engine is the opposite: it wraps the *accelerator*
+/// itself (`wrap_accelerator_with_duckdb_vector_indexes`), not the federated side. Both are checked
+/// here, deduplicating by pointer identity (mirroring `collect_indexes_from_provider`'s own dedup)
+/// in case an index is ever reachable through both paths.
+pub(crate) fn collect_all_indexes(
+    accelerator: &Arc<dyn datafusion::catalog::TableProvider>,
+    federated: &FederatedTable,
+) -> Vec<Arc<dyn runtime_datafusion_index::Index + Send + Sync>> {
+    let mut seen = std::collections::HashSet::new();
+    collect_indexes_from_provider(accelerator)
+        .into_iter()
+        .chain(indexes_from_federated(federated))
+        .filter(|index| seen.insert(Arc::as_ptr(index).cast::<()>()))
+        .collect()
 }
 
 pub struct RefreshTaskBuilder {
@@ -1008,6 +1029,7 @@ impl RefreshTask {
             retention::apply_retention_filters_once(
                 &self.dataset_name,
                 &self.accelerator,
+                &self.federated,
                 retention_sql_delete_expr,
                 &self.io_runtime,
             )

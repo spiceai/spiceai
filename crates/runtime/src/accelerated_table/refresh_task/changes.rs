@@ -15,8 +15,11 @@ limitations under the License.
 */
 use super::DatasetMetricLabels;
 use super::RefreshTask;
+use super::{collect_all_indexes, indexes_from_federated};
 use crate::accelerated_table::refresh::Refresh;
-use crate::accelerated_table::refresh_task::deletion::build_batch_delete_expr_from_change_batch;
+use crate::accelerated_table::refresh_task::deletion::{
+    build_batch_delete_expr_from_change_batch, build_pk_only_batch_from_change_batch,
+};
 use crate::component::dataset::OnSchemaChange;
 use crate::datafusion::error::{find_datafusion_root, format_datafusion_error};
 use crate::schema_evolution::{emit_schema_evolution_event, evolution_allowed};
@@ -2926,7 +2929,27 @@ impl RefreshTask {
                     }
                 };
 
-                if !handled_by_cayenne_cdc_path {
+                if handled_by_cayenne_cdc_path {
+                    // Cayenne's fast CDC-delete path bypasses `TableProvider::delete_from`
+                    // entirely, so it never reaches `IndexedTableProvider::delete_from`'s
+                    // index-aware handling on either side — drive index deletion explicitly
+                    // here instead, across both the accelerator and federated sides (an
+                    // external-store vector/search index, e.g. S3 Vectors, is attached only
+                    // on the federated side; see `collect_all_indexes`). Best-effort: an index
+                    // failure is logged, not propagated, so it can't block the (already-applied)
+                    // accelerator-side delete above.
+                    if let Some(keys) = build_pk_only_batch_from_change_batch(change_batch, chunk)?
+                    {
+                        for index in collect_all_indexes(&self.accelerator, &self.federated) {
+                            if let Err(e) = index.delete_by_keys(keys.clone()).await {
+                                tracing::error!(
+                                    "Index '{}' failed to delete entries for a CDC delete via the Cayenne fast path (best-effort, continuing): {e}",
+                                    index.name()
+                                );
+                            }
+                        }
+                    }
+                } else {
                     let delete_plan = self
                         .accelerator
                         .delete_from(session_state, vec![combined])
@@ -2937,6 +2960,24 @@ impl RefreshTask {
                         .await
                         .map_err(find_datafusion_root)
                         .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+
+                    // `self.accelerator.delete_from` above already drives any
+                    // `IndexedTableProvider` wrapping the accelerator itself (e.g. the DuckDB
+                    // vector engine) through its own index-aware handling. It cannot reach an
+                    // index attached only on the federated side (e.g. S3 Vectors, Elasticsearch)
+                    // — that's a distinct `TableProvider` chain — so drive those explicitly here.
+                    // Best-effort: logged, not propagated.
+                    if let Some(keys) = build_pk_only_batch_from_change_batch(change_batch, chunk)?
+                    {
+                        for index in indexes_from_federated(&self.federated) {
+                            if let Err(e) = index.delete_by_keys(keys.clone()).await {
+                                tracing::error!(
+                                    "Index '{}' failed to delete entries for a CDC delete (best-effort, continuing): {e}",
+                                    index.name()
+                                );
+                            }
+                        }
+                    }
                 }
                 wrote = true;
             }
@@ -4090,6 +4131,64 @@ mod tests {
         let result = group_into_sub_batches(&change_batch);
 
         assert!(result.is_empty(), "Empty batch should return empty vector");
+    }
+
+    #[test]
+    fn build_pk_only_batch_projects_just_the_key_columns() {
+        let change_batch = create_test_change_batch(
+            vec!["d", "d"],
+            &[vec!["id"], vec!["id"]],
+            vec![1, 2],
+            vec![Some("Alice"), Some("Bob")],
+        );
+
+        let keys = build_pk_only_batch_from_change_batch(&change_batch, &[0, 1])
+            .expect("should not error")
+            .expect("keyed rows produce a batch");
+
+        assert_eq!(
+            keys.num_columns(),
+            1,
+            "only the 'id' key column, not 'name'"
+        );
+        assert_eq!(keys.schema().field(0).name(), "id");
+        let id_col = keys
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("id column is Int32");
+        assert_eq!(id_col.values(), &[1, 2]);
+    }
+
+    #[test]
+    fn build_pk_only_batch_selects_requested_rows_only() {
+        let change_batch = create_test_change_batch(
+            vec!["d", "d", "d"],
+            &[vec!["id"], vec!["id"], vec!["id"]],
+            vec![10, 20, 30],
+            vec![Some("A"), Some("B"), Some("C")],
+        );
+
+        let keys = build_pk_only_batch_from_change_batch(&change_batch, &[0, 2])
+            .expect("should not error")
+            .expect("keyed rows produce a batch");
+
+        let id_col = keys
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("id column is Int32");
+        assert_eq!(id_col.values(), &[10, 30]);
+    }
+
+    #[test]
+    fn build_pk_only_batch_empty_row_indices_returns_none() {
+        let change_batch =
+            create_test_change_batch(vec!["d"], &[vec!["id"]], vec![1], vec![Some("Alice")]);
+
+        let result =
+            build_pk_only_batch_from_change_batch(&change_batch, &[]).expect("should not error");
+        assert!(result.is_none());
     }
 
     #[test]

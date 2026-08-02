@@ -145,6 +145,10 @@ pub enum Error {
     /// Local I/O failure for the Cloud Connect / adoption flow.
     #[snafu(display("Cloud Connect I/O error: {message}"))]
     CloudConnectIo { message: String },
+
+    /// Enrollment against the Spice Cloud control plane failed.
+    #[snafu(display("Failed to enroll with Spice Cloud: {message}"))]
+    CloudConnectEnroll { message: String },
 }
 
 /// Check an HTTP response status and return an appropriate error for non-success responses.
