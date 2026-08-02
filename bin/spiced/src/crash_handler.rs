@@ -273,3 +273,64 @@ fn report(_cc: &crash_handler::CrashContext) {
     let written = cur.position() as usize;
     raw_write(&buf[..written]);
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    /// Set in the child process to select the crashing role.
+    const CHILD: &str = "SPICED_CRASH_HANDLER_TEST_CHILD";
+
+    /// Install the handler, fault for real, and assert the report reached stderr.
+    ///
+    /// The process under test necessarily dies, so the test re-executes its own binary
+    /// with `CHILD` set: that run installs the handler and segfaults, and the parent
+    /// makes the assertions on its output. `sadness-generator` is from the authors of
+    /// `crash-handler` and exists for exactly this.
+    #[test]
+    fn reports_a_fatal_signal() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        if std::env::var_os(CHILD).is_some() {
+            super::install("test-version");
+            // SAFETY: faulting deliberately — this is the behaviour under test.
+            unsafe { sadness_generator::raise_segfault() }
+        }
+
+        // `module_path!` is crate-qualified; libtest filters are not.
+        let module = module_path!();
+        let filter = module
+            .split_once("::")
+            .map_or(module, |(_, rest)| rest)
+            .to_owned()
+            + "::reports_a_fatal_signal";
+
+        let exe = std::env::current_exe().expect("locate the test binary");
+        let output = std::process::Command::new(exe)
+            .args(["--exact", &filter, "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .expect("run the crashing child");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            stderr.contains("=== spiced native crash ==="),
+            "no crash report on stderr.\nstderr: {stderr}\nstdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+
+        // The child must die from the signal, not exit normally: the handler reports
+        // and then lets the fault kill the process.
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGSEGV),
+            "child should die from SIGSEGV, got {:?}",
+            output.status
+        );
+
+        // Fields that only the Linux report carries.
+        #[cfg(target_os = "linux")]
+        for field in ["signal=SIGSEGV", "ip=0x", "base=0x", "offset=0x", "thread=", "version=test-version"] {
+            assert!(stderr.contains(field), "report is missing `{field}`: {stderr}");
+        }
+    }
+}

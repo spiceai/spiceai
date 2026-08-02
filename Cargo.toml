@@ -155,7 +155,6 @@ adbc_core = "0.23"
 adbc_driver_manager = "0.23"
 ahash = "0.8.12"
 anyhow = "1.0.103"
-async-channel = "1.9"
 arc-swap = "1.7"
 arrow = { version = "58.0.0", features = ["prettyprint"] }
 arrow-array = "58.0.0"
@@ -204,17 +203,10 @@ ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git"
 ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "f3b8c4b49d251cb5f1326b69fe4846dc09d36ac0" }
 base64 = "0.22.1"
 bb8 = "0.9"
-bb8-postgres = "0.9"
 bigdecimal = "0.4.7"
 blake3 = "1.5"
 byte-unit = "5.1.4"
 bytes = "1.10.0"
-candle = { git = "https://github.com/spiceai/candle.git", rev = "6ee27a4d621a3470cbf83596722c16de7cf97f12", package = "candle-core" } # branch: spiceai
-candle-core = { git = "https://github.com/spiceai/candle.git", rev = "6ee27a4d621a3470cbf83596722c16de7cf97f12" } # branch: spiceai
-candle-kernels = { git = "https://github.com/spiceai/candle.git", rev = "6ee27a4d621a3470cbf83596722c16de7cf97f12", package = "candle-kernels" } # branch: spiceai
-candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "6ee27a4d621a3470cbf83596722c16de7cf97f12", package = "candle-metal-kernels" } # branch: spiceai
-candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "6ee27a4d621a3470cbf83596722c16de7cf97f12", package = "candle-nn" } # branch: spiceai
-candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "6ee27a4d621a3470cbf83596722c16de7cf97f12", package = "candle-transformers" } # branch: spiceai
 charset = "0.1.5"
 chrono = "0.4.44"
 clap = { version = "4.5.60", features = ["derive", "env"] }
@@ -250,11 +242,9 @@ delta_kernel = { version = "0.23.0", features = [
     "arrow-58",
     "internal-api",
 ] }
-derive_builder = "0.20.2"
 dotenv = { path = "crates/dotenv" }
 duration-parse = { path = "crates/duration-parse" }
 duckdb = "1.10505" # 1.10505.x corresponds to DuckDB v1.5.5
-dyn-hash = "1.0.0"
 encoding_rs = "0.8.34"
 fundu = "2.0.1"
 futures = "0.3.32"
@@ -369,7 +359,6 @@ cloud-connect-crypto = { path = "crates/cloud-connect-crypto" }
 runtime-cloud-connect = { path = "crates/runtime-cloud-connect" }
 spice-cloud-client = { path = "crates/spice-cloud-client" }
 snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "744ffd77fe82171a805562ce001a341a94d52541" } # branch: spiceai-58
-sqlparser = "0.59.0"
 ssh2 = { version = "0.9.5" }
 suppaftp = { version = "6.3.0", features = ["async"] }
 syn = { version = "2", features = ["full", "extra-traits"] }
@@ -428,7 +417,6 @@ flatbuffers = "25.2.10"
 # so we specify git deps here directly. The [patch.crates-io] entries below exist to override
 # transitive vortex dependencies pulled in by other patched crates.
 vortex = { git = "https://github.com/spiceai/vortex.git", rev = "1b0f1d2a05c555ceaccda991bccfeeaf24aa169b" } # branch: spiceai-54 (vortex 0.79.0)
-vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "1b0f1d2a05c555ceaccda991bccfeeaf24aa169b" } # branch: spiceai-54 (vortex 0.79.0)
 vortex-btrblocks = { git = "https://github.com/spiceai/vortex.git", rev = "1b0f1d2a05c555ceaccda991bccfeeaf24aa169b" } # branch: spiceai-54 (vortex 0.79.0)
 vortex-datafusion = { path = "crates/vortex" }
 vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "1b0f1d2a05c555ceaccda991bccfeeaf24aa169b" } # branch: spiceai-54 (vortex 0.79.0)
