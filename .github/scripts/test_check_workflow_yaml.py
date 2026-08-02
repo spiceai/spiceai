@@ -121,6 +121,68 @@ class CheckWorkflowTest(unittest.TestCase):
         )
 
 
+def _workflow_with_budgets(job_budget: str, step_budget: str) -> str:
+    """A one-step workflow, with each budget line omitted when passed empty."""
+    return "".join(
+        [
+            "---\non:\n  workflow_dispatch:\n\njobs:\n  gate:\n    runs-on: ubuntu-24.04\n",
+            f"    timeout-minutes: {job_budget}\n" if job_budget else "",
+            "    steps:\n      - name: Run the checks\n        run: echo hello\n",
+            f"        timeout-minutes: {step_budget}\n" if step_budget else "",
+        ]
+    )
+
+
+class CheckStepBudgetTest(unittest.TestCase):
+    """#12340: a step budget its job's budget pre-empts can never fire."""
+
+    def test_a_step_budget_below_the_jobs_is_accepted(self):
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(_workflow_with_budgets("358", "355")), []
+        )
+
+    def test_a_step_budget_equal_to_the_jobs_is_reported(self):
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(_workflow_with_budgets("358", "358")),
+            [
+                "job `gate` gives `Run the checks` a 358-minute budget that its own "
+                "358-minute budget pre-empts"
+            ],
+        )
+
+    def test_a_step_budget_above_the_jobs_is_reported(self):
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(_workflow_with_budgets("358", "360")),
+            [
+                "job `gate` gives `Run the checks` a 360-minute budget that its own "
+                "358-minute budget pre-empts"
+            ],
+        )
+
+    def test_a_step_budget_without_a_job_budget_is_left_alone(self):
+        """Common and legitimate: a short probe inside an otherwise unbounded job."""
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(_workflow_with_budgets("", "1")), []
+        )
+
+    def test_a_job_budget_without_step_budgets_is_left_alone(self):
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(_workflow_with_budgets("358", "")), []
+        )
+
+    def test_an_unnamed_step_is_reported_by_position(self):
+        workflow = (
+            "---\non:\n  workflow_dispatch:\n\njobs:\n  gate:\n"
+            "    runs-on: ubuntu-24.04\n    timeout-minutes: 5\n"
+            "    steps:\n      - run: echo first\n"
+            "      - run: echo second\n        timeout-minutes: 5\n"
+        )
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(workflow),
+            ["job `gate` gives `step 2` a 5-minute budget that its own 5-minute budget pre-empts"],
+        )
+
+
 class CheckActionTest(unittest.TestCase):
     def test_valid_action_has_no_problems(self):
         self.assertEqual(check_workflow_yaml.check_action(VALID_ACTION), [])

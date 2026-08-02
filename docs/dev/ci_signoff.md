@@ -238,6 +238,19 @@ The Actions workflow:
 4. Posts pending → success/failure `signoff` statuses, then re-runs
    **Attestation** if needed
 
+The checks run under a 353-minute budget, inside a 358-minute job budget, so a
+run that overruns fails as a failed step rather than being terminated at the
+runner pool's ~360-minute wall (which reports as `cancelled`, with no failed
+step and no chance to clean up). A run that ends without a verdict — budget
+expired, evicted by a re-dispatch, cancelled — replaces its own `pending` status
+with a failure; otherwise `scripts/signoff status` and `scripts/signoff mine`
+would keep showing a sign-off in progress for a run that is long gone.
+Re-dispatch against the same HEAD to try again.
+
+A branch whose sign-off keeps running out of budget is contending for the pool
+rather than doing anything wrong. `-f skip_targeted_lint=true` drops the
+branch-scoped pre-lint, which trades fail-fast feedback for a shorter run.
+
 Requires write access to the repository (same as local sign-off — fork
 contributors still need a maintainer to sign off). The lab SSH path also needs
 SSH key access to the host and `gh` auth on that machine.
