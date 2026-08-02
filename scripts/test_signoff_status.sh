@@ -154,6 +154,12 @@ assert_pending_post() {
     return
   fi
 
+  local lines
+  lines="$(printf '%s\n' "$posted" | grep -c .)"
+  if [[ "$lines" -ne 1 ]]; then
+    fail_test "$name: expected exactly one posted status, got ${lines} ('${posted}')"
+    return
+  fi
   if [[ "$posted" != "${want_state}"$'\t'"signoff"$'\t'* ]]; then
     fail_test "$name: expected a '${want_state}' status in the 'signoff' context, got '${posted}'"
     return
