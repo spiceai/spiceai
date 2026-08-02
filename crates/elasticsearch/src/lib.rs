@@ -83,12 +83,20 @@ pub struct Mappings {
     pub properties: HashMap<String, FieldMapping>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct FieldMapping {
     #[serde(rename = "type")]
     pub field_type: Option<String>,
     #[serde(default)]
     pub properties: Option<HashMap<String, FieldMapping>>,
+    /// Multi-fields — the same value indexed a second way under `<field>.<sub-field>`, e.g. the
+    /// `keyword` sub-field a dynamically mapped string gets alongside its analyzed `text` form.
+    /// A `term` query against an analyzed field has to address one of these to match.
+    #[serde(default)]
+    pub fields: Option<HashMap<String, FieldMapping>>,
+    /// For `keyword` fields: values longer than this many characters are not indexed at all, so
+    /// an exact-match query cannot find them.
+    pub ignore_above: Option<usize>,
     /// For `dense_vector` fields.
     pub dims: Option<i64>,
     /// Similarity metric for `dense_vector` (e.g. `cosine`, `l2_norm`, `dot_product`).

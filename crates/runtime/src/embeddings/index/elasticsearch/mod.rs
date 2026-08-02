@@ -268,6 +268,7 @@ pub async fn try_from_table(
             vector_field: &vector_field,
             dims,
             text_fields: &text_fields,
+            primary_key: &primary_key,
             mapping_opts: &mapping_opts,
             metadata_columns: &metadata_columns,
             index_settings: index_settings.as_ref(),
@@ -342,6 +343,7 @@ async fn ensure_index_with_mapping(
         vector_field,
         dims,
         text_fields,
+        primary_key,
         mapping_opts,
         metadata_columns,
         index_settings,
@@ -424,6 +426,8 @@ async fn ensure_index_with_mapping(
         properties.insert(name, mapping);
     }
 
+    insert_key_column_mappings(&mut properties, primary_key);
+
     let exists = client
         .index_exists(es_index)
         .await
@@ -479,9 +483,53 @@ struct VectorIndexMapping<'a> {
     vector_field: &'a str,
     dims: i32,
     text_fields: &'a [String],
+    primary_key: &'a [arrow_schema::Field],
     mapping_opts: &'a VectorMappingOptions,
     metadata_columns: &'a MetadataColumns,
     index_settings: Option<&'a serde_json::Value>,
+}
+
+/// Adds an exact-match mapping for every primary-key column not already in `properties`.
+///
+/// Without one, Elasticsearch maps a string key dynamically as `text`, whose inverted index holds
+/// analyzed tokens — and a delete that has to filter on the key column (the chunked-index case,
+/// which cannot address documents by `_id`) then matches nothing and silently removes no
+/// documents (#12272).
+///
+/// `keyword` is declared without an `ignore_above` so that a long key is still indexed: the
+/// default that a *dynamic* string mapping applies to its `keyword` sub-field drops values over
+/// 256 characters, which fails in exactly the same silent way.
+///
+/// A key column already in `properties` — a configured text field, or a declared metadata column —
+/// keeps that mapping: overriding it would silently take away the full-text search the user asked
+/// for. The delete path resolves those through the mapping's `keyword` sub-field instead.
+fn insert_key_column_mappings(
+    properties: &mut serde_json::Map<String, serde_json::Value>,
+    primary_key: &[arrow_schema::Field],
+) {
+    for field in primary_key {
+        if properties.contains_key(field.name()) {
+            continue;
+        }
+        properties.insert(
+            field.name().clone(),
+            key_column_es_mapping(field.data_type()),
+        );
+    }
+}
+
+/// The Elasticsearch mapping for a primary-key column: exact-matchable, never analyzed.
+fn key_column_es_mapping(dt: &DataType) -> serde_json::Value {
+    match dt {
+        // The analyzed `text` mapping `arrow_type_to_es_mapping` gives a string cannot be matched
+        // exactly, which is the whole point here.
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+            serde_json::json!({ "type": "keyword" })
+        }
+        // Every other mapping it produces (`long`, `boolean`, `date`, `keyword`, …) already
+        // indexes the value itself.
+        other => arrow_type_to_es_mapping(other),
+    }
 }
 
 /// Check whether an error from `create_index` indicates the index already exists
@@ -561,12 +609,14 @@ async fn get_store_params(
     .await?)
 }
 
-/// Ensure the Elasticsearch index exists with `text` field mappings for the given fields.
+/// Ensure the Elasticsearch index exists with `text` field mappings for the given fields, plus an
+/// exact-match mapping for the primary-key columns (see [`insert_key_column_mappings`]).
 /// Does NOT create a `dense_vector` field. Best-effort: if the index already exists, leaves it.
 pub(crate) async fn ensure_index_with_text_mapping(
     client: &dyn Elasticsearch,
     es_index: &str,
     text_fields: &[String],
+    primary_key: &[arrow_schema::Field],
     index_settings: Option<&serde_json::Value>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut properties = serde_json::Map::new();
@@ -579,6 +629,8 @@ pub(crate) async fn ensure_index_with_text_mapping(
             }),
         );
     }
+
+    insert_key_column_mappings(&mut properties, primary_key);
 
     let exists = client
         .index_exists(es_index)
@@ -609,5 +661,102 @@ pub(crate) async fn ensure_index_with_text_mapping(
         }
         Err(e) if is_index_already_exists_error(&e) => Ok(()),
         Err(e) => Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn field(name: &str, data_type: DataType) -> arrow_schema::Field {
+        arrow_schema::Field::new(name, data_type, false)
+    }
+
+    /// The reported bug (#12272): without an explicit mapping Elasticsearch maps a string key as
+    /// analyzed `text`, and a delete that has to filter on the key column then matches nothing.
+    /// `keyword` indexes the key itself.
+    #[test]
+    fn a_string_key_column_is_mapped_as_keyword() {
+        let mut properties = serde_json::Map::new();
+        insert_key_column_mappings(&mut properties, &[field("id", DataType::Utf8)]);
+
+        assert_eq!(
+            properties.get("id"),
+            Some(&serde_json::json!({ "type": "keyword" })),
+        );
+    }
+
+    /// `ignore_above` is the other way a `keyword` field silently fails to match: a value over the
+    /// limit is not indexed at all. The mapping the runtime writes must not declare one.
+    #[test]
+    fn a_key_column_mapping_declares_no_ignore_above() {
+        let mut properties = serde_json::Map::new();
+        insert_key_column_mappings(
+            &mut properties,
+            &[
+                field("id", DataType::Utf8),
+                field("wide", DataType::LargeUtf8),
+                field("viewed", DataType::Utf8View),
+            ],
+        );
+
+        for name in ["id", "wide", "viewed"] {
+            let mapping = properties.get(name).expect("key column should be mapped");
+            assert_eq!(mapping["type"], "keyword", "{name}: {mapping}");
+            assert!(
+                mapping.get("ignore_above").is_none(),
+                "{name} must be indexed however long the key is: {mapping}"
+            );
+        }
+    }
+
+    /// Non-string keys were never broken by analysis — they keep the mapping that matches how the
+    /// column reads back, rather than being coerced to `keyword`.
+    #[test]
+    fn a_non_string_key_column_keeps_its_natural_mapping() {
+        let mut properties = serde_json::Map::new();
+        insert_key_column_mappings(
+            &mut properties,
+            &[
+                field("i", DataType::Int64),
+                field("flag", DataType::Boolean),
+                field("day", DataType::Date32),
+            ],
+        );
+
+        assert_eq!(properties["i"], serde_json::json!({ "type": "long" }));
+        assert_eq!(properties["flag"], serde_json::json!({ "type": "boolean" }));
+        assert_eq!(properties["day"], serde_json::json!({ "type": "date" }));
+    }
+
+    /// A key column the user also configured for full-text search keeps the `text` mapping that
+    /// makes it searchable — overriding it would silently take that away. The delete path resolves
+    /// such a column through the `keyword` sub-field the text mapping carries.
+    #[test]
+    fn a_key_column_already_mapped_for_full_text_search_is_left_alone() {
+        let text_mapping = serde_json::json!({
+            "type": "text",
+            "fields": { "keyword": { "type": "keyword", "ignore_above": 256 } },
+        });
+        let mut properties = serde_json::Map::new();
+        properties.insert("id".to_string(), text_mapping.clone());
+
+        insert_key_column_mappings(&mut properties, &[field("id", DataType::Utf8)]);
+
+        assert_eq!(properties["id"], text_mapping);
+    }
+
+    /// Every key column of a composite key needs mapping, not just the first.
+    #[test]
+    fn every_column_of_a_composite_key_is_mapped() {
+        let mut properties = serde_json::Map::new();
+        insert_key_column_mappings(
+            &mut properties,
+            &[field("id", DataType::Utf8), field("region", DataType::Utf8)],
+        );
+
+        assert_eq!(properties.len(), 2);
+        assert_eq!(properties["id"]["type"], "keyword");
+        assert_eq!(properties["region"]["type"], "keyword");
     }
 }

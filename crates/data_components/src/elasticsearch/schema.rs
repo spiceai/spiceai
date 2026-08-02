@@ -116,27 +116,23 @@ mod tests {
             "title".to_string(),
             FieldMapping {
                 field_type: Some("text".to_string()),
-                properties: None,
-                dims: None,
-                similarity: None,
+                ..Default::default()
             },
         );
         properties.insert(
             "count".to_string(),
             FieldMapping {
                 field_type: Some("integer".to_string()),
-                properties: None,
-                dims: None,
-                similarity: None,
+                ..Default::default()
             },
         );
         properties.insert(
             "embedding".to_string(),
             FieldMapping {
                 field_type: Some("dense_vector".to_string()),
-                properties: None,
                 dims: Some(384),
                 similarity: Some("cosine".to_string()),
+                ..Default::default()
             },
         );
 
@@ -162,9 +158,7 @@ mod tests {
             "big".to_string(),
             FieldMapping {
                 field_type: Some("unsigned_long".to_string()),
-                properties: None,
-                dims: None,
-                similarity: None,
+                ..Default::default()
             },
         );
 
