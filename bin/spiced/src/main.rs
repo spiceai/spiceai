@@ -69,12 +69,10 @@ const fn get_allocator_name() -> Option<&'static str> {
     }
 }
 
-mod crash_handler;
-
 fn main() {
     // Before anything else, so a fault during startup is still reported. A native
     // crash is not a panic: without this the process dies silently with exit 139.
-    crash_handler::install(env!("CARGO_PKG_VERSION"));
+    spiced::crash_handler::install();
 
     let matches = spiced::Args::command().get_matches();
     let open_telemetry_deprecated =

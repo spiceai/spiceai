@@ -47,16 +47,12 @@ static LOAD_BASE: OnceLock<usize> = OnceLock::new();
 /// after startup look very different from ones that need hours of load.
 static START: OnceLock<std::time::Instant> = OnceLock::new();
 
-/// Build identifier, so a report names the binary it should be symbolized against.
-static VERSION: OnceLock<&'static str> = OnceLock::new();
-
 /// Install fatal-signal reporting. Call once, as early in `main` as possible — before
 /// the Tokio runtime exists, so faults during startup are covered too.
 ///
 /// Failure to attach is logged and otherwise ignored: crash reporting is a diagnostic
 /// aid, and refusing to start without it would be a worse outcome than starting blind.
-pub fn install(version: &'static str) {
-    let _ = VERSION.set(version);
+pub fn install() {
     let _ = START.set(std::time::Instant::now());
     let _ = LOAD_BASE.set(read_load_base().unwrap_or(0));
 
@@ -85,9 +81,23 @@ fn read_load_base() -> Option<usize> {
     let exe = exe.to_str()?;
     let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
     for line in maps.lines() {
-        if line.ends_with(exe) && line.split_whitespace().nth(1)?.contains('x') {
-            let start = line.split('-').next()?;
-            return usize::from_str_radix(start, 16).ok();
+        // The load base is the mapping of the ELF at FILE OFFSET 0 — not the first
+        // executable segment, which sits at a non-zero file offset. Using the r-xp
+        // start would make `ip - base` an offset into the text segment rather than
+        // into the file, and every printed `addr2line` invocation would resolve to
+        // the wrong place. `/proc/self/maps` is address-ordered, so the first such
+        // mapping is the one to take.
+        //
+        // Fields: <start>-<end> <perms> <file-offset> <dev> <inode> <path>
+        if !line.ends_with(exe) {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let range = fields.next()?;
+        let _perms = fields.next()?;
+        let file_offset = fields.next()?;
+        if file_offset.trim_start_matches('0').is_empty() {
+            return usize::from_str_radix(range.split('-').next()?, 16).ok();
         }
     }
     None
@@ -139,10 +149,6 @@ fn raw_write(bytes: &[u8]) {
     }
 }
 
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "signature is dictated by crash_handler::make_crash_event"
-)]
 fn on_crash(cc: &crash_handler::CrashContext) -> crash_handler::CrashEventResult {
     // Several threads can fault at once. Report only the first, so a cascade cannot
     // loop inside the handler while the process is already dying. (The same guard
@@ -184,12 +190,20 @@ fn on_crash(cc: &crash_handler::CrashContext) -> crash_handler::CrashEventResult
 }
 
 #[cfg(target_os = "linux")]
-/// The crashing thread's name, into a caller-provided buffer. `pthread_getname_np`
-/// does not allocate.
-fn thread_name(buf: &mut [u8; 32]) -> usize {
-    // SAFETY: writing into a caller-owned buffer of the declared length.
+/// The crashing thread's name, into a caller-provided buffer.
+///
+/// `prctl(PR_GET_NAME)` rather than `pthread_getname_np`: the latter is not
+/// async-signal-safe — glibc implements it by reading `/proc` through buffered stdio,
+/// so it allocates and takes locks, either of which can deadlock in a handler that
+/// interrupted the same thread mid-allocation. `PR_GET_NAME` is a single syscall that
+/// copies the kernel's `comm` for the calling thread.
+///
+/// The buffer must be at least 16 bytes: that is `TASK_COMM_LEN`, and also the cap
+/// the kernel applies when a thread name is set, so nothing is lost by the size.
+fn thread_name(buf: &mut [u8; 16]) -> usize {
+    // SAFETY: PR_GET_NAME writes at most 16 bytes into the caller-owned buffer.
     unsafe {
-        libc::pthread_getname_np(libc::pthread_self(), buf.as_mut_ptr().cast(), buf.len());
+        libc::prctl(libc::PR_GET_NAME, buf.as_mut_ptr());
     }
     buf.iter().position(|&b| b == 0).unwrap_or(buf.len())
 }
@@ -201,7 +215,7 @@ fn thread_name(buf: &mut [u8; 32]) -> usize {
 fn report(cc: &crash_handler::CrashContext) {
     use std::io::Write as _;
 
-    let mut name = [0u8; 32];
+    let mut name = [0u8; 16];
     let name_len = thread_name(&mut name);
     let thread = core::str::from_utf8(&name[..name_len]).unwrap_or("?");
 
@@ -219,11 +233,11 @@ fn report(cc: &crash_handler::CrashContext) {
     let mut cur = std::io::Cursor::new(&mut buf[..]);
     let _ = write!(
         cur,
-        "\n=== spiced native crash ===\n\
+        "\n=== native crash ===\n\
          signal={} code={} addr=0x{:x} ip=0x{:x} base=0x{:x} offset=0x{:x}\n\
-         thread=\"{}\" pid={} tid={} uptime={}s version={}\n\
+         thread=\"{}\" pid={} tid={} uptime={}s\n\
          symbolize: addr2line -e spiced -fCi 0x{:x}\n\
-         === end spiced native crash ===\n",
+         === end native crash ===\n",
         signal_name(cc.siginfo.ssi_signo),
         cc.siginfo.ssi_code,
         cc.siginfo.ssi_addr,
@@ -234,7 +248,6 @@ fn report(cc: &crash_handler::CrashContext) {
         cc.pid,
         cc.tid,
         uptime,
-        VERSION.get().copied().unwrap_or("unknown"),
         offset,
     );
     #[expect(
@@ -259,12 +272,10 @@ fn report(_cc: &crash_handler::CrashContext) {
     let mut cur = std::io::Cursor::new(&mut buf[..]);
     let _ = write!(
         cur,
-        "\n=== spiced native crash ===\n\
+        "\n=== native crash ===\n\
          (reduced report: full detail is Linux-only)\n\
-         uptime={}s version={}\n\
-         === end spiced native crash ===\n",
-        uptime,
-        VERSION.get().copied().unwrap_or("unknown"),
+         uptime={uptime}s\n\
+         === end native crash ===\n",
     );
     #[expect(
         clippy::cast_possible_truncation,
@@ -279,20 +290,31 @@ mod tests {
     /// Set in the child process to select the crashing role.
     const CHILD: &str = "SPICED_CRASH_HANDLER_TEST_CHILD";
 
-    /// Install the handler, fault for real, and assert the report reached stderr.
+    /// The function the child faults in. `inline(never)` and `no_mangle` keep it a
+    /// distinct, named symbol so a report can be resolved back to it.
+    #[inline(never)]
+    #[unsafe(no_mangle)]
+    extern "C" fn spiced_crash_handler_test_fault() {
+        // SAFETY: a deliberate null write — the behaviour under test.
+        unsafe {
+            std::ptr::null_mut::<u8>().write(1);
+        }
+    }
+
+    /// Install the handler, take a real fault, and assert the report reached stderr.
     ///
-    /// The process under test necessarily dies, so the test re-executes its own binary
-    /// with `CHILD` set: that run installs the handler and segfaults, and the parent
-    /// makes the assertions on its output. `sadness-generator` is from the authors of
-    /// `crash-handler` and exists for exactly this.
+    /// The process under test necessarily dies, so this re-executes its own test
+    /// binary with `CHILD` set: that run installs the handler and faults, and the
+    /// parent asserts on its output. A genuine fault (rather than a sent signal) is
+    /// what exercises the `si_code > 0` path and populates `addr` and `ip`.
     #[test]
     fn reports_a_fatal_signal() {
         use std::os::unix::process::ExitStatusExt as _;
 
         if std::env::var_os(CHILD).is_some() {
-            super::install("test-version");
-            // SAFETY: faulting deliberately — this is the behaviour under test.
-            unsafe { sadness_generator::raise_segfault() }
+            super::install();
+            spiced_crash_handler_test_fault();
+            unreachable!("the fault must terminate the process");
         }
 
         // `module_path!` is crate-qualified; libtest filters are not.
@@ -308,18 +330,18 @@ mod tests {
             .args(["--exact", &filter, "--nocapture"])
             .env(CHILD, "1")
             .output()
-            .expect("run the crashing child");
+            .expect("run the faulting child");
 
         let stderr = String::from_utf8_lossy(&output.stderr);
 
         assert!(
-            stderr.contains("=== spiced native crash ==="),
+            stderr.contains("=== native crash ==="),
             "no crash report on stderr.\nstderr: {stderr}\nstdout: {}",
             String::from_utf8_lossy(&output.stdout)
         );
 
-        // The child must die from the signal, not exit normally: the handler reports
-        // and then lets the fault kill the process.
+        // The child must die from the signal. A clean exit would mean the handler
+        // swallowed the fault and let execution resume.
         assert_eq!(
             output.status.signal(),
             Some(libc::SIGSEGV),
@@ -327,10 +349,20 @@ mod tests {
             output.status
         );
 
-        // Fields that only the Linux report carries.
+        // Fields only the Linux report carries. `base` must be non-zero: a zero load
+        // base means /proc/self/maps parsing failed and reports are unsymbolizable.
         #[cfg(target_os = "linux")]
-        for field in ["signal=SIGSEGV", "ip=0x", "base=0x", "offset=0x", "thread=", "version=test-version"] {
-            assert!(stderr.contains(field), "report is missing `{field}`: {stderr}");
+        {
+            for field in ["signal=SIGSEGV", "ip=0x", "base=0x", "offset=0x", "thread="] {
+                assert!(
+                    stderr.contains(field),
+                    "report is missing `{field}`: {stderr}"
+                );
+            }
+            assert!(
+                !stderr.contains("base=0x0 "),
+                "load base was not resolved; reports would not be symbolizable: {stderr}"
+            );
         }
     }
 }
