@@ -635,17 +635,18 @@ mod tests {
     use datafusion::sql::unparser::{Unparser, dialect::DefaultDialect};
 
     #[test]
-    fn test_valid_datafusion_expressions() {
+    fn test_supported_s3_vectors_filter_conversions() {
         let columns = vec![
             "genre".to_string(),
             "year".to_string(),
             "rating".to_string(),
             "budget".to_string(),
+            "active".to_string(),
             "optional_field".to_string(),
         ];
 
         let test_cases = vec![
-            // Simple equality
+            // Equality supports string, boolean, and numeric metadata values.
             (
                 Expr::BinaryExpr(BinaryExpr::new(
                     Box::new(col("genre")),
@@ -654,7 +655,39 @@ mod tests {
                 )),
                 r#"{"genre":{"$eq":"documentary"}}"#,
             ),
-            // Numeric comparisons
+            (
+                Expr::BinaryExpr(BinaryExpr::new(
+                    Box::new(col("active")),
+                    Operator::Eq,
+                    Box::new(lit(true)),
+                )),
+                r#"{"active":{"$eq":true}}"#,
+            ),
+            (
+                Expr::BinaryExpr(BinaryExpr::new(
+                    Box::new(col("year")),
+                    Operator::Eq,
+                    Box::new(lit(ScalarValue::UInt32(Some(2020)))),
+                )),
+                r#"{"year":{"$eq":2020}}"#,
+            ),
+            (
+                Expr::BinaryExpr(BinaryExpr::new(
+                    Box::new(col("genre")),
+                    Operator::NotEq,
+                    Box::new(lit("drama")),
+                )),
+                r#"{"genre":{"$ne":"drama"}}"#,
+            ),
+            // Range comparisons support numeric metadata values only.
+            (
+                Expr::BinaryExpr(BinaryExpr::new(
+                    Box::new(col("year")),
+                    Operator::Gt,
+                    Box::new(lit(ScalarValue::Int32(Some(2019)))),
+                )),
+                r#"{"year":{"$gt":2019}}"#,
+            ),
             (
                 Expr::BinaryExpr(BinaryExpr::new(
                     Box::new(col("year")),
@@ -678,6 +711,14 @@ mod tests {
                     Box::new(lit(ScalarValue::Float64(Some(8.5)))),
                 )),
                 r#"{"rating":{"$gte":8.5}}"#,
+            ),
+            (
+                Expr::BinaryExpr(BinaryExpr::new(
+                    Box::new(col("budget")),
+                    Operator::LtEq,
+                    Box::new(lit(ScalarValue::UInt64(Some(1_000_000)))),
+                )),
+                r#"{"budget":{"$lte":1000000}}"#,
             ),
             // Array operations
             (
@@ -741,24 +782,51 @@ mod tests {
         ];
 
         for (expr, expected_json) in test_cases {
-            assert!(supports_filter_expr(&columns, &expr));
+            assert!(
+                supports_filter_expr(&columns, &expr),
+                "supported filter was not advertised for pushdown: {expr}"
+            );
             let result = convert_datafusion_filters_to_s3_vectors(&[expr])
                 .expect("Failed to convert DataFusion filters to S3 Vectors filters");
-            if let Some(filter) = result {
-                filter.validate().expect("Should be a valid filter");
+            let filter = result.expect("supported filter should be converted");
+            filter.validate().expect("Should be a valid filter");
 
-                let json_result = filter.to_json().expect("Failed to convert filter to JSON");
-                let parsed_value: serde_json::Value =
-                    serde_json::from_str(&json_result).expect("Failed to parse JSON");
-                let expected_value: serde_json::Value =
-                    serde_json::from_str(expected_json).expect("Failed to parse expected JSON");
+            let json_result = filter.to_json().expect("Failed to convert filter to JSON");
+            let parsed_value: serde_json::Value =
+                serde_json::from_str(&json_result).expect("Failed to parse JSON");
+            let expected_value: serde_json::Value =
+                serde_json::from_str(expected_json).expect("Failed to parse expected JSON");
 
-                assert_eq!(
-                    parsed_value, expected_value,
-                    "Expression conversion mismatch.\nActual: {json_result}\nExpected: {expected_json}"
-                );
-            }
+            assert_eq!(
+                parsed_value, expected_value,
+                "Expression conversion mismatch.\nActual: {json_result}\nExpected: {expected_json}"
+            );
         }
+    }
+
+    #[test]
+    fn test_multiple_supported_filters_are_combined_with_and() {
+        let filters = vec![
+            col("genre").eq(lit("documentary")),
+            col("year").gt_eq(lit(ScalarValue::Int64(Some(2020)))),
+        ];
+
+        let filter = convert_datafusion_filters_to_s3_vectors(&filters)
+            .expect("Failed to convert DataFusion filters to S3 Vectors filters")
+            .expect("supported filters should be converted");
+        filter.validate().expect("Should be a valid filter");
+
+        let json_result = filter.to_json().expect("Failed to convert filter to JSON");
+        let parsed_value: serde_json::Value =
+            serde_json::from_str(&json_result).expect("Failed to parse JSON");
+        let expected_value: serde_json::Value = serde_json::json!({
+            "$and": [
+                {"genre": {"$eq": "documentary"}},
+                {"year": {"$gte": 2020}},
+            ],
+        });
+
+        assert_eq!(parsed_value, expected_value);
     }
 
     #[test]
