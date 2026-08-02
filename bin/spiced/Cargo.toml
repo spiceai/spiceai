@@ -11,6 +11,8 @@ version.workspace = true
 [dependencies]
 app = { path = "../../crates/app" }
 arrow = { workspace = true }
+crash-handler.workspace = true
+libc = "0.2"
 clap = { workspace = true, features = ["derive"] }
 connector-abfs = { path = "../../crates/data-connectors/connector-abfs" }
 connector-adbc = { path = "../../crates/data-connectors/connector-adbc", optional = true }

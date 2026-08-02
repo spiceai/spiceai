@@ -150,6 +150,7 @@ large_futures = "allow"
 too_many_lines = "allow"
 
 [workspace.dependencies]
+crash-handler = "0.8"
 adbc_core = "0.23"
 adbc_driver_manager = "0.23"
 ahash = "0.8.12"
