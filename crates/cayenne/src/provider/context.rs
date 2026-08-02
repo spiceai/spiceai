@@ -212,7 +212,13 @@ impl CayenneContext {
             } else {
                 inline_flush_bounds
             },
-            compaction_background_interval_ms: if pins.compaction_interval {
+            compaction_background_interval_ms: if pins.compaction_interval
+                || config.compaction_background_interval_ms == 0
+            {
+                // A 0 interval means the background compactor was never spawned
+                // (`spawn_background_compaction` returns early), so letting the
+                // controller raise it off 0 would only make the reported actuator
+                // value disagree with reality. Collapse the range instead.
                 (
                     config.compaction_background_interval_ms,
                     config.compaction_background_interval_ms,

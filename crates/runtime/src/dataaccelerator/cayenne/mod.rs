@@ -572,7 +572,12 @@ const SMALL_WRITE_INLINE_MAX_ROWS: usize = cayenne::metadata::DEFAULT_INLINE_MAX
 const SMALL_WRITE_INLINE_MAX_BYTES: usize = cayenne::metadata::DEFAULT_INLINE_MAX_BYTES;
 const SMALL_WRITE_INLINE_MAX_BUFFER_BYTES: usize =
     cayenne::metadata::DEFAULT_INLINE_MAX_BUFFER_BYTES;
-const APPEND_SMALL_WRITE_REFRESH_INTERVAL_THRESHOLD: Duration = Duration::from_mins(5);
+/// Longest `refresh_check_interval` at which a scheduled `append` still counts as
+/// a small-write (CDC-shaped) stream rather than a bulk load. Shared by both
+/// classification entry points ([`refresh_write_profile`] and
+/// [`RefreshWriteProfile::from_spicepod`]) so the pre-init and post-init views of a
+/// pod agree.
+pub(crate) const APPEND_SMALL_WRITE_REFRESH_INTERVAL_THRESHOLD: Duration = Duration::from_mins(5);
 
 /// Map the runtime's detected acceleration storage class onto the Cayenne-local
 /// [`cayenne::metadata::StorageClass`] (the crates can't share the enum — `runtime`
@@ -685,44 +690,175 @@ fn read_only_scan_freshness() -> std::time::Duration {
     *READ_ONLY_SCAN_FRESHNESS
 }
 
+/// How a dataset's refresh mode writes to its Cayenne table. The three shapes want
+/// materially different compaction defaults, so they are named rather than inferred
+/// at each use site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefreshWriteProfile {
+    /// A continuous stream of small deltas (`changes` / `caching`, or a
+    /// fast-cadence `append`). Files accumulate between refreshes, so compaction is
+    /// load-bearing and runs on a tight cadence; small deltas are inlined into the
+    /// metastore instead of becoming tiny Vortex files.
+    SmallWrite,
+    /// Every refresh REPLACES the whole table (`full`). Nothing accumulates across
+    /// refreshes — the previous snapshot is dropped wholesale — so compaction has
+    /// nothing to consolidate and is off by default; the write should just reach the
+    /// target file size as fast as it can.
+    BulkOverwrite,
+    /// Bulk data arrives incrementally and accumulates (`append` on a slow cadence,
+    /// `snapshot`, or refresh `disabled` with writes arriving another way). Files
+    /// build up across writes, so compaction stays on at the conservative cadence.
+    BulkAppend,
+}
+
+impl RefreshWriteProfile {
+    /// The single classification. Every caller — pre-init and post-init alike —
+    /// funnels through this, so the two views of a pod cannot drift.
+    pub(crate) fn classify(
+        refresh_mode: RefreshMode,
+        refresh_check_interval: Option<Duration>,
+    ) -> Self {
+        match refresh_mode {
+            RefreshMode::Caching | RefreshMode::Changes => Self::SmallWrite,
+            RefreshMode::Append => {
+                if refresh_check_interval
+                    .is_some_and(|i| i <= APPEND_SMALL_WRITE_REFRESH_INTERVAL_THRESHOLD)
+                {
+                    Self::SmallWrite
+                } else {
+                    Self::BulkAppend
+                }
+            }
+            RefreshMode::Full => Self::BulkOverwrite,
+            // `snapshot` reloads whole snapshot files rather than issuing an
+            // overwrite through the sink, and `disabled` means rows arrive by some
+            // other write path entirely (e.g. `INSERT INTO` on a read-write
+            // dataset). Neither is a whole-table replace this module can prove, so
+            // both keep compaction on.
+            RefreshMode::Snapshot | RefreshMode::Disabled => Self::BulkAppend,
+        }
+    }
+
+    /// Classify a Spicepod acceleration, BEFORE component initialization has turned
+    /// it into an [`Acceleration`]. The runtime builder uses this to size host memory
+    /// and decide which thread pools to bring up.
+    ///
+    /// Two things are not yet resolved at this point, and the caller supplies one:
+    ///
+    /// * `unset_refresh_mode` — an absent `refresh_mode` is filled in by the
+    ///   *connector* (`DataConnector::resolve_refresh_mode`), not by a fixed
+    ///   default: `debezium` and `cdc` resolve it to `changes`, `sink` to
+    ///   `disabled`, everything else to `full`. Assuming `full` here would classify
+    ///   an unannotated CDC dataset as a whole-table replace and under-provision its
+    ///   memory. See `crate::builder::connector_unset_refresh_mode`.
+    /// * `refresh_check_interval` is still an unparsed string. An unparseable one is
+    ///   treated as absent — the same conservative direction the component builder
+    ///   takes when it later rejects the value, and the same `fundu` parser it uses.
+    pub(crate) fn from_spicepod(
+        accel: &spicepod::acceleration::Acceleration,
+        unset_refresh_mode: RefreshMode,
+    ) -> Self {
+        let refresh_mode = accel
+            .refresh_mode
+            .as_ref()
+            .map_or(unset_refresh_mode, |mode| RefreshMode::from(mode.clone()));
+        let interval = accel
+            .refresh_check_interval
+            .as_deref()
+            .and_then(|raw| fundu::parse_duration(raw).ok());
+        Self::classify(refresh_mode, interval)
+    }
+
+    /// Whether a table on this profile ever accumulates files for compaction to
+    /// consolidate. False only for the whole-table replace, where each refresh
+    /// discards everything the previous one wrote.
+    pub(crate) const fn needs_compaction(self) -> bool {
+        !matches!(self, RefreshWriteProfile::BulkOverwrite)
+    }
+
+    /// Whether a table on this profile can hold rows in the off-pool in-memory CDC
+    /// tier. `get_vortex_config` forces `cdc_durability` back to `file` for every
+    /// other profile, so this is exactly the set that makes the tier reachable.
+    pub(crate) const fn uses_cdc_tier(self) -> bool {
+        matches!(self, RefreshWriteProfile::SmallWrite)
+    }
+
+}
+
 fn apply_refresh_mode_defaults(
     config: &mut cayenne::metadata::VortexConfig,
     acceleration: &Acceleration,
     inline_flush_caps: autotune::InlineFlushCaps,
 ) {
-    if uses_small_write_refresh_profile(acceleration) {
-        config.compaction_trigger_files = SMALL_WRITE_COMPACTION_TRIGGER_FILES;
-        config.compaction_trigger_protected_snapshots =
-            SMALL_WRITE_COMPACTION_TRIGGER_PROTECTED_SNAPSHOTS;
-        config.compaction_trigger_snapshot_age_ms = SMALL_WRITE_COMPACTION_TRIGGER_SNAPSHOT_AGE_MS;
-        config.compaction_background_interval_ms = SMALL_WRITE_COMPACTION_BACKGROUND_INTERVAL_MS;
-        // Per-entry inline-admission caps stay static by design: inlined entries
-        // are re-read on every scan with no zone-map pruning, so raising them is
-        // pure read-amp (see `provider::table` inlining-caps comment).
-        config.inline_max_rows = SMALL_WRITE_INLINE_MAX_ROWS;
-        config.inline_max_bytes = SMALL_WRITE_INLINE_MAX_BYTES;
-        config.inline_max_buffer_bytes = SMALL_WRITE_INLINE_MAX_BUFFER_BYTES;
-        // Memtable flush caps scale with machine memory + metastore storage class
-        // (see `autotune::HardwareProfile::inline_flush_caps`). Explicit operator
-        // params still override these in the param-resolution pass below.
-        config.inline_flush_max_rows = inline_flush_caps.max_rows;
-        config.inline_flush_max_segments = inline_flush_caps.max_segments;
-        config.inline_flush_max_bytes = inline_flush_caps.max_bytes;
-    } else {
-        config.inline_max_rows = 0;
-        config.inline_max_bytes = 0;
-        config.inline_max_buffer_bytes = 0;
+    match refresh_write_profile(acceleration) {
+        RefreshWriteProfile::SmallWrite => {
+            config.compaction_trigger_files = SMALL_WRITE_COMPACTION_TRIGGER_FILES;
+            config.compaction_trigger_protected_snapshots =
+                SMALL_WRITE_COMPACTION_TRIGGER_PROTECTED_SNAPSHOTS;
+            config.compaction_trigger_snapshot_age_ms =
+                SMALL_WRITE_COMPACTION_TRIGGER_SNAPSHOT_AGE_MS;
+            config.compaction_background_interval_ms =
+                SMALL_WRITE_COMPACTION_BACKGROUND_INTERVAL_MS;
+            // Per-entry inline-admission caps stay static by design: inlined entries
+            // are re-read on every scan with no zone-map pruning, so raising them is
+            // pure read-amp (see `provider::table` inlining-caps comment).
+            config.inline_max_rows = SMALL_WRITE_INLINE_MAX_ROWS;
+            config.inline_max_bytes = SMALL_WRITE_INLINE_MAX_BYTES;
+            config.inline_max_buffer_bytes = SMALL_WRITE_INLINE_MAX_BUFFER_BYTES;
+            // Memtable flush caps scale with machine memory + metastore storage class
+            // (see `autotune::HardwareProfile::inline_flush_caps`). Explicit operator
+            // params still override these in the param-resolution pass below.
+            config.inline_flush_max_rows = inline_flush_caps.max_rows;
+            config.inline_flush_max_segments = inline_flush_caps.max_segments;
+            config.inline_flush_max_bytes = inline_flush_caps.max_bytes;
+        }
+        RefreshWriteProfile::BulkOverwrite => {
+            // Nothing survives a whole-table replace for compaction to consolidate:
+            // the overwrite publishes a fresh snapshot, `update_current_snapshot_id`
+            // resets the small-file counter, and no protected snapshot is ever
+            // created. So the background compactor would wake forever only to re-run
+            // its early-outs. Turn it off and let the refresh spend the whole machine
+            // on ingest instead. Inline compaction on writes is unaffected, so a
+            // table that also takes `INSERT`s still consolidates; an operator can
+            // also set `cayenne_compaction_background_interval_ms` explicitly.
+            config.compaction_background_interval_ms = 0;
+            config.inline_max_rows = 0;
+            config.inline_max_bytes = 0;
+            config.inline_max_buffer_bytes = 0;
+        }
+        RefreshWriteProfile::BulkAppend => {
+            config.inline_max_rows = 0;
+            config.inline_max_bytes = 0;
+            config.inline_max_buffer_bytes = 0;
+        }
     }
 }
 
+/// Classify a post-initialization [`Acceleration`], using `resolved_refresh_mode`
+/// for the connector-filled value rather than reading `acceleration.refresh_mode`
+/// raw.
+///
+/// That distinction is load-bearing: `DataConnector::resolve_refresh_mode` is never
+/// written back into the `Acceleration`, so an unannotated `debezium:`/`cdc:`
+/// dataset is a real `changes` stream while its `refresh_mode` field is still
+/// `None`. Reading the field raw would classify it as a whole-table replace and
+/// switch off its background compactor.
+fn refresh_write_profile_for(
+    acceleration: &Acceleration,
+    resolved_refresh_mode: RefreshMode,
+) -> RefreshWriteProfile {
+    RefreshWriteProfile::classify(resolved_refresh_mode, acceleration.refresh_check_interval)
+}
+
+fn refresh_write_profile(acceleration: &Acceleration) -> RefreshWriteProfile {
+    refresh_write_profile_for(
+        acceleration,
+        acceleration.refresh_mode.unwrap_or(RefreshMode::Full),
+    )
+}
+
 fn uses_small_write_refresh_profile(acceleration: &Acceleration) -> bool {
-    match acceleration.refresh_mode.unwrap_or(RefreshMode::Full) {
-        RefreshMode::Caching | RefreshMode::Changes => true,
-        RefreshMode::Append => acceleration
-            .refresh_check_interval
-            .is_some_and(|interval| interval <= APPEND_SMALL_WRITE_REFRESH_INTERVAL_THRESHOLD),
-        RefreshMode::Disabled | RefreshMode::Full | RefreshMode::Snapshot => false,
-    }
+    refresh_write_profile(acceleration).uses_cdc_tier()
 }
 
 /// Whether the resolved `on_conflict` performs an upsert (replace existing rows
@@ -2571,7 +2707,7 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Maximum number of eligible file paths retained in one compaction candidate for trigger selection and observability. The current compactor rewrites the whole current snapshot once triggered, so this does not bound rewrite IO or memory. Default: 32.")
             .default("32"),
         ParameterSpec::component("compaction_background_interval_ms")
-            .description("Background compaction interval in milliseconds. The accelerator runs a per-table background task at this interval. Set to 0 to disable the background task — inline compaction on writes still runs. Default: 10000 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 30000 otherwise."),
+            .description("Background compaction interval in milliseconds. The accelerator runs a per-table background task at this interval. Set to 0 to disable the background task — inline compaction on writes still runs. Default: 10000 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 0 (disabled) for refresh_mode: full, whose whole-table replace leaves nothing to consolidate; 30000 otherwise."),
         ParameterSpec::component("inline_max_rows")
             .description("Maximum rows in a single write that can be inlined into the Cayenne metastore instead of writing a Vortex file. Set to 0 to disable write-entry inlining. Default: 1024 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 0 otherwise."),
         ParameterSpec::component("inline_max_bytes")
@@ -5028,6 +5164,74 @@ mod tests {
             "non-small-write profiles keep the static default (knob is inert there)"
         );
         assert_eq!(config.cdc_mem_tier_min_flush_bytes, 32 * MIB);
+    }
+
+    /// A full refresh replaces the whole table, so there is nothing for compaction
+    /// to consolidate and the background compactor must be off by default.
+    #[tokio::test]
+    async fn test_full_refresh_disables_background_compaction() {
+        let app = Arc::new(AppBuilder::new("test").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+
+        let build = |name: &str, refresh_mode: RefreshMode, params: Vec<(String, String)>| {
+            let mut ds = DatasetBuilder::try_new(name.to_string(), name)
+                .expect("dataset builder")
+                .with_app(Arc::clone(&app))
+                .with_runtime(Arc::clone(&rt))
+                .build()
+                .expect("dataset");
+            ds.acceleration = Some(Acceleration {
+                engine: Engine::Cayenne,
+                mode: Mode::File,
+                refresh_mode: Some(refresh_mode),
+                params: params.into_iter().collect(),
+                ..Default::default()
+            });
+            ds
+        };
+
+        let full = build("full_tbl", RefreshMode::Full, vec![]);
+        let config = CayenneAccelerator::get_vortex_config("full_tbl", &full).await;
+        assert_eq!(
+            config.compaction_background_interval_ms, 0,
+            "full refresh must not spawn a background compactor"
+        );
+        assert_eq!(
+            config.inline_max_rows, 0,
+            "inlining stays off for a whole-table replace"
+        );
+
+        // An explicit interval still wins: a pod that mixes in-place writes with
+        // full refreshes can turn the compactor back on.
+        let pinned = build(
+            "full_pinned",
+            RefreshMode::Full,
+            vec![(
+                "cayenne_compaction_background_interval_ms".to_string(),
+                "15000".to_string(),
+            )],
+        );
+        let config = CayenneAccelerator::get_vortex_config("full_pinned", &pinned).await;
+        assert_eq!(config.compaction_background_interval_ms, 15_000);
+
+        // CDC is untouched: tight cadence, inlining on.
+        let cdc = build("cdc_tbl", RefreshMode::Changes, vec![]);
+        let config = CayenneAccelerator::get_vortex_config("cdc_tbl", &cdc).await;
+        assert_eq!(
+            config.compaction_background_interval_ms,
+            SMALL_WRITE_COMPACTION_BACKGROUND_INTERVAL_MS
+        );
+        assert_eq!(config.inline_max_rows, SMALL_WRITE_INLINE_MAX_ROWS);
+
+        // Snapshot mode accumulates files, so it keeps the conservative cadence and
+        // stays OUT of the inline tier (its entries would never be drained promptly).
+        let snapshot = build("snap_tbl", RefreshMode::Snapshot, vec![]);
+        let config = CayenneAccelerator::get_vortex_config("snap_tbl", &snapshot).await;
+        assert_ne!(
+            config.compaction_background_interval_ms, 0,
+            "snapshot mode still accumulates files to consolidate"
+        );
+        assert_eq!(config.inline_max_rows, 0);
     }
 
     /// `deletion_mode: auto` resolves to `key` ONLY for `refresh_mode`: changes

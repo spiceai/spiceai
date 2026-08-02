@@ -6403,7 +6403,19 @@ impl CayenneTableProvider {
         // the cheap early-out in the compaction trigger. Only count files
         // landed in the live snapshot; staging writes are tracked separately
         // via the staging_may_have_files flag.
-        if !Self::is_staging_snapshot_id(snapshot_id) && writer_ops > 0 {
+        //
+        // The snapshot must be the CURRENT one, not merely non-staging. An
+        // overwrite writes into a fresh, not-yet-published snapshot id while the
+        // old snapshot is still live, so counting those files here attributes
+        // them to the snapshot they are about to REPLACE — and a background tick
+        // could then pick that doomed snapshot for compaction. The counter is
+        // reset when the overwrite publishes, so the net value is unchanged for
+        // every path that already published; this only stops the transient
+        // mis-attribution during the write.
+        if writer_ops > 0
+            && !Self::is_staging_snapshot_id(snapshot_id)
+            && self.get_current_snapshot_id() == snapshot_id
+        {
             self.record_current_snapshot_files_added(writer_ops);
         }
 

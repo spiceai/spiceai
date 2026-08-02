@@ -27,6 +27,7 @@ use crate::config::ClusterRole;
 use crate::config::Config;
 #[cfg(not(windows))]
 use crate::dataaccelerator::cayenne::CayenneAccelerator;
+use runtime_acceleration::acceleration::RefreshMode;
 use crate::datafusion::builder::CayenneOptimizerRules;
 use crate::datafusion::udf::register_udfs;
 use crate::metrics_reader::MetricsReader;
@@ -467,11 +468,12 @@ impl RuntimeBuilder {
         let cayenne_optimizer_rules =
             parse_cayenne_optimizer_rules(&spicepod_rt.params, cayenne_filter_propagation_enabled);
 
-        // Carve a dedicated compaction memory pool only when Cayenne acceleration is
-        // configured (and enabled) AND dedicated thread pools are enabled. This keeps
-        // non-Cayenne deployments at full query budget and matches the dedicated
-        // compaction runtime's "create only if Cayenne is enabled" lifecycle.
-        let cayenne_configured = cayenne_configured(self.app.as_ref());
+        // Carve a dedicated compaction memory pool only when a configured Cayenne
+        // table will actually compact AND dedicated thread pools are enabled. This
+        // keeps non-Cayenne deployments at full query budget, and gives a
+        // full-refresh-only pod — whose whole-table replace leaves nothing to
+        // consolidate, so compaction is off — that memory back for queries.
+        let cayenne_workload = cayenne_workload(self.app.as_ref());
         let dedicated_thread_pools_enabled = !matches!(
             spicepod_rt
                 .params
@@ -479,7 +481,8 @@ impl RuntimeBuilder {
                 .map(String::as_str),
             Some("disabled")
         );
-        let compaction_memory_fraction = (cayenne_configured && dedicated_thread_pools_enabled)
+        let compaction_memory_fraction = (cayenne_workload.needs_compaction()
+            && dedicated_thread_pools_enabled)
             .then(|| {
                 let requested = parse_f64_runtime_param(
                     &spicepod_rt.params,
@@ -489,14 +492,14 @@ impl RuntimeBuilder {
                 clamp_cayenne_compaction_memory_fraction(requested)
             });
 
-        // Estimate the off-pool per-table Cayenne CDC cache reservation (keyset /
-        // segment / coalesce / inline, summed over enabled changes-mode Cayenne
-        // tables). The DataFusion builder reduces the query-memory default by the
-        // amount this exceeds the base host/8 headroom, so the query pool + the
-        // in-memory tier + the per-table caches stay within host RAM as the table
-        // count grows.
-        let cayenne_cdc_reservation_bytes =
-            estimate_cayenne_cdc_reservation_bytes(self.app.as_ref(), &spicepod_rt.params);
+        // Estimate the off-pool per-table Cayenne cache reservation, summed over
+        // every enabled Cayenne table. The DataFusion builder reduces the
+        // query-memory default by it — by the excess over the host/10 headroom the
+        // CDC base already reserves, or in full on the standard base, which reserves
+        // no such slice — so the query pool + the in-memory tier + the per-table
+        // caches stay within host RAM as the table count grows.
+        let cayenne_reservation_bytes =
+            estimate_cayenne_reservation_bytes(self.app.as_ref(), &spicepod_rt.params);
 
         // ---- Coordinated cgroup-aware memory budget for DuckDB accelerators ----
         // The DataFusion query pool defaults to 90% of RAM and EACH distinct DuckDB
@@ -510,7 +513,11 @@ impl RuntimeBuilder {
         let has_duckdb_instances = duckdb_budget_inputs.num_unset_instances > 0
             || duckdb_budget_inputs.num_explicit_instances > 0;
         let duckdb_query_pool_cap = if has_duckdb_instances {
-            let cayenne_active = compaction_memory_fraction.is_some();
+            // Only a CDC pod pays the reduced query-pool default (it leaves room for
+            // the in-memory tier); a bulk-only Cayenne pod keeps the standard default
+            // minus its measured cache reservation.
+            let cayenne_cdc_active =
+                compaction_memory_fraction.is_some() && cayenne_workload.uses_cdc_tier();
             let total_memory = crate::resource_monitor::get_total_memory();
             // DuckDB's own default memory_limit is ~80% of HOST RAM (not the cgroup
             // limit), so project the un-coordinated ceiling from host memory —
@@ -522,8 +529,8 @@ impl RuntimeBuilder {
                 );
             let base_query_budget = crate::datafusion::builder::effective_query_memory_limit(
                 None,
-                cayenne_active,
-                cayenne_cdc_reservation_bytes,
+                cayenne_cdc_active,
+                cayenne_reservation_bytes,
                 None,
             );
             let plan = crate::accelerator_memory_budget::plan(
@@ -758,7 +765,8 @@ impl RuntimeBuilder {
         .cayenne_sort_merge_memory_pool_fraction(cayenne_sort_merge_memory_pool_fraction)
         .cayenne_footer_cache_mb(cayenne_footer_cache_mb)
         .compaction_memory_fraction(compaction_memory_fraction)
-        .cayenne_cdc_reservation_bytes(cayenne_cdc_reservation_bytes)
+        .cayenne_workload(cayenne_workload)
+        .cayenne_reservation_bytes(cayenne_reservation_bytes)
         .duckdb_query_pool_cap(duckdb_query_pool_cap)
         .cayenne_optimizer_rules(cayenne_optimizer_rules);
 
@@ -1076,12 +1084,134 @@ fn parse_usize_runtime_param(params: &HashMap<String, String>, key: &str) -> Opt
     }
 }
 
-/// Whether `app` configures an enabled Cayenne acceleration anywhere.
+/// What the Cayenne accelerations configured in a Spicepod will demand of the host,
+/// aggregated over every enabled one. Decides how much memory the runtime reserves
+/// outside the query pool and which dedicated thread pools it brings up.
 ///
-/// Gates the dedicated compaction memory pool: the carved fraction is both the
-/// signal `spiced` uses to bring up the compaction worker threads and the
-/// `cayenne_active` input to the query-memory calculation, so a false negative
-/// leaves compaction competing for query memory it should have had reserved.
+/// Both flags are unions, so one CDC table in a pod of full-refresh tables still
+/// gets the full CDC-shaped reservation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CayenneWorkload {
+    /// Any enabled Cayenne acceleration at all.
+    configured: bool,
+    /// Any table on a profile that can hold rows in the off-pool in-memory CDC
+    /// tier. Gates the coordinated host-memory partition — the reduced query-pool
+    /// default and the global mem-tier byte budget — which exists solely to leave
+    /// room for that tier. A pod without one cannot fill it
+    /// (`cdc_durability` is forced to `file` off the small-write profile), so
+    /// fencing ~20% of host for it would shrink the query pool for nothing.
+    uses_cdc_tier: bool,
+    /// Any table that accumulates files across writes. False when every Cayenne
+    /// table is a whole-table replace, whose refresh discards what the previous one
+    /// wrote and so has nothing to compact. Gates the dedicated compaction runtime
+    /// and its carved memory pool.
+    needs_compaction: bool,
+}
+
+impl CayenneWorkload {
+    #[must_use]
+    pub const fn is_configured(self) -> bool {
+        self.configured
+    }
+
+    #[must_use]
+    pub const fn uses_cdc_tier(self) -> bool {
+        self.uses_cdc_tier
+    }
+
+    #[must_use]
+    pub const fn needs_compaction(self) -> bool {
+        self.needs_compaction
+    }
+
+    /// Whether bringing up the dedicated compaction runtime is worthwhile. True
+    /// unless every configured Cayenne acceleration is a whole-table replace — a pod
+    /// with no Cayenne at all still gets one, because a table created later by DDL
+    /// may compact and would otherwise fall back to the ambient runtime.
+    #[must_use]
+    pub const fn may_compact(self) -> bool {
+        !self.configured || self.needs_compaction
+    }
+}
+
+/// The write profile a dataset gets when its `refresh_mode` is left unset, which
+/// the *connector* decides via `DataConnector::resolve_refresh_mode` — not a fixed
+/// default. Mirrors the three overrides that differ from the trait default; keep it
+/// in sync with them.
+///
+/// `from` is the raw Spicepod `from:` value, whose connector name is the segment
+/// before the first `:` (or the whole value when there is none).
+///
+/// This is the pre-init stand-in for `resolve_refresh_mode`, which cannot be called
+/// before connectors are constructed. Getting it wrong in the `full` direction is
+/// the dangerous one — it would classify an unannotated CDC dataset as a whole-table
+/// replace and under-provision its memory — so an unrecognized connector keeps the
+/// trait default (`full`) only because that IS the trait default, not as a guess.
+fn connector_unset_refresh_mode(from: &str) -> RefreshMode {
+    // `DatasetSpec::source()` is the authoritative `from:` parse — it recognizes
+    // `://`, `:` AND `/` as delimiters and maps the empty value to `sink`. Splitting
+    // on `:` alone would read `debezium/topic` as the whole string and miss it.
+    match spicepod_dataset_source(from) {
+        // Both resolve an unset mode to `changes`.
+        "debezium" | "cdc" => RefreshMode::Changes,
+        // Resolves to `disabled`: no refresh runs, but rows arrive by `INSERT INTO`
+        // and accumulate, so files still need consolidating.
+        "sink" => RefreshMode::Disabled,
+        // `DataConnector::resolve_refresh_mode`'s default is `full`.
+        _ => RefreshMode::Full,
+    }
+}
+
+/// The connector name in a Spicepod `from:` value, via the same normalization the
+/// initialized `Dataset` uses (`runtime_component::DatasetSpec::source`).
+fn spicepod_dataset_source(from: &str) -> &str {
+    if from == "sink" || from.is_empty() {
+        return "sink";
+    }
+    match runtime_component::find_first_delimiter(from) {
+        Some((0, _)) => "",
+        Some((pos, _)) => &from[..pos],
+        None => "spice.ai",
+    }
+}
+
+/// The refresh mode a dataset resolves to, accounting for the connector filling in
+/// an unset one.
+fn resolved_refresh_mode(
+    from: &str,
+    refresh_mode: Option<&spicepod::acceleration::RefreshMode>,
+) -> RefreshMode {
+    refresh_mode.map_or_else(
+        || connector_unset_refresh_mode(from),
+        |mode| RefreshMode::from(mode.clone()),
+    )
+}
+
+/// Whether any enabled acceleration in `app` streams CDC changes, for ANY engine.
+///
+/// Gates the dedicated CDC-apply runtime: that pool exists to keep the
+/// freshness-critical `refresh_mode: changes` apply loop off the low-priority
+/// refresh runtime, so a pod with no changes-mode dataset pays `cores - 1` idle
+/// worker threads for a loop that never runs. `DataFusion::cdc_apply_runtime()`
+/// falls back to the refresh runtime (and then the CPU runtime), so skipping it is
+/// a resource decision, not a behavioral one.
+///
+/// Datasets only: `ViewBuilder::try_from` rejects every view refresh mode except
+/// `full`, so no view can stream changes.
+#[must_use]
+pub fn streams_cdc_changes(app: Option<&Arc<app::App>>) -> bool {
+    app.is_some_and(|app| {
+        app.datasets.iter().any(|dataset| {
+            dataset.acceleration.as_ref().is_some_and(|accel| {
+                accel.enabled
+                    && resolved_refresh_mode(&dataset.from, accel.refresh_mode.as_ref())
+                        == RefreshMode::Changes
+            })
+        })
+    })
+}
+
+/// Classify the Cayenne accelerations `app` configures (see [`CayenneWorkload`]).
 ///
 /// Covers both `app.datasets` and `app.views`: a view carries its own
 /// `acceleration` block and is initialized through the same `DataAccelerator::init`
@@ -1090,41 +1220,95 @@ fn parse_usize_runtime_param(params: &HashMap<String, String>, key: &str) -> Opt
 /// views runs a Cayenne tier the memory budget cannot see. Catalogs are excluded
 /// deliberately: they carry `CatalogAcceleration`, a separate type.
 ///
+/// Each acceleration is classified by `RefreshWriteProfile::from_spicepod` — the
+/// same mapping `dataaccelerator::cayenne` uses to configure the table — so the
+/// budget can never disagree with the tables it is budgeting for.
+///
 /// This enumerates component kinds by hand because it runs *before* initialization,
 /// against the Spicepod — the pre-init counterpart of the `AccelerationSource`
 /// trait that datasets and views both implement once components exist.
-fn cayenne_configured(app: Option<&Arc<app::App>>) -> bool {
-    app.is_some_and(|app| {
-        app.datasets
-            .iter()
-            .map(|dataset| dataset.acceleration.as_ref())
-            .chain(app.views.iter().map(|view| view.acceleration.as_ref()))
-            .flatten()
-            .any(|accel| {
-                accel.enabled
-                    && accel
-                        .engine
-                        .as_deref()
-                        .is_some_and(|engine| engine.eq_ignore_ascii_case("cayenne"))
-            })
+fn cayenne_workload(app: Option<&Arc<app::App>>) -> CayenneWorkload {
+    let Some(app) = app else {
+        return CayenneWorkload::default();
+    };
+    cayenne_accelerations(app).fold(CayenneWorkload::default(), |workload, (_accel, profile)| {
+        CayenneWorkload {
+            configured: true,
+            uses_cdc_tier: workload.uses_cdc_tier || profile.uses_cdc_tier(),
+            needs_compaction: workload.needs_compaction || profile.needs_compaction(),
+        }
     })
 }
 
-/// Estimate the aggregate bytes that enabled `refresh_mode: changes` Cayenne tables
-/// reserve OUTSIDE the `DataFusion` query pool: per table, the PK keyset cache +
-/// segment cache + CDC coalesce buffer + inline memtable. Each uses the explicit
-/// per-table param (matching the accelerator's key lists, incl. `cayenne_`-prefixed
-/// aliases) when set, else the accelerator's auto-derived cap (mirroring
-/// `dataaccelerator::cayenne::autotune::HardwareProfile` — keep the fractions in
-/// sync). The globally coordinated in-memory tier and the virtual (non-resident)
-/// metastore mmap are intentionally excluded: the tier is already capped at host/5
-/// and the mmap is page-cache-backed. Returns 0 when no changes-mode Cayenne table
-/// is configured, which disables the query-pool reduction.
+/// Every enabled Cayenne acceleration in `app`, paired with its RESOLVED write
+/// profile — the connector default is already applied for an unset `refresh_mode`
+/// (see [`connector_unset_refresh_mode`]), so a consumer cannot read the fallback
+/// as if it were the answer.
 ///
-/// Datasets only, deliberately: this counts `refresh_mode: changes` tables, and
-/// `ViewBuilder::try_from` rejects every view refresh mode except `full`, so no view
-/// can qualify (unlike [`cayenne_configured`], which must consider views).
-fn estimate_cayenne_cdc_reservation_bytes(
+/// A view has no `from:` and `ViewBuilder::try_from` rejects every refresh mode
+/// except `full`, so its unset default is the whole-table replace.
+fn cayenne_accelerations(
+    app: &Arc<app::App>,
+) -> impl Iterator<
+    Item = (
+        &spicepod::acceleration::Acceleration,
+        crate::dataaccelerator::cayenne::RefreshWriteProfile,
+    ),
+> {
+    use crate::dataaccelerator::cayenne::RefreshWriteProfile;
+
+    app.datasets
+        .iter()
+        .map(|dataset| {
+            (
+                dataset.acceleration.as_ref(),
+                connector_unset_refresh_mode(&dataset.from),
+            )
+        })
+        .chain(
+            app.views
+                .iter()
+                .map(|view| (view.acceleration.as_ref(), RefreshMode::Full)),
+        )
+        .filter_map(|(accel, unset)| accel.map(|accel| (accel, unset)))
+        .filter(|(accel, _)| {
+            accel.enabled
+                && accel
+                    .engine
+                    .as_deref()
+                    .is_some_and(|engine| engine.eq_ignore_ascii_case("cayenne"))
+        })
+        .map(|(accel, unset)| (accel, RefreshWriteProfile::from_spicepod(accel, unset)))
+}
+
+/// Estimate the aggregate bytes that enabled Cayenne tables reserve OUTSIDE the
+/// `DataFusion` query pool. Each uses the explicit per-table param (matching the
+/// accelerator's key lists, incl. `cayenne_`-prefixed aliases) when set, else the
+/// accelerator's auto-derived cap (mirroring
+/// `dataaccelerator::cayenne::autotune::HardwareProfile` — keep the fractions in
+/// sync).
+///
+/// Two tiers of consumer, because they attach to different tables:
+///
+/// * The **Vortex segment cache** is a SCAN-path cache. `CayenneContext` builds one
+///   `SharedSegmentCache` the moment a table is registered, whatever its refresh
+///   mode, and it fills to its cap under query load. It is counted for EVERY enabled
+///   Cayenne acceleration. One per acceleration is exact: a partitioned dataset's
+///   children all share the parent's context, and therefore its one cache
+///   (`CayennePartitionCreator::new`).
+/// * The **PK keyset, CDC coalesce buffer, and inline memtable** are write-path
+///   state that only a small-write (CDC-profile) table populates, so they are
+///   counted only for those.
+///
+/// The globally coordinated in-memory tier and the virtual (non-resident) metastore
+/// mmap are intentionally excluded: the tier is already capped at host/5 and the
+/// mmap is page-cache-backed.
+///
+/// Datasets AND views: a view registers a Cayenne table with its own segment cache
+/// exactly as a dataset does. `ViewBuilder::try_from` rejects every view refresh mode
+/// except `full`, so a view never contributes the write-path tier, but it is
+/// classified through the same predicate rather than assumed.
+fn estimate_cayenne_reservation_bytes(
     app: Option<&Arc<app::App>>,
     runtime_params: &HashMap<String, String>,
 ) -> u64 {
@@ -1154,24 +1338,27 @@ fn estimate_cayenne_cdc_reservation_bytes(
         parse_u64(runtime_params, &["cdc_max_coalesced_bytes"]).unwrap_or(DEFAULT_COALESCE_BYTES);
 
     let mut total: u64 = 0;
-    for dataset in &app.datasets {
-        let Some(accel) = dataset.acceleration.as_ref() else {
-            continue;
-        };
-        if !accel.enabled
-            || !accel
-                .engine
-                .as_deref()
-                .is_some_and(|engine| engine.eq_ignore_ascii_case("cayenne"))
-            || accel.refresh_mode != Some(spicepod::acceleration::RefreshMode::Changes)
-        {
-            continue;
-        }
+    for (accel, profile) in cayenne_accelerations(app) {
         let params = accel
             .params
             .as_ref()
             .map(spicepod::param::Params::as_string_map)
             .unwrap_or_default();
+        // Scan-path cache: allocated per registered Cayenne acceleration regardless
+        // of refresh mode.
+        let segment = parse_u64(&params, &["cayenne_segment_cache_mb", "segment_cache_mb"])
+            .map_or_else(
+                || (total_memory / SEGMENT_CACHE_HOST_FRACTION).clamp(256 * MIB, GIB),
+                |mb| mb.saturating_mul(MIB),
+            );
+        total = total.saturating_add(segment);
+
+        if !profile.uses_cdc_tier() {
+            continue;
+        }
+        // Write-path state below: only a small-write (CDC-profile) table populates
+        // the keyset, the coalesce buffer, or the inline memtable.
+        //
         // MB-valued cache params -> bytes; else the accelerator's auto host-fraction cap.
         let keyset = parse_u64(
             &params,
@@ -1181,11 +1368,6 @@ fn estimate_cayenne_cdc_reservation_bytes(
             || (total_memory / KEYSET_CACHE_HOST_FRACTION).clamp(256 * MIB, 8 * GIB),
             |mb| mb.saturating_mul(MIB),
         );
-        let segment = parse_u64(&params, &["cayenne_segment_cache_mb", "segment_cache_mb"])
-            .map_or_else(
-                || (total_memory / SEGMENT_CACHE_HOST_FRACTION).clamp(256 * MIB, GIB),
-                |mb| mb.saturating_mul(MIB),
-            );
         // Inline memtable is byte-valued; match the accelerator's key list including
         // the `cayenne_`-prefixed aliases (see dataaccelerator::cayenne mod.rs).
         let inline = parse_u64(
@@ -1203,7 +1385,6 @@ fn estimate_cayenne_cdc_reservation_bytes(
             parse_u64(&params, &["cdc_max_coalesced_bytes"]).unwrap_or(global_coalesce_bytes);
         total = total
             .saturating_add(keyset)
-            .saturating_add(segment)
             .saturating_add(coalesce)
             .saturating_add(inline);
     }
@@ -1786,49 +1967,73 @@ mod test {
         assert_eq!(inputs.sum_explicit_bytes, 4 * 1024 * 1024 * 1024);
     }
 
+    fn cayenne_test_accel(engine: &str, enabled: bool) -> spicepod::acceleration::Acceleration {
+        spicepod::acceleration::Acceleration {
+            enabled,
+            engine: Some(engine.to_string()),
+            ..spicepod::acceleration::Acceleration::default()
+        }
+    }
+
+    fn cayenne_test_dataset(
+        name: &str,
+        accel: spicepod::acceleration::Acceleration,
+    ) -> spicepod::component::dataset::Dataset {
+        cayenne_test_dataset_from("dummy:source", name, accel)
+    }
+
+    fn cayenne_test_dataset_from(
+        from: &str,
+        name: &str,
+        accel: spicepod::acceleration::Acceleration,
+    ) -> spicepod::component::dataset::Dataset {
+        let mut ds = spicepod::component::dataset::Dataset::new(from, name);
+        ds.acceleration = Some(accel);
+        ds
+    }
+
+    fn cayenne_test_view(
+        name: &str,
+        accel: spicepod::acceleration::Acceleration,
+    ) -> spicepod::component::view::View {
+        let mut view = spicepod::component::view::View::new(name.to_string());
+        view.sql = Some("SELECT 1".to_string());
+        view.acceleration = Some(accel);
+        view
+    }
+
+    fn cayenne_test_app(
+        datasets: Vec<spicepod::component::dataset::Dataset>,
+        views: Vec<spicepod::component::view::View>,
+    ) -> Arc<app::App> {
+        let builder = datasets.into_iter().fold(
+            app::AppBuilder::new("cayenne-gate-test"),
+            app::AppBuilder::with_dataset,
+        );
+        Arc::new(
+            views
+                .into_iter()
+                .fold(builder, app::AppBuilder::with_view)
+                .build(),
+        )
+    }
+
     /// A view carries its own `acceleration` block and reaches the same
     /// `DataAccelerator::init` path as a dataset, so Cayenne on a view must count
     /// toward the compaction-pool gate — otherwise a view-only Cayenne pod carves no
     /// compaction pool and sizes its query pool as if no Cayenne tier existed.
     #[test]
-    fn cayenne_configured_counts_views_and_datasets() {
-        use spicepod::acceleration::Acceleration;
+    fn cayenne_workload_counts_views_and_datasets() {
         use spicepod::component::dataset::Dataset;
         use spicepod::component::view::View;
-        use std::sync::Arc;
-
-        fn accel(engine: &str, enabled: bool) -> Acceleration {
-            Acceleration {
-                enabled,
-                engine: Some(engine.to_string()),
-                ..Acceleration::default()
-            }
-        }
-
-        fn dataset_with(engine: &str, enabled: bool) -> Dataset {
-            let mut ds = Dataset::new("dummy:source", "ds");
-            ds.acceleration = Some(accel(engine, enabled));
-            ds
-        }
-
-        fn view_with(engine: &str, enabled: bool) -> View {
-            let mut view = View::new("v".to_string());
-            view.sql = Some("SELECT 1".to_string());
-            view.acceleration = Some(accel(engine, enabled));
-            view
-        }
 
         let configured = |datasets: Vec<Dataset>, views: Vec<View>| {
-            let builder = datasets.into_iter().fold(
-                app::AppBuilder::new("cayenne-gate-test"),
-                app::AppBuilder::with_dataset,
-            );
-            let app = views
-                .into_iter()
-                .fold(builder, app::AppBuilder::with_view)
-                .build();
-            cayenne_configured(Some(&Arc::new(app)))
+            cayenne_workload(Some(&cayenne_test_app(datasets, views))).is_configured()
         };
+        let dataset_with =
+            |engine: &str, enabled: bool| cayenne_test_dataset("ds", cayenne_test_accel(engine, enabled));
+        let view_with =
+            |engine: &str, enabled: bool| cayenne_test_view("v", cayenne_test_accel(engine, enabled));
 
         // Regression: Cayenne declared ONLY on a view must still be seen.
         assert!(
@@ -1858,7 +2063,186 @@ mod test {
             vec![view_with("duckdb", true)]
         ));
         assert!(!configured(vec![], vec![]));
-        assert!(!cayenne_configured(None));
+        assert!(!cayenne_workload(None).is_configured());
+    }
+
+    /// The two host-resource decisions the workload drives must key off the refresh
+    /// mode, not merely on Cayenne being present: a full-refresh-only pod has no
+    /// reachable in-memory CDC tier to reserve host RAM for, and nothing for
+    /// compaction to consolidate.
+    #[test]
+    fn cayenne_workload_separates_cdc_tier_from_compaction() {
+        use spicepod::acceleration::RefreshMode;
+
+        let accel_with = |mode: RefreshMode, interval: Option<&str>| {
+            spicepod::acceleration::Acceleration {
+                refresh_mode: Some(mode),
+                refresh_check_interval: interval.map(ToString::to_string),
+                ..cayenne_test_accel("cayenne", true)
+            }
+        };
+        let workload = |accels: Vec<spicepod::acceleration::Acceleration>| {
+            let datasets = accels
+                .into_iter()
+                .enumerate()
+                .map(|(i, a)| cayenne_test_dataset(&format!("ds{i}"), a))
+                .collect();
+            cayenne_workload(Some(&cayenne_test_app(datasets, vec![])))
+        };
+
+        // Full refresh only: neither the CDC tier nor compaction is reachable.
+        let full_only = workload(vec![accel_with(RefreshMode::Full, None)]);
+        assert!(full_only.is_configured());
+        assert!(
+            !full_only.uses_cdc_tier(),
+            "a full-refresh pod must not fence host RAM for a tier cdc_durability forces to `file`"
+        );
+        assert!(
+            !full_only.needs_compaction(),
+            "a whole-table replace leaves nothing to consolidate"
+        );
+
+        // An unset refresh_mode defaults to `full` and must classify identically.
+        assert_eq!(workload(vec![cayenne_test_accel("cayenne", true)]), full_only);
+
+        // Changes mode needs both.
+        let cdc = workload(vec![accel_with(RefreshMode::Changes, None)]);
+        assert!(cdc.uses_cdc_tier() && cdc.needs_compaction());
+
+        // Append accumulates files, so it compacts — but only a fast cadence puts it
+        // on the small-write profile that can reach the tier.
+        let slow_append = workload(vec![accel_with(RefreshMode::Append, Some("1h"))]);
+        assert!(!slow_append.uses_cdc_tier() && slow_append.needs_compaction());
+        let fast_append = workload(vec![accel_with(RefreshMode::Append, Some("10s"))]);
+        assert!(fast_append.uses_cdc_tier() && fast_append.needs_compaction());
+
+        // Snapshot mode is not an overwrite this module can prove, so it keeps
+        // compaction on without reaching the tier.
+        let snapshot = workload(vec![accel_with(RefreshMode::Snapshot, None)]);
+        assert!(!snapshot.uses_cdc_tier() && snapshot.needs_compaction());
+
+        // Both flags are unions: one CDC table in a pod of full-refresh tables still
+        // earns the full CDC-shaped reservation.
+        let mixed = workload(vec![
+            accel_with(RefreshMode::Full, None),
+            accel_with(RefreshMode::Changes, None),
+        ]);
+        assert!(mixed.uses_cdc_tier() && mixed.needs_compaction());
+    }
+
+    /// An unset `refresh_mode` is filled in by the CONNECTOR, not by a fixed
+    /// default, so the pre-init classifier must apply the same connector defaults.
+    /// Assuming `full` for an unannotated `debezium:`/`cdc:` dataset would classify
+    /// a genuine CDC pod as a whole-table replace and under-provision its memory.
+    #[test]
+    fn cayenne_workload_honors_connector_unset_refresh_defaults() {
+        let workload_for = |from: &str| {
+            let ds = cayenne_test_dataset_from(from, "ds", cayenne_test_accel("cayenne", true));
+            cayenne_workload(Some(&cayenne_test_app(vec![ds], vec![])))
+        };
+
+        // `debezium` and `cdc` resolve an unset mode to `changes`.
+        for from in ["debezium:topic", "cdc:stream"] {
+            let w = workload_for(from);
+            assert!(
+                w.uses_cdc_tier() && w.needs_compaction(),
+                "{from} with no refresh_mode is a CDC stream and must get the CDC reservation"
+            );
+        }
+
+        // `sink` resolves to `disabled`: no refresh, but `INSERT INTO` accumulates
+        // files, so compaction is still needed — and the CDC tier is not.
+        let sink = workload_for("sink");
+        assert!(!sink.uses_cdc_tier() && sink.needs_compaction());
+
+        // Everything else takes the trait default of `full`.
+        for from in ["postgres:public.t", "s3://bucket/path", "dummy:source"] {
+            let w = workload_for(from);
+            assert!(
+                !w.uses_cdc_tier() && !w.needs_compaction(),
+                "{from} with no refresh_mode is a full refresh"
+            );
+        }
+
+        // An EXPLICIT refresh_mode is authoritative for every connector — each
+        // override returns the caller's value verbatim when it is `Some`.
+        let mut explicit_full = cayenne_test_accel("cayenne", true);
+        explicit_full.refresh_mode = Some(spicepod::acceleration::RefreshMode::Full);
+        let ds = cayenne_test_dataset_from("debezium:topic", "ds", explicit_full);
+        let w = cayenne_workload(Some(&cayenne_test_app(vec![ds], vec![])));
+        assert!(
+            !w.uses_cdc_tier() && !w.needs_compaction(),
+            "an explicit refresh_mode: full overrides the connector's changes default"
+        );
+    }
+
+    /// The dedicated CDC-apply pool is `cores - 1` threads for a loop only
+    /// `refresh_mode: changes` runs, and it is engine-agnostic.
+    #[test]
+    fn streams_cdc_changes_detects_any_engine() {
+        use spicepod::acceleration::RefreshMode;
+
+        let with_mode = |engine: &str, mode: Option<RefreshMode>, enabled: bool| {
+            cayenne_test_dataset(
+                "ds",
+                spicepod::acceleration::Acceleration {
+                    refresh_mode: mode,
+                    ..cayenne_test_accel(engine, enabled)
+                },
+            )
+        };
+        let from_with_mode = |from: &str, mode: Option<RefreshMode>| {
+            cayenne_test_dataset_from(
+                from,
+                "ds",
+                spicepod::acceleration::Acceleration {
+                    refresh_mode: mode,
+                    ..cayenne_test_accel("cayenne", true)
+                },
+            )
+        };
+        let streams = |ds: Vec<spicepod::component::dataset::Dataset>| {
+            streams_cdc_changes(Some(&cayenne_test_app(ds, vec![])))
+        };
+
+        assert!(streams(vec![with_mode(
+            "duckdb",
+            Some(RefreshMode::Changes),
+            true
+        )]));
+        assert!(streams(vec![with_mode(
+            "cayenne",
+            Some(RefreshMode::Changes),
+            true
+        )]));
+        assert!(!streams(vec![with_mode(
+            "cayenne",
+            Some(RefreshMode::Full),
+            true
+        )]));
+        assert!(!streams(vec![with_mode("cayenne", None, true)]));
+        assert!(
+            !streams(vec![with_mode("cayenne", Some(RefreshMode::Changes), false)]),
+            "a disabled acceleration never runs the apply loop"
+        );
+        assert!(!streams(vec![]));
+        assert!(!streams_cdc_changes(None));
+
+        // An unset refresh_mode on a connector that resolves it to `changes` still
+        // runs the apply loop — skipping the pool for it would deprioritize a
+        // freshness-critical stream onto the low-priority refresh runtime.
+        for from in ["debezium:topic", "cdc:stream"] {
+            assert!(
+                streams(vec![from_with_mode(from, None)]),
+                "{from} with no refresh_mode resolves to changes"
+            );
+        }
+        assert!(!streams(vec![from_with_mode("postgres:public.t", None)]));
+        assert!(!streams(vec![from_with_mode("sink", None)]));
+        assert!(
+            !streams(vec![from_with_mode("debezium:topic", Some(RefreshMode::Full))]),
+            "an explicit refresh_mode overrides the connector default"
+        );
     }
 
     /// A view carrying its own `acceleration` block creates a `DuckDB` instance just
