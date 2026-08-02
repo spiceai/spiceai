@@ -142,13 +142,20 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
 
     let p95 = test.get_p95_response_time_metric()?;
     let rps = test.get_rps_metric()?;
-    let score = test.calculate_search_score_metric(&qrels, |results| {
+    let retrieval_metrics = test.calculate_search_score_metrics(&qrels, |results| {
         mteb_quora::transform_search_results_for_eval(results)
     })?;
 
-    let metrics: QueryMetrics<_, _> = test
-        .collect(TestType::Search)?
-        .with_run_metric(SearchRunMetric::new(rps, p95, score));
+    let metrics: QueryMetrics<_, _> =
+        test.collect(TestType::Search)?
+            .with_run_metric(SearchRunMetric::new(
+                rps,
+                p95,
+                retrieval_metrics.ndcg,
+                retrieval_metrics.recall,
+                retrieval_metrics.mrr,
+                retrieval_metrics.precision,
+            ));
 
     let mut spiced_instance = test.end()?;
     let memory_usage = match memory_readings {
@@ -173,7 +180,10 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
 
     crate::metrics::SEARCH_RPS.record(rps, &[]);
     crate::metrics::SEARCH_P95_RESPONSE_TIME.record(p95, &[]);
-    crate::metrics::SCORE.record(score, &[]);
+    crate::metrics::SCORE.record(retrieval_metrics.ndcg, &[]);
+    crate::metrics::SEARCH_RECALL.record(retrieval_metrics.recall, &[]);
+    crate::metrics::SEARCH_MRR.record(retrieval_metrics.mrr, &[]);
+    crate::metrics::SEARCH_PRECISION.record(retrieval_metrics.precision, &[]);
     if let Some((max_memory, median_memory)) = memory_usage {
         crate::metrics::PEAK_MEMORY_USAGE.record(max_memory * 1024.0, &[]);
         crate::metrics::MEDIAN_MEMORY_USAGE.record(median_memory * 1024.0, &[]);

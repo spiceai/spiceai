@@ -28,6 +28,14 @@ runs:
     - name: Request OAuth token
       id: token
       shell: bash
+      # The credentials are passed through the environment rather than
+      # interpolated into the script body, so they are never part of the
+      # rendered command.
+      env:
+        CLIENT_ID: ${{ inputs.client-id }}
+        CLIENT_SECRET: ${{ inputs.client-secret }}
+        TOKEN_URL: ${{ inputs.token-url }}
+        ENV_NAME: ${{ inputs.env-name }}
       run: |
         set -euo pipefail
 
@@ -36,13 +44,42 @@ runs:
           exit 1
         fi
 
-        response=$(curl -sS -X POST "${{ inputs.token-url }}" -H "Content-Type: application/json" \
-          -d "$(jq -cn --arg client_id '${{ inputs.client-id }}' --arg client_secret '${{ inputs.client-secret }}' '{client_id: $client_id, client_secret: $client_secret, grant_type: "client_credentials"}')")
+        # The name is appended to $GITHUB_ENV as NAME=value, so one carrying a
+        # newline would inject further environment entries into every remaining
+        # step. The token value is already checked for this in
+        # token_response.sh; the name needs the same guarantee.
+        case "$ENV_NAME" in
+          '' | *[!A-Za-z0-9_]* | [0-9]*)
+            echo "::error::Management login: 'env-name' must be a variable name matching [A-Za-z_][A-Za-z0-9_]*." >&2
+            exit 1
+            ;;
+        esac
 
-        value=$(echo "$response" | jq -er '.access_token')
+        # An unset repository secret interpolates to an empty string, so this is
+        # what a missing secret looks like from inside the action.
+        if [ -z "$CLIENT_ID" ] || [ -z "$CLIENT_SECRET" ]; then
+          echo "::error::Management login: the 'client-id'/'client-secret' inputs are empty. The secrets the calling workflow passes are not set on this repository." >&2
+          exit 1
+        fi
+
+        request="$(jq -cn --arg client_id "$CLIENT_ID" --arg client_secret "$CLIENT_SECRET" \
+          '{client_id: $client_id, client_secret: $client_secret, grant_type: "client_credentials"}')"
+
+        # -w appends the status on its own trailing line, so a failing exchange
+        # can report which HTTP status it got.
+        response="$(curl -sS -X POST "$TOKEN_URL" -H "Content-Type: application/json" \
+          -w '\n%{http_code}' -d "$request")"
+        http_status="${response##*$'\n'}"
+        body="${response%$'\n'*}"
+
+        value="$(printf '%s' "$body" | "$GITHUB_ACTION_PATH/token_response.sh" "$http_status" "$TOKEN_URL")"
+
+        # Matches load-aws-secrets: a credential fetched at run time is unknown
+        # to the runner, so register it for redaction explicitly.
+        echo "::add-mask::$value"
 
         {
-          echo "${{ inputs.env-name }}=$value"
+          echo "$ENV_NAME=$value"
         } >> "$GITHUB_ENV"
 
         {

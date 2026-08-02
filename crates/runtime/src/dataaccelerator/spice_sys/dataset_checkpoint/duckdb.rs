@@ -49,7 +49,12 @@ impl DatasetCheckpoint {
         Ok(())
     }
 
-    pub(super) fn exists_duckdb(&self, pool: &Arc<DuckDbConnectionPool>) -> Result<bool> {
+    /// Blocking `DuckDB` I/O. Callers must reach this through
+    /// `spawn_duckdb_blocking`, never directly from an async worker.
+    pub(super) fn exists_duckdb(
+        dataset_name: &str,
+        pool: &Arc<DuckDbConnectionPool>,
+    ) -> Result<bool> {
         let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
         let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
             .map_err(Error::external)?
@@ -57,13 +62,15 @@ impl DatasetCheckpoint {
 
         let query = format!("SELECT 1 FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1");
         let mut stmt = duckdb_conn.prepare(&query).map_err(Error::external)?;
-        let mut rows = stmt.query([&self.dataset_name]).map_err(Error::external)?;
+        let mut rows = stmt.query([dataset_name]).map_err(Error::external)?;
 
         Ok(rows.next().map_err(Error::external)?.is_some())
     }
 
+    /// Blocking `DuckDB` I/O. Callers must reach this through
+    /// `spawn_duckdb_blocking`, never directly from an async worker.
     pub(super) fn last_checkpoint_time_duckdb(
-        &self,
+        dataset_name: &str,
         pool: &Arc<DuckDbConnectionPool>,
     ) -> Result<Option<SystemTime>> {
         let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
@@ -75,7 +82,7 @@ impl DatasetCheckpoint {
             "SELECT epoch_us(timezone('UTC', updated_at::TIMESTAMPTZ)) FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1"
         );
         let mut stmt = duckdb_conn.prepare(&query).map_err(Error::external)?;
-        let mut rows = stmt.query([&self.dataset_name]).map_err(Error::external)?;
+        let mut rows = stmt.query([dataset_name]).map_err(Error::external)?;
 
         let checkpoint_time_micros: Option<i64> = rows
             .next()
@@ -93,8 +100,11 @@ impl DatasetCheckpoint {
         }
     }
 
+    /// Blocking: takes the pool's write gate. Callers must reach this through
+    /// `spawn_duckdb_blocking`, never directly from an async worker.
     pub(super) fn checkpoint_duckdb(
-        &self,
+        dataset_name: &str,
+        create_snapshot: bool,
         pool: &Arc<DuckDbConnectionPool>,
         schema: &SchemaRef,
         refresh_sql: Option<&str>,
@@ -119,11 +129,11 @@ impl DatasetCheckpoint {
         duckdb_conn
             .execute(
                 &upsert,
-                duckdb::params![&self.dataset_name, &schema_json, refresh_sql],
+                duckdb::params![dataset_name, &schema_json, refresh_sql],
             )
             .map_err(Error::external)?;
 
-        if self.snapshot_behavior.create_enabled() {
+        if create_snapshot {
             // Force a DuckDB checkpoint so the WAL and database pages are flushed to disk before the snapshot is taken.
             duckdb_conn
                 .execute("CHECKPOINT", [])
@@ -155,8 +165,10 @@ impl DatasetCheckpoint {
         Ok(())
     }
 
+    /// Blocking `DuckDB` I/O. Callers must reach this through
+    /// `spawn_duckdb_blocking`, never directly from an async worker.
     pub(super) fn get_schema_duckdb(
-        &self,
+        dataset_name: &str,
         pool: &Arc<DuckDbConnectionPool>,
     ) -> Result<Option<SchemaRef>> {
         let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
@@ -168,7 +180,7 @@ impl DatasetCheckpoint {
             "SELECT schema_json FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1"
         );
         let mut stmt = duckdb_conn.prepare(&query).map_err(Error::external)?;
-        let mut rows = stmt.query([&self.dataset_name]).map_err(Error::external)?;
+        let mut rows = stmt.query([dataset_name]).map_err(Error::external)?;
 
         if let Some(row) = rows.next().map_err(Error::external)? {
             let schema_json: Option<String> = row.get(0).map_err(Error::external)?;
@@ -181,8 +193,10 @@ impl DatasetCheckpoint {
         }
     }
 
+    /// Blocking `DuckDB` I/O. Callers must reach this through
+    /// `spawn_duckdb_blocking`, never directly from an async worker.
     pub(super) fn get_refresh_sql_duckdb(
-        &self,
+        dataset_name: &str,
         pool: &Arc<DuckDbConnectionPool>,
     ) -> Result<Option<String>> {
         let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
@@ -194,7 +208,7 @@ impl DatasetCheckpoint {
             "SELECT refresh_sql FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1"
         );
         let mut stmt = duckdb_conn.prepare(&query).map_err(Error::external)?;
-        let mut rows = stmt.query([&self.dataset_name]).map_err(Error::external)?;
+        let mut rows = stmt.query([dataset_name]).map_err(Error::external)?;
 
         if let Some(row) = rows.next().map_err(Error::external)? {
             let refresh_sql: Option<String> = row.get(0).map_err(Error::external)?;
@@ -204,7 +218,12 @@ impl DatasetCheckpoint {
         }
     }
 
-    pub(super) fn delete_duckdb(&self, pool: &Arc<DuckDbConnectionPool>) -> Result<()> {
+    /// Blocking: takes the pool's write gate. Callers must reach this through
+    /// `spawn_duckdb_blocking`, never directly from an async worker.
+    pub(super) fn delete_duckdb(
+        dataset_name: &str,
+        pool: &Arc<DuckDbConnectionPool>,
+    ) -> Result<()> {
         let write_gate = pool.write_gate();
         let _write_guard = write_gate
             .read()
@@ -217,7 +236,7 @@ impl DatasetCheckpoint {
 
         let delete = format!("DELETE FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ?");
         duckdb_conn
-            .execute(&delete, [&self.dataset_name])
+            .execute(&delete, [dataset_name])
             .map_err(Error::external)?;
 
         Ok(())
@@ -573,5 +592,75 @@ mod tests {
             new_checkpoint_time > checkpoint_time,
             "New checkpoint time should be more recent"
         );
+    }
+
+    /// Regression test for <https://github.com/spiceai/spiceai/issues/12175>.
+    ///
+    /// A `duckdb_on_full_refresh: replace_file` swap holds the pool's write gate
+    /// **exclusively** while it copies every co-resident table and checkpoints the
+    /// file. A `spice_sys` write that waits on that gate from an async worker parks
+    /// the worker for the whole window, which starves every other task on it —
+    /// including `/health`, so Kubernetes kills the pod.
+    ///
+    /// The runtime has one worker thread and the gate is held exclusively for the
+    /// duration, so the probe task can only run if the checkpoint's gate wait is
+    /// off the worker. `block_on` drives the test body on the calling thread, so
+    /// the assertion still reports rather than hanging when it regresses.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_duckdb_checkpoint_waits_for_the_write_gate_off_the_async_worker() {
+        use std::sync::PoisonError;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (checkpoint, pool) = create_in_memory_duckdb_checkpoint();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+
+        // Stand in for the exclusive phase of a file swap. The guard lives on its
+        // own thread, both because a real swap holds it off the async runtime and
+        // so no lock guard is held across an `.await` here.
+        let write_gate = pool.write_gate();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let swap = std::thread::spawn(move || {
+            let guard = write_gate.write().unwrap_or_else(PoisonError::into_inner);
+            held_tx.send(()).expect("the test should await the gate");
+            release_rx.recv().expect("the test should release the gate");
+            drop(guard);
+        });
+        held_rx
+            .recv()
+            .expect("the swap thread should take the write gate exclusively");
+
+        let checkpointing = tokio::spawn(async move { checkpoint.checkpoint(&schema, None).await });
+
+        let probe_ran = Arc::new(AtomicBool::new(false));
+        let probe = tokio::spawn({
+            let probe_ran = Arc::clone(&probe_ran);
+            async move {
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                probe_ran.store(true, Ordering::SeqCst);
+            }
+        });
+
+        tokio::time::timeout(tokio::time::Duration::from_secs(10), probe)
+            .await
+            .expect(
+                "an unrelated task made no progress while a spice_sys DuckDB write waited on the write gate: the wait is parking the async worker",
+            )
+            .expect("the probe task should not panic");
+        assert!(
+            probe_ran.load(Ordering::SeqCst),
+            "the probe task should have completed while the gate was held"
+        );
+
+        // Releasing the gate lets the checkpoint finish, proving it really was
+        // blocked on the gate and not skipped.
+        release_tx
+            .send(())
+            .expect("the swap thread should still be holding the gate");
+        swap.join().expect("the swap thread should not panic");
+        checkpointing
+            .await
+            .expect("the checkpoint task should not panic")
+            .expect("the checkpoint should succeed once the gate is released");
     }
 }

@@ -295,6 +295,35 @@ pub fn track_spilled_bytes(value: u64, dimensions: &[KeyValue]) {
         .add(value, dimensions);
 }
 
+static PROCESS_RESIDENT_MEMORY_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
+
+/// Records the process's resident set size — the number the kernel's OOM
+/// decision is made on. Budgets and pool gauges describe intent; this describes
+/// fact, and the gap between them is the off-pool/unaccounted memory.
+///
+/// Resident memory is operator observability, not product-usage telemetry, so
+/// this binds to the OpenTelemetry **global** provider that `init_metrics`
+/// installs with the operator's Prometheus `/metrics` and OTLP readers — not to
+/// the anonymous-telemetry [`meter::METER`], which would never reach an
+/// operator's dashboard. The meter handle is fetched fresh rather than cached,
+/// for the reason `cayenne::operational_meter` documents: caching binds
+/// permanently to whatever provider is global at first access, so the `OnceLock`
+/// holds only the built gauge, whose construction is deferred to the first
+/// record — always after `init_metrics` on this 2s sampling path.
+pub fn track_process_resident_memory_bytes(bytes: u64, dimensions: &[KeyValue]) {
+    PROCESS_RESIDENT_MEMORY_BYTES
+        .get_or_init(|| {
+            global::meter("process")
+                .u64_gauge("process_resident_memory_bytes")
+                .with_description(
+                    "Resident set size of the spiced process. Budgets and pool gauges describe intent; this describes fact, and the gap between them is the off-pool/unaccounted memory.",
+                )
+                .with_unit("By")
+                .build()
+        })
+        .record(bytes, dimensions);
+}
+
 static QUERY_SPILLED_ROWS: OnceLock<Counter<u64>> = OnceLock::new();
 
 pub fn track_spilled_rows(value: u64, dimensions: &[KeyValue]) {
@@ -957,6 +986,46 @@ pub mod cayenne {
     /// the query memory limit. Published once via [`register_compaction_metrics`].
     pub fn track_compaction_memory_pool_bytes(bytes: u64, dimensions: &[KeyValue]) {
         compaction_memory_pool_bytes().record(bytes, dimensions);
+    }
+
+    static QUERY_MEMORY_POOL_USED_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
+
+    /// Build-once accessor for the live query-pool usage gauge.
+    fn query_memory_pool_used_bytes() -> &'static Gauge<u64> {
+        QUERY_MEMORY_POOL_USED_BYTES.get_or_init(|| {
+            operational_meter()
+                .u64_gauge("query_memory_pool_used_bytes")
+                .with_description(
+                    "Live bytes reserved in the query memory pool, excluding the in-memory CDC tier's mirror account.",
+                )
+                .with_unit("By")
+                .build()
+        })
+    }
+
+    /// Records live query-pool usage. Sampled by the mem-tier repartition loop,
+    /// which already reads the pool on an interval; without this gauge the value
+    /// is computed every two seconds and visible nowhere.
+    pub fn track_query_memory_pool_used_bytes(bytes: u64, dimensions: &[KeyValue]) {
+        query_memory_pool_used_bytes().record(bytes, dimensions);
+    }
+
+    static COMPACTION_MEMORY_POOL_USED_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
+
+    /// Build-once accessor for the live compaction-pool usage gauge.
+    fn compaction_memory_pool_used_bytes() -> &'static Gauge<u64> {
+        COMPACTION_MEMORY_POOL_USED_BYTES.get_or_init(|| {
+            operational_meter()
+                .u64_gauge("cayenne_compaction_memory_pool_used_bytes")
+                .with_description("Live bytes reserved in the dedicated compaction memory pool.")
+                .with_unit("By")
+                .build()
+        })
+    }
+
+    /// Records live compaction-pool usage, sampled alongside the query pool.
+    pub fn track_compaction_memory_pool_used_bytes(bytes: u64, dimensions: &[KeyValue]) {
+        compaction_memory_pool_used_bytes().record(bytes, dimensions);
     }
 
     static COMPACTION_MEMORY_EXHAUSTED: OnceLock<Counter<u64>> = OnceLock::new();
