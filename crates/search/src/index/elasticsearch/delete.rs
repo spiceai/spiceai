@@ -388,7 +388,7 @@ fn build_row_term_clauses(
                     data_type = value.data_type(),
                 ).into())
             })?;
-            ensure_within_ignore_above(term_field, &json_value)?;
+            ensure_within_ignore_above(es_index, term_field, &json_value)?;
             terms.push(json!({ "term": { term_field.path.as_str(): json_value } }));
         }
         if !terms.is_empty() {
@@ -412,7 +412,11 @@ fn or_of_row_clauses(row_clauses: &[Value]) -> Value {
 /// Elasticsearch does not index a `keyword` value longer than the field's `ignore_above`, so a
 /// `term` query for such a key matches nothing. Report that rather than issue a delete that
 /// succeeds having removed the row from nowhere.
-fn ensure_within_ignore_above(term_field: &TermField, value: &Value) -> DataFusionResult<()> {
+fn ensure_within_ignore_above(
+    es_index: &str,
+    term_field: &TermField,
+    value: &Value,
+) -> DataFusionResult<()> {
     let (Some(limit), Value::String(text)) = (term_field.ignore_above, value) else {
         return Ok(());
     };
@@ -421,10 +425,21 @@ fn ensure_within_ignore_above(term_field: &TermField, value: &Value) -> DataFusi
     if length <= limit {
         return Ok(());
     }
+    let column = &term_field.column;
+    let path = &term_field.path;
+    // The limit belongs to whichever field the filter actually addresses, which is the column
+    // itself only when its own mapping is exact-matchable — otherwise it is the `keyword`
+    // sub-field the resolver picked, and re-mapping the column alone would not lift the limit.
+    let remedy = if path == column {
+        format!("Re-create the index with '{column}' mapped as 'keyword' without an 'ignore_above'")
+    } else {
+        format!(
+            "Re-create the index so the key is exact-matchable with no 'ignore_above' — either map '{column}' as 'keyword' outright, or give its analyzed mapping a 'keyword' sub-field that declares no 'ignore_above'"
+        )
+    };
     Err(DataFusionError::External(
         format!(
-            "Failed to delete from Elasticsearch: primary key column '{}' has a key of {length} characters, but the index maps '{}' with ignore_above={limit}, so Elasticsearch never indexed it and the delete would remove nothing. Re-create the index mapping '{}' as 'keyword' without an 'ignore_above', and reindex the existing documents. See: {ES_VECTORS_DOCS}",
-            term_field.column, term_field.path, term_field.column
+            "Failed to delete from Elasticsearch index '{es_index}': primary key column '{column}' has a key of {length} characters, but the delete filters on '{path}', which the index maps with ignore_above={limit}, so Elasticsearch never indexed that key and the delete would remove nothing. {remedy}, and reindex the existing documents. See: {ES_VECTORS_DOCS}"
         )
         .into(),
     ))
@@ -825,6 +840,50 @@ mod tests {
         assert!(
             message.contains("ignore_above=8") && message.contains("10 characters"),
             "the error must give both the limit and the key's length: {message}"
+        );
+        assert!(
+            !message.contains("sub-field"),
+            "the column's own mapping carries the limit here, so the remedy is the column: {message}"
+        );
+        assert!(client.queries().is_empty());
+    }
+
+    /// The limit that stops the delete belongs to the field the filter addresses, which for an
+    /// analyzed key is the `keyword` sub-field. Re-mapping the column alone would not lift it, so
+    /// the error has to name the sub-field it read the limit from and say what to change.
+    #[tokio::test]
+    async fn a_key_longer_than_a_sub_fields_ignore_above_names_the_sub_field() {
+        let client = RecordingClient::with_properties(&[(
+            "id",
+            json!({
+                "type": "text",
+                "fields": { "keyword": { "type": "keyword", "ignore_above": 8 } },
+            }),
+        )]);
+        let (primary_key, key_columns) = chunked_key("id", DataType::Utf8);
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &primary_key,
+            &key_columns,
+            &string_key_batch(vec![Some("ORDER-1024")]),
+        )
+        .await
+        .expect_err("a key the sub-field never indexed must not report a successful delete");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("'id.keyword'"),
+            "the error must name the field the delete filters on: {message}"
+        );
+        assert!(
+            message.contains("sub-field"),
+            "the remedy must cover the sub-field, not just the column: {message}"
+        );
+        assert!(
+            message.contains("index 'idx'"),
+            "the error must name the index: {message}"
         );
         assert!(client.queries().is_empty());
     }
