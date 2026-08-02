@@ -58,6 +58,7 @@ const MAX_MESSAGE_SIZE: usize = 1_000_000; // 1MB per message
 const MAX_BATCH_SIZE: usize = 1000; // Maximum rows per batch
 
 pub static AI_UDF_NAME: &str = "ai";
+runtime_udfs_api::register_spice_function!(AI_SPICE_FUNCTION, AI_UDF_NAME);
 pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| {
     Documentation {
     doc_section: DocSection::default(),

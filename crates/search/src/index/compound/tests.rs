@@ -39,6 +39,9 @@ use crate::index::{SearchIndex, VectorIndex};
 /// built from the configured batches; writes and lifecycle callbacks are recorded into a
 /// shared event log tagged with the mock's label.
 #[derive(Debug)]
+// One flag per behavior this double can be asked to exhibit; a state machine would obscure
+// rather than clarify what each test is configuring.
+#[expect(clippy::struct_excessive_bools)]
 struct MockIndex {
     label: &'static str,
     search_column: String,
@@ -55,6 +58,8 @@ struct MockIndex {
     fail_on_write_start: bool,
     /// What this mock reports from `Index::write_complete_failure_is_fatal`.
     write_complete_fatal: bool,
+    /// What this mock reports from `Index::deletes_by_partial_key`.
+    deletes_partial_key: bool,
     events: Arc<Mutex<Vec<String>>>,
 }
 
@@ -72,6 +77,7 @@ impl MockIndex {
             fail_write: false,
             fail_on_write_start: false,
             write_complete_fatal: false,
+            deletes_partial_key: false,
             events: Arc::clone(events),
         }
     }
@@ -169,6 +175,10 @@ impl Index for MockIndex {
     async fn delete_by_keys(&self, keys: RecordBatch) -> DataFusionResult<()> {
         self.record(&format!("delete_by_keys:{}", keys.num_rows()));
         Ok(())
+    }
+
+    fn deletes_by_partial_key(&self) -> bool {
+        self.deletes_partial_key
     }
 
     fn write_complete_failure_is_fatal(&self) -> bool {
@@ -557,6 +567,54 @@ fn write_complete_fatality_is_the_union_of_both_vector_halves() {
             idx.write_complete_failure_is_fatal(),
             expected,
             "primary_fatal={primary_fatal}, secondary_fatal={secondary_fatal}"
+        );
+    }
+}
+
+/// `delete_by_keys` fans out to both halves, so a partial key only clears the whole compound
+/// index when *both* halves delete on one — the intersection, not the trait default.
+#[test]
+fn partial_key_deletion_requires_both_halves() {
+    let events = Arc::new(Mutex::new(vec![]));
+
+    for (primary_partial, secondary_partial, expected) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (true, true, true),
+    ] {
+        let mock = |label: &'static str, partial: bool| {
+            let mut idx = MockIndex::new(label, &events);
+            idx.dimension = Some(4);
+            idx.deletes_partial_key = partial;
+            idx
+        };
+
+        let search = compound(
+            mock("primary", primary_partial),
+            mock("secondary", secondary_partial),
+            CompoundReadMode::PrimaryOnly,
+        );
+        assert_eq!(
+            search.deletes_by_partial_key(),
+            expected,
+            "search: primary={primary_partial}, secondary={secondary_partial}"
+        );
+
+        let (primary, secondary) = (
+            mock("primary", primary_partial),
+            mock("secondary", secondary_partial),
+        );
+        let vector = CompoundVectorIndex::try_new(
+            Arc::new(primary) as Arc<dyn VectorIndex>,
+            Arc::new(secondary) as Arc<dyn VectorIndex>,
+            CompoundReadMode::PrimaryOnly,
+        )
+        .expect("compatible vector indexes");
+        assert_eq!(
+            vector.deletes_by_partial_key(),
+            expected,
+            "vector: primary={primary_partial}, secondary={secondary_partial}"
         );
     }
 }

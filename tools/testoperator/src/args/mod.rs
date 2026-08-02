@@ -19,7 +19,9 @@ use std::path::PathBuf;
 use clap::{ArgAction, Parser, Subcommand};
 
 mod dataset;
-pub use dataset::{DataConsistencyArgs, DatasetTestArgs, LoadTestArgs, SourceType};
+pub use dataset::{
+    ClientConnectionsArg, DataConsistencyArgs, DatasetTestArgs, LoadTestArgs, SourceType,
+};
 
 #[cfg(feature = "append")]
 mod append;
