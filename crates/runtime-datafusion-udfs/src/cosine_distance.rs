@@ -52,6 +52,10 @@ use crate::vector_simd::{
 };
 
 pub static COSINE_DISTANCE_UDF_NAME: &str = "cosine_distance";
+runtime_udfs_api::register_spice_function!(
+    COSINE_DISTANCE_SPICE_FUNCTION,
+    COSINE_DISTANCE_UDF_NAME
+);
 
 macro_rules! downcast_arg {
     ($ARG:expr, $ARRAY_TYPE:ident) => {{

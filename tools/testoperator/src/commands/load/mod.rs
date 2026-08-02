@@ -39,7 +39,11 @@ use tokio_util::sync::CancellationToken;
 
 #[expect(clippy::too_many_lines)]
 pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
-    if args.test_args.common.concurrency < 2 {
+    // Surface a bad connection-topology combination now, not after the
+    // ready-wait.
+    args.test_args.validate_fleet()?;
+    let concurrency = args.test_args.effective_concurrency();
+    if concurrency < 2 {
         return Err(anyhow::anyhow!(
             "Concurrency should be greater than 1 for a load test"
         ));
@@ -98,7 +102,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
             KeyValue::new("testoperator_commit_sha", testoperator_commit_sha),
             KeyValue::new("spiced_commit_sha", spiced_commit_sha),
             KeyValue::new("branch_name", branch_name),
-            KeyValue::new("concurrency", args.test_args.common.concurrency.to_string()),
+            KeyValue::new("concurrency", concurrency.to_string()),
             KeyValue::new("spicepod", spicepod),
             KeyValue::new(
                 "param_set_variants",
@@ -133,6 +137,13 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     // Create the appropriate query executor based on args
     let executor = super::create_query_executor(&args.test_args, &spiced_instance).await?;
 
+    // With `--client-connections per-client`/`pooled`, the concurrent clients
+    // spread across dedicated connections, reused across the warm-up,
+    // baseline, and load phases. Empty in the default `shared` mode.
+    let client_executors =
+        super::create_client_executors(&args.test_args, &spiced_instance, concurrency).await?;
+    super::announce_connection_topology(&args.test_args, concurrency);
+
     // warm up run
     println!("Performing warm up");
 
@@ -140,9 +151,10 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         &args.test_args,
         &app,
         NotStarted::new()
-            .with_parallel_count(args.test_args.common.concurrency)
+            .with_parallel_count(concurrency)
             .with_end_condition(EndCondition::QuerySetCompleted(1))
             .with_query_executor(executor.clone())
+            .with_query_executors(client_executors.clone())
             .with_validate(args.test_args.validate),
     )
     .await?;
@@ -168,9 +180,10 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         &args.test_args,
         &app,
         NotStarted::new()
-            .with_parallel_count(args.test_args.common.concurrency)
+            .with_parallel_count(concurrency)
             .with_end_condition(EndCondition::Duration(baseline_duration))
             .with_query_executor(executor.clone())
+            .with_query_executors(client_executors.clone())
             .with_validate(args.test_args.validate),
     )
     .await?;
@@ -213,9 +226,10 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         .map(|endpoint| StreamingOtlpExporter::spawn(endpoint.clone()));
 
     let mut test_builder = NotStarted::new()
-        .with_parallel_count(args.test_args.common.concurrency)
+        .with_parallel_count(concurrency)
         .with_end_condition(load_end_condition)
         .with_query_executor(executor)
+        .with_query_executors(client_executors)
         .with_query_duration_threshold(args.test_args.mark_query_failed_if_exceeds)
         .with_validate(args.test_args.validate);
 

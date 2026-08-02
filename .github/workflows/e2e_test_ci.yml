@@ -2031,8 +2031,10 @@ jobs:
           # retrying on the next tick. DuckDB surfaces the truncated read as
           # one of two errors depending on which part of the file it reaches
           # first: "TProtocolException: Invalid data" (corrupt Thrift footer)
-          # or "don't know what type:" with an empty type (schema element not
-          # yet written). Tolerate both variants of that specific transient.
+          # or "don't know what type: <token>", where the token is whatever
+          # bytes happen to sit where the schema element's type has not been
+          # written yet — empty, or an arbitrary byte such as 0x0e (see run
+          # 30534651210). Tolerate both variants of that specific transient.
           #
           # Strip ANSI first: spiced logs with_ansi(true), so whitelist
           # patterns like `WARN +runtime::...` miss `WARN\e[0m \e[2mruntime::...`
@@ -2041,7 +2043,7 @@ jobs:
              | grep -iE "(failed|error)" \
              | grep -vE "WARN +runtime::accelerated_table::refresh_task: Failed to load data for dataset" \
              | grep -vE "^Invalid Error: TProtocolException: Invalid data$" \
-             | grep -vE "^Invalid Error: don't know what type: *$"; then
+             | grep -vE "^Invalid Error: don't know what type:"; then
             echo "Failures detected in spice.log"
             exit 1
           fi
@@ -2077,13 +2079,13 @@ jobs:
           cat spice.log
           # See note above: strip ANSI, then tolerate transient parquet-rename
           # races emitted at WARN level by the refresh task (both the
-          # "TProtocolException: Invalid data" and empty-type "don't know what
-          # type:" variants).
+          # "TProtocolException: Invalid data" and "don't know what type:"
+          # variants).
           if sed $'s/\x1b\\[[0-9;]*m//g' spice.log \
              | grep -iE "(failed|error)" \
              | grep -vE "WARN +runtime::accelerated_table::refresh_task: Failed to load data for dataset" \
              | grep -vE "^Invalid Error: TProtocolException: Invalid data$" \
-             | grep -vE "^Invalid Error: don't know what type: *$"; then
+             | grep -vE "^Invalid Error: don't know what type:"; then
             echo "Failures detected in spice.log"
             exit 1
           fi

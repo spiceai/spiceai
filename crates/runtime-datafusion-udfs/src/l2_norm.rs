@@ -28,6 +28,7 @@ use datafusion::logical_expr::{ColumnarValue, ScalarUDFImpl, Signature, Volatili
 use crate::vector_simd::{compute_fsl_f32_l2_norm, is_fixed_size_list_f32, make_scalar_function};
 
 pub static L2_NORM_UDF_NAME: &str = "l2_norm";
+runtime_udfs_api::register_spice_function!(L2_NORM_SPICE_FUNCTION, L2_NORM_UDF_NAME);
 
 #[derive(Debug, Hash, PartialEq, Eq)]
 pub struct L2Norm {

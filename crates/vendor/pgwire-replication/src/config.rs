@@ -83,17 +83,55 @@ impl SslMode {
     }
 }
 
+/// Where the trusted CA certificate bundle comes from.
+///
+/// Deployments that mount the CA as a file use [`CaCertificate::Path`];
+/// deployments that inject it as a configuration value (an orchestrator secret,
+/// an environment variable) use [`CaCertificate::Pem`] and never touch the
+/// filesystem.
+#[derive(Clone, PartialEq, Eq)]
+pub enum CaCertificate {
+    /// Filesystem path to a PEM file containing trusted CA certificates.
+    Path(PathBuf),
+    /// PEM-encoded CA certificate content.
+    Pem(Vec<u8>),
+}
+
+impl CaCertificate {
+    /// A short label naming the source, safe to put in an error or log line.
+    ///
+    /// Never returns the certificate content itself: a PEM blob is kilobytes of
+    /// base64 that would swamp a single-line log record.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            CaCertificate::Path(path) => path.display().to_string(),
+            CaCertificate::Pem(pem) => format!("inline PEM content ({} bytes)", pem.len()),
+        }
+    }
+}
+
+/// Renders the source, not the certificate bytes — see [`CaCertificate::describe`].
+impl std::fmt::Debug for CaCertificate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CaCertificate::Path(path) => f.debug_tuple("Path").field(path).finish(),
+            CaCertificate::Pem(pem) => write!(f, "Pem(<{} bytes>)", pem.len()),
+        }
+    }
+}
+
 /// TLS/SSL configuration for `PostgreSQL` connections.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TlsConfig {
     /// SSL mode controlling connection security level.
     pub mode: SslMode,
 
-    /// Path to PEM file containing trusted CA certificates.
+    /// Source of the trusted CA certificates.
     ///
     /// If `None` and verification is enabled (`VerifyCa`/`VerifyFull`),
     /// the Mozilla root certificates (webpki-roots) are used.
-    pub ca_pem_path: Option<PathBuf>,
+    pub ca: Option<CaCertificate>,
 
     /// Override SNI hostname sent during TLS handshake.
     ///
@@ -157,23 +195,27 @@ impl TlsConfig {
     /// Create a configuration with certificate chain verification.
     ///
     /// # Arguments
-    /// * `ca_path` - Path to CA certificate PEM file, or `None` for system roots
+    /// * `ca` - Source of the CA certificates, or `None` for system roots
     ///
     /// # Example
     /// ```
-    /// use pgwire_replication::config::TlsConfig;
+    /// use pgwire_replication::config::{CaCertificate, TlsConfig};
     ///
     /// // Using system/Mozilla roots
     /// let tls = TlsConfig::verify_ca(None);
     ///
-    /// // Using custom CA
-    /// let tls = TlsConfig::verify_ca(Some("/path/to/ca.pem".into()));
+    /// // Using a custom CA read from a file
+    /// let tls = TlsConfig::verify_ca(Some(CaCertificate::Path("/path/to/ca.pem".into())));
+    ///
+    /// // Using a custom CA supplied as PEM content
+    /// let tls = TlsConfig::verify_ca(Some(CaCertificate::Pem(ca_pem_bytes())));
+    /// # fn ca_pem_bytes() -> Vec<u8> { Vec::new() }
     /// ```
     #[must_use]
-    pub fn verify_ca(ca_path: Option<PathBuf>) -> Self {
+    pub fn verify_ca(ca: Option<CaCertificate>) -> Self {
         Self {
             mode: SslMode::VerifyCa,
-            ca_pem_path: ca_path,
+            ca,
             ..Default::default()
         }
     }
@@ -183,20 +225,20 @@ impl TlsConfig {
     /// **Recommended for production**.
     ///
     /// # Arguments
-    /// * `ca_path` - Path to CA certificate PEM file, or `None` for system roots
+    /// * `ca` - Source of the CA certificates, or `None` for system roots
     ///
     /// # Example
     /// ```
-    /// use pgwire_replication::config::TlsConfig;
+    /// use pgwire_replication::config::{CaCertificate, TlsConfig};
     ///
-    /// let tls = TlsConfig::verify_full(Some("/etc/ssl/certs/ca.pem".into()));
+    /// let tls = TlsConfig::verify_full(Some(CaCertificate::Path("/etc/ssl/certs/ca.pem".into())));
     /// assert!(tls.mode.verifies_hostname());
     /// ```
     #[must_use]
-    pub fn verify_full(ca_path: Option<PathBuf>) -> Self {
+    pub fn verify_full(ca: Option<CaCertificate>) -> Self {
         Self {
             mode: SslMode::VerifyFull,
-            ca_pem_path: ca_path,
+            ca,
             ..Default::default()
         }
     }
@@ -220,9 +262,9 @@ impl TlsConfig {
     ///
     /// # Example
     /// ```
-    /// use pgwire_replication::config::TlsConfig;
+    /// use pgwire_replication::config::{CaCertificate, TlsConfig};
     ///
-    /// let tls = TlsConfig::verify_full(Some("/ca.pem".into()))
+    /// let tls = TlsConfig::verify_full(Some(CaCertificate::Path("/ca.pem".into())))
     ///     .with_client_cert("/client.pem", "/client.key");
     /// ```
     #[must_use]
@@ -249,7 +291,7 @@ impl TlsConfig {
 /// # Example
 ///
 /// ```
-/// use pgwire_replication::config::{ReplicationConfig, TlsConfig, SslMode};
+/// use pgwire_replication::config::{CaCertificate, ReplicationConfig, TlsConfig, SslMode};
 /// use pgwire_replication::lsn::Lsn;
 /// use std::time::Duration;
 ///
@@ -261,7 +303,7 @@ impl TlsConfig {
 ///     database: "mydb".into(),
 ///     slot: "my_slot".into(),
 ///     publication: "my_publication".into(),
-///     tls: TlsConfig::verify_full(Some("/path/to/ca.pem".into())),
+///     tls: TlsConfig::verify_full(Some(CaCertificate::Path("/path/to/ca.pem".into()))),
 ///     start_lsn: Lsn(0),  // Start from slot's confirmed position
 ///     ..Default::default()
 /// };

@@ -49,7 +49,7 @@ use secrecy::SecretString;
 const DEFAULT_STATUS_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_BOOTSTRAP_BATCH_SIZE: usize = 8192;
 const MAX_BOOTSTRAP_BATCH_SIZE: usize = 1_048_576;
-// Upper bound on the configurable shared-slot member channel capacity. Matches
+// Upper bound on the configurable shared-slot member mailbox capacity. Matches
 // the bootstrap-batch ceiling — a bounded, backpressure-preserving queue in
 // front of the accelerator prefetch, not an unbounded buffer.
 const MAX_MEMBER_CHANNEL_CAPACITY: usize = 1_048_576;
@@ -407,7 +407,7 @@ const METRICS: &[MetricSpec] = &[
     )
     .description(
         "Cumulative seconds the shared-slot pump spent blocked delivering committed \
-         changes into this dataset's channel because its sink was not draining \
+         changes into this dataset's mailbox because its sink was not draining \
          (downstream backpressure). The server replication connection stays alive \
          throughout; a rising value indicates a slow apply loop stalling the shared \
          pump. Only reported for datasets on a shared (explicitly-named) slot.",
@@ -433,7 +433,7 @@ const METRICS: &[MetricSpec] = &[
     )
     .description(
         "Cumulative microseconds the shared-slot pump spent awaiting this dataset's \
-         delivery channel while applying committed changes. Unlike \
+         delivery mailbox while applying committed changes. Unlike \
          member_send_stalled_seconds_total, this accrues the full per-commit wait \
          (including sub-second waits). The pump subtracts this wait from \
          reader_processing_micros_total at the source, so that counter stays \
@@ -441,6 +441,59 @@ const METRICS: &[MetricSpec] = &[
          Only meaningful for datasets on a shared slot; dedicated-slot datasets will export 0.",
     )
     .unit("us")
+    .auto_register(),
+    MetricSpec::new(
+        "replication_member_envelopes_delivered_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description(
+        "Change envelopes the shared-slot pump delivered to this dataset as distinct units \
+         of work. Divide replication_wal_transactions_total by this to get the coalescing \
+         factor the accelerator's apply loop actually sees: adjacent transactions for the \
+         same table are folded into one envelope, so this counter rises more slowly than \
+         the transaction count. Only reported for datasets on a shared (explicitly-named) \
+         slot.",
+    )
+    .auto_register(),
+    MetricSpec::new(
+        "replication_member_envelope_eager_merges_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description(
+        "Committed transactions folded into an envelope the shared-slot pump was still \
+         holding back, before it crossed into this dataset's delivery mailbox. Paired with \
+         member_envelope_mailbox_merges_total, this attributes envelope reduction between \
+         the pump's short hold and mailbox back-pressure. Only reported for datasets on a \
+         shared (explicitly-named) slot.",
+    )
+    .auto_register(),
+    MetricSpec::new(
+        "replication_member_envelope_mailbox_merges_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description(
+        "Committed transactions folded into an envelope already sitting unclaimed in this \
+         dataset's delivery mailbox. This is the back-pressure-driven half of coalescing: \
+         it rises when the sink is not keeping up, which is when collapsing envelopes \
+         matters most, so a rising value alongside a flat \
+         member_send_stalled_seconds_total means back-pressure is being absorbed rather \
+         than stalling the slot. Only reported for datasets on a shared (explicitly-named) \
+         slot.",
+    )
+    .auto_register(),
+    MetricSpec::new(
+        "replication_member_mailbox_coalesce_limited_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description(
+        "Times a committed transaction could not be folded into this dataset's unclaimed \
+         delivery-mailbox tail because a configured bound refused it, rather than because the \
+         changes were not foldable. The mailbox bounds ship deliberately low, since mailbox \
+         folding absorbs back-pressure rather than adding throughput. A value that stays at 0 \
+         means the bounds never bind and there is nothing to tune; a rising value alongside a \
+         rising member_envelope_mailbox_merges_total is the evidence that raising them would \
+         absorb more. Only reported for datasets on a shared (explicitly-named) slot.",
+    )
     .auto_register(),
 ];
 
@@ -600,6 +653,26 @@ impl MetricsProvider for PostgresMetricsProvider {
                     instrument.observe(m.member_send_wait_micros_total(), &attributes);
                 })))
             }
+            "replication_member_envelopes_delivered_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.member_envelopes_delivered_total(), &attributes);
+                })))
+            }
+            "replication_member_envelope_eager_merges_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.member_envelope_eager_merges_total(), &attributes);
+                })))
+            }
+            "replication_member_envelope_mailbox_merges_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.member_envelope_mailbox_merges_total(), &attributes);
+                })))
+            }
+            "replication_member_mailbox_coalesce_limited_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.member_mailbox_coalesce_limited_total(), &attributes);
+                })))
+            }
             _ => None,
         }
     }
@@ -638,7 +711,10 @@ fn replication_params_from_connector_params(
     let identity = crate::connection::connection_identity_from_params(params)?;
     let sslmode = config::SslMode::from_str_strict(identity.sslmode.as_deref())
         .map_err(|reason| format!("parameter `{}` {reason}", params.user_param("sslmode")))?;
-    let sslrootcert = identity.sslrootcert.map(std::path::PathBuf::from);
+    let sslrootcert = identity
+        .sslrootcert
+        .as_deref()
+        .map(config::ca_certificate_from_param);
 
     // An explicitly-named slot is shareable: every dataset on the same
     // connection naming the same slot is multiplexed onto one replication
@@ -666,7 +742,6 @@ fn replication_params_from_connector_params(
         ),
     };
     let (initial_snapshot, snapshot_on_resume) = parse_initial_snapshot(params)?;
-    let temporary_slot = optional_bool(params, "replication_temporary_slot", false)?;
     let status_interval = optional_duration(
         params,
         "replication_status_interval",
@@ -704,7 +779,6 @@ fn replication_params_from_connector_params(
         publication_name,
         initial_snapshot,
         snapshot_on_resume,
-        temporary_slot,
         status_interval,
         ready_lag,
         bootstrap_batch_size,
@@ -751,39 +825,6 @@ fn optional_usize_in_range(
     }
 }
 
-/// Parses an optional boolean parameter strictly. An absent or empty value
-/// uses `default`; a recognized token maps to its boolean; anything else is
-/// rejected rather than silently falling back. Accepts `true/1/yes/y` and
-/// `false/0/no/n` (case-insensitive, surrounding whitespace trimmed).
-///
-/// The lenient predecessors collapsed every unrecognized value to `false`, so
-/// a typo'd `replication_initial_snapshot` silently skipped the bootstrap
-/// snapshot and the accelerator served only post-subscription changes —
-/// missing every pre-existing row with no error.
-fn optional_bool(
-    params: &Parameters,
-    key: &str,
-    default: bool,
-) -> std::result::Result<bool, String> {
-    let Some(raw) = optional_string(params, key) else {
-        return Ok(default);
-    };
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Ok(default);
-    }
-    match trimmed.to_ascii_lowercase().as_str() {
-        "true" | "1" | "yes" | "y" => Ok(true),
-        "false" | "0" | "no" | "n" => Ok(false),
-        _ => {
-            let user_param = params.user_param(key);
-            Err(format!(
-                "parameter `{user_param}` must be a boolean (true/false), got {raw:?}"
-            ))
-        }
-    }
-}
-
 /// Map the shared [`InitialSnapshotMode`] onto Postgres's two internal flags
 /// `(initial_snapshot, snapshot_on_resume)`:
 ///
@@ -804,8 +845,10 @@ fn snapshot_flags(mode: InitialSnapshotMode) -> (bool, bool) {
 /// [`InitialSnapshotMode::from_canonical`]) and, for backward compatibility, the
 /// legacy booleans `true|false` (mapped to `auto|disabled`).
 ///
-/// A typo is rejected rather than silently skipping the bootstrap snapshot (the
-/// same correctness concern that motivates the strict [`optional_bool`]).
+/// A typo is rejected rather than silently falling back: a lenient parse that
+/// collapsed an unrecognized value to `disabled` would skip the bootstrap
+/// snapshot, leaving the accelerator serving only post-subscription changes and
+/// missing every pre-existing row with no error.
 fn parse_initial_snapshot(params: &Parameters) -> std::result::Result<(bool, bool), String> {
     let Some(raw) = optional_string(params, "replication_initial_snapshot") else {
         return Ok(snapshot_flags(InitialSnapshotMode::Auto));
@@ -921,6 +964,7 @@ fn extract_primary_keys(provider: &Arc<dyn datafusion::datasource::TableProvider
 #[cfg(test)]
 mod tests {
     use super::*;
+    use data_components::postgres_replication::CaCertificate;
 
     fn params_with_bootstrap_batch_size(value: &str) -> Parameters {
         Parameters::new(
@@ -943,6 +987,88 @@ mod tests {
 
     fn empty_params() -> Parameters {
         Parameters::new(vec![], "pg", crate::PARAMETERS)
+    }
+
+    /// Self-signed CA (`CN=Spice Replication Test CA`, `CA:TRUE`), expiring in 2126.
+    const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIC4DCCAcigAwIBAgIJAODHR+uzOPBvMA0GCSqGSIb3DQEBCwUAMCQxIjAgBgNV
+BAMMGVNwaWNlIFJlcGxpY2F0aW9uIFRlc3QgQ0EwIBcNMjYwNzI4MDU0MDQ0WhgP
+MjEyNjA3MDQwNTQwNDRaMCQxIjAgBgNVBAMMGVNwaWNlIFJlcGxpY2F0aW9uIFRl
+c3QgQ0EwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCzoou00DrTAevF
+RZ6+PFmSBUhzZXsABQFztlPigZzJ1m8hnja66hnkWKyIid9DcitnjkWgtQZCVxm6
+s05tM6QAy5lI2wlfWD7hQi+yIWKv2dcVuD/J4hWPjmG5a5VtRAInV0yBymkCRI6Z
+68JYfvKh+Rku1y6H3dUfNm8dxCbo589L1U8ucJqlQv9Iy/X7Lze+pj2JFU/L1g3t
+k/5ziVgJjdh3VetrHkU1YOiHRPFsqXOxXc2lpzUjd23QR3FfkZkVgLUfEvPWHRSf
+xipaPFhllw9WUWEl6bVqAGO0btPO1OKKqBlIcizf2YO2+lFs/o0e7bApGzI3l5HP
+VZr/e6ZLAgMBAAGjEzARMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQAD
+ggEBACC1XMNpbA+172MQks9R7cqRY5I0HObJRX3dpIsOqrm3EUcHMt9kx7QrO1Af
+gzAWC0ZNHppeU/cuq9ZKZQiFrSmr5fKtXzsxkvgLYRCFO+ZCKZl9k3z9j0AQbTPR
+klJa4bo2SS6WbmoATimD6e0moT++neRIDx7MlijtWB8grfhuH7yFN9xoTRDgdYBU
+KLeFNAIi+S5cVzUwjMiOQnmljphKSRoQnihpA/c6WAVAN3VqMdoPpfmR2pTi7rio
+38busw0nt/y+JCVWzNDr/i5f3mvNi5SaHZ5PTOVnocyMUw+ysx5eQOrJwrirW9XD
+TXTE85+Or9IUwDI9543jsyCvuQ8=
+-----END CERTIFICATE-----
+";
+
+    /// A complete connection, so parsing reaches `sslrootcert` instead of
+    /// aborting on a missing required parameter.
+    fn params_with_sslrootcert(value: &str) -> Parameters {
+        Parameters::new(
+            vec![
+                ("host".to_string(), SecretString::from("pg.internal")),
+                ("user".to_string(), SecretString::from("spice")),
+                ("db".to_string(), SecretString::from("myapp")),
+                ("sslmode".to_string(), SecretString::from("verify-full")),
+                ("sslrootcert".to_string(), SecretString::from(value)),
+            ],
+            "pg",
+            crate::PARAMETERS,
+        )
+    }
+
+    /// `pg_sslrootcert` is documented as accepting a path *or* inline PEM
+    /// content, and a CA injected as a secret arrives as content. Both spellings
+    /// must reach the replication stream as a usable trust anchor.
+    #[test]
+    fn inline_pem_sslrootcert_reaches_replication_params_as_content() {
+        let repl =
+            replication_params_from_connector_params(&params_with_sslrootcert(TEST_CA_PEM), "hits")
+                .expect("inline PEM sslrootcert should parse");
+
+        assert_eq!(repl.sslmode, config::SslMode::VerifyFull);
+        assert_eq!(
+            repl.sslrootcert,
+            Some(CaCertificate::Pem(TEST_CA_PEM.as_bytes().to_vec())),
+            "inline PEM must not be reinterpreted as a filesystem path"
+        );
+    }
+
+    #[test]
+    fn inline_pem_sslrootcert_survives_a_single_line_secret() {
+        let repl = replication_params_from_connector_params(
+            &params_with_sslrootcert(&TEST_CA_PEM.replace('\n', "\\n")),
+            "hits",
+        )
+        .expect("single-line inline PEM sslrootcert should parse");
+
+        assert_eq!(
+            repl.sslrootcert,
+            Some(CaCertificate::Pem(TEST_CA_PEM.as_bytes().to_vec()))
+        );
+    }
+
+    #[test]
+    fn path_sslrootcert_reaches_replication_params_as_a_path() {
+        let repl = replication_params_from_connector_params(
+            &params_with_sslrootcert("/etc/ssl/pg-ca.pem"),
+            "hits",
+        )
+        .expect("sslrootcert path should parse");
+
+        assert_eq!(
+            repl.sslrootcert,
+            Some(CaCertificate::Path("/etc/ssl/pg-ca.pem".into()))
+        );
     }
 
     // Regression for #11994: CDC must honor `pg_connection_string` the same way
@@ -1001,65 +1127,52 @@ mod tests {
         );
     }
 
+    /// Regression test for #12213. `pg_replication_temporary_slot` is retained
+    /// only as a deprecated spec: it must stay declared, so an operator who
+    /// still sets it is told it is ignored, and it must stay deprecated, so it
+    /// is struck through in the Spicepod schema and cannot be mistaken for a
+    /// working knob. A temporary slot is owned by the session that creates it,
+    /// and creation happens on the short-lived setup connection, so the slot
+    /// was always gone before `START_REPLICATION` ran.
     #[test]
-    fn optional_bool_recognizes_true_and_false_tokens() {
-        for v in ["true", "TRUE", "1", "yes", "Y", " true "] {
-            assert_eq!(
-                optional_bool(
-                    &params_with("replication_temporary_slot", v),
-                    "replication_temporary_slot",
-                    false
-                ),
-                Ok(true),
-                "expected {v:?} to parse as true"
-            );
-        }
-        for v in ["false", "FALSE", "0", "no", "N", " false "] {
-            assert_eq!(
-                optional_bool(
-                    &params_with("replication_temporary_slot", v),
-                    "replication_temporary_slot",
-                    true
-                ),
-                Ok(false),
-                "expected {v:?} to parse as false"
-            );
-        }
-    }
-
-    #[test]
-    fn optional_bool_uses_default_when_absent_or_empty() {
-        assert_eq!(
-            optional_bool(&empty_params(), "replication_temporary_slot", true),
-            Ok(true)
+    fn temporary_slot_parameter_is_declared_and_deprecated() {
+        let spec = crate::PARAMETERS
+            .iter()
+            .find(|p| p.name == "replication_temporary_slot")
+            .expect("the deprecated spec must remain declared so setting it is not silent");
+        assert!(
+            spec.deprecation_message.is_some(),
+            "pg_replication_temporary_slot cannot be honoured and must stay deprecated"
         );
-        assert_eq!(
-            optional_bool(&empty_params(), "replication_temporary_slot", false),
-            Ok(false)
-        );
-        assert_eq!(
-            optional_bool(
-                &params_with("replication_temporary_slot", "   "),
-                "replication_temporary_slot",
-                true
-            ),
-            Ok(true)
+        assert!(
+            spec.default.is_none(),
+            "an ignored parameter must not advertise a default"
         );
     }
 
-    // Regression for #11274: a typo'd boolean previously collapsed to `false`,
-    // silently changing behavior. It must now error loudly instead.
+    /// Setting the deprecated parameter must not fail the dataset: it is warned
+    /// about and ignored, so a pod carrying it loads and streams with a durable
+    /// slot instead of breaking at `START_REPLICATION`.
     #[test]
-    fn optional_bool_rejects_unrecognized_value() {
-        let result = optional_bool(
-            &params_with("replication_temporary_slot", "ture"),
-            "replication_temporary_slot",
-            true,
-        );
-        assert_eq!(
-            result,
-            Err("parameter `pg_replication_temporary_slot` must be a boolean (true/false), got \"ture\"".to_string())
-        );
+    fn deprecated_temporary_slot_is_accepted_and_ignored() {
+        for value in ["true", "false", "ture"] {
+            let params = Parameters::new(
+                vec![
+                    ("host".to_string(), SecretString::from("pg.internal")),
+                    ("user".to_string(), SecretString::from("spice")),
+                    ("db".to_string(), SecretString::from("myapp")),
+                    (
+                        "replication_temporary_slot".to_string(),
+                        SecretString::from(value),
+                    ),
+                ],
+                "pg",
+                crate::PARAMETERS,
+            );
+            if let Err(e) = replication_params_from_connector_params(&params, "hits") {
+                panic!("pg_replication_temporary_slot={value} must be ignored, not rejected: {e}");
+            }
+        }
     }
 
     #[test]

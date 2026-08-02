@@ -83,7 +83,11 @@ pub(crate) fn map_oracle_type_to_arrow_type(
 
             Some(DataType::Decimal128(p, s))
         }
-        "DATE" => Some(DataType::Date32),
+        // Oracle's DATE stores century, year, month, day, hour, minute and second, so it is a
+        // datetime with 1-second resolution rather than a date-only type. Mapping it to Date32
+        // would make the time-of-day unrepresentable and silently truncate every value to
+        // midnight, so it shares the mapping used for TIMESTAMP(0).
+        "DATE" => Some(DataType::Timestamp(TimeUnit::Second, None)),
         "BINARY_FLOAT" => Some(DataType::Float32),
         // A subtype of the NUMBER data type having precision p. A FLOAT value is represented internally as NUMBER.
         // The precision p can range from 1 to 126 binary digits.
@@ -406,7 +410,10 @@ mod tests {
                 ("SALARY", "NUMBER", Some(10), Some(2)),
                 DataType::Decimal128(10, 2),
             ),
-            (("HIRE_DATE", "DATE", None, None), DataType::Date32),
+            (
+                ("HIRE_DATE", "DATE", None, None),
+                DataType::Timestamp(TimeUnit::Second, None),
+            ),
             (
                 ("CREATED_AT", "TIMESTAMP", None, Some(6)),
                 DataType::Timestamp(TimeUnit::Nanosecond, None),
@@ -467,6 +474,30 @@ mod tests {
                 "Failed mapping for column {name}: {oracle_type} -> {expected:?}",
             );
         }
+    }
+
+    /// Regression test for #12096.
+    ///
+    /// Oracle's `DATE` carries hour, minute and second, so it must not map to a date-only Arrow
+    /// type: `Date32` cannot represent the time-of-day and the `Date32` read path fetches the
+    /// column as `chrono::NaiveDate`, which drops it. A truncated `DATE` silently corrupts query
+    /// results and stalls `refresh_mode: append` (every row of a day collapses onto that day's
+    /// midnight, so `value > max_seen` is never true again for the rest of the day).
+    #[test]
+    fn oracle_date_maps_to_a_type_that_can_hold_the_time_of_day() {
+        let mapped =
+            map_oracle_type_to_arrow_type("DATE", None, None).expect("DATE should be supported");
+
+        assert_eq!(
+            mapped,
+            DataType::Timestamp(TimeUnit::Second, None),
+            "Oracle DATE has 1-second resolution, so it should map to Timestamp(Second, None)"
+        );
+
+        assert!(
+            !matches!(mapped, DataType::Date32 | DataType::Date64),
+            "Oracle DATE must not map to a date-only Arrow type: {mapped} discards the time-of-day"
+        );
     }
 
     #[test]
