@@ -113,6 +113,14 @@ sign-off.
 `scripts/signoff status` reports only a commit's own status; the inheritance
 check runs in the PR's **Attestation** workflow.
 
+A sign-off that **failed** on `HEAD` disqualifies that commit. **Attestation**
+rejects it before anything else, so an earlier sign-off cannot be inherited past
+it and the fast-track paths below cannot route around it: a merge of the base
+can be textually clean and still be semantically broken, and a sign-off run
+against the merge is exactly what finds that out. Fix what it reported and run
+`make signoff` again — the new status replaces the failed one. A `pending`
+status is not a verdict and does not block inheritance.
+
 ### Reverts are fast-tracked
 
 A pull request that only reverts commits already on the base branch passes
