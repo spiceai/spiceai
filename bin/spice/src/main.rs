@@ -299,10 +299,14 @@ fn main() {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
     };
 
+    // The subscriber writes to stdout, so stdout's terminal-ness decides colour.
+    // The builder default would honour `NO_COLOR` but still paint a redirected
+    // stdout; this is the same decision the CLI's own painted output already uses.
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
         .without_time()
+        .with_ansi(ansi_colors::colors_enabled_for(ansi_colors::Target::Stdout))
         .init();
 
     // Version banner: stderr-only so it doesn't foul pipes, and only for interactive stderr.

@@ -9,6 +9,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+ansi_colors = { path = "../../crates/ansi_colors" }
 app = { path = "../../crates/app" }
 arrow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
