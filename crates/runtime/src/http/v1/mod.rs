@@ -43,8 +43,8 @@ use crate::{
     datafusion::{
         DataFusion,
         query::{
-            Error as QueryError, QueryBuilder, is_cancellation_error, write_to_json_string,
-            write_to_json_value,
+            Error as QueryError, QueryBuilder, error_code::ErrorCode, is_cancellation_error,
+            write_to_json_string, write_to_json_value,
         },
     },
     status::ComponentStatus,
@@ -126,6 +126,40 @@ fn status_for_sql_error(message: &str) -> StatusCode {
         StatusCode::FORBIDDEN
     } else {
         StatusCode::BAD_REQUEST
+    }
+}
+
+/// Whether a query error is the engine refusing the query for want of memory.
+///
+/// Recursion through wrapping variants lives in [`ErrorCode`]'s conversion, so a
+/// pool refusal is still recognized when execution wraps it in a
+/// `DataFusionError::Context`.
+fn is_resources_exhausted(error: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    error
+        .downcast_ref::<datafusion::error::DataFusionError>()
+        .is_some_and(|e| ErrorCode::from(e) == ErrorCode::ResourcesExhausted)
+}
+
+/// Collapses the control characters in a query error message so it logs as a
+/// single record.
+///
+/// A memory-pool refusal spreads its top-consumer breakdown over several lines,
+/// and a record that breaks mid-message is one a log collector cannot group or
+/// alert on. Every control character is replaced rather than dropped, so
+/// offsets into the logged line still match the message the response carries.
+/// Only the logged copy is collapsed — the body keeps what the engine wrote —
+/// and a message with nothing to collapse is borrowed, so the common path does
+/// not allocate.
+fn single_line(message: &str) -> std::borrow::Cow<'_, str> {
+    if message.contains(char::is_control) {
+        std::borrow::Cow::Owned(
+            message
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect(),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(message)
     }
 }
 
@@ -250,7 +284,21 @@ pub async fn sql_to_http_response(
             Ok((data, results_cache_status)) => (data, results_cache_status),
             Err(e) => {
                 let message = e.to_string();
-                tracing::debug!("Error executing query: {message}");
+                let resources_exhausted = is_resources_exhausted(e.as_ref());
+
+                // A malformed query is the client's problem and would only be
+                // noise here, but a runtime refusing queries for want of memory
+                // is an outage its operator cannot see any other way: `/health`
+                // is served by a separate tokio runtime and stays green
+                // throughout, so nothing else raises the condition at the
+                // default verbosity.
+                let logged = single_line(&message);
+                if resources_exhausted {
+                    tracing::warn!("Query refused, out of memory: {logged}");
+                } else {
+                    tracing::debug!("Error executing query: {logged}");
+                }
+
                 let status = if e
                     .downcast_ref::<datafusion::error::DataFusionError>()
                     .is_some_and(is_cancellation_error)
@@ -260,6 +308,16 @@ pub async fn sql_to_http_response(
                     // 499 Client Closed Request: used for cancelled queries so
                     // clients can distinguish cancellation from a bad request.
                     StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST)
+                } else if resources_exhausted {
+                    // A refusal for want of memory is the runtime's own capacity
+                    // condition, not a malformed request: 4xx tells
+                    // intermediaries the client is at fault and the request
+                    // should not be retried, so a load balancer keeps routing to
+                    // a saturated pod and a client that retries on 5xx surfaces a
+                    // hard failure for a query that would likely succeed on
+                    // another replica. Flight already reports the same failure as
+                    // the retriable `RESOURCE_EXHAUSTED`.
+                    StatusCode::SERVICE_UNAVAILABLE
                 } else {
                     status_for_sql_error(&message)
                 };
@@ -513,6 +571,50 @@ mod tests {
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
+
+    /// A memory-pool refusal must be answered with a retriable 5xx, not the 400
+    /// a malformed query gets. Only the capacity condition moves; a plain
+    /// execution failure stays on 400.
+    #[test]
+    fn resource_exhaustion_maps_to_service_unavailable() {
+        let exhausted: Box<dyn std::error::Error + Send + Sync> = Box::new(
+            datafusion::error::DataFusionError::ResourcesExhausted(
+                "Additional allocation failed for HashJoinInput[135]".to_string(),
+            ),
+        );
+        assert!(is_resources_exhausted(exhausted.as_ref()));
+
+        // Execution wraps the pool error often enough that the recursion has to
+        // keep working through `Context`.
+        let wrapped: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(datafusion::error::DataFusionError::Context(
+                "Join Error".to_string(),
+                Box::new(datafusion::error::DataFusionError::ResourcesExhausted(
+                    "out of memory".to_string(),
+                )),
+            ));
+        assert!(is_resources_exhausted(wrapped.as_ref()));
+
+        let plain: Box<dyn std::error::Error + Send + Sync> = Box::new(
+            datafusion::error::DataFusionError::Execution("boom".to_string()),
+        );
+        assert!(!is_resources_exhausted(plain.as_ref()));
+        assert_eq!(status_for_sql_error("boom"), StatusCode::BAD_REQUEST);
+    }
+
+    /// The logged copy is collapsed to one record; the response body is not
+    /// touched. A message with nothing to collapse must not allocate.
+    #[test]
+    fn single_line_collapses_only_the_logged_copy() {
+        assert!(matches!(
+            single_line("no controls here"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+
+        let collapsed = single_line("top consumers:\n  HashJoinInput[135]\n  Sort[2]");
+        assert!(!collapsed.contains('\n'));
+        assert_eq!(collapsed.chars().count(), "top consumers:\n  HashJoinInput[135]\n  Sort[2]".chars().count());
+    }
 
     #[test]
     fn test_arrow_to_vnd_json_v1() {
