@@ -159,19 +159,28 @@ fn on_crash(cc: &crash_handler::CrashContext) -> crash_handler::CrashEventResult
     {
         report(cc);
     }
-    // `Handled(true)` maps to `RestoreDefault`: reset to SIG_DFL and re-raise, so the
-    // exit code stays 139 (or 135/132/136) and any configured core dump is still
-    // produced. `Handled(false)` (`RestorePrevious`, which Tango uses) is equivalent
-    // here only because nothing else installs a handler for these signals; the
-    // explicit default is the stronger guarantee.
+    // `Handled(false)` maps to `RestorePrevious`: restore the handlers that were
+    // installed before us, rather than jumping straight to SIG_DFL.
+    //
+    // This matters because `std` installs its own SIGSEGV/SIGBUS handler during
+    // runtime init — before `main`, so before us — purely to detect stack overflow.
+    // Restoring it means a guard-page fault still prints
+    // `thread '...' has overflowed its stack`, the one message that names stack
+    // exhaustion unambiguously; our line alone cannot distinguish it from a wild
+    // pointer. On any other fault `std` finds the address outside the guard page,
+    // installs SIG_DFL and returns, so the process still dies with the right signal.
+    //
+    // Consequence: a stack overflow now exits 134 (`std` aborts) rather than 139.
+    // Every other fault is unchanged. If `std` had installed nothing, the previous
+    // handler is SIG_DFL and this is identical to `Handled(true)`.
     //
     // No signal unblocking is needed here. For a hard fault (`si_code > 0`)
-    // crash-handler installs SIG_DFL and simply returns; the faulting instruction
-    // re-executes and the kernel kills us. Nothing calls `raise()`, so the signal
-    // being masked for the duration of its own handler never matters. (A hand-rolled
-    // handler that re-raises explicitly must `pthread_sigmask(SIG_UNBLOCK, ...)`
-    // first, or the re-raise sits pending forever.)
-    crash_handler::CrashEventResult::Handled(true)
+    // crash-handler restores the handler and simply returns; the faulting instruction
+    // re-executes and is delivered again. Nothing calls `raise()`, so the signal being
+    // masked for the duration of its own handler never matters. (A hand-rolled handler
+    // that re-raises explicitly must `pthread_sigmask(SIG_UNBLOCK, ...)` first, or the
+    // re-raise sits pending forever.)
+    crash_handler::CrashEventResult::Handled(false)
 }
 
 #[cfg(target_os = "linux")]
