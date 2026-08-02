@@ -1642,7 +1642,7 @@ impl DataFusion {
         // environment into the Cayenne accelerator crate, so background and
         // post-write compaction run isolated from queries and CDC on both CPU
         // (this runtime's threads) and memory (the carved pool).
-        cayenne::set_compaction_runtime_handle(tokio_handle.clone());
+        cayenne::set_compaction_runtime_handle(tokio_handle);
 
         // Install the process-global in-memory CDC tier byte budget: the hard
         // aggregate RAM ceiling for `cdc_durability: memory` across ALL Cayenne
