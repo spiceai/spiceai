@@ -35,9 +35,43 @@ use deferred::DeferredCatalogProvider;
 use snafu::prelude::*;
 use tokio::sync::Mutex;
 
+/// Render `err` together with every error in its `source()` chain, on one line.
+///
+/// Database clients routinely keep the useful part of a failure off the outermost
+/// error: `tokio_postgres::Error` displays as just `db error`, with the SQLSTATE and
+/// the server's message reachable only through its source. Displaying the outer error
+/// alone turns a missing database, a bad password and an unreachable host into the
+/// same unactionable text, so walk the chain and keep what it says.
+///
+/// Causes already quoted by an outer message are skipped, since wrappers commonly
+/// interpolate `{source}` themselves and would otherwise repeat it verbatim.
+fn error_with_causes(err: &dyn std::error::Error) -> String {
+    fn one_line(err: &dyn std::error::Error) -> String {
+        err.to_string()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    let mut message = one_line(err);
+    let mut cause = err.source();
+    while let Some(current) = cause {
+        let text = one_line(current);
+        if !text.is_empty() && !message.contains(&text) {
+            message.push_str(": ");
+            message.push_str(&text);
+        }
+        cause = current.source();
+    }
+    message
+}
+
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to setup the {connector_component} ({connector}). {source}"))]
+    #[snafu(display(
+        "Failed to setup the {connector_component} ({connector}). {}",
+        error_with_causes(source.as_ref())
+    ))]
     UnableToGetCatalogProvider {
         connector: String,
         connector_component: ConnectorComponent,
@@ -401,6 +435,77 @@ mod tests {
 
     static REGISTRY_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
         LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    #[derive(Debug)]
+    struct ChainedError {
+        message: String,
+        source: Option<Box<ChainedError>>,
+    }
+
+    impl std::fmt::Display for ChainedError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.message)
+        }
+    }
+
+    impl std::error::Error for ChainedError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.source
+                .as_ref()
+                .map(|s| s.as_ref() as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    fn chained(messages: &[&str]) -> ChainedError {
+        let mut iter = messages.iter().rev();
+        let last = iter.next().unwrap_or(&"");
+        let mut err = ChainedError {
+            message: (*last).to_string(),
+            source: None,
+        };
+        for message in iter {
+            err = ChainedError {
+                message: (*message).to_string(),
+                source: Some(Box::new(err)),
+            };
+        }
+        err
+    }
+
+    #[test]
+    fn error_with_causes_keeps_the_cause_the_outer_error_hides() {
+        // The shape this exists for: tokio_postgres::Error displays as "db error"
+        // and the connection pool's own message spans lines, so the outermost text
+        // alone cannot distinguish a missing database from bad credentials.
+        let err = chained(&[
+            "PostgreSQL connection failed.\ndb error",
+            "db error",
+            "FATAL: database \"tpch_sf1\" does not exist",
+        ]);
+        assert_eq!(
+            super::error_with_causes(&err),
+            "PostgreSQL connection failed. db error: FATAL: database \"tpch_sf1\" does not exist"
+        );
+    }
+
+    #[test]
+    fn error_with_causes_is_single_line_and_skips_repeats() {
+        // Every message collapses to one line — a multi-line error would break
+        // one-line-per-event log parsing.
+        let err = chained(&["outer\n  spanning lines", "inner"]);
+        assert_eq!(
+            super::error_with_causes(&err),
+            "outer spanning lines: inner"
+        );
+
+        // Wrappers that already interpolate `{source}` must not repeat it.
+        let err = chained(&["connect failed: bad password", "bad password"]);
+        assert_eq!(super::error_with_causes(&err), "connect failed: bad password");
+
+        // A lone error with no chain is unchanged.
+        let err = chained(&["standalone"]);
+        assert_eq!(super::error_with_causes(&err), "standalone");
+    }
 
     #[tokio::test]
     async fn test_catalog_connector_registry_lifecycle() {

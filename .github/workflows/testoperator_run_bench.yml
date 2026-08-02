@@ -253,7 +253,13 @@ jobs:
           DB_NAME="${QUERY_SET}_sf${SCALE_FACTOR}"
 
           sudo apt-get update -y
-          sudo apt-get install -y postgresql-client
+          # make is needed before the "already seeded" check below, not just by the
+          # seeding path further down: a database that already has data still runs
+          # `make pg-create-index`, and on a runner without make preinstalled that
+          # exits 127 before the later install line is ever reached. Only a
+          # pre-provisioned target takes that branch, so it surfaced solely on
+          # SF100 while the always-empty SF1/SF10 containers stayed green.
+          sudo apt-get install -y postgresql-client make
 
           echo "Checking whether $DB_NAME already has data on $PGHOST..."
           set +e
@@ -302,7 +308,7 @@ jobs:
           fi
 
           echo "$DB_NAME is missing or empty on $PGHOST - seeding it now."
-          sudo apt-get install -y git make
+          sudo apt-get install -y git
           if [ "$QUERY_SET" = "tpcds" ]; then
             # tpcds-kit's tools/Makefile hardcodes CC=gcc-9 on Linux; ubuntu-24.04's
             # default gcc isn't named gcc-9, so install it explicitly via the PPA.
