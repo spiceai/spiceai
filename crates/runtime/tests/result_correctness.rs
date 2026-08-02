@@ -513,9 +513,8 @@ mod duckdb_accel {
             ))
             .unwrap_or_else(|e| panic!("load {name}: {e}"));
         }
-        // Keep stage alive by nesting — re-create path: store stage inside by leaking? 
-        // Copy is done; stage can drop after load.
-        let _ = stage;
+        // `CREATE TABLE … AS SELECT` materialized every table into `db`, so the
+        // staged parquet is no longer referenced and `stage` can drop here.
         (temp, conn)
     }
 

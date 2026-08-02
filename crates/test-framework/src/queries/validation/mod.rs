@@ -713,44 +713,47 @@ pub fn validate_row_count(
     }
 }
 
-/// True when both strings look like timestamps that differ only by fractional
-/// second zero-padding (e.g. `…00.000000000` vs `…00.000000`).
+/// True when both strings are timestamps in the format [`array_value_to_string`]
+/// emits and differ only by fractional-second zero padding — a nanosecond engine's
+/// `2024-01-01 00:00:00.000000000` against a microsecond engine's
+/// `2024-01-01 00:00:00.000000`.
+///
+/// The shape test is deliberately exact rather than a "contains `.` and `:`"
+/// heuristic: a loose guard also matches values such as `http://host/a.100`, where
+/// trimming trailing zeros would silently mask a real mismatch. Anything that is
+/// not the emitted timestamp format returns `false`, so the caller falls through
+/// to reporting the mismatch.
 fn timestamp_strings_equivalent(a: &str, b: &str) -> bool {
-    fn strip_frac_zeros(s: &str) -> &str {
-        if let Some(dot) = s.rfind('.') {
-            let (head, frac) = s.split_at(dot);
-            let frac = frac.trim_start_matches('.').trim_end_matches('0');
-            if frac.is_empty() {
-                head
-            } else {
-                // Keep a stable form: head + '.' + trimmed frac — compare via owned below.
-                s
+    /// Exactly `YYYY-MM-DD HH:MM:SS`, the prefix [`array_value_to_string`] emits
+    /// for every `Timestamp` unit.
+    fn is_timestamp_prefix(s: &str) -> bool {
+        let [y0, y1, y2, y3, b'-', mo0, mo1, b'-', d0, d1, b' ', h0, h1, b':', mi0, mi1, b':', s0, s1] =
+            s.as_bytes()
+        else {
+            return false;
+        };
+        [y0, y1, y2, y3, mo0, mo1, d0, d1, h0, h1, mi0, mi1, s0, s1]
+            .iter()
+            .all(|c| c.is_ascii_digit())
+    }
+
+    /// Splits into the `YYYY-MM-DD HH:MM:SS` prefix and its fractional digits with
+    /// trailing zeros trimmed. `None` when `s` is not the emitted format.
+    fn split_timestamp(s: &str) -> Option<(&str, &str)> {
+        match s.split_once('.') {
+            Some((prefix, frac)) => {
+                let frac_is_digits = !frac.is_empty() && frac.bytes().all(|c| c.is_ascii_digit());
+                (is_timestamp_prefix(prefix) && frac_is_digits)
+                    .then(|| (prefix, frac.trim_end_matches('0')))
             }
-        } else {
-            s
+            None => is_timestamp_prefix(s).then_some((s, "")),
         }
     }
-    // Own normalized forms when fractional part needs rebuild.
-    fn normalize(s: &str) -> String {
-        if let Some((date, frac)) = s.rsplit_once('.') {
-            // Require a date-like prefix to avoid collapsing decimals.
-            if !date.contains('-') && !date.contains(':') {
-                return s.to_string();
-            }
-            let frac = frac.trim_end_matches('0');
-            if frac.is_empty() {
-                date.to_string()
-            } else {
-                format!("{date}.{frac}")
-            }
-        } else {
-            s.to_string()
-        }
+
+    match (split_timestamp(a), split_timestamp(b)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
     }
-    let _ = strip_frac_zeros; // keep helper available for readability
-    let na = normalize(a);
-    let nb = normalize(b);
-    na == nb && (a.contains(':') || b.contains(':'))
 }
 
 /// How rows should be compared when validating two independent query results.
@@ -1461,8 +1464,8 @@ mod test {
 
         let multiset = compare_query_result_batches(
             "reorder",
-            &[left.clone()],
-            &[right.clone()],
+            std::slice::from_ref(&left),
+            std::slice::from_ref(&right),
             RowOrder::Multiset,
         )
         .expect("compare multiset");
@@ -1524,5 +1527,52 @@ mod test {
             row_order_from_sql("SELECT a FROM t GROUP BY a"),
             RowOrder::Multiset
         );
+    }
+
+    #[test]
+    fn test_timestamp_strings_equivalent() {
+        // Same instant, different fractional-second width across engines.
+        assert!(timestamp_strings_equivalent(
+            "2024-01-01 00:00:00.000000000",
+            "2024-01-01 00:00:00.000000"
+        ));
+        assert!(timestamp_strings_equivalent(
+            "2024-01-01 00:00:00.123000000",
+            "2024-01-01 00:00:00.123"
+        ));
+        // A bare second-precision timestamp equals an all-zero fraction.
+        assert!(timestamp_strings_equivalent(
+            "2024-01-01 00:00:00",
+            "2024-01-01 00:00:00.000"
+        ));
+        assert!(timestamp_strings_equivalent(
+            "2024-01-01 00:00:00",
+            "2024-01-01 00:00:00"
+        ));
+
+        // Genuinely different instants must never be equivalent.
+        assert!(!timestamp_strings_equivalent(
+            "2024-01-01 00:00:00.100000000",
+            "2024-01-01 00:00:00.000000"
+        ));
+        assert!(!timestamp_strings_equivalent(
+            "2024-01-01 00:00:01",
+            "2024-01-01 00:00:00"
+        ));
+        assert!(!timestamp_strings_equivalent(
+            "2024-01-02 00:00:00",
+            "2024-01-01 00:00:00"
+        ));
+
+        // Non-timestamps must not be normalized: a loose "contains `.` and `:`"
+        // guard would collapse these trailing zeros and mask a real mismatch.
+        assert!(!timestamp_strings_equivalent(
+            "http://host/a.100",
+            "http://host/a.1"
+        ));
+        assert!(!timestamp_strings_equivalent("1.100", "1.1"));
+        assert!(!timestamp_strings_equivalent("12:30.100", "12:30.1"));
+        // Decimals must fall through to the numeric comparison path.
+        assert!(!timestamp_strings_equivalent("1.10", "1.1"));
     }
 }
