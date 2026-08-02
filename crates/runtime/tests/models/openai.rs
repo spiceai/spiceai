@@ -1071,7 +1071,7 @@ async fn openai_responses_api_tools() -> Result<(), anyhow::Error> {
             assert!(tools.iter().all(|tool| matches!(
                 tool,
                 ToolDefinition::CodeInterpreter(_)
-                    | ToolDefinition::WebSearchPreview(_)
+                    | ToolDefinition::WebSearch(_)
                     | ToolDefinition::Function(_)
             )));
 
@@ -1081,7 +1081,7 @@ async fn openai_responses_api_tools() -> Result<(), anyhow::Error> {
                     ToolDefinition::CodeInterpreter(_) => {
                         assert!(desired_tools.remove("code_interpreter"));
                     }
-                    ToolDefinition::WebSearchPreview(_) => {
+                    ToolDefinition::WebSearch(_) => {
                         assert!(desired_tools.remove("web_search"));
                     }
                     ToolDefinition::Function(FunctionTool { name, .. }) => {

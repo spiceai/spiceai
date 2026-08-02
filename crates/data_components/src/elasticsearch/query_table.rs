@@ -1080,6 +1080,14 @@ mod tests {
         ) -> elasticsearch::Result<serde_json::Value> {
             Err(unexpected_call_error("bulk_index"))
         }
+
+        async fn delete_by_query(
+            &self,
+            _index: &str,
+            _query: &serde_json::Value,
+        ) -> elasticsearch::Result<serde_json::Value> {
+            Err(unexpected_call_error("delete_by_query"))
+        }
     }
 
     async fn collect_query_table(

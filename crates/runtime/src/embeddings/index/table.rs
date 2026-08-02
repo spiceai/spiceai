@@ -20,8 +20,18 @@ use crate::model::EmbeddingModelStore;
 use crate::secrets::Secrets;
 use datafusion::datasource::TableProvider;
 use datafusion::{prelude::SessionContext, sql::TableReference};
-#[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
+// Only the s3_vectors / elasticsearch index wrappers below look the embed UDF up
+// by name, so the name is needed only when one of them is built.
+#[cfg(all(
+    feature = "models",
+    any(feature = "s3_vectors", feature = "elasticsearch")
+))]
 use runtime_datafusion_udfs::embed::EMBED_UDF_NAME;
+#[cfg(all(
+    not(feature = "models"),
+    any(feature = "s3_vectors", feature = "elasticsearch")
+))]
+const EMBED_UDF_NAME: &str = "embed";
 use spicepod::vector::VectorStore;
 use std::sync::Arc;
 use tokio::sync::RwLock;

@@ -20,6 +20,7 @@ limitations under the License.
 //! with the Spice search pipeline, enabling hybrid search via `vector_search`,
 //! `text_search`, and `rrf` UDTFs.
 
+mod delete;
 mod write;
 
 use std::any::Any;
@@ -472,6 +473,24 @@ impl Index for ElasticsearchIndex {
             .on_write_complete(self.client.as_ref(), &self.es_index)
             .await
     }
+
+    async fn delete_by_keys(&self, keys: RecordBatch) -> Result<(), DataFusionError> {
+        let key_columns = delete::document_key_columns(&self.primary_key);
+        delete::delete_by_keys(
+            self.client.as_ref(),
+            &self.es_index,
+            &self.primary_key,
+            &key_columns,
+            &keys,
+        )
+        .await
+    }
+
+    /// `_delete_by_query` filters by field value, so a key naming only some of the indexed fields
+    /// removes every document matching it.
+    fn deletes_by_partial_key(&self) -> bool {
+        true
+    }
 }
 
 impl ElasticsearchIndex {
@@ -706,6 +725,23 @@ impl Index for ElasticsearchTextIndex {
             .on_write_complete(self.client.as_ref(), &self.es_index)
             .await
     }
+
+    async fn delete_by_keys(&self, keys: RecordBatch) -> Result<(), DataFusionError> {
+        let key_columns = delete::document_key_columns(&self.primary_key);
+        delete::delete_by_keys(
+            self.client.as_ref(),
+            &self.es_index,
+            &self.primary_key,
+            &key_columns,
+            &keys,
+        )
+        .await
+    }
+
+    /// Same `_delete_by_query` addressing as [`ElasticsearchIndex`].
+    fn deletes_by_partial_key(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -827,6 +863,13 @@ mod write_maintenance_tests {
             &self,
             _: &str,
             _: &[(Option<String>, serde_json::Value)],
+        ) -> elasticsearch::Result<serde_json::Value> {
+            unimplemented!()
+        }
+        async fn delete_by_query(
+            &self,
+            _: &str,
+            _: &serde_json::Value,
         ) -> elasticsearch::Result<serde_json::Value> {
             unimplemented!()
         }

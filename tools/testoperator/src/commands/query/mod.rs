@@ -29,6 +29,7 @@ use test_framework::{
 };
 
 pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
+    super::ensure_shared_client_connections(args, "query")?;
     let mut spiced_instance = SpicedInstance::empty();
 
     spiced_instance

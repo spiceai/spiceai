@@ -20,16 +20,17 @@ use async_trait::async_trait;
 use chunking::Chunker;
 use datafusion::{
     common::Column,
-    error::DataFusionError,
+    error::{DataFusionError, Result as DataFusionResult},
+    execution::context::SessionContext,
     functions_aggregate::expr_fn::{array_agg, first_value},
-    logical_expr::{Aggregate, LogicalPlan, Sort, SortExpr, expr::Alias},
+    logical_expr::{Aggregate, LogicalPlan, LogicalPlanBuilder, Sort, SortExpr, expr::Alias},
     prelude::{Expr, ExprFunctionExt, col},
     sql::TableReference,
 };
 use datafusion_expr::ident;
 use futures::future::try_join_all;
 use itertools::Itertools;
-use runtime_datafusion_index::Index;
+use runtime_datafusion_index::{Index, build_key_match_predicate};
 use snafu::{ResultExt, Snafu};
 use util::{arrow::repeat, convert_string_arrow_to_iterator};
 
@@ -99,6 +100,33 @@ impl Index for ChunkedSearchIndex {
         self.inner.on_write_complete().await
     }
 
+    /// `keys` is shaped by [`SearchIndex::primary_fields`], which excludes
+    /// [`CHUNKED_INDEX_CHUNK_KEY`] — so every chunk row for a given outer key must go, not just
+    /// one. `self.inner`'s own key includes the chunk id, whose values this doesn't know.
+    ///
+    /// An inner index that reports [`Index::deletes_by_partial_key`] deletes that whole group
+    /// from the outer key alone, so hand it straight over. Otherwise the exact chunk-keyed rows
+    /// have to be resolved out of `self.inner`'s own data first, which needs a listable
+    /// [`VectorIndex`] (see [`delete_chunked_vector_by_outer_keys`]; plain full-text indexes have
+    /// no generic "list everything" surface to query).
+    async fn delete_by_keys(&self, keys: RecordBatch) -> DataFusionResult<()> {
+        if self.inner.deletes_by_partial_key() {
+            return self.inner.delete_by_keys(keys).await;
+        }
+        let Some(inner_vector) = Arc::clone(&self.inner).as_vector_index() else {
+            return Err(DataFusionError::NotImplemented(
+                "Deleting from a chunked non-vector search index is not yet supported (no way to \
+                 enumerate its existing chunks for a given primary key)"
+                    .to_string(),
+            ));
+        };
+        delete_chunked_vector_by_outer_keys(&inner_vector, keys).await
+    }
+
+    fn deletes_by_partial_key(&self) -> bool {
+        self.inner.deletes_by_partial_key()
+    }
+
     fn write_complete_failure_is_fatal(&self) -> bool {
         self.inner.write_complete_failure_is_fatal()
     }
@@ -106,6 +134,46 @@ impl Index for ChunkedSearchIndex {
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+/// Deletes every entry in `inner` whose primary-key columns match a row of `outer_keys` (which
+/// carry only the outer/pre-chunk key columns — `inner`'s own key additionally has the chunk id,
+/// whose values aren't known here). Resolves the exact matching entries by scanning `inner`'s own
+/// [`VectorIndex::list_table_provider`] with a predicate built from `outer_keys`, then deletes
+/// those resolved (chunk-key-included) rows via `inner`'s normal [`Index::delete_by_keys`].
+async fn delete_chunked_vector_by_outer_keys(
+    inner: &Arc<dyn VectorIndex>,
+    outer_keys: RecordBatch,
+) -> DataFusionResult<()> {
+    // Only the true outer primary key — not every column `outer_keys` happens to carry (it's
+    // shaped by `required_columns`, a superset that includes the search column and other
+    // metadata). `inner`'s stored value for those extra columns is chunk-specific (e.g. a
+    // fragment of the original search column), so matching on them would never equal the
+    // original row and silently leave chunks undeleted.
+    let outer_columns = ChunkedSearchIndex::base_key_columns(&inner.primary_fields());
+    let Some(predicate) = build_key_match_predicate(&outer_keys, &outer_columns)? else {
+        return Ok(());
+    };
+
+    let list_plan = inner.list_table_provider()?;
+    let filtered_plan = LogicalPlanBuilder::from(list_plan)
+        .filter(predicate)?
+        .build()?;
+
+    let ctx = SessionContext::new();
+    let matches = ctx
+        .execute_logical_plan(filtered_plan)
+        .await?
+        .collect()
+        .await?;
+
+    for batch in matches {
+        if batch.num_rows() > 0 {
+            inner.delete_by_keys(batch).await?;
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Snafu)]
@@ -157,6 +225,17 @@ impl ChunkedSearchIndex {
     #[must_use]
     pub fn chunking_offset_col(search_column: &str) -> String {
         format!("{search_column}_offset")
+    }
+
+    /// The names of the *base* row's primary-key columns, given a chunked index's primary key:
+    /// everything [`augment_primary_key`](Self::augment_primary_key) did not add. These identify
+    /// a source row, and so the whole group of chunk entries stored under it.
+    #[must_use]
+    pub fn base_key_columns(pk: &[Field]) -> Vec<String> {
+        pk.iter()
+            .filter(|f| f.name() != CHUNKED_INDEX_CHUNK_KEY)
+            .map(|f| f.name().clone())
+            .collect()
     }
 
     #[must_use]
@@ -645,13 +724,7 @@ impl VectorIndex for ChunkedVectorIndex {
 
     fn list_table_provider(&self) -> Result<LogicalPlan, DataFusionError> {
         let base_index_table = self.inner.list_table_provider()?;
-        let primary_key_names: Vec<_> = self
-            .inner
-            .primary_fields()
-            .iter()
-            .filter(|f| f.name() != CHUNKED_INDEX_CHUNK_KEY)
-            .map(|f| f.name().clone())
-            .collect();
+        let primary_key_names = ChunkedSearchIndex::base_key_columns(&self.inner.primary_fields());
 
         // Primary key, offsets and embeddings.
         //// Need to `order by _spice.chunk_id`.
@@ -773,6 +846,20 @@ impl Index for ChunkedVectorIndex {
 
     async fn on_write_complete(&self) -> Result<(), DataFusionError> {
         self.inner.on_write_complete().await
+    }
+
+    /// See [`ChunkedSearchIndex::delete_by_keys`] — same outer-key-to-chunk resolution, with the
+    /// same partial-key shortcut, specialized here since `self.inner` is already known to be a
+    /// [`VectorIndex`].
+    async fn delete_by_keys(&self, keys: RecordBatch) -> DataFusionResult<()> {
+        if self.inner.deletes_by_partial_key() {
+            return self.inner.delete_by_keys(keys).await;
+        }
+        delete_chunked_vector_by_outer_keys(&self.inner, keys).await
+    }
+
+    fn deletes_by_partial_key(&self) -> bool {
+        self.inner.deletes_by_partial_key()
     }
 
     fn write_complete_failure_is_fatal(&self) -> bool {
@@ -1035,6 +1122,17 @@ mod tests {
         row_counts: std::sync::Mutex<Vec<usize>>,
         /// What this mock reports from [`Index::write_complete_failure_is_fatal`].
         write_complete_fatal: bool,
+        /// What this mock reports from [`Index::deletes_by_partial_key`].
+        deletes_partial_key: bool,
+        /// What this mock reports from [`SearchIndex::primary_fields`]. A chunked index's inner
+        /// index carries [`CHUNKED_INDEX_CHUNK_KEY`] here.
+        primary_fields: Vec<Field>,
+        /// Rows this mock claims to store, served by [`VectorIndex::list_table_provider`].
+        /// `None` reports no listing at all; `Some` of an empty batch is Elasticsearch, whose
+        /// list plan is a correctly-shaped empty table because it cannot enumerate its vectors.
+        listed: Option<Vec<RecordBatch>>,
+        /// Key batches handed to [`Index::delete_by_keys`].
+        deleted: std::sync::Mutex<Vec<RecordBatch>>,
     }
 
     impl RecordingInner {
@@ -1044,6 +1142,10 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 row_counts: std::sync::Mutex::new(Vec::new()),
                 write_complete_fatal: false,
+                deletes_partial_key: false,
+                primary_fields: vec![Field::new("id", DataType::Int64, false)],
+                listed: None,
+                deleted: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -1052,6 +1154,47 @@ mod tests {
                 write_complete_fatal: true,
                 ..Self::new(search_column)
             }
+        }
+
+        /// A mock shaped like a chunked index's inner index: a chunk-key-augmented primary key,
+        /// and `listed` rows keyed by it.
+        fn chunked(listed: Vec<RecordBatch>) -> Self {
+            Self {
+                primary_fields: ChunkedSearchIndex::augment_primary_key(vec![Field::new(
+                    "id",
+                    DataType::Int64,
+                    false,
+                )]),
+                listed: Some(listed),
+                ..Self::new("content")
+            }
+        }
+
+        /// The key batches passed to [`Index::delete_by_keys`], as
+        /// `(column names, values of the first column)` per call.
+        fn deletes(&self) -> Vec<(Vec<String>, Vec<i64>)> {
+            self.deleted
+                .lock()
+                .expect("mutex")
+                .iter()
+                .map(|batch| {
+                    let names = batch
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|f| f.name().clone())
+                        .collect();
+                    let ids = batch
+                        .column_by_name("id")
+                        .expect("delete keys carry the base key")
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("id is Int64")
+                        .values()
+                        .to_vec();
+                    (names, ids)
+                })
+                .collect()
         }
     }
 
@@ -1062,6 +1205,13 @@ mod tests {
         }
         fn required_columns(&self) -> Vec<String> {
             vec![self.search_column.clone()]
+        }
+        async fn delete_by_keys(&self, keys: RecordBatch) -> DataFusionResult<()> {
+            self.deleted.lock().expect("mutex").push(keys);
+            Ok(())
+        }
+        fn deletes_by_partial_key(&self) -> bool {
+            self.deletes_partial_key
         }
         fn write_complete_failure_is_fatal(&self) -> bool {
             self.write_complete_fatal
@@ -1074,9 +1224,24 @@ mod tests {
     #[async_trait]
     impl VectorIndex for RecordingInner {
         fn list_table_provider(&self) -> Result<LogicalPlan, DataFusionError> {
-            Err(DataFusionError::NotImplemented(
-                "RecordingInner stores embeddings in the underlying table".to_string(),
-            ))
+            let Some(batches) = self.listed.as_ref() else {
+                return Err(DataFusionError::NotImplemented(
+                    "RecordingInner stores embeddings in the underlying table".to_string(),
+                ));
+            };
+            let schema = batches
+                .first()
+                .map(RecordBatch::schema)
+                .expect("a listing needs at least one (possibly empty) batch");
+            let table = datafusion::datasource::MemTable::try_new(schema, vec![batches.clone()])?;
+            LogicalPlanBuilder::scan(
+                "inner",
+                Arc::new(datafusion::datasource::DefaultTableSource::new(Arc::new(
+                    table,
+                ))),
+                None,
+            )?
+            .build()
         }
 
         fn dimension(&self) -> i32 {
@@ -1091,7 +1256,11 @@ mod tests {
         }
 
         fn primary_fields(&self) -> Vec<Field> {
-            vec![Field::new("id", DataType::Int64, false)]
+            self.primary_fields.clone()
+        }
+
+        fn as_vector_index(self: Arc<Self>) -> Option<Arc<dyn VectorIndex>> {
+            Some(self)
         }
 
         async fn write(
@@ -1211,6 +1380,137 @@ mod tests {
             chunker: chunker(),
         };
         assert!(fatal.write_complete_failure_is_fatal());
+    }
+
+    fn chunker() -> Arc<dyn Chunker> {
+        Arc::new(DelimChunker { delim: ' ' }) as Arc<dyn Chunker>
+    }
+
+    /// The base key a chunked index is asked to delete — the shape of
+    /// [`ChunkedSearchIndex::primary_fields`], with no chunk id.
+    fn outer_keys(ids: &[i64]) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(ids.to_vec())) as ArrayRef],
+        )
+        .expect("valid batch")
+    }
+
+    /// The chunk-keyed entries an inner index stores: one row per `(id, chunk_id)`.
+    fn chunk_keyed_rows(rows: &[(i64, u64)]) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(ChunkedSearchIndex::augment_primary_key(vec![
+                Field::new("id", DataType::Int64, false),
+            ]))),
+            vec![
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(UInt64Array::from(
+                    rows.iter().map(|(_, chunk)| *chunk).collect::<Vec<_>>(),
+                )) as ArrayRef,
+            ],
+        )
+        .expect("valid batch")
+    }
+
+    /// An inner index that deletes by a partial key gets the base key handed straight to it, and
+    /// deletes every chunk under it in one operation.
+    ///
+    /// Regression test for #12088. Elasticsearch's list plan is a correctly-shaped *empty* table
+    /// — it cannot enumerate its own vectors — so resolving the chunk-keyed rows first (the only
+    /// path this had) matched nothing, and a chunked Elasticsearch index reported a successful
+    /// delete while keeping every document for the deleted row.
+    #[tokio::test]
+    async fn a_partial_key_inner_index_deletes_from_the_base_key_alone() {
+        for listed in [
+            vec![chunk_keyed_rows(&[])],
+            vec![chunk_keyed_rows(&[(1, 0), (1, 1), (2, 0)])],
+        ] {
+            let inner = Arc::new(RecordingInner {
+                deletes_partial_key: true,
+                ..RecordingInner::chunked(listed)
+            });
+            let idx =
+                ChunkedSearchIndex::new(Arc::clone(&inner) as Arc<dyn SearchIndex>, chunker());
+
+            idx.delete_by_keys(outer_keys(&[1, 2]))
+                .await
+                .expect("delete succeeds");
+
+            assert_eq!(
+                inner.deletes(),
+                vec![(vec!["id".to_string()], vec![1, 2])],
+                "the base key must reach the inner index unchanged, whatever it lists"
+            );
+        }
+    }
+
+    /// An inner index addressed by an exact key still has its chunk-keyed entries resolved first,
+    /// and only the deleted row's chunks are removed.
+    #[tokio::test]
+    async fn an_exact_key_inner_index_resolves_its_chunk_keyed_entries_first() {
+        let inner = Arc::new(RecordingInner::chunked(vec![chunk_keyed_rows(&[
+            (1, 0),
+            (1, 1),
+            (2, 0),
+        ])]));
+        let idx = ChunkedSearchIndex::new(Arc::clone(&inner) as Arc<dyn SearchIndex>, chunker());
+
+        idx.delete_by_keys(outer_keys(&[1]))
+            .await
+            .expect("delete succeeds");
+
+        let deletes = inner.deletes();
+        assert_eq!(deletes.len(), 1, "one resolved batch: {deletes:?}");
+        let (columns, ids) = &deletes[0];
+        assert!(
+            columns.contains(&CHUNKED_INDEX_CHUNK_KEY.to_string()),
+            "resolved keys carry the chunk id: {columns:?}"
+        );
+        assert_eq!(ids, &vec![1, 1], "both chunks of id 1, and nothing else");
+    }
+
+    /// A chunked index with no listing and no partial-key delete has no way to reach its inner
+    /// index's chunks, and must say so rather than report a delete it did not perform.
+    #[tokio::test]
+    async fn a_chunked_index_over_an_unlistable_inner_index_reports_not_implemented() {
+        let inner = Arc::new(RecordingInner::new("content"));
+        let idx = ChunkedSearchIndex::new(Arc::clone(&inner) as Arc<dyn SearchIndex>, chunker());
+
+        let err = idx
+            .delete_by_keys(outer_keys(&[1]))
+            .await
+            .expect_err("no way to enumerate chunks");
+
+        assert!(
+            matches!(err, DataFusionError::NotImplemented(_)),
+            "unexpected error: {err}"
+        );
+        assert!(inner.deletes().is_empty());
+    }
+
+    /// Both chunked wrappers must forward the capability — inheriting the trait default would
+    /// send a partial-key-capable index down the enumerate-first path.
+    #[test]
+    fn chunked_wrappers_forward_partial_key_deletion() {
+        for partial in [false, true] {
+            let inner = || {
+                Arc::new(RecordingInner {
+                    deletes_partial_key: partial,
+                    ..RecordingInner::new("content")
+                })
+            };
+
+            let search = ChunkedSearchIndex::new(inner() as Arc<dyn SearchIndex>, chunker());
+            assert_eq!(search.deletes_by_partial_key(), partial);
+
+            let vector = ChunkedVectorIndex {
+                inner: inner() as Arc<dyn VectorIndex>,
+                chunker: chunker(),
+            };
+            assert_eq!(vector.deletes_by_partial_key(), partial);
+        }
     }
 
     /// Smoke test: a tiny input that fits comfortably under the budget should result in exactly

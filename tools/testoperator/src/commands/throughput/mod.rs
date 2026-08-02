@@ -32,7 +32,11 @@ use test_framework::{
 };
 
 pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
-    if args.common.concurrency < 2 {
+    // Surface a bad connection-topology combination now, not after the
+    // ready-wait.
+    args.validate_fleet()?;
+    let concurrency = args.effective_concurrency();
+    if concurrency < 2 {
         return Err(anyhow::anyhow!(
             "Concurrency should be greater than 1 for a throughput test"
         ));
@@ -102,15 +106,27 @@ async fn run_inner(
     // throughput test
     println!("Running throughput test");
 
-    let (_query_set, test_builder) = super::build_test_with_validation(
-        args,
-        &app,
-        NotStarted::new()
-            .with_parallel_count(args.common.concurrency)
-            .with_end_condition(EndCondition::QuerySetCompleted(2))
-            .with_query_executor(executor),
-    )
-    .await?;
+    // The measured phase drives the requested connection topology; the baseline
+    // above intentionally stays on the shared executor (it runs a single client).
+    let concurrency = args.effective_concurrency();
+    let client_executors =
+        super::create_client_executors(args, &spiced_instance, concurrency).await?;
+    super::announce_connection_topology(args, concurrency);
+
+    let mut builder = NotStarted::new()
+        .with_parallel_count(concurrency)
+        .with_end_condition(EndCondition::QuerySetCompleted(2));
+    if client_executors.is_empty() {
+        builder = builder.with_query_executor(executor);
+    } else {
+        // Drop the shared executor before the measured phase. The baseline ran
+        // on it, so its connection is established; holding it here would leave
+        // the server with N+1 connections for a test that asked for N.
+        drop(executor);
+        builder = builder.with_query_executors(client_executors);
+    }
+
+    let (_query_set, test_builder) = super::build_test_with_validation(args, &app, builder).await?;
 
     let throughput_test = SpiceTest::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)

@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::dataset::Dataset;
 use crate::component::dataset::acceleration::RefreshMode;
+use crate::component::dataset::{Dataset, DatasetSpec};
 use crate::component::{ComponentInitialization, DatasetHealthMonitor, StartupOptions};
 use crate::dataconnector::client_identity::{
     ClientIdentityConfig, ClientIdentityConfigError, TLS_CLIENT_CERTIFICATE,
@@ -104,7 +104,7 @@ impl Https {
     fn shared_rate_control_metrics_for_dataset(
         rate_control_registry: &http_rate_control::HttpRateControlRegistry,
         rate_control_registry_arc: &Arc<http_rate_control::HttpRateControlRegistry>,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         structured_format: bool,
     ) -> (
         Arc<HttpRateControlMetrics>,
@@ -134,7 +134,7 @@ impl Https {
 
     /// Determines if the dataset uses a structured file format (parquet, csv, json, etc.)
     /// that would be handled by `ListingTableConnector` rather than `HttpTableProvider`.
-    fn is_structured_format(&self, dataset: &Dataset) -> bool {
+    fn is_structured_format(&self, dataset: &DatasetSpec) -> bool {
         let file_format = self
             .params
             .get("file_format")
@@ -1724,11 +1724,9 @@ impl DataConnectorFactory for HttpsFactory {
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let runtime_rate_control_params =
-                params.app.as_ref().map(|app| app.runtime.params.clone());
+            let runtime_rate_control_params = params.app().map(|app| app.runtime.params.clone());
             let rate_control_registry = params
-                .runtime
-                .as_ref()
+                .runtime()
                 .map_or_else(http_rate_control::global_registry, |runtime| {
                     runtime.http_rate_control_registry()
                 });

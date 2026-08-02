@@ -46,6 +46,9 @@ use runtime_request_context::{AsyncMarker, RequestContext};
 pub enum OpenAIResponsesTools {
     CodeInterpreter,
     WebSearch,
+    // The legacy `web_search_preview` tool, retained for older models that do not support the
+    // current `web_search` tool.
+    WebSearchPreview,
 }
 
 impl From<OpenAIResponsesTools> for ToolDefinition {
@@ -54,7 +57,8 @@ impl From<OpenAIResponsesTools> for ToolDefinition {
             OpenAIResponsesTools::CodeInterpreter => {
                 ToolDefinition::CodeInterpreter(CodeInterpreterTool::default())
             }
-            OpenAIResponsesTools::WebSearch => {
+            OpenAIResponsesTools::WebSearch => ToolDefinition::WebSearch(WebSearchTool::default()),
+            OpenAIResponsesTools::WebSearchPreview => {
                 ToolDefinition::WebSearchPreview(WebSearchTool::default())
             }
         }
@@ -68,6 +72,7 @@ impl TryFrom<&str> for OpenAIResponsesTools {
         match value {
             "code_interpreter" => Ok(OpenAIResponsesTools::CodeInterpreter),
             "web_search" => Ok(OpenAIResponsesTools::WebSearch),
+            "web_search_preview" => Ok(OpenAIResponsesTools::WebSearchPreview),
             _ => Err(LlmError::ToolNotFound {
                 tool: value.to_string(),
             }),
@@ -659,7 +664,8 @@ fn get_tool_name(tool: &ToolDefinition) -> &str {
     match tool {
         ToolDefinition::Function(f) => &f.name,
         ToolDefinition::CodeInterpreter(_) => "code_interpreter",
-        ToolDefinition::WebSearchPreview(_) => "web_search",
+        ToolDefinition::WebSearch(_) => "web_search",
+        ToolDefinition::WebSearchPreview(_) => "web_search_preview",
         ToolDefinition::FileSearch(_) => "file_search",
         ToolDefinition::ComputerUsePreview(_) => "computer_use",
         ToolDefinition::Mcp(_) => "mcp",

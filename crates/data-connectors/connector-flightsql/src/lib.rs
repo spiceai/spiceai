@@ -235,12 +235,9 @@ impl DataConnectorFactory for FlightSQLFactory {
                 .context(UnableToConstructTlsChannelSnafu)?;
             let flight_channel = CookieService::new(flight_channel, Arc::clone(&cookie_store));
 
+            let app = params.app();
             let max_message_size =
-                match params
-                    .app
-                    .as_ref()
-                    .and_then(|app| app.runtime.flight.as_ref())
-                {
+                match app.as_ref().and_then(|app| app.runtime.flight.as_ref()) {
                     Some(flight) => flight.max_message_size_bytes().map_err(|err| {
                         Error::InvalidParameterValue {
                             parameter: "max_message_size".to_string(),

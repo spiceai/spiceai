@@ -110,11 +110,9 @@ impl DataConnectorFactory for GraphQLFactory {
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let runtime_rate_control_params =
-                params.app.as_ref().map(|app| app.runtime.params.clone());
+            let runtime_rate_control_params = params.app().map(|app| app.runtime.params.clone());
             let rate_control_registry = params
-                .runtime
-                .as_ref()
+                .runtime()
                 .map_or_else(http_rate_control::global_registry, |runtime| {
                     runtime.http_rate_control_registry()
                 });

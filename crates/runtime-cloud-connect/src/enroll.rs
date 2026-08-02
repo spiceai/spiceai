@@ -44,7 +44,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use snafu::{ResultExt, Snafu};
 
 use crate::config::CloudConnectConfig;
-use crate::identity::{EnrollmentMaterial, Identity};
+use crate::identity::{EnrollmentMaterial, Identity, IdentityStore};
 
 /// Path of the cloud enroll endpoint, relative to the enroll base URL.
 pub const ENROLL_PATH: &str = "/v1/cloud-connect/enroll";
@@ -85,10 +85,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 impl Error {
     /// `true` only when the cloud *authoritatively rejected* the request
-    /// (4xx `Rejected`): the adoption code is invalid/consumed/expired, or the
-    /// identity was revoked. This is the sole condition under which the caller
-    /// may take a destructive action — burning the staged adoption code or
-    /// clearing the on-disk identity.
+    /// (4xx `Rejected`): retrying the same request cannot succeed.
     ///
     /// Note this deliberately EXCLUDES [`Error::ProofOfPossession`]. A
     /// proof-of-possession / key-material failure is *local* and never reaches
@@ -99,6 +96,19 @@ impl Error {
     #[must_use]
     pub fn is_authoritative_rejection(&self) -> bool {
         matches!(self, Error::Rejected { .. })
+    }
+
+    /// `true` only when the *credential itself* was rejected (HTTP 401:
+    /// unknown or already-consumed adoption code / revoked identity). This
+    /// is the sole condition under which a staged adoption code may be
+    /// burned or the on-disk identity cleared. Other authoritative 4xx
+    /// rejections (app-attachment validation: 400/403/404/409) are checked
+    /// by the cloud BEFORE the code is consumed, so the code remains
+    /// redeemable once the request is corrected — discarding it would burn
+    /// a live code over a typo in `--app-name`.
+    #[must_use]
+    pub fn is_credential_rejection(&self) -> bool {
+        matches!(self, Error::Rejected { status: 401, .. })
     }
 }
 
@@ -144,7 +154,18 @@ fn non_empty_or_unknown(value: String) -> String {
 struct EnrollRequest<'a> {
     adoption_code: &'a str,
     csr_pem: &'a str,
+    /// The instance's X25519 encryption public key (RFC 8410 SPKI PEM).
+    /// The cloud records it and HPKE-seals secret payloads to it.
+    enc_pubkey_pem: &'a str,
     instance: &'a InstanceFacts,
+    /// Attach-at-connect: the org-scoped app to attach the instance to.
+    /// The cloud validates the attachment BEFORE consuming the code.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    app_name: Option<&'a str>,
+    /// With `app_name`: create the app when it does not exist. Omitted
+    /// (never `false`) when unset — absence is the wire default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    create_app: Option<bool>,
 }
 
 /// Wire shape of a successful enroll response.
@@ -155,6 +176,10 @@ struct EnrollResponseWire {
     ca_bundle_pem: String,
     gateway_addr: String,
     not_after: String,
+    /// The app the instance is attached to, when the enrollment requested
+    /// or carried an attachment. Absent on older control planes.
+    #[serde(default)]
+    app_name: Option<String>,
 }
 
 /// Parsed result of a successful enrollment.
@@ -168,6 +193,8 @@ pub struct EnrollOutcome {
     pub gateway_addr: String,
     /// Leaf expiry, Unix seconds.
     pub not_after_unix: u64,
+    /// The app the instance was attached to at enroll, if any.
+    pub app_name: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -175,6 +202,13 @@ struct RenewRequest<'a> {
     cert_pem: &'a str,
     csr_pem: &'a str,
     pop_sig: &'a str,
+    /// The freshly-generated X25519 encryption public key (RFC 8410 SPKI
+    /// PEM). The cloud records it in the same transaction that rotates the
+    /// identity key, and seals to it from that commit on.
+    ///
+    /// Not covered by `pop_sig`, which signs the CSR DER alone — this field's
+    /// integrity rests on the server-authenticated TLS to the cloud.
+    enc_pubkey_pem: &'a str,
 }
 
 /// Wire shape of a successful renew response.
@@ -233,18 +267,27 @@ impl EnrollClient {
     }
 
     /// First-contact enrollment: present the one-time adoption code, the
-    /// CSR for a freshly-generated keypair, and the host facts. No bearer
+    /// CSR for a freshly-generated keypair, and the host facts — plus the
+    /// optional app attachment (`app_name`, `create_app`). No bearer
     /// token — the code is the credential.
     pub(crate) async fn enroll(
         &self,
         adoption_code: &str,
         material: &EnrollmentMaterial,
         facts: &InstanceFacts,
+        app_name: Option<&str>,
+        create_app: bool,
     ) -> Result<EnrollOutcome> {
         let request = EnrollRequest {
             adoption_code,
             csr_pem: &material.csr_pem,
+            enc_pubkey_pem: &material.enc_public_key_pem,
             instance: facts,
+            app_name,
+            // `create_app` is meaningless without an app to name, so it
+            // rides only alongside `app_name` — the wire never carries the
+            // orphaned combination even if a caller sets the flag alone.
+            create_app: app_name.and(create_app.then_some(true)),
         };
         let wire: EnrollResponseWire = self.post_json(&self.enroll_url, &request).await?;
         let not_after_unix = parse_not_after(&self.enroll_url, &wire.not_after)?;
@@ -264,6 +307,7 @@ impl EnrollClient {
             ca_bundle_pem: wire.ca_bundle_pem,
             gateway_addr: wire.gateway_addr,
             not_after_unix,
+            app_name: wire.app_name,
         })
     }
 
@@ -281,6 +325,7 @@ impl EnrollClient {
             cert_pem: &current.identity_cert_pem,
             csr_pem: &material.csr_pem,
             pop_sig: &pop_sig,
+            enc_pubkey_pem: &material.enc_public_key_pem,
         };
         let wire: RenewResponseWire = self.post_json(&self.renew_url, &request).await?;
         let not_after_unix = parse_not_after(&self.renew_url, &wire.not_after)?;
@@ -340,6 +385,180 @@ impl EnrollClient {
                 status: status.as_u16(),
                 message,
             })
+        }
+    }
+}
+
+/// Generate fresh key material, gather the host facts, and enroll against
+/// the cloud: the shared core of the runtime driver's credential phase and
+/// the CLI's one-shot [`enroll_now`] flow. Does not persist anything — the
+/// two callers differ in how persistence failures are handled. Returns the
+/// issued identity and the name of the app the instance was attached to at
+/// enroll, if any.
+pub(crate) async fn acquire_identity(
+    client: &EnrollClient,
+    adoption_code: &str,
+    config: &CloudConnectConfig,
+) -> Result<(Identity, Option<String>)> {
+    let material =
+        IdentityStore::generate_enrollment().map_err(|source| Error::ProofOfPossession {
+            reason: format!("failed to generate enrollment key material: {source}"),
+        })?;
+    let facts = InstanceFacts::gather(&config.runtime_version);
+    let outcome = client
+        .enroll(
+            adoption_code,
+            &material,
+            &facts,
+            config.adopt_app_name.as_deref(),
+            config.adopt_create_app,
+        )
+        .await?;
+    let identity = Identity {
+        identifier: outcome.instance_id,
+        identity_cert_pem: outcome.identity_cert_pem,
+        private_key_pem: material.private_key_pem,
+        public_key_pem: material.public_key_pem,
+        ca_bundle_pem: outcome.ca_bundle_pem,
+        gateway_addr: outcome.gateway_addr,
+        not_after_unix: Some(outcome.not_after_unix),
+        enc_private_key_pem: material.enc_private_key_pem,
+        enc_public_key_pem: material.enc_public_key_pem,
+    };
+    Ok((identity, outcome.app_name))
+}
+
+/// Errors from the one-shot [`enroll_now`] flow.
+#[derive(Debug, Snafu)]
+pub enum EnrollNowError {
+    #[snafu(display("No adoption code is staged or configured"))]
+    NoAdoptionCode,
+
+    #[snafu(display("{source}"))]
+    Enroll { source: Error },
+
+    #[snafu(display(
+        "Enrollment succeeded but the identity could not be persisted at {}: {source}. \
+         The adoption code was already consumed by the cloud and cannot be reused; \
+         fix the directory (permissions/disk space), mint a new adoption code, and re-run `spice connect <code>`.",
+        path.display()
+    ))]
+    Persist {
+        path: std::path::PathBuf,
+        source: crate::identity::Error,
+    },
+}
+
+impl EnrollNowError {
+    /// `true` when the cloud authoritatively rejected the request (any 4xx
+    /// — see [`Error::is_authoritative_rejection`]): retrying the same
+    /// request cannot succeed.
+    #[must_use]
+    pub fn is_authoritative_rejection(&self) -> bool {
+        matches!(self, Self::Enroll { source } if source.is_authoritative_rejection())
+    }
+
+    /// `true` when the adoption code itself was rejected (HTTP 401 — see
+    /// [`Error::is_credential_rejection`]): the code is dead and the staged
+    /// copy was discarded. Attachment rejections (400/403/404/409) return
+    /// `false`: the code was not consumed and remains redeemable.
+    #[must_use]
+    pub fn is_credential_rejection(&self) -> bool {
+        matches!(self, Self::Enroll { source } if source.is_credential_rejection())
+    }
+}
+
+/// Result of a successful one-shot [`enroll_now`].
+#[derive(Debug)]
+pub struct EnrollNowOutcome {
+    /// The issued (and persisted) identity.
+    pub identity: Identity,
+    /// The app the instance was attached to at enroll, if any.
+    pub app_name: Option<String>,
+}
+
+/// One-shot out-of-band enrollment: present `config.adoption_code` to the
+/// cloud enroll endpoint, persist the issued identity at
+/// `config.identity_path`, and remove the staged pending-code file.
+///
+/// This is the `spice connect` (enroll-and-exit) entry point. Unlike the
+/// long-running runtime client — which tolerates a persistence failure by
+/// carrying the identity in memory — the calling process exits immediately,
+/// so a persistence failure here is a hard error (the single-use code is
+/// already consumed at that point; the error message says so).
+///
+/// The staged pending-code file is removed exactly when the code is spent:
+/// on a successful enroll, on a credential rejection (HTTP 401:
+/// invalid/consumed code), and on a persistence failure (the cloud consumed
+/// the code to issue the identity that could not be written) — so a later
+/// `spiced` start never retries a dead code. It is kept when the code
+/// survives: other authoritative 4xx rejections (app-attachment validation,
+/// which the cloud checks BEFORE consuming the code) and transient failures
+/// (transport, 5xx), so a corrected or retried request can still redeem it.
+///
+/// # Errors
+///
+/// - [`EnrollNowError::NoAdoptionCode`] when `config.adoption_code` is `None`.
+/// - [`EnrollNowError::Enroll`] when the HTTPS enroll fails.
+/// - [`EnrollNowError::Persist`] when the issued identity cannot be written.
+pub async fn enroll_now(config: &CloudConnectConfig) -> Result<EnrollNowOutcome, EnrollNowError> {
+    let Some(ref code) = config.adoption_code else {
+        return Err(EnrollNowError::NoAdoptionCode);
+    };
+    let client = EnrollClient::new(config).context(EnrollSnafu)?;
+
+    let (identity, app_name) = match acquire_identity(&client, code, config).await {
+        Ok(enrolled) => enrolled,
+        Err(source) => {
+            if source.is_credential_rejection() {
+                discard_pending_code_file(config);
+            }
+            return Err(EnrollNowError::Enroll { source });
+        }
+    };
+
+    // The enroll succeeded, so the cloud has consumed the code: the staged
+    // copy is spent regardless of whether the identity below persists.
+    // Discard it here so a persistence failure can't leave a dead code that
+    // `status` reports as redeemable and a later `spiced` start re-presents
+    // for a 401.
+    discard_pending_code_file(config);
+
+    // spawn_blocking: identity persistence is file I/O with fsync inside an
+    // async context.
+    let path = config.identity_path.clone();
+    let to_store = identity.clone();
+    let stored = tokio::task::spawn_blocking(move || IdentityStore::store(&path, &to_store))
+        .await
+        .unwrap_or_else(|join| {
+            Err(crate::identity::Error::Io {
+                path: config.identity_path.clone(),
+                source: std::io::Error::other(format!(
+                    "identity persistence task panicked: {join}"
+                )),
+            })
+        });
+    stored.context(PersistSnafu {
+        path: config.identity_path.clone(),
+    })?;
+
+    Ok(EnrollNowOutcome { identity, app_name })
+}
+
+/// Best-effort removal of the staged pending-code file. A missing file is
+/// success; other failures are logged (the file only risks re-sending an
+/// already-consumed code, which the cloud rejects).
+fn discard_pending_code_file(config: &CloudConnectConfig) {
+    if let Some(ref path) = config.pending_adopt_code_path {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                tracing::warn!(
+                    "Cloud Connect: failed to remove pending adoption code at {}: {err}",
+                    path.display()
+                );
+            }
         }
     }
 }
@@ -523,10 +742,71 @@ mod tests {
             config_dir: std::path::PathBuf::from("."),
             adoption_code: None,
             pending_adopt_code_path: None,
+            adopt_app_name: None,
+            adopt_create_app: false,
             runtime_version: "v0-test".to_string(),
             heartbeat_interval: Duration::from_secs(30),
             telemetry_interval: Duration::from_mins(1),
             renewal_lead: Duration::from_hours(12),
+        }
+    }
+
+    #[test]
+    fn enroll_request_omits_absent_app_attachment_fields() {
+        let facts = InstanceFacts {
+            fingerprint: "f".to_string(),
+            hostname: "h".to_string(),
+            os: "o".to_string(),
+            arch: "a".to_string(),
+            runtime_version: "v".to_string(),
+        };
+        let bare = serde_json::to_value(EnrollRequest {
+            adoption_code: "code",
+            csr_pem: "csr",
+            enc_pubkey_pem: "enc",
+            instance: &facts,
+            app_name: None,
+            create_app: None,
+        })
+        .expect("serialize bare request");
+        // Absent attachment fields must be omitted, not sent as null/false —
+        // older control planes reject unknown-but-present fields loosely and
+        // the wire default is absence.
+        assert!(bare.get("app_name").is_none());
+        assert!(bare.get("create_app").is_none());
+
+        let attached = serde_json::to_value(EnrollRequest {
+            adoption_code: "code",
+            csr_pem: "csr",
+            enc_pubkey_pem: "enc",
+            instance: &facts,
+            app_name: Some("my-app"),
+            create_app: Some(true),
+        })
+        .expect("serialize attach request");
+        assert_eq!(attached["app_name"], "my-app");
+        assert_eq!(attached["create_app"], true);
+    }
+
+    #[test]
+    fn credential_rejection_is_401_only() {
+        let dead_code = Error::Rejected {
+            status: 401,
+            message: "Adoption code already used".to_string(),
+        };
+        assert!(dead_code.is_credential_rejection());
+        // Attachment validation failures (checked before the code is
+        // consumed) must never burn the staged code.
+        for status in [400_u16, 403, 404, 409] {
+            let attach = Error::Rejected {
+                status,
+                message: "attachment rejected".to_string(),
+            };
+            assert!(attach.is_authoritative_rejection());
+            assert!(
+                !attach.is_credential_rejection(),
+                "{status} must not be treated as a dead code"
+            );
         }
     }
 
@@ -543,5 +823,38 @@ mod tests {
                 "https://cloud.spice.ai/v1/cloud-connect/renew"
             );
         }
+    }
+
+    #[test]
+    fn renew_request_includes_enc_pubkey_pem() {
+        // The cloud `/renew` endpoint requires `enc_pubkey_pem` (Zod schema
+        // validation in spicehq/cloud). The request must serialize all four
+        // fields — omitting it causes a 400 that blocks renewal.
+        let renew_req = RenewRequest {
+            cert_pem: "-----BEGIN CERTIFICATE-----\nMOCK\n-----END CERTIFICATE-----",
+            csr_pem: "-----BEGIN CERTIFICATE REQUEST-----\nMOCK\n-----END CERTIFICATE REQUEST-----",
+            pop_sig: "dGVzdC1zaWduYXR1cmU=",
+            enc_pubkey_pem: "-----BEGIN PUBLIC KEY-----\nMOCKENC\n-----END PUBLIC KEY-----",
+        };
+        let value = serde_json::to_value(&renew_req).expect("serialize renew request");
+
+        // All four fields must be present.
+        assert!(value.get("cert_pem").is_some(), "cert_pem must be present");
+        assert!(value.get("csr_pem").is_some(), "csr_pem must be present");
+        assert!(value.get("pop_sig").is_some(), "pop_sig must be present");
+        assert!(
+            value.get("enc_pubkey_pem").is_some(),
+            "enc_pubkey_pem must be present — the cloud schema requires it"
+        );
+
+        // Exactly four keys, no extras.
+        assert_eq!(
+            value
+                .as_object()
+                .expect("serialize produces an object")
+                .len(),
+            4,
+            "renew request must carry exactly four fields"
+        );
     }
 }

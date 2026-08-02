@@ -298,7 +298,7 @@ async fn get_spiceai_table_provider(
 
     dataset.access = AccessMode::ReadWrite;
 
-    let params = ConnectorParamsBuilder::new("spice.ai".into(), (&dataset).into())
+    let params = ConnectorParamsBuilder::for_dataset("spice.ai".into(), &dataset)
         .build(secrets, tokio_io_runtime)
         .await
         .context(UnableToCreateDataConnectorSnafu)?;
@@ -402,7 +402,7 @@ fn is_table_not_ready_error(e: &DataFusionError) -> bool {
 
 // Resolve a secret by key, returning the secret string if found, or the original key if not.
 async fn resolve_secret(secrets: &Arc<RwLock<Secrets>>, key: &str) -> SecretString {
-    let secrets = secrets.read().await;
+    let secrets = Secrets::snapshot(secrets).await;
     if let Ok(Some(secret)) = secrets.get_secret(key).await {
         secret
     } else {
