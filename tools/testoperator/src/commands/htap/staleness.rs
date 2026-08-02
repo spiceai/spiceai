@@ -70,7 +70,12 @@ impl StalenessReport {
         );
         for table in &self.probe_tables {
             if let Some(stats) = self.tables.get(table.as_str()) {
-                let discarded = if stats.discarded > 0 {
+                let discarded = if stats.samples == 0 && stats.discarded > 0 {
+                    format!(
+                        "  (all {} samples > cap; p99/max floored at the cap)",
+                        stats.discarded
+                    )
+                } else if stats.discarded > 0 {
                     format!("  ({} discarded > cap)", stats.discarded)
                 } else {
                     String::new()
@@ -137,8 +142,10 @@ async fn run_staleness_probe(
     // Ordered list of table names for consistent report output.
     let probe_table_names: Vec<String> = probe_tables.iter().map(|t| (*t).to_string()).collect();
 
-    // Wait briefly for initial data to be loaded and replicated before probing.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Let CDC apply the first post-snapshot batches before sampling: the
+    // earliest gaps otherwise measure bootstrap catch-up rather than
+    // steady-state replication lag and land in the discard cap anyway.
+    tokio::time::sleep(Duration::from_secs(30)).await;
 
     loop {
         if cancel.is_cancelled() {
@@ -187,7 +194,12 @@ async fn run_staleness_probe(
         }
     }
 
-    Ok(build_report(samples, &discarded, probe_table_names))
+    Ok(build_report(
+        samples,
+        &discarded,
+        probe_table_names,
+        max_reasonable_gap,
+    ))
 }
 
 /// Query `MAX(_bench_ts)` from Spice via Flight SQL, returning microseconds since epoch.
@@ -237,10 +249,20 @@ pub(super) async fn query_max_bench_ts_spice(
 }
 
 /// Build the final report from raw gap samples (in microseconds).
+///
+/// `discard_cap` is the absurd-gap threshold the probe filtered with. A table
+/// whose every sample exceeded it must not read as fresh: reporting it as
+/// zero-with-zero-samples excludes it from the worst-P99 fold, so the aggregate
+/// IMPROVES as the table falls further behind. Such a table's p99/max are
+/// floored at the cap - the tightest bound the surviving evidence supports -
+/// and folded into the worst figures. A table with no samples and no discards
+/// (never seeded, no traffic) stays at zero: nothing was observed, and
+/// inventing a floor there would be as dishonest as the zero was here.
 fn build_report(
     samples: HashMap<String, Vec<i64>>,
     discarded: &HashMap<String, u64>,
     probe_tables: Vec<String>,
+    discard_cap: Duration,
 ) -> StalenessReport {
     let mut tables = HashMap::new();
     let mut worst_p99 = Duration::ZERO;
@@ -249,11 +271,22 @@ fn build_report(
     for (table, mut gaps) in samples {
         let n_discarded = discarded.get(&table).copied().unwrap_or(0);
         if gaps.is_empty() {
+            let floor = if n_discarded > 0 {
+                discard_cap
+            } else {
+                Duration::ZERO
+            };
+            if floor > worst_p99 {
+                worst_p99 = floor;
+            }
+            if floor > worst_max {
+                worst_max = floor;
+            }
             tables.insert(
                 table,
                 StalenessStats {
-                    p99: Duration::ZERO,
-                    max: Duration::ZERO,
+                    p99: floor,
+                    max: floor,
                     samples: 0,
                     discarded: n_discarded,
                 },
@@ -301,5 +334,74 @@ fn build_report(
         probe_tables,
         worst_p99,
         worst_max,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn report(
+        samples: &[(&str, &[i64])],
+        discarded: &[(&str, u64)],
+        cap: Duration,
+    ) -> StalenessReport {
+        let samples: HashMap<String, Vec<i64>> = samples
+            .iter()
+            .map(|(t, g)| ((*t).to_string(), g.to_vec()))
+            .collect();
+        let discarded: HashMap<String, u64> = discarded
+            .iter()
+            .map(|(t, n)| ((*t).to_string(), *n))
+            .collect();
+        let tables = samples.keys().cloned().collect();
+        build_report(samples, &discarded, tables, cap)
+    }
+
+    #[test]
+    fn a_fully_censored_table_floors_worst_p99_at_the_cap() {
+        // Regression: a run whose order_line had 51 of 51 samples discarded
+        // reported worst P99 over the OTHER six tables - the aggregate improved
+        // as the slowest table got worse.
+        let cap = Duration::from_mins(30);
+        let r = report(
+            &[("customer", &[10_000_000]), ("order_line", &[])],
+            &[("order_line", 51)],
+            cap,
+        );
+        assert_eq!(r.worst_p99, cap, "the censored table must set the floor");
+        assert_eq!(r.worst_max, cap);
+        let ol = &r.tables["order_line"];
+        assert_eq!(ol.p99, cap);
+        assert_eq!(ol.samples, 0, "flooring must not invent samples");
+        assert_eq!(ol.discarded, 51);
+    }
+
+    #[test]
+    fn a_table_with_no_samples_and_no_discards_stays_at_zero() {
+        // No traffic observed is an unknown, not a lag of cap: inventing a
+        // floor there would be as wrong as the zero was for censored tables.
+        let r = report(
+            &[("customer", &[5_000_000]), ("idle_table", &[])],
+            &[],
+            Duration::from_mins(30),
+        );
+        assert_eq!(r.tables["idle_table"].p99, Duration::ZERO);
+        assert_eq!(r.worst_p99, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_partially_censored_table_keeps_its_measured_percentiles() {
+        // Kept samples still carry the p99; the discard count is reported
+        // alongside rather than replacing the measurement.
+        let cap = Duration::from_mins(30);
+        let r = report(&[("stock", &[1_000_000, 2_000_000])], &[("stock", 3)], cap);
+        let stock = &r.tables["stock"];
+        assert_eq!(stock.samples, 2);
+        assert_eq!(stock.discarded, 3);
+        assert!(
+            stock.p99 < cap,
+            "measured p99 must not be replaced by the cap"
+        );
     }
 }

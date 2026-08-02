@@ -20,6 +20,7 @@ use std::sync::Arc;
 use crate::accelerated_table::AcceleratedTable;
 use data_components::MetadataEnrichedTableProvider;
 use datafusion::datasource::TableProvider;
+use datafusion::error::DataFusionError;
 use datafusion_federation::FederatedTableProviderAdaptor;
 use runtime_datafusion_index::{
     INDEXED_INNER, Index, IndexedTableProvider, InnerProviderFn, find_concrete_table_provider_with,
@@ -135,6 +136,10 @@ impl TableProviderExplorer for RuntimeTableProviderExplorer {
     ) -> Option<(Vec<&'a T>, Arc<dyn TableProvider>)> {
         find_index_in_table_provider::<T>(tbl)
     }
+
+    fn not_ready_error(&self, tbl: &Arc<dyn TableProvider>) -> Option<DataFusionError> {
+        find_concrete_table_provider::<AcceleratedTable>(tbl)?.not_ready_error()
+    }
 }
 
 #[cfg(test)]
@@ -185,6 +190,31 @@ mod tests {
         assert!(find_concrete_table_provider::<IndexedTableProvider>(&wrapped_table).is_some());
 
         assert!(find_concrete_table_provider::<EmbeddingTable>(&wrapped_table).is_none());
+    }
+
+    /// A provider with no accelerator behind it has no load to wait on, so it
+    /// must never be reported as not-ready — otherwise search would reject
+    /// federated-only datasets outright (#10956).
+    #[test]
+    fn test_not_ready_error_is_none_without_an_accelerated_table() {
+        let base: Arc<dyn TableProvider> = Arc::new(
+            MemTable::try_new(Arc::new(Schema::empty()), vec![]).expect("failed to make table"),
+        );
+
+        assert!(
+            RuntimeTableProviderExplorer
+                .not_ready_error(&base)
+                .is_none(),
+            "a non-accelerated provider must be scannable"
+        );
+
+        let wrapped: Arc<dyn TableProvider> = Arc::new(IndexedTableProvider::new(base));
+        assert!(
+            RuntimeTableProviderExplorer
+                .not_ready_error(&wrapped)
+                .is_none(),
+            "a wrapped non-accelerated provider must be scannable"
+        );
     }
 
     #[test]

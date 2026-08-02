@@ -29,7 +29,8 @@ limitations under the License.
 //!   - [`readiness_heartbeat`] / [`record_watermark`] / [`commit_ts_ms`] for
 //!     lag-based readiness and freshness metrics,
 //!   - [`adopt_current_layout`] + [`compute_pk_source_indexes`] for compatible
-//!     mid-stream `ALTER` adoption,
+//!     mid-stream `ALTER` adoption, and [`layout_event_mismatch`] to check an
+//!     adopted layout against the row images it will actually decode,
 //!   - [`classify_query`] / [`classify_statement`] for the transaction and DDL
 //!     boundaries in the event stream.
 //!
@@ -44,9 +45,13 @@ limitations under the License.
 use std::time::{Duration, SystemTime};
 
 use arrow::datatypes::SchemaRef;
-use mysql_async::binlog::events::{RowsEventData, TableMapEvent};
+use bitvec::slice::BitSlice;
+use mysql_async::binlog::events::{OptionalMetaExtractor, RowsEventData, TableMapEvent};
 use mysql_async::binlog::row::BinlogRow;
+use mysql_async::binlog::value::BinlogValue;
+use mysql_async::consts::ColumnType;
 use mysql_async::{BinlogStream, BinlogStreamRequest, Conn, Value};
+use mysql_common::io::ParseBuf;
 
 use super::config::{BinlogPosition, ReplicationParams};
 use super::gtid::GtidSet;
@@ -119,7 +124,7 @@ pub(super) async fn open_binlog_stream(
 }
 
 /// Decode a rows event for the subscribed table into the transaction buffer.
-pub(super) fn buffer_rows_event(
+pub fn buffer_rows_event(
     rows_data: &RowsEventData<'_>,
     tme: &TableMapEvent<'_>,
     layout: &TableLayout,
@@ -168,6 +173,173 @@ pub(super) fn buffer_rows_event(
             RowOp::Delete => {
                 let before = required_image(before, "delete", "before")?;
                 buffer.push_delete(binlog_row_to_values(before, layout)?);
+                metrics.inc_delete();
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Per-table row-image decoder prepared from a `TableMapEvent`.
+///
+/// It stores the column types, per-column metadata, and signedness needed to
+/// parse row values without rebuilding that metadata for every row image.
+/// Values still route through [`normalize_binlog_value`], so this path keeps
+/// the same value normalization as [`buffer_rows_event`].
+///
+/// `pub` (not `pub(super)`) so `benches/mysql_binlog_replay.rs` can exercise
+/// this exact decoder against the walk.
+pub struct TableMapRowDecoder {
+    /// Per source column: (binlog type, owned column metadata, unsigned).
+    cols: Vec<(ColumnType, Vec<u8>, bool)>,
+}
+
+impl TableMapRowDecoder {
+    /// Build from the route's `TableMapEvent`. Fails when the optional
+    /// metadata does not parse or a column type is absent; callers can fall
+    /// back to the [`buffer_rows_event`] walk for the same table map.
+    pub fn try_new(tme: &TableMapEvent<'_>) -> Result<Self> {
+        let decode_err = |message: String| Error::Decode { message };
+        let extractor = OptionalMetaExtractor::new(tme.iter_optional_meta())
+            .map_err(|e| decode_err(format!("table-map optional metadata: {e}")))?;
+        let mut signedness = extractor.iter_signedness();
+        let n = usize::try_from(tme.columns_count())
+            .map_err(|_| decode_err("column count exceeds usize".to_string()))?;
+        let mut cols = Vec::with_capacity(n);
+        for i in 0..n {
+            let ty = tme
+                .get_column_type(i)
+                .map_err(|e| decode_err(format!("column #{i} type: {e}")))?
+                .ok_or_else(|| decode_err(format!("column #{i} type missing")))?;
+            let meta = tme.get_column_metadata(i).unwrap_or(&[]).to_vec();
+            let unsigned = ty
+                .is_numeric_type()
+                .then(|| signedness.next())
+                .flatten()
+                .unwrap_or_default();
+            cols.push((ty, meta, unsigned));
+        }
+        Ok(Self { cols })
+    }
+
+    /// Decode one row image off `buf`. Spice requires `binlog_row_image = FULL`
+    /// (enforced the same way the walk does: a missing column is a decode
+    /// error), so `included` must cover every column.
+    fn decode_image<'a>(
+        &'a self,
+        buf: &mut ParseBuf<'a>,
+        included: &BitSlice<u8>,
+        layout: &TableLayout,
+    ) -> Result<Vec<Value>> {
+        let num_included = included.count_ones();
+        if num_included != self.cols.len() {
+            return Err(Error::Decode {
+                message: format!(
+                    "row image carries {num_included} of {} columns. Spice requires \
+                     `binlog_row_image = FULL` — a writer session overrode it.",
+                    self.cols.len()
+                ),
+            });
+        }
+        let bitmap_bytes = num_included.div_ceil(8);
+        let bitmap_buf: &[u8] = buf.parse(bitmap_bytes).map_err(|e| Error::Decode {
+            message: format!("row null bitmap: {e}"),
+        })?;
+        let null_bitmap: &BitSlice<u8> = BitSlice::from_slice(bitmap_buf);
+        let mut out = Vec::with_capacity(self.cols.len());
+        for (idx, (ty, meta, unsigned)) in self.cols.iter().enumerate() {
+            let column = layout.columns.get(idx).ok_or_else(|| Error::Decode {
+                message: format!(
+                    "row image has more columns than the validated layout ({})",
+                    layout.columns.len()
+                ),
+            })?;
+            let value: BinlogValue<'_> =
+                if null_bitmap.get(idx).as_deref().copied().unwrap_or_default() {
+                    BinlogValue::Value(Value::NULL)
+                } else {
+                    buf.parse((*ty, meta.as_slice(), *unsigned, false))
+                        .map_err(|e| Error::Decode {
+                            message: format!("column #{idx} (`{}`) value parse: {e}", column.name),
+                        })?
+                };
+            out.push(normalize_binlog_value(column, value)?);
+        }
+        Ok(out)
+    }
+}
+
+/// [`buffer_rows_event`] on the fast decode path: same op classification,
+/// buffering, and metrics, with the per-row images parsed by the cached
+/// [`TableMapRowDecoder`] instead of `mysql_common`'s per-image metadata rebuild.
+pub fn buffer_rows_event_fast(
+    rows_data: &RowsEventData<'_>,
+    decoder: &TableMapRowDecoder,
+    layout: &TableLayout,
+    pk_source_indexes: &[usize],
+    buffer: &mut TransactionBuffer,
+    metrics: &MetricsCollector,
+) -> Result<()> {
+    enum FastOp {
+        Insert,
+        Update,
+        Delete,
+    }
+    if layout.columns.len() != decoder.cols.len() {
+        return Err(Error::Decode {
+            message: format!(
+                "row image has {} columns but the validated layout has {} — the source \
+                 table was altered. Restart the dataset to re-validate the schema.",
+                decoder.cols.len(),
+                layout.columns.len()
+            ),
+        });
+    }
+    let op = match rows_data {
+        RowsEventData::WriteRowsEvent(_) | RowsEventData::WriteRowsEventV1(_) => FastOp::Insert,
+        RowsEventData::UpdateRowsEvent(_) | RowsEventData::UpdateRowsEventV1(_) => FastOp::Update,
+        RowsEventData::DeleteRowsEvent(_) | RowsEventData::DeleteRowsEventV1(_) => FastOp::Delete,
+        RowsEventData::PartialUpdateRowsEvent(_) => {
+            return Err(Error::Decode {
+                message: "partial-JSON row images are not supported. Set \
+                          `binlog_row_value_options = ''` on the source server."
+                    .to_string(),
+            });
+        }
+    };
+    let before_cols = rows_data.columns_before_image();
+    let after_cols = rows_data.columns_after_image();
+    let mut buf = ParseBuf(rows_data.rows_data());
+    while !buf.0.is_empty() {
+        let before = before_cols
+            .map(|included| decoder.decode_image(&mut buf, included, layout))
+            .transpose()?;
+        let after = after_cols
+            .map(|included| decoder.decode_image(&mut buf, included, layout))
+            .transpose()?;
+        match op {
+            FastOp::Insert => {
+                let after = after.ok_or_else(|| Error::Decode {
+                    message: "write event is missing its after row image".to_string(),
+                })?;
+                buffer.push_insert(after);
+                metrics.inc_insert();
+            }
+            FastOp::Update => {
+                let before = before.ok_or_else(|| Error::Decode {
+                    message: "update event is missing its before row image".to_string(),
+                })?;
+                let after = after.ok_or_else(|| Error::Decode {
+                    message: "update event is missing its after row image".to_string(),
+                })?;
+                buffer.push_update(pk_source_indexes, before, after);
+                metrics.inc_update();
+            }
+            FastOp::Delete => {
+                let before = before.ok_or_else(|| Error::Decode {
+                    message: "delete event is missing its before row image".to_string(),
+                })?;
+                buffer.push_delete(before);
                 metrics.inc_delete();
             }
         }
@@ -339,6 +511,156 @@ pub(super) async fn adopt_current_layout(
         column_map,
         pk_source_indexes,
     })
+}
+
+/// A coarse binlog column-type class, used to compare a layout fetched from
+/// `information_schema` against the column types a `TableMap` event carries.
+///
+/// Deliberately coarse: families whose wire type depends on the server version
+/// or the column's charset/metadata are collapsed into one class (or left
+/// unmapped entirely) so that a class *disagreement* is always a real
+/// disagreement. See [`source_type_class`] for what is intentionally omitted —
+/// this comparison gates every decode, so a false positive would break a
+/// healthy stream, which is strictly worse than the rare scramble it detects.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BinlogTypeClass {
+    Int8,
+    Int16,
+    Int24,
+    Int32,
+    Int64,
+    Float,
+    Double,
+    Decimal,
+    Date,
+    Year,
+    Bit,
+    Json,
+    Geometry,
+    /// `CHAR` / `VARCHAR` / `BINARY` / `VARBINARY` / `ENUM` / `SET`. One class
+    /// because the wire type within this family depends on charset and on the
+    /// `MYSQL_TYPE_STRING` metadata that encodes the real type.
+    StringLike,
+}
+
+/// Classify an `information_schema.COLUMNS.COLUMN_TYPE` string, or `None` when
+/// the binlog wire type is not pinned by the declared type alone.
+///
+/// Unmapped on purpose: `DATETIME` / `TIMESTAMP` / `TIME` (`*2` variants since
+/// 5.6), `TEXT` / `BLOB` (all sent as `MYSQL_TYPE_BLOB`, distinguished only by
+/// a length byte in the metadata), and `REAL` (`REAL_AS_FLOAT` `sql_mode`).
+fn source_type_class(column_type: &str) -> Option<BinlogTypeClass> {
+    let base: String = column_type
+        .chars()
+        .take_while(char::is_ascii_alphabetic)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    match base.as_str() {
+        "tinyint" => Some(BinlogTypeClass::Int8),
+        "smallint" => Some(BinlogTypeClass::Int16),
+        "mediumint" => Some(BinlogTypeClass::Int24),
+        "int" | "integer" => Some(BinlogTypeClass::Int32),
+        "bigint" => Some(BinlogTypeClass::Int64),
+        "float" => Some(BinlogTypeClass::Float),
+        "double" => Some(BinlogTypeClass::Double),
+        "decimal" | "numeric" => Some(BinlogTypeClass::Decimal),
+        "date" => Some(BinlogTypeClass::Date),
+        "year" => Some(BinlogTypeClass::Year),
+        "bit" => Some(BinlogTypeClass::Bit),
+        "json" => Some(BinlogTypeClass::Json),
+        "geometry" | "point" | "linestring" | "polygon" | "multipoint" | "multilinestring"
+        | "multipolygon" | "geomcollection" | "geometrycollection" => {
+            Some(BinlogTypeClass::Geometry)
+        }
+        "char" | "varchar" | "binary" | "varbinary" | "enum" | "set" => {
+            Some(BinlogTypeClass::StringLike)
+        }
+        _ => None,
+    }
+}
+
+/// Classify a `TableMap` column type, or `None` when it carries no usable
+/// signal (see [`source_type_class`] for the omissions this mirrors).
+fn event_type_class(column_type: ColumnType) -> Option<BinlogTypeClass> {
+    match column_type {
+        ColumnType::MYSQL_TYPE_TINY => Some(BinlogTypeClass::Int8),
+        ColumnType::MYSQL_TYPE_SHORT => Some(BinlogTypeClass::Int16),
+        ColumnType::MYSQL_TYPE_INT24 => Some(BinlogTypeClass::Int24),
+        ColumnType::MYSQL_TYPE_LONG => Some(BinlogTypeClass::Int32),
+        ColumnType::MYSQL_TYPE_LONGLONG => Some(BinlogTypeClass::Int64),
+        ColumnType::MYSQL_TYPE_FLOAT => Some(BinlogTypeClass::Float),
+        ColumnType::MYSQL_TYPE_DOUBLE => Some(BinlogTypeClass::Double),
+        ColumnType::MYSQL_TYPE_NEWDECIMAL | ColumnType::MYSQL_TYPE_DECIMAL => {
+            Some(BinlogTypeClass::Decimal)
+        }
+        ColumnType::MYSQL_TYPE_DATE | ColumnType::MYSQL_TYPE_NEWDATE => Some(BinlogTypeClass::Date),
+        ColumnType::MYSQL_TYPE_YEAR => Some(BinlogTypeClass::Year),
+        ColumnType::MYSQL_TYPE_BIT => Some(BinlogTypeClass::Bit),
+        ColumnType::MYSQL_TYPE_JSON => Some(BinlogTypeClass::Json),
+        ColumnType::MYSQL_TYPE_GEOMETRY => Some(BinlogTypeClass::Geometry),
+        ColumnType::MYSQL_TYPE_VARCHAR
+        | ColumnType::MYSQL_TYPE_VAR_STRING
+        | ColumnType::MYSQL_TYPE_STRING
+        | ColumnType::MYSQL_TYPE_ENUM
+        | ColumnType::MYSQL_TYPE_SET => Some(BinlogTypeClass::StringLike),
+        _ => None,
+    }
+}
+
+/// A column position where the in-memory layout disagrees with the row images
+/// the `TableMap` event describes.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct LayoutEventMismatch {
+    pub(super) ordinal: usize,
+    pub(super) column: String,
+    pub(super) source_type: String,
+}
+
+/// Check the layout that will decode this table's row images against the
+/// column types the `TableMap` event itself carries.
+///
+/// [`adopt_current_layout`] re-reads `information_schema`, which reports the
+/// table's shape *now* — not its shape at the event being decoded. Under
+/// replication lag the source can apply a second, same-column-count `ALTER`
+/// (a reorder or a rename swap) before Spice reaches the first one, so the
+/// adopted layout maps ordinals that the row images in flight do not use, and
+/// values land in the wrong columns with nothing to fail on. The `TableMap`
+/// event is the one description of the row image that travels *with* it, so it
+/// is the authority here.
+///
+/// Returns the first position whose class disagrees, or `None` when the layout
+/// is consistent with the event (including when nothing could be compared
+/// confidently).
+pub(super) fn layout_event_mismatch(
+    layout: &TableLayout,
+    tme: &TableMapEvent<'_>,
+) -> Option<LayoutEventMismatch> {
+    // `get_column_type` resolves the real type behind `MYSQL_TYPE_STRING`. An
+    // out-of-range index, or a type this server build encodes in a way the
+    // client doesn't recognize, yields nothing to compare — not a mismatch.
+    layout_mismatch_against(layout, |ordinal| {
+        tme.get_column_type(ordinal).ok().flatten()
+    })
+}
+
+/// [`layout_event_mismatch`] over any source of per-ordinal column types.
+fn layout_mismatch_against(
+    layout: &TableLayout,
+    event_type: impl Fn(usize) -> Option<ColumnType>,
+) -> Option<LayoutEventMismatch> {
+    layout
+        .columns
+        .iter()
+        .enumerate()
+        .find_map(|(ordinal, column)| {
+            let source_class = source_type_class(&column.column_type)?;
+            let event_class = event_type(ordinal).and_then(event_type_class)?;
+            (source_class != event_class).then(|| LayoutEventMismatch {
+                ordinal,
+                column: column.name.clone(),
+                source_type: column.column_type.clone(),
+            })
+        })
 }
 
 pub(super) fn purged_position_error(resume: &BinlogPosition, dataset_name: &str) -> StreamError {
@@ -620,6 +942,200 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::mysql_replication::setup::SourceColumn;
+
+    /// A layout of `(name, COLUMN_TYPE)` columns in ordinal order.
+    fn layout_of(columns: &[(&str, &str)]) -> TableLayout {
+        TableLayout {
+            columns: columns
+                .iter()
+                .map(|(name, column_type)| SourceColumn {
+                    name: (*name).to_string(),
+                    column_type: (*column_type).to_string(),
+                    enum_variants: None,
+                    set_variants: None,
+                    is_primary_key: false,
+                })
+                .collect(),
+        }
+    }
+
+    fn mismatch_against(
+        columns: &[(&str, &str)],
+        event: &[Option<ColumnType>],
+    ) -> Option<LayoutEventMismatch> {
+        layout_mismatch_against(&layout_of(columns), |ordinal| {
+            event.get(ordinal).copied().flatten()
+        })
+    }
+
+    #[test]
+    fn layout_agreeing_with_the_event_is_not_a_mismatch() {
+        assert_eq!(
+            mismatch_against(
+                &[("id", "int(11)"), ("name", "varchar(255)")],
+                &[
+                    Some(ColumnType::MYSQL_TYPE_LONG),
+                    Some(ColumnType::MYSQL_TYPE_VARCHAR),
+                ],
+            ),
+            None
+        );
+    }
+
+    /// The #11764 scramble: two same-column-count ALTERs land while replication
+    /// is behind, so the layout read for the first one is really the layout
+    /// after the second — here `(id int, name varchar)` reordered to
+    /// `(name varchar, id int)`. The row images in flight still use the old
+    /// order, so this must be caught rather than decoded.
+    #[test]
+    fn a_reorder_read_ahead_of_the_event_is_a_mismatch() {
+        let mismatch = mismatch_against(
+            &[("name", "varchar(255)"), ("id", "int(11)")],
+            &[
+                Some(ColumnType::MYSQL_TYPE_LONG),
+                Some(ColumnType::MYSQL_TYPE_VARCHAR),
+            ],
+        )
+        .expect("a reordered layout must not decode against the old row image");
+        assert_eq!(mismatch.ordinal, 0);
+        assert_eq!(mismatch.column, "name");
+        assert_eq!(mismatch.source_type, "varchar(255)");
+    }
+
+    /// The first disagreeing position is reported, not a later one.
+    #[test]
+    fn the_reported_mismatch_is_the_first_disagreeing_column() {
+        let mismatch = mismatch_against(
+            &[("a", "int"), ("b", "bigint"), ("c", "int")],
+            &[
+                Some(ColumnType::MYSQL_TYPE_LONG),
+                Some(ColumnType::MYSQL_TYPE_LONG),
+                Some(ColumnType::MYSQL_TYPE_LONG),
+            ],
+        )
+        .expect("bigint at position 1 disagrees with a 4-byte int");
+        assert_eq!(mismatch.ordinal, 1);
+        assert_eq!(mismatch.column, "b");
+    }
+
+    /// Widths within the integer family are distinct classes — a swap between
+    /// two integer columns of different widths still scrambles values.
+    #[test]
+    fn integer_widths_are_distinguished() {
+        for (declared, event) in [
+            ("tinyint(4)", ColumnType::MYSQL_TYPE_SHORT),
+            ("smallint(6)", ColumnType::MYSQL_TYPE_INT24),
+            ("mediumint(9)", ColumnType::MYSQL_TYPE_LONG),
+            ("bigint(20)", ColumnType::MYSQL_TYPE_LONG),
+        ] {
+            assert!(
+                mismatch_against(&[("n", declared)], &[Some(event)]).is_some(),
+                "{declared} must not be accepted against {event:?}"
+            );
+        }
+    }
+
+    /// A column the event says nothing usable about is skipped, not flagged —
+    /// the check only ever fails on a disagreement it is sure of.
+    #[test]
+    fn an_unreadable_event_type_is_skipped() {
+        assert_eq!(
+            mismatch_against(&[("id", "int(11)")], &[None]),
+            None,
+            "no event type to compare against is not a mismatch"
+        );
+        assert_eq!(
+            mismatch_against(&[("id", "int(11)")], &[]),
+            None,
+            "an out-of-range ordinal is not a mismatch"
+        );
+    }
+
+    /// Types whose wire encoding depends on the server version or the column's
+    /// charset are deliberately unmapped, so they can never produce a false
+    /// positive on a healthy stream. Guards the conservatism of the mapping.
+    #[test]
+    fn version_dependent_types_are_not_compared() {
+        for declared in [
+            "datetime(6)",
+            "timestamp",
+            "time(3)",
+            "text",
+            "longblob",
+            "tinytext",
+            "real",
+        ] {
+            assert_eq!(
+                source_type_class(declared),
+                None,
+                "{declared} must stay unmapped: its wire type is not pinned by the declared type"
+            );
+            // ...and therefore never reports a mismatch, whatever the event says.
+            assert_eq!(
+                mismatch_against(&[("c", declared)], &[Some(ColumnType::MYSQL_TYPE_LONG)]),
+                None
+            );
+        }
+    }
+
+    /// `CHAR`/`VARCHAR`/`BINARY`/`ENUM`/`SET` share one class: which wire type
+    /// the server picks within the family depends on charset and metadata, so
+    /// distinguishing them would fail healthy streams.
+    #[test]
+    fn the_string_family_is_one_class() {
+        for declared in [
+            "char(8)",
+            "varchar(64)",
+            "binary(16)",
+            "varbinary(16)",
+            "enum('a','b')",
+            "set('a','b')",
+        ] {
+            for event in [
+                ColumnType::MYSQL_TYPE_STRING,
+                ColumnType::MYSQL_TYPE_VARCHAR,
+                ColumnType::MYSQL_TYPE_VAR_STRING,
+                ColumnType::MYSQL_TYPE_ENUM,
+                ColumnType::MYSQL_TYPE_SET,
+            ] {
+                assert_eq!(
+                    mismatch_against(&[("c", declared)], &[Some(event)]),
+                    None,
+                    "{declared} vs {event:?} must not be reported"
+                );
+            }
+        }
+        // But a string column against a numeric event still is a mismatch.
+        assert!(
+            mismatch_against(
+                &[("c", "varchar(64)")],
+                &[Some(ColumnType::MYSQL_TYPE_LONG)]
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn source_types_are_parsed_from_their_base_name() {
+        assert_eq!(
+            source_type_class("int(10) unsigned zerofill"),
+            Some(BinlogTypeClass::Int32)
+        );
+        assert_eq!(
+            source_type_class("DECIMAL(10,2)"),
+            Some(BinlogTypeClass::Decimal)
+        );
+        assert_eq!(
+            source_type_class("numeric(5,0)"),
+            Some(BinlogTypeClass::Decimal)
+        );
+        assert_eq!(
+            source_type_class("bigint unsigned"),
+            Some(BinlogTypeClass::Int64)
+        );
+        assert_eq!(source_type_class(""), None);
+    }
 
     #[test]
     fn pk_source_indexes_follow_a_remapped_layout() {

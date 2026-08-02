@@ -44,7 +44,6 @@ use datafusion::sql::unparser::Unparser;
 use linkme::distributed_slice;
 pub use parameters::ConnectorParams;
 use runtime_metrics::component::MetricsProvider;
-use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -195,258 +194,11 @@ pub mod sink;
 // spiceai: registration moved to crates/data-connectors/connector-spiceai; module kept for catalog connector
 pub mod spiceai;
 
-#[derive(Debug, Snafu)]
-#[snafu(visibility(pub))]
-pub enum DataConnectorError {
-    #[snafu(display("Cannot connect to the {connector_component} ({dataconnector}). {source}"))]
-    UnableToConnectInternal {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display(
-        "Cannot connect to the {connector_component} ({dataconnector}) on {host}:{port}. Ensure that the host and port are correctly configured in the spicepod, and that the host is reachable."
-    ))]
-    UnableToConnectInvalidHostOrPort {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-        host: String,
-        port: String,
-    },
-
-    #[snafu(display(
-        "Cannot connect to the {connector_component} ({dataconnector}). Authentication failed. Ensure that the username and password are correctly configured in the spicepod."
-    ))]
-    UnableToConnectInvalidUsernameOrPassword {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-    },
-
-    #[snafu(display(
-        "Cannot connect to the {connector_component} ({dataconnector}). A TLS error occurred. Ensure that the corresponding TLS/secure option is configured to match the data connector's TLS security requirements."
-    ))]
-    UnableToConnectTlsError {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-    },
-
-    #[snafu(display("Failed to load the {connector_component} ({dataconnector}). {source}"))]
-    UnableToGetReadProvider {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display("Failed to load the {connector_component} ({dataconnector}). {source}"))]
-    UnableToGetReadWriteProvider {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display("Failed to setup the {connector_component} ({dataconnector}). {source}"))]
-    UnableToGetCatalogProvider {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display(
-        "The {connector_component} ({dataconnector}) has been rate limited. {source}"
-    ))]
-    RateLimited {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display(
-        "Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration. {message}"
-    ))]
-    InvalidConfiguration {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-        message: String,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display(
-        "Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration. {source}"
-    ))]
-    InvalidConfigurationSourceOnly {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display(
-        "Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration. {message}"
-    ))]
-    InvalidConfigurationNoSource {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-        message: String,
-    },
-
-    // Unlike the InvalidConfiguration* variants, this is a transient (retriable)
-    // condition: an object-store source has no data files at the path yet. Object
-    // stores are eventually consistent and data is frequently written after the
-    // runtime starts, so the dataset load must keep retrying until the files
-    // appear rather than failing permanently. See `is_retriable`.
-    #[snafu(display(
-        "No data files are yet available for the {connector_component} ({dataconnector}). {message} The runtime will keep retrying until the source data becomes available."
-    ))]
-    ObjectStoreNoFilesAvailable {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-        message: String,
-    },
-
-    #[snafu(display(
-        "Cannot setup the {connector_component} ({dataconnector}). The connector '{dataconnector}' is not a valid connector. For details, visit: https://spiceai.org/docs/components/data-connectors"
-    ))]
-    InvalidConnectorType {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-    },
-
-    #[snafu(display(
-        "Failed to load the {connector_component} ({dataconnector}). An invalid glob pattern was provided '{pattern}'. Ensure the glob pattern is valid. {source}"
-    ))]
-    InvalidGlobPattern {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-        pattern: String,
-        source: globset::Error,
-    },
-
-    #[snafu(display(
-        "Failed to load the {connector_component} ({dataconnector}). The table, '{table_name}', was not found. Verify the source table name in the Spicepod configuration."
-    ))]
-    InvalidTableName {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-        table_name: String,
-    },
-
-    #[snafu(display(
-        "Failed to load the {connector_component} ({dataconnector}). Failed to detect a table schema. Ensure the table, '{table_name}', exists in the data source."
-    ))]
-    UnableToGetSchema {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-        table_name: String,
-    },
-
-    #[snafu(display(
-        "Failed to load the {connector_component} ({dataconnector}). An unknown Data Connector Error occurred: {source} Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
-    ))]
-    InternalWithSource {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display(
-        "Failed to load the {connector_component} ({dataconnector}). An internal error occurred in the {dataconnector} Data Connector. Report a bug on GitHub (https://github.com/spiceai/spiceai/issues) and reference the code: {code}"
-    ))]
-    Internal {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-        code: String,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display(
-        "Failed to load the {connector_component} ({dataconnector}). Failed to infer the table schema. Report a bug on GitHub (https://github.com/spiceai/spiceai/issues) and reference the error: {source}"
-    ))]
-    UnableToGetSchemaInternal {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display(
-        "Failed to load the {connector_component} ({dataconnector}). Unsupported type action is not enabled for the {dataconnector} Data Connector. Remove the parameter from your dataset configuration."
-    ))]
-    UnsupportedTypeAction {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-    },
-
-    #[snafu(display(
-        "Failed to load the {connector_component} ({dataconnector}). The field '{field_name}' has an unsupported data type: {data_type}. Skip loading this field by setting the `unsupported_type_action` parameter to `ignore` or `warn` in the dataset configuration. For details, visit: https://spiceai.org/docs/reference/spicepod/datasets#unsupported_type_action"
-    ))]
-    UnsupportedDataType {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-        data_type: String,
-        field_name: String,
-    },
-
-    #[snafu(display(
-        "Failed to initialize the {connector_component} (ODBC). The runtime is built without ODBC support. Build Spice.ai OSS with the `odbc` feature enabled or use the Docker image that includes ODBC support. For details, visit: https://spiceai.org/docs/components/data-connectors/odbc"
-    ))]
-    OdbcNotInstalled {
-        connector_component: ConnectorComponent,
-    },
-
-    #[snafu(display(
-        "Schema mismatch between remote table and acceleration for {dataset_name}. {differences}. The existing accelerated data is available, but updates are disabled. Verify if the remote table schema update is expected and rebuild the acceleration if necessary."
-    ))]
-    SchemaMismatch {
-        dataset_name: String,
-        differences: String,
-    },
-
-    #[snafu(display(
-        "The name '{keyword}' is reserved and cannot be used as a name for a dataset for the {dataconnector} data connector. Change the name in the Spicepod and try again."
-    ))]
-    UseOfProtectedKeyword {
-        dataconnector: String,
-        keyword: String,
-    },
-
-    #[snafu(display(
-        "Insufficient permissions to access the {connector_component} ({dataconnector}). {source}"
-    ))]
-    InsufficientPermissions {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-}
-
-impl DataConnectorError {
-    /// Returns `true` if this error is transient and the operation may succeed
-    /// on retry. Configuration errors, unsupported type/table errors, and
-    /// permission errors are permanent and should not be retried.
-    #[must_use]
-    pub fn is_retriable(&self) -> bool {
-        !matches!(
-            self,
-            Self::InvalidConfiguration { .. }
-                | Self::InvalidConfigurationSourceOnly { .. }
-                | Self::InvalidConfigurationNoSource { .. }
-                | Self::InvalidConnectorType { .. }
-                | Self::InvalidGlobPattern { .. }
-                | Self::InvalidTableName { .. }
-                | Self::InsufficientPermissions { .. }
-                | Self::UnableToConnectInvalidHostOrPort { .. }
-                | Self::UnableToConnectInvalidUsernameOrPassword { .. }
-                | Self::UnableToConnectTlsError { .. }
-                | Self::UnsupportedTypeAction { .. }
-                | Self::UnsupportedDataType { .. }
-                | Self::OdbcNotInstalled { .. }
-                | Self::UseOfProtectedKeyword { .. }
-        )
-    }
-}
-
-pub type Result<T, E = DataConnectorError> = std::result::Result<T, E>;
-pub type AnyErrorResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
-pub type DataConnectorResult<T> = std::result::Result<T, DataConnectorError>;
+// The connector contract — the component configuration a connector is built for
+// and the errors it reports — lives in `data-connector-api`, below `runtime`, so
+// connector crates can name it without depending on the orchestrator. Re-exported
+// here so existing `crate::dataconnector::…` paths keep resolving.
+pub use data_connector_api::*;
 
 pub type NewDataConnectorResult = AnyErrorResult<Arc<dyn DataConnector>>;
 
@@ -646,6 +398,33 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
         None
     }
 
+    /// Whether this connector can accept durable federated write-back delivery
+    /// without risking the silent loss of a committed write.
+    ///
+    /// Delivery reconciles a committed accelerator row to the source. Emulating
+    /// an upsert as a standalone `DELETE` followed by a separate `INSERT` is
+    /// **not** safe for a CDC-fed accelerator: the two are distinct source
+    /// commits, so the source echoes the `DELETE` back over CDC and erases the
+    /// committed row from the accelerator. If the follow-up `INSERT` then fails,
+    /// the next delivery pass sees the key as absent, treats the delete as
+    /// complete, and clears the marker — the write is gone from both sides with
+    /// no error raised.
+    ///
+    /// Returning `true` therefore asserts that delivery is atomic from the
+    /// source's point of view: either a single transaction covering both legs,
+    /// or a native conditional upsert (`INSERT … ON CONFLICT DO UPDATE`) that
+    /// removes the delete leg entirely for present keys.
+    ///
+    /// Defaults to `false` — the conservative answer. A connector that has not
+    /// been audited for this makes the dataset fail registration with an
+    /// actionable error rather than silently risk losing writes.
+    ///
+    /// **Wrappers must forward this.** Inheriting the default would report a
+    /// perfectly safe inner connector as unsafe and reject a valid dataset.
+    fn supports_durable_write_back_delivery(&self) -> bool {
+        false
+    }
+
     async fn metadata_provider(
         &self,
         _dataset: &Dataset,
@@ -798,36 +577,15 @@ pub async fn get_data(
     Ok(record_batch_stream)
 }
 
-#[derive(Debug, Clone)]
-pub enum ConnectorComponent {
-    Catalog(Arc<Catalog>),
-    Dataset(Arc<Dataset>),
-}
-
 impl From<&Dataset> for ConnectorComponent {
     fn from(dataset: &Dataset) -> Self {
-        ConnectorComponent::Dataset(Arc::new(dataset.clone()))
-    }
-}
-
-impl From<&Arc<Dataset>> for ConnectorComponent {
-    fn from(dataset: &Arc<Dataset>) -> Self {
-        ConnectorComponent::Dataset(Arc::clone(dataset))
+        ConnectorComponent::Dataset(Arc::new(dataset.spec.clone()))
     }
 }
 
 impl From<&Catalog> for ConnectorComponent {
     fn from(catalog: &Catalog) -> Self {
-        ConnectorComponent::Catalog(Arc::new(catalog.clone()))
-    }
-}
-
-impl std::fmt::Display for ConnectorComponent {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ConnectorComponent::Catalog(catalog) => write!(f, "catalog {}", catalog.name),
-            ConnectorComponent::Dataset(dataset) => write!(f, "dataset {}", dataset.name),
-        }
+        ConnectorComponent::Catalog(Arc::new(catalog.spec.clone()))
     }
 }
 
@@ -905,13 +663,10 @@ mod tests {
                 .build()
                 .expect("Failed to build dataset");
 
-        ConnectorParamsBuilder::new(
-            connector_name.into(),
-            ConnectorComponent::Dataset(Arc::new(dataset)),
-        )
-        .build(secrets, Handle::current())
-        .await
-        .expect("failed to build connector params")
+        ConnectorParamsBuilder::for_dataset(connector_name.into(), &dataset)
+            .build(secrets, Handle::current())
+            .await
+            .expect("failed to build connector params")
     }
 
     #[tokio::test]
@@ -951,13 +706,10 @@ mod tests {
             .build()
             .expect("Failed to build dataset");
 
-        let params = ConnectorParamsBuilder::new(
-            "default_factory".into(),
-            ConnectorComponent::Dataset(Arc::new(dataset.clone())),
-        )
-        .build(secrets, Handle::current())
-        .await
-        .expect("failed to build connector params");
+        let params = ConnectorParamsBuilder::for_dataset("default_factory".into(), &dataset)
+            .build(secrets, Handle::current())
+            .await
+            .expect("failed to build connector params");
 
         let factory = DefaultFactory;
         assert!(factory.static_schema(&params, &dataset).is_none());
@@ -1027,10 +779,7 @@ mod tests {
         dataset.unsupported_type_action = Some(DatasetUnsupportedTypeAction::Ignore);
 
         let secrets = Arc::new(RwLock::new(Secrets::default()));
-        let builder = ConnectorParamsBuilder::new(
-            "test".into(),
-            ConnectorComponent::Dataset(Arc::new(dataset)),
-        );
+        let builder = ConnectorParamsBuilder::for_dataset("test".into(), &dataset);
 
         let result = builder.build(secrets, Handle::current()).await;
         assert!(result.is_ok());
@@ -1135,6 +884,70 @@ mod tests {
         assert!(
             result_two.expect("second factory should exist").is_ok(),
             "second connector should initialize successfully"
+        );
+    }
+
+    /// A source that advertises safe durable write-back delivery, so a wrapper
+    /// that silently inherits the trait default is visible as `false`.
+    #[derive(Debug)]
+    struct SafeDeliveryConnector;
+
+    #[async_trait]
+    impl DataConnector for SafeDeliveryConnector {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        async fn read_provider(
+            &self,
+            _dataset: &Dataset,
+        ) -> DataConnectorResult<Arc<dyn TableProvider>> {
+            unimplemented!("capability-forwarding test never reads")
+        }
+
+        fn supports_durable_write_back_delivery(&self) -> bool {
+            true
+        }
+    }
+
+    /// `supports_durable_write_back_delivery` has a `false` default, so any
+    /// wrapper that forgets to forward it silently reports a safe source as
+    /// unsafe and the registration gate rejects a valid dataset. That is the
+    /// defaulted-no-op wrapper bug (#10460) applied to this capability, and it
+    /// compiles cleanly — only a test catches it.
+    ///
+    /// `ElasticsearchFullTextConnector` forwards the same one-liner but is
+    /// behind the `elasticsearch` feature and needs a params-bearing dataset to
+    /// construct, so it is not exercised here.
+    #[test]
+    fn every_wrapper_forwards_durable_write_back_delivery_support() {
+        let inner: Arc<dyn DataConnector> = Arc::new(SafeDeliveryConnector);
+        assert!(
+            inner.supports_durable_write_back_delivery(),
+            "precondition: the wrapped source advertises safe delivery"
+        );
+
+        let deferred = crate::dataconnector::deferred::DeferredConnector::new(Arc::clone(&inner));
+        assert!(
+            deferred.supports_durable_write_back_delivery(),
+            "DeferredConnector must forward the source's delivery capability"
+        );
+
+        let full_text =
+            crate::search::full_text::connector::FullTextConnector::new(Arc::clone(&inner));
+        assert!(
+            full_text.supports_durable_write_back_delivery(),
+            "FullTextConnector must forward the source's delivery capability"
+        );
+
+        let embedding = crate::embeddings::connector::EmbeddingConnector::new(
+            Arc::clone(&inner),
+            Arc::new(RwLock::new(std::collections::HashMap::new())),
+            Arc::new(RwLock::new(Secrets::default())),
+        );
+        assert!(
+            embedding.supports_durable_write_back_delivery(),
+            "EmbeddingConnector must forward the source's delivery capability"
         );
     }
 }

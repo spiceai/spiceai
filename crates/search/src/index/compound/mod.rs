@@ -39,8 +39,9 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow_schema::{ArrowError, Field, FieldRef, Schema};
-use datafusion::error::DataFusionError;
+use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use itertools::Itertools;
+use runtime_datafusion_index::Index;
 use snafu::{ResultExt, Snafu, ensure};
 
 pub use search_index::CompoundSearchIndex;
@@ -277,4 +278,19 @@ async fn compound_on_write_start(
         return Err(secondary_err);
     }
     Ok(())
+}
+
+/// Delete `keys` from both indexes (full/both-scope, per [`Index::delete_by_keys`]'s contract).
+/// Both deletes run concurrently and both are driven to completion even if one fails, matching
+/// [`compound_on_write_start`]'s "neither index left inconsistent" approach.
+async fn compound_delete_by_keys(
+    primary: &dyn Index,
+    secondary: &dyn Index,
+    keys: RecordBatch,
+) -> DataFusionResult<()> {
+    let (primary_result, secondary_result) = futures::join!(
+        primary.delete_by_keys(keys.clone()),
+        secondary.delete_by_keys(keys)
+    );
+    primary_result.and(secondary_result)
 }

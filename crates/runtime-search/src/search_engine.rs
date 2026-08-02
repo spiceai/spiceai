@@ -50,6 +50,7 @@ use runtime_query_engine::query_engine::QueryEngine;
 use runtime_request_context::{AsyncMarker, CacheControl, CacheKeyType, RequestContext};
 use search::index::SearchIndex;
 use search::index::chunking::ChunkedSearchIndex;
+use search::index::compound::CompoundVectorIndex;
 #[cfg(feature = "duckdb")]
 use search::index::duckdb::DuckDBVectorIndex;
 use search::index::native_vector::NativeVectorIndex;
@@ -129,6 +130,14 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
         Ok(searchable_tables)
     }
 
+    /// The error a scan of `tbl` would fail with because its data is not loaded
+    /// yet, or `None` when it can be searched. An unknown table is reported as
+    /// scannable so the existing not-found handling still owns that error.
+    async fn not_ready_error(&self, tbl: &TableReference) -> Option<DataFusionError> {
+        let table_provider = self.df.get_table(tbl).await?;
+        self.explorer.not_ready_error(&table_provider)
+    }
+
     async fn embedding_columns_from_table(&self, tbl: &TableReference) -> Option<Vec<String>> {
         let table_provider = self.df.get_table(tbl).await?;
         let mut embedding_columns: HashSet<String> = HashSet::default();
@@ -153,6 +162,13 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
         if let Some((indexes, _)) = self
             .explorer
             .find_index::<ChunkedSearchIndex>(&table_provider)
+        {
+            embedding_columns.extend(indexes.iter().map(|i| i.search_column()));
+        }
+
+        if let Some((indexes, _)) = self
+            .explorer
+            .find_index::<CompoundVectorIndex>(&table_provider)
         {
             embedding_columns.extend(indexes.iter().map(|i| i.search_column()));
         }
@@ -280,6 +296,14 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
 
         #[cfg(feature = "duckdb")]
         if let Some((indexes, _)) = self.explorer.find_index::<DuckDBVectorIndex>(tbl)
+            && let Some(index) = indexes
+                .into_iter()
+                .find(|idx| idx.search_column() == embedding_column)
+        {
+            return Some(Arc::new(index.clone()) as Arc<dyn SearchIndex>);
+        }
+
+        if let Some((indexes, _)) = self.explorer.find_index::<CompoundVectorIndex>(tbl)
             && let Some(index) = indexes
                 .into_iter()
                 .find(|idx| idx.search_column() == embedding_column)
@@ -522,6 +546,22 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
 
                 async move {
                     let request_context = RequestContext::current(AsyncMarker::new().await);
+
+                    // A dataset still loading its initial data cannot serve a search. Check
+                    // before building the plan: the query text is embedded during logical
+                    // optimization, so reaching this at physical planning instead would mean
+                    // paying for an embedding round trip only to be rejected. An explicitly
+                    // requested dataset is an error; when searching every searchable dataset,
+                    // skip it rather than failing the whole request — mirroring how an
+                    // unsearchable dataset is handled below.
+                    if let Some(not_ready) = self.not_ready_error(&tbl).await {
+                        if explicit_datasets_requested {
+                            return Err(Error::DataFusionError { source: not_ready });
+                        }
+                        tracing::debug!("Excluding dataset {tbl} from search: {not_ready}");
+                        return Ok((tbl.clone(), None));
+                    }
+
                     let embedding_columns = self.embedding_columns_from_table(&tbl).await.unwrap_or_default();
                     let mut generators: Vec<Arc<dyn CandidateGeneration>> = Vec::with_capacity(embedding_columns.len());
                     for (i, col) in embedding_columns.iter().enumerate() {

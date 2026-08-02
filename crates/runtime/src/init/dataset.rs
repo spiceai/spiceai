@@ -23,11 +23,12 @@ use crate::dataaccelerator::spice_sys::caching_engine::CachingEngineSys;
 use crate::init::dataset_initialization::DatasetInitialization;
 use crate::{
     AcceleratedTableInvalidChangesSnafu, AcceleratorEngineNotAvailableSnafu,
-    AcceleratorInitializationFailedSnafu, Error, FullTextSearchRequiresAccelerationSnafu,
-    LogErrors, OdbcNotInstalledSnafu, PermanentDatasetFailureSnafu, Result, Runtime,
-    UnableToAttachDataConnectorSnafu, UnableToBuildDatasetSnafu,
-    UnableToCreateAcceleratedTableSnafu, UnableToInitializeDataConnectorSnafu,
-    UnableToLoadDatasetConnectorSnafu, UnknownDataConnectorSnafu,
+    AcceleratorInitializationFailedSnafu, DurableWriteBackUnsupportedBySourceSnafu, Error,
+    FullTextSearchRequiresAccelerationSnafu, LogErrors, OdbcNotInstalledSnafu,
+    PermanentDatasetFailureSnafu, Result, Runtime, UnableToAttachDataConnectorSnafu,
+    UnableToBuildDatasetSnafu, UnableToCreateAcceleratedTableSnafu,
+    UnableToInitializeDataConnectorSnafu, UnableToLoadDatasetConnectorSnafu,
+    UnknownDataConnectorSnafu,
     accelerated_table::AcceleratedTable,
     component::dataset::{
         Dataset,
@@ -772,6 +773,26 @@ impl Runtime {
             return Err(err);
         }
 
+        // Durable write-back delivers each committed row to the source. Unless
+        // the connector can do that atomically, delivery has to emulate an
+        // upsert as a standalone delete plus a separate insert — and because the
+        // accelerator is CDC-fed from that same source, the delete echoes back
+        // and erases the committed row. A failure between the two legs then
+        // leaves the write gone from both sides with nothing reported. Refuse
+        // the dataset instead of accepting a config that can lose data.
+        if let Some(acceleration) = &ds.acceleration
+            && acceleration.resolves_to_durable_write_back()
+            && !data_connector.supports_durable_write_back_delivery()
+        {
+            let err = DurableWriteBackUnsupportedBySourceSnafu {
+                dataset_name: ds.name.to_string(),
+                connector: source.clone(),
+            }
+            .build();
+            warn_spaced!(spaced_tracer, "{}{err}", "");
+            return Err(err);
+        }
+
         // Bypass the deferred-mismatch gate when the dataset recreates on a schema change, so
         // create_accelerated_table drops + recreates the table with the new schema instead of
         // deferring. `recreates_on_schema_mismatch` is the single source of truth for the exact
@@ -1244,7 +1265,7 @@ impl Runtime {
         let source = ds.source();
         let factory = dataconnector::get_connector_factory(source).await?;
 
-        let params = ConnectorParamsBuilder::new(source.into(), ds.into())
+        let params = ConnectorParamsBuilder::for_dataset(source.into(), ds)
             .build(self.secrets(), self.tokio_io_runtime())
             .await
             .ok()?;
@@ -1275,7 +1296,7 @@ impl Runtime {
     ) -> Result<Arc<dyn DataConnector>> {
         let source = ds.source();
 
-        let params = ConnectorParamsBuilder::new(source.into(), (&ds).into())
+        let params = ConnectorParamsBuilder::for_dataset(source.into(), &ds)
             .build(self.secrets(), self.tokio_io_runtime())
             .await
             .context(UnableToInitializeDataConnectorSnafu)?;
@@ -1374,7 +1395,7 @@ impl Runtime {
                 .await
                 .context(UnableToAttachDataConnectorSnafu {
                     data_connector: source.clone(),
-                    connector_component: ConnectorComponent::from(&ds),
+                    connector_component: ConnectorComponent::from(ds.as_ref()),
                 })?;
 
             self.status
@@ -1465,7 +1486,7 @@ impl Runtime {
             .await
             .context(UnableToAttachDataConnectorSnafu {
                 data_connector: source.clone(),
-                connector_component: ConnectorComponent::from(&ds),
+                connector_component: ConnectorComponent::from(ds.as_ref()),
             })?;
 
         if notifier.is_some() {
@@ -1485,9 +1506,15 @@ impl Runtime {
                 // relying on the `Notify`-based completion handle (which is
                 // edge-triggered and can race with this spawn for fast
                 // initial refreshes).
-                runtime_status
+                // A shutdown before the dataset became ready means the initial
+                // load never finished: there is no partition state worth acking.
+                if runtime_status
                     .wait_for_dataset_ready(&dataset_table_ref)
-                    .await;
+                    .await
+                    == crate::status::WaitOutcome::ShuttingDown
+                {
+                    return;
+                }
                 // After the executor's initial load for this dataset finishes,
                 // ack the scheduler with the partition expressions we currently
                 // hold. This is the executor → scheduler readiness signal that
@@ -1779,7 +1806,7 @@ async fn update_cached_dataset_timestamps(dataset: &Dataset) {
 
     match CachingEngineSys::try_new(dataset, OpenOption::OpenExisting).await {
         Ok(caching_sys) => {
-            if let Err(e) = caching_sys.update_fetched_at() {
+            if let Err(e) = caching_sys.update_fetched_at().await {
                 tracing::warn!(
                     "Failed to update _fetched_at for cached dataset {}: {e}",
                     dataset.name

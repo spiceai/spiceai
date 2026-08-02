@@ -1,0 +1,651 @@
+/*
+Copyright 2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+use arrow::array::RecordBatch;
+use arrow_schema::Field;
+use datafusion::common::ScalarValue;
+use datafusion::error::{DataFusionError, Result as DataFusionResult};
+use elasticsearch::Elasticsearch;
+use serde_json::{Value, json};
+use snafu::ResultExt;
+
+use super::write;
+use crate::index::chunking::ChunkedSearchIndex;
+
+/// The columns to address documents by in [`delete_by_keys`], given an index's `primary_key`.
+///
+/// Drops the chunk key, which is only present when the index is the inner index of a
+/// [`ChunkedSearchIndex`]. There, one source row is stored as one document per chunk, and a
+/// source row is deleted (or re-chunked on upsert) as a whole — so the base key, not the
+/// chunk-keyed composite, is what identifies the documents to remove. Deleting on the base key
+/// also means the caller never has to know how many chunks a row produced.
+///
+/// For a non-chunked index the chunk key isn't in `primary_key`, so this is the full key.
+pub fn document_key_columns(primary_key: &[Field]) -> Vec<String> {
+    ChunkedSearchIndex::base_key_columns(primary_key)
+}
+
+/// Chunk size for `_delete_by_query` requests — keeps each request's `bool.should` clause count
+/// comfortably under Elasticsearch's default `indices.query.bool.max_clause_count` (1024) and
+/// request-size limits, regardless of how many keys the caller is deleting in one call.
+const DELETE_CHUNK_ROWS: usize = 512;
+
+/// Deletes every document whose `key_columns` match a row of `keys` — an exact-key delete when
+/// `key_columns` covers every `primary_key` column, a prefix delete when it's a strict subset
+/// (the chunked-index case).
+///
+/// The two cases address documents differently, because filtering on a key *column* is not
+/// reliable. Nothing maps the primary-key columns: the index mapping the runtime creates covers
+/// the vector field, the configured text fields, and declared metadata columns only, so a string
+/// key is dynamically mapped `text` and its inverted index holds *analyzed* tokens. A `term`
+/// query is not analyzed, so `{"term": {"id": "ORDER-1024"}}` looks for one token in an index
+/// holding `[order, 1024]` and matches nothing — a delete that reports success having removed
+/// no documents (#12267).
+///
+/// So when `key_columns` covers the whole primary key, this addresses documents by `_id` via an
+/// `ids` query. `_id` is the value the write path already stores for the row, derived by the
+/// same [`write::extract_primary_key_from_fields`], so the delete matches exactly the documents
+/// the write produced — no field mapping, no analysis, and no dependence on the key's type.
+///
+/// A strict subset of the key (the chunked-index case) cannot use `_id`, because the chunk id is
+/// part of it and is unknown at delete time; that case still filters on the key columns and so
+/// remains subject to the mapping gap above.
+///
+/// Only reads `key_columns` from `keys`, ignoring any other column present — `keys` may be
+/// shaped by [`runtime_datafusion_index::Index::required_columns`] (a superset of the primary
+/// key) rather than the primary key alone, since that's what the default
+/// [`runtime_datafusion_index::Index::resolve_delete_keys`] resolves against.
+///
+/// Issues one `_delete_by_query` request per [`DELETE_CHUNK_ROWS`]-row slice of `keys` rather
+/// than a single request for the whole batch, so a large delete can't build an unbounded
+/// clause or id list.
+///
+/// Shared by [`super::ElasticsearchIndex`] and [`super::ElasticsearchTextIndex`], which both
+/// address documents the same way (client + index name + primary key columns).
+pub async fn delete_by_keys(
+    client: &dyn Elasticsearch,
+    es_index: &str,
+    primary_key: &[Field],
+    key_columns: &[String],
+    keys: &RecordBatch,
+) -> DataFusionResult<()> {
+    // Derive `_id`s only when every primary-key column is available to derive them from; a
+    // partial key yields a different `_id` than the write path stored, which would delete
+    // nothing.
+    let addresses_whole_key = !primary_key.is_empty()
+        && primary_key
+            .iter()
+            .all(|f| key_columns.iter().any(|c| c == f.name()));
+
+    let mut offset = 0;
+    while offset < keys.num_rows() {
+        let len = DELETE_CHUNK_ROWS.min(keys.num_rows() - offset);
+        let chunk = keys.slice(offset, len);
+        offset += len;
+
+        let query = if addresses_whole_key {
+            build_ids_query(primary_key, es_index, &chunk)?
+        } else {
+            build_or_of_row_term_queries(key_columns, &chunk)?
+        };
+        let Some(query) = query else {
+            continue;
+        };
+
+        client
+            .delete_by_query(es_index, &query)
+            .await
+            .boxed()
+            .map_err(DataFusionError::External)?;
+    }
+
+    Ok(())
+}
+
+/// Builds `{"ids": {"values": ["<_id>", ...]}}` — the documents written for `keys`, addressed by
+/// the `_id` the write path derives for each row.
+///
+/// Rows whose key is NULL (any component, for a composite key) yield no `_id`: the write path
+/// skips them rather than writing under a generated `_id`, so there is no document to delete.
+/// Returns `None` when that leaves nothing to address, so the caller issues no request.
+fn build_ids_query(
+    primary_key: &[Field],
+    es_index: &str,
+    keys: &RecordBatch,
+) -> DataFusionResult<Option<Value>> {
+    let ids = write::extract_primary_key_from_fields(primary_key, es_index, keys)
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+    let values: Vec<Value> = ids.into_iter().flatten().map(Value::String).collect();
+    if values.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(json!({ "ids": { "values": values } })))
+}
+
+/// Builds `{"bool": {"should": [{"bool": {"filter": [{"term": {...}}, ...]}}, ...], "minimum_should_match": 1}}`
+/// — one `should` clause (`key_columns` ANDed) per row of `keys`, rows ORed together.
+fn build_or_of_row_term_queries(
+    key_columns: &[String],
+    keys: &RecordBatch,
+) -> DataFusionResult<Option<Value>> {
+    if keys.num_rows() == 0 || key_columns.is_empty() {
+        return Ok(None);
+    }
+
+    let arrays: Vec<_> = key_columns
+        .iter()
+        .map(|name| keys.column_by_name(name).cloned())
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "delete key batch is missing one of the requested key columns: {key_columns:?}"
+            ))
+        })?;
+
+    let mut row_clauses = Vec::with_capacity(keys.num_rows());
+    for row in 0..keys.num_rows() {
+        let mut terms = Vec::with_capacity(key_columns.len());
+        for (name, array) in key_columns.iter().zip(&arrays) {
+            let value = ScalarValue::try_from_array(array.as_ref(), row)?;
+            let Some(json_value) = scalar_to_term_value(&value) else {
+                // A NULL/unsupported key column can never equal anything via `term` — skip this
+                // row's clause entirely rather than emit a filter that matches everything.
+                terms.clear();
+                break;
+            };
+            terms.push(json!({ "term": { name.as_str(): json_value } }));
+        }
+        if !terms.is_empty() {
+            row_clauses.push(json!({ "bool": { "filter": terms } }));
+        }
+    }
+
+    if row_clauses.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(json!({
+        "bool": {
+            "should": row_clauses,
+            "minimum_should_match": 1
+        }
+    })))
+}
+
+fn scalar_to_term_value(value: &ScalarValue) -> Option<Value> {
+    match value {
+        ScalarValue::Utf8(Some(s))
+        | ScalarValue::LargeUtf8(Some(s))
+        | ScalarValue::Utf8View(Some(s)) => Some(Value::String(s.clone())),
+        ScalarValue::Boolean(Some(b)) => Some(Value::Bool(*b)),
+        ScalarValue::Int8(Some(v)) => Some(json!(v)),
+        ScalarValue::Int16(Some(v)) => Some(json!(v)),
+        ScalarValue::Int32(Some(v)) => Some(json!(v)),
+        ScalarValue::Int64(Some(v)) => Some(json!(v)),
+        ScalarValue::UInt8(Some(v)) => Some(json!(v)),
+        ScalarValue::UInt16(Some(v)) => Some(json!(v)),
+        ScalarValue::UInt32(Some(v)) => Some(json!(v)),
+        ScalarValue::UInt64(Some(v)) => Some(json!(v)),
+        // Anything else (NULL, or a type not expected on a primary-key column) — the caller
+        // treats `None` as "cannot express this row's key as an exact-match filter".
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use arrow::array::{Int64Array, StringArray};
+    use arrow_schema::{DataType, Schema};
+    use elasticsearch::{
+        Error as EsError, MappingResponse, Result as EsResult, SearchRequest, SearchResponse,
+    };
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::index::chunking::{CHUNKED_INDEX_CHUNK_KEY, ChunkedSearchIndex};
+    use arrow::array::{ArrayRef, UInt64Array};
+
+    /// Records the `_delete_by_query` bodies it is asked to issue; every other trait method is
+    /// an error, so a test that reaches one fails loudly rather than silently passing.
+    #[derive(Debug, Default)]
+    struct RecordingClient {
+        queries: Mutex<Vec<Value>>,
+    }
+
+    impl RecordingClient {
+        fn queries(&self) -> Vec<Value> {
+            self.queries
+                .lock()
+                .expect("queries mutex should not be poisoned")
+                .clone()
+        }
+    }
+
+    fn unexpected(method: &str) -> EsError {
+        EsError::ElasticsearchError {
+            status: 500,
+            message: format!("unexpected call to {method}"),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Elasticsearch for RecordingClient {
+        async fn delete_by_query(&self, _index: &str, query: &Value) -> EsResult<Value> {
+            self.queries
+                .lock()
+                .expect("queries mutex should not be poisoned")
+                .push(query.clone());
+            Ok(json!({"deleted": 0}))
+        }
+
+        async fn get_mapping(&self, _index: &str) -> EsResult<MappingResponse> {
+            Err(unexpected("get_mapping"))
+        }
+        async fn search(&self, _index: &str, _body: &SearchRequest) -> EsResult<SearchResponse> {
+            Err(unexpected("search"))
+        }
+        async fn search_raw(&self, _index: &str, _body: &Value) -> EsResult<SearchResponse> {
+            Err(unexpected("search_raw"))
+        }
+        async fn open_point_in_time(&self, _index: &str, _keep_alive: &str) -> EsResult<String> {
+            Err(unexpected("open_point_in_time"))
+        }
+        async fn search_point_in_time(&self, _body: &Value) -> EsResult<SearchResponse> {
+            Err(unexpected("search_point_in_time"))
+        }
+        async fn close_point_in_time(&self, _pit_id: &str) -> EsResult<()> {
+            Err(unexpected("close_point_in_time"))
+        }
+        async fn index_exists(&self, _index: &str) -> EsResult<bool> {
+            Err(unexpected("index_exists"))
+        }
+        async fn create_index(&self, _index: &str, _body: &Value) -> EsResult<Value> {
+            Err(unexpected("create_index"))
+        }
+        async fn put_mapping(&self, _index: &str, _body: &Value) -> EsResult<Value> {
+            Err(unexpected("put_mapping"))
+        }
+        async fn get_index_refresh_interval(&self, _index: &str) -> EsResult<Option<String>> {
+            Err(unexpected("get_index_refresh_interval"))
+        }
+        async fn put_index_settings(&self, _index: &str, _body: &Value) -> EsResult<Value> {
+            Err(unexpected("put_index_settings"))
+        }
+        async fn refresh_index(&self, _index: &str) -> EsResult<Value> {
+            Err(unexpected("refresh_index"))
+        }
+        async fn force_merge(&self, _index: &str, _max_num_segments: u32) -> EsResult<Value> {
+            Err(unexpected("force_merge"))
+        }
+        async fn index_document(&self, _index: &str, _id: &str, _doc: &Value) -> EsResult<Value> {
+            Err(unexpected("index_document"))
+        }
+        async fn bulk_index(
+            &self,
+            _index: &str,
+            _docs: &[(Option<String>, Value)],
+        ) -> EsResult<Value> {
+            Err(unexpected("bulk_index"))
+        }
+    }
+
+    fn string_key_batch(values: Vec<Option<&str>>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, true)]));
+        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(values))])
+            .expect("string key batch should build")
+    }
+
+    fn pk(name: &str, data_type: DataType) -> Field {
+        Field::new(name, data_type, true)
+    }
+
+    /// The reported bug: a string key that the standard analyzer would split into several tokens
+    /// (`ORDER-1024` → `[order, 1024]`) can never be matched by an unanalyzed `term` query, so
+    /// the delete must address the document by `_id` instead.
+    #[tokio::test]
+    async fn string_primary_key_deletes_by_document_id_not_by_term_filter() {
+        let client = RecordingClient::default();
+        let primary_key = vec![pk("id", DataType::Utf8)];
+
+        delete_by_keys(
+            &client,
+            "idx",
+            &primary_key,
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024"), Some("a716-446655440000")]),
+        )
+        .await
+        .expect("delete should succeed");
+
+        assert_eq!(
+            client.queries(),
+            vec![json!({"ids": {"values": ["ORDER-1024", "a716-446655440000"]}})],
+            "an exact-key delete must address documents by _id; a `term` filter on the key \
+             column matches nothing for an analyzed string key"
+        );
+    }
+
+    /// `_id` for a composite key is the JSON encoding the write path stores. Pinning the literal
+    /// here (and not re-deriving it) is what catches the two paths drifting apart.
+    #[tokio::test]
+    async fn composite_primary_key_uses_the_json_encoded_document_id() {
+        let client = RecordingClient::default();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new("region", DataType::Utf8, true),
+        ]));
+        let keys = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![Some("ORDER-1024")])),
+                Arc::new(StringArray::from(vec![Some("emea")])),
+            ],
+        )
+        .expect("composite key batch should build");
+
+        delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8), pk("region", DataType::Utf8)],
+            &["id".to_string(), "region".to_string()],
+            &keys,
+        )
+        .await
+        .expect("delete should succeed");
+
+        assert_eq!(
+            client.queries(),
+            vec![json!({"ids": {"values": [r#"{"id":"ORDER-1024","region":"emea"}"#]}})],
+        );
+    }
+
+    /// The write path derives the same `_id`s it deletes — the invariant the fix rests on.
+    #[test]
+    fn delete_ids_match_the_document_ids_the_write_path_derives() {
+        let keys = string_key_batch(vec![Some("ORDER-1024"), Some("x")]);
+        let primary_key = vec![pk("id", DataType::Utf8)];
+
+        let written = write::extract_primary_key_from_fields(&primary_key, "idx", &keys)
+            .expect("write path should derive ids");
+        let query = build_ids_query(&primary_key, "idx", &keys)
+            .expect("ids query should build")
+            .expect("ids query should be present");
+
+        let addressed: Vec<Value> = written.into_iter().flatten().map(Value::String).collect();
+        assert_eq!(query, json!({"ids": {"values": addressed}}));
+    }
+
+    /// A strict subset of the primary key (the chunked-index case) cannot use `_id`, because the
+    /// chunk id is part of it and unknown at delete time — that path still filters on columns.
+    #[tokio::test]
+    async fn partial_key_falls_back_to_term_filters() {
+        let client = RecordingClient::default();
+
+        delete_by_keys(
+            &client,
+            "idx",
+            &[
+                pk("id", DataType::Utf8),
+                pk("_spice.chunk_id", DataType::Int64),
+            ],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024")]),
+        )
+        .await
+        .expect("delete should succeed");
+
+        assert_eq!(
+            client.queries(),
+            vec![json!({
+                "bool": {
+                    "should": [{"bool": {"filter": [{"term": {"id": "ORDER-1024"}}]}}],
+                    "minimum_should_match": 1
+                }
+            })],
+        );
+    }
+
+    /// A NULL key has no stable identity, so the write path never stored a document for it and
+    /// there is nothing to address. A batch of only such rows must issue no request at all —
+    /// never an unconstrained query that would match everything.
+    #[tokio::test]
+    async fn null_keys_issue_no_request() {
+        let client = RecordingClient::default();
+
+        delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(vec![None, None]),
+        )
+        .await
+        .expect("delete should succeed");
+
+        assert!(client.queries().is_empty());
+    }
+
+    #[tokio::test]
+    async fn null_keys_are_skipped_but_present_keys_are_still_deleted() {
+        let client = RecordingClient::default();
+
+        delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(vec![None, Some("kept"), None]),
+        )
+        .await
+        .expect("delete should succeed");
+
+        assert_eq!(client.queries(), vec![json!({"ids": {"values": ["kept"]}})],);
+    }
+
+    #[tokio::test]
+    async fn empty_batch_issues_no_request() {
+        let client = RecordingClient::default();
+
+        delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(vec![]),
+        )
+        .await
+        .expect("delete should succeed");
+
+        assert!(client.queries().is_empty());
+    }
+
+    /// A large delete is split so no single request carries an unbounded id list.
+    #[tokio::test]
+    async fn large_batch_is_split_into_bounded_requests() {
+        let client = RecordingClient::default();
+        let rows = DELETE_CHUNK_ROWS + 3;
+        let values: Vec<String> = (0..rows).map(|i| format!("key-{i}")).collect();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, true)]));
+        let keys = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(values.clone()))])
+            .expect("large key batch should build");
+
+        delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &keys,
+        )
+        .await
+        .expect("delete should succeed");
+
+        let queries = client.queries();
+        assert_eq!(queries.len(), 2);
+
+        let ids_of = |q: &Value| -> Vec<String> {
+            q["ids"]["values"]
+                .as_array()
+                .expect("ids.values should be an array")
+                .iter()
+                .map(|v| v.as_str().expect("each id should be a string").to_string())
+                .collect()
+        };
+        assert_eq!(ids_of(&queries[0]).len(), DELETE_CHUNK_ROWS);
+        assert_eq!(ids_of(&queries[1]).len(), 3);
+
+        // Every key is addressed exactly once, across the split.
+        let mut seen: Vec<String> = queries.iter().flat_map(ids_of).collect();
+        seen.sort();
+        let mut expected = values;
+        expected.sort();
+        assert_eq!(seen, expected);
+    }
+
+    /// An integer key was never broken by the mapping gap (it maps to `long`, which `term`
+    /// matches), but it must keep working now that it goes through `_id` too.
+    #[tokio::test]
+    async fn integer_primary_key_still_deletes() {
+        let client = RecordingClient::default();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let keys = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![7, 8]))])
+            .expect("int key batch should build");
+
+        delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Int64)],
+            &["id".to_string()],
+            &keys,
+        )
+        .await
+        .expect("delete should succeed");
+
+        assert_eq!(
+            client.queries(),
+            vec![json!({"ids": {"values": ["7", "8"]}})]
+        );
+    }
+
+    /// An index with no primary key writes documents under generated `_id`s, so there is no id
+    /// to address and no key column to filter on; the delete must not emit a match-everything
+    /// query.
+    #[tokio::test]
+    async fn empty_primary_key_issues_no_request() {
+        let client = RecordingClient::default();
+
+        delete_by_keys(
+            &client,
+            "idx",
+            &[],
+            &[],
+            &string_key_batch(vec![Some("ORDER-1024")]),
+        )
+        .await
+        .expect("delete should succeed");
+
+        assert!(client.queries().is_empty());
+    }
+
+    fn id_field() -> Field {
+        Field::new("id", DataType::Int64, false)
+    }
+
+    /// A key batch carrying only the base key, as a chunked index hands it over.
+    fn base_keys(ids: &[i64]) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![id_field()])),
+            vec![Arc::new(Int64Array::from(ids.to_vec())) as ArrayRef],
+        )
+        .expect("valid batch")
+    }
+
+    #[test]
+    fn document_key_columns_leaves_a_plain_primary_key_alone() {
+        assert_eq!(document_key_columns(&[id_field()]), vec!["id".to_string()]);
+    }
+
+    #[test]
+    fn document_key_columns_drops_the_chunk_key() {
+        let chunked = ChunkedSearchIndex::augment_primary_key(vec![id_field()]);
+        assert!(chunked.iter().any(|f| f.name() == CHUNKED_INDEX_CHUNK_KEY));
+        assert_eq!(document_key_columns(&chunked), vec!["id".to_string()]);
+    }
+
+    /// The base-key query filters on the base key only, so it matches — and so deletes — every
+    /// chunk document stored under it.
+    #[test]
+    fn a_chunked_index_deletes_every_chunk_of_a_base_key() {
+        let chunked = ChunkedSearchIndex::augment_primary_key(vec![id_field()]);
+        let query = build_or_of_row_term_queries(&document_key_columns(&chunked), &base_keys(&[7]))
+            .expect("query builds")
+            .expect("non-empty batch produces a query");
+
+        let clauses = query["bool"]["should"]
+            .as_array()
+            .expect("one should clause per key row");
+        assert_eq!(clauses.len(), 1);
+        assert_eq!(
+            clauses[0]["bool"]["filter"],
+            serde_json::json!([{ "term": { "id": 7 } }]),
+            "only the base key is filtered on: {query}"
+        );
+    }
+
+    /// Why the chunk key has to be dropped: a chunked index knows the base key but not the chunk
+    /// ids under it, so a query addressing the full composite key cannot be built at all.
+    #[test]
+    fn the_full_composite_key_cannot_address_a_base_key_batch() {
+        let full: Vec<String> = ChunkedSearchIndex::augment_primary_key(vec![id_field()])
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+
+        let err = build_or_of_row_term_queries(&full, &base_keys(&[7]))
+            .expect_err("the chunk id is not in the batch");
+        assert!(
+            err.to_string().contains(CHUNKED_INDEX_CHUNK_KEY),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A chunk id that *is* present is still ignored — one delete removes the whole group.
+    #[test]
+    fn a_present_chunk_id_is_not_filtered_on() {
+        let chunked = ChunkedSearchIndex::augment_primary_key(vec![id_field()]);
+        let keys = RecordBatch::try_new(
+            Arc::new(Schema::new(chunked.clone())),
+            vec![
+                Arc::new(Int64Array::from(vec![7_i64])) as ArrayRef,
+                Arc::new(UInt64Array::from(vec![3_u64])) as ArrayRef,
+            ],
+        )
+        .expect("valid batch");
+
+        let query = build_or_of_row_term_queries(&document_key_columns(&chunked), &keys)
+            .expect("query builds")
+            .expect("non-empty batch produces a query");
+
+        assert_eq!(
+            query["bool"]["should"][0]["bool"]["filter"],
+            serde_json::json!([{ "term": { "id": 7 } }]),
+            "the chunk id must not narrow the delete: {query}"
+        );
+    }
+}

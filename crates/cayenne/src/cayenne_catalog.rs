@@ -8141,6 +8141,105 @@ mod tests {
         let _ = std::fs::remove_file(format!("{db_path}-wal"));
     }
 
+    /// Issue #11477 — at an unbounded cutoff, `commit_compaction_fenced_in_txn`
+    /// clears every tombstone (matching the wholesale
+    /// [`CayenneCatalog::commit_compaction_in_txn`]) while still clearing ONLY
+    /// the named protected snapshots.
+    ///
+    /// This is the shape the position-delete full rewrite commits with: it holds
+    /// `write_lock` for its whole pass so no tombstone can survive it, but the
+    /// mem-tier checkpoint can still publish a protected snapshot the scan never
+    /// folded in — and deleting that row here loses its rows durably.
+    #[tokio::test]
+    async fn test_commit_compaction_fenced_unbounded_cutoff_retains_unfolded_snapshots() {
+        let test_db = format!(
+            "sqlite://./.test_fenced_unbounded_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let table_id =
+            setup_table_with_delete_file(&catalog, "fenced_unbounded", "/tmp/fenced_unbounded")
+                .await;
+
+        // Two protected snapshots the rewrite folded in, and one published after
+        // its scan (the racing checkpoint).
+        let folded: Vec<String> = vec![
+            uuid::Uuid::now_v7().to_string(),
+            uuid::Uuid::now_v7().to_string(),
+        ];
+        let late = uuid::Uuid::now_v7().to_string();
+        for (idx, id) in folded.iter().chain(std::iter::once(&late)).enumerate() {
+            let seq = i64::try_from(idx).expect("test index fits in i64") + 1;
+            catalog
+                .set_snapshot_sequence(&table_id, id, seq)
+                .await
+                .expect("Failed to register protected snapshot");
+        }
+
+        let new_snapshot_id = uuid::Uuid::now_v7().to_string();
+        let mut tx = catalog
+            .begin_transaction()
+            .await
+            .expect("Failed to begin transaction");
+        catalog
+            .commit_compaction_fenced_in_txn(
+                &mut *tx,
+                &table_id,
+                &new_snapshot_id,
+                i64::MAX,
+                &folded,
+            )
+            .await
+            .expect("commit_compaction_fenced_in_txn failed");
+        tx.commit()
+            .await
+            .expect("Failed to commit caller transaction");
+
+        // An unbounded cutoff clears every tombstone, exactly as the wholesale
+        // variant does.
+        let delete_files = catalog
+            .get_table_delete_files(&table_id)
+            .await
+            .expect("Failed to get delete files after commit");
+        assert!(
+            delete_files.is_empty(),
+            "an unbounded cutoff must clear every delete file"
+        );
+
+        // Only the folded protected snapshots are cleared.
+        let sequences = catalog
+            .get_all_snapshot_sequences(&table_id)
+            .await
+            .expect("Failed to read snapshot sequences");
+        assert!(
+            sequences.contains_key(&late),
+            "DATA LOSS: the protected snapshot published after the scan was cleared; \
+             remaining ids: {:?}",
+            sequences.keys().collect::<Vec<_>>()
+        );
+        for id in &folded {
+            assert!(
+                !sequences.contains_key(id),
+                "folded snapshot {id} must be cleared"
+            );
+        }
+
+        // Snapshot pointer advanced.
+        let table = catalog
+            .get_table("fenced_unbounded")
+            .await
+            .expect("Failed to get table after commit");
+        assert_eq!(table.current_snapshot_id, new_snapshot_id);
+
+        // Cleanup.
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
     /// Issue #10125 — two `commit_compaction_in_txn` calls inside one
     /// transaction commit atomically: after `tx.commit()`, both partitions'
     /// pointers have advanced together.

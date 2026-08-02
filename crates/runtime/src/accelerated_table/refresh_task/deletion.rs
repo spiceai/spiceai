@@ -13,13 +13,13 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-#[cfg(test)]
 use arrow::array::RecordBatch;
 use data_components::cdc::ChangeBatch;
 use data_components::pk_filter_expr::{self, balanced_binary};
 use datafusion::logical_expr::Expr;
 #[cfg(test)]
 use datafusion::logical_expr::col;
+use snafu::ResultExt;
 
 #[cfg(test)]
 pub fn build_batch_delete_expr<F, G>(
@@ -113,6 +113,59 @@ pub fn build_batch_delete_expr_from_change_batch(
         .collect::<crate::accelerated_table::Result<Vec<_>>>()?;
 
     Ok(balanced_binary(row_conditions, Expr::or))
+}
+
+/// Projects `change_batch`'s data down to just its primary-key column(s), for `row_indices`.
+///
+/// Companion to [`build_batch_delete_expr_from_change_batch`] (which builds a delete `Expr` for
+/// the accelerator) — this instead produces a [`RecordBatch`] of the same rows' key columns,
+/// shaped for [`runtime_datafusion_index::Index::delete_by_keys`], for call sites that bypass
+/// `TableProvider::delete_from` entirely (Cayenne's fast CDC-delete path) and so need to drive
+/// index deletion explicitly rather than relying on `IndexedTableProvider::delete_from`.
+///
+/// Returns `Ok(None)` for an empty `row_indices`, or if the first row has no primary keys.
+pub fn build_pk_only_batch_from_change_batch(
+    change_batch: &ChangeBatch,
+    row_indices: &[usize],
+) -> crate::accelerated_table::Result<Option<RecordBatch>> {
+    if row_indices.is_empty() {
+        return Ok(None);
+    }
+
+    let pk_names = change_batch.primary_keys(row_indices[0]);
+    if pk_names.is_empty() {
+        return Ok(None);
+    }
+
+    let data_batch = change_batch.data_batch();
+    let schema = data_batch.schema();
+    let projection: Vec<usize> = pk_names
+        .iter()
+        .filter_map(|name| schema.index_of(name).ok())
+        .collect();
+    if projection.len() != pk_names.len() {
+        return Ok(None);
+    }
+
+    let projected = data_batch
+        .project(&projection)
+        .context(crate::accelerated_table::FailedToBuildRecordBatchSnafu)?;
+
+    let indices: Vec<u32> = row_indices
+        .iter()
+        .map(|&i| u32::try_from(i).unwrap_or(u32::MAX))
+        .collect();
+    let indices_array = arrow::array::UInt32Array::from(indices);
+    let columns = projected
+        .columns()
+        .iter()
+        .map(|col| arrow::compute::take(col.as_ref(), &indices_array, None))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context(crate::accelerated_table::FailedToBuildRecordBatchSnafu)?;
+
+    RecordBatch::try_new(projected.schema(), columns)
+        .map(Some)
+        .context(crate::accelerated_table::FailedToBuildRecordBatchSnafu)
 }
 
 /// Builds an IN list expression for single-column primary key deletes.

@@ -28,7 +28,10 @@ use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder};
 use runtime_datafusion_index::Index;
 use snafu::ResultExt;
-use tantivy::schema::{DocParsingError, SchemaBuilder};
+use tantivy::merge_policy::LogMergePolicy;
+use tantivy::schema::{
+    DocParsingError, IndexRecordOption, SchemaBuilder, TextFieldIndexing, TextOptions,
+};
 use tantivy::{TantivyDocument, TantivyError};
 use tokio::sync::Mutex;
 
@@ -47,6 +50,46 @@ use crate::index::SearchIndex;
 /// significantly improving bulk-indexing throughput.
 pub static MEMORY_BUDGET_FOR_INDEX_WRITER: usize = 150 * 1024 * 1024;
 pub static INDEX_UNIQUE_FIELD_NAME: &str = "__spice.unique_field";
+
+/// Tantivy's built-in English Snowball-stemmed tokenizer.
+static EN_STEM_TOKENIZER_NAME: &str = "en_stem";
+
+/// A [`TextOptions`] for [`tantivy::schema::TEXT`] with [`EN_STEM_TOKENIZER_NAME`] tokenization.
+fn tokenized_text_options() -> TextOptions {
+    TextOptions::default().set_indexing_options(
+        TextFieldIndexing::default()
+            .set_index_option(IndexRecordOption::WithFreqsAndPositions)
+            .set_tokenizer(EN_STEM_TOKENIZER_NAME),
+    )
+}
+
+/// The fraction of a tantivy segment's documents that may be superseded/deleted, but
+/// still physically present, before the segment is rewritten by a merge.
+///
+/// Tantivy BM25 collection size statistics includes these superseded documents. A merge
+/// is the only mechanism to expunge documents. The default, [`LogMergePolicy`], does
+/// not merge on deletions, only when the ratio of deleted to collected documents is above a threshold.
+///
+/// [`MAX_SUPERSEDED_DOCS_RATIO_PER_SEGMENT`] is the ratio to use in [`LogMergePolicy`]/
+const MAX_SUPERSEDED_DOCS_RATIO_PER_SEGMENT: f32 = 0.25;
+
+/// The merge policy for the index writer, which differs from tantivy's default only in
+/// capping superseded documents per segment — see
+/// [`MAX_SUPERSEDED_DOCS_RATIO_PER_SEGMENT`].
+fn index_merge_policy() -> LogMergePolicy {
+    let mut policy = LogMergePolicy::default();
+    policy.set_del_docs_ratio_before_merge(MAX_SUPERSEDED_DOCS_RATIO_PER_SEGMENT);
+    policy
+}
+
+/// Perform a [`tantivy::IndexWriter::rollback`] and preserve the [`MergePolicy`] from `index_merge_policy`.
+///
+/// [`tantivy::IndexWriter::rollback`] overwrites any custom [`MergePolicy`] with the default.
+fn rollback_writer(writer: &mut tantivy::IndexWriter) -> Result<(), TantivyError> {
+    writer.rollback()?;
+    writer.set_merge_policy(Box::new(index_merge_policy()));
+    Ok(())
+}
 
 #[derive(Clone)]
 pub struct FullTextDatabaseIndex {
@@ -114,6 +157,20 @@ impl Index for FullTextDatabaseIndex {
         Ok(batches)
     }
 
+    async fn delete_by_keys(&self, keys: RecordBatch) -> Result<(), DataFusionError> {
+        self.delete_terms_for(&keys)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))
+    }
+
+    fn write_complete_failure_is_fatal(&self) -> bool {
+        // Documents are only searchable once the tantivy writer commits them, and
+        // staged-but-uncommitted documents are discarded. A finalize that fails to
+        // commit therefore drops the write's documents while the underlying rows are
+        // already visible, so the write must not report success.
+        true
+    }
+
     async fn on_write_start(&self) -> Result<(), DataFusionError> {
         // A CDC-fed index never defers: its change stream calls `compute_index`
         // outside this lifecycle, and the shared writer cannot commit one caller's
@@ -136,9 +193,7 @@ impl Index for FullTextDatabaseIndex {
         // writer keeps its per-write commit behavior rather than deferring on a
         // writer in an unknown state).
         let mut index_writer = self.writer.lock().await;
-        index_writer
-            .rollback()
-            .map(|_| ())
+        rollback_writer(&mut index_writer)
             .context(TextSearchIndexingSnafu)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         self.defer_commit.store(true, Ordering::Release);
@@ -161,7 +216,7 @@ impl Index for FullTextDatabaseIndex {
             .context(FailedToInsertDataIntoIndexSnafu);
         if let Err(e) = &commit_result {
             tracing::warn!("Rolling back full-text index writer after failed commit: {e}");
-            if let Err(rb_err) = index_writer.rollback() {
+            if let Err(rb_err) = rollback_writer(&mut index_writer) {
                 tracing::error!("Failed to rollback full-text index writer: {rb_err}");
             }
         }
@@ -189,9 +244,7 @@ impl Index for FullTextDatabaseIndex {
         // A rollback failure must reach the caller: staged operations that could not
         // be discarded may leak into a later commit and make a partial refresh
         // visible.
-        index_writer
-            .rollback()
-            .map(|_| ())
+        rollback_writer(&mut index_writer)
             .context(TextSearchIndexingSnafu)
             .map_err(|e| DataFusionError::External(Box::new(e)))
     }
@@ -228,6 +281,7 @@ impl FullTextDatabaseIndex {
         let writer = index
             .writer(MEMORY_BUDGET_FOR_INDEX_WRITER)
             .context(IndexCreationSnafu)?;
+        writer.set_merge_policy(Box::new(index_merge_policy()));
 
         Ok(Self {
             base_table: inner,
@@ -379,7 +433,7 @@ impl FullTextDatabaseIndex {
         })();
         if let Err(e) = &write_result {
             tracing::warn!("Rolling back index writer after failed write: {e}");
-            if let Err(rb_err) = index_writer.rollback() {
+            if let Err(rb_err) = rollback_writer(&mut index_writer) {
                 tracing::error!("Failed to rollback index writer: {rb_err}");
             }
         }
@@ -393,6 +447,49 @@ impl FullTextDatabaseIndex {
 
         self.reader.reload().boxed().context(InvalidIndexingSnafu {
             context: "Data successfully written to full-text index, but failed to update search path to reference the latest commit. Queries will be served from previous revision until the next update.".to_string(),
+        })
+    }
+
+    /// Deletes every document whose primary key matches a row of `keys` — the tantivy
+    /// counterpart of `update_index`'s delete-then-insert, minus the insert.
+    async fn delete_terms_for(&self, keys: &RecordBatch) -> Result<(), super::Error> {
+        let rb = if self.primary_key.len() > 1 {
+            vec![with_json_subset_column(
+                keys,
+                &self.primary_key,
+                INDEX_UNIQUE_FIELD_NAME,
+            )
+            .context(InvalidIndexingSnafu {
+                context: "An error occurred creating the unique column for the full text search index".to_string(),
+            })?]
+        } else {
+            vec![keys.clone()]
+        };
+
+        let index_schema = self.reader.searcher().schema().clone();
+        let terms_to_delete = self.existing_terms_to_delete(&index_schema, &rb)?;
+        if terms_to_delete.is_empty() {
+            return Ok(());
+        }
+
+        let mut index_writer = self.writer.lock().await;
+        for t in terms_to_delete {
+            index_writer.delete_term(t);
+        }
+        let commit_result = index_writer
+            .commit()
+            .context(FailedToInsertDataIntoIndexSnafu);
+        if let Err(e) = &commit_result {
+            tracing::warn!("Rolling back index writer after failed delete commit: {e}");
+            if let Err(rb_err) = index_writer.rollback() {
+                tracing::error!("Failed to rollback index writer: {rb_err}");
+            }
+        }
+        drop(index_writer);
+        commit_result?;
+
+        self.reader.reload().boxed().context(InvalidIndexingSnafu {
+            context: "Deleted from full-text index, but failed to update search path to reference the latest commit. Queries may still return deleted rows until the next update.".to_string(),
         })
     }
 
@@ -516,7 +613,7 @@ impl FullTextDatabaseIndex {
         }
 
         for s in search_fields {
-            let mut text_opts = tantivy::schema::TEXT;
+            let mut text_opts = tokenized_text_options();
             if store_field.contains(s) || primary_key.contains(s) {
                 text_opts = text_opts | tantivy::schema::STORED;
             }
@@ -621,6 +718,7 @@ mod tests {
     use datafusion::datasource::{MemTable, TableProvider};
     use futures::{StreamExt, TryStreamExt};
     use runtime_datafusion_index::Index;
+    use std::time::Duration;
 
     /// Create a basic [`MemTable`] with fields: `id`, `content`.
     fn create_test_table() -> Arc<dyn TableProvider> {
@@ -666,6 +764,146 @@ mod tests {
                 .map(|(original_idx, _)| Arc::clone(batch.column(*original_idx)))
                 .collect::<Vec<_>>(),
         )
+    }
+
+    /// The collection size tantivy uses for BM25: the sum of every segment's `max_doc`,
+    /// which counts superseded documents until a merge expunges them.
+    fn bm25_collection_size(index: &FullTextDatabaseIndex) -> u32 {
+        index
+            .reader
+            .searcher()
+            .segment_readers()
+            .iter()
+            .map(tantivy::SegmentReader::max_doc)
+            .sum()
+    }
+
+    /// Poll the index's segment set until `reached` holds, reloading the reader each
+    /// time. Merges run on their own threads, so a caller that depends on their outcome
+    /// has to wait for it rather than assume it has already happened.
+    async fn wait_for_segments(
+        index: &FullTextDatabaseIndex,
+        expectation: &str,
+        reached: impl Fn(&[tantivy::SegmentReader]) -> bool,
+    ) {
+        const ATTEMPTS: usize = 150;
+        const INTERVAL: Duration = Duration::from_millis(20);
+
+        let mut observed = "<never sampled>".to_string();
+        for _ in 0..ATTEMPTS {
+            index
+                .reader
+                .reload()
+                .expect("failed to reload the full-text index reader");
+            let searcher = index.reader.searcher();
+            if reached(searcher.segment_readers()) {
+                return;
+            }
+            observed = searcher
+                .segment_readers()
+                .iter()
+                .map(|reader| format!("max_doc={} live={}", reader.max_doc(), reader.num_docs()))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            tokio::time::sleep(INTERVAL).await;
+        }
+        panic!("timed out waiting for {expectation}; last observed segments [{observed}]");
+    }
+
+    /// Wait until no segment still holds a superseded document, which is when BM25's
+    /// collection size finally matches the live rows.
+    async fn wait_for_superseded_docs_expunged(index: &FullTextDatabaseIndex) {
+        wait_for_segments(index, "superseded documents to be expunged", |segments| {
+            segments
+                .iter()
+                .all(|reader| reader.max_doc() == reader.num_docs())
+        })
+        .await;
+    }
+
+    /// A full-text index over [`create_test_table`], keyed on `id` and searching `content`.
+    fn new_test_index() -> FullTextDatabaseIndex {
+        FullTextDatabaseIndex::try_new(
+            create_test_table(),
+            vec!["content".to_string()],
+            Some(vec!["id".to_string()]),
+            None,
+            &["content".to_string()],
+        )
+        .expect("Failed to create FullTextDatabaseIndex")
+    }
+
+    const EXPUNGE_FIXTURE_IDS: [i32; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+
+    /// Drive an index into the one state in which superseded documents can linger — a
+    /// single consolidated segment, half of whose documents have been replaced — and
+    /// assert they leave BM25's collection size.
+    async fn supersede_half_of_a_consolidated_segment(index: &FullTextDatabaseIndex) {
+        // Every document is two tokens long, so its field length equals the collection
+        // average and BM25's term-frequency factor cancels to exactly 1. A score is then
+        // purely the term's inverse document frequency, and so a direct reading of the
+        // collection size the index scored against.
+        //
+        // One commit per row leaves eight single-document segments, which the merge
+        // policy's segment-count rule consolidates into one. That is the shape a
+        // long-lived index settles into, and the only shape in which a superseded
+        // document has nowhere to go but a segment it shares with live documents: alone
+        // in its own segment it is dropped outright at commit and never reaches the
+        // statistics at all.
+        for id in EXPUNGE_FIXTURE_IDS {
+            index
+                .compute_index(vec![batch(&[id], &[&format!("term{id} shared")])])
+                .await
+                .expect("failed to compute_index");
+        }
+        wait_for_segments(
+            index,
+            "the single-document segments to consolidate",
+            |segments| segments.len() == 1,
+        )
+        .await;
+        assert_eq!(
+            bm25_collection_size(index),
+            8,
+            "the eight rows should have consolidated into one eight-document segment"
+        );
+
+        // Supersede half of them: the consolidated segment is now half superseded, and is
+        // still the only segment at its size level, so nothing but the deleted-document
+        // ratio can select it for a merge.
+        index
+            .compute_index(vec![batch(
+                &[1, 2, 3, 4],
+                &[
+                    "replaced1 shared",
+                    "replaced2 shared",
+                    "replaced3 shared",
+                    "replaced4 shared",
+                ],
+            )])
+            .await
+            .expect("failed to compute_index");
+
+        wait_for_superseded_docs_expunged(index).await;
+        assert_eq!(
+            bm25_collection_size(index),
+            8,
+            "the four superseded documents must not be counted in the collection size"
+        );
+    }
+
+    fn batch(ids: &[i32], contents: &[&str]) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("content", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(arrow::array::Int32Array::from(ids.to_vec())),
+                Arc::new(arrow::array::StringArray::from(contents.to_vec())),
+            ],
+        )
+        .expect("Failed to create test batch")
     }
 
     async fn search_and_format(idx: &FullTextSearchFieldIndex, query: impl Into<String>) -> String {
@@ -752,6 +990,10 @@ mod tests {
                 ])
                 .await
                 .expect("failed to compute_index");
+
+            // The `_score` column below is a BM25 score, so it is only stable once the
+            // superseded documents have left the collection statistics.
+            wait_for_superseded_docs_expunged(&index).await;
 
             let search_index = index
                 .full_text_search_field_index("content")
@@ -858,6 +1100,10 @@ mod tests {
                 .await
                 .expect("failed to compute_index");
 
+            // See `test_updates_overwrites_on_compute_index`: BM25 scores are only
+            // stable once the superseded documents have left the collection statistics.
+            wait_for_superseded_docs_expunged(&index).await;
+
             let search_index = index
                 .full_text_search_field_index("content")
                 .expect("Failed to create FullTextSearchFieldIndex");
@@ -888,6 +1134,68 @@ mod tests {
                 search_and_format(&search_index, "piano").await
             );
         }
+    }
+
+    /// A segment big enough to sit alone at its size level still has to be rewritten once
+    /// most of its documents have been superseded. Otherwise tantivy keeps counting those
+    /// documents in BM25's collection size and the index scores every query against rows
+    /// it has already replaced.
+    ///
+    /// Regression test for #12053.
+    #[tokio::test]
+    async fn test_superseded_documents_leave_the_bm25_collection_size() {
+        let index = new_test_index();
+        supersede_half_of_a_consolidated_segment(&index).await;
+
+        // An index updated in place must score exactly as one rebuilt from the same final
+        // rows — the comparison a user makes when they check a refreshed dataset against a
+        // freshly loaded one.
+        let rebuilt = new_test_index();
+        rebuilt
+            .compute_index(vec![batch(
+                &EXPUNGE_FIXTURE_IDS,
+                &[
+                    "replaced1 shared",
+                    "replaced2 shared",
+                    "replaced3 shared",
+                    "replaced4 shared",
+                    "term5 shared",
+                    "term6 shared",
+                    "term7 shared",
+                    "term8 shared",
+                ],
+            )])
+            .await
+            .expect("failed to compute_index");
+
+        let updated_search = index
+            .full_text_search_field_index("content")
+            .expect("Failed to create FullTextSearchFieldIndex");
+        let rebuilt_search = rebuilt
+            .full_text_search_field_index("content")
+            .expect("Failed to create FullTextSearchFieldIndex");
+        assert_eq!(
+            search_and_format(&updated_search, "term8").await,
+            search_and_format(&rebuilt_search, "term8").await,
+            "an updated index must score identically to one rebuilt from the same rows"
+        );
+    }
+
+    /// `on_write_start` and `on_write_failed` both roll the writer back, and a tantivy
+    /// rollback swaps in a freshly built writer carrying the default merge policy. If the
+    /// policy is not reinstated, an index stops expunging superseded documents the moment
+    /// its first write window opens — which is every refresh.
+    #[tokio::test]
+    async fn test_merge_policy_survives_a_writer_rollback() {
+        let index = new_test_index();
+        index.on_write_start().await.expect("on_write_start failed");
+        index
+            .on_write_failed()
+            .await
+            .expect("on_write_failed failed");
+
+        // Re-run the whole expunge fixture on the rolled-back writer.
+        supersede_half_of_a_consolidated_segment(&index).await;
     }
 
     #[tokio::test]
@@ -1116,6 +1424,73 @@ mod tests {
         assert!(
             results.contains("apple banana"),
             "committed CDC documents must survive a failed write window, got:\n{results}"
+        );
+    }
+
+    /// A warm full-text tier can be registered inside a
+    /// [`CompoundSearchIndex`](crate::index::compound::CompoundSearchIndex) rather than
+    /// directly, with writes routed to it via [`SearchIndex::write`]. Once that tier is marked
+    /// CDC-attached, it must stop deferring commits regardless of whether writes reach it
+    /// directly or through the compound, or a failed write window discards the change
+    /// stream's documents for good.
+    #[tokio::test]
+    async fn test_cdc_attached_compound_primary_never_defers_commits() {
+        use crate::index::compound::{CompoundReadMode, CompoundSearchIndex};
+
+        let new_tier = || {
+            FullTextDatabaseIndex::try_new(
+                create_test_table(),
+                vec!["content".to_string()],
+                Some(vec!["id".to_string()]),
+                None,
+                &["content".to_string()],
+            )
+            .expect("Failed to create FullTextDatabaseIndex")
+        };
+
+        // Keep a handle on the warm tier: it shares the tantivy writer and reader with the
+        // clone held by the compound, so searching it observes the compound's writes.
+        let warm = new_tier();
+        let compound = CompoundSearchIndex::try_new(
+            Arc::new(warm.clone()) as Arc<dyn SearchIndex>,
+            Arc::new(new_tier()) as Arc<dyn SearchIndex>,
+            CompoundReadMode::PrimaryOnly,
+        )
+        .expect("two full-text tiers over the same table are compatible");
+
+        warm.mark_cdc_attached();
+
+        // A sink-driven refresh opens a write window on both tiers.
+        compound
+            .on_write_start()
+            .await
+            .expect("on_write_start failed");
+
+        // A change-stream document arrives while that window is open.
+        compound
+            .compute_index(vec![
+                record_batch!(("id", Int32, [1]), ("content", Utf8, ["apple banana"]))
+                    .expect("Failed to create test batch"),
+            ])
+            .await
+            .expect("compute_index failed");
+
+        // The refresh then fails, discarding whatever the window staged.
+        compound
+            .on_write_failed()
+            .await
+            .expect("on_write_failed failed");
+
+        warm.reader
+            .reload()
+            .expect("failed to reload the warm tier's reader");
+        let search_index = warm
+            .full_text_search_field_index("content")
+            .expect("Failed to create FullTextSearchFieldIndex");
+        let results = search_and_format(&search_index, "apple").await;
+        assert!(
+            results.contains("apple banana"),
+            "a change-stream document written through a compound must be committed, not staged in the failed window, got:\n{results}"
         );
     }
 }
