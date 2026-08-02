@@ -77,6 +77,7 @@ pub const SPICE_DEFAULT_SCHEMA: &str = "public";
 pub type ChatModelStore = HashMap<String, Arc<dyn Chat>>;
 
 pub static RERANK_UDTF_NAME: &str = "rerank";
+runtime_udfs_api::register_spice_function!(RERANK_SPICE_FUNCTION, RERANK_UDTF_NAME);
 
 /// Signature accepts a variadic positional input plus named arguments.
 /// Parameter names are declared so `DataFusion` v51+ named-arg syntax works.
