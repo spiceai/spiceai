@@ -27,7 +27,6 @@ use crate::config::ClusterRole;
 use crate::config::Config;
 #[cfg(not(windows))]
 use crate::dataaccelerator::cayenne::CayenneAccelerator;
-use runtime_acceleration::acceleration::RefreshMode;
 use crate::datafusion::builder::CayenneOptimizerRules;
 use crate::datafusion::udf::register_udfs;
 use crate::metrics_reader::MetricsReader;
@@ -44,6 +43,7 @@ use crate::{
     status, tracers,
 };
 use app::App;
+use runtime_acceleration::acceleration::RefreshMode;
 use runtime_metrics as metrics;
 use spicepod::component::runtime::Runtime as SpicepodRuntime;
 use spicepod::component::runtime::RuntimeReadyState as SpicepodRuntimeReadyState;
@@ -481,9 +481,8 @@ impl RuntimeBuilder {
                 .map(String::as_str),
             Some("disabled")
         );
-        let compaction_memory_fraction = (cayenne_workload.needs_compaction()
-            && dedicated_thread_pools_enabled)
-            .then(|| {
+        let compaction_memory_fraction =
+            (cayenne_workload.needs_compaction() && dedicated_thread_pools_enabled).then(|| {
                 let requested = parse_f64_runtime_param(
                     &spicepod_rt.params,
                     CAYENNE_COMPACTION_MEMORY_FRACTION_PARAM,
@@ -2030,10 +2029,12 @@ mod test {
         let configured = |datasets: Vec<Dataset>, views: Vec<View>| {
             cayenne_workload(Some(&cayenne_test_app(datasets, views))).is_configured()
         };
-        let dataset_with =
-            |engine: &str, enabled: bool| cayenne_test_dataset("ds", cayenne_test_accel(engine, enabled));
-        let view_with =
-            |engine: &str, enabled: bool| cayenne_test_view("v", cayenne_test_accel(engine, enabled));
+        let dataset_with = |engine: &str, enabled: bool| {
+            cayenne_test_dataset("ds", cayenne_test_accel(engine, enabled))
+        };
+        let view_with = |engine: &str, enabled: bool| {
+            cayenne_test_view("v", cayenne_test_accel(engine, enabled))
+        };
 
         // Regression: Cayenne declared ONLY on a view must still be seen.
         assert!(
@@ -2074,13 +2075,12 @@ mod test {
     fn cayenne_workload_separates_cdc_tier_from_compaction() {
         use spicepod::acceleration::RefreshMode;
 
-        let accel_with = |mode: RefreshMode, interval: Option<&str>| {
-            spicepod::acceleration::Acceleration {
+        let accel_with =
+            |mode: RefreshMode, interval: Option<&str>| spicepod::acceleration::Acceleration {
                 refresh_mode: Some(mode),
                 refresh_check_interval: interval.map(ToString::to_string),
                 ..cayenne_test_accel("cayenne", true)
-            }
-        };
+            };
         let workload = |accels: Vec<spicepod::acceleration::Acceleration>| {
             let datasets = accels
                 .into_iter()
@@ -2103,7 +2103,10 @@ mod test {
         );
 
         // An unset refresh_mode defaults to `full` and must classify identically.
-        assert_eq!(workload(vec![cayenne_test_accel("cayenne", true)]), full_only);
+        assert_eq!(
+            workload(vec![cayenne_test_accel("cayenne", true)]),
+            full_only
+        );
 
         // Changes mode needs both.
         let cdc = workload(vec![accel_with(RefreshMode::Changes, None)]);
@@ -2222,7 +2225,11 @@ mod test {
         )]));
         assert!(!streams(vec![with_mode("cayenne", None, true)]));
         assert!(
-            !streams(vec![with_mode("cayenne", Some(RefreshMode::Changes), false)]),
+            !streams(vec![with_mode(
+                "cayenne",
+                Some(RefreshMode::Changes),
+                false
+            )]),
             "a disabled acceleration never runs the apply loop"
         );
         assert!(!streams(vec![]));
@@ -2240,7 +2247,10 @@ mod test {
         assert!(!streams(vec![from_with_mode("postgres:public.t", None)]));
         assert!(!streams(vec![from_with_mode("sink", None)]));
         assert!(
-            !streams(vec![from_with_mode("debezium:topic", Some(RefreshMode::Full))]),
+            !streams(vec![from_with_mode(
+                "debezium:topic",
+                Some(RefreshMode::Full)
+            )]),
             "an explicit refresh_mode overrides the connector default"
         );
     }

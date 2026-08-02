@@ -782,7 +782,6 @@ impl RefreshWriteProfile {
     pub(crate) const fn uses_cdc_tier(self) -> bool {
         matches!(self, RefreshWriteProfile::SmallWrite)
     }
-
 }
 
 fn apply_refresh_mode_defaults(
