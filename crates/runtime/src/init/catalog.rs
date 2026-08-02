@@ -99,7 +99,7 @@ impl Runtime {
         let catalog = catalog.clone();
 
         let source = catalog.provider.clone();
-        let params = ConnectorParamsBuilder::new(source.clone().into(), (&catalog).into())
+        let params = ConnectorParamsBuilder::for_catalog(source.clone().into(), &catalog)
             .build(self.secrets(), self.tokio_io_runtime())
             .await
             .context(UnableToInitializeCatalogConnectorSnafu)?;

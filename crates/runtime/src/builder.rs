@@ -467,23 +467,11 @@ impl RuntimeBuilder {
         let cayenne_optimizer_rules =
             parse_cayenne_optimizer_rules(&spicepod_rt.params, cayenne_filter_propagation_enabled);
 
-        // Carve a dedicated compaction memory pool only when Cayenne acceleration
-        // is configured (and enabled) on a dataset AND dedicated thread pools are
-        // enabled. This keeps non-Cayenne deployments at full query budget and
-        // matches the dedicated compaction runtime's "create only if Cayenne is
-        // enabled" lifecycle — the carved env is the signal spiced uses to bring
-        // up the compaction worker threads.
-        let cayenne_configured = self.app.as_ref().is_some_and(|app| {
-            app.datasets.iter().any(|dataset| {
-                dataset.acceleration.as_ref().is_some_and(|accel| {
-                    accel.enabled
-                        && accel
-                            .engine
-                            .as_deref()
-                            .is_some_and(|engine| engine.eq_ignore_ascii_case("cayenne"))
-                })
-            })
-        });
+        // Carve a dedicated compaction memory pool only when Cayenne acceleration is
+        // configured (and enabled) AND dedicated thread pools are enabled. This keeps
+        // non-Cayenne deployments at full query budget and matches the dedicated
+        // compaction runtime's "create only if Cayenne is enabled" lifecycle.
+        let cayenne_configured = cayenne_configured(self.app.as_ref());
         let dedicated_thread_pools_enabled = !matches!(
             spicepod_rt
                 .params
@@ -1088,6 +1076,40 @@ fn parse_usize_runtime_param(params: &HashMap<String, String>, key: &str) -> Opt
     }
 }
 
+/// Whether `app` configures an enabled Cayenne acceleration anywhere.
+///
+/// Gates the dedicated compaction memory pool: the carved fraction is both the
+/// signal `spiced` uses to bring up the compaction worker threads and the
+/// `cayenne_active` input to the query-memory calculation, so a false negative
+/// leaves compaction competing for query memory it should have had reserved.
+///
+/// Covers both `app.datasets` and `app.views`: a view carries its own
+/// `acceleration` block and is initialized through the same `DataAccelerator::init`
+/// path as a dataset (`init::view::initialize_views_accelerators`, which resolves
+/// any engine in the registry), so a pod whose Cayenne acceleration lives only on
+/// views runs a Cayenne tier the memory budget cannot see. Catalogs are excluded
+/// deliberately: they carry `CatalogAcceleration`, a separate type.
+///
+/// This enumerates component kinds by hand because it runs *before* initialization,
+/// against the Spicepod — the pre-init counterpart of the `AccelerationSource`
+/// trait that datasets and views both implement once components exist.
+fn cayenne_configured(app: Option<&Arc<app::App>>) -> bool {
+    app.is_some_and(|app| {
+        app.datasets
+            .iter()
+            .map(|dataset| dataset.acceleration.as_ref())
+            .chain(app.views.iter().map(|view| view.acceleration.as_ref()))
+            .flatten()
+            .any(|accel| {
+                accel.enabled
+                    && accel
+                        .engine
+                        .as_deref()
+                        .is_some_and(|engine| engine.eq_ignore_ascii_case("cayenne"))
+            })
+    })
+}
+
 /// Estimate the aggregate bytes that enabled `refresh_mode: changes` Cayenne tables
 /// reserve OUTSIDE the `DataFusion` query pool: per table, the PK keyset cache +
 /// segment cache + CDC coalesce buffer + inline memtable. Each uses the explicit
@@ -1098,6 +1120,10 @@ fn parse_usize_runtime_param(params: &HashMap<String, String>, key: &str) -> Opt
 /// metastore mmap are intentionally excluded: the tier is already capped at host/5
 /// and the mmap is page-cache-backed. Returns 0 when no changes-mode Cayenne table
 /// is configured, which disables the query-pool reduction.
+///
+/// Datasets only, deliberately: this counts `refresh_mode: changes` tables, and
+/// `ViewBuilder::try_from` rejects every view refresh mode except `full`, so no view
+/// can qualify (unlike [`cayenne_configured`], which must consider views).
 fn estimate_cayenne_cdc_reservation_bytes(
     app: Option<&Arc<app::App>>,
     runtime_params: &HashMap<String, String>,
@@ -1758,6 +1784,81 @@ mod test {
         assert!(inputs.has_mixed_instance, "conflicting per-instance limits");
         // The instance's ceiling uses the max of the conflicting values.
         assert_eq!(inputs.sum_explicit_bytes, 4 * 1024 * 1024 * 1024);
+    }
+
+    /// A view carries its own `acceleration` block and reaches the same
+    /// `DataAccelerator::init` path as a dataset, so Cayenne on a view must count
+    /// toward the compaction-pool gate — otherwise a view-only Cayenne pod carves no
+    /// compaction pool and sizes its query pool as if no Cayenne tier existed.
+    #[test]
+    fn cayenne_configured_counts_views_and_datasets() {
+        use spicepod::acceleration::Acceleration;
+        use spicepod::component::dataset::Dataset;
+        use spicepod::component::view::View;
+        use std::sync::Arc;
+
+        fn accel(engine: &str, enabled: bool) -> Acceleration {
+            Acceleration {
+                enabled,
+                engine: Some(engine.to_string()),
+                ..Acceleration::default()
+            }
+        }
+
+        fn dataset_with(engine: &str, enabled: bool) -> Dataset {
+            let mut ds = Dataset::new("dummy:source", "ds");
+            ds.acceleration = Some(accel(engine, enabled));
+            ds
+        }
+
+        fn view_with(engine: &str, enabled: bool) -> View {
+            let mut view = View::new("v".to_string());
+            view.sql = Some("SELECT 1".to_string());
+            view.acceleration = Some(accel(engine, enabled));
+            view
+        }
+
+        let configured = |datasets: Vec<Dataset>, views: Vec<View>| {
+            let builder = datasets.into_iter().fold(
+                app::AppBuilder::new("cayenne-gate-test"),
+                app::AppBuilder::with_dataset,
+            );
+            let app = views
+                .into_iter()
+                .fold(builder, app::AppBuilder::with_view)
+                .build();
+            cayenne_configured(Some(&Arc::new(app)))
+        };
+
+        // Regression: Cayenne declared ONLY on a view must still be seen.
+        assert!(
+            configured(vec![], vec![view_with("cayenne", true)]),
+            "a view-only Cayenne pod must carve a compaction pool"
+        );
+
+        // Pre-existing behavior: Cayenne on a dataset is unchanged.
+        assert!(configured(vec![dataset_with("cayenne", true)], vec![]));
+
+        // Either side alone is enough; a non-Cayenne sibling doesn't mask it.
+        assert!(configured(
+            vec![dataset_with("duckdb", true)],
+            vec![view_with("cayenne", true)]
+        ));
+
+        // Engine matching stays case-insensitive on the view arm too.
+        assert!(configured(vec![], vec![view_with("Cayenne", true)]));
+
+        // A disabled Cayenne acceleration is not configured — on either kind.
+        assert!(!configured(vec![], vec![view_with("cayenne", false)]));
+        assert!(!configured(vec![dataset_with("cayenne", false)], vec![]));
+
+        // No Cayenne anywhere, and the empty / absent-app cases.
+        assert!(!configured(
+            vec![dataset_with("duckdb", true)],
+            vec![view_with("duckdb", true)]
+        ));
+        assert!(!configured(vec![], vec![]));
+        assert!(!cayenne_configured(None));
     }
 
     /// A view carrying its own `acceleration` block creates a `DuckDB` instance just

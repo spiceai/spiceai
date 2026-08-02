@@ -491,6 +491,94 @@ pub(crate) async fn create_query_executor(
     Ok(executor)
 }
 
+/// Build the per-worker executor list that realizes the requested connection
+/// topology. The returned `Vec` has one entry per concurrent query thread, so
+/// the test framework hands each worker exactly the connection it should use.
+/// An empty `Vec` means the default shared mode, where callers fall back to the
+/// single [`create_query_executor`] executor.
+///
+/// Three topologies are expressible:
+/// * shared — every thread multiplexes one connection.
+/// * `per-client` — one dedicated connection per thread.
+/// * a fleet (`--clients`/`--connections-per-client`/`--queries-per-client`) —
+///   `clients * connections_per_client` connections total, with each client's
+///   threads confined to that client's own pool, the way an application
+///   server's pool is private to its process.
+///
+/// Connections are established lazily on each worker's first query, so building
+/// a large number up-front is cheap.
+pub(crate) async fn create_client_executors(
+    args: &DatasetTestArgs,
+    spiced_instance: &test_framework::spiced::SpicedInstance,
+    concurrency: usize,
+) -> anyhow::Result<Vec<Box<dyn test_framework::execution::QueryExecutor>>> {
+    use crate::args::ClientConnectionsArg;
+
+    args.validate_fleet()?;
+
+    if let Some(fleet) = args.fleet() {
+        // Open every connection first, then map threads onto them. Cloning an
+        // executor shares its connection; distinct entries are distinct
+        // connections.
+        let mut connections = Vec::with_capacity(fleet.total_connections());
+        for _ in 0..fleet.total_connections() {
+            connections.push(create_query_executor(args, spiced_instance).await?);
+        }
+        let mut per_worker = Vec::with_capacity(fleet.total_queries());
+        for worker in 0..fleet.total_queries() {
+            per_worker.push(connections[fleet.connection_for_worker(worker)].clone());
+        }
+        return Ok(per_worker);
+    }
+
+    match args.client_connections {
+        ClientConnectionsArg::Shared => Ok(Vec::new()),
+        ClientConnectionsArg::PerClient => {
+            let mut executors = Vec::with_capacity(concurrency);
+            for _ in 0..concurrency {
+                executors.push(create_query_executor(args, spiced_instance).await?);
+            }
+            Ok(executors)
+        }
+    }
+}
+
+/// Print the connection topology a test is about to drive, so the log records
+/// what was actually exercised rather than just a thread count.
+pub(crate) fn announce_connection_topology(args: &DatasetTestArgs, concurrency: usize) {
+    if let Some(fleet) = args.fleet() {
+        println!(
+            "Client fleet: {} clients x {} connections each = {} connections; \
+             {} query threads each = {} concurrent queries",
+            fleet.clients,
+            fleet.connections_per_client,
+            fleet.total_connections(),
+            fleet.queries_per_client,
+            fleet.total_queries(),
+        );
+        return;
+    }
+    if args.client_connections == crate::args::ClientConnectionsArg::PerClient {
+        println!("Using a dedicated connection per client ({concurrency} clients)");
+    }
+}
+
+/// Reject connection-topology flags on commands whose clients all share one
+/// connection, rather than silently ignoring them.
+pub(crate) fn ensure_shared_client_connections(
+    args: &DatasetTestArgs,
+    command: &str,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        args.client_connections == crate::args::ClientConnectionsArg::Shared
+            && args.fleet().is_none(),
+        "'{command}' does not support connection-topology flags \
+         (--client-connections per-client, or --clients/--connections-per-client/\
+         --queries-per-client); they apply to 'run throughput' and 'run load'"
+    );
+    Ok(())
+}
+
 pub(crate) fn duration_millis_between(end: Instant, start: Instant) -> anyhow::Result<u64> {
     let duration = end
         .checked_duration_since(start)

@@ -23,6 +23,8 @@ limitations under the License.
 use test_framework::anyhow::{self, Context};
 use test_framework::opentelemetry::KeyValue;
 
+use crate::stats::percentile;
+
 /// Slack (bytes) below which authoritative per-slot retained WAL counts as "drained"
 /// — ~1 WAL segment of padding, since `confirmed_flush_lsn` trails the WAL head by up
 /// to a segment even when fully caught up.
@@ -573,19 +575,6 @@ fn compaction_duration_percentiles_per_table_kind(
         );
     }
     out
-}
-
-/// Nearest-rank percentile `q` (0.0–1.0) of a sorted, non-empty slice.
-#[expect(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
-)]
-fn percentile(sorted: &[f64], q: f64) -> f64 {
-    let idx = (((sorted.len() as f64) * q).ceil() as usize)
-        .saturating_sub(1)
-        .min(sorted.len() - 1);
-    sorted[idx]
 }
 
 /// Clamps a non-negative float metric value to `u64` for gauge recording.

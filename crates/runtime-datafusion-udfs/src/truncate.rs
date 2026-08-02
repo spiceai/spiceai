@@ -63,6 +63,7 @@ impl From<TruncateError> for DataFusionError {
     }
 }
 pub static TRUNCATE_SCALAR_UDF_NAME: &str = "truncate";
+runtime_udfs_api::register_spice_function!(TRUNCATE_SPICE_FUNCTION, TRUNCATE_SCALAR_UDF_NAME);
 
 #[derive(Debug, Hash, Eq, PartialEq)]
 pub struct Truncate {

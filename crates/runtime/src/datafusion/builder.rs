@@ -61,17 +61,12 @@ use datafusion::{
         object_store::ObjectStoreRegistry,
         runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
     },
-    optimizer::{
-        AnalyzerRule,
-        analyzer::{
-            resolve_grouping_function::ResolveGroupingFunction, type_coercion::TypeCoercion,
-        },
-    },
+    optimizer::AnalyzerRule,
     prelude::{SessionConfig, SessionContext},
 };
 use datafusion::{config::SpillCompression, physical_planner::ExtensionPlanner};
 
-use datafusion_federation::{FederatedPlanner, sql::federation_analyzer_rule};
+use datafusion_federation::FederatedPlanner;
 use runtime_datafusion::analyzer_rule::{PartitionedTableScanRewrite, TablePartitionProvider};
 
 #[cfg(feature = "duckdb")]
@@ -110,43 +105,10 @@ use runtime_metrics::telemetry::track_bytes_processed;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use spicepod::component::runtime::SpillCompression as SpiceSpillCompression;
 use spicepod::metric::Metrics;
-use std::sync::LazyLock;
 use tokio::{
     runtime::Handle,
     sync::{RwLock as TokioRwLock, Semaphore},
 };
-
-pub static DEFAULT_DATAFUSION_CONFIG: LazyLock<RwLock<SessionConfig>> = LazyLock::new(|| {
-    let mut df_config = SessionConfig::new();
-
-    // Prevents DataFusion from lowercasing identifiers, i.e. "SELECT MyColumn FROM my_table" would be "SELECT mycolumn FROM mytable" without this.
-    // This improves the UX for data sources where column names are case-sensitive, since they no longer need to be quoted.
-    df_config
-        .options_mut()
-        .sql_parser
-        .enable_ident_normalization = false;
-
-    df_config.options_mut().optimizer.expand_views_at_output = true;
-    df_config.options_mut().sql_parser.dialect = datafusion::common::config::Dialect::PostgreSQL;
-    df_config
-        .options_mut()
-        .execution
-        .listing_table_ignore_subdirectory = false;
-
-    // There are some unidentified bugs in DataFusion that cause schema checks to fail for aggregate functions.
-    // Spice is affected by this - skip the check until all bugs are fixed.
-    // Tracking issue: https://github.com/apache/datafusion/issues/12733
-    df_config
-        .options_mut()
-        .execution
-        .skip_physical_aggregate_schema_check = true;
-
-    // Enabling parquet filter pushdown can improve query performance by applying filters while decoding
-    // https://docs.rs/datafusion/latest/datafusion/config/struct.ParquetOptions.html#structfield.pushdown_filters
-    df_config.options_mut().execution.parquet.pushdown_filters = true;
-
-    RwLock::new(df_config)
-});
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CayenneOptimizerRules {
@@ -415,12 +377,11 @@ pub struct DataFusionBuilder {
     partition_load_tracker: Option<Arc<runtime_cluster::PartitionLoadTracker>>,
 }
 
-pub(crate) fn get_df_default_config() -> SessionConfig {
-    match DEFAULT_DATAFUSION_CONFIG.read() {
-        Ok(config) => config.clone(),
-        _ => panic!("Failed to read default DataFusion config. This is a bug."),
-    }
-}
+// The default session config and the analyzer-rule list are plain `DataFusion`
+// construction with no runtime coupling, so they live in `runtime-datafusion`.
+// Re-exported here because `runtime::datafusion::builder::…` is a public path.
+pub use runtime_datafusion::analyzer_rule::AnalyzerRulesBuilder;
+pub use runtime_datafusion::session_config::{DEFAULT_DATAFUSION_CONFIG, get_df_default_config};
 
 impl DataFusionBuilder {
     /// Creates a new `DataFusionBuilder` with the runtime defaults.
@@ -1467,60 +1428,6 @@ fn has_cayenne_accelerator_metadata(provider: &dyn TableProvider) -> bool {
         .is_some_and(|accelerator| accelerator == "cayenne")
 }
 
-pub struct AnalyzerRulesBuilder {
-    include_federation: bool,
-    extra_rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>,
-}
-
-impl AnalyzerRulesBuilder {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    #[must_use]
-    pub fn include_federation(mut self, include: bool) -> Self {
-        self.include_federation = include;
-        self
-    }
-
-    #[must_use]
-    pub fn with_extra_rules(
-        mut self,
-        extra_rules: impl IntoIterator<Item = Arc<dyn AnalyzerRule + Send + Sync>>,
-    ) -> Self {
-        self.extra_rules.extend(extra_rules);
-        self
-    }
-
-    /// Spice customizes the order of the analyzer rules, since some of them are only relevant when `DataFusion` is executing the query,
-    /// as opposed to when underlying federated query engines will execute the query.
-    ///
-    /// This list should be kept in sync with the default rules in `Analyzer::new()`, but with the federation analyzer rule added first.
-    #[must_use]
-    pub fn build(self) -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
-        let mut rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>> = vec![];
-        if self.include_federation {
-            rules.push(Arc::new(federation_analyzer_rule()));
-        }
-        // The rest of these rules are run after the federation analyzer since they only affect internal DataFusion execution.
-        rules.extend([
-            Arc::new(ResolveGroupingFunction::new()) as Arc<dyn AnalyzerRule + Send + Sync>,
-            Arc::new(TypeCoercion::new()) as Arc<dyn AnalyzerRule + Send + Sync>,
-        ]);
-        rules.into_iter().chain(self.extra_rules).collect()
-    }
-}
-
-impl Default for AnalyzerRulesBuilder {
-    fn default() -> Self {
-        Self {
-            include_federation: true,
-            extra_rules: vec![],
-        }
-    }
-}
-
 /// Default fraction of host/container RAM for the query memory pool (before the
 /// compaction carve) when the operator sets no explicit `runtime.query.memory_limit`.
 const DEFAULT_QUERY_MEMORY_PERCENT: u64 = 90;
@@ -1552,7 +1459,21 @@ pub(crate) fn effective_query_memory_limit(
     cdc_reservation_bytes: u64,
     duckdb_query_pool_cap: Option<u64>,
 ) -> u64 {
-    memory_limit.unwrap_or_else(|| {
+    if let Some(limit) = memory_limit {
+        // An explicit limit bypasses the reservation-aware derivation below, and
+        // with it the only log line that states the projected off-pool cache
+        // reservation. Emit the projection here too: operators lowering
+        // memory_limit to curb resident memory need to see that the caches do
+        // not shrink with it - they are sized from total memory, not the pool.
+        if cayenne_active && cdc_reservation_bytes > 0 {
+            tracing::info!(
+                memory_limit = limit,
+                cdc_reservation_bytes,
+                "Explicit query memory limit set; the projected per-table Cayenne CDC cache reservation is OFF-pool and unaffected by this limit"
+            );
+        }
+        limit
+    } else {
         let total_memory = crate::resource_monitor::get_total_memory();
         let default_limit = if cayenne_active {
             // Cayenne CDC active. Base is CAYENNE_QUERY_MEMORY_PERCENT of host, leaving
@@ -1573,6 +1494,22 @@ pub(crate) fn effective_query_memory_limit(
             let floor = total_memory.saturating_mul(CAYENNE_QUERY_MEMORY_FLOOR_PERCENT) / 100;
             let default_limit = base.saturating_sub(reservation_excess).max(floor);
 
+            // The floor binding is the unfittable-configuration signal: the
+            // reservation clawback is capped at (base - floor) percent of host,
+            // and when the projected per-table reservation exceeds that, the
+            // startup commitment (pools + tier + off-pool caches) exceeds host
+            // RAM before a single row arrives. A 121.7 GiB host was OOM-killed
+            // at SF-1000 with exactly this signature, and the only trace was
+            // this line at debug level.
+            if default_limit == floor && reservation_excess > 0 {
+                tracing::warn!(
+                    cayenne_active,
+                    cdc_reservation_bytes,
+                    reservation_excess,
+                    "Cayenne CDC cache reservation exceeds what the query pool can yield: the pool is floored at {}% of memory and the projected caches do not fit beside it. Expect resident memory above the coordinated budgets; reduce per-table cache parameters or add memory. See the budget arithmetic in this log at startup.",
+                    CAYENNE_QUERY_MEMORY_FLOOR_PERCENT
+                );
+            }
             tracing::debug!(
                 cayenne_active,
                 cdc_reservation_bytes,
@@ -1612,7 +1549,7 @@ pub(crate) fn effective_query_memory_limit(
             }
             None => default_limit,
         }
-    })
+    }
 }
 
 /// 1/N of host RAM bounding the aggregate off-pool Cayenne in-memory CDC tier (the

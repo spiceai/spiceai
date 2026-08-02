@@ -47,7 +47,7 @@ limitations under the License.
 //! 7. `renewal` — a short-lived leaf triggers the renewal loop: a fresh
 //!    keypair + CSR + PoP signature against `/renew`, and the rotated
 //!    identity is persisted.
-//! 8. `forget` — the server sends `Forget`, the client clears
+//! 8. `remove` — the server sends `Remove`, the client clears
 //!    `identity.json` and the cloud-connect task exits while the
 //!    (simulated) runtime stays up.
 //!
@@ -59,9 +59,6 @@ limitations under the License.
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::doc_markdown,
-    clippy::struct_field_names,
-    clippy::items_after_statements,
-    clippy::too_many_lines,
     reason = "integration-test harness — readability over lint strictness"
 )]
 
@@ -80,7 +77,7 @@ use rcgen::{
     ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, PublicKeyData as _, SanType,
 };
 use runtime_cloud_connect::config::CloudConnectConfig;
-use runtime_cloud_connect::handlers::RuntimeHandle;
+use runtime_cloud_connect::handlers::{Capability, CommandError, RuntimeHandle};
 use runtime_cloud_connect::identity::IdentityStore;
 use runtime_cloud_connect::proto;
 use runtime_cloud_connect::proto::cloud_connect_server::{CloudConnect, CloudConnectServer};
@@ -251,16 +248,19 @@ async fn mock_enroll(
         return error_json(StatusCode::BAD_REQUEST, "Malformed CSR");
     };
     *mock.pinned_point.lock().await = Some(point);
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "instance_id": ASSIGNED_ID,
-            "identity_cert_pem": leaf_pem,
-            "ca_bundle_pem": mock.ca.ca_cert_pem,
-            "gateway_addr": mock.gateway_addr,
-            "not_after": mock.not_after(),
-        })),
-    )
+    let mut response = serde_json::json!({
+        "instance_id": ASSIGNED_ID,
+        "identity_cert_pem": leaf_pem,
+        "ca_bundle_pem": mock.ca.ca_cert_pem,
+        "gateway_addr": mock.gateway_addr,
+        "not_after": mock.not_after(),
+    });
+    // Attach-at-connect: the real cloud validates and attaches; the mock
+    // echoes the requested app back, matching the response contract.
+    if let Some(app_name) = body["app_name"].as_str() {
+        response["app_name"] = serde_json::Value::String(app_name.to_string());
+    }
+    (StatusCode::OK, Json(response))
 }
 
 async fn mock_renew(
@@ -376,8 +376,14 @@ impl GatewayServer {
     }
 }
 
-fn ctrl(body: proto::control_message::Body) -> proto::ControlMessage {
-    proto::ControlMessage { body: Some(body) }
+/// A command the client must answer with a `CommandResult` correlated by
+/// `command_id`. The id lives on the envelope, not on the command.
+fn ctrl_id(command_id: &str, body: proto::control_message::Body) -> proto::ControlMessage {
+    proto::ControlMessage {
+        command_id: command_id.to_string(),
+        target: None,
+        body: Some(body),
+    }
 }
 
 #[async_trait]
@@ -460,15 +466,19 @@ impl CloudConnect for GatewayServer {
                         captured.lock().await.telemetry.push(t);
                     }
                     Some(proto::client_message::Body::Event(event)) => {
-                        if event.kind == "audit" {
+                        if event.event_type == "audit" {
                             captured.lock().await.audits.push(event);
                         }
                     }
-                    // A standalone runtime announces no per-connection
-                    // encryption key, so this never arrives. The arm is spelled
-                    // out rather than wildcarded so a new client message still
-                    // has to be accounted for here.
-                    Some(proto::client_message::Body::SecretsKey(_)) => {}
+                    // Neither of these is emitted yet: a standalone runtime
+                    // announces no per-connection encryption key, and nothing
+                    // pushes OTLP metrics. The arms are spelled out rather than
+                    // wildcarded so a new client message still has to be
+                    // accounted for here.
+                    Some(
+                        proto::client_message::Body::SecretsKey(_)
+                        | proto::client_message::Body::ExportMetrics(_),
+                    ) => {}
                     None => break,
                 }
             }
@@ -537,6 +547,10 @@ impl E2eRuntime {
 
 #[async_trait]
 impl RuntimeHandle for E2eRuntime {
+    fn supports(&self, capability: Capability) -> bool {
+        capability == Capability::ApplySpicepod
+    }
+
     async fn active_datasets(&self) -> u32 {
         2
     }
@@ -548,16 +562,16 @@ impl RuntimeHandle for E2eRuntime {
         &self,
         config_dir: &Path,
         spicepod_yaml: &str,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, CommandError> {
         // Persist to the canonical path and report a hot apply, mirroring the
         // spiced adapter's observable result envelope.
         let path = config_dir.join(runtime_cloud_connect::config::CLOUD_MANAGED_SPICEPOD_FILE);
         tokio::fs::create_dir_all(config_dir)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| CommandError::failed(e.to_string()))?;
         tokio::fs::write(&path, spicepod_yaml)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| CommandError::failed(e.to_string()))?;
         self.state.lock().await.applied_spicepod = Some((path.clone(), spicepod_yaml.to_string()));
         Ok(serde_json::json!({
             "path": path.display().to_string(),
@@ -623,6 +637,8 @@ impl Harness {
             config_dir,
             adoption_code,
             pending_adopt_code_path: None,
+            adopt_app_name: None,
+            adopt_create_app: false,
             runtime_version: "v0.0.0-e2e".to_string(),
             // Sub-second cadences keep the suite fast while still exercising
             // the periodic frame paths.
@@ -754,6 +770,13 @@ async fn enrollment_issues_identity_and_streams_over_mtls() {
             .contains("CERTIFICATE REQUEST"),
         "enroll must carry a PKCS#10 CSR"
     );
+    assert!(
+        body["enc_pubkey_pem"]
+            .as_str()
+            .unwrap()
+            .contains("BEGIN PUBLIC KEY"),
+        "enroll must carry the X25519 encryption public key (SPKI PEM)"
+    );
     assert_eq!(body["instance"]["fingerprint"].as_str().unwrap().len(), 64);
     assert_eq!(body["instance"]["runtime_version"], "v0.0.0-e2e");
 
@@ -764,26 +787,263 @@ async fn enrollment_issues_identity_and_streams_over_mtls() {
     assert!(identity.private_key_pem.contains("PRIVATE KEY"));
     assert!(identity.ca_bundle_pem.contains("BEGIN CERTIFICATE"));
     assert_eq!(identity.gateway_addr, harness.cloud.gateway_addr);
-    assert!(identity.not_after_unix > 0, "leaf expiry must be recorded");
+    assert!(
+        identity.not_after_unix.is_some_and(|secs| secs > 0),
+        "leaf expiry must be recorded"
+    );
+    assert!(
+        identity.enc_private_key_pem.contains("PRIVATE KEY")
+            && identity.enc_public_key_pem.contains("PUBLIC KEY"),
+        "the X25519 encryption keypair must be persisted with the identity"
+    );
     // That the signed leaf genuinely chains to the CA is proved
     // operationally: the gateway REQUIRES client certs chaining to it, so
     // the observed mTLS Hello (in `enroll`) implies a valid chain.
 
-    // The stream Hello names the instance with an empty credential and no
-    // CSR — enrollment moved out-of-band.
+    // The stream Hello names the instance and carries no credential of its
+    // own — enrollment moved out-of-band, and mTLS is the authN.
     let captured = Arc::clone(&harness.gateway.captured);
     let ok = with_captured!(captured, c => {
         c.hellos.iter().any(|(h, mtls)| {
             h.identifier == ASSIGNED_ID
                 && *mtls
-                && h.credential.is_empty()
-                && h.csr_pem.is_empty()
-                && h.kind == proto::InstanceKind::Standalone as i32
+                && h.instance_kind == proto::InstanceKind::Standalone as i32
+                && h.protocol_version == runtime_cloud_connect::PROTOCOL_VERSION
+                && h.capabilities == vec!["apply_spicepod".to_string()]
         })
     });
-    assert!(ok, "mTLS Hello must carry identifier + empty credential");
+    assert!(
+        ok,
+        "mTLS Hello must name the instance and announce its protocol version + capabilities"
+    );
 
     handle.shutdown().await;
+}
+
+/// The `spice connect` enroll-and-exit contract: a one-shot `enroll_now`
+/// issues and persists the identity with no client running (no gateway
+/// connection), discards the staged pending-code file, and a later
+/// `CloudConnect::start` with **no adoption code** connects using the
+/// persisted identity — enroll and run as two separate steps.
+#[tokio::test]
+async fn one_shot_enroll_then_separate_run_connects_with_stored_identity() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+
+    // Stage the code the way `spice connect` does.
+    let pending_path = dir.path().join("pending-adopt-code");
+    std::fs::write(&pending_path, ADOPTION_CODE).unwrap();
+
+    let mut config = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        Some(ADOPTION_CODE.to_string()),
+        Duration::from_hours(12),
+    );
+    config.pending_adopt_code_path = Some(pending_path.clone());
+
+    // Phase 1: one-shot enroll — no client task, no stream.
+    let outcome = runtime_cloud_connect::enroll::enroll_now(&config)
+        .await
+        .expect("one-shot enroll succeeds");
+    assert_eq!(outcome.identity.identifier, ASSIGNED_ID);
+    assert_eq!(outcome.app_name, None, "no attachment was requested");
+    assert!(
+        config.identity_path.exists(),
+        "identity must be persisted by the one-shot enroll"
+    );
+    assert!(
+        !pending_path.exists(),
+        "the staged code must be discarded once consumed"
+    );
+    let captured_after_enroll = Arc::clone(&harness.gateway.captured);
+    let hellos = with_captured!(captured_after_enroll, c => c.hellos.len());
+    assert_eq!(hellos, 0, "one-shot enroll must not connect to the gateway");
+
+    // Phase 2: a separate start with NO adoption code connects with the
+    // stored identity.
+    let run_config = harness.config(
+        config.identity_path.clone(),
+        dir.path().to_path_buf(),
+        None,
+        Duration::from_hours(12),
+    );
+    let (runtime, _rt_state) = E2eRuntime::new();
+    let handle = runtime_cloud_connect::CloudConnect::start(run_config, runtime)
+        .await
+        .expect("start")
+        .expect("enabled with stored identity");
+    let captured = Arc::clone(&harness.gateway.captured);
+    let connected = wait_until_async(Duration::from_secs(10), || {
+        let captured = Arc::clone(&captured);
+        async move {
+            captured
+                .lock()
+                .await
+                .hellos
+                .iter()
+                .any(|(h, mtls)| h.identifier == ASSIGNED_ID && *mtls)
+        }
+    })
+    .await;
+    assert!(
+        connected,
+        "the runtime must connect with the persisted identity"
+    );
+    assert_eq!(
+        harness.cloud.enroll_requests.lock().await.len(),
+        1,
+        "the run phase must reuse the identity, not enroll again"
+    );
+    handle.shutdown().await;
+}
+
+/// An authoritative cloud rejection of a one-shot enroll burns the staged
+/// code file (a dead code must not be re-presented by a later `spiced`
+/// start) and persists no identity.
+#[tokio::test]
+async fn one_shot_enroll_discards_staged_code_on_rejection() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+    let pending_path = dir.path().join("pending-adopt-code");
+    std::fs::write(&pending_path, "SPICE-ADOPT-DEADD-BEEFF").unwrap();
+
+    let mut config = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        // Not registered with the cloud mock — rejected as unknown/consumed.
+        Some("SPICE-ADOPT-DEADD-BEEFF".to_string()),
+        Duration::from_hours(12),
+    );
+    config.pending_adopt_code_path = Some(pending_path.clone());
+
+    let err = runtime_cloud_connect::enroll::enroll_now(&config)
+        .await
+        .expect_err("an unknown code must be rejected");
+    assert!(
+        err.is_authoritative_rejection(),
+        "a 4xx cloud rejection is authoritative: {err}"
+    );
+    assert!(
+        !pending_path.exists(),
+        "a dead code must not stay staged for retry"
+    );
+    assert!(
+        !config.identity_path.exists(),
+        "no identity may be persisted on a rejected enroll"
+    );
+}
+
+/// Attach-at-connect: `adopt_app_name`/`adopt_create_app` ride the enroll
+/// request (`app_name`/`create_app` on the wire, omitted when unset) and
+/// the response's attached app comes back in the outcome.
+#[tokio::test]
+async fn one_shot_enroll_carries_app_attachment() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+
+    let mut config = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        Some(ADOPTION_CODE.to_string()),
+        Duration::from_hours(12),
+    );
+    config.adopt_app_name = Some("e2e-app".to_string());
+    config.adopt_create_app = true;
+
+    let outcome = runtime_cloud_connect::enroll::enroll_now(&config)
+        .await
+        .expect("enroll with attachment succeeds");
+    assert_eq!(outcome.app_name.as_deref(), Some("e2e-app"));
+
+    let requests = harness.cloud.enroll_requests.lock().await.clone();
+    assert_eq!(requests.len(), 1, "exactly one enroll request");
+    assert_eq!(requests[0]["app_name"], "e2e-app");
+    assert_eq!(requests[0]["create_app"], true);
+}
+
+/// `create_app` is meaningless without an app to name, so it must never
+/// reach the wire alone — an invalid enroll request. Reachable by setting
+/// `SPICE_CONNECT_ADOPT_CREATE` with no `SPICE_CONNECT_ADOPT_APP_NAME`
+/// (the `--create` flag pair is guarded by clap, the env pair is not).
+#[tokio::test]
+async fn one_shot_enroll_omits_create_app_without_app_name() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+
+    let mut config = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        Some(ADOPTION_CODE.to_string()),
+        Duration::from_hours(12),
+    );
+    config.adopt_app_name = None;
+    config.adopt_create_app = true;
+
+    let outcome = runtime_cloud_connect::enroll::enroll_now(&config)
+        .await
+        .expect("enroll succeeds unattached");
+    assert_eq!(outcome.app_name, None, "nothing was attached");
+
+    let requests = harness.cloud.enroll_requests.lock().await.clone();
+    assert_eq!(requests.len(), 1, "exactly one enroll request");
+    assert!(
+        requests[0].get("app_name").is_none(),
+        "no app name was configured"
+    );
+    assert!(
+        requests[0].get("create_app").is_none(),
+        "create_app must not ride without app_name"
+    );
+}
+
+/// A persistence failure lands *after* the cloud consumed the code to issue
+/// the identity, so the staged copy is spent: it must be discarded, not left
+/// for `status` to report as redeemable and a later `spiced` start to
+/// re-present for a 401.
+#[tokio::test]
+async fn one_shot_enroll_discards_staged_code_when_identity_cannot_persist() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+    let pending_path = dir.path().join("pending-adopt-code");
+    std::fs::write(&pending_path, ADOPTION_CODE).unwrap();
+
+    // The identity's parent is a regular file, so the directory for it
+    // cannot be created and the issued identity cannot be written.
+    let blocker = dir.path().join("blocker");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+
+    let mut config = harness.config(
+        blocker.join("identity.json"),
+        dir.path().to_path_buf(),
+        Some(ADOPTION_CODE.to_string()),
+        Duration::from_hours(12),
+    );
+    config.pending_adopt_code_path = Some(pending_path.clone());
+
+    let err = runtime_cloud_connect::enroll::enroll_now(&config)
+        .await
+        .expect_err("an unwritable identity path must fail the enroll");
+    assert!(
+        matches!(
+            err,
+            runtime_cloud_connect::enroll::EnrollNowError::Persist { .. }
+        ),
+        "expected a persistence failure, got: {err}"
+    );
+    assert!(
+        !err.is_authoritative_rejection(),
+        "a local persistence failure is not a cloud rejection"
+    );
+    assert!(
+        !pending_path.exists(),
+        "the code was consumed to issue the identity, so it must not stay staged"
+    );
+    assert_eq!(
+        harness.cloud.enroll_requests.lock().await.len(),
+        1,
+        "the code was presented exactly once"
+    );
 }
 
 #[tokio::test]
@@ -885,9 +1145,10 @@ async fn identity_is_reused_across_restart_over_mtls() {
         async move {
             let c = captured.lock().await;
             c.hellos.len() > hellos_before
-                && c.hellos.iter().skip(hellos_before).any(|(h, mtls)| {
-                    h.identifier == ASSIGNED_ID && *mtls && h.credential.is_empty()
-                })
+                && c.hellos
+                    .iter()
+                    .skip(hellos_before)
+                    .any(|(h, mtls)| h.identifier == ASSIGNED_ID && *mtls)
         }
     })
     .await;
@@ -932,21 +1193,28 @@ async fn heartbeat_and_telemetry_cadence() {
 
     // The frames carry the enrolled identifier and the runtime counters.
     let (hb_ok, tel_ok) = with_captured!(captured, c => {
-        let hb_ok = c
-            .heartbeats
-            .iter()
-            .any(|h| h.identifier == ASSIGNED_ID && h.active_datasets == 2 && h.status == "online");
+        let hb_ok = c.heartbeats.iter().any(|h| {
+            h.identifier == ASSIGNED_ID
+                && h.active_datasets == 2
+                && h.active_models == 1
+                // This handle cannot report status, so it must leave the phase
+                // unspecified rather than inventing an "online".
+                && h.phase == proto::RuntimePhase::Unspecified as i32
+        });
         let tel_ok = c.telemetry.iter().any(|t| {
             t.identifier == ASSIGNED_ID
-                && t.metrics.contains_key("datasets_active")
-                && t.window_end_unix >= t.window_start_unix
+                // The dataset/model counters ride on the Heartbeat and only
+                // there; the telemetry map is for everything else.
+                && !t.metrics.contains_key("datasets_active")
+                && !t.metrics.contains_key("models_active")
+                && t.window_end.map(|ts| ts.seconds) >= t.window_start.map(|ts| ts.seconds)
         });
         (hb_ok, tel_ok)
     });
     assert!(hb_ok, "a heartbeat must carry the identifier + counters");
     assert!(
         tel_ok,
-        "a telemetry frame must carry billing-shaped metrics"
+        "a telemetry frame must carry a well-ordered window and no heartbeat counters"
     );
 
     handle.shutdown().await;
@@ -966,9 +1234,9 @@ async fn apply_spicepod_hot_applies_and_persists() {
     let (handle, _identity) = enroll(&harness, &config, runtime).await;
 
     let yaml = "version: v2\nkind: Spicepod\nname: e2e-cloud-managed\n";
-    harness.gateway.outbound.lock().await.push_back(ctrl(
+    harness.gateway.outbound.lock().await.push_back(ctrl_id(
+        "cmd-apply",
         proto::control_message::Body::ApplySpicepod(proto::ApplySpicepod {
-            command_id: "cmd-apply".to_string(),
             spicepod_yaml: yaml.to_string(),
         }),
     ));
@@ -994,8 +1262,19 @@ async fn apply_spicepod_hot_applies_and_persists() {
         .find(|r| r.command_id == "cmd-apply")
         .cloned())
     .expect("apply result");
-    assert!(result.success, "apply must succeed: {}", result.error);
-    let meta: Value = serde_json::from_str(&result.payload_json).unwrap();
+    assert_eq!(
+        result.code,
+        proto::ResultCode::Ok as i32,
+        "apply must succeed: {}",
+        result.message
+    );
+    let Some(proto::command_result::Payload::Json(json)) = result.payload else {
+        panic!(
+            "ApplySpicepod must answer with a JSON payload, got {:?}",
+            result.payload
+        );
+    };
+    let meta: Value = serde_json::from_str(&json).expect("parse ApplySpicepod JSON payload");
     assert_eq!(meta["applied"], true);
     assert_eq!(meta["reload"], "hot");
 
@@ -1054,9 +1333,7 @@ async fn reconnects_over_mtls_after_disconnect() {
             c.stream_count >= 2
                 && c.hellos
                     .iter()
-                    .filter(|(h, mtls)| {
-                        h.identifier == ASSIGNED_ID && *mtls && h.credential.is_empty()
-                    })
+                    .filter(|(h, mtls)| h.identifier == ASSIGNED_ID && *mtls)
                     .count()
                     >= 2
         }
@@ -1136,6 +1413,14 @@ async fn renewal_rotates_keypair_and_persists() {
         !renew_body["pop_sig"].as_str().unwrap().is_empty(),
         "renew carries the current-key proof-of-possession"
     );
+    // The cloud schema requires enc_pubkey_pem; without it renew returns 400.
+    let enc_pubkey = renew_body["enc_pubkey_pem"]
+        .as_str()
+        .expect("renew must carry enc_pubkey_pem — the cloud Zod schema requires it");
+    assert!(
+        enc_pubkey.contains("PUBLIC KEY"),
+        "renew carries an X25519 SPKI public key, got: {enc_pubkey}"
+    );
 
     // The rotated identity is persisted: new keypair, new leaf, later
     // expiry; identifier / CA bundle / gateway address unchanged.
@@ -1173,11 +1458,36 @@ async fn renewal_rotates_keypair_and_persists() {
         "the CA bundle is preserved across renewal"
     );
 
+    // The encryption keypair rotates alongside the identity keypair on renewal:
+    // verify it changed and that private/public keys correspond.
+    assert_ne!(
+        renewed_identity.enc_public_key_pem, enrolled_identity.enc_public_key_pem,
+        "the encryption public key must rotate on renewal"
+    );
+    // The public key sent in the renew request is the same one persisted:
+    // sending a stale public key while persisting a new private key would
+    // break future secret delivery.
+    assert_eq!(
+        enc_pubkey, renewed_identity.enc_public_key_pem,
+        "the persisted encryption public key must match what was sent to the cloud"
+    );
+    // Round-trip: the persisted private key must derive the same public key
+    // that was sent to the cloud in the renew request.
+    let loaded_keypair = cloud_connect_crypto::EncryptionKeypair::from_pkcs8_pem(
+        &renewed_identity.enc_private_key_pem,
+    )
+    .expect("persisted encryption private key must load");
+    assert_eq!(
+        loaded_keypair.public_key_spki_pem(),
+        renewed_identity.enc_public_key_pem,
+        "persisted private key must derive the persisted public key"
+    );
+
     handle.shutdown().await;
 }
 
 #[tokio::test]
-async fn forget_clears_identity_and_exits() {
+async fn remove_clears_identity_and_exits() {
     let harness = Harness::new(24 * 60 * 60).await;
     let dir = tempfile::tempdir().unwrap();
     let identity_path = dir.path().join("identity.json");
@@ -1191,20 +1501,16 @@ async fn forget_clears_identity_and_exits() {
     let (handle, _identity) = enroll(&harness, &config, runtime).await;
     assert!(identity_path.exists(), "identity present after enrollment");
 
-    // Server issues Forget.
-    harness
-        .gateway
-        .outbound
-        .lock()
-        .await
-        .push_back(ctrl(proto::control_message::Body::Forget(proto::Forget {
-            command_id: "cmd-forget".to_string(),
-        })));
+    // Server issues Remove.
+    harness.gateway.outbound.lock().await.push_back(ctrl_id(
+        "cmd-remove",
+        proto::control_message::Body::Remove(proto::Remove {}),
+    ));
 
     // The client clears identity.json and the cloud-connect task exits; spiced
     // itself (here, the runtime handle) is untouched.
     let cleared = wait_until(Duration::from_secs(5), || !identity_path.exists()).await;
-    assert!(cleared, "Forget must remove identity.json");
+    assert!(cleared, "Remove must clear identity.json");
 
     let captured = Arc::clone(&harness.gateway.captured);
     let acked = wait_until_async(Duration::from_secs(5), || {
@@ -1215,12 +1521,12 @@ async fn forget_clears_identity_and_exits() {
                 .await
                 .results
                 .iter()
-                .any(|r| r.command_id == "cmd-forget" && r.success)
+                .any(|r| r.command_id == "cmd-remove" && r.code == proto::ResultCode::Ok as i32)
         }
     })
     .await;
-    assert!(acked, "server must see a successful Forget result");
+    assert!(acked, "server must see a successful Remove result");
 
-    // shutdown() returns promptly because the task already exited on Forget.
+    // shutdown() returns promptly because the task already exited on Remove.
     handle.shutdown().await;
 }

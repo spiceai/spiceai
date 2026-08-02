@@ -186,10 +186,17 @@ const PARAMETERS: &[ParameterSpec] = &[
         .default("auto"),
     ParameterSpec::component("replication_temporary_slot")
         .description(
-            "If true, create a temporary replication slot that is dropped when the \
-             Spice process disconnects. Default: false (durable slot).",
+            "Ignored. The replication slot is always durable. Remove this parameter.",
         )
-        .default("false"),
+        .deprecated(
+            "`pg_replication_temporary_slot` is ignored and the replication slot is always \
+             durable. A temporary slot belongs to the Postgres session that creates it, and the \
+             slot is created on the short-lived setup connection, so Postgres dropped it before \
+             START_REPLICATION could attach and the stream could never start. Remove the \
+             parameter; to stop an unused slot retaining WAL on the source, drop it with \
+             `SELECT pg_drop_replication_slot('<slot_name>')`. See: \
+             https://spiceai.org/docs/components/data-connectors/postgres",
+        ),
     ParameterSpec::component("replication_status_interval")
         .description(
             "How often to send StandbyStatusUpdate to Postgres (e.g. '10s'). \

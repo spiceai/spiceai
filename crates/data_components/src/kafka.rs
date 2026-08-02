@@ -163,7 +163,7 @@ impl KafkaOffset {
 ///
 /// This type is shared between the Kafka data connector and the `spice_sys` persistence
 /// layer so that neither needs to depend on the other.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct KafkaMetadata {
     pub consumer_group_id: String,
     pub topic: String,

@@ -46,6 +46,7 @@ limitations under the License.
 const TABLE_SRC: &str = include_str!("../src/provider/table.rs");
 const DELETE_VECTOR_IO_SRC: &str = include_str!("../src/provider/delete/vector_io.rs");
 const STREAMING_SRC: &str = include_str!("../src/provider/streaming.rs");
+const STAGED_UPSERT_SRC: &str = include_str!("../src/provider/staged_upsert.rs");
 
 /// Extract the body of a named `async fn`/`fn` from a Rust source file.
 ///
@@ -1135,5 +1136,37 @@ fn checkpoint_inlined_pressure_has_cached_fast_path() {
          INLINE_FLUSH_MAX_ROWS) for the fast path to be a load-bearing \
          invariant. A bare numeric literal decouples the fast path from \
          the threshold definitions and risks silent drift."
+    );
+}
+
+/// The fused (multi-table transaction) commit takes a directory barrier on the
+/// staged snapshot, matching the one the non-transactional publish takes.
+///
+/// The non-transactional path fsyncs the snapshot directory in
+/// `record_written_snapshot_sequence`, immediately before the catalog write that
+/// makes it visible. `prepare_commit` never reaches that helper — its
+/// snapshot-sequence row is applied inside the caller's shared transaction — so
+/// the barrier has to be taken in `prepare_commit` itself, or a power loss can
+/// leave the catalog referencing a snapshot whose directory entries were never
+/// flushed (spiceai/spiceai#12208).
+///
+/// Structural for the same reason as the checks above: an fsync is not
+/// observable from a test without stubbing the filesystem.
+#[test]
+fn prepare_commit_syncs_the_staged_snapshot_directory() {
+    let body = extract_fn_body(STAGED_UPSERT_SRC, "prepare_commit")
+        .expect("prepare_commit function not found in staged_upsert.rs");
+
+    // Pinned on the named helper, not on an inlined `sync_snapshot_dir` + its
+    // `s3://` guard: the helper owns the "no barrier on an object store" decision
+    // for every publish path, so asserting the call keeps this check from
+    // penalizing that factoring.
+    assert!(
+        body.contains("sync_local_snapshot_dir("),
+        "prepare_commit must call `sync_local_snapshot_dir` to fsync the staged \
+         snapshot directory before the shared transaction publishes it — the \
+         durability step the non-transactional path takes via \
+         `record_written_snapshot_sequence`. Without it the catalog can \
+         reference a snapshot whose directory entries were never flushed."
     );
 }
