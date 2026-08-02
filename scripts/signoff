@@ -830,7 +830,9 @@ run_checks() {
 # third argument to force the re-run past that short-circuit.
 refresh_attestation_check() {
   local sha="$1" repo="$2" force="${3:-}"
-  local fallback="Open/refresh the PR and it will re-read the sign-off status."
+  # pr.yml runs on `pull_request`/`merge_group`/`workflow_dispatch`, so viewing
+  # the PR page does not start one — say what actually re-reads the status.
+  local fallback="Re-run the PR's 'Attestation' check from the Checks tab once it has reported — reloading the PR page does not re-read the sign-off status."
   local run run_id run_status run_conclusion
 
   if ! command -v gh >/dev/null 2>&1; then
