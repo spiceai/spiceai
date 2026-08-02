@@ -19,8 +19,8 @@ limitations under the License.
 //!
 //! | Spice side | Standalone oracle |
 //! |------------|-------------------|
-//! | DuckDB accelerator (`DataAccelerator`) | `duckdb` crate |
-//! | SQLite accelerator (`DataAccelerator`) | `rusqlite` crate |
+//! | `DuckDB` accelerator (`DataAccelerator`) | `duckdb` crate |
+//! | `SQLite` accelerator (`DataAccelerator`) | `rusqlite` crate |
 //!
 //! Cayenne vs standalone oracles live under `crates/cayenne/tests/result_correctness_*`.
 //! Standalone DuckDB↔SQLite agreement (no Spice) lives under
@@ -32,6 +32,9 @@ limitations under the License.
 #![allow(clippy::cast_possible_wrap)]
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::cast_sign_loss)]
+// SQLite INTEGER widened into a Float64 column when the inferred column kind is
+// real; fixture values are far inside f64's exact-integer range.
+#![allow(clippy::cast_precision_loss)]
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -172,9 +175,9 @@ async fn insert_batch(table: &Arc<dyn TableProvider>, batch: RecordBatch) {
     collect(plan, ctx.task_ctx()).await.expect("insert collect");
 }
 
-/// Run SQL against Spice-accelerated tables via DataFusion.
+/// Run SQL against Spice-accelerated tables via `DataFusion`.
 ///
-/// Bare `SessionContext` + accelerator `TableProvider` hits a DataFusion
+/// Bare `SessionContext` + accelerator `TableProvider` hits a `DataFusion`
 /// physical/logical schema mismatch on some aggregate shapes (`COUNT(*)`).
 /// We therefore materialize each accelerator table through its **scan** path
 /// into an in-memory table (still the accelerator's storage + scan plan), then
@@ -199,8 +202,7 @@ async fn spice_query(
         // types vs the create-time logical schema).
         let schema = batches
             .first()
-            .map(RecordBatch::schema)
-            .unwrap_or_else(|| table.schema());
+            .map_or_else(|| table.schema(), RecordBatch::schema);
         let mem = MemTable::try_new(schema, vec![batches])
             .map_err(|e| format!("memtable {name}: {e}"))?;
         ctx.register_table(name.as_str(), Arc::new(mem))
@@ -333,8 +335,7 @@ mod sqlite_accel {
         let names: Vec<String> = (0..col_count)
             .map(|i| {
                 stmt.column_name(i)
-                    .map(ToOwned::to_owned)
-                    .unwrap_or_else(|_| format!("col_{i}"))
+                    .map_or_else(|_| format!("col_{i}"), ToOwned::to_owned)
             })
             .collect();
 
@@ -388,11 +389,13 @@ mod sqlite_accel {
                         match &row[col_i] {
                             Some(rusqlite::types::Value::Text(t)) => b.append_value(t),
                             Some(rusqlite::types::Value::Integer(i)) => {
-                                b.append_value(i.to_string())
+                                b.append_value(i.to_string());
                             }
                             Some(rusqlite::types::Value::Real(f)) => b.append_value(f.to_string()),
-                            Some(rusqlite::types::Value::Null) | None => b.append_null(),
-                            Some(rusqlite::types::Value::Blob(_)) => b.append_null(),
+                            Some(
+                                rusqlite::types::Value::Null | rusqlite::types::Value::Blob(_),
+                            )
+                            | None => b.append_null(),
                         }
                     }
                     columns.push(Arc::new(b.finish()));
@@ -403,7 +406,6 @@ mod sqlite_accel {
                         match &row[col_i] {
                             Some(rusqlite::types::Value::Real(f)) => b.append_value(*f),
                             Some(rusqlite::types::Value::Integer(i)) => b.append_value(*i as f64),
-                            Some(rusqlite::types::Value::Null) | None => b.append_null(),
                             _ => b.append_null(),
                         }
                     }
@@ -414,7 +416,6 @@ mod sqlite_accel {
                     for row in &rows_data {
                         match &row[col_i] {
                             Some(rusqlite::types::Value::Integer(i)) => b.append_value(*i),
-                            Some(rusqlite::types::Value::Null) | None => b.append_null(),
                             _ => b.append_null(),
                         }
                     }

@@ -246,8 +246,7 @@ impl CayenneHarness {
             .read_parquet(path_str.as_str(), ParquetReadOptions::default())
             .await
             .expect("read parquet for schema");
-        let schema = df.schema().as_arrow().clone();
-        let schema = Arc::new(Schema::from(schema));
+        let schema = Arc::new(df.schema().as_arrow().clone());
 
         let table_path = self
             .data_path
