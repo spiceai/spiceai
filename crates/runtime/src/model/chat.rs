@@ -16,6 +16,8 @@ limitations under the License.
 #![allow(clippy::implicit_hasher)]
 #[cfg(feature = "bedrock")]
 use llms::bedrock::chat::{BedrockConverse, guardrail::GuardRail};
+#[cfg(feature = "models")]
+use llms::chat::PagedAttentionMode;
 use llms::{
     HealthCheck,
     anthropic::Anthropic,
@@ -734,28 +736,27 @@ fn parse_context_length(params: &Parameters) -> Result<Option<usize>, LlmError> 
     }
 }
 
-/// Parse the boolean `paged_attention` model parameter. Defaults to `true`,
-/// preserving the engine's auto behavior (paged attention is enabled on
-/// CUDA/unix when the model supports it). Set `false` to force it off — needed
-/// for architectures that implement dense (Eager) attention only and reject a
-/// `PagedAttention` config at load (e.g. the `glm-dsa` GGUF).
+/// Parse the `paged_attention` model parameter. Defaults to `auto`: `PagedAttention`
+/// wherever the build and the model support it, dense attention where they do not —
+/// which covers the Multi-head Latent Attention GGUFs (GLM-4.x/5.x, DeepSeek-V4) whose
+/// loaders reject a `PagedAttention` config outright. `disabled` forces dense attention
+/// for any model.
 #[cfg(feature = "models")]
-fn parse_paged_attention(params: &Parameters) -> Result<bool, LlmError> {
+fn parse_paged_attention(params: &Parameters) -> Result<PagedAttentionMode, LlmError> {
     let Some(raw) = params.get("paged_attention").expose().ok() else {
-        return Ok(true);
+        return Ok(PagedAttentionMode::default());
     };
-    // Kept in step with the `paged_attention` ParameterSpec, which is `one_of` true/false:
-    // anything else is rejected by `Parameters::try_new` before reaching this parser, so
-    // accepting more here would only produce an error message advertising values the spec
-    // turns away.
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "true" | "" => Ok(true),
-        "false" => Ok(false),
-        other => Err(LlmError::InvalidParamValueError {
+    // Kept in step with the `paged_attention` ParameterSpec: anything outside its
+    // `one_of` is rejected by `Parameters::try_new` before reaching this parser, so
+    // accepting more here would only advertise values the spec turns away.
+    raw.parse::<PagedAttentionMode>()
+        .map_err(|other| LlmError::InvalidParamValueError {
             param: "paged_attention".to_string(),
-            message: format!("Must be 'true' or 'false', got '{other}'"),
-        }),
-    }
+            message: format!(
+                "Must be one of {}, got '{other}'",
+                PagedAttentionMode::VALUES.join(", ")
+            ),
+        })
 }
 
 /// Parse the boolean `trust_pickle` model parameter. Defaults to `false`
@@ -868,44 +869,50 @@ mod test {
 
     #[test]
     #[cfg(feature = "models")]
-    fn paged_attention_defaults_to_enabled() {
-        assert!(
+    fn paged_attention_defaults_to_auto() {
+        assert_eq!(
             parse_paged_attention(&file_parameters("paged_attention", None))
-                .expect("absent paged_attention is valid")
+                .expect("absent paged_attention is valid"),
+            PagedAttentionMode::Auto
         );
     }
 
     #[test]
     #[cfg(feature = "models")]
-    fn paged_attention_parses_booleans_ignoring_case() {
-        for on in ["true", "TRUE", "True", ""] {
-            assert!(
-                parse_paged_attention(&file_parameters("paged_attention", Some(on)))
-                    .unwrap_or_else(|e| panic!("{on:?} should parse: {e}")),
-                "{on:?} should enable paged attention"
-            );
-        }
-        for off in ["false", "FALSE", "False"] {
-            assert!(
-                !parse_paged_attention(&file_parameters("paged_attention", Some(off)))
-                    .unwrap_or_else(|e| panic!("{off:?} should parse: {e}")),
-                "{off:?} should disable paged attention"
+    fn paged_attention_parses_its_modes_ignoring_case() {
+        for (raw, expected) in [
+            ("auto", PagedAttentionMode::Auto),
+            ("AUTO", PagedAttentionMode::Auto),
+            // A key left blank is unset, not a typo.
+            ("", PagedAttentionMode::Auto),
+            ("disabled", PagedAttentionMode::Disabled),
+            ("Disabled", PagedAttentionMode::Disabled),
+        ] {
+            assert_eq!(
+                parse_paged_attention(&file_parameters("paged_attention", Some(raw)))
+                    .unwrap_or_else(|e| panic!("{raw:?} should parse: {e}")),
+                expected,
+                "{raw:?}"
             );
         }
     }
 
     #[test]
     #[cfg(feature = "models")]
-    fn paged_attention_rejects_non_booleans() {
-        // The ParameterSpec is `one_of` true/false, so the parser deliberately accepts no
-        // wider vocabulary than the spec admits.
-        for bad in ["yes", "no", "1", "0", "maybe"] {
+    fn paged_attention_rejects_values_outside_the_spec() {
+        // Booleans included: a Spicepod that spells this `true`/`false` has to fail loudly
+        // rather than have one of them quietly read as a mode.
+        for bad in ["true", "false", "1", "0", "eager", "maybe"] {
             let err = parse_paged_attention(&file_parameters("paged_attention", Some(bad)))
-                .expect_err("non-boolean paged_attention should be invalid");
+                .expect_err("a value outside the spec should be invalid");
             assert!(
                 matches!(err, LlmError::InvalidParamValueError { ref param, .. } if param == "paged_attention"),
                 "unexpected error for {bad:?}: {err}"
             );
+            // The message has to name the accepted values.
+            let message = err.to_string();
+            assert!(message.contains("auto"), "{message}");
+            assert!(message.contains("disabled"), "{message}");
         }
     }
 

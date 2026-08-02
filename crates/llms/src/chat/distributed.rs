@@ -40,8 +40,8 @@ struct RingConfigFile {
 /// Currently only mistral.rs's pure-TCP `ring` all-reduce.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DistributedBackend {
-    /// mistral.rs ring all-reduce over plain TCP. No system dependency; the
-    /// all-reduce is correct at `world_size` = 2 (the two-node case).
+    /// mistral.rs ring all-reduce over plain TCP. No system dependency. The reduction
+    /// rotates the ring once per peer, so it is correct at any world size >= 2.
     Ring,
 }
 
@@ -70,8 +70,11 @@ impl DistributedConfig {
     /// Validate the topology. On failure, returns the offending param name
     /// (`"nodes"` or `"node_rank"`) alongside a human-readable message, so the
     /// caller can attribute the error to the field the user actually set wrong.
-    /// mistral.rs additionally requires the world size to divide the model's
-    /// attention/kv head counts; that is enforced when the model loads.
+    ///
+    /// Any world size of 2 or more is accepted. mistral.rs shards attention heads and
+    /// routed experts across the ranks, balanced to within one each, so the counts need
+    /// not divide evenly — but a rank cannot end up with none of either, which the model
+    /// checks against its own head/expert counts when it loads.
     pub fn validate(&self) -> std::result::Result<(), (&'static str, String)> {
         let world_size = self.world_size();
         if world_size < 2 {
@@ -80,26 +83,12 @@ impl DistributedConfig {
                 format!("distributed inference needs at least 2 nodes; `nodes` lists {world_size}"),
             ));
         }
-        if !world_size.is_power_of_two() {
-            return Err((
-                "nodes",
-                format!("world size (number of `nodes`) must be a power of 2; got {world_size}"),
-            ));
-        }
         if self.node_rank >= world_size {
             return Err((
                 "node_rank",
                 format!(
                     "`node_rank` {} is out of range for world size {world_size} (valid: 0..{world_size})",
                     self.node_rank
-                ),
-            ));
-        }
-        if self.backend == DistributedBackend::Ring && world_size != 2 {
-            return Err((
-                "nodes",
-                format!(
-                    "the `ring` backend currently supports exactly 2 nodes (world_size = 2); got {world_size}. Use 2 nodes (or the future `nccl` backend for larger worlds)."
                 ),
             ));
         }
@@ -232,8 +221,16 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_non_power_of_two_world_size() {
-        assert!(ring_cfg(0, 3).validate().is_err());
+    fn validate_accepts_world_sizes_that_are_not_powers_of_two() {
+        // Three nodes is the case the power-of-two rule used to turn away, and the one
+        // that lets a model too large for two nodes be pooled over a third.
+        for world_size in [3usize, 5, 6, 7] {
+            for rank in 0..world_size {
+                ring_cfg(rank, world_size)
+                    .validate()
+                    .unwrap_or_else(|e| panic!("world size {world_size} rank {rank}: {e:?}"));
+            }
+        }
     }
 
     #[test]
@@ -243,11 +240,10 @@ mod tests {
             .expect_err("rank 2 is out of range for world size 2");
         // The error must be attributed to `node_rank`, not `nodes`.
         assert_eq!(err.0, "node_rank");
-    }
 
-    #[test]
-    fn validate_rejects_ring_world_size_other_than_two() {
-        // 4 is a power of two and the rank is in range, but `ring` only supports 2.
-        assert!(ring_cfg(0, 4).validate().is_err());
+        let err = ring_cfg(3, 3)
+            .validate()
+            .expect_err("rank 3 is out of range for world size 3");
+        assert_eq!(err.0, "node_rank");
     }
 }

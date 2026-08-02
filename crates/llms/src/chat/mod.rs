@@ -68,6 +68,13 @@ use mistralrs::MessageContent;
 #[cfg(feature = "local_llm")]
 pub mod distributed;
 
+// Likewise the attention-implementation knob: it only reaches the local mistral.rs
+// loader.
+#[cfg(feature = "local_llm")]
+pub mod paged_attention;
+#[cfg(feature = "local_llm")]
+pub use crate::chat::paged_attention::PagedAttentionMode;
+
 static WEIGHTS_EXTENSIONS: [&str; 7] = [
     ".safetensors",
     ".pth",
@@ -778,7 +785,7 @@ pub async fn create_local_model(
     chat_template_literal: Option<&str>,
     distributed: Option<DistributedConfig>,
     context_length: Option<usize>,
-    paged_attention: bool,
+    paged_attention: PagedAttentionMode,
 ) -> Result<Arc<dyn Chat>> {
     // Configure multi-node distributed (ring) inference before loading: the
     // loader reads `RING_CONFIG` from the environment while building the
