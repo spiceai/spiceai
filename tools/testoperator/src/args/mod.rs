@@ -116,6 +116,17 @@ pub struct CommonArgs {
     #[arg(long)]
     pub(crate) disable_progress_bars: bool,
 
+    /// Address testoperator serves its own `/health` and `/v1/ready` on, so a
+    /// harness watching the run can tell "seeding the source" from "applying
+    /// load" from "wedged" (see `src/probe.rs`). `off` (or an empty value)
+    /// disables them. Loopback by default: they are unauthenticated, and the
+    /// harness that reads them runs on this host.
+    ///
+    /// Served by `run htap` — the command long-lived enough to be worth
+    /// watching, and the only one whose phases are reported today.
+    #[arg(long, env = "TESTOPERATOR_HEALTH_LISTEN", default_value = crate::probe::DEFAULT_LISTEN)]
+    pub(crate) health_listen: String,
+
     /// An optional data directory, to symlink into the spiced instance
     #[arg(short, long)]
     pub(crate) data_dir: Option<PathBuf>,

@@ -46,6 +46,7 @@ use crate::{
     args::{HtapArgs, SourceType},
     commands::bench::prepare_chbench_source,
     health::HealthMonitor,
+    probe::{self, Phase},
     spiced_metrics::MetricsScraper,
 };
 
@@ -94,6 +95,10 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
         .terminals
         .unwrap_or_else(|| ((scale_factor * 10.0) as usize).min(DEFAULT_TERMINALS_CAP));
     let duration = Duration::from_secs(test_args.common.duration);
+    // Seeding an SF1000 source runs for the better part of an hour and prints
+    // little; without this, `/v1/ready` could not tell it apart from a run stuck
+    // on the source connection.
+    probe::set_phase(Phase::PreparingSource);
     let driver: Arc<dyn chbench_driver::ChBenchDriver> = prepare_chbench_source(
         scale_factor,
         terminals,
@@ -108,10 +113,12 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     // template database) for fast reuse across subsequent runs.
     if args.prepare_only {
         println!("--prepare-only: source prepared, exiting without running the workload");
+        probe::set_phase(Phase::Finished);
         return Ok(());
     }
 
     // 2. Start spiced.
+    probe::set_phase(Phase::WaitingForSpiced);
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
     let ready_wait_start = Instant::now();
 
@@ -234,6 +241,10 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     );
 
     // 4. Run analytical queries through spiced concurrently with the OLTP load.
+    // Load is being applied from here on, so this is where the run becomes
+    // ready: a window that starts earlier would include the seed, and one that
+    // started at the first query would miss the OLTP writes under it.
+    probe::set_phase(Phase::Running);
     println!("Running HTAP analytical queries under OLTP load");
 
     let executor = super::create_query_executor(test_args, &spiced_instance).await?;
@@ -286,7 +297,10 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
         None => Vec::new(),
     };
 
-    // 6. Stop OLTP and collect results.
+    // 6. Stop OLTP and collect results. No load is applied past this point, so
+    //    the run stops reporting itself ready while the gates and reporting
+    //    below (which can take minutes) still run.
+    probe::set_phase(Phase::Finalizing);
     oltp_stop.cancel();
     let oltp_result = oltp_handle.await;
     let staleness_result = staleness_handle.await;
@@ -603,6 +617,10 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     }
 
     spiced_instance.stop()?;
+    // Everything measurable is done; what follows only assembles the verdict.
+    // Set here rather than beside the final `Ok(())` so a run that exits with a
+    // gate failure reports the same phase as one that passes.
+    probe::set_phase(Phase::Finished);
 
     let health_report = health_report?;
 

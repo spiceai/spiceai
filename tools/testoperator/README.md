@@ -6,6 +6,22 @@
 
 While a test is executing, `testoperator` continuously probes the `/health` and `/v1/ready` endpoints on the running `spiced` instance. Responses that fail or take longer than 5 ms are recorded and surfaced after the test run; any such issues will cause the test to fail with a summary that includes the number of failures and the worst latency observed.
 
+## Liveness endpoints (`testoperator run htap`)
+
+An HTAP run seeds the source, waits for `spiced`, drives load for hours, then runs its gates — and from outside the process every one of those phases looks like the same quiet `testoperator`. So the run serves, about itself, the two endpoints it probes on `spiced`. They bind `127.0.0.1:8099` by default (`--health-listen <ADDR>`, `TESTOPERATOR_HEALTH_LISTEN`; `off` disables them):
+
+- `GET /health` — liveness: `200 ok` while the process is up. Answered on the same Tokio runtime that drives the workload, so its *latency* also says whether that runtime is still scheduling promptly.
+- `GET /v1/ready` — readiness, meaning **the measured workload is running**: `200` only while load is being applied, `503` naming the current phase otherwise.
+
+Both bodies are one line of `key=value` tokens, so a shell probe can read them without a JSON parser:
+
+```shell
+$ curl -s localhost:8099/v1/ready
+not_ready phase=preparing_source phase_s=412
+```
+
+Phases are `starting`, `preparing_source`, `waiting_for_spiced`, `running` (the only ready one), `finalizing` and `finished`. Failing to bind is a warning, never a failed run.
+
 ## Common Options
 
 - `-p, --spicepod-path <SPICEPOD_PATH>`: Path to the `spicepod.yaml` file.
@@ -13,6 +29,7 @@ While a test is executing, `testoperator` continuously probes the `/health` and 
 - `-d, --data-dir <DATA_DIR>`: An optional data directory to symlink into the `spiced` instance.
 - `--ready-wait <WAIT TIME>`: How long to wait before spiced is ready.
 - `--disable-progress-bars`: Disable progress bars during the test.
+- `--health-listen <ADDR>`: Where testoperator serves its own `/health` and `/v1/ready` (default `127.0.0.1:8099`, `off` to disable). See [Liveness endpoints](#liveness-endpoints-testoperator-run-htap).
 - `--otlp-endpoint <URL>` / `--otlp-header KEY=VALUE`: Export metrics to an OTLP collector over the standard OTLP protocol instead of the default Arrow exporter. Repeat `--otlp-header` to add multiple headers (e.g., auth tokens).
 
 ## Use cases
