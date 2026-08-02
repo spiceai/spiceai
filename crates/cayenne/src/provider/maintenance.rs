@@ -167,6 +167,11 @@ pub(crate) struct PostWriteMaintenanceState {
     /// (`inserted - superseded - deleted`). Accumulated alongside `stats` and
     /// applied as a [`RowCountUpdate::Delta`] when the stats are persisted.
     pub(crate) live_rows_delta: i64,
+    /// Set when a write wants the metastore WAL drained but has no other
+    /// maintenance to contribute. Every pass ends in a WAL checkpoint, so this
+    /// only has to keep the pass from being skipped as empty. Coalesces with the
+    /// rest of the debounce window: a burst of writes drains the WAL once.
+    pub(crate) wal_checkpoint_requested: bool,
 }
 
 impl PostWriteMaintenanceState {
@@ -175,6 +180,7 @@ impl PostWriteMaintenanceState {
             && !self.refresh_listing
             && !self.retention_requested
             && self.live_rows_delta == 0
+            && !self.wal_checkpoint_requested
     }
 }
 
