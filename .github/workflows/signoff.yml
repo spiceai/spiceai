@@ -309,6 +309,39 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           SIGNOFF_SKIP_TARGETED_LINT: "${{ inputs.skip_targeted_lint && '1' || '' }}"
 
+      # A cancelled job is killed by signal, so `run_checks` in scripts/signoff returns
+      # non-zero under its `set +e`, falls into the failure branch, and posts
+      # `signoff=failure` — "Sign-off checks failed after Ns" — about a branch nothing
+      # actually judged. Since #12362 Attestation rejects a failed sign-off on the head
+      # commit, so that status turns the PR red claiming a code failure that never
+      # happened, and `cancel-in-progress` above makes it routine: every re-dispatch for
+      # a branch cancels the one before it (99 cancelled runs in the last 7 days).
+      #
+      # Overwrite it with the truth. `pending` rather than `error` on purpose: pr.yml
+      # rejects `failure` and `error` but treats `pending` as "not signed off yet", which
+      # is exactly the state a cancelled run leaves behind — so Attestation stays red (it
+      # must; HEAD really is not signed off) and points at the documented remedy of
+      # re-running sign-off instead of at a phantom defect in the diff. See #12424.
+      - name: Correct the sign-off status when this run is cancelled
+        if: cancelled()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+
+          # The commit the cancelled run had checked out, which is what scripts/signoff
+          # posted against. Best-effort throughout: this runs while the job is being
+          # torn down, and failing here must not mask the cancellation itself.
+          sha="$(git rev-parse HEAD 2>/dev/null)" || exit 0
+          [ -n "${sha}" ] || exit 0
+
+          gh api --method POST "repos/${{ github.repository }}/statuses/${sha}" \
+            -f state=pending \
+            -f context=signoff \
+            -f "description=Remote sign-off was cancelled (superseded or stopped) — no checks failed. HEAD is not signed off; re-dispatch." \
+            >/dev/null 2>&1 || true
+          echo "Reset the signoff status on ${sha} to pending — this run was cancelled, not failed."
+
       - name: Show sccache stats
         if: env.SCCACHE_SETUP == 'true'
         run: sccache --show-stats
