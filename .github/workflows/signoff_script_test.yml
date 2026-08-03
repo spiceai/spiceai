@@ -13,14 +13,14 @@ on:
       - release/*
     paths:
       - 'scripts/signoff'
-      - 'scripts/test_signoff_clear_pending.sh'
+      - 'scripts/test_signoff_status.sh'
       - '.github/workflows/signoff_script_test.yml'
   push:
     branches:
       - trunk
     paths:
       - 'scripts/signoff'
-      - 'scripts/test_signoff_clear_pending.sh'
+      - 'scripts/test_signoff_status.sh'
       - '.github/workflows/signoff_script_test.yml'
   workflow_dispatch:
 
@@ -29,8 +29,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test-clear-pending:
-    name: Unit tests for signoff clear-pending
+  test-commit-status:
+    name: Unit tests for signoff commit statuses
     # GitHub-hosted on purpose: a sub-second test must not queue behind the
     # saturated self-hosted pool this workflow exists to keep honest.
     runs-on: ubuntu-24.04
@@ -44,4 +44,4 @@ jobs:
           persist-credentials: false
 
       - name: Run tests
-        run: bash scripts/test_signoff_clear_pending.sh
+        run: bash scripts/test_signoff_status.sh
