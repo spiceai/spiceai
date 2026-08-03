@@ -224,6 +224,7 @@ candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "6e
 charset = "0.1.5"
 chrono = "0.4.44"
 clap = { version = "4.5.60", features = ["derive", "env"] }
+crash-handler = "0.8"
 clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0.2.2", features = [
     "tokio_io",
     "tls",
