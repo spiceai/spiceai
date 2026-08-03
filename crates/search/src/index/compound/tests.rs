@@ -1047,11 +1047,18 @@ mod warm_memory {
         MemoryVectorIndex::try_new(
             "message.body".to_string(),
             vec![Field::new("id", DataType::Int64, false)],
-            MetadataColumns::from(vec![MetadataColumn::NonFilterable(Arc::new(Field::new(
-                "_spice.search_field",
-                DataType::Utf8,
-                false,
-            )))]),
+            MetadataColumns::from(vec![
+                MetadataColumn::NonFilterable(Arc::new(Field::new(
+                    "_spice.search_field",
+                    DataType::Utf8,
+                    false,
+                ))),
+                MetadataColumn::NonFilterable(Arc::new(Field::new(
+                    "CapitalCase",
+                    DataType::Utf8,
+                    false,
+                ))),
+            ]),
             Arc::new(ByteEmbed),
             embed_udf(),
             "model_name".to_string(),
@@ -1065,6 +1072,7 @@ mod warm_memory {
             Field::new("id", DataType::Int64, false),
             Field::new("message.body", DataType::Utf8, false),
             Field::new("_spice.search_field", DataType::Utf8, false),
+            Field::new("CapitalCase", DataType::Utf8, false),
         ]));
         #[expect(clippy::cast_possible_wrap, reason = "small test row counts")]
         let ids: Vec<i64> = (0..rows as i64).collect();
@@ -1074,6 +1082,7 @@ mod warm_memory {
                 Arc::new(Int64Array::from(ids)),
                 Arc::new(StringArray::from(vec!["text"; rows])),
                 Arc::new(StringArray::from(vec!["message.body"; rows])),
+                Arc::new(StringArray::from(vec!["capital"; rows])),
             ],
         )
         .expect("valid dotted-column input batch")
@@ -1230,18 +1239,18 @@ mod warm_memory {
         let chunk_metadata_plan = LogicalPlanBuilder::new_from_arc(
             index.query_table_provider("q").expect("query plan builds"),
         )
-        .project(vec![ident("_spice.search_field")])
-        .expect("chunk metadata projection builds")
+        .project(vec![ident("_spice.search_field"), ident("CapitalCase")])
+        .expect("metadata projection builds")
         .build()
-        .expect("chunk metadata plan builds");
+        .expect("metadata plan builds");
         let context = SessionContext::new();
         let batches = context
             .execute_logical_plan(chunk_metadata_plan)
             .await
-            .expect("chunk metadata query executes")
+            .expect("metadata query executes")
             .collect()
             .await
-            .expect("chunk metadata query collects");
+            .expect("metadata query collects");
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 2);
     }
