@@ -1593,7 +1593,7 @@ params:
                 assert_eq!(cfg.region.as_deref(), Some("eu-west-2"));
                 assert_eq!(
                     cfg.endpoint_url,
-                    Some(url::Url::parse("https://localhost:4566").expect("valid endpoint URL"))
+                    Some(url::Url::parse("https://localhost:4566/").expect("valid endpoint URL"))
                 );
             }
             _ => panic!("expected AwsSecretsManager variant"),
@@ -1705,7 +1705,7 @@ params:
                 assert_eq!(cfg.region.as_deref(), Some("ap-south-1"));
                 assert_eq!(
                     cfg.endpoint_url,
-                    Some(url::Url::parse("https://localhost:4566").expect("valid endpoint URL"))
+                    Some(url::Url::parse("https://localhost:4566/").expect("valid endpoint URL"))
                 );
             }
             _ => panic!("expected AwsSecretsManager variant"),
