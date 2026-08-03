@@ -373,6 +373,13 @@ pub struct Args {
     #[arg(long, action = ArgAction::Append, value_parser = parse_set_string)]
     pub set_runtime: Vec<(String, String)>,
 
+    /// How many CPUs the runtime should behave as though it has, as a
+    /// Kubernetes CPU quantity (`4`, `3.5`, `3500m`). `auto` (the default)
+    /// detects it from the cgroup CPU quota, the pod's `requests.cpu`, or the
+    /// host. Takes precedence over `SPICE_CPU_CORES` and `runtime.cpu.cores`.
+    #[arg(long, value_name = "CORES")]
+    pub cpu_cores: Option<String>,
+
     #[arg(skip)]
     pub open_telemetry_deprecated: bool,
 }
@@ -420,7 +427,47 @@ fn spawn_sighup_reload_task(control: std::sync::Arc<runtime::tls::TlsControl>) {
     }
 }
 
-pub async fn run(args: Args) -> Result<()> {
+/// The parsed spicepod, plus the load error tolerated in pods-watcher mode.
+///
+/// [`build_app`] runs before the runtime's thread pools are built so
+/// `runtime.cpu.cores` can size them; its result is threaded into [`run`]
+/// rather than re-derived, so the spicepod is loaded exactly once.
+pub type AppBundle = (Option<Arc<App>>, Option<app::Error>);
+
+/// Resolve the CPU entitlement from all three configuration surfaces plus host
+/// detection, log it, and install it as the process-wide budget.
+///
+/// Must run before any thread pool, `DataFusion` session, or accelerator is
+/// created: [`cpu_budget::cpu_budget`] lazily detects into the same cell, so a
+/// read beforehand pins the detected value.
+///
+/// # Errors
+///
+/// Fails when the configured value is not a positive CPU quantity or `auto`.
+/// An already-installed budget is a WARN, not an error — the detected value is
+/// the pre-existing behaviour, and refusing to start over it would be worse
+/// than sizing as trunk did.
+pub fn install_cpu_budget(args: &Args, app: Option<&App>) -> Result<(), cpu_budget::Error> {
+    let spicepod_cores = app
+        .and_then(|app| app.runtime.cpu.as_ref())
+        .and_then(|cpu| cpu.cores.as_ref())
+        .map(ToString::to_string);
+    let env_cores = cpu_budget::CpuConfig::env_cores();
+    let config = cpu_budget::CpuConfig::from_sources(
+        args.cpu_cores.as_deref(),
+        env_cores.as_deref(),
+        spicepod_cores.as_deref(),
+    );
+
+    let budget = cpu_budget::CpuBudget::resolve(&config, &cpu_budget::HostReadings::detect())?;
+    in_tracing_context(|| budget.log_summary());
+    if let Err(err) = budget.install() {
+        in_tracing_context(|| tracing::warn!("{err}"));
+    }
+    Ok(())
+}
+
+pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     // Register external data connectors before runtime initialization.
     // This makes connectors from extracted crates available to the runtime.
     register_external_connectors().await;
@@ -432,7 +479,7 @@ pub async fn run(args: Args) -> Result<()> {
         .clone()
         .unwrap_or_else(|| env::current_dir().unwrap_or(PathBuf::from(".")));
 
-    let (app, spicepod_load_error) = build_app(&args).await?;
+    let (app, spicepod_load_error) = app_bundle;
     let mut extension_factories: Vec<Box<dyn ExtensionFactory>> = vec![];
 
     if let Some(some_app) = &app
@@ -751,6 +798,17 @@ pub async fn run(args: Args) -> Result<()> {
         tokio_handles.push(("main", Handle::current()));
         telemetry::register_tokio_runtime_metrics(tokio_handles);
 
+        // The CPU entitlement every one of those pools was sized from.
+        // `tokio_runtime_workers` above is the cross-check.
+        let budget = cpu_budget::cpu_budget();
+        telemetry::register_cpu_budget_metrics(
+            u64::try_from(budget.cores()).unwrap_or(u64::MAX),
+            budget.millicores(),
+            budget.source().as_str(),
+            budget.limit_millicores(),
+            budget.request_millicores(),
+        );
+
         // Cayenne write-path backpressure occupancy gauges (encode budget, in-memory
         // CDC tier byte budget, compaction semaphore). Pull-based observable gauges on
         // the global `cayenne` meter; registered here — after `init_metrics` — for the
@@ -893,7 +951,12 @@ pub async fn run(args: Args) -> Result<()> {
     result
 }
 
-async fn build_app(args: &Args) -> Result<(Option<Arc<App>>, Option<app::Error>)> {
+/// Load the spicepod and apply `--set-runtime` overrides.
+///
+/// Called from `main` before the multi-thread runtime is built, so
+/// `runtime.cpu.cores` can size it; only local/remote YAML parsing happens
+/// here, and the result is passed into [`run`].
+pub async fn build_app(args: &Args) -> Result<AppBundle> {
     // Check for explicit executor role OR implicit executor role (scheduler_address set without explicit role)
     let is_executor = matches!(args.runtime.cluster.role, Some(ClusterRole::Executor))
         || (args.runtime.cluster.role.is_none()
@@ -907,9 +970,13 @@ async fn build_app(args: &Args) -> Result<(Option<Arc<App>>, Option<app::Error>)
             && let Ok(built_app) = AppBuilder::build_from_path(path.clone()).await
         {
             let mut app = App::default();
-            // Copy only runtime flight and telemetry config from the spicepod.
+            // Copy only runtime flight, telemetry, and CPU config from the
+            // spicepod. An executor is the deployment shape most likely to be
+            // running under a CPU request, so `runtime.cpu` must come across
+            // too — everything else it needs arrives from the scheduler.
             app.runtime.flight = built_app.runtime.flight;
             app.runtime.telemetry = built_app.runtime.telemetry;
+            app.runtime.cpu = built_app.runtime.cpu;
             app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
             tracing::info!("Starting as a cluster executor with runtime config from spicepod.");
             return Ok((Some(Arc::new(app)), None));
