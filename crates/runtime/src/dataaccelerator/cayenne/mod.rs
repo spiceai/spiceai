@@ -856,6 +856,12 @@ fn refresh_write_profile(acceleration: &Acceleration) -> RefreshWriteProfile {
     )
 }
 
+/// Whether the dataset writes small batches continuously, which is what the
+/// CDC-shaped defaults (inline memtable, aggressive compaction triggers,
+/// `cdc_durability: memory`) are for. It is also exactly the set of tables that can
+/// reach the off-pool in-memory CDC tier, so the runtime builder gates the tier's
+/// aggregate byte budget — and the reduced query-pool default that leaves room for
+/// it — on a pod containing one (see `builder::CayenneWorkload`).
 fn uses_small_write_refresh_profile(acceleration: &Acceleration) -> bool {
     refresh_write_profile(acceleration).uses_cdc_tier()
 }
