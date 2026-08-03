@@ -411,7 +411,7 @@ impl SearchQueryProvider {
                 //  'Utf8') as '_match'
                 cast(
                     substring(
-                        col(search_col),
+                        ident(search_col),
                         binary_expr(first.clone(), Operator::Plus, lit(1)),
                         binary_expr(second, Operator::Minus, first),
                     ),

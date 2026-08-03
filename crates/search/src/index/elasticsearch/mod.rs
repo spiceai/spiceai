@@ -348,7 +348,7 @@ impl ElasticsearchIndex {
         table: Arc<dyn TableProvider>,
     ) -> Result<Arc<dyn TableProvider>, DataFusionError> {
         use datafusion::datasource::ViewTable;
-        use datafusion::prelude::{Expr, cast, col};
+        use datafusion::prelude::{Expr, cast, ident};
 
         let raw_schema = table.schema();
         let normalized_schema = Arc::clone(&self.source_schema);
@@ -370,9 +370,9 @@ impl ElasticsearchIndex {
                     .map_or_else(|_| raw_type.clone(), |nf| nf.data_type().clone());
 
                 if &target_type == raw_type {
-                    col(f.name())
+                    ident(f.name())
                 } else {
-                    cast(col(f.name()), target_type).alias(f.name())
+                    cast(ident(f.name()), target_type).alias(f.name())
                 }
             })
             .collect();
@@ -607,7 +607,7 @@ impl ElasticsearchTextIndex {
         table: Arc<dyn TableProvider>,
     ) -> Result<Arc<dyn TableProvider>, DataFusionError> {
         use datafusion::datasource::ViewTable;
-        use datafusion::prelude::col;
+        use datafusion::prelude::ident;
 
         let raw_schema = table.schema();
 
@@ -623,7 +623,7 @@ impl ElasticsearchTextIndex {
                     DataType::FixedSizeList(_, _) | DataType::LargeList(_) | DataType::List(_)
                 )
             })
-            .map(|f| col(f.name()))
+            .map(|f| ident(f.name()))
             .collect();
 
         let plan =
