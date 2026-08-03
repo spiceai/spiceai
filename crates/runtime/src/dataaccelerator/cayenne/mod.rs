@@ -646,6 +646,68 @@ fn warn_if_low_disk_blocking(label: &str, path: &str) {
     );
 }
 
+/// Fingerprint of everything the `Cayenne auto-tuned config` line prints for one
+/// table, used to emit it once per resolved configuration instead of once per
+/// provider construction.
+///
+/// Hashes the *rendered* values rather than a hand-listed tuple of typed fields:
+/// `{config:?}` covers every [`cayenne::metadata::VortexConfig`] knob, so a knob
+/// added to the line later cannot silently fall out of the key and start hiding
+/// re-tunes. The measured members of `hw` (`data_perf`, `metastore_perf`) are
+/// deliberately excluded — they are calibration readings the line does not print;
+/// they still reach the fingerprint where they matter, through the knobs they
+/// resolved.
+fn auto_tuned_config_fingerprint(
+    table_name: &str,
+    hw: &autotune::HardwareProfile,
+    workload: &autotune::WorkloadProfile,
+    config: &cayenne::metadata::VortexConfig,
+) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    format!(
+        "{table_name}|{cores}|{total_mem_bytes}|{data_storage:?}|{metastore_storage:?}|\
+         {row_count:?}|{table_bytes:?}|{schema_present}|{has_primary_key}|{is_upsert}|{config:?}",
+        cores = hw.cores,
+        total_mem_bytes = hw.total_mem_bytes,
+        data_storage = hw.data_storage,
+        metastore_storage = hw.metastore_storage,
+        row_count = workload.row_count,
+        table_bytes = workload.table_bytes,
+        schema_present = workload.inferred_metadata.is_present(),
+        has_primary_key = workload.has_primary_key,
+        is_upsert = workload.is_upsert,
+    )
+    .hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Whether the `Cayenne auto-tuned config` line for `table_name` should be emitted
+/// for this `fingerprint`: true the first time the table is resolved, and again
+/// whenever the resolution *changes*.
+///
+/// Dataset initialization retries with unbounded backoff and rebuilds the table
+/// provider on every attempt, so a dataset that never loads would otherwise repeat
+/// its ~1 KB config line at fibonacci-spaced intervals for the life of the process,
+/// burying the WARN that explains why it is unhealthy. Keying on the resolved values
+/// (rather than logging once per table) keeps the two cases worth seeing: the first
+/// resolution, and a genuine re-tune — adaptive tuning moving a knob, or a config
+/// edit after a hot reload.
+fn auto_tuned_config_is_newly_resolved(table_name: &str, fingerprint: u64) -> bool {
+    static LOGGED: LazyLock<std::sync::Mutex<HashMap<String, u64>>> =
+        LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+    let mut logged = LOGGED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if logged.get(table_name) == Some(&fingerprint) {
+        return false;
+    }
+    logged.insert(table_name.to_string(), fingerprint);
+    true
+}
+
 /// Default read-current freshness (bounded staleness), in ms, for a READ-ONLY Cayenne
 /// CDC replica (`access: read` + `refresh_mode: changes`). Such a replica's data
 /// streams in only via CDC and is eventually-consistent by design, so a scan need not
@@ -715,11 +777,34 @@ fn apply_refresh_mode_defaults(
     }
 }
 
+/// Whether the dataset's refresh mode writes small batches continuously, which is
+/// what the CDC-shaped defaults (inline memtable, aggressive compaction triggers,
+/// `cdc_durability: memory`) are for. Together with a file acceleration mode it also
+/// decides whether the process carves the Cayenne compaction memory pool at all — see
+/// `builder::count_cayenne_budget_eligible_accelerations`.
+///
+/// It does *not* gate the in-memory CDC tier budget, which every Cayenne deployment
+/// installs whatever its refresh mode: the carve takes bytes away from queries, so it
+/// is only worth taking when some acceleration can compact into it, whereas the tier
+/// budget is sized from what the query pool leaves over and costs queries nothing.
 fn uses_small_write_refresh_profile(acceleration: &Acceleration) -> bool {
-    match acceleration.refresh_mode.unwrap_or(RefreshMode::Full) {
+    is_small_write_refresh_profile(
+        acceleration.refresh_mode.unwrap_or(RefreshMode::Full),
+        acceleration.refresh_check_interval,
+    )
+}
+
+/// [`uses_small_write_refresh_profile`] over the two fields it reads, for callers
+/// that hold a Spicepod acceleration rather than an initialized component one (the
+/// Runtime builder decides the Cayenne memory budgets before initialization). Both
+/// go through this so the profile rule has a single definition.
+pub(crate) fn is_small_write_refresh_profile(
+    refresh_mode: RefreshMode,
+    refresh_check_interval: Option<Duration>,
+) -> bool {
+    match refresh_mode {
         RefreshMode::Caching | RefreshMode::Changes => true,
-        RefreshMode::Append => acceleration
-            .refresh_check_interval
+        RefreshMode::Append => refresh_check_interval
             .is_some_and(|interval| interval <= APPEND_SMALL_WRITE_REFRESH_INTERVAL_THRESHOLD),
         RefreshMode::Disabled | RefreshMode::Full | RefreshMode::Snapshot => false,
     }
@@ -1796,64 +1881,73 @@ impl CayenneAccelerator {
                 ),
             };
 
-            // Surface cross-parameter and out-of-range issues that parse cleanly
-            // but won't behave as intended (silently clamped at use, or don't
-            // compose with each other) — see `VortexConfig::config_warnings`.
-            for warning in config.config_warnings(hw.cores) {
-                tracing::warn!(
-                    "Dataset '{table_name}': {warning} For details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#configuration"
+            // Report the resolution once per *resolved configuration*, not once per
+            // provider construction: this function runs on every
+            // `create_external_table` / `create_cayenne_table_provider`, and a
+            // dataset that keeps failing to load is rebuilt on every retry. Both
+            // emits below are pure functions of `config` and `hw.cores`, so the one
+            // fingerprint covers them.
+            let fingerprint = auto_tuned_config_fingerprint(table_name, &hw, workload, &config);
+            if auto_tuned_config_is_newly_resolved(table_name, fingerprint) {
+                // Surface cross-parameter and out-of-range issues that parse cleanly
+                // but won't behave as intended (silently clamped at use, or don't
+                // compose with each other) — see `VortexConfig::config_warnings`.
+                for warning in config.config_warnings(hw.cores) {
+                    tracing::warn!(
+                        "Dataset '{table_name}': {warning} For details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#configuration"
+                    );
+                }
+
+                // One structured line per table recording the host basis and the
+                // knobs `auto` resolved to, so an operator (or a benchmark sweep) can
+                // see exactly what was chosen on this host — the observability that
+                // makes "works regardless of the host machine" verifiable.
+                tracing::info!(
+                    target: "spiced::acceleration::cayenne",
+                    table = %table_name,
+                    cores = hw.cores,
+                    total_mem_mib = hw.total_mem_bytes / (1024 * 1024),
+                    data_storage = %hw.data_storage,
+                    metastore_storage = %hw.metastore_storage,
+                    runtime_footer_cache_mb = ?config.footer_cache_mb,
+                    tuning = if config.dynamic_tuning { "adaptive" } else { "auto" },
+                    // Inferred workload signals (from schema inference). When these are
+                    // `None`/false the source exposed no inferred metadata for this
+                    // table (no catalog access, or nothing to infer), so the data-aware
+                    // sizing fell back to hardware-only — makes that immediately visible.
+                    inferred_row_count = ?workload.row_count,
+                    inferred_table_bytes = ?workload.table_bytes,
+                    inferred_schema_present = workload.inferred_metadata.is_present(),
+                    has_primary_key = workload.has_primary_key,
+                    is_upsert = workload.is_upsert,
+                    "Cayenne auto-tuned config: segment_cache={}MB, pk_keyset_cache={:?}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, delta_encoding={}, pk_conflict_detection={}, deletion_mode={:?}, compaction_trigger_files={}, compaction_trigger_protected_snapshots={}, compaction_trigger_snapshot_age_ms={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_flush_max_rows={}, inline_flush_max_segments={}, inline_flush_max_bytes={}, cdc_durability={}, cdc_mem_tier_max_bytes={}, cdc_mem_tier_min_flush_bytes={}",
+                    config.segment_cache_mb,
+                    config.pk_keyset_cache_mb,
+                    config.target_vortex_file_size_mb,
+                    config.upload_concurrency,
+                    config.write_concurrency,
+                    config.sort_columns,
+                    config.compression_strategy,
+                    config.delta_encoding,
+                    config.pk_conflict_detection.as_str(),
+                    config.deletion_mode,
+                    config.compaction_trigger_files,
+                    config.compaction_trigger_protected_snapshots,
+                    config.compaction_trigger_snapshot_age_ms,
+                    config.compaction_max_levels,
+                    config.compaction_max_files_per_pick,
+                    config.compaction_background_interval_ms,
+                    config.inline_max_rows,
+                    config.inline_max_bytes,
+                    config.inline_max_buffer_bytes,
+                    config.inline_flush_max_rows,
+                    config.inline_flush_max_segments,
+                    config.inline_flush_max_bytes,
+                    config.cdc_durability.as_str(),
+                    config.cdc_mem_tier_max_bytes,
+                    config.cdc_mem_tier_min_flush_bytes,
                 );
             }
-
-            // One structured line per table recording the host basis and the
-            // knobs `auto` resolved to, so an operator (or a benchmark sweep) can
-            // see exactly what was chosen on this host — the observability that
-            // makes "works regardless of the host machine" verifiable.
-            tracing::info!(
-                target: "spiced::acceleration::cayenne",
-                table = %table_name,
-                cores = hw.cores,
-                total_mem_mib = hw.total_mem_bytes / (1024 * 1024),
-                data_storage = %hw.data_storage,
-                metastore_storage = %hw.metastore_storage,
-                runtime_footer_cache_mb = ?config.footer_cache_mb,
-                tuning = if config.dynamic_tuning { "adaptive" } else { "auto" },
-                // Inferred workload signals (from schema inference). When these are
-                // `None`/false the source exposed no inferred metadata for this
-                // table (no catalog access, or nothing to infer), so the data-aware
-                // sizing fell back to hardware-only — makes that immediately visible.
-                inferred_row_count = ?workload.row_count,
-                inferred_table_bytes = ?workload.table_bytes,
-                inferred_schema_present = workload.inferred_metadata.is_present(),
-                has_primary_key = workload.has_primary_key,
-                is_upsert = workload.is_upsert,
-                "Cayenne auto-tuned config: segment_cache={}MB, pk_keyset_cache={:?}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, delta_encoding={}, pk_conflict_detection={}, deletion_mode={:?}, compaction_trigger_files={}, compaction_trigger_protected_snapshots={}, compaction_trigger_snapshot_age_ms={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_flush_max_rows={}, inline_flush_max_segments={}, inline_flush_max_bytes={}, cdc_durability={}, cdc_mem_tier_max_bytes={}, cdc_mem_tier_min_flush_bytes={}",
-                config.segment_cache_mb,
-                config.pk_keyset_cache_mb,
-                config.target_vortex_file_size_mb,
-                config.upload_concurrency,
-                config.write_concurrency,
-                config.sort_columns,
-                config.compression_strategy,
-                config.delta_encoding,
-                config.pk_conflict_detection.as_str(),
-                config.deletion_mode,
-                config.compaction_trigger_files,
-                config.compaction_trigger_protected_snapshots,
-                config.compaction_trigger_snapshot_age_ms,
-                config.compaction_max_levels,
-                config.compaction_max_files_per_pick,
-                config.compaction_background_interval_ms,
-                config.inline_max_rows,
-                config.inline_max_bytes,
-                config.inline_max_buffer_bytes,
-                config.inline_flush_max_rows,
-                config.inline_flush_max_segments,
-                config.inline_flush_max_bytes,
-                config.cdc_durability.as_str(),
-                config.cdc_mem_tier_max_bytes,
-                config.cdc_mem_tier_min_flush_bytes,
-            );
         }
 
         config
@@ -4716,6 +4810,220 @@ mod tests {
 
         assert_eq!(hot.write_concurrency, Some(16));
         assert_eq!(quiet.write_concurrency, Some(2));
+    }
+
+    /// A `MakeWriter` that accumulates formatted log output so a test can assert on
+    /// what an operator would actually see in `spice.log`.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn occurrences_of(&self, needle: &str) -> usize {
+            let buffer = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            String::from_utf8_lossy(&buffer).matches(needle).count()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLogs {
+        type Writer = Self;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn auto_tuned_config_is_reported_once_per_resolution() {
+        // Table names are process-global keys; keep them unique to this test.
+        const TABLE: &str = "dedupe_decision_table";
+        const OTHER: &str = "dedupe_decision_other_table";
+
+        // First resolution reports; the identical re-resolutions an unbounded init
+        // retry produces do not.
+        assert!(auto_tuned_config_is_newly_resolved(TABLE, 1));
+        assert!(!auto_tuned_config_is_newly_resolved(TABLE, 1));
+        assert!(!auto_tuned_config_is_newly_resolved(TABLE, 1));
+
+        // A genuine re-tune reports again, then settles at the new resolution.
+        assert!(auto_tuned_config_is_newly_resolved(TABLE, 2));
+        assert!(!auto_tuned_config_is_newly_resolved(TABLE, 2));
+
+        // Reverting to an earlier resolution is still a change worth reporting —
+        // the key is the last value seen, not the set of values ever seen.
+        assert!(auto_tuned_config_is_newly_resolved(TABLE, 1));
+
+        // Tables are independent: one table's line never suppresses another's.
+        assert!(auto_tuned_config_is_newly_resolved(OTHER, 1));
+    }
+
+    #[test]
+    fn auto_tuned_config_fingerprint_covers_the_logged_values_only() {
+        use crate::dataaccelerator::storage::ResolvedAccelerationStorage;
+
+        let hw = autotune::HardwareProfile::new(
+            8,
+            32 * 1024 * 1024 * 1024,
+            ResolvedAccelerationStorage::LocalSsd,
+            ResolvedAccelerationStorage::LocalSsd,
+        );
+        let workload = autotune::WorkloadProfile::default();
+        let config = cayenne::metadata::VortexConfig::default();
+        let baseline = auto_tuned_config_fingerprint("t", &hw, &workload, &config);
+
+        // Deterministic: the same resolution fingerprints the same way, which is
+        // what collapses the retry storm.
+        assert_eq!(
+            baseline,
+            auto_tuned_config_fingerprint("t", &hw, &workload, &config)
+        );
+
+        // Every printed input participates.
+        let mut retuned = config.clone();
+        retuned.target_vortex_file_size_mb += 1;
+        assert_ne!(
+            baseline,
+            auto_tuned_config_fingerprint("t", &hw, &workload, &retuned),
+            "a knob that appears in the line must change the fingerprint"
+        );
+        let mut bigger_host = hw;
+        bigger_host.cores += 1;
+        assert_ne!(
+            baseline,
+            auto_tuned_config_fingerprint("t", &bigger_host, &workload, &config),
+            "the host basis appears in the line and must change the fingerprint"
+        );
+        let inferred = autotune::WorkloadProfile {
+            row_count: Some(1_000),
+            ..workload
+        };
+        assert_ne!(
+            baseline,
+            auto_tuned_config_fingerprint("t", &hw, &inferred, &config),
+            "the inferred workload signals appear in the line"
+        );
+        assert_ne!(
+            baseline,
+            auto_tuned_config_fingerprint("other", &hw, &workload, &config),
+            "the fingerprint is per table"
+        );
+
+        // A knob the line does not print still participates, through `{config:?}`:
+        // over-reporting is the safe direction, and it keeps the key from silently
+        // narrowing as knobs are added to the line.
+        let mut unprinted = config.clone();
+        unprinted.stream_publish_interval_ms += 1;
+        assert_ne!(
+            baseline,
+            auto_tuned_config_fingerprint("t", &hw, &workload, &unprinted)
+        );
+
+        // The calibration measurements are deliberately excluded: they are not
+        // printed, and they reach the fingerprint through the knobs they resolved.
+        let mut probed = hw;
+        probed.data_perf.write_mbps = Some(125.0);
+        probed.metastore_perf.write_mbps = Some(4_000.0);
+        assert_eq!(
+            baseline,
+            auto_tuned_config_fingerprint("t", &probed, &workload, &config),
+            "a measured storage rate is not part of the line and must not re-report it"
+        );
+    }
+
+    /// Regression test for #12330: dataset initialization retries with unbounded
+    /// backoff and rebuilds the table provider on every attempt, so a dataset that
+    /// never loads used to repeat its ~1 KB config line forever.
+    #[tokio::test]
+    async fn auto_tuned_config_line_survives_a_provider_rebuild_storm() {
+        const TABLE: &str = "dedupe_rebuild_storm";
+        const LINE: &str = "Cayenne auto-tuned config:";
+        // A configuration warning derived from the same resolution, so it shares the
+        // gate: a misconfigured dataset is exactly the one that retries forever.
+        const WARNING: &str = "cayenne_compaction_trigger_files is 1";
+        let misconfigured = || {
+            vec![(
+                "cayenne_compaction_trigger_files".to_string(),
+                "1".to_string(),
+            )]
+        };
+
+        let app = Arc::new(AppBuilder::new("test").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+        let build = |params: Vec<(String, String)>| {
+            let mut dataset = DatasetBuilder::try_new(TABLE.to_string(), TABLE)
+                .expect("dataset builder")
+                .with_app(Arc::clone(&app))
+                .with_runtime(Arc::clone(&rt))
+                .build()
+                .expect("dataset");
+            dataset.acceleration = Some(Acceleration {
+                engine: Engine::Cayenne,
+                mode: Mode::File,
+                params: params.into_iter().collect(),
+                ..Default::default()
+            });
+            dataset
+        };
+
+        // Capture only the emits below: `#[tokio::test]` runs the whole test body on
+        // one thread, and `set_default` installs the subscriber on that thread only,
+        // so concurrent tests cannot contribute to the count.
+        let captured = CapturedLogs::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(captured.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .finish(),
+        );
+
+        let dataset = build(misconfigured());
+        for _ in 0..3 {
+            let _ = CayenneAccelerator::get_vortex_config(TABLE, &dataset).await;
+        }
+        assert_eq!(
+            captured.occurrences_of(LINE),
+            1,
+            "rebuilding the provider must not re-report an unchanged resolution"
+        );
+        assert_eq!(
+            captured.occurrences_of(WARNING),
+            1,
+            "a configuration warning derived from that resolution must not repeat either"
+        );
+
+        // A genuine re-tune is still reported — the line's whole purpose is to
+        // record what `auto` resolved to, including when that answer changes.
+        let mut retuned_params = misconfigured();
+        retuned_params.push(("cayenne_target_file_size_mb".to_string(), "512".to_string()));
+        let retuned = build(retuned_params);
+        let _ = CayenneAccelerator::get_vortex_config(TABLE, &retuned).await;
+        assert_eq!(
+            captured.occurrences_of(LINE),
+            2,
+            "a changed resolution must still be reported"
+        );
+        assert_eq!(
+            captured.occurrences_of(WARNING),
+            2,
+            "the warning is re-reported alongside the resolution it describes"
+        );
     }
 
     #[tokio::test]
