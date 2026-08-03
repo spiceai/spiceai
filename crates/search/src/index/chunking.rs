@@ -1483,14 +1483,23 @@ mod tests {
             .await
             .expect("delete succeeds");
 
+        // Asserted over the union of the delete calls rather than a single batch: the resolving
+        // query ends in a `distinct()`, whose hash aggregate emits one batch per non-empty
+        // partition, so how many calls the inner index sees tracks DataFusion's partitioning —
+        // and hence the host's CPU count — not this fix. Which keys get deleted is the guarantee.
         let deletes = inner.deletes();
-        assert_eq!(deletes.len(), 1, "one resolved batch: {deletes:?}");
-        let (columns, ids) = &deletes[0];
+        assert!(!deletes.is_empty(), "the resolved chunks reach the inner index");
         assert!(
-            columns.contains(&CHUNKED_INDEX_CHUNK_KEY.to_string()),
-            "resolved keys carry the chunk id: {columns:?}"
+            deletes
+                .iter()
+                .all(|(columns, _)| columns.contains(&CHUNKED_INDEX_CHUNK_KEY.to_string())),
+            "resolved keys carry the chunk id: {deletes:?}"
         );
-        assert_eq!(ids, &vec![1, 1], "both chunks of id 1, and nothing else");
+        assert_eq!(
+            resolved_ids(&deletes),
+            vec![1, 1],
+            "both chunks of id 1, and nothing else"
+        );
     }
 
     /// An inner index shaped like the S3-Vectors-with-warm-tier case: a warm `primary` holding
