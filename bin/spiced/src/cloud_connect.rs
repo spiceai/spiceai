@@ -529,11 +529,8 @@ impl RuntimeHandle for SpicedRuntimeHandle {
         &self,
         config_dir: &Path,
         spicepod_yaml: &str,
-<<<<<<< HEAD
-    ) -> Result<serde_json::Value, CommandError> {
-=======
         delivered_secrets: Option<runtime_cloud_connect::sealed_secrets::DeliveredSecrets>,
-    ) -> Result<serde_json::Value, String> {
+    ) -> Result<serde_json::Value, CommandError> {
         // Install the delivered secrets BEFORE the spicepod is validated and
         // applied: `AppBuilder::build_from_path` and `apply_app` both resolve
         // `${ secrets:… }` references, so secrets installed afterwards would
@@ -551,7 +548,6 @@ impl RuntimeHandle for SpicedRuntimeHandle {
             }
         };
 
->>>>>>> caf63077ed (feat: add secrets support)
         let (new_app, path) = stage_cloud_managed_spicepod(config_dir, spicepod_yaml).await?;
 
         // Determine which changes can't hot-reload BEFORE apply_app swaps the
@@ -723,7 +719,6 @@ impl RuntimeHandle for SpicedRuntimeHandle {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
 
-<<<<<<< HEAD
         Ok(
             StatusReport::new(phase, reason).with_detail(serde_json::json!({
                 "ready": ready,
@@ -733,31 +728,18 @@ impl RuntimeHandle for SpicedRuntimeHandle {
                 "errors": errors,
                 "restart_pending": restart_pending,
                 "restart_pending_sections": restart_pending_sections,
+                // Names only, never values — this document reaches the portal
+                // and the command log. The count and the names are what let an
+                // operator tell "the deployment delivered no secrets" apart from
+                // "the component's reference is misspelled".
+                "delivered_secrets": self.delivered_secrets.names(),
+                "delivered_secrets_available": !self.delivered_secrets.is_empty(),
+                // Whether a restart will still have them. Without a cache key
+                // the secrets are memory-only, so the next restart needs a
+                // redeploy — status says so rather than failing mutely later.
+                "delivered_secrets_persisted": self.cache_key().is_some(),
             })),
         )
-=======
-        Ok(serde_json::json!({
-            "phase": phase,
-            "reason": reason,
-            "ready": ready,
-            "component_count": total,
-            "ready_count": ready_count,
-            "components": components,
-            "errors": errors,
-            "restart_pending": restart_pending,
-            "restart_pending_sections": restart_pending_sections,
-            // Names only, never values — this document reaches the portal and
-            // the command log. The count and the names are what let an operator
-            // tell "the deployment delivered no secrets" apart from "the
-            // component's reference is misspelled".
-            "delivered_secrets": self.delivered_secrets.names(),
-            "delivered_secrets_available": !self.delivered_secrets.is_empty(),
-            // Whether a restart will still have them. Without a cache key the
-            // secrets are memory-only, so the next restart needs a redeploy —
-            // status says so rather than failing mutely later.
-            "delivered_secrets_persisted": self.cache_key().is_some(),
-        }))
->>>>>>> caf63077ed (feat: add secrets support)
     }
 }
 

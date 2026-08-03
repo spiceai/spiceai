@@ -637,6 +637,8 @@ async fn unknown_command_is_nacked_rather_than_dropped() {
         not_after_unix: None,
         enc_private_key_pem: String::new(),
         enc_public_key_pem: String::new(),
+        enc_previous_private_key_pem: String::new(),
+        cache_key_b64: String::new(),
     };
     IdentityStore::store(&identity_path, &identity).unwrap();
 

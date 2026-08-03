@@ -103,20 +103,13 @@ pub struct Identity {
     /// code).
     #[serde(default)]
     pub gateway_addr: String,
-<<<<<<< HEAD
     /// Unix timestamp (seconds) after which the identity cert is no longer
     /// accepted by the server. `None` when the server issued no expiry —
     /// carried as presence rather than a `0` sentinel so "unbounded" and
     /// "expires at the epoch" stay distinguishable.
     #[serde(default, deserialize_with = "deserialize_not_after")]
     pub not_after_unix: Option<u64>,
-    /// PEM-encoded PKCS#8 X25519 encryption private key. The cloud
-=======
-    /// Unix timestamp (seconds) after which the identity cert is no
-    /// longer accepted by the server. `0` means "unknown / unbounded".
-    pub not_after_unix: u64,
     /// PEM-encoded PKCS#8 X25519 encryption private key. The control plane
->>>>>>> caf63077ed (feat: add secrets support)
     /// HPKE-seals secret payloads to the matching public key; this key
     /// unseals them. Kept local (never sent). Rotated on every renewal,
     /// in the same request that rotates the identity keypair, so the two

@@ -316,13 +316,8 @@ message Restart {
 // for them. Absent means "no secrets with this deploy" and is backward
 // compatible with peers that predate the field.
 message ApplySpicepod {
-<<<<<<< HEAD
   string spicepod_yaml = 1;
-=======
-  string command_id = 1;
-  string spicepod_yaml = 2;
-  SealedSecretPayload sealed_secret_payload = 3;
->>>>>>> caf63077ed (feat: add secrets support)
+  SealedSecretPayload sealed_secret_payload = 2;
 }
 
 message UpgradeRuntime {

@@ -1425,9 +1425,9 @@ async fn apply_spicepod_delivers_double_sealed_secrets() {
     .expect("outer seal");
 
     let yaml = "version: v2\nkind: Spicepod\nname: e2e-secrets\n";
-    harness.gateway.outbound.lock().await.push_back(ctrl(
+    harness.gateway.outbound.lock().await.push_back(ctrl_id(
+        COMMAND_ID,
         proto::control_message::Body::ApplySpicepod(proto::ApplySpicepod {
-            command_id: COMMAND_ID.to_string(),
             spicepod_yaml: yaml.to_string(),
             sealed_secret_payload: Some(proto::SealedSecretPayload {
                 key_id: session.key_id.clone(),
@@ -1446,7 +1446,7 @@ async fn apply_spicepod_delivers_double_sealed_secrets() {
                 .await
                 .results
                 .iter()
-                .any(|r| r.command_id == COMMAND_ID && r.success)
+                .any(|r| r.command_id == COMMAND_ID && r.code == proto::ResultCode::Ok as i32)
         }
     })
     .await;
@@ -1460,15 +1460,26 @@ async fn apply_spicepod_delivers_double_sealed_secrets() {
         "the opened secrets must reach the runtime adapter with the spicepod"
     );
 
-    // No result payload may carry a secret value.
-    let payloads = with_captured!(captured, c => c
+    // No result may carry a secret value — in any payload arm, or in the
+    // human-readable message.
+    let rendered = with_captured!(captured, c => c
         .results
         .iter()
-        .map(|r| r.payload_json.clone())
+        .map(|r| {
+            let payload = match &r.payload {
+                Some(proto::command_result::Payload::Json(json)) => json.clone(),
+                Some(proto::command_result::Payload::Text(text)) => text.clone(),
+                Some(proto::command_result::Payload::Binary(bytes)) => {
+                    String::from_utf8_lossy(bytes).into_owned()
+                }
+                None => String::new(),
+            };
+            format!("{} {payload}", r.message)
+        })
         .collect::<Vec<_>>());
     assert!(
-        payloads.iter().all(|p| !p.contains("sk-e2e")),
-        "no command result may echo a delivered secret value: {payloads:?}"
+        rendered.iter().all(|r| !r.contains("sk-e2e")),
+        "no command result may echo a delivered secret value: {rendered:?}"
     );
 
     handle.shutdown().await;
@@ -1490,9 +1501,9 @@ async fn apply_spicepod_refuses_an_unopenable_payload() {
     let (handle, _identity) = enroll(&harness, &config, runtime).await;
 
     // Garbage addressed to a key this session never announced.
-    harness.gateway.outbound.lock().await.push_back(ctrl(
+    harness.gateway.outbound.lock().await.push_back(ctrl_id(
+        "cmd-bad-secrets",
         proto::control_message::Body::ApplySpicepod(proto::ApplySpicepod {
-            command_id: "cmd-bad-secrets".to_string(),
             spicepod_yaml: "version: v2\nkind: Spicepod\nname: nope\n".to_string(),
             sealed_secret_payload: Some(proto::SealedSecretPayload {
                 key_id: "0000000000000000".to_string(),
@@ -1511,7 +1522,10 @@ async fn apply_spicepod_refuses_an_unopenable_payload() {
                 .await
                 .results
                 .iter()
-                .any(|r| r.command_id == "cmd-bad-secrets" && !r.success)
+                .any(|r| {
+                    r.command_id == "cmd-bad-secrets"
+                        && r.code == proto::ResultCode::InvalidArgument as i32
+                })
         }
     })
     .await;

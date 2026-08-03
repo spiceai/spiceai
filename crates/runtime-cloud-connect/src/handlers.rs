@@ -308,19 +308,17 @@ pub trait RuntimeHandle: Send + Sync + 'static {
         &self,
         config_dir: &Path,
         spicepod_yaml: &str,
-<<<<<<< HEAD
-    ) -> Result<serde_json::Value, CommandError> {
-=======
         delivered_secrets: Option<crate::sealed_secrets::DeliveredSecrets>,
-    ) -> Result<serde_json::Value, String> {
+    ) -> Result<serde_json::Value, CommandError> {
         if delivered_secrets.is_some_and(|secrets| !secrets.is_empty()) {
-            return Err(
+            // `Unsupported`, not `Failed`: this adapter will never be able to
+            // apply secrets, so a retry cannot help and the control plane should
+            // not schedule one.
+            return Err(CommandError::unsupported(
                 "this runtime adapter cannot apply control-plane-delivered secrets; the spicepod \
-                 was NOT written. Implement RuntimeHandle::apply_spicepod to accept them."
-                    .to_string(),
-            );
+                 was NOT written. Implement RuntimeHandle::apply_spicepod to accept them.",
+            ));
         }
->>>>>>> caf63077ed (feat: add secrets support)
         let path = config_dir.join(crate::config::CLOUD_MANAGED_SPICEPOD_FILE);
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)

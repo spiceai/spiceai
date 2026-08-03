@@ -417,15 +417,8 @@ impl ClientDriver {
             // The CA bundle and gateway address are not re-sent on renewal.
             ca_bundle_pem: current.ca_bundle_pem,
             gateway_addr: current.gateway_addr,
-<<<<<<< HEAD
             not_after_unix: Some(outcome.not_after_unix),
-            // The encryption keypair is NOT rotated on renewal: the renew
-            // exchange carries no channel to re-pin a new public key, and
-            // the cloud keeps sealing secrets to the enrolled one.
-=======
-            not_after_unix: outcome.not_after_unix,
             // Rotated just below, which also retains the outgoing key.
->>>>>>> caf63077ed (feat: add secrets support)
             enc_private_key_pem: current.enc_private_key_pem,
             enc_public_key_pem: current.enc_public_key_pem,
             enc_previous_private_key_pem: current.enc_previous_private_key_pem,
@@ -444,11 +437,7 @@ impl ClientDriver {
         // failure; the next successful renewal re-attempts the write.
         self.persist_identity(&rotated).await;
         tracing::info!(
-<<<<<<< HEAD
-            "Cloud Connect: identity renewed for {} (keypair rotated, valid until {})",
-=======
-            "Cloud Connect: identity renewed for {} (identity and encryption keypairs rotated, valid until unix={})",
->>>>>>> caf63077ed (feat: add secrets support)
+            "Cloud Connect: identity renewed for {} (identity and encryption keypairs rotated, valid until {})",
             rotated.identifier,
             rotated
                 .not_after_unix
@@ -785,20 +774,13 @@ impl ClientDriver {
                 }
             }
             proto::control_message::Body::ApplySpicepod(cmd) => {
-<<<<<<< HEAD
                 if self
                     .supported(tx, &command_id, Capability::ApplySpicepod, name)
                     .await
                 {
-                    let result = self
-                        .runtime
-                        .apply_spicepod(&self.config.config_dir, &cmd.spicepod_yaml)
+                    self.handle_apply_spicepod(tx, &command_id, cmd, session_key)
                         .await;
-                    reply_with_json(tx, &command_id, result).await;
                 }
-=======
-                self.handle_apply_spicepod(tx, cmd, session_key).await;
->>>>>>> caf63077ed (feat: add secrets support)
             }
             proto::control_message::Body::UpgradeRuntime(cmd) => {
                 if self
@@ -875,7 +857,6 @@ impl ClientDriver {
         None
     }
 
-<<<<<<< HEAD
     /// Answer UNSUPPORTED when the runtime does not implement `capability`,
     /// returning whether the caller should go on to dispatch.
     ///
@@ -898,7 +879,8 @@ impl ClientDriver {
         );
         send_unsupported(tx, command_id, &self.runtime.unsupported_reason(capability)).await;
         false
-=======
+    }
+
     /// Handle an `ApplySpicepod`, opening any secrets that rode with it.
     ///
     /// A payload that fails to open **fails the whole command**: the spicepod is
@@ -907,22 +889,26 @@ impl ClientDriver {
     /// spicepod and dropping the secrets would report success and then fail
     /// every referencing component with a missing-parameter error naming
     /// nothing.
+    ///
+    /// `command_id` comes from the `ControlMessage` envelope, not from the
+    /// command body — and it is part of the outer AAD, so an envelope cannot be
+    /// replayed onto a different dispatch.
     async fn handle_apply_spicepod(
         &mut self,
         tx: &mpsc::Sender<proto::ClientMessage>,
+        command_id: &str,
         cmd: proto::ApplySpicepod,
         session_key: Option<&cloud_connect_crypto::EncryptionKeypair>,
     ) {
         let delivered = match cmd.sealed_secret_payload.as_ref() {
             None => None,
             Some(payload) => match self
-                .open_delivered_secrets(payload, &cmd.command_id, session_key)
+                .open_delivered_secrets(payload, command_id, session_key)
                 .await
             {
                 Ok(secrets) => Some(secrets),
-                Err(message) => {
-                    send_result(tx, &cmd.command_id, false, &message, serde_json::Value::Null)
-                        .await;
+                Err(err) => {
+                    send_command_error(tx, command_id, &err).await;
                     return;
                 }
             },
@@ -932,23 +918,28 @@ impl ClientDriver {
             .runtime
             .apply_spicepod(&self.config.config_dir, &cmd.spicepod_yaml, delivered)
             .await;
-        reply_with(tx, &cmd.command_id, result).await;
+        reply_with_json(tx, command_id, result).await;
     }
 
-    /// Open a delivered payload against this instance's keys, returning a
-    /// caller-facing message on failure. Never includes key or secret material.
+    /// Open a delivered payload against this instance's keys.
+    ///
+    /// Errors are [`CommandError`]s so the control plane learns whether a retry
+    /// could help: a missing session key or an unknown enrolled key is
+    /// `InvalidArgument` (this envelope will never open here — re-deploy to
+    /// re-seal), while a local key-material fault is `Internal`. No variant
+    /// carries key or secret material.
     async fn open_delivered_secrets(
         &mut self,
         payload: &proto::SealedSecretPayload,
         command_id: &str,
         session_key: Option<&cloud_connect_crypto::EncryptionKeypair>,
-    ) -> std::result::Result<crate::sealed_secrets::DeliveredSecrets, String> {
+    ) -> std::result::Result<crate::sealed_secrets::DeliveredSecrets, CommandError> {
         let identity = self.identity.clone().ok_or_else(|| {
-            "no identity is held, so delivered secrets cannot be opened".to_string()
+            CommandError::internal("no identity is held, so delivered secrets cannot be opened")
         })?;
-        let keyring = identity
-            .encryption_keyring()
-            .map_err(|err| format!("delivered secrets could not be opened: {err}"))?;
+        let keyring = identity.encryption_keyring().map_err(|err| {
+            CommandError::invalid_argument(format!("delivered secrets could not be opened: {err}"))
+        })?;
 
         let opened = crate::sealed_secrets::open_delivered(
             payload,
@@ -957,7 +948,7 @@ impl ClientDriver {
             session_key,
             &keyring,
         )
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| CommandError::invalid_argument(err.to_string()))?;
 
         // The *current* key opening a payload proves the control plane is
         // sealing to the rotated key, so nothing in flight can still be
@@ -993,7 +984,6 @@ impl ClientDriver {
             opened.secrets.len()
         );
         Ok(opened.secrets)
->>>>>>> caf63077ed (feat: add secrets support)
     }
 
     async fn handle_adopt(
