@@ -431,7 +431,7 @@ impl ClusterService for ClusterServiceImpl {
             request.executor_id
         );
 
-        let secrets = self.secrets.read().await;
+        let secrets = Secrets::snapshot(&self.secrets).await;
         // A reference through the `secrets:` sentinel keeps its normal
         // "search every configured store in precedence order" resolution; a
         // reference scoped to a specific store (e.g. `${ env:KEY }`) is

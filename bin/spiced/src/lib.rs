@@ -680,17 +680,11 @@ pub async fn run(args: Args) -> Result<()> {
     if needs_metrics {
         // Resolve secrets in OTEL exporter headers before initializing metrics
         let resolved_otel_headers = if let Some(config) = otel_config {
-            let mut resolved = std::collections::HashMap::new();
-            let secrets = rt.secrets();
-            let secrets_guard = secrets.read().await;
-            for (key, value) in &config.headers {
-                let resolved_value = secrets_guard
-                    .inject_secrets(key, runtime::secrets::ParamStr(value.as_ref()))
-                    .await;
-                resolved.insert(key.clone(), resolved_value.expose_secret().to_string());
-            }
-            drop(secrets_guard);
-            resolved
+            runtime::secrets::get_params_with_secrets(rt.secrets(), &config.headers)
+                .await
+                .into_iter()
+                .map(|(key, value)| (key, value.expose_secret().to_string()))
+                .collect()
         } else {
             std::collections::HashMap::new()
         };

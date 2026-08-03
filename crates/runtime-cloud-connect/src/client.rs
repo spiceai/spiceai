@@ -418,7 +418,10 @@ impl ClientDriver {
             ca_bundle_pem: current.ca_bundle_pem,
             gateway_addr: current.gateway_addr,
             not_after_unix: Some(outcome.not_after_unix),
-            // Rotated just below, which also retains the outgoing key.
+            // Seeded with the OUTGOING keypair and rotated by the call below,
+            // which shifts it into `enc_previous_private_key_pem` — assigning
+            // `material` here instead would leave the retained key equal to the
+            // current one, retaining nothing.
             enc_private_key_pem: current.enc_private_key_pem,
             enc_public_key_pem: current.enc_public_key_pem,
             enc_previous_private_key_pem: current.enc_previous_private_key_pem,
@@ -426,10 +429,14 @@ impl ClientDriver {
             // readable across every identity rotation.
             cache_key_b64: current.cache_key_b64,
         };
-        // The renew request already carried this public key, so the cloud has
-        // re-pinned it. Retain the outgoing private key for exactly one
-        // rotation: a payload sealed moments before this point is still
-        // addressed to it and cannot be re-sealed in flight.
+        // The encryption keypair rotates alongside the identity keypair on each
+        // renewal: the renew request already carried this public key, so the
+        // cloud pinned it in the same transaction that issued the new leaf and
+        // seals to it from that commit on.
+        //
+        // The outgoing private key is retained for exactly one rotation, because
+        // a payload sealed moments before this point is still addressed to it and
+        // cannot be re-sealed in flight.
         rotated.rotate_encryption_key(material.enc_private_key_pem, material.enc_public_key_pem);
         // The cloud has already pinned the new public key: even if
         // persistence fails, the rotated identity must be used in memory

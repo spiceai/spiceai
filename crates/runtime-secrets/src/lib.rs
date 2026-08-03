@@ -152,6 +152,12 @@ pub enum RefStatus {
     UnknownStore { configured: Vec<String> },
 }
 
+/// The configured secret stores, in precedence order.
+///
+/// Cloning copies the store handles (`Arc`s), not the stores themselves, so a
+/// clone is cheap and resolves against exactly the stores that were configured
+/// when it was taken — see [`Secrets::snapshot`].
+#[derive(Clone)]
 pub struct Secrets {
     // Use an IndexMap to maintain the order of the secret stores.
     // This order is the reverse of the order in which the secret stores are defined in the SpicePod.
@@ -173,6 +179,22 @@ pub struct Secrets {
 pub struct ParamStr<'a>(pub &'a str);
 
 impl Secrets {
+    /// Takes a point-in-time copy of the registry under a brief read lock, so
+    /// the caller can run secret lookups without holding the guard.
+    ///
+    /// A lookup is `async` and can take as long as a network round trip — the
+    /// `aws_secrets_manager`, `azure_keyvault`, `hashicorp_vault` and
+    /// cluster-executor `scheduler_rpc` stores all call out. Awaiting one under
+    /// a read guard stalls any writer that swaps the registry (the executor
+    /// bind path installs the `scheduler_rpc` stores that way), and, because
+    /// tokio's `RwLock` is write-preferring, a caller that holds a read guard
+    /// and then takes a second one **deadlocks** as soon as a writer queues
+    /// between the two. Resolving against a snapshot has neither hazard and
+    /// sees the same stores the guard would have pinned.
+    pub async fn snapshot(secrets: &RwLock<Self>) -> Self {
+        secrets.read().await.clone()
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -819,9 +841,16 @@ pub async fn get_params_with_secrets(
     secrets: Arc<RwLock<Secrets>>,
     params: &HashMap<String, String>,
 ) -> HashMap<String, SecretString> {
-    let secrets = secrets.read().await;
+    // Callers routinely pass an empty map (a component with no `params:`), and
+    // there is nothing to resolve it against.
+    if params.is_empty() {
+        return HashMap::new();
+    }
 
-    let mut params_with_secrets: HashMap<String, SecretString> = HashMap::new();
+    let secrets = Secrets::snapshot(&secrets).await;
+
+    let mut params_with_secrets: HashMap<String, SecretString> =
+        HashMap::with_capacity(params.len());
 
     // Inject secrets from the user-supplied params.
     // This will replace any instances of `${ store:key }` with the actual secret value.
@@ -1105,6 +1134,26 @@ mod tests {
         std::iter::once(store.to_string()).collect()
     }
 
+    /// A store whose lookup parks until it is released, standing in for the
+    /// network round trip the remote stores (`aws_secrets_manager`,
+    /// `azure_keyvault`, `hashicorp_vault`, `scheduler_rpc`) make on a miss.
+    struct ParkedStore {
+        entered: std::sync::Arc<tokio::sync::Notify>,
+        release: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl super::SecretStore for ParkedStore {
+        async fn get_secret(
+            &self,
+            _key: &str,
+        ) -> super::AnyErrorResult<Option<secrecy::SecretString>> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(Some(secrecy::SecretString::from("resolved")))
+        }
+    }
+
     /// Builds a `Secrets` registry directly from named stores, already in
     /// precedence order (first entry is consulted first).
     fn secrets_with_stores(
@@ -1224,6 +1273,80 @@ mod tests {
             .expect("lookup")
             .expect("present");
         assert_eq!(value.expose_secret(), "second");
+    }
+
+    /// The registry swap on the executor bind path must not wait behind an
+    /// in-flight expansion. Holding the read guard over the (network-bound)
+    /// lookups stalls the writer for their full duration; a snapshot doesn't.
+    #[tokio::test]
+    async fn test_get_params_with_secrets_does_not_block_a_registry_swap() {
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let secrets = std::sync::Arc::new(super::RwLock::new(secrets_with_stores(vec![(
+            "env",
+            std::sync::Arc::new(ParkedStore {
+                entered: std::sync::Arc::clone(&entered),
+                release: std::sync::Arc::clone(&release),
+            }),
+        )])));
+
+        let params = std::collections::HashMap::from([(
+            "api_key".to_string(),
+            "${ env:API_KEY }".to_string(),
+        )]);
+        let expansion = tokio::spawn({
+            let secrets = std::sync::Arc::clone(&secrets);
+            async move { super::get_params_with_secrets(secrets, &params).await }
+        });
+
+        entered.notified().await;
+
+        drop(
+            tokio::time::timeout(std::time::Duration::from_secs(5), secrets.write())
+                .await
+                .expect("a registry swap must not wait for an in-flight secret lookup"),
+        );
+
+        release.notify_one();
+        let resolved = expansion.await.expect("expansion task should not panic");
+        assert_eq!(
+            "resolved",
+            resolved["api_key"].expose_secret(),
+            "the parked store should still have served the value"
+        );
+    }
+
+    /// A snapshot resolves against the stores configured when it was taken —
+    /// the same view the read guard used to pin — while the live registry
+    /// serves whatever replaced them.
+    #[tokio::test]
+    async fn test_snapshot_resolves_against_the_stores_it_captured() {
+        let secrets = std::sync::Arc::new(super::RwLock::new(secrets_with_stores(vec![(
+            "env",
+            std::sync::Arc::new(MapStore::new(&[("MY_KEY", "before")])),
+        )])));
+
+        let snapshot = super::Secrets::snapshot(&secrets).await;
+
+        *secrets.write().await = secrets_with_stores(vec![(
+            "env",
+            std::sync::Arc::new(MapStore::new(&[("MY_KEY", "after")])),
+        )]);
+
+        let from_snapshot = snapshot
+            .get_secret("MY_KEY")
+            .await
+            .expect("snapshot lookup should succeed")
+            .expect("snapshot should still hold the captured store");
+        assert_eq!("before", from_snapshot.expose_secret());
+
+        let from_live = super::Secrets::snapshot(&secrets)
+            .await
+            .get_secret("MY_KEY")
+            .await
+            .expect("live lookup should succeed")
+            .expect("the swapped-in store holds the key");
+        assert_eq!("after", from_live.expose_secret());
     }
 
     #[tokio::test]
