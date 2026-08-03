@@ -1135,11 +1135,26 @@ impl CayenneWorkload {
 /// the dangerous one — it would classify an unannotated CDC dataset as a whole-table
 /// replace and under-provision its memory — so an unrecognized connector keeps the
 /// trait default (`full`) only because that IS the trait default, not as a guess.
-fn connector_unset_refresh_mode(from: &str) -> RefreshMode {
+pub(crate) fn connector_unset_refresh_mode(from: &str) -> RefreshMode {
     // `DatasetSpec::source()` is the authoritative `from:` parse — it recognizes
     // `://`, `:` AND `/` as delimiters and maps the empty value to `sink`. Splitting
     // on `:` alone would read `debezium/topic` as the whole string and miss it.
-    match spicepod_dataset_source(from) {
+    unset_refresh_mode_for_connector(spicepod_dataset_source(from))
+}
+
+/// [`connector_unset_refresh_mode`] keyed by the CONNECTOR NAME rather than the raw
+/// `from:` value, for a caller that already holds the parsed name — an initialized
+/// component's [`runtime_acceleration::AccelerationSource::connector_name`].
+///
+/// This is the single mapping table: the raw-`from:` entry point above parses and
+/// delegates here, so the pre-init builder and the post-init accelerator classify a
+/// pod through exactly the same rules and cannot disagree about a dataset.
+///
+/// Takes the parsed name, never a raw `from:` — parsing is the caller's job, because
+/// re-parsing an already-parsed name would be wrong (`debezium` has no delimiter, so
+/// a second parse would read it as the `spice.ai` connector).
+pub(crate) fn unset_refresh_mode_for_connector(connector: &str) -> RefreshMode {
+    match connector {
         // Both resolve an unset mode to `changes`.
         "debezium" | "cdc" => RefreshMode::Changes,
         // Resolves to `disabled`: no refresh runs, but rows arrive by `INSERT INTO`

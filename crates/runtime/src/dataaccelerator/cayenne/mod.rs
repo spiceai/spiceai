@@ -786,10 +786,11 @@ impl RefreshWriteProfile {
 
 fn apply_refresh_mode_defaults(
     config: &mut cayenne::metadata::VortexConfig,
+    source: &dyn AccelerationSource,
     acceleration: &Acceleration,
     inline_flush_caps: autotune::InlineFlushCaps,
 ) {
-    match refresh_write_profile(acceleration) {
+    match refresh_write_profile(source, acceleration) {
         RefreshWriteProfile::SmallWrite => {
             config.compaction_trigger_files = SMALL_WRITE_COMPACTION_TRIGGER_FILES;
             config.compaction_trigger_protected_snapshots =
@@ -849,11 +850,34 @@ fn refresh_write_profile_for(
     RefreshWriteProfile::classify(resolved_refresh_mode, acceleration.refresh_check_interval)
 }
 
-fn refresh_write_profile(acceleration: &Acceleration) -> RefreshWriteProfile {
-    refresh_write_profile_for(
-        acceleration,
-        acceleration.refresh_mode.unwrap_or(RefreshMode::Full),
-    )
+/// The refresh mode a source actually runs with, applying the connector's fill-in
+/// for an unset `refresh_mode`.
+///
+/// `DataConnector::resolve_refresh_mode` decides that fill-in and its result is never
+/// written back into the [`Acceleration`], so `acceleration.refresh_mode` is still
+/// `None` for a genuine `debezium:`/`cdc:` stream. Mapping the source's connector
+/// name through [`crate::builder::unset_refresh_mode_for_connector`] — the same table
+/// the runtime builder classifies the pod with — recovers it.
+///
+/// A source with no connector (a view, an Iceberg DDL table) has no default to apply
+/// and falls back to `full`, which is what those paths resolve an unset mode to.
+fn resolved_refresh_mode(
+    source: &dyn AccelerationSource,
+    acceleration: &Acceleration,
+) -> RefreshMode {
+    acceleration.refresh_mode.unwrap_or_else(|| {
+        source.connector_name().map_or(
+            RefreshMode::Full,
+            crate::builder::unset_refresh_mode_for_connector,
+        )
+    })
+}
+
+fn refresh_write_profile(
+    source: &dyn AccelerationSource,
+    acceleration: &Acceleration,
+) -> RefreshWriteProfile {
+    refresh_write_profile_for(acceleration, resolved_refresh_mode(source, acceleration))
 }
 
 /// Whether the dataset writes small batches continuously, which is what the
@@ -862,8 +886,11 @@ fn refresh_write_profile(acceleration: &Acceleration) -> RefreshWriteProfile {
 /// reach the off-pool in-memory CDC tier, so the runtime builder gates the tier's
 /// aggregate byte budget — and the reduced query-pool default that leaves room for
 /// it — on a pod containing one (see `builder::CayenneWorkload`).
-fn uses_small_write_refresh_profile(acceleration: &Acceleration) -> bool {
-    refresh_write_profile(acceleration).uses_cdc_tier()
+fn uses_small_write_refresh_profile(
+    source: &dyn AccelerationSource,
+    acceleration: &Acceleration,
+) -> bool {
+    refresh_write_profile(source, acceleration).uses_cdc_tier()
 }
 
 /// Whether the resolved `on_conflict` performs an upsert (replace existing rows
@@ -888,12 +915,14 @@ fn is_upsert_on_conflict(
 /// signal degrades gracefully: an unknown one falls back to the hardware-only
 /// derivation.
 fn build_workload_profile(
+    source: &dyn AccelerationSource,
     acceleration: Option<&Acceleration>,
     schema: &Schema,
     primary_keys: &[String],
     on_conflict: Option<&datafusion_table_providers::util::on_conflict::OnConflict>,
 ) -> autotune::WorkloadProfile {
-    let small_write = acceleration.is_some_and(uses_small_write_refresh_profile);
+    let small_write = acceleration
+        .is_some_and(|acceleration| uses_small_write_refresh_profile(source, acceleration));
     let inferred =
         data_components::inferred_schema::InferredSchema::from_metadata(schema.metadata());
     autotune::WorkloadProfile::from_inferred(
@@ -1156,7 +1185,7 @@ impl CayenneAccelerator {
     ) -> cayenne::metadata::VortexConfig {
         let small_write = source
             .acceleration()
-            .is_some_and(uses_small_write_refresh_profile);
+            .is_some_and(|acceleration| uses_small_write_refresh_profile(source, acceleration));
         let workload = autotune::WorkloadProfile::hardware_only(small_write);
         Self::get_vortex_config_with_footer_cache(table_name, source, None, &workload).await
     }
@@ -1201,7 +1230,7 @@ impl CayenneAccelerator {
                     .params
                     .get("cayenne_file_path")
                     .is_some_and(|p| p.starts_with("s3://"));
-            let small_write = uses_small_write_refresh_profile(acceleration);
+            let small_write = uses_small_write_refresh_profile(source, acceleration);
 
             // Detect the host profile once: cores, cgroup-aware memory, and the
             // storage medium under both the Vortex data files and the metastore
@@ -1278,7 +1307,7 @@ impl CayenneAccelerator {
             } else {
                 autotune::InlineFlushCaps::FLOOR
             };
-            apply_refresh_mode_defaults(&mut config, acceleration, inline_flush_caps);
+            apply_refresh_mode_defaults(&mut config, source, acceleration, inline_flush_caps);
 
             // In-RAM CDC tier caps (`cdc_durability: memory`) scale with host
             // memory only — see `autotune::HardwareProfile::mem_tier_caps`.
@@ -1437,7 +1466,8 @@ impl CayenneAccelerator {
                     );
                 }
             }
-            if config.cdc_durability.is_memory() && !uses_small_write_refresh_profile(acceleration)
+            if config.cdc_durability.is_memory()
+                && !uses_small_write_refresh_profile(source, acceleration)
             {
                 // Warn only when memory was explicitly requested: memory is
                 // the DEFAULT now, so every full/snapshot-profile dataset
@@ -2204,6 +2234,7 @@ impl CayenneAccelerator {
         // them as inactive so we don't fail with a missing object-store error.
         let is_s3_express = !memory_mode && s3::is_s3_express_data_path(source);
         let workload = build_workload_profile(
+            source,
             acceleration,
             schema.as_ref(),
             &primary_keys,
@@ -3321,6 +3352,7 @@ impl DataAccelerator for CayenneAccelerator {
             let unsupported_type_action = Self::get_unsupported_type_action(source);
             let is_s3_express = s3::is_s3_express_data_path(source);
             let workload = build_workload_profile(
+                source,
                 source.acceleration(),
                 arrow_schema.as_ref(),
                 &primary_keys,
@@ -4568,6 +4600,168 @@ mod tests {
             .collect();
         assert!(dims.contains(&256));
         assert!(dims.contains(&1536));
+    }
+
+    /// `DataConnector::resolve_refresh_mode` fills in an unset `refresh_mode`
+    /// (`debezium`/`cdc` → `changes`, `sink` → `disabled`, everything else → `full`)
+    /// and its result is never written back into the `Acceleration`. So the
+    /// accelerator must resolve the connector default itself: classifying from the
+    /// raw field would read a genuine `debezium:` stream as a whole-table replace and
+    /// switch its background compactor off.
+    ///
+    /// Every case is also checked against the runtime builder's pre-init
+    /// classification, which sizes host memory for the same pod from the raw `from:`
+    /// string. The two reach the connector name by different routes — the builder
+    /// parses the Spicepod value, the accelerator asks the initialized component —
+    /// so agreeing on every case is what proves the pod cannot be budgeted as one
+    /// shape and configured as another.
+    #[tokio::test]
+    async fn accelerator_resolves_connector_unset_refresh_mode() {
+        use spicepod::acceleration::RefreshMode as SpicepodRefreshMode;
+
+        let app = Arc::new(AppBuilder::new("connector-unset-refresh-mode").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+
+        // The profile the ACCELERATOR configures the table with, through a real
+        // `Dataset` — so `Dataset::connector_name` and `DatasetSpec::source()` are
+        // the code under test, not a hand-rolled parse.
+        let accelerator_profile = |from: &str, refresh_mode: Option<&SpicepodRefreshMode>| {
+            let mut dataset = DatasetBuilder::try_new(from.to_string(), "ds")
+                .expect("dataset builder")
+                .with_app(Arc::clone(&app))
+                .with_runtime(Arc::clone(&rt))
+                .build()
+                .expect("build dataset");
+            dataset.acceleration = Some(Acceleration {
+                engine: Engine::Cayenne,
+                mode: Mode::File,
+                refresh_mode: refresh_mode.cloned().map(RefreshMode::from),
+                ..Default::default()
+            });
+            let acceleration = dataset.acceleration.as_ref().expect("acceleration set");
+            refresh_write_profile(&dataset, acceleration)
+        };
+
+        // The profile the runtime BUILDER classifies the same pod with, pre-init.
+        let builder_profile = |from: &str, refresh_mode: Option<&SpicepodRefreshMode>| {
+            let accel = spicepod::acceleration::Acceleration {
+                refresh_mode: refresh_mode.cloned(),
+                ..Default::default()
+            };
+            RefreshWriteProfile::from_spicepod(
+                &accel,
+                crate::builder::connector_unset_refresh_mode(from),
+            )
+        };
+
+        let both_agree = |from: &str, refresh_mode: Option<&SpicepodRefreshMode>| {
+            let accelerator = accelerator_profile(from, refresh_mode);
+            assert_eq!(
+                accelerator,
+                builder_profile(from, refresh_mode),
+                "the accelerator and the runtime builder must classify `from: {from}` identically"
+            );
+            accelerator
+        };
+
+        // A CDC stream with no `refresh_mode:` line. `debezium/topic` is the case a
+        // `split_once(':')` would miss: `DatasetSpec::source()` treats `/` as a
+        // delimiter too.
+        for from in [
+            "debezium:my.topic",
+            "debezium/topic",
+            "cdc:stream",
+            "cdc/stream",
+        ] {
+            assert_eq!(
+                both_agree(from, None),
+                RefreshWriteProfile::SmallWrite,
+                "`{from}` with no refresh_mode is a CDC stream"
+            );
+        }
+
+        // `sink` resolves to `disabled`: no refresh runs, but `INSERT INTO` rows
+        // accumulate, so files still need consolidating.
+        assert_eq!(
+            both_agree("sink", None),
+            RefreshWriteProfile::BulkAppend,
+            "`sink` resolves to refresh_mode: disabled"
+        );
+
+        // Every other connector takes `resolve_refresh_mode`'s `full` default.
+        for from in ["s3://bucket/path", "postgres:public.orders"] {
+            assert_eq!(
+                both_agree(from, None),
+                RefreshWriteProfile::BulkOverwrite,
+                "`{from}` with no refresh_mode is a whole-table replace"
+            );
+        }
+
+        // An explicit `refresh_mode` always wins over the connector default, in both
+        // directions.
+        assert_eq!(
+            both_agree("debezium:my.topic", Some(&SpicepodRefreshMode::Full)),
+            RefreshWriteProfile::BulkOverwrite,
+            "an explicit refresh_mode: full overrides debezium's changes default"
+        );
+        assert_eq!(
+            both_agree(
+                "postgres:public.orders",
+                Some(&SpicepodRefreshMode::Changes)
+            ),
+            RefreshWriteProfile::SmallWrite,
+            "an explicit refresh_mode: changes overrides the full default"
+        );
+    }
+
+    /// The consequence of the classification above: an unannotated `debezium:`
+    /// dataset must keep a background compactor. Reading `refresh_mode` raw makes it
+    /// bulk-overwrite, whose defaults set `compaction_background_interval_ms = 0` —
+    /// the compactor is then never spawned, and its small files never consolidate.
+    #[tokio::test]
+    async fn unset_cdc_refresh_mode_keeps_background_compaction() {
+        let app = Arc::new(AppBuilder::new("connector-unset-compaction").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+
+        let interval_for = |from: &str| {
+            let mut dataset = DatasetBuilder::try_new(from.to_string(), "ds")
+                .expect("dataset builder")
+                .with_app(Arc::clone(&app))
+                .with_runtime(Arc::clone(&rt))
+                .build()
+                .expect("build dataset");
+            dataset.acceleration = Some(Acceleration {
+                engine: Engine::Cayenne,
+                mode: Mode::File,
+                // No `refresh_mode`: the connector fills it in.
+                ..Default::default()
+            });
+            let acceleration = dataset.acceleration.as_ref().expect("acceleration set");
+            let mut config = cayenne::metadata::VortexConfig::default();
+            apply_refresh_mode_defaults(
+                &mut config,
+                &dataset,
+                acceleration,
+                autotune::InlineFlushCaps::FLOOR,
+            );
+            config.compaction_background_interval_ms
+        };
+
+        assert_eq!(
+            interval_for("debezium:my.topic"),
+            SMALL_WRITE_COMPACTION_BACKGROUND_INTERVAL_MS,
+            "an unannotated debezium dataset is a CDC stream and keeps the tight compaction cadence"
+        );
+        assert_ne!(
+            interval_for("cdc:stream"),
+            0,
+            "an unannotated cdc dataset must keep a background compactor"
+        );
+        assert_eq!(
+            interval_for("s3://bucket/path"),
+            0,
+            "a whole-table replace has nothing to consolidate, so the compactor stays off"
+        );
     }
 
     #[tokio::test]
