@@ -708,31 +708,49 @@ impl ReciprocalRankFusion {
             .unwrap_or(RecencyDecay::Exponential);
         let decay_scale_secs = args.decay_scale_secs.unwrap_or(86400.0);
 
-        // Lots of casting annoyances are avoided by treating everything as `long`
+        // Lots of casting annoyances are avoided by treating everything as `long`.
         let today_epoch = to_unixtime(vec![now()]);
         let recency_col_epoch = to_unixtime(vec![qualified_recency_col]);
-        let age_in_units = (today_epoch - recency_col_epoch) / lit(decay_scale_secs);
+
+        Ok((score_expr
+            * Self::recency_boost_expr(
+                recency_decay,
+                args.decay_constant,
+                decay_scale_secs,
+                args.decay_window_secs,
+                today_epoch,
+                recency_col_epoch,
+            ))
+        .alias(RRF_FUSED_SCORE_COLUMN_NAME))
+    }
+
+    fn recency_boost_expr(
+        recency_decay: RecencyDecay,
+        decay_constant: Option<f64>,
+        decay_scale_secs: f64,
+        decay_window_secs: Option<f64>,
+        current_time_epoch: Expr,
+        recency_time_epoch: Expr,
+    ) -> Expr {
+        let age_in_seconds = current_time_epoch - recency_time_epoch;
 
         let recency_expr = match recency_decay {
             // e^(-alpha * age units)
             RecencyDecay::Exponential => {
-                let decay_constant = args.decay_constant.unwrap_or(0.01);
+                let decay_constant = decay_constant.unwrap_or(0.01);
                 #[expect(clippy::neg_multiply)]
-                exp(lit(-1.0f64 * decay_constant) * age_in_units)
+                exp(lit(-1.0f64 * decay_constant) * (age_in_seconds / lit(decay_scale_secs)))
             }
-            // 1 - (age units / boost window)
+            // The linear decay window is expressed in seconds.
             RecencyDecay::Linear => {
-                let decay_window_secs = args.decay_window_secs.unwrap_or(86400.0);
-                let boost = lit(1) - (age_in_units / lit(decay_window_secs));
-                greatest(vec![lit(0), boost])
+                let decay_window_secs = decay_window_secs.unwrap_or(86400.0);
+                let boost = lit(1.0) - (age_in_seconds / lit(decay_window_secs));
+                greatest(vec![lit(0.0), boost])
             }
         };
 
         // Fall back to the original score expression if a recency boost cannot be computed
-        Ok(
-            (score_expr * coalesce(vec![recency_expr, lit(1.0)]))
-                .alias(RRF_FUSED_SCORE_COLUMN_NAME),
-        )
+        coalesce(vec![recency_expr, lit(1.0)])
     }
 
     // Given arguments to n search calls: execute searches, generate row IDs, rank by score, JOIN,
@@ -1323,6 +1341,7 @@ impl TableProvider for ReciprocalRankFusion {
 
 #[cfg(test)]
 mod tests {
+    use crate::rrf::RecencyDecay;
     use crate::rrf::ReciprocalRankFusion;
     use crate::rrf::ReciprocalRankFusionArgs;
     use arrow::array::{Float64Array, StringArray};
@@ -1593,5 +1612,58 @@ mod tests {
                 "+----+\n", "| id |\n", "+----+\n", "| A  |\n", "| B  |\n", "+----+"
             )
         );
+    }
+
+    #[expect(clippy::float_cmp)]
+    #[tokio::test]
+    async fn linear_recency_decay_uses_second_window() {
+        let ctx = SessionContext::new();
+        let fixed_now_epoch_secs = 1_000_000_i64;
+        let decay_window_secs = 3_600.0;
+
+        let boost_at_window = ReciprocalRankFusion::recency_boost_expr(
+            RecencyDecay::Linear,
+            None,
+            86_400.0,
+            Some(decay_window_secs),
+            lit(fixed_now_epoch_secs),
+            lit(fixed_now_epoch_secs - 3_600),
+        )
+        .alias("boost_at_window");
+        let boost_halfway_through_window = ReciprocalRankFusion::recency_boost_expr(
+            RecencyDecay::Linear,
+            None,
+            86_400.0,
+            Some(decay_window_secs),
+            lit(fixed_now_epoch_secs),
+            lit(fixed_now_epoch_secs - 1_800),
+        )
+        .alias("boost_halfway_through_window");
+
+        let batches = ctx
+            .sql("SELECT 1")
+            .await
+            .expect("create single-row dataframe")
+            .select(vec![boost_at_window, boost_halfway_through_window])
+            .expect("select recency boosts")
+            .collect()
+            .await
+            .expect("collect recency boosts");
+        let boosts = &batches[0];
+        let boost_at_window = boosts
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("boost at window is a Float64 array")
+            .value(0);
+        let boost_halfway_through_window = boosts
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("boost halfway through window is a Float64 array")
+            .value(0);
+
+        assert_eq!(boost_at_window, 0.0);
+        assert_eq!(boost_halfway_through_window, 0.5);
     }
 }
