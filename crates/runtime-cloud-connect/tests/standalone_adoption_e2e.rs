@@ -901,20 +901,31 @@ async fn enrollment_issues_identity_and_streams_over_mtls() {
     // the observed mTLS Hello (in `enroll`) implies a valid chain.
 
     // The stream Hello names the instance and carries no credential of its
-    // own — enrollment moved out-of-band, and mTLS is the authN.
+    // own — enrollment moved out-of-band, and mTLS is the authN. Asserted field
+    // by field rather than as one predicate, so a failure says which part broke.
     let captured = Arc::clone(&harness.gateway.captured);
-    let ok = with_captured!(captured, c => {
-        c.hellos.iter().any(|(h, mtls)| {
-            h.identifier == ASSIGNED_ID
-                && *mtls
-                && h.instance_kind == proto::InstanceKind::Standalone as i32
-                && h.protocol_version == runtime_cloud_connect::PROTOCOL_VERSION
-                && h.capabilities == vec!["apply_spicepod".to_string()]
-        })
-    });
+    let (hello, over_mtls) = with_captured!(captured, c => c
+        .hellos
+        .iter()
+        .find(|(h, _)| h.identifier == ASSIGNED_ID)
+        .cloned())
+    .expect("the gateway must observe a Hello naming the enrolled instance");
     assert!(
-        ok,
-        "mTLS Hello must name the instance and announce its protocol version + capabilities"
+        over_mtls,
+        "the Hello must arrive on a mutually-authenticated stream"
+    );
+    assert_eq!(hello.instance_kind, proto::InstanceKind::Standalone as i32);
+    assert_eq!(
+        hello.protocol_version,
+        runtime_cloud_connect::PROTOCOL_VERSION
+    );
+    assert_eq!(
+        hello.capabilities,
+        vec![
+            "apply_spicepod".to_string(),
+            runtime_cloud_connect::handlers::CAPABILITY_DEPLOY_VERSIONS.to_string(),
+        ],
+        "this handle applies spicepods and reports deploy versions, and announces exactly those"
     );
 
     handle.shutdown().await;
