@@ -132,9 +132,8 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
 
     let p95 = test.get_p95_response_time_metric()?;
     let rps = test.get_rps_metric()?;
-    let retrieval_metrics = test.calculate_search_score_metrics(&qrels, |results| {
-        mteb_quora::transform_search_results_for_eval(results)
-    })?;
+    let retrieval_metrics =
+        test.calculate_search_score_metrics(&qrels, |results| dataset.transform_results(results))?;
 
     let metrics: QueryMetrics<_, _> =
         test.collect(TestType::Search)?
