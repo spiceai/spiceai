@@ -612,7 +612,7 @@ mod tests {
 
         assert_eq!(
             err.to_string(),
-            "Cannot write to 'virtual-index' index, data does not have column 'embedding'."
+            "Cannot write to 's3_vector_index' index, data does not have column 'embedding'."
         );
     }
 
