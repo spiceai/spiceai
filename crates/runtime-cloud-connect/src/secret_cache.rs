@@ -55,7 +55,7 @@ limitations under the License.
 //! `deployment_version` fails the open instead of silently misreporting what is
 //! cached.
 //!
-//! A random 192-bit XChaCha20 nonce is drawn per write, which is what makes a
+//! A random 192-bit `XChaCha20` nonce is drawn per write, which is what makes a
 //! random nonce safe under a key that never rotates.
 
 use std::collections::BTreeMap;
@@ -354,11 +354,13 @@ pub fn read(path: &Path, key: &[u8]) -> Result<Option<CachedSecrets>> {
             found: file.format_version,
         }
     );
+    // Moved, not cloned: this arm returns, so nothing reads `file.suite` after
+    // it. The `header_aad` call below is on the success path only.
     snafu::ensure!(
         file.suite == SUITE,
         UnsupportedSuiteSnafu {
             path: path.to_path_buf(),
-            found: file.suite.clone(),
+            found: file.suite,
         }
     );
 

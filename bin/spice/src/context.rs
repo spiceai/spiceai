@@ -534,6 +534,16 @@ fn sudo_invoker_home() -> Option<PathBuf> {
     None
 }
 
+/// Absolute paths `getent` ships at, in the order they are tried.
+///
+/// Resolving it through `PATH` would be a privilege-escalation hole: this runs
+/// under `sudo` on the documented `spice connect --install` path, so a `PATH`
+/// entry the invoking user controls would have this process execute their binary
+/// as root. Only these known locations are accepted, and a host with `getent`
+/// somewhere else falls through to reading `/etc/passwd`.
+#[cfg(unix)]
+const GETENT_PATHS: &[&str] = &["/usr/bin/getent", "/bin/getent"];
+
 /// A user's home directory from the passwd database.
 ///
 /// Asks `getent` first so NSS sources (LDAP, SSSD, systemd-homed) resolve, and
@@ -542,11 +552,16 @@ fn sudo_invoker_home() -> Option<PathBuf> {
 /// path would silently look for a runtime that was never there.
 #[cfg(unix)]
 fn passwd_home(user: &str) -> Option<String> {
-    if let Ok(output) = Command::new("getent").arg("passwd").arg(user).output()
-        && output.status.success()
-        && let Some(home) = passwd_entry_home(&String::from_utf8_lossy(&output.stdout), user)
-    {
-        return Some(home);
+    for getent in GETENT_PATHS {
+        if !std::path::Path::new(getent).is_file() {
+            continue;
+        }
+        if let Ok(output) = Command::new(*getent).arg("passwd").arg(user).output()
+            && output.status.success()
+            && let Some(home) = passwd_entry_home(&String::from_utf8_lossy(&output.stdout), user)
+        {
+            return Some(home);
+        }
     }
     let contents = std::fs::read_to_string("/etc/passwd").ok()?;
     passwd_entry_home(&contents, user)
@@ -641,6 +656,27 @@ mod tests {
         // A user with no home directory has nothing to look in.
         let no_home = "ghost:x:1:1:::/bin/false\n";
         assert_eq!(passwd_entry_home(no_home, "ghost"), None);
+    }
+
+    /// `passwd_home` runs `getent` while this process may be root under `sudo`,
+    /// so it must never be resolved through `PATH` — an entry the invoking user
+    /// controls would be executed as root.
+    #[cfg(unix)]
+    #[test]
+    fn getent_is_only_ever_run_from_an_absolute_path() {
+        assert!(!GETENT_PATHS.is_empty());
+        for candidate in GETENT_PATHS {
+            let path = std::path::Path::new(candidate);
+            assert!(
+                path.is_absolute(),
+                "{candidate} must be absolute, or PATH decides which binary runs as root"
+            );
+            assert_eq!(
+                path.file_name().and_then(std::ffi::OsStr::to_str),
+                Some("getent"),
+                "{candidate} must name getent itself"
+            );
+        }
     }
 
     /// `sudo` rewrites `HOME` to `/root`, so a runtime installed under the

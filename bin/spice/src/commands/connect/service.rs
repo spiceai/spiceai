@@ -284,9 +284,7 @@ fn is_root() -> bool {
 fn stage_runtime(source: &Path) -> Result<PathBuf> {
     let dest = PathBuf::from(STAGED_RUNTIME);
 
-    std::fs::create_dir_all(RUNTIME_STAGE_DIR).map_err(|e| Error::CloudConnectIo {
-        message: format!("create {RUNTIME_STAGE_DIR}: {e}"),
-    })?;
+    ensure_root_only_stage_dir()?;
 
     let stamp_path = dest.with_extension("stamp");
     let stamp = source_stamp(source);
@@ -306,14 +304,7 @@ fn stage_runtime(source: &Path) -> Result<PathBuf> {
     // atomic, and an already-executing image keeps running from its open inode).
     let staging = dest.with_extension("incoming");
     let _ = std::fs::remove_file(&staging);
-    std::fs::copy(source, &staging).map_err(|e| Error::CloudConnectIo {
-        message: format!(
-            "stage the Spice runtime from {} to {}: {e}",
-            source.display(),
-            staging.display()
-        ),
-    })?;
-    set_executable(&staging)?;
+    copy_as_root_only_executable(source, &staging)?;
     std::fs::rename(&staging, &dest).map_err(|e| Error::CloudConnectIo {
         message: format!(
             "install the staged Spice runtime at {}: {e}",
@@ -328,6 +319,142 @@ fn stage_runtime(source: &Path) -> Result<PathBuf> {
     }
 
     Ok(dest)
+}
+
+/// Create [`RUNTIME_STAGE_DIR`] if absent and refuse to stage into it unless
+/// only root can change what it holds.
+///
+/// Creating the directory is not enough on its own. The unit's `ExecStart` runs
+/// as root, so anyone who can write the directory — or rename any directory on
+/// the path to it — can substitute the binary root executes. An existing
+/// `/usr/local/lib/spice` (or `/usr/local/lib`, or `/usr/local`) that is
+/// group- or world-writable, or a symlink into somewhere that is, hands that
+/// power to a local user, and `create_dir_all` on an existing directory changes
+/// nothing about it.
+///
+/// So: create with an explicit `0755` (not the process umask, which could be 0),
+/// then walk the whole path and require every component to be root-owned and
+/// writable by nobody else. A component that fails is reported for the operator
+/// to fix rather than silently chmod'ed — repermissioning someone's
+/// `/usr/local` is not this command's call to make.
+#[cfg(unix)]
+fn ensure_root_only_stage_dir() -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+
+    let dir = Path::new(RUNTIME_STAGE_DIR);
+    // `recursive(true)` applies the mode to every component it creates and
+    // treats an existing directory as success, which is what the checks below
+    // are for.
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o755)
+        .create(dir)
+        .map_err(|e| Error::CloudConnectIo {
+            message: format!("create {RUNTIME_STAGE_DIR}: {e}"),
+        })?;
+
+    // The leaf is checked without following symlinks: a symlinked staging
+    // directory points the root service's binary somewhere this check cannot
+    // vouch for, even if the target itself looks fine today.
+    let leaf = std::fs::symlink_metadata(dir).map_err(|e| Error::CloudConnectIo {
+        message: format!("inspect {RUNTIME_STAGE_DIR}: {e}"),
+    })?;
+    if leaf.file_type().is_symlink() {
+        return Err(Error::InvalidArgument {
+            message: format!(
+                "Failed to install the Spice Cloud Connect service: {RUNTIME_STAGE_DIR} is a symlink. \
+                 The service runs the staged runtime as root, so it must live in a real, root-owned \
+                 directory. Replace the symlink with a directory owned by root (`chown root:root`, \
+                 `chmod 755`) and re-run `sudo spice connect --install`."
+            ),
+        });
+    }
+
+    for component in dir.ancestors() {
+        // Ancestors are resolved (symlinks followed): a root-owned symlink
+        // inside a directory only root can write is not a way in, and refusing
+        // one would fail on distributions that symlink parts of /usr.
+        let meta = std::fs::metadata(component).map_err(|e| Error::CloudConnectIo {
+            message: format!("inspect {}: {e}", component.display()),
+        })?;
+        let mode = meta.permissions().mode();
+        // 0o022: group-write and other-write. Either one lets a non-root user
+        // rename the directory below it and present their own.
+        if meta.uid() != 0 || mode & 0o022 != 0 {
+            return Err(Error::InvalidArgument {
+                message: format!(
+                    "Failed to install the Spice Cloud Connect service: {} is owned by uid {} with mode {:04o}, \
+                     so a non-root user can change what the service executes as root. Restrict it \
+                     (`sudo chown root:root {}` and `sudo chmod go-w {}`) and re-run \
+                     `sudo spice connect --install`.",
+                    component.display(),
+                    meta.uid(),
+                    mode & 0o7777,
+                    component.display(),
+                    component.display(),
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_root_only_stage_dir() -> Result<()> {
+    std::fs::create_dir_all(RUNTIME_STAGE_DIR).map_err(|e| Error::CloudConnectIo {
+        message: format!("create {RUNTIME_STAGE_DIR}: {e}"),
+    })
+}
+
+/// Copy `source` to `dest`, creating `dest` as `0755` from the first byte.
+///
+/// `fs::copy` gives the destination the *source's* permissions, so staging a
+/// runtime that happened to be group- or world-writable would publish a
+/// writable file into the staging directory and only tighten it afterwards.
+/// Directory permissions do not save it: they govern creating and renaming
+/// entries, not writing to a file that already exists — so between the copy and
+/// the chmod, any local user could overwrite the binary root is about to run.
+/// Creating the file with the final mode closes that window, and `create_new`
+/// refuses to inherit a leftover one.
+#[cfg(unix)]
+fn copy_as_root_only_executable(source: &Path, dest: &Path) -> Result<()> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let io_error = |e: std::io::Error| Error::CloudConnectIo {
+        message: format!(
+            "stage the Spice runtime from {} to {}: {e}",
+            source.display(),
+            dest.display()
+        ),
+    };
+
+    let mut reader = std::fs::File::open(source).map_err(io_error)?;
+    let mut writer = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o755)
+        .open(dest)
+        .map_err(io_error)?;
+    std::io::copy(&mut reader, &mut writer).map_err(io_error)?;
+    // The rename that follows publishes this file to the service; flush it first
+    // so a crash cannot leave the unit pointing at a truncated binary.
+    writer.sync_all().map_err(io_error)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn copy_as_root_only_executable(source: &Path, dest: &Path) -> Result<()> {
+    std::fs::copy(source, dest)
+        .map(|_| ())
+        .map_err(|e| Error::CloudConnectIo {
+            message: format!(
+                "stage the Spice runtime from {} to {}: {e}",
+                source.display(),
+                dest.display()
+            ),
+        })
 }
 
 /// Identity of the source binary: length and modified time, which together
@@ -356,23 +483,6 @@ fn runtime_is_already_staged(dest: &Path, stamp_path: &Path, stamp: &str) -> boo
         return false;
     }
     std::fs::read_to_string(stamp_path).is_ok_and(|recorded| recorded == stamp)
-}
-
-#[cfg(unix)]
-fn set_executable(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-    // 0755: root-writable, world-executable — systemd starts it as root, and the
-    // permissions are what stop anyone else replacing it.
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).map_err(|e| {
-        Error::CloudConnectIo {
-            message: format!("make {} executable: {e}", path.display()),
-        }
-    })
-}
-
-#[cfg(not(unix))]
-fn set_executable(_path: &Path) -> Result<()> {
-    Ok(())
 }
 
 /// Install (or reinstall) and start the unit for `instance_dir`.
