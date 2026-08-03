@@ -44,7 +44,12 @@ use tokio::sync::Mutex;
 /// same unactionable text, so walk the chain and keep what it says.
 ///
 /// Causes already quoted by an outer message are skipped, since wrappers commonly
-/// interpolate `{source}` themselves and would otherwise repeat it verbatim.
+/// interpolate `{source}` themselves and would otherwise repeat it verbatim. That
+/// check is a suffix match, not a substring one: `{source}` interpolation puts the
+/// cause at the end, whereas a substring test would silently drop a short cause that
+/// merely appears somewhere in the outer text — dropping "host" from "cannot resolve
+/// host name", say, which is precisely the detail this is here to keep. Repeating a
+/// cause is only noisy; losing one defeats the purpose, so the bias is toward keeping.
 fn error_with_causes(err: &dyn std::error::Error) -> String {
     fn one_line(err: &dyn std::error::Error) -> String {
         err.to_string()
@@ -57,7 +62,10 @@ fn error_with_causes(err: &dyn std::error::Error) -> String {
     let mut cause = err.source();
     while let Some(current) = cause {
         let text = one_line(current);
-        if !text.is_empty() && !message.contains(&text) {
+        // Ignore trailing punctuation so "… : bad password." still counts as already
+        // quoting a "bad password" cause.
+        let quoted = message.trim_end_matches(['.', '!', ' ']).ends_with(&text);
+        if !text.is_empty() && !quoted {
             message.push_str(": ");
             message.push_str(&text);
         }
@@ -500,11 +508,39 @@ mod tests {
 
         // Wrappers that already interpolate `{source}` must not repeat it.
         let err = chained(&["connect failed: bad password", "bad password"]);
-        assert_eq!(super::error_with_causes(&err), "connect failed: bad password");
+        assert_eq!(
+            super::error_with_causes(&err),
+            "connect failed: bad password"
+        );
+
+        // …including when the wrapper punctuates after the interpolated source.
+        let err = chained(&["connect failed: bad password.", "bad password"]);
+        assert_eq!(
+            super::error_with_causes(&err),
+            "connect failed: bad password."
+        );
 
         // A lone error with no chain is unchanged.
         let err = chained(&["standalone"]);
         assert_eq!(super::error_with_causes(&err), "standalone");
+    }
+
+    #[test]
+    fn error_with_causes_keeps_a_cause_that_is_only_a_substring() {
+        // A short cause that merely appears inside the outer text is NOT already
+        // quoted, and dropping it would discard the root cause this exists to keep.
+        let err = chained(&["cannot resolve host name for cluster", "host"]);
+        assert_eq!(
+            super::error_with_causes(&err),
+            "cannot resolve host name for cluster: host"
+        );
+
+        // Same for a cause repeated mid-message rather than interpolated at the end.
+        let err = chained(&["timeout while waiting: retrying", "timeout"]);
+        assert_eq!(
+            super::error_with_causes(&err),
+            "timeout while waiting: retrying: timeout"
+        );
     }
 
     #[tokio::test]
