@@ -19,7 +19,6 @@ use std::sync::Arc;
 use app::{App, AppBuilder};
 
 use crate::Runtime;
-use crate::component::dataset::Dataset;
 
 impl Runtime {
     pub(crate) async fn start_pods_watcher(self: Arc<Self>) -> notify::Result<()> {
@@ -50,27 +49,26 @@ impl Runtime {
     /// datasets, views, models, functions, and (without the `models` feature)
     /// workers against the currently-loaded app.
     ///
-    /// This is the same diff-based reconcile the pods watcher performs when a
-    /// spicepod file changes on disk, factored out so other drivers — e.g.
-    /// Spice Cloud Connect's `apply_spicepod` — can hot-apply a
-    /// control-plane-supplied configuration without restarting the process.
+    /// This is the diff-based reconcile the pods watcher performs when a
+    /// spicepod file changes on disk. It is the *local* configuration path: a
+    /// Spice Cloud deployment does not come through here, because it applies by
+    /// persisting the spicepod and restarting onto it (see
+    /// `spiced`'s `cloud_connect` module).
     ///
     /// Returns `true` if `new_app` differed from the current app and was
     /// applied, `false` if it was identical (a no-op). When there is no
     /// current app yet, `new_app` is installed and `true` is returned.
     ///
     /// Diffs are computed while holding only a read lock on the app; the write
-    /// lock is taken only for the final swap. This whole method is serialized by
-    /// [`Runtime::apply_app_lock`] because it now has two independent callers —
-    /// the on-disk pods watcher loop and Spice Cloud Connect's `apply_spicepod`
-    /// — which can invoke it concurrently. Without serialization two applies
-    /// could diff against the same old app, interleave their catalog/dataset/
-    /// view mutations, and overwrite `self.app` last-writer-wins. We hold the
-    /// dedicated mutex (rather than the app write lock) for the duration so the
-    /// diff phase can still read the app `RwLock` without deadlocking.
+    /// lock is taken only for the final swap. The whole method is serialized by
+    /// [`Runtime::apply_app_lock`] so two applies cannot diff against the same
+    /// old app, interleave their catalog/dataset/view mutations, and overwrite
+    /// `self.app` last-writer-wins. We hold the dedicated mutex (rather than the
+    /// app write lock) for the duration so the diff phase can still read the app
+    /// `RwLock` without deadlocking.
     pub async fn apply_app(self: Arc<Self>, new_app: Arc<App>) -> bool {
-        // Serialize the entire diff-and-swap so concurrent callers (pods watcher
-        // + Cloud Connect) apply one-at-a-time. Must be the first statement.
+        // Serialize the entire diff-and-swap so concurrent callers apply
+        // one-at-a-time. Must be the first statement.
         let _serialize = self.apply_app_lock.lock().await;
 
         // It is safe to operate by read lock until we actually need to update
@@ -83,42 +81,7 @@ impl Runtime {
             .await
     }
 
-    /// Hot-apply `new_app` on top of a runtime whose initial component load was
-    /// abandoned by [`Runtime::supersede_initial_load`].
-    ///
-    /// [`Runtime::apply_app`] diffs against the *declared* app, which after a
-    /// cancelled load overstates what is registered: a dataset the load never
-    /// reached is declared but absent, so the diff would find it in both apps,
-    /// treat it as unchanged, and skip it — leaving the table missing for the
-    /// life of the process. This diffs against the datasets that really are
-    /// registered instead, so everything the load did not finish is applied as
-    /// new. Datasets that did load are still diffed normally and are not
-    /// re-registered.
-    ///
-    /// Scope note: only datasets are reconciled this way. They are the
-    /// components the initial load registers through the unbounded-retry path,
-    /// so they are the ones a cancelled load reliably leaves half-registered;
-    /// catalogs, views, and models are diffed against the declared app exactly
-    /// as [`Runtime::apply_app`] does.
-    pub async fn apply_app_after_cancelled_load(self: Arc<Self>, new_app: Arc<App>) -> bool {
-        let _serialize = self.apply_app_lock.lock().await;
-
-        let baseline = self.read_app().await.map(|current| {
-            let mut registered = (*current).clone();
-            registered.datasets.retain(|ds| {
-                Dataset::parse_table_reference(&ds.name)
-                    .is_ok_and(|table| self.df.table_exists(&table))
-            });
-            Arc::new(registered)
-        });
-
-        Arc::clone(&self)
-            .apply_app_diff(baseline.as_ref(), new_app)
-            .await
-    }
-
-    /// Diff-and-apply shared by [`Runtime::apply_app`] and
-    /// [`Runtime::apply_app_after_cancelled_load`].
+    /// Diff-and-apply behind [`Runtime::apply_app`].
     ///
     /// The caller holds `apply_app_lock`. `current_app` is what to reconcile
     /// *from*, which is not necessarily the installed app; `new_app` is

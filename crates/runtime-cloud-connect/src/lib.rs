@@ -53,12 +53,14 @@ limitations under the License.
 
 pub mod clock_skew;
 pub mod config;
+pub mod deployment;
 pub mod enroll;
 pub mod handlers;
 pub mod identity;
 pub mod release;
 pub mod sealed_secrets;
 pub mod secret_cache;
+pub mod supervisor;
 
 mod client;
 mod fingerprint;
@@ -89,9 +91,11 @@ use tokio::task::JoinHandle;
 
 pub use config::CloudConnectConfig;
 pub use handlers::{
-    Capability, CommandError, RestartMode, RuntimeHandle, RuntimePhase, StatusReport,
+    ApplyOutcome, Capability, CommandError, PostApply, RestartMode, RuntimeHandle, RuntimePhase,
+    SpicepodDeployment, StatusReport,
 };
 pub use identity::{Identity, IdentityStore};
+pub use supervisor::Supervisor;
 
 /// Revision of the `spice.cloud.v1` contract this client implements,
 /// announced in `Hello.protocol_version`.

@@ -36,28 +36,48 @@ limitations under the License.
 //! runtime continues unmanaged. Conversely its absence keeps the
 //! signal-based activation, so instances enrolled before the flag existed
 //! keep connecting after an upgrade.
+//!
+//! ## How a deployment applies
+//!
+//! By restarting, and only by restarting. `apply_spicepod` validates the
+//! incoming spicepod, persists it as `spicepod-cloud-managed.yml`, records the
+//! deployment version beside it, and exits 0 — the supervisor relaunches
+//! `spiced`, [`cloud_managed_spicepod`] hands the persisted file to the app
+//! builder, and the instance comes up serving it and reporting its version.
+//!
+//! Two consequences the caller has to hold:
+//!
+//! - **The command result is not how a deployment is confirmed.** The process
+//!   exits mid-command, so the stream drops; the control plane reconciles
+//!   against `Hello.applied_deployment_version` on the next connection.
+//! - **Downtime is proportional to the app's size, not the change's.** A
+//!   one-line edit reloads every dataset and rebuilds every acceleration.
+//!
+//! What this buys is one behaviour instead of two: no section that reconciles
+//! in-process while another waits for an operator, and no partially-applied
+//! state that is neither the old configuration nor the new one.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use app::{App, AppBuilder};
 use async_trait::async_trait;
+use parking_lot::RwLock;
 use runtime::Runtime;
 use runtime::status::ComponentStatus;
 use runtime_cloud_connect::config::{
     CLOUD_MANAGED_SPICEPOD_FILE, CloudConnectConfig, IDENTITY_FILE, PENDING_ADOPT_CODE_FILE,
 };
 use runtime_cloud_connect::handlers::{
-    Capability, CommandError, RuntimeHandle, RuntimePhase, StatusReport,
+    ApplyOutcome, Capability, CommandError, RuntimeHandle, RuntimePhase, SpicepodDeployment,
+    StatusReport,
 };
-use runtime_cloud_connect::{CloudConnect, identity::IdentityStore};
+use runtime_cloud_connect::supervisor::Supervisor;
+use runtime_cloud_connect::{CloudConnect, deployment, identity::IdentityStore};
 // Reached through the `runtime` re-export rather than a direct dependency, the
 // same way `runtime::status` is.
-use runtime::secrets::stores::cloud_delivered::{
-    CLOUD_DELIVERED_STORE, CloudDeliveredSecretStore,
-};
+use runtime::secrets::stores::cloud_delivered::{CLOUD_DELIVERED_STORE, CloudDeliveredSecretStore};
 use runtime_cloud_connect::identity::CacheKey;
 
 use crate::log_capture::LogRingBuffer;
@@ -65,6 +85,16 @@ use crate::log_capture::LogRingBuffer;
 /// Default number of log lines returned by `GetLogs` when the command leaves
 /// `tail_lines` unset. Bounded by the ring buffer's capacity.
 const DEFAULT_LOG_TAIL_LINES: usize = 500;
+
+/// How long a deployment's shutdown may drain before the process exits anyway.
+///
+/// A deployment restart is a planned shutdown, so it takes the same drain path
+/// a `SIGTERM` would — an accelerator with local state has to flush it. The
+/// bound is what keeps one stuck connection from turning a deployment into an
+/// instance that never comes back: `Runtime::shutdown` has its own
+/// (`runtime.shutdown_timeout`, 30s by default) budget, and this is the outer
+/// one that holds even if that budget is raised or a phase hangs.
+const DEPLOYMENT_DRAIN_BUDGET: Duration = Duration::from_mins(2);
 
 /// Cheap probe for whether Spice Cloud Connect is configured for this
 /// instance, using the same signals as [`maybe_start`]: the explicit
@@ -108,6 +138,45 @@ fn build_config(runtime_version: &str) -> CloudConnectConfig {
         config.enroll_endpoint = override_endpoint;
     }
     config
+}
+
+/// The spicepod a deployment persisted, and the deployment it belongs to.
+///
+/// A deployment applies by persisting this file and restarting, so on every
+/// start it — not the instance directory's `spicepod.yaml` — is the
+/// configuration a cloud-managed instance serves.
+pub struct CloudManagedSpicepod {
+    pub path: PathBuf,
+    /// The persisted YAML, kept so an `ApplySpicepod` can tell a redelivery of
+    /// the running deployment from a new one without re-reading the file.
+    pub spicepod_yaml: String,
+    /// The deployment that persisted it, from the record beside it. `None` when
+    /// the dispatch assigned no version, or the record is missing or corrupt —
+    /// in which case the instance reports that it cannot name a version.
+    pub deployment_version: Option<u64>,
+}
+
+/// The cloud-managed spicepod this instance starts on, or `None` when Cloud
+/// Connect is not configured or no deployment has ever landed here.
+///
+/// Reads files only — no control-plane round trip — so an instance whose
+/// gateway is unreachable still comes up on its deployed configuration.
+pub async fn cloud_managed_spicepod(cloud_connect_flag: bool) -> Option<CloudManagedSpicepod> {
+    if !is_configured(cloud_connect_flag) {
+        return None;
+    }
+    let config_dir = CloudConnectConfig::default_config_dir();
+    let path = config_dir.join(CLOUD_MANAGED_SPICEPOD_FILE);
+    // An unreadable file is the same as an absent one here: the caller falls
+    // back to the local spicepod and reports no applied version, which leaves
+    // the instance reachable for the deployment that fixes it. `is_configured`
+    // ran before this, so a missing file is the ordinary not-yet-deployed case.
+    let spicepod_yaml = tokio::fs::read_to_string(&path).await.ok()?;
+    Some(CloudManagedSpicepod {
+        deployment_version: deployment::read_version(&config_dir),
+        path,
+        spicepod_yaml,
+    })
 }
 
 /// The delivered-secrets store and its cache key, restored from local state.
@@ -162,11 +231,18 @@ pub async fn restore_delivered_secrets(
 /// the client on, but with no identity and no adoption code there is
 /// nothing to connect with — that case logs an actionable warning (instead
 /// of the silent debug skip) and the runtime continues unmanaged.
+///
+/// `running_deployment` is the cloud-managed spicepod the runtime actually
+/// loaded, or `None` when it is serving something else (a local spicepod, or a
+/// deployed one that failed to build). It is what the instance reports as its
+/// applied deployment, so passing it for a configuration that is not live would
+/// resolve a deployment that never landed.
 pub async fn maybe_start(
     runtime_version: &str,
     runtime: Arc<Runtime>,
     cloud_connect_flag: bool,
     delivered_secrets: Option<DeliveredSecretsState>,
+    running_deployment: Option<CloudManagedSpicepod>,
 ) -> Option<CloudConnect> {
     let config = build_config(runtime_version);
 
@@ -237,6 +313,18 @@ pub async fn maybe_start(
         }
     };
 
+    // Detected once: nothing about the process's supervisor changes while it
+    // runs, and every deployment depends on the answer.
+    let supervisor = Supervisor::detect();
+    if let Some(caveat) = supervisor.caveat() {
+        tracing::warn!("Spice Cloud Connect: {caveat}");
+    } else {
+        tracing::info!(
+            "Spice Cloud Connect: process supervisor detected ({}); a deployment applies by restarting spiced",
+            supervisor.as_str()
+        );
+    }
+
     // The cache key is read from the identity on each write, not captured here:
     // an instance enrolling in this very process has no identity yet.
     let identity_path = config.identity_path.clone();
@@ -245,6 +333,8 @@ pub async fn maybe_start(
         logs,
         delivered_store,
         identity_path,
+        running_deployment,
+        supervisor,
     ));
 
     match CloudConnect::start(config, handle).await {
@@ -306,17 +396,43 @@ fn load_cached_secrets(config: &CloudConnectConfig, store: &CloudDeliveredSecret
     }
 }
 
-/// Tracks whether a deployed spicepod carried changes that `apply_app`
-/// cannot hot-reload (see [`restart_required_sections`]) and therefore need a
-/// process restart to take effect. Set by `apply_spicepod` and surfaced by
-/// `status` so the control plane can show a "restart required" state until
-/// the operator restarts spiced (standalone spiced cannot self-restart).
-#[derive(Default)]
-struct RestartState {
-    pending: AtomicBool,
-    /// Names of the spicepod sections still awaiting a restart. Guarded by a
-    /// std mutex held only for the brief read/write — never across `.await`.
-    sections: Mutex<Vec<String>>,
+/// One deployment as this instance sees it: the version that names it and the
+/// spicepod it carries. Two deployments are the same one when both halves
+/// match — a version alone cannot decide it, because a control plane that
+/// redelivers a version with different content is describing a different
+/// configuration whatever it calls it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Deployed {
+    deployment_version: Option<u64>,
+    spicepod_yaml: String,
+}
+
+/// What an incoming `ApplySpicepod` turns out to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Disposition {
+    /// The runtime is already serving exactly this deployment. Restarting for
+    /// it would turn a redelivery into a restart loop.
+    AlreadyLive,
+    /// This process already persisted exactly this deployment and is on its way
+    /// out. Re-issuing the exit is safe and covers an exit that did not happen.
+    AlreadyPersisted,
+    /// Persist it, then restart onto it.
+    Apply,
+}
+
+/// Classify an incoming deployment against what this process is serving
+/// (`live`) and what it has already persisted but not yet restarted onto
+/// (`persisted`).
+fn disposition(live: &Deployed, persisted: Option<&Deployed>, incoming: &Deployed) -> Disposition {
+    if persisted.is_some_and(|persisted| persisted == incoming) {
+        return Disposition::AlreadyPersisted;
+    }
+    // Only meaningful while nothing has been persisted: once it has, the live
+    // configuration is the one being replaced.
+    if persisted.is_none() && live == incoming {
+        return Disposition::AlreadyLive;
+    }
+    Disposition::Apply
 }
 
 /// Thin adapter so the cloud-connect client can call into the runtime
@@ -326,8 +442,6 @@ struct SpicedRuntimeHandle {
     /// Recent log lines for `GetLogs`. `None` when the capture layer was
     /// not installed (Cloud Connect not configured at tracing-init time).
     logs: Option<LogRingBuffer>,
-    /// Pending-restart state accumulated across `apply_spicepod` calls.
-    restart: RestartState,
     /// Secrets the control plane delivered with a deployment. Registered as a
     /// built-in store so `${ secrets:NAME }` resolves them with nothing declared
     /// in the spicepod, and so a spicepod reload cannot drop them.
@@ -340,6 +454,20 @@ struct SpicedRuntimeHandle {
     /// unwritable on a first boot, which is precisely the case the cache exists
     /// for.
     identity_path: std::path::PathBuf,
+    /// The deployment this process is serving. Fixed for the life of the
+    /// process: a deployment takes effect by restarting, so nothing can change
+    /// what is live without starting a new one.
+    ///
+    /// A runtime serving a local spicepod has an empty one, which matches no
+    /// incoming deployment and reports no version.
+    live: Deployed,
+    /// A deployment this process validated and persisted, waiting on the exit
+    /// that makes it live. Read on every `Hello`, written once per apply — a
+    /// `parking_lot` lock held for the read/write only, never across an
+    /// `.await`.
+    persisted: RwLock<Option<Deployed>>,
+    /// What will relaunch this process after a deployment exits it.
+    supervisor: Supervisor,
 }
 
 impl SpicedRuntimeHandle {
@@ -348,14 +476,46 @@ impl SpicedRuntimeHandle {
         logs: Option<LogRingBuffer>,
         delivered_secrets: Arc<CloudDeliveredSecretStore>,
         identity_path: std::path::PathBuf,
+        running_deployment: Option<CloudManagedSpicepod>,
+        supervisor: Supervisor,
     ) -> Self {
+        let live = running_deployment.map_or_else(
+            || Deployed {
+                deployment_version: None,
+                spicepod_yaml: String::new(),
+            },
+            |running| Deployed {
+                deployment_version: running.deployment_version,
+                spicepod_yaml: running.spicepod_yaml,
+            },
+        );
         Self {
             runtime,
             logs,
-            restart: RestartState::default(),
             delivered_secrets,
             identity_path,
+            live,
+            persisted: RwLock::new(None),
+            supervisor,
         }
+    }
+
+    /// The deployment this instance has committed to: the one it persisted if a
+    /// deployment is mid-apply, otherwise the one it is serving.
+    ///
+    /// Reported both on `Hello` and in the `get_status` document, so the two
+    /// can never disagree. It is deliberately the *persisted* deployment during
+    /// the window between the result being sent and the process exiting: the
+    /// instance has accepted that configuration and is restarting onto it, and
+    /// reporting the outgoing version there would read to the control plane as
+    /// a deployment that rolled back.
+    fn committed_deployment_version(&self) -> Option<u64> {
+        self.persisted
+            .read()
+            .as_ref()
+            .map_or(self.live.deployment_version, |persisted| {
+                persisted.deployment_version
+            })
     }
 
     /// The local delivered-secrets cache key, read fresh from `identity.json`.
@@ -380,12 +540,13 @@ impl SpicedRuntimeHandle {
     fn cache_delivered_secrets(
         &self,
         config_dir: &Path,
+        deployment_version: Option<u64>,
         secrets: &runtime_cloud_connect::sealed_secrets::DeliveredSecrets,
     ) -> Option<String> {
         let key = self.cache_key()?;
         let path = config_dir.join(runtime_cloud_connect::secret_cache::SECRET_CACHE_FILE);
-        // No deployment version to record yet — the dispatch does not carry one.
-        match runtime_cloud_connect::secret_cache::write(&path, &key, "", secrets) {
+        let version = deployment::version_label(deployment_version);
+        match runtime_cloud_connect::secret_cache::write(&path, &key, &version, secrets) {
             Ok(()) => None,
             Err(err) => {
                 tracing::warn!("Spice Cloud Connect: could not cache delivered secrets: {err}");
@@ -395,54 +556,13 @@ impl SpicedRuntimeHandle {
     }
 }
 
-/// Spicepod sections that differ between `current` and `new` and that
-/// [`Runtime::apply_app`] does **not** hot-reload — a change to any of them
-/// only takes effect after a process restart. Returns their names (empty means
-/// the change is fully hot-reloadable).
-///
-/// `apply_app` reconciles only catalogs, datasets, views, models, functions,
-/// and workers; every other section is read once at startup. The `runtime:`
-/// block is compared as a whole — a few of its fields are re-read live (e.g.
-/// `flight.batch_size`, `task_history.enabled`, `functions.enabled`), so this
-/// may occasionally over-report a restart, which is the safe direction: we
-/// never silently drop a configuration change (data-correctness first).
-///
-/// `workers` are intentionally NOT checked here: they hot-reload in builds
-/// without the `models` feature and, when `models` is enabled, model reloads
-/// cover the common case — treating them as restart-only would over-report on
-/// the typical spiced build.
-fn restart_required_sections(current: &App, new: &App) -> Vec<&'static str> {
-    let mut changed = Vec::new();
-    if current.runtime != new.runtime {
-        changed.push("runtime");
-    }
-    if current.embeddings != new.embeddings {
-        changed.push("embeddings");
-    }
-    if current.rerankers != new.rerankers {
-        changed.push("rerankers");
-    }
-    if current.tools != new.tools {
-        changed.push("tools");
-    }
-    if current.secrets != new.secrets {
-        changed.push("secrets");
-    }
-    if current.extensions != new.extensions {
-        changed.push("extensions");
-    }
-    if current.management != new.management {
-        changed.push("management");
-    }
-    changed
-}
-
 #[async_trait]
 impl RuntimeHandle for SpicedRuntimeHandle {
     /// What a standalone `spiced` can answer. `Restart` is excluded
-    /// deliberately: there is no supervisor to bring the process back up, so
-    /// the command is not merely unimplemented here — it cannot be
-    /// implemented, and the control plane should not offer it.
+    /// deliberately: a restart is how a *deployment* applies, driven by the
+    /// instance once it has a validated spicepod to come back on — a restart on
+    /// demand, with nothing to change, is a control the portal should not offer
+    /// for a process that may have no supervisor to come back under.
     fn supports(&self, capability: Capability) -> bool {
         match capability {
             Capability::ApplySpicepod | Capability::GetStatus => true,
@@ -455,7 +575,7 @@ impl RuntimeHandle for SpicedRuntimeHandle {
 
     fn unsupported_reason(&self, capability: Capability) -> String {
         match capability {
-            Capability::Restart => "Restart is unsupported on standalone spiced: it has no supervisor to bring the process back up. Restart it via your process manager (systemd/Docker/Kubernetes). Configuration changes apply in-process via ApplySpicepod and do not need a restart.".to_string(),
+            Capability::Restart => "Restart is unsupported on standalone spiced: it is not a control the runtime offers on demand. A deployment already applies by restarting this instance onto the spicepod it validated; to restart it without deploying, use your process manager (systemd/Docker/Kubernetes). See: https://spiceai.org/docs".to_string(),
             Capability::UpgradeRuntime => "UpgradeRuntime is unsupported on standalone spiced: it cannot replace its own binary. Upgrade it the way you installed it (`spice upgrade`, your container image, or your package manager). See: https://spiceai.org/docs".to_string(),
             Capability::GetLogs => "Log capture is not enabled for this runtime: Spice Cloud Connect must be configured before startup for spiced to install the log-capture layer. See: https://spiceai.org/docs".to_string(),
             Capability::ApplySpicepod | Capability::GetStatus => format!(
@@ -500,47 +620,103 @@ impl RuntimeHandle for SpicedRuntimeHandle {
         })
     }
 
-    /// Apply a cloud-managed spicepod, hot-reloading what can be hot-reloaded
-    /// and flagging what cannot.
+    async fn applied_deployment_version(&self) -> Option<u64> {
+        self.committed_deployment_version()
+    }
+
+    /// Apply a cloud-managed spicepod by persisting it and restarting onto it.
     ///
-    /// 1. The YAML is validated by building an [`App`] from it on a sibling
-    ///    temp file, so a malformed control-plane push is rejected with a
-    ///    clear error and the previous good `spicepod-cloud-managed.yml` is
-    ///    left untouched.
-    /// 2. The validated file is promoted to the canonical path so a later
-    ///    process restart picks up the FULL configuration — including the
-    ///    parts that can't hot-reload.
-    /// 3. Changes to catalogs/datasets/views/models/functions/workers are
-    ///    hot-applied via [`Runtime::apply_app`] and take effect immediately.
-    /// 4. Changes to sections `apply_app` does not reconcile (the `runtime:`
-    ///    block, embeddings, rerankers, tools, secrets, extensions,
-    ///    management — see [`restart_required_sections`]) cannot take effect
-    ///    until a restart. Rather than silently drop them, the result reports
-    ///    `restart_required: true` and the affected sections, and the pending
-    ///    state is recorded so `get_status` keeps surfacing it. Standalone
-    ///    spiced cannot self-restart, so the operator must restart it via
-    ///    their process manager.
+    /// 1. A redelivery of the deployment this process is already serving — same
+    ///    version, same YAML — is answered as applied and changes nothing, not
+    ///    even the delivered secrets. Restarting for it would make a redelivery
+    ///    a restart loop, so a change to an app's secrets has to arrive as a new
+    ///    deployment rather than as a re-send of the current one.
+    /// 2. Delivered secrets are installed and cached first. The restart is what
+    ///    makes the spicepod live, and the components that resolve
+    ///    `${ secrets:… }` run during that start, so the cache — not this
+    ///    process's in-memory store — is what has to hold them by then.
+    /// 3. The YAML is validated by building an [`App`] from it on a sibling
+    ///    temp file, so a malformed push is rejected with a clear error and the
+    ///    previous good `spicepod-cloud-managed.yml` is left untouched and
+    ///    still running.
+    /// 4. The validated file is promoted to the canonical path and the
+    ///    deployment version recorded beside it, so the next start comes up on
+    ///    this configuration and reports this version.
+    /// 5. The client sends this result and then calls
+    ///    [`RuntimeHandle::exit_to_apply`], which drains and exits 0 for the
+    ///    supervisor to relaunch.
     ///
-    /// `success` is still `true` in the restart-required case: the spicepod
-    /// was accepted, validated, persisted, and its hot-reloadable parts
-    /// applied — the caller learns the caveat from `restart_required` rather
-    /// than from a blanket failure.
+    /// There is deliberately no hot-reload path. Reconciling part of a spicepod
+    /// in-process and leaving the rest (`runtime:`, `secrets:`, embeddings,
+    /// tools) for an operator to restart for meant two behaviours to reason
+    /// about and a partially-applied state that was neither. The cost is that
+    /// downtime is proportional to the app's size rather than the change's —
+    /// every deployment is a full start, including acceleration rebuilds.
     async fn apply_spicepod(
         &self,
-        config_dir: &Path,
-        spicepod_yaml: &str,
-        delivered_secrets: Option<runtime_cloud_connect::sealed_secrets::DeliveredSecrets>,
-    ) -> Result<serde_json::Value, CommandError> {
-        // Install the delivered secrets BEFORE the spicepod is validated and
-        // applied: `AppBuilder::build_from_path` and `apply_app` both resolve
-        // `${ secrets:… }` references, so secrets installed afterwards would
-        // arrive after the components that needed them had already failed.
+        deployment: SpicepodDeployment<'_>,
+    ) -> Result<ApplyOutcome, CommandError> {
+        let SpicepodDeployment {
+            config_dir,
+            spicepod_yaml,
+            deployment_version,
+            delivered_secrets,
+        } = deployment;
+
+        let incoming = Deployed {
+            deployment_version,
+            spicepod_yaml: spicepod_yaml.to_string(),
+        };
+        let version_label = deployment_version.map_or_else(
+            || "this deployment".to_string(),
+            |version| format!("deployment {version}"),
+        );
+
+        // Cloned out of the lock rather than compared under it: the comparison
+        // is against an owned `incoming` and the guard must not be held across
+        // the awaits below.
+        let persisted = self.persisted.read().as_ref().cloned();
+        match disposition(&self.live, persisted.as_ref(), &incoming) {
+            Disposition::AlreadyLive => {
+                tracing::info!(
+                    "Spice Cloud Connect: {version_label} is already applied; nothing to do"
+                );
+                return Ok(ApplyOutcome::settled(serde_json::json!({
+                    "path": config_dir.join(CLOUD_MANAGED_SPICEPOD_FILE).display().to_string(),
+                    "applied": true,
+                    "live": true,
+                    "restart": "not_required",
+                    "deployment_version": deployment_version,
+                    "message": format!("{version_label} is already applied and live; this instance is serving it."),
+                })));
+            }
+            Disposition::AlreadyPersisted => {
+                tracing::info!(
+                    "Spice Cloud Connect: {version_label} is already persisted; restarting onto it"
+                );
+                return Ok(ApplyOutcome::exit_to_apply(serde_json::json!({
+                    "path": config_dir.join(CLOUD_MANAGED_SPICEPOD_FILE).display().to_string(),
+                    "applied": true,
+                    "live": false,
+                    "restart": "in_progress",
+                    "deployment_version": deployment_version,
+                    "message": format!("{version_label} is persisted; this instance is restarting onto it."),
+                })));
+            }
+            Disposition::Apply => {}
+        }
+
+        // Install and cache the delivered secrets BEFORE the spicepod is
+        // validated: `AppBuilder::build_from_path` resolves `${ secrets:… }`
+        // references, so secrets installed afterwards would arrive after
+        // validation had already failed on them.
         let mut cache_error = None;
         let delivered_names = match delivered_secrets {
             None => None,
             Some(secrets) => {
                 let names: Vec<String> = secrets.keys().cloned().collect();
-                cache_error = self.cache_delivered_secrets(config_dir, &secrets);
+                cache_error =
+                    self.cache_delivered_secrets(config_dir, deployment_version, &secrets);
                 // Replaces the whole set: an app whose secrets were removed
                 // must stop resolving them.
                 self.delivered_secrets.replace(secrets);
@@ -550,87 +726,88 @@ impl RuntimeHandle for SpicedRuntimeHandle {
 
         let (new_app, path) = stage_cloud_managed_spicepod(config_dir, spicepod_yaml).await?;
 
-        // Determine which changes can't hot-reload BEFORE apply_app swaps the
-        // current app. No current app (first load) → startup applies it all,
-        // so nothing is restart-pending.
-        let restart_sections: Vec<String> = match self.runtime.read_app().await {
-            Some(current) => restart_required_sections(&current, &new_app)
-                .into_iter()
-                .map(String::from)
-                .collect(),
-            None => Vec::new(),
-        };
+        // Recorded after the spicepod is promoted, so a failure between the two
+        // leaves the instance on a configuration it can still name. A failure
+        // *here* leaves the reverse — the new spicepod canonical, the version
+        // behind it — which the restart would report as the old version and the
+        // control plane would read as a rollback. It cannot be swallowed: the
+        // result says so, and the instance still restarts onto the persisted
+        // spicepod rather than leaving the canonical file and the running
+        // configuration divergent.
+        let version_error = record_deployment(config_dir, deployment_version).await;
 
-        let datasets = new_app.datasets.len();
-        let models = new_app.models.len();
-        let catalogs = new_app.catalogs.len();
-        let views = new_app.views.len();
+        *self.persisted.write() = Some(incoming);
 
-        // A deployment supersedes an unfinished initial component load. That
-        // load may be retrying forever against the very spicepod this one
-        // replaces, and it holds no lock the apply below could wait on: left
-        // running it would keep registering datasets from the app it started
-        // against, after this app had replaced it.
-        //
-        // Taken only once the spicepod has been validated and staged, so a
-        // rejected deployment leaves the in-flight load running rather than
-        // cancelling it with nothing to put in its place.
-        let superseded_initial_load = self.runtime.supersede_initial_load();
+        tracing::info!(
+            "Spice Cloud Connect: {version_label} validated and persisted to {} ({} datasets, {} models, {} catalogs, {} views); restarting to apply it",
+            path.display(),
+            new_app.datasets.len(),
+            new_app.models.len(),
+            new_app.catalogs.len(),
+            new_app.views.len(),
+        );
 
-        let new_app = Arc::new(new_app);
-        let changed = if superseded_initial_load {
-            // The cancelled load left only some of the previous app registered,
-            // so reconcile against what is actually registered rather than what
-            // was declared — otherwise a dataset present in both apps but never
-            // reached by the load is diffed as unchanged and never loads.
-            Arc::clone(&self.runtime)
-                .apply_app_after_cancelled_load(new_app)
-                .await
-        } else {
-            Arc::clone(&self.runtime).apply_app(new_app).await
-        };
-
-        let restart_required = !restart_sections.is_empty();
-        if restart_required {
-            // Record (accumulate) the pending-restart sections so get_status
-            // reports them until the runtime is actually restarted.
-            self.restart.pending.store(true, Ordering::SeqCst);
-            let mut guard = self
-                .restart
-                .sections
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for section in &restart_sections {
-                if !guard.iter().any(|s| s == section) {
-                    guard.push(section.clone());
-                }
-            }
-        }
-
-        let message = if restart_required {
-            format!(
-                "Spicepod accepted and persisted. Hot-reloadable components were applied, but changes to [{}] do not take effect until spiced is restarted. Standalone spiced cannot self-restart — restart it via your process manager (systemd/Docker/Kubernetes).",
-                restart_sections.join(", ")
-            )
-        } else {
-            "Spicepod applied without a restart.".to_string()
-        };
-
-        Ok(serde_json::json!({
+        Ok(ApplyOutcome::exit_to_apply(serde_json::json!({
             "path": path.display().to_string(),
             "applied": true,
-            "spicepod_changed": changed,
-            "restart_required": restart_required,
-            "restart_required_sections": restart_sections,
-            "message": message,
-            "datasets": datasets,
-            "models": models,
-            "catalogs": catalogs,
-            "views": views,
+            "live": false,
+            "restart": "required",
+            "deployment_version": deployment_version,
+            "deployment_version_error": version_error,
+            "supervised": self.supervisor.is_supervised(),
+            "supervisor": self.supervisor.as_str(),
+            "message": format!(
+                "{version_label} was validated and persisted. This instance is restarting to serve it; \
+                 the restart reloads every dataset, so the app is unavailable until it finishes."
+            ),
+            "datasets": new_app.datasets.len(),
+            "models": new_app.models.len(),
+            "catalogs": new_app.catalogs.len(),
+            "views": new_app.views.len(),
             // Names only — a delivered value never leaves this process.
             "delivered_secrets": delivered_names,
             "secrets_cache_error": cache_error,
-        }))
+        })))
+    }
+
+    /// Drain and exit 0 so the supervisor relaunches spiced on the spicepod
+    /// [`SpicedRuntimeHandle::apply_spicepod`] persisted.
+    ///
+    /// Takes the same drain path a `SIGTERM` would rather than exiting outright:
+    /// a deployment restart is a planned shutdown, and an accelerator with local
+    /// state has to flush it before the process goes. The drain is bounded by
+    /// [`DEPLOYMENT_DRAIN_BUDGET`] — a deployment that cannot finish draining
+    /// must still restart the instance, not strand it.
+    ///
+    /// Does not return.
+    async fn exit_to_apply(&self) {
+        // Abandon an unfinished initial load first. It retries a failing
+        // component for as long as the runtime is up, so left running it would
+        // keep registering datasets from the app being replaced for the whole
+        // drain — work thrown away at exit, against a configuration that is no
+        // longer canonical.
+        if self.runtime.supersede_initial_load() {
+            tracing::debug!(
+                "Spice Cloud Connect: abandoned the in-flight component load to restart for a deployment"
+            );
+        }
+
+        if tokio::time::timeout(DEPLOYMENT_DRAIN_BUDGET, self.runtime.shutdown())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "Spice Cloud Connect: the runtime did not finish draining within {DEPLOYMENT_DRAIN_BUDGET:?}; exiting anyway to apply the deployment"
+            );
+        }
+
+        if !self.supervisor.is_supervised() {
+            tracing::error!(
+                "Spice Cloud Connect: exiting to apply a deployment with no process supervisor detected — nothing will restart this instance. Install the service with `sudo spice connect --install`, or run spiced under a supervisor. See: https://spiceai.org/docs"
+            );
+        }
+        tracing::info!("Spice Cloud Connect: exiting to apply the deployment");
+        std::process::exit(0);
     }
 
     /// Return recent captured log lines for a `GetLogs` command.
@@ -670,8 +847,9 @@ impl RuntimeHandle for SpicedRuntimeHandle {
     /// accelerated dataset can keep serving from its acceleration layer even
     /// while its source is in error — so a component error is not necessarily
     /// terminal. Per-component states and any error messages ride in the
-    /// `components`/`errors` detail, and `restart_pending` surfaces a deploy
-    /// that needs a restart (see `apply_spicepod`).
+    /// `components`/`errors` detail, alongside the deployment this instance is
+    /// serving and whether anything supervises it — the two facts that say
+    /// whether a deployment landed and whether the next one can.
     async fn status(&self) -> Result<StatusReport, CommandError> {
         let status = self.runtime.status();
         let all = status.get_all_statuses();
@@ -733,13 +911,11 @@ impl RuntimeHandle for SpicedRuntimeHandle {
             .map(|(k, v)| (k.clone(), serde_json::json!(v.to_string())))
             .collect();
 
-        let restart_pending = self.restart.pending.load(Ordering::SeqCst);
-        let restart_pending_sections: Vec<String> = self
-            .restart
-            .sections
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        // A deployment this process persisted but has not yet restarted onto.
+        // The window is short — the client exits as soon as the result is
+        // flushed — but a status read inside it must not report the deployment
+        // as live.
+        let restart_pending = self.persisted.read().is_some();
 
         Ok(
             StatusReport::new(phase, reason).with_detail(serde_json::json!({
@@ -748,8 +924,20 @@ impl RuntimeHandle for SpicedRuntimeHandle {
                 "ready_count": ready_count,
                 "components": components,
                 "errors": errors,
+                // The deployment this instance has committed to — the same
+                // value it announces in `Hello.applied_deployment_version`.
+                "applied_deployment_version": self.committed_deployment_version(),
+                // The deployment actually being served, which differs from the
+                // above only while a restart is pending.
+                "live_deployment_version": self.live.deployment_version,
                 "restart_pending": restart_pending,
-                "restart_pending_sections": restart_pending_sections,
+                // Whether anything will bring this instance back when a
+                // deployment exits it. `false` means a deployment stops the
+                // instance instead of updating it — the operator has to know
+                // before that happens, not after.
+                "supervised": self.supervisor.is_supervised(),
+                "supervisor": self.supervisor.as_str(),
+                "supervisor_note": self.supervisor.caveat(),
                 // Names only, never values — this document reaches the portal
                 // and the command log. The count and the names are what let an
                 // operator tell "the deployment delivered no secrets" apart from
@@ -765,14 +953,36 @@ impl RuntimeHandle for SpicedRuntimeHandle {
     }
 }
 
+/// Record `deployment_version` as this instance's applied deployment, returning
+/// the message to surface when it could not be written.
+///
+/// Runs on the blocking pool: the record is written through the same
+/// synchronous atomic-rename path as the identity, and this is called from the
+/// Cloud Connect task on a runtime worker.
+async fn record_deployment(config_dir: &Path, deployment_version: Option<u64>) -> Option<String> {
+    let dir = config_dir.to_path_buf();
+    let result =
+        tokio::task::spawn_blocking(move || deployment::write(&dir, deployment_version)).await;
+    let error = match result {
+        Ok(Ok(())) => return None,
+        Ok(Err(err)) => err.to_string(),
+        Err(join) => format!("the deployment record task panicked: {join}"),
+    };
+    tracing::error!(
+        "Spice Cloud Connect: {error}. The spicepod is persisted and this instance will restart onto it, but it will report the previous deployment version — which the control plane reads as a rollback. Fix the permissions on the Spice config directory and deploy again. See: https://spiceai.org/docs"
+    );
+    Some(error)
+}
+
 /// Validate a cloud-managed spicepod and persist it to disk.
 ///
 /// Writes `spicepod_yaml` to a sibling `*.incoming.yml` temp file, builds an
 /// [`App`] from it to validate (parse + resolve), and only on success
 /// atomically promotes the temp file to the canonical
 /// [`CLOUD_MANAGED_SPICEPOD_FILE`] path. On any failure the canonical file is
-/// left untouched and the temp file is cleaned up. Returns the built `App`
-/// (ready to hot-apply) and the canonical path it was written to.
+/// left untouched — the instance keeps serving it — and the temp file is
+/// cleaned up. Returns the built `App`, which the caller reads counts off for
+/// the command result, and the canonical path it was written to.
 ///
 /// Factored out of [`SpicedRuntimeHandle::apply_spicepod`] so the
 /// file-staging + validation can be unit-tested without a running runtime.
@@ -942,29 +1152,96 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn deployed(version: Option<u64>, yaml: &str) -> Deployed {
+        Deployed {
+            deployment_version: version,
+            spicepod_yaml: yaml.to_string(),
+        }
+    }
+
+    /// The redelivery case #1306 turns into a crash loop if it is missed: the
+    /// deployment the instance is already serving must change nothing.
     #[test]
-    fn restart_required_sections_empty_for_identical_apps() {
-        let a = App::default();
-        let b = App::default();
-        assert!(
-            restart_required_sections(&a, &b).is_empty(),
-            "identical apps need no restart"
+    fn redelivering_the_running_deployment_is_a_no_op() {
+        let live = deployed(Some(7), VALID_SPICEPOD);
+        assert_eq!(
+            disposition(&live, None, &deployed(Some(7), VALID_SPICEPOD)),
+            Disposition::AlreadyLive
         );
     }
 
+    /// A version the instance is serving, with content it is not, is a
+    /// different configuration whatever the control plane calls it — applying
+    /// it is what keeps the running app equal to the deployed one.
     #[test]
-    fn restart_required_sections_flags_runtime_change() {
-        let base = App::default();
-        // Change a `runtime:` field that apply_app does not hot-reload.
-        let mut changed = App::default();
-        changed.runtime.dataset_load_parallelism = Some(4);
-
+    fn the_same_version_with_different_content_is_applied() {
+        let live = deployed(Some(7), VALID_SPICEPOD);
+        let changed = "version: v2\nkind: Spicepod\nname: changed\n";
         assert_eq!(
-            restart_required_sections(&base, &changed),
-            vec!["runtime"],
-            "a runtime-config change must require a restart"
+            disposition(&live, None, &deployed(Some(7), changed)),
+            Disposition::Apply
         );
-        // Detection is symmetric.
-        assert_eq!(restart_required_sections(&changed, &base), vec!["runtime"]);
+    }
+
+    /// A version-less deployment cannot be deduplicated by version, so the
+    /// spicepod itself decides. Two dispatches of the same content must not
+    /// restart the instance twice.
+    #[test]
+    fn versionless_deployments_deduplicate_on_content() {
+        let live = deployed(None, VALID_SPICEPOD);
+        assert_eq!(
+            disposition(&live, None, &deployed(None, VALID_SPICEPOD)),
+            Disposition::AlreadyLive
+        );
+        assert_eq!(
+            disposition(&live, None, &deployed(Some(1), VALID_SPICEPOD)),
+            Disposition::Apply,
+            "the same spicepod under a new deployment is a new deployment to report"
+        );
+    }
+
+    /// Between the result being sent and the process exiting, the control plane
+    /// can redeliver. The instance has already committed to that deployment, so
+    /// it re-issues the exit rather than persisting it again — and never
+    /// reports it as live, which it is not.
+    #[test]
+    fn redelivery_while_a_restart_is_pending_re_issues_the_exit() {
+        let live = deployed(Some(7), VALID_SPICEPOD);
+        let pending = deployed(Some(8), "version: v2\nkind: Spicepod\nname: next\n");
+        assert_eq!(
+            disposition(&live, Some(&pending), &pending),
+            Disposition::AlreadyPersisted
+        );
+        // And the deployment it replaced is no longer "already live": it is on
+        // its way out, so re-sending it is a new deployment to apply.
+        assert_eq!(
+            disposition(&live, Some(&pending), &live),
+            Disposition::Apply
+        );
+    }
+
+    /// An instance serving a local spicepod has no deployment to match, so the
+    /// first one always applies.
+    #[test]
+    fn a_runtime_with_no_deployment_applies_the_first_one() {
+        let live = deployed(None, "");
+        assert_eq!(
+            disposition(&live, None, &deployed(Some(1), VALID_SPICEPOD)),
+            Disposition::Apply
+        );
+    }
+
+    #[tokio::test]
+    async fn the_deployment_version_is_recorded_beside_the_spicepod() {
+        let dir = scratch_dir("record");
+        assert_eq!(record_deployment(&dir, Some(12)).await, None);
+        assert_eq!(deployment::read_version(&dir), Some(12));
+
+        // A deployment that carries no version clears the recorded one rather
+        // than leaving the instance claiming a version it is no longer serving.
+        assert_eq!(record_deployment(&dir, None).await, None);
+        assert_eq!(deployment::read_version(&dir), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

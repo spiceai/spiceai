@@ -15,12 +15,13 @@ limitations under the License.
 */
 
 //! `Runtime::supersede_initial_load` — the escape hatch that lets a
-//! control-plane deployment replace a component load that will not finish.
+//! control-plane deployment stop a component load that will not finish.
 //!
 //! The initial load has no deadline: `load_dataset` retries a transient failure
 //! for as long as the runtime is up. Spice Cloud Connect starts before the load
-//! for exactly that reason, and an `ApplySpicepod` arriving mid-load takes the
-//! load's place rather than racing it.
+//! for exactly that reason, and a deployment arriving mid-load abandons it
+//! rather than letting it keep registering datasets from the configuration it
+//! is restarting away from.
 
 use std::sync::Arc;
 use std::time::Duration;

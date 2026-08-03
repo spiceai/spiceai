@@ -750,6 +750,7 @@ async fn print_status(config_dir: &Path, endpoint: Option<&str>) -> Result<()> {
             println!("  gateway:     {}", id.gateway_addr);
         }
         println!("  expiry:      {expiry}");
+        print_applied_deployment(config_dir);
         print_delivered_secrets(config_dir);
         print_service_for_dir(config_dir);
         // An identity that reads as expired on a host whose clock is wrong is
@@ -815,6 +816,28 @@ async fn print_status(config_dir: &Path, endpoint: Option<&str>) -> Result<()> {
          `spice connect <SPICE-ADOPT-...>` with a code from your Spice Cloud portal."
     );
     Ok(())
+}
+
+/// Report the deployment this instance is configured to serve.
+///
+/// Read from the local record beside the deployed spicepod, so it answers on a
+/// host with no network: it says which deployment the runtime comes up on, which
+/// is the same value the runtime reports to the control plane.
+fn print_applied_deployment(config_dir: &Path) {
+    let spicepod = config_dir.join(runtime_cloud_connect::config::CLOUD_MANAGED_SPICEPOD_FILE);
+    if !spicepod.exists() {
+        println!(
+            "  deployment:  none yet — this instance runs its local spicepod until an app is deployed to it"
+        );
+        return;
+    }
+    match runtime_cloud_connect::deployment::read_version(config_dir) {
+        Some(version) => println!("  deployment:  {version} ({})", spicepod.display()),
+        None => println!(
+            "  deployment:  unversioned ({}) — deployed, but the deployment recorded no version",
+            spicepod.display()
+        ),
+    }
 }
 
 /// Report the delivered secrets held in the local cache.
@@ -974,6 +997,14 @@ async fn remove_identity(
             }
         })?;
     }
+
+    // The applied-deployment record belongs to the app this instance was
+    // released from. The deployed spicepod stays — the runtime keeps serving
+    // what it is serving — but a version left behind would be reported into a
+    // different app if this directory is ever adopted again.
+    runtime_cloud_connect::deployment::remove(config_dir).map_err(|e| Error::CloudConnectIo {
+        message: format!("remove the deployment record: {e}"),
+    })?;
     if had_pending
         && let Err(e) = std::fs::remove_file(&pending_path)
         && e.kind() != std::io::ErrorKind::NotFound

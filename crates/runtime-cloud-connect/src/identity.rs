@@ -207,12 +207,11 @@ impl Identity {
             }
         );
 
-        let current = cloud_connect_crypto::EncryptionKeypair::from_pkcs8_pem(
-            &self.enc_private_key_pem,
-        )
-        .map_err(|source| Error::EncKeyGeneration {
-            reason: format!("the stored encryption key could not be parsed: {source}"),
-        })?;
+        let current =
+            cloud_connect_crypto::EncryptionKeypair::from_pkcs8_pem(&self.enc_private_key_pem)
+                .map_err(|source| Error::EncKeyGeneration {
+                    reason: format!("the stored encryption key could not be parsed: {source}"),
+                })?;
 
         let previous = if self.enc_previous_private_key_pem.is_empty() {
             None

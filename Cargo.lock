@@ -19196,6 +19196,7 @@ dependencies = [
  "opentelemetry-zipkin",
  "opentelemetry_sdk",
  "otel-arrow",
+ "parking_lot",
  "prometheus",
  "repl",
  "reqwest 0.13.4",

@@ -47,7 +47,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
 use runtime_cloud_connect::config::CloudConnectConfig;
-use runtime_cloud_connect::handlers::{Capability, CommandError, RuntimeHandle};
+use runtime_cloud_connect::handlers::{
+    ApplyOutcome, Capability, CommandError, RuntimeHandle, SpicepodDeployment,
+};
 use runtime_cloud_connect::identity::IdentityStore;
 use runtime_cloud_connect::proto;
 use runtime_cloud_connect::proto::cloud_connect_server::{CloudConnect, CloudConnectServer};
@@ -145,15 +147,21 @@ impl RuntimeHandle for CapturedRuntime {
 
     async fn apply_spicepod(
         &self,
-        config_dir: &std::path::Path,
-        spicepod_yaml: &str,
-        _delivered_secrets: Option<runtime_cloud_connect::sealed_secrets::DeliveredSecrets>,
-    ) -> Result<serde_json::Value, CommandError> {
-        let path = config_dir.join(runtime_cloud_connect::config::CLOUD_MANAGED_SPICEPOD_FILE);
-        std::fs::create_dir_all(config_dir).map_err(|e| CommandError::failed(e.to_string()))?;
-        std::fs::write(&path, spicepod_yaml).map_err(|e| CommandError::failed(e.to_string()))?;
-        *self.applied.lock().await = Some((path.clone(), spicepod_yaml.to_string()));
-        Ok(serde_json::json!({ "path": path.display().to_string() }))
+        deployment: SpicepodDeployment<'_>,
+    ) -> Result<ApplyOutcome, CommandError> {
+        let path = deployment
+            .config_dir
+            .join(runtime_cloud_connect::config::CLOUD_MANAGED_SPICEPOD_FILE);
+        std::fs::create_dir_all(deployment.config_dir)
+            .map_err(|e| CommandError::failed(e.to_string()))?;
+        std::fs::write(&path, deployment.spicepod_yaml)
+            .map_err(|e| CommandError::failed(e.to_string()))?;
+        *self.applied.lock().await = Some((path.clone(), deployment.spicepod_yaml.to_string()));
+        // `settled`, not `exit_to_apply`: this handle has no process to restart,
+        // and asking the client to exit would take the test process with it.
+        Ok(ApplyOutcome::settled(
+            serde_json::json!({ "path": path.display().to_string() }),
+        ))
     }
 }
 
@@ -464,6 +472,7 @@ async fn apply_spicepod_writes_file_and_acks() {
             proto::ApplySpicepod {
                 spicepod_yaml: yaml.to_string(),
                 sealed_secret_payload: None,
+                deployment_version: None,
             },
         )),
     };

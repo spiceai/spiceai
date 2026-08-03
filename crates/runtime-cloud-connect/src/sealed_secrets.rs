@@ -165,10 +165,8 @@ pub fn open_delivered(
         }
     );
 
-    let outer_address =
-        SecretAddress::standalone(external_id, session_key.key_id()).context(AddressSnafu {
-            layer: "outer",
-        })?;
+    let outer_address = SecretAddress::standalone(external_id, session_key.key_id())
+        .context(AddressSnafu { layer: "outer" })?;
     let outer_aad = outer_address
         .outer_aad(command_id)
         .context(AddressSnafu { layer: "outer" })?;
@@ -176,8 +174,7 @@ pub fn open_delivered(
         .open(&payload.enc, &payload.ciphertext, &outer_aad)
         .context(OpenSnafu { layer: "outer" })?;
 
-    let inner =
-        proto::SealedSecretPayload::decode(inner_bytes.as_slice()).context(DecodeSnafu)?;
+    let inner = proto::SealedSecretPayload::decode(inner_bytes.as_slice()).context(DecodeSnafu)?;
 
     // The inner layer may be addressed to the current *or* the retained
     // previous enrolled key: a deployment that crossed a renewal was sealed
@@ -305,7 +302,11 @@ mod tests {
         let out = open_delivered(&sealed, EXTERNAL_ID, COMMAND_ID, Some(&session), &rotated)
             .expect("the retained previous key must open it");
         assert_eq!(out.secrets["openai_key"].to_vec(), b"sk-old".to_vec());
-        assert_eq!(out.inner_key_id, old.key_id(), "opened with the retained key");
+        assert_eq!(
+            out.inner_key_id,
+            old.key_id(),
+            "opened with the retained key"
+        );
 
         // ...and that is exactly the case where the previous key must NOT be
         // retired, since the current one did not open it.
@@ -360,8 +361,14 @@ mod tests {
         let sealed = seal(&[("k", b"v")], &keypair(1), &session, COMMAND_ID);
         let keyring = EncryptionKeyring::new(keypair(1), None);
 
-        let err = open_delivered(&sealed, EXTERNAL_ID, "cmd-different", Some(&session), &keyring)
-            .expect_err("a different command_id must not open it");
+        let err = open_delivered(
+            &sealed,
+            EXTERNAL_ID,
+            "cmd-different",
+            Some(&session),
+            &keyring,
+        )
+        .expect_err("a different command_id must not open it");
         assert!(matches!(err, Error::Open { layer: "outer", .. }), "{err}");
     }
 
@@ -379,7 +386,12 @@ mod tests {
     #[test]
     fn refuses_tampered_ciphertext_without_echoing_a_value() {
         let session = keypair(2);
-        let mut sealed = seal(&[("openai_key", b"sk-secret")], &keypair(1), &session, COMMAND_ID);
+        let mut sealed = seal(
+            &[("openai_key", b"sk-secret")],
+            &keypair(1),
+            &session,
+            COMMAND_ID,
+        );
         let last = sealed.ciphertext.len() - 1;
         sealed.ciphertext[last] ^= 0x01;
 

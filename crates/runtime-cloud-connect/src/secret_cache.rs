@@ -230,7 +230,12 @@ impl CachedSecrets {
 /// makes no such guarantee across versions or field reorderings. Components are
 /// NUL-joined and lengths are prefixed on the name list, so no combination of
 /// names can encode to the same bytes as a different combination.
-fn header_aad(format_version: u32, suite: &str, deployment_version: &str, names: &[String]) -> Vec<u8> {
+fn header_aad(
+    format_version: u32,
+    suite: &str,
+    deployment_version: &str,
+    names: &[String],
+) -> Vec<u8> {
     let mut aad = Vec::with_capacity(64 + names.iter().map(String::len).sum::<usize>());
     aad.extend_from_slice(&format_version.to_be_bytes());
     aad.push(0);
@@ -258,7 +263,6 @@ fn cipher(key: &[u8]) -> Result<XChaCha20Poly1305> {
 fn nonce_from(bytes: &[u8; NONCE_LEN]) -> XNonce {
     XNonce::from(*bytes)
 }
-
 
 /// Write `secrets` to the cache at `path`, sealed under `key`.
 ///
@@ -592,7 +596,10 @@ mod tests {
         let err = read(&path, &other).expect_err("a different key must not open it");
         assert!(matches!(err, Error::Undecryptable { .. }), "{err}");
         assert!(!err.to_string().contains("sk-1"));
-        assert!(err.to_string().contains("deploy"), "must name recovery: {err}");
+        assert!(
+            err.to_string().contains("deploy"),
+            "must name recovery: {err}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -642,7 +649,10 @@ mod tests {
         std::fs::write(&path, bumped).expect("write bumped");
 
         let err = read(&path, &key()).expect_err("an unknown version must not be opened");
-        assert!(matches!(err, Error::UnsupportedVersion { found: 9999, .. }), "{err}");
+        assert!(
+            matches!(err, Error::UnsupportedVersion { found: 9999, .. }),
+            "{err}"
+        );
         assert!(err.to_string().contains("Discarding"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -684,7 +694,11 @@ mod tests {
         let path = dir.join(SECRET_CACHE_FILE);
         // An empty value, invalid UTF-8, and an embedded NUL: a secret is
         // arbitrary bytes, which is why the body is not JSON.
-        let input = secrets(&[("empty", b""), ("binary", &[0xff, 0x00, 0xfe]), ("nul", b"a\0b")]);
+        let input = secrets(&[
+            ("empty", b""),
+            ("binary", &[0xff, 0x00, 0xfe]),
+            ("nul", b"a\0b"),
+        ]);
         write(&path, &key(), "", &input).expect("write");
 
         let out = read(&path, &key()).expect("read").expect("present");
@@ -712,6 +726,10 @@ mod tests {
         // this build writes — never a partial map.
         assert!(decode_values(&[0, 0, 0, 8, b'a']).is_none());
         assert!(decode_values(&[0, 0, 0, 1, b'a', 0, 0, 0, 9]).is_none());
-        assert!(decode_values(&[]).expect("empty body is an empty map").is_empty());
+        assert!(
+            decode_values(&[])
+                .expect("empty body is an empty map")
+                .is_empty()
+        );
     }
 }

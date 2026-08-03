@@ -62,7 +62,8 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 use crate::config::CloudConnectConfig;
 use crate::enroll::{EnrollClient, RENEWAL_GRACE};
 use crate::handlers::{
-    Capability, CommandError, RestartMode, RuntimeHandle, advertised_capabilities,
+    Capability, CommandError, PostApply, RestartMode, RuntimeHandle, SpicepodDeployment,
+    advertised_capabilities,
 };
 use crate::heartbeat::{build_heartbeat, build_telemetry, now_unix};
 use crate::identity::{Identity, IdentityStore};
@@ -82,6 +83,15 @@ const RENEW_RETRY_INTERVAL: Duration = Duration::from_mins(5);
 
 /// Outbound channel size: bounded to keep memory predictable.
 const CLIENT_CHANNEL_SIZE: usize = 64;
+
+/// How long the client waits for the outbound channel to drain before exiting
+/// the process to apply a deployment, and how often it re-checks.
+///
+/// Best-effort by design: the deployment is reconciled from the version the
+/// instance reports on its next `Hello`, not from this result arriving, so a
+/// slow gateway delays the exit by at most this budget rather than stalling it.
+const APPLY_FLUSH_BUDGET: Duration = Duration::from_secs(5);
+const APPLY_FLUSH_POLL: Duration = Duration::from_millis(25);
 
 /// State held by the driver across reconnects.
 pub(crate) struct ClientDriver {
@@ -542,7 +552,7 @@ impl ClientDriver {
 
         // Send Hello as the first frame. The client certificate is the
         // credential, so the Hello only names the instance.
-        let hello = build_hello(&self.config, &identity, self.runtime.as_ref());
+        let hello = build_hello(&self.config, &identity, self.runtime.as_ref()).await;
         tx.send(proto::ClientMessage {
             body: Some(proto::client_message::Body::Hello(hello)),
         })
@@ -897,6 +907,14 @@ impl ClientDriver {
     /// every referencing component with a missing-parameter error naming
     /// nothing.
     ///
+    /// A deployment applies by restart, so a successful apply usually ends with
+    /// this process exiting: the result is sent and flushed first, then the
+    /// runtime handle exits and the supervisor relaunches it on the persisted
+    /// spicepod. The control plane does not depend on that result arriving — it
+    /// reconciles the deployment against the version the instance reports on its
+    /// next `Hello` — but sending it is what lets a synchronous caller see the
+    /// validation outcome.
+    ///
     /// `command_id` comes from the `ControlMessage` envelope, not from the
     /// command body — and it is part of the outer AAD, so an envelope cannot be
     /// replayed onto a different dispatch.
@@ -921,11 +939,42 @@ impl ClientDriver {
             },
         };
 
-        let result = self
+        let outcome = self
             .runtime
-            .apply_spicepod(&self.config.config_dir, &cmd.spicepod_yaml, delivered)
+            .apply_spicepod(SpicepodDeployment {
+                config_dir: &self.config.config_dir,
+                spicepod_yaml: &cmd.spicepod_yaml,
+                deployment_version: cmd.deployment_version,
+                delivered_secrets: delivered,
+            })
             .await;
-        reply_with_json(tx, command_id, result).await;
+
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                send_command_error(tx, command_id, &err).await;
+                return;
+            }
+        };
+
+        send_ok_json(tx, command_id, &outcome.document).await;
+
+        if outcome.post_apply == PostApply::ExitToApply {
+            tracing::info!(
+                "Cloud Connect: deployment{} is persisted; exiting so the supervisor restarts spiced on it",
+                cmd.deployment_version
+                    .map_or_else(String::new, |version| format!(" {version}"))
+            );
+            flush_outbound(tx).await;
+            self.runtime.exit_to_apply().await;
+            // Reaching here means the handle did not exit. The spicepod stays
+            // persisted and takes effect on the next start, so say what state
+            // the instance is actually in rather than letting the control plane
+            // infer it from a deployment that never goes live.
+            tracing::error!(
+                "Cloud Connect: the runtime did not exit to apply the deployment; it is persisted but NOT live, and takes effect the next time spiced starts. Restart it via your process manager. See: https://spiceai.org/docs"
+            );
+        }
     }
 
     /// Open a delivered payload against this instance's keys.
@@ -970,12 +1019,11 @@ impl ClientDriver {
                 self.identity = Some(updated);
                 // Best-effort: a failed write only means the superseded key
                 // stays on disk until the next successful one.
-                if let Err(err) = tokio::task::spawn_blocking(move || {
-                    IdentityStore::store(&path, &to_store)
-                })
-                .await
-                .map_err(|join| format!("identity persistence task panicked: {join}"))
-                .and_then(|result| result.map_err(|err| err.to_string()))
+                if let Err(err) =
+                    tokio::task::spawn_blocking(move || IdentityStore::store(&path, &to_store))
+                        .await
+                        .map_err(|join| format!("identity persistence task panicked: {join}"))
+                        .and_then(|result| result.map_err(|err| err.to_string()))
                 {
                     tracing::warn!(
                         "Cloud Connect: could not persist the retirement of the previous encryption key: {err}"
@@ -1121,6 +1169,15 @@ impl ClientDriver {
         self.identity = None;
         live_identifier.write().await.clear();
 
+        // Best-effort, and after the identity: the applied-deployment record
+        // belongs to the app this instance was released from, so a later
+        // re-adoption into a different app must not report its version — but a
+        // record that outlives the identity is stale bookkeeping, not a failed
+        // release, so it does not change the answer above.
+        if let Err(err) = crate::deployment::remove_async(&self.config.config_dir).await {
+            tracing::warn!("Cloud Connect: {err}");
+        }
+
         send_ok_json(tx, command_id, &serde_json::json!({ "status": "removed" })).await;
         true
     }
@@ -1260,7 +1317,33 @@ fn build_channel(
     Ok(endpoint.connect_lazy())
 }
 
-fn build_hello(
+/// Wait for everything queued on the outbound channel to be handed to tonic,
+/// bounded by [`APPLY_FLUSH_BUDGET`].
+///
+/// Called before the process exits to apply a deployment. Full capacity means
+/// the transport took every queued frame — including the `CommandResult` just
+/// sent — which is as close to "it is on the wire" as a channel can report. The
+/// budget is what keeps a stalled gateway from holding up the deployment: the
+/// control plane reconciles from the reported version, not from this result.
+async fn flush_outbound(tx: &mpsc::Sender<proto::ClientMessage>) {
+    let deadline = time::Instant::now() + APPLY_FLUSH_BUDGET;
+    while tx.capacity() < tx.max_capacity() {
+        if time::Instant::now() >= deadline {
+            tracing::warn!(
+                "Cloud Connect: the deployment result was still queued after {}; exiting anyway (the control plane reconciles the deployment from the version reported on reconnect)",
+                humanize(APPLY_FLUSH_BUDGET)
+            );
+            return;
+        }
+        if tx.is_closed() {
+            // The stream is gone, so nothing more will be sent from this queue.
+            return;
+        }
+        time::sleep(APPLY_FLUSH_POLL).await;
+    }
+}
+
+async fn build_hello(
     config: &CloudConnectConfig,
     identity: &Identity,
     runtime: &dyn RuntimeHandle,
@@ -1280,6 +1363,9 @@ fn build_hello(
         runtime_versions: std::collections::HashMap::new(),
         protocol_version: crate::PROTOCOL_VERSION,
         capabilities: advertised_capabilities(runtime),
+        // What the control plane reconciles a deployment against: an apply
+        // restarts the instance, so this is how it learns the deployment landed.
+        applied_deployment_version: runtime.applied_deployment_version().await,
     }
 }
 

@@ -1670,12 +1670,15 @@ impl Runtime {
 
     /// Abandon the initial component load.
     ///
+    /// The load has no deadline — `load_dataset` retries a transient failure for
+    /// as long as the runtime is up — so a process that is on its way out (a
+    /// Spice Cloud deployment restarting onto a new spicepod) has to be able to
+    /// stop it: left running it keeps registering datasets from the
+    /// configuration being replaced, for the whole of the shutdown drain.
+    ///
     /// Returns `true` only when this call is the one that stopped a pending or
-    /// running load — so exactly one caller takes responsibility for the
-    /// partially-registered state it leaves behind, which
-    /// [`Runtime::apply_app_after_cancelled_load`] is how to apply a new app on
-    /// top of. Returns `false` once the load has finished or was already
-    /// superseded, when a plain [`Runtime::apply_app`] is the correct apply.
+    /// running load, and `false` once the load has finished or was already
+    /// superseded.
     ///
     /// Components already registered when this fires stay registered; only the
     /// load's remaining work is dropped.

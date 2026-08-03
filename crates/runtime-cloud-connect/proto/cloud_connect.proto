@@ -216,6 +216,18 @@ message Hello {
   // standalone runtime answers a subset of the operator's commands, so read
   // this rather than inferring from `instance_kind`.
   repeated string capabilities = 12;
+  // The `ApplySpicepod.deployment_version` of the configuration this instance
+  // is serving. A standalone instance applies a deployment by persisting it
+  // and restarting, so the stream drops mid-apply and the `CommandResult` may
+  // never arrive: this field, not the fate of the command, is what says the
+  // deployment landed.
+  //
+  // Absent means the instance cannot name a version — it is running a
+  // configuration no deployment assigned one to (a local spicepod, or a
+  // deployment that carried no version), or it failed to start on the deployed
+  // one and fell back. Absent is NOT zero: a zero would let a deployment
+  // resolve against a version nothing claimed.
+  optional uint64 applied_deployment_version = 13;
 }
 
 message Heartbeat {
@@ -315,9 +327,24 @@ message Restart {
 // none of them sends — see `cloud-connect-crypto`, which is the single source
 // for them. Absent means "no secrets with this deploy" and is backward
 // compatible with peers that predate the field.
+//
+// `deployment_version` names the deployment this dispatch carries, and is what
+// the instance reports back in `Hello.applied_deployment_version` once it is
+// serving the configuration. It is the reconciliation key for a deployment's
+// state, because the command result cannot be one: applying restarts the
+// instance, so the stream drops before the result is guaranteed to arrive.
+//
+// Absent means the dispatch assigns no version. The instance still applies the
+// spicepod; it just reports no version afterwards, so the deployment cannot be
+// reconciled from what the instance says. Absent is NOT zero — a zero would
+// resolve against a version nothing claimed.
+//
+// Redelivering a version the instance already applied is a no-op, not another
+// restart: without that, a redelivery is a restart loop.
 message ApplySpicepod {
   string spicepod_yaml = 1;
   SealedSecretPayload sealed_secret_payload = 2;
+  optional uint64 deployment_version = 3;
 }
 
 message UpgradeRuntime {

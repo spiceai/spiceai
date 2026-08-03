@@ -41,7 +41,9 @@ limitations under the License.
 //!    code loads the persisted identity and reconnects over mTLS.
 //! 4. `heartbeat_and_telemetry_cadence` — periodic frames on their
 //!    configured cadences.
-//! 5. `apply_spicepod` — the YAML is written and hot-applied.
+//! 5. `apply_spicepod` — the YAML is persisted, the result is flushed, and the
+//!    runtime is asked to exit so its supervisor restarts it onto the new
+//!    configuration; the version it comes back on rides the next `Hello`.
 //! 6. `reconnect_over_mtls` — after the server drops the stream, the
 //!    client reconnects, presenting its client certificate again.
 //! 7. `renewal` — a short-lived leaf triggers the renewal loop: a fresh
@@ -64,7 +66,6 @@ limitations under the License.
 
 use std::collections::{HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -77,7 +78,9 @@ use rcgen::{
     ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, PublicKeyData as _, SanType,
 };
 use runtime_cloud_connect::config::CloudConnectConfig;
-use runtime_cloud_connect::handlers::{Capability, CommandError, RuntimeHandle};
+use runtime_cloud_connect::handlers::{
+    ApplyOutcome, Capability, CommandError, RuntimeHandle, SpicepodDeployment,
+};
 use runtime_cloud_connect::identity::IdentityStore;
 use runtime_cloud_connect::proto;
 use runtime_cloud_connect::proto::cloud_connect_server::{CloudConnect, CloudConnectServer};
@@ -498,9 +501,7 @@ impl CloudConnect for GatewayServer {
                     // pushes OTLP metrics. The arms are spelled out rather than
                     // wildcarded so a new client message still has to be
                     // accounted for here.
-                    Some(
-                        proto::client_message::Body::ExportMetrics(_),
-                    ) => {}
+                    Some(proto::client_message::Body::ExportMetrics(_)) => {}
                     // Announced once per stream, immediately after the Hello:
                     // the gateway needs it to seal the outer layer of any
                     // secrets it dispatches on this session.
@@ -558,6 +559,14 @@ struct E2eRuntimeState {
     /// Names of the secrets delivered with the last applied spicepod, never
     /// values. `None` when the deployment carried no payload at all.
     delivered_secret_names: Option<Vec<String>>,
+    /// The deployment this stand-in reports as applied. Seeded to model an
+    /// instance that came back up on a deployment, and advanced by an apply the
+    /// way `spiced` advances the record it writes before restarting.
+    applied_deployment_version: Option<u64>,
+    /// Set when the client asked the runtime to exit and apply. The real
+    /// adapter ends the process here; a test one records that it was asked, so
+    /// the test can assert the result was flushed first.
+    exit_requested: bool,
 }
 
 struct E2eRuntime {
@@ -566,7 +575,16 @@ struct E2eRuntime {
 
 impl E2eRuntime {
     fn new() -> (Arc<Self>, Arc<Mutex<E2eRuntimeState>>) {
-        let state = Arc::new(Mutex::new(E2eRuntimeState::default()));
+        Self::with_applied_version(None)
+    }
+
+    /// An instance already serving `version`, as one that restarted onto a
+    /// deployment reports itself.
+    fn with_applied_version(version: Option<u64>) -> (Arc<Self>, Arc<Mutex<E2eRuntimeState>>) {
+        let state = Arc::new(Mutex::new(E2eRuntimeState {
+            applied_deployment_version: version,
+            ..E2eRuntimeState::default()
+        }));
         (
             Arc::new(Self {
                 state: Arc::clone(&state),
@@ -589,32 +607,47 @@ impl RuntimeHandle for E2eRuntime {
         1
     }
 
+    async fn applied_deployment_version(&self) -> Option<u64> {
+        self.state.lock().await.applied_deployment_version
+    }
+
     async fn apply_spicepod(
         &self,
-        config_dir: &Path,
-        spicepod_yaml: &str,
-        delivered_secrets: Option<runtime_cloud_connect::sealed_secrets::DeliveredSecrets>,
-    ) -> Result<Value, CommandError> {
+        deployment: SpicepodDeployment<'_>,
+    ) -> Result<ApplyOutcome, CommandError> {
         // Record the delivered names (never values) so a test can assert the
         // payload reached the runtime adapter.
-        self.state.lock().await.delivered_secret_names = delivered_secrets
+        self.state.lock().await.delivered_secret_names = deployment
+            .delivered_secrets
             .as_ref()
             .map(|secrets| secrets.keys().cloned().collect());
-        // Persist to the canonical path and report a hot apply, mirroring the
-        // spiced adapter's observable result envelope.
-        let path = config_dir.join(runtime_cloud_connect::config::CLOUD_MANAGED_SPICEPOD_FILE);
-        tokio::fs::create_dir_all(config_dir)
+        // Persist to the canonical path and ask for the restart that makes it
+        // live, mirroring the spiced adapter's observable behavior.
+        let path = deployment
+            .config_dir
+            .join(runtime_cloud_connect::config::CLOUD_MANAGED_SPICEPOD_FILE);
+        tokio::fs::create_dir_all(deployment.config_dir)
             .await
             .map_err(|e| CommandError::failed(e.to_string()))?;
-        tokio::fs::write(&path, spicepod_yaml)
+        tokio::fs::write(&path, deployment.spicepod_yaml)
             .await
             .map_err(|e| CommandError::failed(e.to_string()))?;
-        self.state.lock().await.applied_spicepod = Some((path.clone(), spicepod_yaml.to_string()));
-        Ok(serde_json::json!({
+        {
+            let mut state = self.state.lock().await;
+            state.applied_spicepod = Some((path.clone(), deployment.spicepod_yaml.to_string()));
+            state.applied_deployment_version = deployment.deployment_version;
+        }
+        Ok(ApplyOutcome::exit_to_apply(serde_json::json!({
             "path": path.display().to_string(),
             "applied": true,
-            "reload": "hot",
-        }))
+            "live": false,
+            "restart": "required",
+            "deployment_version": deployment.deployment_version,
+        })))
+    }
+
+    async fn exit_to_apply(&self) {
+        self.state.lock().await.exit_requested = true;
     }
 }
 
@@ -1384,10 +1417,9 @@ async fn apply_spicepod_delivers_double_sealed_secrets() {
     assert_eq!(session.aead_id, cloud_connect_crypto::AEAD_ID);
 
     // Inner: the control plane seals to the instance's *enrolled* key.
-    let enrolled_pub = cloud_connect_crypto::EncryptionKeypair::from_pkcs8_pem(
-        &identity.enc_private_key_pem,
-    )
-    .expect("enrolled key parses");
+    let enrolled_pub =
+        cloud_connect_crypto::EncryptionKeypair::from_pkcs8_pem(&identity.enc_private_key_pem)
+            .expect("enrolled key parses");
     let plaintext = proto::SecretPayload {
         string_data: [("openai_key".to_string(), b"sk-e2e".to_vec())]
             .into_iter()
@@ -1429,6 +1461,7 @@ async fn apply_spicepod_delivers_double_sealed_secrets() {
         COMMAND_ID,
         proto::control_message::Body::ApplySpicepod(proto::ApplySpicepod {
             spicepod_yaml: yaml.to_string(),
+            deployment_version: None,
             sealed_secret_payload: Some(proto::SealedSecretPayload {
                 key_id: session.key_id.clone(),
                 enc: outer_sealed.enc,
@@ -1505,6 +1538,7 @@ async fn apply_spicepod_refuses_an_unopenable_payload() {
         "cmd-bad-secrets",
         proto::control_message::Body::ApplySpicepod(proto::ApplySpicepod {
             spicepod_yaml: "version: v2\nkind: Spicepod\nname: nope\n".to_string(),
+            deployment_version: None,
             sealed_secret_payload: Some(proto::SealedSecretPayload {
                 key_id: "0000000000000000".to_string(),
                 enc: vec![0_u8; 32],
@@ -1517,15 +1551,10 @@ async fn apply_spicepod_refuses_an_unopenable_payload() {
     let failed = wait_until_async(Duration::from_secs(5), || {
         let captured = Arc::clone(&captured);
         async move {
-            captured
-                .lock()
-                .await
-                .results
-                .iter()
-                .any(|r| {
-                    r.command_id == "cmd-bad-secrets"
-                        && r.code == proto::ResultCode::InvalidArgument as i32
-                })
+            captured.lock().await.results.iter().any(|r| {
+                r.command_id == "cmd-bad-secrets"
+                    && r.code == proto::ResultCode::InvalidArgument as i32
+            })
         }
     })
     .await;
@@ -1539,8 +1568,12 @@ async fn apply_spicepod_refuses_an_unopenable_payload() {
     handle.shutdown().await;
 }
 
+/// A deployment persists the spicepod and applies it by restarting — and the
+/// result reaches the gateway *before* the runtime is asked to exit. If the
+/// client exited first, every deployment would lose its validation outcome, and
+/// an operator watching a deploy would see nothing at all.
 #[tokio::test]
-async fn apply_spicepod_hot_applies_and_persists() {
+async fn apply_spicepod_persists_then_exits_to_restart() {
     let harness = Harness::new(24 * 60 * 60).await;
     let dir = tempfile::tempdir().unwrap();
     let config = harness.config(
@@ -1558,30 +1591,29 @@ async fn apply_spicepod_hot_applies_and_persists() {
         proto::control_message::Body::ApplySpicepod(proto::ApplySpicepod {
             spicepod_yaml: yaml.to_string(),
             sealed_secret_payload: None,
+            deployment_version: Some(41),
         }),
     ));
 
-    let captured = Arc::clone(&harness.gateway.captured);
-    let applied = wait_until_async(Duration::from_secs(5), || {
-        let captured = Arc::clone(&captured);
-        async move {
-            captured
-                .lock()
-                .await
-                .results
-                .iter()
-                .any(|r| r.command_id == "cmd-apply")
-        }
+    // Wait on the exit request, not on the result: the exit is the *last* step
+    // of the apply, so once it has happened the result must already be out.
+    let exited = wait_until_async(Duration::from_secs(5), || {
+        let state = Arc::clone(&rt_state);
+        async move { state.lock().await.exit_requested }
     })
     .await;
-    assert!(applied, "apply result must arrive within 5s");
+    assert!(
+        exited,
+        "a persisted deployment must ask the runtime to exit so the supervisor restarts it"
+    );
 
+    let captured = Arc::clone(&harness.gateway.captured);
     let result = with_captured!(captured, c => c
         .results
         .iter()
         .find(|r| r.command_id == "cmd-apply")
         .cloned())
-    .expect("apply result");
+    .expect("the apply result must be flushed to the gateway before the runtime exits");
     assert_eq!(
         result.code,
         proto::ResultCode::Ok as i32,
@@ -1596,9 +1628,15 @@ async fn apply_spicepod_hot_applies_and_persists() {
     };
     let meta: Value = serde_json::from_str(&json).expect("parse ApplySpicepod JSON payload");
     assert_eq!(meta["applied"], true);
-    assert_eq!(meta["reload"], "hot");
+    assert_eq!(
+        meta["live"], false,
+        "the deployment is persisted, not yet serving — the restart is what makes it live"
+    );
+    assert_eq!(meta["restart"], "required");
+    assert_eq!(meta["deployment_version"], 41);
 
-    // The runtime persisted the YAML to the canonical cloud-managed path.
+    // The runtime persisted the YAML to the canonical cloud-managed path, which
+    // is what the restart comes back up on.
     let (path, written) = rt_state
         .lock()
         .await
@@ -1607,6 +1645,55 @@ async fn apply_spicepod_hot_applies_and_persists() {
         .expect("spicepod applied");
     assert_eq!(written, yaml);
     assert!(path.exists(), "spicepod file must be on disk");
+
+    handle.shutdown().await;
+}
+
+/// The reconciliation contract: an instance that came up on a deployment says
+/// so in its `Hello`. The control plane cannot learn it from the command result
+/// — the apply exits the process before the result is guaranteed to land.
+#[tokio::test]
+async fn hello_reports_the_applied_deployment_version() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+    let config = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        Some(ADOPTION_CODE.to_string()),
+        Duration::from_hours(12),
+    );
+    let (runtime, _rt_state) = E2eRuntime::with_applied_version(Some(41));
+    let (handle, _identity) = enroll(&harness, &config, runtime).await;
+
+    let captured = Arc::clone(&harness.gateway.captured);
+    let hello = with_captured!(captured, c => c.hellos[0].0.clone());
+    assert_eq!(
+        hello.applied_deployment_version,
+        Some(41),
+        "an instance serving a deployment must name it, or a deploy can never resolve"
+    );
+
+    handle.shutdown().await;
+}
+
+/// An instance that no deployment has configured reports absence, not zero: a
+/// zero would resolve a deployment against a version nothing claimed.
+#[tokio::test]
+async fn hello_omits_the_version_when_no_deployment_is_applied() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+    let config = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        Some(ADOPTION_CODE.to_string()),
+        Duration::from_hours(12),
+    );
+    let (runtime, _rt_state) = E2eRuntime::new();
+    let (handle, _identity) = enroll(&harness, &config, runtime).await;
+
+    let captured = Arc::clone(&harness.gateway.captured);
+    let hello = with_captured!(captured, c => c.hellos[0].0.clone());
+    assert_eq!(hello.applied_deployment_version, None);
 
     handle.shutdown().await;
 }
