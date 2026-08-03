@@ -835,15 +835,16 @@ fn inspect_bulk_response(resp: &Value, es_index: &str) -> Result<()> {
             1,
             "the response reported errors but carried no `items` array".to_string(),
         ),
-        Some(items) => {
-            let (failures, first) = scan_failed_items(items);
-            (
-                failures,
-                first.unwrap_or_else(|| {
-                    "the response reported errors but no item carried one".to_string()
-                }),
-            )
-        }
+        Some(items) => match scan_failed_items(items) {
+            (failures, Some(first)) => (failures, first),
+            // `errors: true` with no item carrying an `error` is a contradictory response.
+            // Report one failure rather than the scanned zero: a message reading "0 document
+            // failure(s)" would claim success by count while returning an error.
+            (_, None) => (
+                1,
+                "the response reported errors but no item carried one".to_string(),
+            ),
+        },
     };
 
     Err(Error::BulkIndexItemErrors {
@@ -1115,6 +1116,11 @@ mod tests {
         assert!(
             message.contains("no item carried one"),
             "expected the contradictory-response case to be named: {message}"
+        );
+        assert_eq!(
+            failure_count(&resp),
+            1,
+            "a contradictory response must not report 0 failures while returning an error"
         );
     }
 
