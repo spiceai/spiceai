@@ -222,7 +222,7 @@ pub fn extract_and_format_metadata(
                 column: name,
             }
             .fail()
-            .map_err(|error| Error::from(*error));
+            .map_err(Error::from);
         };
         metadata_projection.push(idx);
     }
