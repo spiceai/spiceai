@@ -30,6 +30,12 @@ limitations under the License.
 //! one replication connection and one publication instead of each opening
 //! its own — WAL is decoded once for the whole catalog, not once per table.
 //!
+//! The catalog's `acceleration.mode` and `acceleration.params` are applied
+//! uniformly to every table. The default `mode: memory` holds the acceleration
+//! only in RAM, so each table re-runs its initial snapshot on every start; a
+//! file mode (with `params.cayenne_file_path`) persists it and resumes from the
+//! shared slot instead. `new` warns when the configured mode is not durable.
+//!
 //! Each table is accelerated according to its `PostgreSQL` `REPLICA IDENTITY`
 //! (see `classify_replica_identity`): `DEFAULT` + primary key and `USING INDEX`
 //! (keyed by the nominated unique index) replicate normally; `FULL` + primary
@@ -50,6 +56,18 @@ limitations under the License.
 //! while its dataset is still bootstrapping — `AcceleratedSchemaProvider`
 //! reports it as not-yet-present rather than serving reads through the
 //! source.
+//!
+//! Each synthesized dataset declares a [`crate::datafusion::DatasetPlacement`]
+//! before it is loaded, so the dataset lifecycle installs its table provider
+//! into this catalog's own [`AcceleratedSchemaProvider`] rather than the default
+//! catalog. A user therefore reaches each table only as
+//! `{catalog}.{schema}.{table}`; the synthesized registration name is never
+//! queryable, and the catalog owns its providers the same way every other
+//! catalog connector's schema provider does.
+//!
+//! The datasets are otherwise completely ordinary — status, metrics, health
+//! monitoring, retry and the refresh loop are all keyed on the dataset name and
+//! are unaffected by where the provider lands.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -74,7 +92,8 @@ use globset::GlobSet;
 use parking_lot::RwLock;
 use snafu::prelude::*;
 use spicepod::acceleration::{
-    Acceleration as SpicepodAcceleration, OnConflictBehavior, RefreshMode as SpicepodRefreshMode,
+    Acceleration as SpicepodAcceleration, Mode as SpicepodMode, OnConflictBehavior,
+    RefreshMode as SpicepodRefreshMode,
 };
 use spicepod::component::dataset::Dataset as SpicepodDataset;
 use spicepod::param::Params;
@@ -116,34 +135,69 @@ fn table_is_selected(
     included && !excluded
 }
 
-/// Hex-encodes `s` so the result contains only `[0-9a-f]` -- always a valid
-/// SQL identifier word, regardless of what characters `s` itself contains.
-fn hex_encode(s: &str) -> String {
+/// Escapes one `PostgreSQL` identifier into a component of a synthesized dataset
+/// name, so the joined result is always a valid SQL identifier word and no two
+/// distinct `(catalog, schema, table)` triples can encode to the same string.
+///
+/// The encoding keeps ordinary names readable — `orders` escapes to itself:
+///
+///   * `_`                          -> `_u`
+///   * any other non-`[A-Za-z0-9]`  -> `_x{byte:02x}` (per UTF-8 byte)
+///   * everything else              -> verbatim
+///
+/// Every `_` an encoded component contains is therefore followed by `u` or `x`,
+/// so **`__` can never occur inside one**. Joining components with `__` (see
+/// [`synthesized_dataset_name`]) is what makes the whole name injective: the
+/// first `__` is always the first separator, so the split — and hence the
+/// original triple — is uniquely recoverable.
+///
+/// Escaping `_` as `__` and separating with a single `_` would *not* be
+/// injective, even though a lone `_` never appears inside a component: the
+/// separator is the same character as the doubled one, so boundaries shift.
+/// `("x", "_y")` and `("x_", "y")` both encode to `x___y`. Two source tables
+/// would then share one dataset name, one component-status key, and one data
+/// directory — see the regression test.
+fn escape_name_component(s: &str) -> String {
     use std::fmt::Write;
     s.bytes()
-        .fold(String::with_capacity(s.len() * 2), |mut out, b| {
-            let _ = write!(out, "{b:02x}");
+        .fold(String::with_capacity(s.len()), |mut out, b| {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' => out.push(char::from(b)),
+                b'_' => out.push_str("_u"),
+                other => {
+                    let _ = write!(out, "_x{other:02x}");
+                }
+            }
             out
         })
 }
 
 /// A sanitized, collision-safe internal name for the per-table dataset
-/// synthesized for `catalog_name.schema_name.table_name`. Never exposed to
-/// users directly — they query the table through the catalog's own
-/// namespace; this is only the registration key under the default catalog.
+/// synthesized for `catalog_name.schema_name.table_name`.
 ///
-/// Catalog/schema/table names discovered from `PostgreSQL` can contain any
-/// character a quoted identifier allows (e.g. `-`, spaces), which plain
-/// concatenation would carry into a name `validate_identifier` rejects. Each
-/// component is hex-encoded so the result is always a valid identifier and
-/// component boundaries can't collide (a hex-encoded segment can't itself
-/// contain the `_` separator).
+/// This name is never queryable: the dataset's provider is installed into the
+/// catalog's own schema provider rather than the default catalog (see
+/// [`AcceleratedSchemaProvider`]), so users only ever reach the table as
+/// `{catalog}.{schema}.{table}`.
+///
+/// It is still visible, and still has to be unique and stable. It appears in
+/// logs, component status (`dataset:<name>`), and metric attributes, and under a
+/// file mode it is the table's directory beneath `cayenne_file_path` — so two
+/// tables colliding here would share a status key and a data directory, and a
+/// name that changed between restarts would orphan the acceleration on disk.
+/// Hence escaping rather than hex-encoding: the common case stays legible
+/// (`__catalog_accel_pg__cdc_public_orders`) while any character a quoted
+/// `PostgreSQL` identifier allows (`-`, spaces, dots, non-ASCII) still round-trips
+/// into a valid identifier — see [`escape_name_component`].
 fn synthesized_dataset_name(catalog_name: &str, schema_name: &str, table_name: &str) -> String {
+    // Components are joined with `__`, which no encoded component can contain
+    // (see `escape_name_component`) -- that, not the escaping alone, is what
+    // makes the name injective.
     format!(
-        "__catalog_accel_{}_{}_{}",
-        hex_encode(catalog_name),
-        hex_encode(schema_name),
-        hex_encode(table_name)
+        "__catalog_accel_{}__{}__{}",
+        escape_name_component(catalog_name),
+        escape_name_component(schema_name),
+        escape_name_component(table_name)
     )
 }
 
@@ -415,6 +469,14 @@ pub struct AcceleratedCatalogProvider {
     /// this catalog, so WAL is decoded once by one shared connection rather
     /// than once per table.
     slot_name: String,
+    /// Storage mode written onto every synthesized dataset's acceleration block
+    /// (the catalog's `acceleration.mode`). `Memory` -- the default -- is fully
+    /// in-RAM, so every table re-snapshots from the source on each restart; a
+    /// file mode persists and resumes from the shared slot instead.
+    acceleration_mode: SpicepodMode,
+    /// Accelerator params written onto every synthesized dataset's acceleration
+    /// block (the catalog's `acceleration.params`, e.g. `cayenne_file_path`).
+    acceleration_params: HashMap<String, String>,
     include: Option<Arc<GlobSet>>,
     exclude: Option<Arc<GlobSet>>,
     schemas: RwLock<HashMap<String, Arc<AcceleratedSchemaProvider>>>,
@@ -453,6 +515,37 @@ impl AcceleratedCatalogProvider {
         let mut dataset_params = catalog.params.clone();
         dataset_params.extend(catalog.dataset_params.clone());
 
+        // Absent only on a path that never accelerates (the connector builds this
+        // provider solely when `acceleration` is set); defaulting keeps `new`
+        // total rather than making callers unwrap.
+        let (acceleration_mode, acceleration_params) = catalog.acceleration.as_ref().map_or_else(
+            || (SpicepodMode::default(), HashMap::new()),
+            |acceleration| (acceleration.mode.into(), acceleration.params.clone()),
+        );
+
+        // `mode: memory` (the default) and `mode: file_create` both start empty
+        // on every boot. That is a supported configuration, not an error -- but
+        // it is easy to configure by accident and its cost is invisible until a
+        // restart, so state it once at startup rather than letting an operator
+        // discover it as apparent data loss.
+        //
+        // The message names `cayenne_cdc_durability` too, because that is the
+        // setting operators reach for when they mean "buffer writes in RAM":
+        // `mode` decides whether the acceleration exists on disk at all, while
+        // `cayenne_cdc_durability` only defers the durable write of a file-backed
+        // one. Choosing `mode: memory` for the throughput of the second is the
+        // most likely way to arrive here by accident.
+        if catalog
+            .acceleration
+            .as_ref()
+            .is_some_and(|acceleration| !acceleration.is_durable())
+        {
+            tracing::warn!(
+                "Catalog '{}': acceleration `mode: {acceleration_mode}` does not persist across restarts -- nothing is written to disk, so the acceleration starts empty and every table re-runs its initial snapshot from the source on every start. Set `acceleration.mode: file` with `acceleration.params.cayenne_file_path` to keep the acceleration across restarts and resume from the replication slot instead. If the goal was to keep CDC writes off the disk hot path rather than to discard them, use a file mode with `acceleration.params.cayenne_cdc_durability: memory`, which buffers in RAM but still drains to durable storage. Docs: {DOCS_URL}",
+                catalog.name,
+            );
+        }
+
         Self {
             catalog_name: catalog.name.clone(),
             pool,
@@ -460,6 +553,8 @@ impl AcceleratedCatalogProvider {
             app: catalog.app(),
             dataset_params,
             slot_name,
+            acceleration_mode,
+            acceleration_params,
             include: catalog.include.clone().map(Arc::new),
             exclude: catalog.exclude.clone().map(Arc::new),
             schemas: RwLock::new(HashMap::new()),
@@ -633,6 +728,13 @@ impl AcceleratedCatalogProvider {
         spicepod_ds.acceleration = Some(SpicepodAcceleration {
             engine: Some(CAYENNE_ENGINE.to_string()),
             refresh_mode: Some(SpicepodRefreshMode::Changes),
+            // The catalog's storage mode and accelerator params apply uniformly
+            // to every table it accelerates. Under a file mode each table lands
+            // in its own directory beneath `cayenne_file_path`, named for the
+            // dataset (see `synthesized_dataset_name`).
+            mode: self.acceleration_mode.clone(),
+            params: (!self.acceleration_params.is_empty())
+                .then(|| Params::from_string_map(self.acceleration_params.clone())),
             primary_key: Some(key_ref.clone()),
             on_conflict: HashMap::from([(key_ref, OnConflictBehavior::Upsert)]),
             ..SpicepodAcceleration::default()
@@ -903,20 +1005,37 @@ impl RefreshableCatalogProvider for AcceleratedCatalogProvider {
         // registration can no longer be left partially applied.
         let mut schemas = HashMap::new();
         for (schema_name, plan) in plans {
+            // Reuse this schema's existing provider when there is one. It owns
+            // the providers of every table already loaded, so replacing it on a
+            // periodic refresh would drop them and make ready tables vanish
+            // until their datasets happened to reload.
+            let provider = self.schemas.read().get(&schema_name).map_or_else(
+                || Arc::new(AcceleratedSchemaProvider::default()),
+                Arc::clone,
+            );
+            *provider.tables.write() = plan.tables;
+
             for (table_name, dataset_name, kind, dataset) in plan.to_spawn {
+                // Declare where the provider belongs *before* spawning, so the
+                // dataset is never briefly registered under the default catalog:
+                // users reach these tables through this catalog's own namespace,
+                // and the synthesized registration name is not part of its
+                // interface.
+                provider
+                    .dataset_to_table
+                    .write()
+                    .insert(dataset_name.clone(), table_name.clone());
+                self.runtime.df.set_dataset_placement(
+                    &TableReference::bare(dataset_name.clone()),
+                    Arc::clone(&provider) as Arc<dyn crate::datafusion::DatasetPlacement>,
+                );
                 self.spawned.write().insert(
                     (schema_name.clone(), table_name),
                     SpawnedTable { dataset_name, kind },
                 );
                 tokio::spawn(Arc::clone(&self.runtime).load_synthesized_dataset(Arc::new(dataset)));
             }
-            schemas.insert(
-                schema_name,
-                Arc::new(AcceleratedSchemaProvider {
-                    runtime: Arc::clone(&self.runtime),
-                    tables: RwLock::new(plan.tables),
-                }),
-            );
+            schemas.insert(schema_name, provider);
         }
 
         {
@@ -948,11 +1067,46 @@ impl CatalogProvider for AcceleratedCatalogProvider {
     }
 }
 
-/// A schema provider whose tables are all CDC-accelerated via a synthesized
-/// dataset (`table_name` -> the dataset's registration name).
+/// A schema provider that owns the accelerated tables of one schema, the same
+/// way every other catalog connector's schema provider owns its own
+/// `TableProvider`s.
+///
+/// `tables` maps the source table name to the name of the dataset synthesized
+/// for it; `providers` holds each table's provider once its dataset finishes
+/// loading and the dataset lifecycle installs it here (see
+/// [`DatasetPlacement`]). A table that is discovered but still bootstrapping is
+/// present in `tables` and absent from `providers`, which is exactly the
+/// "not yet queryable" state.
+impl AcceleratedSchemaProvider {
+    /// The provider for `name`, but only while `name` is still part of the
+    /// current plan.
+    ///
+    /// Both halves are required. `providers` alone would keep serving a table
+    /// that a later `refresh()` dropped from `tables` — because the source
+    /// dropped it, or because `include`/`exclude` now filter it out — leaving a
+    /// ghost that `table_names()` no longer lists but queries still resolve,
+    /// backed by an accelerator no longer being fed. `tables` alone would report
+    /// a discovered-but-still-bootstrapping table as present, letting
+    /// `normalize_table_reference` resolve something whose `table()` returns
+    /// `None`, which then fails as "not found" at query time and can shadow a
+    /// ready same-named table in another schema.
+    fn installed_provider(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
+        if !self.tables.read().contains_key(name) {
+            return None;
+        }
+        self.providers.read().get(name).map(Arc::clone)
+    }
+}
+
+#[derive(Default)]
 struct AcceleratedSchemaProvider {
-    runtime: Arc<Runtime>,
     tables: RwLock<HashMap<String, String>>,
+    /// `table_name` -> its accelerated provider. Keyed by the *source* table
+    /// name, since that is what `SchemaProvider` is asked for.
+    providers: RwLock<HashMap<String, Arc<dyn TableProvider>>>,
+    /// Reverse index (`dataset name` -> `table name`) so an install, which
+    /// arrives keyed by dataset name, can find the table it belongs to.
+    dataset_to_table: RwLock<HashMap<String, String>>,
 }
 
 impl std::fmt::Debug for AcceleratedSchemaProvider {
@@ -970,57 +1124,43 @@ impl SchemaProvider for AcceleratedSchemaProvider {
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        let dataset_name = {
-            let guard = self.tables.read();
-            match guard.get(name) {
-                Some(dataset_name) => dataset_name.clone(),
-                None => return Ok(None),
-            }
-        };
-
-        // Not yet registered (dataset still bootstrapping) simply reads as
-        // "table not found" -- no federated stand-in during bootstrap. Any
-        // other failure (e.g. a registration inconsistency) is logged so
-        // it's not indistinguishable from an in-progress bootstrap.
-        match self
-            .runtime
-            .df
-            .get_accelerated_table_provider(&dataset_name)
-            .await
-        {
-            Ok(provider) => Ok(Some(provider)),
-            Err(e) => {
-                tracing::debug!(
-                    "Accelerated table '{dataset_name}' not yet available (table '{name}'): {e}"
-                );
-                Ok(None)
-            }
-        }
+        Ok(self.installed_provider(name))
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        let dataset_name = {
-            let guard = self.tables.read();
-            match guard.get(name) {
-                Some(dataset_name) => dataset_name.clone(),
-                None => return false,
-            }
-        };
+        self.installed_provider(name).is_some()
+    }
+}
 
-        // Mirror `table()`: report the table as existing only once its
-        // synthesized dataset is actually registered and queryable, not
-        // merely discovered. Returning `true` on discovery alone would let a
-        // still-bootstrapping table (whose `table()` returns `Ok(None)`) be
-        // resolved by `DataFusion::normalize_table_reference` and then fail
-        // as "not found" at query time -- and could shadow a ready same-named
-        // table in another schema/catalog during that window.
-        // `get_table_sync` resolves the synthesized dataset in the default
-        // catalog synchronously and flips to `Some` at the same registration
-        // point `get_accelerated_table_provider` begins succeeding.
-        self.runtime
-            .df
-            .get_table_sync(&TableReference::bare(dataset_name))
-            .is_some()
+impl crate::datafusion::DatasetPlacement for AcceleratedSchemaProvider {
+    /// Take ownership of a synthesized dataset's provider instead of letting it
+    /// be registered under the default catalog.
+    fn install(
+        &self,
+        name: &TableReference,
+        provider: Arc<dyn TableProvider>,
+    ) -> crate::datafusion::Result<()> {
+        let dataset_name = name.to_string();
+        // The catalog registers the placement before spawning the dataset, so an
+        // install for an unknown dataset means the two have gone out of sync.
+        // Fail rather than log-and-continue: returning `Ok` here would let the
+        // lifecycle mark the dataset Ready while its provider was dropped on the
+        // floor, so the table would be permanently unqueryable and reported
+        // healthy. Failing surfaces it as a dataset error and retries.
+        let table_name = self
+            .dataset_to_table
+            .read()
+            .get(&dataset_name)
+            .cloned()
+            .ok_or_else(
+                || crate::datafusion::Error::UnableToRegisterTableToDataFusion {
+                    source: datafusion::error::DataFusionError::Internal(format!(
+                        "accelerated catalog has no table registered for dataset '{dataset_name}'"
+                    )),
+                },
+            )?;
+        self.providers.write().insert(table_name, provider);
+        Ok(())
     }
 }
 
@@ -1035,6 +1175,66 @@ mod tests {
         // name `validate_identifier` rejects.
         let name = synthesized_dataset_name("my-catalog", "my schema", "my-table");
         crate::component::validate_identifier(&name).expect("should be a valid identifier");
+
+        // Non-ASCII is escaped per UTF-8 byte, so it stays a valid identifier.
+        let unicode = synthesized_dataset_name("cat", "public", "ürders");
+        crate::component::validate_identifier(&unicode).expect("should be a valid identifier");
+    }
+
+    #[test]
+    fn test_synthesized_dataset_name_is_readable_for_ordinary_identifiers() {
+        // The name shows up in logs, status, metric attributes and -- under a
+        // file mode -- as the table's directory under `cayenne_file_path`, so
+        // the common all-alphanumeric case must stay legible.
+        assert_eq!(
+            synthesized_dataset_name("pg_cdc", "public", "order_items"),
+            "__catalog_accel_pg_ucdc__public__order_uitems"
+        );
+    }
+
+    /// Regression: escaping `_` as `__` and separating with a single `_` was
+    /// NOT injective, because the separator was the same character as the
+    /// doubled one, so a `_` at a component boundary shifted the split.
+    /// `("x", "_y")` and `("x_", "y")` both produced `..._x___y`, which would
+    /// give two source tables one dataset name, one component-status key and
+    /// one data directory.
+    #[test]
+    fn test_synthesized_dataset_name_survives_underscores_at_component_boundaries() {
+        assert_ne!(
+            synthesized_dataset_name("cat", "x", "_y"),
+            synthesized_dataset_name("cat", "x_", "y"),
+        );
+        assert_ne!(
+            synthesized_dataset_name("cat", "x_", "_y"),
+            synthesized_dataset_name("cat", "x", "__y"),
+        );
+        assert_ne!(
+            synthesized_dataset_name("cat_", "x", "y"),
+            synthesized_dataset_name("cat", "_x", "y"),
+        );
+    }
+
+    /// Brute-force the property the whole scheme rests on, rather than trusting
+    /// the argument for it: over every triple drawn from a set of adversarial
+    /// components (empty, underscores in every position, the escape sequences
+    /// themselves, non-ASCII), no two distinct triples may share a name.
+    #[test]
+    fn test_synthesized_dataset_name_is_injective_over_adversarial_triples() {
+        let parts = [
+            "", "a", "_", "__", "___", "a_", "_a", "a_b", "ab", "a__b", "u", "_u", "x61", "_x61",
+            "a_u", "a_x61", "-", " ", ".", "ü",
+        ];
+        let mut seen: HashMap<String, (&str, &str, &str)> = HashMap::new();
+        for c in parts {
+            for s in parts {
+                for t in parts {
+                    let name = synthesized_dataset_name(c, s, t);
+                    if let Some(prev) = seen.insert(name.clone(), (c, s, t)) {
+                        panic!("{:?} and {:?} both encode to {name:?}", (c, s, t), prev);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -1048,12 +1248,37 @@ mod tests {
 
         // A naive "join with '_'" scheme collides here: schema="a_b",
         // table="c" and schema="a", table="b_c" both naively join to
-        // "a_b_c". Hex-encoding each component before joining rules this
-        // out, since a hex-encoded segment can never contain the `_`
-        // separator itself.
+        // "a_b_c". Doubling `_` inside each component rules this out: a lone
+        // `_` then only ever appears as the separator between components.
         let shifted_left = synthesized_dataset_name("cat", "a_b", "c");
         let shifted_right = synthesized_dataset_name("cat", "a", "b_c");
         assert_ne!(shifted_left, shifted_right);
+
+        // The same shift, but with the escape sequence itself in the input --
+        // a table literally named `x61` must not collide with the escaping of
+        // some other character.
+        assert_ne!(
+            synthesized_dataset_name("cat", "public", "_x61"),
+            synthesized_dataset_name("cat", "public", "a"),
+        );
+    }
+
+    #[test]
+    fn test_escape_name_component_is_injective_over_awkward_identifiers() {
+        // Every distinct input must produce a distinct component; a collision
+        // here means two source tables share one accelerated dataset, and one
+        // silently serves the other's rows.
+        let inputs = [
+            "", "a", "A", "_", "__", "a_", "_a", "a_b", "ab", "a-b", "a b", "a.b", "a_x62", "x62",
+            "_x62", "ürders", "0", "_0",
+        ];
+        let mut seen = HashMap::new();
+        for input in inputs {
+            let escaped = escape_name_component(input);
+            if let Some(previous) = seen.insert(escaped.clone(), input) {
+                panic!("{input:?} and {previous:?} both escape to {escaped:?}");
+            }
+        }
     }
 
     fn globset(patterns: &[&str]) -> GlobSet {
@@ -1107,6 +1332,127 @@ mod tests {
             Some(&include),
             Some(&exclude)
         ));
+    }
+
+    fn empty_provider() -> Arc<dyn TableProvider> {
+        Arc::new(datafusion::datasource::empty::EmptyTable::new(Arc::new(
+            datafusion::arrow::datatypes::Schema::empty(),
+        )))
+    }
+
+    /// The schema provider owns its tables outright -- the same contract every
+    /// other catalog connector's schema provider has. A discovered table is not
+    /// queryable until its synthesized dataset finishes loading and installs a
+    /// provider here; reporting it earlier would let it resolve and then fail as
+    /// "not found" at query time.
+    #[tokio::test]
+    async fn a_table_is_queryable_only_once_its_provider_is_installed() {
+        use crate::datafusion::DatasetPlacement;
+
+        let schema = AcceleratedSchemaProvider::default();
+        *schema.tables.write() =
+            HashMap::from([("orders".to_string(), "__catalog_accel_x".to_string())]);
+        schema
+            .dataset_to_table
+            .write()
+            .insert("__catalog_accel_x".to_string(), "orders".to_string());
+
+        // Discovered, still bootstrapping: listed, but not yet resolvable.
+        assert_eq!(schema.table_names(), vec!["orders".to_string()]);
+        assert!(!schema.table_exist("orders"));
+        assert!(schema.table("orders").await.expect("lookup").is_none());
+
+        schema
+            .install(&TableReference::bare("__catalog_accel_x"), empty_provider())
+            .expect("install");
+
+        assert!(schema.table_exist("orders"));
+        assert!(schema.table("orders").await.expect("lookup").is_some());
+    }
+
+    /// A periodic refresh rebuilds the per-schema table map, but must not
+    /// discard providers already installed -- doing so would make every ready
+    /// table vanish until its dataset happened to reload.
+    #[tokio::test]
+    async fn refreshing_the_table_map_keeps_installed_providers() {
+        use crate::datafusion::DatasetPlacement;
+
+        let schema = AcceleratedSchemaProvider::default();
+        schema
+            .dataset_to_table
+            .write()
+            .insert("__catalog_accel_x".to_string(), "orders".to_string());
+        schema
+            .install(&TableReference::bare("__catalog_accel_x"), empty_provider())
+            .expect("install");
+
+        // What `refresh()` does to a reused provider: replace the table map.
+        *schema.tables.write() = HashMap::from([
+            ("orders".to_string(), "__catalog_accel_x".to_string()),
+            ("items".to_string(), "__catalog_accel_y".to_string()),
+        ]);
+
+        assert!(
+            schema.table("orders").await.expect("lookup").is_some(),
+            "an already-loaded table must survive a re-plan"
+        );
+        assert!(
+            !schema.table_exist("items"),
+            "a newly discovered table is not queryable until its provider lands"
+        );
+    }
+
+    /// An install for a dataset the schema does not know about means the
+    /// placement registry and the table map have diverged. Dropping the provider
+    /// silently would leave that table permanently unqueryable with nothing in
+    /// the logs, so the mismatch is surfaced instead.
+    #[tokio::test]
+    async fn an_install_for_an_unknown_dataset_is_not_silently_dropped() {
+        use crate::datafusion::DatasetPlacement;
+
+        let schema = AcceleratedSchemaProvider::default();
+        let result = schema.install(
+            &TableReference::bare("__catalog_accel_missing"),
+            empty_provider(),
+        );
+
+        assert!(
+            result.is_err(),
+            "an install with nowhere to go must fail the dataset rather than let it \
+             report Ready while its table is unqueryable"
+        );
+        assert!(schema.table_names().is_empty());
+        assert!(schema.providers.read().is_empty());
+    }
+
+    /// A table dropped from the plan by a later `refresh()` -- removed at the
+    /// source, or newly matched by `exclude` -- must stop resolving, not linger
+    /// as a ghost backed by an accelerator that is no longer fed.
+    #[tokio::test]
+    async fn a_table_removed_from_the_plan_stops_resolving() {
+        use crate::datafusion::DatasetPlacement;
+
+        let schema = AcceleratedSchemaProvider::default();
+        *schema.tables.write() =
+            HashMap::from([("orders".to_string(), "__catalog_accel_x".to_string())]);
+        schema
+            .dataset_to_table
+            .write()
+            .insert("__catalog_accel_x".to_string(), "orders".to_string());
+        schema
+            .install(&TableReference::bare("__catalog_accel_x"), empty_provider())
+            .expect("install");
+        assert!(schema.table_exist("orders"));
+
+        // The next refresh no longer discovers `orders`.
+        schema.tables.write().clear();
+
+        assert!(
+            !schema.table_exist("orders"),
+            "removed table must not resolve"
+        );
+        assert!(schema.table("orders").await.expect("lookup").is_none());
+        assert!(schema.table_names().is_empty());
     }
 
     #[test]

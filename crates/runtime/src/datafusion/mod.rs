@@ -818,6 +818,23 @@ struct DeferredTableRegistration {
     connector: Arc<dyn DataConnector>,
 }
 
+/// Where a dataset's table provider is installed once the dataset lifecycle has
+/// built it.
+///
+/// By default a dataset is registered into the default catalog, which is what
+/// makes it queryable as `spice.data.<name>`. A component that synthesizes
+/// datasets on a user's behalf — the `PostgreSQL` catalog connector, which
+/// builds one per discovered table — installs them into its own schema provider
+/// instead, so its internal registration names never occupy the user-facing
+/// namespace. The dataset is otherwise completely ordinary: status, metrics,
+/// health monitoring and the refresh loop are all keyed on the dataset name and
+/// are unaffected by where the provider lands.
+pub trait DatasetPlacement: std::fmt::Debug + Send + Sync {
+    /// Install `provider` for the dataset registered as `name`. Called in place
+    /// of registering it into the default catalog.
+    fn install(&self, name: &TableReference, provider: Arc<dyn TableProvider>) -> Result<()>;
+}
+
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
     pub(crate) runtime_status: Arc<status::RuntimeStatus>,
@@ -832,6 +849,9 @@ pub struct DataFusion {
     /// Used by the extension planner to pass `Weak<DataFusion>` to physical plans.
     datafusion_ref: iceberg_ddl::SharedDataFusionRef,
     accelerated_tables: TokioRwLock<HashSet<TableReference>>,
+    /// Datasets whose table provider is installed somewhere other than the
+    /// default catalog, keyed by dataset name (see [`DatasetPlacement`]).
+    dataset_placements: dashmap::DashMap<String, Arc<dyn DatasetPlacement>>,
     caching: Arc<Caching>,
     /// Per-dataset locks serializing write-time schema evolution + rebind (the `OTel`
     /// metric-dimension path). Keyed by table reference so concurrent exports for the
@@ -1052,6 +1072,39 @@ impl DataFusion {
 
     pub fn accelerator_engine_registry(&self) -> Arc<AcceleratorEngineRegistry> {
         Arc::clone(&self.accelerator_engine_registry)
+    }
+
+    /// Declare that `dataset_name`'s table provider belongs to `placement`
+    /// rather than the default catalog (see [`DatasetPlacement`]).
+    ///
+    /// Must be called before the dataset is loaded. Registering the placement up
+    /// front — rather than moving the provider afterwards — is what keeps the
+    /// dataset from ever being briefly queryable as `spice.data.<name>`.
+    pub fn set_dataset_placement(
+        &self,
+        dataset_name: &TableReference,
+        placement: Arc<dyn DatasetPlacement>,
+    ) {
+        self.dataset_placements
+            .insert(dataset_name.to_string(), placement);
+    }
+
+    /// Install a freshly built table provider wherever the dataset belongs: its
+    /// declared [`DatasetPlacement`] if it has one, otherwise the default
+    /// catalog.
+    fn install_table_provider(
+        &self,
+        name: &TableReference,
+        provider: Arc<dyn TableProvider>,
+    ) -> Result<()> {
+        if let Some(placement) = self.dataset_placements.get(&name.to_string()) {
+            return placement.install(name, provider);
+        }
+        self.ctx
+            .register_table(name.clone(), provider)
+            .map_err(find_datafusion_root)
+            .context(UnableToRegisterTableToDataFusionSnafu)?;
+        Ok(())
     }
 
     /// The query-admission semaphore when `runtime.query.max_concurrent_queries`
@@ -3857,10 +3910,7 @@ impl DataFusion {
             &dataset.columns,
         );
 
-        self.ctx
-            .register_table(dataset.name.clone(), table_provider)
-            .map_err(find_datafusion_root)
-            .context(UnableToRegisterTableToDataFusionSnafu)?;
+        self.install_table_provider(&dataset.name, table_provider)?;
 
         self.register_metadata_table(&dataset, Arc::clone(&source))
             .await?;
