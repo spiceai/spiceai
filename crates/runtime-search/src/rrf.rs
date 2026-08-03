@@ -157,7 +157,7 @@ macro_rules! col_qualified {
     };
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 enum RecencyDecay {
     Linear,
     Exponential,
