@@ -36,7 +36,6 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
         update_snapshots,
         max_concurrent,
         max_concurrent_wait_timeout_mins,
-        exclude_run_id,
         ..
     } = args;
     if !path.is_dir() && !path.is_file() {
@@ -228,8 +227,7 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
 
         let octo_client = octocrab::instance().user_access_token(gh_token)?;
         let workflow =
-            GitHubWorkflow::new("spiceai", "spiceai", test_type.workflow(), &workflow_commit)
-                .with_excluded_run_id(exclude_run_id);
+            GitHubWorkflow::new("spiceai", "spiceai", test_type.workflow(), &workflow_commit);
 
         let result = match max_concurrent {
             Some(max_concurrent) => {
