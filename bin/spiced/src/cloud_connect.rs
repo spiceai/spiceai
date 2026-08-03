@@ -321,20 +321,19 @@ pub async fn maybe_start(
     // references. `None` only if that call was skipped, in which case a
     // deployment can still deliver secrets to this process — they just will not
     // have been available at startup.
-    let delivered_store = match delivered_secrets {
-        Some(state) => state.store,
-        None => {
-            tracing::debug!(
-                "Spice Cloud Connect: no delivered-secrets store was installed before component load; registering one now"
-            );
-            let store = Arc::new(CloudDeliveredSecretStore::new());
-            runtime.secrets().write().await.register_builtin_store(
-                CLOUD_DELIVERED_STORE,
-                Arc::clone(&store) as Arc<dyn runtime::secrets::SecretStore>,
-            );
-            load_cached_secrets(&config, &store);
-            store
-        }
+    let delivered_store = if let Some(state) = delivered_secrets {
+        state.store
+    } else {
+        tracing::debug!(
+            "Spice Cloud Connect: no delivered-secrets store was installed before component load; registering one now"
+        );
+        let store = Arc::new(CloudDeliveredSecretStore::new());
+        runtime.secrets().write().await.register_builtin_store(
+            CLOUD_DELIVERED_STORE,
+            Arc::clone(&store) as Arc<dyn runtime::secrets::SecretStore>,
+        );
+        load_cached_secrets(&config, &store);
+        store
     };
 
     // Detected once: nothing about the process's supervisor changes while it

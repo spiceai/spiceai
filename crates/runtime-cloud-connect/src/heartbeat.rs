@@ -50,13 +50,16 @@ pub(crate) async fn build_heartbeat(
     let active_models = runtime.active_models().await;
 
     let deploy_state = match runtime.deploy_state().await {
-        Some(state) if reported.as_ref() != Some(&state) => {
+        // An adapter that does not report deploy versions at all.
+        None => None,
+        // Already reported on this connection: repeating it would say nothing,
+        // since each state replaces the whole record the control plane holds.
+        Some(state) if reported.as_ref() == Some(&state) => None,
+        Some(state) => {
             let frame = deploy_state_proto(&state);
             *reported = Some(state);
             Some(frame)
         }
-        // Unchanged, or an adapter that does not report deploy versions at all.
-        _ => None,
     };
 
     proto::Heartbeat {
