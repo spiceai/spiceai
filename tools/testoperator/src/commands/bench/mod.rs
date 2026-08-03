@@ -73,6 +73,7 @@ pub(crate) fn emit_acceleration_size_if_applicable(
 }
 
 pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
+    super::ensure_shared_client_connections(args, "bench")?;
     // Two SUT acquisition paths: when a system adapter is configured, delegate
     // setup() to it over JSON-RPC; otherwise spawn a local `spiced` as before.
     // The rest of the benchmark flow is identical apart from a few

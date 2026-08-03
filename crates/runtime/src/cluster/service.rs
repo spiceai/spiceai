@@ -62,7 +62,7 @@ use runtime_proto::{
     executor_control_message::Message as ExecutorMessage,
     scheduler_control_message::Message as SchedulerMessage,
 };
-use runtime_secrets::Secrets;
+use runtime_secrets::{SECRETS, Secrets, iter_secret_references};
 use secrecy::ExposeSecret;
 use std::collections::{HashMap, HashSet};
 use std::task::{Context, Poll};
@@ -368,6 +368,14 @@ impl ClusterService for ClusterServiceImpl {
             ));
         }
 
+        // Empty key is never a valid secret reference and is rejected before
+        // any store lookup or allowlist work.
+        if request.key.is_empty() {
+            return Err(Status::invalid_argument(
+                "Unable to expand secret: empty key",
+            ));
+        }
+
         let span = tracing::span!(
             target: "task_history",
             tracing::Level::INFO,
@@ -383,21 +391,65 @@ impl ClusterService for ClusterServiceImpl {
             request.key
         );
 
+        // Only keys referenced by the current app (spicepod) may be expanded.
+        // This closes the "any mTLS peer can request any env/vault key by name"
+        // hole: unreferenced secrets in the host environment or external stores
+        // are never returned, and unallowlisted keys never hit the secret store
+        // (so deny does not create a lookup side-channel).
+        //
+        // Snapshot the `Arc<App>` under the lock and drop the guard before the
+        // (CPU-bound) allowlist build so ExpandSecret does not hold the app
+        // write path while serializing/scanning the spicepod.
+        let Some(app) = self.app.read().await.clone() else {
+            tracing::warn!(
+                executor_id = %request.executor_id,
+                "Denied cluster secret expansion: app context not available"
+            );
+            return Err(Status::failed_precondition(
+                "Secret expansion requires a loaded app definition",
+            ));
+        };
+        let allowed_keys = expandable_secret_keys(&app);
+
+        let Some(allowed_stores) = allowed_keys.get(request.key.as_str()) else {
+            tracing::warn!(
+                executor_id = %request.executor_id,
+                key = %request.key,
+                "Denied cluster secret expansion: key is not referenced by the app"
+            );
+            // Same status/message shape as a miss so callers cannot distinguish
+            // "not in spicepod" from "not in any store" for unallowlisted keys.
+            return Err(Status::invalid_argument(format!(
+                "Unable to expand secret {}",
+                request.key
+            )));
+        };
+
         tracing::debug!(
             "ExpandSecret: expanding secret {} for executor {}",
             request.key,
             request.executor_id
         );
 
-        let secrets = self.secrets.read().await;
-        let Some(value) = secrets
-            .get_secret(&request.key)
-            .await
-            .map_err(|e| Status::internal(format!("Failed to get secret: {e}")))?
+        let secrets = Secrets::snapshot(&self.secrets).await;
+        // A reference through the `secrets:` sentinel keeps its normal
+        // "search every configured store in precedence order" resolution; a
+        // reference scoped to a specific store (e.g. `${ env:KEY }`) is
+        // restricted to that store, so a same-named key in an unrelated
+        // store can't answer in its place.
+        let lookup = if allowed_stores.contains(SECRETS) {
+            secrets.get_secret(&request.key).await
+        } else {
+            secrets
+                .get_secret_from_stores(&request.key, allowed_stores)
+                .await
+        };
+        let Some(value) =
+            lookup.map_err(|e| Status::internal(format!("Failed to get secret: {e}")))?
         else {
             tracing::error!(target: "task_history", "Secret not found");
             return Err(Status::invalid_argument(format!(
-                "Unable to read secret {}",
+                "Unable to expand secret {}",
                 request.key
             )));
         };
@@ -462,14 +514,19 @@ impl ClusterService for ClusterServiceImpl {
         let local_sql = rewrite_task_history_sql(&request.sql)
             .map_err(|e| Status::invalid_argument(format!("Invalid task history query: {e}")))?;
 
-        // Execute the query against local_task_history
+        // Always run under the strict read-only validator: GetTaskHistory is a
+        // cluster-internal fan-in for observability, not a general SQL surface.
+        // Without this gate, a peer could smuggle DDL/DML that merely *mentions*
+        // task_history (e.g. `INSERT INTO writable SELECT * FROM runtime.task_history`)
+        // and execute it with the scheduler's full DataFusion context.
         let query_result = self
             .datafusion
             .query_builder(&local_sql)
+            .read_only(true)
             .build()
             .run()
             .await
-            .map_err(|e| Status::internal(format!("Failed to execute query: {e}")))?;
+            .map_err(|e| map_task_history_query_error(&e))?;
 
         // Collect all record batches
         let batches: Vec<RecordBatch> = query_result
@@ -1299,6 +1356,86 @@ fn encode_batches_to_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>, arrow::erro
     Ok(buffer)
 }
 
+/// Collects, for each secret key the cluster may expand via [`ExpandSecret`],
+/// the set of store names it was referenced through.
+///
+/// Keys are taken from every `${ store:key }` reference in the serialized app
+/// definition (datasets, catalogs, models, tools, runtime auth, snapshots, …);
+/// a key the spicepod never references is absent from the map and therefore
+/// denied. The per-key store set lets the `expand_secret` handler honor the
+/// store a reference named — e.g. `${ env:KEY }` may only expand from
+/// `env` — instead of an unscoped search across every configured store, which
+/// could return an unrelated, same-named secret from a different store than
+/// the spicepod referenced. A key reached via the `${ secrets:KEY }` sentinel
+/// keeps its normal "any configured store" semantics: its store set contains
+/// [`SECRETS`].
+///
+/// Serialization failure fails closed (empty map) so a broken app cannot
+/// open the expansion surface.
+fn expandable_secret_keys(app: &App) -> HashMap<String, HashSet<String>> {
+    match serde_json::to_string(app) {
+        Ok(json) => {
+            let mut allowed: HashMap<String, HashSet<String>> = HashMap::new();
+            for reference in iter_secret_references(&json) {
+                allowed
+                    .entry(reference.key)
+                    .or_default()
+                    .insert(reference.store);
+            }
+            allowed
+        }
+        Err(e) => {
+            tracing::error!(
+                "Failed to serialize app while building ExpandSecret allowlist: {e}. Denying all secret expansion."
+            );
+            HashMap::new()
+        }
+    }
+}
+
+/// Maps a task-history query execution error to a gRPC status.
+///
+/// Read-only validator failures (DDL/DML/COPY/etc.) become
+/// [`Status::permission_denied`] so callers can distinguish policy rejections
+/// from unexpected internal failures.
+fn map_task_history_query_error(e: &crate::datafusion::query::Error) -> Status {
+    // Classify on the underlying DataFusion message, not `Error`'s Display —
+    // `UnableToExecuteQuery` already prefixes with "Failed to execute query: ",
+    // and re-wrapping that string would double the prefix and couple the
+    // mutation classifier to wrapper formatting.
+    let underlying = match e {
+        crate::datafusion::query::Error::UnableToExecuteQuery { source }
+        | crate::datafusion::query::Error::UnableToCreateMemoryStream { source }
+        | crate::datafusion::query::Error::UnableToCollectResults { source }
+        | crate::datafusion::query::Error::BindingParameters { source } => source.to_string(),
+        other => other.to_string(),
+    };
+
+    // Prefer PermissionDenied for any mutation rejection so cluster peers get a
+    // clear policy signal rather than a 500-class Internal. The read-only
+    // validator is the primary gate; the general operations validator can also
+    // reject writes first (e.g. internal datasets) with a different message.
+    if is_task_history_mutation_rejection(&underlying) {
+        Status::permission_denied(format!(
+            "Task history queries are read-only and cannot mutate data: {underlying}"
+        ))
+    } else {
+        // `Error`'s Display already formats `UnableToExecuteQuery` as
+        // "Failed to execute query: …"; use it as-is to avoid a second prefix.
+        Status::internal(e.to_string())
+    }
+}
+
+fn is_task_history_mutation_rejection(message: &str) -> bool {
+    message.contains("read-only SQL context")
+        || message.contains("INSERT operations are not allowed")
+        || message.contains("DELETE operations are not allowed")
+        || message.contains("UPDATE operations are not allowed")
+        || message.contains("COPY operations are not allowed")
+        || message.contains("DDL operation")
+        || message.contains("are not allowed in read-only")
+}
+
 /// Rewrites a task history SQL query to use `local_task_history` instead of `task_history`.
 ///
 /// This function parses the SQL, validates it references the expected table, and rewrites
@@ -1375,16 +1512,58 @@ fn rewrite_task_history_sql(sql: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use app::AppBuilder;
     use arrow::datatypes::{DataType, Field, Schema};
+    use async_trait::async_trait;
     use datafusion::datasource::MemTable;
     use runtime_proto::{
         cluster_service_client::ClusterServiceClient, cluster_service_server::ClusterServiceServer,
     };
+    use runtime_secrets::{AnyErrorResult, SecretStore};
+    use secrecy::SecretString;
+    use spicepod::component::dataset::Dataset;
+    use spicepod::param::Params;
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::transport::{Channel, Server};
 
-    async fn make_test_service() -> ClusterServiceImpl {
+    /// Fixed-map secret store for `ExpandSecret` allowlist tests.
+    struct FakeSecretStore(HashMap<String, String>);
+
+    #[async_trait]
+    impl SecretStore for FakeSecretStore {
+        async fn get_secret(&self, key: &str) -> AnyErrorResult<Option<SecretString>> {
+            Ok(self.0.get(key).map(|v| SecretString::from(v.clone())))
+        }
+    }
+
+    fn secrets_with(entries: &[(&str, &str)]) -> Secrets {
+        let mut secrets = Secrets::new();
+        secrets.register_store(
+            "fake",
+            Arc::new(FakeSecretStore(
+                entries
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
+            )),
+        );
+        secrets
+    }
+
+    fn app_with_secret_ref(param: &str, reference: &str) -> Arc<App> {
+        let mut ds = Dataset::new("memory:data", "orders");
+        let map: HashMap<String, String> =
+            HashMap::from([(param.to_string(), reference.to_string())]);
+        ds.params = Some(Params::from_string_map(map));
+        Arc::new(AppBuilder::new("test").with_dataset(ds).build())
+    }
+
+    async fn make_test_service_with(
+        app: Option<Arc<App>>,
+        secrets: Secrets,
+        allow_secret_expansion: bool,
+    ) -> ClusterServiceImpl {
         let runtime = crate::Runtime::builder().build().await;
         let datafusion = Arc::new(
             DataFusion::builder(
@@ -1411,6 +1590,22 @@ mod tests {
             )
             .expect("local task history table should be registered");
 
+        // Writable sink used by read-only mutation tests: INSERT INTO sink
+        // SELECT FROM task_history must still be denied by the read-only gate
+        // even though the target table is individually writable.
+        let sink = Arc::new(
+            MemTable::try_new(Arc::clone(&task_history_schema), vec![vec![]])
+                .expect("empty sink table should be created"),
+        );
+        let sink_ref = TableReference::bare("task_history_sink");
+        datafusion
+            .ctx
+            .register_table(sink_ref.clone(), sink)
+            .expect("sink table should be registered");
+        datafusion
+            .mark_dataset_writable(&sink_ref)
+            .expect("sink table should be marked writable");
+
         let store: Arc<dyn object_store::ObjectStore> =
             Arc::new(object_store::memory::InMemory::new());
         let cluster_state = Arc::new(runtime_cluster::ClusterStateStore::new(store, ""));
@@ -1428,15 +1623,19 @@ mod tests {
         ));
 
         ClusterServiceImpl::new(
-            Arc::new(TokioRwLock::new(None)),
-            Arc::new(TokioRwLock::new(Secrets::default())),
+            Arc::new(TokioRwLock::new(app)),
+            Arc::new(TokioRwLock::new(secrets)),
             "127.0.0.1:0".to_string(),
             Arc::new(TokioRwLock::new(HashMap::new())),
             datafusion,
             executor_registry,
             None,
-            true,
+            allow_secret_expansion,
         )
+    }
+
+    async fn make_test_service() -> ClusterServiceImpl {
+        make_test_service_with(None, Secrets::default(), true).await
     }
 
     async fn make_test_client() -> (ClusterServiceClient<Channel>, CancellationToken) {
@@ -1465,6 +1664,185 @@ mod tests {
             .expect("test cluster service client should connect");
 
         (client, shutdown)
+    }
+
+    #[test]
+    fn expandable_secret_keys_collects_dataset_refs() {
+        let app = app_with_secret_ref("pg_pass", "${ secrets:PG_PASS }");
+        let keys = expandable_secret_keys(&app);
+        let stores = keys.get("PG_PASS");
+        assert_eq!(
+            stores.map(|s| s.contains(SECRETS)),
+            Some(true),
+            "expected PG_PASS allowlisted via the `secrets` sentinel, got {keys:?}"
+        );
+        assert!(
+            !keys.contains_key("AWS_SECRET_ACCESS_KEY"),
+            "unreferenced keys must not be allowlisted"
+        );
+    }
+
+    #[test]
+    fn expandable_secret_keys_empty_when_app_has_no_refs() {
+        let app = AppBuilder::new("empty").build();
+        let keys = expandable_secret_keys(&app);
+        assert!(keys.is_empty(), "expected empty allowlist, got {keys:?}");
+    }
+
+    #[tokio::test]
+    async fn expand_secret_allows_app_referenced_key() {
+        let app = app_with_secret_ref("pg_pass", "${ secrets:PG_PASS }");
+        let secrets = secrets_with(&[
+            ("PG_PASS", "correct-horse"),
+            ("UNRELATED_ENV_SECRET", "should-not-leak"),
+        ]);
+        let service = make_test_service_with(Some(app), secrets, true).await;
+
+        let response = service
+            .expand_secret(Request::new(ExpandSecretRequest {
+                executor_id: "executor-1".to_string(),
+                key: "PG_PASS".to_string(),
+            }))
+            .await
+            .expect("referenced secret should expand");
+
+        let body = response.into_inner();
+        assert_eq!(body.key, "PG_PASS");
+        assert_eq!(body.value, "correct-horse");
+    }
+
+    #[tokio::test]
+    async fn expand_secret_denies_unreferenced_key_even_if_present_in_store() {
+        let app = app_with_secret_ref("pg_pass", "${ secrets:PG_PASS }");
+        let secrets = secrets_with(&[
+            ("PG_PASS", "correct-horse"),
+            ("AWS_SECRET_ACCESS_KEY", "should-not-leak"),
+        ]);
+        let service = make_test_service_with(Some(app), secrets, true).await;
+
+        let err = service
+            .expand_secret(Request::new(ExpandSecretRequest {
+                executor_id: "executor-1".to_string(),
+                key: "AWS_SECRET_ACCESS_KEY".to_string(),
+            }))
+            .await
+            .expect_err("unreferenced secret must be denied");
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message().contains("Unable to expand secret"),
+            "unexpected message: {}",
+            err.message()
+        );
+        // Must not leak the secret value in the error.
+        assert!(!err.message().contains("should-not-leak"));
+    }
+
+    #[tokio::test]
+    async fn expand_secret_store_scoped_reference_ignores_other_stores() {
+        // The spicepod references `${ env:API_KEY }` — a store-scoped
+        // reference, not the `secrets:` sentinel. A higher-precedence
+        // `vault` store happens to define an unrelated secret under the
+        // same key name; ExpandSecret must resolve from `env` (the store
+        // the reference named) and must never return `vault`'s value in
+        // its place.
+        let app = app_with_secret_ref("api_key", "${ env:API_KEY }");
+        let mut secrets = Secrets::new();
+        secrets.register_store(
+            "vault",
+            Arc::new(FakeSecretStore(HashMap::from([(
+                "API_KEY".to_string(),
+                "wrong-store-value".to_string(),
+            )]))),
+        );
+        secrets.register_store(
+            "env",
+            Arc::new(FakeSecretStore(HashMap::from([(
+                "API_KEY".to_string(),
+                "correct-store-value".to_string(),
+            )]))),
+        );
+        let service = make_test_service_with(Some(app), secrets, true).await;
+
+        let response = service
+            .expand_secret(Request::new(ExpandSecretRequest {
+                executor_id: "executor-1".to_string(),
+                key: "API_KEY".to_string(),
+            }))
+            .await
+            .expect("store-scoped key referenced by the app should expand");
+
+        assert_eq!(response.into_inner().value, "correct-store-value");
+    }
+
+    #[tokio::test]
+    async fn expand_secret_denies_when_mtls_disabled() {
+        let app = app_with_secret_ref("pg_pass", "${ secrets:PG_PASS }");
+        let secrets = secrets_with(&[("PG_PASS", "correct-horse")]);
+        let service = make_test_service_with(Some(app), secrets, false).await;
+
+        let err = service
+            .expand_secret(Request::new(ExpandSecretRequest {
+                executor_id: "executor-1".to_string(),
+                key: "PG_PASS".to_string(),
+            }))
+            .await
+            .expect_err("ExpandSecret without mTLS must be denied");
+
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(err.message().contains("requires cluster mTLS"));
+    }
+
+    #[tokio::test]
+    async fn expand_secret_denies_when_app_missing() {
+        let secrets = secrets_with(&[("PG_PASS", "correct-horse")]);
+        let service = make_test_service_with(None, secrets, true).await;
+
+        let err = service
+            .expand_secret(Request::new(ExpandSecretRequest {
+                executor_id: "executor-1".to_string(),
+                key: "PG_PASS".to_string(),
+            }))
+            .await
+            .expect_err("ExpandSecret without app must be denied");
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn expand_secret_denies_empty_key() {
+        let app = app_with_secret_ref("pg_pass", "${ secrets:PG_PASS }");
+        let secrets = secrets_with(&[("PG_PASS", "correct-horse")]);
+        let service = make_test_service_with(Some(app), secrets, true).await;
+
+        let err = service
+            .expand_secret(Request::new(ExpandSecretRequest {
+                executor_id: "executor-1".to_string(),
+                key: String::new(),
+            }))
+            .await
+            .expect_err("empty key must be denied");
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn expand_secret_referenced_but_missing_from_store_is_invalid_argument() {
+        let app = app_with_secret_ref("pg_pass", "${ secrets:PG_PASS }");
+        // Allowlisted key is referenced by the app but not present in any store.
+        let secrets = secrets_with(&[]);
+        let service = make_test_service_with(Some(app), secrets, true).await;
+
+        let err = service
+            .expand_secret(Request::new(ExpandSecretRequest {
+                executor_id: "executor-1".to_string(),
+                key: "PG_PASS".to_string(),
+            }))
+            .await
+            .expect_err("missing allowlisted secret must fail");
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("Unable to expand secret PG_PASS"));
     }
 
     #[tokio::test]
@@ -1508,6 +1886,136 @@ mod tests {
             .expect("second task history request should also succeed");
 
         shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn get_task_history_allows_select() {
+        let service = make_test_service().await;
+        let response = service
+            .get_task_history(Request::new(GetTaskHistoryRequest {
+                sql: format!(
+                    "SELECT trace_id FROM \"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\""
+                ),
+            }))
+            .await
+            .expect("SELECT against task_history must succeed under read-only");
+        // Empty MemTable still produces a valid response (possibly empty IPC).
+        let _ = response.into_inner().arrow_ipc;
+    }
+
+    #[tokio::test]
+    async fn get_task_history_rejects_insert_into_writable_from_task_history() {
+        let service = make_test_service().await;
+        // Target is a writable non-system table so the operations validator
+        // would allow the INSERT; the read-only gate must still reject it.
+        let err = service
+            .get_task_history(Request::new(GetTaskHistoryRequest {
+                sql: format!(
+                    "INSERT INTO task_history_sink \
+                     SELECT * FROM \"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\""
+                ),
+            }))
+            .await
+            .expect_err("INSERT into writable sink must be rejected by read-only GetTaskHistory");
+
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(
+            err.message().contains("read-only"),
+            "unexpected message: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn get_task_history_rejects_delete() {
+        let service = make_test_service().await;
+        let err = service
+            .get_task_history(Request::new(GetTaskHistoryRequest {
+                sql: format!(
+                    "DELETE FROM \"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\""
+                ),
+            }))
+            .await
+            .expect_err("DELETE must be rejected by read-only GetTaskHistory");
+
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(
+            err.message().contains("read-only") || err.message().contains("not allowed"),
+            "unexpected message: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn get_task_history_rejects_ddl_over_task_history_select() {
+        let service = make_test_service().await;
+        // CREATE VIEW ... AS SELECT FROM task_history passes the rewrite gate
+        // (references task_history) but is DDL and must be rejected.
+        let err = service
+            .get_task_history(Request::new(GetTaskHistoryRequest {
+                sql: format!(
+                    "CREATE VIEW \"{SPICE_RUNTIME_SCHEMA}\".\"leaked\" AS \
+                     SELECT * FROM \"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\""
+                ),
+            }))
+            .await
+            .expect_err("DDL must be rejected by read-only GetTaskHistory");
+
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(
+            err.message().contains("read-only") || err.message().contains("DDL"),
+            "unexpected message: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn map_task_history_query_error_classifies_read_only() {
+        let e = crate::datafusion::query::Error::UnableToExecuteQuery {
+            source: datafusion::error::DataFusionError::Plan(
+                "INSERT operations are not allowed in read-only SQL context.".to_string(),
+            ),
+        };
+        let status = map_task_history_query_error(&e);
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert!(status.message().contains("read-only"));
+        // Underlying Plan text only — no Error Display wrapper re-prefixed.
+        assert!(
+            !status
+                .message()
+                .contains("Failed to execute query: Failed to execute query:"),
+            "must not double-prefix Display: {}",
+            status.message()
+        );
+    }
+
+    #[test]
+    fn map_task_history_query_error_keeps_other_failures_internal() {
+        let e = crate::datafusion::query::Error::UnableToExecuteQuery {
+            source: datafusion::error::DataFusionError::Internal(
+                "something unexpected".to_string(),
+            ),
+        };
+        let status = map_task_history_query_error(&e);
+        assert_eq!(status.code(), tonic::Code::Internal);
+        // Error Display already includes "Failed to execute query: " once.
+        assert!(
+            status.message().starts_with("Failed to execute query:"),
+            "unexpected message: {}",
+            status.message()
+        );
+        assert!(
+            !status
+                .message()
+                .contains("Failed to execute query: Failed to execute query:"),
+            "must not double-prefix Display: {}",
+            status.message()
+        );
+        assert!(
+            status.message().contains("something unexpected"),
+            "unexpected message: {}",
+            status.message()
+        );
     }
 
     #[test]

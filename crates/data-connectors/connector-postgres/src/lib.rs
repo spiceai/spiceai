@@ -186,10 +186,17 @@ const PARAMETERS: &[ParameterSpec] = &[
         .default("auto"),
     ParameterSpec::component("replication_temporary_slot")
         .description(
-            "If true, create a temporary replication slot that is dropped when the \
-             Spice process disconnects. Default: false (durable slot).",
+            "Ignored. The replication slot is always durable. Remove this parameter.",
         )
-        .default("false"),
+        .deprecated(
+            "`pg_replication_temporary_slot` is ignored and the replication slot is always \
+             durable. A temporary slot belongs to the Postgres session that creates it, and the \
+             slot is created on the short-lived setup connection, so Postgres dropped it before \
+             START_REPLICATION could attach and the stream could never start. Remove the \
+             parameter; to stop an unused slot retaining WAL on the source, drop it with \
+             `SELECT pg_drop_replication_slot('<slot_name>')`. See: \
+             https://spiceai.org/docs/components/data-connectors/postgres",
+        ),
     ParameterSpec::component("replication_status_interval")
         .description(
             "How often to send StandbyStatusUpdate to Postgres (e.g. '10s'). \
@@ -213,9 +220,12 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("replication_member_channel_capacity")
         .description(
             "Shared-slot only: envelopes buffered per member table before the shared \
-             replication pump back-pressures. Too small a value lets one member's \
-             transient stall block the whole slot (head-of-line blocking). \
-             Default: 1024. Maximum: 1048576.",
+             replication pump back-pressures. Adjacent changes for one table coalesce \
+             into a single envelope, so this bounds the buffered envelope count rather \
+             than the source transaction count, and the pump blocks only once the \
+             buffer can neither coalesce nor admit another envelope. Too small a value \
+             lets one member's transient stall block the whole slot (head-of-line \
+             blocking). Default: 1024. Maximum: 1048576.",
         )
         .default("1024"),
 ];

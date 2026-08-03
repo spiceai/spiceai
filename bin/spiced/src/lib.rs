@@ -125,6 +125,7 @@ use yaml::Value;
 const TELEMETRY_DISABLED_SETTING_IGNORED_MESSAGE: &str = "Usage telemetry is anonymous and aggregated. In Spice.ai Open Source, setting runtime.telemetry.enabled: false in a Spicepod or passing --telemetry-enabled=false does not disable anonymous usage telemetry. To remove anonymous telemetry from an Open Source build, build from source without the anonymous_telemetry feature, or consider using Spice.ai Enterprise. Learn more at https://docs.spice.ai/docs/enterprise";
 
 mod cloud_connect;
+pub mod crash_handler;
 mod log_capture;
 #[path = "tracing.rs"]
 mod spiced_tracing;
@@ -345,6 +346,15 @@ pub struct Args {
     /// Enable pods watcher (disabled by default).
     #[arg(long, default_value_t = false, action = ArgAction::SetTrue)]
     pub pods_watcher_enabled: bool,
+
+    /// Connect this runtime to Spice Cloud for remote management (Cloud
+    /// Connect). Requires an enrolled identity or an adoption code (run
+    /// `spice connect <code>`, or set `SPICE_CONNECT_ADOPT_CODE`). When
+    /// omitted, the client still activates if such adoption state exists —
+    /// so already-enrolled instances keep connecting across upgrades — and a
+    /// `spiced` with no adoption state never connects to the cloud.
+    #[arg(long, default_value_t = false, action = ArgAction::SetTrue)]
+    pub cloud_connect: bool,
 
     #[arg(short, long, action = ArgAction::Count)]
     pub verbose: u8,
@@ -575,6 +585,7 @@ pub async fn run(args: Args) -> Result<()> {
             "SPICED_LOG",
             app.as_ref().and_then(|a| a.runtime.output_level),
         ),
+        args.cloud_connect,
     )
     .await
     .context(UnableToInitializeTracingSnafu)?;
@@ -670,17 +681,11 @@ pub async fn run(args: Args) -> Result<()> {
     if needs_metrics {
         // Resolve secrets in OTEL exporter headers before initializing metrics
         let resolved_otel_headers = if let Some(config) = otel_config {
-            let mut resolved = std::collections::HashMap::new();
-            let secrets = rt.secrets();
-            let secrets_guard = secrets.read().await;
-            for (key, value) in &config.headers {
-                let resolved_value = secrets_guard
-                    .inject_secrets(key, runtime::secrets::ParamStr(value.as_ref()))
-                    .await;
-                resolved.insert(key.clone(), resolved_value.expose_secret().to_string());
-            }
-            drop(secrets_guard);
-            resolved
+            runtime::secrets::get_params_with_secrets(rt.secrets(), &config.headers)
+                .await
+                .into_iter()
+                .map(|(key, value)| (key, value.expose_secret().to_string()))
+                .collect()
         } else {
             std::collections::HashMap::new()
         };
@@ -836,6 +841,9 @@ pub async fn run(args: Args) -> Result<()> {
     }
     let endpoint_auth = endpoint_auth.with_identity_source(identity_source);
 
+    // Captured before `args` is moved into the server task below.
+    let cloud_connect_flag = args.cloud_connect;
+
     let server_thread = tokio::spawn(async move {
         Box::pin(cloned_rt.start_servers(args.runtime, tls_config, endpoint_auth)).await
     });
@@ -848,13 +856,19 @@ pub async fn run(args: Args) -> Result<()> {
         },
     }
 
-    // Spice Cloud Connect. Default off — only activates when an identity is
-    // on disk or an adoption code is available. Failures here are non-fatal:
-    // spiced keeps running. Started only after `load_components()` completes
-    // so an adopted control plane can't issue GetRuntimeInfo against a
-    // half-loaded runtime (datasets/models still registering).
+    // Spice Cloud Connect. Default off — only activates on the explicit
+    // `--cloud-connect` flag, or when an identity is on disk or an adoption
+    // code is available. Failures here are non-fatal: spiced keeps running.
+    // Started only after `load_components()` completes so an adopted control
+    // plane can't issue GetRuntimeInfo against a half-loaded runtime
+    // (datasets/models still registering).
     let cloud_connect_handle = if components_loaded {
-        cloud_connect::maybe_start(env!("CARGO_PKG_VERSION"), Arc::clone(&rt)).await
+        cloud_connect::maybe_start(
+            env!("CARGO_PKG_VERSION"),
+            Arc::clone(&rt),
+            cloud_connect_flag,
+        )
+        .await
     } else {
         // Shutting down before components finished loading — don't start.
         None

@@ -44,9 +44,9 @@ use datafusion::{
 
 use s3_vectors::{
     CreateIndexError, CreateIndexInput, CreateVectorBucketError, CreateVectorBucketInput,
-    DistanceMetric, Document, GetIndexError, GetIndexInput, GetIndexOutput, GetVectorBucketError,
-    GetVectorBucketInput, MetadataConfiguration, PUT_VECTORS_MAX_ITEMS, PutInputVector,
-    PutVectorsError, PutVectorsInput, S3Vectors, SdkError, VectorData,
+    DeleteVectorsInput, DistanceMetric, Document, GetIndexError, GetIndexInput, GetIndexOutput,
+    GetVectorBucketError, GetVectorBucketInput, MetadataConfiguration, PUT_VECTORS_MAX_ITEMS,
+    PutInputVector, PutVectorsError, PutVectorsInput, S3Vectors, SdkError, VectorData,
 };
 use s3_vectors_metadata_filter::json_value_to_document;
 use serde_json::Value;
@@ -560,6 +560,38 @@ impl S3VectorsTable {
                 }
             }
         }
+    }
+
+    /// Deletes vectors by key from this single physical index.
+    ///
+    /// Only reaches the index `self` is bound to — a caller managing multiple physical indexes
+    /// for one logical index (spillover, partitioning) is responsible for calling this once per
+    /// relevant target (see `search::index::s3_vectors::S3Vector::delete_target_tables`).
+    pub async fn delete_by_keys(&self, keys: Vec<String>) -> Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+
+        let (index_arn, vector_bucket_name, index_name) = self.idx.index_identifier_variables();
+
+        for chunk in keys.chunks(PUT_VECTORS_MAX_ITEMS) {
+            self.client
+                .delete_vectors(
+                    &DeleteVectorsInput::builder()
+                        .set_index_arn(index_arn.clone())
+                        .set_index_name(index_name.clone())
+                        .set_vector_bucket_name(vector_bucket_name.clone())
+                        .set_keys(Some(chunk.to_vec()))
+                        .build()
+                        .context(S3VectorBuildSnafu)?,
+                )
+                .await
+                .map_err(|e| Error::S3VectorDeleteVectorError {
+                    source: Box::new(e.into_service_error()),
+                })?;
+        }
+
+        Ok(())
     }
 
     pub(super) fn query_provider_schema(&self) -> SchemaRef {

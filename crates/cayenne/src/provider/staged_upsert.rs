@@ -167,9 +167,23 @@ impl CayenneStagedUpsert {
     /// # Errors
     ///
     /// Returns an error if the table needs the non-composable inline-tombstone or
-    /// position-deletion publish path (rejected for multi-table), or if reserving
-    /// sequences / writing deletion vectors fails.
+    /// position-deletion publish path (rejected for multi-table), if the staged
+    /// snapshot directory cannot be synced, or if reserving sequences / writing
+    /// deletion vectors fails.
     pub async fn prepare_commit(mut self) -> Result<PreparedTxnCommit> {
+        // Directory barrier for the staged rows, before the shared transaction
+        // makes them visible. The non-transactional publish takes this barrier
+        // in `record_written_snapshot_sequence`; the fused path commits the
+        // snapshot-sequence row inside the caller's multi-table transaction and
+        // so never reaches that helper — without the barrier here a power loss
+        // can leave the catalog referencing a snapshot whose directory entries
+        // were never flushed. Nothing after `stage_upsert_data` adds files to
+        // this directory (the on-conflict deletion vectors are written under the
+        // *current* snapshot's `_deletes/`), so the barrier is complete here.
+        self.table
+            .sync_local_snapshot_dir(&self.new_snapshot_id)
+            .await?;
+
         let on_conflict_deletions = std::mem::take(&mut self.on_conflict_deletions);
         // Reserve sequences + write deletion-vector files + build the inline
         // tombstone, WITHOUT committing the catalog metadata — `defer_catalog_commit`

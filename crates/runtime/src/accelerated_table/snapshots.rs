@@ -17,7 +17,7 @@ use crate::dataaccelerator::AccelerationSource;
 use crate::dataaccelerator::DataAccelerator;
 use crate::dataaccelerator::ReloadProviderFactory;
 use crate::dataaccelerator::swappable::SwappableTableProvider;
-use crate::status::RuntimeStatus;
+use crate::status::{RuntimeStatus, WaitOutcome};
 use arrow_schema::{FieldRef, Schema, SchemaRef};
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
@@ -244,8 +244,11 @@ pub fn spawn_snapshot_interval_task(
     );
 
     Some(tokio::spawn(async move {
-        // Wait for the runtime to become ready
-        runtime_status.wait_for_ready().await;
+        // Wait for the runtime to become ready. A shutdown that starts first
+        // means the runtime never became ready, so there is nothing to snapshot.
+        if runtime_status.wait_for_ready().await == WaitOutcome::ShuttingDown {
+            return;
+        }
 
         // Determine the initial delay based on last checkpoint time
         let initial_delay = if bootstrap_status.is_bootstrapped() {
@@ -371,7 +374,9 @@ pub fn create_periodic_snapshot_callback(
             let accelerator_clone = accelerator.clone();
             let refresh_clone = Arc::clone(&refresh);
             tokio::spawn(async move {
-                runtime_status.wait_for_ready().await;
+                if runtime_status.wait_for_ready().await == WaitOutcome::ShuttingDown {
+                    return;
+                }
                 if !bootstrap_status.is_bootstrapped() {
                     let refresh_sql = refresh_clone
                         .read()

@@ -37,7 +37,7 @@ impl KafkaSys {
         {
             let _schema_guard = pool.acquire_schema_write_lock().await;
             ensure_kafka_tables(&conn).await?;
-            self.mark_schema_ensured();
+            self.schema_ensured.mark_ensured();
         }
 
         // Turso lacks explicit transactions in its current Rust binding; the
@@ -71,10 +71,10 @@ impl KafkaSys {
     ) -> Result<Option<KafkaMetadata>> {
         let dataset_name = self.dataset_name.clone();
         let conn = pool.connect().await.map_err(Error::external)?;
-        if self.schema_needs_ensure() {
+        if self.schema_ensured.needs_ensure() {
             let _schema_guard = pool.acquire_schema_write_lock().await;
             ensure_kafka_tables(&conn).await?;
-            self.mark_schema_ensured();
+            self.schema_ensured.mark_ensured();
         }
 
         let query = format!(
@@ -110,10 +110,10 @@ impl KafkaSys {
         offsets: &[KafkaOffset],
     ) -> Result<()> {
         let conn = pool.connect().await.map_err(Error::external)?;
-        if self.schema_needs_ensure() {
+        if self.schema_ensured.needs_ensure() {
             let _schema_guard = pool.acquire_schema_write_lock().await;
             ensure_kafka_tables(&conn).await?;
-            self.mark_schema_ensured();
+            self.schema_ensured.mark_ensured();
         }
 
         let _schema_guard = pool.acquire_schema_read_lock().await;
