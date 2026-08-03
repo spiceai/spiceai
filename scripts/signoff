@@ -815,17 +815,24 @@ run_checks() {
   SIGNOFF_CHECK_SUMMARY="lint+test passed"
 }
 
-# After a successful sign-off, the PR's `Attestation` job (pr.yml) only
-# re-evaluates the `signoff` commit status when its workflow run executes. If
-# that run already completed — e.g. sign-off happened after the PR's checks
-# ran — `Attestation` is stuck showing a stale failure until something
-# re-triggers it. Re-run that job instead of making the developer open or
-# refresh the PR by hand. `gh` is already required by require_tools() before
-# cmd_signoff can reach this point, but the check stays here so this function
-# remains correct if it's ever called on its own.
+# The PR's `Attestation` job (pr.yml) only re-reads the `signoff` commit status
+# when its workflow run executes: pr.yml triggers on `pull_request`,
+# `merge_group` and `workflow_dispatch`, never on a status change. So a run that
+# already completed keeps whatever verdict it reached, however the status has
+# moved since. Re-run that job instead of making the developer open or refresh
+# the PR by hand. `gh` is already required by require_tools() before cmd_signoff
+# can reach this point, but the check stays here so this function remains
+# correct if it's ever called on its own.
+#
+# A run that concluded `success` needs no refresh when this sign-off also
+# succeeded — but it needs one precisely when the sign-off failed, or the gate
+# keeps reporting an attestation this run just overturned. Pass a non-empty
+# third argument to force the re-run past that short-circuit.
 refresh_attestation_check() {
-  local sha="$1" repo="$2"
-  local fallback="Open/refresh the PR and it will pick up the sign-off."
+  local sha="$1" repo="$2" force="${3:-}"
+  # pr.yml runs on `pull_request`/`merge_group`/`workflow_dispatch`, so viewing
+  # the PR page does not start one — say what actually re-reads the status.
+  local fallback="Re-run the PR's 'Attestation' check from the Checks tab once it has reported — reloading the PR page does not re-read the sign-off status."
   local run run_id run_status run_conclusion
 
   if ! command -v gh >/dev/null 2>&1; then
@@ -848,10 +855,21 @@ refresh_attestation_check() {
     return 0
   fi
   if [[ "$run_status" != "completed" ]]; then
-    info "  The 'Attestation' check (run ${run_id}) is still ${run_status} — it will evaluate the sign-off once it finishes."
+    # A run that is still going may already have read the status — the read is
+    # the first thing its job does, and validating an inherited sign-off keeps
+    # it busy long after. So "it will evaluate the sign-off once it finishes"
+    # holds only when the status it is about to report is the one we want; on
+    # the failure path an in-flight run can still land green on what it read
+    # before this verdict existed, and there is nothing to re-run yet.
+    if [[ -n "$force" ]]; then
+      info "  The 'Attestation' check (run ${run_id}) is still ${run_status} and may have read the previous sign-off already."
+      info "  Re-run it once it finishes if it lands green — this sign-off failed."
+    else
+      info "  The 'Attestation' check (run ${run_id}) is still ${run_status} — it will evaluate the sign-off once it finishes."
+    fi
     return 0
   fi
-  if [[ "$run_conclusion" == "success" ]]; then
+  if [[ "$run_conclusion" == "success" && -z "$force" ]]; then
     debug "run ${run_id} already succeeded — nothing to refresh"
     return 0
   fi
@@ -859,11 +877,38 @@ refresh_attestation_check() {
   # Not `--failed`: that only reruns jobs with conclusion=failure and no-ops
   # on cancelled/skipped runs. Rerunning the whole run is fine here — on a
   # `pull_request` event, pr.yml executes nothing but the Attestation job.
+  local outcome="it will turn green shortly"
+  [[ -z "$force" ]] || outcome="it will pick up the failed sign-off"
   if gh run rerun "$run_id" --repo "$repo" >/dev/null 2>&1; then
-    echo "  Re-ran the 'Attestation' check (run ${run_id}) — it will turn green shortly."
+    echo "  Re-ran the 'Attestation' check (run ${run_id}) — ${outcome}."
   else
     info "  Could not auto-refresh the 'Attestation' check — ${fallback}"
   fi
+}
+
+# Post this run's failing verdict, then make the gate reflect it.
+#
+# The raw `signoff` status is not itself a required check — `Attestation` is,
+# and it only re-reads the status when its pr.yml run executes. A commit that
+# was already attested therefore keeps a green `Attestation` after a later run
+# overturns it, and the branch can still enter the merge queue on an attestation
+# this run contradicted. The merge queue re-runs the full suite, so that cannot
+# put broken code on trunk; it spends a queue slot learning what the sign-off
+# already knew. Hence the forced refresh — the inverse of the success path,
+# which is right to skip a run that already passed.
+#
+# When the post itself fails the commit still carries whatever it had before, so
+# there is nothing new for a re-run to read: warn and leave the check alone. The
+# caller aborts either way, with the more useful message.
+post_failure_status() {
+  local repo="$1" sha="$2" user="$3" elapsed="$4"
+
+  if ! post_commit_status "$repo" "$sha" failure \
+    "Sign-off checks failed after ${elapsed}s (triggered by ${user})"; then
+    info "warning: could not post the failed sign-off status — the 'Attestation' check still reflects the previous sign-off"
+    return 0
+  fi
+  refresh_attestation_check "$sha" "$repo" force
 }
 
 cmd_signoff() {
@@ -919,9 +964,7 @@ cmd_signoff() {
     if [[ "$check_status" -ne 0 ]]; then
       elapsed=$(( $(date +%s) - start ))
       if is_remote_run; then
-        post_commit_status "$repo" "$sha" failure \
-          "Sign-off checks failed after ${elapsed}s (triggered by ${user})" \
-          || true
+        post_failure_status "$repo" "$sha" "$user" "$elapsed"
         append_step_summary "### Sign-off"$'\n'"**Failed** after ${elapsed}s."$'\n'
       fi
       fail "sign-off checks failed"

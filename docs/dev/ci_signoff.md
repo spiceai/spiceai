@@ -253,11 +253,19 @@ it has a verdict of its own, so a run that never finishes cannot cost you an
 attestation. `mine` still shows ⟳ while it runs — that comes from the run list,
 not the commit status.
 
-A re-dispatch that *does* fail posts `signoff=failure`, but note that this does
-not by itself close the gate: **Attestation** is the required check, `pr.yml`
-does not run on commit-status changes, and an already-green Attestation is left
-alone. Re-run that check (or push) if a failed re-sign-off needs to be reflected
-in the PR's required checks.
+A re-dispatch that *does* fail posts `signoff=failure` and then re-runs
+**Attestation** so the required check reflects that verdict. The status alone
+would not close the gate — **Attestation** is the required check and `pr.yml`
+does not run on commit-status changes — so the failure path forces the re-run
+even when the check is already green, which is the one case the success path
+deliberately skips. If the status post itself fails, the run says so and leaves
+**Attestation** showing the previous sign-off; re-dispatch or push to move it.
+
+Two cases the re-run cannot cover, both reported by the run rather than hidden:
+an **Attestation** run that is still in flight may already have read the status
+this verdict replaced, so it can finish green and needs re-running by hand; and
+a HEAD that only merges the base branch can *inherit* an earlier sign-off, which
+the failing status on HEAD does not veto ([#12357](https://github.com/spiceai/spiceai/issues/12357)).
 
 A branch whose sign-off keeps running out of budget is contending for the pool
 rather than doing anything wrong. `-f skip_targeted_lint=true` drops the
