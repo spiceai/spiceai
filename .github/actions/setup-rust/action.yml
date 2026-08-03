@@ -9,6 +9,62 @@ inputs:
 runs:
   using: 'composite'
   steps:
+    # The merge queue can textually merge two branches into a Cargo.lock that is valid
+    # TOML but not a valid lockfile: git sees two edits to different regions, and emits
+    # the same `[[package]]` block twice. Cargo then refuses to parse it, so every job
+    # that shells out to cargo dies at once — on 2026-08-02 that was 42 failed runs
+    # across 7 queue branches and 6 workflows in 40 minutes, each reporting only
+    # `make build-cli Error 101` / `exit code 101` with the real cause one line deep in
+    # a 4,000-line log. Every affected workflow already uses this action, so asserting
+    # it here names the problem once, before any expensive cargo work.
+    #
+    # Deliberately textual rather than `cargo metadata`: no registry index, no network,
+    # no warm cache, so it runs in milliseconds and cannot itself become a flake. Note
+    # for anyone tempted by the cargo route that `cargo metadata --locked --no-deps`
+    # exits 0 on this corruption — it skips the dependency resolution that notices a
+    # duplicate — so `--no-deps` would pass on exactly the input it exists to catch.
+    - name: Validate Cargo.lock is coherent
+      shell: bash
+      run: |
+        set -uo pipefail
+
+        [ -f Cargo.lock ] || exit 0
+        command -v awk >/dev/null 2>&1 || {
+          echo "::warning::awk is unavailable, skipping the Cargo.lock coherence check."
+          exit 0
+        }
+
+        # Keyed on (name, version, source) because that is cargo's own package
+        # identity: several versions of one crate are legal, and so is one version from
+        # two different sources (a [patch] against a registry dep). Only an exact
+        # triple duplicate is something cargo rejects, so a lockfile cargo accepts can
+        # never trip this.
+        dupes="$(
+          awk '
+            function flush() {
+              if (inpkg && name != "") {
+                key = name " " version " " source
+                if (key in seen) dup[name " " version] = 1
+                seen[key] = 1
+              }
+              inpkg = 0; name = ""; version = ""; source = ""
+            }
+            { sub(/\r$/, "") }
+            /^\[\[package\]\][[:space:]]*$/ { flush(); inpkg = 1; next }
+            /^\[/                           { flush(); next }
+            inpkg && /^name = "/    { name = $0;    sub(/^name = "/, "", name);       sub(/"[[:space:]]*$/, "", name) }
+            inpkg && /^version = "/ { version = $0; sub(/^version = "/, "", version); sub(/"[[:space:]]*$/, "", version) }
+            inpkg && /^source = "/  { source = $0;  sub(/^source = "/, "", source);   sub(/"[[:space:]]*$/, "", source) }
+            END { flush(); for (k in dup) print k }
+          ' Cargo.lock
+        )"
+
+        if [ -n "${dupes}" ]; then
+          list="$(echo "${dupes}" | tr '\n' ';' | sed 's/;$//')"
+          echo "::error::Cargo.lock lists the same package twice: ${list}. Cargo cannot parse this lockfile, so every cargo job in this run will fail. This is usually the merge queue textually merging two branches that each edited the same package entry — regenerate the lockfile on the PR branch ('cargo update --workspace') and re-queue."
+          exit 1
+        fi
+
     - name: Set up Rust toolchain (Linux/macOS)
       if: runner.os != 'Windows'
       shell: bash
