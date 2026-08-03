@@ -100,10 +100,10 @@ readonly NO="✗"
 # Colors for `mine`'s human-facing report only — every other command's output
 # stays plain text (docs/scripts may grep it). Respects NO_COLOR and piping.
 if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != "dumb" ]]; then
-  readonly C_RED=$'\033[31m' C_GREEN=$'\033[32m' C_YELLOW=$'\033[33m' \
+  readonly C_RED=$'\033[31m' C_GREEN=$'\033[32m' C_YELLOW=$'\033[33m' C_CYAN=$'\033[36m' \
     C_DIM=$'\033[2m' C_BOLD=$'\033[1m' C_RESET=$'\033[0m'
 else
-  readonly C_RED='' C_GREEN='' C_YELLOW='' C_DIM='' C_BOLD='' C_RESET=''
+  readonly C_RED='' C_GREEN='' C_YELLOW='' C_CYAN='' C_DIM='' C_BOLD='' C_RESET=''
 fi
 
 debug() { [[ -n "$DEBUG" ]] && echo "debug: $*" >&2 || true; }
@@ -937,8 +937,11 @@ truncate_str() {
 # its current tip, since the workflow checks out the ref live); otherwise
 # `run_id`, if set, is the most recent *failed* run for a `failure`/`error`
 # state, so you can jump straight to its logs instead of re-triggering blind.
+# `in_queue`=1 means GitHub's merge queue already holds an entry for this PR —
+# distinguished from a plain attested-and-waiting PR by color, since both show
+# the same checkmark glyph.
 print_pr_row() {
-  local number="$1" title="$2" state="$3" run_id="$4" running="$5" width="$6"
+  local number="$1" title="$2" state="$3" run_id="$4" running="$5" width="$6" in_queue="$7"
   local icon room run_col run_color
 
   if [[ "$running" == "1" ]]; then
@@ -946,7 +949,13 @@ print_pr_row() {
     run_color="$C_YELLOW"
   else
     case "$state" in
-      success)       icon="${C_GREEN}${OK}${C_RESET}" ;;
+      success)
+        if [[ "$in_queue" == "1" ]]; then
+          icon="${C_CYAN}${OK}${C_RESET}"  # attested and already in the merge queue
+        else
+          icon="${C_GREEN}${OK}${C_RESET}"
+        fi
+        ;;
       pending)       icon="${C_YELLOW}…${C_RESET}" ;;
       failure|error) icon="${C_RED}${NO}${C_RESET}" ;;   # a sign-off attempt ran and failed
       *)             icon="${C_DIM}○${C_RESET}" ;;       # none: never attempted
@@ -963,6 +972,20 @@ print_pr_row() {
   room=$(( width - 22 ))  # icon(1) + space + "#NNNNN"(6) + space + run id(12) + 2 spaces
   (( room < 20 )) && room=20
   printf '%s %-6s %s %s\n' "$icon" "#${number}" "$run_col" "$(truncate_str "$title" "$room")"
+}
+
+# Batched GraphQL lookup of merge-queue membership for a set of PR numbers,
+# one round trip for all of them via aliases (a REST call per PR would be
+# N+1). Returns `{}` on any failure so callers degrade to "not queued".
+fetch_merge_queue_status() {
+  local repo="$1" numbers="$2"
+  local owner name fields query
+  owner="${repo%%/*}"
+  name="${repo#*/}"
+  fields=$(jq -r '[.[] | "pr\(.): pullRequest(number: \(.)) { isInMergeQueue }"] | join("\n")' <<<"$numbers")
+  [[ -n "$fields" ]] || { echo '{}'; return; }
+  query="query(\$owner:String!,\$name:String!){repository(owner:\$owner,name:\$name){${fields}}}"
+  gh api graphql -f query="$query" -f owner="$owner" -f name="$name" 2>/dev/null || echo '{}'
 }
 
 # List the sign-off/attestation status of every open PR authored by the
@@ -994,13 +1017,17 @@ cmd_mine() {
   remote_runs=$(gh run list --repo "$repo" --workflow signoff.yml \
     --json displayTitle,status,conclusion,databaseId --limit 50) || remote_runs="[]"
 
+  # Fetch merge-queue membership once for all PRs, not once per PR.
+  local mq_status
+  mq_status=$(fetch_merge_queue_status "$repo" "$(jq '[.[].number]' <<<"$prs")")
+
   local width
   width=$(tput cols 2>/dev/null) || width=100
 
   echo "${C_BOLD}${repo}${C_RESET} — ${count} open PR(s)"
   echo
 
-  local i pr number title branch sha combined state run_id running
+  local i pr number title branch sha combined state run_id running in_queue
   for ((i = 0; i < count; i++)); do
     pr=$(jq -c ".[$i]" <<<"$prs")
     number=$(jq -r '.number' <<<"$pr")
@@ -1025,11 +1052,14 @@ cmd_mine() {
         <<<"$remote_runs")
     fi
 
-    print_pr_row "$number" "$title" "$state" "$run_id" "$running" "$width"
+    in_queue=0
+    [[ "$(jq -r ".data.repository.pr${number}.isInMergeQueue // false" <<<"$mq_status")" == "true" ]] && in_queue=1
+
+    print_pr_row "$number" "$title" "$state" "$run_id" "$running" "$width" "$in_queue"
   done
 
   echo
-  echo "${C_DIM}○ not attested   ${NO} attestation failed   … pending   ⟳ remote sign-off running   ${OK} attested${C_RESET}"
+  echo "${C_DIM}○ not attested   ${NO} attestation failed   … pending   ⟳ remote sign-off running   ${OK} attested, awaiting queue   ${C_CYAN}${OK}${C_DIM} in merge queue${C_RESET}"
   echo "${C_DIM}Sign off with: make signoff  (or: scripts/signoff remote)${C_RESET}"
 }
 
