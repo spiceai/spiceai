@@ -873,7 +873,9 @@ mod tests {
             false,
         ));
         assert!(!supports_filter_expr(&columns, &null_in_list));
+    }
 
+    #[test]
     fn partial_logical_and_conversion_returns_none() {
         let supported = binary_expr(col("genre"), Operator::Eq, lit("drama"));
         let unsupported = binary_expr(col("year"), Operator::Plus, lit(1));
@@ -901,7 +903,6 @@ mod tests {
             result.is_none(),
             "a partially converted OR predicate must not be pushed down"
         );
-
     }
 
     #[test]
