@@ -148,9 +148,7 @@ pub(crate) async fn create_local(model_id: &str) -> Result<Arc<dyn Chat>, anyhow
         temp_dir.join("tokenizer_config.json").to_str(),
         None,
         None,
-        None,
-        None,
-        llms::chat::PagedAttentionMode::Auto,
+        llms::chat::LocalModelOptions::default(),
     )
     .await
     .map_err(anyhow::Error::from)?;

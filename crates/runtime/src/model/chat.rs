@@ -705,10 +705,12 @@ async fn file(
         tokenizer_path.as_deref(),
         tokenizer_config_path.as_deref(),
         generation_config.as_deref(),
-        chat_template_literal,
         distributed,
-        context_length,
-        paged_attention,
+        llms::chat::LocalModelOptions {
+            chat_template_literal,
+            context_length,
+            paged_attention,
+        },
     )
     .await
 }
@@ -718,9 +720,11 @@ async fn file(
 /// the engine default applies. Rejects non-integer or zero values.
 #[cfg(feature = "models")]
 fn parse_context_length(params: &Parameters) -> Result<Option<usize>, LlmError> {
-    let Some(raw) = params.get("context_length").expose().ok() else {
-        return Ok(None);
-    };
+    let raw = params
+        .get("context_length")
+        .expose()
+        .ok()
+        .unwrap_or_default();
     let raw = raw.trim();
     if raw.is_empty() {
         return Ok(None);
@@ -729,9 +733,7 @@ fn parse_context_length(params: &Parameters) -> Result<Option<usize>, LlmError> 
         Ok(n) if n > 0 => Ok(Some(n)),
         _ => Err(LlmError::InvalidParamValueError {
             param: "context_length".to_string(),
-            message: format!(
-                "Invalid value for `params.context_length`: '{raw}'. Expected a positive integer number of tokens."
-            ),
+            message: format!("Must be a positive integer number of tokens, got '{raw}'"),
         }),
     }
 }
@@ -743,19 +745,18 @@ fn parse_context_length(params: &Parameters) -> Result<Option<usize>, LlmError> 
 /// for any model.
 #[cfg(feature = "models")]
 fn parse_paged_attention(params: &Parameters) -> Result<PagedAttentionMode, LlmError> {
-    let Some(raw) = params.get("paged_attention").expose().ok() else {
-        return Ok(PagedAttentionMode::default());
-    };
-    // Kept in step with the `paged_attention` ParameterSpec: anything outside its
-    // `one_of` is rejected by `Parameters::try_new` before reaching this parser, so
-    // accepting more here would only advertise values the spec turns away.
-    raw.parse::<PagedAttentionMode>()
-        .map_err(|other| LlmError::InvalidParamValueError {
+    // `Parameters::try_new` substitutes the spec's `auto` default and rejects anything
+    // outside `VALUES` before this runs, so in production an absent value parses as the
+    // default and the error arm is unreachable.
+    params
+        .get("paged_attention")
+        .expose()
+        .ok()
+        .unwrap_or_default()
+        .parse::<PagedAttentionMode>()
+        .map_err(|message| LlmError::InvalidParamValueError {
             param: "paged_attention".to_string(),
-            message: format!(
-                "Must be one of {}, got '{other}'",
-                PagedAttentionMode::VALUES.join(", ")
-            ),
+            message,
         })
 }
 
@@ -803,27 +804,38 @@ mod test {
     use serde_json::Number;
     use spicepod::component::model::Model;
 
-    fn parameters_with_responses_api(value: Option<&str>) -> Parameters {
+    /// A `Parameters` over the given key/value pairs. `spec` supplies the user-facing
+    /// parameter names only — `Parameters::new` applies neither `one_of` nor the spec
+    /// defaults, so a test built this way exercises the parser alone.
+    fn params_for(
+        component: &'static str,
+        spec: &'static [crate::parameters::ParameterSpec],
+        pairs: &[(&str, &str)],
+    ) -> Parameters {
         Parameters::new(
-            value.map_or_else(Vec::new, |value| {
-                vec![(
-                    "responses_api".to_string(),
-                    SecretString::from(value.to_string()),
-                )]
-            }),
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), SecretString::from((*v).to_string())))
+                .collect(),
+            component,
+            spec,
+        )
+    }
+
+    fn parameters_with_responses_api(value: Option<&str>) -> Parameters {
+        params_for(
             "openai",
             crate::model::params::openai::PARAMETERS,
+            &value.map_or_else(Vec::new, |value| vec![("responses_api", value)]),
         )
     }
 
     #[cfg(feature = "models")]
     fn file_parameters(key: &str, value: Option<&str>) -> Parameters {
-        Parameters::new(
-            value.map_or_else(Vec::new, |value| {
-                vec![(key.to_string(), SecretString::from(value.to_string()))]
-            }),
+        params_for(
             "file",
             crate::model::params::file::PARAMETERS,
+            &value.map_or_else(Vec::new, |value| vec![(key, value)]),
         )
     }
 
@@ -879,41 +891,30 @@ mod test {
 
     #[test]
     #[cfg(feature = "models")]
-    fn paged_attention_parses_its_modes_ignoring_case() {
-        for (raw, expected) in [
-            ("auto", PagedAttentionMode::Auto),
-            ("AUTO", PagedAttentionMode::Auto),
-            // A key left blank is unset, not a typo.
-            ("", PagedAttentionMode::Auto),
-            ("disabled", PagedAttentionMode::Disabled),
-            ("Disabled", PagedAttentionMode::Disabled),
-        ] {
-            assert_eq!(
-                parse_paged_attention(&file_parameters("paged_attention", Some(raw)))
-                    .unwrap_or_else(|e| panic!("{raw:?} should parse: {e}")),
-                expected,
-                "{raw:?}"
-            );
-        }
+    fn paged_attention_reads_the_configured_mode() {
+        // The accepted vocabulary and its case-insensitivity are covered where `FromStr`
+        // lives; what matters here is that the param reaches the parser at all.
+        assert_eq!(
+            parse_paged_attention(&file_parameters("paged_attention", Some("disabled")))
+                .expect("disabled is a valid mode"),
+            PagedAttentionMode::Disabled
+        );
     }
 
     #[test]
     #[cfg(feature = "models")]
     fn paged_attention_rejects_values_outside_the_spec() {
-        // Booleans included: a Spicepod that spells this `true`/`false` has to fail loudly
-        // rather than have one of them quietly read as a mode.
-        for bad in ["true", "false", "1", "0", "eager", "maybe"] {
-            let err = parse_paged_attention(&file_parameters("paged_attention", Some(bad)))
-                .expect_err("a value outside the spec should be invalid");
-            assert!(
-                matches!(err, LlmError::InvalidParamValueError { ref param, .. } if param == "paged_attention"),
-                "unexpected error for {bad:?}: {err}"
-            );
-            // The message has to name the accepted values.
-            let message = err.to_string();
-            assert!(message.contains("auto"), "{message}");
-            assert!(message.contains("disabled"), "{message}");
-        }
+        // A Spicepod that spells this `true`/`false` has to fail loudly, naming the values
+        // it should have used, rather than have one of them quietly read as a mode.
+        let err = parse_paged_attention(&file_parameters("paged_attention", Some("true")))
+            .expect_err("a value outside the spec should be invalid");
+        assert!(
+            matches!(err, LlmError::InvalidParamValueError { ref param, .. } if param == "paged_attention"),
+            "unexpected error: {err}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("auto"), "{message}");
+        assert!(message.contains("disabled"), "{message}");
     }
 
     #[test]
@@ -1043,13 +1044,10 @@ mod test {
 
     #[cfg(feature = "models")]
     fn distributed_params(pairs: &[(&str, &str)]) -> Parameters {
-        Parameters::new(
-            pairs
-                .iter()
-                .map(|&(k, v)| (k.to_string(), SecretString::from(v.to_string())))
-                .collect(),
+        params_for(
             "huggingface",
             crate::model::params::huggingface::PARAMETERS,
+            pairs,
         )
     }
 

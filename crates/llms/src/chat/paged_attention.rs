@@ -17,22 +17,6 @@ limitations under the License.
 
 use std::str::FromStr;
 
-/// GGUF architectures the local engine evaluates with dense attention only. Their
-/// loaders reject a `PagedAttentionConfig` outright, so `auto` must not hand them one.
-///
-/// These are Multi-head Latent Attention models: the paged kernels have no MLA path, and
-/// the GGUF loader reconstructs full per-head K/V from the compressed latent and caches
-/// those instead.
-const DENSE_ATTENTION_ONLY_GGUF_ARCHITECTURES: &[&str] = &[
-    // GLM-4.x / GLM-5.x MoE (MLA + sigmoid-gated MoE, plus a sparse-attention indexer
-    // the loader skips).
-    "glm-dsa",
-    // DeepSeek-V4 (MLA with an output LoRA, sqrt-softplus routing, hash layers). Listed
-    // ahead of its loader so that when the loader lands, `auto` already routes it to
-    // dense attention rather than a config the loader would reject.
-    "deepseek4",
-];
-
 /// Operator-selected attention implementation for a locally served model, from the
 /// `paged_attention` model param.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -47,8 +31,9 @@ pub enum PagedAttentionMode {
 }
 
 impl PagedAttentionMode {
-    /// The values accepted in a Spicepod, for the parameter spec and error messages.
-    pub const VALUES: [&'static str; 2] = ["auto", "disabled"];
+    /// The values accepted in a Spicepod. The parameter spec validates against this same
+    /// slice, so the documented vocabulary and the parsed one cannot drift.
+    pub const VALUES: &'static [&'static str] = &["auto", "disabled"];
 }
 
 impl FromStr for PagedAttentionMode {
@@ -60,27 +45,12 @@ impl FromStr for PagedAttentionMode {
         match s.trim().to_ascii_lowercase().as_str() {
             "" | "auto" => Ok(Self::Auto),
             "disabled" => Ok(Self::Disabled),
-            other => Err(other.to_string()),
+            other => Err(format!(
+                "must be one of: {}. Found {other}",
+                Self::VALUES.join(", ")
+            )),
         }
     }
-}
-
-impl std::fmt::Display for PagedAttentionMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Auto => f.write_str("auto"),
-            Self::Disabled => f.write_str("disabled"),
-        }
-    }
-}
-
-/// Whether a GGUF `general.architecture` value is one the local engine serves with dense
-/// attention only. Matching is case-insensitive: GGUF writers are not consistent about case.
-#[must_use]
-pub fn gguf_requires_dense_attention(architecture: &str) -> bool {
-    DENSE_ATTENTION_ONLY_GGUF_ARCHITECTURES
-        .iter()
-        .any(|known| known.eq_ignore_ascii_case(architecture.trim()))
 }
 
 #[cfg(test)]
@@ -119,34 +89,14 @@ mod tests {
         }
     }
 
+    /// The parameter spec advertises `VALUES`, so every entry has to parse — otherwise
+    /// config validation accepts a value the parser then rejects.
     #[test]
-    fn round_trips_through_display() {
-        for mode in [PagedAttentionMode::Auto, PagedAttentionMode::Disabled] {
-            assert_eq!(
-                mode.to_string()
-                    .parse::<PagedAttentionMode>()
-                    .expect("Display output is a valid value"),
-                mode
-            );
+    fn every_advertised_value_parses() {
+        for value in PagedAttentionMode::VALUES {
+            value
+                .parse::<PagedAttentionMode>()
+                .unwrap_or_else(|e| panic!("{value:?} is advertised but does not parse: {e}"));
         }
-        // Every variant is listed in the spec's accepted values.
-        for mode in [PagedAttentionMode::Auto, PagedAttentionMode::Disabled] {
-            assert!(
-                PagedAttentionMode::VALUES.contains(&mode.to_string().as_str()),
-                "{mode} missing from VALUES"
-            );
-        }
-    }
-
-    #[test]
-    fn recognizes_the_dense_attention_only_architectures() {
-        // GLM-4.x/5.x and DeepSeek-V4 GGUFs: MLA models with no paged kernel.
-        assert!(gguf_requires_dense_attention("glm-dsa"));
-        assert!(gguf_requires_dense_attention("GLM-DSA"));
-        assert!(gguf_requires_dense_attention("deepseek4"));
-        // Ordinary architectures keep paged attention.
-        assert!(!gguf_requires_dense_attention("llama"));
-        assert!(!gguf_requires_dense_attention("qwen3moe"));
-        assert!(!gguf_requires_dense_attention(""));
     }
 }

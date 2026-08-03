@@ -14,8 +14,7 @@ limitations under the License.
 #![allow(clippy::borrowed_box)]
 #![allow(clippy::needless_pass_by_value)]
 
-use crate::chat::message_to_mistral;
-use crate::chat::paged_attention::PagedAttentionMode;
+use crate::chat::{LocalModelOptions, PagedAttentionMode, message_to_mistral};
 use crate::streaming_utils::create_stream_response_with_timestamp;
 
 use super::{Chat, Error as ChatError, FailedToRunModelSnafu, Result, nsql::SqlGeneration};
@@ -65,54 +64,6 @@ use tokio::sync::mpsc::{Receiver, Sender, channel};
 /// the same cap so enabling cache-aware scheduling does not change request parallelism.
 const LOCAL_LLM_MAX_SEQS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(4);
 
-/// Read `general.architecture` out of the first GGUF header that declares it.
-///
-/// A model split across shards only carries the full metadata in one of them, and nothing
-/// orders the weight list, so every shard has to be tried rather than just the first.
-///
-/// `None` when no shard declares one: the value only selects an attention implementation,
-/// and the load that follows reports any real problem with the files in far more detail
-/// than a preflight could.
-async fn read_gguf_architecture(paths: &[PathBuf]) -> Option<String> {
-    for path in paths {
-        if let Some(architecture) = read_one_gguf_architecture(path).await {
-            return Some(architecture);
-        }
-    }
-    None
-}
-
-/// `general.architecture` from a single GGUF header, or `None` if it is unreadable or the
-/// key is absent (which is the normal case for the trailing shards of a split model).
-async fn read_one_gguf_architecture(path: &Path) -> Option<String> {
-    let owned = path.to_path_buf();
-    // Blocking file I/O, and for a large sharded model the header carries thousands of
-    // tensor descriptors — keep it off the async worker.
-    let architecture = tokio::task::spawn_blocking(move || {
-        let mut file = std::fs::File::open(&owned).map_err(|e| e.to_string())?;
-        let content = candle_core::quantized::gguf_file::Content::read(&mut file)
-            .map_err(|e| e.to_string())?;
-        content
-            .metadata
-            .get("general.architecture")
-            .and_then(|value| value.to_string().ok().cloned())
-            .ok_or_else(|| "no `general.architecture` key".to_string())
-    })
-    .await;
-
-    match architecture {
-        Ok(Ok(architecture)) => Some(architecture),
-        Ok(Err(why)) => {
-            tracing::debug!("Could not read the GGUF architecture from {path:?}: {why}");
-            None
-        }
-        Err(e) => {
-            tracing::debug!("Reading the GGUF architecture from {path:?} panicked: {e}");
-            None
-        }
-    }
-}
-
 pub struct MistralLlama {
     pipeline: Arc<MistralRs>,
     counter: AtomicUsize,
@@ -133,18 +84,20 @@ fn to_openai_response(
 }
 
 impl MistralLlama {
-    #[expect(clippy::too_many_arguments)]
     pub async fn from(
         model_weights: &[PathBuf],
         config: Option<&Path>,
         tokenizer: Option<&Path>,
         tokenizer_config: Option<&Path>,
         generation_config: Option<&Path>,
-        chat_template_literal: Option<&str>,
-        context_length: Option<usize>,
-        paged_attention: PagedAttentionMode,
+        options: LocalModelOptions<'_>,
         ring_config_path: Option<tempfile::TempPath>,
     ) -> Result<Self> {
+        let LocalModelOptions {
+            chat_template_literal,
+            context_length,
+            paged_attention,
+        } = options;
         for weight in model_weights {
             if !weight.exists() {
                 return Err(ChatError::LocalModelNotFound {
@@ -195,23 +148,16 @@ impl MistralLlama {
             .and_then(|p| p.as_path().extension())
             .and_then(|e| e.to_str());
 
-        // A GGUF names its architecture in the header. Read it before building the
-        // pipeline: it decides whether PagedAttention is usable at all, and logging it
-        // makes a later load failure self-describing.
-        let gguf_architecture = match extension {
-            Some("gguf") => read_gguf_architecture(model_weights).await,
-            _ => None,
+        let paged_attn_config = match paged_attention {
+            PagedAttentionMode::Disabled => {
+                tracing::info!(
+                    "Serving model {model_id} with dense attention (paged_attention: disabled)"
+                );
+                None
+            }
+            PagedAttentionMode::Auto => Self::paged_attention_config(&device),
         };
-        if let Some(architecture) = &gguf_architecture {
-            tracing::debug!("Loading GGUF model {model_id} (architecture {architecture})");
-        }
-
-        let paged_attn_config = Self::paged_attention_config(
-            &device,
-            paged_attention,
-            gguf_architecture.as_deref(),
-            &model_id,
-        );
+        let device_map = DeviceMapSetting::Auto(Self::text_device_map_params(context_length));
         let paged_attn_requested = paged_attn_config.is_some();
         let pipeline = match extension {
             Some("ggml") => Self::load_ggml_pipeline(
@@ -219,7 +165,7 @@ impl MistralLlama {
                 &device,
                 &model_id,
                 chat_template_literal,
-                context_length,
+                device_map,
                 paged_attn_config,
             )?,
             Some("gguf") => Self::load_gguf_pipeline(
@@ -227,7 +173,7 @@ impl MistralLlama {
                 &device,
                 &model_id,
                 chat_template_literal,
-                context_length,
+                device_map,
                 paged_attn_config,
             )?,
             _ => Self::load_default_pipeline(
@@ -235,7 +181,7 @@ impl MistralLlama {
                 &device,
                 &model_id,
                 chat_template_literal,
-                context_length,
+                device_map,
                 paged_attn_config,
             )?,
         };
@@ -282,7 +228,7 @@ impl MistralLlama {
         device: &Device,
         model_id: &str,
         chat_template_literal: Option<&str>,
-        context_length: Option<usize>,
+        device_map: DeviceMapSetting,
         paged_attn_config: Option<mistralrs::PagedAttentionConfig>,
     ) -> Result<Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>> {
         let model_parts: Vec<&str> = model_id.split(':').collect();
@@ -301,7 +247,7 @@ impl MistralLlama {
             &ModelDType::Auto,
             device,
             true,
-            DeviceMapSetting::Auto(Self::text_device_map_params(context_length)),
+            device_map,
             None,
             paged_attn_config,
         )
@@ -313,7 +259,7 @@ impl MistralLlama {
         device: &Device,
         model_id: &str,
         chat_template_literal: Option<&str>,
-        context_length: Option<usize>,
+        device_map: DeviceMapSetting,
         paged_attn_config: Option<mistralrs::PagedAttentionConfig>,
     ) -> Result<Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>> {
         // Note: GGUF supports chat templates in the file, but since GGML/llama.cpp does
@@ -362,7 +308,7 @@ impl MistralLlama {
             &ModelDType::Auto,
             device,
             true,
-            DeviceMapSetting::Auto(Self::text_device_map_params(context_length)),
+            device_map,
             None,
             paged_attn_config,
         )
@@ -374,7 +320,7 @@ impl MistralLlama {
         device: &Device,
         model_id: &str,
         chat_template_literal: Option<&str>,
-        context_length: Option<usize>,
+        device_map: DeviceMapSetting,
         paged_attn_config: Option<mistralrs::PagedAttentionConfig>,
     ) -> Result<Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>> {
         let tokenizer = paths.get_tokenizer_filename().to_string_lossy().to_string();
@@ -394,42 +340,21 @@ impl MistralLlama {
             &ModelDType::Auto,
             device,
             true,
-            DeviceMapSetting::Auto(Self::text_device_map_params(context_length)),
+            device_map,
             None,
             paged_attn_config,
         )
         .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })
     }
 
-    /// Build the mistral.rs `PagedAttention` config for a locally served model, or
-    /// `None` to serve with dense attention and a contiguous KV cache.
+    /// Build the mistral.rs `PagedAttention` config for a locally served model, or `None`
+    /// where this build cannot use it.
     ///
-    /// Under `auto` (the default) `PagedAttention` is used wherever the build and the
-    /// model support it. Multi-head Latent Attention GGUFs — GLM-4.x/5.x, DeepSeek-V4 —
-    /// have no paged kernel and their loaders reject a `PagedAttentionConfig` outright,
-    /// so `auto` recognizes those architectures and serves them dense instead of failing
-    /// the load. `disabled` forces dense attention for any model.
-    fn paged_attention_config(
-        device: &Device,
-        mode: PagedAttentionMode,
-        gguf_architecture: Option<&str>,
-        model_id: &str,
-    ) -> Option<mistralrs::PagedAttentionConfig> {
-        if mode == PagedAttentionMode::Disabled {
-            tracing::info!(
-                "Serving model {model_id} with dense attention (paged_attention: disabled)"
-            );
-            return None;
-        }
+    /// Requesting it is all a caller can do: the engine downgrades to dense attention for
+    /// architectures with no paged kernel (the Multi-head Latent Attention GGUFs), which
+    /// is knowledge that belongs with its loaders rather than here.
+    fn paged_attention_config(device: &Device) -> Option<mistralrs::PagedAttentionConfig> {
         if matches!(device, Device::Cpu) || !Self::paged_attention_supported() {
-            return None;
-        }
-        if let Some(architecture) = gguf_architecture
-            && crate::chat::paged_attention::gguf_requires_dense_attention(architecture)
-        {
-            tracing::info!(
-                "Serving model {model_id} with dense attention: GGUF architecture {architecture} has no PagedAttention implementation"
-            );
             return None;
         }
 
@@ -446,16 +371,18 @@ impl MistralLlama {
         cfg!(all(feature = "cuda", target_family = "unix"))
     }
 
-    /// Auto device-map params for text models, honoring an optional operator-set
-    /// context length (the `context_length` model param). Falls back to mistral.rs's
-    /// default sequence length (`DEFAULT_MAX_SEQ_LEN`, 4096) when unset. This value
-    /// sets the sequence length used to plan cross-device layer placement and to size
-    /// the KV cache, so it is the effective maximum context for the served model.
+    /// Auto device-map params for text models, honoring an optional operator-set context
+    /// length (the `context_length` model param); the engine's own default applies when
+    /// unset. This is the sequence-length budget used to plan cross-device layer placement
+    /// and size the KV reservation — it does not raise the context the weights were
+    /// trained for, which the model's own metadata still caps.
     fn text_device_map_params(context_length: Option<usize>) -> AutoDeviceMapParams {
-        AutoDeviceMapParams::Text {
-            max_seq_len: context_length.unwrap_or(AutoDeviceMapParams::DEFAULT_MAX_SEQ_LEN),
-            max_batch_size: AutoDeviceMapParams::DEFAULT_MAX_BATCH_SIZE,
-        }
+        context_length.map_or_else(AutoDeviceMapParams::default_text, |max_seq_len| {
+            AutoDeviceMapParams::Text {
+                max_seq_len,
+                max_batch_size: AutoDeviceMapParams::DEFAULT_MAX_BATCH_SIZE,
+            }
+        })
     }
 
     fn default_scheduler_config() -> mistralrs::SchedulerConfig {
@@ -585,11 +512,7 @@ impl MistralLlama {
             TokenSource::Literal(secret.expose_secret().to_string())
         });
 
-        // The `paged_attention` operator param is a file-model knob; HuggingFace
-        // loads keep the auto behavior (enabled on CUDA/unix when supported). The
-        // architecture is not known here — these are repo ids, not local GGUF headers.
-        let paged_attn_config =
-            Self::paged_attention_config(&device, PagedAttentionMode::Auto, None, model_id);
+        let paged_attn_config = Self::paged_attention_config(&device);
         let paged_attn_requested = paged_attn_config.is_some();
 
         let pipeline = loader?
@@ -1087,93 +1010,5 @@ fn parse_tool_call_response(
             name: Some(r.function.name.clone()),
             arguments: Some(r.function.arguments.clone()),
         }),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{read_gguf_architecture, read_one_gguf_architecture};
-
-    /// Minimal GGUF v3 header carrying a single `general.architecture` string, so the
-    /// preflight can be tested without a multi-gigabyte model file.
-    fn gguf_header_with_architecture(architecture: &str) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"GGUF");
-        bytes.extend_from_slice(&3u32.to_le_bytes()); // version
-        bytes.extend_from_slice(&0u64.to_le_bytes()); // tensor count
-        bytes.extend_from_slice(&1u64.to_le_bytes()); // metadata kv count
-
-        let key = b"general.architecture";
-        bytes.extend_from_slice(&(key.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(key);
-        bytes.extend_from_slice(&8u32.to_le_bytes()); // value type: string
-        bytes.extend_from_slice(&(architecture.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(architecture.as_bytes());
-        bytes
-    }
-
-    fn write_temp(bytes: &[u8]) -> tempfile::TempPath {
-        let mut file = tempfile::Builder::new()
-            .suffix(".gguf")
-            .tempfile()
-            .expect("a temp file");
-        std::io::Write::write_all(&mut file, bytes).expect("writing the header");
-        file.into_temp_path()
-    }
-
-    #[tokio::test]
-    async fn reads_the_architecture_from_a_gguf_header() {
-        let path = write_temp(&gguf_header_with_architecture("glm-dsa"));
-        assert_eq!(
-            read_gguf_architecture(&[path.to_path_buf()])
-                .await
-                .as_deref(),
-            Some("glm-dsa")
-        );
-    }
-
-    /// A split model declares the architecture in one shard, and nothing orders the
-    /// weight list, so a shard without it must not end the search.
-    #[tokio::test]
-    async fn finds_the_architecture_in_a_later_shard() {
-        let mut trailing_shard = Vec::new();
-        trailing_shard.extend_from_slice(b"GGUF");
-        trailing_shard.extend_from_slice(&3u32.to_le_bytes());
-        trailing_shard.extend_from_slice(&0u64.to_le_bytes());
-        trailing_shard.extend_from_slice(&0u64.to_le_bytes());
-
-        let without = write_temp(&trailing_shard);
-        let with = write_temp(&gguf_header_with_architecture("glm-dsa"));
-        assert_eq!(
-            read_gguf_architecture(&[without.to_path_buf(), with.to_path_buf()])
-                .await
-                .as_deref(),
-            Some("glm-dsa")
-        );
-    }
-
-    #[tokio::test]
-    async fn returns_none_rather_than_failing_on_an_unreadable_file() {
-        // Single-file behaviour, exercised through the per-shard reader.
-        // A truncated header, a file with no architecture key, and a missing path all
-        // have to degrade to `None`: the value only selects an attention implementation,
-        // and the load that follows reports the real problem.
-        let full = gguf_header_with_architecture("glm-dsa");
-        let truncated = write_temp(&full[..full.len() / 2]);
-        assert_eq!(read_one_gguf_architecture(&truncated).await, None);
-
-        let mut no_metadata = Vec::new();
-        no_metadata.extend_from_slice(b"GGUF");
-        no_metadata.extend_from_slice(&3u32.to_le_bytes());
-        no_metadata.extend_from_slice(&0u64.to_le_bytes());
-        no_metadata.extend_from_slice(&0u64.to_le_bytes());
-        let empty = write_temp(&no_metadata);
-        assert_eq!(read_one_gguf_architecture(&empty).await, None);
-
-        assert_eq!(
-            read_one_gguf_architecture(std::path::Path::new("/nonexistent/spice-test-model.gguf"))
-                .await,
-            None
-        );
     }
 }

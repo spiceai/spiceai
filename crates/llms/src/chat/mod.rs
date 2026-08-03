@@ -68,11 +68,10 @@ use mistralrs::MessageContent;
 #[cfg(feature = "local_llm")]
 pub mod distributed;
 
-// Likewise the attention-implementation knob: it only reaches the local mistral.rs
-// loader.
-#[cfg(feature = "local_llm")]
-pub mod paged_attention;
-#[cfg(feature = "local_llm")]
+// The attention-implementation knob is plain config with no engine dependency, so it
+// stays ungated: the model parameter spec compiles unconditionally and shares its
+// accepted values.
+mod paged_attention;
 pub use crate::chat::paged_attention::PagedAttentionMode;
 
 static WEIGHTS_EXTENSIONS: [&str; 7] = [
@@ -774,18 +773,31 @@ pub async fn create_hf_model(
     .map(|x| Arc::new(x) as Arc<dyn Chat>)
 }
 
+/// Knobs pushed into the loader for a locally served model. Grouped so that adding one is
+/// a field rather than another positional argument on two signatures and every call site —
+/// and so a caller cannot transpose two of the several optional arguments and still
+/// type-check. Multi-node topology is deliberately not here: it is a side effect applied
+/// before the loader runs, not something the loader reads.
 #[cfg(feature = "local_llm")]
-#[expect(clippy::too_many_arguments)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LocalModelOptions<'a> {
+    /// Overrides the chat template; ignored for GGUF when the file carries its own.
+    pub chat_template_literal: Option<&'a str>,
+    /// Sequence-length budget for layer placement and KV-cache sizing.
+    pub context_length: Option<usize>,
+    /// Attention implementation to request from the engine.
+    pub paged_attention: PagedAttentionMode,
+}
+
+#[cfg(feature = "local_llm")]
 pub async fn create_local_model(
     model_weights: &[String],
     config: Option<&str>,
     tokenizer: Option<&str>,
     tokenizer_config: Option<&str>,
     generation_config: Option<&str>,
-    chat_template_literal: Option<&str>,
     distributed: Option<DistributedConfig>,
-    context_length: Option<usize>,
-    paged_attention: PagedAttentionMode,
+    options: LocalModelOptions<'_>,
 ) -> Result<Arc<dyn Chat>> {
     // Configure multi-node distributed (ring) inference before loading: the
     // loader reads `RING_CONFIG` from the environment while building the
@@ -812,9 +824,7 @@ pub async fn create_local_model(
         tokenizer.map(Path::new),
         tokenizer_config.map(Path::new),
         generation_config.map(Path::new),
-        chat_template_literal,
-        context_length,
-        paged_attention,
+        options,
         ring_config,
     )
     .await

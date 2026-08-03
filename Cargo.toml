@@ -209,12 +209,12 @@ bigdecimal = "0.4.7"
 blake3 = "1.5"
 byte-unit = "5.1.4"
 bytes = "1.10.0"
-candle = { git = "https://github.com/spiceai/candle.git", rev = "2aeae9ef90c31491aa187168f24261b461d11227", package = "candle-core" } # branch: lukim/spiceai-0.11.0 (candle 0.11 + i-quant; refresh to merged SHA)
-candle-core = { git = "https://github.com/spiceai/candle.git", rev = "2aeae9ef90c31491aa187168f24261b461d11227" } # branch: lukim/spiceai-0.11.0 (candle 0.11 + i-quant; refresh to merged SHA)
-candle-kernels = { git = "https://github.com/spiceai/candle.git", rev = "2aeae9ef90c31491aa187168f24261b461d11227", package = "candle-kernels" } # branch: lukim/spiceai-0.11.0 (candle 0.11 + i-quant; refresh to merged SHA)
-candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "2aeae9ef90c31491aa187168f24261b461d11227", package = "candle-metal-kernels" } # branch: lukim/spiceai-0.11.0 (candle 0.11 + i-quant; refresh to merged SHA)
-candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "2aeae9ef90c31491aa187168f24261b461d11227", package = "candle-nn" } # branch: lukim/spiceai-0.11.0 (candle 0.11 + i-quant; refresh to merged SHA)
-candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "2aeae9ef90c31491aa187168f24261b461d11227", package = "candle-transformers" } # branch: lukim/spiceai-0.11.0 (candle 0.11 + i-quant; refresh to merged SHA)
+candle = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6", package = "candle-core" } # branch: lukim/spiceai-0.11.0 (candle 0.11 + i-quant; refresh to merged SHA)
+candle-core = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6" } # branch: lukim/spiceai-0.11.0 (candle 0.11 + i-quant; refresh to merged SHA)
+candle-kernels = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6", package = "candle-kernels" } # branch: lukim/spiceai-0.11.0 (candle 0.11 + i-quant; refresh to merged SHA)
+candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6", package = "candle-metal-kernels" } # branch: lukim/spiceai-0.11.0 (candle 0.11 + i-quant; refresh to merged SHA)
+candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6", package = "candle-nn" } # branch: lukim/spiceai-0.11.0 (candle 0.11 + i-quant; refresh to merged SHA)
+candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6", package = "candle-transformers" } # branch: lukim/spiceai-0.11.0 (candle 0.11 + i-quant; refresh to merged SHA)
 charset = "0.1.5"
 chrono = "0.4.44"
 clap = { version = "4.5.60", features = ["derive", "env"] }
@@ -515,11 +515,11 @@ mysql-common-derive = { path = "vendor/mysql-common-derive" }
 
 # Redirect candle-core / kernels / nn / transformers to the spiceai fork;
 # this matches the git rev pinned in [workspace.dependencies] above.
-candle-core = { git = "https://github.com/spiceai/candle.git", rev = "2aeae9ef90c31491aa187168f24261b461d11227" } # spiceai
-candle-kernels = { git = "https://github.com/spiceai/candle.git", rev = "2aeae9ef90c31491aa187168f24261b461d11227" } # spiceai
-candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "2aeae9ef90c31491aa187168f24261b461d11227" } # spiceai
-candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "2aeae9ef90c31491aa187168f24261b461d11227" } # spiceai
-candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "2aeae9ef90c31491aa187168f24261b461d11227" } # spiceai
+candle-core = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6" } # spiceai
+candle-kernels = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6" } # spiceai
+candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6" } # spiceai
+candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6" } # spiceai
+candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6" } # spiceai
 # candle-index-select-cu is crates.io-sourced by text-embeddings-inference;
 # point it at the spiceai fork, which builds against candle 0.11.
 candle-index-select-cu = { git = "https://github.com/spiceai/candle-index-select-cu.git", rev = "75fc0b689b33a327907d36dd479f7d242640ca71" } # spiceai (candle 0.11)

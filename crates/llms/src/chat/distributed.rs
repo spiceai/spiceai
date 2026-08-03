@@ -71,10 +71,13 @@ impl DistributedConfig {
     /// (`"nodes"` or `"node_rank"`) alongside a human-readable message, so the
     /// caller can attribute the error to the field the user actually set wrong.
     ///
-    /// Any world size of 2 or more is accepted. mistral.rs shards attention heads and
-    /// routed experts across the ranks, balanced to within one each, so the counts need
-    /// not divide evenly — but a rank cannot end up with none of either, which the model
-    /// checks against its own head/expert counts when it loads.
+    /// Any world size of 2 or more is accepted. These two rules mirror the engine's own
+    /// (`RingComm::from_device`), and must stay a *subset* of them: Spice rejecting a
+    /// topology the engine would happily run is the failure mode to avoid, whereas being
+    /// looser only costs a worse error message from deeper in the load. Whether a given
+    /// model can be split this many ways is the engine's call: loaders differ in whether
+    /// they shard heads and experts evenly, and it reports the specifics when the model
+    /// loads.
     pub fn validate(&self) -> std::result::Result<(), (&'static str, String)> {
         let world_size = self.world_size();
         if world_size < 2 {
@@ -222,8 +225,8 @@ mod tests {
 
     #[test]
     fn validate_accepts_world_sizes_that_are_not_powers_of_two() {
-        // Three nodes is the case the power-of-two rule used to turn away, and the one
-        // that lets a model too large for two nodes be pooled over a third.
+        // Three nodes is the smallest world size that pools a model too large for two,
+        // and the smallest that is not a power of two.
         for world_size in [3usize, 5, 6, 7] {
             for rank in 0..world_size {
                 ring_cfg(rank, world_size)
@@ -235,15 +238,12 @@ mod tests {
 
     #[test]
     fn validate_rejects_rank_out_of_range() {
-        let err = ring_cfg(2, 2)
-            .validate()
-            .expect_err("rank 2 is out of range for world size 2");
-        // The error must be attributed to `node_rank`, not `nodes`.
-        assert_eq!(err.0, "node_rank");
-
-        let err = ring_cfg(3, 3)
-            .validate()
-            .expect_err("rank 3 is out of range for world size 3");
-        assert_eq!(err.0, "node_rank");
+        for (rank, world_size) in [(2usize, 2usize), (3, 3)] {
+            let err = ring_cfg(rank, world_size)
+                .validate()
+                .expect_err("a rank equal to the world size is out of range");
+            // The error must be attributed to `node_rank`, not `nodes`.
+            assert_eq!(err.0, "node_rank", "world size {world_size}");
+        }
     }
 }

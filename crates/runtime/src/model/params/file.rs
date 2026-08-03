@@ -45,11 +45,11 @@ pub(crate) const FILE_PARAMETERS: [ParameterSpec; FILE_PARAM_LEN] = [
     ParameterSpec::runtime("node_rank")
         .description("This node's 0-indexed rank in the distributed `nodes` list. Rank 0 is the head and serves the API; other ranks are compute replicas."),
     ParameterSpec::runtime("nodes")
-        .description("Comma-separated, rank-ordered node addresses for distributed inference (e.g. '10.0.0.1,10.0.0.2,10.0.0.3'). Identical on every node; only `node_rank` differs. Two or more nodes; the model's attention head and expert counts need not divide evenly by the node count."),
+        .description("Comma-separated, rank-ordered node addresses for distributed inference (e.g. '10.0.0.1,10.0.0.2,10.0.0.3'). Identical on every node; only `node_rank` differs. Two or more nodes. Whether a given model can be split across that many nodes depends on the model and is reported when it loads."),
     ParameterSpec::runtime("context_length")
-        .description("Maximum context length, in tokens, for a locally served model. Sets the sequence length used to plan cross-device layer placement and KV-cache sizing; defaults to the engine default (4096) when unset, whatever context the weights were trained for. Larger values need proportionally more KV-cache memory."),
+        .description("Sequence-length budget, in tokens, for a locally served model: it plans cross-device layer placement and sizes the KV cache. Defaults to the engine default (4096) when unset. It does not raise the context the weights were trained for, and larger values need proportionally more KV-cache memory."),
     ParameterSpec::runtime("paged_attention")
-        .description("Attention implementation for a locally served model. 'auto' (the default) uses PagedAttention wherever the build and the model support it, and dense attention where they do not - including Multi-head Latent Attention GGUFs (GLM-4.x/5.x, DeepSeek-V4), which have no paged kernel. 'disabled' forces dense attention with a contiguous KV cache.")
+        .description("Attention implementation for a locally served model. 'auto' (the default) uses PagedAttention wherever the build supports it, and the engine falls back to dense attention for architectures with no paged kernel, such as the Multi-head Latent Attention GGUFs. 'disabled' forces dense attention with a contiguous KV cache.")
         .default("auto")
-        .one_of_ignore_ascii_case(&["auto", "disabled"]),
+        .one_of_ignore_ascii_case(llms::chat::PagedAttentionMode::VALUES),
 ];
