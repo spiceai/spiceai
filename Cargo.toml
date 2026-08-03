@@ -10,6 +10,7 @@ members = [
     "crates/aws-sdk-credential-bridge",
     "crates/chunking",
     "crates/cloud-connect-crypto",
+    "crates/cpu-budget",
     "crates/data-accelerator-api",
     "crates/data-connectors/*",
     "crates/datafusion-ddl",
@@ -145,6 +146,11 @@ redundant_clone = "deny"
 todo = "deny"
 assertions_on_result_states = "deny"
 allow_attributes = "deny"
+# The list of forbidden methods lives in `clippy.toml` (a clippy config, not a
+# lint level). Denying the lint here is what makes a direct CPU-detection call
+# fail a scoped `cargo clippy -p <crate>` and show up in rust-analyzer, rather
+# than only under the `-Dwarnings` CI gate.
+disallowed_methods = "deny"
 # Pedantic members we opt out of (priority 0 overrides the group deny above).
 module_name_repetitions = "allow"
 large_futures = "allow"
@@ -367,6 +373,7 @@ serde_json = "1"
 sha2 = "0.10.8"
 snafu = "0.8.6"
 cloud-connect-crypto = { path = "crates/cloud-connect-crypto" }
+cpu-budget = { path = "crates/cpu-budget" }
 runtime-cloud-connect = { path = "crates/runtime-cloud-connect" }
 spice-cloud-client = { path = "crates/spice-cloud-client" }
 snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "744ffd77fe82171a805562ce001a341a94d52541" } # branch: spiceai-58

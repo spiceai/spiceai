@@ -1601,9 +1601,7 @@ impl DataFusion {
         // #11170 mechanism — lowering write fan-out yielded 3-11x OLAP latency
         // wins from CPU-contention relief alone). Compaction is unaffected: it
         // has its own dedicated runtime and memory carve-out.
-        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-        let query_reserve = (cores / 4).max(2);
-        let encode_budget = cores.saturating_sub(query_reserve).max(1);
+        let encode_budget = cpu_budget::cpu_budget().cayenne_encode_permits();
         cayenne::set_global_encode_concurrency(encode_budget);
         tracing::info!(
             encode_budget,

@@ -309,7 +309,7 @@ pub struct CayenneAccelerator {
     footer_cache_mb: Option<usize>,
     /// Shared semaphore that bounds the number of concurrent per-table
     /// background compactions across all Cayenne tables registered with this
-    /// accelerator. Sized at `available_parallelism()` so a fleet of tables
+    /// accelerator. Sized at the CPU budget's core count so a fleet of tables
     /// can't oversubscribe the writer pool.
     compaction_semaphore: Arc<tokio::sync::Semaphore>,
     /// Initial permit count of `compaction_semaphore` (the semaphore itself only
@@ -1041,9 +1041,7 @@ impl CayenneAccelerator {
 
     #[must_use]
     pub fn with_footer_cache_mb(footer_cache_mb: Option<usize>) -> Self {
-        let permits = std::thread::available_parallelism()
-            .map_or(1, std::num::NonZeroUsize::get)
-            .max(1);
+        let permits = cpu_budget::cpu_budget().cayenne_compaction_permits();
         let compaction_semaphore = Arc::new(tokio::sync::Semaphore::new(permits));
         Self {
             catalog: Arc::new(OnceCell::new()),
@@ -1759,8 +1757,8 @@ impl CayenneAccelerator {
             }
 
             // Write concurrency: `auto`/unset leaves the per-write default
-            // (session target_partitions, capped at the host core count and the
-            // global encode budget); 0 → warn + minimum 1.
+            // (session target_partitions, capped at the CPU budget's core count
+            // and the global encode budget); 0 → warn + minimum 1.
             match autotune::read_knob(
                 acceleration,
                 &["cayenne_write_concurrency", "write_concurrency"],
@@ -2796,9 +2794,9 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .one_of(&["auto", "key", "position"])
             .default("auto"),
         ParameterSpec::component("upload_concurrency")
-            .description("Maximum number of concurrent file uploads when writing multiple Vortex files. 'auto' (or unset) uses available CPU parallelism. The aggregate encode concurrency across all Cayenne tables is separately bounded by a process-global budget sized to the host core count."),
+            .description("Maximum number of concurrent file uploads when writing multiple Vortex files. 'auto' (or unset) uses the runtime's CPU budget (see `runtime.cpu.cores`). The aggregate encode concurrency across all Cayenne tables is separately bounded by a process-global budget sized from that same value."),
         ParameterSpec::component("write_concurrency")
-            .description("Writer partition override (parallel encoders) for unsorted Cayenne ingests. 'auto' (or unset) uses a small fixed default of 4, capped at the host core count (= runtime.query.target_partitions) and the process-global encode budget — deliberately not the full core count, because each table is sized independently and the per-table values sum across tables under concurrent CDC. Raise it explicitly for a table that needs more encode parallelism."),
+            .description("Writer partition override (parallel encoders) for unsorted Cayenne ingests. 'auto' (or unset) uses a small fixed default of 4, capped at the runtime's CPU budget (= runtime.query.target_partitions) and the process-global encode budget — deliberately not the full core count, because each table is sized independently and the per-table values sum across tables under concurrent CDC. Raise it explicitly for a table that needs more encode parallelism."),
         ParameterSpec::component("compaction_trigger_files")
             .description("Minimum number of small Vortex files in the current snapshot before tiered compaction runs. A 'small' file is one whose size is below cayenne_target_file_size_mb / 4. Default: 4 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 8 otherwise."),
         ParameterSpec::component("bake_deletion_index_trigger")

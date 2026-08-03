@@ -85,25 +85,26 @@ fn main() {
         return;
     }
 
-    let tokio_runtime = match Runtime::new() {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            eprintln!("Unable to start Tokio runtime: {err}");
-            std::process::exit(1);
-        }
-    };
-
     // Install the default AWS LC RS crypto provider for rusttls
     let _ = CryptoProvider::install_default(crypto::aws_lc_rs::default_provider());
 
     if args.repl {
-        if let Err(e) = tokio_runtime.block_on(repl::run(args.repl_config)) {
+        // The REPL is a Flight client, not the runtime: it sizes nothing, so it
+        // keeps Tokio's own default runtime.
+        let repl_runtime = match Runtime::new() {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                eprintln!("Unable to start Tokio runtime: {err}");
+                std::process::exit(1);
+            }
+        };
+        if let Err(e) = repl_runtime.block_on(repl::run(args.repl_config)) {
             eprintln!("SQL REPL Error: {e}");
         }
         return;
     }
 
-    if let Err(err) = tokio_runtime.block_on(start_runtime(args)) {
+    if let Err(err) = load_and_run(args) {
         in_tracing_context(|| {
             tracing::error!("{err}");
         });
@@ -114,7 +115,34 @@ fn main() {
     tracing::info!("Goodbye!");
 }
 
-async fn start_runtime(args: spiced::Args) -> Result<(), Box<dyn std::error::Error>> {
+/// Load the spicepod, resolve the CPU budget it configures, and only then build
+/// the runtime that budget sizes.
+///
+/// The ordering is the point: `runtime.cpu.cores` lives in the spicepod, and the
+/// budget sizes this runtime's own worker pool — so the spicepod has to be
+/// parsed before the pool exists. It is loaded here on a throwaway
+/// current-thread runtime and handed to `spiced::run`, so it is read exactly
+/// once and all three configuration surfaces resolve through one path.
+fn load_and_run(args: spiced::Args) -> Result<(), Box<dyn std::error::Error>> {
+    let bootstrap = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let app_bundle = bootstrap.block_on(spiced::build_app(&args))?;
+    drop(bootstrap);
+
+    spiced::install_cpu_budget(&args, app_bundle.0.as_deref())?;
+
+    let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(cpu_budget::cpu_budget().main_runtime_worker_threads())
+        .enable_all()
+        .build()?;
+    tokio_runtime.block_on(start_runtime(args, app_bundle))
+}
+
+async fn start_runtime(
+    args: spiced::Args,
+    app_bundle: spiced::AppBundle,
+) -> Result<(), Box<dyn std::error::Error>> {
     in_tracing_context(|| {
         if let Some(allocator_name) = get_allocator_name() {
             tracing::info!(
@@ -125,7 +153,7 @@ async fn start_runtime(args: spiced::Args) -> Result<(), Box<dyn std::error::Err
             tracing::info!("Starting runtime {version}", version = get_version_string());
         }
     });
-    spiced::run(args).await?;
+    spiced::run(args, app_bundle).await?;
     Ok(())
 }
 
