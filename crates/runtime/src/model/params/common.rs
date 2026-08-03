@@ -70,7 +70,7 @@ const OVERRIDES: [&str; 22] = [
     "user",
 ];
 
-/// Common params for the OpenAI provider: the runtime tunables, the override
+/// Common params for the `OpenAI` provider: the runtime tunables, the override
 /// params accepted unprefixed (runtime), and the `openai_`-prefixed forms
 /// (`openai_temperature`, …) kept as deprecated aliases for back-compat.
 pub const OPENAI_COMMON: &[PassthroughParam] = &openai_common();
