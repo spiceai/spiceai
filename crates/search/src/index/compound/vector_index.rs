@@ -21,7 +21,7 @@ use arrow_schema::Field;
 use async_trait::async_trait;
 use datafusion::{
     error::{DataFusionError, Result as DataFusionResult},
-    logical_expr::LogicalPlan,
+    logical_expr::{LogicalPlan, LogicalPlanBuilder},
 };
 use futures::future::try_join_all;
 use runtime_datafusion_index::Index;
@@ -102,6 +102,20 @@ impl VectorIndex for CompoundVectorIndex {
                 fallback_on_empty_plan(primary, secondary)
             }
         }
+    }
+
+    /// Both halves, unioned — never narrowed by [`Self::read_mode`].
+    ///
+    /// `list_table_provider` answers "what should a read see", and for
+    /// [`CompoundReadMode::PrimaryOnly`] that is the warm primary alone; the primary only holds
+    /// rows the write path has passed through it, so it is not authoritative for what is stored.
+    /// A union rather than a fallback because the two halves can disagree in *either* direction:
+    /// an entry either one holds is an entry a delete still has to resolve, and
+    /// [`Index::delete_by_keys`] already fans out to both.
+    fn list_all_entries(&self) -> Result<LogicalPlan, DataFusionError> {
+        let primary = self.primary.list_all_entries()?;
+        let secondary = self.secondary.list_all_entries()?;
+        LogicalPlanBuilder::from(primary).union(secondary)?.build()
     }
 
     fn dimension(&self) -> i32 {

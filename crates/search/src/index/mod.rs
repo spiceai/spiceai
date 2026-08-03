@@ -210,6 +210,23 @@ pub trait VectorIndex: SearchIndex {
     /// not be wrapped by [`VectorScanTableProvider`].
     fn list_table_provider(&self) -> Result<LogicalPlan, DataFusionError>;
 
+    /// A [`LogicalPlan`] enumerating every entry the index holds, for maintenance paths that must
+    /// resolve *stored* entries rather than serve a read — currently resolving a chunked index's
+    /// chunk-keyed entries so they can be deleted.
+    ///
+    /// Distinct from [`VectorIndex::list_table_provider`], which serves reads and may deliberately
+    /// return less than the index holds: a [`compound`](crate::index::compound) index's read mode
+    /// can restrict listing to its warm primary, which is not authoritative for what is stored.
+    /// Resolving a delete against that narrowed listing silently leaves entries behind.
+    ///
+    /// The schema matches [`VectorIndex::list_table_provider`]'s.
+    ///
+    /// Wrapper implementations MUST forward this to the index they wrap — inheriting the default
+    /// silently resolves maintenance work against a read-narrowed listing.
+    fn list_all_entries(&self) -> Result<LogicalPlan, DataFusionError> {
+        self.list_table_provider()
+    }
+
     fn dimension(&self) -> i32;
 
     /// Returns column names in [`VectorIndex::list_table_provider`] and/or [`SearchIndex::query_table_provider`] that

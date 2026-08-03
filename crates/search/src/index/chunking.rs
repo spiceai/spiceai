@@ -139,8 +139,14 @@ impl Index for ChunkedSearchIndex {
 /// Deletes every entry in `inner` whose primary-key columns match a row of `outer_keys` (which
 /// carry only the outer/pre-chunk key columns — `inner`'s own key additionally has the chunk id,
 /// whose values aren't known here). Resolves the exact matching entries by scanning `inner`'s own
-/// [`VectorIndex::list_table_provider`] with a predicate built from `outer_keys`, then deletes
+/// [`VectorIndex::list_all_entries`] with a predicate built from `outer_keys`, then deletes
 /// those resolved (chunk-key-included) rows via `inner`'s normal [`Index::delete_by_keys`].
+///
+/// Resolution goes through [`VectorIndex::list_all_entries`], not
+/// [`VectorIndex::list_table_provider`]: the read listing can be narrower than what the index
+/// stores (a compound index's read mode may serve only its warm primary), and a chunk entry that
+/// does not resolve is never passed to [`Index::delete_by_keys`] at all — the delete then reports
+/// success having removed nothing.
 async fn delete_chunked_vector_by_outer_keys(
     inner: &Arc<dyn VectorIndex>,
     outer_keys: RecordBatch,
@@ -155,9 +161,20 @@ async fn delete_chunked_vector_by_outer_keys(
         return Ok(());
     };
 
-    let list_plan = inner.list_table_provider()?;
+    // `delete_by_keys` reads only the primary-key columns, so project to them and drop the
+    // duplicates a multi-store listing can carry (the same entry held by more than one half).
+    // This also keeps the embedding vectors — the bulk of the listing — out of a delete.
+    let key_projection = inner
+        .primary_fields()
+        .iter()
+        .map(|f| Expr::Column(Column::new_unqualified(f.name())))
+        .collect::<Vec<_>>();
+
+    let list_plan = inner.list_all_entries()?;
     let filtered_plan = LogicalPlanBuilder::from(list_plan)
         .filter(predicate)?
+        .project(key_projection)?
+        .distinct()?
         .build()?;
 
     let ctx = SessionContext::new();
@@ -723,7 +740,27 @@ impl VectorIndex for ChunkedVectorIndex {
     }
 
     fn list_table_provider(&self) -> Result<LogicalPlan, DataFusionError> {
-        let base_index_table = self.inner.list_table_provider()?;
+        self.aggregate_chunk_listing(self.inner.list_table_provider()?)
+    }
+
+    /// Forwards to the inner index's authoritative listing, aggregated the same way
+    /// [`Self::list_table_provider`] aggregates the read listing.
+    fn list_all_entries(&self) -> Result<LogicalPlan, DataFusionError> {
+        self.aggregate_chunk_listing(self.inner.list_all_entries()?)
+    }
+
+    fn dimension(&self) -> i32 {
+        self.inner.dimension()
+    }
+}
+
+impl ChunkedVectorIndex {
+    /// Collapses a chunk-keyed listing of `self.inner` into one row per *base* row, aggregating
+    /// each base row's chunk offsets and embeddings in chunk-id order.
+    fn aggregate_chunk_listing(
+        &self,
+        base_index_table: LogicalPlan,
+    ) -> Result<LogicalPlan, DataFusionError> {
         let primary_key_names = ChunkedSearchIndex::base_key_columns(&self.inner.primary_fields());
 
         // Primary key, offsets and embeddings.
@@ -800,10 +837,6 @@ impl VectorIndex for ChunkedVectorIndex {
             )
             .boxed()?,
         ))
-    }
-
-    fn dimension(&self) -> i32 {
-        self.inner.dimension()
     }
 }
 
@@ -924,6 +957,7 @@ impl SearchIndex for ChunkedVectorIndex {
 )]
 mod tests {
     use super::*;
+    use crate::index::compound::{CompoundReadMode, CompoundVectorIndex};
     use arrow::array::{Float32Array, Int32Array, Int64Array, StringArray};
     use chunking::Chunker;
     use std::fmt::Write as _;
@@ -1469,6 +1503,255 @@ mod tests {
             "resolved keys carry the chunk id: {columns:?}"
         );
         assert_eq!(ids, &vec![1, 1], "both chunks of id 1, and nothing else");
+    }
+
+    /// [`chunk_keyed_rows`] plus the offset and embedding columns a real inner index's listing
+    /// carries, so [`ChunkedVectorIndex::list_table_provider`]'s aggregation can be built over it.
+    fn chunk_keyed_listing(rows: &[(i64, u64)]) -> RecordBatch {
+        let keys = chunk_keyed_rows(rows);
+        let offset_field = Arc::new(Field::new("item", DataType::Int32, true));
+        let offsets = FixedSizeListArray::try_new(
+            Arc::clone(&offset_field),
+            2,
+            // The values are irrelevant — these columns exist only so the chunk-listing
+            // aggregation, which references them by name, can be built over this batch.
+            Arc::new(Int32Array::from(vec![0; rows.len() * 2])),
+            None,
+        )
+        .expect("valid offsets");
+        let embedding_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let embeddings = FixedSizeListArray::try_new(
+            Arc::clone(&embedding_field),
+            4,
+            Arc::new(Float32Array::from(vec![0.0_f32; rows.len() * 4])),
+            None,
+        )
+        .expect("valid embeddings");
+
+        let mut fields = keys.schema().fields().to_vec();
+        fields.push(Arc::new(Field::new(
+            ChunkedSearchIndex::chunking_offset_col("content"),
+            offsets.data_type().clone(),
+            true,
+        )));
+        fields.push(Arc::new(Field::new(
+            embedding_col("content"),
+            embeddings.data_type().clone(),
+            true,
+        )));
+
+        let mut columns = keys.columns().to_vec();
+        columns.push(Arc::new(offsets) as ArrayRef);
+        columns.push(Arc::new(embeddings) as ArrayRef);
+
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("valid listing batch")
+    }
+
+    /// An inner index shaped like the S3-Vectors-with-warm-tier case: a warm `primary` holding
+    /// only what the write path has passed through it, over an authoritative `secondary`.
+    fn compound_inner(
+        warm: &Arc<RecordingInner>,
+        durable: &Arc<RecordingInner>,
+        read_mode: CompoundReadMode,
+    ) -> Arc<CompoundVectorIndex> {
+        Arc::new(
+            CompoundVectorIndex::try_new(
+                Arc::clone(warm) as Arc<dyn VectorIndex>,
+                Arc::clone(durable) as Arc<dyn VectorIndex>,
+                read_mode,
+            )
+            .expect("the two mocks share a search column, primary key and dimension"),
+        )
+    }
+
+    /// Deletes base key 1 through a chunked index over a compound inner, returning what each half
+    /// was asked to delete.
+    async fn delete_through_compound(
+        warm: &Arc<RecordingInner>,
+        durable: &Arc<RecordingInner>,
+        read_mode: CompoundReadMode,
+    ) -> (Vec<(Vec<String>, Vec<i64>)>, Vec<(Vec<String>, Vec<i64>)>) {
+        let idx = ChunkedSearchIndex::new(
+            compound_inner(warm, durable, read_mode) as Arc<dyn SearchIndex>,
+            chunker(),
+        );
+
+        idx.delete_by_keys(outer_keys(&[1]))
+            .await
+            .expect("delete succeeds");
+
+        (warm.deletes(), durable.deletes())
+    }
+
+    /// The resolved chunk ids across every `delete_by_keys` call a half received.
+    fn resolved_ids(deletes: &[(Vec<String>, Vec<i64>)]) -> Vec<i64> {
+        deletes.iter().flat_map(|(_, ids)| ids.clone()).collect()
+    }
+
+    /// Regression test for #12266. A compound inner index serves *reads* from its warm primary
+    /// (`PrimaryOnly`) or falls back per-plan (`FallbackToSecondary`) — neither is authoritative
+    /// for what is stored. Resolving the chunk-keyed entries against that read listing found
+    /// nothing for a row the warm tier does not hold, so `delete_by_keys` was never called for it
+    /// and the delete reported success having removed nothing from the durable store.
+    #[tokio::test]
+    async fn a_compound_inner_resolves_chunks_the_warm_primary_does_not_hold() {
+        for read_mode in [
+            CompoundReadMode::PrimaryOnly,
+            CompoundReadMode::FallbackToSecondary,
+        ] {
+            let warm = Arc::new(RecordingInner::chunked(vec![chunk_keyed_rows(&[])]));
+            let durable = Arc::new(RecordingInner::chunked(vec![chunk_keyed_rows(&[
+                (1, 0),
+                (1, 1),
+            ])]));
+
+            let (warm_deletes, durable_deletes) =
+                delete_through_compound(&warm, &durable, read_mode).await;
+
+            assert_eq!(
+                resolved_ids(&durable_deletes),
+                vec![1, 1],
+                "both chunks the durable half holds must be deleted ({read_mode:?})"
+            );
+            assert!(
+                durable_deletes
+                    .iter()
+                    .all(|(columns, _)| columns.contains(&CHUNKED_INDEX_CHUNK_KEY.to_string())),
+                "resolved keys carry the chunk id: {durable_deletes:?}"
+            );
+            assert_eq!(
+                resolved_ids(&warm_deletes),
+                vec![1, 1],
+                "the delete fans out to both halves, whichever resolved the entries ({read_mode:?})"
+            );
+        }
+    }
+
+    /// The narrower half of the same bug: a *partially* populated warm tier. `FallbackToSecondary`
+    /// falls back only when the primary's plan is entirely empty, so a warm tier holding one of
+    /// two chunks resolved just that one and left the other in the durable store.
+    #[tokio::test]
+    async fn a_compound_inner_resolves_chunks_a_partial_warm_primary_is_missing() {
+        for read_mode in [
+            CompoundReadMode::PrimaryOnly,
+            CompoundReadMode::FallbackToSecondary,
+        ] {
+            let warm = Arc::new(RecordingInner::chunked(vec![chunk_keyed_rows(&[(1, 0)])]));
+            let durable = Arc::new(RecordingInner::chunked(vec![chunk_keyed_rows(&[
+                (1, 0),
+                (1, 1),
+            ])]));
+
+            let (_, durable_deletes) = delete_through_compound(&warm, &durable, read_mode).await;
+
+            assert_eq!(
+                resolved_ids(&durable_deletes),
+                vec![1, 1],
+                "the chunk the warm tier is missing must still be resolved ({read_mode:?})"
+            );
+        }
+    }
+
+    /// The other direction: resolving from the durable half *alone* would be equally wrong. The
+    /// two halves can disagree either way, so an entry only the warm tier holds must also be
+    /// resolved — hence a union rather than a switch to the secondary.
+    #[tokio::test]
+    async fn a_compound_inner_resolves_an_entry_only_the_warm_primary_holds() {
+        let warm = Arc::new(RecordingInner::chunked(vec![chunk_keyed_rows(&[(1, 7)])]));
+        let durable = Arc::new(RecordingInner::chunked(vec![chunk_keyed_rows(&[])]));
+
+        let (warm_deletes, _) =
+            delete_through_compound(&warm, &durable, CompoundReadMode::FallbackToSecondary).await;
+
+        assert_eq!(
+            resolved_ids(&warm_deletes),
+            vec![1],
+            "an entry only the warm tier holds must still be resolved and deleted"
+        );
+    }
+
+    /// The union must not turn one stored entry into two deletes just because both halves hold it.
+    #[tokio::test]
+    async fn a_compound_inner_resolves_a_shared_entry_once() {
+        let warm = Arc::new(RecordingInner::chunked(vec![chunk_keyed_rows(&[(1, 0)])]));
+        let durable = Arc::new(RecordingInner::chunked(vec![chunk_keyed_rows(&[(1, 0)])]));
+
+        let (warm_deletes, durable_deletes) =
+            delete_through_compound(&warm, &durable, CompoundReadMode::PrimaryOnly).await;
+
+        assert_eq!(
+            resolved_ids(&durable_deletes),
+            vec![1],
+            "an entry both halves hold resolves once, not once per half"
+        );
+        assert_eq!(resolved_ids(&warm_deletes), vec![1]);
+    }
+
+    /// Resolving from the union must not widen *which* rows are deleted — only the requested base
+    /// key's chunks may be removed, from either half.
+    #[tokio::test]
+    async fn a_compound_inner_delete_leaves_other_base_keys_alone() {
+        let warm = Arc::new(RecordingInner::chunked(vec![chunk_keyed_rows(&[(2, 0)])]));
+        let durable = Arc::new(RecordingInner::chunked(vec![chunk_keyed_rows(&[
+            (1, 0),
+            (2, 0),
+            (3, 0),
+        ])]));
+
+        let (warm_deletes, durable_deletes) =
+            delete_through_compound(&warm, &durable, CompoundReadMode::PrimaryOnly).await;
+
+        assert_eq!(
+            resolved_ids(&durable_deletes),
+            vec![1],
+            "only base key 1's chunk is deleted: {durable_deletes:?}"
+        );
+        assert_eq!(
+            resolved_ids(&warm_deletes),
+            vec![1],
+            "the other base keys the warm tier holds are untouched: {warm_deletes:?}"
+        );
+    }
+
+    /// `ChunkedVectorIndex` is a wrapper, so it must forward `list_all_entries` to its inner index
+    /// rather than inherit the default (which would resolve against the read listing again).
+    #[tokio::test]
+    async fn chunked_vector_index_forwards_list_all_entries_to_its_inner_index() {
+        let warm = Arc::new(RecordingInner::chunked(vec![chunk_keyed_listing(&[])]));
+        let durable = Arc::new(RecordingInner::chunked(vec![chunk_keyed_listing(&[
+            (1, 0),
+            (1, 1),
+        ])]));
+        let idx = ChunkedVectorIndex {
+            inner: compound_inner(&warm, &durable, CompoundReadMode::PrimaryOnly)
+                as Arc<dyn VectorIndex>,
+            chunker: chunker(),
+        };
+
+        // A `PrimaryOnly` read listing is the warm primary's scan alone; the authoritative
+        // listing unions both halves. Comparing the two plans is what shows the forward: had
+        // `ChunkedVectorIndex` inherited the default, both would be the read listing.
+        let read = format!(
+            "{}",
+            idx.list_table_provider()
+                .expect("read plan builds")
+                .display_indent()
+        );
+        let all = format!(
+            "{}",
+            idx.list_all_entries()
+                .expect("authoritative plan builds")
+                .display_indent()
+        );
+
+        assert!(
+            all.contains("Union"),
+            "the authoritative listing must reach both halves of the compound inner:\n{all}"
+        );
+        assert!(
+            !read.contains("Union"),
+            "a PrimaryOnly read listing is the warm primary alone:\n{read}"
+        );
     }
 
     /// A chunked index with no listing and no partial-key delete has no way to reach its inner
