@@ -601,6 +601,32 @@ mod tests {
         assert_eq!(status_for_sql_error("boom"), StatusCode::BAD_REQUEST);
     }
 
+    /// A join wraps its build-side failure in `Shared`, which renders with no
+    /// prefix, so the body reads like a bare refusal while the status stays on
+    /// 400. The status has to be derived from the variant, not the text.
+    #[test]
+    fn a_shared_pool_refusal_is_recognised() {
+        let shared: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(datafusion::error::DataFusionError::Shared(Arc::new(
+                datafusion::error::DataFusionError::ResourcesExhausted(
+                    "Additional allocation failed for HashJoinInput[135]".to_string(),
+                ),
+            )));
+
+        assert!(
+            shared.to_string().starts_with("Resources exhausted: "),
+            "`Shared` must delegate its message, or this test is not covering the real shape"
+        );
+        assert!(is_resources_exhausted(shared.as_ref()));
+
+        // A shared failure that is not a refusal must not be swept up with it.
+        let shared_other: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(datafusion::error::DataFusionError::Shared(Arc::new(
+                datafusion::error::DataFusionError::Execution("boom".to_string()),
+            )));
+        assert!(!is_resources_exhausted(shared_other.as_ref()));
+    }
+
     /// The logged copy is collapsed to one record; the response body is not
     /// touched. A message with nothing to collapse must not allocate.
     #[test]
