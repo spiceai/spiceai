@@ -20,15 +20,50 @@
 #   make signoff-remote
 #   gh workflow run signoff.yml -f branch=<your-branch>
 #   gh workflow run signoff.yml -f branch=<your-branch> -f skip_targeted_lint=true
+#
+# Fork PRs (pr_number input): dispatching this workflow already requires write
+# access to this repo, so we don't gate fork sign-off behind an extra
+# confirmation input — the write-access check on workflow_dispatch itself is
+# the trust boundary. But the fork's code (build.rs, tests, Makefiles, …)
+# still runs on our self-hosted runner with full access to this job's
+# secrets, so only dispatch this for a fork PR you've actually reviewed:
+#   gh workflow run signoff.yml -f pr_number=<PR number>
+# The PR's head commit (not the mutable branch) is what gets checked out and
+# signed off, pinned at resolve time, so a push to the fork branch after you
+# dispatch doesn't silently swap in unreviewed code. The fork is fetched as a
+# second git remote rather than passed to actions/checkout's `repository:` —
+# that input repoints "origin" at whatever repo it's given, which would
+# misdirect every `gh`-based repo lookup in scripts/signoff (status posts,
+# PR/run lookups) at the fork instead of this repo.
+#
+# scripts/signoff and the setup-* composite actions below are also saved to
+# .trusted-ci/ from this repo *before* any fork commit is checked out, and
+# every later step references those copies (literal `.trusted-ci/...` paths)
+# rather than the working tree. This runs unconditionally, not just for fork
+# PRs, so every step downstream has one fixed path to depend on instead of
+# branching on is_fork — `uses:` can't read a step output (the `steps`
+# context isn't available there), so a per-case path chosen at runtime
+# isn't an option. Otherwise a fork PR could ship
+# its own scripts/signoff that unconditionally posts "success", or a setup-*
+# action that exfiltrates this job's secrets — i.e. it could rig the very
+# checks meant to validate it. What's still (necessarily) untrusted: the
+# actual build/lint/test run — `make lint-rust`/`build-cli`/`nextest` still
+# execute against the fork's own Makefile/Cargo.toml/build.rs/tests, because
+# that's the code under review. That's inherent to CI-testing any PR's code
+# and isn't something pinning scripts/signoff can fix.
 name: Remote Sign-off
 
-run-name: Remote Sign-off (${{ inputs.branch }})
+run-name: "Remote Sign-off (${{ inputs.pr_number && format('PR #{0}', inputs.pr_number) || inputs.branch }})"
 on:
   workflow_dispatch:
     inputs:
       branch:
-        description: 'Branch to sign off (must be pushed to origin)'
-        required: true
+        description: 'Branch to sign off (must be pushed to origin). Mutually exclusive with pr_number.'
+        required: false
+        type: string
+      pr_number:
+        description: 'PR number to sign off — use this for fork PRs. Resolves and pins to the head commit automatically. Mutually exclusive with branch.'
+        required: false
         type: string
       skip_targeted_lint:
         description: 'Skip the branch-scoped targeted pre-lint'
@@ -37,7 +72,7 @@ on:
         default: false
 
 concurrency:
-  group: signoff-${{ github.event.inputs.branch }}
+  group: signoff-${{ inputs.pr_number || inputs.branch }}
   cancel-in-progress: true
 
 env:
@@ -49,7 +84,7 @@ env:
 
 jobs:
   sign-off:
-    name: Sign off on ${{ github.event.inputs.branch }}
+    name: "Sign off on ${{ inputs.pr_number && format('PR #{0}', inputs.pr_number) || github.event.inputs.branch }}"
     runs-on: spiceai-macos
     permissions:
       contents: read
@@ -71,38 +106,156 @@ jobs:
       SIGNOFF_DEBUG: '1'
 
     steps:
-      - name: Validate branch input
+      - name: Resolve branch/PR input
+        id: resolve
         env:
-          BRANCH: ${{ github.event.inputs.branch }}
+          BRANCH: ${{ inputs.branch }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          BASE_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          if [[ -z "${BRANCH// }" ]]; then
-            echo "::error::branch input is required"
+          if [[ -n "${BRANCH// }" && -n "${PR_NUMBER// }" ]]; then
+            echo "::error::specify either 'branch' or 'pr_number', not both"
             exit 1
           fi
-          # Mirror scripts/signoff remote: allow feature/foo, reject whitespace,
-          # quotes, $, `, leading dashes, absolute paths, `..`, and any char
-          # outside [A-Za-z0-9._/-] so dispatch/checkout cannot be broken by the name.
-          if [[ "$BRANCH" =~ [[:space:]] || "$BRANCH" == -* || "$BRANCH" == /* || "$BRANCH" == *..* \
-              || "$BRANCH" == *\"* || "$BRANCH" == *\'* || "$BRANCH" == *\$* || "$BRANCH" == *\`* ]]; then
-            echo "::error::invalid branch name: '${BRANCH}'"
+
+          if [[ -n "${PR_NUMBER// }" ]]; then
+            if [[ ! "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+              echo "::error::pr_number must be a positive integer, got '${PR_NUMBER}'"
+              exit 1
+            fi
+            pr_json=$(gh pr view "$PR_NUMBER" --repo "$BASE_REPO" \
+              --json state,isCrossRepository,headRepositoryOwner,headRepository,headRefName,headRefOid) \
+              || { echo "::error::could not look up PR #${PR_NUMBER} on ${BASE_REPO}"; exit 1; }
+
+            state=$(jq -r '.state' <<<"$pr_json")
+            is_fork=$(jq -r '.isCrossRepository' <<<"$pr_json")
+            head_ref=$(jq -r '.headRefName' <<<"$pr_json")
+            head_sha=$(jq -r '.headRefOid' <<<"$pr_json")
+            owner=$(jq -r '.headRepositoryOwner.login' <<<"$pr_json")
+            name=$(jq -r '.headRepository.name' <<<"$pr_json")
+
+            if [[ "$state" != "OPEN" ]]; then
+              echo "::warning::PR #${PR_NUMBER} is ${state}, not OPEN — signing off its last-known head anyway"
+            fi
+
+            checkout_repo="${owner}/${name}"
+            # Pin to the exact commit resolved right now, not the mutable
+            # branch — the PR author (fork owner or collaborator) can push
+            # new commits between this dispatch and when the runner actually
+            # checks it out, and this job runs that code with full secrets.
+            checkout_ref="$head_sha"
+
+            if [[ "$is_fork" == "true" ]]; then
+              echo "::warning::Signing off PR #${PR_NUMBER} from FORK ${checkout_repo}@${head_ref}, pinned to ${head_sha}. This runs fork-authored code (build scripts, tests, Makefiles) on a self-hosted runner with full access to this job's secrets — only dispatch this for a fork PR you've reviewed and trust."
+            fi
+            echo "Signing off PR #${PR_NUMBER}: ${checkout_repo}@${checkout_ref}"
+          elif [[ -n "${BRANCH// }" ]]; then
+            # Mirror scripts/signoff remote: allow feature/foo, reject whitespace,
+            # quotes, $, `, leading dashes, absolute paths, `..`, and any char
+            # outside [A-Za-z0-9._/-] so dispatch/checkout cannot be broken by the name.
+            if [[ "$BRANCH" =~ [[:space:]] || "$BRANCH" == -* || "$BRANCH" == /* || "$BRANCH" == *..* \
+                || "$BRANCH" == *\"* || "$BRANCH" == *\'* || "$BRANCH" == *\$* || "$BRANCH" == *\`* ]]; then
+              echo "::error::invalid branch name: '${BRANCH}'"
+              exit 1
+            fi
+            if [[ ! "$BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+              echo "::error::invalid branch name: '${BRANCH}'"
+              exit 1
+            fi
+            checkout_repo="$BASE_REPO"
+            checkout_ref="$BRANCH"
+            echo "Signing off branch: ${BRANCH}"
+          else
+            echo "::error::one of 'branch' or 'pr_number' is required"
             exit 1
           fi
-          if [[ ! "$BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]]; then
-            echo "::error::invalid branch name: '${BRANCH}'"
-            exit 1
+
+          if [[ "$checkout_repo" == "$BASE_REPO" ]]; then
+            is_fork=false
+          else
+            is_fork=true
           fi
-          echo "Signing off branch: ${BRANCH}"
+
+          echo "checkout_repo=${checkout_repo}" >> "$GITHUB_OUTPUT"
+          echo "checkout_ref=${checkout_ref}" >> "$GITHUB_OUTPUT"
+          echo "is_fork=${is_fork}" >> "$GITHUB_OUTPUT"
           echo "Triggered by: ${{ github.actor }}"
           echo "Targeted pre-lint base: trunk (fixed)"
 
-      - name: Check out branch
+      - name: Check out branch/PR
+        # Same-repo case only — never pass a `repository:` override here. Doing
+        # so would repoint the local "origin" remote at whatever repo we pass,
+        # which breaks every `gh` call in scripts/signoff that infers the repo
+        # from "origin" (status posts, PR/run lookups) — they'd silently target
+        # that other repo instead of this one. The fork case below keeps
+        # "origin" pointed at this repo and fetches the fork as a second,
+        # separate remote instead.
+        if: steps.resolve.outputs.is_fork != 'true'
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ github.event.inputs.branch }}
+          ref: ${{ steps.resolve.outputs.checkout_ref }}
           # Full history so local merge-base with trunk works when trunk is present.
           # scripts/signoff still falls back to the GitHub compare API if needed.
           fetch-depth: 0
+
+      - name: Check out this repo (fork PR)
+        # Establishes "origin" == this repo and full history, same as the
+        # step above. The actual PR content is fetched from the fork and
+        # checked out over this in the next step; ref is left at whatever
+        # triggered this workflow_dispatch since it's immediately replaced.
+        if: steps.resolve.outputs.is_fork == 'true'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          # Defense in depth: the next step pulls in fork-authored code, which
+          # shouldn't be able to read a persisted git credential back out of
+          # .git/config. `gh`/git operations in this job authenticate via
+          # GH_TOKEN instead, so this doesn't affect them.
+          persist-credentials: false
+
+      - name: Save trusted CI helpers
+        # scripts/signoff decides pass/fail and posts the sign-off status;
+        # the setup-* composite actions below run with this job's secrets in
+        # scope (sccache/MinIO creds, etc.). For a fork PR, the next step
+        # overlays the fork's commit onto the working tree, so those paths
+        # would otherwise resolve to whatever the fork shipped — e.g. a fork
+        # could ship a scripts/signoff that unconditionally posts "success"
+        # regardless of whether checks passed, or a setup-rust action that
+        # exfiltrates secrets. Copying them out now, from this repo's
+        # checkout, and pointing every later step at these copies keeps the
+        # checks/decision/status-post logic trusted even though the code
+        # being built/linted/tested may be the fork's. Unconditional (not
+        # just for forks) so every later step has one fixed path regardless
+        # of is_fork — see the top-of-file comment. This directory is
+        # untracked, so the fork checkout below (which only touches tracked
+        # paths) leaves it alone.
+        run: |
+          set -euo pipefail
+          mkdir -p .trusted-ci
+          cp -R .github/actions .trusted-ci/actions
+          cp scripts/signoff .trusted-ci/signoff
+          chmod +x .trusted-ci/signoff
+          echo "Saved trusted CI helpers from $(git rev-parse --short HEAD) to .trusted-ci/"
+
+      - name: Fetch and check out fork head commit
+        if: steps.resolve.outputs.is_fork == 'true'
+        env:
+          FORK_REPO: ${{ steps.resolve.outputs.checkout_repo }}
+          FORK_SHA: ${{ steps.resolve.outputs.checkout_ref }}
+        run: |
+          set -euo pipefail
+          echo "Fetching ${FORK_SHA} from fork ${FORK_REPO} ('origin' stays $(git remote get-url origin))…"
+          git remote add fork-source "https://github.com/${FORK_REPO}.git"
+          # No --depth: a shallow fetch here would leave HEAD with no known
+          # parents, breaking the local `git merge-base HEAD origin/trunk`
+          # below (and scripts/signoff's own diffing). A full fetch is cheap
+          # in practice — this fork shares almost all of its object history
+          # with the "Check out this repo" step's already-fetched origin.
+          git fetch --no-tags fork-source "$FORK_SHA"
+          git checkout --detach "$FORK_SHA"
+          git remote remove fork-source
+          echo "Checked out: $(git rev-parse HEAD)"
 
       - name: Fetch trunk for targeted pre-lint
         run: |
@@ -114,10 +267,10 @@ jobs:
           echo "merge-base with origin/trunk: $(git merge-base HEAD origin/trunk 2>/dev/null | cut -c1-12 || echo 'n/a (API fallback)')"
 
       - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+        uses: ./.trusted-ci/actions/setup-rust
 
       - name: Set up Nextest
-        uses: ./.github/actions/setup-nextest
+        uses: ./.trusted-ci/actions/setup-nextest
 
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
@@ -131,25 +284,25 @@ jobs:
           region: us-west-1
 
       - name: Set up sccache
-        uses: ./.github/actions/setup-sccache
+        uses: ./.trusted-ci/actions/setup-sccache
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
 
       - name: Install Protoc
-        uses: ./.github/actions/install-protoc
+        uses: ./.trusted-ci/actions/install-protoc
 
       - name: Set up make
-        uses: ./.github/actions/setup-make
+        uses: ./.trusted-ci/actions/setup-make
 
       - name: Set up cc
-        uses: ./.github/actions/setup-cc
+        uses: ./.trusted-ci/actions/setup-cc
 
       - name: Sign off
         # -f: Actions checkouts have no @{push} upstream tracking, so the local
         # clean/pushed guards would otherwise refuse to run. The branch ref was
         # just checked out from origin, so HEAD is exactly the remote tip.
-        run: scripts/signoff -f
+        run: .trusted-ci/signoff -f
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
