@@ -84,6 +84,14 @@ impl Runtime {
             tracing::debug!("Updated pods information: {new_app:?}");
             tracing::debug!("Previous pods information: {current_app:?}");
 
+            // `runtime.cpu` sizes thread pools that are already running, so it
+            // is start-time only. Say so rather than silently ignoring the edit.
+            if current_app.runtime.cpu != new_app.runtime.cpu {
+                tracing::warn!(
+                    "`runtime.cpu` changed, but the CPU budget sizes thread pools that are already running: the previous value stays in effect. Restart spiced to apply it."
+                );
+            }
+
             Arc::clone(&self)
                 .apply_catalog_diff(current_app, &new_app)
                 .await;

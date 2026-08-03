@@ -158,7 +158,7 @@ impl CayenneContext {
         // reads exactly the static value until (and unless) the controller moves
         // it — enabling dynamic tuning is therefore a strict, bounded refinement,
         // never a behavior change on its own.
-        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        let cores = cpu_budget::cpu_budget().cayenne_write_concurrency_ceiling();
         // When `write_concurrency` is unset, seed the live actuator to the SAME value
         // the write path resolves to (`DEFAULT_WRITE_CONCURRENCY` capped by host
         // cores), not 0. The controller grows from this real current value; a 0
