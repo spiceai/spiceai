@@ -353,9 +353,12 @@ pub struct DataFusionBuilder {
     cayenne_sort_merge_memory_pool_fraction: Option<f64>,
     cayenne_footer_cache_mb: Option<usize>,
     /// Fraction of the query memory limit to carve into a dedicated compaction
-    /// memory pool. `Some` only when Cayenne acceleration is configured and
-    /// dedicated thread pools are enabled (set by the Runtime builder); `None`
-    /// leaves the full budget to queries and gives compaction no separate pool.
+    /// memory pool. `Some` only when dedicated thread pools are enabled AND at
+    /// least one enabled Cayenne acceleration can compact into it — a file
+    /// acceleration mode on a profile that accumulates files (set by the Runtime
+    /// builder; see [`crate::builder::CayenneWorkload::needs_compaction`]). `None`
+    /// leaves the full budget to queries and gives compaction no separate pool; it
+    /// then accounts against the query pool, as it does with no Cayenne at all.
     compaction_memory_fraction: Option<f64>,
     /// Estimated aggregate bytes the enabled Cayenne tables reserve OUTSIDE the
     /// query pool (the per-table scan segment cache on every table, plus
@@ -367,6 +370,12 @@ pub struct DataFusionBuilder {
     /// Runtime builder from the Spicepod. Gates the coordinated host-memory
     /// partition, which exists solely to leave room for the in-memory CDC tier.
     cayenne_workload: crate::builder::CayenneWorkload,
+    /// Whether `runtime.params.dedicated_thread_pool` leaves the dedicated pools on
+    /// (set by the Runtime builder; the default is on). The in-memory CDC tier
+    /// budget is installed by `set_compaction_runtime`, which `spiced` only calls
+    /// when they are, so the coordinated host-memory partition is pointless without
+    /// them — it would shrink the query pool for a tier cap that never installs.
+    dedicated_thread_pools_enabled: bool,
     /// Coordinated query-pool ceiling (bytes) when `DuckDB` file accelerators are
     /// present, computed by the Runtime builder's cgroup-aware budget so the query
     /// pool + each `DuckDB` instance's own `memory_limit` can't over-commit the
@@ -434,6 +443,7 @@ impl DataFusionBuilder {
             compaction_memory_fraction: None,
             cayenne_reservation_bytes: 0,
             cayenne_workload: crate::builder::CayenneWorkload::default(),
+            dedicated_thread_pools_enabled: true,
             duckdb_query_pool_cap: None,
             cayenne_optimizer_rules: CayenneOptimizerRules::default(),
             additional_analyzer_rules: vec![],
@@ -604,6 +614,14 @@ impl DataFusionBuilder {
         self
     }
 
+    /// Whether the dedicated thread pools are left on. Gates the coordinated
+    /// host-memory partition alongside the workload; see the field docs.
+    #[must_use]
+    pub fn dedicated_thread_pools_enabled(mut self, enabled: bool) -> Self {
+        self.dedicated_thread_pools_enabled = enabled;
+        self
+    }
+
     /// Coordinated query-pool ceiling (bytes) when `DuckDB` file accelerators are
     /// present. Reduces ONLY the default query pool (via a `min`-cap in
     /// [`effective_query_memory_limit`]) so the query pool + each `DuckDB` instance's
@@ -617,9 +635,11 @@ impl DataFusionBuilder {
         self
     }
 
-    /// Carve a dedicated compaction memory pool of `fraction` of the query
-    /// memory limit. Set by the Runtime builder only when Cayenne acceleration
-    /// is configured and dedicated thread pools are enabled.
+    /// Sets the fraction of the query memory limit carved into a dedicated Cayenne
+    /// compaction pool. The Runtime builder passes `Some` only when dedicated thread
+    /// pools are enabled and at least one enabled acceleration can compact into the
+    /// pool; `None` leaves the whole budget to queries and lets compaction account
+    /// against the query pool.
     #[must_use]
     pub fn compaction_memory_fraction(mut self, fraction: Option<f64>) -> Self {
         self.compaction_memory_fraction = fraction;
@@ -687,14 +707,14 @@ impl DataFusionBuilder {
     pub fn build(self) -> DataFusion {
         let mut config = self.config;
         // Request a dedicated compaction memory budget when a fraction is
-        // configured (Cayenne acceleration + dedicated thread pools). The query pool
-        // is only shrunk by the compaction carve after the dedicated compaction
-        // RuntimeEnv builds successfully; otherwise queries keep the full configured
-        // budget.
+        // configured. The Runtime builder sets it only when dedicated thread pools
+        // are enabled AND a Cayenne acceleration can actually compact into it. The
+        // query pool is only shrunk by the compaction carve after the dedicated
+        // compaction RuntimeEnv builds successfully; otherwise queries keep the full
+        // configured budget.
         let compaction_memory_fraction = self
             .compaction_memory_fraction
             .and_then(validate_compaction_memory_fraction);
-        let compaction_pool_carved = compaction_memory_fraction.is_some();
         // The coordinated host-memory partition — a reduced query-pool default that
         // leaves room for the off-pool in-memory CDC tier, so
         // `query_pool + compaction + tier + headroom <= host` — is gated on the tier
@@ -705,10 +725,15 @@ impl DataFusionBuilder {
         // concurrency wall — for nothing. Such a pod keeps the standard default,
         // still reduced by its measured off-pool cache reservation below.
         //
-        // Also gated on the compaction carve, which is the runtime builder's signal
-        // that dedicated thread pools are enabled: `set_compaction_runtime` is what
-        // installs the mem-tier budget, and it only runs when they are.
-        let cayenne_cdc_active = compaction_pool_carved && self.cayenne_workload.uses_cdc_tier();
+        // Also gated on dedicated thread pools, because `set_compaction_runtime` is
+        // what installs the mem-tier budget and it only runs when they are enabled.
+        // That is deliberately NOT read off the compaction carve: the carve
+        // additionally requires a file acceleration mode, and a `mode: memory` table
+        // — the Spicepod default — reaches the tier without ever compacting into a
+        // carve, so keying the two together would drop the partition for exactly the
+        // pod that holds its whole dataset in RAM.
+        let cayenne_cdc_active =
+            self.dedicated_thread_pools_enabled && self.cayenne_workload.uses_cdc_tier();
         let effective_memory_limit = effective_query_memory_limit(
             self.memory_limit,
             cayenne_cdc_active,

@@ -218,6 +218,7 @@ candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "6e
 charset = "0.1.5"
 chrono = "0.4.44"
 clap = { version = "4.5.60", features = ["derive", "env"] }
+crash-handler = "0.8"
 clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0.2.2", features = [
     "tokio_io",
     "tls",
@@ -412,7 +413,7 @@ tracing = "0.1.43"
 tracing-futures = { version = "0.2.5", features = ["futures-03"] }
 tracing-opentelemetry = "0.33"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
-turso = { version = "0.7.1", default-features = false }
+turso = { version = "0.7.2", default-features = false }
 turso-shared = { path = "crates/turso-shared" }
 twox-hash = "2.1.2"
 url = { version = "2.5", features = ["serde"] }

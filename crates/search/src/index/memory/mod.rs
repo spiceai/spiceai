@@ -326,6 +326,17 @@ impl Index for MemoryVectorIndex {
             .map(|rb| async { self.write(rb).await.map_err(DataFusionError::External) });
         try_join_all(futs).await
     }
+
+    async fn delete_by_keys(&self, keys: RecordBatch) -> Result<(), DataFusionError> {
+        let key_strings =
+            write_util::extract_and_format_primary_key(INDEX_NAME, &self.primary_key, &keys)
+                .map_err(|e| DataFusionError::External(Box::new(*e)))?
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+
+        self.store.write().delete_by_keys(&key_strings)
+    }
 }
 
 #[async_trait]

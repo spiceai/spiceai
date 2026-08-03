@@ -125,6 +125,7 @@ use yaml::Value;
 const TELEMETRY_DISABLED_SETTING_IGNORED_MESSAGE: &str = "Usage telemetry is anonymous and aggregated. In Spice.ai Open Source, setting runtime.telemetry.enabled: false in a Spicepod or passing --telemetry-enabled=false does not disable anonymous usage telemetry. To remove anonymous telemetry from an Open Source build, build from source without the anonymous_telemetry feature, or consider using Spice.ai Enterprise. Learn more at https://docs.spice.ai/docs/enterprise";
 
 mod cloud_connect;
+pub mod crash_handler;
 mod log_capture;
 #[path = "tracing.rs"]
 mod spiced_tracing;
@@ -661,8 +662,9 @@ pub async fn run(args: Args) -> Result<()> {
             // memory environment from the initial spicepod. `set_compaction_runtime`
             // injects the carved memory environment only when one is available.
             //
-            // The one case we can rule out is a pod whose Cayenne tables are ALL
-            // full-refresh: a whole-table replace leaves nothing to consolidate, so
+            // The one case we can rule out is a pod where no Cayenne table can
+            // produce a file to compact: a whole-table replace leaves nothing to
+            // consolidate, and `mode: memory` never writes a Vortex file at all, so
             // their background compactors are never even spawned. A table created
             // later by DDL in such a pod falls back to the ambient runtime
             // (`spawn_compaction` handles an uninstalled handle), trading isolation —
