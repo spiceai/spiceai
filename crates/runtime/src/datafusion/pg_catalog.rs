@@ -41,7 +41,15 @@ use datafusion::{
 };
 
 pub const OBJ_DESCRIPTION_UDF_NAME: &str = "obj_description";
+runtime_udfs_api::register_spice_function!(
+    OBJ_DESCRIPTION_SPICE_FUNCTION,
+    OBJ_DESCRIPTION_UDF_NAME
+);
 pub const COL_DESCRIPTION_UDF_NAME: &str = "col_description";
+runtime_udfs_api::register_spice_function!(
+    COL_DESCRIPTION_SPICE_FUNCTION,
+    COL_DESCRIPTION_UDF_NAME
+);
 
 static NEXT_COMMENT_UDF_ID: AtomicU64 = AtomicU64::new(1);
 

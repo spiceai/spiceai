@@ -78,7 +78,7 @@ impl KafkaSys {
         type MetadataRow = (String, String, String);
 
         let dataset_name = self.dataset_name.clone();
-        let schema_needs_ensure = self.schema_needs_ensure();
+        let schema_needs_ensure = self.schema_ensured.needs_ensure();
 
         let conn_sync = pool.connect_sync();
         let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
@@ -114,7 +114,7 @@ impl KafkaSys {
             .map_err(Error::external)?;
 
         if schema_needs_ensure {
-            self.mark_schema_ensured();
+            self.schema_ensured.mark_ensured();
         }
 
         let Some((consumer_group_id, topic, schema_json, offsets)) = result else {
@@ -137,7 +137,7 @@ impl KafkaSys {
         let dataset_name = self.dataset_name.clone();
         let new_offsets = offsets.to_vec();
         let warn_dataset = self.dataset_name.clone();
-        let schema_needs_ensure = self.schema_needs_ensure();
+        let schema_needs_ensure = self.schema_ensured.needs_ensure();
 
         let conn_sync = pool.connect_sync();
         let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
@@ -167,7 +167,7 @@ impl KafkaSys {
             .map_err(Error::external)?;
 
         if schema_needs_ensure {
-            self.mark_schema_ensured();
+            self.schema_ensured.mark_ensured();
         }
 
         Ok(())
