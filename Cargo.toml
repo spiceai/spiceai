@@ -96,7 +96,7 @@ license-file = "LICENSE"
 publish = false
 repository = "https://github.com/spiceai/spiceai"
 rust-version = "1.95.0"
-version = "2.1.2"
+version = "2.1.3"
 
 [workspace.dependencies]
 adbc_core = "0.23"
