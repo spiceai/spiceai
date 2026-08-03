@@ -615,9 +615,7 @@ impl CayenneAccelerator {
 
     #[must_use]
     pub fn with_footer_cache_mb(footer_cache_mb: Option<usize>) -> Self {
-        let permits = std::thread::available_parallelism()
-            .map_or(1, std::num::NonZeroUsize::get)
-            .max(1);
+        let permits = cpu_budget::cpu_budget().cayenne_compaction_permits();
         Self {
             catalog: Arc::new(OnceCell::new()),
             footer_cache_mb,

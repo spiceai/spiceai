@@ -205,7 +205,7 @@ impl HardwareProfile {
         data_path: &str,
         metastore_path: &str,
     ) -> Self {
-        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        let cores = cpu_budget::cpu_budget().cayenne_write_concurrency_ceiling();
         let total_mem_bytes = crate::resource_monitor::get_total_memory();
         // The two storage classifications, the two calibration probes (cloud-agnostic,
         // memoized per volume — the only storage signal for a memory-tier table that

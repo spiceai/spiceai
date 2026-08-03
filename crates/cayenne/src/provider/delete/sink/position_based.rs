@@ -36,7 +36,6 @@ use datafusion::execution::context::SessionContext;
 use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
 use datafusion_common::DFSchema;
 use datafusion_common::tree_node::TreeNode;
-use datafusion_common::utils::get_available_parallelism;
 use datafusion_expr::Expr;
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::create_physical_expr;
@@ -54,7 +53,8 @@ use vortex_datafusion::DefaultExpressionConvertor;
 use vortex_datafusion::ExpressionConvertor;
 use vortex_session::VortexSession;
 
-static MAX_CONCURRENT_FILE_SCANS: LazyLock<usize> = LazyLock::new(get_available_parallelism);
+static MAX_CONCURRENT_FILE_SCANS: LazyLock<usize> =
+    LazyLock::new(|| cpu_budget::cpu_budget().cayenne_max_concurrent_file_scans());
 
 impl CayenneDeletionSink {
     /// Delete filtered rows using Vortex-native streaming scan with per-file deletion tracking.

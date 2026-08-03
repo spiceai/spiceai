@@ -455,9 +455,7 @@ impl SqliteMetastore {
     async fn pool(&self) -> CatalogResult<&Arc<SqliteConnectionPool>> {
         self.pool
             .get_or_try_init(|| async {
-                let k = std::thread::available_parallelism()
-                    .map_or(4, |n| n.get().min(32))
-                    .max(2);
+                let k = cpu_budget::cpu_budget().metastore_pool_connections();
                 let mut conns = Vec::with_capacity(k);
                 for _ in 0..k {
                     conns.push(Arc::new(Mutex::new(self.open_connection().await?)));

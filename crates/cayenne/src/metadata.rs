@@ -1024,7 +1024,7 @@ impl SchemaEvolutionMode {
 }
 
 fn default_concurrency() -> usize {
-    std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+    cpu_budget::cpu_budget().cayenne_upload_concurrency()
 }
 
 fn default_upload_concurrency() -> usize {
@@ -1164,8 +1164,8 @@ impl VortexConfig {
     ///
     /// Pure and side-effect-free so the rules stay unit-testable. The actual
     /// clamping still happens at the use sites — this only makes it visible
-    /// instead of silent. `available_cores` is the host's logical core count (the
-    /// encode-shard ceiling); pass `std::thread::available_parallelism()`.
+    /// instead of silent. `available_cores` is the encode-shard ceiling; pass
+    /// `cpu_budget::cpu_budget().cayenne_write_concurrency_ceiling()`.
     #[must_use]
     pub fn config_warnings(&self, available_cores: usize) -> Vec<String> {
         let cores = available_cores.max(1);
@@ -1178,7 +1178,7 @@ impl VortexConfig {
             && write_concurrency > cores
         {
             warnings.push(format!(
-                "cayenne_write_concurrency ({write_concurrency}) exceeds the host core count ({cores}); encode is CPU-bound so it is capped at {cores} — the surplus only inflates the per-snapshot file count without speeding the write. Set it to {cores} or below."
+                "cayenne_write_concurrency ({write_concurrency}) exceeds the runtime's CPU budget ({cores} cores); encode is CPU-bound so it is capped at {cores} — the surplus only inflates the per-snapshot file count without speeding the write. Set it to {cores} or below."
             ));
         }
 
@@ -1291,6 +1291,10 @@ impl Default for VortexConfig {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "these tests assert the defaults against the host the test process sees, which is the value the budget resolves to when nothing is configured"
+)]
 mod tests {
     use super::{PkConflictDetection, VortexConfig};
 

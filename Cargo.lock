@@ -3497,6 +3497,7 @@ dependencies = [
  "bytes",
  "chdb-rust",
  "chrono",
+ "cpu-budget",
  "criterion 0.7.0",
  "data_components",
  "datafusion",
@@ -4595,6 +4596,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2bb79cb74d735044c972aae58ed0aaa9a837e85b01106a54c39e42e97f62253"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "cpu-budget"
+version = "2.1.3"
+dependencies = [
+ "insta",
+ "snafu",
+ "tracing",
 ]
 
 [[package]]
@@ -16131,6 +16141,7 @@ dependencies = [
  "connector-smb",
  "connector-snowflake",
  "connector-spark",
+ "cpu-budget",
  "criterion 0.7.0",
  "csv",
  "dashmap",
@@ -16345,9 +16356,9 @@ dependencies = [
 name = "runtime-async"
 version = "2.1.3"
 dependencies = [
+ "cpu-budget",
  "futures",
  "libc",
- "num_cpus",
  "snafu",
  "tokio",
  "tokio-util",
@@ -16639,6 +16650,7 @@ dependencies = [
  "async-trait",
  "cache",
  "chunking",
+ "cpu-budget",
  "data_components",
  "datafusion",
  "datafusion-expr",
@@ -18429,6 +18441,7 @@ dependencies = [
  "connector-smb",
  "connector-snowflake",
  "connector-spark",
+ "cpu-budget",
  "crash-handler",
  "event_stream",
  "futures",
@@ -18453,6 +18466,7 @@ dependencies = [
  "snmalloc-rs",
  "spice-cloud",
  "telemetry",
+ "tempfile",
  "tikv-jemallocator",
  "tokio",
  "tpc-extension",

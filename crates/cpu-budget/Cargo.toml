@@ -1,0 +1,17 @@
+[package]
+description = "Resolves how many CPUs the Spice runtime is entitled to, and owns every sizing decision derived from it"
+edition.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "cpu-budget"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+snafu.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+

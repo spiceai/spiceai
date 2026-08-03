@@ -1300,16 +1300,11 @@ pub async fn initialize_cluster_executor(
 
     let app_def = Arc::new(app_def);
 
-    let Some(concurrent_tasks) = std::thread::available_parallelism()
-        .ok()
-        .and_then(|nz| u32::try_from(nz.get()).ok())
-    else {
-        return Err(FailedToStartClusterExecutor {
-            source: "Unable to determine executor task parallelism."
-                .to_string()
-                .into(),
-        });
-    };
+    // The CPU budget is always at least one core, so this only saturates on a
+    // machine with more than 4 billion of them.
+    let concurrent_tasks =
+        u32::try_from(cpu_budget::cpu_budget().cluster_executor_concurrent_tasks())
+            .unwrap_or(u32::MAX);
 
     let executor_meta = ExecutorRegistration {
         id: executor_id.clone(),
