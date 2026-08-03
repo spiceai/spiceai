@@ -6022,9 +6022,18 @@ mod tests {
             CayenneAccelerator::get_vortex_config("full_partial_override", &large_write_dataset)
                 .await;
 
+        // Bulk-overwrite inlines too, on the same static caps as small-write, so
+        // the un-overridden knobs keep those defaults rather than the zeros that
+        // meant "this profile never inlines".
         assert_eq!(large_write_config.inline_max_rows, 321);
-        assert_eq!(large_write_config.inline_max_bytes, 0);
-        assert_eq!(large_write_config.inline_max_buffer_bytes, 0);
+        assert_eq!(
+            large_write_config.inline_max_bytes,
+            SMALL_WRITE_INLINE_MAX_BYTES
+        );
+        assert_eq!(
+            large_write_config.inline_max_buffer_bytes,
+            SMALL_WRITE_INLINE_MAX_BUFFER_BYTES
+        );
     }
 
     #[tokio::test]
