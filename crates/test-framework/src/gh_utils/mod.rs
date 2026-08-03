@@ -26,6 +26,10 @@ pub struct GitHubWorkflow {
     pub repo: String,
     pub workflow_file: String,
     pub r#ref: String,
+    /// Run ID excluded from `active_runs_count`. A workflow that dispatches runs of its
+    /// own workflow file must exclude its own run, or it always counts toward the
+    /// concurrency limit and no slot ever frees up.
+    pub excluded_run_id: Option<u64>,
 }
 
 impl GitHubWorkflow {
@@ -36,7 +40,14 @@ impl GitHubWorkflow {
             repo: repo.to_string(),
             workflow_file: workflow_file.to_string(),
             r#ref: r#ref.to_string(),
+            excluded_run_id: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_excluded_run_id(mut self, run_id: Option<u64>) -> Self {
+        self.excluded_run_id = run_id;
+        self
     }
 
     /// Dispatches the GitHub workflow with the provided JSON input as workflow inputs
@@ -112,6 +123,7 @@ impl GitHubWorkflow {
     /// Returns the number of active workflow runs for this workflow.
     ///
     /// Active runs include workflows that are either queued or currently in progress.
+    /// The run identified by `excluded_run_id` (if set) is not counted.
     ///
     /// Notes:
     /// - This method retrieves **only the first page** of results, with a maximum of **100 runs** (`per_page(100)` limit).
@@ -127,6 +139,7 @@ impl GitHubWorkflow {
             .items
             .into_iter()
             .filter(|run| matches!(run.status.as_str(), "queued" | "in_progress" | "waiting"))
+            .filter(|run| self.excluded_run_id.is_none_or(|id| run.id.0 != id))
             .count();
 
         Ok(active_runs)

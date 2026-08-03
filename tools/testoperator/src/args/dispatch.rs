@@ -58,6 +58,12 @@ pub struct DispatchArgs {
     /// Dry run mode - print the workflow dispatch request without sending it
     #[arg(long, default_value = "false")]
     pub(crate) dry_run: bool,
+
+    /// Workflow run ID to exclude when counting active runs for `--max-concurrent`.
+    /// Defaults to `GITHUB_RUN_ID` on GitHub Actions runners, so a workflow that
+    /// dispatches runs of its own workflow file does not count itself as active.
+    #[arg(long, env = "GITHUB_RUN_ID")]
+    pub(crate) exclude_run_id: Option<u64>,
 }
 
 #[derive(Debug, Copy, Clone, ValueEnum)]
