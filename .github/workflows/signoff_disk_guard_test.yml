@@ -49,4 +49,6 @@ jobs:
           persist-credentials: false
 
       - name: Run tests
-        run: scripts/test_signoff_disk_guard.sh
+        # Invoked through `bash` rather than as `./…` so the job does not depend
+        # on the script's executable bit surviving a checkout on every platform.
+        run: bash scripts/test_signoff_disk_guard.sh
