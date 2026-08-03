@@ -566,7 +566,29 @@ impl RuntimeHandle for SpicedRuntimeHandle {
         let catalogs = new_app.catalogs.len();
         let views = new_app.views.len();
 
-        let changed = Arc::clone(&self.runtime).apply_app(Arc::new(new_app)).await;
+        // A deployment supersedes an unfinished initial component load. That
+        // load may be retrying forever against the very spicepod this one
+        // replaces, and it holds no lock the apply below could wait on: left
+        // running it would keep registering datasets from the app it started
+        // against, after this app had replaced it.
+        //
+        // Taken only once the spicepod has been validated and staged, so a
+        // rejected deployment leaves the in-flight load running rather than
+        // cancelling it with nothing to put in its place.
+        let superseded_initial_load = self.runtime.supersede_initial_load();
+
+        let new_app = Arc::new(new_app);
+        let changed = if superseded_initial_load {
+            // The cancelled load left only some of the previous app registered,
+            // so reconcile against what is actually registered rather than what
+            // was declared — otherwise a dataset present in both apps but never
+            // reached by the load is diffed as unchanged and never loads.
+            Arc::clone(&self.runtime)
+                .apply_app_after_cancelled_load(new_app)
+                .await
+        } else {
+            Arc::clone(&self.runtime).apply_app(new_app).await
+        };
 
         let restart_required = !restart_sections.is_empty();
         if restart_required {

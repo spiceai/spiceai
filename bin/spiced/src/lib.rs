@@ -861,32 +861,32 @@ pub async fn run(args: Args) -> Result<()> {
     )
     .await;
 
-    let mut components_loaded = false;
+    // Spice Cloud Connect. Default off — only activates on the explicit
+    // `--cloud-connect` flag, or when an identity is on disk or an adoption
+    // code is available. Failures here are non-fatal: spiced keeps running.
+    //
+    // Started BEFORE `load_components()` so the control plane holds a session
+    // while components initialize. The load has no deadline — a dataset whose
+    // source is unreachable is retried for as long as the runtime is up — so
+    // gating the channel on a finished load lets a spicepod the runtime cannot
+    // satisfy lock out the very deployment that would fix it, with no way back
+    // short of an operator editing files on the host. Commands are answered
+    // during the load and `GetStatus` reports the runtime as progressing until
+    // it finishes; an `ApplySpicepod` supersedes the load outright.
+    let cloud_connect_handle = cloud_connect::maybe_start(
+        env!("CARGO_PKG_VERSION"),
+        Arc::clone(&rt),
+        cloud_connect_flag,
+        delivered_secrets,
+    )
+    .await;
+
     tokio::select! {
-        () = Arc::clone(&rt).load_components() => { components_loaded = true; },
+        () = Arc::clone(&rt).load_components() => {},
         () = runtime::shutdown_signal() => {
             tracing::debug!("Cancelling runtime initializing!");
         },
     }
-
-    // Spice Cloud Connect. Default off — only activates on the explicit
-    // `--cloud-connect` flag, or when an identity is on disk or an adoption
-    // code is available. Failures here are non-fatal: spiced keeps running.
-    // Started only after `load_components()` completes so an adopted control
-    // plane can't issue GetRuntimeInfo against a half-loaded runtime
-    // (datasets/models still registering).
-    let cloud_connect_handle = if components_loaded {
-        cloud_connect::maybe_start(
-            env!("CARGO_PKG_VERSION"),
-            Arc::clone(&rt),
-            cloud_connect_flag,
-            delivered_secrets,
-        )
-        .await
-    } else {
-        // Shutting down before components finished loading — don't start.
-        None
-    };
 
     let result = match server_thread.await {
         // Don't treat force terminated as an error

@@ -19,6 +19,7 @@ use std::sync::Arc;
 use app::{App, AppBuilder};
 
 use crate::Runtime;
+use crate::component::dataset::Dataset;
 
 impl Runtime {
     pub(crate) async fn start_pods_watcher(self: Arc<Self>) -> notify::Result<()> {
@@ -76,7 +77,58 @@ impl Runtime {
         // the app state: with applies serialized by `_serialize`, no other path
         // mutates the app during the diff phase, so a write lock is not needed
         // until the final swap.
-        if let Some(ref current_app) = self.read_app().await {
+        let current_app = self.read_app().await;
+        Arc::clone(&self)
+            .apply_app_diff(current_app.as_ref(), new_app)
+            .await
+    }
+
+    /// Hot-apply `new_app` on top of a runtime whose initial component load was
+    /// abandoned by [`Runtime::supersede_initial_load`].
+    ///
+    /// [`Runtime::apply_app`] diffs against the *declared* app, which after a
+    /// cancelled load overstates what is registered: a dataset the load never
+    /// reached is declared but absent, so the diff would find it in both apps,
+    /// treat it as unchanged, and skip it — leaving the table missing for the
+    /// life of the process. This diffs against the datasets that really are
+    /// registered instead, so everything the load did not finish is applied as
+    /// new. Datasets that did load are still diffed normally and are not
+    /// re-registered.
+    ///
+    /// Scope note: only datasets are reconciled this way. They are the
+    /// components the initial load registers through the unbounded-retry path,
+    /// so they are the ones a cancelled load reliably leaves half-registered;
+    /// catalogs, views, and models are diffed against the declared app exactly
+    /// as [`Runtime::apply_app`] does.
+    pub async fn apply_app_after_cancelled_load(self: Arc<Self>, new_app: Arc<App>) -> bool {
+        let _serialize = self.apply_app_lock.lock().await;
+
+        let baseline = self.read_app().await.map(|current| {
+            let mut registered = (*current).clone();
+            registered.datasets.retain(|ds| {
+                Dataset::parse_table_reference(&ds.name)
+                    .is_ok_and(|table| self.df.table_exists(&table))
+            });
+            Arc::new(registered)
+        });
+
+        Arc::clone(&self)
+            .apply_app_diff(baseline.as_ref(), new_app)
+            .await
+    }
+
+    /// Diff-and-apply shared by [`Runtime::apply_app`] and
+    /// [`Runtime::apply_app_after_cancelled_load`].
+    ///
+    /// The caller holds `apply_app_lock`. `current_app` is what to reconcile
+    /// *from*, which is not necessarily the installed app; `new_app` is
+    /// installed either way.
+    async fn apply_app_diff(
+        self: Arc<Self>,
+        current_app: Option<&Arc<App>>,
+        new_app: Arc<App>,
+    ) -> bool {
+        if let Some(current_app) = current_app {
             if *current_app == new_app {
                 return false;
             }
@@ -101,16 +153,9 @@ impl Runtime {
                     .apply_worker_diff(current_app, &new_app)
                     .await;
             }
-
-            let mut app_write_lock = self.app.write().await;
-            let Some(current_app) = app_write_lock.as_mut() else {
-                unreachable!("current app must exist");
-            };
-            *current_app = new_app;
-        } else {
-            let mut app_write_lock = self.app.write().await;
-            *app_write_lock = Some(new_app);
         }
+
+        *self.app.write().await = Some(new_app);
 
         true
     }
