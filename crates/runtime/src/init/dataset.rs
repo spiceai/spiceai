@@ -20,6 +20,7 @@ use crate::cluster::partition::get_partition_filter_exprs;
 use crate::dataaccelerator::BootstrapStatus;
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::caching_engine::CachingEngineSys;
+use crate::dataaccelerator::spice_sys::is_shutdown_cancellation;
 use crate::init::dataset_initialization::DatasetInitialization;
 use crate::{
     AcceleratedTableInvalidChangesSnafu, AcceleratorEngineNotAvailableSnafu,
@@ -1807,10 +1808,17 @@ async fn update_cached_dataset_timestamps(dataset: &Dataset) {
     match CachingEngineSys::try_new(dataset, OpenOption::OpenExisting).await {
         Ok(caching_sys) => {
             if let Err(e) = caching_sys.update_fetched_at().await {
-                tracing::warn!(
-                    "Failed to update _fetched_at for cached dataset {}: {e}",
-                    dataset.name
-                );
+                if is_shutdown_cancellation(&e) {
+                    tracing::debug!(
+                        "Did not update _fetched_at for cached dataset {}: the runtime is shutting down ({e})",
+                        dataset.name
+                    );
+                } else {
+                    tracing::warn!(
+                        "Failed to update _fetched_at for cached dataset {}: {e}",
+                        dataset.name
+                    );
+                }
             } else {
                 tracing::info!(
                     "Updated _fetched_at for all records in cached dataset {}",
