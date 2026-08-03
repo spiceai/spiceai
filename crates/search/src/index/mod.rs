@@ -19,7 +19,10 @@ use std::sync::Arc;
 use arrow::array::RecordBatch;
 use arrow_schema::Field;
 use async_trait::async_trait;
-use datafusion::{error::DataFusionError, logical_expr::LogicalPlan};
+use datafusion::{
+    error::DataFusionError,
+    logical_expr::{Expr, LogicalPlan, ident},
+};
 use runtime_datafusion_index::Index;
 
 pub mod chunking;
@@ -247,11 +250,8 @@ fn embedding_col(search_column: &str) -> String {
 /// Projection expressions selecting `fields` by name — the key columns
 /// [`VectorIndex::list_all_entry_keys`] promises, used both to narrow a listing to them and to
 /// bring two stores' listings to a common schema before combining them.
-pub(crate) fn primary_key_projection(fields: &[Field]) -> Vec<datafusion::logical_expr::Expr> {
-    fields
-        .iter()
-        .map(|f| datafusion::logical_expr::ident(f.name()))
-        .collect()
+pub(crate) fn primary_key_projection(fields: &[Field]) -> Vec<Expr> {
+    fields.iter().map(|f| ident(f.name())).collect()
 }
 
 #[cfg(test)]
