@@ -15,6 +15,7 @@ use arrow::{
     compute::concat,
 };
 
+use crate::index::primary_key_projection;
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use chunking::Chunker;
@@ -139,10 +140,10 @@ impl Index for ChunkedSearchIndex {
 /// Deletes every entry in `inner` whose primary-key columns match a row of `outer_keys` (which
 /// carry only the outer/pre-chunk key columns — `inner`'s own key additionally has the chunk id,
 /// whose values aren't known here). Resolves the exact matching entries by scanning `inner`'s own
-/// [`VectorIndex::list_all_entries`] with a predicate built from `outer_keys`, then deletes
+/// [`VectorIndex::list_all_entry_keys`] with a predicate built from `outer_keys`, then deletes
 /// those resolved (chunk-key-included) rows via `inner`'s normal [`Index::delete_by_keys`].
 ///
-/// Resolution goes through [`VectorIndex::list_all_entries`], not
+/// Resolution goes through [`VectorIndex::list_all_entry_keys`], not
 /// [`VectorIndex::list_table_provider`]: the read listing can be narrower than what the index
 /// stores (a compound index's read mode may serve only its warm primary), and a chunk entry that
 /// does not resolve is never passed to [`Index::delete_by_keys`] at all — the delete then reports
@@ -164,13 +165,9 @@ async fn delete_chunked_vector_by_outer_keys(
     // `delete_by_keys` reads only the primary-key columns, so project to them and drop the
     // duplicates a multi-store listing can carry (the same entry held by more than one half).
     // This also keeps the embedding vectors — the bulk of the listing — out of a delete.
-    let key_projection = inner
-        .primary_fields()
-        .iter()
-        .map(|f| Expr::Column(Column::new_unqualified(f.name())))
-        .collect::<Vec<_>>();
+    let key_projection = primary_key_projection(&inner.primary_fields());
 
-    let list_plan = inner.list_all_entries()?;
+    let list_plan = inner.list_all_entry_keys()?;
     let filtered_plan = LogicalPlanBuilder::from(list_plan)
         .filter(predicate)?
         .project(key_projection)?
@@ -740,27 +737,7 @@ impl VectorIndex for ChunkedVectorIndex {
     }
 
     fn list_table_provider(&self) -> Result<LogicalPlan, DataFusionError> {
-        self.aggregate_chunk_listing(self.inner.list_table_provider()?)
-    }
-
-    /// Forwards to the inner index's authoritative listing, aggregated the same way
-    /// [`Self::list_table_provider`] aggregates the read listing.
-    fn list_all_entries(&self) -> Result<LogicalPlan, DataFusionError> {
-        self.aggregate_chunk_listing(self.inner.list_all_entries()?)
-    }
-
-    fn dimension(&self) -> i32 {
-        self.inner.dimension()
-    }
-}
-
-impl ChunkedVectorIndex {
-    /// Collapses a chunk-keyed listing of `self.inner` into one row per *base* row, aggregating
-    /// each base row's chunk offsets and embeddings in chunk-id order.
-    fn aggregate_chunk_listing(
-        &self,
-        base_index_table: LogicalPlan,
-    ) -> Result<LogicalPlan, DataFusionError> {
+        let base_index_table = self.inner.list_table_provider()?;
         let primary_key_names = ChunkedSearchIndex::base_key_columns(&self.inner.primary_fields());
 
         // Primary key, offsets and embeddings.
@@ -837,6 +814,17 @@ impl ChunkedVectorIndex {
             )
             .boxed()?,
         ))
+    }
+
+    /// Forwards to the index this wraps. The inner index's keys carry the chunk id on top of the
+    /// base key, which is a superset of this index's own key — the contract asks for at least the
+    /// key columns, so no aggregation is needed here.
+    fn list_all_entry_keys(&self) -> Result<LogicalPlan, DataFusionError> {
+        self.inner.list_all_entry_keys()
+    }
+
+    fn dimension(&self) -> i32 {
+        self.inner.dimension()
     }
 }
 
@@ -1505,48 +1493,6 @@ mod tests {
         assert_eq!(ids, &vec![1, 1], "both chunks of id 1, and nothing else");
     }
 
-    /// [`chunk_keyed_rows`] plus the offset and embedding columns a real inner index's listing
-    /// carries, so [`ChunkedVectorIndex::list_table_provider`]'s aggregation can be built over it.
-    fn chunk_keyed_listing(rows: &[(i64, u64)]) -> RecordBatch {
-        let keys = chunk_keyed_rows(rows);
-        let offset_field = Arc::new(Field::new("item", DataType::Int32, true));
-        let offsets = FixedSizeListArray::try_new(
-            Arc::clone(&offset_field),
-            2,
-            // The values are irrelevant — these columns exist only so the chunk-listing
-            // aggregation, which references them by name, can be built over this batch.
-            Arc::new(Int32Array::from(vec![0; rows.len() * 2])),
-            None,
-        )
-        .expect("valid offsets");
-        let embedding_field = Arc::new(Field::new("item", DataType::Float32, true));
-        let embeddings = FixedSizeListArray::try_new(
-            Arc::clone(&embedding_field),
-            4,
-            Arc::new(Float32Array::from(vec![0.0_f32; rows.len() * 4])),
-            None,
-        )
-        .expect("valid embeddings");
-
-        let mut fields = keys.schema().fields().to_vec();
-        fields.push(Arc::new(Field::new(
-            ChunkedSearchIndex::chunking_offset_col("content"),
-            offsets.data_type().clone(),
-            true,
-        )));
-        fields.push(Arc::new(Field::new(
-            embedding_col("content"),
-            embeddings.data_type().clone(),
-            true,
-        )));
-
-        let mut columns = keys.columns().to_vec();
-        columns.push(Arc::new(offsets) as ArrayRef);
-        columns.push(Arc::new(embeddings) as ArrayRef);
-
-        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("valid listing batch")
-    }
-
     /// An inner index shaped like the S3-Vectors-with-warm-tier case: a warm `primary` holding
     /// only what the write path has passed through it, over an authoritative `secondary`.
     fn compound_inner(
@@ -1713,12 +1659,12 @@ mod tests {
         );
     }
 
-    /// `ChunkedVectorIndex` is a wrapper, so it must forward `list_all_entries` to its inner index
+    /// `ChunkedVectorIndex` is a wrapper, so it must forward `list_all_entry_keys` to its inner index
     /// rather than inherit the default (which would resolve against the read listing again).
     #[tokio::test]
-    async fn chunked_vector_index_forwards_list_all_entries_to_its_inner_index() {
-        let warm = Arc::new(RecordingInner::chunked(vec![chunk_keyed_listing(&[])]));
-        let durable = Arc::new(RecordingInner::chunked(vec![chunk_keyed_listing(&[
+    async fn chunked_vector_index_forwards_list_all_entry_keys_to_its_inner_index() {
+        let warm = Arc::new(RecordingInner::chunked(vec![chunk_keyed_rows(&[])]));
+        let durable = Arc::new(RecordingInner::chunked(vec![chunk_keyed_rows(&[
             (1, 0),
             (1, 1),
         ])]));
@@ -1728,29 +1674,19 @@ mod tests {
             chunker: chunker(),
         };
 
-        // A `PrimaryOnly` read listing is the warm primary's scan alone; the authoritative
-        // listing unions both halves. Comparing the two plans is what shows the forward: had
-        // `ChunkedVectorIndex` inherited the default, both would be the read listing.
-        let read = format!(
+        // The compound inner unions its two halves, so the forward is visible in the plan. Had
+        // `ChunkedVectorIndex` inherited the default, this would be the *read* listing — the warm
+        // primary's scan alone under `PrimaryOnly`, with no `Union` in it.
+        let plan = format!(
             "{}",
-            idx.list_table_provider()
-                .expect("read plan builds")
-                .display_indent()
-        );
-        let all = format!(
-            "{}",
-            idx.list_all_entries()
+            idx.list_all_entry_keys()
                 .expect("authoritative plan builds")
                 .display_indent()
         );
 
         assert!(
-            all.contains("Union"),
-            "the authoritative listing must reach both halves of the compound inner:\n{all}"
-        );
-        assert!(
-            !read.contains("Union"),
-            "a PrimaryOnly read listing is the warm primary alone:\n{read}"
+            plan.contains("Union"),
+            "the authoritative listing must reach both halves of the compound inner:\n{plan}"
         );
     }
 

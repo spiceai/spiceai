@@ -210,7 +210,7 @@ pub trait VectorIndex: SearchIndex {
     /// not be wrapped by [`VectorScanTableProvider`].
     fn list_table_provider(&self) -> Result<LogicalPlan, DataFusionError>;
 
-    /// A [`LogicalPlan`] enumerating every entry the index holds, for maintenance paths that must
+    /// A [`LogicalPlan`] identifying every entry the index holds, for maintenance paths that must
     /// resolve *stored* entries rather than serve a read — currently resolving a chunked index's
     /// chunk-keyed entries so they can be deleted.
     ///
@@ -219,11 +219,14 @@ pub trait VectorIndex: SearchIndex {
     /// can restrict listing to its warm primary, which is not authoritative for what is stored.
     /// Resolving a delete against that narrowed listing silently leaves entries behind.
     ///
-    /// The schema matches [`VectorIndex::list_table_provider`]'s.
+    /// The plan carries *at least* the [`SearchIndex::primary_fields`] columns, and callers must
+    /// not depend on any other column being present. Keeping the contract to the key columns is
+    /// what lets a multi-store implementation combine its stores: the key fields are the only ones
+    /// guaranteed to agree across them.
     ///
     /// Wrapper implementations MUST forward this to the index they wrap — inheriting the default
     /// silently resolves maintenance work against a read-narrowed listing.
-    fn list_all_entries(&self) -> Result<LogicalPlan, DataFusionError> {
+    fn list_all_entry_keys(&self) -> Result<LogicalPlan, DataFusionError> {
         self.list_table_provider()
     }
 
@@ -239,6 +242,16 @@ pub trait VectorIndex: SearchIndex {
 
 fn embedding_col(search_column: &str) -> String {
     format!("{search_column}_embedding")
+}
+
+/// Projection expressions selecting `fields` by name — the key columns
+/// [`VectorIndex::list_all_entry_keys`] promises, used both to narrow a listing to them and to
+/// bring two stores' listings to a common schema before combining them.
+pub(crate) fn primary_key_projection(fields: &[Field]) -> Vec<datafusion::logical_expr::Expr> {
+    fields
+        .iter()
+        .map(|f| datafusion::logical_expr::ident(f.name()))
+        .collect()
 }
 
 #[cfg(test)]
