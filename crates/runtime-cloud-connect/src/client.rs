@@ -62,10 +62,10 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 use crate::config::CloudConnectConfig;
 use crate::enroll::{EnrollClient, RENEWAL_GRACE};
 use crate::handlers::{
-    Capability, CommandError, PostApply, RestartMode, RuntimeHandle, SpicepodDeployment,
-    advertised_capabilities,
+    Capability, CommandError, DeployState, PostApply, RestartMode, RuntimeHandle,
+    SpicepodDeployment, advertised_capabilities,
 };
-use crate::heartbeat::{build_heartbeat, build_telemetry, now_unix};
+use crate::heartbeat::{build_heartbeat, build_telemetry, deploy_state_proto, now_unix};
 use crate::identity::{Identity, IdentityStore};
 use crate::proto;
 use crate::shutdown::Shutdown;
@@ -552,7 +552,17 @@ impl ClientDriver {
 
         // Send Hello as the first frame. The client certificate is the
         // credential, so the Hello only names the instance.
-        let hello = build_hello(&self.config, &identity, self.runtime.as_ref()).await;
+        //
+        // The deploy state it carries is kept: it is what the control plane now
+        // holds for this session, so the heartbeats behind it only report a
+        // change (see [`build_heartbeat`]).
+        let reported_deploy_state = self.runtime.deploy_state().await;
+        let hello = build_hello(
+            &self.config,
+            &identity,
+            self.runtime.as_ref(),
+            reported_deploy_state.as_ref(),
+        );
         tx.send(proto::ClientMessage {
             body: Some(proto::client_message::Body::Hello(hello)),
         })
@@ -631,13 +641,19 @@ impl ClientDriver {
         let hb_identifier = Arc::clone(&identifier);
         let hb_handle = tokio::spawn(async move {
             let mut seq: u64 = 0;
+            // Seeded with what the Hello reported, and carried across ticks: a
+            // heartbeat attaches a deploy state only when it differs from the
+            // last one the control plane was told, and this connection is the
+            // scope of that memory — a reconnect opens with a fresh Hello that
+            // reports the state again.
+            let mut reported = reported_deploy_state;
             let mut ticker = time::interval(hb_interval);
             ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
             loop {
                 ticker.tick().await;
                 seq = seq.wrapping_add(1);
                 let id = hb_identifier.read().await.clone();
-                let hb = build_heartbeat(&id, seq, &hb_runtime).await;
+                let hb = build_heartbeat(&id, seq, &hb_runtime, &mut reported).await;
                 let msg = proto::ClientMessage {
                     body: Some(proto::client_message::Body::Heartbeat(hb)),
                 };
@@ -933,6 +949,15 @@ impl ClientDriver {
             {
                 Ok(secrets) => Some(secrets),
                 Err(err) => {
+                    // Refused before the spicepod was even read: the components
+                    // that referenced those secrets keep running the previous
+                    // configuration. Recorded like any other refusal so the
+                    // deployment is reported failed rather than left pending —
+                    // nothing restarts here, so the next heartbeat is the only
+                    // frame that can say so.
+                    self.runtime
+                        .refuse_deployment(cmd.deployment_version, &err.to_string())
+                        .await;
                     send_command_error(tx, command_id, &err).await;
                     return;
                 }
@@ -952,6 +977,12 @@ impl ClientDriver {
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(err) => {
+                // A rejected spicepod restarts nothing, so this session's next
+                // heartbeat is the only route the report has: with no restart
+                // there is no reconnect and no new `Hello`.
+                self.runtime
+                    .refuse_deployment(cmd.deployment_version, &err.to_string())
+                    .await;
                 send_command_error(tx, command_id, &err).await;
                 return;
             }
@@ -1343,10 +1374,20 @@ async fn flush_outbound(tx: &mpsc::Sender<proto::ClientMessage>) {
     }
 }
 
-async fn build_hello(
+/// Build the `Hello` that opens a stream.
+///
+/// `deploy_state` is what the instance reports about the deployment it is
+/// serving, already read by the caller so the same value can seed the heartbeat
+/// deduplication. It is `None` only for a handle that does not report deploy
+/// versions — the same handle that does not announce
+/// [`Capability::DeployVersions`], which is what tells the control plane to
+/// reconcile deployments some other way rather than read the absence as "nothing
+/// applied".
+fn build_hello(
     config: &CloudConnectConfig,
     identity: &Identity,
     runtime: &dyn RuntimeHandle,
+    deploy_state: Option<&DeployState>,
 ) -> proto::Hello {
     // The client certificate carries the identity, so the Hello only names
     // the instance and declares what it can do.
@@ -1364,8 +1405,9 @@ async fn build_hello(
         protocol_version: crate::PROTOCOL_VERSION,
         capabilities: advertised_capabilities(runtime),
         // What the control plane reconciles a deployment against: an apply
-        // restarts the instance, so this is how it learns the deployment landed.
-        applied_deployment_version: runtime.applied_deployment_version().await,
+        // restarts the instance, so the version reported here is how it learns
+        // the deployment landed — the command result may never arrive.
+        deploy_state: deploy_state.map(deploy_state_proto),
     }
 }
 

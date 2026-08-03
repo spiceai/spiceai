@@ -48,8 +48,10 @@ limitations under the License.
 //! Two consequences the caller has to hold:
 //!
 //! - **The command result is not how a deployment is confirmed.** The process
-//!   exits mid-command, so the stream drops; the control plane reconciles
-//!   against `Hello.applied_deployment_version` on the next connection.
+//!   exits mid-command, so the stream drops; the control plane reconciles against
+//!   the `DeployState` on the next connection's `Hello`. A deployment that never
+//!   gets that far — one rejected at validation — is reported on the open
+//!   session's next `Heartbeat` instead, since nothing restarts.
 //! - **Downtime is proportional to the app's size, not the change's.** A
 //!   one-line edit reloads every dataset and rebuilds every acceleration.
 //!
@@ -70,8 +72,8 @@ use runtime_cloud_connect::config::{
     CLOUD_MANAGED_SPICEPOD_FILE, CloudConnectConfig, IDENTITY_FILE, PENDING_ADOPT_CODE_FILE,
 };
 use runtime_cloud_connect::handlers::{
-    ApplyOutcome, Capability, CommandError, RuntimeHandle, RuntimePhase, SpicepodDeployment,
-    StatusReport,
+    ApplyOutcome, Capability, CommandError, DeployState, RuntimeHandle, RuntimePhase,
+    SpicepodDeployment, StatusReport,
 };
 use runtime_cloud_connect::supervisor::Supervisor;
 use runtime_cloud_connect::{CloudConnect, deployment, identity::IdentityStore};
@@ -156,6 +158,23 @@ pub struct CloudManagedSpicepod {
     pub deployment_version: Option<u64>,
 }
 
+/// A deployed spicepod this start would not load, and the deployment it belongs
+/// to.
+///
+/// The apply that persisted it validated it and then exited, so this process is
+/// the first to discover the problem — a secret that has since been removed, a
+/// file that is no longer there. It is reported on the `Hello` this start
+/// connects with, which is the only frame left: the command that dispatched the
+/// deployment was answered a restart ago.
+pub struct RejectedDeployment {
+    /// The refused deployment. `None` when the record named no version, in which
+    /// case there is nothing for the control plane to attach the failure to and
+    /// it is logged only.
+    pub deployment_version: Option<u64>,
+    /// Why it would not load, verbatim — an operator reads this in the portal.
+    pub message: String,
+}
+
 /// The cloud-managed spicepod this instance starts on, or `None` when Cloud
 /// Connect is not configured or no deployment has ever landed here.
 ///
@@ -237,12 +256,17 @@ pub async fn restore_delivered_secrets(
 /// deployed one that failed to build). It is what the instance reports as its
 /// applied deployment, so passing it for a configuration that is not live would
 /// resolve a deployment that never landed.
+///
+/// `rejected_deployment` is the deployed spicepod this start refused, when there
+/// is one. The two are mutually exclusive in practice: a start either serves the
+/// deployment it found or falls back and reports it failed.
 pub async fn maybe_start(
     runtime_version: &str,
     runtime: Arc<Runtime>,
     cloud_connect_flag: bool,
     delivered_secrets: Option<DeliveredSecretsState>,
     running_deployment: Option<CloudManagedSpicepod>,
+    rejected_deployment: Option<RejectedDeployment>,
 ) -> Option<CloudConnect> {
     let config = build_config(runtime_version);
 
@@ -334,6 +358,7 @@ pub async fn maybe_start(
         delivered_store,
         identity_path,
         running_deployment,
+        rejected_deployment,
         supervisor,
     ));
 
@@ -420,6 +445,22 @@ enum Disposition {
     Apply,
 }
 
+/// The report for a `committed` deployment version and a `refused` deployment.
+///
+/// The applied version is always named, and `0` when there is nothing to name:
+/// no deployment since enrolment, a deployment that carried no version, or a
+/// start that fell back because the deployed spicepod would not load. Absent
+/// would mean "this instance cannot say", which is a different answer — the
+/// control plane settles the two differently, and an instance announcing
+/// `deploy.versions` never sends it.
+fn deploy_state_of(committed: Option<u64>, refused: Option<RefusedDeployment>) -> DeployState {
+    let state = DeployState::applied(committed.unwrap_or(0));
+    match refused {
+        Some(refused) => state.with_failure(refused.deployment_version, refused.message),
+        None => state,
+    }
+}
+
 /// Classify an incoming deployment against what this process is serving
 /// (`live`) and what it has already persisted but not yet restarted onto
 /// (`persisted`).
@@ -466,8 +507,27 @@ struct SpicedRuntimeHandle {
     /// `parking_lot` lock held for the read/write only, never across an
     /// `.await`.
     persisted: RwLock<Option<Deployed>>,
+    /// The deployment this instance refused, and why: a spicepod rejected at
+    /// validation, or one that validated at apply time and then would not load
+    /// at startup.
+    ///
+    /// One slot, because the report is a snapshot the control plane replaces
+    /// wholesale — the latest refusal is the only one worth naming, and an
+    /// accepted deployment clears it. A stale failure left here would fail a
+    /// later deployment that reused the version.
+    refused: RwLock<Option<RefusedDeployment>>,
     /// What will relaunch this process after a deployment exits it.
     supervisor: Supervisor,
+}
+
+/// A deployment this instance would not serve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RefusedDeployment {
+    deployment_version: u64,
+    /// The runtime's own error, verbatim — the validation failure, or the load
+    /// failure behind a fallback. It reaches an operator in the portal, so it
+    /// has to say what was wrong with *their* spicepod.
+    message: String,
 }
 
 impl SpicedRuntimeHandle {
@@ -477,6 +537,7 @@ impl SpicedRuntimeHandle {
         delivered_secrets: Arc<CloudDeliveredSecretStore>,
         identity_path: std::path::PathBuf,
         running_deployment: Option<CloudManagedSpicepod>,
+        rejected_deployment: Option<RejectedDeployment>,
         supervisor: Supervisor,
     ) -> Self {
         let live = running_deployment.map_or_else(
@@ -489,6 +550,19 @@ impl SpicedRuntimeHandle {
                 spicepod_yaml: running.spicepod_yaml,
             },
         );
+        // A deployed spicepod that would not load at startup is a refusal this
+        // process discovered on its own, and the `Hello` it is about to send is
+        // the frame that reports it: the apply that persisted it exited long ago,
+        // so nothing else will. A rejection with no version is dropped — it names
+        // no deployment, so the control plane could only attach it to the wrong
+        // one (see `DeployState::failure_message`).
+        let refused = rejected_deployment.and_then(|rejected| {
+            let deployment_version = rejected.deployment_version?;
+            Some(RefusedDeployment {
+                deployment_version,
+                message: rejected.message,
+            })
+        });
         Self {
             runtime,
             logs,
@@ -496,8 +570,23 @@ impl SpicedRuntimeHandle {
             identity_path,
             live,
             persisted: RwLock::new(None),
+            refused: RwLock::new(refused),
             supervisor,
         }
+    }
+
+    /// Record `version` as refused, replacing any earlier refusal.
+    fn refuse(&self, version: Option<u64>, message: &str) {
+        let Some(deployment_version) = version else {
+            // Nothing to report it against: a failure with no version names no
+            // deployment. The error still reaches the caller as the command
+            // result and the log.
+            return;
+        };
+        *self.refused.write() = Some(RefusedDeployment {
+            deployment_version,
+            message: message.to_string(),
+        });
     }
 
     /// The deployment this instance has committed to: the one it persisted if a
@@ -516,6 +605,20 @@ impl SpicedRuntimeHandle {
             .map_or(self.live.deployment_version, |persisted| {
                 persisted.deployment_version
             })
+    }
+
+    /// What this instance reports about its deployments, for the `Hello` and for
+    /// any `Heartbeat` with news.
+    ///
+    /// The applied version is always named — `0` when no deployment has been
+    /// applied since enrolment, including when a deployment landed without one
+    /// (there is no version to claim) or when the deployed spicepod would not
+    /// load and this start fell back. Absent would mean "cannot say", which an
+    /// instance announcing the capability never reports.
+    fn deploy_state_snapshot(&self) -> DeployState {
+        // Cloned out of the lock rather than held across the call below.
+        let refused = self.refused.read().clone();
+        deploy_state_of(self.committed_deployment_version(), refused)
     }
 
     /// The local delivered-secrets cache key, read fresh from `identity.json`.
@@ -565,7 +668,12 @@ impl RuntimeHandle for SpicedRuntimeHandle {
     /// for a process that may have no supervisor to come back under.
     fn supports(&self, capability: Capability) -> bool {
         match capability {
-            Capability::ApplySpicepod | Capability::GetStatus => true,
+            // `DeployVersions` is unconditional: every start reads the deployment
+            // record beside the spicepod, so there is always a version to name
+            // (`0` when none has been applied). Announcing it is what tells the
+            // control plane to reconcile deployments against what this instance
+            // reports instead of against a command result the restart discards.
+            Capability::ApplySpicepod | Capability::GetStatus | Capability::DeployVersions => true,
             // Only when the log-capture layer was installed at startup;
             // otherwise there is no buffer to read from.
             Capability::GetLogs => self.logs.is_some(),
@@ -578,10 +686,9 @@ impl RuntimeHandle for SpicedRuntimeHandle {
             Capability::Restart => "Restart is unsupported on standalone spiced: it is not a control the runtime offers on demand. A deployment already applies by restarting this instance onto the spicepod it validated; to restart it without deploying, use your process manager (systemd/Docker/Kubernetes). See: https://spiceai.org/docs".to_string(),
             Capability::UpgradeRuntime => "UpgradeRuntime is unsupported on standalone spiced: it cannot replace its own binary. Upgrade it the way you installed it (`spice upgrade`, your container image, or your package manager). See: https://spiceai.org/docs".to_string(),
             Capability::GetLogs => "Log capture is not enabled for this runtime: Spice Cloud Connect must be configured before startup for spiced to install the log-capture layer. See: https://spiceai.org/docs".to_string(),
-            Capability::ApplySpicepod | Capability::GetStatus => format!(
-                "{} is not supported by this instance",
-                capability.wire_name()
-            ),
+            Capability::ApplySpicepod | Capability::GetStatus | Capability::DeployVersions => {
+                format!("{} is not supported by this instance", capability.wire_name())
+            }
         }
     }
 
@@ -620,8 +727,19 @@ impl RuntimeHandle for SpicedRuntimeHandle {
         })
     }
 
-    async fn applied_deployment_version(&self) -> Option<u64> {
-        self.committed_deployment_version()
+    async fn deploy_state(&self) -> Option<DeployState> {
+        Some(self.deploy_state_snapshot())
+    }
+
+    async fn refuse_deployment(&self, deployment_version: Option<u64>, message: &str) {
+        self.refuse(deployment_version, message);
+        tracing::warn!(
+            "Spice Cloud Connect: {} was refused and is NOT applied; this instance keeps serving its current configuration and reports the refusal to Spice Cloud: {message}",
+            deployment_version.map_or_else(
+                || "a deployment".to_string(),
+                |version| format!("deployment {version}")
+            )
+        );
     }
 
     /// Apply a cloud-managed spicepod by persisting it and restarting onto it.
@@ -737,6 +855,11 @@ impl RuntimeHandle for SpicedRuntimeHandle {
         let version_error = record_deployment(config_dir, deployment_version).await;
 
         *self.persisted.write() = Some(incoming);
+        // This deployment supersedes any earlier refusal, so the report stops
+        // naming it. Keeping a stale failure would fail a later deployment that
+        // reused that version — the control plane replaces its whole record with
+        // each state it receives.
+        *self.refused.write() = None;
 
         tracing::info!(
             "Spice Cloud Connect: {version_label} validated and persisted to {} ({} datasets, {} models, {} catalogs, {} views); restarting to apply it",
@@ -916,6 +1039,7 @@ impl RuntimeHandle for SpicedRuntimeHandle {
         // flushed — but a status read inside it must not report the deployment
         // as live.
         let restart_pending = self.persisted.read().is_some();
+        let refused = self.refused.read().clone();
 
         Ok(
             StatusReport::new(phase, reason).with_detail(serde_json::json!({
@@ -924,12 +1048,17 @@ impl RuntimeHandle for SpicedRuntimeHandle {
                 "ready_count": ready_count,
                 "components": components,
                 "errors": errors,
-                // The deployment this instance has committed to — the same
-                // value it announces in `Hello.applied_deployment_version`.
+                // The deployment this instance has committed to — the same value
+                // it announces in the `DeployState` on its `Hello`.
                 "applied_deployment_version": self.committed_deployment_version(),
                 // The deployment actually being served, which differs from the
                 // above only while a restart is pending.
                 "live_deployment_version": self.live.deployment_version,
+                // The deployment this instance refused, and why — the same pair
+                // it reports in the `DeployState`, so a `get_status` read and the
+                // reconciler never disagree about which deployment failed.
+                "failed_deployment_version": refused.as_ref().map(|refused| refused.deployment_version),
+                "deployment_failure": refused.as_ref().map(|refused| refused.message.clone()),
                 "restart_pending": restart_pending,
                 // Whether anything will bring this instance back when a
                 // deployment exits it. `false` means a deployment stops the
@@ -1228,6 +1357,49 @@ mod tests {
         assert_eq!(
             disposition(&live, None, &deployed(Some(1), VALID_SPICEPOD)),
             Disposition::Apply
+        );
+    }
+
+    /// An instance that has applied nothing reports a zero, never an absence:
+    /// "cannot say" sends the control plane down a different path than "nothing
+    /// yet", and this instance can always say.
+    #[test]
+    fn nothing_applied_reports_a_zero() {
+        let state = deploy_state_of(None, None);
+        assert_eq!(state.applied_deployment_version, Some(0));
+        assert_eq!(state.failed_deployment_version, None);
+        assert!(state.failure_message.is_empty());
+    }
+
+    /// A refusal names the version it refused and leaves the applied version
+    /// reporting what the instance is still running — the control plane reads
+    /// the pair, not one or the other.
+    #[test]
+    fn a_refusal_is_reported_alongside_what_is_still_running() {
+        let state = deploy_state_of(
+            Some(7),
+            Some(RefusedDeployment {
+                deployment_version: 8,
+                message: "invalid spicepod: bad yaml".to_string(),
+            }),
+        );
+        assert_eq!(state.applied_deployment_version, Some(7));
+        assert_eq!(state.failed_deployment_version, Some(8));
+        assert_eq!(state.failure_message, "invalid spicepod: bad yaml");
+    }
+
+    /// A refusal with no version to name is dropped rather than reported: on its
+    /// own a message names no deployment, so it could only be attached to the
+    /// wrong one.
+    #[test]
+    fn a_refusal_without_a_version_is_not_reported() {
+        let handle_refused: Option<RefusedDeployment> = None;
+        let state = deploy_state_of(Some(4), handle_refused);
+        assert_eq!(state.applied_deployment_version, Some(4));
+        assert_eq!(state.failed_deployment_version, None);
+        assert!(
+            state.failure_message.is_empty(),
+            "a message with no version must not travel on its own"
         );
     }
 

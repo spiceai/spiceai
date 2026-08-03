@@ -209,25 +209,64 @@ message Hello {
   // Highest revision of `spice.cloud.v1` this instance implements. 0 means
   // the instance predates version negotiation.
   uint32 protocol_version = 11;
-  // Optional commands this instance answers, by wire name (`apply_spicepod`,
-  // `get_logs`, `secrets.hpke`, …). A command absent from this list is
+  // What this instance can do, by wire name (`apply_spicepod`, `get_logs`,
+  // `secrets.hpke`, `deploy.versions`, …). A *command* absent from this list is
   // answered RESULT_CODE_UNSUPPORTED if dispatched anyway; the list exists so
   // the control plane does not have to find that out by dispatching. A
   // standalone runtime answers a subset of the operator's commands, so read
   // this rather than inferring from `instance_kind`.
-  repeated string capabilities = 12;
-  // The `ApplySpicepod.deployment_version` of the configuration this instance
-  // is serving. A standalone instance applies a deployment by persisting it
-  // and restarting, so the stream drops mid-apply and the `CommandResult` may
-  // never arrive: this field, not the fate of the command, is what says the
-  // deployment landed.
   //
-  // Absent means the instance cannot name a version — it is running a
-  // configuration no deployment assigned one to (a local spicepod, or a
-  // deployment that carried no version), or it failed to start on the deployed
-  // one and fell back. Absent is NOT zero: a zero would let a deployment
-  // resolve against a version nothing claimed.
-  optional uint64 applied_deployment_version = 13;
+  // Not every entry is a command: `deploy.versions` says the instance reports
+  // `DeployState`, which the control plane must know *before* the instance's
+  // first frame arrives — the gateway registers a session ahead of it, and
+  // "reports versions but has applied nothing" (a `DeployState` with
+  // `applied_deployment_version: 0`) is otherwise indistinguishable from "does
+  // not report versions" for as long as that window lasts. Reading an absent
+  // `DeployState` as the latter would commit a deployment to the wrong
+  // reconciliation path over a millisecond of timing.
+  repeated string capabilities = 12;
+  // Which deployment this instance is serving, and which one it refused. Always
+  // present on the `Hello` of an instance whose `capabilities` contain
+  // `deploy.versions`; absent from any other instance's, which is what the
+  // capability exists to disambiguate — see [DeployState].
+  DeployState deploy_state = 13;
+}
+
+// What an instance has deployed: the reconciliation input for a deployment's
+// state, sent on `Hello` and `Heartbeat`.
+//
+// It is not the `ApplySpicepod` result that settles a deployment. Applying
+// restarts the instance, so the stream drops mid-command and the result may
+// never arrive; what the instance reports about the configuration it is *running*
+// is the only ground truth that a deploy took.
+//
+// Which frame carries a report follows from when the outcome is known. A
+// spicepod rejected at validation restarts nothing, so no new `Hello` follows and
+// the open session's `Heartbeat` is the only route. A spicepod that validates and
+// then fails to start is known after the restart, on the `Hello` the instance
+// reconnects with.
+//
+// A `DeployState` is a **snapshot, not a delta**: each one replaces what the
+// receiver holds for the session. A failure clears by sending a `DeployState`
+// without `failed_deployment_version` — re-sending a stale one would fail a later
+// deployment that reuses that version. A frame carrying no `DeployState` at all
+// changes nothing, which is how an instance sends a heartbeat with no deploy news.
+message DeployState {
+  // The deployment whose spicepod the instance is serving. `0` means none has
+  // been applied since enrolment — distinct from absent, which is an instance
+  // that cannot say (and which an instance announcing `deploy.versions` never
+  // sends).
+  optional uint64 applied_deployment_version = 1;
+  // The deployment the instance refused: rejected at validation, or rolled back
+  // after failing to start. `applied_deployment_version` alongside it reports
+  // what is *actually* running — the previous good version in the rollback case.
+  optional uint64 failed_deployment_version = 2;
+  // Why that deployment was refused, in the instance's own words (the validation
+  // error, or the startup error behind a rollback). Empty means nothing to
+  // explain. Meaningless without `failed_deployment_version`, since on its own it
+  // names no deployment — a receiver drops it rather than attach it to the wrong
+  // one.
+  string failure_message = 3;
 }
 
 message Heartbeat {
@@ -243,6 +282,10 @@ message Heartbeat {
   uint32 active_models = 6;
   uint32 active_spicepods = 7;
   map<string, string> runtime_versions = 8;
+  // Deploy news since the last frame that carried any, or absent when there is
+  // none — a heartbeat is how a rejected deployment is reported, because nothing
+  // restarted and no new `Hello` follows. See [DeployState].
+  DeployState deploy_state = 9;
 }
 
 // Terminal reply to a command, correlated by `command_id`.

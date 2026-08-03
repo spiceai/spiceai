@@ -436,6 +436,7 @@ pub async fn run(args: Args) -> Result<()> {
         app,
         spicepod_load_error,
         running_deployment,
+        rejected_deployment,
         deployment_note,
     } = build_app(&args).await?;
     // Deferred until tracing exists, and appended to below — everything about
@@ -904,6 +905,7 @@ pub async fn run(args: Args) -> Result<()> {
         cloud_connect_flag,
         delivered_secrets,
         running_deployment,
+        rejected_deployment,
     )
     .await;
 
@@ -944,6 +946,10 @@ struct LoadedApp {
     /// deployment did not put there, so the instance reports no applied
     /// deployment.
     running_deployment: Option<cloud_connect::CloudManagedSpicepod>,
+    /// The deployed spicepod this start refused, when there is one. Reported to
+    /// the control plane on the `Hello` that follows, which is the only frame
+    /// left to report it on — the apply that persisted it exited a restart ago.
+    rejected_deployment: Option<cloud_connect::RejectedDeployment>,
     /// Deferred because `build_app` runs before tracing is initialized.
     deployment_note: Option<DeploymentNote>,
 }
@@ -1029,6 +1035,7 @@ async fn build_app(args: &Args) -> Result<LoadedApp> {
                 app: Some(Arc::new(app)),
                 spicepod_load_error: None,
                 running_deployment: None,
+                rejected_deployment: None,
                 deployment_note: None,
             });
         }
@@ -1039,6 +1046,7 @@ async fn build_app(args: &Args) -> Result<LoadedApp> {
             app: Some(Arc::new(App::default())),
             spicepod_load_error: None,
             running_deployment: None,
+            rejected_deployment: None,
             deployment_note: None,
         });
     }
@@ -1048,6 +1056,7 @@ async fn build_app(args: &Args) -> Result<LoadedApp> {
     // that file and restarting, so reading anything else here would drop every
     // deployment on the floor at the moment it was meant to take effect.
     let mut deployment_note = None;
+    let mut rejected_deployment = None;
     if let Some(deployed) = cloud_connect::cloud_managed_spicepod(args.cloud_connect).await {
         match AppBuilder::build_from_path(deployed.path.clone()).await {
             Ok(mut app) => {
@@ -1055,6 +1064,7 @@ async fn build_app(args: &Args) -> Result<LoadedApp> {
                 return Ok(LoadedApp {
                     app: Some(Arc::new(app)),
                     spicepod_load_error: None,
+                    rejected_deployment: None,
                     deployment_note: Some(DeploymentNote::Loaded {
                         path: deployed.path.clone(),
                         deployment_version: deployed.deployment_version,
@@ -1068,9 +1078,17 @@ async fn build_app(args: &Args) -> Result<LoadedApp> {
                 // connects, and the next deployment can replace the file. A
                 // runtime that refused to start here would crash-loop with no
                 // path back except an operator editing files on the host.
+                let error = e.to_string();
+                // Reported to the control plane, not just logged: the deployment
+                // that persisted this spicepod was answered a restart ago, so
+                // without this it would sit in the portal as applying forever.
+                rejected_deployment = Some(cloud_connect::RejectedDeployment {
+                    deployment_version: deployed.deployment_version,
+                    message: error.clone(),
+                });
                 deployment_note = Some(DeploymentNote::Rejected {
                     path: deployed.path,
-                    error: e.to_string(),
+                    error,
                 });
             }
         }
@@ -1123,6 +1141,7 @@ async fn build_app(args: &Args) -> Result<LoadedApp> {
         app,
         spicepod_load_error,
         running_deployment: None,
+        rejected_deployment,
         deployment_note,
     })
 }

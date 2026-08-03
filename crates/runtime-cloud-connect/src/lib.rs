@@ -91,8 +91,8 @@ use tokio::task::JoinHandle;
 
 pub use config::CloudConnectConfig;
 pub use handlers::{
-    ApplyOutcome, Capability, CommandError, PostApply, RestartMode, RuntimeHandle, RuntimePhase,
-    SpicepodDeployment, StatusReport,
+    ApplyOutcome, CAPABILITY_DEPLOY_VERSIONS, Capability, CommandError, DeployState, PostApply,
+    RestartMode, RuntimeHandle, RuntimePhase, SpicepodDeployment, StatusReport,
 };
 pub use identity::{Identity, IdentityStore};
 pub use supervisor::Supervisor;

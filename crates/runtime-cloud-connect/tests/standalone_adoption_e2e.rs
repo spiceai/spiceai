@@ -79,7 +79,7 @@ use rcgen::{
 };
 use runtime_cloud_connect::config::CloudConnectConfig;
 use runtime_cloud_connect::handlers::{
-    ApplyOutcome, Capability, CommandError, RuntimeHandle, SpicepodDeployment,
+    ApplyOutcome, Capability, CommandError, DeployState, RuntimeHandle, SpicepodDeployment,
 };
 use runtime_cloud_connect::identity::IdentityStore;
 use runtime_cloud_connect::proto;
@@ -559,14 +559,21 @@ struct E2eRuntimeState {
     /// Names of the secrets delivered with the last applied spicepod, never
     /// values. `None` when the deployment carried no payload at all.
     delivered_secret_names: Option<Vec<String>>,
-    /// The deployment this stand-in reports as applied. Seeded to model an
-    /// instance that came back up on a deployment, and advanced by an apply the
-    /// way `spiced` advances the record it writes before restarting.
-    applied_deployment_version: Option<u64>,
+    /// The deployment this stand-in reports as applied. `0` is "none since
+    /// enrolment"; seeded to model an instance that came back up on a
+    /// deployment, and advanced by an apply the way `spiced` advances the record
+    /// it writes before restarting.
+    applied_deployment_version: u64,
+    /// The deployment it refused, and why — set through `refuse_deployment` and
+    /// cleared by the next accepted one, as the real adapter does.
+    refused: Option<(u64, String)>,
     /// Set when the client asked the runtime to exit and apply. The real
     /// adapter ends the process here; a test one records that it was asked, so
     /// the test can assert the result was flushed first.
     exit_requested: bool,
+    /// Makes the next apply fail validation, so the refusal path can be driven
+    /// without building a spicepod this harness would have to parse.
+    reject_next_apply: Option<String>,
 }
 
 struct E2eRuntime {
@@ -575,12 +582,12 @@ struct E2eRuntime {
 
 impl E2eRuntime {
     fn new() -> (Arc<Self>, Arc<Mutex<E2eRuntimeState>>) {
-        Self::with_applied_version(None)
+        Self::with_applied_version(0)
     }
 
     /// An instance already serving `version`, as one that restarted onto a
-    /// deployment reports itself.
-    fn with_applied_version(version: Option<u64>) -> (Arc<Self>, Arc<Mutex<E2eRuntimeState>>) {
+    /// deployment reports itself. `0` is an instance that has applied nothing.
+    fn with_applied_version(version: u64) -> (Arc<Self>, Arc<Mutex<E2eRuntimeState>>) {
         let state = Arc::new(Mutex::new(E2eRuntimeState {
             applied_deployment_version: version,
             ..E2eRuntimeState::default()
@@ -597,7 +604,10 @@ impl E2eRuntime {
 #[async_trait]
 impl RuntimeHandle for E2eRuntime {
     fn supports(&self, capability: Capability) -> bool {
-        capability == Capability::ApplySpicepod
+        matches!(
+            capability,
+            Capability::ApplySpicepod | Capability::DeployVersions
+        )
     }
 
     async fn active_datasets(&self) -> u32 {
@@ -607,14 +617,30 @@ impl RuntimeHandle for E2eRuntime {
         1
     }
 
-    async fn applied_deployment_version(&self) -> Option<u64> {
-        self.state.lock().await.applied_deployment_version
+    async fn deploy_state(&self) -> Option<DeployState> {
+        let state = self.state.lock().await;
+        let deploy = DeployState::applied(state.applied_deployment_version);
+        Some(match state.refused.as_ref() {
+            Some((version, message)) => deploy.with_failure(*version, message.clone()),
+            None => deploy,
+        })
+    }
+
+    async fn refuse_deployment(&self, deployment_version: Option<u64>, message: &str) {
+        if let Some(version) = deployment_version {
+            self.state.lock().await.refused = Some((version, message.to_string()));
+        }
     }
 
     async fn apply_spicepod(
         &self,
         deployment: SpicepodDeployment<'_>,
     ) -> Result<ApplyOutcome, CommandError> {
+        if let Some(reason) = self.state.lock().await.reject_next_apply.take() {
+            // Validation refuses it: nothing is persisted and nothing restarts,
+            // so the client records the refusal and the next heartbeat reports it.
+            return Err(CommandError::invalid_argument(reason));
+        }
         // Record the delivered names (never values) so a test can assert the
         // payload reached the runtime adapter.
         self.state.lock().await.delivered_secret_names = deployment
@@ -635,7 +661,10 @@ impl RuntimeHandle for E2eRuntime {
         {
             let mut state = self.state.lock().await;
             state.applied_spicepod = Some((path.clone(), deployment.spicepod_yaml.to_string()));
-            state.applied_deployment_version = deployment.deployment_version;
+            state.applied_deployment_version = deployment.deployment_version.unwrap_or(0);
+            // An accepted deployment supersedes an earlier refusal, which is how
+            // a stale failure stops being reported.
+            state.refused = None;
         }
         Ok(ApplyOutcome::exit_to_apply(serde_json::json!({
             "path": path.display().to_string(),
@@ -1665,24 +1694,33 @@ async fn hello_reports_the_applied_deployment_version() {
         Some(ADOPTION_CODE.to_string()),
         Duration::from_hours(12),
     );
-    let (runtime, _rt_state) = E2eRuntime::with_applied_version(Some(41));
+    let (runtime, _rt_state) = E2eRuntime::with_applied_version(41);
     let (handle, _identity) = enroll(&harness, &config, runtime).await;
 
     let captured = Arc::clone(&harness.gateway.captured);
     let hello = with_captured!(captured, c => c.hellos[0].0.clone());
+    let state = hello
+        .deploy_state
+        .expect("a reporting instance always attaches a DeployState to its Hello");
     assert_eq!(
-        hello.applied_deployment_version,
+        state.applied_deployment_version,
         Some(41),
         "an instance serving a deployment must name it, or a deploy can never resolve"
     );
+    assert_eq!(state.failed_deployment_version, None);
+    assert!(state.failure_message.is_empty());
 
     handle.shutdown().await;
 }
 
-/// An instance that no deployment has configured reports absence, not zero: a
-/// zero would resolve a deployment against a version nothing claimed.
+/// A freshly enrolled instance that has applied nothing announces
+/// `deploy.versions` and reports a **zero**, not an absent version. The
+/// capability is what tells the control plane which reconciliation path to take,
+/// and it must be readable before any frame arrives — the gateway registers the
+/// session first, and "reports versions, has applied nothing" would otherwise be
+/// indistinguishable from "does not report versions" for the width of that window.
 #[tokio::test]
-async fn hello_omits_the_version_when_no_deployment_is_applied() {
+async fn hello_announces_the_capability_and_reports_zero_before_any_deployment() {
     let harness = Harness::new(24 * 60 * 60).await;
     let dir = tempfile::tempdir().unwrap();
     let config = harness.config(
@@ -1696,7 +1734,132 @@ async fn hello_omits_the_version_when_no_deployment_is_applied() {
 
     let captured = Arc::clone(&harness.gateway.captured);
     let hello = with_captured!(captured, c => c.hellos[0].0.clone());
-    assert_eq!(hello.applied_deployment_version, None);
+    assert!(
+        hello
+            .capabilities
+            .iter()
+            .any(|c| c == runtime_cloud_connect::handlers::CAPABILITY_DEPLOY_VERSIONS),
+        "an instance that reports deploy versions must announce it: {:?}",
+        hello.capabilities
+    );
+    let state = hello.deploy_state.expect("the Hello always carries one");
+    assert_eq!(
+        state.applied_deployment_version,
+        Some(0),
+        "nothing applied is a zero, not an absence — the two settle a deployment differently"
+    );
+
+    handle.shutdown().await;
+}
+
+/// A spicepod rejected at validation restarts nothing, so no new `Hello`
+/// follows and the open session's `Heartbeat` is the only route the failure has.
+/// It names the version it refused and leaves the applied version reporting what
+/// is still running.
+#[tokio::test]
+async fn a_rejected_deployment_is_reported_on_a_heartbeat() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+    let config = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        Some(ADOPTION_CODE.to_string()),
+        Duration::from_hours(12),
+    );
+    let (runtime, rt_state) = E2eRuntime::with_applied_version(7);
+    rt_state.lock().await.reject_next_apply = Some("invalid spicepod: bad yaml".to_string());
+    let (handle, _identity) = enroll(&harness, &config, runtime).await;
+
+    harness.gateway.outbound.lock().await.push_back(ctrl_id(
+        "cmd-reject",
+        proto::control_message::Body::ApplySpicepod(proto::ApplySpicepod {
+            spicepod_yaml: "name: [unclosed".to_string(),
+            sealed_secret_payload: None,
+            deployment_version: Some(8),
+        }),
+    ));
+
+    let captured = Arc::clone(&harness.gateway.captured);
+    let reported = wait_until_async(Duration::from_secs(5), || {
+        let captured = Arc::clone(&captured);
+        async move {
+            captured
+                .lock()
+                .await
+                .heartbeats
+                .iter()
+                .any(|hb| hb.deploy_state.is_some())
+        }
+    })
+    .await;
+    assert!(
+        reported,
+        "a rejected deployment must be reported on a heartbeat — nothing restarts, so there is no other frame"
+    );
+
+    let state = with_captured!(captured, c => c
+        .heartbeats
+        .iter()
+        .filter_map(|hb| hb.deploy_state.clone())
+        .next_back())
+    .expect("a heartbeat carried a deploy state");
+    assert_eq!(state.failed_deployment_version, Some(8));
+    assert_eq!(state.failure_message, "invalid spicepod: bad yaml");
+    assert_eq!(
+        state.applied_deployment_version,
+        Some(7),
+        "the applied version must still report what is running, not the refused one"
+    );
+
+    // The refusal was also answered as a command failure — the heartbeat report
+    // is what settles the deployment, not a replacement for the result.
+    let failed = with_captured!(captured, c => c
+        .results
+        .iter()
+        .any(|r| r.command_id == "cmd-reject"
+            && r.code == proto::ResultCode::InvalidArgument as i32));
+    assert!(
+        failed,
+        "the rejected apply must also answer INVALID_ARGUMENT"
+    );
+
+    handle.shutdown().await;
+}
+
+/// Heartbeats do not repeat a state the control plane already holds: each one
+/// *replaces* its record, so an unchanged report says nothing, and a heartbeat
+/// carrying none leaves the previous report standing.
+#[tokio::test]
+async fn heartbeats_carry_a_deploy_state_only_when_it_changes() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let dir = tempfile::tempdir().unwrap();
+    let config = harness.config(
+        dir.path().join("identity.json"),
+        dir.path().to_path_buf(),
+        Some(ADOPTION_CODE.to_string()),
+        Duration::from_hours(12),
+    );
+    let (runtime, _rt_state) = E2eRuntime::with_applied_version(3);
+    let (handle, _identity) = enroll(&harness, &config, runtime).await;
+
+    // The 150ms cadence gives several heartbeats inside this budget.
+    let captured = Arc::clone(&harness.gateway.captured);
+    let enough = wait_until_async(Duration::from_secs(5), || {
+        let captured = Arc::clone(&captured);
+        async move { captured.lock().await.heartbeats.len() >= 3 }
+    })
+    .await;
+    assert!(enough, "expected >=3 heartbeats");
+
+    let repeated = with_captured!(captured, c => c
+        .heartbeats
+        .iter()
+        .filter(|hb| hb.deploy_state.is_some())
+        .count());
+    assert_eq!(
+        repeated, 0,
+        "the Hello already reported this state; the heartbeats behind it must add nothing"
+    );
 
     handle.shutdown().await;
 }

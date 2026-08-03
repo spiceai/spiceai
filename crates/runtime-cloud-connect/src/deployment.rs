@@ -19,8 +19,8 @@ limitations under the License.
 //! A deployment applies by persisting the spicepod and restarting the process,
 //! so the `CommandResult` cannot be what tells the control plane the deployment
 //! landed — the stream drops mid-apply. What the instance reports on its next
-//! `Hello` is (`Hello.applied_deployment_version`), and this file is what
-//! carries the answer across the restart.
+//! `Hello` is (its `DeployState.applied_deployment_version`), and this file is
+//! what carries the answer across the restart.
 //!
 //! # Format
 //!
