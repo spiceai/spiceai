@@ -17335,6 +17335,7 @@ version = "2.2.0-unstable"
 dependencies = [
  "parking_lot",
  "sysinfo 0.38.4",
+ "telemetry",
  "tracing",
  "util",
 ]
