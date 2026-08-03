@@ -228,6 +228,10 @@ runner. It deliberately never SSHes into ad-hoc hosts — the LAN lab boxes
 double as benchmark machines, and a workspace build there mid-run silently
 corrupts the measurement.
 
+Remote sign-off has four concurrency slots. Additional dispatches remain queued
+until a slot is available, so long-running sign-offs cannot consume the whole
+self-hosted runner pool.
+
 The Actions workflow:
 
 1. Checks out your branch (full history) and fetches `trunk`

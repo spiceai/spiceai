@@ -48,8 +48,32 @@ env:
   CARGO_NET_GIT_FETCH_WITH_CLI: true
 
 jobs:
+  assign-slot:
+    name: Assign sign-off slot
+    runs-on: ubuntu-24.04
+    permissions: {}
+    outputs:
+      slot: ${{ steps.slot.outputs.slot }}
+    steps:
+      - name: Assign one of four sign-off slots
+        id: slot
+        env:
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          slot=$((RUN_ID % 4))
+          echo "Assigned sign-off slot ${slot}"
+          echo "slot=${slot}" >> "${GITHUB_OUTPUT}"
+
   sign-off:
     name: Sign off on ${{ github.event.inputs.branch }}
+    needs: assign-slot
+    # A concurrency group permits one running job. Four groups provide four
+    # sign-off slots, while queue:max keeps additional dispatches pending.
+    concurrency:
+      group: signoff-slot-${{ needs.assign-slot.outputs.slot }}
+      cancel-in-progress: false
+      queue: max
     runs-on: spiceai-macos
     permissions:
       contents: read
