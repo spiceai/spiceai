@@ -331,6 +331,7 @@ jobs:
           SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
         run: |
           set -uo pipefail
+          umask 077
 
           # hf-hub caches artifacts under $HOME/.cache/huggingface/hub and reads its
           # credential from the sibling `token` file. $HOME persists between jobs on
@@ -340,12 +341,19 @@ jobs:
           mkdir -p "${HOME}/.cache/huggingface/hub"
           token_file="${HOME}/.cache/huggingface/token"
 
-          if [ -n "${SPICE_HF_TOKEN:-}" ]; then
+          # $HOME is shared by every job that lands on this host, and it outlives this
+          # one. So a token we write here must not be left behind for an unrelated job
+          # to read, and a token the host already owns must not be clobbered:
+          #   - file already present -> use it, touch nothing.
+          #   - absent + secret set  -> write it, and mark it for removal in cleanup.
+          #   - absent + no secret   -> warn; downloads are anonymous.
+          if [ -s "${token_file}" ]; then
+            echo "Using the Hugging Face token already present on this runner."
+          elif [ -n "${SPICE_HF_TOKEN:-}" ]; then
             printf '%s' "${SPICE_HF_TOKEN}" > "${token_file}"
             chmod 600 "${token_file}"
-            echo "Wrote a Hugging Face token for hf-hub to pick up."
-          elif [ -s "${token_file}" ]; then
-            echo "Using the Hugging Face token already present on this runner."
+            echo "SPICE_REMOVE_HF_TOKEN=${token_file}" >> "$GITHUB_ENV"
+            echo "Wrote a job-scoped Hugging Face token for hf-hub to pick up."
           else
             echo "::warning::No Hugging Face token available. Downloads will be anonymous, and anonymous requests share a per-IP quota across this whole runner pool — exhausting it surfaces as HTTP 401 on model config files."
           fi
@@ -364,18 +372,27 @@ jobs:
             exit 0
           fi
 
-          auth=()
-          if [ -s "${HOME}/.cache/huggingface/token" ]; then
-            auth=(-H "Authorization: Bearer $(cat "${HOME}/.cache/huggingface/token")")
-          fi
+          token_file="${HOME}/.cache/huggingface/token"
+
+          # The token goes to curl through a config on stdin rather than an -H argument,
+          # so it never appears in this process's argv. `printf` is a shell builtin, so
+          # it spawns nothing that could carry it either. curl drops the header on a
+          # cross-host redirect by default, which is what keeps `-L` safe here.
+          probe() {
+            if [ -s "${token_file}" ]; then
+              printf 'header = "Authorization: Bearer %s"\n' "$(cat "${token_file}")" |
+                curl -K - -sSL -o /dev/null -w '%{http_code}' --max-time 30 "$1" 2>/dev/null
+            else
+              curl -sSL -o /dev/null -w '%{http_code}' --max-time 30 "$1" 2>/dev/null
+            fi
+          }
 
           rc=0
-          for repo in ${repos}; do
+          while IFS= read -r repo; do
+            [ -n "${repo}" ] || continue
             code=""
             for attempt in 1 2 3 4 5; do
-              code="$(curl -sSL -o /dev/null -w '%{http_code}' --max-time 30 \
-                "${auth[@]+"${auth[@]}"}" \
-                "https://huggingface.co/${repo}/resolve/main/config.json" 2>/dev/null)" || code="000"
+              code="$(probe "https://huggingface.co/${repo}/resolve/main/config.json")" || code="000"
               if [ "${code}" -lt 400 ] 2>/dev/null; then
                 echo "  ok    ${repo} (HTTP ${code}, attempt ${attempt})"
                 break
@@ -395,7 +412,9 @@ jobs:
               esac
               rc=1
             fi
-          done
+          # A here-string, not a pipe: a pipe would run the loop in a subshell and `rc`
+          # would never make it back out, so every failure would exit 0.
+          done <<< "${repos}"
 
           exit "${rc}"
 
@@ -462,6 +481,15 @@ jobs:
           if [ -f spice.log ]; then
             cat spice.log
           fi
+
+      # Only fires when the step above wrote the token itself; a credential the runner
+      # already owned is left alone. Without this, a secret would outlive the job in a
+      # $HOME that every later job on this host can read.
+      - name: Remove the job-scoped Hugging Face token
+        if: always() && env.SPICE_REMOVE_HF_TOKEN != ''
+        run: |
+          rm -f "${SPICE_REMOVE_HF_TOKEN}"
+          echo "Removed the job-scoped Hugging Face token."
 
   test_quickstart_dremio:
     name: 'Test Dremio quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
