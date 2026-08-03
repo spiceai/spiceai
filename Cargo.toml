@@ -60,6 +60,7 @@ members = [
     "crates/runtime-parameters-derive",
     "crates/runtime-secrets",
     "crates/runtime-status",
+    "crates/runtime-udfs-api",
     "crates/runtime-table-partition",
     "crates/runtime-rate-control",
     "crates/runtime-request-context",
@@ -217,6 +218,7 @@ candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "6e
 charset = "0.1.5"
 chrono = "0.4.44"
 clap = { version = "4.5.60", features = ["derive", "env"] }
+crash-handler = "0.8"
 clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0.2.2", features = [
     "tokio_io",
     "tls",
@@ -418,7 +420,7 @@ url = { version = "2.5", features = ["serde"] }
 util = { path = "crates/util", default-features = false }
 utoipa = { version = "5" }
 uuid = "1"
-wasmtime = { version = "44.0.1", default-features = false, features = ["cranelift", "runtime", "std"] }
+wasmtime = { version = "47.0.3", default-features = false, features = ["cranelift", "runtime", "std"] }
 wat = "1.248.0"
 
 flatbuffers = "25.2.10"

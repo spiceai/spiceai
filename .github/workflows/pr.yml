@@ -73,6 +73,44 @@ jobs:
       # pulls.listCommits for pure-revert fast-track detection
       pull-requests: read
     steps:
+      # An explicit sign-off verdict on the head commit answers the only question
+      # this job asks, so it is settled before anything below can route around
+      # it. `Inspect developer sign-off` treats a non-success status as an absent
+      # one and walks the first-parent chain, which is right for an intermediate
+      # merge commit — its status says nothing about the tree under review — but
+      # wrong for HEAD: inheritance exists so that merging the base costs no
+      # re-sign-off, not so that it can resurrect a sign-off that HEAD's own run
+      # has already overturned. The fast-track paths below skip the inspection
+      # entirely, and they mean "this head needs no sign-off", not "a failed one
+      # may be ignored". A `pending` status is deliberately not rejected here: it
+      # is not a verdict, and a sign-off still running must not turn Attestation
+      # red on a branch that already has a valid sign-off to inherit. See #12357.
+      - name: Reject a failed sign-off on the head commit
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const headSha = context.payload.pull_request.head.sha;
+
+            // 'signoff' matches the hardcoded STATUS_CONTEXT in scripts/signoff.
+            const { data } = await github.rest.repos.getCombinedStatusForRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: headSha,
+            });
+            const signoff = data.statuses.find((status) => status.context === 'signoff');
+            if (signoff?.state !== 'failure' && signoff?.state !== 'error') {
+              return;
+            }
+
+            const reported = signoff.description ? `: ${signoff.description}` : '';
+            core.setFailed(
+              `The developer sign-off for ${headSha} reported ${signoff.state}${reported}. ` +
+              `Fix what it found and run make signoff again on the pushed HEAD; a sign-off ` +
+              `that has failed on this commit cannot be satisfied by an earlier one. ` +
+              `See docs/dev/ci_signoff.md.`
+            );
+
       # Dependabot dependency bumps are fast-tracked: a PR Dependabot opened that
       # is still exactly the one commit Dependabot pushed carries no
       # human-authored change to sign off on, and the merge queue re-runs the

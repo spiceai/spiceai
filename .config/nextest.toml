@@ -27,3 +27,8 @@ cayenne-property-tests = { max-threads = 2 }
 filter = 'binary(=mutation_property_test) | binary(=cdc_compaction_delete_race_test) | binary(=maintained_aggregate_filter_test)'
 test-group = 'cayenne-property-tests'
 retries = 0
+
+# Same reasoning for the MySQL CDC convergence tests: a retry that passes hides a lost update.
+[[profile.default.overrides]]
+filter = 'test(=mysql::replication_e2e::mysql_binlog_replication_survives_a_dump_reconnect_cayenne) | test(=mysql::replication_e2e::mysql_binlog_replication_decodes_every_column_type_cayenne)'
+retries = 0

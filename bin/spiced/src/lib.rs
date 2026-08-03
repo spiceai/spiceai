@@ -125,6 +125,7 @@ use yaml::Value;
 const TELEMETRY_DISABLED_SETTING_IGNORED_MESSAGE: &str = "Usage telemetry is anonymous and aggregated. In Spice.ai Open Source, setting runtime.telemetry.enabled: false in a Spicepod or passing --telemetry-enabled=false does not disable anonymous usage telemetry. To remove anonymous telemetry from an Open Source build, build from source without the anonymous_telemetry feature, or consider using Spice.ai Enterprise. Learn more at https://docs.spice.ai/docs/enterprise";
 
 mod cloud_connect;
+pub mod crash_handler;
 mod log_capture;
 #[path = "tracing.rs"]
 mod spiced_tracing;
@@ -680,17 +681,11 @@ pub async fn run(args: Args) -> Result<()> {
     if needs_metrics {
         // Resolve secrets in OTEL exporter headers before initializing metrics
         let resolved_otel_headers = if let Some(config) = otel_config {
-            let mut resolved = std::collections::HashMap::new();
-            let secrets = rt.secrets();
-            let secrets_guard = secrets.read().await;
-            for (key, value) in &config.headers {
-                let resolved_value = secrets_guard
-                    .inject_secrets(key, runtime::secrets::ParamStr(value.as_ref()))
-                    .await;
-                resolved.insert(key.clone(), resolved_value.expose_secret().to_string());
-            }
-            drop(secrets_guard);
-            resolved
+            runtime::secrets::get_params_with_secrets(rt.secrets(), &config.headers)
+                .await
+                .into_iter()
+                .map(|(key, value)| (key, value.expose_secret().to_string()))
+                .collect()
         } else {
             std::collections::HashMap::new()
         };

@@ -132,8 +132,7 @@ impl SpiceExtension {
     }
 
     async fn get_spice_api_key(&self, runtime: &Runtime) -> Result<String, Error> {
-        let secret = runtime.secrets();
-        let secret = secret.read().await;
+        let secret = Secrets::snapshot(&runtime.secrets()).await;
         let api_key = secret
             .get_secret("spiceai_api_key")
             .await

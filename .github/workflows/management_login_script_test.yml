@@ -1,0 +1,36 @@
+---
+name: Management Login Script Tests
+
+on:
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+    paths:
+      - '.github/actions/management-login/**'
+      - '.github/workflows/management_login_script_test.yml'
+  push:
+    branches:
+      - trunk
+    paths:
+      - '.github/actions/management-login/**'
+      - '.github/workflows/management_login_script_test.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  test-token-response-script:
+    name: Unit tests for token_response.sh
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Run tests
+        run: bash .github/actions/management-login/test_token_response.sh
