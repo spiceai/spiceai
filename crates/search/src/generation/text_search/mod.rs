@@ -321,7 +321,7 @@ impl FullTextSearchFieldIndex {
         )
     }
 
-    pub async fn search(
+    pub fn search(
         &self,
         query: String,
         opt_filters: &[&Expr],

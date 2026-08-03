@@ -900,7 +900,6 @@ mod tests {
     async fn search_and_format(idx: &FullTextSearchFieldIndex, query: impl Into<String>) -> String {
         let rb: Vec<RecordBatch> = idx
             .search(query.into(), &[], 1000)
-            .await
             .expect("Failed to search")
             .map(|res| match res {
                 Ok(rb) => sort_columns_alphabetically(&rb)
@@ -961,7 +960,6 @@ mod tests {
             .expect("Failed to create FullTextSearchFieldIndex");
         let batches = search_index
             .search("matching".to_string(), &[], 100)
-            .await
             .expect("Failed to search")
             .try_collect::<Vec<_>>()
             .await
