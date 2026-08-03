@@ -373,6 +373,13 @@ pub struct Args {
     #[arg(long, action = ArgAction::Append, value_parser = parse_set_string)]
     pub set_runtime: Vec<(String, String)>,
 
+    /// How many CPUs the runtime should behave as though it has, as a
+    /// Kubernetes CPU quantity (`4`, `3.5`, `3500m`). `auto` (the default)
+    /// detects it from the cgroup CPU quota, the pod's `requests.cpu`, or the
+    /// host. Takes precedence over `SPICE_CPU_CORES` and `runtime.cpu.cores`.
+    #[arg(long, value_name = "CORES")]
+    pub cpu_cores: Option<String>,
+
     #[arg(skip)]
     pub open_telemetry_deprecated: bool,
 }
@@ -420,7 +427,61 @@ fn spawn_sighup_reload_task(control: std::sync::Arc<runtime::tls::TlsControl>) {
     }
 }
 
-pub async fn run(args: Args) -> Result<()> {
+/// The parsed spicepod, where it came from, and the load error tolerated in
+/// pods-watcher mode.
+///
+/// [`build_app`] runs before the runtime's thread pools are built so
+/// `runtime.cpu.cores` can size them; its result is threaded into [`run`]
+/// rather than re-derived, so the spicepod is loaded exactly once — including
+/// the deployed one, whose `runtime.cpu.cores` therefore sizes the pools the
+/// same way a local spicepod's does.
+pub struct AppBundle {
+    pub app: Option<Arc<App>>,
+    /// Why the local `spicepod.yaml` did not load, in pods-watcher mode where
+    /// that is not fatal.
+    spicepod_load_error: Option<app::Error>,
+    /// The spicepod the app was loaded from, when it came from the cloud-managed
+    /// file. `None` means the runtime is serving something a deployment did not
+    /// put there, so no redelivery can match it.
+    running_deployment: Option<cloud_connect::CloudManagedSpicepod>,
+    /// Deferred because `build_app` runs before tracing is initialized.
+    deployment_note: Option<DeploymentNote>,
+}
+
+/// Resolve the CPU entitlement from all three configuration surfaces plus host
+/// detection, log it, and install it as the process-wide budget.
+///
+/// Must run before any thread pool, `DataFusion` session, or accelerator is
+/// created: [`cpu_budget::cpu_budget`] lazily detects into the same cell, so a
+/// read beforehand pins the detected value.
+///
+/// # Errors
+///
+/// Fails when the configured value is not a positive CPU quantity or `auto`.
+/// An already-installed budget is a WARN, not an error — the detected value is
+/// the pre-existing behaviour, and refusing to start over it would be worse
+/// than sizing as trunk did.
+pub fn install_cpu_budget(args: &Args, app: Option<&App>) -> Result<(), cpu_budget::Error> {
+    let spicepod_cores = app
+        .and_then(|app| app.runtime.cpu.as_ref())
+        .and_then(|cpu| cpu.cores.as_ref())
+        .map(ToString::to_string);
+    let env_cores = cpu_budget::CpuConfig::env_cores();
+    let config = cpu_budget::CpuConfig::from_sources(
+        args.cpu_cores.as_deref(),
+        env_cores.as_deref(),
+        spicepod_cores.as_deref(),
+    );
+
+    let budget = cpu_budget::CpuBudget::resolve(&config, &cpu_budget::HostReadings::detect())?;
+    in_tracing_context(|| budget.log_summary());
+    if let Err(err) = budget.install() {
+        in_tracing_context(|| tracing::warn!("{err}"));
+    }
+    Ok(())
+}
+
+pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     // Register external data connectors before runtime initialization.
     // This makes connectors from extracted crates available to the runtime.
     register_external_connectors().await;
@@ -432,12 +493,12 @@ pub async fn run(args: Args) -> Result<()> {
         .clone()
         .unwrap_or_else(|| env::current_dir().unwrap_or(PathBuf::from(".")));
 
-    let LoadedApp {
+    let AppBundle {
         app,
         spicepod_load_error,
         running_deployment,
         deployment_note,
-    } = build_app(&args).await?;
+    } = app_bundle;
     // Deferred until tracing exists, and appended to below — everything about
     // which configuration this start is serving belongs in one place in the log.
     let mut deployment_notes: Vec<DeploymentNote> = deployment_note.into_iter().collect();
@@ -773,6 +834,17 @@ pub async fn run(args: Args) -> Result<()> {
         tokio_handles.push(("main", Handle::current()));
         telemetry::register_tokio_runtime_metrics(tokio_handles);
 
+        // The CPU entitlement every one of those pools was sized from.
+        // `tokio_runtime_workers` above is the cross-check.
+        let budget = cpu_budget::cpu_budget();
+        telemetry::register_cpu_budget_metrics(
+            u64::try_from(budget.cores()).unwrap_or(u64::MAX),
+            budget.millicores(),
+            budget.source().as_str(),
+            budget.limit_millicores(),
+            budget.request_millicores(),
+        );
+
         // Cayenne write-path backpressure occupancy gauges (encode budget, in-memory
         // CDC tier byte budget, compaction semaphore). Pull-based observable gauges on
         // the global `cayenne` meter; registered here — after `init_metrics` — for the
@@ -932,20 +1004,6 @@ pub async fn run(args: Args) -> Result<()> {
     result
 }
 
-/// The app the runtime starts on, and where it came from.
-struct LoadedApp {
-    app: Option<Arc<App>>,
-    /// Why the local `spicepod.yaml` did not load, in pods-watcher mode where
-    /// that is not fatal.
-    spicepod_load_error: Option<app::Error>,
-    /// The spicepod the app was loaded from, when it came from the cloud-managed
-    /// file. `None` means the runtime is serving something a deployment did not
-    /// put there, so no redelivery can match it.
-    running_deployment: Option<cloud_connect::CloudManagedSpicepod>,
-    /// Deferred because `build_app` runs before tracing is initialized.
-    deployment_note: Option<DeploymentNote>,
-}
-
 /// What `build_app` decided about the deployed spicepod, logged once tracing
 /// exists.
 enum DeploymentNote {
@@ -993,7 +1051,16 @@ impl DeploymentNote {
     }
 }
 
-async fn build_app(args: &Args) -> Result<LoadedApp> {
+/// Load the spicepod and apply `--set-runtime` overrides.
+///
+/// Called from `main` before the multi-thread runtime is built, so
+/// `runtime.cpu.cores` can size it; only local/remote YAML parsing happens
+/// here, and the result is passed into [`run`].
+///
+/// A cloud-managed instance is loaded from the spicepod its last deployment
+/// persisted rather than the instance directory's `spicepod.yaml` — see the
+/// cloud-managed branch below.
+pub async fn build_app(args: &Args) -> Result<AppBundle> {
     // Check for explicit executor role OR implicit executor role (scheduler_address set without explicit role)
     let is_executor = matches!(args.runtime.cluster.role, Some(ClusterRole::Executor))
         || (args.runtime.cluster.role.is_none()
@@ -1007,12 +1074,16 @@ async fn build_app(args: &Args) -> Result<LoadedApp> {
             && let Ok(built_app) = AppBuilder::build_from_path(path.clone()).await
         {
             let mut app = App::default();
-            // Copy only runtime flight and telemetry config from the spicepod.
+            // Copy only runtime flight, telemetry, and CPU config from the
+            // spicepod. An executor is the deployment shape most likely to be
+            // running under a CPU request, so `runtime.cpu` must come across
+            // too — everything else it needs arrives from the scheduler.
             app.runtime.flight = built_app.runtime.flight;
             app.runtime.telemetry = built_app.runtime.telemetry;
+            app.runtime.cpu = built_app.runtime.cpu;
             app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
             tracing::info!("Starting as a cluster executor with runtime config from spicepod.");
-            return Ok(LoadedApp {
+            return Ok(AppBundle {
                 app: Some(Arc::new(app)),
                 spicepod_load_error: None,
                 running_deployment: None,
@@ -1022,7 +1093,7 @@ async fn build_app(args: &Args) -> Result<LoadedApp> {
         tracing::info!(
             "Starting as a cluster executor, without a Spicepod. The runtime will initialize its components upon joining the cluster."
         );
-        return Ok(LoadedApp {
+        return Ok(AppBundle {
             app: Some(Arc::new(App::default())),
             spicepod_load_error: None,
             running_deployment: None,
@@ -1039,7 +1110,7 @@ async fn build_app(args: &Args) -> Result<LoadedApp> {
         match AppBuilder::build_from_path(deployed.path.clone()).await {
             Ok(mut app) => {
                 app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
-                return Ok(LoadedApp {
+                return Ok(AppBundle {
                     app: Some(Arc::new(app)),
                     spicepod_load_error: None,
                     deployment_note: Some(DeploymentNote::Loaded {
@@ -1105,7 +1176,7 @@ async fn build_app(args: &Args) -> Result<LoadedApp> {
         }
     };
 
-    Ok(LoadedApp {
+    Ok(AppBundle {
         app,
         spicepod_load_error,
         running_deployment: None,

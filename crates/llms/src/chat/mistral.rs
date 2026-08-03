@@ -14,7 +14,7 @@ limitations under the License.
 #![allow(clippy::borrowed_box)]
 #![allow(clippy::needless_pass_by_value)]
 
-use crate::chat::message_to_mistral;
+use crate::chat::{LocalModelOptions, PagedAttentionMode, message_to_mistral};
 use crate::streaming_utils::create_stream_response_with_timestamp;
 
 use super::{Chat, Error as ChatError, FailedToRunModelSnafu, Result, nsql::SqlGeneration};
@@ -90,9 +90,14 @@ impl MistralLlama {
         tokenizer: Option<&Path>,
         tokenizer_config: Option<&Path>,
         generation_config: Option<&Path>,
-        chat_template_literal: Option<&str>,
+        options: LocalModelOptions<'_>,
         ring_config_path: Option<tempfile::TempPath>,
     ) -> Result<Self> {
+        let LocalModelOptions {
+            chat_template_literal,
+            context_length,
+            paged_attention,
+        } = options;
         for weight in model_weights {
             if !weight.exists() {
                 return Err(ChatError::LocalModelNotFound {
@@ -143,7 +148,16 @@ impl MistralLlama {
             .and_then(|p| p.as_path().extension())
             .and_then(|e| e.to_str());
 
-        let paged_attn_config = Self::paged_attention_config(&device);
+        let paged_attn_config = match paged_attention {
+            PagedAttentionMode::Disabled => {
+                tracing::info!(
+                    "Serving model {model_id} with dense attention (paged_attention: disabled)"
+                );
+                None
+            }
+            PagedAttentionMode::Auto => Self::paged_attention_config(&device),
+        };
+        let device_map = DeviceMapSetting::Auto(Self::text_device_map_params(context_length));
         let paged_attn_requested = paged_attn_config.is_some();
         let pipeline = match extension {
             Some("ggml") => Self::load_ggml_pipeline(
@@ -151,6 +165,7 @@ impl MistralLlama {
                 &device,
                 &model_id,
                 chat_template_literal,
+                device_map,
                 paged_attn_config,
             )?,
             Some("gguf") => Self::load_gguf_pipeline(
@@ -158,6 +173,7 @@ impl MistralLlama {
                 &device,
                 &model_id,
                 chat_template_literal,
+                device_map,
                 paged_attn_config,
             )?,
             _ => Self::load_default_pipeline(
@@ -165,6 +181,7 @@ impl MistralLlama {
                 &device,
                 &model_id,
                 chat_template_literal,
+                device_map,
                 paged_attn_config,
             )?,
         };
@@ -186,17 +203,24 @@ impl MistralLlama {
         tokenizer_config: Option<&Path>,
         generation_config: Option<&Path>,
     ) -> Box<dyn ModelPaths> {
-        Box::new(LocalModelPaths::new(
-            tokenizer.map(PathBuf::from).unwrap_or_default(),
-            config.map(PathBuf::from).unwrap_or_default(),
-            tokenizer_config.map(PathBuf::from).unwrap_or_default(),
-            model_weights.to_vec(),
-            AdapterPaths::None,
-            generation_config.map(PathBuf::from),
-            None,
-            None,
-            None,
-        ))
+        // NOTE: `LocalModelPaths::new` wraps its 3rd arg (`template_filename`) in `Some`,
+        // so passing an empty `PathBuf` (GGUF models carry no `tokenizer_config`) yields
+        // `Some("")`, which panics in mistral.rs `get_chat_template` (`.extension()` on an
+        // empty path -> "Template filename must be a file"). Construct the struct directly
+        // so `template_filename` is `None` when absent: GGUF models then fall back to the
+        // chat template embedded in the GGUF metadata. A present `tokenizer_config`
+        // (safetensors) is still used as the template source, preserving prior behavior.
+        Box::new(LocalModelPaths {
+            tokenizer_filename: tokenizer.map(PathBuf::from).unwrap_or_default(),
+            config_filename: config.map(PathBuf::from).unwrap_or_default(),
+            template_filename: tokenizer_config.map(PathBuf::from),
+            filenames: model_weights.to_vec(),
+            adapter_paths: AdapterPaths::None,
+            gen_conf: generation_config.map(PathBuf::from),
+            preprocessor_config: None,
+            processor_config: None,
+            chat_template_json_filename: None,
+        })
     }
 
     fn load_default_pipeline(
@@ -204,6 +228,7 @@ impl MistralLlama {
         device: &Device,
         model_id: &str,
         chat_template_literal: Option<&str>,
+        device_map: DeviceMapSetting,
         paged_attn_config: Option<mistralrs::PagedAttentionConfig>,
     ) -> Result<Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>> {
         let model_parts: Vec<&str> = model_id.split(':').collect();
@@ -222,7 +247,7 @@ impl MistralLlama {
             &ModelDType::Auto,
             device,
             true,
-            DeviceMapSetting::Auto(AutoDeviceMapParams::default_text()),
+            device_map,
             None,
             paged_attn_config,
         )
@@ -234,6 +259,7 @@ impl MistralLlama {
         device: &Device,
         model_id: &str,
         chat_template_literal: Option<&str>,
+        device_map: DeviceMapSetting,
         paged_attn_config: Option<mistralrs::PagedAttentionConfig>,
     ) -> Result<Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>> {
         // Note: GGUF supports chat templates in the file, but since GGML/llama.cpp does
@@ -282,7 +308,7 @@ impl MistralLlama {
             &ModelDType::Auto,
             device,
             true,
-            DeviceMapSetting::Auto(AutoDeviceMapParams::default_text()),
+            device_map,
             None,
             paged_attn_config,
         )
@@ -294,6 +320,7 @@ impl MistralLlama {
         device: &Device,
         model_id: &str,
         chat_template_literal: Option<&str>,
+        device_map: DeviceMapSetting,
         paged_attn_config: Option<mistralrs::PagedAttentionConfig>,
     ) -> Result<Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>> {
         let tokenizer = paths.get_tokenizer_filename().to_string_lossy().to_string();
@@ -313,13 +340,19 @@ impl MistralLlama {
             &ModelDType::Auto,
             device,
             true,
-            DeviceMapSetting::Auto(AutoDeviceMapParams::default_text()),
+            device_map,
             None,
             paged_attn_config,
         )
         .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })
     }
 
+    /// Build the mistral.rs `PagedAttention` config for a locally served model, or `None`
+    /// where this build cannot use it.
+    ///
+    /// Requesting it is all a caller can do: the engine downgrades to dense attention for
+    /// architectures with no paged kernel (the Multi-head Latent Attention GGUFs), which
+    /// is knowledge that belongs with its loaders rather than here.
     fn paged_attention_config(device: &Device) -> Option<mistralrs::PagedAttentionConfig> {
         if matches!(device, Device::Cpu) || !Self::paged_attention_supported() {
             return None;
@@ -336,6 +369,20 @@ impl MistralLlama {
 
     fn paged_attention_supported() -> bool {
         cfg!(all(feature = "cuda", target_family = "unix"))
+    }
+
+    /// Auto device-map params for text models, honoring an optional operator-set context
+    /// length (the `context_length` model param); the engine's own default applies when
+    /// unset. This is the sequence-length budget used to plan cross-device layer placement
+    /// and size the KV reservation — it does not raise the context the weights were
+    /// trained for, which the model's own metadata still caps.
+    fn text_device_map_params(context_length: Option<usize>) -> AutoDeviceMapParams {
+        context_length.map_or_else(AutoDeviceMapParams::default_text, |max_seq_len| {
+            AutoDeviceMapParams::Text {
+                max_seq_len,
+                max_batch_size: AutoDeviceMapParams::DEFAULT_MAX_BATCH_SIZE,
+            }
+        })
     }
 
     fn default_scheduler_config() -> mistralrs::SchedulerConfig {
@@ -527,6 +574,19 @@ impl MistralLlama {
             truncate_sequence: false,
             max_tool_rounds: None,
             tool_dispatch_url: None,
+            // mistral.rs v0.9.0 agentic / code-execution / shell / files features:
+            // Spice does not use them, so opt out with defaults.
+            enable_code_execution: false,
+            enable_shell: false,
+            shell_options: None,
+            code_execution_permission: None,
+            code_execution_approval_notifier: None,
+            agent_permission: None,
+            agent_approval_handler: None,
+            agent_approval_notifier: None,
+            session_id: None,
+            files: None,
+            input_files: Vec::new(),
         }))
     }
 
@@ -797,6 +857,21 @@ fn stream_from_response(
                 MistralResponse::Embeddings{..} => {
                     yield Err(OpenAIError::ApiError(ApiError {
                         message: "Embeddings response is not supported in chat".to_string(),
+                        r#type: None,
+                        param: None,
+                        code: None,
+                    }));
+                }
+                // mistral.rs v0.9.0 agentic / diffusion / file responses: Spice does
+                // not enable those features on the chat path (agent_permission/files
+                // are None), so they should not occur here. Surface an error rather
+                // than panic if the engine ever emits one.
+                MistralResponse::AgenticToolCallProgress { .. }
+                | MistralResponse::BlockDenoisingProgress(_)
+                | MistralResponse::AgenticToolApprovalRequired { .. }
+                | MistralResponse::File(_) => {
+                    yield Err(OpenAIError::ApiError(ApiError {
+                        message: "Unsupported response type for chat completions".to_string(),
                         r#type: None,
                         param: None,
                         code: None,
