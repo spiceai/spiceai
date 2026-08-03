@@ -16,6 +16,7 @@ use crate::accelerated_table::refresh::Refresh;
 use crate::dataaccelerator::AccelerationSource;
 use crate::dataaccelerator::DataAccelerator;
 use crate::dataaccelerator::ReloadProviderFactory;
+use crate::dataaccelerator::spice_sys::is_shutdown_cancellation;
 use crate::dataaccelerator::swappable::SwappableTableProvider;
 use crate::status::{RuntimeStatus, WaitOutcome};
 use arrow_schema::{FieldRef, Schema, SchemaRef};
@@ -491,7 +492,15 @@ pub async fn create_checkpoint_and_snapshot(
         .checkpoint(checkpoint_schema, refresh_sql)
         .await
     {
-        tracing::warn!("Failed to checkpoint dataset {dataset_name}: {e}");
+        if is_shutdown_cancellation(e.as_ref()) {
+            // Expected under shutdown — reporting it at `warn` makes a clean stop
+            // look like a failure. See `is_shutdown_cancellation`.
+            tracing::debug!(
+                "Did not checkpoint dataset {dataset_name}: the runtime is shutting down ({e})"
+            );
+        } else {
+            tracing::warn!("Failed to checkpoint dataset {dataset_name}: {e}");
+        }
         return;
     }
 
@@ -520,6 +529,12 @@ pub async fn create_checkpoint_and_snapshot(
             .await
         {
             Ok(_) => {}
+            Err(e) if is_shutdown_cancellation(&e) => {
+                // The snapshot engines carry a cancelled `JoinError` up this path
+                // too, in the same shutdown window as the checkpoint above. Not a
+                // snapshot failure, so it is not counted as one either.
+                tracing::debug!(dataset = %dataset_name, error = %e, "Did not create snapshot: the runtime is shutting down");
+            }
             Err(e) => {
                 let dataset_label = dataset_name.to_string();
                 snapshot_metrics::record_snapshot_failure(&dataset_label);
