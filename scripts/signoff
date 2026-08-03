@@ -697,6 +697,11 @@ run_make_step() {
     return $?
   fi
   local status
+  # Truncate per step, so the marker describes the step that actually failed.
+  # Left to accumulate, a step that merely *mentioned* running out of disk and
+  # then succeeded would still be blaming the volume for a genuine test failure
+  # two steps later.
+  : >"$SIGNOFF_DISK_MARKER" 2>/dev/null || true
   # awk rather than `tee` to a full log: it passes every line straight through
   # while copying only the out-of-disk lines to the marker, so the recorder
   # costs a few hundred bytes instead of tens of megabytes. fflush keeps the
@@ -709,9 +714,20 @@ run_make_step() {
   return "$status"
 }
 
+# True when this run watched its build output at all, i.e. the marker's verdict
+# — including an empty marker's "not disk" — is worth something.
+marker_is_armed() {
+  [[ -n "$SIGNOFF_DISK_MARKER" && -f "$SIGNOFF_DISK_MARKER" ]]
+}
+
 # True when this run's build actually reported running out of disk. This is the
 # authoritative signal — unlike a free-space reading taken after the fact, it
 # cannot be washed out by the partial artifacts cargo unlinks on its way out.
+#
+# Known gap: at true ENOSPC the append that records the line can itself fail,
+# leaving the marker empty and the failure read as the branch's. That is the
+# behavior this whole guard replaced, so it is no worse than not watching — but
+# it is why the marker lives in $TMPDIR rather than beside the build output.
 build_hit_disk_full() {
   [[ -n "$SIGNOFF_DISK_MARKER" && -s "$SIGNOFF_DISK_MARKER" ]]
 }
@@ -721,7 +737,9 @@ build_hit_disk_full() {
 # parse — every caller reads that as "unknown" and never as "full", so a runner
 # whose df we cannot read still gets to run its sign-off.
 free_disk_gib() {
-  local path="${1:-.}" free
+  # The volume that actually holds the build output: `target/` is what fills,
+  # and CARGO_TARGET_DIR can put it on a different filesystem than the checkout.
+  local path="${1:-${CARGO_TARGET_DIR:-.}}" free
   command -v df >/dev/null 2>&1 || return 1
   # -P: POSIX one-line-per-filesystem output, so Available is reliably field 4
   # even when a long device name would wrap in df's default format.
@@ -748,13 +766,25 @@ disk_is_critical() {
 # not record (a local run), which is why it is not the only signal.
 failure_kind() {
   local check_status="$1"
-  if [[ "$check_status" -eq "$EXIT_DISK_EXHAUSTED" ]] \
-    || build_hit_disk_full \
-    || disk_is_critical; then
+
+  # The preflight's own refusal needs no corroboration.
+  if [[ "$check_status" -eq "$EXIT_DISK_EXHAUSTED" ]]; then
     echo "disk"
-  else
-    echo "checks"
+    return
   fi
+
+  # If we watched the build, the watch decides — both ways. An empty marker
+  # means the build ran out of many things but not disk, and a free-space
+  # reading must not overrule that: on a shared pool another run can drag the
+  # volume under any threshold while *this* branch fails for its own reasons,
+  # and calling that "infrastructure" tells the author to re-dispatch a branch
+  # that will fail again. Free space is consulted only when nothing watched.
+  if marker_is_armed; then
+    if build_hit_disk_full; then echo "disk"; else echo "checks"; fi
+    return
+  fi
+
+  if disk_is_critical; then echo "disk"; else echo "checks"; fi
 }
 
 # Stop before the Rust checks when the work volume cannot hold them. Fatal only
@@ -769,6 +799,9 @@ preflight_disk() {
     info "warning: SIGNOFF_MIN_FREE_GIB='${min}' is not an integer — using ${DEFAULT_MIN_FREE_GIB}"
     min="$DEFAULT_MIN_FREE_GIB"
   fi
+  # Force base 10: bash arithmetic reads a leading zero as octal, so a
+  # well-meaning `SIGNOFF_MIN_FREE_GIB=08` is an arithmetic error, not 8.
+  min=$((10#$min))
 
   if ! free=$(free_disk_gib); then
     debug "could not measure free disk space — skipping the preflight check"
@@ -1034,9 +1067,9 @@ cmd_signoff() {
       # all most readers see, so it has to carry the distinction itself.
       case "$(failure_kind "$check_status")" in
         disk)
-          status_desc="Runner out of disk after ${elapsed}s — branch NOT evaluated, re-dispatch (triggered by ${user})"
-          summary_text="### Sign-off"$'\n'"**Infrastructure failure** after ${elapsed}s — the runner work volume is out of disk, so **the branch was not evaluated**. Re-dispatch once the runner has space rather than looking for a defect in the diff."$'\n'
-          fail_message="sign-off aborted: the runner is out of disk (the branch was not evaluated)"
+          status_desc="Runner out of disk after ${elapsed}s — checks did not complete, re-dispatch (triggered by ${user})"
+          summary_text="### Sign-off"$'\n'"**Infrastructure failure** after ${elapsed}s — the build ran out of disk on the runner work volume, so **the checks did not complete**. Re-dispatch once the runner has space. Only if this recurs for one branch alone is the diff worth suspecting: a build script or dependency change can consume the volume by itself."$'\n'
+          fail_message="sign-off aborted: the runner ran out of disk (the checks did not complete)"
           ;;
         *)
           status_desc="Sign-off checks failed after ${elapsed}s (triggered by ${user})"

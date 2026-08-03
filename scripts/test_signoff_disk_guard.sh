@@ -225,6 +225,22 @@ assert_recorder "reports make's failure, not the recorder's success" \
   'echo "some output"; exit 42' \
   42 no "some output"
 
+# Stickiness: a step that merely mentions running out of disk and then succeeds
+# must not leave the marker blaming the volume for a later, genuine failure.
+tests_run=$((tests_run + 1))
+sticky_marker="$stub_dir/marker-sticky"
+printf 'ld: write() failed, errno=28 (No space left on device)\n' >"$sticky_marker"
+printf '#!/usr/bin/env bash\necho "error[E0308]: mismatched types"; exit 101\n' >"$stub_dir/make"
+chmod +x "$stub_dir/make"
+env "PATH=$stub_dir:$PATH" SIGNOFF_DISK_MARKER="$sticky_marker" \
+  bash -c 'source "$1"; run_make_step some-target' _ "$subject" >/dev/null 2>&1
+if [[ -s "$sticky_marker" ]]; then
+  fail_test "each step truncates the marker: a previous step's ENOSPC still marks a later compile failure ('$(cat "$sticky_marker")')"
+else
+  echo "  ok: each step truncates the marker, so only the failing step speaks"
+fi
+rm -f "$stub_dir/make"
+
 echo "failure_kind"
 # The regression: run 30831204417 passed 8809 tests, then died at the linker
 # with errno=28 and reported as a plain check failure. run_checks exits non-zero
@@ -243,6 +259,19 @@ marker_empty="$stub_dir/marker-empty"
 : >"$marker_empty"
 assert_failure_kind "an empty marker does not itself imply a disk failure" 101 "checks" \
   SIGNOFF_DISK_MARKER="$marker_empty" STUB_FREE_KB="$(gib_to_kb 200)"
+# A watched run's verdict is final in BOTH directions. On a shared pool another
+# run can drag the volume under any threshold while this branch fails for its
+# own reasons; calling that "infrastructure" tells the author to re-dispatch a
+# branch that will just fail again.
+assert_failure_kind "a watched build that did not hit ENOSPC stays a check failure on an empty volume" 101 "checks" \
+  SIGNOFF_DISK_MARKER="$marker_empty" STUB_FREE_KB="$(gib_to_kb 1)"
+# ...and free space is still consulted when nothing watched, which is how a
+# local run gets any classification at all.
+assert_failure_kind "falls back to free space when no marker is armed" 101 "disk" \
+  STUB_FREE_KB="$(gib_to_kb 1)"
+# A marker path that was never created is not an armed watch.
+assert_failure_kind "an uncreated marker path does not count as a watch" 101 "disk" \
+  SIGNOFF_DISK_MARKER="$stub_dir/marker-never-made" STUB_FREE_KB="$(gib_to_kb 1)"
 assert_failure_kind "calls the preflight's own refusal a disk failure" 70 "disk" \
   STUB_FREE_KB="$(gib_to_kb 60)"
 # The other direction matters just as much: a real defect on a tight disk must
@@ -254,6 +283,13 @@ assert_failure_kind "calls a failure on a roomy volume a check failure" 101 "che
   STUB_FREE_KB="$(gib_to_kb 200)"
 assert_failure_kind "calls a failure with unknown free space a check failure" 101 "checks" \
   STUB_DF_RC=1
+
+# `08` passes the digit regex, but bash arithmetic reads a leading zero as
+# octal — untreated, the floor becomes an arithmetic error rather than 8.
+assert_preflight "reads a leading-zero floor as base 10, not octal" 0 "" \
+  SIGNOFF_REMOTE_RUN=1 SIGNOFF_MIN_FREE_GIB=08 STUB_FREE_KB="$(gib_to_kb 9)"
+assert_preflight "still stops below a leading-zero floor" 70 "not evaluated" \
+  SIGNOFF_REMOTE_RUN=1 SIGNOFF_MIN_FREE_GIB=08 STUB_FREE_KB="$(gib_to_kb 7)"
 
 echo
 if [[ "$failures" -gt 0 ]]; then
