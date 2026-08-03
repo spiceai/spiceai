@@ -372,9 +372,10 @@ pub struct DataFusionBuilder {
     cayenne_workload: crate::builder::CayenneWorkload,
     /// Whether `runtime.params.dedicated_thread_pool` leaves the dedicated pools on
     /// (set by the Runtime builder; the default is on). The in-memory CDC tier
-    /// budget is installed by `set_compaction_runtime`, which `spiced` only calls
-    /// when they are, so the coordinated host-memory partition is pointless without
-    /// them — it would shrink the query pool for a tier cap that never installs.
+    /// budget is installed by `install_cayenne_global_budgets`, which `spiced` only
+    /// calls when they are, so the coordinated host-memory partition is pointless
+    /// without them — it would shrink the query pool for a tier cap that never
+    /// installs.
     dedicated_thread_pools_enabled: bool,
     /// Coordinated query-pool ceiling (bytes) when `DuckDB` file accelerators are
     /// present, computed by the Runtime builder's cgroup-aware budget so the query
@@ -725,8 +726,8 @@ impl DataFusionBuilder {
         // concurrency wall — for nothing. Such a pod keeps the standard default,
         // still reduced by its measured off-pool cache reservation below.
         //
-        // Also gated on dedicated thread pools, because `set_compaction_runtime` is
-        // what installs the mem-tier budget and it only runs when they are enabled.
+        // Also gated on dedicated thread pools, because `install_cayenne_global_budgets`
+        // is what installs the mem-tier budget and it only runs when they are enabled.
         // That is deliberately NOT read off the compaction carve: the carve
         // additionally requires a file acceleration mode, and a `mode: memory` table
         // — the Spicepod default — reaches the tier without ever compacting into a
@@ -779,8 +780,8 @@ impl DataFusionBuilder {
         // reservation (e.g. co-resident DuckDB instance ceilings) so they never sum
         // past the memory available to this process — get_total_memory() is
         // cgroup-aware, so in a container that is the cgroup limit, not host RAM.
-        // `set_compaction_runtime` installs `mem_tier_budget_bytes` instead of the
-        // old, isolation-sized `get_total_memory() / 4`.
+        // `install_cayenne_global_budgets` installs `mem_tier_budget_bytes` into the
+        // Cayenne crate.
         let query_memory_pool_bytes = effective_memory_limit;
         let mem_tier_budget_bytes = cayenne_cdc_active.then(|| {
             let total_memory = crate::resource_monitor::get_total_memory();

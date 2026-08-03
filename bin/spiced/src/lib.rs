@@ -648,11 +648,13 @@ pub async fn run(args: Args) -> Result<()> {
                 rt.datafusion().set_cdc_apply_runtime(cdc_apply_runtime);
             }
 
-            // Process-global Cayenne write-path budgets (encode concurrency, the
-            // auto-tuner's memory budget, query admission). These bound every Cayenne
-            // table, compacting or not, so they are installed independently of the
-            // compaction runtime below — a fleet of full-refresh tables refreshing at
-            // once needs the encode cap just as much as a CDC fleet does.
+            // Process-global Cayenne budgets: the write path (encode concurrency, the
+            // auto-tuner's memory budget, query admission) and the off-pool in-memory
+            // CDC tier ceiling. These bound every Cayenne table, compacting or not, so
+            // they are installed independently of the compaction runtime below — a
+            // fleet of full-refresh tables refreshing at once needs the encode cap just
+            // as much as a CDC fleet does, and a `mode: memory` pod holds its whole
+            // dataset in the tier while never producing a file to compact.
             rt.datafusion().install_cayenne_global_budgets();
 
             // Bring up the dedicated compaction runtime whenever dedicated thread
