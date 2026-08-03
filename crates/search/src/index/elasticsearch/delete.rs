@@ -465,13 +465,21 @@ fn ensure_delete_applied(es_index: &str, response: &Value) -> DataFusionResult<(
         ));
     }
 
-    if let Some(reason) = response.get("canceled").and_then(Value::as_str) {
-        return Err(delete_not_applied(
-            es_index,
-            &format!(
-                "the delete was cancelled before it finished ('{reason}'), so Elasticsearch stopped short of the documents it had matched"
-            ),
-        ));
+    if let Some(canceled) = response.get("canceled") {
+        if canceled.as_bool() == Some(true) {
+            return Err(delete_not_applied(
+                es_index,
+                "the delete was cancelled before it finished, so Elasticsearch stopped short of the documents it had matched",
+            ));
+        }
+        if let Some(reason) = canceled.as_str() {
+            return Err(delete_not_applied(
+                es_index,
+                &format!(
+                    "the delete was cancelled before it finished ('{reason}'), so Elasticsearch stopped short of the documents it had matched"
+                ),
+            ));
+        }
     }
 
     let version_conflicts = response
