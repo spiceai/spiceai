@@ -181,7 +181,10 @@ mod tests {
             .expect_err("a non-UTF-8 value cannot be substituted");
         let message = err.to_string();
         assert!(message.contains("binary_key"), "{message}");
-        assert!(!message.contains('\u{fffd}'), "no lossy replacement: {message}");
+        assert!(
+            !message.contains('\u{fffd}'),
+            "no lossy replacement: {message}"
+        );
     }
 
     #[test]
