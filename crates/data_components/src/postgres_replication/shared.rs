@@ -1816,7 +1816,7 @@ fn finish_pump(source: &Arc<SharedSource>) {
 /// Best-effort and time-bounded — shutdown never blocks on the source, and a
 /// surviving slot costs retained WAL, not correctness.
 async fn drop_slot_if_ephemeral(source: &Arc<SharedSource>) {
-    if source.params.ephemeral_accelerator {
+    if source.params.slot_is_disposable() {
         slot::drop_slot_after_shutdown(&source.params).await;
     }
 }

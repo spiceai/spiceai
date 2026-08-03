@@ -395,7 +395,7 @@ async fn advance_slot_for_rebootstrap(
     client: &tokio_postgres::Client,
     params: &ReplicationParams,
 ) -> Option<u64> {
-    if !should_fast_forward(params.ephemeral_accelerator, params.snapshot_on_resume) {
+    if !params.slot_is_disposable() {
         return None;
     }
 
@@ -454,12 +454,6 @@ async fn advance_slot_for_rebootstrap(
             None
         }
     }
-}
-
-/// Whether skipping the backlog is safe. Both conditions are load-bearing — see
-/// [`advance_slot_for_rebootstrap`] for why neither alone is sufficient.
-const fn should_fast_forward(ephemeral_accelerator: bool, snapshot_on_resume: bool) -> bool {
-    ephemeral_accelerator && snapshot_on_resume
 }
 
 /// The server's current WAL insert position.
@@ -952,28 +946,6 @@ fn quote_ident(ident: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Skipping the backlog discards WAL, so the gate is the safety boundary.
-    /// Each condition is asserted to be individually necessary: a wrong `true`
-    /// here silently drops changes that nothing else will replace.
-    #[test]
-    fn fast_forward_requires_an_empty_accelerator_and_a_guaranteed_snapshot() {
-        // ephemeral + will snapshot: the snapshot rebuilds the whole table, so
-        // the skipped WAL is redundant.
-        assert!(should_fast_forward(true, true));
-
-        // Durable accelerator with the snapshot forced via
-        // `initial_snapshot: always`. Its snapshot upserts into rows that
-        // already exist, so discarding the WAL that carried the source's
-        // deletes would leave them behind in the accelerator.
-        assert!(!should_fast_forward(false, true));
-
-        // Empty accelerator but no snapshot will run
-        // (`initial_snapshot: disabled`) -- skipping WAL leaves the gap unfilled.
-        assert!(!should_fast_forward(true, false));
-
-        assert!(!should_fast_forward(false, false));
-    }
 
     /// The advance target is bound as `pg_lsn`, so it must round-trip through
     /// the exact textual form Postgres accepts.

@@ -132,6 +132,23 @@ pub struct ReplicationParams {
     pub pg_output_format: PgOutputFormat,
 }
 
+impl ReplicationParams {
+    /// Whether this slot carries nothing worth keeping across a restart, so it
+    /// may be released at shutdown and fast-forwarded past a backlog.
+    ///
+    /// Both conditions are required, and the second is the subtle one. An
+    /// ephemeral accelerator boots empty, but that only makes the slot
+    /// disposable if a snapshot is actually going to rebuild it. With
+    /// `pg_replication_initial_snapshot: disabled` no snapshot ever runs -- the
+    /// documented workflow is to pre-seed the accelerator yourself -- and the
+    /// slot is then the *only* thing carrying the changes that happened while
+    /// Spice was down. Dropping it there loses them with no way to replay.
+    #[must_use]
+    pub fn slot_is_disposable(&self) -> bool {
+        self.ephemeral_accelerator && self.snapshot_on_resume
+    }
+}
+
 impl std::fmt::Debug for ReplicationParams {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReplicationParams")
@@ -766,6 +783,36 @@ KLeFNAIi+S5cVzUwjMiOQnmljphKSRoQnihpA/c6WAVAN3VqMdoPpfmR2pTi7rio
 TXTE85+Or9IUwDI9543jsyCvuQ8=
 -----END CERTIFICATE-----
 ";
+
+    /// `slot_is_disposable` gates BOTH releasing the slot at shutdown and
+    /// fast-forwarding it past a backlog, so a wrong `true` discards WAL that
+    /// nothing else will replace. Each condition is asserted individually
+    /// necessary.
+    #[test]
+    fn a_slot_is_disposable_only_with_an_empty_accelerator_and_a_guaranteed_snapshot() {
+        let with = |ephemeral, snapshot_on_resume| {
+            let mut p = verify_full_params(None);
+            p.ephemeral_accelerator = ephemeral;
+            p.snapshot_on_resume = snapshot_on_resume;
+            p.slot_is_disposable()
+        };
+
+        // Boots empty and will re-snapshot: the WAL is genuinely redundant.
+        assert!(with(true, true));
+
+        // Durable accelerator, snapshot forced by `initial_snapshot: always`.
+        // Its snapshot upserts into rows that already exist, so discarding the
+        // WAL that carried the source's deletes would leave them behind.
+        assert!(!with(false, true));
+
+        // Empty accelerator but `initial_snapshot: disabled`, so no snapshot
+        // ever runs -- the operator pre-seeds and the slot is the only thing
+        // carrying the changes from while Spice was down. Regression for the
+        // review finding that the shutdown drop was gated on ephemerality alone.
+        assert!(!with(true, false));
+
+        assert!(!with(false, false));
+    }
 
     /// `verify-full` params — the strictest mode, and the one that actually
     /// consults `sslrootcert`. A weaker mode would build a connector even with
