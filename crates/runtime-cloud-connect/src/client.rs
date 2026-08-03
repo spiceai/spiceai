@@ -62,10 +62,10 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 use crate::config::CloudConnectConfig;
 use crate::enroll::{EnrollClient, RENEWAL_GRACE};
 use crate::handlers::{
-    Capability, CommandError, DeployState, PostApply, RestartMode, RuntimeHandle,
-    SpicepodDeployment, advertised_capabilities,
+    Capability, CommandError, PostApply, RestartMode, RuntimeHandle, SpicepodDeployment,
+    advertised_capabilities,
 };
-use crate::heartbeat::{build_heartbeat, build_telemetry, deploy_state_proto, now_unix};
+use crate::heartbeat::{build_heartbeat, build_telemetry, now_unix};
 use crate::identity::{Identity, IdentityStore};
 use crate::proto;
 use crate::shutdown::Shutdown;
@@ -87,9 +87,9 @@ const CLIENT_CHANNEL_SIZE: usize = 64;
 /// How long the client waits for the outbound channel to drain before exiting
 /// the process to apply a deployment, and how often it re-checks.
 ///
-/// Best-effort by design: the deployment is reconciled from the version the
-/// instance reports on its next `Hello`, not from this result arriving, so a
-/// slow gateway delays the exit by at most this budget rather than stalling it.
+/// Best-effort by design: the spicepod is already persisted and the restart is
+/// what makes it live, so a slow gateway delays the exit by at most this budget
+/// rather than stalling the deployment on a result nobody is waiting for.
 const APPLY_FLUSH_BUDGET: Duration = Duration::from_secs(5);
 const APPLY_FLUSH_POLL: Duration = Duration::from_millis(25);
 
@@ -552,17 +552,7 @@ impl ClientDriver {
 
         // Send Hello as the first frame. The client certificate is the
         // credential, so the Hello only names the instance.
-        //
-        // The deploy state it carries is kept: it is what the control plane now
-        // holds for this session, so the heartbeats behind it only report a
-        // change (see [`build_heartbeat`]).
-        let reported_deploy_state = self.runtime.deploy_state().await;
-        let hello = build_hello(
-            &self.config,
-            &identity,
-            self.runtime.as_ref(),
-            reported_deploy_state.as_ref(),
-        );
+        let hello = build_hello(&self.config, &identity, self.runtime.as_ref());
         tx.send(proto::ClientMessage {
             body: Some(proto::client_message::Body::Hello(hello)),
         })
@@ -641,19 +631,13 @@ impl ClientDriver {
         let hb_identifier = Arc::clone(&identifier);
         let hb_handle = tokio::spawn(async move {
             let mut seq: u64 = 0;
-            // Seeded with what the Hello reported, and carried across ticks: a
-            // heartbeat attaches a deploy state only when it differs from the
-            // last one the control plane was told, and this connection is the
-            // scope of that memory — a reconnect opens with a fresh Hello that
-            // reports the state again.
-            let mut reported = reported_deploy_state;
             let mut ticker = time::interval(hb_interval);
             ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
             loop {
                 ticker.tick().await;
                 seq = seq.wrapping_add(1);
                 let id = hb_identifier.read().await.clone();
-                let hb = build_heartbeat(&id, seq, &hb_runtime, &mut reported).await;
+                let hb = build_heartbeat(&id, seq, &hb_runtime).await;
                 let msg = proto::ClientMessage {
                     body: Some(proto::client_message::Body::Heartbeat(hb)),
                 };
@@ -926,10 +910,9 @@ impl ClientDriver {
     /// A deployment applies by restart, so a successful apply usually ends with
     /// this process exiting: the result is sent and flushed first, then the
     /// runtime handle exits and the supervisor relaunches it on the persisted
-    /// spicepod. The control plane does not depend on that result arriving — it
-    /// reconciles the deployment against the version the instance reports on its
-    /// next `Hello` — but sending it is what lets a synchronous caller see the
-    /// validation outcome.
+    /// spicepod. Sending the result first is what lets a caller see the
+    /// validation outcome at all — once the process is gone the stream is too,
+    /// so a result that has not been flushed by then is lost.
     ///
     /// `command_id` comes from the `ControlMessage` envelope, not from the
     /// command body — and it is part of the outer AAD, so an envelope cannot be
@@ -949,15 +932,6 @@ impl ClientDriver {
             {
                 Ok(secrets) => Some(secrets),
                 Err(err) => {
-                    // Refused before the spicepod was even read: the components
-                    // that referenced those secrets keep running the previous
-                    // configuration. Recorded like any other refusal so the
-                    // deployment is reported failed rather than left pending —
-                    // nothing restarts here, so the next heartbeat is the only
-                    // frame that can say so.
-                    self.runtime
-                        .refuse_deployment(cmd.deployment_version, &err.to_string())
-                        .await;
                     send_command_error(tx, command_id, &err).await;
                     return;
                 }
@@ -969,7 +943,6 @@ impl ClientDriver {
             .apply_spicepod(SpicepodDeployment {
                 config_dir: &self.config.config_dir,
                 spicepod_yaml: &cmd.spicepod_yaml,
-                deployment_version: cmd.deployment_version,
                 delivered_secrets: delivered,
             })
             .await;
@@ -977,12 +950,6 @@ impl ClientDriver {
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(err) => {
-                // A rejected spicepod restarts nothing, so this session's next
-                // heartbeat is the only route the report has: with no restart
-                // there is no reconnect and no new `Hello`.
-                self.runtime
-                    .refuse_deployment(cmd.deployment_version, &err.to_string())
-                    .await;
                 send_command_error(tx, command_id, &err).await;
                 return;
             }
@@ -992,9 +959,7 @@ impl ClientDriver {
 
         if outcome.post_apply == PostApply::ExitToApply {
             tracing::info!(
-                "Cloud Connect: deployment{} is persisted; exiting so the supervisor restarts spiced on it",
-                cmd.deployment_version
-                    .map_or_else(String::new, |version| format!(" {version}"))
+                "Cloud Connect: the deployed spicepod is persisted; exiting so the supervisor restarts spiced on it"
             );
             flush_outbound(tx).await;
             self.runtime.exit_to_apply().await;
@@ -1200,15 +1165,6 @@ impl ClientDriver {
         self.identity = None;
         live_identifier.write().await.clear();
 
-        // Best-effort, and after the identity: the applied-deployment record
-        // belongs to the app this instance was released from, so a later
-        // re-adoption into a different app must not report its version — but a
-        // record that outlives the identity is stale bookkeeping, not a failed
-        // release, so it does not change the answer above.
-        if let Err(err) = crate::deployment::remove_async(&self.config.config_dir).await {
-            tracing::warn!("Cloud Connect: {err}");
-        }
-
         send_ok_json(tx, command_id, &serde_json::json!({ "status": "removed" })).await;
         true
     }
@@ -1354,8 +1310,8 @@ fn build_channel(
 /// Called before the process exits to apply a deployment. Full capacity means
 /// the transport took every queued frame — including the `CommandResult` just
 /// sent — which is as close to "it is on the wire" as a channel can report. The
-/// budget is what keeps a stalled gateway from holding up the deployment: the
-/// control plane reconciles from the reported version, not from this result.
+/// budget is what keeps a stalled gateway from holding up the deployment, which
+/// is already persisted and takes effect on the restart either way.
 async fn flush_outbound(tx: &mpsc::Sender<proto::ClientMessage>) {
     let deadline = time::Instant::now() + APPLY_FLUSH_BUDGET;
     while tx.capacity() < tx.max_capacity() {
@@ -1374,20 +1330,10 @@ async fn flush_outbound(tx: &mpsc::Sender<proto::ClientMessage>) {
     }
 }
 
-/// Build the `Hello` that opens a stream.
-///
-/// `deploy_state` is what the instance reports about the deployment it is
-/// serving, already read by the caller so the same value can seed the heartbeat
-/// deduplication. It is `None` only for a handle that does not report deploy
-/// versions — the same handle that does not announce
-/// [`Capability::DeployVersions`], which is what tells the control plane to
-/// reconcile deployments some other way rather than read the absence as "nothing
-/// applied".
 fn build_hello(
     config: &CloudConnectConfig,
     identity: &Identity,
     runtime: &dyn RuntimeHandle,
-    deploy_state: Option<&DeployState>,
 ) -> proto::Hello {
     // The client certificate carries the identity, so the Hello only names
     // the instance and declares what it can do.
@@ -1404,10 +1350,6 @@ fn build_hello(
         runtime_versions: std::collections::HashMap::new(),
         protocol_version: crate::PROTOCOL_VERSION,
         capabilities: advertised_capabilities(runtime),
-        // What the control plane reconciles a deployment against: an apply
-        // restarts the instance, so the version reported here is how it learns
-        // the deployment landed — the command result may never arrive.
-        deploy_state: deploy_state.map(deploy_state_proto),
     }
 }
 

@@ -43,7 +43,7 @@ limitations under the License.
 //!    configured cadences.
 //! 5. `apply_spicepod` — the YAML is persisted, the result is flushed, and the
 //!    runtime is asked to exit so its supervisor restarts it onto the new
-//!    configuration; the version it comes back on rides the next `Hello`.
+//!    configuration.
 //! 6. `reconnect_over_mtls` — after the server drops the stream, the
 //!    client reconnects, presenting its client certificate again.
 //! 7. `renewal` — a short-lived leaf triggers the renewal loop: a fresh
@@ -79,7 +79,7 @@ use rcgen::{
 };
 use runtime_cloud_connect::config::CloudConnectConfig;
 use runtime_cloud_connect::handlers::{
-    ApplyOutcome, Capability, CommandError, DeployState, RuntimeHandle, SpicepodDeployment,
+    ApplyOutcome, Capability, CommandError, RuntimeHandle, SpicepodDeployment,
 };
 use runtime_cloud_connect::identity::IdentityStore;
 use runtime_cloud_connect::proto;
@@ -559,21 +559,10 @@ struct E2eRuntimeState {
     /// Names of the secrets delivered with the last applied spicepod, never
     /// values. `None` when the deployment carried no payload at all.
     delivered_secret_names: Option<Vec<String>>,
-    /// The deployment this stand-in reports as applied. `0` is "none since
-    /// enrolment"; seeded to model an instance that came back up on a
-    /// deployment, and advanced by an apply the way `spiced` advances the record
-    /// it writes before restarting.
-    applied_deployment_version: u64,
-    /// The deployment it refused, and why — set through `refuse_deployment` and
-    /// cleared by the next accepted one, as the real adapter does.
-    refused: Option<(u64, String)>,
     /// Set when the client asked the runtime to exit and apply. The real
     /// adapter ends the process here; a test one records that it was asked, so
     /// the test can assert the result was flushed first.
     exit_requested: bool,
-    /// Makes the next apply fail validation, so the refusal path can be driven
-    /// without building a spicepod this harness would have to parse.
-    reject_next_apply: Option<String>,
 }
 
 struct E2eRuntime {
@@ -582,16 +571,7 @@ struct E2eRuntime {
 
 impl E2eRuntime {
     fn new() -> (Arc<Self>, Arc<Mutex<E2eRuntimeState>>) {
-        Self::with_applied_version(0)
-    }
-
-    /// An instance already serving `version`, as one that restarted onto a
-    /// deployment reports itself. `0` is an instance that has applied nothing.
-    fn with_applied_version(version: u64) -> (Arc<Self>, Arc<Mutex<E2eRuntimeState>>) {
-        let state = Arc::new(Mutex::new(E2eRuntimeState {
-            applied_deployment_version: version,
-            ..E2eRuntimeState::default()
-        }));
+        let state = Arc::new(Mutex::new(E2eRuntimeState::default()));
         (
             Arc::new(Self {
                 state: Arc::clone(&state),
@@ -604,10 +584,7 @@ impl E2eRuntime {
 #[async_trait]
 impl RuntimeHandle for E2eRuntime {
     fn supports(&self, capability: Capability) -> bool {
-        matches!(
-            capability,
-            Capability::ApplySpicepod | Capability::DeployVersions
-        )
+        capability == Capability::ApplySpicepod
     }
 
     async fn active_datasets(&self) -> u32 {
@@ -617,30 +594,10 @@ impl RuntimeHandle for E2eRuntime {
         1
     }
 
-    async fn deploy_state(&self) -> Option<DeployState> {
-        let state = self.state.lock().await;
-        let deploy = DeployState::applied(state.applied_deployment_version);
-        Some(match state.refused.as_ref() {
-            Some((version, message)) => deploy.with_failure(*version, message.clone()),
-            None => deploy,
-        })
-    }
-
-    async fn refuse_deployment(&self, deployment_version: Option<u64>, message: &str) {
-        if let Some(version) = deployment_version {
-            self.state.lock().await.refused = Some((version, message.to_string()));
-        }
-    }
-
     async fn apply_spicepod(
         &self,
         deployment: SpicepodDeployment<'_>,
     ) -> Result<ApplyOutcome, CommandError> {
-        if let Some(reason) = self.state.lock().await.reject_next_apply.take() {
-            // Validation refuses it: nothing is persisted and nothing restarts,
-            // so the client records the refusal and the next heartbeat reports it.
-            return Err(CommandError::invalid_argument(reason));
-        }
         // Record the delivered names (never values) so a test can assert the
         // payload reached the runtime adapter.
         self.state.lock().await.delivered_secret_names = deployment
@@ -658,20 +615,13 @@ impl RuntimeHandle for E2eRuntime {
         tokio::fs::write(&path, deployment.spicepod_yaml)
             .await
             .map_err(|e| CommandError::failed(e.to_string()))?;
-        {
-            let mut state = self.state.lock().await;
-            state.applied_spicepod = Some((path.clone(), deployment.spicepod_yaml.to_string()));
-            state.applied_deployment_version = deployment.deployment_version.unwrap_or(0);
-            // An accepted deployment supersedes an earlier refusal, which is how
-            // a stale failure stops being reported.
-            state.refused = None;
-        }
+        self.state.lock().await.applied_spicepod =
+            Some((path.clone(), deployment.spicepod_yaml.to_string()));
         Ok(ApplyOutcome::exit_to_apply(serde_json::json!({
             "path": path.display().to_string(),
             "applied": true,
             "live": false,
             "restart": "required",
-            "deployment_version": deployment.deployment_version,
         })))
     }
 
@@ -901,31 +851,20 @@ async fn enrollment_issues_identity_and_streams_over_mtls() {
     // the observed mTLS Hello (in `enroll`) implies a valid chain.
 
     // The stream Hello names the instance and carries no credential of its
-    // own — enrollment moved out-of-band, and mTLS is the authN. Asserted field
-    // by field rather than as one predicate, so a failure says which part broke.
+    // own — enrollment moved out-of-band, and mTLS is the authN.
     let captured = Arc::clone(&harness.gateway.captured);
-    let (hello, over_mtls) = with_captured!(captured, c => c
-        .hellos
-        .iter()
-        .find(|(h, _)| h.identifier == ASSIGNED_ID)
-        .cloned())
-    .expect("the gateway must observe a Hello naming the enrolled instance");
+    let ok = with_captured!(captured, c => {
+        c.hellos.iter().any(|(h, mtls)| {
+            h.identifier == ASSIGNED_ID
+                && *mtls
+                && h.instance_kind == proto::InstanceKind::Standalone as i32
+                && h.protocol_version == runtime_cloud_connect::PROTOCOL_VERSION
+                && h.capabilities == vec!["apply_spicepod".to_string()]
+        })
+    });
     assert!(
-        over_mtls,
-        "the Hello must arrive on a mutually-authenticated stream"
-    );
-    assert_eq!(hello.instance_kind, proto::InstanceKind::Standalone as i32);
-    assert_eq!(
-        hello.protocol_version,
-        runtime_cloud_connect::PROTOCOL_VERSION
-    );
-    assert_eq!(
-        hello.capabilities,
-        vec![
-            "apply_spicepod".to_string(),
-            runtime_cloud_connect::handlers::CAPABILITY_DEPLOY_VERSIONS.to_string(),
-        ],
-        "this handle applies spicepods and reports deploy versions, and announces exactly those"
+        ok,
+        "mTLS Hello must name the instance and announce its protocol version + capabilities"
     );
 
     handle.shutdown().await;
@@ -1504,7 +1443,6 @@ async fn apply_spicepod_delivers_double_sealed_secrets() {
         COMMAND_ID,
         proto::control_message::Body::ApplySpicepod(proto::ApplySpicepod {
             spicepod_yaml: yaml.to_string(),
-            deployment_version: None,
             sealed_secret_payload: Some(proto::SealedSecretPayload {
                 key_id: session.key_id.clone(),
                 enc: outer_sealed.enc,
@@ -1581,7 +1519,6 @@ async fn apply_spicepod_refuses_an_unopenable_payload() {
         "cmd-bad-secrets",
         proto::control_message::Body::ApplySpicepod(proto::ApplySpicepod {
             spicepod_yaml: "version: v2\nkind: Spicepod\nname: nope\n".to_string(),
-            deployment_version: None,
             sealed_secret_payload: Some(proto::SealedSecretPayload {
                 key_id: "0000000000000000".to_string(),
                 enc: vec![0_u8; 32],
@@ -1634,7 +1571,6 @@ async fn apply_spicepod_persists_then_exits_to_restart() {
         proto::control_message::Body::ApplySpicepod(proto::ApplySpicepod {
             spicepod_yaml: yaml.to_string(),
             sealed_secret_payload: None,
-            deployment_version: Some(41),
         }),
     ));
 
@@ -1676,7 +1612,6 @@ async fn apply_spicepod_persists_then_exits_to_restart() {
         "the deployment is persisted, not yet serving — the restart is what makes it live"
     );
     assert_eq!(meta["restart"], "required");
-    assert_eq!(meta["deployment_version"], 41);
 
     // The runtime persisted the YAML to the canonical cloud-managed path, which
     // is what the restart comes back up on.
@@ -1688,189 +1623,6 @@ async fn apply_spicepod_persists_then_exits_to_restart() {
         .expect("spicepod applied");
     assert_eq!(written, yaml);
     assert!(path.exists(), "spicepod file must be on disk");
-
-    handle.shutdown().await;
-}
-
-/// The reconciliation contract: an instance that came up on a deployment says
-/// so in its `Hello`. The control plane cannot learn it from the command result
-/// — the apply exits the process before the result is guaranteed to land.
-#[tokio::test]
-async fn hello_reports_the_applied_deployment_version() {
-    let harness = Harness::new(24 * 60 * 60).await;
-    let dir = tempfile::tempdir().unwrap();
-    let config = harness.config(
-        dir.path().join("identity.json"),
-        dir.path().to_path_buf(),
-        Some(ADOPTION_CODE.to_string()),
-        Duration::from_hours(12),
-    );
-    let (runtime, _rt_state) = E2eRuntime::with_applied_version(41);
-    let (handle, _identity) = enroll(&harness, &config, runtime).await;
-
-    let captured = Arc::clone(&harness.gateway.captured);
-    let hello = with_captured!(captured, c => c.hellos[0].0.clone());
-    let state = hello
-        .deploy_state
-        .expect("a reporting instance always attaches a DeployState to its Hello");
-    assert_eq!(
-        state.applied_deployment_version,
-        Some(41),
-        "an instance serving a deployment must name it, or a deploy can never resolve"
-    );
-    assert_eq!(state.failed_deployment_version, None);
-    assert!(state.failure_message.is_empty());
-
-    handle.shutdown().await;
-}
-
-/// A freshly enrolled instance that has applied nothing announces
-/// `deploy.versions` and reports a **zero**, not an absent version. The
-/// capability is what tells the control plane which reconciliation path to take,
-/// and it must be readable before any frame arrives — the gateway registers the
-/// session first, and "reports versions, has applied nothing" would otherwise be
-/// indistinguishable from "does not report versions" for the width of that window.
-#[tokio::test]
-async fn hello_announces_the_capability_and_reports_zero_before_any_deployment() {
-    let harness = Harness::new(24 * 60 * 60).await;
-    let dir = tempfile::tempdir().unwrap();
-    let config = harness.config(
-        dir.path().join("identity.json"),
-        dir.path().to_path_buf(),
-        Some(ADOPTION_CODE.to_string()),
-        Duration::from_hours(12),
-    );
-    let (runtime, _rt_state) = E2eRuntime::new();
-    let (handle, _identity) = enroll(&harness, &config, runtime).await;
-
-    let captured = Arc::clone(&harness.gateway.captured);
-    let hello = with_captured!(captured, c => c.hellos[0].0.clone());
-    assert!(
-        hello
-            .capabilities
-            .iter()
-            .any(|c| c == runtime_cloud_connect::handlers::CAPABILITY_DEPLOY_VERSIONS),
-        "an instance that reports deploy versions must announce it: {:?}",
-        hello.capabilities
-    );
-    let state = hello.deploy_state.expect("the Hello always carries one");
-    assert_eq!(
-        state.applied_deployment_version,
-        Some(0),
-        "nothing applied is a zero, not an absence — the two settle a deployment differently"
-    );
-
-    handle.shutdown().await;
-}
-
-/// A spicepod rejected at validation restarts nothing, so no new `Hello`
-/// follows and the open session's `Heartbeat` is the only route the failure has.
-/// It names the version it refused and leaves the applied version reporting what
-/// is still running.
-#[tokio::test]
-async fn a_rejected_deployment_is_reported_on_a_heartbeat() {
-    let harness = Harness::new(24 * 60 * 60).await;
-    let dir = tempfile::tempdir().unwrap();
-    let config = harness.config(
-        dir.path().join("identity.json"),
-        dir.path().to_path_buf(),
-        Some(ADOPTION_CODE.to_string()),
-        Duration::from_hours(12),
-    );
-    let (runtime, rt_state) = E2eRuntime::with_applied_version(7);
-    rt_state.lock().await.reject_next_apply = Some("invalid spicepod: bad yaml".to_string());
-    let (handle, _identity) = enroll(&harness, &config, runtime).await;
-
-    harness.gateway.outbound.lock().await.push_back(ctrl_id(
-        "cmd-reject",
-        proto::control_message::Body::ApplySpicepod(proto::ApplySpicepod {
-            spicepod_yaml: "name: [unclosed".to_string(),
-            sealed_secret_payload: None,
-            deployment_version: Some(8),
-        }),
-    ));
-
-    let captured = Arc::clone(&harness.gateway.captured);
-    let reported = wait_until_async(Duration::from_secs(5), || {
-        let captured = Arc::clone(&captured);
-        async move {
-            captured
-                .lock()
-                .await
-                .heartbeats
-                .iter()
-                .any(|hb| hb.deploy_state.is_some())
-        }
-    })
-    .await;
-    assert!(
-        reported,
-        "a rejected deployment must be reported on a heartbeat — nothing restarts, so there is no other frame"
-    );
-
-    let state = with_captured!(captured, c => c
-        .heartbeats
-        .iter()
-        .filter_map(|hb| hb.deploy_state.clone())
-        .next_back())
-    .expect("a heartbeat carried a deploy state");
-    assert_eq!(state.failed_deployment_version, Some(8));
-    assert_eq!(state.failure_message, "invalid spicepod: bad yaml");
-    assert_eq!(
-        state.applied_deployment_version,
-        Some(7),
-        "the applied version must still report what is running, not the refused one"
-    );
-
-    // The refusal was also answered as a command failure — the heartbeat report
-    // is what settles the deployment, not a replacement for the result.
-    let failed = with_captured!(captured, c => c
-        .results
-        .iter()
-        .any(|r| r.command_id == "cmd-reject"
-            && r.code == proto::ResultCode::InvalidArgument as i32));
-    assert!(
-        failed,
-        "the rejected apply must also answer INVALID_ARGUMENT"
-    );
-
-    handle.shutdown().await;
-}
-
-/// Heartbeats do not repeat a state the control plane already holds: each one
-/// *replaces* its record, so an unchanged report says nothing, and a heartbeat
-/// carrying none leaves the previous report standing.
-#[tokio::test]
-async fn heartbeats_carry_a_deploy_state_only_when_it_changes() {
-    let harness = Harness::new(24 * 60 * 60).await;
-    let dir = tempfile::tempdir().unwrap();
-    let config = harness.config(
-        dir.path().join("identity.json"),
-        dir.path().to_path_buf(),
-        Some(ADOPTION_CODE.to_string()),
-        Duration::from_hours(12),
-    );
-    let (runtime, _rt_state) = E2eRuntime::with_applied_version(3);
-    let (handle, _identity) = enroll(&harness, &config, runtime).await;
-
-    // The 150ms cadence gives several heartbeats inside this budget.
-    let captured = Arc::clone(&harness.gateway.captured);
-    let enough = wait_until_async(Duration::from_secs(5), || {
-        let captured = Arc::clone(&captured);
-        async move { captured.lock().await.heartbeats.len() >= 3 }
-    })
-    .await;
-    assert!(enough, "expected >=3 heartbeats");
-
-    let repeated = with_captured!(captured, c => c
-        .heartbeats
-        .iter()
-        .filter(|hb| hb.deploy_state.is_some())
-        .count());
-    assert_eq!(
-        repeated, 0,
-        "the Hello already reported this state; the heartbeats behind it must add nothing"
-    );
 
     handle.shutdown().await;
 }

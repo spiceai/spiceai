@@ -90,30 +90,19 @@ impl CommandError {
     }
 }
 
-/// Wire name of the deploy-version-reporting capability.
+/// An optional command a [`RuntimeHandle`] may or may not implement.
 ///
-/// A constant, not a literal at each call site: a typo in this string does not
-/// fail, it reads to the control plane as "this instance does not report deploy
-/// versions" and silently sends every deployment down the fallback
-/// reconciliation path.
-pub const CAPABILITY_DEPLOY_VERSIONS: &str = "deploy.versions";
-
-/// Something a [`RuntimeHandle`] may or may not implement, announced in
-/// `Hello.capabilities`.
+/// The set an instance announces in `Hello.capabilities` is derived from
+/// [`RuntimeHandle::supports`], and the client consults the same method before
+/// invoking a handler — so what an instance advertises and what it actually
+/// answers cannot drift apart.
 ///
-/// The set an instance announces is derived from [`RuntimeHandle::supports`],
-/// and the client consults the same method before invoking a handler — so what
-/// an instance advertises and what it actually answers cannot drift apart.
-///
-/// Mostly commands, but not only: [`Capability::DeployVersions`] announces that
-/// the instance reports a [`DeployState`], which the control plane has to know
-/// before the instance's first frame arrives rather than infer from one.
-///
+/// Only commands this client can dispatch to a `RuntimeHandle` appear here.
 /// The operator-only commands (manifests, drain, pause, sealed secrets, `PromQL`
 /// proxying, HTTP proxying) have no handler to route to and are always
-/// answered as unsupported, so they are absent here. The wire field is an open
-/// list of names, so a cluster instance built on a different implementation can
-/// advertise capabilities this enum does not know about.
+/// answered as unsupported. The wire field is an open list of names, so a
+/// cluster instance built on a different implementation can advertise
+/// capabilities this enum does not know about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Capability {
     /// Apply cloud-managed Spicepod YAML.
@@ -126,26 +115,20 @@ pub enum Capability {
     GetLogs,
     /// Report runtime readiness.
     GetStatus,
-    /// Report which deployment is applied, and which was refused, as a
-    /// [`DeployState`] on every `Hello` and on any `Heartbeat` that has news.
-    /// Not a command — nothing dispatches it; announcing it is the whole point.
-    DeployVersions,
 }
 
 impl Capability {
     /// Every capability this client can advertise, in wire-name order.
     pub const ALL: &'static [Self] = &[
         Self::ApplySpicepod,
-        Self::DeployVersions,
         Self::GetLogs,
         Self::GetStatus,
         Self::Restart,
         Self::UpgradeRuntime,
     ];
 
-    /// The name carried in `Hello.capabilities`. For a command it is the
-    /// `snake_case` field name in the `ControlMessage` oneof; anything else is
-    /// dotted, so the two cannot be confused.
+    /// The name carried in `Hello.capabilities`, matching the command's
+    /// `snake_case` field name in the `ControlMessage` oneof.
     #[must_use]
     pub fn wire_name(self) -> &'static str {
         match self {
@@ -154,59 +137,7 @@ impl Capability {
             Self::UpgradeRuntime => "upgrade_runtime",
             Self::GetLogs => "get_logs",
             Self::GetStatus => "get_status",
-            Self::DeployVersions => CAPABILITY_DEPLOY_VERSIONS,
         }
-    }
-}
-
-/// What this instance has deployed: the deployment it is serving, and the one it
-/// refused.
-///
-/// The control plane reconciles a deployment against this rather than against
-/// the `ApplySpicepod` result, because applying restarts the instance: the
-/// stream drops mid-command, so the result may never arrive while the version
-/// reported on the next connection always does.
-///
-/// Every value sent **replaces** what the receiver holds for the session — a
-/// snapshot, not a delta. A failure therefore clears by sending a state without
-/// one; re-sending a stale failure would fail a later deployment that reused
-/// that version.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DeployState {
-    /// The deployment whose spicepod this instance is serving. `Some(0)` means
-    /// none has been applied since enrolment; `None` means the instance cannot
-    /// say, which an instance announcing [`Capability::DeployVersions`] never
-    /// reports — the two settle a deployment differently.
-    pub applied_deployment_version: Option<u64>,
-    /// The deployment this instance refused, if any: rejected at validation, or
-    /// rolled back after failing to start. `applied_deployment_version` reports
-    /// what is running *instead*.
-    pub failed_deployment_version: Option<u64>,
-    /// Why it was refused, in this instance's own words. Empty when there is
-    /// nothing to explain, and ignored by the control plane without a
-    /// `failed_deployment_version` — on its own it names no deployment.
-    pub failure_message: String,
-}
-
-impl DeployState {
-    /// The state of an instance serving `applied` and refusing nothing. `0`
-    /// stands for "no deployment applied since enrolment".
-    #[must_use]
-    pub fn applied(applied: u64) -> Self {
-        Self {
-            applied_deployment_version: Some(applied),
-            failed_deployment_version: None,
-            failure_message: String::new(),
-        }
-    }
-
-    /// Record `version` as refused, with the error that refused it. The applied
-    /// version is left alone: it is what the instance is running instead.
-    #[must_use]
-    pub fn with_failure(mut self, version: u64, message: impl Into<String>) -> Self {
-        self.failed_deployment_version = Some(version);
-        self.failure_message = message.into();
-        self
     }
 }
 
@@ -258,23 +189,14 @@ impl RuntimePhase {
 
 /// One deployment, as it reaches a [`RuntimeHandle`].
 ///
-/// A struct rather than four positional arguments because two of them are
-/// optional and adjacent: `apply_spicepod(dir, yaml, None, None)` reads as
-/// nothing at the call site, and a later field would be one more thing to
-/// thread through every implementation in the right order.
+/// A struct rather than positional arguments: `apply_spicepod(dir, yaml, None)`
+/// reads as nothing at the call site, and a later field would be one more thing
+/// to thread through every implementation in the right order.
 pub struct SpicepodDeployment<'a> {
-    /// Where the cloud-managed spicepod and the deployment record live.
+    /// Where the cloud-managed spicepod lives.
     pub config_dir: &'a Path,
     /// The spicepod to apply, verbatim.
     pub spicepod_yaml: &'a str,
-    /// The deployment this dispatch belongs to, reported back as the
-    /// [`DeployState::applied_deployment_version`] once the instance serves it —
-    /// or as the [`DeployState::failed_deployment_version`] if it is refused.
-    ///
-    /// `None` means the dispatch named no deployment: apply the spicepod, but
-    /// report no version for it afterwards. It is never zero — a zero would let a
-    /// deployment resolve against a version nothing claimed.
-    pub deployment_version: Option<u64>,
     /// App secrets that rode the same dispatch, already opened (see
     /// [`crate::sealed_secrets`]). They arrive *with* the spicepod because
     /// applying is a restart: secrets that landed afterwards would arrive after
@@ -424,43 +346,6 @@ pub trait RuntimeHandle: Send + Sync + 'static {
         })
     }
 
-    /// What this instance has deployed, for the `Hello` it connects with and any
-    /// `Heartbeat` that has news since the last one.
-    ///
-    /// `None` means this adapter does not report deploy versions at all, and it
-    /// must then also answer `false` to [`Capability::DeployVersions`] — the
-    /// capability and this method are the same claim, and the control plane reads
-    /// the capability before any frame arrives. An adapter that *does* report
-    /// must always name an applied version, `0` when nothing has been applied
-    /// since enrolment: "reported nothing" and "reported zero" settle a
-    /// deployment differently.
-    ///
-    /// The default reports nothing: an adapter that does not persist a deployment
-    /// record has no version to back up, and claiming one would resolve a
-    /// deployment that never landed.
-    async fn deploy_state(&self) -> Option<DeployState> {
-        None
-    }
-
-    /// Remember that `deployment_version` was refused, so the next
-    /// [`RuntimeHandle::deploy_state`] reports it.
-    ///
-    /// Called by the client for *every* refused `ApplySpicepod` — including the
-    /// ones that never reach [`RuntimeHandle::apply_spicepod`], such as a
-    /// delivered secret payload that will not open — so an implementation has one
-    /// place to record them rather than having to reconstruct which failures the
-    /// client swallowed.
-    ///
-    /// Nothing restarts after a refusal, so no new `Hello` follows and the report
-    /// rides the open session's next `Heartbeat`. `message` is the runtime's own
-    /// error, and reaches an operator in the portal.
-    ///
-    /// The default does nothing, matching the default `deploy_state`: an adapter
-    /// that reports no versions has nothing to attach a refusal to.
-    async fn refuse_deployment(&self, deployment_version: Option<u64>, message: &str) {
-        let _ = (deployment_version, message);
-    }
-
     /// Persist a cloud-managed spicepod as the configuration this instance
     /// starts on.
     ///
@@ -512,7 +397,6 @@ pub trait RuntimeHandle: Send + Sync + 'static {
         Ok(ApplyOutcome::settled(serde_json::json!({
             "path": path.display().to_string(),
             "applied": false,
-            "deployment_version": deployment.deployment_version,
             "note": "spicepod written to disk; restart spiced (or implement RuntimeHandle::apply_spicepod) to take effect",
         })))
     }
@@ -649,68 +533,6 @@ mod tests {
             h.status().await,
             Err(CommandError::Unsupported { .. })
         ));
-        assert_eq!(
-            h.deploy_state().await,
-            None,
-            "a handle that persists no deployment record must not claim a version"
-        );
-    }
-
-    /// The capability and [`RuntimeHandle::deploy_state`] are one claim. A handle
-    /// that announces the capability and then reports nothing leaves the control
-    /// plane waiting for a report that never comes; one that reports without
-    /// announcing is read as not reporting at all, because the capability is
-    /// checked before any frame arrives.
-    #[tokio::test]
-    async fn deploy_versions_capability_and_report_agree() {
-        struct Reporting;
-
-        #[async_trait]
-        impl RuntimeHandle for Reporting {
-            fn supports(&self, capability: Capability) -> bool {
-                capability == Capability::DeployVersions
-            }
-            async fn deploy_state(&self) -> Option<DeployState> {
-                Some(DeployState::applied(0))
-            }
-        }
-
-        for handle in [
-            Box::new(Reporting) as Box<dyn RuntimeHandle>,
-            Box::new(NoopRuntimeHandle),
-        ] {
-            assert_eq!(
-                handle.supports(Capability::DeployVersions),
-                handle.deploy_state().await.is_some(),
-                "announcing {CAPABILITY_DEPLOY_VERSIONS} and reporting a DeployState must agree"
-            );
-        }
-    }
-
-    /// A reporting instance that has applied nothing says so with a zero, not by
-    /// omitting the field: absent means "cannot say", which the control plane
-    /// settles differently.
-    #[test]
-    fn an_instance_with_no_deployment_reports_zero_not_absent() {
-        let state = DeployState::applied(0);
-        assert_eq!(state.applied_deployment_version, Some(0));
-        assert_eq!(state.failed_deployment_version, None);
-        assert!(state.failure_message.is_empty());
-    }
-
-    /// A failure names the version it refused and leaves the applied version
-    /// reporting what is running instead.
-    #[test]
-    fn a_failure_names_its_version_and_keeps_the_applied_one() {
-        let state = DeployState::applied(7).with_failure(8, "invalid spicepod: bad yaml");
-        assert_eq!(state.applied_deployment_version, Some(7));
-        assert_eq!(state.failed_deployment_version, Some(8));
-        assert_eq!(state.failure_message, "invalid spicepod: bad yaml");
-
-        // Superseded: the next state simply carries no failure, which clears it.
-        let cleared = DeployState::applied(9);
-        assert_eq!(cleared.failed_deployment_version, None);
-        assert!(cleared.failure_message.is_empty());
     }
 
     /// The default apply persists the spicepod but cannot make it live, so it
@@ -727,7 +549,6 @@ mod tests {
             .apply_spicepod(SpicepodDeployment {
                 config_dir: &dir,
                 spicepod_yaml: "version: v2\nkind: Spicepod\nname: default-apply\n",
-                deployment_version: Some(11),
                 delivered_secrets: None,
             })
             .await
@@ -735,7 +556,6 @@ mod tests {
 
         assert_eq!(outcome.post_apply, PostApply::Nothing);
         assert_eq!(outcome.document["applied"], false);
-        assert_eq!(outcome.document["deployment_version"], 11);
         let written = std::fs::read_to_string(dir.join(crate::config::CLOUD_MANAGED_SPICEPOD_FILE))
             .expect("spicepod written");
         assert!(written.contains("name: default-apply"));
@@ -763,7 +583,6 @@ mod tests {
             .apply_spicepod(SpicepodDeployment {
                 config_dir: &dir,
                 spicepod_yaml: "version: v2\nkind: Spicepod\nname: refused\n",
-                deployment_version: None,
                 delivered_secrets: Some(secrets),
             })
             .await
@@ -795,8 +614,7 @@ mod tests {
                 | Capability::Restart
                 | Capability::UpgradeRuntime
                 | Capability::GetLogs
-                | Capability::GetStatus
-                | Capability::DeployVersions => {}
+                | Capability::GetStatus => {}
             }
         }
         let names: BTreeSet<&str> = Capability::ALL.iter().map(|c| c.wire_name()).collect();
@@ -809,7 +627,6 @@ mod tests {
             names,
             BTreeSet::from([
                 "apply_spicepod",
-                CAPABILITY_DEPLOY_VERSIONS,
                 "get_logs",
                 "get_status",
                 "restart",

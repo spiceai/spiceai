@@ -23,7 +23,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use crate::handlers::{Capability, DeployState, RuntimeHandle, RuntimePhase};
+use crate::handlers::{Capability, RuntimeHandle, RuntimePhase};
 use crate::proto;
 
 /// Build a heartbeat for the current runtime state.
@@ -32,35 +32,13 @@ use crate::proto;
 /// instance. They are deliberately *not* mirrored into
 /// [`build_telemetry`]'s open metrics map: one datum, one channel, so the
 /// two can never disagree about the same number.
-///
-/// `reported` is the deploy state last sent on this connection — by the `Hello`
-/// that opened it, or by an earlier heartbeat. A `DeployState` rides along only
-/// when it differs from that, because each one *replaces* what the control plane
-/// holds and a frame carrying none leaves the previous report intact. Repeating
-/// an unchanged report every heartbeat would say nothing; omitting a *changed*
-/// one would leave a rejected deployment unreported until the next reconnect,
-/// which for a validation failure never comes — nothing restarted.
 pub(crate) async fn build_heartbeat(
     identifier: &str,
     sequence: u64,
     runtime: &Arc<dyn RuntimeHandle>,
-    reported: &mut Option<DeployState>,
 ) -> proto::Heartbeat {
     let active_datasets = runtime.active_datasets().await;
     let active_models = runtime.active_models().await;
-
-    let deploy_state = match runtime.deploy_state().await {
-        // An adapter that does not report deploy versions at all.
-        None => None,
-        // Already reported on this connection: repeating it would say nothing,
-        // since each state replaces the whole record the control plane holds.
-        Some(state) if reported.as_ref() == Some(&state) => None,
-        Some(state) => {
-            let frame = deploy_state_proto(&state);
-            *reported = Some(state);
-            Some(frame)
-        }
-    };
 
     proto::Heartbeat {
         identifier: identifier.to_string(),
@@ -71,20 +49,6 @@ pub(crate) async fn build_heartbeat(
         active_models,
         active_spicepods: 0,
         runtime_versions: std::collections::HashMap::new(),
-        deploy_state,
-    }
-}
-
-/// The wire form of a [`DeployState`].
-///
-/// Lives here rather than on the handler type so nothing in `handlers` names a
-/// generated proto type — the trait stays the crate's stable surface and the
-/// client maps it onto the wire.
-pub(crate) fn deploy_state_proto(state: &DeployState) -> proto::DeployState {
-    proto::DeployState {
-        applied_deployment_version: state.applied_deployment_version,
-        failed_deployment_version: state.failed_deployment_version,
-        failure_message: state.failure_message.clone(),
     }
 }
 
@@ -158,104 +122,11 @@ mod tests {
     #[tokio::test]
     async fn heartbeat_contains_identifier_and_sequence() {
         let runtime: Arc<dyn RuntimeHandle> = Arc::new(NoopRuntimeHandle);
-        let mut reported = None;
-        let hb = build_heartbeat("inst_test", 42, &runtime, &mut reported).await;
+        let hb = build_heartbeat("inst_test", 42, &runtime).await;
         assert_eq!(hb.identifier, "inst_test");
         assert_eq!(hb.sequence, 42);
         // A handle that cannot report status must not claim a phase.
         assert_eq!(hb.phase, proto::RuntimePhase::Unspecified as i32);
-        assert!(
-            hb.deploy_state.is_none(),
-            "a handle that does not report deploy versions must attach no DeployState"
-        );
-        assert_eq!(reported, None);
-    }
-
-    /// A `DeployState` rides a heartbeat only when it has changed. The control
-    /// plane replaces its record with every one it receives, so repeating an
-    /// unchanged state says nothing — and a heartbeat with none left the previous
-    /// report standing, which is what makes the omission correct rather than lossy.
-    #[tokio::test]
-    async fn a_deploy_state_rides_a_heartbeat_only_when_it_changes() {
-        use async_trait::async_trait;
-        use std::sync::Mutex;
-
-        struct Reporting {
-            state: Mutex<DeployState>,
-        }
-
-        impl Reporting {
-            fn set(&self, state: DeployState) {
-                *self.state.lock().expect("deploy state lock") = state;
-            }
-        }
-
-        #[async_trait]
-        impl RuntimeHandle for Reporting {
-            fn supports(&self, capability: Capability) -> bool {
-                capability == Capability::DeployVersions
-            }
-            async fn deploy_state(&self) -> Option<DeployState> {
-                Some(self.state.lock().expect("deploy state lock").clone())
-            }
-        }
-
-        let handle = Arc::new(Reporting {
-            state: Mutex::new(DeployState::applied(7)),
-        });
-        let runtime: Arc<dyn RuntimeHandle> = Arc::clone(&handle) as Arc<dyn RuntimeHandle>;
-
-        // Nothing reported yet on this connection: the first heartbeat carries it.
-        let mut reported = None;
-        let first = build_heartbeat("inst_test", 1, &runtime, &mut reported).await;
-        let state = first.deploy_state.expect("the first state is news");
-        assert_eq!(state.applied_deployment_version, Some(7));
-
-        // Unchanged: nothing to say.
-        let second = build_heartbeat("inst_test", 2, &runtime, &mut reported).await;
-        assert!(second.deploy_state.is_none());
-
-        // A rejected deployment is news, and this is the only frame that can
-        // carry it — nothing restarted, so no new Hello follows.
-        handle.set(DeployState::applied(7).with_failure(8, "invalid spicepod"));
-        let third = build_heartbeat("inst_test", 3, &runtime, &mut reported).await;
-        let state = third.deploy_state.expect("a new failure is news");
-        assert_eq!(state.applied_deployment_version, Some(7));
-        assert_eq!(state.failed_deployment_version, Some(8));
-        assert_eq!(state.failure_message, "invalid spicepod");
-
-        // Superseded: clearing the failure is news too, or a later deployment
-        // reusing version 8 would be failed by a stale report.
-        handle.set(DeployState::applied(9));
-        let fourth = build_heartbeat("inst_test", 4, &runtime, &mut reported).await;
-        let state = fourth.deploy_state.expect("clearing a failure is news");
-        assert_eq!(state.applied_deployment_version, Some(9));
-        assert_eq!(state.failed_deployment_version, None);
-        assert!(state.failure_message.is_empty());
-    }
-
-    /// A `Hello` seeds what has been reported, so the heartbeat right behind it
-    /// does not repeat the state the Hello just sent.
-    #[tokio::test]
-    async fn a_state_sent_on_the_hello_is_not_repeated_by_the_next_heartbeat() {
-        use async_trait::async_trait;
-
-        struct Reporting;
-
-        #[async_trait]
-        impl RuntimeHandle for Reporting {
-            fn supports(&self, capability: Capability) -> bool {
-                capability == Capability::DeployVersions
-            }
-            async fn deploy_state(&self) -> Option<DeployState> {
-                Some(DeployState::applied(3))
-            }
-        }
-
-        let runtime: Arc<dyn RuntimeHandle> = Arc::new(Reporting);
-        let mut reported = runtime.deploy_state().await; // what the Hello carried
-        let hb = build_heartbeat("inst_test", 1, &runtime, &mut reported).await;
-        assert!(hb.deploy_state.is_none());
     }
 
     #[tokio::test]
@@ -276,8 +147,7 @@ mod tests {
         }
 
         let runtime: Arc<dyn RuntimeHandle> = Arc::new(ReadyHandle);
-        let mut reported = None;
-        let hb = build_heartbeat("inst_test", 1, &runtime, &mut reported).await;
+        let hb = build_heartbeat("inst_test", 1, &runtime).await;
         assert_eq!(hb.phase, proto::RuntimePhase::Ready as i32);
     }
 

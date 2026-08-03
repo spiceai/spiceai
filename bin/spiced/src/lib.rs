@@ -436,7 +436,6 @@ pub async fn run(args: Args) -> Result<()> {
         app,
         spicepod_load_error,
         running_deployment,
-        rejected_deployment,
         deployment_note,
     } = build_app(&args).await?;
     // Deferred until tracing exists, and appended to below — everything about
@@ -581,9 +580,8 @@ pub async fn run(args: Args) -> Result<()> {
         if running_deployment.is_some() {
             // The watcher reconciles the *local* spicepod into the running app.
             // On an instance serving a deployment that would swap the deployed
-            // configuration out from under the version this instance reports
-            // as applied — a control plane reading `succeeded` for a
-            // configuration the runtime is no longer running.
+            // configuration out from under it, leaving the runtime serving
+            // something the control plane never sent.
             deployment_notes.push(DeploymentNote::PodsWatcherDeclined);
         } else {
             let pods_watcher = PodsWatcher::new(spicepod_path.clone());
@@ -905,7 +903,6 @@ pub async fn run(args: Args) -> Result<()> {
         cloud_connect_flag,
         delivered_secrets,
         running_deployment,
-        rejected_deployment,
     )
     .await;
 
@@ -941,15 +938,10 @@ struct LoadedApp {
     /// Why the local `spicepod.yaml` did not load, in pods-watcher mode where
     /// that is not fatal.
     spicepod_load_error: Option<app::Error>,
-    /// The deployment the app was loaded from, when it came from the
-    /// cloud-managed spicepod. `None` means the runtime is serving something a
-    /// deployment did not put there, so the instance reports no applied
-    /// deployment.
+    /// The spicepod the app was loaded from, when it came from the cloud-managed
+    /// file. `None` means the runtime is serving something a deployment did not
+    /// put there, so no redelivery can match it.
     running_deployment: Option<cloud_connect::CloudManagedSpicepod>,
-    /// The deployed spicepod this start refused, when there is one. Reported to
-    /// the control plane on the `Hello` that follows, which is the only frame
-    /// left to report it on — the apply that persisted it exited a restart ago.
-    rejected_deployment: Option<cloud_connect::RejectedDeployment>,
     /// Deferred because `build_app` runs before tracing is initialized.
     deployment_note: Option<DeploymentNote>,
 }
@@ -958,10 +950,7 @@ struct LoadedApp {
 /// exists.
 enum DeploymentNote {
     /// The runtime started on the deployed spicepod.
-    Loaded {
-        path: PathBuf,
-        deployment_version: Option<u64>,
-    },
+    Loaded { path: PathBuf },
     /// The deployed spicepod would not build, so the runtime fell back to the
     /// local configuration.
     Rejected { path: PathBuf, error: String },
@@ -974,27 +963,19 @@ enum DeploymentNote {
     },
     /// `--pods-watcher-enabled` was passed on an instance serving a deployment.
     /// The watcher is not installed: reconciling the local spicepod into a
-    /// deployed app would leave the instance serving something other than the
-    /// deployment it reports as applied.
+    /// deployed app would swap the deployed configuration out from under it.
     PodsWatcherDeclined,
 }
 
 impl DeploymentNote {
     fn log(&self) {
         match self {
-            Self::Loaded {
-                path,
-                deployment_version,
-            } => tracing::info!(
-                "Spice Cloud Connect: serving the deployed spicepod from {} ({})",
-                path.display(),
-                deployment_version.map_or_else(
-                    || "no deployment version recorded".to_string(),
-                    |version| { format!("deployment {version}") }
-                )
+            Self::Loaded { path } => tracing::info!(
+                "Spice Cloud Connect: serving the deployed spicepod from {}",
+                path.display()
             ),
             Self::Rejected { path, error } => tracing::error!(
-                "Spice Cloud Connect: the deployed spicepod at {} could not be loaded, so this instance started on its local configuration instead and reports no applied deployment. Deploy a corrected spicepod to replace it: {error}",
+                "Spice Cloud Connect: the deployed spicepod at {} could not be loaded, so this instance started on its local configuration instead. Deploy a corrected spicepod to replace it: {error}",
                 path.display()
             ),
             Self::NothingLoadable {
@@ -1035,7 +1016,6 @@ async fn build_app(args: &Args) -> Result<LoadedApp> {
                 app: Some(Arc::new(app)),
                 spicepod_load_error: None,
                 running_deployment: None,
-                rejected_deployment: None,
                 deployment_note: None,
             });
         }
@@ -1046,7 +1026,6 @@ async fn build_app(args: &Args) -> Result<LoadedApp> {
             app: Some(Arc::new(App::default())),
             spicepod_load_error: None,
             running_deployment: None,
-            rejected_deployment: None,
             deployment_note: None,
         });
     }
@@ -1056,7 +1035,6 @@ async fn build_app(args: &Args) -> Result<LoadedApp> {
     // that file and restarting, so reading anything else here would drop every
     // deployment on the floor at the moment it was meant to take effect.
     let mut deployment_note = None;
-    let mut rejected_deployment = None;
     if let Some(deployed) = cloud_connect::cloud_managed_spicepod(args.cloud_connect).await {
         match AppBuilder::build_from_path(deployed.path.clone()).await {
             Ok(mut app) => {
@@ -1064,10 +1042,8 @@ async fn build_app(args: &Args) -> Result<LoadedApp> {
                 return Ok(LoadedApp {
                     app: Some(Arc::new(app)),
                     spicepod_load_error: None,
-                    rejected_deployment: None,
                     deployment_note: Some(DeploymentNote::Loaded {
                         path: deployed.path.clone(),
-                        deployment_version: deployed.deployment_version,
                     }),
                     running_deployment: Some(deployed),
                 });
@@ -1078,17 +1054,9 @@ async fn build_app(args: &Args) -> Result<LoadedApp> {
                 // connects, and the next deployment can replace the file. A
                 // runtime that refused to start here would crash-loop with no
                 // path back except an operator editing files on the host.
-                let error = e.to_string();
-                // Reported to the control plane, not just logged: the deployment
-                // that persisted this spicepod was answered a restart ago, so
-                // without this it would sit in the portal as applying forever.
-                rejected_deployment = Some(cloud_connect::RejectedDeployment {
-                    deployment_version: deployed.deployment_version,
-                    message: error.clone(),
-                });
                 deployment_note = Some(DeploymentNote::Rejected {
                     path: deployed.path,
-                    error,
+                    error: e.to_string(),
                 });
             }
         }
@@ -1141,7 +1109,6 @@ async fn build_app(args: &Args) -> Result<LoadedApp> {
         app,
         spicepod_load_error,
         running_deployment: None,
-        rejected_deployment,
         deployment_note,
     })
 }

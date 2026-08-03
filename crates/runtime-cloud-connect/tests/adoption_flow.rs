@@ -472,7 +472,6 @@ async fn apply_spicepod_writes_file_and_acks() {
             proto::ApplySpicepod {
                 spicepod_yaml: yaml.to_string(),
                 sealed_secret_payload: None,
-                deployment_version: None,
             },
         )),
     };
@@ -565,14 +564,6 @@ async fn apply_spicepod_writes_file_and_acks() {
         hello.capabilities,
         vec!["apply_spicepod".to_string()],
         "Hello must announce exactly what the runtime handle supports"
-    );
-    // The other half of that contract: a handle that does not announce
-    // `deploy.versions` attaches no DeployState, which is what tells the control
-    // plane to reconcile deployments some other way instead of reading the
-    // absence as "nothing applied".
-    assert!(
-        hello.deploy_state.is_none(),
-        "a handle that reports no deploy versions must attach no DeployState"
     );
 
     let result = s.last_result.clone().expect("server saw CommandResult");
