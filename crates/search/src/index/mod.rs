@@ -227,6 +227,11 @@ pub trait VectorIndex: SearchIndex {
     /// what lets a multi-store implementation combine its stores: the key fields are the only ones
     /// guaranteed to agree across them.
     ///
+    /// **Keys may repeat.** A multi-store implementation combines its stores by union, so an entry
+    /// both stores hold appears once per store. Callers that need each key once must apply their
+    /// own `DISTINCT` — as the chunked delete resolution does, since deleting a key twice is
+    /// wasted work.
+    ///
     /// Wrapper implementations MUST forward this to the index they wrap — inheriting the default
     /// silently resolves maintenance work against a read-narrowed listing.
     fn list_all_entry_keys(&self) -> Result<LogicalPlan, DataFusionError> {
