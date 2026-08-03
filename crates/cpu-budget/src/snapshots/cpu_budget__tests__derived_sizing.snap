@@ -2,4 +2,4 @@
 source: crates/cpu-budget/src/lib.rs
 expression: budget.derived_sizing_line()
 ---
-CPU budget derived sizing: main_runtime_worker_threads=4, dedicated_runtime_worker_threads=3, target_partitions=4, cayenne_encode_permits=2, cayenne_write_concurrency_ceiling=4, cayenne_compaction_permits=4, cayenne_upload_concurrency=4, cayenne_max_concurrent_file_scans=4, metastore_pool_connections=4, embedding_pool_threads=4, duckdb_threads=4, cluster_executor_concurrent_tasks=4
+CPU budget derived sizing: main_runtime_worker_threads=4, dedicated_runtime_worker_threads=3, target_partitions=4, max_concurrent_queries=16, cayenne_encode_permits=2, cayenne_write_concurrency_ceiling=4, cayenne_compaction_permits=4, cayenne_upload_concurrency=4, cayenne_max_concurrent_file_scans=4, metastore_pool_connections=4, embedding_pool_threads=4, duckdb_threads=4, cluster_executor_concurrent_tasks=4

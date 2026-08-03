@@ -803,7 +803,10 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         let budget = cpu_budget::cpu_budget();
         telemetry::register_cpu_budget_metrics(
             u64::try_from(budget.cores()).unwrap_or(u64::MAX),
+            budget.millicores(),
             budget.source().as_str(),
+            budget.limit_millicores(),
+            budget.request_millicores(),
         );
 
         // Cayenne write-path backpressure occupancy gauges (encode budget, in-memory

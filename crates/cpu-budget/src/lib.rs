@@ -29,12 +29,15 @@ limitations under the License.
 //! `sched_getaffinity`). What is new is that the value has one owner, a named
 //! source, and an explicit override for deployments the host cannot describe.
 //!
-//! Detection deliberately reads only a cgroup CPU *quota*, never a CPU *share*.
+//! Sizing deliberately follows only a cgroup CPU *quota*, never a CPU *share*.
 //! Under Kubernetes the kubelet derives the share from `requests.cpu`, but a
 //! request is a scheduling floor, not a ceiling: a burstable pod is entitled to
 //! every idle core on its node, and sizing from the request would take that
 //! away. An operator who wants the runtime sized to the request says so
-//! explicitly with `runtime.cpu.cores`.
+//! explicitly with `runtime.cpu.cores`. The share is still *read*, so the
+//! startup log and the metrics can show the request and the limit next to the
+//! budget actually chosen — that comparison is what makes a mis-sized pod
+//! diagnosable.
 //!
 //! This crate owns both halves of the fix: [`HostReadings`] +
 //! [`CpuBudget::resolve`] decide the entitlement, and the methods on
@@ -156,6 +159,11 @@ pub struct HostReadings {
     /// Millicores implied by a cgroup CPU quota (`limits.cpu`). `None` when no
     /// quota is set, which includes every burstable pod.
     pub quota_millicores: Option<u64>,
+    /// Millicores implied by the cgroup CPU share (`requests.cpu`). Reported
+    /// only — never an input to [`CpuBudget::resolve`]'s ladder, because a
+    /// request is a scheduling floor rather than a ceiling. `None` when no
+    /// request is expressed.
+    pub request_millicores: Option<u64>,
 }
 
 impl HostReadings {
@@ -170,24 +178,81 @@ impl HostReadings {
             affinity_cores: std::thread::available_parallelism()
                 .map_or(1, std::num::NonZeroUsize::get),
             quota_millicores: detect_quota_millicores(),
+            request_millicores: detect_request_millicores(),
         }
     }
 }
 
+/// The cgroup CPU quota, in millicores.
+///
+/// Read along the whole cgroup path rather than at the leaf — see
+/// [`cgroup::min_along_cgroup_path`] for why a quota on an ancestor is just as
+/// binding.
 fn detect_quota_millicores() -> Option<u64> {
-    if let Some(path) = cgroup::v2_file_path("cpu.max")
-        && let Ok(contents) = std::fs::read_to_string(&path)
-        && let Some(millicores) = cgroup::parse_cpu_max(&contents)
+    if let Some((mountpoint, cgroup_path)) = cgroup::v2_mount_and_path()
+        && let Some(millicores) =
+            cgroup::min_along_cgroup_path(&mountpoint, &cgroup_path, |mount, rel| {
+                let path = cgroup::cgroup_file_path(mount, rel, "cpu.max");
+                cgroup::parse_cpu_max(&std::fs::read_to_string(path).ok()?)
+            })
     {
         return Some(millicores);
     }
-    let quota = cgroup::v1_file_path("cpu", "cpu.cfs_quota_us")?;
-    let period = cgroup::v1_file_path("cpu", "cpu.cfs_period_us")?;
-    cgroup::parse_cfs_quota(
-        &std::fs::read_to_string(quota).ok()?,
-        &std::fs::read_to_string(period).ok()?,
-    )
+
+    let (mountpoint, cgroup_path) = cgroup::v1_mount_and_path("cpu")?;
+    cgroup::min_along_cgroup_path(&mountpoint, &cgroup_path, |mount, rel| {
+        let quota =
+            std::fs::read_to_string(cgroup::cgroup_file_path(mount, rel, "cpu.cfs_quota_us"))
+                .ok()?;
+        let period =
+            std::fs::read_to_string(cgroup::cgroup_file_path(mount, rel, "cpu.cfs_period_us"))
+                .ok()?;
+        cgroup::parse_cfs_quota(&quota, &period)
+    })
 }
+
+/// The `requests.cpu` behind this process's cgroup CPU share, in millicores.
+///
+/// Reporting only. Sizing never consults it — see [`CpuBudget::resolve`].
+///
+/// Read at the leaf, unlike the quota. A share is a relative weight *among
+/// siblings at one level*, not a ceiling inherited down the tree, so the
+/// smallest value along the path would mean nothing; the container's own share
+/// is the one the kubelet derived from its `requests.cpu`.
+fn detect_request_millicores() -> Option<u64> {
+    if let Some((mountpoint, cgroup_path)) = cgroup::v2_mount_and_path()
+        && let Ok(contents) = std::fs::read_to_string(cgroup::cgroup_file_path(
+            &mountpoint,
+            &cgroup_path,
+            "cpu.weight",
+        ))
+        && let Some(millicores) = cgroup::parse_cpu_weight(&contents)
+    {
+        return Some(millicores);
+    }
+    let (mountpoint, cgroup_path) = cgroup::v1_mount_and_path("cpu")?;
+    let shares = std::fs::read_to_string(cgroup::cgroup_file_path(
+        &mountpoint,
+        &cgroup_path,
+        "cpu.shares",
+    ))
+    .ok()?;
+    cgroup::parse_cpu_shares(&shares)
+}
+
+/// Query plans admitted concurrently per core when
+/// `runtime.query.max_concurrent_queries` is unset. Above one per core so a
+/// query blocked on I/O does not idle its core, low enough that the memory pool
+/// is shared between a countable number of plans.
+const QUERIES_PER_CORE: usize = 4;
+
+/// A CPU request at or above this fraction of the budget is close enough not to
+/// warn about. A quarter is loose enough to absorb cgroup quantization (a
+/// `requests.cpu: 1` lands at 974m under cgroup v2) while still catching a
+/// request that is a different order of magnitude from the budget.
+const REQUEST_SHORTFALL_NUM: u64 = 3;
+/// Denominator of [`REQUEST_SHORTFALL_NUM`].
+const REQUEST_SHORTFALL_DEN: u64 = 4;
 
 /// The process-wide CPU entitlement and every sizing decision derived from it.
 #[derive(Debug, Clone)]
@@ -200,6 +265,10 @@ pub struct CpuBudget {
     setting: Option<&'static str>,
     /// What `sched_getaffinity` saw, for the startup log.
     detected_cores: usize,
+    /// The cgroup CPU limit, reported alongside the budget it produced.
+    limit_millicores: Option<u64>,
+    /// The cgroup CPU request. Reported, never an input to the ladder.
+    request_millicores: Option<u64>,
 }
 
 impl CpuBudget {
@@ -271,6 +340,8 @@ impl CpuBudget {
             source,
             setting,
             detected_cores,
+            limit_millicores: host.quota_millicores,
+            request_millicores: host.request_millicores,
         })
     }
 
@@ -296,17 +367,27 @@ impl CpuBudget {
         Ok(())
     }
 
-    /// Log the effective budget and every value derived from it. Call once,
-    /// before anything is sized.
+    /// Log the effective budget and the defaults it implies. Call once, before
+    /// anything is sized.
     ///
     /// The derived values are logged as their own line because the headline
     /// summary names only the three an operator recognizes. Every consumer's
     /// number is here, so a mis-sized pool can be diagnosed from a startup log
     /// alone rather than by correlating `/metrics` gauges — and so that a future
     /// change to a sizing policy is visible in the log diff.
+    ///
+    /// These are *defaults*, not necessarily the values in force. Several are
+    /// overridable by their own setting (`runtime.query.target_partitions`,
+    /// `runtime.query.max_concurrent_queries`, `DuckDB`'s `threads`, a model's
+    /// parallelism), and this runs at startup, before that configuration is
+    /// resolved — some of it per dataset. A consumer that can be overridden logs
+    /// the value it actually used, and where it came from, where it applies it.
     pub fn log_summary(&self) {
         tracing::info!("{}", self.summary_line());
         tracing::info!("{}", self.derived_sizing_line());
+        if let Some(warning) = self.request_shortfall_warning() {
+            tracing::warn!("{warning}");
+        }
     }
 
     /// Every quantity this budget derives, paired with the consumer it sizes.
@@ -325,6 +406,7 @@ impl CpuBudget {
                 self.dedicated_runtime_worker_threads(),
             ),
             ("target_partitions", self.target_partitions()),
+            ("max_concurrent_queries", self.max_concurrent_queries()),
             ("cayenne_encode_permits", self.cayenne_encode_permits()),
             (
                 "cayenne_write_concurrency_ceiling",
@@ -367,26 +449,85 @@ impl CpuBudget {
         format!("CPU budget derived sizing: {values}")
     }
 
-    /// The one-line startup summary: the effective value, where it came from,
-    /// and what it sizes.
-    #[must_use]
-    pub fn summary_line(&self) -> String {
-        let origin = match self.source {
-            CpuSource::Configured => self.setting.unwrap_or(CpuConfig::SPICEPOD_SETTING),
+    /// Where the effective value came from, phrased for an operator.
+    const fn origin(&self) -> &'static str {
+        match self.source {
+            CpuSource::Configured => match self.setting {
+                Some(setting) => setting,
+                None => CpuConfig::SPICEPOD_SETTING,
+            },
             CpuSource::CgroupQuota => "cgroup CPU quota",
             CpuSource::Affinity => "detected CPUs",
             CpuSource::Fallback => "fallback",
-        };
+        }
+    }
+
+    /// The one-line startup summary: the effective value, where it came from,
+    /// the cgroup request and limit it sits between, and what it sizes.
+    #[must_use]
+    pub fn summary_line(&self) -> String {
+        let unset = "unset".to_string();
         format!(
-            "CPU budget: {entitlement} (source: {origin}; host reports {detected}) \u{2192} \
+            "CPU budget: {entitlement} (source: {origin}; host reports {detected}, \
+             cgroup request {request}, cgroup limit {limit}) \u{2192} \
              {main} main worker threads, {dedicated} per dedicated runtime pool, \
              {partitions} target partitions",
             entitlement = format_millicores(self.millicores),
+            origin = self.origin(),
             detected = self.detected_cores,
+            request = self
+                .request_millicores
+                .map_or_else(|| unset.clone(), format_millicores),
+            limit = self.limit_millicores.map_or(unset, format_millicores),
             main = self.main_runtime_worker_threads(),
             dedicated = self.dedicated_runtime_worker_threads(),
             partitions = self.target_partitions(),
         )
+    }
+
+    /// A warning when the CPU request sits well below the budget the runtime
+    /// chose, i.e. when sizing leans on CPU the scheduler does not guarantee.
+    ///
+    /// Fires for every source, and names the one responsible: a value read from
+    /// an explicit `limits.cpu`, a value configured by hand, and — the case that
+    /// motivates this crate — a request with no limit at all, where the budget
+    /// falls back to the node's cores. An over-large configured value is just as
+    /// wrong as an over-large inferred one, so the check is on the effective
+    /// budget rather than on any particular rung of the ladder.
+    ///
+    /// `None` when there is no request to compare against, or when the request is
+    /// within [`REQUEST_SHORTFALL_NUM`]/[`REQUEST_SHORTFALL_DEN`] of the budget.
+    #[must_use]
+    pub fn request_shortfall_warning(&self) -> Option<String> {
+        let request = self.request_millicores?;
+        if request.saturating_mul(REQUEST_SHORTFALL_DEN)
+            >= self.millicores.saturating_mul(REQUEST_SHORTFALL_NUM)
+        {
+            return None;
+        }
+        // Telling an operator to set the surface they already set is no advice at
+        // all, so the remedy depends on whether the value was chosen or detected.
+        let remedy = if matches!(self.source, CpuSource::Configured) {
+            format!(
+                "Lower {origin} to match the request, or raise the pod's CPU request to match it.",
+                origin = self.origin()
+            )
+        } else {
+            format!(
+                "Set {spicepod} (or {env}, or {cli}) to size for the request instead.",
+                spicepod = CpuConfig::SPICEPOD_SETTING,
+                env = CpuConfig::ENV_SETTING,
+                cli = CpuConfig::CLI_SETTING,
+            )
+        };
+        Some(format!(
+            "CPU request {request} is well below the CPU budget of {budget} taken from {origin}: \
+             the runtime is sized for CPU the scheduler does not guarantee, so every CPU-derived \
+             pool may be too large for what this process actually gets. {remedy}",
+            request = format_millicores(request),
+            budget = format_millicores(self.millicores),
+            origin = self.origin(),
+        ))
     }
 
     // ---- the entitlement ----
@@ -395,6 +536,22 @@ impl CpuBudget {
     #[must_use]
     pub const fn cores(&self) -> usize {
         self.cores
+    }
+
+    /// The cgroup CPU limit (`limits.cpu`) in millicores, when one is set.
+    #[must_use]
+    pub const fn limit_millicores(&self) -> Option<u64> {
+        self.limit_millicores
+    }
+
+    /// The cgroup CPU request (`requests.cpu`) in millicores, when one is
+    /// expressed.
+    ///
+    /// Reported so an operator can see the request next to the budget; it is
+    /// never an input to the detection ladder.
+    #[must_use]
+    pub const fn request_millicores(&self) -> Option<u64> {
+        self.request_millicores
     }
 
     /// The entitlement in millicores, exact.
@@ -437,6 +594,20 @@ impl CpuBudget {
     #[must_use]
     pub const fn target_partitions(&self) -> usize {
         self.cores
+    }
+
+    /// Concurrently-executing query plans admitted when
+    /// `runtime.query.max_concurrent_queries` is unset.
+    ///
+    /// Queues arrivals beyond a depth the runtime can still service instead of
+    /// admitting every one of them: each admitted plan fans out into
+    /// [`Self::target_partitions`] operator reservations against a fixed memory
+    /// pool, so unbounded concurrency lets queries starve each other and, past a
+    /// point, take the process down. A small multiple of the core count keeps
+    /// enough in flight to hide I/O stalls without that.
+    #[must_use]
+    pub const fn max_concurrent_queries(&self) -> usize {
+        self.cores.saturating_mul(QUERIES_PER_CORE)
     }
 
     // ---- Cayenne ----
@@ -556,6 +727,8 @@ pub fn cpu_budget() -> &'static CpuBudget {
             source: CpuSource::Fallback,
             setting: None,
             detected_cores: 1,
+            limit_millicores: None,
+            request_millicores: None,
         })
     })
 }
@@ -637,7 +810,118 @@ mod tests {
         HostReadings {
             affinity_cores,
             quota_millicores: Some(quota_millicores),
+            ..HostReadings::default()
         }
+    }
+
+    /// A burstable pod: a CPU request, no CPU limit.
+    fn request_only(affinity_cores: usize, request_millicores: u64) -> HostReadings {
+        HostReadings {
+            affinity_cores,
+            quota_millicores: None,
+            request_millicores: Some(request_millicores),
+        }
+    }
+
+    #[test]
+    fn cpu_shares_and_weight_recover_the_request() {
+        // v1: 1024 shares is one CPU.
+        assert_eq!(cgroup::parse_cpu_shares("4096"), Some(4000));
+        assert_eq!(cgroup::parse_cpu_shares(" 512 \n"), Some(500));
+        // Kubernetes' floor for "no CPU request" reads back as absent, not as a
+        // request of ~2 millicores.
+        assert_eq!(cgroup::parse_cpu_shares("2"), None);
+        assert_eq!(cgroup::parse_cpu_shares("garbage"), None);
+
+        // v2: the kubelet's share-to-weight mapping, inverted. `requests.cpu: 4`
+        // becomes 4096 shares becomes weight 157.
+        let four_cores = cgroup::parse_cpu_weight("157").expect("a weight maps back to a request");
+        assert!(
+            (3900..=4100).contains(&four_cores),
+            "weight 157 should recover ~4000 millicores, got {four_cores}"
+        );
+        assert_eq!(cgroup::parse_cpu_weight("1"), None);
+        assert_eq!(cgroup::parse_cpu_weight("garbage"), None);
+    }
+
+    #[test]
+    fn a_request_far_below_the_budget_warns() {
+        // The shape this crate exists for: a request, no limit, so the budget
+        // falls back to the node and dwarfs what the scheduler guarantees.
+        let burstable = CpuBudget::resolve(&CpuConfig::default(), &request_only(64, 4000))
+            .expect("detection cannot fail");
+        let warning = burstable
+            .request_shortfall_warning()
+            .expect("4 cores requested against a 64-core budget must warn");
+        assert!(warning.contains("4 cores"), "{warning}");
+        assert!(warning.contains("64 cores"), "{warning}");
+        assert!(warning.contains(CpuConfig::SPICEPOD_SETTING), "{warning}");
+
+        // A request under an explicit limit warns the same way.
+        let capped = CpuBudget::resolve(
+            &CpuConfig::default(),
+            &HostReadings {
+                affinity_cores: 64,
+                quota_millicores: Some(16_000),
+                request_millicores: Some(4000),
+            },
+        )
+        .expect("detection cannot fail");
+        let capped = capped
+            .request_shortfall_warning()
+            .expect("a request far under the limit must warn");
+        assert!(capped.contains("cgroup CPU quota"), "{capped}");
+    }
+
+    /// An over-large *configured* value is as wrong as an over-large inferred
+    /// one, so the warning fires there too — naming the surface that set it, and
+    /// advising something other than "set the setting you already set".
+    #[test]
+    fn an_oversized_configured_value_warns_against_the_request() {
+        let configured = CpuBudget::resolve(
+            &CpuConfig::from_sources(None, None, Some("384")),
+            &request_only(18, 4000),
+        )
+        .expect("valid");
+
+        let warning = configured
+            .request_shortfall_warning()
+            .expect("384 configured cores against a 4-core request must warn");
+        assert!(warning.contains(CpuConfig::SPICEPOD_SETTING), "{warning}");
+        assert!(warning.contains("384 cores"), "{warning}");
+        assert!(warning.contains("Lower"), "{warning}");
+
+        // The CLI surface names itself rather than the spicepod field.
+        let via_cli = CpuBudget::resolve(
+            &CpuConfig::from_sources(Some("384"), None, None),
+            &request_only(18, 4000),
+        )
+        .expect("valid")
+        .request_shortfall_warning()
+        .expect("must warn");
+        assert!(via_cli.contains(CpuConfig::CLI_SETTING), "{via_cli}");
+    }
+
+    #[test]
+    fn a_request_close_to_the_budget_is_quiet() {
+        // Within a quarter of the budget: no warning.
+        let matched = CpuBudget::resolve(&CpuConfig::default(), &request_only(4, 4000))
+            .expect("detection cannot fail");
+        assert_eq!(matched.request_shortfall_warning(), None);
+
+        // cgroup v2 quantizes `requests.cpu: 1` to 974m; that must not warn.
+        let quantized = CpuBudget::resolve(&CpuConfig::default(), &request_only(1, 974))
+            .expect("detection cannot fail");
+        assert_eq!(quantized.request_shortfall_warning(), None);
+
+        // Nothing to compare against.
+        assert_eq!(budget(16).request_shortfall_warning(), None);
+    }
+
+    #[test]
+    fn max_concurrent_queries_scales_with_the_budget() {
+        assert_eq!(budget(1).max_concurrent_queries(), 4);
+        assert_eq!(budget(16).max_concurrent_queries(), 64);
     }
 
     #[test]
@@ -744,10 +1028,8 @@ mod tests {
     /// silently take that headroom away.
     #[test]
     fn a_request_without_a_limit_still_sizes_for_the_whole_node() {
-        let burstable = HostReadings {
-            affinity_cores: 64,
-            quota_millicores: None, // requests.cpu set, limits.cpu unset
-        };
+        // requests.cpu set, limits.cpu unset
+        let burstable = request_only(64, 4000);
         let budget = CpuBudget::resolve(&CpuConfig::default(), &burstable).expect("valid");
         assert_eq!(budget.source(), CpuSource::Affinity);
         assert_eq!(budget.cores(), 64);
@@ -866,6 +1148,7 @@ mod tests {
             "main_runtime_worker_threads",
             "dedicated_runtime_worker_threads",
             "target_partitions",
+            "max_concurrent_queries",
             "cayenne_encode_permits",
             "cayenne_write_concurrency_ceiling",
             "cayenne_compaction_permits",
