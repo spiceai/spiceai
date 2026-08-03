@@ -1488,7 +1488,10 @@ mod tests {
         // partition, so how many calls the inner index sees tracks DataFusion's partitioning —
         // and hence the host's CPU count — not this fix. Which keys get deleted is the guarantee.
         let deletes = inner.deletes();
-        assert!(!deletes.is_empty(), "the resolved chunks reach the inner index");
+        assert!(
+            !deletes.is_empty(),
+            "the resolved chunks reach the inner index"
+        );
         assert!(
             deletes
                 .iter()
