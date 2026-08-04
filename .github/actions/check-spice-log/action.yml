@@ -15,13 +15,21 @@ inputs:
 runs:
   using: 'composite'
   steps:
-    - name: Stop spice and check logs
+    # Stops the `spiced` child as well as the `spice` CLI. `killall spice` here
+    # used to leave the runtime holding :8090 for the next job on the same
+    # self-hosted runner (#12058).
+    - name: Stop spice
+      uses: ./.github/actions/stop-spice
+      with:
+        working-directory: ${{ inputs.working-directory }}
+        print-log: 'false'
+
+    - name: Check logs
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       env:
         ALLOW: ${{ inputs.allow }}
       run: |
-        killall spice || true
         cat spice.log
 
         # `spiced` logs with_ansi(true), so an allow pattern such as
