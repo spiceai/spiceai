@@ -61,17 +61,12 @@ use datafusion::{
         object_store::ObjectStoreRegistry,
         runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
     },
-    optimizer::{
-        AnalyzerRule,
-        analyzer::{
-            resolve_grouping_function::ResolveGroupingFunction, type_coercion::TypeCoercion,
-        },
-    },
+    optimizer::AnalyzerRule,
     prelude::{SessionConfig, SessionContext},
 };
 use datafusion::{config::SpillCompression, physical_planner::ExtensionPlanner};
 
-use datafusion_federation::{FederatedPlanner, sql::federation_analyzer_rule};
+use datafusion_federation::FederatedPlanner;
 use runtime_datafusion::analyzer_rule::{PartitionedTableScanRewrite, TablePartitionProvider};
 
 #[cfg(feature = "duckdb")]
@@ -110,43 +105,10 @@ use runtime_metrics::telemetry::track_bytes_processed;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use spicepod::component::runtime::SpillCompression as SpiceSpillCompression;
 use spicepod::metric::Metrics;
-use std::sync::LazyLock;
 use tokio::{
     runtime::Handle,
     sync::{RwLock as TokioRwLock, Semaphore},
 };
-
-pub static DEFAULT_DATAFUSION_CONFIG: LazyLock<RwLock<SessionConfig>> = LazyLock::new(|| {
-    let mut df_config = SessionConfig::new();
-
-    // Prevents DataFusion from lowercasing identifiers, i.e. "SELECT MyColumn FROM my_table" would be "SELECT mycolumn FROM mytable" without this.
-    // This improves the UX for data sources where column names are case-sensitive, since they no longer need to be quoted.
-    df_config
-        .options_mut()
-        .sql_parser
-        .enable_ident_normalization = false;
-
-    df_config.options_mut().optimizer.expand_views_at_output = true;
-    df_config.options_mut().sql_parser.dialect = datafusion::common::config::Dialect::PostgreSQL;
-    df_config
-        .options_mut()
-        .execution
-        .listing_table_ignore_subdirectory = false;
-
-    // There are some unidentified bugs in DataFusion that cause schema checks to fail for aggregate functions.
-    // Spice is affected by this - skip the check until all bugs are fixed.
-    // Tracking issue: https://github.com/apache/datafusion/issues/12733
-    df_config
-        .options_mut()
-        .execution
-        .skip_physical_aggregate_schema_check = true;
-
-    // Enabling parquet filter pushdown can improve query performance by applying filters while decoding
-    // https://docs.rs/datafusion/latest/datafusion/config/struct.ParquetOptions.html#structfield.pushdown_filters
-    df_config.options_mut().execution.parquet.pushdown_filters = true;
-
-    RwLock::new(df_config)
-});
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CayenneOptimizerRules {
@@ -391,15 +353,30 @@ pub struct DataFusionBuilder {
     cayenne_sort_merge_memory_pool_fraction: Option<f64>,
     cayenne_footer_cache_mb: Option<usize>,
     /// Fraction of the query memory limit to carve into a dedicated compaction
-    /// memory pool. `Some` only when Cayenne acceleration is configured and
-    /// dedicated thread pools are enabled (set by the Runtime builder); `None`
-    /// leaves the full budget to queries and gives compaction no separate pool.
+    /// memory pool. `Some` only when dedicated thread pools are enabled AND at
+    /// least one enabled Cayenne acceleration can compact into it — a file
+    /// acceleration mode on a profile that accumulates files (set by the Runtime
+    /// builder; see [`crate::builder::CayenneWorkload::needs_compaction`]). `None`
+    /// leaves the full budget to queries and gives compaction no separate pool; it
+    /// then accounts against the query pool, as it does with no Cayenne at all.
     compaction_memory_fraction: Option<f64>,
-    /// Estimated aggregate bytes the enabled changes-mode Cayenne tables reserve
-    /// OUTSIDE the query pool (per-table keyset/segment/coalesce/inline caches),
-    /// set by the Runtime builder. When it exceeds the base host/10 headroom, the
-    /// query-memory default is reduced by the excess. 0 = none / not Cayenne CDC.
-    cayenne_cdc_reservation_bytes: u64,
+    /// Estimated aggregate bytes the enabled Cayenne tables reserve OUTSIDE the
+    /// query pool (the per-table scan segment cache on every table, plus
+    /// keyset/coalesce/inline on the CDC-profile ones), set by the Runtime builder.
+    /// When it exceeds the base host/10 headroom, the query-memory default is
+    /// reduced by the excess. 0 = no Cayenne acceleration.
+    cayenne_reservation_bytes: u64,
+    /// What the pod's Cayenne accelerations demand of the host, classified by the
+    /// Runtime builder from the Spicepod. Gates the coordinated host-memory
+    /// partition, which exists solely to leave room for the in-memory CDC tier.
+    cayenne_workload: crate::builder::CayenneWorkload,
+    /// Whether `runtime.params.dedicated_thread_pool` leaves the dedicated pools on
+    /// (set by the Runtime builder; the default is on). The in-memory CDC tier
+    /// budget is installed by `install_cayenne_global_budgets`, which `spiced` only
+    /// calls when they are, so the coordinated host-memory partition is pointless
+    /// without them — it would shrink the query pool for a tier cap that never
+    /// installs.
+    dedicated_thread_pools_enabled: bool,
     /// Coordinated query-pool ceiling (bytes) when `DuckDB` file accelerators are
     /// present, computed by the Runtime builder's cgroup-aware budget so the query
     /// pool + each `DuckDB` instance's own `memory_limit` can't over-commit the
@@ -415,12 +392,11 @@ pub struct DataFusionBuilder {
     partition_load_tracker: Option<Arc<runtime_cluster::PartitionLoadTracker>>,
 }
 
-pub(crate) fn get_df_default_config() -> SessionConfig {
-    match DEFAULT_DATAFUSION_CONFIG.read() {
-        Ok(config) => config.clone(),
-        _ => panic!("Failed to read default DataFusion config. This is a bug."),
-    }
-}
+// The default session config and the analyzer-rule list are plain `DataFusion`
+// construction with no runtime coupling, so they live in `runtime-datafusion`.
+// Re-exported here because `runtime::datafusion::builder::…` is a public path.
+pub use runtime_datafusion::analyzer_rule::AnalyzerRulesBuilder;
+pub use runtime_datafusion::session_config::{DEFAULT_DATAFUSION_CONFIG, get_df_default_config};
 
 impl DataFusionBuilder {
     /// Creates a new `DataFusionBuilder` with the runtime defaults.
@@ -466,7 +442,9 @@ impl DataFusionBuilder {
             cayenne_sort_merge_memory_pool_fraction: None,
             cayenne_footer_cache_mb: None,
             compaction_memory_fraction: None,
-            cayenne_cdc_reservation_bytes: 0,
+            cayenne_reservation_bytes: 0,
+            cayenne_workload: crate::builder::CayenneWorkload::default(),
+            dedicated_thread_pools_enabled: true,
             duckdb_query_pool_cap: None,
             cayenne_optimizer_rules: CayenneOptimizerRules::default(),
             additional_analyzer_rules: vec![],
@@ -559,13 +537,32 @@ impl DataFusionBuilder {
 
     /// Bound the number of concurrently-executing query plans — ordinary queries
     /// plus DDL/DML and `EXECUTE` (not lightweight `PREPARE`/`DEALLOCATE`/`SET`) —
-    /// i.e. query admission control. `None` leaves the gate unbounded (the prior
-    /// behavior); `Some(n)` installs a semaphore of `n` permits (clamped to at
-    /// least 1).
+    /// i.e. query admission control.
+    ///
+    /// `None` (unset) sizes the gate from the CPU budget. `Some(0)` opts out and
+    /// leaves it unbounded. `Some(n)` installs a semaphore of `n` permits.
     #[must_use]
     pub fn max_concurrent_queries(mut self, max_concurrent_queries: Option<usize>) -> Self {
-        self.query_admission_semaphore =
-            max_concurrent_queries.map(|n| Arc::new(Semaphore::new(n.max(1))));
+        let permits = match max_concurrent_queries {
+            // Opting out is spelled `0`; every other configured value is a limit.
+            Some(0) => None,
+            Some(configured) => {
+                tracing::info!(
+                    max_concurrent_queries = configured,
+                    "Applied runtime.query.max_concurrent_queries"
+                );
+                Some(configured)
+            }
+            None => {
+                let sized = cpu_budget::cpu_budget().max_concurrent_queries();
+                tracing::info!(
+                    max_concurrent_queries = sized,
+                    "runtime.query.max_concurrent_queries not set; sized from the CPU budget"
+                );
+                Some(sized)
+            }
+        };
+        self.query_admission_semaphore = permits.map(|n| Arc::new(Semaphore::new(n)));
         self
     }
 
@@ -619,13 +616,29 @@ impl DataFusionBuilder {
         self
     }
 
-    /// Estimated off-pool per-table Cayenne CDC cache reservation (bytes), summed
-    /// over enabled changes-mode Cayenne tables (keyset/segment/coalesce/inline).
-    /// Used to reduce the query-memory default when it exceeds the base host/10
-    /// headroom. Set by the Runtime builder; `0` disables the reduction.
+    /// Estimated off-pool per-table Cayenne cache reservation (bytes), summed over
+    /// enabled Cayenne tables. Used to reduce the query-memory default when it
+    /// exceeds the base host/10 headroom. Set by the Runtime builder; `0` disables
+    /// the reduction.
     #[must_use]
-    pub fn cayenne_cdc_reservation_bytes(mut self, bytes: u64) -> Self {
-        self.cayenne_cdc_reservation_bytes = bytes;
+    pub fn cayenne_reservation_bytes(mut self, bytes: u64) -> Self {
+        self.cayenne_reservation_bytes = bytes;
+        self
+    }
+
+    /// What the pod's Cayenne accelerations demand of the host. Gates the
+    /// coordinated host-memory partition; see the field docs.
+    #[must_use]
+    pub fn cayenne_workload(mut self, workload: crate::builder::CayenneWorkload) -> Self {
+        self.cayenne_workload = workload;
+        self
+    }
+
+    /// Whether the dedicated thread pools are left on. Gates the coordinated
+    /// host-memory partition alongside the workload; see the field docs.
+    #[must_use]
+    pub fn dedicated_thread_pools_enabled(mut self, enabled: bool) -> Self {
+        self.dedicated_thread_pools_enabled = enabled;
         self
     }
 
@@ -642,9 +655,11 @@ impl DataFusionBuilder {
         self
     }
 
-    /// Carve a dedicated compaction memory pool of `fraction` of the query
-    /// memory limit. Set by the Runtime builder only when Cayenne acceleration
-    /// is configured and dedicated thread pools are enabled.
+    /// Sets the fraction of the query memory limit carved into a dedicated Cayenne
+    /// compaction pool. The Runtime builder passes `Some` only when dedicated thread
+    /// pools are enabled and at least one enabled acceleration can compact into the
+    /// pool; `None` leaves the whole budget to queries and lets compaction account
+    /// against the query pool.
     #[must_use]
     pub fn compaction_memory_fraction(mut self, fraction: Option<f64>) -> Self {
         self.compaction_memory_fraction = fraction;
@@ -712,21 +727,37 @@ impl DataFusionBuilder {
     pub fn build(self) -> DataFusion {
         let mut config = self.config;
         // Request a dedicated compaction memory budget when a fraction is
-        // configured (Cayenne acceleration + dedicated thread pools). Its presence
-        // is also the "Cayenne in-memory acceleration active" signal that gates the
-        // coordinated host-memory partition below: a reduced query-pool default
-        // that leaves room for the off-pool Cayenne in-memory CDC tier so
-        // query_pool + compaction + tier + headroom ≤ host. The query pool is only
-        // shrunk by the compaction carve after the dedicated compaction RuntimeEnv
-        // builds successfully; otherwise queries keep the full configured budget.
+        // configured. The Runtime builder sets it only when dedicated thread pools
+        // are enabled AND a Cayenne acceleration can actually compact into it. The
+        // query pool is only shrunk by the compaction carve after the dedicated
+        // compaction RuntimeEnv builds successfully; otherwise queries keep the full
+        // configured budget.
         let compaction_memory_fraction = self
             .compaction_memory_fraction
             .and_then(validate_compaction_memory_fraction);
-        let cayenne_active = compaction_memory_fraction.is_some();
+        // The coordinated host-memory partition — a reduced query-pool default that
+        // leaves room for the off-pool in-memory CDC tier, so
+        // `query_pool + compaction + tier + headroom <= host` — is gated on the tier
+        // being REACHABLE, not merely on Cayenne being configured. A pod whose
+        // Cayenne tables are all bulk-written can never fill that tier
+        // (`cdc_durability` is forced to `file` off the small-write profile), so
+        // fencing ~20% of host for it would shrink the query pool — the measured
+        // concurrency wall — for nothing. Such a pod keeps the standard default,
+        // still reduced by its measured off-pool cache reservation below.
+        //
+        // Also gated on dedicated thread pools, because `install_cayenne_global_budgets`
+        // is what installs the mem-tier budget and it only runs when they are enabled.
+        // That is deliberately NOT read off the compaction carve: the carve
+        // additionally requires a file acceleration mode, and a `mode: memory` table
+        // — the Spicepod default — reaches the tier without ever compacting into a
+        // carve, so keying the two together would drop the partition for exactly the
+        // pod that holds its whole dataset in RAM.
+        let cayenne_cdc_active =
+            self.dedicated_thread_pools_enabled && self.cayenne_workload.uses_cdc_tier();
         let effective_memory_limit = effective_query_memory_limit(
             self.memory_limit,
-            cayenne_active,
-            self.cayenne_cdc_reservation_bytes,
+            cayenne_cdc_active,
+            self.cayenne_reservation_bytes,
             self.duckdb_query_pool_cap,
         );
         let compaction_memory_bytes = compaction_memory_fraction.map(|fraction| {
@@ -768,10 +799,10 @@ impl DataFusionBuilder {
         // reservation (e.g. co-resident DuckDB instance ceilings) so they never sum
         // past the memory available to this process — get_total_memory() is
         // cgroup-aware, so in a container that is the cgroup limit, not host RAM.
-        // `set_compaction_runtime` installs `mem_tier_budget_bytes` instead of the
-        // old, isolation-sized `get_total_memory() / 4`.
+        // `install_cayenne_global_budgets` installs `mem_tier_budget_bytes` into the
+        // Cayenne crate.
         let query_memory_pool_bytes = effective_memory_limit;
-        let mem_tier_budget_bytes = cayenne_active.then(|| {
+        let mem_tier_budget_bytes = cayenne_cdc_active.then(|| {
             let total_memory = crate::resource_monitor::get_total_memory();
             let external_reservation_bytes =
                 crate::accelerator_memory_budget::duckdb_total_reservation_bytes();
@@ -810,7 +841,7 @@ impl DataFusionBuilder {
         // small, so a spill fails and the query exhausts the memory pool
         // (ResourceExhausted) instead of spilling — the SF1000 Q10/Q18 symptom.
         // Guide operators to point spill at a roomy volume.
-        if cayenne_active && self.temp_directory.is_none() {
+        if self.cayenne_workload.is_configured() && self.temp_directory.is_none() {
             tracing::info!(
                 "Cayenne acceleration is active but runtime.query.temp_directory is unset: large analytical queries spill to the OS temp directory. If your data is on a separate volume (e.g. EBS) and the root volume is small, set runtime.query.temp_directory to a path with ample free space so large queries can spill instead of failing."
             );
@@ -830,9 +861,16 @@ impl DataFusionBuilder {
                 );
             }
         } else {
+            // DataFusion's own default is `available_parallelism()`, which reads
+            // a cgroup CPU quota and otherwise reports the node's cores — so a
+            // pod with a CPU request and no limit would fan every query out
+            // across the whole node. Size from the CPU budget instead, which is
+            // the same number wherever detection was already correct.
+            let target_partitions = cpu_budget::cpu_budget().target_partitions();
+            config = config.with_target_partitions(target_partitions);
             tracing::info!(
-                effective = config.options().execution.target_partitions,
-                "runtime.query.target_partitions not set; using DataFusion default"
+                target_partitions,
+                "runtime.query.target_partitions not set; sized from the CPU budget"
             );
         }
 
@@ -1233,6 +1271,7 @@ impl DataFusionBuilder {
             plan_capture: OnceLock::new(),
             write_stats_notify: tokio::sync::Notify::new(),
             accelerated_tables: TokioRwLock::new(HashSet::new()),
+            dataset_placements: dashmap::DashMap::new(),
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
             query_admission_semaphore: self.query_admission_semaphore,
@@ -1246,6 +1285,8 @@ impl DataFusionBuilder {
             compaction_memory_bytes,
             query_memory_pool_bytes,
             mem_tier_budget_bytes,
+            cayenne_workload: self.cayenne_workload,
+            total_memory: crate::resource_monitor::get_total_memory(),
             io_runtime: self.io_runtime,
             metrics: self.metrics,
             resource_monitor: self.resource_monitor,
@@ -1466,60 +1507,6 @@ fn has_cayenne_accelerator_metadata(provider: &dyn TableProvider) -> bool {
         .is_some_and(|accelerator| accelerator == "cayenne")
 }
 
-pub struct AnalyzerRulesBuilder {
-    include_federation: bool,
-    extra_rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>,
-}
-
-impl AnalyzerRulesBuilder {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    #[must_use]
-    pub fn include_federation(mut self, include: bool) -> Self {
-        self.include_federation = include;
-        self
-    }
-
-    #[must_use]
-    pub fn with_extra_rules(
-        mut self,
-        extra_rules: impl IntoIterator<Item = Arc<dyn AnalyzerRule + Send + Sync>>,
-    ) -> Self {
-        self.extra_rules.extend(extra_rules);
-        self
-    }
-
-    /// Spice customizes the order of the analyzer rules, since some of them are only relevant when `DataFusion` is executing the query,
-    /// as opposed to when underlying federated query engines will execute the query.
-    ///
-    /// This list should be kept in sync with the default rules in `Analyzer::new()`, but with the federation analyzer rule added first.
-    #[must_use]
-    pub fn build(self) -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
-        let mut rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>> = vec![];
-        if self.include_federation {
-            rules.push(Arc::new(federation_analyzer_rule()));
-        }
-        // The rest of these rules are run after the federation analyzer since they only affect internal DataFusion execution.
-        rules.extend([
-            Arc::new(ResolveGroupingFunction::new()) as Arc<dyn AnalyzerRule + Send + Sync>,
-            Arc::new(TypeCoercion::new()) as Arc<dyn AnalyzerRule + Send + Sync>,
-        ]);
-        rules.into_iter().chain(self.extra_rules).collect()
-    }
-}
-
-impl Default for AnalyzerRulesBuilder {
-    fn default() -> Self {
-        Self {
-            include_federation: true,
-            extra_rules: vec![],
-        }
-    }
-}
-
 /// Default fraction of host/container RAM for the query memory pool (before the
 /// compaction carve) when the operator sets no explicit `runtime.query.memory_limit`.
 const DEFAULT_QUERY_MEMORY_PERCENT: u64 = 90;
@@ -1547,13 +1534,28 @@ const CAYENNE_QUERY_MEMORY_FLOOR_PERCENT: u64 = 50;
 
 pub(crate) fn effective_query_memory_limit(
     memory_limit: Option<u64>,
-    cayenne_active: bool,
-    cdc_reservation_bytes: u64,
+    cayenne_cdc_active: bool,
+    cayenne_reservation_bytes: u64,
     duckdb_query_pool_cap: Option<u64>,
 ) -> u64 {
-    memory_limit.unwrap_or_else(|| {
+    if let Some(limit) = memory_limit {
+        // An explicit limit bypasses the reservation-aware derivation below, and
+        // with it the only log line that states the projected off-pool cache
+        // reservation. Emit the projection here too: operators lowering
+        // memory_limit to curb resident memory need to see that the caches do
+        // not shrink with it - they are sized from total memory, not the pool.
+        if cayenne_reservation_bytes > 0 {
+            tracing::info!(
+                memory_limit = limit,
+                cayenne_reservation_bytes,
+                "Explicit query memory limit set; the projected per-table Cayenne cache reservation is OFF-pool and unaffected by this limit"
+            );
+        }
+        limit
+    } else {
         let total_memory = crate::resource_monitor::get_total_memory();
-        let default_limit = if cayenne_active {
+        let floor = total_memory.saturating_mul(CAYENNE_QUERY_MEMORY_FLOOR_PERCENT) / 100;
+        let default_limit = if cayenne_cdc_active {
             // Cayenne CDC active. Base is CAYENNE_QUERY_MEMORY_PERCENT of host, leaving
             // room for the off-pool in-memory tier (clamped to <= host/5 by
             // `coordinated_mem_tier_budget`) plus a host/10 headroom for the off-pool
@@ -1568,15 +1570,49 @@ pub(crate) fn effective_query_memory_limit(
             // install-time check warns).
             let base = total_memory.saturating_mul(CAYENNE_QUERY_MEMORY_PERCENT) / 100;
             let base_headroom = total_memory / MEM_TIER_HEADROOM_FRACTION;
-            let reservation_excess = cdc_reservation_bytes.saturating_sub(base_headroom);
-            let floor = total_memory.saturating_mul(CAYENNE_QUERY_MEMORY_FLOOR_PERCENT) / 100;
+            let reservation_excess = cayenne_reservation_bytes.saturating_sub(base_headroom);
             let default_limit = base.saturating_sub(reservation_excess).max(floor);
 
+            // The floor binding is the unfittable-configuration signal: the
+            // reservation clawback is capped at (base - floor) percent of host,
+            // and when the projected per-table reservation exceeds that, the
+            // startup commitment (pools + tier + off-pool caches) exceeds host
+            // RAM before a single row arrives. A 121.7 GiB host was OOM-killed
+            // at SF-1000 with exactly this signature, and the only trace was
+            // this line at debug level.
+            if default_limit == floor && reservation_excess > 0 {
+                tracing::warn!(
+                    cayenne_cdc_active,
+                    cayenne_reservation_bytes,
+                    reservation_excess,
+                    "Cayenne CDC cache reservation exceeds what the query pool can yield: the pool is floored at {}% of memory and the projected caches do not fit beside it. Expect resident memory above the coordinated budgets; reduce per-table cache parameters or add memory. See the budget arithmetic in this log at startup.",
+                    CAYENNE_QUERY_MEMORY_FLOOR_PERCENT
+                );
+            }
             tracing::debug!(
-                cayenne_active,
-                cdc_reservation_bytes,
+                cayenne_cdc_active,
+                cayenne_reservation_bytes,
                 reservation_excess,
                 "No query memory limit specified; Cayenne CDC base {CAYENNE_QUERY_MEMORY_PERCENT}% of total, reduced by the per-table CDC reservation above the host/10 headroom to: {}",
+                util::human_readable_bytes(default_limit as usize)
+            );
+
+            default_limit
+        } else if cayenne_reservation_bytes > 0 {
+            // Cayenne configured but bulk-written only: the in-memory CDC tier is
+            // unreachable, so there is nothing to fence 20% of host for and the pool
+            // keeps the standard DEFAULT_QUERY_MEMORY_PERCENT base. Cayenne still
+            // holds one off-pool scan segment cache per table, though, and unlike the
+            // CDC base this one does NOT pre-reserve a headroom slice for it — the
+            // remaining 10% covers OS/allocator overhead alone. So subtract the FULL
+            // reservation rather than only its excess, keeping
+            // `query_pool + caches + overhead <= host`. Same floor as the CDC branch.
+            let base = total_memory.saturating_mul(DEFAULT_QUERY_MEMORY_PERCENT) / 100;
+            let default_limit = base.saturating_sub(cayenne_reservation_bytes).max(floor);
+
+            tracing::debug!(
+                cayenne_reservation_bytes,
+                "No query memory limit specified; Cayenne configured without an in-memory CDC tier, so the standard {DEFAULT_QUERY_MEMORY_PERCENT}% base applies, reduced by the off-pool per-table cache reservation to: {}",
                 util::human_readable_bytes(default_limit as usize)
             );
 
@@ -1584,7 +1620,6 @@ pub(crate) fn effective_query_memory_limit(
         } else {
             let default_limit = total_memory.saturating_mul(DEFAULT_QUERY_MEMORY_PERCENT) / 100;
             tracing::debug!(
-                cayenne_active,
                 "No query memory limit specified, defaulting to {DEFAULT_QUERY_MEMORY_PERCENT}% of total memory: {}",
                 util::human_readable_bytes(default_limit as usize)
             );
@@ -1611,7 +1646,7 @@ pub(crate) fn effective_query_memory_limit(
             }
             None => default_limit,
         }
-    })
+    }
 }
 
 /// 1/N of host RAM bounding the aggregate off-pool Cayenne in-memory CDC tier (the
@@ -2009,10 +2044,35 @@ mod tests {
         assert_eq!(floored, floor);
         assert!(floored > 0);
 
-        // The reservation never affects the non-Cayenne default.
+        // A pod with no Cayenne acceleration reports a zero reservation and keeps
+        // the standard default untouched.
         assert_eq!(
-            effective_query_memory_limit(None, false, total, None),
+            effective_query_memory_limit(None, false, 0, None),
             total.saturating_mul(DEFAULT_QUERY_MEMORY_PERCENT) / 100
+        );
+
+        // Bulk-only Cayenne (no reachable in-memory CDC tier) keeps the STANDARD
+        // base rather than the reduced CDC base — there is no tier to leave room
+        // for — but still gives back its off-pool per-table cache reservation, in
+        // full: unlike the CDC base, the 90% base pre-reserves no slice for it.
+        let bulk_base = total.saturating_mul(DEFAULT_QUERY_MEMORY_PERCENT) / 100;
+        let bulk_reservation = total / 50;
+        assert_eq!(
+            effective_query_memory_limit(None, false, bulk_reservation, None),
+            bulk_base - bulk_reservation,
+            "a bulk-only Cayenne pod subtracts its whole cache reservation"
+        );
+        assert!(
+            effective_query_memory_limit(None, false, bulk_reservation, None)
+                > effective_query_memory_limit(None, true, bulk_reservation, None),
+            "bulk-only must leave queries strictly more memory than the CDC partition"
+        );
+
+        // ...and is floored identically, so a pathological cache config cannot
+        // starve queries on either branch.
+        assert_eq!(
+            effective_query_memory_limit(None, false, total.saturating_mul(2), None),
+            floor
         );
 
         // A DuckDB query-pool cap lowers (never raises) the default query pool.

@@ -53,6 +53,7 @@ use runtime::Runtime;
 use runtime::status::ComponentStatus;
 use secrecy::{ExposeSecret, SecretString};
 use spicepod::{
+    acceleration::Mode as AccelerationMode,
     component::catalog::{
         Catalog, CatalogAcceleration, CatalogAccelerationEngine, CatalogRefreshMode,
     },
@@ -236,6 +237,8 @@ fn accelerated_pg_catalog(port: usize) -> Catalog {
     catalog.acceleration = Some(CatalogAcceleration {
         engine: CatalogAccelerationEngine::Cayenne,
         refresh_mode: CatalogRefreshMode::Changes,
+        mode: AccelerationMode::default(),
+        params: None,
     });
     catalog
 }
@@ -459,6 +462,36 @@ async fn test_catalog_acceleration_bootstraps_tables_with_primary_key() -> Resul
             assert_eq!(
                 slot_count, 1,
                 "both tables should share one replication slot, found {slot_count}"
+            );
+
+            // The per-table datasets the catalog synthesizes are an internal
+            // registration detail: a user reaches each table through the
+            // catalog's namespace, so listing the synthesized names too would
+            // show every accelerated table a second time under a name that
+            // isn't part of the catalog's interface.
+            let listed = run_query(
+                &rt,
+                "SELECT table_name FROM information_schema.tables \
+                 WHERE table_catalog = 'spice' AND table_schema = 'data'",
+            )
+            .await?;
+            let listed_names: Vec<String> = listed
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<arrow::array::StringArray>()
+                        .map_or_else(Vec::new, |arr| {
+                            arr.iter().flatten().map(ToString::to_string).collect()
+                        })
+                })
+                .collect();
+            assert!(
+                !listed_names
+                    .iter()
+                    .any(|name| name.starts_with("__catalog_accel_")),
+                "synthesized catalog datasets must not be listed in spice.data, found: {listed_names:?}"
             );
 
             Ok(())

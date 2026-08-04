@@ -44,7 +44,6 @@ use runtime_datafusion_index::Index;
 use tokio::sync::Mutex;
 
 use crate::SEARCH_SCORE_COLUMN_NAME;
-use crate::index::chunking::{CHUNKED_INDEX_CHUNK_KEY, ChunkedSearchIndex};
 use crate::index::{SearchIndex, VectorIndex, embedding_col};
 use crate::metadata::MetadataColumns;
 use data_components::elasticsearch::search_table::{
@@ -348,7 +347,7 @@ impl ElasticsearchIndex {
         table: Arc<dyn TableProvider>,
     ) -> Result<Arc<dyn TableProvider>, DataFusionError> {
         use datafusion::datasource::ViewTable;
-        use datafusion::prelude::{Expr, cast, col};
+        use datafusion::prelude::{Expr, cast, ident};
 
         let raw_schema = table.schema();
         let normalized_schema = Arc::clone(&self.source_schema);
@@ -370,9 +369,9 @@ impl ElasticsearchIndex {
                     .map_or_else(|_| raw_type.clone(), |nf| nf.data_type().clone());
 
                 if &target_type == raw_type {
-                    col(f.name())
+                    ident(f.name())
                 } else {
-                    cast(col(f.name()), target_type).alias(f.name())
+                    cast(ident(f.name()), target_type).alias(f.name())
                 }
             })
             .collect();
@@ -476,7 +475,7 @@ impl Index for ElasticsearchIndex {
     }
 
     async fn delete_by_keys(&self, keys: RecordBatch) -> Result<(), DataFusionError> {
-        let key_columns: Vec<String> = self.primary_key.iter().map(|f| f.name().clone()).collect();
+        let key_columns = delete::document_key_columns(&self.primary_key);
         delete::delete_by_keys(
             self.client.as_ref(),
             &self.es_index,
@@ -486,24 +485,41 @@ impl Index for ElasticsearchIndex {
         )
         .await
     }
+
+    /// `_delete_by_query` filters by field value, so a key naming only some of the indexed fields
+    /// removes every document matching it.
+    fn deletes_by_partial_key(&self) -> bool {
+        true
+    }
 }
 
 impl ElasticsearchIndex {
-    /// Schema for `query_table_provider` results: primary keys + embedding + `_score`.
-    ///
-    /// `_spice.chunk_id` is excluded even when present in `self.primary_key` (added by
-    /// [`ChunkedSearchIndex::augment_primary_key`]). It is an internal ordering key used
-    /// only inside `list_table_provider`'s aggregation — it is never stored in ES `_source`
-    /// as a retrievable field, so `knn_hits_to_batch` would fill it with nulls and violate
-    /// the non-nullable declaration ("Column '_spice.chunk_id' is declared as non-nullable
-    /// but contains null values").
-    fn query_result_schema(&self) -> SchemaRef {
-        let mut fields: Vec<Field> = self
-            .primary_key
+    /// The metadata columns to advertise in the query/list schemas: every declared metadata
+    /// column except any that collides with the derived embedding column (which is appended
+    /// separately). When chunking is enabled this includes the `{col}_offset`
+    /// `FixedSizeList(Int32, 2)` column, and — if the search column is itself metadata — the
+    /// full-search-field column.
+    fn metadata_fields(&self) -> Vec<Field> {
+        let embedding_name = embedding_col(&self.embedded_column);
+        self.metadata_columns
             .iter()
-            .filter(|f| f.name() != CHUNKED_INDEX_CHUNK_KEY)
-            .cloned()
-            .collect();
+            .filter(|c| c.name() != embedding_name)
+            .map(|c| Arc::unwrap_or_clone(c.field()))
+            .collect()
+    }
+
+    /// Schema for `query_table_provider` results: primary keys + metadata + embedding +
+    /// `_score`.
+    ///
+    /// This mirrors the S3 Vectors engine: both the query and list plans expose the full
+    /// (augmented, when chunked) primary key and the metadata columns, so an in-memory warm
+    /// index can fall back onto Elasticsearch — the fallback projection requires every warm
+    /// column to be present by name in the Elasticsearch plan. `_spice.chunk_id` (a primary
+    /// key when chunked) and `{col}_offset` (a metadata column when chunked) are both stored
+    /// in `_source` and read back by `knn_hits_to_batch`.
+    fn query_result_schema(&self) -> SchemaRef {
+        let mut fields: Vec<Field> = self.primary_key.clone();
+        fields.extend(self.metadata_fields());
         fields.push(Field::new(
             embedding_col(&self.embedded_column),
             DataType::FixedSizeList(
@@ -520,18 +536,15 @@ impl ElasticsearchIndex {
         Arc::new(Schema::new(fields))
     }
 
-    /// Schema for `list_table_provider` results: primary keys + embedding (+ offset when chunked).
+    /// Schema for `list_table_provider` results: primary keys + metadata + embedding.
     ///
-    /// The offset column (`{embedded_column}_offset`) is only included when this index is
-    /// wrapped by [`ChunkedSearchIndex`] / [`super::chunking::ChunkedVectorIndex`] (detected
-    /// by the presence of [`CHUNKED_INDEX_CHUNK_KEY`] in `self.primary_key`). The chunking
-    /// write path always emits the offset column into the inner-index batch, so Elasticsearch
-    /// stores it even though the schema was previously not advertising it—causing
-    /// "Schema error: No field named content_offset". For non-chunked indexes the offset
-    /// is never written, so advertising it here would produce null values and violate the
-    /// non-nullable declaration.
+    /// See [`Self::query_result_schema`] for why metadata columns are projected uniformly.
+    /// Elasticsearch cannot enumerate vectors, so this schema only shapes the empty
+    /// `MemTable` returned by `list_table_provider`; matching column *names* is what lets the
+    /// warm-index fallback plan build.
     fn list_result_schema(&self) -> SchemaRef {
         let mut fields: Vec<Field> = self.primary_key.clone();
+        fields.extend(self.metadata_fields());
         fields.push(Field::new(
             embedding_col(&self.embedded_column),
             DataType::FixedSizeList(
@@ -540,23 +553,7 @@ impl ElasticsearchIndex {
             ),
             true,
         ));
-        if self.is_chunked() {
-            fields.push(Field::new(
-                ChunkedSearchIndex::chunking_offset_col(&self.embedded_column),
-                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, false)), 2),
-                false,
-            ));
-        }
         Arc::new(Schema::new(fields))
-    }
-
-    /// Whether this index is being used as the inner index of a [`ChunkedSearchIndex`],
-    /// detected by the presence of [`CHUNKED_INDEX_CHUNK_KEY`] in `self.primary_key`
-    /// (added by [`ChunkedSearchIndex::augment_primary_key`]).
-    fn is_chunked(&self) -> bool {
-        self.primary_key
-            .iter()
-            .any(|f| f.name() == CHUNKED_INDEX_CHUNK_KEY)
     }
 }
 
@@ -601,7 +598,7 @@ impl ElasticsearchTextIndex {
         table: Arc<dyn TableProvider>,
     ) -> Result<Arc<dyn TableProvider>, DataFusionError> {
         use datafusion::datasource::ViewTable;
-        use datafusion::prelude::col;
+        use datafusion::prelude::ident;
 
         let raw_schema = table.schema();
 
@@ -617,7 +614,7 @@ impl ElasticsearchTextIndex {
                     DataType::FixedSizeList(_, _) | DataType::LargeList(_) | DataType::List(_)
                 )
             })
-            .map(|f| col(f.name()))
+            .map(|f| ident(f.name()))
             .collect();
 
         let plan =
@@ -730,7 +727,7 @@ impl Index for ElasticsearchTextIndex {
     }
 
     async fn delete_by_keys(&self, keys: RecordBatch) -> Result<(), DataFusionError> {
-        let key_columns: Vec<String> = self.primary_key.iter().map(|f| f.name().clone()).collect();
+        let key_columns = delete::document_key_columns(&self.primary_key);
         delete::delete_by_keys(
             self.client.as_ref(),
             &self.es_index,
@@ -739,6 +736,11 @@ impl Index for ElasticsearchTextIndex {
             &keys,
         )
         .await
+    }
+
+    /// Same `_delete_by_query` addressing as [`ElasticsearchIndex`].
+    fn deletes_by_partial_key(&self) -> bool {
+        true
     }
 }
 
@@ -1050,5 +1052,151 @@ mod write_maintenance_tests {
         assert_eq!(client.refresh_index_calls.load(Ordering::Relaxed), 0);
         assert_eq!(client.force_merge_calls.load(Ordering::Relaxed), 0);
         assert_eq!(client.put_settings_calls.load(Ordering::Relaxed), 0);
+    }
+
+    // ── Chunked warm-index fallback contract ─────────────────────────────────────
+
+    use crate::index::chunking::{CHUNKED_INDEX_CHUNK_KEY, ChunkedSearchIndex};
+    use crate::index::compound::{CompoundReadMode, CompoundVectorIndex};
+    use crate::index::memory::{MemoryDistanceMetric, MemoryVectorIndex};
+    use crate::metadata::MetadataColumn;
+    use llms::embeddings::EmbeddingInput;
+
+    #[derive(Debug)]
+    struct NoopEmbed;
+
+    #[async_trait::async_trait]
+    impl Embed for NoopEmbed {
+        async fn embed(&self, _input: EmbeddingInput) -> llms::embeddings::Result<Vec<Vec<f32>>> {
+            Ok(vec![])
+        }
+        fn size(&self) -> i32 {
+            3
+        }
+    }
+
+    fn noop_embed_udf() -> Arc<datafusion::logical_expr::ScalarUDF> {
+        use datafusion::logical_expr::{Volatility, create_udf};
+        Arc::new(create_udf(
+            "embed",
+            vec![],
+            DataType::Null,
+            Volatility::Volatile,
+            Arc::new(|_| unimplemented!("not exercised by schema/plan tests")),
+        ))
+    }
+
+    /// A chunked [`ElasticsearchIndex`] with an augmented primary key (`_spice.chunk_id`)
+    /// and a `{col}_offset` non-filterable metadata column, mirroring what `try_from_table`
+    /// produces for a chunked column.
+    fn chunked_es_index() -> ElasticsearchIndex {
+        let embedded_column = "content".to_string();
+        let dims = 3;
+        let primary_key =
+            ChunkedSearchIndex::augment_primary_key(vec![Field::new("id", DataType::Int64, false)]);
+        let offset_field = Field::new(
+            ChunkedSearchIndex::chunking_offset_col(&embedded_column),
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, false)), 2),
+            false,
+        );
+        let metadata_columns: MetadataColumns = vec![MetadataColumn::NonFilterable(Arc::new(
+            offset_field.clone(),
+        ))]
+        .into();
+
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("content", DataType::Utf8, true),
+            offset_field,
+            Field::new(CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64, false),
+            Field::new(
+                embedding_col(&embedded_column),
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, false)),
+                    dims,
+                ),
+                true,
+            ),
+        ]));
+
+        ElasticsearchIndex {
+            client: Arc::new(MockElasticsearch::default()),
+            es_index: "test-index".to_string(),
+            embedded_column,
+            vector_field: embedding_col("content"),
+            text_fields: vec![],
+            primary_key,
+            compute_query: Arc::new(NoopEmbed),
+            dims,
+            similarity: "cosine".to_string(),
+            source_schema,
+            metadata_columns,
+            batch_write_rows: 1000,
+            write_maintenance: Arc::new(ElasticsearchIndexWriteMaintenance::default()),
+        }
+    }
+
+    #[test]
+    fn chunked_result_schemas_expose_chunk_id_and_offset() {
+        let index = chunked_es_index();
+        let offset_col = ChunkedSearchIndex::chunking_offset_col("content");
+        let embedding = embedding_col("content");
+
+        let query = index.query_result_schema();
+        query
+            .field_with_name(CHUNKED_INDEX_CHUNK_KEY)
+            .expect("query schema should expose the chunk key column");
+        query
+            .field_with_name(&offset_col)
+            .expect("query schema should expose the offset column");
+        query
+            .field_with_name(&embedding)
+            .expect("query schema should expose the embedding column");
+        query
+            .field_with_name(SEARCH_SCORE_COLUMN_NAME)
+            .expect("query schema should expose the score column");
+
+        let list = index.list_result_schema();
+        list.field_with_name(CHUNKED_INDEX_CHUNK_KEY)
+            .expect("list schema should expose the chunk key column");
+        list.field_with_name(&offset_col)
+            .expect("list schema should expose the offset column");
+        list.field_with_name(&embedding)
+            .expect("list schema should expose the embedding column");
+        list.field_with_name(SEARCH_SCORE_COLUMN_NAME)
+            .expect_err("list schema should not expose the score column");
+    }
+
+    /// The core fallback-contract guard: a `CompoundVectorIndex` pairing an in-memory warm
+    /// index with the chunked Elasticsearch index must build both its query and list fallback
+    /// plans without a plan error — i.e. every warm-index column exists by name in the
+    /// Elasticsearch plan.
+    #[test]
+    fn chunked_warm_index_fallback_plans_build() {
+        let es_index = chunked_es_index();
+        let memory = MemoryVectorIndex::try_new(
+            es_index.search_column(),
+            es_index.primary_fields(),
+            es_index.metadata_columns.clone(),
+            Arc::new(NoopEmbed),
+            noop_embed_udf(),
+            "test-model".to_string(),
+            MemoryDistanceMetric::Cosine,
+        )
+        .expect("memory warm index should build");
+
+        let compound = CompoundVectorIndex::try_new(
+            Arc::new(memory) as Arc<dyn VectorIndex>,
+            Arc::new(es_index) as Arc<dyn VectorIndex>,
+            CompoundReadMode::FallbackToSecondary,
+        )
+        .expect("compound index should build");
+
+        compound
+            .query_table_provider("query")
+            .expect("query fallback plan should build over the augmented primary key + metadata");
+        compound
+            .list_table_provider()
+            .expect("list fallback plan should build over the augmented primary key + metadata");
     }
 }

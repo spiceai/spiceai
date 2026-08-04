@@ -328,3 +328,77 @@ pub struct ColumnEmbeddingConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_elements_per_row: Option<usize>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::component::model::split_hf_model_id;
+
+    /// A revision-pinned `HuggingFace` embedding must survive the round trip through
+    /// `get_model_id`. `get_model_id` re-joins the revision onto the repo id, so a loader has
+    /// to split it back out; the embeddings loader did not, and asked the Hub for a repo
+    /// literally named `org/model:revision`, which 401s (#12430).
+    #[test]
+    fn revision_pinned_embedding_model_id_round_trips() {
+        let sha = "a5beb1e3e68b9ab74eb54cfd186867f64f240e1a";
+
+        // The exact spicepod reported in #12430.
+        assert_splits_to(
+            &format!("huggingface:huggingface.co/BAAI/bge-base-en-v1.5:{sha}"),
+            "BAAI/bge-base-en-v1.5",
+            Some(sha),
+        );
+
+        // A branch name pins just as well as a sha.
+        assert_splits_to(
+            "hf:BAAI/bge-small-en-v1.5:v2-branch",
+            "BAAI/bge-small-en-v1.5",
+            Some("v2-branch"),
+        );
+
+        // Unpinned: every existing fixture takes this branch, which is why the defect
+        // stayed invisible.
+        assert_splits_to(
+            "hf:sentence-transformers/all-MiniLM-L6-v2",
+            "sentence-transformers/all-MiniLM-L6-v2",
+            None,
+        );
+    }
+
+    /// Asserts that the id `get_model_id` builds for `from` splits back into the repo and
+    /// revision a loader has to pass to the Hub separately.
+    fn assert_splits_to(from: &str, expected_repo: &str, expected_revision: Option<&str>) {
+        let Some(model_id) = Embeddings::new(from, "test").get_model_id() else {
+            panic!("expected a model id for {from}");
+        };
+
+        assert_eq!(
+            split_hf_model_id(&model_id),
+            (expected_repo, expected_revision),
+            "round trip lost the revision for {from}"
+        );
+    }
+
+    /// Guards the reason the bug was silent: the joined id is not itself a usable repo id, so
+    /// forwarding it unsplit cannot work. Without the split, the repo segment of the request
+    /// URL carries the revision and the revision segment falls back to `main`.
+    #[test]
+    fn joined_model_id_is_not_a_usable_repo_id() {
+        let from = "hf:BAAI/bge-base-en-v1.5:a5beb1e3";
+        let Some(model_id) = Embeddings::new(from, "test").get_model_id() else {
+            panic!("expected a model id for {from}");
+        };
+
+        assert!(
+            model_id.contains(':'),
+            "expected the joined id to carry the revision separator: {model_id}"
+        );
+
+        let (repo_id, revision) = split_hf_model_id(&model_id);
+        assert!(
+            !repo_id.contains(':'),
+            "repo id must not carry the revision: {repo_id}"
+        );
+        assert_eq!(revision, Some("a5beb1e3"));
+    }
+}

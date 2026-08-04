@@ -101,6 +101,22 @@ first CI run — or the rerun call fails, it falls back to prompting you to
 open/refresh the PR yourself.) That, together with a review, lets a
 maintainer add the PR to the merge queue.
 
+The refresh only fires while the commit it signed off is **still the head of an open
+PR**. If you pushed while a long sign-off was running, it says so, names the heads
+of every open PR that contains the commit, and refreshes nothing:
+
+```
+  1111111111aa is not the head of any open PR that contains it (PR heads: 2222222222bb) — not refreshing 'Attestation'.
+```
+
+That is deliberate. `pr.yml`'s concurrency group resolves its SHA term to the
+literal `any-sha` on a `pull_request` event, so every attempt for a PR shares one
+group — re-running the old commit's run would cancel the current head's in-flight
+one, and a re-run evaluates its *original* event payload, so the verdict it
+published would be for the superseded commit. The stale sign-off had nothing to
+propagate anyway (its status is on a commit no longer under review), so skipping
+loses nothing. Sign off again on the new head.
+
 The sign-off is normally bound to the **exact commit** you pushed. If you push a
 code change, the old sign-off no longer applies and you must run `make signoff`
 again. The only exception is merging the PR's base branch. **Attestation** walks
@@ -112,6 +128,14 @@ amended merge, octopus merge, or merge from another branch still requires a new
 sign-off.
 `scripts/signoff status` reports only a commit's own status; the inheritance
 check runs in the PR's **Attestation** workflow.
+
+A sign-off that **failed** on `HEAD` disqualifies that commit. **Attestation**
+rejects it before anything else, so an earlier sign-off cannot be inherited past
+it and the fast-track paths below cannot route around it: a merge of the base
+can be textually clean and still be semantically broken, and a sign-off run
+against the merge is exactly what finds that out. Fix what it reported and run
+`make signoff` again — the new status replaces the failed one. A `pending`
+status is not a verdict and does not block inheritance.
 
 ### Reverts are fast-tracked
 
@@ -235,8 +259,41 @@ The Actions workflow:
    fallback when merge-base isn't available), or skips Rust checks when the
    branch has no Rust-affecting files
 3. Runs full `make lint-rust` + `make build-cli-dev nextest` when Rust is affected
-4. Posts pending → success/failure `signoff` statuses, then re-runs
-   **Attestation** if needed
+4. Posts pending → success/failure `signoff` statuses (skipping the pending when
+   the commit is already signed off), then re-runs **Attestation** if needed
+
+The checks run under a 353-minute budget, inside a 358-minute job budget, so a
+run that overruns fails as a failed step rather than being terminated at the
+runner pool's ~360-minute wall (which reports as `cancelled`, with no failed
+step and no chance to clean up). A run that ends without a verdict — budget
+expired, evicted by a re-dispatch, cancelled — replaces its own `pending` status
+with a failure; otherwise `scripts/signoff status` and `scripts/signoff mine`
+would keep showing a sign-off in progress for a run that is long gone.
+Re-dispatch against the same HEAD to try again.
+
+Re-dispatching against a HEAD that is *already* signed off leaves that success in
+place: the run skips the in-progress `pending` and only replaces the status once
+it has a verdict of its own, so a run that never finishes cannot cost you an
+attestation. `mine` still shows ⟳ while it runs — that comes from the run list,
+not the commit status.
+
+A re-dispatch that *does* fail posts `signoff=failure` and then re-runs
+**Attestation** so the required check reflects that verdict. The status alone
+would not close the gate — **Attestation** is the required check and `pr.yml`
+does not run on commit-status changes — so the failure path forces the re-run
+even when the check is already green, which is the one case the success path
+deliberately skips. If the status post itself fails, the run says so and leaves
+**Attestation** showing the previous sign-off; re-dispatch or push to move it.
+
+Two cases the re-run cannot cover, both reported by the run rather than hidden:
+an **Attestation** run that is still in flight may already have read the status
+this verdict replaced, so it can finish green and needs re-running by hand; and
+a HEAD that only merges the base branch can *inherit* an earlier sign-off, which
+the failing status on HEAD does not veto ([#12357](https://github.com/spiceai/spiceai/issues/12357)).
+
+A branch whose sign-off keeps running out of budget is contending for the pool
+rather than doing anything wrong. `-f skip_targeted_lint=true` drops the
+branch-scoped pre-lint, which trades fail-fast feedback for a shorter run.
 
 Requires write access to the repository (same as local sign-off — fork
 contributors still need a maintainer to sign off). The lab SSH path also needs
@@ -272,6 +329,54 @@ checks the PR's head commit first, then walks backward through clean, unmodified
 base merges on the first-parent chain. Make sure the commit under review is
 pushed, then run `make signoff` again. Any new code or manual merge resolution
 needs a fresh sign-off.
+
+### "Runner out of disk — checks did not complete"
+
+The sign-off runner's work volume filled up, so the run stopped before finishing
+its judgement of your branch. **Re-dispatch it.** If it recurs on the same
+runner, that machine needs space reclaimed — `target/` is shared across every
+branch that pool signs off, so it grows without bound. If instead it follows
+*your branch* from runner to runner, suspect the diff: a new build script,
+a dependency bump, or a feature expansion can consume the volume by itself.
+
+Sign-off refuses to start when the volume has less than 25 GiB free, and a run
+whose build reports running out of disk is reported as an infrastructure failure
+rather than a check failure. Without that, the failure is nearly impossible to
+read correctly: the linker dies with `errno=28` thousands of lines after nextest
+has already reported every test passing, on a crate the branch never touched,
+with no `-->` source pointer anywhere in the log.
+
+The floor is checked twice: once as the job's first step after checkout
+(`scripts/signoff preflight-disk`), so an already-full runner is turned away
+before the toolchain setup rather than after it, and again inside the run. A stop
+at the early step has no commit status to explain itself — the `pending` status is
+posted later — so it annotates the run instead.
+
+A remote run watches its own build output for that error, and a watched run's
+verdict is final **in both directions**. It has to be: by the time anything
+measures free space again, cargo has unlinked the partial binaries it was
+writing and the volume can look healthy — and conversely, on a shared pool
+another run can drag the volume under any threshold while your branch is failing
+for its own reasons. Measured free space is consulted only when nothing watched,
+which is how a local run gets a classification at all. The verdict resets per
+build step, so only the step that actually failed speaks.
+
+"Final in both directions" applies only to a watcher that actually reported. The
+watcher exits with a reserved status to say it saw the error, so a watcher that
+exits any *other* non-zero way — no `awk` on the runner, a signal — is a watcher
+that reached no verdict rather than one that saw nothing. That disarms the watch
+and hands classification back to the free-space backstop; treating its silence as
+"not disk" would blame the branch for the volume just as surely as the unwritable
+marker did.
+
+The watch keeps its answer in a shell variable, not a file. Recording it on disk
+needed an allocation at the one moment allocation is failing — and on macOS
+`$TMPDIR` and the workspace are usually the same APFS container, so there was no
+reliably writable place to put it. An unwritable marker read as "not a disk
+failure", which blamed the branch for the volume.
+
+Set `SIGNOFF_MIN_FREE_GIB` to change the floor. Locally both checks only warn and
+the output is not watched — your own disk is yours to manage.
 
 ### External contributors (forks)
 
