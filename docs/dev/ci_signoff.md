@@ -254,6 +254,8 @@ corrupts the measurement.
 
 The Actions workflow:
 
+0. Resolves the dispatch input to a commit, in a small GitHub-hosted `resolve`
+   job, so the sign-off job can key its concurrency group on that commit
 1. Checks out your branch (full history) and fetches `trunk`
 2. Target-lints crates touched by the branch vs `trunk` (GitHub compare API as a
    fallback when merge-base isn't available), or skips Rust checks when the
@@ -270,6 +272,15 @@ expired, evicted by a re-dispatch, cancelled — replaces its own `pending` stat
 with a failure; otherwise `scripts/signoff status` and `scripts/signoff mine`
 would keep showing a sign-off in progress for a run that is long gone.
 Re-dispatch against the same HEAD to try again.
+
+Only one sign-off runs per commit. Both dispatch forms — `-f branch=<branch>` and
+`-f pr_number=<N>` — resolve to the same commit before the sign-off job starts,
+and its concurrency group is keyed on that commit, so a second dispatch for a
+commit already being signed off evicts the first rather than duplicating 1-4
+hours of identical work and racing it for the `signoff` status (#12472). Two open
+PRs that happen to share a head commit collapse into one run for the same reason.
+Dispatching after the branch tip has *moved* is a different commit, so it starts
+a fresh run (and the branch-keyed group evicts the run on the stale commit).
 
 Re-dispatching against a HEAD that is *already* signed off leaves that success in
 place: the run skips the in-progress `pending` and only replaces the status once
