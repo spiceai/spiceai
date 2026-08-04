@@ -190,12 +190,30 @@ fn normalize_privilege(token: &str) -> String {
     out
 }
 
+/// Escape the characters that would end a `MySQL` single-quoted string early.
+///
+/// `MySQL` and `MariaDB` both permit `'` and `\` inside a user or host name, so
+/// interpolating one unescaped would make the suggested `GRANT` unpasteable.
+fn escape_quoted(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch == '\'' || ch == '\\' {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// Render `user@host` (as `CURRENT_USER()` reports it) in `MySQL` account
 /// syntax, so the suggested `GRANT` can be pasted verbatim.
 fn quote_account(account: &str) -> String {
     match account.rsplit_once('@') {
-        Some((user, host)) => format!("'{user}'@'{host}'"),
-        None => format!("'{account}'"),
+        Some((user, host)) => {
+            let (user, host) = (escape_quoted(user), escape_quoted(host));
+            format!("'{user}'@'{host}'")
+        }
+        None => format!("'{}'", escape_quoted(account)),
     }
 }
 
@@ -287,10 +305,9 @@ pub async fn check_privileges(conn: &mut Conn) -> Result<()> {
     };
 
     let current_user = conn
-        .query_first::<Option<String>, _>("SELECT CURRENT_USER()")
+        .query_first::<String, _>("SELECT CURRENT_USER()")
         .await
         .ok()
-        .flatten()
         .flatten();
     let (account, grant_target) = match current_user {
         Some(user) => {
@@ -878,5 +895,16 @@ mod tests {
         assert_eq!(quote_account("spice@10.0.0.1"), "'spice'@'10.0.0.1'");
         // A host-less value still yields valid single-quoted SQL.
         assert_eq!(quote_account("spice"), "'spice'");
+    }
+
+    #[test]
+    fn account_quoting_escapes_characters_that_would_end_the_string_early() {
+        // `MySQL` permits both characters in an account name, and an unescaped
+        // one would close the literal and make the suggested GRANT unpasteable.
+        assert_eq!(quote_account(r"o'brien@%"), r"'o\'brien'@'%'");
+        assert_eq!(quote_account(r"spice@ho'st"), r"'spice'@'ho\'st'");
+        assert_eq!(quote_account(r"back\slash@%"), r"'back\\slash'@'%'");
+        // The host-less arm escapes on the same path.
+        assert_eq!(quote_account(r"o'brien"), r"'o\'brien'");
     }
 }
