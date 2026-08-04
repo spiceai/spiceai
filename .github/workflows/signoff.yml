@@ -281,6 +281,19 @@ jobs:
           echo "HEAD: $(git rev-parse --short HEAD)"
           echo "merge-base with origin/trunk: $(git merge-base HEAD origin/trunk 2>/dev/null | cut -c1-12 || echo 'n/a (API fallback)')"
 
+      # Before the toolchain setup, not after. The same floor is checked inside
+      # the sign-off run, but that check sits behind Rust, Nextest, spiceio,
+      # sccache, protoc, cc and make setup — so an already-full runner spent all
+      # of that before being told, and a volume that filled *during* those steps
+      # failed the job with no indication that the volume, not the branch, was at
+      # fault (#12427). Checking here stops the already-full case at once, with an
+      # annotation and a step summary that name it as infrastructure.
+      #
+      # `.trusted-ci/signoff`, not the working tree's copy: this runs before any
+      # of the branch's code, and a fork PR must not choose its own floor.
+      - name: Check the work volume before setting up the toolchain
+        run: .trusted-ci/signoff preflight-disk
+
       - name: Set up Rust
         uses: ./.trusted-ci/actions/setup-rust
 
