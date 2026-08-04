@@ -94,8 +94,13 @@ jobs:
           BRANCH: spiceai-54
 
       - name: Show sccache stats
-        if: runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != ''
-        run: sccache --show-stats
+        if: always() && (runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != '')
+        # `always()`: this is the one step that reports cache health, and without it
+        # it is skipped on exactly the failures it would explain (#12420). The `||`
+        # keeps a diagnostic from ever deciding a verdict — when the cache backend is
+        # gone `--show-stats` cannot answer either, and that is itself the finding.
+        run: |
+          sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
 
       - name: Kill spiceio
         if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
@@ -174,8 +179,13 @@ jobs:
         run: cargo build -p testoperator --all-features --locked
 
       - name: Show sccache stats
-        if: runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != ''
-        run: sccache --show-stats
+        if: always() && (runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != '')
+        # `always()`: this is the one step that reports cache health, and without it
+        # it is skipped on exactly the failures it would explain (#12420). The `||`
+        # keeps a diagnostic from ever deciding a verdict — when the cache backend is
+        # gone `--show-stats` cannot answer either, and that is itself the finding.
+        run: |
+          sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
 
       - name: Check if Cargo.lock is updated
         run: |
