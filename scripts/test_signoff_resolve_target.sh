@@ -39,6 +39,11 @@ fail_test() {
 
 command -v python3 >/dev/null 2>&1 || { echo "python3 not found — required to extract the step"; exit 1; }
 command -v jq >/dev/null 2>&1 || { echo "jq not found — the step under test uses it"; exit 1; }
+# Checked separately from python3 itself: without this the extraction below fails
+# as an ImportError traceback, which reads like a bug in the test rather than a
+# missing dependency.
+python3 -c 'import yaml' 2>/dev/null \
+  || { echo "python3 cannot import yaml — required to extract the step (pip install pyyaml)"; exit 1; }
 
 stub_dir="$(mktemp -d)"
 trap 'rm -rf "$stub_dir"' EXIT
