@@ -483,6 +483,12 @@ impl SpicedInstance {
     }
 }
 
+/// How long [`unready_datasets_summary`] will wait for `/v1/datasets`. Short on
+/// purpose: the readiness wait has already spent its own timeout by the time
+/// this runs, so the diagnostic is worth a few seconds at most before the
+/// original error should be reported without it.
+const DATASETS_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Best-effort diagnostic appended to the readiness-timeout error: how many
 /// datasets are not `Ready`, and the first error among them.
 ///
@@ -491,9 +497,22 @@ impl SpicedInstance {
 /// advisory — any failure to fetch or parse returns an empty string, leaving the
 /// original message intact, because a broken diagnostic must not mask the
 /// timeout it is describing.
+///
+/// The request carries its own short timeout: the client built by
+/// [`SpicedInstance::http_client`] has none, and this runs on the path where the
+/// runtime has already failed to become ready — so a wedged or half-open
+/// connection is the expected case, not the unlikely one. Without it the
+/// "returns an empty string" contract above does not hold, because the call
+/// never returns at all and the readiness timeout it was describing is never
+/// reported.
 async fn unready_datasets_summary(client: &reqwest::Client, http_base: &str) -> String {
     let url = format!("{http_base}{DATASETS_ENDPOINT}?status=true");
-    let Ok(response) = client.get(&url).send().await else {
+    let Ok(response) = client
+        .get(&url)
+        .timeout(DATASETS_DIAGNOSTIC_TIMEOUT)
+        .send()
+        .await
+    else {
         return String::new();
     };
     if !response.status().is_success() {
