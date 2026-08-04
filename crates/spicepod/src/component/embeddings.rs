@@ -389,7 +389,7 @@ mod tests {
             "./relative/path/to/model",
             "C:/models/potion-base-8M",
             "C:/models",
-            "C:\models\potion-base-8M",
+            r"C:\models\potion-base-8M",
             "",
         ] {
             assert_eq!(pinned_revision(id), None, "{id} pins nothing");
