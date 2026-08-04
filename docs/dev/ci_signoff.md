@@ -243,8 +243,41 @@ The Actions workflow:
    fallback when merge-base isn't available), or skips Rust checks when the
    branch has no Rust-affecting files
 3. Runs full `make lint-rust` + `make build-cli-dev nextest` when Rust is affected
-4. Posts pending → success/failure `signoff` statuses, then re-runs
-   **Attestation** if needed
+4. Posts pending → success/failure `signoff` statuses (skipping the pending when
+   the commit is already signed off), then re-runs **Attestation** if needed
+
+The checks run under a 353-minute budget, inside a 358-minute job budget, so a
+run that overruns fails as a failed step rather than being terminated at the
+runner pool's ~360-minute wall (which reports as `cancelled`, with no failed
+step and no chance to clean up). A run that ends without a verdict — budget
+expired, evicted by a re-dispatch, cancelled — replaces its own `pending` status
+with a failure; otherwise `scripts/signoff status` and `scripts/signoff mine`
+would keep showing a sign-off in progress for a run that is long gone.
+Re-dispatch against the same HEAD to try again.
+
+Re-dispatching against a HEAD that is *already* signed off leaves that success in
+place: the run skips the in-progress `pending` and only replaces the status once
+it has a verdict of its own, so a run that never finishes cannot cost you an
+attestation. `mine` still shows ⟳ while it runs — that comes from the run list,
+not the commit status.
+
+A re-dispatch that *does* fail posts `signoff=failure` and then re-runs
+**Attestation** so the required check reflects that verdict. The status alone
+would not close the gate — **Attestation** is the required check and `pr.yml`
+does not run on commit-status changes — so the failure path forces the re-run
+even when the check is already green, which is the one case the success path
+deliberately skips. If the status post itself fails, the run says so and leaves
+**Attestation** showing the previous sign-off; re-dispatch or push to move it.
+
+Two cases the re-run cannot cover, both reported by the run rather than hidden:
+an **Attestation** run that is still in flight may already have read the status
+this verdict replaced, so it can finish green and needs re-running by hand; and
+a HEAD that only merges the base branch can *inherit* an earlier sign-off, which
+the failing status on HEAD does not veto ([#12357](https://github.com/spiceai/spiceai/issues/12357)).
+
+A branch whose sign-off keeps running out of budget is contending for the pool
+rather than doing anything wrong. `-f skip_targeted_lint=true` drops the
+branch-scoped pre-lint, which trades fail-fast feedback for a shorter run.
 
 Requires write access to the repository (same as local sign-off — fork
 contributors still need a maintainer to sign off). The lab SSH path also needs

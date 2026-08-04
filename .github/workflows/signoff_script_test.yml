@@ -1,0 +1,47 @@
+---
+# Unit tests for scripts/signoff. The script decides whether a commit counts as
+# signed off, so a regression in it either blocks a good branch from the merge
+# queue or leaves a bad one reading as attested — neither is visible until a
+# real multi-hour sign-off run says so.
+name: Sign-off Script Tests
+
+on:
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+    paths:
+      - 'scripts/signoff'
+      - 'scripts/test_signoff_status.sh'
+      - '.github/workflows/signoff_script_test.yml'
+  push:
+    branches:
+      - trunk
+    paths:
+      - 'scripts/signoff'
+      - 'scripts/test_signoff_status.sh'
+      - '.github/workflows/signoff_script_test.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  test-commit-status:
+    name: Unit tests for signoff commit statuses
+    # GitHub-hosted on purpose: a sub-second test must not queue behind the
+    # saturated self-hosted pool this workflow exists to keep honest.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Run tests
+        run: bash scripts/test_signoff_status.sh

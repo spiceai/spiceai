@@ -148,6 +148,21 @@ impl From<spicepod_acceleration::Mode> for Mode {
     }
 }
 
+/// The inverse mapping, for callers that synthesize a Spicepod component from
+/// already-parsed runtime config (see the `PostgreSQL` catalog connector, which
+/// builds a Spicepod `Dataset` per discovered table from the catalog's own
+/// acceleration settings).
+impl From<Mode> for spicepod_acceleration::Mode {
+    fn from(mode: Mode) -> Self {
+        match mode {
+            Mode::Memory => spicepod_acceleration::Mode::Memory,
+            Mode::File => spicepod_acceleration::Mode::File,
+            Mode::FileCreate => spicepod_acceleration::Mode::FileCreate,
+            Mode::FileUpdate => spicepod_acceleration::Mode::FileUpdate,
+        }
+    }
+}
+
 impl Display for Mode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
