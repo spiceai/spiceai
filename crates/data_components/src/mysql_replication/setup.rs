@@ -194,19 +194,32 @@ fn normalize_privilege(token: &str) -> String {
 ///
 /// `MySQL` and `MariaDB` both permit `'` and `\` inside a user or host name, so
 /// interpolating one unescaped would make the suggested `GRANT` unpasteable.
+///
+/// A quote is **doubled** rather than backslash-escaped because doubling is
+/// accepted whatever the session's `NO_BACKSLASH_ESCAPES` `sql_mode` is, whereas
+/// `\'` silently stops being an escape under that mode. A literal backslash has
+/// no such mode-independent spelling — `\\` is correct under the default mode,
+/// and an account name containing one is far rarer than one containing a quote.
 fn escape_quoted(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
-        if ch == '\'' || ch == '\\' {
-            out.push('\\');
+        match ch {
+            '\'' => out.push_str("''"),
+            '\\' => out.push_str("\\\\"),
+            _ => out.push(ch),
         }
-        out.push(ch);
     }
     out
 }
 
 /// Render `user@host` (as `CURRENT_USER()` reports it) in `MySQL` account
 /// syntax, so the suggested `GRANT` can be pasted verbatim.
+///
+/// `CURRENT_USER()` flattens the two components into one string with no
+/// escaping, so the last `@` is the only available boundary. That is right for
+/// every host that contains no `@` — every DNS name, IPv4 and IPv6 literal, and
+/// `%` — and misattributes only a proxied account whose host component itself
+/// contains one.
 fn quote_account(account: &str) -> String {
     match account.rsplit_once('@') {
         Some((user, host)) => {
@@ -304,10 +317,16 @@ pub async fn check_privileges(conn: &mut Conn) -> Result<()> {
         return Ok(());
     };
 
+    // Typed as `Option<String>`, not `String`, so the fallback below survives a
+    // server that answers with SQL NULL: `query_first` converts rows with the
+    // panicking `FromRow`, so a NULL decoded straight into `String` would panic
+    // instead of falling through to the placeholder. Hence the double flatten —
+    // one for the `Result`, one for the NULL.
     let current_user = conn
-        .query_first::<String, _>("SELECT CURRENT_USER()")
+        .query_first::<Option<String>, _>("SELECT CURRENT_USER()")
         .await
         .ok()
+        .flatten()
         .flatten();
     let (account, grant_target) = match current_user {
         Some(user) => {
@@ -901,10 +920,23 @@ mod tests {
     fn account_quoting_escapes_characters_that_would_end_the_string_early() {
         // `MySQL` permits both characters in an account name, and an unescaped
         // one would close the literal and make the suggested GRANT unpasteable.
-        assert_eq!(quote_account(r"o'brien@%"), r"'o\'brien'@'%'");
-        assert_eq!(quote_account(r"spice@ho'st"), r"'spice'@'ho\'st'");
+        // A quote is doubled so the result parses under `NO_BACKSLASH_ESCAPES`
+        // too; a backslash has no spelling that is correct under both modes.
+        assert_eq!(quote_account(r"o'brien@%"), r"'o''brien'@'%'");
+        assert_eq!(quote_account(r"spice@ho'st"), r"'spice'@'ho''st'");
         assert_eq!(quote_account(r"back\slash@%"), r"'back\\slash'@'%'");
         // The host-less arm escapes on the same path.
-        assert_eq!(quote_account(r"o'brien"), r"'o\'brien'");
+        assert_eq!(quote_account(r"o'brien"), r"'o''brien'");
+    }
+
+    #[test]
+    fn account_quoting_splits_on_the_last_at_sign() {
+        // A username may contain `@`; the host component of a direct connection
+        // never does, so the last `@` is the correct boundary.
+        assert_eq!(quote_account("cdc@corp@10.0.0.1"), "'cdc@corp'@'10.0.0.1'");
+        // An anonymous account reports an empty user part.
+        assert_eq!(quote_account("@localhost"), "''@'localhost'");
+        // An IPv6 host carries `:`, not `@`, so it survives the split intact.
+        assert_eq!(quote_account("spice@::1"), "'spice'@'::1'");
     }
 }
