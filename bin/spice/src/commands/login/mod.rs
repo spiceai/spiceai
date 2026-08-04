@@ -515,8 +515,7 @@ mod tests {
     }
 
     fn localhost_listener() -> TcpListener {
-        TcpListener::bind("127.0.0.1:0")
-            .expect("a test listener should bind to an ephemeral port")
+        TcpListener::bind("127.0.0.1:0").expect("test listener should bind")
     }
 
     fn local_port(listener: &TcpListener) -> u16 {
