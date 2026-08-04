@@ -686,8 +686,8 @@ mod tests {
     fn test_convert_still_applies_one_operator_to_every_column() {
         // `convert` also builds the wall-clock refresh_data_window filter, which must
         // keep taking its operator verbatim.
-        let time_format = data_type_to_timestamp_format(&DataType::Date32, None)
-            .expect("time format resolves");
+        let time_format =
+            data_type_to_timestamp_format(&DataType::Date32, None).expect("time format resolves");
         let partition_format = data_type_to_timestamp_format(&DataType::Date32, None)
             .expect("partition format resolves");
         let converter = TimestampFilterConvert::new(

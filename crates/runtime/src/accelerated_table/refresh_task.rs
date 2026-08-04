@@ -3822,33 +3822,27 @@ mod tests {
     /// stall turned into unbounded duplication. Both sides must come out the same.
     #[tokio::test]
     async fn test_high_water_comparison_agrees_across_mismatched_schemas() {
-        let source_schema = Arc::new(Schema::new(vec![
+        let src = Arc::new(Schema::new(vec![
             Field::new("day", DataType::Date32, false),
             Field::new("id", DataType::Int32, false),
         ]));
 
         // What `SELECT CAST(day AS TIMESTAMP) AS day, id FROM source` materialises.
         let ts_type = DataType::Timestamp(TimeUnit::Nanosecond, None);
-        let accelerator_schema = Arc::new(Schema::new(vec![
+        let acc = Arc::new(Schema::new(vec![
             Field::new("day", ts_type, false),
             Field::new("id", DataType::Int32, false),
         ]));
 
-        let federated_table = Arc::new(
-            MemTable::try_new(Arc::clone(&source_schema), vec![vec![]])
-                .expect("federated mem table"),
-        ) as Arc<dyn TableProvider>;
-        let accelerator = Arc::new(
-            MemTable::try_new(Arc::clone(&accelerator_schema), vec![vec![]])
-                .expect("accelerator mem table"),
-        ) as Arc<dyn TableProvider>;
+        let federated = MemTable::try_new(Arc::clone(&src), vec![vec![]]).expect("src table");
+        let accelerator = MemTable::try_new(Arc::clone(&acc), vec![vec![]]).expect("acc table");
 
         let task = RefreshTaskBuilder::new(
             crate::status::RuntimeStatus::new(),
             TableReference::bare("test_mismatched_schemas"),
-            Arc::new(FederatedTable::new_unchecked(federated_table)),
+            Arc::new(FederatedTable::new_unchecked(Arc::new(federated))),
             None,
-            accelerator,
+            Arc::new(accelerator),
             Handle::current(),
             Arc::new(Mutex::new(())),
         )
