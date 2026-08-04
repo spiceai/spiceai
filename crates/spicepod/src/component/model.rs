@@ -677,7 +677,10 @@ mod tests {
         assert_eq!(split_hf_model_id(&pinned), (repo, Some(sha)));
 
         // A model name containing dots must not be mistaken for a revision.
-        assert_eq!(split_hf_model_id("org/my-model.v2"), ("org/my-model.v2", None));
+        assert_eq!(
+            split_hf_model_id("org/my-model.v2"),
+            ("org/my-model.v2", None)
+        );
 
         // A revision carrying the dots, hyphens and digits the regex admits.
         assert_eq!(
@@ -688,7 +691,10 @@ mod tests {
         // An empty revision is reported absent, so the caller asks for the default branch
         // rather than for the empty revision. `HUGGINGFACE_PATH_REGEX` rejects a trailing
         // colon, so only a caller that built its id some other way reaches this.
-        assert_eq!(split_hf_model_id("org/model-name:"), ("org/model-name", None));
+        assert_eq!(
+            split_hf_model_id("org/model-name:"),
+            ("org/model-name", None)
+        );
     }
 
     /// The join in `ModelSource::parse_from` and the split in [`split_hf_model_id`] have to be
@@ -697,8 +703,16 @@ mod tests {
     #[test]
     fn hf_model_id_round_trips_through_split() {
         let cases = [
-            ("hf:BAAI/bge-base-en-v1.5:a5beb1e3", "BAAI/bge-base-en-v1.5", Some("a5beb1e3")),
-            ("hf:org/model-name:v1.2-beta.3", "org/model-name", Some("v1.2-beta.3")),
+            (
+                "hf:BAAI/bge-base-en-v1.5:a5beb1e3",
+                "BAAI/bge-base-en-v1.5",
+                Some("a5beb1e3"),
+            ),
+            (
+                "hf:org/model-name:v1.2-beta.3",
+                "org/model-name",
+                Some("v1.2-beta.3"),
+            ),
             ("huggingface.co/org/model-name", "org/model-name", None),
         ];
 
