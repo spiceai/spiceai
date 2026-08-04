@@ -42,7 +42,7 @@ use llms::embeddings::Embed;
 use rayon::prelude::*;
 use snafu::ResultExt;
 use std::collections::HashMap;
-use std::{sync::Arc, thread};
+use std::sync::Arc;
 
 use super::EmbeddingModelStore;
 use crate::udtf::{EmbeddingColumnConfig, EmbeddingInputMode};
@@ -947,17 +947,8 @@ async fn get_vectors_with_chunker(
 fn build_embedding_pool(
     model_parallelism: Option<usize>,
 ) -> Result<ThreadPool, Box<dyn std::error::Error + Send + Sync>> {
-    let parallelism = match (model_parallelism, thread::available_parallelism()) {
-        (Some(p), _) => p,
-        (None, Ok(host_parallelism)) => host_parallelism.get(),
-        (_, Err(e)) => {
-            let default_parallelism = 2;
-            tracing::trace!(
-                "Defaulting to parallelism {default_parallelism}, error determining host parallelism: {e} "
-            );
-            default_parallelism
-        }
-    };
+    let parallelism =
+        model_parallelism.unwrap_or_else(|| cpu_budget::cpu_budget().embedding_pool_threads());
 
     rayon::ThreadPoolBuilder::new()
         .num_threads(parallelism)

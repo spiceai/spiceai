@@ -6889,10 +6889,10 @@ impl CayenneTableProvider {
 
     /// Requested number of intra-write shards (parallel encoders) for a snapshot
     /// write: the per-table `cayenne_write_concurrency` override if set, else a
-    /// conservative default of [`DEFAULT_WRITE_CONCURRENCY`] (capped at the host
-    /// core count so tiny hosts don't over-shard).
+    /// conservative default of [`DEFAULT_WRITE_CONCURRENCY`] (capped at the CPU
+    /// budget's core count so tiny hosts don't over-shard).
     ///
-    /// The default is deliberately NOT the host core count. `write_concurrency` is
+    /// The default is deliberately NOT the core count. `write_concurrency` is
     /// sized per table in isolation, so a default of "all cores" makes independent
     /// tables oversubscribe the box under concurrent CDC — the aggregate is the
     /// sum across every writing table, not the per-table value. A small default
@@ -6901,8 +6901,8 @@ impl CayenneTableProvider {
     /// encode budget still bounds the aggregate — see `provider::write_budget`).
     ///
     /// This is the *requested* count. `VortexFormat::build_shard_spec` then clamps
-    /// it to the write session's `target_partitions` — the host's logical-core
-    /// count (see [`Self::create_session_context`]) — so a configured value above
+    /// it to the write session's `target_partitions` — the CPU budget's core count
+    /// (see [`Self::create_session_context`]) — so a configured value above
     /// the core count is capped, not honored. That ceiling is intentional:
     /// parallel encode is CPU-bound, so extra shards would only add files (read
     /// amplification) without speeding the write.

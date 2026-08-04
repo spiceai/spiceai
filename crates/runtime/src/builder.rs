@@ -2848,6 +2848,54 @@ mod test {
         assert_eq!(no_cayenne.compaction_memory_fraction, None);
     }
 
+    /// A `mode: memory` + `refresh_mode: changes` pod reaches the off-pool in-memory
+    /// CDC tier but never produces a file to compact, so `spiced` brings up no
+    /// dedicated compaction runtime for it ([`CayenneWorkload::may_compact`] is
+    /// false). The aggregate tier byte ceiling must be installed anyway: the
+    /// query-pool default has already been reduced to leave room for that tier, and
+    /// with no ceiling installed every mem-tier reserve succeeds unconditionally —
+    /// the coordinated host partition would hold on paper while the tier grew
+    /// unbounded, which is the shape of the SF1000 process OOM it exists to prevent.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn memory_mode_cdc_pod_installs_the_mem_tier_budget_without_a_compaction_runtime() {
+        use spicepod::acceleration::{Mode, RefreshMode};
+
+        let workload = cayenne_workload(Some(&cayenne_budget_app(
+            vec![(
+                "cayenne",
+                true,
+                Mode::Memory,
+                Some(RefreshMode::Changes),
+                None,
+            )],
+            0,
+        )));
+        assert!(
+            workload.uses_cdc_tier(),
+            "a memory-mode CDC table holds its whole dataset in the tier"
+        );
+        assert!(
+            !workload.may_compact(),
+            "memory mode never writes a Vortex file, so no compaction runtime is brought up"
+        );
+
+        let df = crate::datafusion::builder::DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            Handle::current(),
+        )
+        .cayenne_workload(workload)
+        .build();
+
+        df.install_cayenne_global_budgets();
+
+        assert!(
+            cayenne::global_mem_tier_total().is_some_and(|bytes| bytes > 0),
+            "the aggregate in-memory CDC tier ceiling must be installed for a pod that has no compaction runtime"
+        );
+    }
+
     /// A view carrying its own `acceleration` block creates a `DuckDB` instance just
     /// as a dataset does, so the budget must count it: a view-only pod is coordinated
     /// at all, a mixed pod divides by every instance, and a view shares instance
