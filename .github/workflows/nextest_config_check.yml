@@ -1,0 +1,56 @@
+---
+name: Nextest Config Check
+
+# `.config/nextest.toml`'s `slow-timeout` exists to kill hangs. When a genuinely
+# slow test's runtime drifts up into that ceiling, it stops catching hangs and
+# starts failing unrelated PRs whenever the self-hosted pool is busy — and for the
+# cayenne convergence binaries, which carry `retries = 0`, that is an
+# unrecoverable merge-queue failure. This gate keeps the ceiling ahead of the
+# measured runtimes. See #12336 / #12434.
+on:
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+    paths:
+      - '.config/nextest.toml'
+      - '.github/scripts/check_nextest_config.py'
+      - '.github/scripts/test_check_nextest_config.py'
+  push:
+    branches:
+      - trunk
+    paths:
+      - '.config/nextest.toml'
+      - '.github/scripts/check_nextest_config.py'
+      - '.github/scripts/test_check_nextest_config.py'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  check-nextest-config:
+    name: Validate nextest timeout ceilings
+    # GitHub-hosted on purpose: this is a sub-second check and must not queue
+    # behind the saturated self-hosted pool.
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # 3.11 for `tomllib` in the standard library — this check needs no pip deps.
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+
+      - name: Run tests
+        run: python .github/scripts/test_check_nextest_config.py -v
+
+      - name: Validate nextest timeout ceilings
+        run: python .github/scripts/check_nextest_config.py
