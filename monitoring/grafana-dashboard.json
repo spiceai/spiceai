@@ -5176,15 +5176,15 @@
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "(k8s_volume_capacity{k8s_pod_name=~\"spiceai-.+\", k8s_volume_name!~\"kube-api-access-.*|default-token-.*|spiceai-config-volume\"} - k8s_volume_available{k8s_pod_name=~\"spiceai-.+\", k8s_volume_name!~\"kube-api-access-.*|default-token-.*|spiceai-config-volume|script\"}) and on(k8s_pod_name) label_replace(up{job=~\".*spiceai.*\", instance=~\"($instances)\"}, \"k8s_pod_name\", \"$1\", \"instance\", \"^([^:]+)\")",
-              "legendFormat": "{{ k8s_pod_name }} - {{ k8s_volume_name }}",
+              "expr": "(kubelet_volume_stats_used_bytes * on(namespace, persistentvolumeclaim) group_left(pod) kube_pod_spec_volumes_persistentvolumeclaims_info) and on(pod) label_replace(up{job=~\".*spiceai.*\", instance=~\"($instances)\"}, \"pod\", \"$1\", \"instance\", \"^([^:]+)\")",
+              "legendFormat": "{{pod}} - {{persistentvolumeclaim}}",
               "range": true,
               "refId": "A"
             }
           ],
           "title": "PVC Storage Usage",
           "type": "timeseries",
-          "description": "Filtered by the Instances dropdown. Matches Kubernetes pod metrics to the selected Spice scrape targets (pod name = instance host, port stripped when present)."
+          "description": "Best-effort PVC usage from Prometheus volume stats (kubelet_volume_stats_*), joined to the pod that mounts each claim. Filtered by the Instances dropdown. Empty if volume stats or kube-state-metrics are not scraped in the cluster."
         },
         {
           "datasource": {
@@ -5242,7 +5242,8 @@
                     "value": 80
                   }
                 ]
-              }
+              },
+              "unit": "percent"
             },
             "overrides": []
           },
@@ -5273,15 +5274,15 @@
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "((1 - (k8s_volume_available{k8s_pod_name=~\"spiceai-.+\", k8s_volume_name!~\"kube-api-access-.*|default-token-.*|spiceai-config-volume\"} / k8s_volume_capacity{k8s_pod_name=~\"spiceai-.+\", k8s_volume_name!~\"kube-api-access-.*|default-token-.*|spiceai-config-volume|script\"})) * 100) and on(k8s_pod_name) label_replace(up{job=~\".*spiceai.*\", instance=~\"($instances)\"}, \"k8s_pod_name\", \"$1\", \"instance\", \"^([^:]+)\")",
-              "legendFormat": "{{ k8s_pod_name }} - {{ k8s_volume_name }}",
+              "expr": "(((kubelet_volume_stats_used_bytes / kubelet_volume_stats_capacity_bytes) * on(namespace, persistentvolumeclaim) group_left(pod) kube_pod_spec_volumes_persistentvolumeclaims_info) and on(pod) label_replace(up{job=~\".*spiceai.*\", instance=~\"($instances)\"}, \"pod\", \"$1\", \"instance\", \"^([^:]+)\")) * 100",
+              "legendFormat": "{{pod}} - {{persistentvolumeclaim}}",
               "range": true,
               "refId": "A"
             }
           ],
           "title": "PVC Storage Usage %",
           "type": "timeseries",
-          "description": "Filtered by the Instances dropdown. Matches Kubernetes pod metrics to the selected Spice scrape targets (pod name = instance host, port stripped when present)."
+          "description": "Best-effort PVC usage from Prometheus volume stats (kubelet_volume_stats_*), joined to the pod that mounts each claim. Filtered by the Instances dropdown. Empty if volume stats or kube-state-metrics are not scraped in the cluster."
         }
       ],
       "title": "\ud83d\udd27 Kubernetes Resource Utilization",
@@ -5892,6 +5893,6 @@
   "timezone": "browser",
   "title": "Spice.ai Dashboard",
   "uid": "ddgw8xtn75ybkb",
-  "version": 32,
+  "version": 34,
   "weekStart": ""
 }
