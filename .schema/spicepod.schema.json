@@ -531,6 +531,16 @@
             }
           ]
         },
+        "cpu": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Cpu"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "metrics": {
           "anyOf": [
             {
@@ -1300,7 +1310,7 @@
           "minimum": 0
         },
         "max_concurrent_queries": {
-          "description": "Bounds the number of query-executing plans that may run concurrently —\nordinary queries, DDL/DML, and `EXECUTE`; lightweight session-state\nstatements (`PREPARE`/`DEALLOCATE`/`SET`) are not gated. Excess plans wait\n(admission control) rather than oversubscribing the shared query runtime\nand memory pool and starving each other under load (e.g. analytical\nqueries alongside CDC ingestion and compaction). The permit is held for\nthe plan's full execution and result-streaming lifetime; a results-cache\nhit is never gated. Unset = unbounded (the prior behavior). A configured\nvalue is clamped to a minimum of `1` in the runtime builder, so `0` means\none concurrent query (not unbounded).",
+          "description": "Bounds the number of query-executing plans that may run concurrently —\nordinary queries, DDL/DML, and `EXECUTE`; lightweight session-state\nstatements (`PREPARE`/`DEALLOCATE`/`SET`) are not gated. Excess plans wait\n(admission control) rather than oversubscribing the shared query runtime\nand memory pool and starving each other under load (e.g. analytical\nqueries alongside CDC ingestion and compaction). The permit is held for\nthe plan's full execution and result-streaming lifetime; a results-cache\nhit is never gated.\n\nUnset sizes the bound from the CPU budget (four plans per core). `0` opts\nout and leaves admission unbounded. Any other value is that limit.",
           "type": [
             "integer",
             "null"
@@ -1324,6 +1334,28 @@
         "lz4_frame",
         "uncompressed"
       ]
+    },
+    "Cpu": {
+      "description": "How many CPUs the runtime should behave as though it has.\n\nDetection reads a cgroup CPU *quota* and otherwise falls back to the node's\ncore count, so a Kubernetes pod that sets `resources.requests.cpu` without a\nmatching `resources.limits.cpu` is sized for the whole node. This section is\nthe explicit override, in the `GOMAXPROCS` / `-XX:ActiveProcessorCount`\nidiom: one entitlement that feeds every thread pool, the query fan-out, and\naccelerator concurrency coherently.",
+      "type": "object",
+      "properties": {
+        "cores": {
+          "description": "The CPU entitlement, as a Kubernetes CPU quantity: `4`, `3.5`, `3500m`.\n`auto` (the default) detects it. Applied at startup only — the thread\npools it sizes cannot be resized on a spicepod reload.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CpuQuantity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "CpuQuantity": {
+      "description": "A CPU quantity, held verbatim so it can be echoed back in an error message.\n\nAccepts a YAML number (`cores: 4`, `cores: 3.5`) or a string\n(`cores: 3500m`, `cores: auto`); it always serializes as a string, so\n`--set-runtime cpu.cores=…` round-trips through YAML unchanged. Validation\nlives in `cpu_budget`, which is where the value is used.",
+      "type": "string"
     },
     "Metrics": {
       "type": "object",
@@ -7500,6 +7532,10 @@
         "duckdb_memory_limit": {
           "type": "string"
         },
+        "duckdb_threads": {
+          "description": "The size of DuckDB's own thread pool for this instance. Defaults to the runtime's CPU budget (see `runtime.cpu.cores`); DuckDB would otherwise size it from the host core count, over-committing a CPU-constrained container.",
+          "type": "string"
+        },
         "duckdb_preserve_insertion_order": {
           "type": "string"
         },
@@ -7526,6 +7562,10 @@
           "type": "string"
         },
         "partitioned_write_buffer": {
+          "type": "string"
+        },
+        "on_full_refresh": {
+          "description": "How a full refresh writes into a file-mode DuckDB acceleration: 'reuse_file' (default) keeps writing into the current database file; 'replace_file' writes a new database file, checkpoints it, and atomically replaces the live file with it, bounding database file growth; 'checkpoint_file' keeps the current file but checkpoints it after each refresh commit, returning dropped table generations to the free list.",
           "type": "string"
         },
         "optimizer_duckdb_aggregate_pushdown": {
