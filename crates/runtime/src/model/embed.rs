@@ -422,8 +422,14 @@ async fn huggingface(
     let hf_token = params.hf_token.as_ref().map(ExposeSecret::expose_secret);
     let pooling = params.pooling.map(embedding_params::Pooling::as_str);
     if let Some(id) = model_id {
+        // `get_model_id` joins a pinned revision onto the repo id as `org/model:revision`, so
+        // the two halves have to be recovered before the repo id reaches the Hub. Passing the
+        // joined string through requests a repo named `org/model:revision`, which does not
+        // exist, and leaves the revision defaulted to `main`. `chat` splits the same
+        // convention back out; this path did not.
+        let (repo_id, revision) = spicepod::component::model::split_hf_model_id(&id);
         Ok(Arc::new(
-            TeiEmbed::from_hf(&id, None, hf_token, pooling, params.max_seq_length)
+            TeiEmbed::from_hf(repo_id, revision, hf_token, pooling, params.max_seq_length)
                 .await?
                 .set_cache(embeddings_cache)
                 .set_cache_model_id(name),

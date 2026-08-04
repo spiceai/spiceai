@@ -346,16 +346,36 @@ read correctly: the linker dies with `errno=28` thousands of lines after nextest
 has already reported every test passing, on a crate the branch never touched,
 with no `-->` source pointer anywhere in the log.
 
+The floor is checked twice: once as the job's first step after checkout
+(`scripts/signoff preflight-disk`), so an already-full runner is turned away
+before the toolchain setup rather than after it, and again inside the run. A stop
+at the early step has no commit status to explain itself — the `pending` status is
+posted later — so it annotates the run instead.
+
 A remote run watches its own build output for that error, and a watched run's
 verdict is final **in both directions**. It has to be: by the time anything
 measures free space again, cargo has unlinked the partial binaries it was
 writing and the volume can look healthy — and conversely, on a shared pool
 another run can drag the volume under any threshold while your branch is failing
 for its own reasons. Measured free space is consulted only when nothing watched,
-which is how a local run gets a classification at all. The marker is truncated
-per build step, so only the step that actually failed speaks.
+which is how a local run gets a classification at all. The verdict resets per
+build step, so only the step that actually failed speaks.
 
-Set `SIGNOFF_MIN_FREE_GIB` to change the floor. Locally the check only warns and
+"Final in both directions" applies only to a watcher that actually reported. The
+watcher exits with a reserved status to say it saw the error, so a watcher that
+exits any *other* non-zero way — no `awk` on the runner, a signal — is a watcher
+that reached no verdict rather than one that saw nothing. That disarms the watch
+and hands classification back to the free-space backstop; treating its silence as
+"not disk" would blame the branch for the volume just as surely as the unwritable
+marker did.
+
+The watch keeps its answer in a shell variable, not a file. Recording it on disk
+needed an allocation at the one moment allocation is failing — and on macOS
+`$TMPDIR` and the workspace are usually the same APFS container, so there was no
+reliably writable place to put it. An unwritable marker read as "not a disk
+failure", which blamed the branch for the volume.
+
+Set `SIGNOFF_MIN_FREE_GIB` to change the floor. Locally both checks only warn and
 the output is not watched — your own disk is yours to manage.
 
 ### External contributors (forks)
