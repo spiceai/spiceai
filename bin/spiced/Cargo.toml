@@ -9,6 +9,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+ansi_colors = { path = "../../crates/ansi_colors" }
 app = { path = "../../crates/app" }
 arrow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
@@ -47,6 +48,7 @@ connector-smb = { path = "../../crates/data-connectors/connector-smb", optional 
 connector-snowflake = { path = "../../crates/data-connectors/connector-snowflake", optional = true }
 connector-spark = { path = "../../crates/data-connectors/connector-spark", optional = true }
 connector-spiceai = { path = "../../crates/data-connectors/connector-spiceai" }
+cpu-budget = { path = "../../crates/cpu-budget" }
 crash-handler.workspace = true
 event_stream = { path = "../../crates/event_stream" }
 repl = { path = "../../crates/repl" }
@@ -91,6 +93,9 @@ tracing-subscriber.workspace = true
 util = { path = "../../crates/util"}
 
 # Non-default features should be added to `lint-rust` make target.
+[dev-dependencies]
+tempfile.workspace = true
+
 [features]
 adbc = ["dep:connector-adbc", "runtime/adbc"]
 alloc-jemalloc = ["dep:tikv-jemallocator"]

@@ -25,6 +25,8 @@ jobs:
           banned_labels: 'invalid,wontfix,nomerge,duplicate'
           require_assignee: 'true'
           auto_label: 'true'
-          auto_label_size: 'true'
+          # No auto_label_size: GitHub applies size labels natively now, and the
+          # action's input defaults to false, so leaving it out is the whole
+          # change — a second labeller would only fight the native one.
           auto_label_type: 'true'
           auto_assign_author: 'true'

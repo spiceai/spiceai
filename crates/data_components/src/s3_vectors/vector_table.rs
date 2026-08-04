@@ -306,6 +306,12 @@ impl S3VectorsTable {
         client: &Arc<dyn S3Vectors + Send + Sync>,
         id: &S3VectorIdentifier,
     ) -> Result<bool> {
+        // An index ARN identifies an existing index directly. It has no bucket name, so
+        // `GetVectorBucket` cannot validate it; `get_index_if_exists` performs that check next.
+        if matches!(id, S3VectorIdentifier::IndexArn(_)) {
+            return Ok(true);
+        }
+
         let bucket_name_opt = id.bucket_name().map(ToString::to_string);
         match client
             .get_vector_bucket(
@@ -726,6 +732,23 @@ mod tests {
                     .ok()
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn index_arn_does_not_check_for_a_bucket() {
+        let mock_client = Arc::new(MockClient::new());
+        let client = Arc::clone(&mock_client) as Arc<dyn S3Vectors + Send + Sync>;
+        let id = S3VectorIdentifier::IndexArn(
+            "arn:aws:s3vectors:us-east-2:123456789012:bucket/test-bucket/index/test-index"
+                .to_string(),
+        );
+
+        let exists = S3VectorsTable::check_if_bucket_exists(&client, &id)
+            .await
+            .expect("an index ARN must bypass bucket validation");
+
+        assert!(exists);
+        assert_eq!(mock_client.get_vector_bucket_call_count(), 0);
     }
 
     #[tokio::test]

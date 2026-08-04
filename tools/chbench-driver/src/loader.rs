@@ -50,6 +50,10 @@ use crate::Result;
 use crate::csv_gen::{self, GeneratedShard};
 
 /// Max concurrent connections for the parallel CSV load.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a host-local data-generation tool, not spiced: it should use the whole machine it runs on, not spiced's CPU entitlement"
+)]
 fn loader_concurrency() -> usize {
     std::thread::available_parallelism()
         .map_or(4, std::num::NonZeroUsize::get)

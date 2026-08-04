@@ -1179,4 +1179,27 @@ mod warm_memory {
         let plan = idx.list_table_provider().expect("list plan builds");
         assert_eq!(collect_ids(plan).await, vec![0, 1]);
     }
+
+    #[tokio::test]
+    async fn delete_by_keys_removes_entries_from_warm_memory_tier() {
+        let events = Arc::new(Mutex::new(vec![]));
+        let mut secondary = MockIndex::new("engine", &events);
+        secondary.dimension = Some(DIM);
+        secondary.list_batches = vec![engine_list_batch(&[])];
+        let idx = warm_compound(secondary);
+
+        idx.write(input_batch(2)).await.expect("write succeeds");
+
+        idx.delete_by_keys(delete_keys_batch(1))
+            .await
+            .expect("delete succeeds");
+        let plan = idx.list_table_provider().expect("list plan builds");
+        assert_eq!(collect_ids(plan).await, vec![1]);
+
+        idx.delete_by_keys(delete_keys_batch(2))
+            .await
+            .expect("delete succeeds");
+        let plan = idx.list_table_provider().expect("list plan builds");
+        assert!(collect_ids(plan).await.is_empty());
+    }
 }

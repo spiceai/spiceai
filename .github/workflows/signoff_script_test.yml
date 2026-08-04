@@ -1,0 +1,74 @@
+---
+# Unit tests for scripts/signoff. The script decides whether a commit counts as
+# signed off, so a regression in it either blocks a good branch from the merge
+# queue or leaves a bad one reading as attested — neither is visible until a
+# real multi-hour sign-off run says so.
+name: Sign-off Script Tests
+
+on:
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+    paths:
+      - 'scripts/signoff'
+      - 'scripts/test_signoff_status.sh'
+      - 'scripts/test_signoff_attestation_refresh.sh'
+      - '.github/workflows/signoff_script_test.yml'
+  push:
+    branches:
+      - trunk
+    paths:
+      - 'scripts/signoff'
+      - 'scripts/test_signoff_status.sh'
+      - 'scripts/test_signoff_attestation_refresh.sh'
+      - '.github/workflows/signoff_script_test.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  test-commit-status:
+    name: Unit tests for signoff commit statuses
+    # GitHub-hosted on purpose: a sub-second test must not queue behind the
+    # saturated self-hosted pool this workflow exists to keep honest.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Run tests
+        run: bash scripts/test_signoff_status.sh
+
+  test-attestation-refresh:
+    name: Unit tests for the sign-off Attestation refresh
+    # `refresh_attestation_check` re-runs the PR's pr.yml run so Attestation
+    # re-reads the status just posted, selecting that run by commit. When a long
+    # sign-off has been overtaken by a push, re-running the stale commit's run
+    # cancels the current head's in-flight one and reports a verdict computed for
+    # the wrong commit (#12360) — and skipping too eagerly would silently stop
+    # refreshing legitimate sign-offs. Neither direction shows up until a real
+    # multi-hour run has already cost someone a required check.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # A checkout plus a local bash script against a stub `gh`. The stub records
+    # the rerun call instead of making it, so this job re-runs no workflow and
+    # posts no status.
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Run tests
+        run: bash scripts/test_signoff_attestation_refresh.sh
