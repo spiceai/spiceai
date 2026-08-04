@@ -26,6 +26,8 @@
 #   scripts/signoff status          Show the sign-off status of HEAD
 #   scripts/signoff mine            Show attestation status for all your open PRs
 #   scripts/signoff clear-pending   Turn a left-behind pending status into a failure
+#   scripts/signoff preflight-disk  Check the work volume's free space (CI: run
+#                                   before the toolchain setup steps)
 #   scripts/signoff check           Show whether trunk requires sign-off
 #   scripts/signoff install         Configure the trunk ruleset (maintainers)
 #   scripts/signoff install --yes   Apply the ruleset change (default is a dry-run)
@@ -42,9 +44,11 @@
 #   SIGNOFF_SKIP_TARGETED_TESTS Set to any value to skip the branch-scoped unit
 #                     tests that run after the pre-lint
 #   SIGNOFF_MIN_FREE_GIB  Free space (GiB) the work volume must have before a
-#                     remote run starts its Rust checks (default: 25). Below it
-#                     a remote run stops immediately as an infrastructure
-#                     failure; a local run only warns.
+#                     remote run starts its Rust checks (default: 25). Checked
+#                     twice: by the `preflight-disk` step before the toolchain
+#                     setup, and again inside the run. Below it a remote run
+#                     stops immediately as an infrastructure failure; a local
+#                     run only warns.
 #
 # Targeted pre-lint always diffs against trunk (not configurable).
 # When the branch has no Rust-affecting changes vs trunk (.rs, Cargo.toml,
@@ -728,53 +732,94 @@ readonly EXIT_DISK_EXHAUSTED=70
 # enough; matching both survives a toolchain that words one of them differently.
 readonly DISK_FULL_PATTERN='No space left on device|errno=28'
 
-# Set on remote runs to a file collecting any out-of-disk line the build emits.
-# Only matching lines are kept — writing a full three-hour transcript to a
-# volume that is already out of space would make the very problem worse.
-SIGNOFF_DISK_MARKER="${SIGNOFF_DISK_MARKER:-}"
+# Set to 1 on remote runs, where run_make_step watches build output for the
+# out-of-disk signature. Separates "watched, and it was not disk" from "nothing
+# watched at all", which failure_kind answers differently.
+SIGNOFF_DISK_WATCH="${SIGNOFF_DISK_WATCH:-}"
+
+# Set to 1 by run_make_step when the step it ran reported running out of disk.
+#
+# A shell variable rather than a file, because the signal has to survive the
+# condition it reports. Recording the line by appending to a marker file needed
+# an allocation at exactly the moment allocation is failing — and on macOS
+# $TMPDIR and the workspace are usually the same APFS container, so there was
+# nowhere to put that file that was reliably writable. An empty marker read as
+# "not a disk failure", so the branch was blamed for the volume (#12427). The
+# watcher's exit status needs no disk at all.
+#
+# Seeded from the environment so the unit tests can set up a classification
+# without running a build; run_make_step resets it per step, so an inherited
+# value cannot outlive a run that watched anything.
+SIGNOFF_DISK_HIT="${SIGNOFF_DISK_HIT:-}"
+
+# The status the watcher exits with to report an out-of-disk line. Deliberately
+# not 1 or 2: awk uses those for its own errors, and a watcher that itself died
+# must not be read as a volume that filled. Reserving a distinct status is also
+# what lets run_make_step tell "ran, saw nothing" (0) from "never reached a
+# verdict" (anything else), which it must not conflate — see run_make_step.
+readonly DISK_WATCH_HIT_STATUS=3
 
 # Run one `make` step, recording whether it died for want of disk. Returns
-# make's own status, never the recorder's. With no marker set — every local run
-# — make is invoked exactly as before, so local output is untouched.
+# make's own status, never the watcher's. With the watch off — every local run —
+# make is invoked exactly as before, so local output is untouched.
 run_make_step() {
-  if [[ -z "$SIGNOFF_DISK_MARKER" ]]; then
+  if [[ -z "$SIGNOFF_DISK_WATCH" ]]; then
     make "$@"
     return $?
   fi
-  local status
-  # Truncate per step, so the marker describes the step that actually failed.
-  # Left to accumulate, a step that merely *mentioned* running out of disk and
-  # then succeeded would still be blaming the volume for a genuine test failure
-  # two steps later.
-  : >"$SIGNOFF_DISK_MARKER" 2>/dev/null || true
-  # awk rather than `tee` to a full log: it passes every line straight through
-  # while copying only the out-of-disk lines to the marker, so the recorder
-  # costs a few hundred bytes instead of tens of megabytes. fflush keeps the
-  # output streaming to the Actions log line by line, as it does untee'd.
-  make "$@" 2>&1 | awk -v marker="$SIGNOFF_DISK_MARKER" -v pat="$DISK_FULL_PATTERN" '
-    $0 ~ pat { print >> marker; close(marker) }
+  local status watch_status
+  local -a pipe_status
+  # Reset per step, so the verdict describes the step that actually failed. Left
+  # to accumulate, a step that merely *mentioned* running out of disk and then
+  # succeeded would still be blaming the volume for a genuine test failure two
+  # steps later.
+  SIGNOFF_DISK_HIT=""
+  # awk rather than a captured log: it passes every line straight through and
+  # keeps one bit of state, so watching costs nothing on a volume that is
+  # already short of space. fflush keeps the output streaming to the Actions log
+  # line by line, as it does unwatched.
+  make "$@" 2>&1 | awk -v pat="$DISK_FULL_PATTERN" -v hit_status="$DISK_WATCH_HIT_STATUS" '
+    $0 ~ pat { hit = 1 }
     { print; fflush() }
+    END { if (hit) exit (hit_status + 0) }
   '
-  status="${PIPESTATUS[0]}"
+  # Copy the whole array in one statement: reading PIPESTATUS is itself a command,
+  # so a second `x="${PIPESTATUS[1]}"` would be reading the *assignment's* status
+  # and, under `set -u`, abort on the now-absent index.
+  pipe_status=("${PIPESTATUS[@]}")
+  status="${pipe_status[0]:-0}"
+  watch_status="${pipe_status[1]:-0}"
+  if [[ "$watch_status" -eq "$DISK_WATCH_HIT_STATUS" ]]; then
+    SIGNOFF_DISK_HIT=1
+  elif [[ "$watch_status" -ne 0 ]]; then
+    # The watcher died instead of reaching a verdict: no awk on the runner, a
+    # syntax error, a signal. Its silence is then not "no out-of-disk line went
+    # past" — nothing reliably read the output at all — so leaving the watch
+    # armed would let failure_kind assert "not disk" on the authority of a
+    # watcher that never ran, which is the same mislabelling in the other
+    # direction from #12427. Disarm it so classification falls back to the
+    # free-space backstop, exactly as on an unwatched local run.
+    info "warning: the out-of-disk watcher exited ${watch_status} rather than reporting a verdict — falling back to free-space classification"
+    SIGNOFF_DISK_WATCH=""
+  fi
   return "$status"
 }
 
-# True when this run watched its build output at all, i.e. the marker's verdict
-# — including an empty marker's "not disk" — is worth something.
-marker_is_armed() {
-  [[ -n "$SIGNOFF_DISK_MARKER" && -f "$SIGNOFF_DISK_MARKER" ]]
+# True when this run watched its build output at all, i.e. the watch's verdict —
+# including its "no ENOSPC line went past" — is worth something. run_make_step
+# clears the flag if the watcher itself failed, so this stays false for a run
+# whose watch was requested but never actually delivered a reading.
+disk_watch_armed() {
+  [[ -n "$SIGNOFF_DISK_WATCH" ]]
 }
 
 # True when this run's build actually reported running out of disk. This is the
 # authoritative signal — unlike a free-space reading taken after the fact, it
-# cannot be washed out by the partial artifacts cargo unlinks on its way out.
-#
-# Known gap: at true ENOSPC the append that records the line can itself fail,
-# leaving the marker empty and the failure read as the branch's. That is the
-# behavior this whole guard replaced, so it is no worse than not watching — but
-# it is why the marker lives in $TMPDIR rather than beside the build output.
+# cannot be washed out by the partial artifacts cargo unlinks on its way out,
+# and unlike a marker file it costs no allocation at the moment allocation is
+# what is failing.
 build_hit_disk_full() {
-  [[ -n "$SIGNOFF_DISK_MARKER" && -s "$SIGNOFF_DISK_MARKER" ]]
+  [[ -n "$SIGNOFF_DISK_HIT" ]]
 }
 
 # Free space in GiB on the volume holding "$1" (default: the working tree).
@@ -808,7 +853,8 @@ disk_is_critical() {
 # else, which is the branch. Three ways to reach "disk", in falling order of
 # authority: the preflight refused to start, the build said so itself, or the
 # volume is at ~0 now. The last is a backstop for a build whose output we did
-# not record (a local run), which is why it is not the only signal.
+# not record — a local run, or a remote one whose watcher died before it could
+# read anything — which is why it is not the only signal.
 failure_kind() {
   local check_status="$1"
 
@@ -818,13 +864,13 @@ failure_kind() {
     return
   fi
 
-  # If we watched the build, the watch decides — both ways. An empty marker
-  # means the build ran out of many things but not disk, and a free-space
-  # reading must not overrule that: on a shared pool another run can drag the
-  # volume under any threshold while *this* branch fails for its own reasons,
-  # and calling that "infrastructure" tells the author to re-dispatch a branch
-  # that will fail again. Free space is consulted only when nothing watched.
-  if marker_is_armed; then
+  # If we watched the build, the watch decides — both ways. No ENOSPC line means
+  # the build ran out of many things but not disk, and a free-space reading must
+  # not overrule that: on a shared pool another run can drag the volume under any
+  # threshold while *this* branch fails for its own reasons, and calling that
+  # "infrastructure" tells the author to re-dispatch a branch that will fail
+  # again. Free space is consulted only when nothing watched.
+  if disk_watch_armed; then
     if build_hit_disk_full; then echo "disk"; else echo "checks"; fi
     return
   fi
@@ -865,6 +911,11 @@ preflight_disk() {
 
   info "${NO} Only ${free} GiB free on the work volume; a sign-off needs ${min} GiB."
   info "  The branch was not evaluated. Reclaim space on this runner and re-dispatch."
+  # An Actions annotation as well as the step summary. Reached from the standalone
+  # `preflight-disk` step there is no commit status yet to carry the distinction —
+  # the pending status is posted later, inside the sign-off run — so the run page
+  # is the only place an operator can learn this was the volume and not the diff.
+  echo "::error title=Runner out of disk::Only ${free} GiB free on the work volume, below the ${min} GiB floor. The branch was not evaluated: reclaim space on this runner and re-dispatch."
   append_step_summary "### Preflight: not enough disk"$'\n'"Only **${free} GiB** free on the runner work volume, below the **${min} GiB** floor, so the Rust checks did not run and **the branch was not evaluated**. This is an infrastructure failure, not a code failure: reclaim space on this runner (\`target/\` is shared across branches) and re-dispatch. Adjust the floor with \`SIGNOFF_MIN_FREE_GIB\`."$'\n'
   return "$EXIT_DISK_EXHAUSTED"
 }
@@ -1174,14 +1225,11 @@ cmd_signoff() {
     start=$(date +%s)
     if is_remote_run; then
       post_pending_status "$repo" "$sha" "$user"
-      # Record out-of-disk lines from here on, so a failure can say whether the
-      # volume or the branch was at fault. Remote only: a local run's output
-      # then stays byte-for-byte what it is today. A marker we cannot create is
-      # not fatal — failure_kind falls back to reading free space.
-      SIGNOFF_DISK_MARKER=$(mktemp "${TMPDIR:-/tmp}/signoff-disk.XXXXXX" 2>/dev/null) \
-        || SIGNOFF_DISK_MARKER=""
-      [[ -z "$SIGNOFF_DISK_MARKER" ]] \
-        || trap 'rm -f "$SIGNOFF_DISK_MARKER"' EXIT
+      # Watch for out-of-disk lines from here on, so a failure can say whether
+      # the volume or the branch was at fault. Remote only: a local run's output
+      # then stays byte-for-byte what it is today. Arming cannot fail — there is
+      # no file to create and so nothing to clean up on exit.
+      SIGNOFF_DISK_WATCH=1
     fi
     # Capture status without wrapping in `if`/`||` (those also disable set -e
     # for the LHS). run_checks uses explicit `|| return` so make failures still
@@ -1226,6 +1274,23 @@ cmd_signoff() {
 
   echo "${OK} Signed off on ${sha:0:12} — ${description}"
   refresh_attestation_check "$sha" "$repo"
+}
+
+# Run the disk preflight on its own, for the workflow to call *before* the
+# toolchain setup steps.
+#
+# The guard reached through `run_checks` sits behind Rust, Nextest, sccache,
+# protoc, cc and spiceio setup, so a volume that was already below the floor
+# spent all of that first, and a volume that filled during those steps produced
+# an ordinary red job with none of the labelling (#12427). Running the same floor
+# check as the first step after checkout stops the already-full case immediately
+# and says why. It cannot catch a volume that fills mid-setup — that would need
+# the setup actions to report it — so this narrows the gap rather than closing it.
+#
+# Same floor, same `SIGNOFF_MIN_FREE_GIB` override, same remote-only fatality as
+# the in-run preflight, because it is the same function.
+cmd_preflight_disk() {
+  preflight_disk
 }
 
 cmd_status() {
@@ -1572,6 +1637,12 @@ Developers:
                                Replace a left-behind '${STATUS_CONTEXT}' pending status
                                on HEAD with a failure (no-op for any other state)
 
+CI (.github/workflows/signoff.yml):
+  scripts/signoff preflight-disk
+                               Check the work volume against the ${DEFAULT_MIN_FREE_GIB} GiB floor
+                               before the toolchain setup steps run; fatal only
+                               on a remote run (override: SIGNOFF_MIN_FREE_GIB)
+
 Maintainers:
   scripts/signoff check        Show whether '${TARGET_BRANCH}' requires sign-off
   scripts/signoff install      Preview the required-checks change (dry run)
@@ -1616,6 +1687,7 @@ main() {
     status)   shift; cmd_status "$@" ;;
     mine)     shift; cmd_mine "$@" ;;
     clear-pending) shift; cmd_clear_pending "$@" ;;
+    preflight-disk) shift; cmd_preflight_disk "$@" ;;
     check)    shift; cmd_check "$@" ;;
     install)  shift; cmd_install "$@" ;;
     version|--version) echo "signoff ${VERSION}" ;;
