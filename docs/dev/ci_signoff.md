@@ -250,6 +250,44 @@ Requires write access to the repository (same as local sign-off — fork
 contributors still need a maintainer to sign off). The lab SSH path also needs
 SSH key access to the host and `gh` auth on that machine.
 
+### A cancelled Remote Sign-off is not a failed one
+
+`signoff.yml` sets `concurrency: signoff-<pr|branch>` with `cancel-in-progress`, so
+re-dispatching sign-off for a branch cancels the run before it. A cancelled job is
+killed by signal, which makes the in-flight `run_checks` return non-zero — and the
+dying script posts `signoff=failure`, "Sign-off checks failed after Ns", about a
+branch nothing actually judged.
+
+So the workflow corrects the record on its way out. When the job ends cancelled it
+runs:
+
+```bash
+scripts/signoff correct-cancelled [<sha>] [<owner/repo>]
+```
+
+which rewrites the status to `pending` — not `success`, because HEAD really is not
+signed off, and not `error`, because `pending` is the state Attestation already
+describes as "re-dispatch sign-off" rather than as a defect in the diff.
+
+**It rewrites only `failure` and `error`.** A cancelled run can find a legitimate
+`success` on the commit two ways, and overwriting either would throw away checks
+that passed and cost another 1-4 hour run:
+
+- Its own `Sign off` step completed, and the cancel signal landed in the window
+  before the correction ran.
+- A second run signed the same commit off. The concurrency group keys on the
+  dispatch *input*, so `-f branch=my-branch` and `-f pr_number=123` for that same
+  branch are different groups: they do not cancel each other, and either can be
+  cancelled after the other has succeeded.
+
+A read failure is likewise not treated as "no status" — that would license the
+overwrite the guard exists to prevent. Every path exits 0, so the correction can
+never add a second failure to a job that was already cancelled.
+
+If you see `signoff=pending` with "Remote sign-off was cancelled", nothing is
+wrong with the branch: dispatch sign-off again. `scripts/test_signoff_cancelled_correction.sh`
+covers both directions.
+
 ### Jujutsu workspaces
 
 `make signoff` also works in non-colocated JJ workspaces (where there is a

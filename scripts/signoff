@@ -898,6 +898,15 @@ cmd_signoff() {
   refresh_attestation_check "$sha" "$repo"
 }
 
+# Pick the current STATUS_CONTEXT state out of a combined-status payload. The
+# combined endpoint collapses each context to its latest status, so the first
+# matching entry is the current one. Prints "" when the context is unset.
+# Every reader of the sign-off status goes through this so they cannot disagree
+# about what "the current state" means (see cmd_correct_cancelled).
+combined_status_state() {
+  jq -r "first(.statuses[]? | select(.context==\"${STATUS_CONTEXT}\") | .state) // \"\"" <<<"${1}"
+}
+
 cmd_status() {
   require_tools
   require_jq
@@ -910,7 +919,7 @@ cmd_status() {
   # Fail on a real API error rather than falling back to {} → "not signed off".
   combined=$(gh api "repos/${repo}/commits/${sha}/status") \
     || fail "failed to read commit status for ${sha} on ${repo} (auth/rate-limit/network?)"
-  state=$(jq -r "first(.statuses[]? | select(.context==\"${STATUS_CONTEXT}\") | .state) // \"\"" <<<"$combined")
+  state=$(combined_status_state "$combined")
   if [[ "$state" == "success" ]]; then
     desc=$(jq -r "first(.statuses[]? | select(.context==\"${STATUS_CONTEXT}\") | .description) // \"\"" <<<"$combined")
     echo "${OK} ${sha:0:12} is signed off — ${desc}"
@@ -918,6 +927,80 @@ cmd_status() {
     echo "${NO} ${sha:0:12} is not signed off — run: make signoff"
     exit 1
   fi
+}
+
+# Repair the sign-off status a *cancelled* Remote Sign-off run left behind.
+#
+# Usage: cmd_correct_cancelled [<sha>] [<owner/repo>]
+# Both default from the environment: the SHA from HEAD (what the cancelled run had
+# checked out, and so what it posted against), the repo from GITHUB_REPOSITORY —
+# authoritative inside Actions — falling back to the gh context for local use.
+#
+# A cancelled job is killed by signal, so `run_checks` returns non-zero under its
+# `set +e` and the script posts `signoff=failure` — "checks failed" about a branch
+# nothing actually judged. Attestation then reports a code failure that never
+# happened (#12424). `cancel-in-progress` makes that routine: every re-dispatch for
+# a branch cancels the one before it.
+#
+# But cancellation does not always mean that, so this must not write blindly
+# (#12428). Two ways a cancelled run can find a *legitimate* `success` on the SHA:
+#
+#   1. Its own `Sign off` step completed and posted success, and the cancel signal
+#      landed in the window before this correction runs.
+#   2. Another run signed the same commit off. `concurrency: signoff-<pr|branch>`
+#      keys on the dispatch input, so a `-f branch=x` run and a `-f pr_number=N`
+#      run for that same branch are in *different* groups: they do not cancel each
+#      other, and either can be cancelled after the other has succeeded.
+#
+# Overwriting either one throws away checks that genuinely passed and pushes the
+# branch back through a 1-4 hour re-dispatch. So: rewrite `failure`/`error` — the
+# only states a dying run posts — and leave everything else exactly as found.
+#
+# Best-effort by construction. This runs while a cancelled job is being torn down,
+# where the API may be unreachable and the exit status is not worth anything: it
+# must never mask the cancellation itself, so every path exits 0.
+cmd_correct_cancelled() {
+  local sha="${1:-}" repo="${2:-${GITHUB_REPOSITORY:-}}" combined state
+
+  # `|| true` on each fallback: a resolver that fails leaves the value empty, and
+  # the emptiness check below is what reports it. Splitting those into separate
+  # failure branches just duplicates the message.
+  [[ -n "$sha" ]] || sha=$(git rev-parse HEAD 2>/dev/null) || true
+  [[ -n "$sha" ]] || { info "no SHA given and HEAD is unreadable — nothing to correct."; return 0; }
+
+  command -v gh >/dev/null 2>&1 || { info "gh unavailable — leaving the ${STATUS_CONTEXT} status on ${sha} alone."; return 0; }
+  command -v jq >/dev/null 2>&1 || { info "jq unavailable — leaving the ${STATUS_CONTEXT} status on ${sha} alone."; return 0; }
+
+  [[ -n "$repo" ]] || repo=$(repo_slug 2>/dev/null) || true
+  [[ -n "$repo" ]] || { info "could not resolve the repo — leaving the ${STATUS_CONTEXT} status on ${sha} alone."; return 0; }
+
+  # A read failure must not be treated as "unset" — that would license a write over
+  # a status we simply could not see, which is the bug this command exists to fix.
+  if ! combined=$(gh api "repos/${repo}/commits/${sha}/status" 2>/dev/null); then
+    info "could not read the ${STATUS_CONTEXT} status on ${sha} — leaving it alone."
+    return 0
+  fi
+  state=$(combined_status_state "$combined" 2>/dev/null) || state=""
+
+  case "$state" in
+    failure | error)
+      # `pending` rather than `error`: pr.yml rejects failure/error but treats
+      # pending as "not signed off yet", which is exactly the state a cancelled
+      # run leaves behind. Attestation stays red — HEAD really is not signed off —
+      # but points at re-running sign-off instead of at a phantom defect.
+      if post_commit_status "$repo" "$sha" pending \
+        "Remote sign-off was cancelled (superseded or stopped) — no checks failed. HEAD is not signed off; re-dispatch." \
+        2>/dev/null; then
+        echo "${OK} Reset ${STATUS_CONTEXT}=${state} on ${sha:0:12} to pending — this run was cancelled, not failed."
+      else
+        info "could not reset the ${STATUS_CONTEXT} status on ${sha} — leaving it as ${state}."
+      fi
+      ;;
+    *)
+      echo "${STATUS_CONTEXT} on ${sha:0:12} is '${state:-unset}', not a failure this run posted — leaving it alone."
+      ;;
+  esac
+  return 0
 }
 
 # Truncate to at most `n` display columns, adding an ellipsis when cut.
@@ -1009,7 +1092,8 @@ cmd_mine() {
     sha=$(jq -r '.headRefOid' <<<"$pr")
 
     combined=$(gh api "repos/${repo}/commits/${sha}/status" 2>/dev/null) || combined='{}'
-    state=$(jq -r "first(.statuses[]? | select(.context==\"${STATUS_CONTEXT}\") | .state) // \"none\"" <<<"$combined")
+    state=$(combined_status_state "$combined")
+    state="${state:-none}"
 
     running=0
     run_id=$(jq -r --arg title "Remote Sign-off (${branch})" \
@@ -1201,6 +1285,12 @@ Developers:
   scripts/signoff status       Show the sign-off status of HEAD
   scripts/signoff mine         Show attestation status for all your open PRs
 
+CI (.github/workflows/signoff.yml):
+  scripts/signoff correct-cancelled [<sha>] [<owner/repo>]
+                               Repair the status a cancelled run left behind:
+                               rewrite '${STATUS_CONTEXT}=failure'/'error' to pending,
+                               and leave any other state (notably success) alone
+
 Maintainers:
   scripts/signoff check        Show whether '${TARGET_BRANCH}' requires sign-off
   scripts/signoff install      Preview the required-checks change (dry run)
@@ -1244,6 +1334,7 @@ main() {
     remote)   shift; cmd_remote "$@" ;;
     status)   shift; cmd_status "$@" ;;
     mine)     shift; cmd_mine "$@" ;;
+    correct-cancelled) shift; cmd_correct_cancelled "$@" ;;
     check)    shift; cmd_check "$@" ;;
     install)  shift; cmd_install "$@" ;;
     version|--version) echo "signoff ${VERSION}" ;;
@@ -1252,4 +1343,11 @@ main() {
   esac
 }
 
-main "$@"
+# Only dispatch when executed. The unit tests source this file to call
+# individual functions, and sourcing must not run a command. BASH_SOURCE is unset
+# when the script's *contents* are fed to bash (`bash -c "$(cat …)"`, a piped
+# download), which `set -u` would abort on — default it to $0, which dispatches,
+# since that invocation means to run the thing.
+if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
+  main "$@"
+fi
