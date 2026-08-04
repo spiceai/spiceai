@@ -449,13 +449,13 @@ pub fn track_hash_index_lookup_rows(rows: u64, dimensions: &[KeyValue]) {
 /// sized for its request from one sized for its whole node. `source` is
 /// `CpuSource::as_str` — the rung of the detection ladder the budget came from.
 ///
-/// The two request-shaped inputs are deliberately separate gauges, because they
-/// are different claims. `spiced_cpu_declared_request_millicores` is the pod's
-/// own `requests.cpu`, passed in by whatever wrote the pod spec, and is exact.
-/// `spiced_cpu_request_millicores` is *inferred* from the cgroup CPU share, and
-/// every cgroup has one whether or not a request was expressed — cgroup v2's
-/// default `cpu.weight: 100` inverts to ~2536m on bare metal — so it is not
-/// evidence that anything requested anything.
+/// `spiced_cpu_request_millicores` is the pod's own `requests.cpu`, exact, as
+/// declared by whatever wrote the pod spec. The cgroup CPU *share* is
+/// deliberately not exported: every cgroup has one whether or not a request was
+/// expressed — cgroup v2 defaults `cpu.weight: 100`, which inverts to ~2536m in
+/// a plain `docker run` — so a gauge for it would report a request-shaped number
+/// on hosts where nothing requested anything. It stays in the startup log, where
+/// it is read next to the source that was actually used.
 ///
 /// Each optional input is `None` when no such value exists; the gauge then
 /// reports nothing rather than `0`, which would be indistinguishable from a real
@@ -471,7 +471,6 @@ pub fn register_cpu_budget_metrics(
     millicores: u64,
     source: &'static str,
     limit_millicores: Option<u64>,
-    cpu_share_millicores: Option<u64>,
     declared_request_millicores: Option<u64>,
 ) {
     let meter = global::meter("cpu_budget");
@@ -503,23 +502,12 @@ pub fn register_cpu_budget_metrics(
 
     if let Some(declared) = declared_request_millicores {
         let _ = meter
-            .u64_observable_gauge("spiced_cpu_declared_request_millicores")
+            .u64_observable_gauge("spiced_cpu_request_millicores")
             .with_description(
-                "The pod's own CPU request (Kubernetes requests.cpu), as declared by the surface that wrote the pod spec. Exact; reported only.",
+                "The pod's own CPU request (Kubernetes requests.cpu), as declared by the surface that wrote the pod spec. Reported only; never used for sizing.",
             )
             .with_unit("{millicpu}")
             .with_callback(move |obs| obs.observe(declared, &[]))
-            .build();
-    }
-
-    if let Some(share) = cpu_share_millicores {
-        let _ = meter
-            .u64_observable_gauge("spiced_cpu_request_millicores")
-            .with_description(
-                "CPU request inferred from the cgroup CPU share. Present in every cgroup whether or not a request was expressed, so not evidence of one. Reported only; never used for sizing.",
-            )
-            .with_unit("{millicpu}")
-            .with_callback(move |obs| obs.observe(share, &[]))
             .build();
     }
 }

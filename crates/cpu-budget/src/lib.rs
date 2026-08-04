@@ -166,7 +166,7 @@ pub struct HostReadings {
     /// `systemd` service on bare metal. `None` when no share can be read.
     pub cpu_share_millicores: Option<u64>,
     /// The pod's own `requests.cpu`, in millicores, as declared by whatever
-    /// wrote the pod spec (`SPICE_CPU_REQUEST`). Unlike the share this is exact
+    /// wrote the pod spec ([`CPU_REQUEST_ENV`]). Unlike the share this is exact
     /// and unquantized, and its presence is itself evidence that something which
     /// could read a pod spec put it there. `None` when no request is declared,
     /// which is every bare-metal and benchmark deployment.
@@ -197,7 +197,7 @@ impl HostReadings {
 /// Kubernetes operator — from the downward API, never by hand:
 ///
 /// ```yaml
-/// - name: SPICE_CPU_REQUEST
+/// - name: SPICE_CPU_REQUEST_MILLICORES
 ///   valueFrom:
 ///     resourceFieldRef:
 ///       resource: requests.cpu
@@ -205,11 +205,18 @@ impl HostReadings {
 /// ```
 ///
 /// The `divisor: 1m` is what makes the value millicores, and it is load-bearing:
-/// `requests.cpu: 4` arrives as `4000`, not `4`. A surface that omits the
-/// divisor sends `4`, which this reads as 4 millicores rather than 4 cores — so
-/// the two forms are told apart by [`parse_declared_request_millicores`] and a
-/// core-shaped value is rejected rather than silently under-sizing by 1000x.
-pub const CPU_REQUEST_ENV: &str = "SPICE_CPU_REQUEST";
+/// `requests.cpu: 4` arrives as `4000`, not `4`.
+///
+/// The unit is in the variable's name because it has to be. `SPICE_CPU_CORES`
+/// takes the Kubernetes quantity grammar, where a bare `4` means four *cores*,
+/// and the two variables sit one concept apart — so a shared name with unstated
+/// units would put a 1000x difference behind two indistinguishable values.
+/// `divisor: 1` would have avoided that by sending whole cores, but it rounds
+/// up, and this value is *reported*: a `100m` request would arrive as `1` and be
+/// logged as one core, misstating by 10x the exact number an operator compares
+/// against the budget. A core-shaped value is therefore rejected rather than
+/// read 1000x too small — see [`parse_declared_request_millicores`].
+pub const CPU_REQUEST_ENV: &str = "SPICE_CPU_REQUEST_MILLICORES";
 
 /// The declared `requests.cpu` from [`CPU_REQUEST_ENV`], in millicores.
 ///
@@ -958,6 +965,42 @@ mod tests {
         assert_eq!(cgroup::parse_cpu_weight("garbage"), None);
     }
 
+    /// The measured reason a share is not a request.
+    ///
+    /// `docker run` with no CPU flags at all produces `cpu.weight: 100` and
+    /// `cpu.max: max 100000` — a share with no quota, on cgroup v2 (verified on
+    /// Docker 29.4, cgroupfs driver). Every cgroup has that weight whether or not
+    /// anyone expressed a request, and it inverts to a plausible-looking ~2.5
+    /// cores, which is why comparing it against the budget warned on hosts that
+    /// were sized correctly.
+    #[test]
+    fn the_default_cgroup_weight_looks_like_a_request_but_is_not_one() {
+        let default_weight = cgroup::parse_cpu_weight("100").expect("weight 100 inverts");
+        assert!(
+            (2500..=2600).contains(&default_weight),
+            "cgroup v2's default weight of 100 should invert to ~2536 millicores, got \
+             {default_weight}"
+        );
+
+        // Nothing declared a request, so nothing may be compared against the
+        // budget — however request-shaped that number looks.
+        let resolved = CpuBudget::resolve(
+            &CpuConfig::default(),
+            &HostReadings {
+                affinity_cores: 18,
+                quota_millicores: None,
+                cpu_share_millicores: Some(default_weight),
+                declared_request_millicores: None,
+            },
+        )
+        .expect("valid");
+        assert_eq!(resolved.request_shortfall_warning(), None);
+
+        // `--cpu-shares 2048` moves the weight to 174, and that is still not a
+        // request: it is a relative weight among siblings.
+        assert!(cgroup::parse_cpu_weight("174").is_some());
+    }
+
     #[test]
     fn a_request_far_below_the_effective_cores_warns() {
         // The shape this crate exists for: a request, no limit, so detection
@@ -1361,7 +1404,7 @@ mod tests {
         assert_eq!(resolved.declared_request_millicores(), None);
     }
 
-    /// `SPICE_CPU_REQUEST` is millicores (`divisor: 1m`), not the core-denominated
+    /// [`CPU_REQUEST_ENV`] is millicores (`divisor: 1m`), not the core-denominated
     /// grammar `runtime.cpu.cores` accepts. The two disagree on every bare
     /// integer, so a core-shaped value must be rejected rather than read 1000x
     /// too small.

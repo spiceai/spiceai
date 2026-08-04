@@ -830,7 +830,6 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
             budget.millicores(),
             budget.source().as_str(),
             budget.limit_millicores(),
-            budget.cpu_share_millicores(),
             budget.declared_request_millicores(),
         );
 
