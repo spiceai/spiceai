@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -34,8 +34,9 @@ use reqwest::Url;
 /// How many same-origin redirects to follow before refusing, matching the depth of
 /// `reqwest`'s own default policy.
 ///
-/// Compared the way `reqwest` compares it: the first entry of `previous()` is the initial
-/// URL rather than a redirect, so the bound is `previous().len() > MAX_REDIRECTS`.
+/// Compared the same way `reqwest` compares it: because the first entry of `previous()` is
+/// the initial URL rather than a redirect, the limit is exceeded only once
+/// `previous().len() > MAX_REDIRECTS`.
 const MAX_REDIRECTS: usize = 10;
 
 /// Whether two URLs share an origin, per the URL standard's definition.
