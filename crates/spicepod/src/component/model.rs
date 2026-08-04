@@ -184,7 +184,11 @@ pub static HUGGINGFACE_PATH_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 pub fn split_hf_model_id(model_id: &str) -> (&str, Option<&str>) {
     match model_id.split_once(':') {
         Some((repo_id, revision)) if !revision.is_empty() => (repo_id, Some(revision)),
-        _ => (model_id, None),
+        // A trailing `:` still separates: the repo id is what precedes it. Folding this
+        // into the `None` arm below would hand the Hub `org/model:` as the repo name —
+        // the same "repo that does not exist" failure this function exists to prevent.
+        Some((repo_id, _)) => (repo_id, None),
+        None => (model_id, None),
     }
 }
 
