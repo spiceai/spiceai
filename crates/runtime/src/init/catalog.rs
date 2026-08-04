@@ -282,8 +282,9 @@ mod tests {
     /// suggestion-bearing `UnknownCatalogConnector` written for this case was unreachable.
     #[tokio::test]
     async fn a_misspelled_catalog_provider_suggests_the_closest_provider() {
-        catalogconnector::register_all().await;
-
+        // `Runtime::builder().build()` registers the default catalog connectors itself, so
+        // `iceberg` is present for the suggestion to find without this test touching the
+        // process-global registry on its own account.
         let runtime = Arc::new(Runtime::builder().build().await);
         let catalog = test_catalog("iceber:some_catalog", &runtime);
 
