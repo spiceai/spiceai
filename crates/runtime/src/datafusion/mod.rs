@@ -924,9 +924,18 @@ pub struct DataFusion {
     // Coordinated aggregate byte budget for the off-pool Cayenne in-memory CDC
     // tier, sized in the builder so query_pool + compaction + tier + headroom ≤
     // host (the cross-subsystem coordination that prevents the SF1000 process
-    // OOM). `Some` only when Cayenne acceleration is active; installed in
-    // `set_compaction_runtime`.
+    // OOM). `Some` only when some configured table can actually reach that tier
+    // (the small-write refresh profile); installed in
+    // `install_cayenne_global_budgets`.
     mem_tier_budget_bytes: Option<u64>,
+    // What the pod's Cayenne accelerations demand of the host, classified from the
+    // Spicepod in the Runtime builder. Retained so `spiced` can decide which
+    // dedicated thread pools are worth bringing up without re-reading the app.
+    cayenne_workload: crate::builder::CayenneWorkload,
+    // Cgroup-aware total memory, captured once at build time. `get_total_memory`
+    // rebuilds a sysinfo System on every call, so the budget installers read this
+    // rather than re-probing.
+    total_memory: u64,
     pub(crate) io_runtime: Handle,
     metrics: Option<Metrics>,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
@@ -1621,36 +1630,22 @@ impl DataFusion {
             .or_else(|| self.refresh_runtime())
     }
 
-    /// Set the dedicated compaction runtime for background Cayenne compaction
-    /// (size-tiered protected-snapshot merge + full snapshot rewrite).
+    /// Install the process-global Cayenne budgets that are NOT tied to the
+    /// compaction runtime, so they apply even to a pod that never brings one up
+    /// (nothing it accelerates produces a file to compact).
     ///
-    /// Also injects the runtime's [`Handle`](tokio::runtime::Handle) into the
-    /// Cayenne accelerator crate, so its background and post-write compaction
-    /// tasks spawn here instead of on the ambient (refresh/query) runtime.
-    /// Isolating compaction keeps the CPU-heavy snapshot rewrite off the
-    /// latency-sensitive query and CDC paths while letting it use spare cores.
-    pub fn set_compaction_runtime(&self, handle: ManagedTokioRuntime) {
-        let tokio_handle = handle.handle().clone();
-        if self.compaction_runtime.set(handle).is_err() {
-            // Already set — e.g. a concurrent first-Cayenne-table registration
-            // lost the race. Drop this redundant runtime WITHOUT injecting its
-            // handle into Cayenne: Cayenne must reference the runtime we actually
-            // retained, never one that is about to be dropped here.
-            tracing::debug!("Dedicated compaction runtime already set; dropping the redundant one");
-            return;
-        }
-        // Inject the dedicated runtime handle and the carved compaction memory
-        // environment into the Cayenne accelerator crate, so background and
-        // post-write compaction run isolated from queries and CDC on both CPU
-        // (this runtime's threads) and memory (the carved pool).
-        cayenne::set_compaction_runtime_handle(tokio_handle.clone());
-        // Install the process-global encode-concurrency budget: cap the aggregate
-        // number of concurrent Vortex encode shards across ALL Cayenne tables.
-        // Per-table `cayenne_write_concurrency` is sized in isolation — its unset
-        // default is conservative, but it can be raised per table — so without
-        // this a fleet of tables receiving CDC at once would sum their per-table
-        // shard counts and oversubscribe the machine. CPU-bound encode past the
-        // core count buys no throughput, only contention.
+    /// Kept separate from [`Self::set_compaction_runtime`] because these bound the
+    /// WRITE path and the off-pool in-memory CDC tier, which a pod that never
+    /// compacts exercises just as hard as a compacting one — folding them into the
+    /// compaction setup would silently un-cap a fleet of simultaneously-refreshing
+    /// tables, and leave a `mode: memory` pod's RAM tier unbounded.
+    pub fn install_cayenne_global_budgets(&self) {
+        // Cap the aggregate number of concurrent Vortex encode shards across ALL
+        // Cayenne tables. Per-table `cayenne_write_concurrency` is sized in
+        // isolation — its unset default is conservative, but it can be raised per
+        // table — so without this a fleet of tables writing at once would sum their
+        // per-table shard counts and oversubscribe the machine. CPU-bound encode
+        // past the core count buys no throughput, only contention.
         //
         // The ceiling is the core count MINUS a query reserve (a quarter of the
         // cores, at least 2, never reducing the budget below 1): encode shards
@@ -1685,6 +1680,21 @@ impl DataFusion {
             );
         }
 
+        // Install the cgroup-aware memory budget the dynamic auto-tuner uses to
+        // compute memory pressure (so the control loop closes on memory, not just
+        // ingest/query behavior). Mirrors the encode budget: injected here so the
+        // cayenne crate needs no runtime-specific resource detection of its own.
+        // Read from the value captured at build time rather than re-probing:
+        // `get_total_memory` rebuilds a sysinfo System on every call.
+        let memory_budget = self.total_memory;
+        cayenne::set_global_memory_budget(memory_budget);
+        tracing::info!(
+            memory_budget,
+            "Cayenne dynamic-tuning memory budget active (cgroup-aware)"
+        );
+
+        let rt = self.ctx.runtime_env();
+
         // Install the process-global in-memory CDC tier byte budget: the hard
         // aggregate RAM ceiling for `cdc_durability: memory` across ALL Cayenne
         // tables. Per-table `cayenne_cdc_mem_tier_max_bytes` is sized in
@@ -1694,73 +1704,85 @@ impl DataFusion {
         // under sustained overload, falls back to the durable path) rather than
         // growing the tier. File-mode tables never touch this budget.
         //
-        // CRITICAL: this budget is now COORDINATED with the query + compaction
-        // memory pools (sized in `DataFusionBuilder::build`). The tier lives
-        // off-pool, so sizing it from total RAM in isolation (the old
-        // `get_total_memory() / 4`) summed with the off-pool tier and the in-pool
-        // query/compaction budgets to >100% of host — the SF1000 process OOM (RSS
-        // 242 GiB on a 256 GiB box). `mem_tier_budget_bytes` is instead the host
-        // RAM left after the query pool, the compaction pool, and a headroom
-        // reserve, so the off-pool tier and the on-pool query/compaction budgets
-        // are coordinated against host RAM (see `coordinated_mem_tier_budget` for
-        // the exact bound and its precondition). The per-table caps and the
-        // spill/durable fallbacks stay the OOM backstops; the dynamic re-partition
-        // sampler may later resize this budget within the same envelope.
+        // CRITICAL: this budget is COORDINATED with the query + compaction memory
+        // pools (sized in `DataFusionBuilder::build`). The tier lives off-pool, so
+        // sizing it from total RAM in isolation summed with the off-pool tier and
+        // the in-pool query/compaction budgets to >100% of host — the SF1000
+        // process OOM (RSS 242 GiB on a 256 GiB box). `mem_tier_budget_bytes` is
+        // instead the host RAM left after the query pool, the compaction pool, and
+        // a headroom reserve, so the off-pool tier and the on-pool
+        // query/compaction budgets are coordinated against host RAM (see
+        // `coordinated_mem_tier_budget` for the exact bound and its precondition).
+        // The per-table caps and the spill/durable fallbacks stay the OOM
+        // backstops; the dynamic re-partition sampler below may later resize this
+        // budget within the same envelope.
         //
-        // Installed only when Cayenne acceleration is active (`mem_tier_budget_bytes`
-        // is `Some`, computed in the builder). It is `None` for non-Cayenne
-        // deployments that still get a dedicated compaction runtime — dedicated
-        // thread pools are the default, so `set_compaction_runtime` runs even with
-        // no Cayenne dataset — and those have no in-memory CDC tier to bound, so we
-        // install nothing and emit no tuning warning. `get_total_memory` rebuilds a
-        // sysinfo System each call, so read it once.
-        let total_memory = crate::resource_monitor::get_total_memory();
+        // It belongs with the other process-global budgets rather than with the
+        // compaction runtime because the tier is independent of compaction: a
+        // `mode: memory` table holds its whole dataset in the tier and never
+        // produces a file to compact, so pairing the two would leave exactly that
+        // pod's tier uncapped — with the query pool already shrunk to make room
+        // for it. `mem_tier_budget_bytes` is `None` when no configured table can
+        // reach the tier (and for a non-Cayenne deployment): nothing to bound, so
+        // nothing is installed and no tuning warning is emitted.
         if let Some(mem_tier_budget_bytes) = self.mem_tier_budget_bytes {
             cayenne::set_global_mem_tier_bytes(mem_tier_budget_bytes);
             // Mirror mem-tier `used` into the query MemoryPool so operators and
             // the planner see CDC RAM as reserved (visibility). Hard bound stays
             // the byte budget + spill path; the account is infallible resize.
             // Install AFTER the budget so the seed reads used=0.
-            let rt = self.ctx.runtime_env();
             cayenne::set_global_mem_tier_pool_account(&rt.memory_pool);
             tracing::info!(
                 mem_tier_budget_bytes,
                 query_memory_pool_bytes = self.query_memory_pool_bytes,
                 compaction_memory_bytes = self.compaction_memory_bytes.unwrap_or(0),
-                total_memory,
+                total_memory = self.total_memory,
                 "Cayenne global in-memory CDC tier byte budget active (coordinated with the query + compaction pools so their sum stays within host RAM)"
-            );
-
-            // Dynamic re-partition sampler: watches LIVE query + compaction pool
-            // usage and resizes the mem-tier budget within [floor, mem_tier_budget_bytes]
-            // so the off-pool CDC tier yields RAM to the query pool as it fills and
-            // reclaims it as the pool drains — never above the coordinated static
-            // ceiling, so it cannot reintroduce overcommit. The critical-pressure
-            // reactive spill drains the tier when the budget is lowered below resident.
-            let query_pool = Arc::downgrade(&rt.memory_pool);
-            let compaction_pool = self
-                .compaction_runtime_env
-                .as_ref()
-                .map(|env| Arc::downgrade(&env.memory_pool));
-            Self::spawn_mem_tier_repartition_sampler(
-                &tokio_handle,
-                query_pool,
-                compaction_pool,
-                mem_tier_budget_bytes,
-                total_memory,
             );
         }
 
-        // Install the cgroup-aware memory budget the dynamic auto-tuner uses to
-        // compute memory pressure (so the control loop closes on memory, not just
-        // ingest/query behavior). Mirrors the encode budget: injected here so the
-        // cayenne crate needs no runtime-specific resource detection of its own.
-        let memory_budget = total_memory;
-        cayenne::set_global_memory_budget(memory_budget);
-        tracing::info!(
-            memory_budget,
-            "Cayenne dynamic-tuning memory budget active (cgroup-aware)"
+        // The memory sampler runs for EVERY deployment, not just CDC ones. It owns
+        // two jobs: publishing the pool/RSS gauges that explain an OOM (#12195), and
+        // — only when an in-memory CDC tier budget exists — resizing that tier from
+        // live pool usage. The gauges are the reason it is unconditional: they are
+        // general memory observability, and a pod without a tier is no less likely
+        // to OOM. `mem_tier_budget_bytes` is `None` for such a pod, which switches
+        // off the resize half while leaving the gauges running.
+        Self::spawn_mem_tier_repartition_sampler(
+            &Handle::current(),
+            Arc::downgrade(&rt.memory_pool),
+            self.compaction_runtime_env
+                .as_ref()
+                .map(|env| Arc::downgrade(&env.memory_pool)),
+            self.mem_tier_budget_bytes,
+            self.total_memory,
         );
+    }
+
+    /// Set the dedicated compaction runtime for background Cayenne compaction
+    /// (size-tiered protected-snapshot merge + full snapshot rewrite).
+    ///
+    /// Also injects the runtime's [`Handle`](tokio::runtime::Handle) into the
+    /// Cayenne accelerator crate, so its background and post-write compaction
+    /// tasks spawn here instead of on the ambient (refresh/query) runtime.
+    /// Isolating compaction keeps the CPU-heavy snapshot rewrite off the
+    /// latency-sensitive query and CDC paths while letting it use spare cores.
+    pub fn set_compaction_runtime(&self, handle: ManagedTokioRuntime) {
+        let tokio_handle = handle.handle().clone();
+        if self.compaction_runtime.set(handle).is_err() {
+            // Already set — e.g. a concurrent first-Cayenne-table registration
+            // lost the race. Drop this redundant runtime WITHOUT injecting its
+            // handle into Cayenne: Cayenne must reference the runtime we actually
+            // retained, never one that is about to be dropped here.
+            tracing::debug!("Dedicated compaction runtime already set; dropping the redundant one");
+            return;
+        }
+        // Inject the dedicated runtime handle and the carved compaction memory
+        // environment into the Cayenne accelerator crate, so background and
+        // post-write compaction run isolated from queries and CDC on both CPU
+        // (this runtime's threads) and memory (the carved pool).
+        cayenne::set_compaction_runtime_handle(tokio_handle);
+
         if let Some(env) = &self.compaction_runtime_env {
             cayenne::set_compaction_runtime_env(Arc::clone(env));
         }
@@ -1795,7 +1817,7 @@ impl DataFusion {
         compaction_pool: Option<
             std::sync::Weak<dyn datafusion::execution::memory_pool::MemoryPool>,
         >,
-        static_ceiling_bytes: u64,
+        static_ceiling_bytes: Option<u64>,
         total_memory: u64,
     ) {
         // Short enough to react to a query-pool spike ahead of the slower per-table
@@ -1824,14 +1846,19 @@ impl DataFusion {
                 // Same coordinated partition as the static install (one tested
                 // definition of the no-overcommit invariant), but from LIVE pool
                 // usage, and never above the static ceiling so it can't overcommit.
-                let dynamic = builder::coordinated_mem_tier_budget(
-                    total_memory,
-                    pool_used,
-                    compaction_used,
-                    crate::accelerator_memory_budget::duckdb_total_reservation_bytes(),
-                )
-                .min(static_ceiling_bytes);
-                cayenne::update_global_mem_tier_total(dynamic);
+                // Only when a tier budget exists: a pod whose Cayenne tables are all
+                // bulk-written has no tier to resize, but still needs the gauges
+                // below — they are general memory observability, not CDC-specific.
+                if let Some(ceiling) = static_ceiling_bytes {
+                    let dynamic = builder::coordinated_mem_tier_budget(
+                        total_memory,
+                        pool_used,
+                        compaction_used,
+                        crate::accelerator_memory_budget::duckdb_total_reservation_bytes(),
+                    )
+                    .min(ceiling);
+                    cayenne::update_global_mem_tier_total(dynamic);
+                }
                 // Publish what this loop already measures. These are the numbers
                 // that reconcile budget against fact: pool gauges describe what
                 // the accounting believes, the RSS gauge describes what the
@@ -1852,6 +1879,14 @@ impl DataFusion {
                 }
             }
         });
+    }
+
+    /// What the pod's Cayenne accelerations demand of the host (classified from the
+    /// Spicepod at build time). `spiced` reads this to skip bringing up dedicated
+    /// thread pools nothing in the pod can use.
+    #[must_use]
+    pub fn cayenne_workload(&self) -> crate::builder::CayenneWorkload {
+        self.cayenne_workload
     }
 
     /// Returns the dedicated compaction runtime, if one has been set.
