@@ -23,6 +23,7 @@ use crate::context::RuntimeContext;
 use crate::error::Result;
 use crate::manifest;
 use clap::{Args, Subcommand};
+use spice_cloud_client::redirect::same_origin_redirect_policy;
 
 pub use auth_config::{merge_auth_config, store_keychain};
 
@@ -212,18 +213,9 @@ async fn login_spiceai(
 
     tracing::info!("Waiting for authentication...");
 
-    // Poll for auth status
-    let client = reqwest::Client::builder()
-        .user_agent(format!(
-            "spice/{} ({}; {})",
-            env!("CARGO_PKG_VERSION"),
-            std::env::consts::OS,
-            std::env::consts::ARCH
-        ))
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .unwrap_or_default();
+    // Poll for auth status. The exchange below posts the auth code in the request body, so
+    // this client must not follow a redirect off the origin.
+    let client = credentialed_client()?;
     let exchange_url = format!("{base_url}/auth/token/exchange");
 
     let access_token = loop {
@@ -243,6 +235,20 @@ async fn login_spiceai(
                 continue;
             }
         };
+
+        // A 3xx here means the redirect policy refused to follow it, so this is the
+        // redirecting origin's own response, not the target's. Fail instead of parsing it:
+        // retrying cannot make a redirect succeed, and an unchecked body could otherwise be
+        // read as a token or as "still pending".
+        let status = response.status();
+        if status.is_redirection() {
+            return Err(crate::error::Error::InvalidResponse {
+                message: format!(
+                    "The Spice.ai token exchange answered {status}. The redirect was not \
+                     followed because it leaves the origin the auth code was issued for."
+                ),
+            });
+        }
 
         let body: serde_json::Value = match response.json().await {
             Ok(v) => v,
@@ -309,6 +315,36 @@ async fn login_spiceai(
     }
 
     Ok(())
+}
+
+/// Build the HTTP client for the credential-bearing calls `spice login` makes.
+///
+/// The redirect policy is the reason this is shared rather than built per call site. These
+/// requests carry an auth code, a device code or a bearer token, and `reqwest`'s default
+/// policy follows a `Location` up to ten hops. Stripping headers is not enough on its own:
+/// `Authorization` is dropped on a cross-origin hop, but a 307 or 308 replays the request
+/// *body* — which is exactly where the Spice.ai token exchange and the Microsoft
+/// device-code flow carry their credential — so the hop itself has to be refused.
+///
+/// # Errors
+///
+/// Returns an error if the client cannot be built. This is deliberately not defaulted
+/// past: a default client would silently drop the same-origin policy.
+fn credentialed_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent(format!(
+            "spice/{} ({}; {})",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        ))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .redirect(same_origin_redirect_policy())
+        .build()
+        .map_err(|e| crate::error::Error::InvalidResponse {
+            message: format!("Could not build the login HTTP client: {e}"),
+        })
 }
 
 /// Get the Spice.ai base URL.
@@ -394,17 +430,7 @@ async fn get_spice_auth_context(
         url = format!("{url}?{}", params.join("&"));
     }
 
-    let client = reqwest::Client::builder()
-        .user_agent(format!(
-            "spice/{} ({}; {})",
-            env!("CARGO_PKG_VERSION"),
-            std::env::consts::OS,
-            std::env::consts::ARCH
-        ))
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .unwrap_or_default();
+    let client = credentialed_client()?;
     let response = client
         .get(&url)
         .header("Authorization", format!("Bearer {access_token}"))
@@ -437,4 +463,156 @@ async fn get_spice_auth_context(
         app_name: body["app"]["name"].as_str().map(String::from),
         app_api_key: body["app"]["api_key"].as_str().map(String::from),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::credentialed_client;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    /// How long a request that must not hang is given before the test fails it. Well under
+    /// the client's own 30-second timeout, so a regression fails fast instead of stalling.
+    const TEST_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Read the whole request — head *and* body — so the client's write completes before we
+    /// reply. Closing a socket with unread request data still buffered can surface as a
+    /// reset rather than the response under test, which on Windows is packetisation
+    /// dependent and so intermittent.
+    fn drain_request(stream: &mut TcpStream) {
+        let mut reader = BufReader::new(stream);
+        let mut content_length = 0usize;
+        let mut line = String::new();
+
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+            if line == "\r\n" || line == "\n" {
+                break;
+            }
+            let lowered = line.to_ascii_lowercase();
+            if let Some(value) = lowered.strip_prefix("content-length:") {
+                content_length = value.trim().parse().unwrap_or(0);
+            }
+        }
+
+        if content_length > 0 {
+            let mut body = vec![0u8; content_length];
+            let _ = reader.read_exact(&mut body);
+        }
+    }
+
+    fn serve_once(listener: &TcpListener, response: &str) {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        drain_request(&mut stream);
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    }
+
+    fn localhost_listener() -> TcpListener {
+        TcpListener::bind("127.0.0.1:0")
+            .expect("a test listener should bind to an ephemeral port")
+    }
+
+    fn local_port(listener: &TcpListener) -> u16 {
+        listener
+            .local_addr()
+            .expect("listener should have a local address")
+            .port()
+    }
+
+    /// A cross-origin redirect must not be followed, because the request body carries the
+    /// auth code and a 307 replays it to the new origin.
+    #[tokio::test]
+    async fn test_cross_origin_redirect_is_not_followed() {
+        let redirector = localhost_listener();
+        let elsewhere = localhost_listener();
+        let elsewhere_port = local_port(&elsewhere);
+        let redirector_port = local_port(&redirector);
+        let url = format!("http://127.0.0.1:{redirector_port}/auth/token/exchange");
+
+        // Nothing should ever connect here; poll without blocking after the call returns.
+        elsewhere
+            .set_nonblocking(true)
+            .expect("listener should go non-blocking");
+
+        let response = format!(
+            "HTTP/1.1 307 Temporary Redirect\r\n\
+             Location: http://127.0.0.1:{elsewhere_port}/collect\r\n\
+             Content-Length: 0\r\n\
+             Connection: close\r\n\r\n"
+        );
+        let server = std::thread::spawn(move || serve_once(&redirector, &response));
+
+        let client = credentialed_client().expect("client should build");
+        let request = client
+            .post(&url)
+            .json(&serde_json::json!({ "code": "SECRET12" }))
+            .send();
+        // On the old default policy the client follows the hop and then waits on a listener
+        // that never answers, so without this bound the regression would surface only as a
+        // 30-second stall.
+        let got = tokio::time::timeout(TEST_REQUEST_TIMEOUT, request)
+            .await
+            .expect("a refused redirect must return promptly, not hang")
+            .expect("the 307 should come back as a response");
+
+        // Stopped at the redirect rather than followed, and the 3xx is still diagnosable.
+        assert_eq!(got.status().as_u16(), 307);
+
+        // `WouldBlock` specifically: any other error would mean the listener itself failed,
+        // which is not evidence that nothing ever connected to it.
+        let contacted = elsewhere.accept();
+        let refused_kind = contacted.as_ref().err().map(std::io::Error::kind);
+        assert_eq!(
+            refused_kind,
+            Some(std::io::ErrorKind::WouldBlock),
+            "the off-origin listener must never be contacted"
+        );
+
+        server.join().expect("server thread should not panic");
+    }
+
+    /// The policy must not break a legitimate same-origin redirect.
+    #[tokio::test]
+    async fn test_same_origin_redirect_is_followed() {
+        let listener = localhost_listener();
+        let port = local_port(&listener);
+        let url = format!("http://127.0.0.1:{port}/auth/token/exchange");
+
+        let redirect = format!(
+            "HTTP/1.1 307 Temporary Redirect\r\n\
+             Location: http://127.0.0.1:{port}/auth/token/exchange/retry\r\n\
+             Content-Length: 0\r\n\
+             Connection: close\r\n\r\n"
+        );
+        let ok = "HTTP/1.1 200 OK\r\n\
+                  Content-Type: application/json\r\n\
+                  Content-Length: 11\r\n\
+                  Connection: close\r\n\r\n\
+                  {\"ok\":true}";
+        let server = std::thread::spawn(move || {
+            serve_once(&listener, &redirect);
+            serve_once(&listener, ok);
+        });
+
+        let client = credentialed_client().expect("client should build");
+        let request = client
+            .post(&url)
+            .json(&serde_json::json!({ "code": "SECRET12" }))
+            .send();
+        let got = tokio::time::timeout(TEST_REQUEST_TIMEOUT, request)
+            .await
+            .expect("the same-origin redirect chain must not hang")
+            .expect("a same-origin redirect should be followed");
+
+        assert_eq!(got.status().as_u16(), 200);
+
+        server.join().expect("server thread should not panic");
+    }
 }
