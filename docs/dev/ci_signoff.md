@@ -101,6 +101,22 @@ first CI run — or the rerun call fails, it falls back to prompting you to
 open/refresh the PR yourself.) That, together with a review, lets a
 maintainer add the PR to the merge queue.
 
+The refresh only fires while the commit it signed off is **still the head of an open
+PR**. If you pushed while a long sign-off was running, it says so, names the heads
+of every open PR that contains the commit, and refreshes nothing:
+
+```
+  1111111111aa is not the head of any open PR that contains it (PR heads: 2222222222bb) — not refreshing 'Attestation'.
+```
+
+That is deliberate. `pr.yml`'s concurrency group resolves its SHA term to the
+literal `any-sha` on a `pull_request` event, so every attempt for a PR shares one
+group — re-running the old commit's run would cancel the current head's in-flight
+one, and a re-run evaluates its *original* event payload, so the verdict it
+published would be for the superseded commit. The stale sign-off had nothing to
+propagate anyway (its status is on a commit no longer under review), so skipping
+loses nothing. Sign off again on the new head.
+
 The sign-off is normally bound to the **exact commit** you pushed. If you push a
 code change, the old sign-off no longer applies and you must run `make signoff`
 again. The only exception is merging the PR's base branch. **Attestation** walks
@@ -313,6 +329,34 @@ checks the PR's head commit first, then walks backward through clean, unmodified
 base merges on the first-parent chain. Make sure the commit under review is
 pushed, then run `make signoff` again. Any new code or manual merge resolution
 needs a fresh sign-off.
+
+### "Runner out of disk — checks did not complete"
+
+The sign-off runner's work volume filled up, so the run stopped before finishing
+its judgement of your branch. **Re-dispatch it.** If it recurs on the same
+runner, that machine needs space reclaimed — `target/` is shared across every
+branch that pool signs off, so it grows without bound. If instead it follows
+*your branch* from runner to runner, suspect the diff: a new build script,
+a dependency bump, or a feature expansion can consume the volume by itself.
+
+Sign-off refuses to start when the volume has less than 25 GiB free, and a run
+whose build reports running out of disk is reported as an infrastructure failure
+rather than a check failure. Without that, the failure is nearly impossible to
+read correctly: the linker dies with `errno=28` thousands of lines after nextest
+has already reported every test passing, on a crate the branch never touched,
+with no `-->` source pointer anywhere in the log.
+
+A remote run watches its own build output for that error, and a watched run's
+verdict is final **in both directions**. It has to be: by the time anything
+measures free space again, cargo has unlinked the partial binaries it was
+writing and the volume can look healthy — and conversely, on a shared pool
+another run can drag the volume under any threshold while your branch is failing
+for its own reasons. Measured free space is consulted only when nothing watched,
+which is how a local run gets a classification at all. The marker is truncated
+per build step, so only the step that actually failed speaks.
+
+Set `SIGNOFF_MIN_FREE_GIB` to change the floor. Locally the check only warns and
+the output is not watched — your own disk is yours to manage.
 
 ### External contributors (forks)
 
