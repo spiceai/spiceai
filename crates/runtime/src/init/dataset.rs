@@ -1315,6 +1315,14 @@ impl Runtime {
     ) -> Result<Arc<dyn DataConnector>> {
         let source = ds.source();
 
+        // Resolve the connector before building parameters. The builder resolves it too — it
+        // reads the factory's prefix and parameter list — and fails with
+        // `InvalidConnectorType`, which names no alternative, so it used to answer every
+        // typo'd `from:` before `UnknownDataConnector` could. See #12415.
+        if dataconnector::get_connector_factory(source).await.is_none() {
+            return Err(unknown_data_connector(source).await);
+        }
+
         let params = ConnectorParamsBuilder::for_dataset(source.into(), &ds)
             .build(self.secrets(), self.tokio_io_runtime())
             .await
@@ -1329,18 +1337,9 @@ impl Runtime {
             if let Some(dc) = dataconnector::create_new_connector(source, params).await {
                 dc.context(UnableToInitializeDataConnectorSnafu {})?
             } else {
-                if source == ODBC_DATACONNECTOR {
-                    return Err(OdbcNotInstalledSnafu.build());
-                }
-
-                let suggestion = dataconnector::suggest_connector(source).await;
-                let available = dataconnector::registered_connector_names().await;
-                return Err(UnknownDataConnectorSnafu {
-                    data_connector: source,
-                    suggestion,
-                    available,
-                }
-                .build());
+                // Only reachable if the connector is deregistered between the check above and
+                // this lookup; report the same error rather than a second, blunter one.
+                return Err(unknown_data_connector(source).await);
             };
 
         if ds.has_embeddings() {
@@ -1833,6 +1832,25 @@ fn validate_dataset(ds: &Arc<Dataset>) -> Result<()> {
     Ok(())
 }
 
+/// The error for a `from:` naming a connector this build does not register: the closest
+/// registered name plus the full list, so the message names a fix.
+///
+/// ODBC is the exception. It is a real connector that this build may simply not have been
+/// compiled with, so it gets the build-with-`odbc` instruction instead of a "did you mean"
+/// over the connectors that happen to be present.
+async fn unknown_data_connector(source: &str) -> Error {
+    if source == ODBC_DATACONNECTOR {
+        return OdbcNotInstalledSnafu.build();
+    }
+
+    UnknownDataConnectorSnafu {
+        data_connector: source,
+        suggestion: dataconnector::suggest_connector(source).await,
+        available: dataconnector::registered_connector_names().await,
+    }
+    .build()
+}
+
 /// Updates the `fetched_at` column for all records in a cached dataset that was bootstrapped.
 /// This is necessary for caching mode to ensure all bootstrapped records have a valid timestamp.
 async fn update_cached_dataset_timestamps(dataset: &Dataset) {
@@ -2021,6 +2039,50 @@ mod tests {
             err.to_string()
                 .contains("acceleration is required for full text search"),
             "unexpected error: {err}"
+        );
+    }
+
+    /// The #12415 regression: `ConnectorParamsBuilder::build` resolves the factory first and
+    /// fails with `InvalidConnectorType`, which names no alternative, so the
+    /// suggestion-bearing `UnknownDataConnector` written for this case was unreachable.
+    #[tokio::test]
+    async fn a_misspelled_dataset_connector_suggests_the_closest_connector() {
+        register_connector_factory("schema_only", Arc::new(SchemaOnlyConnectorFactory)).await;
+
+        let app = Arc::new(app::AppBuilder::new("connector_typo").build());
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        let spec = spicepod::component::dataset::Dataset::new("schema_onl:any", "typo_dataset");
+        let dataset = DatasetBuilder::try_from(spec)
+            .expect("valid dataset builder")
+            .with_app(app)
+            .with_runtime(Arc::clone(&runtime))
+            .build()
+            .expect("valid runtime dataset");
+
+        let err = runtime
+            .get_dataconnector_from_dataset(Arc::new(dataset))
+            .await
+            .expect_err("a `from:` naming an unregistered connector must fail");
+
+        assert!(
+            matches!(err, Error::UnknownDataConnector { .. }),
+            "expected UnknownDataConnector, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("Did you mean 'schema_only'?"),
+            "the error should name the closest registered connector: {err}"
+        );
+    }
+
+    /// ODBC is the one unregistered name that is not a typo: it is a real connector this build
+    /// may simply lack, so it gets the build instruction instead of a lookalike suggestion.
+    #[tokio::test]
+    async fn an_unregistered_odbc_connector_reports_the_missing_build() {
+        let err = unknown_data_connector(ODBC_DATACONNECTOR).await;
+
+        assert!(
+            matches!(err, Error::OdbcNotInstalled),
+            "expected OdbcNotInstalled, got: {err}"
         );
     }
 
