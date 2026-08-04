@@ -25,6 +25,7 @@
 #   scripts/signoff --no-verify     Sign off without running the checks (honor system)
 #   scripts/signoff status          Show the sign-off status of HEAD
 #   scripts/signoff mine            Show attestation status for all your open PRs
+#   scripts/signoff clear-pending   Turn a left-behind pending status into a failure
 #   scripts/signoff check           Show whether trunk requires sign-off
 #   scripts/signoff install         Configure the trunk ruleset (maintainers)
 #   scripts/signoff install --yes   Apply the ruleset change (default is a dry-run)
@@ -53,7 +54,7 @@
 
 set -euo pipefail
 
-readonly VERSION="1.4.0"
+readonly VERSION="1.5.0"
 # Fixed, not configurable: it must match the hardcoded context the Attestation
 # workflow (pr.yml) looks for, so an env override would silently break the gate.
 readonly STATUS_CONTEXT="signoff"
@@ -608,6 +609,50 @@ post_commit_status() {
     -f "description=${description}" >/dev/null
 }
 
+# The STATUS_CONTEXT state currently on a commit: success/pending/failure/error,
+# or "none" when it has none. Asks gh's own jq rather than the jq binary — the
+# remote sign-off path is otherwise free of that dependency (see require_jq).
+signoff_state() {
+  local repo="$1" sha="$2"
+  gh api "repos/${repo}/commits/${sha}/status" \
+    --jq ".statuses // [] | map(select(.context == \"${STATUS_CONTEXT}\")) | .[0].state // \"none\""
+}
+
+# Post the in-progress status for a remote run — unless the commit is already
+# signed off. A re-dispatch against an attested commit is routine
+# (`cancel-in-progress` makes it the normal way to recover from an evicted run),
+# and posting `pending` over the success discards an attestation a multi-hour run
+# earned — leaving the commit worse off than before if this run never reaches a
+# verdict of its own. Suppressing the post costs no
+# progress reporting: `mine` takes its ⟳ from the in-flight run list, not from
+# this status. A `failure` from the checks still overwrites, because that one is
+# this run's own verdict; a stale `failure` or `error` is likewise overwritten,
+# because a run that is retrying it has nothing to preserve.
+#
+# Read-then-write with no compare-and-set, same as cmd_clear_pending: a success
+# posted by another run on this SHA in the gap between the two calls is still
+# overwritten. Nothing closes that gap, so it stays narrow — one API round trip —
+# rather than the whole length of a run, which is what it was before.
+post_pending_status() {
+  local repo="$1" sha="$2" user="$3"
+  # Declared before it is assigned on purpose: `local state=$(…)` reports
+  # `local`'s own exit status, so the read's failure would go unnoticed.
+  local state
+
+  if ! state=$(signoff_state "$repo" "$sha"); then
+    info "warning: could not read the current sign-off status — not posting pending"
+    return 0
+  fi
+  if [[ "$state" == "success" ]]; then
+    info "${sha:0:12} is already signed off — leaving that status in place while this run re-verifies it"
+    return 0
+  fi
+
+  post_commit_status "$repo" "$sha" pending \
+    "Remote sign-off in progress (triggered by ${user})…" \
+    || info "warning: could not post pending sign-off status"
+}
+
 # --- commands ----------------------------------------------------------------
 
 # Paths that can change what cargo/clippy/fmt/nextest do — Rust sources, the
@@ -770,17 +815,24 @@ run_checks() {
   SIGNOFF_CHECK_SUMMARY="lint+test passed"
 }
 
-# After a successful sign-off, the PR's `Attestation` job (pr.yml) only
-# re-evaluates the `signoff` commit status when its workflow run executes. If
-# that run already completed — e.g. sign-off happened after the PR's checks
-# ran — `Attestation` is stuck showing a stale failure until something
-# re-triggers it. Re-run that job instead of making the developer open or
-# refresh the PR by hand. `gh` is already required by require_tools() before
-# cmd_signoff can reach this point, but the check stays here so this function
-# remains correct if it's ever called on its own.
+# The PR's `Attestation` job (pr.yml) only re-reads the `signoff` commit status
+# when its workflow run executes: pr.yml triggers on `pull_request`,
+# `merge_group` and `workflow_dispatch`, never on a status change. So a run that
+# already completed keeps whatever verdict it reached, however the status has
+# moved since. Re-run that job instead of making the developer open or refresh
+# the PR by hand. `gh` is already required by require_tools() before cmd_signoff
+# can reach this point, but the check stays here so this function remains
+# correct if it's ever called on its own.
+#
+# A run that concluded `success` needs no refresh when this sign-off also
+# succeeded — but it needs one precisely when the sign-off failed, or the gate
+# keeps reporting an attestation this run just overturned. Pass a non-empty
+# third argument to force the re-run past that short-circuit.
 refresh_attestation_check() {
-  local sha="$1" repo="$2"
-  local fallback="Open/refresh the PR and it will pick up the sign-off."
+  local sha="$1" repo="$2" force="${3:-}"
+  # pr.yml runs on `pull_request`/`merge_group`/`workflow_dispatch`, so viewing
+  # the PR page does not start one — say what actually re-reads the status.
+  local fallback="Re-run the PR's 'Attestation' check from the Checks tab once it has reported — reloading the PR page does not re-read the sign-off status."
   local run run_id run_status run_conclusion
 
   if ! command -v gh >/dev/null 2>&1; then
@@ -803,10 +855,21 @@ refresh_attestation_check() {
     return 0
   fi
   if [[ "$run_status" != "completed" ]]; then
-    info "  The 'Attestation' check (run ${run_id}) is still ${run_status} — it will evaluate the sign-off once it finishes."
+    # A run that is still going may already have read the status — the read is
+    # the first thing its job does, and validating an inherited sign-off keeps
+    # it busy long after. So "it will evaluate the sign-off once it finishes"
+    # holds only when the status it is about to report is the one we want; on
+    # the failure path an in-flight run can still land green on what it read
+    # before this verdict existed, and there is nothing to re-run yet.
+    if [[ -n "$force" ]]; then
+      info "  The 'Attestation' check (run ${run_id}) is still ${run_status} and may have read the previous sign-off already."
+      info "  Re-run it once it finishes if it lands green — this sign-off failed."
+    else
+      info "  The 'Attestation' check (run ${run_id}) is still ${run_status} — it will evaluate the sign-off once it finishes."
+    fi
     return 0
   fi
-  if [[ "$run_conclusion" == "success" ]]; then
+  if [[ "$run_conclusion" == "success" && -z "$force" ]]; then
     debug "run ${run_id} already succeeded — nothing to refresh"
     return 0
   fi
@@ -814,11 +877,38 @@ refresh_attestation_check() {
   # Not `--failed`: that only reruns jobs with conclusion=failure and no-ops
   # on cancelled/skipped runs. Rerunning the whole run is fine here — on a
   # `pull_request` event, pr.yml executes nothing but the Attestation job.
+  local outcome="it will turn green shortly"
+  [[ -z "$force" ]] || outcome="it will pick up the failed sign-off"
   if gh run rerun "$run_id" --repo "$repo" >/dev/null 2>&1; then
-    echo "  Re-ran the 'Attestation' check (run ${run_id}) — it will turn green shortly."
+    echo "  Re-ran the 'Attestation' check (run ${run_id}) — ${outcome}."
   else
     info "  Could not auto-refresh the 'Attestation' check — ${fallback}"
   fi
+}
+
+# Post this run's failing verdict, then make the gate reflect it.
+#
+# The raw `signoff` status is not itself a required check — `Attestation` is,
+# and it only re-reads the status when its pr.yml run executes. A commit that
+# was already attested therefore keeps a green `Attestation` after a later run
+# overturns it, and the branch can still enter the merge queue on an attestation
+# this run contradicted. The merge queue re-runs the full suite, so that cannot
+# put broken code on trunk; it spends a queue slot learning what the sign-off
+# already knew. Hence the forced refresh — the inverse of the success path,
+# which is right to skip a run that already passed.
+#
+# When the post itself fails the commit still carries whatever it had before, so
+# there is nothing new for a re-run to read: warn and leave the check alone. The
+# caller aborts either way, with the more useful message.
+post_failure_status() {
+  local repo="$1" sha="$2" user="$3" elapsed="$4"
+
+  if ! post_commit_status "$repo" "$sha" failure \
+    "Sign-off checks failed after ${elapsed}s (triggered by ${user})"; then
+    info "warning: could not post the failed sign-off status — the 'Attestation' check still reflects the previous sign-off"
+    return 0
+  fi
+  refresh_attestation_check "$sha" "$repo" force
 }
 
 cmd_signoff() {
@@ -862,9 +952,7 @@ cmd_signoff() {
     SIGNOFF_CHECK_SUMMARY="lint+test passed"
     start=$(date +%s)
     if is_remote_run; then
-      post_commit_status "$repo" "$sha" pending \
-        "Remote sign-off in progress (triggered by ${user})…" \
-        || info "warning: could not post pending sign-off status"
+      post_pending_status "$repo" "$sha" "$user"
     fi
     # Capture status without wrapping in `if`/`||` (those also disable set -e
     # for the LHS). run_checks uses explicit `|| return` so make failures still
@@ -876,9 +964,7 @@ cmd_signoff() {
     if [[ "$check_status" -ne 0 ]]; then
       elapsed=$(( $(date +%s) - start ))
       if is_remote_run; then
-        post_commit_status "$repo" "$sha" failure \
-          "Sign-off checks failed after ${elapsed}s (triggered by ${user})" \
-          || true
+        post_failure_status "$repo" "$sha" "$user" "$elapsed"
         append_step_summary "### Sign-off"$'\n'"**Failed** after ${elapsed}s."$'\n'
       fi
       fail "sign-off checks failed"
@@ -1001,6 +1087,44 @@ cmd_correct_cancelled() {
       ;;
   esac
   return 0
+}
+
+# Replace a `pending` sign-off status with a failure.
+#
+# A remote run posts `pending` before it starts the checks, so a run that never
+# reaches a verdict — the job is terminated at its budget, the runner goes away —
+# leaves that `pending` on the commit for good. `status` and `mine` then render
+# the branch as a sign-off still in progress, which is the one thing it is not.
+#
+# Only `pending` is replaced. A run that finished has already posted its own
+# success or failure, and overwriting that would discard the real verdict; the
+# same guard makes this safe to run unconditionally at the end of a job.
+#
+# Read-then-write, and commit statuses have no compare-and-set, so a verdict
+# posted in the gap between the two calls is overwritten. Nothing closes that
+# gap — an ownership token in the status would still be read before the write —
+# so keep it narrow instead: this is one API round trip, and the caller runs it
+# once, at the end of a run that has already stopped working.
+cmd_clear_pending() {
+  local reason="${1:-Sign-off run ended before the checks completed — sign off again}"
+  require_tools
+
+  local revision sha repo state
+  revision=$(current_revision true)
+  sha=$(revision_sha "$revision") || fail "could not resolve ${revision}"
+  repo=$(repo_slug)
+  state=$(signoff_state "$repo" "$sha") \
+    || fail "failed to read commit status for ${sha} on ${repo} (auth/rate-limit/network?)"
+
+  if [[ "$state" != "pending" ]]; then
+    info "${STATUS_CONTEXT} on ${sha:0:12} is '${state}' — leaving it alone"
+    return 0
+  fi
+
+  post_commit_status "$repo" "$sha" failure "$reason" \
+    || fail "failed to post the sign-off status (do you have write access to ${repo}?)"
+  append_step_summary "### Sign-off"$'\n'"**Incomplete** on \`${sha:0:12}\` — ${reason}"$'\n'
+  echo "${NO} ${sha:0:12} — ${reason}"
 }
 
 # Truncate to at most `n` display columns, adding an ellipsis when cut.
@@ -1284,6 +1408,9 @@ Developers:
   scripts/signoff --no-verify  Sign off without running checks (honor system)
   scripts/signoff status       Show the sign-off status of HEAD
   scripts/signoff mine         Show attestation status for all your open PRs
+  scripts/signoff clear-pending [reason]
+                               Replace a left-behind '${STATUS_CONTEXT}' pending status
+                               on HEAD with a failure (no-op for any other state)
 
 CI (.github/workflows/signoff.yml):
   scripts/signoff correct-cancelled [<sha>] [<owner/repo>]
@@ -1335,6 +1462,7 @@ main() {
     status)   shift; cmd_status "$@" ;;
     mine)     shift; cmd_mine "$@" ;;
     correct-cancelled) shift; cmd_correct_cancelled "$@" ;;
+    clear-pending) shift; cmd_clear_pending "$@" ;;
     check)    shift; cmd_check "$@" ;;
     install)  shift; cmd_install "$@" ;;
     version|--version) echo "signoff ${VERSION}" ;;
