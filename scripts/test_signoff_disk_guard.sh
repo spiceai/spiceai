@@ -166,24 +166,33 @@ assert_preflight "proceeds when free space is unknown" 0 "" \
   SIGNOFF_REMOTE_RUN=1 STUB_DF_RC=1
 
 echo "run_make_step + build_hit_disk_full"
-# The recorder has to notice the linker's death without swallowing make's own
+# The watcher has to notice the linker's death without swallowing make's own
 # exit status, and without eating the output the Actions log shows the reader.
+#
+# The verdict is read back out of `SIGNOFF_DISK_HIT` in the same shell that ran
+# the step, which is exactly how failure_kind reads it in production. It has to
+# be: a file could not be written at true ENOSPC, which is the whole point of
+# #12427, so there is nothing on disk for a later shell to inspect.
 assert_recorder() {
   local name="$1" make_body="$2" want_rc="$3" want_marked="$4" want_passthrough="${5:-}"
   tests_run=$((tests_run + 1))
 
-  local marker="$stub_dir/marker" fake_make="$stub_dir/make"
-  : >"$marker"
+  local fake_make="$stub_dir/make"
   printf '#!/usr/bin/env bash\n%s\n' "$make_body" >"$fake_make"
   chmod +x "$fake_make"
 
   local output rc
-  output="$(env "PATH=$stub_dir:$PATH" SIGNOFF_DISK_MARKER="$marker" \
-    bash -c 'source "$1"; run_make_step some-target' _ "$subject" 2>&1)"
+  # `if run_make_step` rather than a bare call: sourcing the subject turns on
+  # `set -e`, which would abort before the verdict could be reported.
+  output="$(env "PATH=$stub_dir:$PATH" SIGNOFF_DISK_WATCH=1 \
+    bash -c 'source "$1"
+      if run_make_step some-target; then step_rc=0; else step_rc=$?; fi
+      echo "VERDICT=${SIGNOFF_DISK_HIT:+yes}"
+      exit "$step_rc"' _ "$subject" 2>&1)"
   rc=$?
 
   if [[ "$rc" -ne "$want_rc" ]]; then
-    fail_test "$name: expected make's status ${want_rc} to survive the recorder, got ${rc}"
+    fail_test "$name: expected make's status ${want_rc} to survive the watcher, got ${rc}"
     rm -f "$fake_make"
     return
   fi
@@ -194,9 +203,14 @@ assert_recorder() {
   fi
 
   local marked="no"
-  [[ -s "$marker" ]] && marked="yes"
+  [[ "$output" == *"VERDICT=yes"* ]] && marked="yes"
+  if [[ "$output" != *"VERDICT="* ]]; then
+    fail_test "$name: the step never reported a verdict — output: '${output}'"
+    rm -f "$fake_make"
+    return
+  fi
   if [[ "$marked" != "$want_marked" ]]; then
-    fail_test "$name: expected marked=${want_marked}, got ${marked} (marker: '$(cat "$marker")')"
+    fail_test "$name: expected marked=${want_marked}, got ${marked} (output: '${output}')"
     rm -f "$fake_make"
     return
   fi
@@ -226,20 +240,73 @@ assert_recorder "reports make's failure, not the recorder's success" \
   42 no "some output"
 
 # Stickiness: a step that merely mentions running out of disk and then succeeds
-# must not leave the marker blaming the volume for a later, genuine failure.
+# must not leave the verdict blaming the volume for a later, genuine failure.
 tests_run=$((tests_run + 1))
-sticky_marker="$stub_dir/marker-sticky"
-printf 'ld: write() failed, errno=28 (No space left on device)\n' >"$sticky_marker"
 printf '#!/usr/bin/env bash\necho "error[E0308]: mismatched types"; exit 101\n' >"$stub_dir/make"
 chmod +x "$stub_dir/make"
-env "PATH=$stub_dir:$PATH" SIGNOFF_DISK_MARKER="$sticky_marker" \
-  bash -c 'source "$1"; run_make_step some-target' _ "$subject" >/dev/null 2>&1
-if [[ -s "$sticky_marker" ]]; then
-  fail_test "each step truncates the marker: a previous step's ENOSPC still marks a later compile failure ('$(cat "$sticky_marker")')"
+sticky_output="$(env "PATH=$stub_dir:$PATH" SIGNOFF_DISK_WATCH=1 SIGNOFF_DISK_HIT=1 \
+  bash -c 'source "$1"
+    if run_make_step some-target; then :; fi
+    echo "VERDICT=${SIGNOFF_DISK_HIT:+yes}"' _ "$subject" 2>&1)"
+if [[ "$sticky_output" == *"VERDICT=yes"* ]]; then
+  fail_test "each step resets the verdict: a previous step's ENOSPC still marks a later compile failure"
 else
-  echo "  ok: each step truncates the marker, so only the failing step speaks"
+  echo "  ok: each step resets the verdict, so only the failing step speaks"
 fi
 rm -f "$stub_dir/make"
+
+echo "run_make_step when the watcher itself fails"
+# A watcher that exits for its own reasons — no awk on the runner, a syntax error
+# in its program, a signal — has not reported "no out-of-disk line went past". It
+# has reported nothing. Leaving the watch armed on that would let failure_kind
+# assert "not disk" on the authority of a reading nobody took, mislabelling a
+# genuine ENOSPC death as the branch's fault: #12427 in the other direction.
+#
+# The stub fails *only* the watcher invocation and delegates everything else to
+# the real awk, so this isolates a dead watcher from a host with no awk at all —
+# and lets the same shell go on to check that the free-space backstop takes over.
+tests_run=$((tests_run + 1))
+broken_dir="$stub_dir/broken-watcher"
+mkdir -p "$broken_dir"
+real_awk="$(command -v awk)"
+cat >"$broken_dir/awk" <<STUB
+#!/usr/bin/env bash
+set -uo pipefail
+# The watcher is the only awk call carrying \`-v pat=…\`; free_disk_gib's df
+# parsing has no such argument and must keep working.
+for arg in "\$@"; do
+  # Exit 2, awk's own error status — deliberately not the hit status 3.
+  [[ "\$arg" == pat=* ]] && exit 2
+done
+exec "${real_awk}" "\$@"
+STUB
+chmod +x "$broken_dir/awk"
+printf '#!/usr/bin/env bash\necho "ld: write() failed, errno=28"; exit 101\n' >"$broken_dir/make"
+chmod +x "$broken_dir/make"
+
+broken_output="$(env "PATH=$broken_dir:$stub_dir:$PATH" SIGNOFF_DISK_WATCH=1 \
+  STUB_FREE_KB="$(gib_to_kb 1)" \
+  bash -c 'source "$1"
+    if run_make_step some-target; then step_rc=0; else step_rc=$?; fi
+    echo "RC=${step_rc}"
+    echo "VERDICT=${SIGNOFF_DISK_HIT:+yes}"
+    echo "ARMED=${SIGNOFF_DISK_WATCH:+yes}"
+    echo "KIND=$(failure_kind "$step_rc")"' _ "$subject" 2>&1)"
+
+if [[ "$broken_output" != *"RC=101"* ]]; then
+  fail_test "a dead watcher still reports make's own status: expected RC=101, got '${broken_output}'"
+elif [[ "$broken_output" == *"VERDICT=yes"* ]]; then
+  fail_test "a dead watcher must not be read as an out-of-disk hit: '${broken_output}'"
+elif [[ "$broken_output" == *"ARMED=yes"* ]]; then
+  fail_test "a dead watcher must disarm the watch, not leave it asserting 'not disk': '${broken_output}'"
+elif [[ "$broken_output" != *"watcher exited 2"* ]]; then
+  fail_test "a dead watcher is reported, not silent: expected 'watcher exited 2', got '${broken_output}'"
+elif [[ "$broken_output" != *"KIND=disk"* ]]; then
+  fail_test "with the watch disarmed, a near-empty volume must classify as disk: '${broken_output}'"
+else
+  echo "  ok: a watcher that died disarms the watch and lets free space classify"
+fi
+rm -rf "$broken_dir"
 
 echo "failure_kind"
 # The regression: run 30831204417 passed 8809 tests, then died at the linker
@@ -251,27 +318,24 @@ assert_failure_kind "calls a failure on a near-empty volume a disk failure" 101 
 # The authoritative signal, and the one that matters most: the volume can look
 # healthy again by the time we measure it, because cargo unlinks the partial
 # binaries it was writing on its way out. What the build *said* still stands.
-marker_with_disk_error="$stub_dir/marker-disk"
-echo "ld: write() failed, errno=28 (No space left on device)" >"$marker_with_disk_error"
 assert_failure_kind "trusts what the build said over free space measured after it" 101 "disk" \
-  SIGNOFF_DISK_MARKER="$marker_with_disk_error" STUB_FREE_KB="$(gib_to_kb 200)"
-marker_empty="$stub_dir/marker-empty"
-: >"$marker_empty"
-assert_failure_kind "an empty marker does not itself imply a disk failure" 101 "checks" \
-  SIGNOFF_DISK_MARKER="$marker_empty" STUB_FREE_KB="$(gib_to_kb 200)"
+  SIGNOFF_DISK_WATCH=1 SIGNOFF_DISK_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_failure_kind "a watch that saw no ENOSPC does not itself imply a disk failure" 101 "checks" \
+  SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
 # A watched run's verdict is final in BOTH directions. On a shared pool another
 # run can drag the volume under any threshold while this branch fails for its
 # own reasons; calling that "infrastructure" tells the author to re-dispatch a
 # branch that will just fail again.
 assert_failure_kind "a watched build that did not hit ENOSPC stays a check failure on an empty volume" 101 "checks" \
-  SIGNOFF_DISK_MARKER="$marker_empty" STUB_FREE_KB="$(gib_to_kb 1)"
+  SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 1)"
 # ...and free space is still consulted when nothing watched, which is how a
 # local run gets any classification at all.
-assert_failure_kind "falls back to free space when no marker is armed" 101 "disk" \
+assert_failure_kind "falls back to free space when nothing watched the build" 101 "disk" \
   STUB_FREE_KB="$(gib_to_kb 1)"
-# A marker path that was never created is not an armed watch.
-assert_failure_kind "an uncreated marker path does not count as a watch" 101 "disk" \
-  SIGNOFF_DISK_MARKER="$stub_dir/marker-never-made" STUB_FREE_KB="$(gib_to_kb 1)"
+# A hit with no armed watch is not a watch: only a run that armed the watch can
+# have produced the flag, so an inherited one must not classify on its own.
+assert_failure_kind "a hit without an armed watch falls back to free space" 101 "checks" \
+  SIGNOFF_DISK_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
 assert_failure_kind "calls the preflight's own refusal a disk failure" 70 "disk" \
   STUB_FREE_KB="$(gib_to_kb 60)"
 # The other direction matters just as much: a real defect on a tight disk must
@@ -290,6 +354,45 @@ assert_preflight "reads a leading-zero floor as base 10, not octal" 0 "" \
   SIGNOFF_REMOTE_RUN=1 SIGNOFF_MIN_FREE_GIB=08 STUB_FREE_KB="$(gib_to_kb 9)"
 assert_preflight "still stops below a leading-zero floor" 70 "not evaluated" \
   SIGNOFF_REMOTE_RUN=1 SIGNOFF_MIN_FREE_GIB=08 STUB_FREE_KB="$(gib_to_kb 7)"
+
+echo
+echo "preflight-disk subcommand"
+# The workflow runs this as its own step, before the toolchain setup, so it has
+# to be reachable through the dispatcher and not just as an internal function —
+# and it has to carry the same verdict, since that step's exit status is the
+# only thing the job sees.
+assert_preflight_cmd() {
+  local name="$1" want_rc="$2" want_out="$3"
+  shift 3
+  tests_run=$((tests_run + 1))
+
+  local output rc
+  output="$(env "PATH=$stub_dir:$PATH" "$@" \
+    bash "$subject" preflight-disk 2>&1)"
+  rc=$?
+
+  if [[ "$rc" -ne "$want_rc" ]]; then
+    fail_test "$name: expected exit ${want_rc}, got ${rc} (output: '${output}')"
+  elif [[ -n "$want_out" && "$output" != *"$want_out"* ]]; then
+    fail_test "$name: expected '${want_out}' in the output, got '${output}'"
+  else
+    echo "  ok: $name"
+  fi
+}
+assert_preflight_cmd "proceeds when the volume has room" 0 "" \
+  SIGNOFF_REMOTE_RUN=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_preflight_cmd "stops a remote run below the floor" 70 "not evaluated" \
+  SIGNOFF_REMOTE_RUN=1 STUB_FREE_KB="$(gib_to_kb 5)"
+# The step summary is not visible on the run page when the step itself is what
+# failed, so the annotation is what an operator actually reads.
+assert_preflight_cmd "annotates the stop as a runner problem" 70 "::error title=Runner out of disk::" \
+  SIGNOFF_REMOTE_RUN=1 STUB_FREE_KB="$(gib_to_kb 5)"
+# Locally it must stay advisory: a developer's own disk is theirs to manage, and
+# this subcommand is reachable by hand.
+assert_preflight_cmd "only warns locally below the floor" 0 "warning" \
+  STUB_FREE_KB="$(gib_to_kb 5)"
+assert_preflight_cmd "proceeds when free space is unknown" 0 "" \
+  SIGNOFF_REMOTE_RUN=1 STUB_DF_RC=1
 
 echo
 if [[ "$failures" -gt 0 ]]; then
