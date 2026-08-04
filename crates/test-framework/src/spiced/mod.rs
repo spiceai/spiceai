@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use std::{
-    fmt::Display,
+    fmt::{Display, Write},
     path::PathBuf,
     process::{Child, Command},
     sync::Arc,
@@ -31,7 +31,7 @@ use sysinfo::Pid;
 use tempfile::TempDir;
 
 use crate::{
-    constants::{FLIGHT_URL, HEALTH_ENDPOINT, HTTP_BASE_URL, READY_ENDPOINT},
+    constants::{DATASETS_ENDPOINT, FLIGHT_URL, HEALTH_ENDPOINT, HTTP_BASE_URL, READY_ENDPOINT},
     process::Process,
     utils::wait_until_true,
 };
@@ -410,7 +410,14 @@ impl SpicedInstance {
         })
         .await
         {
-            anyhow::bail!("Spiced instance not ready within {timeout:?}");
+            // `/v1/ready` only says "not ready", so on its own this reads as "the
+            // runtime was slow". Name what was actually unready — usually a backing
+            // service the datasets could not reach — so the failure is diagnosable
+            // without opening the run's log. See #12473.
+            anyhow::bail!(
+                "Spiced instance not ready within {timeout:?}{}",
+                unready_datasets_summary(&client, &http_base).await
+            );
         }
 
         // Give Flight server a moment to finish starting up after HTTP is ready
@@ -476,6 +483,64 @@ impl SpicedInstance {
     }
 }
 
+/// Best-effort diagnostic appended to the readiness-timeout error: how many
+/// datasets are not `Ready`, and the first error among them.
+///
+/// The runtime stays up and serving `/v1/datasets` while its datasets fail, so
+/// this is usually available exactly when the timeout fires. It is purely
+/// advisory — any failure to fetch or parse returns an empty string, leaving the
+/// original message intact, because a broken diagnostic must not mask the
+/// timeout it is describing.
+async fn unready_datasets_summary(client: &reqwest::Client, http_base: &str) -> String {
+    let url = format!("{http_base}{DATASETS_ENDPOINT}?status=true");
+    let Ok(response) = client.get(&url).send().await else {
+        return String::new();
+    };
+    if !response.status().is_success() {
+        return String::new();
+    }
+    let Ok(datasets) = response.json::<Vec<serde_json::Value>>().await else {
+        return String::new();
+    };
+
+    format_unready_summary(&datasets)
+}
+
+/// Render the diagnostic for a `/v1/datasets?status=true` payload. Empty when
+/// there is nothing useful to add — no datasets, or all of them ready.
+fn format_unready_summary(datasets: &[serde_json::Value]) -> String {
+    let unready: Vec<&serde_json::Value> = datasets
+        .iter()
+        .filter(|d| d.get("status").and_then(serde_json::Value::as_str) != Some("Ready"))
+        .collect();
+    if unready.is_empty() {
+        return String::new();
+    }
+
+    let mut summary = format!(". {}/{} datasets not ready", unready.len(), datasets.len());
+
+    // The first dataset carrying a message explains the rest: these arms fail
+    // because one shared backing service is unreachable, so every dataset on it
+    // reports the same connector error.
+    let first_error = unready.iter().find_map(|d| {
+        let message = d
+            .get("error_message")
+            .and_then(serde_json::Value::as_str)
+            .filter(|m| !m.is_empty())?;
+        let name = d
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<unknown>");
+        Some((name, message))
+    });
+
+    if let Some((name, message)) = first_error {
+        let _ = write!(summary, "; first error on `{name}`: {message}");
+    }
+
+    summary
+}
+
 fn derive_http_base_url(flight_url: &str) -> String {
     if flight_url.contains("flight.spiceai.io") {
         return "https://data.spiceai.io".to_string();
@@ -519,6 +584,83 @@ impl Drop for SpicedInstance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The signature from #12473: the runtime came up, and 16 of 17 datasets
+    /// could not reach the backing service. The bail message has to carry that,
+    /// not just the timeout.
+    #[test]
+    fn unready_summary_names_the_connector_failure() {
+        let datasets = vec![
+            serde_json::json!({"name": "nation", "status": "Ready"}),
+            serde_json::json!({
+                "name": "customer",
+                "status": "Error",
+                "error_message": "Failed to connect to endpoint 'grpc://dremio-client:32010'"
+            }),
+            serde_json::json!({
+                "name": "lineitem",
+                "status": "Error",
+                "error_message": "Failed to connect to endpoint 'grpc://dremio-client:32010'"
+            }),
+        ];
+
+        let summary = format_unready_summary(&datasets);
+
+        assert!(
+            summary.contains("2/3 datasets not ready"),
+            "the count of unready datasets explains the timeout, got: {summary}"
+        );
+        assert!(
+            summary.contains("first error on `customer`"),
+            "the summary must name the first failing dataset, got: {summary}"
+        );
+        assert!(
+            summary.contains("grpc://dremio-client:32010"),
+            "the summary must carry the unreachable endpoint, got: {summary}"
+        );
+    }
+
+    /// A dataset still initializing is not ready either, and carries no message.
+    #[test]
+    fn unready_summary_counts_initializing_without_an_error() {
+        let datasets = vec![
+            serde_json::json!({"name": "nation", "status": "Ready"}),
+            serde_json::json!({"name": "orders", "status": "Initializing"}),
+        ];
+
+        let summary = format_unready_summary(&datasets);
+
+        assert_eq!(summary, ". 1/2 datasets not ready");
+    }
+
+    /// The diagnostic must add nothing when it has nothing to say, so the
+    /// timeout message it appends to is unchanged.
+    #[test]
+    fn unready_summary_is_empty_when_nothing_is_unready() {
+        assert_eq!(format_unready_summary(&[]), "");
+        assert_eq!(
+            format_unready_summary(&[serde_json::json!({"name": "nation", "status": "Ready"})]),
+            ""
+        );
+    }
+
+    /// An `Error` dataset whose message is absent or blank must not produce a
+    /// dangling "first error on ...:" fragment.
+    #[test]
+    fn unready_summary_skips_a_blank_error_message() {
+        let datasets = vec![
+            serde_json::json!({"name": "a", "status": "Error", "error_message": ""}),
+            serde_json::json!({"name": "b", "status": "Error", "error_message": null}),
+            serde_json::json!({"name": "c", "status": "Error", "error_message": "the real one"}),
+        ];
+
+        let summary = format_unready_summary(&datasets);
+
+        assert_eq!(
+            summary,
+            ". 3/3 datasets not ready; first error on `c`: the real one"
+        );
+    }
 
     #[test]
     fn external_derives_http_base_url_without_flight_port() {
