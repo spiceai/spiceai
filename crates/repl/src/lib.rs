@@ -1052,7 +1052,7 @@ fn display_records(
     Ok(pretty_batches)
 }
 
-/// Use the `POST v1/nsql` HTTP endpoint to send an NSQL query and display the resulting records.
+/// Use the `POST /v1/nsql` HTTP endpoint to send an NSQL query and display the resulting records.
 ///
 /// `api_key` is the session's key — the same one every Flight query authenticates with. See
 /// #12491.
@@ -1419,6 +1419,46 @@ mod tests {
         );
     }
 
+    /// How long a stub server waits to be contacted, and then to be spoken to, before giving up.
+    const STUB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Accept one connection, giving up after `STUB_TIMEOUT` rather than parking forever.
+    ///
+    /// Each stub below is joined only *after* the client call has returned, so a regression that
+    /// makes `get_and_display_nql_records` fail before it connects would leave a plain blocking
+    /// `accept()` waiting for a client that is never coming. The deadline turns that into a
+    /// prompt, named failure, and the matching read timeout does the same for a client that
+    /// connects but never finishes its request.
+    fn accept_one(listener: &std::net::TcpListener) -> std::net::TcpStream {
+        listener
+            .set_nonblocking(true)
+            .expect("set stub listener non-blocking");
+
+        let deadline = Instant::now() + STUB_TIMEOUT;
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    // Back to blocking reads, but bounded, so `read_http_request` cannot stall.
+                    stream
+                        .set_nonblocking(false)
+                        .expect("restore blocking stub stream");
+                    stream
+                        .set_read_timeout(Some(STUB_TIMEOUT))
+                        .expect("set stub read timeout");
+                    return stream;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "no client connected to the stub server within {STUB_TIMEOUT:?}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => panic!("accept on the stub server failed: {e}"),
+            }
+        }
+    }
+
     /// Serve exactly one HTTP request on an ephemeral port from a plain-std thread, answering
     /// with a one-row JSON array, and hand back the raw request text.
     ///
@@ -1432,7 +1472,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind capture listener");
         let addr = listener.local_addr().expect("capture listener addr");
         let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept nsql request");
+            let mut stream = accept_one(&listener);
             let request = read_http_request(&mut stream);
 
             // A real row, so the response parses through schema inference the way a runtime's
@@ -1455,13 +1495,18 @@ mod tests {
     /// Read one whole HTTP request — headers plus the body its `Content-Length` declares — and
     /// return it as text, so a stub answers only once the client has finished sending and the
     /// captured text is complete.
+    ///
+    /// Bounded by the read timeout `accept_one` installs: a client that connects and then goes
+    /// quiet fails here instead of stalling the thread.
     fn read_http_request(stream: &mut std::net::TcpStream) -> String {
         use std::io::Read as _;
 
         let mut buf = Vec::new();
         let mut chunk = [0_u8; 4096];
         loop {
-            let read = stream.read(&mut chunk).expect("read request");
+            let read = stream
+                .read(&mut chunk)
+                .expect("read request from the stub server's client within the read timeout");
             if read == 0 {
                 break;
             }
@@ -1539,7 +1584,7 @@ mod tests {
         let addr = listener.local_addr().expect("redirect listener addr");
         let location = location.to_string();
         let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept redirected request");
+            let mut stream = accept_one(&listener);
             // Drained but not inspected: the response below is what this stub is for.
             let _ = read_http_request(&mut stream);
             let response = format!(
