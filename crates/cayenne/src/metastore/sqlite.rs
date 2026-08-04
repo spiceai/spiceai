@@ -1572,10 +1572,15 @@ impl MetastoreBackend for SqliteMetastore {
         // and the main DB file only shrinks when a checkpoint copies them back,
         // so vacuuming after the checkpoint would defer the actual truncation by
         // a whole tick.
-        let max_pages = sqlite_metastore_config().incremental_vacuum_pages;
-        if max_pages == 0 {
+        let cfg = sqlite_metastore_config();
+        // Skip the dedicated-connection lock when reclamation is not configured.
+        // The DB's *actual* mode is still checked inside the pragma call below —
+        // config only takes effect on a fresh file, so a later flip to Incremental
+        // must not pretend an existing NONE/FULL database is reclaimable.
+        if cfg.auto_vacuum != SqliteAutoVacuum::Incremental || cfg.incremental_vacuum_pages == 0 {
             return Ok(0);
         }
+        let max_pages = cfg.incremental_vacuum_pages;
         let Some(pool) = self.pool.get() else {
             return Ok(0);
         };

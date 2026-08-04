@@ -1875,13 +1875,14 @@ pub mod cayenne {
     }
 
     static METASTORE_INCREMENTAL_VACUUM_MS: OnceLock<Histogram<f64>> = OnceLock::new();
-    static METASTORE_VACUUM_PAGES: OnceLock<Counter<u64>> = OnceLock::new();
+    static METASTORE_INCREMENTAL_VACUUM_PAGES: OnceLock<Counter<u64>> = OnceLock::new();
 
     /// Records one off-hot-path incremental-vacuum pass over the metastore
-    /// freelist: how long it held the write lock, and how many pages it returned
-    /// to the filesystem. Only emitted for a pass that reclaimed something, so
-    /// the histogram describes real reclamation rather than being diluted by the
-    /// no-op ticks of a database whose freelist is already drained.
+    /// freelist: wall-clock duration of the pass (caller-supplied), and how many
+    /// freelist pages it returned to the filesystem. Only emitted for a pass that
+    /// reclaimed something, so the histogram describes real reclamation rather
+    /// than being diluted by the no-op ticks of a database whose freelist is
+    /// already drained.
     pub fn track_metastore_incremental_vacuum(duration: Duration, pages: u64) {
         METASTORE_INCREMENTAL_VACUUM_MS
             .get_or_init(|| {
@@ -1895,11 +1896,13 @@ pub mod cayenne {
                     .build()
             })
             .record(duration.as_secs_f64() * 1000.0, &[]);
-        METASTORE_VACUUM_PAGES
+        METASTORE_INCREMENTAL_VACUUM_PAGES
             .get_or_init(|| {
                 operational_meter()
-                    .u64_counter("cayenne_metastore_vacuum_pages_total")
-                    .with_description("Freelist pages reclaimed from the Cayenne metastore file.")
+                    .u64_counter("cayenne_metastore_incremental_vacuum_pages_total")
+                    .with_description(
+                        "Freelist pages reclaimed by Cayenne metastore incremental vacuum.",
+                    )
                     .build()
             })
             .add(pages, &[]);
