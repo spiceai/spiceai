@@ -135,7 +135,7 @@ For Linux systems with NVIDIA GPUs, CUDA distributions enable GPU-accelerated AI
 - 89 (RTX 40xx, L40, L4)
 - 90 (H100, H200)
 
-**Docker (Nightly):**
+**Docker:**
 
 One image is published per compute capability. Pull the tag matching your GPU —
 `nvidia-smi --query-gpu=compute_cap --format=csv,noheader` reports it as `8.9`

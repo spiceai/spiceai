@@ -647,6 +647,10 @@ jobs:
     if: ${{ needs.setup.outputs.run_cuda == 'true' }}
     runs-on: ubuntu-24.04
     env:
+      # The capabilities `setup` resolved, so the publish step can check what it
+      # parsed out of an artifact filename against what this run actually built
+      # rather than trusting the filename's shape alone.
+      CUDA_COMPUTE_CAPS: ${{ needs.setup.outputs.cuda_compute_caps }}
       REL_VERSION: ${{ needs.setup.outputs.rel_version }}
       PUBLISH: ${{ needs.setup.outputs.publish }}
       SHOULD_TAG_LATEST: ${{ needs.setup.outputs.should_tag_latest }}
@@ -708,6 +712,15 @@ jobs:
             exit 0
           fi
 
+          # The capabilities this run built, as a word list. Every non-digit in
+          # the JSON array becomes a separator, so `["80","86"]` reads as `80 86`
+          # without needing jq on the runner.
+          read -r -a expected_caps <<< "${CUDA_COMPUTE_CAPS//[^0-9]/ }"
+          if [ ${#expected_caps[@]} -eq 0 ]; then
+            echo "No compute capabilities resolved, but artifacts are present." >&2
+            exit 1
+          fi
+
           # Each capability is published under its own tag suffix. The
           # unsuffixed `-cuda` tags are kept as an alias of
           # DEFAULT_CUDA_COMPUTE_CAP so existing pulls keep resolving to the
@@ -716,12 +729,25 @@ jobs:
             cap="${tarball##*/images-amd64-cuda-}"
             cap="${cap%.tar}"
 
-            # The capability comes from a filename rather than from the
-            # validated list, so re-check it here: it is about to become part of
-            # a published image tag, and any other tarball that happened to match
-            # the glob would otherwise be published under a nonsense one.
+            # The capability comes from a filename rather than from the resolved
+            # list, so re-check it here: it is about to become part of a
+            # published image tag. Shape first, for a clear message on a stray
+            # file, then membership — a well-formed but unexpected number like
+            # `120` would otherwise be published under a tag this run never
+            # built.
             if ! [[ "${cap}" =~ ^[0-9]+$ ]]; then
               echo "Refusing to publish ${tarball}: '${cap}' is not a compute capability" >&2
+              exit 1
+            fi
+            matched=false
+            for expected in "${expected_caps[@]}"; do
+              if [ "${cap}" = "${expected}" ]; then
+                matched=true
+              fi
+            done
+            if [ "${matched}" != "true" ]; then
+              echo "Refusing to publish ${tarball}: capability ${cap} is not one of" \
+                   "${expected_caps[*]}, which is what this run built" >&2
               exit 1
             fi
 

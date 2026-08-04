@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -67,6 +68,7 @@ def run_publish(
     rel_version: str = "9.9.9",
     default_cap: str = "80",
     extra_files: list[str] | None = None,
+    expected_caps: list[str] | None = None,
 ) -> tuple[int, list[str], str]:
     """Run the publish step over fake artifacts for `caps`.
 
@@ -107,6 +109,10 @@ def run_publish(
             "REL_VERSION": rel_version,
             "SHOULD_TAG_LATEST": should_tag_latest,
             "DEFAULT_CUDA_COMPUTE_CAP": default_cap,
+            # The setup job hands this to the publish job as a JSON array.
+            "CUDA_COMPUTE_CAPS": json.dumps(
+                expected_caps if expected_caps is not None else caps
+            ),
         }
         completed = subprocess.run(
             ["bash", "-c", script], env=env, capture_output=True, text=True
@@ -184,10 +190,24 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(calls, [])
 
     def test_a_stray_tarball_is_refused(self):
-        """The capability is parsed from a filename, so it is re-validated."""
+        """The capability is parsed from a filename, so its shape is re-validated."""
         code, _, stderr = run_publish(["80"], extra_files=["images-amd64-cuda-evil.tar"])
         self.assertEqual(code, 1)
         self.assertIn("is not a compute capability", stderr)
+
+    def test_a_capability_this_run_did_not_build_is_refused(self):
+        """A well-formed but unexpected number must not reach a published tag."""
+        code, _, stderr = run_publish(
+            ["80"], extra_files=["images-amd64-cuda-120.tar"], expected_caps=["80"]
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("capability 120 is not one of", stderr)
+
+    def test_an_empty_capability_list_with_artifacts_present_is_refused(self):
+        """Artifacts but no resolved capabilities means the two disagree."""
+        code, _, stderr = run_publish(["80"], expected_caps=[])
+        self.assertEqual(code, 1)
+        self.assertIn("No compute capabilities resolved", stderr)
 
     def test_each_capability_is_loaded_from_its_own_tarball(self):
         code, calls, stderr = run_publish(CAPS)
