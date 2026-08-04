@@ -893,11 +893,11 @@ mod tests {
                     loop {
                         line.clear();
                         match reader.read_line(&mut line) {
-                            // 0 bytes is EOF; a bare CRLF is the end of the head.
-                            Ok(0) => break,
+                            // 0 bytes is EOF, and an error means the peer went away.
+                            Ok(0) | Err(_) => break,
+                            // A bare CRLF ends the request head.
                             Ok(_) if line == "\r\n" || line == "\n" => break,
                             Ok(_) => {}
-                            Err(_) => break,
                         }
                     }
                 }
