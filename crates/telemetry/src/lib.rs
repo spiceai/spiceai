@@ -444,16 +444,22 @@ pub fn track_hash_index_lookup_rows(rows: u64, dimensions: &[KeyValue]) {
 /// Registers the CPU-sizing gauges, so a mis-sized deployment is greppable
 /// across a fleet rather than diagnosed pod-by-pod.
 ///
-/// Three quantities, deliberately separate: `spiced_cpu_budget_*` is the value
-/// the runtime *uses*, while `spiced_cpu_limit_millicores` and
-/// `spiced_cpu_request_millicores` are the cgroup *inputs* it was chosen
-/// against. Comparing them is what distinguishes a pod sized for its request
-/// from one sized for its whole node. `source` is `CpuSource::as_str` — the rung
-/// of the detection ladder the budget came from.
+/// `spiced_cpu_budget_*` is the value the runtime *uses*; the rest are the
+/// inputs it was chosen against. Comparing them is what distinguishes a pod
+/// sized for its request from one sized for its whole node. `source` is
+/// `CpuSource::as_str` — the rung of the detection ladder the budget came from.
 ///
-/// `limit` and `request` are `None` when the cgroup expresses no such value; the
-/// gauge then reports nothing rather than `0`, which would be indistinguishable
-/// from a real zero.
+/// The two request-shaped inputs are deliberately separate gauges, because they
+/// are different claims. `spiced_cpu_declared_request_millicores` is the pod's
+/// own `requests.cpu`, passed in by whatever wrote the pod spec, and is exact.
+/// `spiced_cpu_request_millicores` is *inferred* from the cgroup CPU share, and
+/// every cgroup has one whether or not a request was expressed — cgroup v2's
+/// default `cpu.weight: 100` inverts to ~2536m on bare metal — so it is not
+/// evidence that anything requested anything.
+///
+/// Each optional input is `None` when no such value exists; the gauge then
+/// reports nothing rather than `0`, which would be indistinguishable from a real
+/// zero.
 ///
 /// Like [`register_tokio_runtime_metrics`], the binary MUST call this once
 /// AFTER `init_metrics` has installed the Prometheus meter.
@@ -465,7 +471,8 @@ pub fn register_cpu_budget_metrics(
     millicores: u64,
     source: &'static str,
     limit_millicores: Option<u64>,
-    request_millicores: Option<u64>,
+    cpu_share_millicores: Option<u64>,
+    declared_request_millicores: Option<u64>,
 ) {
     let meter = global::meter("cpu_budget");
 
@@ -494,14 +501,25 @@ pub fn register_cpu_budget_metrics(
             .build();
     }
 
-    if let Some(request) = request_millicores {
+    if let Some(declared) = declared_request_millicores {
+        let _ = meter
+            .u64_observable_gauge("spiced_cpu_declared_request_millicores")
+            .with_description(
+                "The pod's own CPU request (Kubernetes requests.cpu), as declared by the surface that wrote the pod spec. Exact; reported only.",
+            )
+            .with_unit("{millicpu}")
+            .with_callback(move |obs| obs.observe(declared, &[]))
+            .build();
+    }
+
+    if let Some(share) = cpu_share_millicores {
         let _ = meter
             .u64_observable_gauge("spiced_cpu_request_millicores")
             .with_description(
-                "CPU request inferred from the cgroup CPU share (Kubernetes requests.cpu). Reported only; never used for sizing.",
+                "CPU request inferred from the cgroup CPU share. Present in every cgroup whether or not a request was expressed, so not evidence of one. Reported only; never used for sizing.",
             )
             .with_unit("{millicpu}")
-            .with_callback(move |obs| obs.observe(request, &[]))
+            .with_callback(move |obs| obs.observe(share, &[]))
             .build();
     }
 }

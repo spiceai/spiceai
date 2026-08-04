@@ -159,11 +159,18 @@ pub struct HostReadings {
     /// Millicores implied by a cgroup CPU quota (`limits.cpu`). `None` when no
     /// quota is set, which includes every burstable pod.
     pub quota_millicores: Option<u64>,
-    /// Millicores implied by the cgroup CPU share (`requests.cpu`). Reported
-    /// only — never an input to [`CpuBudget::resolve`]'s ladder, because a
-    /// request is a scheduling floor rather than a ceiling. `None` when no
-    /// request is expressed.
-    pub request_millicores: Option<u64>,
+    /// Millicores implied by the cgroup CPU share (`cpu.weight` / `cpu.shares`).
+    /// Reported only, and never an input to anything that sizes or warns: a
+    /// share is not a request outside Kubernetes, where the default
+    /// `cpu.weight: 100` inverts to ~2536m in *every* cgroup — including a plain
+    /// `systemd` service on bare metal. `None` when no share can be read.
+    pub cpu_share_millicores: Option<u64>,
+    /// The pod's own `requests.cpu`, in millicores, as declared by whatever
+    /// wrote the pod spec (`SPICE_CPU_REQUEST`). Unlike the share this is exact
+    /// and unquantized, and its presence is itself evidence that something which
+    /// could read a pod spec put it there. `None` when no request is declared,
+    /// which is every bare-metal and benchmark deployment.
+    pub declared_request_millicores: Option<u64>,
 }
 
 impl HostReadings {
@@ -178,9 +185,70 @@ impl HostReadings {
             affinity_cores: std::thread::available_parallelism()
                 .map_or(1, std::num::NonZeroUsize::get),
             quota_millicores: detect_quota_millicores(),
-            request_millicores: detect_request_millicores(),
+            cpu_share_millicores: detect_cpu_share_millicores(),
+            declared_request_millicores: detect_declared_request_millicores(),
         }
     }
+}
+
+/// The environment variable carrying the pod's own `requests.cpu`.
+///
+/// Written by whatever templates the pod spec — the Helm chart and the
+/// Kubernetes operator — from the downward API, never by hand:
+///
+/// ```yaml
+/// - name: SPICE_CPU_REQUEST
+///   valueFrom:
+///     resourceFieldRef:
+///       resource: requests.cpu
+///       divisor: 1m
+/// ```
+///
+/// The `divisor: 1m` is what makes the value millicores, and it is load-bearing:
+/// `requests.cpu: 4` arrives as `4000`, not `4`. A surface that omits the
+/// divisor sends `4`, which this reads as 4 millicores rather than 4 cores — so
+/// the two forms are told apart by [`parse_declared_request_millicores`] and a
+/// core-shaped value is rejected rather than silently under-sizing by 1000x.
+pub const CPU_REQUEST_ENV: &str = "SPICE_CPU_REQUEST";
+
+/// The declared `requests.cpu` from [`CPU_REQUEST_ENV`], in millicores.
+///
+/// A value that is set but unparseable warns and reads as absent, so a
+/// malformed variable falls through to the next reading rather than sizing
+/// anything from a number nobody can interpret.
+fn detect_declared_request_millicores() -> Option<u64> {
+    let raw = std::env::var(CPU_REQUEST_ENV).ok()?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    let parsed = parse_declared_request_millicores(&raw);
+    if parsed.is_none() {
+        tracing::warn!(
+            "Ignoring {CPU_REQUEST_ENV}: '{raw}' is not a whole number of millicores. Expected the pod's CPU request in millicores, as written by `resourceFieldRef` with `divisor: 1m` (a `requests.cpu` of 4 arrives as '4000'). CPU sizing will fall back to the cgroup CPU limit or the available CPU count. See: {DOCS_URL}"
+        );
+    }
+    parsed
+}
+
+/// Parse [`CPU_REQUEST_ENV`]: a whole number of millicores, with an optional
+/// `m` suffix.
+///
+/// Deliberately *not* [`parse_cpu_quantity`]. That grammar reads a bare number
+/// as cores, which is the opposite of what `divisor: 1m` produces, so sharing it
+/// would read a correctly-wired `requests.cpu: 4` (`4000`) as 4000 cores. Since
+/// the two grammars disagree on every bare integer, anything core-shaped — a
+/// decimal like `3.5`, or a sign — is rejected instead of guessed at: a
+/// deployment surface that dropped the divisor is a bug to surface, not a value
+/// to interpret 1000x too small.
+#[must_use]
+pub fn parse_declared_request_millicores(value: &str) -> Option<u64> {
+    let value = value.trim();
+    let digits = value.strip_suffix('m').unwrap_or(value).trim();
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let millicores: u64 = digits.parse().ok()?;
+    (millicores > 0).then_some(millicores)
 }
 
 /// The cgroup CPU quota, in millicores.
@@ -211,7 +279,7 @@ fn detect_quota_millicores() -> Option<u64> {
     })
 }
 
-/// The `requests.cpu` behind this process's cgroup CPU share, in millicores.
+/// The cgroup CPU share, in millicores.
 ///
 /// Reporting only. Sizing never consults it — see [`CpuBudget::resolve`].
 ///
@@ -219,7 +287,7 @@ fn detect_quota_millicores() -> Option<u64> {
 /// siblings at one level*, not a ceiling inherited down the tree, so the
 /// smallest value along the path would mean nothing; the container's own share
 /// is the one the kubelet derived from its `requests.cpu`.
-fn detect_request_millicores() -> Option<u64> {
+fn detect_cpu_share_millicores() -> Option<u64> {
     if let Some((mountpoint, cgroup_path)) = cgroup::v2_mount_and_path()
         && let Ok(contents) = std::fs::read_to_string(cgroup::cgroup_file_path(
             &mountpoint,
@@ -268,8 +336,12 @@ pub struct CpuBudget {
     detected_cores: usize,
     /// The cgroup CPU limit, reported alongside the budget it produced.
     limit_millicores: Option<u64>,
-    /// The cgroup CPU request. Reported, never an input to the ladder.
-    request_millicores: Option<u64>,
+    /// The cgroup CPU share. Reported only — see
+    /// [`HostReadings::cpu_share_millicores`] for why it never sizes or warns.
+    cpu_share_millicores: Option<u64>,
+    /// The pod's declared `requests.cpu`. Reported, and the only request the
+    /// warning below is allowed to compare against.
+    declared_request_millicores: Option<u64>,
 }
 
 impl CpuBudget {
@@ -342,7 +414,8 @@ impl CpuBudget {
             setting,
             detected_cores,
             limit_millicores: host.quota_millicores,
-            request_millicores: host.request_millicores,
+            cpu_share_millicores: host.cpu_share_millicores,
+            declared_request_millicores: host.declared_request_millicores,
         })
     }
 
@@ -468,20 +541,28 @@ impl CpuBudget {
     }
 
     /// The one-line startup summary: the effective value, where it came from,
-    /// the cgroup request and limit it sits between, and what it sizes.
+    /// the readings it sits between, and what it sizes.
+    ///
+    /// Names the declared request and the cgroup share separately, because they
+    /// are different claims: the request is what the pod asked for, the share is
+    /// a weight that only means anything under Kubernetes.
     #[must_use]
     pub fn summary_line(&self) -> String {
         let unset = "unset".to_string();
         format!(
             "CPU budget: {entitlement} (source: {origin}; host reports {detected}, \
-             cgroup request {request}, cgroup limit {limit}) \u{2192} \
+             declared CPU request {declared}, cgroup share {share}, \
+             cgroup limit {limit}) \u{2192} \
              {main} main worker threads, {dedicated} per dedicated runtime pool, \
              {partitions} target partitions",
             entitlement = format_millicores(self.millicores),
             origin = self.origin(),
             detected = self.detected_cores,
-            request = self
-                .request_millicores
+            declared = self
+                .declared_request_millicores
+                .map_or_else(|| unset.clone(), format_millicores),
+            share = self
+                .cpu_share_millicores
                 .map_or_else(|| unset.clone(), format_millicores),
             limit = self.limit_millicores.map_or(unset, format_millicores),
             main = self.main_runtime_worker_threads(),
@@ -490,9 +571,9 @@ impl CpuBudget {
         )
     }
 
-    /// A warning when the CPU request sits well below the core count the runtime
-    /// sized itself for, i.e. when sizing leans on CPU the scheduler does not
-    /// guarantee.
+    /// A warning when the *declared* CPU request sits well below the core count
+    /// the runtime sized itself for, i.e. when sizing leans on CPU the scheduler
+    /// does not guarantee.
     ///
     /// States the discrepancy and where the effective value came from, and stops
     /// there: which of the two numbers is wrong is the operator's call, and both
@@ -501,16 +582,22 @@ impl CpuBudget {
     /// Fires for every source, and names the one responsible: a value read from
     /// an explicit `limits.cpu`, a value configured by hand, and — the case that
     /// motivates this crate — a request with no limit at all, where detection
-    /// falls back to every CPU the process may use. An over-large configured value is just as
-    /// wrong as an over-large inferred one, so the check is on the effective core
-    /// count rather than on any particular rung of the ladder.
+    /// falls back to every CPU the process may use. An over-large configured value
+    /// is just as wrong as an over-large inferred one, so the check is on the
+    /// effective core count rather than on any particular rung of the ladder.
     ///
-    /// `None` when there is no request to compare against, or when the request is
-    /// at or above [`REQUEST_SHORTFALL_NUM`]/[`REQUEST_SHORTFALL_DEN`] of the
-    /// effective core count.
+    /// Compares against [`HostReadings::declared_request_millicores`] and never
+    /// the cgroup share. A share is not a request: cgroup v2 defaults
+    /// `cpu.weight: 100`, which inverts to ~2536m in every cgroup, so driving
+    /// this from the share told every bare-metal host with more than ~5 cores
+    /// that its correct budget was misconfigured.
+    ///
+    /// `None` when no request was declared, or when the request is at or above
+    /// [`REQUEST_SHORTFALL_NUM`]/[`REQUEST_SHORTFALL_DEN`] of the effective core
+    /// count.
     #[must_use]
     pub fn request_shortfall_warning(&self) -> Option<String> {
-        let request = self.request_millicores?;
+        let request = self.declared_request_millicores?;
         if request.saturating_mul(REQUEST_SHORTFALL_DEN)
             >= self.millicores.saturating_mul(REQUEST_SHORTFALL_NUM)
         {
@@ -551,14 +638,21 @@ impl CpuBudget {
         self.limit_millicores
     }
 
-    /// The cgroup CPU request (`requests.cpu`) in millicores, when one is
-    /// expressed.
+    /// The cgroup CPU share in millicores, when one can be read.
     ///
-    /// Reported so an operator can see the request next to the budget; it is
-    /// never an input to the detection ladder.
+    /// Reported so an operator can see it next to the budget; it is never an
+    /// input to the detection ladder, and never compared against the budget —
+    /// see [`HostReadings::cpu_share_millicores`].
     #[must_use]
-    pub const fn request_millicores(&self) -> Option<u64> {
-        self.request_millicores
+    pub const fn cpu_share_millicores(&self) -> Option<u64> {
+        self.cpu_share_millicores
+    }
+
+    /// The pod's declared `requests.cpu` in millicores, when one was declared
+    /// through [`CPU_REQUEST_ENV`].
+    #[must_use]
+    pub const fn declared_request_millicores(&self) -> Option<u64> {
+        self.declared_request_millicores
     }
 
     /// The entitlement in millicores, exact.
@@ -735,7 +829,8 @@ pub fn cpu_budget() -> &'static CpuBudget {
             setting: None,
             detected_cores: 1,
             limit_millicores: None,
-            request_millicores: None,
+            cpu_share_millicores: None,
+            declared_request_millicores: None,
         })
     })
 }
@@ -821,12 +916,24 @@ mod tests {
         }
     }
 
-    /// A burstable pod: a CPU request, no CPU limit.
-    fn request_only(affinity_cores: usize, request_millicores: u64) -> HostReadings {
+    /// An unconstrained Linux host: no quota, no declared request, and the cgroup
+    /// CPU share every cgroup has whether or not anyone asked for one. `2536`
+    /// is what cgroup v2's default `cpu.weight: 100` inverts to.
+    fn bare_metal(affinity_cores: usize) -> HostReadings {
+        HostReadings {
+            affinity_cores,
+            cpu_share_millicores: Some(2536),
+            ..HostReadings::default()
+        }
+    }
+
+    /// A burstable pod: a *declared* CPU request, no CPU limit.
+    fn request_only(affinity_cores: usize, declared_request_millicores: u64) -> HostReadings {
         HostReadings {
             affinity_cores,
             quota_millicores: None,
-            request_millicores: Some(request_millicores),
+            cpu_share_millicores: None,
+            declared_request_millicores: Some(declared_request_millicores),
         }
     }
 
@@ -883,7 +990,8 @@ mod tests {
             &HostReadings {
                 affinity_cores: 64,
                 quota_millicores: Some(16_000),
-                request_millicores: Some(4000),
+                cpu_share_millicores: None,
+                declared_request_millicores: Some(4000),
             },
         )
         .expect("detection cannot fail")
@@ -897,7 +1005,8 @@ mod tests {
             &HostReadings {
                 affinity_cores: 64,
                 quota_millicores: Some(16_000),
-                request_millicores: Some(4000),
+                cpu_share_millicores: None,
+                declared_request_millicores: Some(4000),
             },
         )
         .expect("detection cannot fail");
@@ -1200,6 +1309,85 @@ mod tests {
                 .expect("valid")
                 .summary_line()
         );
+        // The case that had no fixture: a share is present, no request was
+        // declared. The summary must show them as the separate claims they are.
+        insta::assert_snapshot!(
+            "summary_bare_metal_share",
+            CpuBudget::resolve(&CpuConfig::default(), &bare_metal(18))
+                .expect("valid")
+                .summary_line()
+        );
+        insta::assert_snapshot!(
+            "summary_declared_request",
+            CpuBudget::resolve(&CpuConfig::default(), &request_only(18, 4000))
+                .expect("valid")
+                .summary_line()
+        );
+    }
+
+    /// The guard that keeps an inferred value out of the reporting path: a cgroup
+    /// CPU share is never a request.
+    ///
+    /// Every cgroup has a share whether or not anyone expressed a request —
+    /// cgroup v2 defaults `cpu.weight: 100`, which inverts to ~2536m on bare
+    /// metal — so comparing it against the budget told every unconstrained Linux
+    /// host above ~5 cores that its correct budget was misconfigured. The
+    /// arithmetic below is the proof that the warning would fire if the share
+    /// were still the input, so this test fails if the wiring is ever restored.
+    #[test]
+    fn a_cgroup_share_is_never_treated_as_a_declared_request() {
+        let readings = bare_metal(18);
+        let share = readings
+            .cpu_share_millicores
+            .expect("the fixture sets a share");
+        let resolved = CpuBudget::resolve(&CpuConfig::default(), &readings).expect("valid");
+
+        assert_eq!(
+            resolved.request_shortfall_warning(),
+            None,
+            "a cgroup share must never produce a shortfall warning"
+        );
+        // Same numbers, declared this time: this is what the share used to do.
+        let declared = CpuBudget::resolve(&CpuConfig::default(), &request_only(18, share))
+            .expect("valid")
+            .request_shortfall_warning();
+        assert!(
+            declared.is_some(),
+            "the fixture must be below the threshold, or this test proves nothing"
+        );
+
+        // The share is still reported — it is dropped as an input, not as output.
+        assert_eq!(resolved.cpu_share_millicores(), Some(share));
+        assert_eq!(resolved.declared_request_millicores(), None);
+    }
+
+    /// `SPICE_CPU_REQUEST` is millicores (`divisor: 1m`), not the core-denominated
+    /// grammar `runtime.cpu.cores` accepts. The two disagree on every bare
+    /// integer, so a core-shaped value must be rejected rather than read 1000x
+    /// too small.
+    #[test]
+    fn declared_request_parses_millicores_and_rejects_core_quantities() {
+        // What the downward API actually sends.
+        assert_eq!(parse_declared_request_millicores("4000"), Some(4000));
+        assert_eq!(parse_declared_request_millicores("100"), Some(100));
+        assert_eq!(parse_declared_request_millicores(" 250 "), Some(250));
+        // An explicit unit is accepted and means the same thing.
+        assert_eq!(parse_declared_request_millicores("3500m"), Some(3500));
+
+        // Core-shaped, and therefore a surface that dropped `divisor: 1m`.
+        // Reading `3.5` as 3 millicores would under-size by 1000x.
+        assert_eq!(parse_declared_request_millicores("3.5"), None);
+        assert_eq!(parse_declared_request_millicores("0.1"), None);
+
+        // Not a quantity at all.
+        assert_eq!(parse_declared_request_millicores(""), None);
+        assert_eq!(parse_declared_request_millicores("  "), None);
+        assert_eq!(parse_declared_request_millicores("abc"), None);
+        assert_eq!(parse_declared_request_millicores("-1"), None);
+        assert_eq!(parse_declared_request_millicores("1e3"), None);
+        // Zero cores is not a request; it reads as absent, not as "all".
+        assert_eq!(parse_declared_request_millicores("0"), None);
+        assert_eq!(parse_declared_request_millicores("0m"), None);
     }
 
     /// The startup log has to name every derived value, so a mis-sized pool is
