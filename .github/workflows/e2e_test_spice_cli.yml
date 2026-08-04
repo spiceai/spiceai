@@ -106,6 +106,10 @@ jobs:
         if: matrix.target.target_os == 'linux' && github.event.inputs.build_cli == 'true'
         uses: ./.github/actions/setup-cc
 
+      - name: Install protoc
+        if: github.event.inputs.build_cli == 'true'
+        uses: ./.github/actions/install-protoc
+
       - name: Build spice
         if: github.event.inputs.build_cli == 'true'
         run: cargo build --release -p spice
