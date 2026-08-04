@@ -229,14 +229,27 @@ echo
 echo "Missing tools are a no-op, not a crash:"
 for tool in gh jq; do
   tests_run=$((tests_run + 1))
-  # An empty PATH plus only the *other* tool available, so the guard for this
-  # one is what decides. bash itself is invoked by absolute path.
+  # A PATH holding only the *other* tool, so the guard for this one is what
+  # decides. bash itself is invoked by absolute path.
+  #
+  # The tool that stays is a placeholder, not a symlink to the host's copy: the
+  # host is not guaranteed to have both, and symlinking what it happens to have
+  # made each case depend on the *other* tool being installed — a box with `gh`
+  # but no `jq` would leave the jq-missing case with an empty PATH and report
+  # "gh unavailable", failing an assertion about a guard that worked correctly.
+  # A placeholder is enough because the subject exits at the missing guard
+  # without ever invoking the surviving tool; it fails loudly if that ever stops
+  # being true rather than passing on a path this case does not mean to test.
   empty_dir="$stub_dir/without-$tool"
   mkdir -p "$empty_dir"
   for keep in gh jq; do
     [[ "$keep" == "$tool" ]] && continue
-    src="$(command -v "$keep" 2>/dev/null)" || continue
-    ln -sf "$src" "$empty_dir/$keep" 2>/dev/null || true
+    cat >"$empty_dir/$keep" <<PLACEHOLDER
+#!/usr/bin/env bash
+echo "placeholder ${keep}: should never be invoked — the missing-${tool} guard runs first" >&2
+exit 97
+PLACEHOLDER
+    chmod +x "$empty_dir/$keep"
   done
   : >"$posted"
   output="$(env "PATH=$empty_dir" "STUB_POSTED=$posted" \
