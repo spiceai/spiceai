@@ -665,7 +665,7 @@ impl ChunkedNonIndexVectorGeneration {
         // Step 1: per (pk, q_idx) — MAX cosine (best stored element for
         // this query) and FIRST_VALUE(match element ordered by score).
         let step1_group: Vec<LogicalExpr> =
-            [pks.iter().map(col).collect(), vec![col("q_idx")]].concat();
+            [pks.iter().map(ident).collect(), vec![col("q_idx")]].concat();
         let per_query_best_col = "per_query_best";
         let per_query_match_col = "per_query_match";
 
@@ -683,7 +683,7 @@ impl ChunkedNonIndexVectorGeneration {
 
         // Step 2: per pk — SUM per-query bests (late-interaction total);
         // pick the match element from whichever query scored highest.
-        let step2_group: Vec<LogicalExpr> = pks.iter().map(col).collect();
+        let step2_group: Vec<LogicalExpr> = pks.iter().map(ident).collect();
         let match_sort = vec![col(per_query_best_col).sort(false, false)];
         let aggregated = step1
             .aggregate(
