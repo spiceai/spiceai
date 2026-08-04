@@ -330,6 +330,34 @@ base merges on the first-parent chain. Make sure the commit under review is
 pushed, then run `make signoff` again. Any new code or manual merge resolution
 needs a fresh sign-off.
 
+### "Runner out of disk — checks did not complete"
+
+The sign-off runner's work volume filled up, so the run stopped before finishing
+its judgement of your branch. **Re-dispatch it.** If it recurs on the same
+runner, that machine needs space reclaimed — `target/` is shared across every
+branch that pool signs off, so it grows without bound. If instead it follows
+*your branch* from runner to runner, suspect the diff: a new build script,
+a dependency bump, or a feature expansion can consume the volume by itself.
+
+Sign-off refuses to start when the volume has less than 25 GiB free, and a run
+whose build reports running out of disk is reported as an infrastructure failure
+rather than a check failure. Without that, the failure is nearly impossible to
+read correctly: the linker dies with `errno=28` thousands of lines after nextest
+has already reported every test passing, on a crate the branch never touched,
+with no `-->` source pointer anywhere in the log.
+
+A remote run watches its own build output for that error, and a watched run's
+verdict is final **in both directions**. It has to be: by the time anything
+measures free space again, cargo has unlinked the partial binaries it was
+writing and the volume can look healthy — and conversely, on a shared pool
+another run can drag the volume under any threshold while your branch is failing
+for its own reasons. Measured free space is consulted only when nothing watched,
+which is how a local run gets a classification at all. The marker is truncated
+per build step, so only the step that actually failed speaks.
+
+Set `SIGNOFF_MIN_FREE_GIB` to change the floor. Locally the check only warns and
+the output is not watched — your own disk is yours to manage.
+
 ### External contributors (forks)
 
 Posting a commit status requires write access to this repository, so
