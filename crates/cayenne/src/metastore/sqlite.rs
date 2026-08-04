@@ -28,9 +28,42 @@ use super::{
 use crate::catalog::{CatalogError, CatalogResult};
 use async_trait::async_trait;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use tokio::sync::{Mutex, OnceCell, OwnedMutexGuard};
+
+/// `PRAGMA auto_vacuum` integer value for INCREMENTAL (0 = NONE, 1 = FULL, 2 = INCREMENTAL).
+const SQLITE_AUTO_VACUUM_INCREMENTAL: i64 = 2;
+
+/// Read the database's live `auto_vacuum` mode. Fixed at file creation — the
+/// configured mode only applies to a fresh DB — so a single probe is enough for
+/// the process lifetime of a given file.
+fn read_auto_vacuum_mode(conn: &mut rusqlite::Connection) -> Result<i64, rusqlite::Error> {
+    conn.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
+}
+
+/// Boundedly reclaim freelist pages on a connection already known to be in
+/// INCREMENTAL auto-vacuum mode.
+///
+/// Returns pages reclaimed (0 when the freelist is empty). Holds the write lock
+/// only for the duration of `PRAGMA incremental_vacuum(N)`, and only when there
+/// is actually work to do.
+fn reclaim_freelist_pages(
+    conn: &mut rusqlite::Connection,
+    max_pages: u32,
+) -> Result<u64, rusqlite::Error> {
+    // Cheap counter read; skip the write lock entirely when there is nothing to
+    // reclaim, which is the steady state once the freelist has drained.
+    let free_before: i64 = conn.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+    if free_before <= 0 {
+        return Ok(0);
+    }
+    // Bounded: reclaims at most `max_pages`, leaving the rest for later ticks
+    // rather than holding the write lock proportional to the whole freelist.
+    conn.execute_batch(&format!("PRAGMA incremental_vacuum({max_pages})"))?;
+    let free_after: i64 = conn.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+    Ok(u64::try_from((free_before - free_after).max(0)).unwrap_or(0))
+}
 
 const DELETE_FILE_TABLE_UNIQUE_INDEX_DDL: &str = "CREATE UNIQUE INDEX IF NOT EXISTS idx_cayenne_delete_file_table_path ON cayenne_delete_file(table_id, path)";
 const SQLITE_PRAGMA_RETRY_DELAYS_MS: &[u64] = &[10, 25, 50, 100, 200];
@@ -384,6 +417,14 @@ pub struct SqliteMetastore {
     /// [`OwnedMutexGuard`] on one pool slot for the full transaction
     /// lifetime.
     pool: OnceCell<Arc<SqliteConnectionPool>>,
+    /// Whether this DB file's *actual* `auto_vacuum` mode is INCREMENTAL.
+    ///
+    /// The mode is fixed at file creation (a config flip over an existing file
+    /// is a no-op without a full VACUUM), so one probe under the checkpoint
+    /// lock is enough for the process lifetime. Cached so the maintenance tick
+    /// does not re-issue `PRAGMA auto_vacuum` (or take the checkpoint lock at
+    /// all, when the answer is no) on every pass.
+    db_auto_vacuum_is_incremental: OnceLock<bool>,
 }
 
 /// Convert a `tokio_rusqlite::Error` to a `CatalogError`, distinguishing constraint violations.
@@ -421,6 +462,7 @@ impl SqliteMetastore {
         Self {
             connection_string: connection_string.into(),
             pool: OnceCell::new(),
+            db_auto_vacuum_is_incremental: OnceLock::new(),
         }
     }
 
@@ -1574,10 +1616,16 @@ impl MetastoreBackend for SqliteMetastore {
         // a whole tick.
         let cfg = sqlite_metastore_config();
         // Skip the dedicated-connection lock when reclamation is not configured.
-        // The DB's *actual* mode is still checked inside the pragma call below —
-        // config only takes effect on a fresh file, so a later flip to Incremental
-        // must not pretend an existing NONE/FULL database is reclaimable.
+        // The DB's *actual* mode is still gated below (and cached) — config only
+        // takes effect on a fresh file, so a later flip to Incremental must not
+        // pretend an existing NONE/FULL database is reclaimable.
         if cfg.auto_vacuum != SqliteAutoVacuum::Incremental || cfg.incremental_vacuum_pages == 0 {
+            return Ok(0);
+        }
+        // Cached live-mode probe: once we know the file is not INCREMENTAL, skip
+        // the checkpoint lock entirely on every subsequent tick. The mode is
+        // fixed at file creation, so the answer never changes for this handle.
+        if matches!(self.db_auto_vacuum_is_incremental.get(), Some(false)) {
             return Ok(0);
         }
         let max_pages = cfg.incremental_vacuum_pages;
@@ -1588,43 +1636,40 @@ impl MetastoreBackend for SqliteMetastore {
         let guard = conn.lock().await;
 
         let start = std::time::Instant::now();
-        let reclaimed = guard
-            .call(move |conn| {
-                // Gate on the DB's ACTUAL mode, not the configured one. The
-                // `auto_vacuum` pragma only takes effect on a fresh database, so
-                // a deployment that switched the config over an existing file is
-                // still in mode 0 — and `incremental_vacuum` there is silently a
-                // no-op. Reading the real mode keeps this from burning a lock
-                // acquisition per tick forever on such a database.
-                //
-                // 0 = NONE, 1 = FULL, 2 = INCREMENTAL. FULL already reclaims at
-                // commit time, so it needs nothing here either.
-                let mode: i64 = conn.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))?;
-                if mode != 2 {
-                    return Ok(0);
-                }
-                // Cheap counter read; skip the write lock entirely when there is
-                // nothing to reclaim, which is the steady state once the freelist
-                // has drained.
-                let free_before: i64 =
-                    conn.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
-                if free_before <= 0 {
-                    return Ok(0);
-                }
-                // Bounded: reclaims at most `max_pages`, leaving the rest for
-                // later ticks rather than holding the write lock proportional to
-                // the whole freelist.
-                conn.execute_batch(&format!("PRAGMA incremental_vacuum({max_pages})"))?;
-                let free_after: i64 =
-                    conn.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
-                Ok(u64::try_from((free_before - free_after).max(0)).unwrap_or(0))
-            })
-            .await
-            .map_err(
-                |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
-                    message: format!("Failed to incrementally vacuum the catalog: {e}"),
-                },
-            )?;
+        let map_err = |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+            message: format!("Failed to incrementally vacuum the catalog: {e}"),
+        };
+        // Once the live mode is known INCREMENTAL, each tick is a single
+        // freelist reclaim call. The first tick also probes the mode in that
+        // same call so we never pay two round-trips to the connection thread.
+        let reclaimed = if self.db_auto_vacuum_is_incremental.get() == Some(&true) {
+            guard
+                .call(move |conn| reclaim_freelist_pages(conn, max_pages))
+                .await
+                .map_err(map_err)?
+        } else {
+            let (is_incremental, reclaimed) = guard
+                .call(move |conn| {
+                    // 0 = NONE, 1 = FULL, 2 = INCREMENTAL. FULL already reclaims
+                    // at commit time, so it needs nothing here either.
+                    let mode = read_auto_vacuum_mode(conn)?;
+                    let is_inc = mode == SQLITE_AUTO_VACUUM_INCREMENTAL;
+                    if !is_inc {
+                        return Ok((false, 0));
+                    }
+                    let n = reclaim_freelist_pages(conn, max_pages)?;
+                    Ok((true, n))
+                })
+                .await
+                .map_err(map_err)?;
+            // Racing first probes may both try to set; the value is deterministic
+            // for a given file so a failed set is fine.
+            let _ = self.db_auto_vacuum_is_incremental.set(is_incremental);
+            if !is_incremental {
+                return Ok(0);
+            }
+            reclaimed
+        };
 
         if reclaimed > 0 {
             telemetry::cayenne::track_metastore_incremental_vacuum(start.elapsed(), reclaimed);
