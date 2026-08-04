@@ -41,6 +41,10 @@
 #   SIGNOFF_SKIP_TARGETED_LINT  Set to any value to skip the branch-scoped pre-lint
 #   SIGNOFF_SKIP_TARGETED_TESTS Set to any value to skip the branch-scoped unit
 #                     tests that run after the pre-lint
+#   SIGNOFF_MIN_FREE_GIB  Free space (GiB) the work volume must have before a
+#                     remote run starts its Rust checks (default: 25). Below it
+#                     a remote run stops immediately as an infrastructure
+#                     failure; a local run only warns.
 #
 # Targeted pre-lint always diffs against trunk (not configurable).
 # When the branch has no Rust-affecting changes vs trunk (.rs, Cargo.toml,
@@ -694,6 +698,177 @@ branch_has_rust_changes() {
   return 1
 }
 
+# --- disk guard ---------------------------------------------------------------
+#
+# A sign-off links every test binary in the workspace into a `target/` that the
+# self-hosted pool shares across branches. When that volume fills, the run does
+# not fail where the space ran out: nextest reports the whole suite green, and
+# then the *linker* dies with `errno=28` thousands of lines later, on a crate
+# the branch never touched. That failure has none of the tells of a real one —
+# no `-->` source pointers, no clippy diagnostic, a passing test summary — so
+# it reads as a defect in the branch, and the reader either hunts a
+# nonexistent bug or re-dispatches onto the same full disk. What follows makes
+# the run say which one it was: a floor it refuses to start below, a recorder
+# that catches the build saying it ran out, and a free-space backstop.
+
+# Refuse to *start* a run the volume cannot hold, rather than discovering it
+# three hours in. This is headroom for linking, not an estimate of a cold
+# build: `target/` is warm on the pool, so what a run actually needs is room
+# for the binaries it relinks.
+readonly DEFAULT_MIN_FREE_GIB=25
+# At failure time, this little free space means the volume is what broke, not
+# the branch. Deliberately far below the preflight floor: a genuine compile
+# error on a tight-but-workable disk must not be relabelled "infrastructure",
+# while the `errno=28` death this exists to catch leaves the volume at ~0.
+readonly DISK_CRITICAL_GIB=2
+# run_checks returns this when the preflight refuses to start.
+readonly EXIT_DISK_EXHAUSTED=70
+# How the linker's out-of-disk death actually reads in the run log:
+# `ld: write() failed, errno=28 (No space left on device)`. Either spelling is
+# enough; matching both survives a toolchain that words one of them differently.
+readonly DISK_FULL_PATTERN='No space left on device|errno=28'
+
+# Set on remote runs to a file collecting any out-of-disk line the build emits.
+# Only matching lines are kept — writing a full three-hour transcript to a
+# volume that is already out of space would make the very problem worse.
+SIGNOFF_DISK_MARKER="${SIGNOFF_DISK_MARKER:-}"
+
+# Run one `make` step, recording whether it died for want of disk. Returns
+# make's own status, never the recorder's. With no marker set — every local run
+# — make is invoked exactly as before, so local output is untouched.
+run_make_step() {
+  if [[ -z "$SIGNOFF_DISK_MARKER" ]]; then
+    make "$@"
+    return $?
+  fi
+  local status
+  # Truncate per step, so the marker describes the step that actually failed.
+  # Left to accumulate, a step that merely *mentioned* running out of disk and
+  # then succeeded would still be blaming the volume for a genuine test failure
+  # two steps later.
+  : >"$SIGNOFF_DISK_MARKER" 2>/dev/null || true
+  # awk rather than `tee` to a full log: it passes every line straight through
+  # while copying only the out-of-disk lines to the marker, so the recorder
+  # costs a few hundred bytes instead of tens of megabytes. fflush keeps the
+  # output streaming to the Actions log line by line, as it does untee'd.
+  make "$@" 2>&1 | awk -v marker="$SIGNOFF_DISK_MARKER" -v pat="$DISK_FULL_PATTERN" '
+    $0 ~ pat { print >> marker; close(marker) }
+    { print; fflush() }
+  '
+  status="${PIPESTATUS[0]}"
+  return "$status"
+}
+
+# True when this run watched its build output at all, i.e. the marker's verdict
+# — including an empty marker's "not disk" — is worth something.
+marker_is_armed() {
+  [[ -n "$SIGNOFF_DISK_MARKER" && -f "$SIGNOFF_DISK_MARKER" ]]
+}
+
+# True when this run's build actually reported running out of disk. This is the
+# authoritative signal — unlike a free-space reading taken after the fact, it
+# cannot be washed out by the partial artifacts cargo unlinks on its way out.
+#
+# Known gap: at true ENOSPC the append that records the line can itself fail,
+# leaving the marker empty and the failure read as the branch's. That is the
+# behavior this whole guard replaced, so it is no worse than not watching — but
+# it is why the marker lives in $TMPDIR rather than beside the build output.
+build_hit_disk_full() {
+  [[ -n "$SIGNOFF_DISK_MARKER" && -s "$SIGNOFF_DISK_MARKER" ]]
+}
+
+# Free space in GiB on the volume holding "$1" (default: the working tree).
+# Prints an integer. Returns non-zero when df is absent or its output does not
+# parse — every caller reads that as "unknown" and never as "full", so a runner
+# whose df we cannot read still gets to run its sign-off.
+free_disk_gib() {
+  # The volume that actually holds the build output: `target/` is what fills,
+  # and CARGO_TARGET_DIR can put it on a different filesystem than the checkout.
+  local path="${1:-${CARGO_TARGET_DIR:-.}}" free
+  command -v df >/dev/null 2>&1 || return 1
+  # -P: POSIX one-line-per-filesystem output, so Available is reliably field 4
+  # even when a long device name would wrap in df's default format.
+  # -k: 1024-byte blocks on both macOS (whose df defaults to 512) and Linux.
+  free=$(df -Pk "$path" 2>/dev/null | awk 'NR==2 { print int($4 / 1048576) }') || return 1
+  [[ "$free" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$free"
+}
+
+# True when the work volume is so empty that a failure is the volume's fault
+# rather than the branch's. Unknown free space answers false: without a reading
+# we cannot claim infrastructure, and mislabelling a real failure is worse.
+disk_is_critical() {
+  local free
+  free=$(free_disk_gib) || return 1
+  (( free < DISK_CRITICAL_GIB ))
+}
+
+# Names what broke in a check run that did not pass, given run_checks' exit
+# status: "disk" when the work volume is the cause, "checks" for everything
+# else, which is the branch. Three ways to reach "disk", in falling order of
+# authority: the preflight refused to start, the build said so itself, or the
+# volume is at ~0 now. The last is a backstop for a build whose output we did
+# not record (a local run), which is why it is not the only signal.
+failure_kind() {
+  local check_status="$1"
+
+  # The preflight's own refusal needs no corroboration.
+  if [[ "$check_status" -eq "$EXIT_DISK_EXHAUSTED" ]]; then
+    echo "disk"
+    return
+  fi
+
+  # If we watched the build, the watch decides — both ways. An empty marker
+  # means the build ran out of many things but not disk, and a free-space
+  # reading must not overrule that: on a shared pool another run can drag the
+  # volume under any threshold while *this* branch fails for its own reasons,
+  # and calling that "infrastructure" tells the author to re-dispatch a branch
+  # that will fail again. Free space is consulted only when nothing watched.
+  if marker_is_armed; then
+    if build_hit_disk_full; then echo "disk"; else echo "checks"; fi
+    return
+  fi
+
+  if disk_is_critical; then echo "disk"; else echo "checks"; fi
+}
+
+# Stop before the Rust checks when the work volume cannot hold them. Fatal only
+# on a remote run — that shared pool is where this happens, and it is where a
+# wasted run costs hours. A local run just warns: a developer's own disk is
+# theirs to manage, and blocking their sign-off on a floor tuned for the pool
+# would be wrong.
+preflight_disk() {
+  local free min="${SIGNOFF_MIN_FREE_GIB:-$DEFAULT_MIN_FREE_GIB}"
+
+  if [[ ! "$min" =~ ^[0-9]+$ ]]; then
+    info "warning: SIGNOFF_MIN_FREE_GIB='${min}' is not an integer — using ${DEFAULT_MIN_FREE_GIB}"
+    min="$DEFAULT_MIN_FREE_GIB"
+  fi
+  # Force base 10: bash arithmetic reads a leading zero as octal, so a
+  # well-meaning `SIGNOFF_MIN_FREE_GIB=08` is an arithmetic error, not 8.
+  min=$((10#$min))
+
+  if ! free=$(free_disk_gib); then
+    debug "could not measure free disk space — skipping the preflight check"
+    return 0
+  fi
+
+  debug "free space on the work volume: ${free} GiB (floor ${min} GiB)"
+  if (( free >= min )); then
+    return 0
+  fi
+
+  if ! is_remote_run; then
+    info "warning: only ${free} GiB free here and sign-off wants ${min} GiB — the build may die at the linker"
+    return 0
+  fi
+
+  info "${NO} Only ${free} GiB free on the work volume; a sign-off needs ${min} GiB."
+  info "  The branch was not evaluated. Reclaim space on this runner and re-dispatch."
+  append_step_summary "### Preflight: not enough disk"$'\n'"Only **${free} GiB** free on the runner work volume, below the **${min} GiB** floor, so the Rust checks did not run and **the branch was not evaluated**. This is an infrastructure failure, not a code failure: reclaim space on this runner (\`target/\` is shared across branches) and re-dispatch. Adjust the floor with \`SIGNOFF_MIN_FREE_GIB\`."$'\n'
+  return "$EXIT_DISK_EXHAUSTED"
+}
+
 # Unit tests for the packages a branch touched, run before the full workspace
 # lint. A broken test in the crate you just edited is the likeliest failure, and
 # it would otherwise surface only after the longest step in the gate.
@@ -728,7 +903,7 @@ run_targeted_tests() {
   append_step_summary "### Targeted unit tests"$'\n'"Packages: \`${test_packages}\`"$'\n'
   # Explicit `|| return` so failures short-circuit even when the caller has
   # temporarily disabled `set -e` (see cmd_signoff).
-  make nextest-packages PACKAGES="$test_packages" FEATURES="$features" || return $?
+  run_make_step nextest-packages PACKAGES="$test_packages" FEATURES="$features" || return $?
   info "Targeted unit tests passed."
 }
 
@@ -768,6 +943,10 @@ run_checks() {
     return 0
   fi
 
+  # Deliberately after the Rust-changes skip: a docs-only sign-off compiles
+  # nothing, so a full volume is no reason to refuse it.
+  preflight_disk || return $?
+
   if [[ -z "${SIGNOFF_SKIP_TARGETED_LINT:-}" && -n "$revision" ]]; then
     packages=$(changed_workspace_packages "$revision" || true)
   fi
@@ -789,7 +968,7 @@ run_checks() {
     # FEATURES is set explicitly so a user-exported value cannot reintroduce a
     # workspace-only set. Explicit `|| return` so failures short-circuit even
     # when the caller has temporarily disabled `set -e` (see cmd_signoff).
-    make lint-rust PACKAGES="$packages" FEATURES="$features" || return $?
+    run_make_step lint-rust PACKAGES="$packages" FEATURES="$features" || return $?
     info "Targeted pre-lint passed."
     run_targeted_tests "$packages" "$features" || return $?
     info "Running full workspace lint…"
@@ -801,7 +980,7 @@ run_checks() {
   info "Running Rust lint (make lint-rust)…"
   # Clear PACKAGES/FEATURES so a user-exported env cannot scope or re-feature
   # the full gate; empty values leave the Makefile on its workspace defaults.
-  make lint-rust PACKAGES= FEATURES= || return $?
+  run_make_step lint-rust PACKAGES= FEATURES= || return $?
 
   # build-cli-dev, not build-cli: the release CLI build shares no artifacts with
   # the profile the lint and test passes just warmed, so it recompiles its whole
@@ -810,7 +989,7 @@ run_checks() {
   # CLI, spiced, and the release install for real, so release-only breakage is
   # still caught before trunk.
   info "Building the CLI and running unit tests (make build-cli-dev nextest)…"
-  make build-cli-dev nextest || return $?
+  run_make_step build-cli-dev nextest || return $?
 
   SIGNOFF_CHECK_SUMMARY="lint+test passed"
 }
@@ -939,11 +1118,14 @@ refresh_attestation_check() {
 # When the post itself fails the commit still carries whatever it had before, so
 # there is nothing new for a re-run to read: warn and leave the check alone. The
 # caller aborts either way, with the more useful message.
+# `description` rather than user+elapsed: the caller already decides what the
+# failure was — an out-of-disk runner reads differently from a failing branch —
+# and the commit status is all most readers see, so that wording has to reach
+# them intact.
 post_failure_status() {
-  local repo="$1" sha="$2" user="$3" elapsed="$4"
+  local repo="$1" sha="$2" description="$3"
 
-  if ! post_commit_status "$repo" "$sha" failure \
-    "Sign-off checks failed after ${elapsed}s (triggered by ${user})"; then
+  if ! post_commit_status "$repo" "$sha" failure "$description"; then
     info "warning: could not post the failed sign-off status — the 'Attestation' check still reflects the previous sign-off"
     return 0
   fi
@@ -992,6 +1174,14 @@ cmd_signoff() {
     start=$(date +%s)
     if is_remote_run; then
       post_pending_status "$repo" "$sha" "$user"
+      # Record out-of-disk lines from here on, so a failure can say whether the
+      # volume or the branch was at fault. Remote only: a local run's output
+      # then stays byte-for-byte what it is today. A marker we cannot create is
+      # not fatal — failure_kind falls back to reading free space.
+      SIGNOFF_DISK_MARKER=$(mktemp "${TMPDIR:-/tmp}/signoff-disk.XXXXXX" 2>/dev/null) \
+        || SIGNOFF_DISK_MARKER=""
+      [[ -z "$SIGNOFF_DISK_MARKER" ]] \
+        || trap 'rm -f "$SIGNOFF_DISK_MARKER"' EXIT
     fi
     # Capture status without wrapping in `if`/`||` (those also disable set -e
     # for the LHS). run_checks uses explicit `|| return` so make failures still
@@ -1002,11 +1192,26 @@ cmd_signoff() {
     set -e
     if [[ "$check_status" -ne 0 ]]; then
       elapsed=$(( $(date +%s) - start ))
+      local status_desc summary_text fail_message
+      # An out-of-disk run says nothing useful by default — the commit status is
+      # all most readers see, so it has to carry the distinction itself.
+      case "$(failure_kind "$check_status")" in
+        disk)
+          status_desc="Runner out of disk after ${elapsed}s — checks did not complete, re-dispatch (triggered by ${user})"
+          summary_text="### Sign-off"$'\n'"**Infrastructure failure** after ${elapsed}s — the build ran out of disk on the runner work volume, so **the checks did not complete**. Re-dispatch once the runner has space. Only if this recurs for one branch alone is the diff worth suspecting: a build script or dependency change can consume the volume by itself."$'\n'
+          fail_message="sign-off aborted: the runner ran out of disk (the checks did not complete)"
+          ;;
+        *)
+          status_desc="Sign-off checks failed after ${elapsed}s (triggered by ${user})"
+          summary_text="### Sign-off"$'\n'"**Failed** after ${elapsed}s."$'\n'
+          fail_message="sign-off checks failed"
+          ;;
+      esac
       if is_remote_run; then
-        post_failure_status "$repo" "$sha" "$user" "$elapsed"
-        append_step_summary "### Sign-off"$'\n'"**Failed** after ${elapsed}s."$'\n'
+        post_failure_status "$repo" "$sha" "$status_desc"
+        append_step_summary "$summary_text"
       fi
-      fail "sign-off checks failed"
+      fail "$fail_message"
     fi
     elapsed=$(( $(date +%s) - start ))
     description="Signed off by ${user}${via} — ${SIGNOFF_CHECK_SUMMARY} in ${elapsed}s"
