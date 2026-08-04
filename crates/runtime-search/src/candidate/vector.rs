@@ -822,6 +822,31 @@ mod tests {
         );
     }
 
+    /// Regression test: the per-pk window partition went through `col()`, which routes
+    /// through `Column::from_qualified_name` and splits on `.`, so a chunked index's
+    /// `_spice.chunk_id` key partitioned by column `chunk_id` of relation `_spice`
+    /// instead of by the one column actually named `_spice.chunk_id`. Asserted on the
+    /// resolved column refs, not on the rendered expression: a `Column`'s display is
+    /// `_spice.chunk_id` either way, so only the `relation`/`name` split tells them apart.
+    #[test]
+    fn aggregate_score_expr_partitions_by_a_dotted_primary_key_whole() {
+        let candidate = make_list_multi_gen(EmbeddingAggregation::Max);
+        let expr = candidate
+            .aggregate_score_expr(&["_spice.chunk_id".to_string()])
+            .expect("should not error");
+
+        let refs = expr.column_refs();
+        assert!(
+            refs.iter()
+                .any(|c| c.relation.is_none() && c.name == "_spice.chunk_id"),
+            "the partition key must stay one unqualified column named `_spice.chunk_id`: {refs:?}"
+        );
+        assert!(
+            !refs.iter().any(|c| c.name == "chunk_id"),
+            "the dotted key was split into relation `_spice` + column `chunk_id`: {refs:?}"
+        );
+    }
+
     #[test]
     fn test_quoting_embedding_columns() {
         // lowercase
