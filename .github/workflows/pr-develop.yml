@@ -158,7 +158,9 @@ jobs:
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           RUST_PROFILE: ${{ env.RUST_PROFILE }}
-          NEXTEST_FLAG: "--exclude libnfs --exclude connector-nfs"
+          # `libnfs` is already excluded by the `nextest` target itself; only the
+          # CI-specific exclusion belongs here.
+          NEXTEST_FLAG: "--exclude connector-nfs"
           # Intersected with the gate's own filterset by the Makefile. Passing it
           # as a second `-E` would union with that filterset and widen the run,
           # because that is how nextest composes repeated `-E` flags.
