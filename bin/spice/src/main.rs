@@ -770,6 +770,7 @@ fn machine_error_code(error: &spice::error::Error) -> &'static str {
         spice::error::Error::RuntimeHttp { .. } => "runtime_http_error",
         spice::error::Error::ConnectionFailed { .. } => "connection_failed",
         spice::error::Error::HttpRequestFailed { .. } => "http_request_failed",
+        spice::error::Error::HttpClientBuild { .. } => "http_client_build",
         spice::error::Error::InvalidResponse { .. } => "invalid_response",
         spice::error::Error::Registry { .. } => "registry",
         spice::error::Error::ConfigIo { .. } => "config_io",

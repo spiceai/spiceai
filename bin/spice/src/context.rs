@@ -17,8 +17,9 @@ limitations under the License.
 //! Runtime context for managing Spice runtime installation and configuration.
 
 use crate::error::{
-    CreateDirectorySnafu, HomeDirectoryNotFoundSnafu, Result, RuntimeExecutionSnafu,
-    RuntimeNotInstalledSnafu, RuntimeVersionSnafu, WindowsNativeRuntimeUnsupportedSnafu,
+    CreateDirectorySnafu, HomeDirectoryNotFoundSnafu, HttpClientBuildSnafu, Result,
+    RuntimeExecutionSnafu, RuntimeNotInstalledSnafu, RuntimeVersionSnafu,
+    WindowsNativeRuntimeUnsupportedSnafu,
 };
 use snafu::ResultExt;
 use spice_cloud_client::endpoints::data_endpoint as spice_cloud_data_endpoint;
@@ -32,6 +33,53 @@ const DOT_SPICE: &str = ".spice";
 const SPICED_FILENAME: &str = "spiced";
 const SPICEPODS_DIR: &str = "spicepods";
 const WSL_ENV_KEYS: [&str; 2] = ["WSL_DISTRO_NAME", "WSL_INTEROP"];
+
+/// How many same-origin redirects to follow before giving up, matching `reqwest`'s own
+/// default depth.
+///
+/// Compared the way `reqwest::redirect::Policy::limited` compares it — `previous().len()`
+/// counts the initial URL as well, so the bound is exclusive.
+const MAX_REDIRECTS: usize = 10;
+
+/// Whether two URLs share an origin: scheme, host and effective port.
+///
+/// `port_or_known_default` is what makes `http://host` and `http://host:80` the same
+/// origin; `Url` has already lowercased the host by the time it gets here.
+fn is_same_origin(previous: &reqwest::Url, next: &reqwest::Url) -> bool {
+    previous.scheme() == next.scheme()
+        && previous.host_str() == next.host_str()
+        && previous.port_or_known_default() == next.port_or_known_default()
+}
+
+/// A redirect policy that follows same-origin redirects and refuses to leave the origin.
+///
+/// Every CLI request carries the API key in an `X-API-Key` header. On a cross-origin
+/// redirect `reqwest` strips only the standard credential headers — `Authorization`,
+/// `Cookie`, `Cookie2`, `Proxy-Authorization`, `WWW-Authenticate` — so a custom header
+/// rides along to whatever the `Location` names. A runtime, proxy or ingress answering
+/// with an off-origin `Location` would therefore be handed the key (#12495).
+///
+/// Stopping (rather than erroring) hands the 3xx back to the caller as a response, which
+/// keeps a redirect a diagnosable condition instead of a transport failure.
+#[must_use]
+pub fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let Some(previous) = attempt.previous().last() else {
+            // No previous hop to compare against: nothing proves this stays on origin.
+            return attempt.stop();
+        };
+
+        if !is_same_origin(previous, attempt.url()) {
+            return attempt.stop();
+        }
+
+        if attempt.previous().len() > MAX_REDIRECTS {
+            return attempt.stop();
+        }
+
+        attempt.follow()
+    })
+}
 
 /// Runtime context holding paths and configuration for CLI operations.
 #[derive(Debug, Clone)]
@@ -75,7 +123,9 @@ impl RuntimeContext {
     ///
     /// # Errors
     ///
-    /// Returns an error if the home directory cannot be determined.
+    /// Returns an error if the home directory cannot be determined, or if the HTTP client
+    /// cannot be built — the latter is not defaulted past, because a default client would
+    /// not carry the same-origin redirect policy.
     pub fn new() -> Result<Self> {
         let home_dir = dirs::home_dir().ok_or_else(|| HomeDirectoryNotFoundSnafu.build())?;
         let spice_runtime_dir = home_dir.join(DOT_SPICE);
@@ -84,12 +134,16 @@ impl RuntimeContext {
         let app_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let pods_dir = app_dir.join(SPICEPODS_DIR);
 
+        // Every `/v1/*` call the CLI makes goes through this client — the context helpers
+        // and the per-command sites that build their own request from `ctx.http_client()`
+        // alike — so the redirect policy is set once here rather than per call site.
         let http_client = reqwest::Client::builder()
             .user_agent(Self::default_user_agent())
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
+            .redirect(same_origin_redirect_policy())
             .build()
-            .unwrap_or_default();
+            .context(HttpClientBuildSnafu)?;
 
         Ok(Self {
             spice_runtime_dir,
@@ -486,6 +540,33 @@ impl RuntimeContext {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn url(value: &str) -> reqwest::Url {
+        reqwest::Url::parse(value).expect("test URL should parse")
+    }
+
+    /// The origin check is what keeps the API key on the runtime it was meant for: the CLI
+    /// sends it in an `X-API-Key` header, and `reqwest` strips only the standard credential
+    /// headers when a redirect crosses origin, so a custom one would ride along (#12495).
+    #[test]
+    fn test_is_same_origin_matches_scheme_host_and_effective_port() {
+        let base = url("http://host:8090/v1/status");
+        assert!(is_same_origin(&base, &url("http://host:8090/v1/ready")));
+
+        // An implicit default port is the same origin as the explicit one.
+        let implicit_http = url("http://host/a");
+        let explicit_http = url("http://host:80/b");
+        assert!(is_same_origin(&implicit_http, &explicit_http));
+
+        let implicit_https = url("https://host/a");
+        let explicit_https = url("https://host:443/b");
+        assert!(is_same_origin(&implicit_https, &explicit_https));
+
+        // A different port, host or scheme is a different origin — the key must not follow.
+        assert!(!is_same_origin(&base, &url("http://host:9090/v1")));
+        assert!(!is_same_origin(&base, &url("http://elsewhere:8090/v1")));
+        assert!(!is_same_origin(&implicit_http, &implicit_https));
+    }
 
     /// Helper to create a `RuntimeContext` with a mocked spiced binary for testing.
     fn create_test_context() -> RuntimeContext {
