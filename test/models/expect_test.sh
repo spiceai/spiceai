@@ -14,6 +14,11 @@
 
 set -u
 
+# Every case here drives a stand-in, so none of them wants the deadline a live
+# model operation is given: cases that care about the timeout set it themselves,
+# and the default-timeout case only means anything if it starts out unset.
+unset SPICE_REPL_TIMEOUT_SECONDS
+
 script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
 work_dir=$(mktemp -d)
 trap 'rm -rf "$work_dir"' EXIT
@@ -206,7 +211,24 @@ assert_reports 'REACHED THE END'
 assert_silent_about 'no longer running'
 
 # CI can give live model operations a longer deadline without slowing down the
-# stand-in tests. Invalid values must fail before a REPL is spawned.
+# stand-in tests, which run on the per-script defaults. Invalid values must fail
+# before a REPL is spawned.
+#
+# `array unset` rather than `unset ::env(...)`: the latter raises when the
+# variable is absent, which is the very state this case is about.
+helper_case 'falls back to the script default response timeout' '
+array unset ::env SPICE_REPL_TIMEOUT_SECONDS
+if {[repl_timeout 5] != 5} {
+    send_user "WRONG TIMEOUT\n"
+    exit 1
+}
+send_user "DEFAULT TIMEOUT USED\n"
+exit 0
+'
+assert_status 0
+assert_reports 'DEFAULT TIMEOUT USED'
+assert_silent_about 'WRONG TIMEOUT'
+
 helper_case 'uses a configured response timeout' '
 set ::env(SPICE_REPL_TIMEOUT_SECONDS) 17
 if {[repl_timeout 5] != 17} {

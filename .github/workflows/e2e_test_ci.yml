@@ -258,9 +258,8 @@ jobs:
             HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew install expect
           fi
 
+      # Drives stand-in processes, not a model, so it sets its own deadlines.
       - name: Test the expect scripts driving the REPLs
-        env:
-          SPICE_REPL_TIMEOUT_SECONDS: 60
         run: ./test/models/expect_test.sh
 
       - name: Test vector search
@@ -342,9 +341,8 @@ jobs:
             HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew install expect
           fi
 
+      # Drives stand-in processes, not a model, so it sets its own deadlines.
       - name: Test the expect scripts driving the REPLs
-        env:
-          SPICE_REPL_TIMEOUT_SECONDS: 60
         run: ./test/models/expect_test.sh
 
       - name: Test vector search
