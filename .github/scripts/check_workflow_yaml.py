@@ -13,6 +13,10 @@
 # raises a failed run nobody is obliged to look at. Regression guard for #12181,
 # where a mis-indented block scalar left the daily Rust advisory scan unable to
 # run at all.
+#
+# It also rejects a step budget its own job's budget pre-empts, which is dead
+# config with the same symptom — the job is terminated as `cancelled` with no
+# failed step to explain it (#12340).
 """Validate the repository's GitHub Actions workflow and composite action YAML."""
 
 from __future__ import annotations
@@ -72,7 +76,48 @@ def check_workflow(text: str) -> list[str]:
         problems.append("has no `jobs:` block")
     elif not isinstance(jobs, dict) or not jobs:
         problems.append("has a `jobs:` block that is not a non-empty mapping")
+    else:
+        problems.extend(check_step_budgets(jobs))
 
+    return problems
+
+
+def check_step_budgets(jobs: dict) -> list[str]:
+    """Report step budgets that the job's own budget pre-empts.
+
+    A step whose `timeout-minutes` is not below its job's can never fire: the job
+    is terminated first, which reports as `cancelled` with no failed step and
+    gives the steps after it no chance to run. That is the shape of #12340, where
+    the whole sign-off job reached the runner pool's wall and its `if: always()`
+    cleanup never got to resolve the status the run had posted.
+
+    This catches dead config, not a budget that is merely too tight: whether the
+    gap between the two also covers the job's setup and cleanup steps depends on
+    how long those take, which is not in the definition.
+    """
+    problems = []
+    for name, job in jobs.items():
+        if not isinstance(job, dict):
+            continue
+        job_budget = job.get("timeout-minutes")
+        if not isinstance(job_budget, int):
+            continue
+        steps = job.get("steps")
+        if not isinstance(steps, list):
+            continue
+        for position, step in enumerate(steps, start=1):
+            if not isinstance(step, dict):
+                continue
+            step_budget = step.get("timeout-minutes")
+            if not isinstance(step_budget, int):
+                continue
+            if step_budget < job_budget:
+                continue
+            label = step.get("name") or f"step {position}"
+            problems.append(
+                f"job `{name}` gives `{label}` a {step_budget}-minute budget that its "
+                f"own {job_budget}-minute budget pre-empts"
+            )
     return problems
 
 
@@ -133,14 +178,15 @@ def main(argv: list[str] | None = None) -> int:
     if failures:
         print(
             f"{len(failures)} GitHub Actions definition problem(s) found. A definition "
-            "GitHub cannot parse is silently disabled, so this fails the build:",
+            "GitHub cannot parse is silently disabled, and a budget it pre-empts never "
+            "fires, so this fails the build:",
             file=sys.stderr,
         )
         for failure in failures:
             print(f"  {failure}", file=sys.stderr)
         return 1
 
-    print(f"OK: {checked} GitHub Actions definitions parse and declare the required keys")
+    print(f"OK: {checked} GitHub Actions definitions are well-formed")
     return 0
 
 

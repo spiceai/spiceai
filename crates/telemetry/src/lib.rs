@@ -441,6 +441,71 @@ pub fn track_hash_index_lookup_rows(rows: u64, dimensions: &[KeyValue]) {
 /// just parked" signal — require the `tokio_unstable` cfg at build time
 /// (`RUSTFLAGS="--cfg tokio_unstable"`); without it only the stable gauges register, so
 /// default and CI builds are unaffected.
+/// Registers the CPU-sizing gauges, so a mis-sized deployment is greppable
+/// across a fleet rather than diagnosed pod-by-pod.
+///
+/// Three quantities, deliberately separate: `spiced_cpu_budget_*` is the value
+/// the runtime *uses*, while `spiced_cpu_limit_millicores` and
+/// `spiced_cpu_request_millicores` are the cgroup *inputs* it was chosen
+/// against. Comparing them is what distinguishes a pod sized for its request
+/// from one sized for its whole node. `source` is `CpuSource::as_str` — the rung
+/// of the detection ladder the budget came from.
+///
+/// `limit` and `request` are `None` when the cgroup expresses no such value; the
+/// gauge then reports nothing rather than `0`, which would be indistinguishable
+/// from a real zero.
+///
+/// Like [`register_tokio_runtime_metrics`], the binary MUST call this once
+/// AFTER `init_metrics` has installed the Prometheus meter.
+///
+/// Takes plain scalars rather than the budget itself: `telemetry` is a
+/// foundation crate and does not depend on `cpu-budget`.
+pub fn register_cpu_budget_metrics(
+    cores: u64,
+    millicores: u64,
+    source: &'static str,
+    limit_millicores: Option<u64>,
+    request_millicores: Option<u64>,
+) {
+    let meter = global::meter("cpu_budget");
+
+    let _ = meter
+        .u64_observable_gauge("spiced_cpu_budget_cores")
+        .with_description("CPU cores the runtime sizes itself for, and where that value came from.")
+        .with_unit("{cpu}")
+        .with_callback(move |obs| obs.observe(cores, &[KeyValue::new("source", source)]))
+        .build();
+
+    let _ = meter
+        .u64_observable_gauge("spiced_cpu_budget_millicores")
+        .with_description(
+            "CPU millicores the runtime sizes itself for, and where that value came from.",
+        )
+        .with_unit("{millicpu}")
+        .with_callback(move |obs| obs.observe(millicores, &[KeyValue::new("source", source)]))
+        .build();
+
+    if let Some(limit) = limit_millicores {
+        let _ = meter
+            .u64_observable_gauge("spiced_cpu_limit_millicores")
+            .with_description("CPU limit from the cgroup CPU quota (Kubernetes limits.cpu).")
+            .with_unit("{millicpu}")
+            .with_callback(move |obs| obs.observe(limit, &[]))
+            .build();
+    }
+
+    if let Some(request) = request_millicores {
+        let _ = meter
+            .u64_observable_gauge("spiced_cpu_request_millicores")
+            .with_description(
+                "CPU request inferred from the cgroup CPU share (Kubernetes requests.cpu). Reported only; never used for sizing.",
+            )
+            .with_unit("{millicpu}")
+            .with_callback(move |obs| obs.observe(request, &[]))
+            .build();
+    }
+}
+
 pub fn register_tokio_runtime_metrics(handles: Vec<(&'static str, tokio::runtime::Handle)>) {
     if handles.is_empty() {
         return;

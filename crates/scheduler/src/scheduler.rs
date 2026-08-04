@@ -421,10 +421,8 @@ mod test {
     use crate::schedule::Schedule;
     use crate::task::{ScheduledTask, TaskRequest};
     use async_trait::async_trait;
-    use std::{
-        sync::LazyLock,
-        time::{Duration, Instant},
-    };
+    use std::{sync::LazyLock, time::Duration};
+    use tokio::time::Instant;
     use tracing_subscriber::EnvFilter;
 
     fn init_tracing(default_level: Option<&str>) -> tracing::subscriber::DefaultGuard {
@@ -546,7 +544,10 @@ mod test {
         );
     }
 
-    #[tokio::test]
+    /// Runs on the paused clock: the property under test is that the interval trigger
+    /// fires once per interval, which a wall-clock reading on a loaded runner cannot
+    /// measure. Ticks land at 1s..=9s, so waking at 9.5s avoids a tie with the tenth.
+    #[tokio::test(start_paused = true)]
     async fn test_scheduler_timing() {
         init_tracing(None);
         let schedule = Schedule::new(
@@ -558,25 +559,26 @@ mod test {
         .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))));
         let scheduler = Scheduler::new("test_scheduler_timing".into(), vec![Arc::new(schedule)]);
         let scheduler = scheduler.start().await.expect("Scheduler should start");
-        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        tokio::time::sleep(Duration::from_millis(9500)).await;
         scheduler.stop().await;
         let map_lock = TIMING_MAP.read().await;
         let timings = map_lock
             .get("test_scheduler_timing")
             .expect("To get test execution count");
-        let mut diffs = Vec::new();
-        for i in 1..timings.len() {
-            let diff = timings[i].duration_since(timings[i - 1]);
-            diffs.push(diff);
-        }
-        assert!(
-            diffs.len() == 8 || diffs.len() == 9,
-            "There should be more than 8 or 9 timing differences, but got {diffs:?}"
+        let diffs: Vec<Duration> = timings
+            .windows(2)
+            .map(|pair| pair[1].duration_since(pair[0]))
+            .collect();
+        assert_eq!(
+            diffs.len(),
+            8,
+            "There should be 8 timing differences, but got {diffs:?}"
         );
         for diff in diffs {
-            assert!(
-                diff.as_millis() >= 990 && diff.as_millis() <= 1010,
-                "Timing difference should be around 1 second, but got {diff:?}ms"
+            assert_eq!(
+                diff,
+                Duration::from_secs(1),
+                "Each interval should be exactly 1 second, but got {diff:?}"
             );
         }
     }

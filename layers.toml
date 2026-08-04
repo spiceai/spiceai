@@ -154,6 +154,7 @@ chunking = "foundation"
 # Shared by implementations outside this repo via a git dependency, so its
 # dependency closure has to stay small — foundation is also a budget here.
 cloud-connect-crypto = "foundation"
+cpu-budget = "foundation"
 dataformat-json = "foundation"
 datafusion-dml = "foundation"
 datafusion-flightsql = "foundation"
