@@ -10,6 +10,7 @@ members = [
     "crates/aws-sdk-credential-bridge",
     "crates/chunking",
     "crates/cloud-connect-crypto",
+    "crates/cpu-budget",
     "crates/data-accelerator-api",
     "crates/data-connectors/*",
     "crates/datafusion-ddl",
@@ -145,6 +146,11 @@ redundant_clone = "deny"
 todo = "deny"
 assertions_on_result_states = "deny"
 allow_attributes = "deny"
+# The list of forbidden methods lives in `clippy.toml` (a clippy config, not a
+# lint level). Denying the lint here is what makes a direct CPU-detection call
+# fail a scoped `cargo clippy -p <crate>` and show up in rust-analyzer, rather
+# than only under the `-Dwarnings` CI gate.
+disallowed_methods = "deny"
 # Pedantic members we opt out of (priority 0 overrides the group deny above).
 module_name_repetitions = "allow"
 large_futures = "allow"
@@ -209,15 +215,16 @@ bigdecimal = "0.4.7"
 blake3 = "1.5"
 byte-unit = "5.1.4"
 bytes = "1.10.0"
-candle = { git = "https://github.com/spiceai/candle.git", rev = "6ee27a4d621a3470cbf83596722c16de7cf97f12", package = "candle-core" } # branch: spiceai
-candle-core = { git = "https://github.com/spiceai/candle.git", rev = "6ee27a4d621a3470cbf83596722c16de7cf97f12" } # branch: spiceai
-candle-kernels = { git = "https://github.com/spiceai/candle.git", rev = "6ee27a4d621a3470cbf83596722c16de7cf97f12", package = "candle-kernels" } # branch: spiceai
-candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "6ee27a4d621a3470cbf83596722c16de7cf97f12", package = "candle-metal-kernels" } # branch: spiceai
-candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "6ee27a4d621a3470cbf83596722c16de7cf97f12", package = "candle-nn" } # branch: spiceai
-candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "6ee27a4d621a3470cbf83596722c16de7cf97f12", package = "candle-transformers" } # branch: spiceai
+candle = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6", package = "candle-core" } # branch: lukim/spiceai-0.11.0 (candle 0.11 + i-quant; refresh to merged SHA)
+candle-core = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6" } # branch: lukim/spiceai-0.11.0 (candle 0.11 + i-quant; refresh to merged SHA)
+candle-kernels = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6", package = "candle-kernels" } # branch: lukim/spiceai-0.11.0 (candle 0.11 + i-quant; refresh to merged SHA)
+candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6", package = "candle-metal-kernels" } # branch: lukim/spiceai-0.11.0 (candle 0.11 + i-quant; refresh to merged SHA)
+candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6", package = "candle-nn" } # branch: lukim/spiceai-0.11.0 (candle 0.11 + i-quant; refresh to merged SHA)
+candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6", package = "candle-transformers" } # branch: lukim/spiceai-0.11.0 (candle 0.11 + i-quant; refresh to merged SHA)
 charset = "0.1.5"
 chrono = "0.4.44"
 clap = { version = "4.5.60", features = ["derive", "env"] }
+crash-handler = "0.8"
 clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0.2.2", features = [
     "tokio_io",
     "tls",
@@ -366,6 +373,7 @@ serde_json = "1"
 sha2 = "0.10.8"
 snafu = "0.8.6"
 cloud-connect-crypto = { path = "crates/cloud-connect-crypto" }
+cpu-budget = { path = "crates/cpu-budget" }
 runtime-cloud-connect = { path = "crates/runtime-cloud-connect" }
 spice-cloud-client = { path = "crates/spice-cloud-client" }
 snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "744ffd77fe82171a805562ce001a341a94d52541" } # branch: spiceai-58
@@ -412,7 +420,7 @@ tracing = "0.1.43"
 tracing-futures = { version = "0.2.5", features = ["futures-03"] }
 tracing-opentelemetry = "0.33"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
-turso = { version = "0.7.1", default-features = false }
+turso = { version = "0.7.2", default-features = false }
 turso-shared = { path = "crates/turso-shared" }
 twox-hash = "2.1.2"
 url = { version = "2.5", features = ["serde"] }
@@ -515,14 +523,14 @@ mysql-common-derive = { path = "vendor/mysql-common-derive" }
 
 # Redirect candle-core / kernels / nn / transformers to the spiceai fork;
 # this matches the git rev pinned in [workspace.dependencies] above.
-candle-core = { git = "https://github.com/spiceai/candle.git", rev = "6ee27a4d621a3470cbf83596722c16de7cf97f12" } # spiceai
-candle-kernels = { git = "https://github.com/spiceai/candle.git", rev = "6ee27a4d621a3470cbf83596722c16de7cf97f12" } # spiceai
-candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "6ee27a4d621a3470cbf83596722c16de7cf97f12" } # spiceai
-candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "6ee27a4d621a3470cbf83596722c16de7cf97f12" } # spiceai
-candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "6ee27a4d621a3470cbf83596722c16de7cf97f12" } # spiceai
+candle-core = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6" } # spiceai
+candle-kernels = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6" } # spiceai
+candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6" } # spiceai
+candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6" } # spiceai
+candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6" } # spiceai
 # candle-index-select-cu is crates.io-sourced by text-embeddings-inference;
-# point it at the spiceai fork's candle-0.10-compatible fallback shim.
-candle-index-select-cu = { git = "https://github.com/spiceai/candle-index-select-cu.git", rev = "397d733869484e21c61a6137f75489d0eca71f5f" } # spiceai
+# point it at the spiceai fork, which builds against candle 0.11.
+candle-index-select-cu = { git = "https://github.com/spiceai/candle-index-select-cu.git", rev = "75fc0b689b33a327907d36dd479f7d242640ca71" } # spiceai (candle 0.11)
 
 # datafusion-table-providers v0.11.0 pulls crates.io datafusion-federation, while the rest of the
 # workspace uses the spiceai fork (DF53-compatible). Redirect crates.io to the fork so the whole

@@ -533,13 +533,32 @@ impl DataFusionBuilder {
 
     /// Bound the number of concurrently-executing query plans — ordinary queries
     /// plus DDL/DML and `EXECUTE` (not lightweight `PREPARE`/`DEALLOCATE`/`SET`) —
-    /// i.e. query admission control. `None` leaves the gate unbounded (the prior
-    /// behavior); `Some(n)` installs a semaphore of `n` permits (clamped to at
-    /// least 1).
+    /// i.e. query admission control.
+    ///
+    /// `None` (unset) sizes the gate from the CPU budget. `Some(0)` opts out and
+    /// leaves it unbounded. `Some(n)` installs a semaphore of `n` permits.
     #[must_use]
     pub fn max_concurrent_queries(mut self, max_concurrent_queries: Option<usize>) -> Self {
-        self.query_admission_semaphore =
-            max_concurrent_queries.map(|n| Arc::new(Semaphore::new(n.max(1))));
+        let permits = match max_concurrent_queries {
+            // Opting out is spelled `0`; every other configured value is a limit.
+            Some(0) => None,
+            Some(configured) => {
+                tracing::info!(
+                    max_concurrent_queries = configured,
+                    "Applied runtime.query.max_concurrent_queries"
+                );
+                Some(configured)
+            }
+            None => {
+                let sized = cpu_budget::cpu_budget().max_concurrent_queries();
+                tracing::info!(
+                    max_concurrent_queries = sized,
+                    "runtime.query.max_concurrent_queries not set; sized from the CPU budget"
+                );
+                Some(sized)
+            }
+        };
+        self.query_admission_semaphore = permits.map(|n| Arc::new(Semaphore::new(n)));
         self
     }
 
@@ -811,9 +830,16 @@ impl DataFusionBuilder {
                 );
             }
         } else {
+            // DataFusion's own default is `available_parallelism()`, which reads
+            // a cgroup CPU quota and otherwise reports the node's cores — so a
+            // pod with a CPU request and no limit would fan every query out
+            // across the whole node. Size from the CPU budget instead, which is
+            // the same number wherever detection was already correct.
+            let target_partitions = cpu_budget::cpu_budget().target_partitions();
+            config = config.with_target_partitions(target_partitions);
             tracing::info!(
-                effective = config.options().execution.target_partitions,
-                "runtime.query.target_partitions not set; using DataFusion default"
+                target_partitions,
+                "runtime.query.target_partitions not set; sized from the CPU budget"
             );
         }
 
@@ -1214,6 +1240,7 @@ impl DataFusionBuilder {
             plan_capture: OnceLock::new(),
             write_stats_notify: tokio::sync::Notify::new(),
             accelerated_tables: TokioRwLock::new(HashSet::new()),
+            dataset_placements: dashmap::DashMap::new(),
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
             query_admission_semaphore: self.query_admission_semaphore,
