@@ -142,7 +142,7 @@ fn insert_batch(stmt: &mut rusqlite::Statement<'_>, batch: &RecordBatch) {
     for row in 0..n {
         let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(ncols);
         for col in 0..ncols {
-            values.push(array_value_to_sqlite(batch.column(col).as_ref(), row));
+            values.push(array_value_to_sqlite(batch.column(col).as_ref(), row, col));
         }
         let params: Vec<&dyn rusqlite::types::ToSql> = values
             .iter()
@@ -153,7 +153,7 @@ fn insert_batch(stmt: &mut rusqlite::Statement<'_>, batch: &RecordBatch) {
     }
 }
 
-fn array_value_to_sqlite(array: &dyn Array, row: usize) -> rusqlite::types::Value {
+fn array_value_to_sqlite(array: &dyn Array, row: usize, col: usize) -> rusqlite::types::Value {
     use arrow::array::*;
     use arrow::datatypes::DataType;
 
@@ -227,10 +227,13 @@ fn array_value_to_sqlite(array: &dyn Array, row: usize) -> rusqlite::types::Valu
             let a = array.as_any().downcast_ref::<BinaryArray>().expect("bin");
             rusqlite::types::Value::Blob(a.value(row).to_vec())
         }
-        other => {
-            // Fallback: Debug string (keeps load from failing on rare types).
-            rusqlite::types::Value::Text(format!("unsupported:{other:?}"))
-        }
+        // Coercing an unconvertible type to a placeholder string would load
+        // values into the oracle that the source data never had, so the
+        // comparison could pass on corrupt data. Fail the load instead.
+        other => panic!(
+            "cannot load Arrow type {other:?} into the SQLite oracle (column {col}, row {row}): \
+             add an explicit conversion arm to `array_value_to_sqlite`"
+        ),
     }
 }
 
