@@ -33,6 +33,16 @@ const SPICED_FILENAME: &str = "spiced";
 const SPICEPODS_DIR: &str = "spicepods";
 const WSL_ENV_KEYS: [&str; 2] = ["WSL_DISTRO_NAME", "WSL_INTEROP"];
 
+/// Treat a blank credential as absent.
+///
+/// A credential that is empty or whitespace-only cannot authenticate anything, so
+/// carrying it as `Some` only means an empty header goes out on the wire and any
+/// fallback that keys off `is_none` is suppressed. The value is otherwise kept
+/// verbatim -- only the all-blank case is discarded.
+fn normalize_credential(value: Option<String>) -> Option<String> {
+    value.filter(|key| !key.trim().is_empty())
+}
+
 /// Runtime context holding paths and configuration for CLI operations.
 #[derive(Debug, Clone)]
 pub struct RuntimeContext {
@@ -127,7 +137,7 @@ impl RuntimeContext {
             ctx.cloud_region = Some(region.to_string());
         }
 
-        ctx.api_key = api_key;
+        ctx.api_key = normalize_credential(api_key);
         ctx.tls_root_certificate_file = tls_root_certificate_file;
 
         // Load API key from .env if not provided
@@ -148,8 +158,26 @@ impl RuntimeContext {
         )
     }
 
-    /// Load API key from .env or .env.local file.
+    /// Load API key from the environment or a .env / .env.local file.
+    ///
+    /// `SPICE_API_KEY` is checked before the files because `--api-key` is declared
+    /// with `env = "SPICE_API_KEY"`: clap resolves that variable itself whenever the
+    /// flag is omitted, so consulting it first here is what makes a blank
+    /// `--api-key` resolve to the same key that omitting the flag would.
     fn load_api_key_from_env(&self) -> Option<String> {
+        normalize_credential(std::env::var("SPICE_API_KEY").ok())
+            .or_else(|| self.load_api_key_from_env_files())
+            .or_else(|| normalize_credential(std::env::var("SPICE_SPICEAI_API_KEY").ok()))
+    }
+
+    /// Load API key from the app's .env.local or .env file.
+    ///
+    /// The first matching entry wins, exactly as before -- .env.local outranks .env,
+    /// and within a file the earlier line wins. A blank value is authoritative but is
+    /// never a credential: `spice login` writes `SPICE_SPICEAI_API_KEY=` for an app
+    /// that has no key, so a blank resolves to `None` rather than falling through to
+    /// an older key in a lower-precedence file.
+    fn load_api_key_from_env_files(&self) -> Option<String> {
         // Try .env.local first, then .env
         let env_files = [".env.local", ".env"];
 
@@ -160,16 +188,13 @@ impl RuntimeContext {
             {
                 for item in env_map.flatten() {
                     if item.0 == "SPICE_SPICEAI_API_KEY" || item.0 == "SPICE_API_KEY" {
-                        return Some(item.1);
+                        return normalize_credential(Some(item.1));
                     }
                 }
             }
         }
 
-        // Also check environment variables
-        std::env::var("SPICE_API_KEY")
-            .or_else(|_| std::env::var("SPICE_SPICEAI_API_KEY"))
-            .ok()
+        None
     }
 
     /// Get the Spice runtime directory (~/.spice).
@@ -892,6 +917,107 @@ mod tests {
             .expect("with_args should succeed");
 
         assert_eq!(ctx.api_key(), Some("test-key"));
+    }
+
+    #[test]
+    fn test_normalize_credential_discards_blank_values() {
+        assert_eq!(normalize_credential(None), None);
+        assert_eq!(normalize_credential(Some(String::new())), None);
+        assert_eq!(normalize_credential(Some("   ".to_string())), None);
+        assert_eq!(normalize_credential(Some("\t\r\n".to_string())), None);
+    }
+
+    #[test]
+    fn test_normalize_credential_keeps_a_real_key_verbatim() {
+        assert_eq!(
+            normalize_credential(Some("real-key".to_string())),
+            Some("real-key".to_string())
+        );
+        // Surrounding whitespace decides only whether the value is blank; a key that
+        // has any content is passed through exactly as supplied.
+        assert_eq!(
+            normalize_credential(Some(" real-key ".to_string())),
+            Some(" real-key ".to_string())
+        );
+    }
+
+    #[test]
+    fn test_with_args_treats_an_empty_api_key_as_absent() {
+        // Regression: `--api-key ""` used to be carried as Some("") -- it suppressed the
+        // .env fallback and every authenticated request went out with a blank credential.
+        // The resolved key may legitimately come from the environment here, so what is
+        // asserted is that the blank flag itself is never what gets carried.
+        for blank in ["", "   ", "\t"] {
+            let ctx = RuntimeContext::with_args(None, Some(blank.to_string()), None, None)
+                .expect("with_args should succeed");
+
+            assert_ne!(
+                ctx.api_key(),
+                Some(blank),
+                "an explicitly blank --api-key must not be carried verbatim"
+            );
+            assert!(
+                ctx.api_key().is_none_or(|key| !key.trim().is_empty()),
+                "a blank --api-key must never resolve to a blank credential"
+            );
+        }
+    }
+
+    /// A context whose app dir is an isolated temp dir, for the .env lookup tests.
+    /// The `TempDir` must be kept alive for the test.
+    fn create_test_context_with_app_dir() -> (RuntimeContext, TempDir) {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let mut ctx = create_test_context();
+        ctx.app_dir = temp_dir.path().to_path_buf();
+
+        (ctx, temp_dir)
+    }
+
+    /// Write one of the app dir's env files for a .env lookup test.
+    fn write_env_file(dir: &TempDir, name: &str, contents: &str) {
+        std::fs::write(dir.path().join(name), contents).expect("write env file");
+    }
+
+    #[test]
+    fn test_load_api_key_from_env_files_returns_a_stored_key() {
+        let (ctx, temp_dir) = create_test_context_with_app_dir();
+        write_env_file(&temp_dir, ".env", "SPICE_API_KEY=real-key\n");
+
+        assert_eq!(
+            ctx.load_api_key_from_env_files(),
+            Some("real-key".to_string())
+        );
+    }
+
+    #[test]
+    fn test_load_api_key_from_env_files_prefers_env_local() {
+        let (ctx, temp_dir) = create_test_context_with_app_dir();
+        write_env_file(&temp_dir, ".env.local", "SPICE_API_KEY=local-key\n");
+        write_env_file(&temp_dir, ".env", "SPICE_API_KEY=plain-key\n");
+
+        assert_eq!(
+            ctx.load_api_key_from_env_files(),
+            Some("local-key".to_string())
+        );
+    }
+
+    #[test]
+    fn test_load_api_key_from_env_files_treats_a_stored_blank_as_no_key() {
+        let (ctx, temp_dir) = create_test_context_with_app_dir();
+        // `spice login` writes SPICE_SPICEAI_API_KEY= for an app that has no key, so a
+        // blank is a deliberate "no key" -- it must resolve to None rather than either
+        // becoming a blank credential or resurrecting an older key from .env.
+        write_env_file(&temp_dir, ".env.local", "SPICE_SPICEAI_API_KEY=\n");
+        write_env_file(&temp_dir, ".env", "SPICE_API_KEY=older-key\n");
+
+        assert_eq!(ctx.load_api_key_from_env_files(), None);
+    }
+
+    #[test]
+    fn test_load_api_key_from_env_files_without_any_env_file() {
+        let (ctx, _temp_dir) = create_test_context_with_app_dir();
+
+        assert_eq!(ctx.load_api_key_from_env_files(), None);
     }
 
     #[test]
