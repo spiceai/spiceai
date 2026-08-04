@@ -101,11 +101,12 @@ first CI run — or the rerun call fails, it falls back to prompting you to
 open/refresh the PR yourself.) That, together with a review, lets a
 maintainer add the PR to the merge queue.
 
-The refresh only fires while the commit it signed off is **still the PR's head**.
-If you pushed while a long sign-off was running, it says so and refreshes nothing:
+The refresh only fires while the commit it signed off is **still the head of an open
+PR**. If you pushed while a long sign-off was running, it says so, names the heads
+of every open PR that contains the commit, and refreshes nothing:
 
 ```
-  1111111111aa is no longer the head of its PR (now 2222222222bb) — not refreshing 'Attestation'.
+  1111111111aa is not the head of any open PR that contains it (PR heads: 2222222222bb) — not refreshing 'Attestation'.
 ```
 
 That is deliberate. `pr.yml`'s concurrency group resolves its SHA term to the

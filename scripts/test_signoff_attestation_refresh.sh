@@ -39,6 +39,8 @@ reruns="$stub_dir/reruns"
 # The SHA under sign-off, and a later one standing in for "the branch moved".
 SIGNED_SHA="1111111111111111111111111111111111111111"
 NEWER_SHA="2222222222222222222222222222222222222222"
+# A third, for the case where the commit sits in more than one open PR.
+THIRD_SHA="3333333333333333333333333333333333333333"
 
 # A `gh` covering exactly the three calls this function makes:
 #
@@ -161,14 +163,19 @@ echo "The branch advanced — skip, and say why (#12360):"
 # The regression this file exists for: re-running the stale commit's run would
 # cancel the current head's in-flight Attestation.
 assert_refresh "a stale SHA does not re-run anything" \
-  "no longer the head of its PR" norerun "$SIGNED_SHA" \
+  "is not the head of any open PR" norerun "$SIGNED_SHA" \
   STUB_PR_HEADS="$NEWER_SHA" STUB_RUN="4242 completed failure"
 assert_refresh "the skip names the current head" \
-  "now ${NEWER_SHA:0:12}" norerun "$SIGNED_SHA" \
+  "PR heads: ${NEWER_SHA:0:12}" norerun "$SIGNED_SHA" \
   STUB_PR_HEADS="$NEWER_SHA" STUB_RUN="4242 completed failure"
 assert_refresh "the skip explains the cancellation risk" \
   "would cancel the current head's" norerun "$SIGNED_SHA" \
   STUB_PR_HEADS="$NEWER_SHA" STUB_RUN="4242 completed failure"
+# A commit can belong to several open PRs, so the message must name every head
+# rather than implying there is a single "its PR".
+assert_refresh "the skip names every open PR head, not just one" \
+  "PR heads: ${NEWER_SHA:0:12}, ${THIRD_SHA:0:12}" norerun "$SIGNED_SHA" \
+  STUB_PR_HEADS="$NEWER_SHA $THIRD_SHA" STUB_RUN="4242 completed failure"
 echo
 
 echo "Cases that must NOT be read as stale — the guard has to fall through:"
@@ -206,7 +213,7 @@ assert_refresh "force still refreshes on the current head" \
   "Re-ran the 'Attestation' check" rerun "$SIGNED_SHA" \
   STUB_PR_HEADS="$SIGNED_SHA" STUB_RUN="4242 completed success" STUB_FORCE=1
 assert_refresh "force does not re-run a stale commit's check" \
-  "no longer the head of its PR" norerun "$SIGNED_SHA" \
+  "is not the head of any open PR" norerun "$SIGNED_SHA" \
   STUB_PR_HEADS="$NEWER_SHA" STUB_RUN="4242 completed success" STUB_FORCE=1
 echo
 

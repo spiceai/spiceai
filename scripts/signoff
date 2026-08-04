@@ -833,7 +833,8 @@ refresh_attestation_check() {
   # pr.yml runs on `pull_request`/`merge_group`/`workflow_dispatch`, so viewing
   # the PR page does not start one — say what actually re-reads the status.
   local fallback="Re-run the PR's 'Attestation' check from the Checks tab once it has reported — reloading the PR page does not re-read the sign-off status."
-  local run run_id run_status run_conclusion pr_heads current_head
+  local run run_id run_status run_conclusion pr_heads head heads_short=""
+  local -a head_list=()
 
   if ! command -v gh >/dev/null 2>&1; then
     info "  Install the GitHub CLI (https://cli.github.com) so signoff can auto-refresh the 'Attestation' check."
@@ -865,9 +866,16 @@ refresh_attestation_check() {
   # blipped lookup is no reason to skip a refresh that would have worked. The
   # membership test is space-delimited so a short SHA cannot partially match.
   if [[ -n "$pr_heads" && " ${pr_heads} " != *" ${sha} "* ]]; then
-    current_head="${pr_heads%% *}"
-    info "  ${sha:0:12} is no longer the head of its PR (now ${current_head:0:12}) — not refreshing 'Attestation'."
-    info "  Re-running that commit's check would cancel the current head's, and would report a verdict for the wrong commit."
+    # "not the head of any open PR", not "no longer the head of its PR": a commit
+    # can belong to several open PRs, so name every current head rather than
+    # implying there is one. `read -ra` rather than an unquoted `for` so the split
+    # cannot glob, regardless of what the API returned.
+    read -ra head_list <<<"$pr_heads"
+    for head in "${head_list[@]}"; do
+      heads_short="${heads_short:+${heads_short}, }${head:0:12}"
+    done
+    info "  ${sha:0:12} is not the head of any open PR that contains it (PR heads: ${heads_short}) — not refreshing 'Attestation'."
+    info "  Re-running this commit's check would cancel the current head's, and would report a verdict for the wrong commit."
     info "  Sign off on the current head instead."
     return 0
   fi
