@@ -28,7 +28,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spice.dataset_active_count{$service.instance.id}",
+                      "query": "sum:spice.dataset_active_count{$instance}",
                       "aggregator": "last"
                     }
                   ],
@@ -63,7 +63,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spice.model_active_count{$service.instance.id}",
+                      "query": "sum:spice.model_active_count{$instance}",
                       "aggregator": "last"
                     }
                   ],
@@ -98,7 +98,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spice.embeddings_active_count{$service.instance.id}",
+                      "query": "sum:spice.embeddings_active_count{$instance}",
                       "aggregator": "last"
                     }
                   ],
@@ -133,7 +133,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spice.tool_active_count{$service.instance.id}",
+                      "query": "sum:spice.tool_active_count{$instance}",
                       "aggregator": "last"
                     }
                   ],
@@ -170,7 +170,7 @@
           {
             "id": 201,
             "definition": {
-              "title": "Query Duration by Protocol (p99)",
+              "title": "Query Duration by Protocol",
               "title_size": "16",
               "title_align": "left",
               "show_legend": true,
@@ -198,7 +198,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "max:spice.query_duration_ms_summary.quantile{$service.instance.id,quantile:0.99} by {protocol}.rollup(max)"
+                      "query": "avg:spice.query_duration_ms_summary.quantile{$instance,quantile:0.99} by {protocol}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -228,7 +228,7 @@
           {
             "id": 202,
             "definition": {
-              "title": "Query Count by Protocol",
+              "title": "Query Throughput",
               "title_size": "16",
               "title_align": "left",
               "show_legend": true,
@@ -249,7 +249,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spice.query_executions{*} by {protocol}.as_count()"
+                      "query": "sum:spice.query_executions.count{$instance} by {protocol}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -298,7 +298,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spice.query_active_count{$service.instance.id} by {protocol}"
+                      "query": "sum:spice.query_active_count{$instance} by {protocol}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -346,7 +346,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spice.query_failures{$service.instance.id} by {err_code}.as_count()"
+                      "query": "sum:spice.query_failures.count{$instance} by {err_code}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -373,7 +373,7 @@
           {
             "id": 205,
             "definition": {
-              "title": "Rows Returned per Query (p99)",
+              "title": "Rows Returned per Query",
               "title_size": "16",
               "title_align": "left",
               "show_legend": true,
@@ -394,7 +394,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "max:spice.query_returned_rows_summary.quantile{$service.instance.id,quantile:0.99} by {protocol}.rollup(max)"
+                      "query": "avg:spice.query_returned_rows_summary.quantile{$instance,quantile:0.99} by {protocol}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -465,12 +465,12 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spice.query_processed_bytes{$service.instance.id}"
+                      "query": "sum:spice.query_processed_bytes.count{$instance}"
                     },
                     {
                       "data_source": "metrics",
                       "name": "query2",
-                      "query": "sum:spice.query_returned_bytes{$service.instance.id}"
+                      "query": "sum:spice.query_returned_bytes.count{$instance}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -520,7 +520,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spice.query_spilled_bytes{$service.instance.id}.as_count()"
+                      "query": "sum:spice.query_spilled_bytes.count{$instance}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -574,7 +574,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spice.dataset_acceleration.time_since_last_refresh_ms{$service.instance.id,!dataset:runtime.*} by {dataset}",
+                      "query": "avg:spice.dataset_acceleration_last_refresh_unix_time_ms{$instance,!dataset:runtime.*} by {dataset}",
                       "aggregator": "last"
                     }
                   ],
@@ -598,7 +598,13 @@
                   ],
                   "formulas": [
                     {
-                      "formula": "query1"
+                      "formula": "time() * 1000 - query1",
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "millisecond"
+                        }
+                      }
                     }
                   ],
                   "sort": {
@@ -652,7 +658,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "max:spice.dataset_acceleration_refresh_duration_ms_summary.quantile{$service.instance.id,!dataset:runtime.*,quantile:0.99} by {dataset}.rollup(max)"
+                      "query": "avg:spice.dataset_acceleration_refresh_duration_ms_summary.quantile{$instance,!dataset:runtime.*,quantile:0.99} by {dataset}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -700,7 +706,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spice.dataset_acceleration_refresh_errors{$service.instance.id} by {dataset}.as_count()"
+                      "query": "sum:spice.dataset_acceleration_refresh_errors.count{$instance} by {dataset}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -738,7 +744,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spice.dataset_acceleration_ingestion_lag_ms{$service.instance.id,!dataset:runtime.*} by {dataset}",
+                      "query": "avg:spice.dataset_acceleration_ingestion_lag_ms{$instance,!dataset:runtime.*} by {dataset}",
                       "aggregator": "last"
                     }
                   ],
@@ -806,7 +812,7 @@
                     {
                       "name": "query1",
                       "data_source": "metrics",
-                      "query": "avg:spice.dataset_acceleration_refresh_lag_ms{$service.instance.id,!dataset:runtime.*} by {dataset}",
+                      "query": "avg:spice.dataset_acceleration_refresh_lag_ms{$instance,!dataset:runtime.*} by {dataset}",
                       "aggregator": "avg"
                     }
                   ],
@@ -888,7 +894,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spice.results_cache_hit_ratio{$service.instance.id}",
+                      "query": "avg:spice.results_cache_hit_ratio{$instance}",
                       "aggregator": "last"
                     }
                   ],
@@ -953,12 +959,12 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spice.results_cache_hits{$service.instance.id}.as_count()"
+                      "query": "sum:spice.results_cache_hits.count{$instance}.as_count()"
                     },
                     {
                       "data_source": "metrics",
                       "name": "query2",
-                      "query": "sum:spice.results_cache_requests{$service.instance.id}.as_count()"
+                      "query": "sum:spice.results_cache_requests.count{$instance}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1015,12 +1021,12 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spice.results_cache_size_bytes{$service.instance.id}"
+                      "query": "sum:spice.results_cache_size_bytes{$instance}"
                     },
                     {
                       "data_source": "metrics",
                       "name": "query2",
-                      "query": "sum:spice.results_cache_max_size_bytes{$service.instance.id}"
+                      "query": "sum:spice.results_cache_max_size_bytes{$instance}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1064,7 +1070,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spice.results_cache_items_count{$service.instance.id}"
+                      "query": "sum:spice.results_cache_items_count{$instance}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1108,7 +1114,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spice.results_cache_evictions{$service.instance.id}.as_count()"
+                      "query": "sum:spice.results_cache_evictions.count{$instance}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1152,7 +1158,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spice.results_cache_swr_background_query_count{$service.instance.id}.as_count()"
+                      "query": "sum:spice.results_cache_swr_background_query_count.count{$instance}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1217,7 +1223,7 @@
                     {
                       "name": "query1",
                       "data_source": "metrics",
-                      "query": "spice.dataset_acceleration_snapshot_write_duration_ms{$service.instance.id} by {dataset}"
+                      "query": "avg:spice.dataset_acceleration_snapshot_write_duration_ms_summary.quantile{$instance,quantile:0.99} by {dataset}"
                     }
                   ],
                   "formulas": [
@@ -1271,12 +1277,18 @@
                     {
                       "name": "query1",
                       "data_source": "metrics",
-                      "query": "spice.dataset_acceleration_snapshot_write_bytes{$service.instance.id} by {dataset}"
+                      "query": "avg:spice.dataset_acceleration_snapshot_write_bytes{$instance} by {dataset}"
                     }
                   ],
                   "formulas": [
                     {
-                      "formula": "query1"
+                      "formula": "query1",
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "byte"
+                        }
+                      }
                     }
                   ],
                   "style": {
@@ -1319,7 +1331,7 @@
                     {
                       "name": "query1",
                       "data_source": "metrics",
-                      "query": "spice.dataset_acceleration_snapshot_bootstrap_duration_ms{$service.instance.id} by {dataset}"
+                      "query": "avg:spice.dataset_acceleration_snapshot_bootstrap_duration_ms.count{$instance} by {dataset}"
                     }
                   ],
                   "formulas": [
@@ -1385,14 +1397,20 @@
                 {
                   "formulas": [
                     {
-                      "formula": "query1"
+                      "formula": "query1",
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "millisecond"
+                        }
+                      }
                     }
                   ],
                   "queries": [
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "max:spice.http_requests_duration_ms_summary.quantile{$service.instance.id,quantile:0.99} by {method,path}.rollup(max)"
+                      "query": "avg:spice.http_requests_duration_ms_summary.quantile{$instance,quantile:0.99} by {method,path}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1440,7 +1458,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spice.http_requests{$service.instance.id} by {method,path,status}.as_count()"
+                      "query": "sum:spice.http_requests.count{$instance} by {method,path,status}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1512,7 +1530,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "max:spice.flight_request_duration_ms_summary.quantile{$service.instance.id,method:do_get,quantile:0.99} by {command}.rollup(max)"
+                      "query": "avg:spice.flight_request_duration_ms_summary.quantile{$instance,method:do_get,quantile:0.99} by {command}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1567,7 +1585,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "max:spice.flight_request_duration_ms_summary.quantile{$service.instance.id,method:do_put,quantile:0.99} by {command}.rollup(max)"
+                      "query": "avg:spice.flight_request_duration_ms_summary.quantile{$instance,method:do_put,quantile:0.99} by {command}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1622,7 +1640,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "max:spice.flight_request_duration_ms_summary.quantile{$service.instance.id,method:get_flight_info,quantile:0.99} by {command}.rollup(max)"
+                      "query": "avg:spice.flight_request_duration_ms_summary.quantile{$instance,method:get_flight_info,quantile:0.99} by {command}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1670,7 +1688,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spice.flight_requests{$service.instance.id} by {method}.as_count()"
+                      "query": "sum:spice.flight_requests.count{$instance} by {method}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1719,7 +1737,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spice.flight_do_exchange_data_updates_sent{$service.instance.id}.as_count()"
+                      "query": "sum:spice.flight_do_exchange_data_updates_sent.count{$instance}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1784,7 +1802,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spice.dataset_kafka_records_lag{$service.instance.id} by {name}"
+                      "query": "avg:spice.dataset_kafka_records_lag{$instance} by {name}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1831,7 +1849,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spice.dataset_kafka_records_consumed_total{$service.instance.id} by {name}"
+                      "query": "sum:spice.dataset_kafka_records_consumed_total.count{$instance} by {name}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1897,7 +1915,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spice.dataset_dynamodb_lag_ms{$service.instance.id} by {name}"
+                      "query": "avg:spice.dataset_dynamodb_lag_ms{$instance} by {name}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1945,7 +1963,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spice.dataset_dynamodb_records_consumed_total{$service.instance.id} by {name}"
+                      "query": "sum:spice.dataset_dynamodb_records_consumed_total.count{$instance} by {name}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1993,7 +2011,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spice.dataset_dynamodb_shards_active{$service.instance.id} by {name}"
+                      "query": "avg:spice.dataset_dynamodb_shards_active{$instance} by {name}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2041,7 +2059,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spice.dataset_dynamodb_errors_transient_total{$service.instance.id} by {name}"
+                      "query": "sum:spice.dataset_dynamodb_errors_transient_total.count{$instance} by {name}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2072,6 +2090,469 @@
         "y": 34,
         "width": 12,
         "height": 1
+      }
+    },
+    {
+      "id": 11,
+      "definition": {
+        "title": "⚙️ Runtime Resources",
+        "background_color": "vivid_yellow",
+        "show_title": true,
+        "type": "group",
+        "layout_type": "ordered",
+        "widgets": [
+          {
+            "id": 1001,
+            "definition": {
+              "title": "CPU Cores",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "auto",
+              "legend_columns": [
+                "avg",
+                "max",
+                "value"
+              ],
+              "type": "timeseries",
+              "requests": [
+                {
+                  "formulas": [
+                    {
+                      "formula": "query1"
+                    }
+                  ],
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "avg:spice.spiced_cpu_budget_cores{$instance} by {pod_name,source}"
+                    }
+                  ],
+                  "response_format": "timeseries",
+                  "style": {
+                    "palette": "dog_classic",
+                    "line_type": "solid",
+                    "line_width": "normal"
+                  },
+                  "display_type": "line"
+                }
+              ],
+              "yaxis": {
+                "include_zero": true,
+                "scale": "linear"
+              }
+            },
+            "layout": {
+              "x": 0,
+              "y": 0,
+              "width": 6,
+              "height": 3
+            }
+          },
+          {
+            "id": 1002,
+            "definition": {
+              "title": "CPU Entitlement",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "auto",
+              "legend_columns": [
+                "avg",
+                "max",
+                "value"
+              ],
+              "type": "timeseries",
+              "requests": [
+                {
+                  "formulas": [
+                    {
+                      "formula": "query1",
+                      "alias": "budget"
+                    },
+                    {
+                      "formula": "query2",
+                      "alias": "limit"
+                    },
+                    {
+                      "formula": "query3",
+                      "alias": "request"
+                    }
+                  ],
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "avg:spice.spiced_cpu_budget_millicores{$instance} by {pod_name,source}"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "query2",
+                      "query": "avg:spice.spiced_cpu_limit_millicores{$instance} by {pod_name}"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "query3",
+                      "query": "avg:spice.spiced_cpu_request_millicores{$instance} by {pod_name}"
+                    }
+                  ],
+                  "response_format": "timeseries",
+                  "style": {
+                    "palette": "dog_classic",
+                    "line_type": "solid",
+                    "line_width": "normal"
+                  },
+                  "display_type": "line"
+                }
+              ],
+              "yaxis": {
+                "include_zero": true,
+                "scale": "linear"
+              }
+            },
+            "layout": {
+              "x": 6,
+              "y": 0,
+              "width": 6,
+              "height": 3
+            }
+          },
+          {
+            "id": 1003,
+            "definition": {
+              "title": "Worker Threads",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "auto",
+              "legend_columns": [
+                "avg",
+                "max",
+                "value"
+              ],
+              "type": "timeseries",
+              "requests": [
+                {
+                  "formulas": [
+                    {
+                      "formula": "query1"
+                    }
+                  ],
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "avg:spice.tokio_runtime_workers{$instance} by {pod_name,runtime}"
+                    }
+                  ],
+                  "response_format": "timeseries",
+                  "style": {
+                    "palette": "dog_classic",
+                    "line_type": "solid",
+                    "line_width": "normal"
+                  },
+                  "display_type": "line"
+                }
+              ],
+              "yaxis": {
+                "include_zero": true,
+                "scale": "linear"
+              }
+            },
+            "layout": {
+              "x": 0,
+              "y": 3,
+              "width": 4,
+              "height": 3
+            }
+          },
+          {
+            "id": 1004,
+            "definition": {
+              "title": "Active Tasks",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "auto",
+              "legend_columns": [
+                "avg",
+                "max",
+                "value"
+              ],
+              "type": "timeseries",
+              "requests": [
+                {
+                  "formulas": [
+                    {
+                      "formula": "query1"
+                    }
+                  ],
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "avg:spice.tokio_runtime_alive_tasks{$instance} by {pod_name,runtime}"
+                    }
+                  ],
+                  "response_format": "timeseries",
+                  "style": {
+                    "palette": "dog_classic",
+                    "line_type": "solid",
+                    "line_width": "normal"
+                  },
+                  "display_type": "line"
+                }
+              ],
+              "yaxis": {
+                "include_zero": true,
+                "scale": "linear"
+              }
+            },
+            "layout": {
+              "x": 4,
+              "y": 3,
+              "width": 4,
+              "height": 3
+            }
+          },
+          {
+            "id": 1005,
+            "definition": {
+              "title": "Queued Tasks",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "auto",
+              "legend_columns": [
+                "avg",
+                "max",
+                "value"
+              ],
+              "type": "timeseries",
+              "requests": [
+                {
+                  "formulas": [
+                    {
+                      "formula": "query1"
+                    }
+                  ],
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "avg:spice.tokio_runtime_global_queue_depth{$instance} by {pod_name,runtime}"
+                    }
+                  ],
+                  "response_format": "timeseries",
+                  "style": {
+                    "palette": "dog_classic",
+                    "line_type": "solid",
+                    "line_width": "normal"
+                  },
+                  "display_type": "line"
+                }
+              ],
+              "yaxis": {
+                "include_zero": true,
+                "scale": "linear"
+              }
+            },
+            "layout": {
+              "x": 8,
+              "y": 3,
+              "width": 4,
+              "height": 3
+            }
+          },
+          {
+            "id": 1006,
+            "definition": {
+              "title": "Process Memory",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "auto",
+              "legend_columns": [
+                "avg",
+                "max",
+                "value"
+              ],
+              "type": "timeseries",
+              "requests": [
+                {
+                  "formulas": [
+                    {
+                      "formula": "query1",
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "byte"
+                        }
+                      }
+                    }
+                  ],
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "avg:spice.process_resident_memory_bytes{$instance} by {pod_name}"
+                    }
+                  ],
+                  "response_format": "timeseries",
+                  "style": {
+                    "palette": "dog_classic",
+                    "line_type": "solid",
+                    "line_width": "normal"
+                  },
+                  "display_type": "line"
+                }
+              ],
+              "yaxis": {
+                "include_zero": true,
+                "scale": "linear"
+              }
+            },
+            "layout": {
+              "x": 0,
+              "y": 6,
+              "width": 4,
+              "height": 3
+            }
+          },
+          {
+            "id": 1007,
+            "definition": {
+              "title": "Query Memory",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "auto",
+              "legend_columns": [
+                "avg",
+                "max",
+                "value"
+              ],
+              "type": "timeseries",
+              "requests": [
+                {
+                  "formulas": [
+                    {
+                      "formula": "query1",
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "byte"
+                        }
+                      }
+                    }
+                  ],
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "avg:spice.query_memory_pool_used_bytes{$instance} by {pod_name}"
+                    }
+                  ],
+                  "response_format": "timeseries",
+                  "style": {
+                    "palette": "dog_classic",
+                    "line_type": "solid",
+                    "line_width": "normal"
+                  },
+                  "display_type": "line"
+                }
+              ],
+              "yaxis": {
+                "include_zero": true,
+                "scale": "linear"
+              }
+            },
+            "layout": {
+              "x": 4,
+              "y": 6,
+              "width": 4,
+              "height": 3
+            }
+          },
+          {
+            "id": 1008,
+            "definition": {
+              "title": "Compaction Memory",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "auto",
+              "legend_columns": [
+                "avg",
+                "max",
+                "value"
+              ],
+              "type": "timeseries",
+              "requests": [
+                {
+                  "formulas": [
+                    {
+                      "formula": "query1",
+                      "alias": "used",
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "byte"
+                        }
+                      }
+                    },
+                    {
+                      "formula": "query2",
+                      "alias": "budget",
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "byte"
+                        }
+                      }
+                    }
+                  ],
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "avg:spice.cayenne_compaction_memory_pool_used_bytes{$instance} by {pod_name}"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "query2",
+                      "query": "avg:spice.cayenne_compaction_memory_pool_bytes{$instance} by {pod_name}"
+                    }
+                  ],
+                  "response_format": "timeseries",
+                  "style": {
+                    "palette": "dog_classic",
+                    "line_type": "solid",
+                    "line_width": "normal"
+                  },
+                  "display_type": "line"
+                }
+              ],
+              "yaxis": {
+                "include_zero": true,
+                "scale": "linear"
+              }
+            },
+            "layout": {
+              "x": 8,
+              "y": 6,
+              "width": 4,
+              "height": 3
+            }
+          }
+        ]
+      },
+      "layout": {
+        "x": 0,
+        "y": 35,
+        "width": 12,
+        "height": 10
       }
     },
     {
@@ -2108,7 +2589,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:k8s.pod.cpu.usage{*} by {pod_name}"
+                      "query": "avg:k8s.pod.cpu.usage{$instance} by {pod_name}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2157,7 +2638,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:k8s.pod.memory.working_set{*} by {pod_name}"
+                      "query": "avg:k8s.pod.memory.working_set{$instance} by {pod_name}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2205,12 +2686,12 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:k8s.volume.capacity{!persistentvolumeclaim:kube-api-access-*,!persistentvolumeclaim:default-token-*} by {pod_name,persistentvolumeclaim}"
+                      "query": "avg:k8s.volume.capacity{$instance,!persistentvolumeclaim:kube-api-access-*,!persistentvolumeclaim:default-token-*} by {pod_name,persistentvolumeclaim}"
                     },
                     {
                       "data_source": "metrics",
                       "name": "query2",
-                      "query": "avg:k8s.volume.available{!persistentvolumeclaim:kube-api-access-*,!persistentvolumeclaim:default-token-*} by {pod_name,persistentvolumeclaim}"
+                      "query": "avg:k8s.volume.available{$instance,!persistentvolumeclaim:kube-api-access-*,!persistentvolumeclaim:default-token-*} by {pod_name,persistentvolumeclaim}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2258,12 +2739,12 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:k8s.volume.capacity{!persistentvolumeclaim:kube-api-access-*,!persistentvolumeclaim:default-token-*} by {pod_name,persistentvolumeclaim}"
+                      "query": "avg:k8s.volume.capacity{$instance,!persistentvolumeclaim:kube-api-access-*,!persistentvolumeclaim:default-token-*} by {pod_name,persistentvolumeclaim}"
                     },
                     {
                       "data_source": "metrics",
                       "name": "query2",
-                      "query": "avg:k8s.volume.available{!persistentvolumeclaim:kube-api-access-*,!persistentvolumeclaim:default-token-*} by {pod_name,persistentvolumeclaim}"
+                      "query": "avg:k8s.volume.available{$instance,!persistentvolumeclaim:kube-api-access-*,!persistentvolumeclaim:default-token-*} by {pod_name,persistentvolumeclaim}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2292,7 +2773,7 @@
       },
       "layout": {
         "x": 0,
-        "y": 35,
+        "y": 45,
         "width": 12,
         "height": 1
       }
@@ -2300,8 +2781,8 @@
   ],
   "template_variables": [
     {
-      "name": "service.instance.id",
-      "prefix": "service.instance.id",
+      "name": "instance",
+      "prefix": "pod_name",
       "available_values": [],
       "default": "*"
     }
