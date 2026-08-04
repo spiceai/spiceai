@@ -48,6 +48,12 @@ const SQLITE_PRAGMA_RETRY_DELAYS_MS: &[u64] = &[10, 25, 50, 100, 200];
 /// — TRUNCATEs ~3× rarer than at 48 MiB while the file stays modest for readers —
 /// and the hot COMMIT path still never checkpoints (the A2 invariant).
 const DEFAULT_WAL_TRUNCATE_THRESHOLD_BYTES: u64 = 160 * 1024 * 1024;
+
+/// Freelist pages reclaimed per maintenance tick under INCREMENTAL auto-vacuum.
+/// 256 pages is 1 MiB at the 4 KiB default page size — small enough that the
+/// write-lock hold stays imperceptible next to the checkpoint that follows it in
+/// the same pass, large enough to converge on a growing freelist.
+const DEFAULT_INCREMENTAL_VACUUM_PAGES: u32 = 256;
 // cycle-10 CORRECTION to the 48 MiB rationale above: benchmarked 48 MiB showed the
 // large-WAL acquisition tax was NOT the held-time driver (WAL max 369->77 MB yet
 // writer_held ROSE 219->307 ms) — the frequent TRUNCATEs each briefly block
@@ -161,6 +167,17 @@ pub struct SqliteMetastoreConfig {
     /// `auto_vacuum` mode. Takes effect only on a fresh DB (an existing DB needs
     /// a full VACUUM to change it). Defaults to [`SqliteAutoVacuum::None`].
     pub auto_vacuum: SqliteAutoVacuum,
+    /// Freelist pages reclaimed per maintenance tick when the database is in
+    /// INCREMENTAL auto-vacuum mode. Ignored in every other mode.
+    ///
+    /// `PRAGMA incremental_vacuum(N)` relocates pages to the end of the file and
+    /// truncates, holding the write lock for the duration — so the cap is what
+    /// makes it safe to run at all. At the 4 KiB default page size the default
+    /// reclaims 1 MiB per tick; with the maintenance debounce at ~100 ms under
+    /// load that converges at roughly 10 MiB/s while each individual pause stays
+    /// short. Raise it to drain a large freelist faster at the cost of longer
+    /// write-lock holds; `0` disables reclamation without changing the DB mode.
+    pub incremental_vacuum_pages: u32,
 }
 
 impl Default for SqliteMetastoreConfig {
@@ -183,6 +200,7 @@ impl Default for SqliteMetastoreConfig {
             wal_autocheckpoint_pages: 0,
             wal_truncate_threshold_bytes: DEFAULT_WAL_TRUNCATE_THRESHOLD_BYTES,
             auto_vacuum: SqliteAutoVacuum::None,
+            incremental_vacuum_pages: DEFAULT_INCREMENTAL_VACUUM_PAGES,
         }
     }
 }
@@ -1542,6 +1560,73 @@ impl MetastoreBackend for SqliteMetastore {
         self.sample_wal_bytes().await;
         Ok(())
     }
+
+    async fn incremental_vacuum(&self) -> CatalogResult<u64> {
+        // Runs on the SAME dedicated connection as the background checkpoint,
+        // for the same reason: `PRAGMA incremental_vacuum` takes the write lock
+        // while it relocates pages, and taking a pool writer slot to do that
+        // would serialize a hot writer behind footprint housekeeping.
+        //
+        // Ordering note for the caller: this belongs BEFORE the checkpoint in a
+        // maintenance pass. In WAL mode the relocation is written as WAL frames
+        // and the main DB file only shrinks when a checkpoint copies them back,
+        // so vacuuming after the checkpoint would defer the actual truncation by
+        // a whole tick.
+        let max_pages = sqlite_metastore_config().incremental_vacuum_pages;
+        if max_pages == 0 {
+            return Ok(0);
+        }
+        let Some(pool) = self.pool.get() else {
+            return Ok(0);
+        };
+        let conn = &pool.checkpoint_conn;
+        let guard = conn.lock().await;
+
+        let start = std::time::Instant::now();
+        let reclaimed = guard
+            .call(move |conn| {
+                // Gate on the DB's ACTUAL mode, not the configured one. The
+                // `auto_vacuum` pragma only takes effect on a fresh database, so
+                // a deployment that switched the config over an existing file is
+                // still in mode 0 — and `incremental_vacuum` there is silently a
+                // no-op. Reading the real mode keeps this from burning a lock
+                // acquisition per tick forever on such a database.
+                //
+                // 0 = NONE, 1 = FULL, 2 = INCREMENTAL. FULL already reclaims at
+                // commit time, so it needs nothing here either.
+                let mode: i64 = conn.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))?;
+                if mode != 2 {
+                    return Ok(0);
+                }
+                // Cheap counter read; skip the write lock entirely when there is
+                // nothing to reclaim, which is the steady state once the freelist
+                // has drained.
+                let free_before: i64 =
+                    conn.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+                if free_before <= 0 {
+                    return Ok(0);
+                }
+                // Bounded: reclaims at most `max_pages`, leaving the rest for
+                // later ticks rather than holding the write lock proportional to
+                // the whole freelist.
+                conn.execute_batch(&format!("PRAGMA incremental_vacuum({max_pages})"))?;
+                let free_after: i64 =
+                    conn.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+                Ok(u64::try_from((free_before - free_after).max(0)).unwrap_or(0))
+            })
+            .await
+            .map_err(
+                |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                    message: format!("Failed to incrementally vacuum the catalog: {e}"),
+                },
+            )?;
+
+        if reclaimed > 0 {
+            telemetry::cayenne::track_metastore_incremental_vacuum(start.elapsed(), reclaimed);
+            tracing::debug!(reclaimed_pages = reclaimed, "Metastore incremental vacuum");
+        }
+        Ok(reclaimed)
+    }
 }
 
 impl SqliteMetastore {
@@ -1951,6 +2036,138 @@ mod tests {
     /// is the SOLE drain. Force the TRUNCATE escalation (threshold = 0) and
     /// assert it reclaims a grown `-wal` file — proving the off-hot-path drain
     /// keeps the WAL bounded without the inline backstop.
+    /// The whole point of the driver: under INCREMENTAL the freelist is actually
+    /// returned to the filesystem, and the main DB file shrinks.
+    #[tokio::test]
+    async fn test_incremental_vacuum_reclaims_freelist_and_shrinks_the_file() {
+        let _guard = CONFIG_LOCK.lock().await;
+        set_sqlite_metastore_config(SqliteMetastoreConfig {
+            auto_vacuum: SqliteAutoVacuum::Incremental,
+            // TRUNCATE every checkpoint so the file size is deterministic here.
+            wal_truncate_threshold_bytes: 0,
+            // Big enough to drain this freelist in one pass.
+            incremental_vacuum_pages: 100_000,
+            ..SqliteMetastoreConfig::default()
+        });
+
+        let (_dir, metastore) = temp_metastore();
+        metastore.init_schema().await.expect("init schema");
+        grow_wal(&metastore, 64, 64).await;
+        metastore.checkpoint_wal().await.expect("checkpoint");
+
+        let size_before = std::fs::metadata(metastore.db_path())
+            .expect("db file")
+            .len();
+
+        // Free a large run of pages, then drain the WAL so the deletion itself is
+        // resident in the main DB and its pages are on the freelist.
+        metastore
+            .execute_batch("DELETE FROM t")
+            .await
+            .expect("delete rows");
+        metastore.checkpoint_wal().await.expect("checkpoint");
+
+        let reclaimed = metastore.incremental_vacuum().await.expect("vacuum");
+        assert!(
+            reclaimed > 0,
+            "INCREMENTAL mode must reclaim the freed pages; reclaimed={reclaimed}"
+        );
+        // The relocation lands in the WAL — the file only shrinks once a
+        // checkpoint copies it back, which is why the caller vacuums BEFORE the
+        // checkpoint in a maintenance pass.
+        metastore.checkpoint_wal().await.expect("checkpoint");
+
+        let size_after = std::fs::metadata(metastore.db_path())
+            .expect("db file")
+            .len();
+        assert!(
+            size_after < size_before,
+            "vacuum + checkpoint must shrink the DB file: before={size_before} after={size_after}"
+        );
+    }
+
+    /// The default mode must stay a no-op — freed pages are reused and the file
+    /// plateaus, which is the documented trade and costs the write path nothing.
+    #[tokio::test]
+    async fn test_incremental_vacuum_is_a_noop_in_the_default_mode() {
+        let _guard = CONFIG_LOCK.lock().await;
+        set_sqlite_metastore_config(SqliteMetastoreConfig::default());
+
+        let (_dir, metastore) = temp_metastore();
+        metastore.init_schema().await.expect("init schema");
+        grow_wal(&metastore, 16, 64).await;
+        metastore.checkpoint_wal().await.expect("checkpoint");
+        metastore
+            .execute_batch("DELETE FROM t")
+            .await
+            .expect("delete rows");
+        metastore.checkpoint_wal().await.expect("checkpoint");
+
+        assert_eq!(
+            metastore.incremental_vacuum().await.expect("vacuum"),
+            0,
+            "auto_vacuum NONE keeps freed pages on the freelist for reuse"
+        );
+    }
+
+    /// A database created in the default mode does not become reclaimable just
+    /// because the config later says INCREMENTAL — `auto_vacuum` only takes
+    /// effect on a fresh file. The driver gates on the DB's real mode so it does
+    /// not take the write lock every tick forever on such a database.
+    #[tokio::test]
+    async fn test_incremental_vacuum_gates_on_the_databases_actual_mode() {
+        let (_dir, metastore) = {
+            let _guard = CONFIG_LOCK.lock().await;
+            set_sqlite_metastore_config(SqliteMetastoreConfig::default());
+            let (dir, metastore) = temp_metastore();
+            metastore.init_schema().await.expect("init schema");
+            grow_wal(&metastore, 16, 64).await;
+            metastore
+                .execute_batch("DELETE FROM t")
+                .await
+                .expect("delete rows");
+            metastore.checkpoint_wal().await.expect("checkpoint");
+            (dir, metastore)
+        };
+
+        let _guard = CONFIG_LOCK.lock().await;
+        set_sqlite_metastore_config(SqliteMetastoreConfig {
+            auto_vacuum: SqliteAutoVacuum::Incremental,
+            ..SqliteMetastoreConfig::default()
+        });
+        assert_eq!(
+            metastore.incremental_vacuum().await.expect("vacuum"),
+            0,
+            "the file was created NONE; flipping the config must not pretend otherwise"
+        );
+    }
+
+    /// `0` turns reclamation off without changing the database's mode.
+    #[tokio::test]
+    async fn test_incremental_vacuum_pages_zero_disables_the_driver() {
+        let _guard = CONFIG_LOCK.lock().await;
+        set_sqlite_metastore_config(SqliteMetastoreConfig {
+            auto_vacuum: SqliteAutoVacuum::Incremental,
+            incremental_vacuum_pages: 0,
+            ..SqliteMetastoreConfig::default()
+        });
+
+        let (_dir, metastore) = temp_metastore();
+        metastore.init_schema().await.expect("init schema");
+        grow_wal(&metastore, 16, 64).await;
+        metastore
+            .execute_batch("DELETE FROM t")
+            .await
+            .expect("delete rows");
+        metastore.checkpoint_wal().await.expect("checkpoint");
+
+        assert_eq!(
+            metastore.incremental_vacuum().await.expect("vacuum"),
+            0,
+            "incremental_vacuum_pages = 0 must reclaim nothing"
+        );
+    }
+
     #[tokio::test]
     async fn test_background_checkpoint_truncates_grown_wal() {
         let _guard = CONFIG_LOCK.lock().await;
