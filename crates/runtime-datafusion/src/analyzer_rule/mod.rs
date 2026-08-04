@@ -18,3 +18,66 @@ pub use duplicate_plan_node::*;
 
 pub mod partitioned_table_scan_rewrite;
 pub use partitioned_table_scan_rewrite::*;
+
+use std::sync::Arc;
+
+use datafusion::optimizer::AnalyzerRule;
+use datafusion::optimizer::analyzer::{
+    resolve_grouping_function::ResolveGroupingFunction, type_coercion::TypeCoercion,
+};
+use datafusion_federation::sql::federation_analyzer_rule;
+
+/// Builds the analyzer-rule list Spice runs, in Spice's order.
+pub struct AnalyzerRulesBuilder {
+    include_federation: bool,
+    extra_rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>,
+}
+
+impl AnalyzerRulesBuilder {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn include_federation(mut self, include: bool) -> Self {
+        self.include_federation = include;
+        self
+    }
+
+    #[must_use]
+    pub fn with_extra_rules(
+        mut self,
+        extra_rules: impl IntoIterator<Item = Arc<dyn AnalyzerRule + Send + Sync>>,
+    ) -> Self {
+        self.extra_rules.extend(extra_rules);
+        self
+    }
+
+    /// Spice customizes the order of the analyzer rules, since some of them are only relevant when `DataFusion` is executing the query,
+    /// as opposed to when underlying federated query engines will execute the query.
+    ///
+    /// This list should be kept in sync with the default rules in `Analyzer::new()`, but with the federation analyzer rule added first.
+    #[must_use]
+    pub fn build(self) -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
+        let mut rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>> = vec![];
+        if self.include_federation {
+            rules.push(Arc::new(federation_analyzer_rule()));
+        }
+        // The rest of these rules are run after the federation analyzer since they only affect internal DataFusion execution.
+        rules.extend([
+            Arc::new(ResolveGroupingFunction::new()) as Arc<dyn AnalyzerRule + Send + Sync>,
+            Arc::new(TypeCoercion::new()) as Arc<dyn AnalyzerRule + Send + Sync>,
+        ]);
+        rules.into_iter().chain(self.extra_rules).collect()
+    }
+}
+
+impl Default for AnalyzerRulesBuilder {
+    fn default() -> Self {
+        Self {
+            include_federation: true,
+            extra_rules: vec![],
+        }
+    }
+}

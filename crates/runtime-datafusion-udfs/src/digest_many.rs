@@ -30,6 +30,7 @@ use std::fmt::{Debug, Write};
 use std::sync::{Arc, LazyLock};
 
 pub static DIGEST_UDF_NAME: &str = "digest_many";
+runtime_udfs_api::register_spice_function!(DIGEST_SPICE_FUNCTION, DIGEST_UDF_NAME);
 pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| {
     Documentation {
     doc_section: DocSection::default(),

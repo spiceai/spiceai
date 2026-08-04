@@ -1771,6 +1771,22 @@ fn parameter_schema_for_plan(plan: &LogicalPlan) -> Result<Option<Schema>, DataF
     Ok(maybe_schema)
 }
 
+/// The `err_code` a failure raised while batches are being polled is recorded
+/// under.
+///
+/// A memory-pool refusal is characteristically mid-stream — an operator grows
+/// its reservation as batches arrive — so this site has to name it, or capacity
+/// never appears in a `query_failures{err_code}` breakdown. Everything else
+/// stays `QueryExecutionError`: the stream is executing, and `ErrorCode::from`
+/// would put Arrow, IO and Parquet failures under `InternalError`, which reads
+/// as a runtime bug rather than a data-plane one.
+fn stream_error_code(error: &DataFusionError) -> ErrorCode {
+    match ErrorCode::from(error) {
+        ErrorCode::ResourcesExhausted => ErrorCode::ResourcesExhausted,
+        _ => ErrorCode::QueryExecutionError,
+    }
+}
+
 #[must_use]
 /// Attaches a query tracker to a stream of record batches.
 ///
@@ -1823,7 +1839,7 @@ fn attach_query_tracker_to_stream(
                         .finish_with_error(
                             &request_context,
                             e.to_string(),
-                            ErrorCode::QueryExecutionError,
+                            stream_error_code(e),
                         );
                     if capture_task_history {
                         tracing::error!(target: "task_history", parent: &inner_span, "{e}");
@@ -2784,6 +2800,53 @@ mod tests {
 
     use super::*;
 
+    /// A pool refusal is the one condition this site names, in every wrapper
+    /// the join and execution paths produce.
+    #[test]
+    fn stream_error_code_names_a_pool_refusal() {
+        assert_eq!(
+            stream_error_code(&DataFusionError::ResourcesExhausted("oom".to_string())),
+            ErrorCode::ResourcesExhausted
+        );
+        assert_eq!(
+            stream_error_code(&DataFusionError::Shared(Arc::new(
+                DataFusionError::ResourcesExhausted("oom".to_string())
+            ))),
+            ErrorCode::ResourcesExhausted
+        );
+        assert_eq!(
+            stream_error_code(&DataFusionError::Context(
+                "Join Error".to_string(),
+                Box::new(DataFusionError::ResourcesExhausted("oom".to_string()))
+            )),
+            ErrorCode::ResourcesExhausted
+        );
+    }
+
+    /// Everything else keeps the code it had before capacity was split out —
+    /// including the variants `ErrorCode::from` would otherwise move to
+    /// `InternalError`.
+    #[test]
+    fn stream_error_code_leaves_every_other_failure_alone() {
+        for error in [
+            DataFusionError::Execution("boom".to_string()),
+            DataFusionError::External("connector failed".into()),
+            DataFusionError::ArrowError(
+                Box::new(arrow::error::ArrowError::ComputeError("cast".to_string())),
+                None,
+            ),
+            DataFusionError::IoError(std::io::Error::other("disk")),
+            DataFusionError::Internal("bug".to_string()),
+            DataFusionError::Plan("bad plan".to_string()),
+        ] {
+            assert_eq!(
+                stream_error_code(&error),
+                ErrorCode::QueryExecutionError,
+                "{error} must stay on the execution code"
+            );
+        }
+    }
+
     #[derive(Debug)]
     struct NoopDmlHandler;
 
@@ -3029,6 +3092,34 @@ mod tests {
             registry.list().iter().all(|info| info.query_id != query_id),
             "cached query should be deregistered after the stream terminates"
         );
+    }
+
+    /// [query admission] The three states of
+    /// `runtime.query.max_concurrent_queries`: unset sizes the gate from the CPU
+    /// budget, `0` opts out of admission control entirely, and any other value is
+    /// that many permits. `0` is the only way to get the unbounded behavior, so a
+    /// regression that reinstated "unset means unbounded" would show up here.
+    #[tokio::test]
+    async fn query_admission_permits_follow_the_configured_value() {
+        let gate = |configured: Option<usize>| {
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .max_concurrent_queries(configured)
+            .build()
+            .query_admission_semaphore()
+            .map(|s| s.available_permits())
+        };
+
+        assert_eq!(
+            gate(None),
+            Some(cpu_budget::cpu_budget().max_concurrent_queries()),
+            "unset must be bounded by the CPU budget, not unbounded"
+        );
+        assert_eq!(gate(Some(0)), None, "0 opts out of admission control");
+        assert_eq!(gate(Some(7)), Some(7));
     }
 
     /// [query admission] With `max_concurrent_queries = 1`, a second

@@ -151,9 +151,9 @@ pub use runtime_datafusion::param_utils;
 pub mod pg_catalog;
 #[cfg(not(windows))]
 pub mod planner;
-pub mod refresh_sql;
+pub use runtime_datafusion::refresh_sql;
 pub mod request_context_extension;
-pub mod retention_sql;
+pub use runtime_datafusion::retention_sql;
 pub mod schema;
 pub mod secrets_context_extension;
 pub mod table;
@@ -164,12 +164,10 @@ pub mod tool_udf;
 pub mod udf;
 pub mod udtf;
 
-pub use runtime_datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
-
-pub const SPICE_RUNTIME_SCHEMA: &str = "runtime";
-pub const SPICE_EVAL_SCHEMA: &str = "eval";
-pub const SPICE_METADATA_SCHEMA: &str = "metadata";
-pub const SPICE_SCP_SCHEMA: &str = "scp";
+pub use runtime_datafusion::{
+    SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_EVAL_SCHEMA, SPICE_METADATA_SCHEMA,
+    SPICE_RUNTIME_SCHEMA, SPICE_SCP_SCHEMA, is_spice_internal_dataset, is_spice_internal_schema,
+};
 
 const MAX_STREAMING_BROADCAST_BATCHES: usize = 128;
 const MAX_STREAMING_BROADCAST_ROWS: usize = 1_000_000;
@@ -528,6 +526,47 @@ pub enum Error {
     },
 }
 
+impl Error {
+    /// Returns `true` if this error is transient and the operation may succeed
+    /// on retry. Errors that are a pure function of the Spicepod configuration
+    /// (and the engine capabilities it selects) are permanent: they resolve
+    /// only when an operator edits the configuration, so retrying them is
+    /// wasted work. Mirrors [`DataConnectorError::is_retriable`], which
+    /// classifies the same way for connector creation.
+    ///
+    /// Anything not listed stays retriable. A misclassified transient error
+    /// would leave a recoverable dataset permanently unloaded, so the default
+    /// is the conservative one.
+    #[must_use]
+    pub(crate) fn is_retriable(&self) -> bool {
+        !matches!(
+            self,
+            // Invalid `refresh_sql` / `retention_sql` in the Spicepod.
+            Self::RefreshSql { .. }
+                | Self::RetentionSql { .. }
+                // `time_column`/`time_format` disagree with the source schema.
+                | Self::InvalidTimeColumnTimeFormat { .. }
+                | Self::AppendRequiresTimeColumn { .. }
+                // Refresh-mode and snapshot settings the selected engine or
+                // connector cannot serve.
+                | Self::InvalidCachingRefreshMode { .. }
+                | Self::ConflictingStaleWhileRevalidateConfig { .. }
+                | Self::UnsupportedDistributedAccelerationEngine { .. }
+                | Self::UnsupportedStreamBatchesForBatchRefresh
+                | Self::UnsupportedRefreshCompleteForStream
+                | Self::UnsupportedSnapshotTriggerForCaching
+                | Self::UnsupportedAccelerationEngineForSnapshots
+                | Self::SnapshotRefreshModeRequiresSnapshots
+                | Self::SnapshotRefreshModeUnsupportedEngine { .. }
+                | Self::SnapshotRefreshModeReloadUnsupported { .. }
+                // Unparseable `snapshots_trigger_threshold` value.
+                | Self::InvalidSnapshotCreationInterval { .. }
+                | Self::InvalidSnapshotCreationBatches { .. }
+                | Self::SnapshotCreationBatchesShouldBePositive
+        )
+    }
+}
+
 /// Validates that the acceleration engine is supported in distributed mode.
 ///
 /// Only Arrow, `PartitionedArrow`, and Cayenne engines are supported for distributed acceleration.
@@ -779,6 +818,23 @@ struct DeferredTableRegistration {
     connector: Arc<dyn DataConnector>,
 }
 
+/// Where a dataset's table provider is installed once the dataset lifecycle has
+/// built it.
+///
+/// By default a dataset is registered into the default catalog, which is what
+/// makes it queryable as `spice.data.<name>`. A component that synthesizes
+/// datasets on a user's behalf — the `PostgreSQL` catalog connector, which
+/// builds one per discovered table — installs them into its own schema provider
+/// instead, so its internal registration names never occupy the user-facing
+/// namespace. The dataset is otherwise completely ordinary: status, metrics,
+/// health monitoring and the refresh loop are all keyed on the dataset name and
+/// are unaffected by where the provider lands.
+pub trait DatasetPlacement: std::fmt::Debug + Send + Sync {
+    /// Install `provider` for the dataset registered as `name`. Called in place
+    /// of registering it into the default catalog.
+    fn install(&self, name: &TableReference, provider: Arc<dyn TableProvider>) -> Result<()>;
+}
+
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
     pub(crate) runtime_status: Arc<status::RuntimeStatus>,
@@ -793,6 +849,9 @@ pub struct DataFusion {
     /// Used by the extension planner to pass `Weak<DataFusion>` to physical plans.
     datafusion_ref: iceberg_ddl::SharedDataFusionRef,
     accelerated_tables: TokioRwLock<HashSet<TableReference>>,
+    /// Datasets whose table provider is installed somewhere other than the
+    /// default catalog, keyed by dataset name (see [`DatasetPlacement`]).
+    dataset_placements: dashmap::DashMap<String, Arc<dyn DatasetPlacement>>,
     caching: Arc<Caching>,
     /// Per-dataset locks serializing write-time schema evolution + rebind (the `OTel`
     /// metric-dimension path). Keyed by table reference so concurrent exports for the
@@ -1013,6 +1072,39 @@ impl DataFusion {
 
     pub fn accelerator_engine_registry(&self) -> Arc<AcceleratorEngineRegistry> {
         Arc::clone(&self.accelerator_engine_registry)
+    }
+
+    /// Declare that `dataset_name`'s table provider belongs to `placement`
+    /// rather than the default catalog (see [`DatasetPlacement`]).
+    ///
+    /// Must be called before the dataset is loaded. Registering the placement up
+    /// front — rather than moving the provider afterwards — is what keeps the
+    /// dataset from ever being briefly queryable as `spice.data.<name>`.
+    pub fn set_dataset_placement(
+        &self,
+        dataset_name: &TableReference,
+        placement: Arc<dyn DatasetPlacement>,
+    ) {
+        self.dataset_placements
+            .insert(dataset_name.to_string(), placement);
+    }
+
+    /// Install a freshly built table provider wherever the dataset belongs: its
+    /// declared [`DatasetPlacement`] if it has one, otherwise the default
+    /// catalog.
+    fn install_table_provider(
+        &self,
+        name: &TableReference,
+        provider: Arc<dyn TableProvider>,
+    ) -> Result<()> {
+        if let Some(placement) = self.dataset_placements.get(&name.to_string()) {
+            return placement.install(name, provider);
+        }
+        self.ctx
+            .register_table(name.clone(), provider)
+            .map_err(find_datafusion_root)
+            .context(UnableToRegisterTableToDataFusionSnafu)?;
+        Ok(())
     }
 
     /// The query-admission semaphore when `runtime.query.max_concurrent_queries`
@@ -1567,9 +1659,7 @@ impl DataFusion {
         // #11170 mechanism — lowering write fan-out yielded 3-11x OLAP latency
         // wins from CPU-contention relief alone). Compaction is unaffected: it
         // has its own dedicated runtime and memory carve-out.
-        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-        let query_reserve = (cores / 4).max(2);
-        let encode_budget = cores.saturating_sub(query_reserve).max(1);
+        let encode_budget = cpu_budget::cpu_budget().cayenne_encode_permits();
         cayenne::set_global_encode_concurrency(encode_budget);
         tracing::info!(
             encode_budget,
@@ -3820,10 +3910,7 @@ impl DataFusion {
             &dataset.columns,
         );
 
-        self.ctx
-            .register_table(dataset.name.clone(), table_provider)
-            .map_err(find_datafusion_root)
-            .context(UnableToRegisterTableToDataFusionSnafu)?;
+        self.install_table_provider(&dataset.name, table_provider)?;
 
         self.register_metadata_table(&dataset, Arc::clone(&source))
             .await?;
@@ -4973,28 +5060,10 @@ fn partition_expr_from_table_provider(table_provider: &Arc<dyn TableProvider>) -
     None
 }
 
-#[must_use]
-pub fn is_spice_internal_dataset(dataset: &TableReference) -> bool {
-    match (dataset.catalog(), dataset.schema()) {
-        (Some(catalog), Some(schema)) => is_spice_internal_schema(catalog, schema),
-        (None, Some(schema)) => is_spice_internal_schema(SPICE_DEFAULT_CATALOG, schema),
-        _ => false,
-    }
-}
-
 // Normalizes a table reference to a full table reference with catalog, schema, and table name
 // so it can be used for comparison.
 fn resolve_table_reference(table: TableReference) -> ResolvedTableReference {
     table.resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
-}
-
-#[must_use]
-pub fn is_spice_internal_schema(catalog: &str, schema: &str) -> bool {
-    catalog == SPICE_DEFAULT_CATALOG
-        && (schema == SPICE_RUNTIME_SCHEMA
-            || schema == SPICE_METADATA_SCHEMA
-            || schema == SPICE_SCP_SCHEMA
-            || schema == SPICE_EVAL_SCHEMA)
 }
 
 impl Drop for DataFusion {

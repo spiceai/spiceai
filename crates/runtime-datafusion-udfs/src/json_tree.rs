@@ -70,6 +70,7 @@ use opentelemetry::metrics::{Counter, Meter};
 use serde_json::Value;
 
 pub const JSON_TREE_UDTF_NAME: &str = "json_tree";
+runtime_udfs_api::register_spice_function!(JSON_TREE_SPICE_FUNCTION, JSON_TREE_UDTF_NAME);
 
 const DEFAULT_MAX_DEPTH: usize = 64;
 const DEFAULT_MAX_ROWS: usize = 1_000_000;

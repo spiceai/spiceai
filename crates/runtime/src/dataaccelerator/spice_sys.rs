@@ -254,13 +254,48 @@ where
         Err(join_error) if join_error.is_panic() => {
             std::panic::resume_unwind(join_error.into_panic())
         }
-        // Cancellation, i.e. the runtime is shutting down under the read. Nothing
-        // downstream can act on it, but it must not pass for "no checkpoint".
+        // Cancellation, i.e. the runtime is shutting down under the read (see
+        // `is_shutdown_cancellation`). Below the default level, but not silent: it
+        // must not pass unremarked for "no checkpoint".
         Err(join_error) => {
-            tracing::error!("Failed to read the sidecar checkpoint: {join_error}");
+            tracing::debug!(
+                "Did not read the sidecar checkpoint: the runtime is shutting down ({join_error})"
+            );
             None
         }
     }
+}
+
+/// True when a `spice_sys` failure is the runtime shutting down under a task on the
+/// blocking pool, rather than the operation itself failing.
+///
+/// A sidecar helper that runs on the blocking pool surfaces a shutdown as a
+/// cancelled [`tokio::task::JoinError`] wrapped in [`Error::External`], which
+/// callers see only as an opaque `"Acceleration error: task ... was cancelled"` —
+/// hence classifying by type rather than by message. The task never started, so
+/// there is nothing to retry and nothing an operator can act on; a caller that
+/// reports its failures at `warn` should report this one below the default level.
+///
+/// Prefer this over the `RuntimeStatus::is_shutdown()` guard the refresh task uses
+/// for the same purpose: `is_shutdown()` is only *coincidental* — every failure that
+/// races a shutdown gets quietened, including real ones — whereas the `JoinError`
+/// is a *causal* statement that this specific work did not run.
+///
+/// The condition it reads is "the task was cancelled", and the shutdown reading
+/// holds because a `spawn_blocking` task is cancelled only when the runtime is
+/// dropped with the task still queued; nothing here calls `JoinHandle::abort`. A
+/// caller that starts aborting sidecar tasks (a per-operation timeout, say) has to
+/// revisit that.
+///
+/// The whole source chain is walked, so it holds however deeply the caller has
+/// boxed or wrapped the error. A *panicked* task is deliberately not matched: that
+/// is a bug and must stay loud.
+pub(crate) fn is_shutdown_cancellation(error: &(dyn std::error::Error + 'static)) -> bool {
+    std::iter::successors(Some(error), |error| std::error::Error::source(*error)).any(|error| {
+        error
+            .downcast_ref::<tokio::task::JoinError>()
+            .is_some_and(tokio::task::JoinError::is_cancelled)
+    })
 }
 
 /// Retries for a sidecar write contending with another writer, on top of the
@@ -667,8 +702,11 @@ async fn acceleration_connection(
     }
 }
 
-#[cfg(all(test, any(feature = "mongodb", feature = "mysql")))]
+#[cfg(test)]
 mod tests {
+    use super::{Error, is_shutdown_cancellation};
+
+    #[cfg(any(feature = "mongodb", feature = "mysql"))]
     #[tokio::test]
     #[should_panic(expected = "sidecar read panicked")]
     async fn spawn_duckdb_blocking_opt_does_not_report_a_panic_as_no_checkpoint() {
@@ -679,6 +717,7 @@ mod tests {
             super::spawn_duckdb_blocking_opt(|| panic!("sidecar read panicked")).await;
     }
 
+    #[cfg(any(feature = "mongodb", feature = "mysql"))]
     #[tokio::test]
     async fn spawn_duckdb_blocking_opt_passes_through_both_outcomes() {
         assert_eq!(super::spawn_duckdb_blocking_opt(|| Some(7)).await, Some(7));
@@ -686,5 +725,59 @@ mod tests {
             super::spawn_duckdb_blocking_opt(|| Option::<u8>::None).await,
             None
         );
+    }
+
+    /// A task the runtime dropped before it ran, i.e. what a sidecar write on the
+    /// blocking pool sees when the process is shutting down under it.
+    async fn cancelled_join_error() -> tokio::task::JoinError {
+        let handle = tokio::spawn(std::future::pending::<()>());
+        handle.abort();
+        let join_error = handle
+            .await
+            .expect_err("an aborted task must not complete successfully");
+        assert!(join_error.is_cancelled());
+        join_error
+    }
+
+    /// The chain a checkpoint caller actually sees: `DatasetCheckpointer::checkpoint`
+    /// boxes the `spice_sys` error, whose `External` variant carries the `JoinError`.
+    #[tokio::test]
+    async fn a_cancelled_sidecar_task_is_recognized_through_the_boxed_chain() {
+        let boxed: Box<dyn std::error::Error + Send + Sync> = Box::new(Error::External {
+            source: Box::new(cancelled_join_error().await),
+        });
+        assert!(is_shutdown_cancellation(boxed.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn a_bare_cancellation_is_recognized_without_any_wrapping() {
+        let join_error = cancelled_join_error().await;
+        assert!(is_shutdown_cancellation(&join_error));
+    }
+
+    /// A panicking task is a bug, not a shutdown, and has to keep its `warn`.
+    #[tokio::test]
+    async fn a_panicked_task_is_not_a_shutdown_cancellation() {
+        let handle = tokio::spawn(async { panic!("sidecar write panicked") });
+        let join_error = handle
+            .await
+            .expect_err("a panicking task must not complete successfully");
+        assert!(join_error.is_panic());
+
+        let boxed: Box<dyn std::error::Error + Send + Sync> = Box::new(Error::External {
+            source: Box::new(join_error),
+        });
+        assert!(!is_shutdown_cancellation(boxed.as_ref()));
+    }
+
+    /// An ordinary sidecar failure — the case that must keep reporting at `warn`.
+    #[test]
+    fn an_ordinary_sidecar_failure_is_not_a_shutdown_cancellation() {
+        let boxed: Box<dyn std::error::Error + Send + Sync> = Box::new(Error::External {
+            source: "TransactionContext Error: Conflict on update!".into(),
+        });
+        assert!(!is_shutdown_cancellation(boxed.as_ref()));
+
+        assert!(!is_shutdown_cancellation(&Error::NoAccelerationConnection));
     }
 }
