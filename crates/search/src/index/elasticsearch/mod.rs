@@ -188,15 +188,17 @@ impl ElasticsearchIndexWriteMaintenance {
             return Ok(());
         }
 
-        let previous = client
-            .get_index_refresh_interval(es_index)
-            .await
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let previous = match client.get_index_refresh_interval(es_index).await {
+            Ok(previous) => previous,
+            Err(e) => {
+                self.abandon_write_cycle();
+                return Err(DataFusionError::External(Box::new(e)));
+            }
+        };
         let body = serde_json::json!({ "index": { "refresh_interval": refresh_interval } });
 
         if let Err(e) = client.put_index_settings(es_index, &body).await {
-            self.refresh_interval_overridden
-                .store(false, Ordering::Release);
+            self.abandon_write_cycle();
             return Err(DataFusionError::External(Box::new(e)));
         }
 
@@ -208,6 +210,19 @@ impl ElasticsearchIndexWriteMaintenance {
             "Set Elasticsearch index '{es_index}' refresh_interval to '{refresh_interval}' for bulk write."
         );
         Ok(())
+    }
+
+    /// Undo everything [`Self::on_write_start`] set before it failed, so a failed start
+    /// leaves no write cycle open.
+    ///
+    /// A caller that abandons the write does not call `on_write_failed` on the index whose
+    /// start failed — a start that fails partway owns its own cleanup — so without this the
+    /// cycle stays open forever and every later write's start short-circuits as a
+    /// second-batch no-op, silently dropping the `refresh_interval` tuning.
+    fn abandon_write_cycle(&self) {
+        self.refresh_interval_overridden
+            .store(false, Ordering::Release);
+        self.write_cycle_active.store(false, Ordering::Release);
     }
 
     async fn on_write_failed(
@@ -773,6 +788,9 @@ mod write_maintenance_tests {
         refresh_index_calls: AtomicU32,
         force_merge_calls: AtomicU32,
         last_force_merge_segments: std::sync::Mutex<Option<u32>>,
+        /// When set, every `put_index_settings` call fails — the shape of an ES cluster that
+        /// rejects the `refresh_interval` override `on_write_start` applies.
+        fail_put_settings: bool,
     }
 
     #[async_trait::async_trait]
@@ -792,6 +810,12 @@ mod write_maintenance_tests {
             _body: &serde_json::Value,
         ) -> elasticsearch::Result<serde_json::Value> {
             self.put_settings_calls.fetch_add(1, Ordering::Relaxed);
+            if self.fail_put_settings {
+                return Err(elasticsearch::Error::ElasticsearchError {
+                    status: 400,
+                    message: "settings rejected".to_string(),
+                });
+            }
             Ok(serde_json::json!({}))
         }
 
@@ -936,6 +960,40 @@ mod write_maintenance_tests {
             client.put_settings_calls.load(Ordering::Relaxed),
             1,
             "refresh_interval must be overridden exactly once per write cycle, not once per batch"
+        );
+    }
+
+    /// A start that fails leaves no write cycle open, so the *next* write still applies the
+    /// `refresh_interval` override instead of short-circuiting as a second-batch no-op.
+    ///
+    /// The caller does not call `on_write_failed` on an index whose own start failed — a
+    /// partway start owns its cleanup — so this has to be self-contained.
+    #[tokio::test]
+    async fn a_failed_write_start_leaves_no_write_cycle_open() {
+        let failing = MockElasticsearch {
+            fail_put_settings: true,
+            ..Default::default()
+        };
+        let m = make_maintenance(ElasticsearchIndexWriteOptions {
+            refresh_interval_during_write: Some("-1".to_string()),
+            force_merge_segments: None,
+        });
+
+        m.on_write_start(&failing, "my-index")
+            .await
+            .expect_err("the override was rejected");
+
+        // A second write, against a healthy cluster, must apply the override rather than
+        // treat itself as another batch of the abandoned cycle.
+        let healthy = MockElasticsearch::default();
+        m.on_write_start(&healthy, "my-index")
+            .await
+            .expect("a later write starts a fresh cycle");
+
+        assert_eq!(
+            healthy.put_settings_calls.load(Ordering::Relaxed),
+            1,
+            "the write after a failed start must still override refresh_interval"
         );
     }
 

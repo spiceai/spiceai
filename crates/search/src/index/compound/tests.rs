@@ -56,6 +56,8 @@ struct MockIndex {
     write_output_rows: Option<usize>,
     fail_write: bool,
     fail_on_write_start: bool,
+    /// What this mock reports from `Index::write_start_failure_is_fatal`.
+    write_start_fatal: bool,
     /// What this mock reports from `Index::write_complete_failure_is_fatal`.
     write_complete_fatal: bool,
     /// What this mock reports from `Index::deletes_by_partial_key`.
@@ -76,6 +78,7 @@ impl MockIndex {
             write_output_rows: None,
             fail_write: false,
             fail_on_write_start: false,
+            write_start_fatal: false,
             write_complete_fatal: false,
             deletes_partial_key: false,
             events: Arc::clone(events),
@@ -179,6 +182,10 @@ impl Index for MockIndex {
 
     fn deletes_by_partial_key(&self) -> bool {
         self.deletes_partial_key
+    }
+
+    fn write_start_failure_is_fatal(&self) -> bool {
+        self.write_start_fatal
     }
 
     fn write_complete_failure_is_fatal(&self) -> bool {
@@ -567,6 +574,72 @@ fn write_complete_fatality_is_the_union_of_both_vector_halves() {
             idx.write_complete_failure_is_fatal(),
             expected,
             "primary_fatal={primary_fatal}, secondary_fatal={secondary_fatal}"
+        );
+    }
+}
+
+/// `compound_on_write_start` fails if either half fails to start, so the start-fatality flag
+/// is the union of both halves rather than the trait default (#12421).
+#[test]
+fn write_start_fatality_is_the_union_of_both_search_halves() {
+    let events = Arc::new(Mutex::new(vec![]));
+
+    for (primary_fatal, secondary_fatal, expected) in [
+        (false, false, false),
+        (true, false, true),
+        (false, true, true),
+        (true, true, true),
+    ] {
+        let mut primary = MockIndex::new("primary", &events);
+        primary.write_start_fatal = primary_fatal;
+        let mut secondary = MockIndex::new("secondary", &events);
+        secondary.write_start_fatal = secondary_fatal;
+
+        let idx = compound(primary, secondary, CompoundReadMode::PrimaryOnly);
+        assert_eq!(
+            idx.write_start_failure_is_fatal(),
+            expected,
+            "primary_fatal={primary_fatal}, secondary_fatal={secondary_fatal}"
+        );
+        assert!(
+            !idx.write_complete_failure_is_fatal(),
+            "a fatal start must not be reported as a fatal finalize"
+        );
+    }
+}
+
+#[test]
+fn write_start_fatality_is_the_union_of_both_vector_halves() {
+    let events = Arc::new(Mutex::new(vec![]));
+
+    for (primary_fatal, secondary_fatal, expected) in [
+        (false, false, false),
+        (true, false, true),
+        (false, true, true),
+        (true, true, true),
+    ] {
+        let mut primary = MockIndex::new("primary", &events);
+        primary.dimension = Some(4);
+        primary.write_start_fatal = primary_fatal;
+        let mut secondary = MockIndex::new("secondary", &events);
+        secondary.dimension = Some(4);
+        secondary.write_start_fatal = secondary_fatal;
+
+        let idx = CompoundVectorIndex::try_new(
+            Arc::new(primary) as Arc<dyn VectorIndex>,
+            Arc::new(secondary) as Arc<dyn VectorIndex>,
+            CompoundReadMode::PrimaryOnly,
+        )
+        .expect("compatible vector indexes");
+
+        assert_eq!(
+            idx.write_start_failure_is_fatal(),
+            expected,
+            "primary_fatal={primary_fatal}, secondary_fatal={secondary_fatal}"
+        );
+        assert!(
+            !idx.write_complete_failure_is_fatal(),
+            "a fatal start must not be reported as a fatal finalize"
         );
     }
 }
