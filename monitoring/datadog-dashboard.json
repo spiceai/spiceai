@@ -1,6 +1,6 @@
 {
   "title": "Spice.ai Dashboard",
-  "description": "Base Datadog dashboard for Spice.ai scraped by the Datadog Agent OpenMetrics check (Kubernetes Autodiscovery). Expected check shape: openmetrics_endpoint on the Spice metrics port (default 9090), namespace \"spice\", metrics [.*]. Filter pods with pod_name (Agent Kubernetes tag; leave * for all). Percentile selects the quantile tag on *_summary.quantile panels (default 0.99). Counter panels use OpenMetrics V2 *.count names.",
+  "description": "Monitoring dashboard for Spice.ai runtime - covers system health, query performance, data acceleration, caching, AI/ML operations, and Flight protocol metrics.",
   "widgets": [
     {
       "id": 1,
