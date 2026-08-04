@@ -74,6 +74,28 @@ limitations under the License.
 //! Width is what makes an unnecessary file open expensive rather than merely
 //! wasteful, so a narrow-only bench would understate the gap.
 //!
+//! ## Mixed-tier joins
+//!
+//! `bench_mixed_tier_dim_join` covers the case the two lanes above cannot: a
+//! join across a table small enough to live in the metastore inline tier and one
+//! that does not. That is the customer's real shape — `integration_points` (13
+//! rows) and `module_specifications` (117) inline while the 2M-row tables do
+//! not — and it is where inlining changes the PLAN rather than just the storage.
+//!
+//! An inlined table is served as a single-partition in-memory source; the same
+//! table on Vortex is a file scan the optimizer may repartition. When the two
+//! sides disagree on partitioning, `EnforceDistribution` resolves it by
+//! COALESCING the other side rather than fanning this one out, which costs the
+//! join its parallelism. That is the mechanism measured at +11% on TPC-DS q64
+//! (611 -> 720 ms at SF-10), so it needs a bench that isolates it.
+//!
+//! The two lanes hold the dimension's CONTENT and the query constant and vary
+//! only the tier: `dim_inlined` leaves the inline-admission caps at their
+//! defaults so the small dimension is admitted, `dim_file` sets
+//! `inline_max_rows = 0` so the identical rows land in Vortex instead. Any
+//! difference is therefore the tier and nothing else — the same isolation the
+//! `cayenne_inline_max_rows: 0` arm gives at benchmark scale.
+//!
 //! A second axis, `file_count`, exists because PK **hash**-sharding on the write
 //! path gives every file a `min/max` spanning the whole key domain
 //! (`resolved_shard_key_columns`), so listing-time min/max pruning can never
@@ -237,10 +259,16 @@ async fn query(
 ) -> Vec<RecordBatch> {
     let config = SessionConfig::new().with_target_partitions(target_partitions);
     let ctx = SessionContext::new_with_config(config);
+    // Registered under both name pairs so one helper serves the probe lanes
+    // (`p`/`c`) and the mixed-tier lane (`f`/`d`).
     ctx.register_table("p", Arc::clone(parent) as Arc<dyn TableProvider>)
         .expect("register parent");
     ctx.register_table("c", Arc::clone(child) as Arc<dyn TableProvider>)
         .expect("register child");
+    ctx.register_table("f", Arc::clone(parent) as Arc<dyn TableProvider>)
+        .expect("register fact");
+    ctx.register_table("d", Arc::clone(child) as Arc<dyn TableProvider>)
+        .expect("register dim");
     ctx.sql(sql)
         .await
         .expect("sql")
@@ -283,6 +311,116 @@ fn bench_literal_vs_join(c: &mut Criterion) {
     }
 }
 
+/// Rows for the small dimension the fact table joins against. Comfortably under
+/// `DEFAULT_INLINE_MAX_ROWS` (1024) so the default-config lane is admitted to the
+/// inline tier, and matching the scale of the dimensions that inline in
+/// production (13 and 117 rows).
+const DIM_ROWS: usize = 64;
+
+fn dim_join_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("dim_id", DataType::Int64, false),
+        Field::new("label", DataType::Utf8, false),
+    ]))
+}
+
+/// Build a fact table plus a small dimension, with the dimension's storage tier
+/// chosen by `inline`. Everything else — rows, schema, query — is identical.
+async fn load_fact_and_dim(inline: bool) -> (CayenneFixture, CayenneFixture) {
+    let f_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("dim_id", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    let fact = setup_cayenne_custom(
+        "mt_fact",
+        Metastore::Sqlite,
+        vec!["id".to_string()],
+        None,
+        Arc::clone(&f_schema),
+        cayenne::metadata::VortexConfig::default(),
+        Arc::new(datafusion::execution::runtime_env::RuntimeEnv::default()),
+    )
+    .await;
+    let ids: Vec<i64> = (0..PARENT_ROWS as i64).collect();
+    let dim_ids: Vec<i64> = ids.iter().map(|i| i % DIM_ROWS as i64).collect();
+    let values: Vec<i64> = ids.iter().map(|i| i * 7).collect();
+    let _ = cayenne_insert(
+        &fact.table,
+        RecordBatch::try_new(
+            f_schema,
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(Int64Array::from(dim_ids)),
+                Arc::new(Int64Array::from(values)),
+            ],
+        )
+        .expect("fact batch"),
+    )
+    .await;
+
+    // The ONLY difference between the lanes. `0` bars admission, so the same
+    // rows are written as a Vortex file instead of a metastore row.
+    let mut dim_config = cayenne::metadata::VortexConfig::default();
+    if !inline {
+        dim_config.inline_max_rows = 0;
+        dim_config.inline_max_bytes = 0;
+        dim_config.inline_max_buffer_bytes = 0;
+    }
+    let dim = setup_cayenne_custom(
+        "mt_dim",
+        Metastore::Sqlite,
+        vec!["dim_id".to_string()],
+        None,
+        dim_join_schema(),
+        dim_config,
+        Arc::new(datafusion::execution::runtime_env::RuntimeEnv::default()),
+    )
+    .await;
+    let d_ids: Vec<i64> = (0..DIM_ROWS as i64).collect();
+    let labels: Vec<String> = d_ids.iter().map(|i| format!("label_{i}")).collect();
+    let _ = cayenne_insert(
+        &dim.table,
+        RecordBatch::try_new(
+            dim_join_schema(),
+            vec![
+                Arc::new(Int64Array::from(d_ids)),
+                Arc::new(StringArray::from(labels)),
+            ],
+        )
+        .expect("dim batch"),
+    )
+    .await;
+
+    (fact, dim)
+}
+
+/// A fact table joined to a small dimension, with the dimension inlined vs
+/// file-backed. Same rows, same query — only the tier differs.
+///
+/// Swept over `target_partitions` because the cost is a partitioning mismatch:
+/// at 1 there is nothing to coalesce and the lanes should converge, and any gap
+/// at 16 is the parallelism the join gives up to accommodate a single-partition
+/// side.
+fn bench_mixed_tier_dim_join(c: &mut Criterion) {
+    let rt = Runtime::new().expect("runtime");
+    let mut group = c.benchmark_group("selective_join_pk_probe/mixed_tier");
+
+    for (label, inline) in [("dim_inlined", true), ("dim_file", false)] {
+        let (fact, dim) = rt.block_on(load_fact_and_dim(inline));
+        for &tp in TARGET_PARTITIONS {
+            // An aggregate, not a point lookup: the coalesce penalty is paid by
+            // the pipeline ABOVE the join, so a one-row answer would hide it.
+            let sql = "SELECT d.label, count(*) AS n, sum(f.value) AS s                        FROM f INNER JOIN d ON f.dim_id = d.dim_id                        GROUP BY d.label";
+            group.bench_with_input(BenchmarkId::new(label, tp), &tp, |b, &tp| {
+                b.to_async(&rt)
+                    .iter(|| async { black_box(query(&fact.table, &dim.table, sql, tp).await) });
+            });
+        }
+    }
+    group.finish();
+}
+
 /// Cost of the same one-row answer as the parent is split across more files.
 ///
 /// Flat is the goal. A rising curve is PK hash-sharding denying listing-time
@@ -307,5 +445,10 @@ fn bench_file_count_scaling(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_literal_vs_join, bench_file_count_scaling);
+criterion_group!(
+    benches,
+    bench_literal_vs_join,
+    bench_mixed_tier_dim_join,
+    bench_file_count_scaling
+);
 criterion_main!(benches);
