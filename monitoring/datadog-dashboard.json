@@ -198,7 +198,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "p99:spice.query_duration_ms{$service.instance.id} by {protocol}"
+                      "query": "max:spice.query_duration_ms_summary.quantile{$service.instance.id,quantile:0.99} by {protocol}.rollup(max)"
                     }
                   ],
                   "response_format": "timeseries",
@@ -228,7 +228,7 @@
           {
             "id": 202,
             "definition": {
-              "title": "Query Throughput",
+              "title": "Query Count by Protocol",
               "title_size": "16",
               "title_align": "left",
               "show_legend": true,
@@ -394,7 +394,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "p99:spice.query_returned_rows{$service.instance.id} by {protocol}"
+                      "query": "max:spice.query_returned_rows_summary.quantile{$service.instance.id,quantile:0.99} by {protocol}.rollup(max)"
                     }
                   ],
                   "response_format": "timeseries",
@@ -652,7 +652,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "p99:spice.dataset_acceleration_refresh_duration_ms{$service.instance.id,!dataset:runtime.*} by {dataset}"
+                      "query": "max:spice.dataset_acceleration_refresh_duration_ms_summary.quantile{$service.instance.id,!dataset:runtime.*,quantile:0.99} by {dataset}.rollup(max)"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1392,7 +1392,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "p99:spice.http_requests_duration_ms{$service.instance.id} by {method,path}"
+                      "query": "max:spice.http_requests_duration_ms_summary.quantile{$service.instance.id,quantile:0.99} by {method,path}.rollup(max)"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1512,7 +1512,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "p99:spice.flight_request_duration_ms{$service.instance.id,method:do_get} by {command}"
+                      "query": "max:spice.flight_request_duration_ms_summary.quantile{$service.instance.id,method:do_get,quantile:0.99} by {command}.rollup(max)"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1567,7 +1567,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "p99:spice.flight_request_duration_ms{$service.instance.id,method:do_put} by {command}"
+                      "query": "max:spice.flight_request_duration_ms_summary.quantile{$service.instance.id,method:do_put,quantile:0.99} by {command}.rollup(max)"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1622,7 +1622,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "p99:spice.flight_request_duration_ms{$service.instance.id,method:get_flight_info} by {command}"
+                      "query": "max:spice.flight_request_duration_ms_summary.quantile{$service.instance.id,method:get_flight_info,quantile:0.99} by {command}.rollup(max)"
                     }
                   ],
                   "response_format": "timeseries",
