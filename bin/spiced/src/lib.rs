@@ -681,29 +681,53 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
             // oversubscribed host. (Benchmarked nice-0 vs a nice-5 variant at SF50: equal
             // QPH, but nice-0 drained replication lag harder — cleared the stock backlog —
             // so it's the better default; the QPH cost vs the shared runtime was noise.)
-            let cdc_apply_runtime = ManagedTokioRuntime::builder()
-                .with_thread_name("cdc-apply-worker")
-                .build()
-                .boxed()
-                .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
+            //
+            // Skipped when no dataset streams changes: each runtime is `cores - 1`
+            // worker threads, and `cdc_apply_runtime()` falls back to the refresh
+            // runtime, so a pod that never runs the apply loop should not pay for it.
+            if runtime::builder::streams_cdc_changes(app.as_ref()) {
+                let cdc_apply_runtime = ManagedTokioRuntime::builder()
+                    .with_thread_name("cdc-apply-worker")
+                    .build()
+                    .boxed()
+                    .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
 
-            rt.datafusion().set_cdc_apply_runtime(cdc_apply_runtime);
+                rt.datafusion().set_cdc_apply_runtime(cdc_apply_runtime);
+            }
 
-            // Bring up the dedicated compaction runtime whenever dedicated
-            // thread pools are enabled. Cayenne can be activated lazily after
-            // startup (for example via Iceberg DDL acceleration defaults), so
-            // install the runtime handle even when the DataFusion builder did
-            // not carve a compaction memory environment from the initial
-            // spicepod. `set_compaction_runtime` injects the carved memory
-            // environment only when one is available.
-            let compaction_runtime = ManagedTokioRuntime::builder()
-                .with_low_priority()
-                .with_thread_name("compaction-worker")
-                .build()
-                .boxed()
-                .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
+            // Process-global Cayenne budgets: the write path (encode concurrency, the
+            // auto-tuner's memory budget, query admission) and the off-pool in-memory
+            // CDC tier ceiling. These bound every Cayenne table, compacting or not, so
+            // they are installed independently of the compaction runtime below — a
+            // fleet of full-refresh tables refreshing at once needs the encode cap just
+            // as much as a CDC fleet does, and a `mode: memory` pod holds its whole
+            // dataset in the tier while never producing a file to compact.
+            rt.datafusion().install_cayenne_global_budgets();
 
-            rt.datafusion().set_compaction_runtime(compaction_runtime);
+            // Bring up the dedicated compaction runtime whenever dedicated thread
+            // pools are enabled. Cayenne can be activated lazily after startup (for
+            // example via Iceberg DDL acceleration defaults), so install the runtime
+            // handle even when the DataFusion builder did not carve a compaction
+            // memory environment from the initial spicepod. `set_compaction_runtime`
+            // injects the carved memory environment only when one is available.
+            //
+            // The one case we can rule out is a pod where no Cayenne table can
+            // produce a file to compact: a whole-table replace leaves nothing to
+            // consolidate, and `mode: memory` never writes a Vortex file at all, so
+            // their background compactors are never even spawned. A table created
+            // later by DDL in such a pod falls back to the ambient runtime
+            // (`spawn_compaction` handles an uninstalled handle), trading isolation —
+            // not correctness — for not reserving a pool the pod cannot use.
+            if rt.datafusion().cayenne_workload().may_compact() {
+                let compaction_runtime = ManagedTokioRuntime::builder()
+                    .with_low_priority()
+                    .with_thread_name("compaction-worker")
+                    .build()
+                    .boxed()
+                    .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
+
+                rt.datafusion().set_compaction_runtime(compaction_runtime);
+            }
         }
         Some("disabled") => {
             tracing::info!(
