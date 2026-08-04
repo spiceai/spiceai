@@ -20479,6 +20479,7 @@ dependencies = [
  "aws-config",
  "aws-credential-types",
  "aws-sdk-dynamodb",
+ "axum",
  "bollard",
  "chbench-driver",
  "clap",

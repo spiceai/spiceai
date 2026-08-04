@@ -239,9 +239,9 @@ jobs:
           spice run &> spice.log &
 
       - name: Wait for Spice runtime is ready
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          timeout: '60'
 
       - name: Install expect (linux)
         if: matrix.target.target_os == 'linux'
@@ -272,16 +272,7 @@ jobs:
 
       - name: Stop spice and check logs
         if: always()
-        run: |
-          if command -v pkill >/dev/null 2>&1; then
-            pkill -x spice || true
-          elif command -v killall >/dev/null 2>&1; then
-            killall spice || true
-          fi
-
-          if [ -f spice.log ]; then
-            cat spice.log
-          fi
+        uses: ./.github/actions/stop-spice
 
   test_hf_model:
     name: 'huggingface model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
@@ -424,23 +415,11 @@ jobs:
           SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
         run: |
           spice run &> spice.log &
-          echo "SPICE_PID=$!" >> "$GITHUB_ENV"
 
-      # A bare `while … sleep 1` cannot tell "still loading" from "exited two seconds
-      # ago", so any startup failure costs the full timeout and reports only that the
-      # step timed out. Watching the child turns that into a named failure in seconds.
       - name: Wait for Spice runtime is ready
-        timeout-minutes: 5
-        run: |
-          set -uo pipefail
-          while [[ "$(curl -s --max-time 5 http://localhost:8090/v1/ready)" != "ready" ]]; do
-            if ! kill -0 "${SPICE_PID}" 2>/dev/null; then
-              echo "::error::The spice runtime exited before becoming ready. Last 40 lines of spice.log:"
-              tail -40 spice.log || true
-              exit 1
-            fi
-            sleep 1
-          done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          timeout: '300'
 
       - name: Install expect (linux)
         if: matrix.target.target_os == 'linux'
@@ -471,16 +450,7 @@ jobs:
 
       - name: Stop spice and check logs
         if: always()
-        run: |
-          if command -v pkill >/dev/null 2>&1; then
-            pkill -x spice || true
-          elif command -v killall >/dev/null 2>&1; then
-            killall spice || true
-          fi
-
-          if [ -f spice.log ]; then
-            cat spice.log
-          fi
+        uses: ./.github/actions/stop-spice
 
       # Only fires when the step above wrote the token itself; a credential the runner
       # already owned is left alone. Without this, a secret would outlive the job in a
@@ -550,10 +520,10 @@ jobs:
           cat spicepod.yaml
 
       - name: Wait for dataset to be ready
-        working-directory: test_app
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: test_app
+          timeout: '60'
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -561,11 +531,10 @@ jobs:
           name: taxi_trips
 
       - name: Stop spice and check logs
-        working-directory: test_app
         if: always()
-        run: |
-          killall spice || true
-          cat spice.log
+        uses: ./.github/actions/stop-spice
+        with:
+          working-directory: test_app
 
   test_quickstart_spiceai:
     name: 'Test Spice.ai quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
@@ -616,10 +585,10 @@ jobs:
           sleep 10
 
       - name: Wait for dataset to be ready
-        working-directory: test_app
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: test_app
+          timeout: '60'
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -627,11 +596,10 @@ jobs:
           name: taxi_trips
 
       - name: Stop spice and check logs
-        working-directory: test_app
         if: always()
-        run: |
-          killall spice || true
-          cat spice.log
+        uses: ./.github/actions/stop-spice
+        with:
+          working-directory: test_app
 
   test_quickstart_s3:
     name: 'Test S3 quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}; acceleration: ${{ matrix.acceleration.engine }})'
@@ -711,10 +679,10 @@ jobs:
           sleep 10
 
       - name: Wait for dataset to be ready
-        working-directory: test_app
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: test_app
+          timeout: '60'
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -722,11 +690,10 @@ jobs:
           name: test_parquet_table
 
       - name: Stop spice and check logs
-        working-directory: test_app
         if: always()
-        run: |
-          killall spice || true
-          cat spice.log
+        uses: ./.github/actions/stop-spice
+        with:
+          working-directory: test_app
 
   test_quickstart_data_postgres:
     name: 'Test PostgreSQL quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}; acceleration: ${{ matrix.acceleration.engine }})'
@@ -885,10 +852,10 @@ jobs:
           sleep 10
 
       - name: Wait for dataset to be ready
-        working-directory: test_app
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: test_app
+          timeout: '60'
 
       - name: Verify dataset1
         uses: ./.github/actions/verify-dataset
@@ -1094,10 +1061,10 @@ jobs:
           sleep 10
 
       - name: Wait for dataset to be ready
-        working-directory: test_app
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: test_app
+          timeout: '60'
 
       - name: Verify dataset1
         uses: ./.github/actions/verify-dataset
@@ -1207,10 +1174,10 @@ jobs:
           sleep 10
 
       - name: Wait for dataset to be ready
-        working-directory: test_app
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: test_app
+          timeout: '60'
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -1218,11 +1185,10 @@ jobs:
           name: test_clickhouse_table
 
       - name: Stop spice and check logs
-        working-directory: test_app
         if: always()
-        run: |
-          killall spice || true
-          cat spice.log
+        uses: ./.github/actions/stop-spice
+        with:
+          working-directory: test_app
 
   test_quickstart_duckdb:
     env:
@@ -1292,10 +1258,10 @@ jobs:
           sleep 5
 
       - name: Wait for dataset to be ready
-        working-directory: duckdb-app
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: duckdb-app
+          timeout: '60'
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -1304,10 +1270,9 @@ jobs:
 
       - name: Stop spice and check logs
         if: always()
-        working-directory: duckdb-app
-        run: |
-          killall spice || true
-          cat spice.log
+        uses: ./.github/actions/stop-spice
+        with:
+          working-directory: duckdb-app
 
   test_local_acceleration:
     name: 'Test acceleration on ${{ matrix.target.name }} using ${{ matrix.acceleration.engine }} (${{ matrix.acceleration.mode }})'
@@ -1408,10 +1373,10 @@ jobs:
           sleep 10
 
       - name: Wait for dataset to be ready
-        working-directory: test_app
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: test_app
+          timeout: '60'
 
       - name: Manually refresh dataset (no params)
         working-directory: test_app
@@ -1452,11 +1417,10 @@ jobs:
           expected-rows-count: 2
 
       - name: Stop spice and check logs
-        working-directory: test_app
         if: always()
-        run: |
-          killall spice || true
-          cat spice.log
+        uses: ./.github/actions/stop-spice
+        with:
+          working-directory: test_app
 
   test_results_caching:
     name: 'Test results caching on ${{ matrix.target.name }}'
@@ -1518,10 +1482,10 @@ jobs:
           sleep 10
 
       - name: Wait for dataset to be ready
-        working-directory: test_app
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: test_app
+          timeout: '60'
 
       - name: Run SQL query and check Miss cache header
         working-directory: test_app
@@ -1603,11 +1567,10 @@ jobs:
           fi
 
       - name: Stop spice and check logs
-        working-directory: test_app
         if: always()
-        run: |
-          killall spice || true
-          cat spice.log
+        uses: ./.github/actions/stop-spice
+        with:
+          working-directory: test_app
 
   gh_connector_quickstart:
     name: 'Test GitHub connector on ${{ matrix.target.name }}'
@@ -1701,10 +1664,10 @@ jobs:
           sleep 20
 
       - name: Wait for dataset to be ready
-        working-directory: test_app
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: test_app
+          timeout: '60'
 
       - name: Run test query (issues)
         env:
@@ -1747,11 +1710,10 @@ jobs:
           query: 'select * from spiceai.stargazers limit 10;'
 
       - name: Stop spice and check logs
-        working-directory: test_app
         if: always()
-        run: |
-          killall spice || true
-          cat spice.log
+        uses: ./.github/actions/stop-spice
+        with:
+          working-directory: test_app
 
   mssql_connector_quickstart:
     name: 'Test MS SQL connector on ${{ matrix.target.name }}'
@@ -1840,10 +1802,10 @@ jobs:
           sleep 20
 
       - name: Wait for dataset to be ready
-        working-directory: test_app
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: test_app
+          timeout: '60'
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -1927,10 +1889,10 @@ jobs:
           sleep 20
 
       - name: Wait for dataset to be ready
-        working-directory: test_app
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: test_app
+          timeout: '60'
 
       - name: Run test query (tpch)
         env:
@@ -1949,11 +1911,10 @@ jobs:
           query: 'select * from db_uc.tpcds.store limit 1;'
 
       - name: Stop spice and check logs
-        working-directory: test_app
         if: always()
-        run: |
-          killall spice || true
-          cat spice.log
+        uses: ./.github/actions/stop-spice
+        with:
+          working-directory: test_app
 
   graceful_shutdown_test_append:
     name: '${{ matrix.spicepod }} acceleration and graceful shutdown on ${{ matrix.target.name }}'
@@ -2065,10 +2026,10 @@ jobs:
           spice run &> spice.log &
 
       - name: Wait for Spice runtime to be ready
-        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
+          timeout: '60'
 
       - name: Verify data_upsert dataset is queryable
         uses: ./.github/actions/verify-dataset
@@ -2111,8 +2072,16 @@ jobs:
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         timeout-minutes: 2
         run: |
-          killall spice || true
-          while pgrep -x spice > /dev/null; do sleep 1; done
+          # `spice run` spawns `spiced`, and `spiced` is the process that holds the
+          # ports and the data — SIGTERM to the CLI alone left it running, so the
+          # graceful-shutdown path under test never ran (#12058). Reuse the shared
+          # stopper so this signals both, and only processes belonging to this
+          # runner instance: several instances share one machine.
+          #
+          # A grace longer than the step timeout on purpose. This step exists to
+          # verify the runtime exits cleanly on SIGTERM, so one that does not must
+          # trip the step timeout rather than be SIGKILLed into looking healthy.
+          SPICE_STOP_GRACE=600 bash "$GITHUB_WORKSPACE/.github/actions/stop-spice/stop_spice.sh"
           # Allow filesystem to sync after process exits
           sleep 2
 
@@ -2155,10 +2124,10 @@ jobs:
           spice run &> spice.log &
 
       - name: Wait for dataset to be ready
-        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
+          timeout: '60'
 
       - name: Verify data_upsert dataset
         uses: ./.github/actions/verify-dataset
@@ -2246,10 +2215,10 @@ jobs:
           spice run &> spice.log &
 
       - name: Wait for dataset to be ready
-        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
-        timeout-minutes: 3
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
+          timeout: '180'
 
       - name: Run test workfload for 120s
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
@@ -2261,8 +2230,16 @@ jobs:
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         timeout-minutes: 2
         run: |
-          killall spice || true
-          while pgrep -x spice > /dev/null; do sleep 1; done
+          # `spice run` spawns `spiced`, and `spiced` is the process that holds the
+          # ports and the data — SIGTERM to the CLI alone left it running, so the
+          # graceful-shutdown path under test never ran (#12058). Reuse the shared
+          # stopper so this signals both, and only processes belonging to this
+          # runner instance: several instances share one machine.
+          #
+          # A grace longer than the step timeout on purpose. This step exists to
+          # verify the runtime exits cleanly on SIGTERM, so one that does not must
+          # trip the step timeout rather than be SIGKILLed into looking healthy.
+          SPICE_STOP_GRACE=600 bash "$GITHUB_WORKSPACE/.github/actions/stop-spice/stop_spice.sh"
           sleep 2
 
       - name: Verify local DuckDB database
@@ -2300,10 +2277,10 @@ jobs:
           spice run &> spice.log &
 
       - name: Wait for dataset to be ready
-        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
-        timeout-minutes: 3
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
+          timeout: '180'
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset

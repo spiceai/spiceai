@@ -1,0 +1,64 @@
+---
+name: E2E Lifecycle Scripts Test
+
+# The E2E jobs share two scripts for starting and stopping the runtime, and
+# both are load-bearing for CI reliability rather than for any product
+# behaviour — which is exactly why they need their own tests. A stop that
+# misses the `spiced` child leaks a listener into the next job on a reused
+# self-hosted runner, and a readiness wait that cannot explain a timeout sends
+# whoever triages it back to a bare "the action has timed out" (#12058).
+on:
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+    paths:
+      - '.github/actions/stop-spice/**'
+      - '.github/actions/wait-for-spice-ready/**'
+      - 'scripts/test_e2e_spice_lifecycle.sh'
+      - '.github/workflows/e2e_lifecycle_scripts_test.yml'
+  push:
+    branches:
+      - trunk
+    paths:
+      - '.github/actions/stop-spice/**'
+      - '.github/actions/wait-for-spice-ready/**'
+      - 'scripts/test_e2e_spice_lifecycle.sh'
+      - '.github/workflows/e2e_lifecycle_scripts_test.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  test-e2e-lifecycle-scripts:
+    name: Unit tests for the E2E runtime lifecycle scripts (${{ matrix.os }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Both families the E2E jobs actually run on. macOS matters most —
+          # that is where the reused self-hosted runners are — and it ships an
+          # older bash, so it catches syntax the Linux runners would accept.
+          - os: linux-x64
+            runner: ubuntu-24.04
+          - os: macos-arm64
+            runner: macos-latest
+    # Stubbed processes and ports throughout: the tests read the repository and
+    # nothing else, so they need no write scope and no credentials.
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run tests
+        # Invoked through `bash` so the job does not depend on the script's
+        # executable bit surviving a checkout on every platform.
+        run: bash scripts/test_e2e_spice_lifecycle.sh
