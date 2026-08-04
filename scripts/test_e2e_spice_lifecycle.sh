@@ -172,7 +172,12 @@ run_subject() {
   local subject="$1"
   shift
   local output rc
-  output="$(cd "$work_dir" && env "PATH=$stub_dir:$PATH" "STATE_DIR=$stub_dir" "$@" \
+  # `-u RUNNER_WORKSPACE -u SPICE_STOP_SCOPE` first: these are real variables on
+  # a GitHub runner, and inheriting them would silently scope a case that meant
+  # to run unscoped — passing locally and failing only in CI. Each case then
+  # sets whatever it needs through "$@".
+  output="$(cd "$work_dir" && env -u RUNNER_WORKSPACE -u SPICE_STOP_SCOPE \
+    "PATH=$stub_dir:$PATH" "STATE_DIR=$stub_dir" "$@" \
     bash -c 'enable -n kill; source "$1"' _ "$subject" 2>&1)"
   rc=$?
   printf '%s|%s' "$rc" "$output"
