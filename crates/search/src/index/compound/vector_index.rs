@@ -177,8 +177,7 @@ impl Index for CompoundVectorIndex {
     fn write_start_failure_is_fatal(&self) -> bool {
         // `compound_on_write_start` fails if either half fails to start, so either half
         // treating that as fatal makes it fatal for this compound index.
-        self.primary.write_start_failure_is_fatal()
-            || self.secondary.write_start_failure_is_fatal()
+        self.primary.write_start_failure_is_fatal() || self.secondary.write_start_failure_is_fatal()
     }
 
     fn write_complete_failure_is_fatal(&self) -> bool {
