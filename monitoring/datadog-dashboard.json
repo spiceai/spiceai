@@ -5,7 +5,7 @@
     {
       "id": 1,
       "definition": {
-        "title": "🏠 System Overview",
+        "title": "\ud83c\udfe0 System Overview",
         "background_color": "vivid_blue",
         "type": "group",
         "layout_type": "ordered",
@@ -162,7 +162,7 @@
     {
       "id": 2,
       "definition": {
-        "title": "📊 Query Performance",
+        "title": "\ud83d\udcca Query Performance",
         "background_color": "vivid_green",
         "type": "group",
         "layout_type": "ordered",
@@ -430,7 +430,7 @@
     {
       "id": 3,
       "definition": {
-        "title": "📈 Data Throughput",
+        "title": "\ud83d\udcc8 Data Throughput",
         "background_color": "vivid_purple",
         "type": "group",
         "layout_type": "ordered",
@@ -556,7 +556,7 @@
     {
       "id": 4,
       "definition": {
-        "title": "⚡ Accelerated Datasets",
+        "title": "\u26a1 Accelerated Datasets",
         "background_color": "vivid_orange",
         "type": "group",
         "layout_type": "ordered",
@@ -865,7 +865,7 @@
     {
       "id": 5,
       "definition": {
-        "title": "💾 Results Cache",
+        "title": "\ud83d\udcbe Results Cache",
         "background_color": "vivid_pink",
         "type": "group",
         "layout_type": "ordered",
@@ -1194,7 +1194,7 @@
     {
       "id": 6025761671556420,
       "definition": {
-        "title": "📦 Acceleration Snapshots",
+        "title": "\ud83d\udce6 Acceleration Snapshots",
         "background_color": "vivid_orange",
         "show_title": true,
         "type": "group",
@@ -1374,7 +1374,7 @@
     {
       "id": 6,
       "definition": {
-        "title": "🌐 HTTP API",
+        "title": "\ud83c\udf10 HTTP API",
         "background_color": "vivid_yellow",
         "type": "group",
         "layout_type": "ordered",
@@ -1494,7 +1494,7 @@
     {
       "id": 7,
       "definition": {
-        "title": "✈️ Arrow Flight Operations",
+        "title": "\u2708\ufe0f Arrow Flight Operations",
         "background_color": "gray",
         "type": "group",
         "layout_type": "ordered",
@@ -1773,7 +1773,7 @@
     {
       "id": 8,
       "definition": {
-        "title": "⏩ Debezium Ingestion",
+        "title": "\u23e9 Debezium Ingestion",
         "background_color": "white",
         "show_title": true,
         "type": "group",
@@ -1885,7 +1885,7 @@
     {
       "id": 9,
       "definition": {
-        "title": "⏩ DynamoDB Streams Ingestion",
+        "title": "\u23e9 DynamoDB Streams Ingestion",
         "background_color": "blue",
         "show_title": true,
         "type": "group",
@@ -2095,7 +2095,7 @@
     {
       "id": 11,
       "definition": {
-        "title": "⚙️ Runtime Resources",
+        "title": "\u2699\ufe0f Runtime Resources",
         "background_color": "vivid_yellow",
         "show_title": true,
         "type": "group",
@@ -2126,7 +2126,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spice.spiced_cpu_budget_cores{$instance} by {service.instance.id,source}"
+                      "query": "avg:spice.spiced_cpu_budget_cores{$instance} by {service_instance_id,source}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2184,17 +2184,17 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spice.spiced_cpu_budget_millicores{$instance} by {service.instance.id,source}"
+                      "query": "avg:spice.spiced_cpu_budget_millicores{$instance} by {service_instance_id,source}"
                     },
                     {
                       "data_source": "metrics",
                       "name": "query2",
-                      "query": "avg:spice.spiced_cpu_limit_millicores{$instance} by {service.instance.id}"
+                      "query": "avg:spice.spiced_cpu_limit_millicores{$instance} by {service_instance_id}"
                     },
                     {
                       "data_source": "metrics",
                       "name": "query3",
-                      "query": "avg:spice.spiced_cpu_request_millicores{$instance} by {service.instance.id}"
+                      "query": "avg:spice.spiced_cpu_request_millicores{$instance} by {service_instance_id}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2243,7 +2243,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spice.tokio_runtime_workers{$instance} by {service.instance.id,runtime}"
+                      "query": "avg:spice.tokio_runtime_workers{$instance} by {service_instance_id,runtime}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2292,7 +2292,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spice.tokio_runtime_alive_tasks{$instance} by {service.instance.id,runtime}"
+                      "query": "avg:spice.tokio_runtime_alive_tasks{$instance} by {service_instance_id,runtime}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2341,7 +2341,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spice.tokio_runtime_global_queue_depth{$instance} by {service.instance.id,runtime}"
+                      "query": "avg:spice.tokio_runtime_global_queue_depth{$instance} by {service_instance_id,runtime}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2396,7 +2396,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spice.process_resident_memory_bytes{$instance} by {service.instance.id}"
+                      "query": "avg:spice.process_resident_memory_bytes{$instance} by {service_instance_id}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2451,7 +2451,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spice.query_memory_pool_used_bytes{$instance} by {service.instance.id}"
+                      "query": "avg:spice.query_memory_pool_used_bytes{$instance} by {service_instance_id}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2517,12 +2517,12 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spice.cayenne_compaction_memory_pool_used_bytes{$instance} by {service.instance.id}"
+                      "query": "avg:spice.cayenne_compaction_memory_pool_used_bytes{$instance} by {service_instance_id}"
                     },
                     {
                       "data_source": "metrics",
                       "name": "query2",
-                      "query": "avg:spice.cayenne_compaction_memory_pool_bytes{$instance} by {service.instance.id}"
+                      "query": "avg:spice.cayenne_compaction_memory_pool_bytes{$instance} by {service_instance_id}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2558,7 +2558,7 @@
     {
       "id": 10,
       "definition": {
-        "title": "🔧 Kubernetes Resource Utilization",
+        "title": "\ud83d\udd27 Kubernetes Resource Utilization",
         "background_color": "vivid_green",
         "show_title": true,
         "type": "group",
@@ -2782,8 +2782,7 @@
   "template_variables": [
     {
       "name": "instance",
-      "prefix": "service.instance.id",
-      "available_values": [],
+      "prefix": "service_instance_id",
       "default": "*"
     },
     {
