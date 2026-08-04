@@ -83,8 +83,10 @@ call_refresh() {
   local output rc
   # `env` rather than an assignment prefix: these come from "$@", and words that
   # only look like assignments after expansion are read as the command name.
+  # STUB_FORCE feeds the optional third argument (the failed-sign-off force path),
+  # so a case can exercise it the same way it sets any other stub input.
   output="$(env "PATH=$stub_dir:$PATH" "STUB_RERUNS=$reruns" "$@" \
-    bash -c 'source "$1"; refresh_attestation_check "$2" "$3"' \
+    bash -c 'source "$1"; refresh_attestation_check "$2" "$3" "${STUB_FORCE:-}"' \
     _ "$subject" "$sha" "spiceai/spiceai" 2>&1)"
   rc=$?
   printf '%s|%s' "$rc" "$output"
@@ -188,11 +190,24 @@ assert_refresh "an already-green run is not re-run" \
   "" norerun "$SIGNED_SHA" \
   STUB_PR_HEADS="$SIGNED_SHA" STUB_RUN="4242 completed success"
 assert_refresh "no run found falls back to the manual hint" \
-  "Open/refresh the PR" norerun "$SIGNED_SHA" \
+  "Re-run the PR's 'Attestation' check from the Checks tab" norerun "$SIGNED_SHA" \
   STUB_PR_HEADS="$SIGNED_SHA" STUB_RUN=""
 assert_refresh "a rerun that fails reports the fallback" \
   "Could not auto-refresh" rerun "$SIGNED_SHA" \
   STUB_PR_HEADS="$SIGNED_SHA" STUB_RUN="4242 completed failure" STUB_RERUN_RC=1
+echo
+
+echo "The force path (a failed sign-off, #12346) gets the same guard:"
+# `force` exists so a *failed* sign-off re-runs a run that concluded success,
+# overturning an attestation it just invalidated. The staleness question is
+# orthogonal: a commit that is no longer the PR head must not be re-run either
+# way, or the force path reintroduces the same cancellation.
+assert_refresh "force still refreshes on the current head" \
+  "Re-ran the 'Attestation' check" rerun "$SIGNED_SHA" \
+  STUB_PR_HEADS="$SIGNED_SHA" STUB_RUN="4242 completed success" STUB_FORCE=1
+assert_refresh "force does not re-run a stale commit's check" \
+  "no longer the head of its PR" norerun "$SIGNED_SHA" \
+  STUB_PR_HEADS="$NEWER_SHA" STUB_RUN="4242 completed success" STUB_FORCE=1
 echo
 
 echo "A missing gh is a no-op, not a crash:"

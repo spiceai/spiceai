@@ -897,6 +897,40 @@ mod tests {
         assert_eq!(read_only_response.status(), StatusCode::FORBIDDEN);
     }
 
+    /// A join wraps its build-side failure in `Shared`, which renders with no
+    /// prefix, so the body reads like a bare refusal while the status stays on
+    /// 400. The status has to be derived from the variant, not the text.
+    #[test]
+    fn a_shared_pool_refusal_reaches_the_same_status() {
+        let shared = datafusion::error::DataFusionError::Shared(std::sync::Arc::new(
+            datafusion::error::DataFusionError::ResourcesExhausted(
+                "Additional allocation failed for HashJoinInput[135]".to_string(),
+            ),
+        ));
+        assert!(
+            shared.to_string().starts_with("Resources exhausted: "),
+            "`Shared` must delegate its message, or this test is not covering the real shape"
+        );
+        assert!(matches!(
+            SqlErrorKind::of_datafusion_error(&shared),
+            SqlErrorKind::ResourcesExhausted
+        ));
+        let response = sql_error_response(
+            shared.to_string(),
+            SqlErrorKind::of_datafusion_error(&shared),
+        );
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // A shared failure that is not a refusal must not be swept up with it.
+        let shared_other = datafusion::error::DataFusionError::Shared(std::sync::Arc::new(
+            datafusion::error::DataFusionError::Execution("boom".to_string()),
+        ));
+        assert!(matches!(
+            SqlErrorKind::of_datafusion_error(&shared_other),
+            SqlErrorKind::General
+        ));
+    }
+
     /// `TrackConsumersPool` writes its breakdown as `"… (across reservations)
     /// as:\n{consumers}\nError: {msg}"`, so the message reaching
     /// `sql_error_response` is genuinely multi-line. The log record has to stay
