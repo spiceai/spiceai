@@ -1240,6 +1240,7 @@ impl DataFusionBuilder {
             plan_capture: OnceLock::new(),
             write_stats_notify: tokio::sync::Notify::new(),
             accelerated_tables: TokioRwLock::new(HashSet::new()),
+            dataset_placements: dashmap::DashMap::new(),
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
             query_admission_semaphore: self.query_admission_semaphore,
