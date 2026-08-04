@@ -24,6 +24,7 @@ use spice::commands::{
     datasets, feedback, init, install, login, models, nsql, pods, query, refresh, run, search, sql,
     status, trace, upgrade, validate, version, workers,
 };
+use spice::context::DEFAULT_HTTP_ENDPOINT;
 use spice::output::OutputFormat;
 use spice::{Result, RuntimeContext};
 use spice_cloud_client::endpoints::{
@@ -135,7 +136,7 @@ struct Cli {
     cloud_region: String,
 
     /// HTTP endpoint of the Spice runtime to talk to.
-    #[arg(long, global = true, default_value = "http://127.0.0.1:8090")]
+    #[arg(long, global = true, default_value = DEFAULT_HTTP_ENDPOINT)]
     http_endpoint: String,
 
     /// Path to a PEM root certificate used to verify the runtime's TLS server certificate.

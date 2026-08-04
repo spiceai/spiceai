@@ -27,6 +27,12 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
+/// The runtime HTTP endpoint the CLI talks to when `--http-endpoint` is not given.
+///
+/// Shared with the `--http-endpoint` flag's `default_value` so a command can tell an
+/// explicitly chosen endpoint from the built-in local one.
+pub const DEFAULT_HTTP_ENDPOINT: &str = "http://127.0.0.1:8090";
+
 /// Constants for Spice paths and filenames
 const DOT_SPICE: &str = ".spice";
 const SPICED_FILENAME: &str = "spiced";
@@ -96,7 +102,7 @@ impl RuntimeContext {
             spice_bin_dir,
             app_dir,
             pods_dir,
-            http_endpoint: "http://127.0.0.1:8090".to_string(),
+            http_endpoint: DEFAULT_HTTP_ENDPOINT.to_string(),
             api_key: None,
             cloud_region: None,
             user_agent: Self::default_user_agent(),

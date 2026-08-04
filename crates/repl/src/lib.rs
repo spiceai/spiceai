@@ -144,6 +144,15 @@ pub struct ReplConfig {
     /// line per record (useful for wide tables). Toggle at runtime with `.expanded`.
     #[arg(long, short = 'x', help_heading = "SQL REPL")]
     pub expanded: bool,
+
+    /// Set when `http_endpoint` was left at its local default while SQL queries go to an
+    /// explicitly chosen remote Flight endpoint. The two then address different runtimes, so
+    /// `nql` — the one REPL feature that speaks HTTP rather than Flight — must say so instead
+    /// of answering from whatever happens to be listening locally. See #11005.
+    ///
+    /// Not a flag: the caller that resolved both endpoints is the only thing that can know.
+    #[arg(skip)]
+    pub http_endpoint_may_be_another_runtime: bool,
 }
 
 const NQL_LINE_PREFIX: &str = "nql ";
@@ -616,6 +625,15 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
             }
             _ if lower.starts_with(NQL_LINE_PREFIX) => {
                 let _ = rl.add_history_entry(line);
+                if repl_config.http_endpoint_may_be_another_runtime {
+                    println!(
+                        "{} {}",
+                        Color::Red.paint("Error:"),
+                        nql_endpoint_mismatch_message(&repl_config)
+                    );
+                    let _ = std::io::stdout().flush();
+                    continue;
+                }
                 // `lower` and `line` have the same byte length, so slicing
                 // off the prefix on the original line yields the user's
                 // original-case question.
@@ -793,6 +811,38 @@ fn format_flight_sql_status(status: &Status) -> String {
     )
 }
 
+/// Why `nql` will not run when the HTTP endpoint and the SQL target are different runtimes.
+///
+/// `nql` is the one REPL feature that goes over the runtime's HTTP API; everything else uses
+/// Flight. Answering it from the local default while this session's SQL goes to a remote would
+/// silently mix results from two runtimes, so name both endpoints and the flag that fixes it.
+fn nql_endpoint_mismatch_message(repl_config: &ReplConfig) -> String {
+    let http_endpoint = &repl_config.http_endpoint;
+    let flight_endpoint = &repl_config.repl_flight_endpoint;
+
+    format!(
+        "`nql` uses the runtime's HTTP API at '{http_endpoint}', but this session's SQL \
+         queries go to '{flight_endpoint}' — a different runtime. Re-run with \
+         `--http-endpoint <http url of that runtime>` to ask it instead."
+    )
+}
+
+/// Why the REPL could not open its Flight connection.
+///
+/// The endpoint is the runtime's **Arrow Flight (gRPC)** address, not its HTTP API, and the
+/// scheme (`http://`) hides that: pointing the REPL at an HTTP ingress, or at the HTTP port,
+/// fails here with a bare transport error. Say what the endpoint has to serve. See #11005.
+fn flight_connection_failed(flight_endpoint: &str, cause: &str) -> Box<dyn Error> {
+    Box::<dyn Error>::from(format!(
+        "Connection failed to spiced at '{flight_endpoint}': {cause}. This endpoint must \
+         serve the runtime's Arrow Flight (gRPC) API — its flight port, 50051 by default, \
+         reached through a gRPC-capable route if it is behind a proxy or ingress; the \
+         runtime's HTTP port will not answer here. Check that the Spice runtime is running, \
+         that the endpoint including port is correct, and that the TLS config (if used) is \
+         valid."
+    ))
+}
+
 async fn connect_flight_client(
     repl_config: &ReplConfig,
     user_agent: &str,
@@ -841,11 +891,7 @@ async fn connect_flight_client(
 
     let channel = connect_channel(repl_flight_endpoint.clone(), user_agent, client_tls_config)
         .await
-        .map_err(|e| {
-        Box::<dyn Error>::from(format!(
-            "Connection failed to spiced at '{repl_flight_endpoint}': {e}. Check if the Spice runtime is running, endpoint including port is correct, and TLS config (if used) is valid."
-        ))
-    })?;
+        .map_err(|e| flight_connection_failed(&repl_flight_endpoint, &e.to_string()))?;
 
     Ok(FlightServiceClient::new(channel)
         .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE)
@@ -1370,6 +1416,47 @@ mod tests {
     fn test_cache_control_default() {
         let default = cache_control::CacheControl::default();
         assert_eq!(default, cache_control::CacheControl::Cache);
+    }
+
+    /// #11005: refusing `nql` is only useful if the message names both endpoints and the flag
+    /// that reconciles them — otherwise it reads as `nql` being broken.
+    #[test]
+    fn the_nql_mismatch_message_names_both_endpoints_and_the_flag() {
+        let config = ReplConfig::parse_from([
+            "repl",
+            "--http-endpoint",
+            "http://127.0.0.1:8090",
+            "--repl-flight-endpoint",
+            "http://spiced.internal:50051",
+        ]);
+
+        let message = nql_endpoint_mismatch_message(&config);
+
+        assert!(message.contains("http://127.0.0.1:8090"), "{message}");
+        assert!(message.contains("http://spiced.internal:50051"), "{message}");
+        assert!(message.contains("--http-endpoint"), "{message}");
+    }
+
+    /// #11005: the reporter pointed `--endpoint` at an HTTP ingress and got a bare transport
+    /// error, so the message has to say the endpoint serves Flight/gRPC on its own port.
+    #[test]
+    fn the_flight_connection_failure_says_the_endpoint_serves_grpc() {
+        let endpoint = "http://spice-test.127.0.0.1.nip.io";
+        let message = flight_connection_failed(endpoint, "transport error").to_string();
+
+        assert!(message.contains(endpoint), "{message}");
+        assert!(message.contains("transport error"), "{message}");
+        assert!(message.contains("gRPC"), "{message}");
+        assert!(message.contains("50051"), "{message}");
+    }
+
+    /// The `nql` guard is off unless a caller sets it, so parsing the REPL's own flags — what
+    /// `spiced` does — never turns it on.
+    #[test]
+    fn the_nql_guard_defaults_off_when_parsed_from_flags() {
+        let config = ReplConfig::parse_from(["repl"]);
+
+        assert!(!config.http_endpoint_may_be_another_runtime);
     }
 
     #[test]
