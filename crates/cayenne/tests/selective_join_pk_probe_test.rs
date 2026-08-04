@@ -37,8 +37,8 @@ use std::sync::Arc;
 
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use cayenne::CayenneTableProvider;
 use cayenne::metadata::{CreateTableOptions, VortexConfig};
+use cayenne::{CayenneTableProvider, MetadataCatalog};
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::*;
 
@@ -46,6 +46,7 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 test_with_backends!(selective_join_probe_emits_one_row_impl);
 test_with_backends!(selective_join_pushes_a_dynamic_filter_to_the_probe_impl);
+test_with_backends!(mixed_tier_join_keeps_the_inlined_side_in_the_metastore_impl);
 
 const PARENT_ROWS: i64 = 20_000;
 
@@ -77,7 +78,7 @@ async fn make_table(
 ) -> CayenneTableProvider {
     let ctx = SessionContext::new();
     CayenneTableProvider::create_table(
-        Arc::clone(&fixture.catalog) as Arc<dyn cayenne::MetadataCatalog>,
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
         CreateTableOptions {
             table_name: name.to_string(),
             schema,
@@ -318,6 +319,131 @@ async fn join_driven_lookup_costs_the_same_as_a_literal_lookup() -> TestResult {
         "the join path opened {join_groups} file groups against the literal path's \
          {literal_groups} for the SAME single row — the PK-selective fan-out \
          suppression did not engage for a dynamic filter.\n\nliteral:\n{literal_plan}\n\njoin:\n{join_plan}"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Mixed-tier joins: one side small enough to inline, the other file-backed.
+// ---------------------------------------------------------------------------
+
+/// Under `DEFAULT_INLINE_MAX_ROWS` (1024), matching the production dimensions
+/// that inline (`integration_points` 13 rows, `module_specifications` 117).
+const DIM_ROWS: i64 = 64;
+
+fn dim_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("dim_id", DataType::Int64, false),
+        Field::new("label", DataType::Utf8, false),
+    ]))
+}
+
+/// A join across the tier boundary: a fact table on Vortex against a dimension
+/// small enough to live in the metastore.
+///
+/// This is the customer's real shape, and the case where inlining changes the
+/// PLAN rather than only the storage: an inlined table is a single-partition
+/// in-memory source, so when it meets a repartitionable file scan
+/// `EnforceDistribution` resolves the mismatch by coalescing the other side.
+/// That is the mechanism behind the +11% measured on TPC-DS q64.
+///
+/// What is asserted here is the precondition the bench depends on — that the
+/// dimension really is in the inline tier and the join is still correct across
+/// it. The COST is measured by `bench_mixed_tier_dim_join`, because a
+/// partitioning penalty is a timing property and asserting a coalesce count
+/// would pin today's plan shape and fight every future optimiser change.
+async fn mixed_tier_join_keeps_the_inlined_side_in_the_metastore_impl(
+    fixture: common::TestFixture,
+) -> TestResult {
+    let fact_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("dim_id", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    let fact = Arc::new(
+        make_table(
+            &fixture,
+            "f",
+            Arc::clone(&fact_schema),
+            vec!["id".to_string()],
+        )
+        .await,
+    );
+    let dim = Arc::new(make_table(&fixture, "d", dim_schema(), vec!["dim_id".to_string()]).await);
+
+    let ids: Vec<i64> = (0..PARENT_ROWS).collect();
+    let dim_ids: Vec<i64> = ids.iter().map(|i| i % DIM_ROWS).collect();
+    let values: Vec<i64> = ids.iter().map(|i| i * 7).collect();
+    common::insert_batch(
+        &fact,
+        RecordBatch::try_new(
+            fact_schema,
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(Int64Array::from(dim_ids)),
+                Arc::new(Int64Array::from(values)),
+            ],
+        )
+        .expect("fact batch"),
+    )
+    .await
+    .expect("insert fact");
+
+    let d_ids: Vec<i64> = (0..DIM_ROWS).collect();
+    let labels: Vec<String> = d_ids.iter().map(|i| format!("label_{i}")).collect();
+    common::insert_batch(
+        &dim,
+        RecordBatch::try_new(
+            dim_schema(),
+            vec![
+                Arc::new(Int64Array::from(d_ids)),
+                Arc::new(StringArray::from(labels)),
+            ],
+        )
+        .expect("dim batch"),
+    )
+    .await
+    .expect("insert dim");
+
+    // The precondition: a 64-row write clears the admission caps, so the
+    // dimension is a metastore row rather than a Vortex file. If this ever stops
+    // holding, the mixed-tier bench is silently comparing two file-backed
+    // tables and measuring nothing.
+    let dim_id = fixture.catalog.get_table("d").await?.table_id;
+    let inlined_rows = fixture.catalog.get_inlined_data_count(&dim_id).await?;
+    assert_eq!(
+        inlined_rows, DIM_ROWS,
+        "the {DIM_ROWS}-row dimension should be admitted to the inline tier \
+         (get_inlined_data_count sums record_count, so this counts ROWS)"
+    );
+
+    // And the join across the tier boundary is correct: every fact row finds its
+    // dimension, and the group count is the dimension's cardinality.
+    let ctx = SessionContext::new();
+    ctx.register_table("f", Arc::clone(&fact) as Arc<dyn TableProvider>)?;
+    ctx.register_table("d", Arc::clone(&dim) as Arc<dyn TableProvider>)?;
+    let rows = ctx
+        .sql("SELECT d.label, count(*) AS n FROM f INNER JOIN d ON f.dim_id = d.dim_id GROUP BY d.label")
+        .await?
+        .collect()
+        .await?;
+    let groups: usize = rows.iter().map(RecordBatch::num_rows).sum();
+    assert_eq!(
+        groups, DIM_ROWS as usize,
+        "a join across the inline/file tier boundary must not drop or duplicate groups"
+    );
+    let total: i64 = rows
+        .iter()
+        .flat_map(|b| {
+            b.column_by_name("n")
+                .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                .map(|a| a.values().to_vec())
+                .unwrap_or_default()
+        })
+        .sum();
+    assert_eq!(
+        total, PARENT_ROWS,
+        "every fact row must join to exactly one dimension row"
     );
     Ok(())
 }
