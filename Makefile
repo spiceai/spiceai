@@ -125,7 +125,16 @@ endif
 # out would silently drop runtime-parameters-derive's tests from the gate.
 # `--tests` also builds the 14 bin targets as unit-test harnesses; `--lib` never
 # ran those, and nothing here selects `kind(=bin)`, so it still doesn't.
-NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + (package(=cayenne) & kind(=test)) + binary(=query_metrics)
+#
+# Running cayenne's integration tests under the workspace resolve rather than
+# `-p cayenne` enables its `turso` feature, which brings 304 `*_turso` variants
+# into the gate for the first time. Four of them abort with a stack overflow —
+# they need more than the 2 MiB std gives a tokio worker thread. That is a
+# pre-existing defect in a configuration the gate never executed, not a
+# regression from merging the invocations, so it is tracked in #12436 and
+# excluded by name here; the other 300 run.
+NEXTEST_STACK_OVERFLOW_12436 := test(=prop_sequential_cold_impl_turso) + test(=prop_sequential_key_impl_turso) + test(=prop_sequential_position_impl_turso) + test(=test_cold_tier_promotion_racing_stage_b_finalize_impl_turso)
+NEXTEST_FILTER := (kind(=lib) + kind(=proc-macro) + (package(=cayenne) & kind(=test)) + binary(=query_metrics)) - ($(NEXTEST_STACK_OVERFLOW_12436))
 # Extra narrowing for callers that can't run everything (CI lacks credentials
 # for some tests). It has to *intersect* the expression above rather than sit
 # beside it: nextest unions repeated `-E` flags, so a second `-E 'not (…)'` would
