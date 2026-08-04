@@ -16,12 +16,13 @@ limitations under the License.
 
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
-use elasticsearch::ClientOptions;
+use elasticsearch::{Client, ClientOptions, Elasticsearch};
 use runtime_parameters::TypedParams;
 use search::index::elasticsearch::ElasticsearchIndexWriteOptions;
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 
 /// Vector similarity metric for Elasticsearch kNN search (the `similarity` of
 /// the `dense_vector` mapping).
@@ -67,7 +68,7 @@ impl FromStr for EsDistanceMetric {
 #[params(prefix = "elasticsearch")]
 pub struct ElasticsearchVectorParams {
     /// Elasticsearch cluster URL (e.g., `https://localhost:9200`).
-    pub endpoint: Option<String>,
+    pub endpoint: String,
     /// Username for Elasticsearch authentication.
     #[param(autoload_secret)]
     pub user: Option<SecretString>,
@@ -119,6 +120,56 @@ pub struct ElasticsearchVectorParams {
     /// Not yet supported for the Elasticsearch vector engine.
     #[param(parse_with = crate::store_params::parse_bool)]
     pub spill_writes: Option<bool>,
+}
+
+impl ElasticsearchVectorParams {
+    /// Build an Elasticsearch HTTP client from these connection params, applying the
+    /// configured timeout and retry options.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client fails to construct (e.g. an invalid endpoint URL).
+    pub fn client(
+        &self,
+    ) -> Result<Arc<dyn Elasticsearch>, Box<dyn std::error::Error + Send + Sync>> {
+        let opts = build_client_options(
+            self.client_timeout,
+            self.connect_timeout,
+            self.max_retries,
+            self.retry_initial_backoff,
+        );
+        Ok(Arc::new(
+            Client::new_with_options(
+                &self.endpoint,
+                self.user.as_ref().map(ExposeSecret::expose_secret),
+                self.pass.as_ref().map(ExposeSecret::expose_secret),
+                &opts,
+            )
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?,
+        ))
+    }
+
+    /// Reject params that require infrastructure the Elasticsearch vector engine does not
+    /// yet support (per-partition index routing, spill queues), so misconfigurations fail
+    /// loudly instead of being silently ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `partition_by` or `spill_writes` is set, since neither is
+    /// supported yet for the Elasticsearch vector engine.
+    pub fn validate(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.partition_by.is_some() {
+            return Err(Box::<dyn std::error::Error + Send + Sync>::from(
+                "`partition_by` is not yet supported for the Elasticsearch vector engine. Remove the parameter or use the S3 Vectors engine for partitioned workloads.",
+            ));
+        }
+        if self.spill_writes == Some(true) {
+            return Err(Box::<dyn std::error::Error + Send + Sync>::from(
+                "`spill_writes` is not yet supported for the Elasticsearch vector engine.",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Typed parameters for Elasticsearch full-text search, deserialized from
@@ -368,7 +419,7 @@ mod tests {
         .await
         .expect("Elasticsearch vector parameters should be valid");
 
-        assert_eq!(typed.endpoint.as_deref(), Some("http://localhost:9200"));
+        assert_eq!(typed.endpoint, "http://localhost:9200");
         assert_eq!(typed.distance_metric, Some(EsDistanceMetric::L2Norm));
         assert_eq!(typed.hnsw_m, Some(16));
         assert_eq!(typed.client_timeout, Some(Duration::from_secs(30)));
