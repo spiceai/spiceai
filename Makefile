@@ -138,6 +138,10 @@ CARGO_TARGET_DIR ?= target
 # pre-existing defect in a configuration the gate never executed, not a
 # regression from merging the invocations, so it is tracked in #12436 and
 # excluded by name here; the other 300 run.
+# Shared so `nextest` and `verify-cli` cannot drift onto different selections:
+# a different selection resolves different features, which would make verify-cli
+# recompile instead of reading the build nextest just did.
+NEXTEST_SELECTION := --all --exclude libnfs
 NEXTEST_STACK_OVERFLOW_12436 := test(=prop_sequential_cold_impl_turso) + test(=prop_sequential_key_impl_turso) + test(=prop_sequential_position_impl_turso) + test(=test_cold_tier_promotion_racing_stage_b_finalize_impl_turso)
 NEXTEST_FILTER := (kind(=lib) + kind(=proc-macro) + (package(=cayenne) & kind(=test)) + binary(=query_metrics)) - ($(NEXTEST_STACK_OVERFLOW_12436))
 # Extra narrowing for callers that can't run everything (CI lacks credentials
@@ -156,7 +160,7 @@ $(error NEXTEST_FLAG carries a nextest filterset — pass it as NEXTEST_FILTER_E
 endif
 .PHONY: nextest
 nextest:
-	@cargo nextest run --all --exclude libnfs --tests $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG) -E '$(_NEXTEST_FILTER)'
+	@cargo nextest run $(NEXTEST_SELECTION) --tests $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG) -E '$(_NEXTEST_FILTER)'
 
 # Unit tests for named packages — the fail-fast pre-check scripts/signoff runs on
 # the crates a branch touched, before the full workspace gate. Same lib-only
@@ -174,25 +178,18 @@ nextest:
 # whole graph at a selection no other phase in the gate shares.
 #
 # That is an assumption about cargo's target selection, and it is the quiet kind
-# to lose: removing `spice`'s `tests/` targets would stop its bin from being
-# built, and the gate would drop CLI coverage without a single failure. So assert
-# the binary is there and runs, rather than trusting the assumption.
+# to lose: removing `spice`'s `tests/` targets would stop its bin from being built,
+# and the gate would drop CLI coverage without a single failure. So ask cargo
+# whether the bin is in that build graph, rather than looking for the file — a warm
+# `target/` would still hold a stale binary from an earlier build, so a file check
+# would pass at exactly the moment coverage was lost. Same selection as `nextest`,
+# so after it this is a fingerprint scan (measured ~2s), not a build.
 .PHONY: verify-cli
 verify-cli:
-	@bin="$(CARGO_TARGET_DIR)/$(CARGO_PROFILE_DIR)/spice"; \
-	if [ ! -x "$$bin" ]; then \
-	  echo "verify-cli: $$bin is missing or not executable." >&2; \
-	  echo "  'make nextest' is expected to build the spice CLI as a side effect of building" >&2; \
-	  echo "  spice's integration tests. If those test targets were removed, add an explicit" >&2; \
-	  echo "  'cargo build $(CARGO_PROFILE) -p spice' back to the gate." >&2; \
-	  exit 1; \
-	fi; \
-	got=$$("$$bin" --version 2>&1) || { echo "verify-cli: $$bin failed to run: $$got" >&2; exit 1; }; \
-	want="spice $$(cat version.txt)"; \
-	if [ "$$got" != "$$want" ]; then \
-	  echo "verify-cli: $$bin reports '$$got', expected '$$want'" >&2; exit 1; \
-	fi; \
-	echo "verify-cli: $$bin runs and reports $$got"
+	@out="$(CARGO_TARGET_DIR)/verify-cli-artifacts.json"; \
+	cargo test --no-run --message-format json $(CARGO_PROFILE) --tests \
+	  $(NEXTEST_SELECTION) $(NEXTEST_FLAG) > "$$out" || exit $$?; \
+	python3 scripts/verify_cli_build.py "$$out" version.txt
 
 .PHONY: nextest-packages
 nextest-packages:
