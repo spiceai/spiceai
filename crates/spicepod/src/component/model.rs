@@ -162,6 +162,36 @@ pub static HUGGINGFACE_PATH_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     }
 });
 
+/// Splits a `HuggingFace` model id back into its repo id and optional revision.
+///
+/// Both joiners of this convention — [`ModelSource::parse_from`] for `models` and
+/// `Embedding::get_model_id` for `embeddings` — encode a pinned revision by appending it to
+/// the repo id as `org/model:revision`. A loader that forwards that joined string to the Hub
+/// as the repo name therefore asks for a repo that does not exist, and the revision defaults
+/// to `main`. This is the inverse of that join, so a loader can recover both halves.
+///
+/// The first colon is unambiguously the separator: [`HUGGINGFACE_PATH_REGEX`] matches `org`
+/// as `[\w\-]+` and `model` as `[\w\-\.]+`, neither of which admits a `:`.
+///
+/// An empty revision yields `None` rather than `Some("")`, because a caller would otherwise
+/// request the empty revision from the Hub instead of the default branch. The regex already
+/// rejects a trailing `:`, so this only guards a caller that did not build its id from it.
+///
+/// # Example
+/// - `BAAI/bge-base-en-v1.5` -> (`BAAI/bge-base-en-v1.5`, `None`)
+/// - `BAAI/bge-base-en-v1.5:a5beb1e` -> (`BAAI/bge-base-en-v1.5`, `Some("a5beb1e")`)
+#[must_use]
+pub fn split_hf_model_id(model_id: &str) -> (&str, Option<&str>) {
+    match model_id.split_once(':') {
+        Some((repo_id, revision)) if !revision.is_empty() => (repo_id, Some(revision)),
+        // A trailing `:` still separates: the repo id is what precedes it. Folding this
+        // into the `None` arm below would hand the Hub `org/model:` as the repo name —
+        // the same "repo that does not exist" failure this function exists to prevent.
+        Some((repo_id, _)) => (repo_id, None),
+        None => (model_id, None),
+    }
+}
+
 /// Implement the [`TryFrom<&str>`] trait for [`ModelSource`]. Should be the inverse of [`ModelSource`]'s [`Display`].
 impl TryFrom<&str> for ModelSource {
     type Error = &'static str;
@@ -636,5 +666,70 @@ mod tests {
     fn spiceai_model_id_is_trimmed() {
         let model = Model::new("spice.ai: openai/gpt-4o ", "test");
         assert_eq!(model.get_model_id().as_deref(), Some("openai/gpt-4o"));
+    }
+
+    #[test]
+    fn split_hf_model_id_recovers_repo_and_revision() {
+        let repo = "BAAI/bge-base-en-v1.5";
+        let sha = "a5beb1e3e68b9ab74eb54cfd186867f64f240e1a";
+        let pinned = format!("{repo}:{sha}");
+
+        // No revision pinned: the whole id is the repo.
+        assert_eq!(split_hf_model_id(repo), (repo, None));
+
+        // A full commit sha, the form reported in #12430.
+        assert_eq!(split_hf_model_id(&pinned), (repo, Some(sha)));
+
+        // A model name containing dots must not be mistaken for a revision.
+        assert_eq!(
+            split_hf_model_id("org/my-model.v2"),
+            ("org/my-model.v2", None)
+        );
+
+        // A revision carrying the dots, hyphens and digits the regex admits.
+        assert_eq!(
+            split_hf_model_id("org/model-name:v1.2-beta.3"),
+            ("org/model-name", Some("v1.2-beta.3"))
+        );
+
+        // An empty revision is reported absent, so the caller asks for the default branch
+        // rather than for the empty revision. `HUGGINGFACE_PATH_REGEX` rejects a trailing
+        // colon, so only a caller that built its id some other way reaches this.
+        assert_eq!(
+            split_hf_model_id("org/model-name:"),
+            ("org/model-name", None)
+        );
+    }
+
+    /// The join in `ModelSource::parse_from` and the split in [`split_hf_model_id`] have to be
+    /// inverses. If they drift, a revision-pinned model is fetched from a repo id that has the
+    /// revision glued onto it, which is #12430.
+    #[test]
+    fn hf_model_id_round_trips_through_split() {
+        let cases = [
+            (
+                "hf:BAAI/bge-base-en-v1.5:a5beb1e3",
+                "BAAI/bge-base-en-v1.5",
+                Some("a5beb1e3"),
+            ),
+            (
+                "hf:org/model-name:v1.2-beta.3",
+                "org/model-name",
+                Some("v1.2-beta.3"),
+            ),
+            ("huggingface.co/org/model-name", "org/model-name", None),
+        ];
+
+        for (from, expected_repo, expected_revision) in cases {
+            let model = Model::new(from, "test");
+            let Some(model_id) = model.get_model_id() else {
+                panic!("expected a model id for {from}");
+            };
+            assert_eq!(
+                split_hf_model_id(&model_id),
+                (expected_repo, expected_revision),
+                "round trip lost the revision for {from}"
+            );
+        }
     }
 }
