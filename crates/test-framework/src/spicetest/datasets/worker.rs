@@ -64,6 +64,9 @@ pub(crate) struct SpiceTestQueryWorker {
     streaming_metrics_sender: Option<mpsc::Sender<QueryMetricEvent>>,
     /// Duration threshold - queries exceeding this are marked as failed in streaming metrics
     query_duration_threshold: Option<Duration>,
+    /// Fleet-wide issue-rate limiter. `None` runs closed-loop, where the offered
+    /// rate is whatever the server's latency allows.
+    pacer: Option<Arc<crate::spicetest::pacer::QueryPacer>>,
 }
 
 pub struct SpiceTestQueryWorkerResult {
@@ -128,6 +131,7 @@ impl SpiceTestQueryWorker {
             shutdown_token: CancellationToken::new(),
             streaming_metrics_sender: None,
             query_duration_threshold: None,
+            pacer: None,
         }
     }
 
@@ -153,6 +157,12 @@ impl SpiceTestQueryWorker {
 
     pub fn with_query_duration_threshold(mut self, threshold: Duration) -> Self {
         self.query_duration_threshold = Some(threshold);
+        self
+    }
+
+    #[must_use]
+    pub fn with_pacer(mut self, pacer: Option<Arc<crate::spicetest::pacer::QueryPacer>>) -> Self {
+        self.pacer = pacer;
         self
     }
 
@@ -461,6 +471,13 @@ impl SpiceTestQueryWorker {
         start: &Instant,
     ) -> Result<bool> {
         for query in queries {
+            // Hold this worker at the fleet's scheduled issue rate before doing
+            // anything else, so the wait is not counted in the query's own
+            // duration below.
+            if let Some(pacer) = &self.pacer {
+                pacer.acquire().await;
+            }
+
             // Stop submitting new queries once the duration has elapsed or shutdown
             // was requested, so the test finishes close to the scheduled duration.
             if self.shutdown_token.is_cancelled()

@@ -476,6 +476,19 @@ pub struct LoadTestArgs {
     #[arg(long)]
     pub(crate) run_until_stopped: bool,
 
+    /// Pin the aggregate query issue rate, in queries per second across the
+    /// whole client fleet, for the load phase.
+    ///
+    /// Without it the load phase is CLOSED-LOOP: each client sends a query,
+    /// waits, and sends the next, so the offered rate is a result of the
+    /// server's latency rather than an input. That makes two builds hard to
+    /// compare — a slower build simply issues fewer queries and can post the
+    /// same per-query latency, hiding the regression in the throughput column.
+    /// Pinning the rate makes both do identical work, so the difference lands
+    /// in latency. Unset (or 0) keeps the closed-loop behaviour.
+    #[arg(long)]
+    pub(crate) target_qps: Option<f64>,
+
     /// API key for authenticating with an external spiced instance.
     /// Only applicable when --spiced-path is a URL to an already-running instance.
     #[arg(long)]
