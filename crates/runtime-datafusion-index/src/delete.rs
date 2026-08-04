@@ -71,7 +71,10 @@ pub async fn resolve_keys_matching_predicate(
     for filter in filters {
         builder = builder.filter(filter)?;
     }
-    let projection: Vec<Expr> = key_columns.iter().map(|name| ident(name.as_str())).collect();
+    let projection: Vec<Expr> = key_columns
+        .iter()
+        .map(|name| ident(name.as_str()))
+        .collect();
     let plan = builder.project(projection)?.build()?;
 
     let physical_plan = session.create_physical_plan(&plan).await?;

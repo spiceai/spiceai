@@ -347,7 +347,7 @@ impl ChunkedNonIndexVectorGeneration {
     /// partitioned by pk, so a sibling `row_number() = 1` filter selects
     /// the best-matching element in the same step.
     fn aggregate_score_expr(&self, pks: &[String]) -> Result<LogicalExpr, DataFusionError> {
-        let partition: Vec<LogicalExpr> = pks.iter().map(col).collect();
+        let partition: Vec<LogicalExpr> = pks.iter().map(ident).collect();
         let score_arg = col(SEARCH_SCORE_COLUMN_NAME);
 
         let aggregation = match &self.mode {
@@ -460,7 +460,7 @@ impl ChunkedNonIndexVectorGeneration {
 
         // Then apply the window function in a separate step
         let window_expr = row_number()
-            .partition_by(pks.iter().map(col).collect())
+            .partition_by(pks.iter().map(ident).collect())
             .order_by(vec![col(SEARCH_SCORE_COLUMN_NAME).sort(false, false)])
             .build()?
             .alias("chunk_rank");
@@ -562,7 +562,7 @@ impl ChunkedNonIndexVectorGeneration {
         // Two sibling window functions: one to pick the argmax element
         // (`chunk_rank = 1`), one to compute the aggregated per-pk score.
         let rank_window = row_number()
-            .partition_by(pks.iter().map(col).collect())
+            .partition_by(pks.iter().map(ident).collect())
             .order_by(vec![col(SEARCH_SCORE_COLUMN_NAME).sort(false, false)])
             .build()?
             .alias("chunk_rank");
