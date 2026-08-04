@@ -26,7 +26,7 @@ use async_trait::async_trait;
 use datafusion::datasource::{DefaultTableSource, TableProvider};
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder};
-use runtime_datafusion_index::Index;
+use runtime_datafusion_index::{Index, WriteWindow};
 use snafu::{ResultExt, ensure};
 use tantivy::merge_policy::LogMergePolicy;
 use tantivy::schema::{
@@ -290,10 +290,16 @@ impl Index for FullTextDatabaseIndex {
         true
     }
 
-    async fn on_write_start(&self) -> Result<(), DataFusionError> {
+    async fn on_write_start(&self, window: WriteWindow) -> Result<(), DataFusionError> {
         // A CDC-fed index never defers: its change stream calls `compute_index`
         // outside this lifecycle, and the shared writer cannot commit one caller's
         // documents without also publishing (or, on rollback, discarding) the other's.
+        //
+        // That also rules out the `ReplaceAll` clear below, whose atomicity depends on the
+        // deferred window: an immediately-committed clear would publish an empty index for the
+        // length of the refresh, and would discard change-stream documents staged alongside it.
+        // A CDC-fed index is told about deletions explicitly by its change stream, so it does
+        // not depend on the replace-window clear to drop rows the source removed.
         if self.cdc_attached.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -315,6 +321,22 @@ impl Index for FullTextDatabaseIndex {
         rollback_writer(&mut index_writer)
             .context(TextSearchIndexingSnafu)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        // A replacing write reproduces the table's whole contents, so every document this index
+        // already holds is either re-sent by this window or belongs to a row the source dropped.
+        // Stage the clear *inside* the window that is about to open: `delete_all_documents`
+        // needs a commit to take effect, so the wipe and the repopulation land in the single
+        // `on_write_complete` commit and a searcher never observes an empty index (#12066).
+        //
+        // Ordering matters. The rollback above discards operations staged by an abandoned
+        // window, and it must happen before the clear so it cannot revert it.
+        if window == WriteWindow::ReplaceAll {
+            index_writer
+                .delete_all_documents()
+                .context(TextSearchIndexingSnafu)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        }
+
         self.defer_commit.store(true, Ordering::Release);
         Ok(())
     }
@@ -839,7 +861,7 @@ mod tests {
     use arrow_schema::{ArrowError, Schema};
     use datafusion::datasource::{MemTable, TableProvider};
     use futures::{StreamExt, TryStreamExt};
-    use runtime_datafusion_index::Index;
+    use runtime_datafusion_index::{Index, WriteWindow};
     use std::time::Duration;
 
     /// Create a basic [`MemTable`] with fields: `id`, `content`.
@@ -1310,7 +1332,10 @@ mod tests {
     #[tokio::test]
     async fn test_merge_policy_survives_a_writer_rollback() {
         let index = new_test_index();
-        index.on_write_start().await.expect("on_write_start failed");
+        index
+            .on_write_start(WriteWindow::Append)
+            .await
+            .expect("on_write_start failed");
         index
             .on_write_failed()
             .await
@@ -1373,7 +1398,10 @@ mod tests {
         .expect("Failed to create FullTextDatabaseIndex");
 
         // Open a deferred-commit window, mirroring the sink's on_write_start hook.
-        index.on_write_start().await.expect("on_write_start failed");
+        index
+            .on_write_start(WriteWindow::Append)
+            .await
+            .expect("on_write_start failed");
 
         index
             .compute_index(vec![
@@ -1421,6 +1449,200 @@ mod tests {
         }
     }
 
+    /// Run one sink-driven write window end to end: `on_write_start(window)`, one batch,
+    /// `on_write_complete`.
+    async fn write_window(index: &FullTextDatabaseIndex, window: WriteWindow, rb: RecordBatch) {
+        index
+            .on_write_start(window)
+            .await
+            .expect("on_write_start failed");
+        index
+            .compute_index(vec![rb])
+            .await
+            .expect("compute_index failed");
+        index
+            .on_write_complete()
+            .await
+            .expect("on_write_complete failed");
+    }
+
+    fn replace_all_tier() -> FullTextDatabaseIndex {
+        FullTextDatabaseIndex::try_new(
+            create_test_table(),
+            vec!["content".to_string()],
+            Some(vec!["id".to_string()]),
+            None,
+            &["content".to_string()],
+        )
+        .expect("Failed to create FullTextDatabaseIndex")
+    }
+
+    fn three_rows() -> RecordBatch {
+        record_batch!(
+            ("id", Int32, [1, 2, 3]),
+            (
+                "content",
+                Utf8,
+                [
+                    "apple banana cherry",
+                    "dog elephant frog",
+                    "guitar harmonica instrument"
+                ]
+            )
+        )
+        .expect("Failed to create test batch")
+    }
+
+    /// Regression test for #12066: a `refresh_mode: full` refresh replaces the table's rows, so
+    /// a row the source deleted is simply absent from the second window. `compute_index` only
+    /// deletes the keys it is handed, so before the `ReplaceAll` clear the dropped row stayed
+    /// searchable forever with its stale stored content.
+    #[tokio::test]
+    async fn replace_all_window_drops_documents_for_rows_the_source_dropped() {
+        let index = replace_all_tier();
+
+        // Refresh 1: the source has ids 1, 2, 3.
+        write_window(&index, WriteWindow::ReplaceAll, three_rows()).await;
+
+        // Refresh 2: id=2 was deleted at the source, so the refresh returns only 1 and 3.
+        write_window(
+            &index,
+            WriteWindow::ReplaceAll,
+            record_batch!(
+                ("id", Int32, [1, 3]),
+                (
+                    "content",
+                    Utf8,
+                    ["apple banana cherry", "guitar harmonica instrument"]
+                )
+            )
+            .expect("Failed to create test batch"),
+        )
+        .await;
+
+        let search_index = index
+            .full_text_search_field_index("content")
+            .expect("Failed to create FullTextSearchFieldIndex");
+
+        let dropped = search_and_format(&search_index, "elephant").await;
+        assert!(
+            !dropped.contains("dog elephant frog"),
+            "a row dropped by a full refresh must not remain searchable, got:\n{dropped}"
+        );
+
+        // The rows the refresh *did* re-send must survive the clear.
+        let kept = search_and_format(&search_index, "apple").await;
+        assert!(
+            kept.contains("apple banana cherry"),
+            "a row re-sent by the refresh must still be searchable, got:\n{kept}"
+        );
+    }
+
+    /// The clear must be scoped to a replacing window. An append adds rows and says nothing
+    /// about the ones it omits, so wiping on `Append` would delete live rows' documents —
+    /// which is also why `InsertOp::Replace` (an upsert) maps to `WriteWindow::Append`.
+    #[tokio::test]
+    async fn append_window_keeps_documents_absent_from_the_batch() {
+        let index = replace_all_tier();
+
+        write_window(&index, WriteWindow::ReplaceAll, three_rows()).await;
+        write_window(
+            &index,
+            WriteWindow::Append,
+            record_batch!(("id", Int32, [4]), ("content", Utf8, ["jackal koala"]))
+                .expect("Failed to create test batch"),
+        )
+        .await;
+
+        let search_index = index
+            .full_text_search_field_index("content")
+            .expect("Failed to create FullTextSearchFieldIndex");
+
+        let results = search_and_format(&search_index, "elephant").await;
+        assert!(
+            results.contains("dog elephant frog"),
+            "an append must not clear rows it does not mention, got:\n{results}"
+        );
+    }
+
+    /// The clear is staged inside the deferred-commit window rather than applied eagerly, so
+    /// the wipe and the repopulation land in one commit. Queries running during the refresh
+    /// must keep seeing the *previous* contents, never an empty index.
+    #[tokio::test]
+    async fn replace_all_clear_is_invisible_until_write_complete() {
+        let index = replace_all_tier();
+        write_window(&index, WriteWindow::ReplaceAll, three_rows()).await;
+
+        // Open a replacing window and stage its rows, but do not close it.
+        index
+            .on_write_start(WriteWindow::ReplaceAll)
+            .await
+            .expect("on_write_start failed");
+        index
+            .compute_index(vec![
+                record_batch!(("id", Int32, [1]), ("content", Utf8, ["apple banana"]))
+                    .expect("Failed to create test batch"),
+            ])
+            .await
+            .expect("compute_index failed");
+
+        {
+            let search_index = index
+                .full_text_search_field_index("content")
+                .expect("Failed to create FullTextSearchFieldIndex");
+            let mid = search_and_format(&search_index, "elephant").await;
+            assert!(
+                mid.contains("dog elephant frog"),
+                "previous contents must stay readable until the window commits, got:\n{mid}"
+            );
+        }
+
+        index
+            .on_write_complete()
+            .await
+            .expect("on_write_complete failed");
+
+        // A `FullTextSearchFieldIndex` snapshots the searcher when it is built, so the
+        // post-commit revision needs a freshly built one.
+        {
+            let search_index = index
+                .full_text_search_field_index("content")
+                .expect("Failed to create FullTextSearchFieldIndex");
+            let after = search_and_format(&search_index, "elephant").await;
+            assert!(
+                !after.contains("dog elephant frog"),
+                "the clear must take effect once the window commits, got:\n{after}"
+            );
+        }
+    }
+
+    /// A failed replacing window must leave the index exactly as it was: the staged clear is
+    /// rolled back along with the staged documents, so a refresh that dies partway does not
+    /// empty the index.
+    #[tokio::test]
+    async fn failed_replace_all_window_leaves_the_index_intact() {
+        let index = replace_all_tier();
+        write_window(&index, WriteWindow::ReplaceAll, three_rows()).await;
+
+        index
+            .on_write_start(WriteWindow::ReplaceAll)
+            .await
+            .expect("on_write_start failed");
+        index
+            .on_write_failed()
+            .await
+            .expect("on_write_failed failed");
+
+        let search_index = index
+            .full_text_search_field_index("content")
+            .expect("Failed to create FullTextSearchFieldIndex");
+        let results = search_and_format(&search_index, "elephant").await;
+        assert!(
+            results.contains("dog elephant frog"),
+            "a failed refresh must not empty the index, got:\n{results}"
+        );
+    }
+
     /// The CDC path drives `compute_index` directly without the sink lifecycle hooks,
     /// so each call must still commit immediately (no deferral) and be visible at once.
     #[tokio::test]
@@ -1465,7 +1687,10 @@ mod tests {
         )
         .expect("Failed to create FullTextDatabaseIndex");
 
-        index.on_write_start().await.expect("on_write_start failed");
+        index
+            .on_write_start(WriteWindow::Append)
+            .await
+            .expect("on_write_start failed");
 
         index
             .compute_index(vec![
@@ -1511,7 +1736,10 @@ mod tests {
         index.mark_cdc_attached();
 
         // Opening a window is a no-op for a CDC-fed index.
-        index.on_write_start().await.expect("on_write_start failed");
+        index
+            .on_write_start(WriteWindow::Append)
+            .await
+            .expect("on_write_start failed");
 
         index
             .compute_index(vec![
@@ -1584,7 +1812,7 @@ mod tests {
 
         // A sink-driven refresh opens a write window on both tiers.
         compound
-            .on_write_start()
+            .on_write_start(WriteWindow::Append)
             .await
             .expect("on_write_start failed");
 

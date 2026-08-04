@@ -37,7 +37,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use util::RetryError;
 
 use data_components::index_maintenance::perform_index_maintenance;
-use runtime_datafusion_index::Index;
+use runtime_datafusion_index::{Index, WriteWindow};
 
 use crate::{
     accelerated_table::{
@@ -152,13 +152,16 @@ impl MultiSink {
         let (parent_complete_tx, parent_complete_rx) = watch::channel(false);
         let child_barrier = Arc::new(Barrier::new(self.synchronized_tables.len()));
 
-        // Run on_write_start for all sink_indexes before any write begins.
+        // Run on_write_start for all sink_indexes before any write begins. A replacing write
+        // drops source rows by not re-sending them, so an index backed by its own store has to
+        // be told to clear rather than upsert (#12066).
+        let write_window = WriteWindow::from(overwrite);
         for index in &self.sink_indexes {
             tracing::debug!(
                 "MultiSink: running on_write_start for index '{}'",
                 index.name()
             );
-            if let Err(e) = index.on_write_start().await {
+            if let Err(e) = index.on_write_start(write_window).await {
                 tracing::warn!(
                     "MultiSink: on_write_start failed for index '{}': {e}. Continuing with write.",
                     index.name()

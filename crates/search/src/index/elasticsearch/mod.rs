@@ -40,7 +40,7 @@ use datafusion_expr::LogicalPlanBuilder;
 use elasticsearch::Elasticsearch;
 use futures::future::try_join_all;
 use llms::embeddings::Embed;
-use runtime_datafusion_index::Index;
+use runtime_datafusion_index::{Index, WriteWindow};
 use tokio::sync::Mutex;
 
 use crate::SEARCH_SCORE_COLUMN_NAME;
@@ -456,7 +456,12 @@ impl Index for ElasticsearchIndex {
         try_join_all(futs).await
     }
 
-    async fn on_write_start(&self) -> Result<(), DataFusionError> {
+    async fn on_write_start(&self, _window: WriteWindow) -> Result<(), DataFusionError> {
+        // The refresh-interval override applies to any write window. Clearing the index for
+        // `WriteWindow::ReplaceAll` cannot be an in-place delete — Elasticsearch has no
+        // deferred window to hide it, so a `_delete_by_query` + reindex would serve an empty
+        // or half-populated index to readers for the length of the refresh. It needs an
+        // atomic index-per-refresh alias swap, tracked separately in #12413.
         self.write_maintenance
             .on_write_start(self.client.as_ref(), &self.es_index)
             .await
@@ -708,7 +713,12 @@ impl Index for ElasticsearchTextIndex {
         try_join_all(futs).await
     }
 
-    async fn on_write_start(&self) -> Result<(), DataFusionError> {
+    async fn on_write_start(&self, _window: WriteWindow) -> Result<(), DataFusionError> {
+        // The refresh-interval override applies to any write window. Clearing the index for
+        // `WriteWindow::ReplaceAll` cannot be an in-place delete — Elasticsearch has no
+        // deferred window to hide it, so a `_delete_by_query` + reindex would serve an empty
+        // or half-populated index to readers for the length of the refresh. It needs an
+        // atomic index-per-refresh alias swap, tracked separately in #12413.
         self.write_maintenance
             .on_write_start(self.client.as_ref(), &self.es_index)
             .await
