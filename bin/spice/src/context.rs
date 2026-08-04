@@ -165,9 +165,25 @@ impl RuntimeContext {
     /// flag is omitted, so consulting it first here is what makes a blank
     /// `--api-key` resolve to the same key that omitting the flag would.
     fn load_api_key_from_env(&self) -> Option<String> {
-        normalize_credential(std::env::var("SPICE_API_KEY").ok())
-            .or_else(|| self.load_api_key_from_env_files())
-            .or_else(|| normalize_credential(std::env::var("SPICE_SPICEAI_API_KEY").ok()))
+        self.resolve_api_key(|key| std::env::var(key).ok())
+    }
+
+    /// `load_api_key_from_env` with the environment lookup injected, so the precedence
+    /// between the process environment and the app's .env files is testable without
+    /// mutating this process's environment.
+    fn resolve_api_key<F>(&self, mut get_env: F) -> Option<String>
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        if let Some(api_key) = normalize_credential(get_env("SPICE_API_KEY")) {
+            return Some(api_key);
+        }
+
+        if let Some(api_key) = self.load_api_key_from_env_files() {
+            return Some(api_key);
+        }
+
+        normalize_credential(get_env("SPICE_SPICEAI_API_KEY"))
     }
 
     /// Load API key from the app's .env.local or .env file.
@@ -1018,6 +1034,51 @@ mod tests {
         let (ctx, _temp_dir) = create_test_context_with_app_dir();
 
         assert_eq!(ctx.load_api_key_from_env_files(), None);
+    }
+
+    /// An env lookup for the resolve tests: `name` is set to `value`, nothing else is.
+    fn only_env(name: &'static str, value: &'static str) -> impl FnMut(&str) -> Option<String> {
+        move |key| (key == name).then(|| value.to_string())
+    }
+
+    #[test]
+    fn test_resolve_api_key_prefers_the_process_environment() {
+        // --api-key is declared `env = "SPICE_API_KEY"`, so clap resolves that variable
+        // itself when the flag is omitted. This fallback has to agree with clap:
+        // otherwise a blank --api-key would resolve to the .env key while omitting the
+        // flag resolved to the environment's, silently selecting a different credential.
+        let (ctx, temp_dir) = create_test_context_with_app_dir();
+        write_env_file(&temp_dir, ".env.local", "SPICE_API_KEY=file-key\n");
+
+        let api_key = ctx.resolve_api_key(only_env("SPICE_API_KEY", "env-key"));
+
+        assert_eq!(api_key, Some("env-key".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_api_key_prefers_files_over_the_legacy_variable() {
+        let (ctx, temp_dir) = create_test_context_with_app_dir();
+        write_env_file(&temp_dir, ".env", "SPICE_API_KEY=file-key\n");
+
+        // A blank primary variable falls through to the files, and a stored key outranks
+        // the legacy variable -- together with the two tests either side of this one,
+        // that pins the whole order: SPICE_API_KEY > .env files > SPICE_SPICEAI_API_KEY.
+        let api_key = ctx.resolve_api_key(|key| match key {
+            "SPICE_API_KEY" => Some("   ".to_string()),
+            "SPICE_SPICEAI_API_KEY" => Some("legacy-key".to_string()),
+            _ => None,
+        });
+
+        assert_eq!(api_key, Some("file-key".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_api_key_uses_the_legacy_variable_last() {
+        let (ctx, _temp_dir) = create_test_context_with_app_dir();
+
+        let api_key = ctx.resolve_api_key(only_env("SPICE_SPICEAI_API_KEY", "legacy-key"));
+
+        assert_eq!(api_key, Some("legacy-key".to_string()));
     }
 
     #[test]
