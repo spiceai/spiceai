@@ -781,11 +781,42 @@ run_checks() {
 refresh_attestation_check() {
   local sha="$1" repo="$2"
   local fallback="Open/refresh the PR and it will pick up the sign-off."
-  local run run_id run_status run_conclusion
+  local run run_id run_status run_conclusion pr_heads current_head
 
   if ! command -v gh >/dev/null 2>&1; then
     info "  Install the GitHub CLI (https://cli.github.com) so signoff can auto-refresh the 'Attestation' check."
     info "  ${fallback}"
+    return 0
+  fi
+
+  # Only refresh while $sha is still a PR head. A remote sign-off can run for
+  # hours (the job budget is 358 minutes), so the branch may have advanced
+  # underneath it — and re-running the *stale* commit's pr.yml run then cancels
+  # the current head's in-flight one: pr.yml's concurrency group is
+  # `pr-<ref_name>-<ref_name == 'trunk' && sha || 'any-sha'>`, and on a
+  # pull_request event ref_name is `<number>/merge` while the SHA term collapses
+  # to the literal `any-sha`, so every attempt for a PR shares one group whatever
+  # its commit. The re-run also keeps its original event payload, so the verdict
+  # it publishes is computed for the stale commit.
+  #
+  # Fixing it here rather than by making that group SHA-specific: the shared group
+  # is deliberate — it is what lets a new push cancel the run for the commit it
+  # superseded. A stale sign-off has nothing to propagate anyway (its status sits
+  # on a commit no longer under review), so skipping is the whole fix. See #12360.
+  #
+  # `gh --jq` (gh's built-in filter), not the jq binary: this path runs from
+  # cmd_signoff, which requires gh but not jq.
+  pr_heads=$(gh api "repos/${repo}/commits/${sha}/pulls" \
+    --jq '[.[] | select(.state == "open") | .head.sha] | join(" ")' 2>/dev/null) || pr_heads=""
+  # Empty means "no open PR yet" or "the lookup failed"; both fall through to the
+  # original behaviour, since signing off before the PR exists is ordinary and a
+  # blipped lookup is no reason to skip a refresh that would have worked. The
+  # membership test is space-delimited so a short SHA cannot partially match.
+  if [[ -n "$pr_heads" && " ${pr_heads} " != *" ${sha} "* ]]; then
+    current_head="${pr_heads%% *}"
+    info "  ${sha:0:12} is no longer the head of its PR (now ${current_head:0:12}) — not refreshing 'Attestation'."
+    info "  Re-running that commit's check would cancel the current head's, and would report a verdict for the wrong commit."
+    info "  Sign off on the current head instead."
     return 0
   fi
 
@@ -1252,4 +1283,11 @@ main() {
   esac
 }
 
-main "$@"
+# Only dispatch when executed. The unit tests source this file to call
+# individual functions, and sourcing must not run a command. BASH_SOURCE is unset
+# when the script's *contents* are fed to bash (`bash -c "$(cat …)"`, a piped
+# download), which `set -u` would abort on — default it to $0, which dispatches,
+# since that invocation means to run the thing.
+if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
+  main "$@"
+fi
