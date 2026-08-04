@@ -38,8 +38,10 @@ import yaml
 TRIGGER_KEYS = ("on", True)
 
 # Every context GitHub defines. Only these names are reported when they appear
-# somewhere they are not available — an unrecognised `word.` is left alone, so an
-# incidental dotted string inside a condition cannot fail the build.
+# somewhere they are not available, so an unrecognised `word.` / `word[` is left
+# alone. String literals are removed before the scan (see `unavailable_contexts`),
+# so an incidental dotted or bracketed string inside a condition cannot fail the
+# build even when it leads with a real context name.
 KNOWN_CONTEXTS = frozenset(
     {
         "env",
@@ -65,10 +67,18 @@ STEP_IF_CONTEXTS = JOB_IF_CONTEXTS | frozenset(
     {"env", "job", "matrix", "runner", "steps", "strategy"}
 )
 
-# A context reference is `name.` — but only when `name` starts the token. The
-# lookbehind is what keeps `needs.setup-model-matrix.outputs.matrix` from reading
-# as a use of the `matrix` context (`e2e_test_ci.yml` has exactly that).
-CONTEXT_REFERENCE = re.compile(r"(?<![\w.-])([a-z]+)\s*\.")
+# A context reference is `name.` or `name[` — GitHub expressions accept property
+# access in either form, and `secrets['TOKEN']` makes a definition unschedulable
+# exactly as `secrets.TOKEN` does. The match holds only when `name` starts the
+# token: the lookbehind is what keeps `needs.setup-model-matrix.outputs.matrix`
+# from reading as a use of the `matrix` context (`e2e_test_ci.yml` has that).
+CONTEXT_REFERENCE = re.compile(r"(?<![\w.-])([a-z]+)\s*[.\[]")
+
+# A GitHub expression quotes string literals with `'`, doubling the quote to
+# escape it. Literals are dropped before the scan so that a condition comparing
+# against text that happens to lead with a context name — `== 'env.FOO'` — is not
+# read as a use of that context.
+STRING_LITERAL = re.compile(r"'[^']*'")
 
 # `secrets` is the case that has actually bitten, so its diagnosis names the fix
 # trunk already uses rather than leaving the reader to find it.
@@ -133,11 +143,16 @@ def check_workflow(text: str) -> list[str]:
 def unavailable_contexts(condition: object, available: frozenset[str]) -> list[str]:
     """Return the contexts `condition` names that are not available to it.
 
+    Property access counts in either of the forms GitHub accepts, `name.KEY` and
+    `name['KEY']`. Quoted string literals are removed first, so text that merely
+    reads like a context reference is not mistaken for one.
+
     Order follows first appearance in the condition so the message reads in the
     same order as the line it is about, and each context is reported once.
     """
+    scanned = STRING_LITERAL.sub("''", str(condition))
     found = []
-    for name in CONTEXT_REFERENCE.findall(str(condition)):
+    for name in CONTEXT_REFERENCE.findall(scanned):
         if name in KNOWN_CONTEXTS and name not in available and name not in found:
             found.append(name)
     return found

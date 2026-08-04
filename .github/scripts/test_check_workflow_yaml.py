@@ -214,6 +214,57 @@ class CheckConditionContextTest(unittest.TestCase):
         self.assertEqual(len(problems), 1, problems)
         self.assertIn("job `gate` has an `if:`", problems[0])
 
+    def test_bracket_property_access_is_reported_like_dotted_access(self):
+        """`secrets['A']` is the same unschedulable definition as `secrets.A`."""
+        problems = check_workflow_yaml.check_workflow(
+            _workflow_with_conditions(job_if="${{ secrets['A'] != '' }}")
+        )
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("naming `secrets`", problems[0])
+
+    def test_bracket_access_in_a_step_condition_is_reported_with_the_remedy(self):
+        problems = check_workflow_yaml.check_workflow(
+            _workflow_with_conditions(step_if="${{ secrets['SPICE_SECRET_HF_TOKEN'] != '' }}")
+        )
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("job `gate` step `Run the checks`", problems[0])
+        self.assertIn("hoist the test into a job-level `env:`", problems[0])
+
+    def test_bracket_access_on_an_available_context_is_accepted(self):
+        """The lookbehind must still keep `needs['x'].outputs` from reading as a use."""
+        self.assertEqual(
+            check_workflow_yaml.unavailable_contexts(
+                "needs['setup'].outputs.matrix != ''",
+                check_workflow_yaml.JOB_IF_CONTEXTS,
+            ),
+            [],
+        )
+
+    def test_a_context_name_inside_a_quoted_literal_is_not_a_reference(self):
+        """A literal compared against is text, not property access on a context."""
+        for condition in (
+            "github.event.head_commit.message == 'env.READY'",
+            "contains(github.ref, 'secrets.A')",
+            "github.ref == 'matrix[0]'",
+        ):
+            with self.subTest(condition=condition):
+                self.assertEqual(
+                    check_workflow_yaml.unavailable_contexts(
+                        condition, check_workflow_yaml.JOB_IF_CONTEXTS
+                    ),
+                    [],
+                )
+
+    def test_a_real_reference_beside_a_quoted_literal_is_still_reported(self):
+        """Dropping literals must not swallow the reference next to them."""
+        self.assertEqual(
+            check_workflow_yaml.unavailable_contexts(
+                "github.ref == 'env.READY' && secrets.A != ''",
+                check_workflow_yaml.JOB_IF_CONTEXTS,
+            ),
+            ["secrets"],
+        )
+
     def test_the_env_indirection_trunk_uses_is_accepted(self):
         self.assertEqual(
             check_workflow_yaml.check_workflow(
