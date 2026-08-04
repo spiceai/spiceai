@@ -8,8 +8,8 @@
 # Same fail-fast order as local sign-off:
 #   0. Skip Rust lint/build/tests when the branch has no Rust-affecting files
 #      vs trunk (.rs, Cargo.toml/lock, rust-toolchain*, .cargo/*)
-#   1. Targeted lint of crates touched by the branch vs trunk (off by default —
-#      see the skip_targeted_lint input)
+#   1. Targeted lint of crates touched by the branch vs trunk (off by default
+#      here — see the run_targeted_prechecks input)
 #   2. Targeted unit tests for those crates (runs only when step 1 does)
 #   3. Full workspace lint (make lint-rust)
 #   4. CLI build + unit tests (make build-cli-dev nextest)
@@ -23,7 +23,7 @@
 # the LAN lab boxes double as benchmark machines):
 #   make signoff-remote
 #   gh workflow run signoff.yml -f branch=<your-branch>
-#   gh workflow run signoff.yml -f branch=<your-branch> -f skip_targeted_lint=true
+#   gh workflow run signoff.yml -f branch=<your-branch> -f run_targeted_prechecks=true
 #
 # Fork PRs (pr_number input): dispatching this workflow already requires write
 # access to this repo, so we don't gate fork sign-off behind an extra
@@ -69,8 +69,13 @@ on:
         description: 'PR number to sign off — use this for fork PRs. Resolves and pins to the head commit automatically. Mutually exclusive with branch.'
         required: false
         type: string
-      skip_targeted_lint:
-        description: 'Skip the branch-scoped targeted pre-lint'
+      # The branch-scoped pre-lint and unit tests exist to fail fast in front of
+      # the full gate. That is worth an extra resolve of the changed crates'
+      # graph when a developer is watching the terminal; on a runner nobody
+      # watches, the log is read after the fact and the only thing the extra
+      # pass buys is compile time. Local `make signoff` keeps them on.
+      run_targeted_prechecks:
+        description: 'Run the branch-scoped targeted pre-lint and unit tests before the full gate'
         required: false
         type: boolean
         default: false
@@ -425,7 +430,8 @@ jobs:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-          SIGNOFF_SKIP_TARGETED_LINT: "${{ inputs.skip_targeted_lint && '1' || '' }}"
+          SIGNOFF_SKIP_TARGETED_LINT: "${{ inputs.run_targeted_prechecks && '' || '1' }}"
+          SIGNOFF_SKIP_TARGETED_TESTS: "${{ inputs.run_targeted_prechecks && '' || '1' }}"
 
       # A run that does not reach a verdict — its budget expires, it is evicted
       # by a re-dispatch, someone cancels it — never gets back to

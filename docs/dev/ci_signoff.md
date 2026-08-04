@@ -73,6 +73,10 @@ Steps 1-2 exist to fail fast: a lint or test failure in the crate you edited is
 the likeliest outcome, and step 3 is by far the longest, so covering your own
 crates first turns a late failure into an early one.
 `SIGNOFF_SKIP_TARGETED_LINT=1` and `SIGNOFF_SKIP_TARGETED_TESTS=1` opt out.
+Remote sign-off sets both: fail-fast is worth an extra resolve of the changed
+crates' graph only while someone is watching the output, and nobody watches a
+self-hosted runner — dispatch `signoff.yml` with `run_targeted_prechecks=true`
+to get them back.
 
 **The scoped steps build each crate the way the workspace builds it.** The
 features come from a `cargo metadata` resolve of the whole workspace,
@@ -257,9 +261,9 @@ The Actions workflow:
 0. Resolves the dispatch input to a commit, in a small GitHub-hosted `resolve`
    job, so the sign-off job can key its concurrency group on that commit
 1. Checks out your branch (full history) and fetches `trunk`
-2. Target-lints crates touched by the branch vs `trunk` (GitHub compare API as a
-   fallback when merge-base isn't available), or skips Rust checks when the
-   branch has no Rust-affecting files
+2. Skips Rust checks when the branch has no Rust-affecting files. The targeted
+   pre-lint and unit tests are off here (`run_targeted_prechecks` turns them on,
+   with the GitHub compare API as a fallback when merge-base isn't available)
 3. Runs full `make lint-rust` + `make build-cli-dev nextest` when Rust is affected
 4. Posts pending → success/failure `signoff` statuses (skipping the pending when
    the commit is already signed off), then re-runs **Attestation** if needed
@@ -404,7 +408,7 @@ merge queue is still the real gate.
 | Stage | Trigger | Checks |
 | --- | --- | --- |
 | Local | `make signoff` | skip Rust if no Rust-affecting files in the branch diff; else targeted `make lint-rust PACKAGES=… FEATURES=…` + `make nextest-packages PACKAGES=… FEATURES=…` (features from the workspace resolve), full `make lint-rust`, `make build-cli-dev nextest` |
-| Remote | `make signoff-remote` | same checks via the self-hosted `signoff.yml` workflow; posts `signoff` |
+| Remote | `make signoff-remote` | the same checks via the self-hosted `signoff.yml` workflow, without the targeted pre-checks (`run_targeted_prechecks=true` restores them); posts `signoff` |
 | Pull request | `pull_request` | **Attestation** (validates the sign-off, or auto-passes a branch with no Rust-affecting files, a pure revert, or a single-commit Dependabot bump) + PR hygiene; merge-queue check names report lightweight skipped/passthrough results |
 | Merge queue | `merge_group` | the full required suite (below) + advisory niche checks |
 
