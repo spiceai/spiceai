@@ -17,11 +17,16 @@
 # It also rejects a step budget its own job's budget pre-empts, which is dead
 # config with the same symptom — the job is terminated as `cancelled` with no
 # failed step to explain it (#12340).
+#
+# And it rejects an `if:` naming a context GitHub does not make available there,
+# which fails the same way for a different reason: GitHub rejects the definition
+# rather than the expression, so the workflow never schedules (#12396).
 """Validate the repository's GitHub Actions workflow and composite action YAML."""
 
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -31,6 +36,48 @@ import yaml
 # is also how it reaches GitHub's parser, so a trigger block is present under
 # either spelling.
 TRIGGER_KEYS = ("on", True)
+
+# Every context GitHub defines. Only these names are reported when they appear
+# somewhere they are not available — an unrecognised `word.` is left alone, so an
+# incidental dotted string inside a condition cannot fail the build.
+KNOWN_CONTEXTS = frozenset(
+    {
+        "env",
+        "github",
+        "inputs",
+        "job",
+        "jobs",
+        "matrix",
+        "needs",
+        "runner",
+        "secrets",
+        "steps",
+        "strategy",
+        "vars",
+    }
+)
+
+# What each kind of `if:` may name. A job-level `if:` is evaluated before the job
+# has an environment, a matrix row, or any completed step, so it sees far less
+# than a step's does.
+JOB_IF_CONTEXTS = frozenset({"github", "inputs", "needs", "vars"})
+STEP_IF_CONTEXTS = JOB_IF_CONTEXTS | frozenset(
+    {"env", "job", "matrix", "runner", "steps", "strategy"}
+)
+
+# A context reference is `name.` — but only when `name` starts the token. The
+# lookbehind is what keeps `needs.setup-model-matrix.outputs.matrix` from reading
+# as a use of the `matrix` context (`e2e_test_ci.yml` has exactly that).
+CONTEXT_REFERENCE = re.compile(r"(?<![\w.-])([a-z]+)\s*\.")
+
+# `secrets` is the case that has actually bitten, so its diagnosis names the fix
+# trunk already uses rather than leaving the reader to find it.
+CONTEXT_REMEDIES = {
+    "secrets": (
+        "hoist the test into a job-level `env:` "
+        "(`HAS_X: ${{ secrets.X != '' }}`) and test `env.HAS_X == 'true'`"
+    ),
+}
 
 
 def workflow_files(github_dir: Path) -> list[Path]:
@@ -78,7 +125,98 @@ def check_workflow(text: str) -> list[str]:
         problems.append("has a `jobs:` block that is not a non-empty mapping")
     else:
         problems.extend(check_step_budgets(jobs))
+        problems.extend(check_workflow_conditions(jobs))
 
+    return problems
+
+
+def unavailable_contexts(condition: object, available: frozenset[str]) -> list[str]:
+    """Return the contexts `condition` names that are not available to it.
+
+    Order follows first appearance in the condition so the message reads in the
+    same order as the line it is about, and each context is reported once.
+    """
+    found = []
+    for name in CONTEXT_REFERENCE.findall(str(condition)):
+        if name in KNOWN_CONTEXTS and name not in available and name not in found:
+            found.append(name)
+    return found
+
+
+def _condition_problem(where: str, condition: object, available: frozenset[str]) -> str | None:
+    """Describe one `if:` that names an unavailable context, or None if it is fine."""
+    unavailable = unavailable_contexts(condition, available)
+    if not unavailable:
+        return None
+    named = ", ".join(f"`{name}`" for name in unavailable)
+    problem = (
+        f"{where} has an `if:` naming {named}, which GitHub does not make available "
+        f"there, so it cannot schedule this definition at all"
+    )
+    remedies = [CONTEXT_REMEDIES[name] for name in unavailable if name in CONTEXT_REMEDIES]
+    return f"{problem} — {'; '.join(remedies)}" if remedies else problem
+
+
+def check_workflow_conditions(jobs: dict) -> list[str]:
+    """Report `if:` conditions naming a context GitHub does not provide there.
+
+    GitHub validates an `if:` expression's contexts when it reads the file, not
+    when it evaluates the condition, so naming an unavailable one does not fail
+    the step — it makes the whole workflow unschedulable. The run that appears is
+    a startup failure: zero jobs, no downloadable log, and a run named after the
+    file path because `name:` was never reached, which reads as a mystery rather
+    than as a definition error.
+
+    #12396 is the shape: ten `if: ${{ secrets.X != '' }}` conditionals left
+    `integration tests (models)` unable to start on any push or PR to the
+    release/2.1 line. `secrets` is available in `env:` and `with:`, just not in an
+    `if:`, so the fix is an indirection through the job's environment rather than
+    dropping the condition.
+    """
+    problems = []
+    for name, job in jobs.items():
+        if not isinstance(job, dict):
+            continue
+        if "if" in job:
+            problem = _condition_problem(f"job `{name}`", job["if"], JOB_IF_CONTEXTS)
+            if problem:
+                problems.append(problem)
+        steps = job.get("steps")
+        if not isinstance(steps, list):
+            continue
+        for position, step in enumerate(steps, start=1):
+            if not isinstance(step, dict) or "if" not in step:
+                continue
+            label = step.get("name") or f"step {position}"
+            problem = _condition_problem(
+                f"job `{name}` step `{label}`", step["if"], STEP_IF_CONTEXTS
+            )
+            if problem:
+                problems.append(problem)
+    return problems
+
+
+def check_action_conditions(runs: object) -> list[str]:
+    """Report the same unavailable-context problem in a composite action's steps.
+
+    Reuses the workflow step set, which is deliberately the permissive choice: a
+    composite step sees a little less than a workflow step (no `needs`, no matrix),
+    so allowing those cannot produce a false positive — and `secrets`, the one that
+    has actually broken a definition here, is excluded either way.
+    """
+    if not isinstance(runs, dict):
+        return []
+    steps = runs.get("steps")
+    if not isinstance(steps, list):
+        return []
+    problems = []
+    for position, step in enumerate(steps, start=1):
+        if not isinstance(step, dict) or "if" not in step:
+            continue
+        label = step.get("name") or f"step {position}"
+        problem = _condition_problem(f"step `{label}`", step["if"], STEP_IF_CONTEXTS)
+        if problem:
+            problems.append(problem)
     return problems
 
 
@@ -127,7 +265,10 @@ def check_action(text: str) -> list[str]:
     if document is None:
         return problems
 
-    return [] if "runs" in document else ["has no `runs:` block"]
+    if "runs" not in document:
+        return ["has no `runs:` block"]
+
+    return check_action_conditions(document["runs"])
 
 
 def _format_yaml_error(error: yaml.YAMLError) -> str:
@@ -178,8 +319,8 @@ def main(argv: list[str] | None = None) -> int:
     if failures:
         print(
             f"{len(failures)} GitHub Actions definition problem(s) found. A definition "
-            "GitHub cannot parse is silently disabled, and a budget it pre-empts never "
-            "fires, so this fails the build:",
+            "GitHub cannot parse or schedule is silently disabled, and a budget it "
+            "pre-empts never fires, so this fails the build:",
             file=sys.stderr,
         )
         for failure in failures:
