@@ -611,19 +611,26 @@ async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response> {
 /// is not one, and is dropped rather than truncated.
 const MAX_ERROR_CLASS_LEN: usize = 64;
 
-/// Stands in for a response body that was read but deliberately not reported.
-const WITHHELD_BODY: &str = "response body withheld (it can contain document data)";
+/// Stands in for a response body that is not reported. Deliberately neutral about why:
+/// the body may have carried no usable `error.type`, or may not have been readable at
+/// all. An operator cannot act on that difference — the body is withheld either way —
+/// and claiming it was read when it was not would be wrong half the time.
+const UNREPORTED_BODY: &str = "no error class reported (response body can contain document data)";
 
 /// True when `s` has the shape of an Elasticsearch exception class name: a short
-/// `snake_case` run of ASCII lowercase letters, digits and underscores.
+/// `snake_case` run of ASCII lowercase letters, digits and underscores, starting with a
+/// letter.
 ///
 /// A shape check rather than an allow-list, so an exception type this build has never
 /// heard of still reaches the operator, while anything that could carry row data — a
 /// quoted document fragment, a key/value pair, whitespace, punctuation, non-ASCII text —
-/// is refused.
+/// is refused. The leading-letter requirement holds for every Elasticsearch exception
+/// class and drops the all-digit and all-underscore strings the character test alone
+/// would admit, so a row-derived identifier an intermediary put in `error.type` cannot
+/// pass as a class name.
 fn is_error_class_token(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= MAX_ERROR_CLASS_LEN
+    s.len() <= MAX_ERROR_CLASS_LEN
+        && s.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
         && s.bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
@@ -671,7 +678,7 @@ async fn check_status_without_body(resp: reqwest::Response) -> Result<reqwest::R
         status,
         // Still an `ElasticsearchError`, so `is_transient` — and with it the 429/5xx
         // retry classification in `with_retry` — keeps working unchanged.
-        message: class.unwrap_or_else(|| WITHHELD_BODY.to_string()),
+        message: class.unwrap_or_else(|| UNREPORTED_BODY.to_string()),
     })
 }
 
@@ -844,7 +851,7 @@ impl Elasticsearch for Client {
 #[cfg(test)]
 mod tests {
     use super::{
-        Client, ClientOptions, Error, RetryConfig, WITHHELD_BODY, error_class_from_body,
+        Client, ClientOptions, Error, RetryConfig, UNREPORTED_BODY, error_class_from_body,
         is_error_class_token,
     };
     use std::io::{BufRead, BufReader, Write};
@@ -942,6 +949,13 @@ mod tests {
         assert!(!is_error_class_token("значение"));
         // Long enough that it is prose wearing a class name's clothes.
         assert!(!is_error_class_token(&"a".repeat(65)));
+
+        // Shapes the character test alone would admit: no exception class starts with a
+        // digit or an underscore, but a row-derived identifier can look exactly like this.
+        assert!(!is_error_class_token("12345"));
+        assert!(!is_error_class_token("42_7"));
+        assert!(!is_error_class_token("_internal_exception"));
+        assert!(!is_error_class_token("___"));
     }
 
     #[test]
@@ -967,6 +981,12 @@ mod tests {
         // A `type` that is prose rather than a class name is refused, not truncated.
         assert_eq!(
             error_class_from_body(&format!(r#"{{"error":{{"type":"{SENTINEL} bad"}}}}"#)),
+            None
+        );
+        // An intermediary that puts a row-derived id where the class belongs: digits and
+        // underscores alone pass the character test, so the leading letter is what stops it.
+        assert_eq!(
+            error_class_from_body(r#"{"error":{"type":"90210_44317"}}"#),
             None
         );
     }
@@ -1043,7 +1063,7 @@ mod tests {
             !rendered.contains(SENTINEL),
             "the response body reached the error: {rendered}"
         );
-        assert!(rendered.contains(WITHHELD_BODY), "got: {rendered}");
+        assert!(rendered.contains(UNREPORTED_BODY), "got: {rendered}");
     }
 
     #[tokio::test]
