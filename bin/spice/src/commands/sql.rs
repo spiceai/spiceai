@@ -16,12 +16,11 @@ limitations under the License.
 
 //! SQL command implementation - starts an interactive SQL REPL or runs one query.
 
-use crate::context::{DEFAULT_HTTP_ENDPOINT, RuntimeContext};
+use crate::context::RuntimeContext;
 use crate::error::Result;
 use crate::output::OutputFormat;
 use clap::Args;
 use spice_cloud_client::endpoints::flight_endpoint as spice_cloud_flight_endpoint;
-use std::net::IpAddr;
 
 /// Arguments for the sql command.
 #[derive(Args, Debug)]
@@ -163,7 +162,8 @@ fn build_repl_config(ctx: &RuntimeContext, args: &SqlArgs) -> repl::ReplConfig {
         _ => repl::cache_control::CacheControl::Cache,
     };
 
-    let another_runtime = may_be_another_runtime(&http_endpoint, &flight_endpoint);
+    let flight_chosen = flight_endpoint_chosen(args);
+    let another_runtime = repl::http_endpoint_unpaired(flight_chosen, ctx.http_endpoint_chosen());
 
     repl::ReplConfig {
         repl_flight_endpoint: flight_endpoint,
@@ -180,113 +180,54 @@ fn build_repl_config(ctx: &RuntimeContext, args: &SqlArgs) -> repl::ReplConfig {
     }
 }
 
-/// Whether the REPL's HTTP endpoint addresses a different runtime than its SQL queries do.
+/// Whether this session's Flight endpoint was chosen on the command line.
 ///
-/// `--endpoint` moves only the Flight endpoint; the HTTP endpoint comes from the global
-/// `--http-endpoint`, whose default is this machine. Point the REPL at a remote runtime and the
-/// two disagree — SQL goes to the remote, `nql` to whatever is listening locally.
-///
-/// A non-default HTTP endpoint is taken at its word: the user set it, and cloud mode derives it
-/// from the region alongside the Flight endpoint (so `data.` vs `flight.` hosts are not a
-/// mismatch). Only the untouched local default paired with a non-loopback Flight target is one.
-fn may_be_another_runtime(http_endpoint: &str, flight_endpoint: &str) -> bool {
-    if http_endpoint != DEFAULT_HTTP_ENDPOINT {
-        return false;
-    }
-
-    !is_loopback_endpoint(flight_endpoint)
-}
-
-/// Whether `endpoint`'s host is this machine, for endpoints in `scheme://host:port/…` form.
-fn is_loopback_endpoint(endpoint: &str) -> bool {
-    let mut authority = endpoint;
-    if let Some((_scheme, rest)) = authority.split_once("://") {
-        authority = rest;
-    }
-    if let Some(path_start) = authority.find(['/', '?', '#']) {
-        authority = &authority[..path_start];
-    }
-    if let Some((_userinfo, host)) = authority.rsplit_once('@') {
-        authority = host;
-    }
-
-    // An IPv6 literal is bracketed, so its own colons are not port separators.
-    let host = if let Some(rest) = authority.strip_prefix('[') {
-        rest.split_once(']').map_or(rest, |(host, _rest)| host)
-    } else {
-        let split = authority.split_once(':');
-        split.map_or(authority, |(host, _port)| host)
-    };
-
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-
-    host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+/// `--flight-endpoint` is the deprecated spelling of `--endpoint`; either one moves the SQL
+/// target away from the default.
+fn flight_endpoint_chosen(args: &SqlArgs) -> bool {
+    args.endpoint.is_some() || args.flight_endpoint.is_some()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        sql: SqlArgs,
+    }
+
+    fn sql_args(argv: &[&str]) -> SqlArgs {
+        TestCli::parse_from(argv.iter().copied()).sql
+    }
 
     /// #11005: `spice sql --endpoint <remote>` moves only the Flight endpoint, so the REPL's
-    /// HTTP-backed `nql` kept asking the local runtime — silently answering from a different
-    /// instance than the one every SQL query in the same session went to.
+    /// HTTP-backed `nql` kept asking the local runtime - silently answering from a different
+    /// instance than the one every SQL query in the same session went to. Reporting that starts
+    /// with knowing the SQL target was moved.
     #[test]
-    fn a_remote_flight_endpoint_with_the_default_http_endpoint_is_another_runtime() {
-        assert!(may_be_another_runtime(
-            DEFAULT_HTTP_ENDPOINT,
-            "http://spice-test.127.0.0.1.nip.io:50051"
-        ));
-        assert!(may_be_another_runtime(
-            DEFAULT_HTTP_ENDPOINT,
-            "https://spiced.internal:50051"
-        ));
+    fn the_endpoint_flag_counts_as_a_chosen_flight_endpoint() {
+        let args = sql_args(&["sql", "--endpoint", "grpc://spiced.internal:50051"]);
+
+        assert!(flight_endpoint_chosen(&args));
     }
 
-    /// The default local session, and an explicitly named local Flight endpoint, both reach the
-    /// same runtime the default HTTP endpoint does — `nql` must keep working untouched.
+    /// The deprecated spelling moves the SQL target just as far.
     #[test]
-    fn a_loopback_flight_endpoint_is_the_same_runtime() {
-        for flight_endpoint in [
-            "http://localhost:50051",
-            "http://LOCALHOST:50051",
-            "http://127.0.0.1:50051",
-            "http://127.7.7.7:50051",
-            "https://[::1]:50051",
-        ] {
-            assert!(
-                !may_be_another_runtime(DEFAULT_HTTP_ENDPOINT, flight_endpoint),
-                "{flight_endpoint} is this machine"
-            );
-        }
+    fn the_deprecated_flight_endpoint_flag_counts_as_chosen() {
+        let args = sql_args(&["sql", "--flight-endpoint", "grpc://spiced.internal:50051"]);
+
+        assert!(flight_endpoint_chosen(&args));
     }
 
-    /// An HTTP endpoint the user (or cloud mode) chose is taken at its word, even when its host
-    /// differs from the Flight host — Cloud serves the two APIs from `data.` and `flight.`.
+    /// A local session chose neither endpoint, and cloud mode derives both from the region, so
+    /// `nql` keeps working untouched in each.
     #[test]
-    fn a_chosen_http_endpoint_is_never_reported_as_another_runtime() {
-        assert!(!may_be_another_runtime(
-            "http://spiced.internal:8090",
-            "http://spiced.internal:50051"
-        ));
-        assert!(!may_be_another_runtime(
-            "https://us-east-1.data.spiceai.io",
-            "https://us-east-1.flight.spiceai.io"
-        ));
-        // Same host as the default but a different port: still chosen, still trusted.
-        assert!(!may_be_another_runtime(
-            "http://127.0.0.1:9090",
-            "http://spiced.internal:50051"
-        ));
-    }
+    fn endpoints_nobody_moved_are_the_same_runtime() {
+        let args = sql_args(&["sql"]);
 
-    #[test]
-    fn a_host_without_a_port_or_scheme_is_still_classified() {
-        assert!(is_loopback_endpoint("http://localhost"));
-        assert!(is_loopback_endpoint("localhost:50051"));
-        assert!(is_loopback_endpoint("http://user@127.0.0.1:50051/path"));
-        assert!(!is_loopback_endpoint("spice-test.127.0.0.1.nip.io"));
-        assert!(!is_loopback_endpoint("http://192.168.1.10:50051"));
+        assert!(!flight_endpoint_chosen(&args));
     }
 }

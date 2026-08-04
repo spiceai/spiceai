@@ -24,7 +24,6 @@ use spice::commands::{
     datasets, feedback, init, install, login, models, nsql, pods, query, refresh, run, search, sql,
     status, trace, upgrade, validate, version, workers,
 };
-use spice::context::DEFAULT_HTTP_ENDPOINT;
 use spice::output::OutputFormat;
 use spice::{Result, RuntimeContext};
 use spice_cloud_client::endpoints::{
@@ -135,9 +134,13 @@ struct Cli {
     #[arg(long, global = true, value_parser = parse_cloud_region, default_value = DEFAULT_CLOUD_REGION, requires = "cloud")]
     cloud_region: String,
 
-    /// HTTP endpoint of the Spice runtime to talk to.
-    #[arg(long, global = true, default_value = DEFAULT_HTTP_ENDPOINT)]
-    http_endpoint: String,
+    /// HTTP endpoint of the Spice runtime to talk to [default: http://127.0.0.1:8090].
+    ///
+    /// The default is applied by the runtime context rather than by clap, so that omitting
+    /// this flag stays distinguishable from passing the default value: `spice sql` refuses to
+    /// send a natural-language query to an HTTP endpoint nobody chose. See #11005.
+    #[arg(long, global = true)]
+    http_endpoint: Option<String>,
 
     /// Path to a PEM root certificate used to verify the runtime's TLS server certificate.
     #[arg(long, global = true)]
@@ -866,7 +869,7 @@ fn run_cli(cli: Cli) -> Result<()> {
     // Create runtime context from CLI args
     let cloud_region = cli.cloud.then_some(cli.cloud_region.as_str());
     let ctx = RuntimeContext::with_args(
-        Some(cli.http_endpoint),
+        cli.http_endpoint,
         cli.api_key,
         cloud_region,
         cli.tls_root_certificate_file,
@@ -1062,6 +1065,16 @@ mod tests {
     fn parse_normalized(args: &[&str]) -> Cli {
         let args = normalize_direct_command_args(args.iter().map(OsString::from));
         Cli::try_parse_from(args).expect("failed to parse CLI args")
+    }
+
+    /// #11005: the guard that keeps the SQL REPL's `nql` from answering out of an unrelated
+    /// runtime reads whether `--http-endpoint` was *given*, so the flag must carry no clap
+    /// `default_value` — with one, omitting it is indistinguishable from passing it.
+    #[test]
+    fn an_omitted_http_endpoint_stays_unset() {
+        let cli = parse_normalized(&["spice", "-sql", "show tables"]);
+
+        assert!(cli.http_endpoint.is_none());
     }
 
     fn try_parse_normalized(args: &[&str]) -> std::result::Result<Cli, clap::Error> {
@@ -1280,7 +1293,8 @@ mod tests {
             "-sql",
             "show tables",
         ]);
-        assert_eq!(cli.http_endpoint, "http://127.0.0.1:8090");
+        let endpoint = cli.http_endpoint.as_deref();
+        assert_eq!(endpoint, Some("http://127.0.0.1:8090"));
         let Commands::Sql(args) = cli.command else {
             panic!("expected sql command");
         };
@@ -1450,7 +1464,8 @@ mod tests {
             "--http-endpoint",
             "http://127.0.0.1:8090",
         ]);
-        assert_eq!(cli.http_endpoint, "http://127.0.0.1:8090");
+        let endpoint = cli.http_endpoint.as_deref();
+        assert_eq!(endpoint, Some("http://127.0.0.1:8090"));
         let Commands::Sql(args) = cli.command else {
             panic!("expected sql command");
         };

@@ -29,8 +29,8 @@ use std::time::Duration;
 
 /// The runtime HTTP endpoint the CLI talks to when `--http-endpoint` is not given.
 ///
-/// Shared with the `--http-endpoint` flag's `default_value` so a command can tell an
-/// explicitly chosen endpoint from the built-in local one.
+/// The default lives here rather than on the flag so that not passing the flag is
+/// distinguishable from passing this exact value — see [`RuntimeContext::http_endpoint_chosen`].
 pub const DEFAULT_HTTP_ENDPOINT: &str = "http://127.0.0.1:8090";
 
 /// Constants for Spice paths and filenames
@@ -56,6 +56,11 @@ pub struct RuntimeContext {
 
     /// HTTP endpoint for runtime API
     http_endpoint: String,
+
+    /// Whether `http_endpoint` came from `--http-endpoint`, rather than the built-in default
+    /// or the cloud region. `spice sql` needs the provenance and not the value: it moves only
+    /// the Flight endpoint, so an HTTP endpoint nobody pointed at that runtime is not it.
+    http_endpoint_chosen: bool,
 
     /// API key for authentication
     api_key: Option<String>,
@@ -103,6 +108,7 @@ impl RuntimeContext {
             app_dir,
             pods_dir,
             http_endpoint: DEFAULT_HTTP_ENDPOINT.to_string(),
+            http_endpoint_chosen: false,
             api_key: None,
             cloud_region: None,
             user_agent: Self::default_user_agent(),
@@ -126,10 +132,15 @@ impl RuntimeContext {
 
         if let Some(endpoint) = http_endpoint {
             ctx.http_endpoint = endpoint;
+            ctx.http_endpoint_chosen = true;
         }
 
         if let Some(region) = cloud {
+            // The region replaces whatever `--http-endpoint` asked for, so the endpoint in use
+            // is derived from the region rather than chosen. It is derived alongside the Cloud
+            // Flight endpoint, which is what makes the pair trustworthy.
             ctx.http_endpoint = spice_cloud_data_endpoint(region);
+            ctx.http_endpoint_chosen = false;
             ctx.cloud_region = Some(region.to_string());
         }
 
@@ -211,6 +222,13 @@ impl RuntimeContext {
     #[must_use]
     pub fn http_endpoint(&self) -> &str {
         &self.http_endpoint
+    }
+
+    /// Whether the HTTP endpoint came from `--http-endpoint`, rather than the built-in default
+    /// or the cloud region.
+    #[must_use]
+    pub fn http_endpoint_chosen(&self) -> bool {
+        self.http_endpoint_chosen
     }
 
     /// Get the API key if set.
@@ -501,6 +519,7 @@ mod tests {
             app_dir: PathBuf::from("/test/app"),
             pods_dir: PathBuf::from("/test/app/spicepods"),
             http_endpoint: "http://127.0.0.1:8090".to_string(),
+            http_endpoint_chosen: false,
             api_key: None,
             cloud_region: None,
             user_agent: "spice/test (test; test)".to_string(),
@@ -525,6 +544,7 @@ mod tests {
             app_dir: PathBuf::from("/test/app"),
             pods_dir: PathBuf::from("/test/app/spicepods"),
             http_endpoint: "http://127.0.0.1:8090".to_string(),
+            http_endpoint_chosen: false,
             api_key: None,
             cloud_region: None,
             user_agent: "spice/test (test; test)".to_string(),
@@ -890,6 +910,40 @@ mod tests {
                 .expect("with_args should succeed");
 
         assert_eq!(ctx.http_endpoint(), "http://custom:9999");
+    }
+
+    /// #11005: `spice sql` moves only the Flight endpoint, so it needs to tell an HTTP endpoint
+    /// somebody chose from the default one nobody pointed anywhere.
+    #[test]
+    fn test_with_args_records_whether_the_http_endpoint_was_chosen() {
+        let chosen =
+            RuntimeContext::with_args(Some("http://custom:9999".to_string()), None, None, None)
+                .expect("with_args should succeed");
+
+        assert!(chosen.http_endpoint_chosen());
+
+        let omitted =
+            RuntimeContext::with_args(None, None, None, None).expect("with_args should succeed");
+
+        assert!(!omitted.http_endpoint_chosen());
+        assert_eq!(omitted.http_endpoint(), DEFAULT_HTTP_ENDPOINT);
+    }
+
+    /// A cloud region replaces the flag's value, so the endpoint in use was derived rather than
+    /// chosen — and it is derived alongside the Cloud Flight endpoint, which is what makes the
+    /// pair trustworthy without either being chosen.
+    #[test]
+    fn test_with_args_treats_a_cloud_endpoint_as_derived() {
+        let ctx = RuntimeContext::with_args(
+            Some("http://custom:9999".to_string()),
+            None,
+            Some("us-east-1"),
+            None,
+        )
+        .expect("with_args should succeed");
+
+        assert!(!ctx.http_endpoint_chosen());
+        assert_ne!(ctx.http_endpoint(), "http://custom:9999");
     }
 
     #[test]

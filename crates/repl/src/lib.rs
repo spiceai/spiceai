@@ -145,14 +145,35 @@ pub struct ReplConfig {
     #[arg(long, short = 'x', help_heading = "SQL REPL")]
     pub expanded: bool,
 
-    /// Set when `http_endpoint` was left at its local default while SQL queries go to an
-    /// explicitly chosen remote Flight endpoint. The two then address different runtimes, so
-    /// `nql` — the one REPL feature that speaks HTTP rather than Flight — must say so instead
-    /// of answering from whatever happens to be listening locally. See #11005.
+    /// Set when the Flight endpoint was chosen on the command line and `http_endpoint` was
+    /// left to its default, so nothing pointed the HTTP endpoint at the runtime the SQL
+    /// queries go to. `nql` — the one REPL feature that speaks HTTP rather than Flight — then
+    /// says so instead of answering from whatever the default reaches. See #11005.
     ///
-    /// Not a flag: the caller that resolved both endpoints is the only thing that can know.
+    /// Not a flag: only the caller that resolved both endpoints knows where each came from.
     #[arg(skip)]
     pub http_endpoint_may_be_another_runtime: bool,
+}
+
+/// Whether the REPL's HTTP endpoint may address a runtime other than the one SQL queries go to,
+/// given whether each endpoint was chosen on the command line.
+///
+/// This is a question about provenance, not about hosts. The Flight endpoint can be moved on
+/// its own — by `spice sql --endpoint` or `spiced --repl-flight-endpoint` — while the HTTP
+/// endpoint keeps its own default, and comparing the two cannot settle whether they agree: a
+/// host and port say nothing about which runtime answers there. Two runtimes can both be on
+/// loopback, and one runtime can be reached at unrelated addresses through a tunnel or ingress.
+///
+/// So only endpoints that were chosen, or defaulted as a pair, are trusted:
+///
+/// - neither chosen — the built-in defaults, or a pair derived from a cloud region: trusted;
+/// - both chosen — the caller paired them, even if the HTTP one repeats the default: trusted;
+/// - Flight chosen alone — nothing pointed the HTTP endpoint at that runtime: not trusted.
+///
+/// Callers pass the result to [`ReplConfig::http_endpoint_may_be_another_runtime`]. See #11005.
+#[must_use]
+pub fn http_endpoint_unpaired(flight_chosen: bool, http_chosen: bool) -> bool {
+    flight_chosen && !http_chosen
 }
 
 const NQL_LINE_PREFIX: &str = "nql ";
@@ -811,19 +832,21 @@ fn format_flight_sql_status(status: &Status) -> String {
     )
 }
 
-/// Why `nql` will not run when the HTTP endpoint and the SQL target are different runtimes.
+/// Why `nql` will not run when nothing pointed the HTTP endpoint at the SQL target.
 ///
 /// `nql` is the one REPL feature that goes over the runtime's HTTP API; everything else uses
-/// Flight. Answering it from the local default while this session's SQL goes to a remote would
-/// silently mix results from two runtimes, so name both endpoints and the flag that fixes it.
+/// Flight. Answering it from an endpoint nobody chose, while this session's SQL goes somewhere
+/// chosen, would silently mix results from two runtimes — so state both endpoints, and the flag
+/// that settles which runtime `nql` should ask, without claiming to know what answers where.
 fn nql_endpoint_mismatch_message(repl_config: &ReplConfig) -> String {
     let http_endpoint = &repl_config.http_endpoint;
     let flight_endpoint = &repl_config.repl_flight_endpoint;
 
     format!(
-        "`nql` uses the runtime's HTTP API at '{http_endpoint}', but this session's SQL \
-         queries go to '{flight_endpoint}' — a different runtime. Re-run with \
-         `--http-endpoint <http url of that runtime>` to ask it instead."
+        "`nql` uses the runtime's HTTP API, which is still at its default \
+         '{http_endpoint}' while this session's SQL queries go to '{flight_endpoint}'. \
+         Pass `--http-endpoint` for the runtime `nql` should ask — repeating the default \
+         is accepted, and confirms that is the one you mean."
     )
 }
 
@@ -1427,13 +1450,13 @@ mod tests {
             "--http-endpoint",
             "http://127.0.0.1:8090",
             "--repl-flight-endpoint",
-            "http://spiced.internal:50051",
+            "http://remote:50051",
         ]);
 
         let message = nql_endpoint_mismatch_message(&config);
 
         assert!(message.contains("http://127.0.0.1:8090"), "{message}");
-        assert!(message.contains("http://spiced.internal:50051"), "{message}");
+        assert!(message.contains("http://remote:50051"), "{message}");
         assert!(message.contains("--http-endpoint"), "{message}");
     }
 
@@ -1442,7 +1465,8 @@ mod tests {
     #[test]
     fn the_flight_connection_failure_says_the_endpoint_serves_grpc() {
         let endpoint = "http://spice-test.127.0.0.1.nip.io";
-        let message = flight_connection_failed(endpoint, "transport error").to_string();
+        let error = flight_connection_failed(endpoint, "transport error");
+        let message = error.to_string();
 
         assert!(message.contains(endpoint), "{message}");
         assert!(message.contains("transport error"), "{message}");
@@ -1450,13 +1474,27 @@ mod tests {
         assert!(message.contains("50051"), "{message}");
     }
 
-    /// The `nql` guard is off unless a caller sets it, so parsing the REPL's own flags — what
-    /// `spiced` does — never turns it on.
+    /// The guard is not a flag, and defaults off: a caller that does not resolve endpoint
+    /// provenance gets the previous behaviour rather than a REPL that refuses `nql`.
     #[test]
     fn the_nql_guard_defaults_off_when_parsed_from_flags() {
         let config = ReplConfig::parse_from(["repl"]);
 
         assert!(!config.http_endpoint_may_be_another_runtime);
+    }
+
+    /// #11005: moving the SQL target without saying where `nql` should go is the one case
+    /// nothing can vouch for. Defaulted pairs and chosen pairs both can.
+    #[test]
+    fn only_a_flight_endpoint_chosen_alone_is_unpaired() {
+        assert!(http_endpoint_unpaired(true, false));
+
+        // Both defaulted: the local pair, or a pair derived from a cloud region.
+        assert!(!http_endpoint_unpaired(false, false));
+        // Both chosen: the caller paired them, even if the HTTP one repeats its default.
+        assert!(!http_endpoint_unpaired(true, true));
+        // Only the HTTP endpoint moved, so SQL still goes to the default it belongs to.
+        assert!(!http_endpoint_unpaired(false, true));
     }
 
     #[test]

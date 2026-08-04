@@ -69,6 +69,11 @@ const fn get_allocator_name() -> Option<&'static str> {
     }
 }
 
+/// Whether `id` was given on the command line, rather than falling back to its default.
+fn chosen_on_command_line(matches: &clap::ArgMatches, id: &str) -> bool {
+    matches.value_source(id) == Some(ValueSource::CommandLine)
+}
+
 fn main() {
     // Before anything else, so a fault during startup is still reported. A native
     // crash is not a panic: without this the process dies silently with exit 139.
@@ -77,8 +82,16 @@ fn main() {
     let matches = spiced::Args::command().get_matches();
     let open_telemetry_deprecated =
         matches.value_source("open_telemetry_bind_address") == Some(ValueSource::CommandLine);
+    // `--repl-flight-endpoint` moves only the REPL's SQL target; its HTTP endpoint, which is
+    // what `nql` uses, keeps its own default. Choosing one without the other leaves nothing
+    // pointing the HTTP endpoint at that runtime, so `nql` says so instead of answering from
+    // whatever the default reaches. See #11005.
+    let flight_chosen = chosen_on_command_line(&matches, "repl_flight_endpoint");
+    let http_chosen = chosen_on_command_line(&matches, "http_endpoint");
     let mut args = spiced::Args::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
     args.open_telemetry_deprecated = open_telemetry_deprecated;
+    args.repl_config.http_endpoint_may_be_another_runtime =
+        repl::http_endpoint_unpaired(flight_chosen, http_chosen);
 
     if args.version {
         println!("{}", get_version_string());
