@@ -73,6 +73,44 @@ jobs:
       # pulls.listCommits for pure-revert fast-track detection
       pull-requests: read
     steps:
+      # An explicit sign-off verdict on the head commit answers the only question
+      # this job asks, so it is settled before anything below can route around
+      # it. `Inspect developer sign-off` treats a non-success status as an absent
+      # one and walks the first-parent chain, which is right for an intermediate
+      # merge commit — its status says nothing about the tree under review — but
+      # wrong for HEAD: inheritance exists so that merging the base costs no
+      # re-sign-off, not so that it can resurrect a sign-off that HEAD's own run
+      # has already overturned. The fast-track paths below skip the inspection
+      # entirely, and they mean "this head needs no sign-off", not "a failed one
+      # may be ignored". A `pending` status is deliberately not rejected here: it
+      # is not a verdict, and a sign-off still running must not turn Attestation
+      # red on a branch that already has a valid sign-off to inherit. See #12357.
+      - name: Reject a failed sign-off on the head commit
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const headSha = context.payload.pull_request.head.sha;
+
+            // 'signoff' matches the hardcoded STATUS_CONTEXT in scripts/signoff.
+            const { data } = await github.rest.repos.getCombinedStatusForRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: headSha,
+            });
+            const signoff = data.statuses.find((status) => status.context === 'signoff');
+            if (signoff?.state !== 'failure' && signoff?.state !== 'error') {
+              return;
+            }
+
+            const reported = signoff.description ? `: ${signoff.description}` : '';
+            core.setFailed(
+              `The developer sign-off for ${headSha} reported ${signoff.state}${reported}. ` +
+              `Fix what it found and run make signoff again on the pushed HEAD; a sign-off ` +
+              `that has failed on this commit cannot be satisfied by an earlier one. ` +
+              `See docs/dev/ci_signoff.md.`
+            );
+
       # Dependabot dependency bumps are fast-tracked: a PR Dependabot opened that
       # is still exactly the one commit Dependabot pushed carries no
       # human-authored change to sign off on, and the merge queue re-runs the
@@ -464,7 +502,7 @@ jobs:
       # and blobs to reproduce the merge without relying on a lazy network fetch.
       - name: Check out pull request history
         if: ${{ github.event_name == 'pull_request' && steps.signoff.outputs.inheritance_candidate == 'true' }}
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
@@ -569,7 +607,7 @@ jobs:
     outputs:
       relevant_changes: ${{ steps.check.outputs.relevant_changes }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Use fetch-depth 2 for PR change detection (dorny/paths-filter only needs base + head)
           fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 0 }}
@@ -593,7 +631,7 @@ jobs:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
           fetch-depth: 1
@@ -617,13 +655,14 @@ jobs:
       - name: Set up spiceio
         if: needs.check_changes.outputs.relevant_changes == 'true' && runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@973bc49a7be396ec9430255ad0f7ed684d7a1317 # v0.5.8
+        uses: spiceai/spiceio/.github/actions/setup@dc53e1f5e2a92e64bfc785923b8f9471c42fbf46 # v0.5.10
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
+          immutable-objects: "true"
 
       - name: Set up sccache
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -679,7 +718,7 @@ jobs:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
           fetch-depth: 1
@@ -707,13 +746,14 @@ jobs:
       - name: Set up spiceio
         if: needs.check_changes.outputs.relevant_changes == 'true' && runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@973bc49a7be396ec9430255ad0f7ed684d7a1317 # v0.5.8
+        uses: spiceai/spiceio/.github/actions/setup@dc53e1f5e2a92e64bfc785923b8f9471c42fbf46 # v0.5.10
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
+          immutable-objects: "true"
 
       - name: Set up sccache
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -806,7 +846,7 @@ jobs:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
           fetch-depth: 1
@@ -818,13 +858,14 @@ jobs:
       - name: Set up spiceio
         if: needs.check_changes.outputs.relevant_changes == 'true' && runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@973bc49a7be396ec9430255ad0f7ed684d7a1317 # v0.5.8
+        uses: spiceai/spiceio/.github/actions/setup@dc53e1f5e2a92e64bfc785923b8f9471c42fbf46 # v0.5.10
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
+          immutable-objects: "true"
 
       - name: Set up sccache
         if: needs.check_changes.outputs.relevant_changes == 'true'

@@ -217,10 +217,11 @@ pub fn duckdb_default_per_instance_bytes(host_memory: u64) -> u64 {
 ///   instance, from HOST RAM (see [`duckdb_default_per_instance_bytes`]) so the
 ///   projection is correct in containers, not the cgroup total.
 /// * `base_query_budget` — what the query pool WOULD be with no `DuckDB` coordination,
-///   i.e. `effective_query_memory_limit(None, cayenne_active, cdc, None)` — 90% of
-///   RAM (non-Cayenne) or the reduced 70%-based Cayenne region. Splitting *this*
-///   (not `total`) confines `DuckDB` to the query region and preserves the Cayenne
-///   tier/headroom.
+///   i.e. `effective_query_memory_limit(None, cayenne_cdc_active, reservation, None)`
+///   — 90% of RAM, less any Cayenne off-pool cache reservation, or the reduced
+///   70%-based region when a Cayenne table can reach the in-memory CDC tier.
+///   Splitting *this* (not `total`) confines `DuckDB` to the query region and
+///   preserves the Cayenne tier/headroom.
 /// * `query_explicit` — parsed `runtime.query.memory_limit` (`Some` ⇒ honored verbatim).
 /// * `inputs` — the deduped `DuckDB` instance summary.
 #[must_use]

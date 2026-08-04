@@ -8,36 +8,92 @@
 # Same fail-fast order as local sign-off:
 #   0. Skip Rust lint/build/tests when the branch has no Rust-affecting files
 #      vs trunk (.rs, Cargo.toml/lock, rust-toolchain*, .cargo/*)
-#   1. Targeted lint of crates touched by the branch vs trunk (off by default —
-#      see the skip_targeted_lint input)
+#   1. Targeted lint of crates touched by the branch vs trunk (off by default
+#      here — see the run_targeted_prechecks input)
 #   2. Targeted unit tests for those crates (runs only when step 1 does)
 #   3. Full workspace lint (make lint-rust)
 #   4. CLI build + unit tests (make build-cli-dev nextest)
 #   5. Post signoff status + re-run Attestation if needed
 #
+# The checks run under an explicit budget below the pool's ~360-minute job wall,
+# so a run that overruns fails legibly and clears the pending status it posted
+# rather than being terminated as `cancelled` with nothing to show for it.
+#
 # This workflow is the only remote sign-off path (never SSH to ad-hoc hosts —
 # the LAN lab boxes double as benchmark machines):
 #   make signoff-remote
 #   gh workflow run signoff.yml -f branch=<your-branch>
-#   gh workflow run signoff.yml -f branch=<your-branch> -f skip_targeted_lint=true
+#   gh workflow run signoff.yml -f branch=<your-branch> -f run_targeted_prechecks=true
+#
+# Fork PRs (pr_number input): dispatching this workflow already requires write
+# access to this repo, so we don't gate fork sign-off behind an extra
+# confirmation input — the write-access check on workflow_dispatch itself is
+# the trust boundary. But the fork's code (build.rs, tests, Makefiles, …)
+# still runs on our self-hosted runner with full access to this job's
+# secrets, so only dispatch this for a fork PR you've actually reviewed:
+#   gh workflow run signoff.yml -f pr_number=<PR number>
+# The PR's head commit (not the mutable branch) is what gets checked out and
+# signed off, pinned at resolve time, so a push to the fork branch after you
+# dispatch doesn't silently swap in unreviewed code. The fork is fetched as a
+# second git remote rather than passed to actions/checkout's `repository:` —
+# that input repoints "origin" at whatever repo it's given, which would
+# misdirect every `gh`-based repo lookup in scripts/signoff (status posts,
+# PR/run lookups) at the fork instead of this repo.
+#
+# scripts/signoff and the setup-* composite actions below are also saved to
+# .trusted-ci/ from this repo *before* any fork commit is checked out, and
+# every later step references those copies (literal `.trusted-ci/...` paths)
+# rather than the working tree. This runs unconditionally, not just for fork
+# PRs, so every step downstream has one fixed path to depend on instead of
+# branching on is_fork — `uses:` can't read a step output (the `steps`
+# context isn't available there), so a per-case path chosen at runtime
+# isn't an option. Otherwise a fork PR could ship
+# its own scripts/signoff that unconditionally posts "success", or a setup-*
+# action that exfiltrates this job's secrets — i.e. it could rig the very
+# checks meant to validate it. What's still (necessarily) untrusted: the
+# actual build/lint/test run — `make lint-rust`/`build-cli`/`nextest` still
+# execute against the fork's own Makefile/Cargo.toml/build.rs/tests, because
+# that's the code under review. That's inherent to CI-testing any PR's code
+# and isn't something pinning scripts/signoff can fix.
 name: Remote Sign-off
 
-run-name: Remote Sign-off (${{ inputs.branch }})
+run-name: "Remote Sign-off (${{ inputs.pr_number && format('PR #{0}', inputs.pr_number) || inputs.branch }})"
 on:
   workflow_dispatch:
     inputs:
       branch:
-        description: 'Branch to sign off (must be pushed to origin)'
-        required: true
+        description: 'Branch to sign off (must be pushed to origin). Mutually exclusive with pr_number.'
+        required: false
         type: string
-      skip_targeted_lint:
-        description: 'Skip the branch-scoped targeted pre-lint'
+      pr_number:
+        description: 'PR number to sign off — use this for fork PRs. Resolves and pins to the head commit automatically. Mutually exclusive with branch.'
+        required: false
+        type: string
+      # The branch-scoped pre-lint and unit tests exist to fail fast in front of
+      # the full gate. That is worth an extra resolve of the changed crates'
+      # graph when a developer is watching the terminal; on a runner nobody
+      # watches, the log is read after the fact and the only thing the extra
+      # pass buys is compile time. Local `make signoff` keeps them on.
+      run_targeted_prechecks:
+        description: 'Run the branch-scoped targeted pre-lint and unit tests before the full gate'
         required: false
         type: boolean
         default: false
 
+# Coarse, pre-resolution guard: it only collapses re-dispatches that used the
+# *same* input form, because `concurrency` is evaluated before any step runs and
+# so cannot see which branch a `pr_number` actually names. That still earns its
+# keep — a `branch=X` re-dispatch after X's tip moved lands here, and the two
+# runs target different commits, so the SHA group below would not pair them.
+#
+# The authoritative guard is the `concurrency` block on `sign-off`, keyed on the
+# commit `resolve` pins. Without it, `-f branch=X` and `-f pr_number=N` for the
+# same branch sat in different groups (`signoff-X` vs `signoff-N`), so neither
+# cancelled the other: two 1-4h runs held two slots of the shared self-hosted
+# pool for one commit and both posted the `signoff` status on it, last write
+# winning regardless of which run was authoritative (#12472).
 concurrency:
-  group: signoff-${{ github.event.inputs.branch }}
+  group: signoff-${{ inputs.pr_number || inputs.branch }}
   cancel-in-progress: true
 
 env:
@@ -48,9 +104,169 @@ env:
   CARGO_NET_GIT_FETCH_WITH_CLI: true
 
 jobs:
+  # Its own job purely so `sign-off` can key `concurrency` on the commit this
+  # resolves to: a job-level `concurrency` group can read `needs`, but a
+  # workflow-level one cannot read a step output, so the canonical key is not
+  # available where the workflow-level group above is declared (#12472).
+  #
+  # GitHub-hosted on purpose. It is two API calls and must not queue behind the
+  # saturated self-hosted pool — every sign-off now waits on it.
+  resolve:
+    name: "Resolve sign-off target"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      # Reading the PR to pin its head commit.
+      pull-requests: read
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    outputs:
+      checkout_repo: ${{ steps.resolve.outputs.checkout_repo }}
+      checkout_ref: ${{ steps.resolve.outputs.checkout_ref }}
+      is_fork: ${{ steps.resolve.outputs.is_fork }}
+      head_sha: ${{ steps.resolve.outputs.head_sha }}
+    steps:
+      - name: Resolve branch/PR input
+        id: resolve
+        env:
+          BRANCH: ${{ inputs.branch }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          BASE_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${BRANCH// }" && -n "${PR_NUMBER// }" ]]; then
+            echo "::error::specify either 'branch' or 'pr_number', not both"
+            exit 1
+          fi
+
+          if [[ -n "${PR_NUMBER// }" ]]; then
+            if [[ ! "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+              echo "::error::pr_number must be a positive integer, got '${PR_NUMBER}'"
+              exit 1
+            fi
+            pr_json=$(gh pr view "$PR_NUMBER" --repo "$BASE_REPO" \
+              --json state,isCrossRepository,headRepositoryOwner,headRepository,headRefName,headRefOid) \
+              || { echo "::error::could not look up PR #${PR_NUMBER} on ${BASE_REPO}"; exit 1; }
+
+            state=$(jq -r '.state' <<<"$pr_json")
+            is_fork=$(jq -r '.isCrossRepository' <<<"$pr_json")
+            head_ref=$(jq -r '.headRefName' <<<"$pr_json")
+            head_sha=$(jq -r '.headRefOid' <<<"$pr_json")
+            owner=$(jq -r '.headRepositoryOwner.login' <<<"$pr_json")
+            name=$(jq -r '.headRepository.name' <<<"$pr_json")
+
+            # Same shape check the branch arm applies below. `jq -r` renders a
+            # missing field as the string "null", which a PR whose head repo has
+            # been deleted really does return — and an unvalidated "null" here
+            # would become both the checkout ref and the concurrency key, so two
+            # such PRs would share a group and cancel each other.
+            if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::PR #${PR_NUMBER} resolved to head commit '${head_sha}', which is not a commit SHA — is its head repository still present?"
+              exit 1
+            fi
+
+            if [[ "$state" != "OPEN" ]]; then
+              echo "::warning::PR #${PR_NUMBER} is ${state}, not OPEN — signing off its last-known head anyway"
+            fi
+
+            checkout_repo="${owner}/${name}"
+            # Pin to the exact commit resolved right now, not the mutable
+            # branch — the PR author (fork owner or collaborator) can push
+            # new commits between this dispatch and when the runner actually
+            # checks it out, and this job runs that code with full secrets.
+            checkout_ref="$head_sha"
+
+            if [[ "$is_fork" == "true" ]]; then
+              echo "::warning::Signing off PR #${PR_NUMBER} from FORK ${checkout_repo}@${head_ref}, pinned to ${head_sha}. This runs fork-authored code (build scripts, tests, Makefiles) on a self-hosted runner with full access to this job's secrets — only dispatch this for a fork PR you've reviewed and trust."
+            fi
+            echo "Signing off PR #${PR_NUMBER}: ${checkout_repo}@${checkout_ref}"
+          elif [[ -n "${BRANCH// }" ]]; then
+            # Mirror scripts/signoff remote: allow feature/foo, reject whitespace,
+            # quotes, $, `, leading dashes, absolute paths, `..`, and any char
+            # outside [A-Za-z0-9._/-] so dispatch/checkout cannot be broken by the name.
+            if [[ "$BRANCH" =~ [[:space:]] || "$BRANCH" == -* || "$BRANCH" == /* || "$BRANCH" == *..* \
+                || "$BRANCH" == *\"* || "$BRANCH" == *\'* || "$BRANCH" == *\$* || "$BRANCH" == *\`* ]]; then
+              echo "::error::invalid branch name: '${BRANCH}'"
+              exit 1
+            fi
+            if [[ ! "$BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+              echo "::error::invalid branch name: '${BRANCH}'"
+              exit 1
+            fi
+            checkout_repo="$BASE_REPO"
+            checkout_ref="$BRANCH"
+            # The concurrency key needs a commit, and this form only names a
+            # branch, so resolve its tip. `checkout_ref` deliberately stays the
+            # branch name: pinning it here would change what a `branch=`
+            # sign-off attests, which is not this fix's business. A push between
+            # this lookup and the checkout therefore signs a commit the SHA
+            # group did not pair on — that race is why the coarse branch-keyed
+            # workflow-level group above is still worth having.
+            head_sha=$(gh api "repos/${BASE_REPO}/commits/${BRANCH}" --jq '.sha') \
+              || { echo "::error::could not resolve branch '${BRANCH}' on ${BASE_REPO} — is it pushed?"; exit 1; }
+            if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::resolved branch '${BRANCH}' to '${head_sha}', which is not a commit SHA"
+              exit 1
+            fi
+            echo "Signing off branch: ${BRANCH} (${head_sha})"
+          else
+            echo "::error::one of 'branch' or 'pr_number' is required"
+            exit 1
+          fi
+
+          if [[ "$checkout_repo" == "$BASE_REPO" ]]; then
+            is_fork=false
+          else
+            is_fork=true
+          fi
+
+          echo "checkout_repo=${checkout_repo}" >> "$GITHUB_OUTPUT"
+          echo "checkout_ref=${checkout_ref}" >> "$GITHUB_OUTPUT"
+          echo "is_fork=${is_fork}" >> "$GITHUB_OUTPUT"
+          # Keys the sign-off job's concurrency group — see its comment.
+          echo "head_sha=${head_sha}" >> "$GITHUB_OUTPUT"
+          echo "Triggered by: ${{ github.actor }}"
+          echo "Targeted pre-lint base: trunk (fixed)"
+
   sign-off:
-    name: Sign off on ${{ github.event.inputs.branch }}
+    name: "Sign off on ${{ inputs.pr_number && format('PR #{0}', inputs.pr_number) || github.event.inputs.branch }}"
+    needs: resolve
+    # The authoritative one-run-per-commit guard. Both dispatch forms reduce to
+    # the same commit here, so a second dispatch for a commit already being
+    # signed off evicts the first instead of duplicating 1-4h of identical work
+    # and racing it for the `signoff` status (#12472). Two open PRs sharing a
+    # head commit collapse into one group too, which is the same desirable
+    # dedupe: the status they would post is for that one commit.
+    #
+    # The evicted run is cancelled mid-flight, which is the case
+    # `scripts/signoff correct-cancelled` covers — it repairs only the
+    # `signoff=failure` a dying run posted and leaves a genuine `success`
+    # alone (#12424, #12428).
+    #
+    # The `||` fallback matters more than it looks. `needs` is a documented
+    # context for a job-level `concurrency` (unlike a workflow-level one, which
+    # is why the group above cannot do this), but if `head_sha` ever arrived
+    # empty the key would collapse to the constant `signoff-commit-` for every
+    # run — and with `cancel-in-progress` that means every dispatch evicting
+    # every other branch's sign-off, a far worse failure than the duplicate runs
+    # this fixes. Falling back to the raw inputs degrades to the old
+    # per-input behaviour instead.
+    concurrency:
+      group: signoff-commit-${{ needs.resolve.outputs.head_sha || format('input-{0}-{1}', inputs.pr_number, inputs.branch) }}
+      cancel-in-progress: true
     runs-on: spiceai-macos
+    # The spiceai-macos pool terminates a job at ~360 minutes, and that arrives
+    # as `cancelled` with no failed step — the same shape as the
+    # cancel-in-progress eviction above, and with no chance for the steps below
+    # to run. Stop just short of the wall so an overrun is this workflow's own,
+    # legible failure.
+    #
+    # The budget that has to hold is `setup + sign-off step + cleanup < 358`,
+    # not just `353 < 358`: the job clock starts before the setup steps, the
+    # step clock only when the step does. Measured on this pool, setup is ~25s
+    # and cleanup ~20s, so the 5-minute gap is about 6x what it needs.
+    timeout-minutes: 358
     permissions:
       contents: read
       statuses: write
@@ -71,38 +287,79 @@ jobs:
       SIGNOFF_DEBUG: '1'
 
     steps:
-      - name: Validate branch input
-        env:
-          BRANCH: ${{ github.event.inputs.branch }}
-        run: |
-          set -euo pipefail
-          if [[ -z "${BRANCH// }" ]]; then
-            echo "::error::branch input is required"
-            exit 1
-          fi
-          # Mirror scripts/signoff remote: allow feature/foo, reject whitespace,
-          # quotes, $, `, leading dashes, absolute paths, `..`, and any char
-          # outside [A-Za-z0-9._/-] so dispatch/checkout cannot be broken by the name.
-          if [[ "$BRANCH" =~ [[:space:]] || "$BRANCH" == -* || "$BRANCH" == /* || "$BRANCH" == *..* \
-              || "$BRANCH" == *\"* || "$BRANCH" == *\'* || "$BRANCH" == *\$* || "$BRANCH" == *\`* ]]; then
-            echo "::error::invalid branch name: '${BRANCH}'"
-            exit 1
-          fi
-          if [[ ! "$BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]]; then
-            echo "::error::invalid branch name: '${BRANCH}'"
-            exit 1
-          fi
-          echo "Signing off branch: ${BRANCH}"
-          echo "Triggered by: ${{ github.actor }}"
-          echo "Targeted pre-lint base: trunk (fixed)"
-
-      - name: Check out branch
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Check out branch/PR
+        # Same-repo case only — never pass a `repository:` override here. Doing
+        # so would repoint the local "origin" remote at whatever repo we pass,
+        # which breaks every `gh` call in scripts/signoff that infers the repo
+        # from "origin" (status posts, PR/run lookups) — they'd silently target
+        # that other repo instead of this one. The fork case below keeps
+        # "origin" pointed at this repo and fetches the fork as a second,
+        # separate remote instead.
+        if: needs.resolve.outputs.is_fork != 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.inputs.branch }}
+          ref: ${{ needs.resolve.outputs.checkout_ref }}
           # Full history so local merge-base with trunk works when trunk is present.
           # scripts/signoff still falls back to the GitHub compare API if needed.
           fetch-depth: 0
+
+      - name: Check out this repo (fork PR)
+        # Establishes "origin" == this repo and full history, same as the
+        # step above. The actual PR content is fetched from the fork and
+        # checked out over this in the next step; ref is left at whatever
+        # triggered this workflow_dispatch since it's immediately replaced.
+        if: needs.resolve.outputs.is_fork == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          # Defense in depth: the next step pulls in fork-authored code, which
+          # shouldn't be able to read a persisted git credential back out of
+          # .git/config. `gh`/git operations in this job authenticate via
+          # GH_TOKEN instead, so this doesn't affect them.
+          persist-credentials: false
+
+      - name: Save trusted CI helpers
+        # scripts/signoff decides pass/fail and posts the sign-off status;
+        # the setup-* composite actions below run with this job's secrets in
+        # scope (sccache/MinIO creds, etc.). For a fork PR, the next step
+        # overlays the fork's commit onto the working tree, so those paths
+        # would otherwise resolve to whatever the fork shipped — e.g. a fork
+        # could ship a scripts/signoff that unconditionally posts "success"
+        # regardless of whether checks passed, or a setup-rust action that
+        # exfiltrates secrets. Copying them out now, from this repo's
+        # checkout, and pointing every later step at these copies keeps the
+        # checks/decision/status-post logic trusted even though the code
+        # being built/linted/tested may be the fork's. Unconditional (not
+        # just for forks) so every later step has one fixed path regardless
+        # of is_fork — see the top-of-file comment. This directory is
+        # untracked, so the fork checkout below (which only touches tracked
+        # paths) leaves it alone.
+        run: |
+          set -euo pipefail
+          mkdir -p .trusted-ci
+          cp -R .github/actions .trusted-ci/actions
+          cp scripts/signoff .trusted-ci/signoff
+          chmod +x .trusted-ci/signoff
+          echo "Saved trusted CI helpers from $(git rev-parse --short HEAD) to .trusted-ci/"
+
+      - name: Fetch and check out fork head commit
+        if: needs.resolve.outputs.is_fork == 'true'
+        env:
+          FORK_REPO: ${{ needs.resolve.outputs.checkout_repo }}
+          FORK_SHA: ${{ needs.resolve.outputs.checkout_ref }}
+        run: |
+          set -euo pipefail
+          echo "Fetching ${FORK_SHA} from fork ${FORK_REPO} ('origin' stays $(git remote get-url origin))…"
+          git remote add fork-source "https://github.com/${FORK_REPO}.git"
+          # No --depth: a shallow fetch here would leave HEAD with no known
+          # parents, breaking the local `git merge-base HEAD origin/trunk`
+          # below (and scripts/signoff's own diffing). A full fetch is cheap
+          # in practice — this fork shares almost all of its object history
+          # with the "Check out this repo" step's already-fetched origin.
+          git fetch --no-tags fork-source "$FORK_SHA"
+          git checkout --detach "$FORK_SHA"
+          git remote remove fork-source
+          echo "Checked out: $(git rev-parse HEAD)"
 
       - name: Fetch trunk for targeted pre-lint
         run: |
@@ -113,48 +370,80 @@ jobs:
           echo "HEAD: $(git rev-parse --short HEAD)"
           echo "merge-base with origin/trunk: $(git merge-base HEAD origin/trunk 2>/dev/null | cut -c1-12 || echo 'n/a (API fallback)')"
 
+      # Before the toolchain setup, not after. The same floor is checked inside
+      # the sign-off run, but that check sits behind Rust, Nextest, spiceio,
+      # sccache, protoc, cc and make setup — so an already-full runner spent all
+      # of that before being told, and a volume that filled *during* those steps
+      # failed the job with no indication that the volume, not the branch, was at
+      # fault (#12427). Checking here stops the already-full case at once, with an
+      # annotation and a step summary that name it as infrastructure.
+      #
+      # `.trusted-ci/signoff`, not the working tree's copy: this runs before any
+      # of the branch's code, and a fork PR must not choose its own floor.
+      - name: Check the work volume before setting up the toolchain
+        run: .trusted-ci/signoff preflight-disk
+
       - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+        uses: ./.trusted-ci/actions/setup-rust
 
       - name: Set up Nextest
-        uses: ./.github/actions/setup-nextest
+        uses: ./.trusted-ci/actions/setup-nextest
 
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@973bc49a7be396ec9430255ad0f7ed684d7a1317 # v0.5.8
+        uses: spiceai/spiceio/.github/actions/setup@dc53e1f5e2a92e64bfc785923b8f9471c42fbf46 # v0.5.10
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
+          immutable-objects: "true"
 
       - name: Set up sccache
-        uses: ./.github/actions/setup-sccache
+        uses: ./.trusted-ci/actions/setup-sccache
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
 
       - name: Install Protoc
-        uses: ./.github/actions/install-protoc
+        uses: ./.trusted-ci/actions/install-protoc
 
       - name: Set up make
-        uses: ./.github/actions/setup-make
+        uses: ./.trusted-ci/actions/setup-make
 
       - name: Set up cc
-        uses: ./.github/actions/setup-cc
+        uses: ./.trusted-ci/actions/setup-cc
 
       - name: Sign off
+        id: sign_off
         # -f: Actions checkouts have no @{push} upstream tracking, so the local
         # clean/pushed guards would otherwise refuse to run. The branch ref was
         # just checked out from origin, so HEAD is exactly the remote tip.
-        run: scripts/signoff -f
+        run: .trusted-ci/signoff -f
+        # Measured on this pool, passing sign-offs peak at 345 minutes, so this
+        # gives up only on a run that was within minutes of the wall anyway —
+        # and gives up as a failed step, which the run after it can read.
+        timeout-minutes: 353
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-          SIGNOFF_SKIP_TARGETED_LINT: "${{ inputs.skip_targeted_lint && '1' || '' }}"
+          SIGNOFF_SKIP_TARGETED_LINT: "${{ inputs.run_targeted_prechecks && '' || '1' }}"
+          SIGNOFF_SKIP_TARGETED_TESTS: "${{ inputs.run_targeted_prechecks && '' || '1' }}"
+
+      # A run that does not reach a verdict — its budget expires, it is evicted
+      # by a re-dispatch, someone cancels it — never gets back to
+      # scripts/signoff, so the `pending` status it posted outlives it. Every
+      # non-success conclusion is handled, because every one of them leaves that
+      # status behind. A run that evicted this one re-posts its own `pending`
+      # after checkout and setup (~25s), well after this step has run.
+      - name: Resolve an incomplete sign-off
+        if: always() && steps.sign_off.conclusion != 'success'
+        run: |
+          .trusted-ci/signoff clear-pending \
+            "Remote sign-off ended without posting a verdict — sign off again"
 
       - name: Show sccache stats
         if: env.SCCACHE_SETUP == 'true'

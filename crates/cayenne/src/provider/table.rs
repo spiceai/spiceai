@@ -6403,7 +6403,19 @@ impl CayenneTableProvider {
         // the cheap early-out in the compaction trigger. Only count files
         // landed in the live snapshot; staging writes are tracked separately
         // via the staging_may_have_files flag.
-        if !Self::is_staging_snapshot_id(snapshot_id) && writer_ops > 0 {
+        //
+        // The snapshot must be the CURRENT one, not merely non-staging. An
+        // overwrite writes into a fresh, not-yet-published snapshot id while the
+        // old snapshot is still live, so counting those files here attributes
+        // them to the snapshot they are about to REPLACE — and a background tick
+        // could then pick that doomed snapshot for compaction. The counter is
+        // reset when the overwrite publishes, so the net value is unchanged for
+        // every path that already published; this only stops the transient
+        // mis-attribution during the write.
+        if writer_ops > 0
+            && !Self::is_staging_snapshot_id(snapshot_id)
+            && self.get_current_snapshot_id() == snapshot_id
+        {
             self.record_current_snapshot_files_added(writer_ops);
         }
 
@@ -6716,10 +6728,10 @@ impl CayenneTableProvider {
 
     /// Requested number of intra-write shards (parallel encoders) for a snapshot
     /// write: the per-table `cayenne_write_concurrency` override if set, else a
-    /// conservative default of [`DEFAULT_WRITE_CONCURRENCY`] (capped at the host
-    /// core count so tiny hosts don't over-shard).
+    /// conservative default of [`DEFAULT_WRITE_CONCURRENCY`] (capped at the CPU
+    /// budget's core count so tiny hosts don't over-shard).
     ///
-    /// The default is deliberately NOT the host core count. `write_concurrency` is
+    /// The default is deliberately NOT the core count. `write_concurrency` is
     /// sized per table in isolation, so a default of "all cores" makes independent
     /// tables oversubscribe the box under concurrent CDC — the aggregate is the
     /// sum across every writing table, not the per-table value. A small default
@@ -6728,8 +6740,8 @@ impl CayenneTableProvider {
     /// encode budget still bounds the aggregate — see `provider::write_budget`).
     ///
     /// This is the *requested* count. `VortexFormat::build_shard_spec` then clamps
-    /// it to the write session's `target_partitions` — the host's logical-core
-    /// count (see [`Self::create_session_context`]) — so a configured value above
+    /// it to the write session's `target_partitions` — the CPU budget's core count
+    /// (see [`Self::create_session_context`]) — so a configured value above
     /// the core count is capped, not honored. That ceiling is intentional:
     /// parallel encode is CPU-bound, so extra shards would only add files (read
     /// amplification) without speeding the write.
