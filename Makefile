@@ -102,17 +102,27 @@ endif
 # of the gate agreeing on which crates need system libraries, so a sign-off on
 # such a host fails only for reasons in the branch under test. The crate has no
 # unit tests of its own.
-# The `query_metrics` test binary is listed explicitly because `--lib` skips it:
-# it needs its own process to control the OTel meter-provider install order.
+# Every line below must keep the same package selection. Cargo resolves features per
+# PACKAGE selection, so a narrower `-p <crate>` line gives `runtime` 6 features where
+# the workspace gives it 35 — new fingerprints for `runtime` and hundreds of its
+# dependencies, so the whole graph recompiles (spiceai/spiceai#12381: 42 minutes to
+# run one 0.6s test). TARGET filters (`--lib`, `--test <name>`) do not affect the
+# resolve, so naming an extra test binary on the workspace line is free.
+# `metrics` is named because `--lib` skips `tests/*.rs`: it must own its process to
+# install the OTel meter provider before any `LazyLock` instrument is built.
+# TODO(#12504): the `-p cayenne` line below still re-resolves features that way — 131
+# packages get a different feature set than the workspace line gives them, including
+# tokio, bytes and arrow — so it pays a full rebuild. Folding it in means naming its
+# test targets and changing the features they compile against: its own gate run.
 .PHONY: nextest
 nextest:
-	@cargo nextest run --all --exclude libnfs --lib $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
+	@cargo nextest run --all --exclude libnfs --lib --test metrics $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
 	@cargo nextest run -p cayenne --tests $(NEXTEST_CARGO_PROFILE)
-	@cargo nextest run -p runtime --test query_metrics $(NEXTEST_CARGO_PROFILE)
 
 # Unit tests for named packages — the fail-fast pre-check scripts/signoff runs on
-# the crates a branch touched, before the full workspace gate. Same lib-only
-# scope and profile as `nextest`, so its test binaries carry into that run.
+# the crates a branch touched, before the full workspace gate. Its `-p` selection
+# resolves features differently from `nextest`'s workspace selection, so expect it to
+# recompile rather than to warm that run up; the point is to fail on one crate early.
 # Callers must filter out packages without a library target: `--lib` is a fatal
 # `no library targets found` on bin-only crates.
 # --no-tests=pass because a scoped selection legitimately covers crates with no
