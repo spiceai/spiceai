@@ -5307,7 +5307,12 @@ mod tests {
         );
 
         drop(catalog);
-        let _ = std::fs::remove_file(test_db.trim_start_matches("sqlite://"));
+
+        // Cleanup test database
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
     }
 
     #[tokio::test]
