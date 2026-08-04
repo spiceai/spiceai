@@ -382,7 +382,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum FailAt {
         /// The connector is never constructed. This is the #12414 case: a
-        /// deferred FlightSQL dataset with declared columns and no endpoint,
+        /// deferred `FlightSQL` dataset with declared columns and no endpoint,
         /// whose factory raises a permanent `MissingParameter`.
         Build,
         /// The connector is built, and reading the source fails.
