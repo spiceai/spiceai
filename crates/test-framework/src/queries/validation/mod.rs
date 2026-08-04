@@ -277,6 +277,9 @@ pub fn array_value_to_string(array: &dyn Array, index: usize) -> Result<Option<S
     }
 
     match array.data_type() {
+        // Entirely-null columns (e.g. CSV import of all-`\\N` field) collapse to
+        // Arrow `Null` — every cell is null.
+        DataType::Null => Ok(None),
         DataType::Int64 => downcast_and_stringify!(array, index, Int64Array),
         DataType::Int32 => downcast_and_stringify!(array, index, Int32Array),
         DataType::Int16 => downcast_and_stringify!(array, index, Int16Array),
@@ -497,6 +500,13 @@ pub fn validate_batches_as_strings(
                             }
                         }
 
+                        // Timestamp strings may differ only in fractional-second
+                        // padding (ns vs us engines). Treat equal after stripping
+                        // trailing fractional zeros.
+                        if timestamp_strings_equivalent(&expected_val, &actual_val) {
+                            continue;
+                        }
+
                         return Ok(QueryValidationResult::Fail(
                             QueryValidationFailReason::DataMismatch {
                                 column: column_name,
@@ -701,6 +711,214 @@ pub fn validate_row_count(
             },
         ))
     }
+}
+
+/// True when both strings are timestamps in the format [`array_value_to_string`]
+/// emits and differ only by fractional-second zero padding — a nanosecond engine's
+/// `2024-01-01 00:00:00.000000000` against a microsecond engine's
+/// `2024-01-01 00:00:00.000000`.
+///
+/// The shape test is deliberately exact rather than a "contains `.` and `:`"
+/// heuristic: a loose guard also matches values such as `http://host/a.100`, where
+/// trimming trailing zeros would silently mask a real mismatch. Anything that is
+/// not the emitted timestamp format returns `false`, so the caller falls through
+/// to reporting the mismatch.
+fn timestamp_strings_equivalent(a: &str, b: &str) -> bool {
+    /// Exactly `YYYY-MM-DD HH:MM:SS`, the prefix [`array_value_to_string`] emits
+    /// for every `Timestamp` unit.
+    fn is_timestamp_prefix(s: &str) -> bool {
+        /// Literal separators at their exact offsets; `#` marks a digit slot.
+        const SHAPE: &[u8; 19] = b"####-##-## ##:##:##";
+
+        s.len() == SHAPE.len()
+            && s.bytes().zip(SHAPE).all(|(c, &want)| {
+                if want == b'#' {
+                    c.is_ascii_digit()
+                } else {
+                    c == want
+                }
+            })
+    }
+
+    /// Splits into the `YYYY-MM-DD HH:MM:SS` prefix and its fractional digits with
+    /// trailing zeros trimmed. `None` when `s` is not the emitted format.
+    fn split_timestamp(s: &str) -> Option<(&str, &str)> {
+        match s.split_once('.') {
+            Some((prefix, frac)) => {
+                let frac_is_digits = !frac.is_empty() && frac.bytes().all(|c| c.is_ascii_digit());
+                (is_timestamp_prefix(prefix) && frac_is_digits)
+                    .then(|| (prefix, frac.trim_end_matches('0')))
+            }
+            None => is_timestamp_prefix(s).then_some((s, "")),
+        }
+    }
+
+    match (split_timestamp(a), split_timestamp(b)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// How rows should be compared when validating two independent query results.
+///
+/// SQL without `ORDER BY` does not define row order, so engines may return the
+/// same multiset of rows in different orders. [`RowOrder::Multiset`] sorts both
+/// sides into a canonical order before cell-by-cell comparison.
+/// [`RowOrder::Preserved`] requires identical row order (use when the SQL has
+/// an explicit `ORDER BY` that both engines honor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RowOrder {
+    /// Sort both results lexicographically by all columns, then compare.
+    #[default]
+    Multiset,
+    /// Compare rows in the order returned (for `ORDER BY` queries).
+    Preserved,
+}
+
+/// Infer [`RowOrder`] from SQL text: presence of `ORDER BY` (case-insensitive)
+/// means preserved order; otherwise multiset. Comments are not stripped — the
+/// inventory queries do not put `ORDER BY` only inside comments.
+#[must_use]
+pub fn row_order_from_sql(sql: &str) -> RowOrder {
+    let upper = sql.to_ascii_uppercase();
+    if upper.contains("ORDER BY") {
+        RowOrder::Preserved
+    } else {
+        RowOrder::Multiset
+    }
+}
+
+/// Full-content equality of two independent result sets (schema + cell values).
+///
+/// This is the engine-vs-engine parity path: both sides are treated as "actual"
+/// answers for the same SQL on the same data. Numeric comparison reuses the
+/// relative tolerance in [`validate_batches_as_strings`].
+///
+/// When `row_order` is [`RowOrder::Multiset`], both sides are concatenated and
+/// sorted into a canonical order so differing physical scan orders do not
+/// produce false mismatches.
+pub fn compare_query_result_batches(
+    query_name: &str,
+    left_batches: &[RecordBatch],
+    right_batches: &[RecordBatch],
+    row_order: RowOrder,
+) -> Result<QueryValidationResult> {
+    if left_batches.is_empty() && right_batches.is_empty() {
+        return Ok(QueryValidationResult::Pass);
+    }
+
+    if left_batches.is_empty() {
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::NoAnswer,
+        ));
+    }
+
+    if right_batches.is_empty() {
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::NoExpectedAnswer,
+        ));
+    }
+
+    let Some(left_schema) = left_batches.first().map(RecordBatch::schema) else {
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::NoAnswer,
+        ));
+    };
+    let Some(right_schema) = right_batches.first().map(RecordBatch::schema) else {
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::NoExpectedAnswer,
+        ));
+    };
+
+    // Engine-vs-engine parity cares about cell values, not Arrow physical types
+    // (Utf8View vs Utf8, Decimal128 vs Float64, qualified vs bare aggregate
+    // names). Require the same arity; stringified comparison below absorbs type
+    // representation differences the way `validate_batches_as_strings` already
+    // does for TPCH CSV answers.
+    if left_schema.fields().len() != right_schema.fields().len() {
+        println!("Query '{query_name}' schema arity mismatch (left vs right):");
+        if let Some(diff) = schema_difference(&left_schema, &right_schema) {
+            println!("{diff}");
+        } else {
+            println!("  left_schema: {left_schema:?}");
+            println!("  right_schema: {right_schema:?}");
+        }
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::SchemaMismatch,
+        ));
+    }
+    if !equivalent_schemas(&left_schema, &right_schema) {
+        // Log but continue — positional string compare still validates content.
+        if let Some(diff) = schema_difference(&left_schema, &right_schema) {
+            println!(
+                "Query '{query_name}' logical schema differs (continuing value compare):\n{diff}"
+            );
+        }
+    }
+
+    let mut left = arrow::compute::concat_batches(&left_schema, left_batches)?;
+    let mut right = arrow::compute::concat_batches(&right_schema, right_batches)?;
+
+    if left.num_rows() != right.num_rows() {
+        println!("Query '{query_name}' row count mismatch:");
+        println!("  left: {}", left.num_rows());
+        println!("  right: {}", right.num_rows());
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::RowCountMismatch {
+                expected: left.num_rows(),
+                actual: right.num_rows(),
+            },
+        ));
+    }
+
+    if row_order == RowOrder::Multiset {
+        left = sort_batch_lexicographic_as_strings(&left)?;
+        right = sort_batch_lexicographic_as_strings(&right)?;
+    }
+
+    // `validate_batches_as_strings` compares expected (first arg) to actual
+    // (second). For engine-vs-engine parity the labels are arbitrary; left is
+    // treated as the reference side in mismatch messages.
+    let result = validate_batches_as_strings(&left, &right)?;
+    if let QueryValidationResult::Fail(ref reason) = result {
+        println!("Query '{query_name}' content mismatch: {reason:?}");
+    }
+    Ok(result)
+}
+
+/// Canonical row order for multiset equality: sort by stringified cell values
+/// across all columns (same string forms used by [`validate_batches_as_strings`]).
+fn sort_batch_lexicographic_as_strings(batch: &RecordBatch) -> Result<RecordBatch> {
+    let n = batch.num_rows();
+    if n <= 1 {
+        return Ok(batch.clone());
+    }
+
+    let mut keys: Vec<(Vec<Option<String>>, usize)> = Vec::with_capacity(n);
+    for row in 0..n {
+        let mut key = Vec::with_capacity(batch.num_columns());
+        for col in 0..batch.num_columns() {
+            key.push(array_value_to_string(batch.column(col).as_ref(), row)?);
+        }
+        keys.push((key, row));
+    }
+    keys.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let indices: Vec<u32> = keys
+        .into_iter()
+        .map(|(_, i)| u32::try_from(i).map_err(|_| anyhow!("row index does not fit in u32")))
+        .collect::<Result<Vec<_>>>()?;
+    let index_array = arrow::array::UInt32Array::from(indices);
+
+    let columns: Result<Vec<_>> = batch
+        .columns()
+        .iter()
+        .map(|col| {
+            arrow::compute::take(col.as_ref(), &index_array, None)
+                .map_err(|e| anyhow!("take failed during multiset sort: {e}"))
+        })
+        .collect();
+    Ok(RecordBatch::try_new(batch.schema(), columns?)?)
 }
 
 #[cfg(test)]
@@ -1221,5 +1439,142 @@ mod test {
             result.expect_err("Should return an error").to_string(),
             "Index out of bounds: 1 >= 1"
         );
+    }
+
+    #[test]
+    fn test_compare_query_result_batches_multiset_reorders() {
+        // Same multiset, different physical order — Multiset must pass; Preserved must fail.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", arrow::datatypes::DataType::Utf8, false),
+            Field::new("v", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let left = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["a", "b"])),
+                Arc::new(arrow::array::Int64Array::from(vec![1, 2])),
+            ],
+        )
+        .expect("left batch");
+        let right = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["b", "a"])),
+                Arc::new(arrow::array::Int64Array::from(vec![2, 1])),
+            ],
+        )
+        .expect("right batch");
+
+        let multiset = compare_query_result_batches(
+            "reorder",
+            std::slice::from_ref(&left),
+            std::slice::from_ref(&right),
+            RowOrder::Multiset,
+        )
+        .expect("compare multiset");
+        assert_eq!(multiset, QueryValidationResult::Pass);
+
+        let preserved =
+            compare_query_result_batches("reorder", &[left], &[right], RowOrder::Preserved)
+                .expect("compare preserved");
+        assert!(
+            matches!(
+                preserved,
+                QueryValidationResult::Fail(QueryValidationFailReason::DataMismatch { .. })
+            ),
+            "preserved order must detect swapped rows: {preserved:?}"
+        );
+    }
+
+    #[test]
+    fn test_compare_query_result_batches_detects_value_mismatch() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "v",
+            arrow::datatypes::DataType::Int64,
+            false,
+        )]));
+        let left = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::Int64Array::from(vec![1, 2, 3]))],
+        )
+        .expect("left");
+        let right = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::Int64Array::from(vec![1, 2, 99]))],
+        )
+        .expect("right");
+
+        let result = compare_query_result_batches("values", &[left], &[right], RowOrder::Multiset)
+            .expect("compare");
+        assert!(
+            matches!(
+                result,
+                QueryValidationResult::Fail(QueryValidationFailReason::DataMismatch { .. })
+            ),
+            "value mismatch must fail: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_row_order_from_sql() {
+        assert_eq!(
+            row_order_from_sql("SELECT a FROM t ORDER BY a"),
+            RowOrder::Preserved
+        );
+        assert_eq!(
+            row_order_from_sql("select a from t order by a desc"),
+            RowOrder::Preserved
+        );
+        assert_eq!(
+            row_order_from_sql("SELECT a FROM t GROUP BY a"),
+            RowOrder::Multiset
+        );
+    }
+
+    #[test]
+    fn test_timestamp_strings_equivalent() {
+        // Same instant, different fractional-second width across engines.
+        assert!(timestamp_strings_equivalent(
+            "2024-01-01 00:00:00.000000000",
+            "2024-01-01 00:00:00.000000"
+        ));
+        assert!(timestamp_strings_equivalent(
+            "2024-01-01 00:00:00.123000000",
+            "2024-01-01 00:00:00.123"
+        ));
+        // A bare second-precision timestamp equals an all-zero fraction.
+        assert!(timestamp_strings_equivalent(
+            "2024-01-01 00:00:00",
+            "2024-01-01 00:00:00.000"
+        ));
+        assert!(timestamp_strings_equivalent(
+            "2024-01-01 00:00:00",
+            "2024-01-01 00:00:00"
+        ));
+
+        // Genuinely different instants must never be equivalent.
+        assert!(!timestamp_strings_equivalent(
+            "2024-01-01 00:00:00.100000000",
+            "2024-01-01 00:00:00.000000"
+        ));
+        assert!(!timestamp_strings_equivalent(
+            "2024-01-01 00:00:01",
+            "2024-01-01 00:00:00"
+        ));
+        assert!(!timestamp_strings_equivalent(
+            "2024-01-02 00:00:00",
+            "2024-01-01 00:00:00"
+        ));
+
+        // Non-timestamps must not be normalized: a loose "contains `.` and `:`"
+        // guard would collapse these trailing zeros and mask a real mismatch.
+        assert!(!timestamp_strings_equivalent(
+            "http://host/a.100",
+            "http://host/a.1"
+        ));
+        assert!(!timestamp_strings_equivalent("1.100", "1.1"));
+        assert!(!timestamp_strings_equivalent("12:30.100", "12:30.1"));
+        // Decimals must fall through to the numeric comparison path.
+        assert!(!timestamp_strings_equivalent("1.10", "1.1"));
     }
 }
