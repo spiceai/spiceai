@@ -137,9 +137,21 @@ For Linux systems with NVIDIA GPUs, CUDA distributions enable GPU-accelerated AI
 
 **Docker (Nightly):**
 
+One image is published per compute capability. Pull the tag matching your GPU —
+`nvidia-smi --query-gpu=compute_cap --format=csv,noheader` reports it as `8.9`
+for capability `89`:
+
 ```bash
-docker pull ghcr.io/spiceai/spiceai-nightly:latest-cuda
+docker pull ghcr.io/spiceai/spiceai:latest-cuda-89
 ```
+
+The unsuffixed `latest-cuda` tag is an alias for `latest-cuda-80`, so it only
+runs on capability 80 hardware (A100, A30). Prefer the explicit tag.
+
+CUDA images are published to `ghcr.io/spiceai/spiceai` (and `spiceai/spiceai` on
+Docker Hub) by a manual dispatch of the `spiced_docker` workflow; they are not
+part of the automated nightly image build, so `spiceai-nightly` carries no CUDA
+tags.
 
 **Local Build:**
 

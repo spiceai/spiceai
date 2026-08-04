@@ -41,6 +41,29 @@ on:
           - arm64
           - cuda
         default: all
+      compute_cap:
+        # Must stay in sync with the matrix in build_and_release_cuda.yml — that
+        # workflow produces the release assets this one packages, so a capability
+        # missing there cannot be built here. Enforced by
+        # .github/scripts/check_cuda_compute_caps.py.
+        description: Which CUDA compute capability to package (only applies when CUDA is built)
+        required: false
+        type: choice
+        options:
+          - all
+          - '80'
+          - '86'
+          - '87'
+          - '89'
+          - '90'
+        default: all
+
+env:
+  # The capability the unsuffixed `:<version>-cuda` / `:latest-cuda` tags point
+  # at. It stays 80 because those tags have always shipped an sm_80 binary, and
+  # an image whose contents silently changed capability would break the pulls
+  # that already depend on them. Per-capability tags are additive.
+  DEFAULT_CUDA_COMPUTE_CAP: '80'
 
 jobs:
   setup:
@@ -81,12 +104,19 @@ jobs:
       run_amd64: ${{ steps.resolve.outputs.run_amd64 }}
       run_arm64: ${{ steps.resolve.outputs.run_arm64 }}
       run_cuda: ${{ steps.resolve.outputs.run_cuda }}
+      cuda_compute_caps: ${{ steps.resolve.outputs.cuda_compute_caps }}
     steps:
       - name: Resolve release metadata
         id: resolve
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          # Passed through the environment rather than interpolated into the
+          # script body, so the value can never be parsed as shell. It is a
+          # `choice` input, so GitHub already constrains it, but a dispatch input
+          # reaching `run:` via `${{ }}` is the shape of a script injection and
+          # is not worth reproducing for a new input.
+          COMPUTE_CAP_INPUT: ${{ github.event.inputs.compute_cap }}
         run: |
           set -euo pipefail
 
@@ -95,12 +125,14 @@ jobs:
             target_input="${{ github.event.inputs.target }}"
             publish_flag="${{ github.event.inputs.publish || 'false' }}"
             release_tag_input="${{ github.event.inputs.release_tag }}"
+            compute_cap_input="${COMPUTE_CAP_INPUT:-all}"
             allow_cuda=true
           else
             # For release events, CUDA is not built (nightly-only)
             target_input="all"
             publish_flag="true"
             release_tag_input="${{ github.event.release.tag_name }}"
+            compute_cap_input="all"
             allow_cuda=false
           fi
 
@@ -165,6 +197,55 @@ jobs:
               ;;
           esac
 
+          # CUDA compute capabilities to package. `build_and_release_cuda.yml`
+          # publishes one `spiced_cuda_<cap>_linux_x86_64.tar.gz` release asset
+          # per capability, and this workflow turns each into an image. Building
+          # only 80 is what left the CUDA image unusable on anything newer than
+          # an A100 even though the binaries existed (#10622).
+          #
+          # Kept in sync with that workflow's matrix — and with the choice list
+          # on this workflow's `compute_cap` input — by
+          # .github/scripts/check_cuda_compute_caps.py.
+          all_compute_caps='80 86 87 89 90'
+
+          compute_cap_input="${compute_cap_input:-all}"
+          if [ "$compute_cap_input" = "all" ]; then
+            selected_caps="$all_compute_caps"
+          else
+            selected_caps=""
+            for cap in $all_compute_caps; do
+              if [ "$cap" = "$compute_cap_input" ]; then
+                selected_caps="$cap"
+              fi
+            done
+            if [ -z "$selected_caps" ]; then
+              echo "Unknown CUDA compute capability: $compute_cap_input" >&2
+              echo "Known capabilities: $all_compute_caps" >&2
+              exit 1
+            fi
+          fi
+
+          # The matrix must never be empty. `build-cuda` is deliberately always
+          # scheduled — it no-ops through per-step `if`s rather than a job-level
+          # one, so that `publish-cuda`'s `needs` can still be satisfied — and an
+          # empty matrix would skip the job rather than run it as a no-op. When
+          # CUDA is not being built, collapse to the single default capability so
+          # exactly one no-op job runs, exactly as before this change.
+          if [ "$run_cuda" != "true" ]; then
+            selected_caps="${DEFAULT_CUDA_COMPUTE_CAP}"
+          fi
+
+          # Built by hand rather than with `jq` so this step keeps working on any
+          # runner image, hosted or self-hosted, without a tool check.
+          cuda_compute_caps="["
+          cap_sep=""
+          for cap in $selected_caps; do
+            cuda_compute_caps="${cuda_compute_caps}${cap_sep}\"${cap}\""
+            cap_sep=","
+          done
+          cuda_compute_caps="${cuda_compute_caps}]"
+          echo "CUDA compute capabilities: ${cuda_compute_caps}"
+
           # Determine if this release should be tagged as 'latest'.
           #
           # Rule: ONLY apply the ':latest' Docker tag when the GitHub release
@@ -217,6 +298,7 @@ jobs:
           echo "run_amd64=${run_amd64}" >> "$GITHUB_OUTPUT"
           echo "run_arm64=${run_arm64}" >> "$GITHUB_OUTPUT"
           echo "run_cuda=${run_cuda}" >> "$GITHUB_OUTPUT"
+          echo "cuda_compute_caps=${cuda_compute_caps}" >> "$GITHUB_OUTPUT"
 
   build-amd64:
     needs: setup
@@ -360,10 +442,20 @@ jobs:
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
 
   build-cuda:
+    name: Build CUDA ${{ matrix.compute_cap }} image
     needs: setup
     runs-on: 'spiceai-dev-runners'
+    strategy:
+      # One capability's failure should not cancel the others mid-build, so a
+      # broken run reports every capability that failed instead of only the
+      # first. `publish-cuda` still needs the whole job green, so a partial set
+      # is never published — a release missing some CUDA tags with no failure
+      # anywhere is harder to notice than one that failed outright.
+      fail-fast: false
+      matrix:
+        compute_cap: ${{ fromJson(needs.setup.outputs.cuda_compute_caps) }}
     env:
-      CUDA_COMPUTE_CAP: 80
+      CUDA_COMPUTE_CAP: ${{ matrix.compute_cap }}
     steps:
       - name: Skip CUDA build
         if: ${{ needs.setup.outputs.run_cuda != 'true' }}
@@ -387,7 +479,7 @@ jobs:
 
       - name: Configure CUDA build
         run: |
-          echo "IMAGE_TAG=cuda" >> $GITHUB_ENV
+          echo "IMAGE_TAG=cuda-${CUDA_COMPUTE_CAP}" >> $GITHUB_ENV
           echo "BINARY_VARIANT=cuda" >> $GITHUB_ENV
           echo "CARGO_FEATURES=release,models,cuda" >> $GITHUB_ENV
         if: ${{ needs.setup.outputs.run_cuda == 'true' }}
@@ -398,9 +490,12 @@ jobs:
           context: .
           file: Dockerfile-cuda-release
           platforms: linux/amd64
-          outputs: type=docker,name=localhost:5000/spiceai:${{ env.IMAGE_TAG }}-amd64,dest=/tmp/images-amd64-cuda.tar
-          cache-from: type=gha,scope=build-cuda
-          cache-to: type=gha,scope=build-cuda,mode=max
+          outputs: type=docker,name=localhost:5000/spiceai:${{ env.IMAGE_TAG }}-amd64,dest=/tmp/images-amd64-cuda-${{ matrix.compute_cap }}.tar
+          # Scoped per capability: the layers differ only in the release asset
+          # each one downloads, so a shared scope would have the capabilities
+          # evicting each other's cache on every run.
+          cache-from: type=gha,scope=build-cuda-${{ matrix.compute_cap }}
+          cache-to: type=gha,scope=build-cuda-${{ matrix.compute_cap }},mode=max
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
@@ -410,15 +505,15 @@ jobs:
 
       - name: Validate CUDA image
         run: |
-          docker load -i /tmp/images-amd64-cuda.tar
+          docker load -i /tmp/images-amd64-cuda-${{ matrix.compute_cap }}.tar
           docker run --rm localhost:5000/spiceai:${{ env.IMAGE_TAG }}-amd64 --version
         if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
       - name: Upload CUDA artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: images-amd64-cuda
-          path: /tmp/images-amd64-cuda.tar
+          name: images-amd64-cuda-${{ matrix.compute_cap }}
+          path: /tmp/images-amd64-cuda-${{ matrix.compute_cap }}.tar
         if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
   publish:
@@ -559,7 +654,11 @@ jobs:
       - name: Download CUDA artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: images-amd64-cuda
+          # One artifact per compute capability. `merge-multiple` flattens them
+          # into /tmp rather than one directory per artifact, so the tarballs
+          # land at the paths the publish step globs for.
+          pattern: images-amd64-cuda-*
+          merge-multiple: true
           path: /tmp
 
       - name: Verify artifacts
@@ -600,43 +699,77 @@ jobs:
 
       - name: Import images and create manifests
         run: |
-          if [ ! -f /tmp/images-amd64-cuda.tar ]; then
+          set -euo pipefail
+
+          shopt -s nullglob
+          tarballs=(/tmp/images-amd64-cuda-*.tar)
+          if [ ${#tarballs[@]} -eq 0 ]; then
             echo "No CUDA artifacts to publish."
             exit 0
           fi
 
-          echo "Handling CUDA..."
-          docker load -i /tmp/images-amd64-cuda.tar
-          docker push localhost:5000/spiceai:cuda-amd64
+          # Each capability is published under its own tag suffix. The
+          # unsuffixed `-cuda` tags are kept as an alias of
+          # DEFAULT_CUDA_COMPUTE_CAP so existing pulls keep resolving to the
+          # same binary they always have. See #10622.
+          for tarball in "${tarballs[@]}"; do
+            cap="${tarball##*/images-amd64-cuda-}"
+            cap="${cap%.tar}"
 
-          if [[ "${PUBLISH}" == "true" ]]; then
-            echo "Pushing CUDA to GHCR and DockerHub"
-
-            # Build tag arguments - always include version tag
-            ghcr_tags="-t ghcr.io/spiceai/spiceai:${REL_VERSION}-cuda"
-            dockerhub_tags="-t spiceai/spiceai:${REL_VERSION}-cuda"
-
-            # Add optionally 'latest-cuda' tags
-            if [[ "${SHOULD_TAG_LATEST}" == "true" ]]; then
-              echo "Adding 'latest-cuda' tag"
-              ghcr_tags="${ghcr_tags} -t ghcr.io/spiceai/spiceai:latest-cuda"
-              dockerhub_tags="${dockerhub_tags} -t spiceai/spiceai:latest-cuda"
-            else
-              echo "Skipping 'latest-cuda' tag (pre-release or explicitly disabled)"
+            # The capability comes from a filename rather than from the
+            # validated list, so re-check it here: it is about to become part of
+            # a published image tag, and any other tarball that happened to match
+            # the glob would otherwise be published under a nonsense one.
+            if ! [[ "${cap}" =~ ^[0-9]+$ ]]; then
+              echo "Refusing to publish ${tarball}: '${cap}' is not a compute capability" >&2
+              exit 1
             fi
 
-            docker buildx imagetools create ${ghcr_tags} ${dockerhub_tags} localhost:5000/spiceai:cuda-amd64
+            echo "Handling CUDA ${cap}..."
+            docker load -i "${tarball}"
+            docker push "localhost:5000/spiceai:cuda-${cap}-amd64"
 
-            echo "Verifying CUDA GHCR image:"
-            docker buildx imagetools inspect ghcr.io/spiceai/spiceai:${REL_VERSION}-cuda
+            suffixes=("-cuda-${cap}")
+            if [ "${cap}" = "${DEFAULT_CUDA_COMPUTE_CAP}" ]; then
+              echo "Compute capability ${cap} is the default; also tagging it unsuffixed"
+              suffixes+=("-cuda")
+            fi
 
-            echo "Verifying CUDA DockerHub image:"
-            docker buildx imagetools inspect spiceai/spiceai:${REL_VERSION}-cuda
-          else
-            echo "Skipping push for non-publish CUDA build"
-            docker buildx imagetools create \
-              -t localhost:5000/spiceai:latest-cuda \
-              localhost:5000/spiceai:cuda-amd64
+            if [[ "${PUBLISH}" == "true" ]]; then
+              echo "Pushing CUDA ${cap} to GHCR and DockerHub"
 
-            docker buildx imagetools inspect localhost:5000/spiceai:latest-cuda
-          fi
+              tags=()
+              for suffix in "${suffixes[@]}"; do
+                # Always include the version tag.
+                tags+=(-t "ghcr.io/spiceai/spiceai:${REL_VERSION}${suffix}")
+                tags+=(-t "spiceai/spiceai:${REL_VERSION}${suffix}")
+
+                # Optionally add the 'latest' tags.
+                if [[ "${SHOULD_TAG_LATEST}" == "true" ]]; then
+                  echo "Adding 'latest${suffix}' tag"
+                  tags+=(-t "ghcr.io/spiceai/spiceai:latest${suffix}")
+                  tags+=(-t "spiceai/spiceai:latest${suffix}")
+                else
+                  echo "Skipping 'latest${suffix}' tag (pre-release or explicitly disabled)"
+                fi
+              done
+
+              docker buildx imagetools create "${tags[@]}" "localhost:5000/spiceai:cuda-${cap}-amd64"
+
+              echo "Verifying CUDA ${cap} GHCR image:"
+              docker buildx imagetools inspect "ghcr.io/spiceai/spiceai:${REL_VERSION}-cuda-${cap}"
+
+              echo "Verifying CUDA ${cap} DockerHub image:"
+              docker buildx imagetools inspect "spiceai/spiceai:${REL_VERSION}-cuda-${cap}"
+            else
+              echo "Skipping push for non-publish CUDA ${cap} build"
+
+              tags=()
+              for suffix in "${suffixes[@]}"; do
+                tags+=(-t "localhost:5000/spiceai:latest${suffix}")
+              done
+
+              docker buildx imagetools create "${tags[@]}" "localhost:5000/spiceai:cuda-${cap}-amd64"
+              docker buildx imagetools inspect "localhost:5000/spiceai:latest-cuda-${cap}"
+            fi
+          done

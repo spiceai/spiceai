@@ -16,6 +16,9 @@ on:
       - '.github/actions/**'
       - '.github/scripts/check_workflow_yaml.py'
       - '.github/scripts/test_check_workflow_yaml.py'
+      - '.github/scripts/check_cuda_compute_caps.py'
+      - '.github/scripts/test_cuda_compute_caps.py'
+      - '.github/scripts/test_spiced_docker_cuda_publish.py'
   push:
     branches:
       - trunk
@@ -24,6 +27,9 @@ on:
       - '.github/actions/**'
       - '.github/scripts/check_workflow_yaml.py'
       - '.github/scripts/test_check_workflow_yaml.py'
+      - '.github/scripts/check_cuda_compute_caps.py'
+      - '.github/scripts/test_cuda_compute_caps.py'
+      - '.github/scripts/test_spiced_docker_cuda_publish.py'
   workflow_dispatch:
 
 concurrency:
@@ -55,3 +61,20 @@ jobs:
 
       - name: Validate GitHub Actions definitions
         run: python .github/scripts/check_workflow_yaml.py
+
+      # Two workflows have to agree on which CUDA compute capabilities exist —
+      # one builds the release binaries, the other packages them into images.
+      # Drift between them is silent: the image for a capability simply never
+      # gets published. See #10622.
+      - name: Run CUDA compute-capability tests
+        run: python .github/scripts/test_cuda_compute_caps.py -v
+
+      - name: Validate CUDA compute capabilities
+        run: python .github/scripts/check_cuda_compute_caps.py
+
+      # The CUDA publish step decides which Docker tags a release ships, and only
+      # ever runs during a release dispatch against real registries. This runs
+      # the step's own script with a stub `docker` so a tagging mistake is caught
+      # here instead of in a release.
+      - name: Test the spiced_docker CUDA publish step
+        run: python .github/scripts/test_spiced_docker_cuda_publish.py -v
