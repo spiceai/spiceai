@@ -4131,7 +4131,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 129
+            "y": 113
           },
           "id": 921,
           "options": {
@@ -4228,7 +4228,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 129
+            "y": 113
           },
           "id": 922,
           "options": {
@@ -4347,7 +4347,7 @@
             "h": 8,
             "w": 8,
             "x": 0,
-            "y": 137
+            "y": 121
           },
           "id": 923,
           "options": {
@@ -4444,7 +4444,7 @@
             "h": 8,
             "w": 8,
             "x": 8,
-            "y": 137
+            "y": 121
           },
           "id": 924,
           "options": {
@@ -4541,7 +4541,7 @@
             "h": 8,
             "w": 8,
             "x": 16,
-            "y": 137
+            "y": 121
           },
           "id": 925,
           "options": {
@@ -4638,7 +4638,7 @@
             "h": 8,
             "w": 8,
             "x": 0,
-            "y": 145
+            "y": 129
           },
           "id": 926,
           "options": {
@@ -4735,7 +4735,7 @@
             "h": 8,
             "w": 8,
             "x": 8,
-            "y": 145
+            "y": 129
           },
           "id": 927,
           "options": {
@@ -4832,7 +4832,7 @@
             "h": 8,
             "w": 8,
             "x": 16,
-            "y": 145
+            "y": 129
           },
           "id": 928,
           "options": {
@@ -4957,7 +4957,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 113
+            "y": 137
           },
           "id": 910,
           "options": {
@@ -4980,7 +4980,7 @@
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "k8s_pod_cpu_usage{k8s_pod_name=~\"spiceai-.+\"} and on(k8s_pod_name) label_replace(up{job=~\".*spiceai.*\", instance=~\"($instances)\"}, \"k8s_pod_name\", \"$1\", \"instance\", \"^([^:]+)\")",
+              "expr": "k8s_pod_cpu_usage and on(k8s_pod_name) label_replace(runtime_flight_server_started{instance=~\"($instances)\"}, \"k8s_pod_name\", \"$1\", \"instance\", \"^([^:]+)\")",
               "legendFormat": "{{k8s_pod_name}}",
               "range": true,
               "refId": "A"
@@ -5055,7 +5055,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 113
+            "y": 137
           },
           "id": 911,
           "options": {
@@ -5078,7 +5078,7 @@
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "k8s_pod_memory_working_set{k8s_pod_name=~\"spiceai-.+\"} and on(k8s_pod_name) label_replace(up{job=~\".*spiceai.*\", instance=~\"($instances)\"}, \"k8s_pod_name\", \"$1\", \"instance\", \"^([^:]+)\")",
+              "expr": "k8s_pod_memory_working_set and on(k8s_pod_name) label_replace(runtime_flight_server_started{instance=~\"($instances)\"}, \"k8s_pod_name\", \"$1\", \"instance\", \"^([^:]+)\")",
               "legendFormat": "{{k8s_pod_name}}",
               "range": true,
               "refId": "A"
@@ -5153,7 +5153,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 121
+            "y": 145
           },
           "id": 912,
           "options": {
@@ -5176,7 +5176,7 @@
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "(kubelet_volume_stats_used_bytes * on(namespace, persistentvolumeclaim) group_left(pod) kube_pod_spec_volumes_persistentvolumeclaims_info) and on(pod) label_replace(up{job=~\".*spiceai.*\", instance=~\"($instances)\"}, \"pod\", \"$1\", \"instance\", \"^([^:]+)\")",
+              "expr": "(kubelet_volume_stats_used_bytes * on(namespace, persistentvolumeclaim) group_left(pod) kube_pod_spec_volumes_persistentvolumeclaims_info) and on(pod) label_replace(runtime_flight_server_started{instance=~\"($instances)\"}, \"pod\", \"$1\", \"instance\", \"^([^:]+)\")",
               "legendFormat": "{{pod}} - {{persistentvolumeclaim}}",
               "range": true,
               "refId": "A"
@@ -5251,7 +5251,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 121
+            "y": 145
           },
           "id": 913,
           "options": {
@@ -5274,7 +5274,7 @@
                 "uid": "${DS_PROMETHEUS}"
               },
               "editorMode": "code",
-              "expr": "(((kubelet_volume_stats_used_bytes / kubelet_volume_stats_capacity_bytes) * on(namespace, persistentvolumeclaim) group_left(pod) kube_pod_spec_volumes_persistentvolumeclaims_info) and on(pod) label_replace(up{job=~\".*spiceai.*\", instance=~\"($instances)\"}, \"pod\", \"$1\", \"instance\", \"^([^:]+)\")) * 100",
+              "expr": "(((kubelet_volume_stats_used_bytes / kubelet_volume_stats_capacity_bytes) * on(namespace, persistentvolumeclaim) group_left(pod) kube_pod_spec_volumes_persistentvolumeclaims_info) and on(pod) label_replace(runtime_flight_server_started{instance=~\"($instances)\"}, \"pod\", \"$1\", \"instance\", \"^([^:]+)\")) * 100",
               "legendFormat": "{{pod}} - {{persistentvolumeclaim}}",
               "range": true,
               "refId": "A"
@@ -5824,17 +5824,17 @@
           "type": "prometheus",
           "uid": "${DS_PROMETHEUS}"
         },
-        "definition": "label_values(up{job=~\".*spiceai.*\", instance=~\"spiceai-.+\"}, instance)",
+        "definition": "label_values(runtime_flight_server_started, instance)",
         "includeAll": true,
         "label": "Instances",
         "multi": true,
         "name": "instances",
         "options": [],
         "query": {
-          "query": "label_values(up{job=~\".*spiceai.*\", instance=~\"spiceai-.+\"}, instance)",
+          "query": "label_values(runtime_flight_server_started, instance)",
           "refId": "PrometheusVariableQueryEditor-VariableQuery"
         },
-        "refresh": 2,
+        "refresh": 1,
         "regex": "",
         "sort": 1,
         "type": "query",
@@ -5893,6 +5893,6 @@
   "timezone": "browser",
   "title": "Spice.ai Dashboard",
   "uid": "ddgw8xtn75ybkb",
-  "version": 34,
+  "version": 35,
   "weekStart": ""
 }
