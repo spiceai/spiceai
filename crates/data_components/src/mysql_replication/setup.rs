@@ -795,9 +795,8 @@ mod tests {
 
     #[test]
     fn audit_accepts_the_documented_cdc_grant() {
-        let held = grants(&[
-            "GRANT SELECT, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO `spice`@`%`",
-        ]);
+        let held =
+            grants(&["GRANT SELECT, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO `spice`@`%`"]);
         assert_eq!(audit_grants(&held), PrivilegeAudit::Satisfied);
     }
 
@@ -826,17 +825,14 @@ mod tests {
         // MariaDB 10.5+ reports REPLICATION REPLICA / BINLOG MONITOR for the
         // grants MySQL calls REPLICATION SLAVE / REPLICATION CLIENT. Rejecting
         // those would break a MariaDB source that replicates today.
-        let held = grants(&[
-            "GRANT SELECT, REPLICATION REPLICA, BINLOG MONITOR ON *.* TO `spice`@`%`",
-        ]);
+        let held =
+            grants(&["GRANT SELECT, REPLICATION REPLICA, BINLOG MONITOR ON *.* TO `spice`@`%`"]);
         assert_eq!(audit_grants(&held), PrivilegeAudit::Satisfied);
     }
 
     #[test]
     fn audit_accepts_all_privileges() {
-        let held = grants(&[
-            "GRANT ALL PRIVILEGES ON *.* TO `root`@`localhost` WITH GRANT OPTION",
-        ]);
+        let held = grants(&["GRANT ALL PRIVILEGES ON *.* TO `root`@`localhost` WITH GRANT OPTION"]);
         assert_eq!(audit_grants(&held), PrivilegeAudit::Satisfied);
     }
 
@@ -872,9 +868,7 @@ mod tests {
 
     #[test]
     fn audit_tolerates_lowercase_keywords_and_loose_whitespace() {
-        let held = grants(&[
-            "  grant  replication   slave ,replication client on *.* to `s`@`%`",
-        ]);
+        let held = grants(&["  grant  replication   slave ,replication client on *.* to `s`@`%`"]);
         assert_eq!(audit_grants(&held), PrivilegeAudit::Satisfied);
     }
 
