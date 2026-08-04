@@ -318,7 +318,7 @@ async fn fixed_offset_timezone_column_survives_a_vortex_file_write() {
         let (actual, expected_type) = scanned_type(&rows[0], column, tz);
         assert_eq!(
             actual, expected_type,
-            "{column} must keep its timezone through the write and scan"
+            "{column} must still carry its timezone, not a naive timestamp"
         );
     }
 
