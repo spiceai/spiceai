@@ -282,6 +282,15 @@ impl Index for FullTextDatabaseIndex {
             .map_err(|e| DataFusionError::External(Box::new(e)))
     }
 
+    fn write_start_failure_is_fatal(&self) -> bool {
+        // `on_write_start` rolls the writer back to discard operations an earlier abandoned
+        // window left staged. If that rollback fails those stale operations are still in the
+        // writer, and continuing would sweep them into this window's commit — publishing
+        // index state the write never asked for. The window is also left undeferred, so the
+        // deferral this write is written against is not the one in effect.
+        true
+    }
+
     fn write_complete_failure_is_fatal(&self) -> bool {
         // Documents are only searchable once the tantivy writer commits them, and
         // staged-but-uncommitted documents are discarded. A finalize that fails to
@@ -1318,6 +1327,16 @@ mod tests {
 
         // Re-run the whole expunge fixture on the rolled-back writer.
         supersede_half_of_a_consolidated_segment(&index).await;
+    }
+
+    /// `on_write_start` returns an error precisely so the write is abandoned: the rollback it
+    /// performs is what discards operations an earlier abandoned window left staged. The sink
+    /// only honours that by declaring the failure fatal — without this the sink logs a warning
+    /// and writes anyway, and those stale operations land in this window's commit (#12421).
+    #[tokio::test]
+    async fn test_a_failed_write_start_is_fatal() {
+        let index = new_test_index();
+        assert!(index.write_start_failure_is_fatal());
     }
 
     #[tokio::test]
