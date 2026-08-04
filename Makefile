@@ -90,10 +90,15 @@ test:
 ifdef RUST_PROFILE
     CARGO_PROFILE := --profile $(RUST_PROFILE)
     NEXTEST_CARGO_PROFILE := --cargo-profile $(RUST_PROFILE)
+    # Cargo names the `dev` profile's output directory `debug`; every other
+    # profile's directory matches its name.
+    CARGO_PROFILE_DIR := $(if $(filter dev,$(RUST_PROFILE)),debug,$(RUST_PROFILE))
 else
     CARGO_PROFILE := --profile dev
     NEXTEST_CARGO_PROFILE := --cargo-profile dev
+    CARGO_PROFILE_DIR := debug
 endif
+CARGO_TARGET_DIR ?= target
 
 # `libnfs` binds a system library, and on a modern glibc its generated bindings
 # carry a layout assertion for a type the headers only forward-declare, so the
@@ -162,6 +167,33 @@ nextest:
 # unit tests (29 workspace libraries have none). nextest exits 4 on "no tests to
 # run" by default, which would abort the sign-off for a branch that only touched
 # one of them; the full `nextest` run still gates the workspace.
+# The gate does not build the `spice` CLI on its own, because `nextest`'s `--tests`
+# build already emits it: cargo builds a package's bins alongside that package's
+# integration tests, and `spice` has three. A CLI link error therefore fails
+# `nextest` itself, and a separate `cargo build -p spice` only re-resolved the
+# whole graph at a selection no other phase in the gate shares.
+#
+# That is an assumption about cargo's target selection, and it is the quiet kind
+# to lose: removing `spice`'s `tests/` targets would stop its bin from being
+# built, and the gate would drop CLI coverage without a single failure. So assert
+# the binary is there and runs, rather than trusting the assumption.
+.PHONY: verify-cli
+verify-cli:
+	@bin="$(CARGO_TARGET_DIR)/$(CARGO_PROFILE_DIR)/spice"; \
+	if [ ! -x "$$bin" ]; then \
+	  echo "verify-cli: $$bin is missing or not executable." >&2; \
+	  echo "  'make nextest' is expected to build the spice CLI as a side effect of building" >&2; \
+	  echo "  spice's integration tests. If those test targets were removed, add an explicit" >&2; \
+	  echo "  'cargo build $(CARGO_PROFILE) -p spice' back to the gate." >&2; \
+	  exit 1; \
+	fi; \
+	got=$$("$$bin" --version 2>&1) || { echo "verify-cli: $$bin failed to run: $$got" >&2; exit 1; }; \
+	want="spice $$(cat version.txt)"; \
+	if [ "$$got" != "$$want" ]; then \
+	  echo "verify-cli: $$bin reports '$$got', expected '$$want'" >&2; exit 1; \
+	fi; \
+	echo "verify-cli: $$bin runs and reports $$got"
+
 .PHONY: nextest-packages
 nextest-packages:
 	@test -n "$(strip $(PACKAGES))" || { echo 'nextest-packages requires PACKAGES="crate1 crate2"' >&2; exit 1; }

@@ -67,7 +67,7 @@ crates and runs, in order:
 1. `make lint-rust PACKAGES="…" FEATURES="…"` — lint the crates you touched
 2. `make nextest-packages PACKAGES="…" FEATURES="…"` — their unit tests
 3. `make lint-rust` — the full workspace lint
-4. `make build-cli-dev nextest` — CLI build + all unit tests
+4. `make nextest verify-cli` — all unit tests, then assert the `spice` binary exists
 
 Steps 1-2 exist to fail fast: a lint or test failure in the crate you edited is
 the likeliest outcome, and step 3 is by far the longest, so covering your own
@@ -246,7 +246,7 @@ The Actions workflow:
 2. Skips Rust checks when the branch has no Rust-affecting files. The targeted
    pre-lint and unit tests are off here (`run_targeted_prechecks` turns them on,
    with the GitHub compare API as a fallback when merge-base isn't available)
-3. Runs full `make lint-rust` + `make build-cli-dev nextest` when Rust is affected
+3. Runs full `make lint-rust` + `make nextest verify-cli` when Rust is affected
 4. Posts pending → success/failure `signoff` statuses, then re-runs
    **Attestation** if needed
 
@@ -299,7 +299,7 @@ merge queue is still the real gate.
 
 | Stage | Trigger | Checks |
 | --- | --- | --- |
-| Local | `make signoff` | skip Rust if no Rust-affecting files in the branch diff; else targeted `make lint-rust PACKAGES=… FEATURES=…` + `make nextest-packages PACKAGES=… FEATURES=…` (features from the workspace resolve), full `make lint-rust`, `make build-cli-dev nextest` |
+| Local | `make signoff` | skip Rust if no Rust-affecting files in the branch diff; else targeted `make lint-rust PACKAGES=… FEATURES=…` + `make nextest-packages PACKAGES=… FEATURES=…` (features from the workspace resolve), full `make lint-rust`, `make nextest verify-cli` |
 | Remote | `make signoff-remote` | the same checks via the self-hosted `signoff.yml` workflow, without the targeted pre-checks (`run_targeted_prechecks=true` restores them); posts `signoff` |
 | Pull request | `pull_request` | **Attestation** (validates the sign-off, or auto-passes a branch with no Rust-affecting files, a pure revert, or a single-commit Dependabot bump) + PR hygiene; merge-queue check names report lightweight skipped/passthrough results |
 | Merge queue | `merge_group` | the full required suite (below) + advisory niche checks |

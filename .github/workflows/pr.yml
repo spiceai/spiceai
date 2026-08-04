@@ -772,14 +772,15 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-cc
 
-      # build-cli-dev, not build-cli: the latter is hardcoded to --release, so
-      # this job compiled the CLI in release while running its tests under
-      # RUST_PROFILE (lint) — two profiles, sharing nothing, in one job. Nothing
-      # here consumes the release binary, and the required `Build (release
-      # profile)` job below does the real release installs.
-      - name: Build CLI and run nextest
+      # No separate CLI build: nextest's `--tests` build already emits the `spice`
+      # binary, since cargo builds a package's bins alongside that package's
+      # integration tests, so a CLI link error fails nextest itself. `verify-cli`
+      # asserts the binary is there and runs, so the gate reports it if cargo ever
+      # stops producing it. The required `Build (release profile)` job below does
+      # the real release installs.
+      - name: Run nextest and verify the CLI
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        run: make build-cli-dev nextest
+        run: make nextest verify-cli
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}

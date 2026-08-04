@@ -12,7 +12,7 @@
 #      here — see the run_targeted_prechecks input)
 #   2. Targeted unit tests for those crates (runs only when step 1 does)
 #   3. Full workspace lint (make lint-rust)
-#   4. CLI build + unit tests (make build-cli-dev nextest)
+#   4. Unit tests + CLI verification (make nextest verify-cli)
 #   5. Post signoff status + re-run Attestation if needed
 #
 # This workflow is the only remote sign-off path (never SSH to ad-hoc hosts —

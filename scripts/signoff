@@ -758,14 +758,17 @@ run_checks() {
   # the full gate; empty values leave the Makefile on its workspace defaults.
   make lint-rust PACKAGES= FEATURES= || return $?
 
-  # build-cli-dev, not build-cli: the release CLI build shares no artifacts with
-  # the profile the lint and test passes just warmed, so it recompiles its whole
-  # graph (~590 crates, DataFusion and Arrow among them) to prove the binary
-  # links. The merge queue's required `Build (release profile)` job builds the
-  # CLI, spiced, and the release install for real, so release-only breakage is
-  # still caught before trunk.
-  info "Building the CLI and running unit tests (make build-cli-dev nextest)…"
-  make build-cli-dev nextest || return $?
+  # No separate CLI build: `nextest`'s `--tests` build already emits the `spice`
+  # binary, because cargo builds a package's bins alongside that package's
+  # integration tests. A `cargo build -p spice` on top of that only re-resolved
+  # the graph at a selection no other phase shares, to relink a binary that was
+  # already there. `verify-cli` asserts it exists and runs, so the day cargo stops
+  # producing it the gate says so instead of quietly dropping CLI coverage.
+  # The merge queue's required `Build (release profile)` job builds the CLI,
+  # spiced, and the release install for real, so release-only breakage — and the
+  # `-p spice` resolution this no longer exercises — is still caught before trunk.
+  info "Running unit tests and verifying the CLI (make nextest verify-cli)…"
+  make nextest verify-cli || return $?
 
   SIGNOFF_CHECK_SUMMARY="lint+test passed"
 }
@@ -1215,7 +1218,7 @@ Checks (when verify is on):
      (make lint-rust PACKAGES="…") — fail-fast feedback
   2. Targeted unit tests for those crates (make nextest-packages PACKAGES="…")
   3. Full workspace lint (make lint-rust)
-  4. CLI build + unit tests (make build-cli-dev nextest)
+  4. Unit tests, then assert the CLI binary exists (make nextest verify-cli)
 
   Steps 1-2 pass the features each crate resolves to in a workspace build, not
   the crate's own defaults — a scoped build of a crate that declares no
