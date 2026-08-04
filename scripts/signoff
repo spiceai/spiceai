@@ -754,7 +754,9 @@ SIGNOFF_DISK_HIT="${SIGNOFF_DISK_HIT:-}"
 
 # The status the watcher exits with to report an out-of-disk line. Deliberately
 # not 1 or 2: awk uses those for its own errors, and a watcher that itself died
-# must not be read as a volume that filled.
+# must not be read as a volume that filled. Reserving a distinct status is also
+# what lets run_make_step tell "ran, saw nothing" (0) from "never reached a
+# verdict" (anything else), which it must not conflate — see run_make_step.
 readonly DISK_WATCH_HIT_STATUS=3
 
 # Run one `make` step, recording whether it died for want of disk. Returns
@@ -789,12 +791,24 @@ run_make_step() {
   watch_status="${pipe_status[1]:-0}"
   if [[ "$watch_status" -eq "$DISK_WATCH_HIT_STATUS" ]]; then
     SIGNOFF_DISK_HIT=1
+  elif [[ "$watch_status" -ne 0 ]]; then
+    # The watcher died instead of reaching a verdict: no awk on the runner, a
+    # syntax error, a signal. Its silence is then not "no out-of-disk line went
+    # past" — nothing reliably read the output at all — so leaving the watch
+    # armed would let failure_kind assert "not disk" on the authority of a
+    # watcher that never ran, which is the same mislabelling in the other
+    # direction from #12427. Disarm it so classification falls back to the
+    # free-space backstop, exactly as on an unwatched local run.
+    info "warning: the out-of-disk watcher exited ${watch_status} rather than reporting a verdict — falling back to free-space classification"
+    SIGNOFF_DISK_WATCH=""
   fi
   return "$status"
 }
 
 # True when this run watched its build output at all, i.e. the watch's verdict —
-# including its "no ENOSPC line went past" — is worth something.
+# including its "no ENOSPC line went past" — is worth something. run_make_step
+# clears the flag if the watcher itself failed, so this stays false for a run
+# whose watch was requested but never actually delivered a reading.
 disk_watch_armed() {
   [[ -n "$SIGNOFF_DISK_WATCH" ]]
 }
@@ -839,7 +853,8 @@ disk_is_critical() {
 # else, which is the branch. Three ways to reach "disk", in falling order of
 # authority: the preflight refused to start, the build said so itself, or the
 # volume is at ~0 now. The last is a backstop for a build whose output we did
-# not record (a local run), which is why it is not the only signal.
+# not record — a local run, or a remote one whose watcher died before it could
+# read anything — which is why it is not the only signal.
 failure_kind() {
   local check_status="$1"
 

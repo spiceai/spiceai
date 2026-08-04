@@ -361,6 +361,14 @@ for its own reasons. Measured free space is consulted only when nothing watched,
 which is how a local run gets a classification at all. The verdict resets per
 build step, so only the step that actually failed speaks.
 
+"Final in both directions" applies only to a watcher that actually reported. The
+watcher exits with a reserved status to say it saw the error, so a watcher that
+exits any *other* non-zero way — no `awk` on the runner, a signal — is a watcher
+that reached no verdict rather than one that saw nothing. That disarms the watch
+and hands classification back to the free-space backstop; treating its silence as
+"not disk" would blame the branch for the volume just as surely as the unwritable
+marker did.
+
 The watch keeps its answer in a shell variable, not a file. Recording it on disk
 needed an allocation at the one moment allocation is failing — and on macOS
 `$TMPDIR` and the workspace are usually the same APFS container, so there was no

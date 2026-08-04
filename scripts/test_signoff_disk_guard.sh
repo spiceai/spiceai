@@ -255,6 +255,59 @@ else
 fi
 rm -f "$stub_dir/make"
 
+echo "run_make_step when the watcher itself fails"
+# A watcher that exits for its own reasons — no awk on the runner, a syntax error
+# in its program, a signal — has not reported "no out-of-disk line went past". It
+# has reported nothing. Leaving the watch armed on that would let failure_kind
+# assert "not disk" on the authority of a reading nobody took, mislabelling a
+# genuine ENOSPC death as the branch's fault: #12427 in the other direction.
+#
+# The stub fails *only* the watcher invocation and delegates everything else to
+# the real awk, so this isolates a dead watcher from a host with no awk at all —
+# and lets the same shell go on to check that the free-space backstop takes over.
+tests_run=$((tests_run + 1))
+broken_dir="$stub_dir/broken-watcher"
+mkdir -p "$broken_dir"
+real_awk="$(command -v awk)"
+cat >"$broken_dir/awk" <<STUB
+#!/usr/bin/env bash
+set -uo pipefail
+# The watcher is the only awk call carrying \`-v pat=…\`; free_disk_gib's df
+# parsing has no such argument and must keep working.
+for arg in "\$@"; do
+  # Exit 2, awk's own error status — deliberately not the hit status 3.
+  [[ "\$arg" == pat=* ]] && exit 2
+done
+exec "${real_awk}" "\$@"
+STUB
+chmod +x "$broken_dir/awk"
+printf '#!/usr/bin/env bash\necho "ld: write() failed, errno=28"; exit 101\n' >"$broken_dir/make"
+chmod +x "$broken_dir/make"
+
+broken_output="$(env "PATH=$broken_dir:$stub_dir:$PATH" SIGNOFF_DISK_WATCH=1 \
+  STUB_FREE_KB="$(gib_to_kb 1)" \
+  bash -c 'source "$1"
+    if run_make_step some-target; then step_rc=0; else step_rc=$?; fi
+    echo "RC=${step_rc}"
+    echo "VERDICT=${SIGNOFF_DISK_HIT:+yes}"
+    echo "ARMED=${SIGNOFF_DISK_WATCH:+yes}"
+    echo "KIND=$(failure_kind "$step_rc")"' _ "$subject" 2>&1)"
+
+if [[ "$broken_output" != *"RC=101"* ]]; then
+  fail_test "a dead watcher still reports make's own status: expected RC=101, got '${broken_output}'"
+elif [[ "$broken_output" == *"VERDICT=yes"* ]]; then
+  fail_test "a dead watcher must not be read as an out-of-disk hit: '${broken_output}'"
+elif [[ "$broken_output" == *"ARMED=yes"* ]]; then
+  fail_test "a dead watcher must disarm the watch, not leave it asserting 'not disk': '${broken_output}'"
+elif [[ "$broken_output" != *"watcher exited 2"* ]]; then
+  fail_test "a dead watcher is reported, not silent: expected 'watcher exited 2', got '${broken_output}'"
+elif [[ "$broken_output" != *"KIND=disk"* ]]; then
+  fail_test "with the watch disarmed, a near-empty volume must classify as disk: '${broken_output}'"
+else
+  echo "  ok: a watcher that died disarms the watch and lets free space classify"
+fi
+rm -rf "$broken_dir"
+
 echo "failure_kind"
 # The regression: run 30831204417 passed 8809 tests, then died at the linker
 # with errno=28 and reported as a plain check failure. run_checks exits non-zero
