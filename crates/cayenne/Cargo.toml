@@ -151,6 +151,10 @@ loom = { workspace = true }
 
 [[bench]]
 harness = false
+name = "selective_join_pk_probe"
+
+[[bench]]
+harness = false
 name = "zorder_clustering"
 
 [[bench]]
