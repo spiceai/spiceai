@@ -383,6 +383,21 @@ async fn bedrock(
     }
 }
 
+/// Splits a Huggingface model id into its repo id and optional revision.
+///
+/// `Embeddings::get_model_id` re-joins the optional revision from `from:` onto the repo id
+/// with a colon (`huggingface:huggingface.co/BAAI/bge-base-en-v1.5:a5beb1e3` yields
+/// `BAAI/bge-base-en-v1.5:a5beb1e3`), so the two have to be separated again before the
+/// repo id is used to address the Huggingface API. `HUGGINGFACE_PATH_REGEX` admits a colon
+/// in neither the org nor the model name, so the first colon is the separator.
+#[cfg(feature = "models")]
+fn split_hf_repo_revision(model_id: &str) -> (&str, Option<&str>) {
+    match model_id.split_once(':') {
+        Some((repo_id, revision)) => (repo_id, Some(revision)),
+        None => (model_id, None),
+    }
+}
+
 #[cfg(feature = "models")]
 async fn huggingface(
     name: &String,
@@ -393,8 +408,11 @@ async fn huggingface(
     let hf_token = params.hf_token.as_ref().map(ExposeSecret::expose_secret);
     let pooling = params.pooling.map(embedding_params::Pooling::as_str);
     if let Some(id) = model_id {
+        // Passing the revision as part of the repo id addresses a repo that does not exist,
+        // which the Huggingface API rejects for every artifact fetch.
+        let (repo_id, revision) = split_hf_repo_revision(&id);
         Ok(Arc::new(
-            TeiEmbed::from_hf(&id, None, hf_token, pooling, params.max_seq_length)
+            TeiEmbed::from_hf(repo_id, revision, hf_token, pooling, params.max_seq_length)
                 .await?
                 .set_cache(embeddings_cache)
                 .set_cache_model_id(name),
@@ -778,5 +796,55 @@ async fn get_file_from_hf(
         Err(e) => Err(Box::<dyn std::error::Error + Send + Sync>::from(format!(
             "Downloaded HF url, but failed to get local path. Error: {e:?}"
         ))),
+    }
+}
+
+#[cfg(all(test, feature = "models"))]
+mod tests {
+    use super::split_hf_repo_revision;
+    use spicepod::component::embeddings::Embeddings;
+
+    /// The repo id handed to the Huggingface API must never carry the revision, otherwise
+    /// every artifact fetch addresses a nonexistent repo.
+    #[test]
+    fn splits_revision_from_hf_repo_id() {
+        assert_eq!(
+            split_hf_repo_revision(
+                "BAAI/bge-base-en-v1.5:a5beb1e3e68b9ab74eb54cfd186867f64f240e1a"
+            ),
+            (
+                "BAAI/bge-base-en-v1.5",
+                Some("a5beb1e3e68b9ab74eb54cfd186867f64f240e1a")
+            )
+        );
+        assert_eq!(
+            split_hf_repo_revision("BAAI/bge-base-en-v1.5"),
+            ("BAAI/bge-base-en-v1.5", None)
+        );
+        assert_eq!(
+            split_hf_repo_revision("sentence-transformers/all-MiniLM-L6-v2:latest"),
+            ("sentence-transformers/all-MiniLM-L6-v2", Some("latest"))
+        );
+    }
+
+    /// Guards the seam between the two: whatever `get_model_id` joins, the split must undo,
+    /// so a pinned revision in `from:` reaches the Huggingface API as a revision.
+    #[test]
+    fn splits_revision_parsed_from_spicepod_from_field() {
+        let embeddings = Embeddings::new(
+            "huggingface:huggingface.co/BAAI/bge-base-en-v1.5:a5beb1e3e68b9ab74eb54cfd186867f64f240e1a",
+            "bge_base",
+        );
+        let model_id = embeddings
+            .get_model_id()
+            .expect("huggingface `from` should yield a model id");
+
+        assert_eq!(
+            split_hf_repo_revision(&model_id),
+            (
+                "BAAI/bge-base-en-v1.5",
+                Some("a5beb1e3e68b9ab74eb54cfd186867f64f240e1a")
+            )
+        );
     }
 }
