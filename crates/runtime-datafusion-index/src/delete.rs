@@ -366,7 +366,8 @@ mod tests {
             .expect("should not error")
             .expect("non-empty batch produces a predicate");
 
-        let mem = MemTable::try_new(keys.schema(), vec![vec![keys.clone()]]).expect("mem table");
+        let schema = keys.schema();
+        let mem = MemTable::try_new(schema, vec![vec![keys]]).expect("mem table");
         let table: Arc<dyn TableProvider> = Arc::new(mem);
         let table_source = Arc::new(DefaultTableSource::new(table));
         let plan = LogicalPlanBuilder::scan("t", table_source, None)
