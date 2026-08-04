@@ -82,10 +82,10 @@ fn main() {
     let matches = spiced::Args::command().get_matches();
     let open_telemetry_deprecated =
         matches.value_source("open_telemetry_bind_address") == Some(ValueSource::CommandLine);
-    // `--repl-flight-endpoint` moves only the REPL's SQL target; its HTTP endpoint, which is
-    // what `nql` uses, keeps its own default. Choosing one without the other leaves nothing
-    // pointing the HTTP endpoint at that runtime, so `nql` says so instead of answering from
-    // whatever the default reaches. See #11005.
+    // `--repl-flight-endpoint` moves only the REPL's SQL target, leaving the HTTP endpoint that
+    // `nql` uses wherever it already was. Choosing one without the other leaves nothing pointing
+    // the HTTP endpoint at that runtime, so `nql` says so instead of answering from whatever
+    // that endpoint reaches. See #11005.
     let flight_chosen = chosen_on_command_line(&matches, "repl_flight_endpoint");
     let http_chosen = chosen_on_command_line(&matches, "http_endpoint");
     let mut args = spiced::Args::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());

@@ -145,10 +145,11 @@ pub struct ReplConfig {
     #[arg(long, short = 'x', help_heading = "SQL REPL")]
     pub expanded: bool,
 
-    /// Set when the Flight endpoint was chosen on the command line and `http_endpoint` was
-    /// left to its default, so nothing pointed the HTTP endpoint at the runtime the SQL
-    /// queries go to. `nql` — the one REPL feature that speaks HTTP rather than Flight — then
-    /// says so instead of answering from whatever the default reaches. See #11005.
+    /// Set when the Flight endpoint was chosen on the command line and `http_endpoint` was not,
+    /// so nothing pointed the HTTP endpoint at the runtime the SQL queries go to — whether it
+    /// then holds a built-in default or a value derived from something else, such as a cloud
+    /// region. `nql` — the one REPL feature that speaks HTTP rather than Flight — says so
+    /// instead of answering from whatever that endpoint reaches. See #11005.
     ///
     /// Not a flag: only the caller that resolved both endpoints knows where each came from.
     #[arg(skip)]
@@ -159,10 +160,10 @@ pub struct ReplConfig {
 /// given whether each endpoint was chosen on the command line.
 ///
 /// This is a question about provenance, not about hosts. The Flight endpoint can be moved on
-/// its own — by `spice sql --endpoint` or `spiced --repl-flight-endpoint` — while the HTTP
-/// endpoint keeps its own default, and comparing the two cannot settle whether they agree: a
-/// host and port say nothing about which runtime answers there. Two runtimes can both be on
-/// loopback, and one runtime can be reached at unrelated addresses through a tunnel or ingress.
+/// its own — by `spice sql --endpoint` or `spiced --repl-flight-endpoint` — leaving the HTTP
+/// endpoint at whatever it already held, and comparing the two cannot settle whether they
+/// agree: a host and port say nothing about which runtime answers there. Two runtimes can both
+/// be on loopback, and one runtime can be reached at unrelated addresses through a tunnel.
 ///
 /// So only endpoints that were chosen, or defaulted as a pair, are trusted:
 ///
@@ -843,9 +844,9 @@ fn nql_endpoint_mismatch_message(repl_config: &ReplConfig) -> String {
     let flight_endpoint = &repl_config.repl_flight_endpoint;
 
     format!(
-        "`nql` uses the runtime's HTTP API, which is still at its default \
-         '{http_endpoint}' while this session's SQL queries go to '{flight_endpoint}'. \
-         Pass `--http-endpoint` for the runtime `nql` should ask — repeating the default \
+        "`nql` uses the runtime's HTTP API at '{http_endpoint}', which nothing pointed at \
+         the runtime this session's SQL queries go to ('{flight_endpoint}'). Pass \
+         `--http-endpoint` for the runtime `nql` should ask — repeating the endpoint above \
          is accepted, and confirms that is the one you mean."
     )
 }
