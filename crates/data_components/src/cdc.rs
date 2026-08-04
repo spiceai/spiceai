@@ -579,6 +579,16 @@ impl ChangeEnvelope {
         }
     }
 
+    /// Whether the change batch is already built, so [`Self::into_parts`]
+    /// resolves without running a deferred build.
+    ///
+    /// Lets a caller holding a whole burst decide once whether it needs a
+    /// blocking-pool handoff at all — see [`into_parts_offloaded_burst`].
+    #[must_use]
+    pub fn is_materialized(&self) -> bool {
+        self.change_batch.is_materialized()
+    }
+
     #[must_use]
     pub fn from_parts(
         change_committer: Box<dyn CommitChange + Send + Sync>,
@@ -600,6 +610,50 @@ impl ChangeEnvelope {
     #[must_use]
     pub fn is_dataset_ready(&self) -> bool {
         self.is_dataset_ready
+    }
+}
+
+/// The parts of a consumed [`ChangeEnvelope`]: its committer, its built change
+/// batch, and its dataset-ready flag.
+pub type ChangeEnvelopeParts = (Box<dyn CommitChange + Send + Sync>, ChangeBatch, bool);
+
+/// [`ChangeEnvelope::into_parts_offloaded`] for a whole drained burst, paying at
+/// most **one** blocking-pool handoff for the burst instead of one per envelope.
+///
+/// The decode work is identical either way; what is amortized is the
+/// `spawn_blocking` dispatch-and-await round trip (~11µs uncontended, and more
+/// when several datasets share the blocking pool). The win therefore scales with
+/// envelopes-per-burst — largest for many small transactions, negligible for
+/// bulk ones.
+///
+/// A burst whose envelopes are all already materialized (an eager source such as
+/// the `MySQL` pump, which decodes on delivery) resolves inline: the builds are
+/// no-ops and a handoff would be pure overhead on that hot path.
+///
+/// The first failed build discards the rest of the burst — callers MUST treat
+/// the error as terminal for the dataset (the source re-streams from the last
+/// acked position, since the collected committers are dropped unacked).
+pub async fn into_parts_offloaded_burst(
+    envelopes: Vec<ChangeEnvelope>,
+) -> Result<Vec<ChangeEnvelopeParts>, ChangeBatchError> {
+    if envelopes.iter().all(ChangeEnvelope::is_materialized) {
+        return envelopes
+            .into_iter()
+            .map(ChangeEnvelope::into_parts)
+            .collect();
+    }
+    match tokio::task::spawn_blocking(move || {
+        envelopes
+            .into_iter()
+            .map(ChangeEnvelope::into_parts)
+            .collect()
+    })
+    .await
+    {
+        Ok(parts) => parts,
+        Err(join_err) => Err(ChangeBatchError::DeferredBuild {
+            message: format!("deferred CDC batch build task failed: {join_err}"),
+        }),
     }
 }
 
@@ -1330,6 +1384,102 @@ mod deferred_tests {
             env.change_batch().expect("already built").record.num_rows(),
             0
         );
+    }
+
+    // ----- burst-wide deferred build -----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn burst_builds_every_deferred_envelope_in_order() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let envelopes: Vec<ChangeEnvelope> = [1i32, 2, 3]
+            .into_iter()
+            .map(|rows| {
+                deferred(
+                    MockRows {
+                        result: Some(sample_batch(rows)),
+                        builds: Arc::clone(&builds),
+                        rows_hint: usize::try_from(rows).expect("positive row count"),
+                        empty: false,
+                        ts: None,
+                    },
+                    false,
+                )
+            })
+            .collect();
+
+        let parts = into_parts_offloaded_burst(envelopes)
+            .await
+            .expect("burst builds ok");
+
+        assert_eq!(
+            parts
+                .iter()
+                .map(|(_, batch, _)| batch.record.num_rows())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "burst order must be preserved — committers pair with their batches"
+        );
+        assert_eq!(builds.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn burst_of_materialized_envelopes_resolves_without_a_blocking_handoff() {
+        // Eager sources materialize on delivery; the burst must resolve inline,
+        // which a single-threaded runtime (this test's flavor) also proves.
+        let envelopes = vec![
+            ChangeEnvelope::new(Box::new(NoOpCommitter), sample_batch(2), false),
+            ChangeEnvelope::new(Box::new(NoOpCommitter), sample_batch(4), true),
+        ];
+        assert!(envelopes.iter().all(ChangeEnvelope::is_materialized));
+
+        let parts = into_parts_offloaded_burst(envelopes)
+            .await
+            .expect("materialized burst resolves");
+
+        assert_eq!(
+            parts
+                .iter()
+                .map(|(_, batch, ready)| (batch.record.num_rows(), *ready))
+                .collect::<Vec<_>>(),
+            vec![(2, false), (4, true)]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn burst_surfaces_a_failed_build_as_a_typed_error() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let envelopes = vec![
+            deferred(
+                MockRows {
+                    result: Some(sample_batch(1)),
+                    builds: Arc::clone(&builds),
+                    rows_hint: 1,
+                    empty: false,
+                    ts: None,
+                },
+                false,
+            ),
+            deferred(
+                MockRows {
+                    result: None, // build fails
+                    builds: Arc::clone(&builds),
+                    rows_hint: 1,
+                    empty: false,
+                    ts: None,
+                },
+                false,
+            ),
+        ];
+
+        // `expect_err` is unavailable: the Ok side holds a `Box<dyn CommitChange>`,
+        // which is not `Debug`.
+        match into_parts_offloaded_burst(envelopes).await {
+            Ok(_) => panic!("a failed build must fail the burst"),
+            Err(err) => assert!(
+                matches!(err, ChangeBatchError::DeferredBuild { .. }),
+                "expected a typed DeferredBuild error, got {err:?}"
+            ),
+        }
     }
 
     // ----- lag-based readiness helpers -----
