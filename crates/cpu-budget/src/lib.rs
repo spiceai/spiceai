@@ -148,6 +148,31 @@ impl CpuConfig {
     }
 }
 
+/// A cgroup CPU share, exactly as the kernel reports it.
+///
+/// Carried raw and never converted into a `requests.cpu`. The kubelet derives
+/// the share *from* the request, but the conversion varies by writer — see
+/// [`cgroup::parse_cpu_weight`] for measurements two to three times off — so a
+/// recovered core count would be a confident wrong answer. What the raw value is
+/// good for is comparing against itself: if it moves while the process runs, the
+/// pod was resized, whatever the number means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CpuShare {
+    /// cgroup v2 `cpu.weight`, in its 1..=10000 range.
+    Weight(u64),
+    /// cgroup v1 `cpu.shares`, in its 2..=262144 range.
+    Shares(u64),
+}
+
+impl std::fmt::Display for CpuShare {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Weight(weight) => write!(f, "weight {weight}"),
+            Self::Shares(shares) => write!(f, "{shares} shares"),
+        }
+    }
+}
+
 /// What the host reports about this process's CPU entitlement.
 ///
 /// Split out from [`CpuBudget::resolve`] so the whole detection ladder is a pure
@@ -159,12 +184,19 @@ pub struct HostReadings {
     /// Millicores implied by a cgroup CPU quota (`limits.cpu`). `None` when no
     /// quota is set, which includes every burstable pod.
     pub quota_millicores: Option<u64>,
-    /// Millicores implied by the cgroup CPU share (`cpu.weight` / `cpu.shares`).
-    /// Reported only, and never an input to anything that sizes or warns: a
-    /// share is not a request outside Kubernetes, where the default
-    /// `cpu.weight: 100` inverts to ~2536m in *every* cgroup — including a plain
-    /// `systemd` service on bare metal. `None` when no share can be read.
-    pub cpu_share_millicores: Option<u64>,
+    /// The cgroup CPU share, raw. Never an input to sizing: every cgroup carries
+    /// a share whether or not a request was expressed — a plain `docker run`
+    /// reports `cpu.weight: 100` — so its presence is not evidence of a request
+    /// unless something else establishes that the kubelet wrote it. `None` when
+    /// no share can be read, or when it sits at the no-request floor.
+    pub cpu_share: Option<CpuShare>,
+    /// Whether this process is running under Kubernetes, from
+    /// `KUBERNETES_SERVICE_HOST` — the same signal `client-go` uses for
+    /// in-cluster detection, and the one thing that makes a share interpretable
+    /// as evidence that a request was set. A cgroup path gate cannot do this
+    /// job: with cgroup namespaces `/proc/self/cgroup` reads `0::/` inside a
+    /// container, so the `kubepods` ancestry is not visible from in here.
+    pub kubernetes: bool,
     /// The pod's own `requests.cpu`, in millicores, as declared by whatever
     /// wrote the pod spec ([`CPU_REQUEST_ENV`]). Unlike the share this is exact
     /// and unquantized, and its presence is itself evidence that something which
@@ -185,7 +217,9 @@ impl HostReadings {
             affinity_cores: std::thread::available_parallelism()
                 .map_or(1, std::num::NonZeroUsize::get),
             quota_millicores: detect_quota_millicores(),
-            cpu_share_millicores: detect_cpu_share_millicores(),
+            cpu_share: detect_cpu_share(),
+            kubernetes: std::env::var_os("KUBERNETES_SERVICE_HOST")
+                .is_some_and(|value| !value.is_empty()),
             declared_request_millicores: detect_declared_request_millicores(),
         }
     }
@@ -286,24 +320,26 @@ fn detect_quota_millicores() -> Option<u64> {
     })
 }
 
-/// The cgroup CPU share, in millicores.
+/// The cgroup CPU share, raw.
 ///
-/// Reporting only. Sizing never consults it — see [`CpuBudget::resolve`].
+/// Reporting only. Sizing never consults it — see [`CpuBudget::resolve`]. Public
+/// so a later re-read can compare against the value captured at startup and
+/// notice that the pod was resized underneath the process.
 ///
 /// Read at the leaf, unlike the quota. A share is a relative weight *among
 /// siblings at one level*, not a ceiling inherited down the tree, so the
 /// smallest value along the path would mean nothing; the container's own share
 /// is the one the kubelet derived from its `requests.cpu`.
-fn detect_cpu_share_millicores() -> Option<u64> {
+pub fn detect_cpu_share() -> Option<CpuShare> {
     if let Some((mountpoint, cgroup_path)) = cgroup::v2_mount_and_path()
         && let Ok(contents) = std::fs::read_to_string(cgroup::cgroup_file_path(
             &mountpoint,
             &cgroup_path,
             "cpu.weight",
         ))
-        && let Some(millicores) = cgroup::parse_cpu_weight(&contents)
+        && let Some(weight) = cgroup::parse_cpu_weight(&contents)
     {
-        return Some(millicores);
+        return Some(CpuShare::Weight(weight));
     }
     let (mountpoint, cgroup_path) = cgroup::v1_mount_and_path("cpu")?;
     let shares = std::fs::read_to_string(cgroup::cgroup_file_path(
@@ -312,7 +348,7 @@ fn detect_cpu_share_millicores() -> Option<u64> {
         "cpu.shares",
     ))
     .ok()?;
-    cgroup::parse_cpu_shares(&shares)
+    cgroup::parse_cpu_shares(&shares).map(CpuShare::Shares)
 }
 
 /// Query plans admitted concurrently per core when
@@ -343,9 +379,11 @@ pub struct CpuBudget {
     detected_cores: usize,
     /// The cgroup CPU limit, reported alongside the budget it produced.
     limit_millicores: Option<u64>,
-    /// The cgroup CPU share. Reported only — see
-    /// [`HostReadings::cpu_share_millicores`] for why it never sizes or warns.
-    cpu_share_millicores: Option<u64>,
+    /// The cgroup CPU share, raw. Reported only — see [`HostReadings::cpu_share`]
+    /// for why it never sizes and is never converted to cores.
+    cpu_share: Option<CpuShare>,
+    /// Whether this process is running under Kubernetes.
+    kubernetes: bool,
     /// The pod's declared `requests.cpu`. Reported, and the only request the
     /// warning below is allowed to compare against.
     declared_request_millicores: Option<u64>,
@@ -421,7 +459,8 @@ impl CpuBudget {
             setting,
             detected_cores,
             limit_millicores: host.quota_millicores,
-            cpu_share_millicores: host.cpu_share_millicores,
+            cpu_share: host.cpu_share,
+            kubernetes: host.kubernetes,
             declared_request_millicores: host.declared_request_millicores,
         })
     }
@@ -467,6 +506,9 @@ impl CpuBudget {
         tracing::info!("{}", self.summary_line());
         tracing::info!("{}", self.derived_sizing_line());
         if let Some(warning) = self.request_shortfall_warning() {
+            tracing::warn!("{warning}");
+        }
+        if let Some(warning) = self.undeclared_request_warning() {
             tracing::warn!("{warning}");
         }
     }
@@ -569,8 +611,8 @@ impl CpuBudget {
                 .declared_request_millicores
                 .map_or_else(|| unset.clone(), format_millicores),
             share = self
-                .cpu_share_millicores
-                .map_or_else(|| unset.clone(), format_millicores),
+                .cpu_share
+                .map_or_else(|| unset.clone(), |share| share.to_string()),
             limit = self.limit_millicores.map_or(unset, format_millicores),
             main = self.main_runtime_worker_threads(),
             dedicated = self.dedicated_runtime_worker_threads(),
@@ -631,6 +673,40 @@ impl CpuBudget {
         ))
     }
 
+    /// A warning when this is a Kubernetes pod whose CPU request never reached
+    /// the process.
+    ///
+    /// Sizing needs the request declared through [`CPU_REQUEST_ENV`], and only
+    /// the surface that wrote the pod spec can supply it. When that surface did
+    /// not — a hand-rolled manifest, or a chart predating the passthrough — this
+    /// process silently sizes for whatever the next rung reports, which on a
+    /// burstable pod is the whole machine.
+    ///
+    /// The cgroup share is what makes the gap detectable without making it
+    /// sizeable. Under Kubernetes a share above the no-request floor means the
+    /// kubelet was given a request, so its *presence* is the evidence, while its
+    /// value stays unused — the conversion back to cores is not trustworthy (see
+    /// [`cgroup::parse_cpu_weight`]).
+    ///
+    /// `None` outside Kubernetes, where a share is just the cgroup default and
+    /// implies nothing, and `None` once the request has been declared.
+    #[must_use]
+    pub fn undeclared_request_warning(&self) -> Option<String> {
+        if !self.kubernetes || self.declared_request_millicores.is_some() {
+            return None;
+        }
+        let share = self.cpu_share?;
+        Some(format!(
+            "This pod has a CPU request ({share}) that spiced cannot read: {CPU_REQUEST_ENV} is \
+             not set, so CPU sizing fell back to {origin} and every CPU-derived pool is sized for \
+             {entitlement}. Pass the request through with the downward API \
+             (`resourceFieldRef` on `requests.cpu`, `divisor: 1m`); the Spice Helm chart does this \
+             automatically. See: {DOCS_URL}",
+            origin = self.origin(),
+            entitlement = format_millicores(self.millicores),
+        ))
+    }
+
     // ---- the entitlement ----
 
     /// The entitlement in whole cores, rounded up, at least 1.
@@ -649,10 +725,10 @@ impl CpuBudget {
     ///
     /// Reported so an operator can see it next to the budget; it is never an
     /// input to the detection ladder, and never compared against the budget —
-    /// see [`HostReadings::cpu_share_millicores`].
+    /// see [`HostReadings::cpu_share`].
     #[must_use]
-    pub const fn cpu_share_millicores(&self) -> Option<u64> {
-        self.cpu_share_millicores
+    pub const fn cpu_share(&self) -> Option<CpuShare> {
+        self.cpu_share
     }
 
     /// The pod's declared `requests.cpu` in millicores, when one was declared
@@ -836,7 +912,8 @@ pub fn cpu_budget() -> &'static CpuBudget {
             setting: None,
             detected_cores: 1,
             limit_millicores: None,
-            cpu_share_millicores: None,
+            cpu_share: None,
+            kubernetes: false,
             declared_request_millicores: None,
         })
     })
@@ -929,7 +1006,7 @@ mod tests {
     fn bare_metal(affinity_cores: usize) -> HostReadings {
         HostReadings {
             affinity_cores,
-            cpu_share_millicores: Some(2536),
+            cpu_share: Some(CpuShare::Weight(100)),
             ..HostReadings::default()
         }
     }
@@ -939,66 +1016,52 @@ mod tests {
         HostReadings {
             affinity_cores,
             quota_millicores: None,
-            cpu_share_millicores: None,
+            cpu_share: None,
+            kubernetes: false,
             declared_request_millicores: Some(declared_request_millicores),
         }
     }
 
     #[test]
-    fn cpu_shares_and_weight_recover_the_request() {
-        // v1: 1024 shares is one CPU.
-        assert_eq!(cgroup::parse_cpu_shares("4096"), Some(4000));
-        assert_eq!(cgroup::parse_cpu_shares(" 512 \n"), Some(500));
-        // Kubernetes' floor for "no CPU request" reads back as absent, not as a
-        // request of ~2 millicores.
-        assert_eq!(cgroup::parse_cpu_shares("2"), None);
-        assert_eq!(cgroup::parse_cpu_shares("garbage"), None);
+    fn cpu_share_parsing_rejects_the_no_request_floors_and_junk() {
+        // Raw values through, both flavours.
+        assert_eq!(cgroup::parse_cpu_shares("4096"), Some(4096));
+        assert_eq!(cgroup::parse_cpu_shares(" 512 \n"), Some(512));
+        assert_eq!(cgroup::parse_cpu_weight("157"), Some(157));
 
-        // v2: the kubelet's share-to-weight mapping, inverted. `requests.cpu: 4`
-        // becomes 4096 shares becomes weight 157.
-        let four_cores = cgroup::parse_cpu_weight("157").expect("a weight maps back to a request");
-        assert!(
-            (3900..=4100).contains(&four_cores),
-            "weight 157 should recover ~4000 millicores, got {four_cores}"
-        );
+        // The floors Kubernetes writes for "no CPU request" read back as absent,
+        // rather than as a share of 2 or a weight of 1.
+        assert_eq!(cgroup::parse_cpu_shares("2"), None);
+        assert_eq!(cgroup::parse_cpu_shares("1"), None);
         assert_eq!(cgroup::parse_cpu_weight("1"), None);
+
+        assert_eq!(cgroup::parse_cpu_shares("garbage"), None);
         assert_eq!(cgroup::parse_cpu_weight("garbage"), None);
     }
 
-    /// The measured reason a share is not a request.
+    /// The measured reason a share is not a request, and is not converted.
     ///
-    /// `docker run` with no CPU flags at all produces `cpu.weight: 100` and
-    /// `cpu.max: max 100000` — a share with no quota, on cgroup v2 (verified on
-    /// Docker 29.4, cgroupfs driver). Every cgroup has that weight whether or not
-    /// anyone expressed a request, and it inverts to a plausible-looking ~2.5
-    /// cores, which is why comparing it against the budget warned on hosts that
-    /// were sized correctly.
+    /// `docker run` with no CPU flags produces `cpu.weight: 100` and
+    /// `cpu.max: max 100000` — a share with no quota (Docker 29.4, cgroup v2,
+    /// cgroupfs driver). Every cgroup carries that weight whether or not anyone
+    /// expressed a request.
+    ///
+    /// The same runtime maps `--cpu-shares` 512/1024/2048/4096 to weights
+    /// 59/100/174/303. The kubelet's formula would invert those to roughly
+    /// 1486m/2536m/4431m/7734m for requests of 500m/1000m/2000m/4000m, i.e. two
+    /// to three times too high, so the weight is reported exactly as read.
     #[test]
-    fn the_default_cgroup_weight_looks_like_a_request_but_is_not_one() {
-        let default_weight = cgroup::parse_cpu_weight("100").expect("weight 100 inverts");
-        assert!(
-            (2500..=2600).contains(&default_weight),
-            "cgroup v2's default weight of 100 should invert to ~2536 millicores, got \
-             {default_weight}"
-        );
+    fn a_cgroup_share_is_reported_raw_and_never_converted() {
+        // Raw, both flavours, with the no-request floors rejected.
+        assert_eq!(cgroup::parse_cpu_weight("100"), Some(100));
+        assert_eq!(cgroup::parse_cpu_weight("174"), Some(174));
+        assert_eq!(cgroup::parse_cpu_weight("1"), None);
+        assert_eq!(cgroup::parse_cpu_shares("2048"), Some(2048));
+        assert_eq!(cgroup::parse_cpu_shares("2"), None);
 
-        // Nothing declared a request, so nothing may be compared against the
-        // budget — however request-shaped that number looks.
-        let resolved = CpuBudget::resolve(
-            &CpuConfig::default(),
-            &HostReadings {
-                affinity_cores: 18,
-                quota_millicores: None,
-                cpu_share_millicores: Some(default_weight),
-                declared_request_millicores: None,
-            },
-        )
-        .expect("valid");
-        assert_eq!(resolved.request_shortfall_warning(), None);
-
-        // `--cpu-shares 2048` moves the weight to 174, and that is still not a
-        // request: it is a relative weight among siblings.
-        assert!(cgroup::parse_cpu_weight("174").is_some());
+        // Rendered as the reading it is, so nobody reads it as an entitlement.
+        assert_eq!(CpuShare::Weight(100).to_string(), "weight 100");
+        assert_eq!(CpuShare::Shares(2048).to_string(), "2048 shares");
     }
 
     #[test]
@@ -1033,7 +1096,8 @@ mod tests {
             &HostReadings {
                 affinity_cores: 64,
                 quota_millicores: Some(16_000),
-                cpu_share_millicores: None,
+                cpu_share: None,
+            kubernetes: false,
                 declared_request_millicores: Some(4000),
             },
         )
@@ -1048,7 +1112,8 @@ mod tests {
             &HostReadings {
                 affinity_cores: 64,
                 quota_millicores: Some(16_000),
-                cpu_share_millicores: None,
+                cpu_share: None,
+            kubernetes: false,
                 declared_request_millicores: Some(4000),
             },
         )
@@ -1371,37 +1436,89 @@ mod tests {
     /// The guard that keeps an inferred value out of the reporting path: a cgroup
     /// CPU share is never a request.
     ///
-    /// Every cgroup has a share whether or not anyone expressed a request —
-    /// cgroup v2 defaults `cpu.weight: 100`, which inverts to ~2536m on bare
-    /// metal — so comparing it against the budget told every unconstrained Linux
-    /// host above ~5 cores that its correct budget was misconfigured. The
-    /// arithmetic below is the proof that the warning would fire if the share
-    /// were still the input, so this test fails if the wiring is ever restored.
+    /// A plain `docker run` reports `cpu.weight: 100`, which the kubelet's
+    /// formula inverts to ~2536m. Feeding that to the shortfall warning told
+    /// every unconstrained Linux host above ~5 cores that its correct budget was
+    /// misconfigured. The second half of this test declares that same 2536m to
+    /// prove the warning still fires on a real request, so this fails if the
+    /// share is ever wired back in.
     #[test]
     fn a_cgroup_share_is_never_treated_as_a_declared_request() {
-        let readings = bare_metal(18);
-        let share = readings
-            .cpu_share_millicores
-            .expect("the fixture sets a share");
-        let resolved = CpuBudget::resolve(&CpuConfig::default(), &readings).expect("valid");
-
+        let resolved = CpuBudget::resolve(&CpuConfig::default(), &bare_metal(18)).expect("valid");
         assert_eq!(
             resolved.request_shortfall_warning(),
             None,
             "a cgroup share must never produce a shortfall warning"
         );
-        // Same numbers, declared this time: this is what the share used to do.
-        let declared = CpuBudget::resolve(&CpuConfig::default(), &request_only(18, share))
+        // Dropped as an input, not as output: still reported, still raw.
+        assert_eq!(resolved.cpu_share(), Some(CpuShare::Weight(100)));
+        assert_eq!(resolved.declared_request_millicores(), None);
+
+        // What the share used to be inverted to, declared properly this time.
+        let declared = CpuBudget::resolve(&CpuConfig::default(), &request_only(18, 2536))
             .expect("valid")
             .request_shortfall_warning();
         assert!(
             declared.is_some(),
-            "the fixture must be below the threshold, or this test proves nothing"
+            "2536m against 18 cores must warn, or this test proves nothing"
+        );
+    }
+
+    /// Under Kubernetes a share above the no-request floor means the kubelet was
+    /// given a request, so a missing [`CPU_REQUEST_ENV`] is a wiring gap worth
+    /// naming — the diagnostic a hand-rolled manifest would otherwise never get.
+    #[test]
+    fn a_kubernetes_pod_whose_request_never_arrived_is_warned_about() {
+        let unwired = HostReadings {
+            affinity_cores: 18,
+            quota_millicores: None,
+            cpu_share: Some(CpuShare::Weight(174)),
+            declared_request_millicores: None,
+            kubernetes: true,
+        };
+        let warning = CpuBudget::resolve(&CpuConfig::default(), &unwired)
+            .expect("valid")
+            .undeclared_request_warning()
+            .expect("a Kubernetes pod with a share but no declared request must warn");
+        assert!(warning.contains(CPU_REQUEST_ENV), "{warning}");
+        assert!(warning.contains("weight 174"), "{warning}");
+        // It says what happened, and never converts the share to cores.
+        assert!(warning.contains("18 cores"), "{warning}");
+
+        // Wired up: nothing to say.
+        let wired = HostReadings {
+            declared_request_millicores: Some(4000),
+            ..unwired.clone()
+        };
+        assert_eq!(
+            CpuBudget::resolve(&CpuConfig::default(), &wired)
+                .expect("valid")
+                .undeclared_request_warning(),
+            None
         );
 
-        // The share is still reported — it is dropped as an input, not as output.
-        assert_eq!(resolved.cpu_share_millicores(), Some(share));
-        assert_eq!(resolved.declared_request_millicores(), None);
+        // Not Kubernetes: the same share is just the cgroup default and implies
+        // nothing, so bare metal and plain Docker stay silent.
+        assert_eq!(
+            CpuBudget::resolve(&CpuConfig::default(), &bare_metal(18))
+                .expect("valid")
+                .undeclared_request_warning(),
+            None,
+            "a share outside Kubernetes is not evidence of a request"
+        );
+
+        // Kubernetes, but the pod genuinely declared no request: the kubelet
+        // writes the floor, which reads back as absent.
+        let no_request = HostReadings {
+            cpu_share: None,
+            ..unwired
+        };
+        assert_eq!(
+            CpuBudget::resolve(&CpuConfig::default(), &no_request)
+                .expect("valid")
+                .undeclared_request_warning(),
+            None
+        );
     }
 
     /// [`CPU_REQUEST_ENV`] is millicores (`divisor: 1m`), not the core-denominated
