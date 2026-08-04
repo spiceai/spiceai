@@ -116,6 +116,11 @@ STUB
 
 # Answers with STUB_READY_BODY. STUB_READY_AFTER makes it fail N times first,
 # modelling a runtime that comes up partway through the wait.
+#
+# STUB_READY_STATUS models the real endpoint: a runtime that is up but not ready
+# answers 503 *with a body* saying so. This stub reproduces curl's `-f`
+# behaviour of suppressing that body, which is why passing `-f` would blind the
+# diagnostics — the reason the subject must not use it.
 cat >"$stub_dir/curl" <<'STUB'
 #!/usr/bin/env bash
 set -uo pipefail
@@ -125,6 +130,13 @@ n=$((n + 1))
 echo "$n" > "${STATE_DIR}/curl_calls"
 if [[ -n "${STUB_READY_AFTER:-}" && "$n" -lt "${STUB_READY_AFTER}" ]]; then
   exit 7   # connection refused
+fi
+status="${STUB_READY_STATUS:-200}"
+if [[ "$status" -ge 400 ]]; then
+  # `-f`: no body, exit 22. Without it: body on stdout, exit 0.
+  [[ "$*" == *-f* ]] && exit 22
+  printf '%s' "${STUB_READY_BODY:-}"
+  exit 0
 fi
 printf '%s' "${STUB_READY_BODY:-}"
 exit 0
@@ -318,6 +330,17 @@ reset_state "101 spiced $OURS"
 result="$(run_subject "$wait_script" STUB_READY_BODY=ready STUB_READY_AFTER=3 SPICE_READY_TIMEOUT=20 SPICE_READY_INTERVAL=1)"
 assert_eq "waits through connection refused, then succeeds" "${result%%|*}" "0"
 
+# The real not-ready response is 503 *with* a body. Reporting that body is the
+# entire diagnostic value here, and `curl -f` would throw it away — so this is
+# the case that pins the absence of `-f`.
+reset_state "101 spiced $OURS"
+result="$(run_subject "$wait_script" STUB_READY_BODY="not ready" STUB_READY_STATUS=503 \
+  SPICE_READY_TIMEOUT=3 SPICE_READY_INTERVAL=1)"
+out="${result#*|}"
+assert_eq "a 503 keeps the wait going" "${result%%|*}" "1"
+assert_contains "reports the body of a 503, not an empty response" "$out" "not ready"
+assert_not_contains "does not report a 503 as an empty response" "$out" "(empty"
+
 # The whole point of #12058: a timeout must name its cause.
 reset_state
 printf 'ERROR spiced: Unable to start HTTP server: Unable to bind to address: Address already in use (os error 48)\n' \
@@ -350,6 +373,28 @@ assert_contains "says the log is missing" "${result#*|}" "no spice.log"
 reset_state
 result="$(run_subject "$wait_script" SPICE_READY_URL="http://localhost:9091/v1/ready" SPICE_READY_TIMEOUT=2 SPICE_READY_INTERVAL=1)"
 assert_contains "diagnoses the configured port" "${result#*|}" "listeners on :9091"
+
+# Ready answered by somebody else. Runner instances share a network namespace,
+# so if our spiced lost the bind, this poll can be satisfied by another job's
+# runtime and every later step would silently test *that* one. Our own log
+# saying we failed to bind has to outrank whatever answered the socket.
+reset_state "201 spiced $THEIRS"
+printf 'ERROR spiced: Unable to bind to address: Address already in use (os error 48)\n' \
+  > "$work_dir/spice.log"
+result="$(run_subject "$wait_script" STUB_READY_BODY=ready SPICE_READY_TIMEOUT=5 SPICE_READY_INTERVAL=1)"
+out="${result#*|}"
+assert_eq "refuses a ready answered by another job's runtime" "${result%%|*}" "1"
+assert_contains "says whose runtime it is not" "$out" "not this job's runtime"
+assert_not_contains "does not claim our runtime came up" "$out" "Runtime ready after"
+rm -f "$work_dir/spice.log"
+
+# ...but a genuine ready alongside an unrelated log must still pass, or the
+# guard above would fail every job whose log merely mentions the phrase.
+reset_state "101 spiced $OURS"
+printf 'INFO runtime: all good here\n' > "$work_dir/spice.log"
+result="$(run_subject "$wait_script" STUB_READY_BODY=ready SPICE_READY_TIMEOUT=5)"
+assert_eq "still accepts a genuine ready" "${result%%|*}" "0"
+rm -f "$work_dir/spice.log"
 
 echo
 if [ "$failures" -eq 0 ]; then

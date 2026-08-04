@@ -36,6 +36,11 @@ port_from_url() {
   esac
 }
 
+# Runs only on the failure path, and is deliberately not itself time-bounded:
+# `lsof` can block on a wedged mount, and the job-level `timeout-minutes` is the
+# backstop for that. A step-level timeout is not an option — the inner steps of
+# a composite action do not honour one — and wrapping this in `timeout(1)` is
+# not portable to the macOS runners, which do not ship it.
 diagnose() {
   local last_body="$1" port
   port="$(port_from_url)"
@@ -100,11 +105,28 @@ last_body=""
 next_progress=$PROGRESS_EVERY
 
 while :; do
-  # `|| true`: curl exits non-zero while nothing is listening yet, which is the
-  # normal state early on and must not end the wait.
-  last_body="$(curl -fsS --max-time 5 "$URL" 2>/dev/null || true)"
+  # No `-f`. A runtime that is up but not ready answers 503 with a body saying
+  # so (crates/runtime/src/http/v1/ready.rs), and `-f` suppresses the body on an
+  # error status — which would leave every progress line and the timeout
+  # diagnosis reporting an empty response, the exact blindness being fixed here.
+  # The exact `= "ready"` comparison below is what guards against a false pass.
+  # `|| true`: curl still exits non-zero while nothing is listening yet, which
+  # is the normal state early on and must not end the wait.
+  last_body="$(curl -sS --max-time 5 "$URL" 2>/dev/null || true)"
 
   if [ "$last_body" = "ready" ]; then
+    # "Something on :8090 says ready" is not "our runtime is ready". Several
+    # runner instances share one machine and one network namespace, so if our
+    # `spiced` failed to bind, this poll can be answered by a *different job's*
+    # runtime — and every test step after this would then run against it.
+    # Failing to bind always leaves this line in our own log, so treat it as
+    # authoritative over whatever answered the socket.
+    if [ -f "$LOG_FILE" ] && grep -q "Address already in use" "$LOG_FILE" 2>/dev/null; then
+      echo "Something on ${URL} reports ready, but it is not this job's runtime:"
+      echo "${LOG_FILE} shows our own spiced failed to bind its port."
+      diagnose "$last_body"
+      exit 1
+    fi
     echo "Runtime ready after $((SECONDS - start))s."
     exit 0
   fi

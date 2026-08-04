@@ -66,9 +66,10 @@ PROCS=(spice spiced)
 # it cannot be determined.
 proc_cwd() {
   local pid="$1" cwd=""
-  if [ -e "/proc/${pid}/cwd" ]; then
-    cwd="$(readlink "/proc/${pid}/cwd" 2>/dev/null || true)"
-  fi
+  # `readlink` unconditionally rather than behind `[ -e ]`: a process whose
+  # working directory has been deleted has a dangling cwd link, which fails an
+  # existence test while still naming the directory it is charged to.
+  cwd="$(readlink "/proc/${pid}/cwd" 2>/dev/null || true)"
   if [ -z "$cwd" ] && command -v lsof >/dev/null 2>&1; then
     cwd="$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)"
   fi
