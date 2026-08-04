@@ -134,7 +134,7 @@ struct Cli {
     #[arg(long, global = true, value_parser = parse_cloud_region, default_value = DEFAULT_CLOUD_REGION, requires = "cloud")]
     cloud_region: String,
 
-    /// HTTP endpoint of the Spice runtime to talk to [default: http://127.0.0.1:8090].
+    /// HTTP endpoint of the Spice runtime to talk to (default `http://127.0.0.1:8090`).
     ///
     /// The default is applied by the runtime context rather than by clap, so that omitting
     /// this flag stays distinguishable from passing the default value: `spice sql` refuses to
