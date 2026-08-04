@@ -458,10 +458,11 @@ impl CpuBudget {
                 None => CpuConfig::SPICEPOD_SETTING,
             },
             CpuSource::CgroupQuota => "cgroup CPU limit",
-            // `available_parallelism`, which is the CPU affinity mask on Linux and
-            // the logical CPU count elsewhere — "host CPU count" is the one
-            // description true on every platform.
-            CpuSource::Affinity => "the host CPU count",
+            // `available_parallelism`: the CPU affinity mask on Linux, the logical
+            // CPU count elsewhere. Not the host's total either way — a cpuset or
+            // `taskset` pins the process to a subset — so this names what the
+            // process may use rather than what the machine has.
+            CpuSource::Affinity => "the CPUs available to this process",
             CpuSource::Fallback => "fallback",
         }
     }
@@ -515,12 +516,15 @@ impl CpuBudget {
         {
             return None;
         }
-        // Detection is reached only when nothing capped the process, and that is
-        // the fact behind this note: a request with no limit sizes for the node.
-        // `summary_line` reports the same thing as `cgroup limit unset`, so the
-        // qualifier belongs here rather than in `origin`.
+        // Detection is reached only when no limit was found, and that is the fact
+        // behind this note: a request with nothing capping it sizes for the whole
+        // machine. "detected" rather than "set" because a quota that exists but
+        // cannot be read degrades to the same `None` as one that was never set
+        // (see `detect_quota_millicores`), and the note must not claim the pod has
+        // no limit when it may only be unreadable. `summary_line` carries the same
+        // fact, so the qualifier belongs here rather than in `origin`.
         let unlimited = if matches!(self.source, CpuSource::Affinity) {
-            ", no CPU limit set"
+            ", no CPU limit detected"
         } else {
             ""
         };
@@ -860,9 +864,17 @@ mod tests {
         assert!(warning.contains("64 cores"), "{warning}");
         // No configuration surface and no limit set this one — detection did, and
         // the note names that rather than a setting the operator never touched,
-        // plus the absent limit that sent sizing to the node in the first place.
-        assert!(warning.contains("the host CPU count"), "{warning}");
-        assert!(warning.contains("no CPU limit set"), "{warning}");
+        // plus the absent limit that sent sizing to the machine in the first place.
+        assert!(
+            warning.contains("the CPUs available to this process"),
+            "{warning}"
+        );
+        assert!(warning.contains("no CPU limit detected"), "{warning}");
+        // Never "the host CPU count": a cpuset can pin this process to a subset of
+        // the machine, and never "no CPU limit set": an unreadable quota degrades
+        // to the same `None` as an absent one, so neither claim is ours to make.
+        assert!(!warning.contains("host CPU count"), "{warning}");
+        assert!(!warning.contains("no CPU limit set"), "{warning}");
 
         // Under an explicit limit the value is capped, so the qualifier must not
         // appear — it would contradict the limit the note just named.
@@ -877,7 +889,7 @@ mod tests {
         .expect("detection cannot fail")
         .request_shortfall_warning()
         .expect("must warn");
-        assert!(!limited.contains("no CPU limit set"), "{limited}");
+        assert!(!limited.contains("no CPU limit detected"), "{limited}");
 
         // A request under an explicit limit warns the same way.
         let capped = CpuBudget::resolve(
