@@ -132,8 +132,8 @@ pub async fn autoload_secret(
     lookup_key: &str,
 ) -> Option<SecretString> {
     tracing::debug!("Attempting to autoload secret for {component_name}: {lookup_key}");
-    let secret_guard = secrets.read().await;
-    match secret_guard.get_secret(lookup_key).await {
+    let secrets = Secrets::snapshot(secrets).await;
+    match secrets.get_secret(lookup_key).await {
         Ok(Some(secret)) => {
             tracing::debug!("Autoloading secret for {component_name}: {lookup_key}");
             Some(secret)

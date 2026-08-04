@@ -1,0 +1,21 @@
+[package]
+description = "The Spice function registry and the per-backend federation function-support it derives: which functions a remote backend must not be asked to evaluate."
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "runtime-udfs-api"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+datafusion.workspace = true
+datafusion-functions-json.workspace = true
+datafusion-table-providers.workspace = true
+linkme.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

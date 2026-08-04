@@ -125,6 +125,7 @@ use yaml::Value;
 const TELEMETRY_DISABLED_SETTING_IGNORED_MESSAGE: &str = "Usage telemetry is anonymous and aggregated. In Spice.ai Open Source, setting runtime.telemetry.enabled: false in a Spicepod or passing --telemetry-enabled=false does not disable anonymous usage telemetry. To remove anonymous telemetry from an Open Source build, build from source without the anonymous_telemetry feature, or consider using Spice.ai Enterprise. Learn more at https://docs.spice.ai/docs/enterprise";
 
 mod cloud_connect;
+pub mod crash_handler;
 mod log_capture;
 #[path = "tracing.rs"]
 mod spiced_tracing;
@@ -372,6 +373,13 @@ pub struct Args {
     #[arg(long, action = ArgAction::Append, value_parser = parse_set_string)]
     pub set_runtime: Vec<(String, String)>,
 
+    /// How many CPUs the runtime should behave as though it has, as a
+    /// Kubernetes CPU quantity (`4`, `3.5`, `3500m`). `auto` (the default)
+    /// detects it from the cgroup CPU quota, the pod's `requests.cpu`, or the
+    /// host. Takes precedence over `SPICE_CPU_CORES` and `runtime.cpu.cores`.
+    #[arg(long, value_name = "CORES")]
+    pub cpu_cores: Option<String>,
+
     #[arg(skip)]
     pub open_telemetry_deprecated: bool,
 }
@@ -419,7 +427,47 @@ fn spawn_sighup_reload_task(control: std::sync::Arc<runtime::tls::TlsControl>) {
     }
 }
 
-pub async fn run(args: Args) -> Result<()> {
+/// The parsed spicepod, plus the load error tolerated in pods-watcher mode.
+///
+/// [`build_app`] runs before the runtime's thread pools are built so
+/// `runtime.cpu.cores` can size them; its result is threaded into [`run`]
+/// rather than re-derived, so the spicepod is loaded exactly once.
+pub type AppBundle = (Option<Arc<App>>, Option<app::Error>);
+
+/// Resolve the CPU entitlement from all three configuration surfaces plus host
+/// detection, log it, and install it as the process-wide budget.
+///
+/// Must run before any thread pool, `DataFusion` session, or accelerator is
+/// created: [`cpu_budget::cpu_budget`] lazily detects into the same cell, so a
+/// read beforehand pins the detected value.
+///
+/// # Errors
+///
+/// Fails when the configured value is not a positive CPU quantity or `auto`.
+/// An already-installed budget is a WARN, not an error — the detected value is
+/// the pre-existing behaviour, and refusing to start over it would be worse
+/// than sizing as trunk did.
+pub fn install_cpu_budget(args: &Args, app: Option<&App>) -> Result<(), cpu_budget::Error> {
+    let spicepod_cores = app
+        .and_then(|app| app.runtime.cpu.as_ref())
+        .and_then(|cpu| cpu.cores.as_ref())
+        .map(ToString::to_string);
+    let env_cores = cpu_budget::CpuConfig::env_cores();
+    let config = cpu_budget::CpuConfig::from_sources(
+        args.cpu_cores.as_deref(),
+        env_cores.as_deref(),
+        spicepod_cores.as_deref(),
+    );
+
+    let budget = cpu_budget::CpuBudget::resolve(&config, &cpu_budget::HostReadings::detect())?;
+    in_tracing_context(|| budget.log_summary());
+    if let Err(err) = budget.install() {
+        in_tracing_context(|| tracing::warn!("{err}"));
+    }
+    Ok(())
+}
+
+pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     // Register external data connectors before runtime initialization.
     // This makes connectors from extracted crates available to the runtime.
     register_external_connectors().await;
@@ -431,7 +479,7 @@ pub async fn run(args: Args) -> Result<()> {
         .clone()
         .unwrap_or_else(|| env::current_dir().unwrap_or(PathBuf::from(".")));
 
-    let (app, spicepod_load_error) = build_app(&args).await?;
+    let (app, spicepod_load_error) = app_bundle;
     let mut extension_factories: Vec<Box<dyn ExtensionFactory>> = vec![];
 
     if let Some(some_app) = &app
@@ -633,29 +681,53 @@ pub async fn run(args: Args) -> Result<()> {
             // oversubscribed host. (Benchmarked nice-0 vs a nice-5 variant at SF50: equal
             // QPH, but nice-0 drained replication lag harder — cleared the stock backlog —
             // so it's the better default; the QPH cost vs the shared runtime was noise.)
-            let cdc_apply_runtime = ManagedTokioRuntime::builder()
-                .with_thread_name("cdc-apply-worker")
-                .build()
-                .boxed()
-                .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
+            //
+            // Skipped when no dataset streams changes: each runtime is `cores - 1`
+            // worker threads, and `cdc_apply_runtime()` falls back to the refresh
+            // runtime, so a pod that never runs the apply loop should not pay for it.
+            if runtime::builder::streams_cdc_changes(app.as_ref()) {
+                let cdc_apply_runtime = ManagedTokioRuntime::builder()
+                    .with_thread_name("cdc-apply-worker")
+                    .build()
+                    .boxed()
+                    .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
 
-            rt.datafusion().set_cdc_apply_runtime(cdc_apply_runtime);
+                rt.datafusion().set_cdc_apply_runtime(cdc_apply_runtime);
+            }
 
-            // Bring up the dedicated compaction runtime whenever dedicated
-            // thread pools are enabled. Cayenne can be activated lazily after
-            // startup (for example via Iceberg DDL acceleration defaults), so
-            // install the runtime handle even when the DataFusion builder did
-            // not carve a compaction memory environment from the initial
-            // spicepod. `set_compaction_runtime` injects the carved memory
-            // environment only when one is available.
-            let compaction_runtime = ManagedTokioRuntime::builder()
-                .with_low_priority()
-                .with_thread_name("compaction-worker")
-                .build()
-                .boxed()
-                .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
+            // Process-global Cayenne budgets: the write path (encode concurrency, the
+            // auto-tuner's memory budget, query admission) and the off-pool in-memory
+            // CDC tier ceiling. These bound every Cayenne table, compacting or not, so
+            // they are installed independently of the compaction runtime below — a
+            // fleet of full-refresh tables refreshing at once needs the encode cap just
+            // as much as a CDC fleet does, and a `mode: memory` pod holds its whole
+            // dataset in the tier while never producing a file to compact.
+            rt.datafusion().install_cayenne_global_budgets();
 
-            rt.datafusion().set_compaction_runtime(compaction_runtime);
+            // Bring up the dedicated compaction runtime whenever dedicated thread
+            // pools are enabled. Cayenne can be activated lazily after startup (for
+            // example via Iceberg DDL acceleration defaults), so install the runtime
+            // handle even when the DataFusion builder did not carve a compaction
+            // memory environment from the initial spicepod. `set_compaction_runtime`
+            // injects the carved memory environment only when one is available.
+            //
+            // The one case we can rule out is a pod where no Cayenne table can
+            // produce a file to compact: a whole-table replace leaves nothing to
+            // consolidate, and `mode: memory` never writes a Vortex file at all, so
+            // their background compactors are never even spawned. A table created
+            // later by DDL in such a pod falls back to the ambient runtime
+            // (`spawn_compaction` handles an uninstalled handle), trading isolation —
+            // not correctness — for not reserving a pool the pod cannot use.
+            if rt.datafusion().cayenne_workload().may_compact() {
+                let compaction_runtime = ManagedTokioRuntime::builder()
+                    .with_low_priority()
+                    .with_thread_name("compaction-worker")
+                    .build()
+                    .boxed()
+                    .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
+
+                rt.datafusion().set_compaction_runtime(compaction_runtime);
+            }
         }
         Some("disabled") => {
             tracing::info!(
@@ -680,17 +752,11 @@ pub async fn run(args: Args) -> Result<()> {
     if needs_metrics {
         // Resolve secrets in OTEL exporter headers before initializing metrics
         let resolved_otel_headers = if let Some(config) = otel_config {
-            let mut resolved = std::collections::HashMap::new();
-            let secrets = rt.secrets();
-            let secrets_guard = secrets.read().await;
-            for (key, value) in &config.headers {
-                let resolved_value = secrets_guard
-                    .inject_secrets(key, runtime::secrets::ParamStr(value.as_ref()))
-                    .await;
-                resolved.insert(key.clone(), resolved_value.expose_secret().to_string());
-            }
-            drop(secrets_guard);
-            resolved
+            runtime::secrets::get_params_with_secrets(rt.secrets(), &config.headers)
+                .await
+                .into_iter()
+                .map(|(key, value)| (key, value.expose_secret().to_string()))
+                .collect()
         } else {
             std::collections::HashMap::new()
         };
@@ -755,6 +821,17 @@ pub async fn run(args: Args) -> Result<()> {
         }
         tokio_handles.push(("main", Handle::current()));
         telemetry::register_tokio_runtime_metrics(tokio_handles);
+
+        // The CPU entitlement every one of those pools was sized from.
+        // `tokio_runtime_workers` above is the cross-check.
+        let budget = cpu_budget::cpu_budget();
+        telemetry::register_cpu_budget_metrics(
+            u64::try_from(budget.cores()).unwrap_or(u64::MAX),
+            budget.millicores(),
+            budget.source().as_str(),
+            budget.limit_millicores(),
+            budget.request_millicores(),
+        );
 
         // Cayenne write-path backpressure occupancy gauges (encode budget, in-memory
         // CDC tier byte budget, compaction semaphore). Pull-based observable gauges on
@@ -898,7 +975,12 @@ pub async fn run(args: Args) -> Result<()> {
     result
 }
 
-async fn build_app(args: &Args) -> Result<(Option<Arc<App>>, Option<app::Error>)> {
+/// Load the spicepod and apply `--set-runtime` overrides.
+///
+/// Called from `main` before the multi-thread runtime is built, so
+/// `runtime.cpu.cores` can size it; only local/remote YAML parsing happens
+/// here, and the result is passed into [`run`].
+pub async fn build_app(args: &Args) -> Result<AppBundle> {
     // Check for explicit executor role OR implicit executor role (scheduler_address set without explicit role)
     let is_executor = matches!(args.runtime.cluster.role, Some(ClusterRole::Executor))
         || (args.runtime.cluster.role.is_none()
@@ -912,9 +994,13 @@ async fn build_app(args: &Args) -> Result<(Option<Arc<App>>, Option<app::Error>)
             && let Ok(built_app) = AppBuilder::build_from_path(path.clone()).await
         {
             let mut app = App::default();
-            // Copy only runtime flight and telemetry config from the spicepod.
+            // Copy only runtime flight, telemetry, and CPU config from the
+            // spicepod. An executor is the deployment shape most likely to be
+            // running under a CPU request, so `runtime.cpu` must come across
+            // too — everything else it needs arrives from the scheduler.
             app.runtime.flight = built_app.runtime.flight;
             app.runtime.telemetry = built_app.runtime.telemetry;
+            app.runtime.cpu = built_app.runtime.cpu;
             app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
             tracing::info!("Starting as a cluster executor with runtime config from spicepod.");
             return Ok((Some(Arc::new(app)), None));

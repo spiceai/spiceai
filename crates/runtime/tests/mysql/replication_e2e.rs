@@ -51,7 +51,7 @@ use tokio::time::sleep;
 
 use crate::mysql::common;
 use crate::utils::{
-    register_test_connectors, run_query, runtime_ready_check, test_request_context,
+    register_test_connectors, run_query, runtime_ready_check, test_request_context, wait_until_true,
 };
 use crate::{configure_test_datafusion, init_tracing};
 
@@ -62,6 +62,10 @@ const MYSQL_E2E_CAYENNE_PORT: u16 = 13323;
 const MYSQL_E2E_RESTART_PORT: u16 = 13321;
 #[cfg(not(target_os = "windows"))]
 const MYSQL_E2E_GTID_PORT: u16 = 13330;
+#[cfg(not(target_os = "windows"))]
+const MYSQL_E2E_RECONNECT_PORT: u16 = 13331;
+#[cfg(not(target_os = "windows"))]
+const MYSQL_E2E_TYPES_PORT: u16 = 13332;
 
 /// The accelerator engine a run of the e2e exercises.
 struct EngineConfig {
@@ -667,6 +671,651 @@ async fn mysql_binlog_replication_gtid_resume_cayenne() -> Result<(), anyhow::Er
                 );
                 drop(rt);
             }
+
+            pool.disconnect().await?;
+            Ok(())
+        })
+        .await
+}
+
+/// One `UPDATE`-only table whose `update_count` column is incremented by every
+/// write, so a lost or stale row version shows up as a short `SUM` while the
+/// row count stays correct.
+const RECONNECT_DDL: &str = r"CREATE TABLE repl_counters (
+        c_id          INT PRIMARY KEY,
+        update_count  INT NOT NULL,
+        payload       VARCHAR(64) NOT NULL
+    )";
+
+/// Rows repeatedly updated by the workload. Small enough that several versions
+/// of the same primary key are in flight at once.
+const RECONNECT_ROWS: i64 = 20;
+/// Updates applied to every row, half before the dump connection is killed and
+/// half after.
+const RECONNECT_UPDATES_PER_ROW: i64 = 40;
+
+/// The `Binlog Dump` thread's connection id, or `None` when the pump has not
+/// (re)connected yet.
+async fn binlog_dump_thread_id(pool: &mysql_async::Pool) -> Result<Option<u64>, anyhow::Error> {
+    let mut conn = pool.get_conn().await?;
+    let id: Option<u64> = conn
+        .query_first(
+            "SELECT id FROM information_schema.processlist \
+             WHERE command LIKE 'Binlog Dump%' ORDER BY id DESC LIMIT 1",
+        )
+        .await?;
+    Ok(id)
+}
+
+/// Wait for the pump's `Binlog Dump` thread to appear and return its id. It
+/// registers a moment after the first rows land, so the test waits rather than
+/// racing it.
+async fn wait_for_binlog_dump_thread(pool: &mysql_async::Pool) -> Result<u64, anyhow::Error> {
+    let up = wait_until_true(CHANGE_PROPAGATION_TIMEOUT, || async {
+        matches!(binlog_dump_thread_id(pool).await, Ok(Some(_)))
+    })
+    .await;
+    if !up {
+        return Err(anyhow!("no `Binlog Dump` thread appeared"));
+    }
+    binlog_dump_thread_id(pool)
+        .await?
+        .ok_or_else(|| anyhow!("the `Binlog Dump` thread vanished between polls"))
+}
+
+/// Wait for the dump thread id to change, i.e. the pump has reconnected.
+async fn wait_for_dump_thread_change(
+    pool: &mysql_async::Pool,
+    previous: u64,
+) -> Result<(), anyhow::Error> {
+    let reconnected = wait_until_true(CHANGE_PROPAGATION_TIMEOUT, || async {
+        matches!(binlog_dump_thread_id(pool).await, Ok(Some(id)) if id != previous)
+    })
+    .await;
+    if reconnected {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "timed out waiting for a dump thread other than {previous}; \
+             the pump either never reconnected or has no dump thread at all"
+        ))
+    }
+}
+
+async fn mysql_scalar_i64(pool: &mysql_async::Pool, sql: &str) -> Result<i64, anyhow::Error> {
+    let mut conn = pool.get_conn().await?;
+    conn.query_first(sql)
+        .await?
+        .ok_or_else(|| anyhow!("no rows from source query `{sql}`"))
+}
+
+/// Bump every `repl_counters` row `rounds` times, one statement per row so each
+/// update is its own transaction. `MySQL` emits one envelope per transaction per
+/// table, so single-row transactions give the pump many envelopes to coalesce; a
+/// set-based `UPDATE` per round would produce a fraction of them and lose the
+/// overlap this test depends on.
+async fn bump_counter_rows(pool: &mysql_async::Pool, rounds: i64) -> Result<(), anyhow::Error> {
+    for round in 0..rounds {
+        for id in 1..=RECONNECT_ROWS {
+            exec(
+                pool,
+                &format!(
+                    "UPDATE repl_counters SET update_count = update_count + 1, \
+                     payload = 'round-{round}' WHERE c_id = {id}"
+                ),
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Killing the dump connection mid-stream makes the pump resume from its ack
+/// floor and re-send everything delivered but not yet durably applied. An update
+/// past the floor is lost, and a re-sent older image landing over a newer one
+/// leaves the row stale — both keep the row count correct, so only an aggregate
+/// detects them. Every update is worth `+1`, making the final `SUM` exact, and
+/// `MIN` catches one row left behind even if another offsets the sum.
+///
+/// Coalescing is pinned wide so the consumer is holding a batch of not-yet-durable
+/// updates when the kill lands.
+#[cfg(not(target_os = "windows"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn mysql_binlog_replication_survives_a_dump_reconnect_cayenne() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some(
+        "integration=debug,runtime=debug,data_components::mysql_replication=debug,info",
+    ));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let _container = common::start_mysql_docker_container(MYSQL_E2E_RECONNECT_PORT)
+                .await
+                .map_err(|e| anyhow!("start container: {e}"))?;
+
+            let pool = common::get_mysql_conn(MYSQL_E2E_RECONNECT_PORT)?;
+            exec(&pool, RECONNECT_DDL).await?;
+            for id in 1..=RECONNECT_ROWS {
+                exec(
+                    &pool,
+                    &format!("INSERT INTO repl_counters VALUES ({id}, 0, 'seed')"),
+                )
+                .await?;
+            }
+
+            let temp_dir = tempfile::tempdir()?;
+            let data_dir = temp_dir.path().join("cayenne");
+            std::fs::create_dir_all(&data_dir)?;
+            let accel_params = HashMap::from([
+                (
+                    "cayenne_file_path".to_string(),
+                    data_dir.display().to_string(),
+                ),
+                (
+                    "cayenne_metadata_dir".to_string(),
+                    temp_dir.path().join("metadata.db").display().to_string(),
+                ),
+                // Widen coalescing so one write carries many envelopes.
+                ("cdc_prefetch_buffer".to_string(), "16384".to_string()),
+                (
+                    "cdc_max_coalesced_envelopes".to_string(),
+                    "16384".to_string(),
+                ),
+                ("cdc_max_coalesce_age_ms".to_string(), "2000".to_string()),
+            ]);
+            let dataset = ReplicatedDataset {
+                dataset_name: "counters",
+                table: "mysqldb.repl_counters",
+                primary_key: "c_id",
+                expected_initial_count: u64::try_from(RECONNECT_ROWS)?,
+            };
+            let engine = EngineConfig {
+                engine: "cayenne",
+                mode: spicepod::acceleration::Mode::File,
+                accel_params,
+            };
+            let app = AppBuilder::new("mysql_replication_reconnect")
+                .with_dataset(make_dataset(
+                    &dataset,
+                    &mysql_params(MYSQL_E2E_RECONNECT_PORT),
+                    &engine,
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(90)) => {
+                    return Err(anyhow!("timed out waiting for the dataset to load"));
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+            runtime_ready_check(&rt).await;
+            wait_for_scalar_i64(
+                &rt,
+                "SELECT count(*) FROM counters",
+                i64::try_from(dataset.expected_initial_count)?,
+            )
+            .await?;
+
+            // The dump thread may register a moment after the first rows land,
+            // so wait for it rather than racing it.
+            let dump_thread = wait_for_binlog_dump_thread(&pool).await?;
+
+            let half = RECONNECT_UPDATES_PER_ROW / 2;
+            bump_counter_rows(&pool, half).await?;
+
+            // Kill the dump connection mid-stream, then keep writing so the
+            // replay window overlaps live traffic.
+            exec(&pool, &format!("KILL {dump_thread}")).await?;
+            bump_counter_rows(&pool, RECONNECT_UPDATES_PER_ROW - half).await?;
+            wait_for_dump_thread_change(&pool, dump_thread).await?;
+
+            // Every update is worth exactly +1, so the source total is the
+            // yardstick: a stale image winning anywhere leaves Spice short.
+            let expected_total = mysql_scalar_i64(
+                &pool,
+                "SELECT CAST(SUM(update_count) AS SIGNED) FROM repl_counters",
+            )
+            .await?;
+            assert_eq!(
+                expected_total,
+                RECONNECT_ROWS * RECONNECT_UPDATES_PER_ROW,
+                "the workload must have applied every update on the source"
+            );
+            wait_for_scalar_i64(
+                &rt,
+                "SELECT SUM(update_count) FROM counters",
+                expected_total,
+            )
+            .await?;
+            assert_eq!(
+                scalar_i64(&rt, "SELECT min(update_count) FROM counters").await?,
+                RECONNECT_UPDATES_PER_ROW,
+                "every row must carry its final value, not an earlier one"
+            );
+
+            pool.disconnect().await?;
+            Ok(())
+        })
+        .await
+}
+
+/// One column per decode branch the row-image decoder has to get right:
+/// every integer width signed and unsigned, both decimal metadata shapes, the
+/// temporal types at several fractional-second precisions, both `VARCHAR`
+/// length-prefix widths, every blob length width, and the types whose value is
+/// resolved from table-map metadata rather than the wire type (`BIT`, `ENUM`,
+/// `SET`).
+const TYPES_DDL: &str = r"CREATE TABLE repl_types (
+        t_id      INT PRIMARY KEY,
+        c_tiny    TINYINT,          c_tiny_u   TINYINT UNSIGNED,
+        c_small   SMALLINT,         c_small_u  SMALLINT UNSIGNED,
+        c_medium  MEDIUMINT,        c_medium_u MEDIUMINT UNSIGNED,
+        c_int     INT,              c_int_u    INT UNSIGNED,
+        c_big     BIGINT,           c_big_u    BIGINT UNSIGNED,
+        c_float   FLOAT,            c_double   DOUBLE,
+        c_dec     DECIMAL(6,2),     c_dec_wide DECIMAL(20,8),
+        c_date    DATE,             c_time     TIME(3),
+        c_dt      DATETIME(6),      c_ts       TIMESTAMP(3) NULL,
+        c_year    YEAR,
+        c_char    CHAR(10),         c_varchar  VARCHAR(64),
+        c_varchar_long VARCHAR(300),
+        c_utf     VARCHAR(10) CHARACTER SET utf8mb4,
+        c_bin     BINARY(4),        c_varbin   VARBINARY(64),
+        c_tinyblob TINYBLOB,        c_blob     BLOB,
+        c_medblob MEDIUMBLOB,       c_longblob LONGBLOB,
+        c_tinytext TINYTEXT,        c_text     TEXT,
+        c_bit     BIT(9),
+        c_enum    ENUM('alpha','beta','gamma'),
+        c_set     SET('x','y','z'),
+        c_json    JSON
+    )";
+
+/// Row 1 carries ordinary values, row 2 the width boundaries, row 3 is NULL in
+/// every nullable column — which also exercises the null bitmap either side of
+/// its first byte, since the table is far wider than eight columns.
+const TYPES_SEED: &[&str] = &[
+    r#"INSERT INTO repl_types VALUES (1,
+        -12, 200, -1234, 60000, -8000000, 16000000, -70000, 4000000000,
+        -5000000000, 9000000000, 1.5, 2.25, 1234.56, 12.34567890,
+        '2026-07-30', '12:34:56.789', '2026-07-30 12:34:56.123456',
+        '2026-07-30 12:34:56.123', 2026,
+        'char', 'varchar', REPEAT('x', 300), 'ünïcødé',
+        'abcd', 'varbinary', 'tiny', 'blob', 'medium', 'long',
+        'tinytext', 'text', b'101010101', 'beta', 'x,z', '{"k": 7}')"#,
+    // The signed minimum and unsigned maximum at each width. `c_big_u` stops at
+    // i64::MAX and `c_time` at the end of the day; see the note on the test.
+    r"INSERT INTO repl_types VALUES (2,
+        -128, 255, -32768, 65535, -8388608, 16777215, -2147483648, 4294967295,
+        -9223372036854775808, 9223372036854775807, 0, 0, -9999.99, -99999999999.99999999,
+        '1000-01-01', '23:59:59.999', '1000-01-01 00:00:00.000000',
+        '1970-01-02 00:00:01.000', 1901,
+        '', '', '', '',
+        '\0\0\0\0', '', '', '', '', '', '', '',
+        b'0', 'alpha', '', '[]')",
+    "INSERT INTO repl_types (t_id) VALUES (3)",
+];
+
+/// `(sql, expected)` checks run against the accelerator. Every check returns a
+/// single integer so one helper covers the whole matrix: values are compared
+/// directly, text and binary by length or equality, so nothing depends on how
+/// either engine formats a value.
+const TYPES_CHECKS: &[(&str, i64)] = &[
+    ("SELECT count(*) FROM types", 3),
+    // Signed columns keep their sign; unsigned columns above the signed range
+    // are the case that silently corrupts if the table map's signedness block
+    // is ever misread.
+    (
+        "SELECT CAST(c_tiny AS BIGINT) FROM types WHERE t_id = 1",
+        -12,
+    ),
+    (
+        "SELECT CAST(c_tiny_u AS BIGINT) FROM types WHERE t_id = 1",
+        200,
+    ),
+    (
+        "SELECT CAST(c_small AS BIGINT) FROM types WHERE t_id = 1",
+        -1234,
+    ),
+    (
+        "SELECT CAST(c_small_u AS BIGINT) FROM types WHERE t_id = 1",
+        60000,
+    ),
+    (
+        "SELECT CAST(c_medium AS BIGINT) FROM types WHERE t_id = 1",
+        -8_000_000,
+    ),
+    (
+        "SELECT CAST(c_medium_u AS BIGINT) FROM types WHERE t_id = 1",
+        16_000_000,
+    ),
+    (
+        "SELECT CAST(c_int AS BIGINT) FROM types WHERE t_id = 1",
+        -70000,
+    ),
+    (
+        "SELECT CAST(c_int_u AS BIGINT) FROM types WHERE t_id = 1",
+        4_000_000_000,
+    ),
+    (
+        "SELECT CAST(c_big AS BIGINT) FROM types WHERE t_id = 1",
+        -5_000_000_000,
+    ),
+    // Floats scaled to an integer, which is exact for these values.
+    (
+        "SELECT CAST(c_float * 2 AS BIGINT) FROM types WHERE t_id = 1",
+        3,
+    ),
+    (
+        "SELECT CAST(c_double * 4 AS BIGINT) FROM types WHERE t_id = 1",
+        9,
+    ),
+    (
+        "SELECT CAST(c_tiny AS BIGINT) FROM types WHERE t_id = 2",
+        -128,
+    ),
+    (
+        "SELECT CAST(c_tiny_u AS BIGINT) FROM types WHERE t_id = 2",
+        255,
+    ),
+    (
+        "SELECT CAST(c_small AS BIGINT) FROM types WHERE t_id = 2",
+        -32768,
+    ),
+    (
+        "SELECT CAST(c_small_u AS BIGINT) FROM types WHERE t_id = 2",
+        65535,
+    ),
+    (
+        "SELECT CAST(c_medium AS BIGINT) FROM types WHERE t_id = 2",
+        -8_388_608,
+    ),
+    (
+        "SELECT CAST(c_medium_u AS BIGINT) FROM types WHERE t_id = 2",
+        16_777_215,
+    ),
+    (
+        "SELECT CAST(c_int AS BIGINT) FROM types WHERE t_id = 2",
+        -2_147_483_648,
+    ),
+    (
+        "SELECT CAST(c_int_u AS BIGINT) FROM types WHERE t_id = 2",
+        4_294_967_295,
+    ),
+    (
+        "SELECT CAST(c_big AS BIGINT) FROM types WHERE t_id = 2",
+        i64::MIN,
+    ),
+    (
+        "SELECT CAST(c_big_u AS BIGINT) FROM types WHERE t_id = 2",
+        i64::MAX,
+    ),
+    // Decimal scale comes from table-map metadata, so a decoder that ignored it
+    // would still produce a plausible number.
+    (
+        "SELECT CAST(c_dec * 100 AS BIGINT) FROM types WHERE t_id = 1",
+        123_456,
+    ),
+    (
+        "SELECT CAST(c_dec_wide * 100000000 AS BIGINT) FROM types WHERE t_id = 1",
+        1_234_567_890,
+    ),
+    // Temporal: date, fractional seconds at 3 and 6 digits, and YEAR.
+    (
+        "SELECT count(*) FROM types WHERE c_date = DATE '2026-07-30'",
+        1,
+    ),
+    (
+        "SELECT count(*) FROM types \
+         WHERE c_dt = TIMESTAMP '2026-07-30 12:34:56.123456'",
+        1,
+    ),
+    (
+        "SELECT count(*) FROM types WHERE c_ts = TIMESTAMP '2026-07-30 12:34:56.123'",
+        1,
+    ),
+    (
+        "SELECT CAST(c_year AS BIGINT) FROM types WHERE t_id = 1",
+        2026,
+    ),
+    // `TIME` as nanoseconds since midnight, which is exact and independent of
+    // how either engine formats the value: 12:34:56.789 and the last
+    // millisecond of the day.
+    (
+        "SELECT CAST(c_time AS BIGINT) FROM types WHERE t_id = 1",
+        45_296_789_000_000,
+    ),
+    (
+        "SELECT CAST(c_time AS BIGINT) FROM types WHERE t_id = 2",
+        86_399_999_000_000,
+    ),
+    // Strings: the 1-byte and 2-byte VARCHAR length prefixes, and a multi-byte
+    // charset where character count and byte count differ.
+    (
+        "SELECT CAST(character_length(c_varchar_long) AS BIGINT) FROM types WHERE t_id = 1",
+        300,
+    ),
+    (
+        "SELECT CAST(character_length(c_utf) AS BIGINT) FROM types WHERE t_id = 1",
+        7,
+    ),
+    ("SELECT count(*) FROM types WHERE c_varchar = 'varchar'", 1),
+    ("SELECT count(*) FROM types WHERE c_char = 'char'", 1),
+    // Every blob length width (1, 2, 3 and 4 byte prefixes), plus the binary
+    // string types. A misread length prefix changes the bytes, so comparing the
+    // value covers the prefix too. The cast normalizes `Binary`, `LargeBinary`,
+    // `Utf8` and `LargeUtf8`, which is how the four widths and the binary flag
+    // land in Arrow; every value here is ASCII, so the cast is exact.
+    (
+        "SELECT count(*) FROM types WHERE CAST(c_tinyblob AS VARCHAR) = 'tiny'",
+        1,
+    ),
+    (
+        "SELECT count(*) FROM types WHERE CAST(c_blob AS VARCHAR) = 'blob'",
+        1,
+    ),
+    (
+        "SELECT count(*) FROM types WHERE CAST(c_medblob AS VARCHAR) = 'medium'",
+        1,
+    ),
+    (
+        "SELECT count(*) FROM types WHERE CAST(c_longblob AS VARCHAR) = 'long'",
+        1,
+    ),
+    (
+        "SELECT count(*) FROM types WHERE CAST(c_bin AS VARCHAR) = 'abcd'",
+        1,
+    ),
+    (
+        "SELECT count(*) FROM types WHERE CAST(c_varbin AS VARCHAR) = 'varbinary'",
+        1,
+    ),
+    (
+        "SELECT count(*) FROM types WHERE CAST(c_tinytext AS VARCHAR) = 'tinytext'",
+        1,
+    ),
+    ("SELECT count(*) FROM types WHERE c_text = 'text'", 1),
+    // Values resolved from table-map metadata rather than the wire type: the
+    // ENUM/SET variant lists and the BIT width all live there, so a decoder
+    // that read the wire type alone could not produce these.
+    ("SELECT count(*) FROM types WHERE c_enum = 'beta'", 1),
+    ("SELECT count(*) FROM types WHERE c_enum = 'alpha'", 1),
+    ("SELECT count(*) FROM types WHERE c_set = 'x,z'", 1),
+    (
+        "SELECT CAST(c_bit AS BIGINT) FROM types WHERE t_id = 1",
+        341,
+    ),
+    // JSON arrives as `JSONB` and is decoded to text, so the content has to be
+    // checked, not just its presence. The empty array is compared exactly; the
+    // object is matched on key and value, since `MySQL` chooses the spacing.
+    (r"SELECT count(*) FROM types WHERE c_json = '[]'", 1),
+    (
+        r#"SELECT count(*) FROM types WHERE c_json LIKE '{%"k"%7%}'"#,
+        1,
+    ),
+    // The all-NULL row: every nullable column is NULL, and the primary key is
+    // still readable.
+    ("SELECT count(c_tiny) FROM types", 2),
+    ("SELECT count(c_varchar_long) FROM types", 2),
+    ("SELECT count(c_json) FROM types", 2),
+    ("SELECT count(*) FROM types WHERE t_id = 3", 1),
+];
+
+/// Every `MySQL` column type through the binlog decode path, checked against a
+/// real server. Each value is asserted from the snapshot and again after a
+/// binlog INSERT, then an UPDATE covers the before/after row images.
+///
+/// Two columns stop short of `MySQL`'s range because the Arrow type cannot hold
+/// it: `c_big_u` at `i64::MAX`, and `c_time` at the end of the day, since
+/// `Time64` is a time-of-day while `TIME` spans ±838 hours. Negative `TIME` is
+/// rejected with a structured error, covered by `negative_time_errors` in
+/// `data_components::mysql_replication::rows`.
+#[cfg(not(target_os = "windows"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn mysql_binlog_replication_decodes_every_column_type_cayenne() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some(
+        "integration=debug,runtime=debug,data_components::mysql_replication=debug,info",
+    ));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let _container = common::start_mysql_docker_container(MYSQL_E2E_TYPES_PORT)
+                .await
+                .map_err(|e| anyhow!("start container: {e}"))?;
+
+            let pool = common::get_mysql_conn(MYSQL_E2E_TYPES_PORT)?;
+            exec(&pool, TYPES_DDL).await?;
+            for seed in TYPES_SEED {
+                exec(&pool, seed).await?;
+            }
+
+            let temp_dir = tempfile::tempdir()?;
+            let data_dir = temp_dir.path().join("cayenne");
+            std::fs::create_dir_all(&data_dir)?;
+            let accel_params = HashMap::from([
+                (
+                    "cayenne_file_path".to_string(),
+                    data_dir.display().to_string(),
+                ),
+                (
+                    "cayenne_metadata_dir".to_string(),
+                    temp_dir.path().join("metadata.db").display().to_string(),
+                ),
+            ]);
+            let dataset = ReplicatedDataset {
+                dataset_name: "types",
+                table: "mysqldb.repl_types",
+                primary_key: "t_id",
+                expected_initial_count: 3,
+            };
+            let app = AppBuilder::new("mysql_replication_types")
+                .with_dataset(make_dataset(
+                    &dataset,
+                    &mysql_params(MYSQL_E2E_TYPES_PORT),
+                    &EngineConfig {
+                        engine: "cayenne",
+                        mode: spicepod::acceleration::Mode::File,
+                        accel_params,
+                    },
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(90)) => {
+                    return Err(anyhow!("timed out waiting for the dataset to load"));
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+            runtime_ready_check(&rt).await;
+
+            // The snapshot path first. TYPES_CHECKS opens with the row count,
+            // so waiting on it here covers the whole list settling.
+            wait_for_scalar_i64(&rt, TYPES_CHECKS[0].0, TYPES_CHECKS[0].1).await?;
+            for (sql, expected) in TYPES_CHECKS {
+                assert_eq!(scalar_i64(&rt, sql).await?, *expected, "snapshot: `{sql}`");
+            }
+
+            // Then the same values again through the binlog INSERT path.
+            exec(&pool, "DELETE FROM repl_types").await?;
+            wait_for_scalar_i64(&rt, "SELECT count(*) FROM types", 0).await?;
+            for seed in TYPES_SEED {
+                exec(&pool, seed).await?;
+            }
+            wait_for_scalar_i64(&rt, "SELECT count(*) FROM types", 3).await?;
+            for (sql, expected) in TYPES_CHECKS {
+                assert_eq!(
+                    scalar_i64(&rt, sql).await?,
+                    *expected,
+                    "binlog insert: `{sql}`"
+                );
+            }
+
+            // An UPDATE carries a full before and after image of the row, so
+            // changing a few columns still decodes every column twice.
+            exec(
+                &pool,
+                "UPDATE repl_types SET c_tiny = 7, c_big_u = 42, c_varchar = 'updated', \
+                 c_varchar_long = REPEAT('y', 300), c_enum = 'gamma', c_dec = 1.00 \
+                 WHERE t_id = 1",
+            )
+            .await?;
+            wait_for_scalar_i64(
+                &rt,
+                "SELECT CAST(c_tiny AS BIGINT) FROM types WHERE t_id = 1",
+                7,
+            )
+            .await?;
+            assert_eq!(
+                scalar_i64(&rt, "SELECT count(*) FROM types WHERE c_enum = 'gamma'").await?,
+                1,
+                "an updated ENUM must resolve to its new variant"
+            );
+            assert_eq!(
+                scalar_i64(
+                    &rt,
+                    "SELECT CAST(length(c_varchar_long) AS BIGINT) FROM types WHERE t_id = 1"
+                )
+                .await?,
+                300,
+                "a two-byte-length VARCHAR must survive an update"
+            );
+            // The rest of the columns the UPDATE touched, so an update applied
+            // partially or not at all cannot pass.
+            assert_eq!(
+                scalar_i64(
+                    &rt,
+                    "SELECT CAST(c_big_u AS BIGINT) FROM types WHERE t_id = 1"
+                )
+                .await?,
+                42,
+                "an updated BIGINT UNSIGNED must carry its new value"
+            );
+            assert_eq!(
+                scalar_i64(
+                    &rt,
+                    "SELECT count(*) FROM types WHERE c_varchar = 'updated'"
+                )
+                .await?,
+                1,
+                "an updated VARCHAR must carry its new value"
+            );
+            assert_eq!(
+                scalar_i64(
+                    &rt,
+                    "SELECT CAST(c_dec * 100 AS BIGINT) FROM types WHERE t_id = 1"
+                )
+                .await?,
+                100,
+                "an updated DECIMAL must keep its scale"
+            );
+
+            // And a DELETE, whose row image is the full before-image.
+            exec(&pool, "DELETE FROM repl_types WHERE t_id = 2").await?;
+            wait_for_scalar_i64(&rt, "SELECT count(*) FROM types", 2).await?;
 
             pool.disconnect().await?;
             Ok(())

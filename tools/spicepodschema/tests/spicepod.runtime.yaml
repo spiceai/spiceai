@@ -24,3 +24,8 @@ runtime:
   task_history:
     enabled: true
     captured_context: redacted
+  cpu:
+    # How many CPUs the runtime behaves as though it has. Accepts 4, 3.5, 3500m,
+    # or `auto` (the default) to detect it. Also settable via --cpu-cores or
+    # SPICE_CPU_CORES.
+    cores: 4
