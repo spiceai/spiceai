@@ -1,0 +1,54 @@
+---
+name: Sign-off Disk Guard Tests
+
+# `scripts/signoff` decides whether a branch may enter the merge queue, and the
+# disk guard decides whether a failed run gets blamed on the branch or on the
+# runner. Both directions are load-bearing and neither is exercised anywhere
+# else: a guard that under-reports leaves an out-of-disk run looking like a code
+# failure (the bug it was written for, #12412), and one that over-reports
+# excuses a genuinely broken branch as "infrastructure, just re-dispatch".
+on:
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+    paths:
+      - 'scripts/signoff'
+      - 'scripts/test_signoff_disk_guard.sh'
+      - '.github/workflows/signoff_disk_guard_test.yml'
+  push:
+    branches:
+      - trunk
+    paths:
+      - 'scripts/signoff'
+      - 'scripts/test_signoff_disk_guard.sh'
+      - '.github/workflows/signoff_disk_guard_test.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  test-signoff-disk-guard:
+    name: Unit tests for the sign-off disk guard
+    # GitHub-hosted on purpose: this is a sub-second check and must not queue
+    # behind the saturated self-hosted pool — the same pool whose full disks
+    # this guard exists to report.
+    runs-on: ubuntu-24.04
+    # A checkout plus a local bash script against a stub `df` — the job reads
+    # the repository and nothing else, so it needs no write scope.
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run tests
+        # Invoked through `bash` rather than as `./…` so the job does not depend
+        # on the script's executable bit surviving a checkout on every platform.
+        run: bash scripts/test_signoff_disk_guard.sh

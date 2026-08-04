@@ -1037,13 +1037,13 @@ mod warm_memory {
     use super::*;
     use crate::SEARCH_SCORE_COLUMN_NAME;
     use crate::index::memory::{MemoryDistanceMetric, MemoryVectorIndex};
-    use crate::metadata::MetadataColumns;
+    use crate::metadata::{MetadataColumn, MetadataColumns};
     use arrow::array::{
         FixedSizeListArray, Float32Array, Float32Builder, Float64Array, ListBuilder,
     };
     use datafusion::logical_expr::ColumnarValue;
     use datafusion::scalar::ScalarValue;
-    use datafusion_expr::{Volatility, create_udf};
+    use datafusion_expr::{Volatility, create_udf, ident};
     use llms::embeddings::{Embed, EmbeddingInput};
 
     const DIM: i32 = 3;
@@ -1114,6 +1114,51 @@ mod warm_memory {
             MemoryDistanceMetric::Cosine,
         )
         .expect("valid memory index")
+    }
+
+    fn dotted_column_memory_index() -> MemoryVectorIndex {
+        MemoryVectorIndex::try_new(
+            "message.body".to_string(),
+            vec![Field::new("id", DataType::Int64, false)],
+            MetadataColumns::from(vec![
+                MetadataColumn::NonFilterable(Arc::new(Field::new(
+                    "_spice.search_field",
+                    DataType::Utf8,
+                    false,
+                ))),
+                MetadataColumn::NonFilterable(Arc::new(Field::new(
+                    "CapitalCase",
+                    DataType::Utf8,
+                    false,
+                ))),
+            ]),
+            Arc::new(ByteEmbed),
+            embed_udf(),
+            "model_name".to_string(),
+            MemoryDistanceMetric::Cosine,
+        )
+        .expect("valid memory index")
+    }
+
+    fn dotted_column_input_batch(rows: usize) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("message.body", DataType::Utf8, false),
+            Field::new("_spice.search_field", DataType::Utf8, false),
+            Field::new("CapitalCase", DataType::Utf8, false),
+        ]));
+        #[expect(clippy::cast_possible_wrap, reason = "small test row counts")]
+        let ids: Vec<i64> = (0..rows as i64).collect();
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(vec!["text"; rows])),
+                Arc::new(StringArray::from(vec!["message.body"; rows])),
+                Arc::new(StringArray::from(vec!["capital"; rows])),
+            ],
+        )
+        .expect("valid dotted-column input batch")
     }
 
     fn embedding_field() -> Field {
@@ -1251,6 +1296,36 @@ mod warm_memory {
 
         let plan = idx.list_table_provider().expect("list plan builds");
         assert_eq!(collect_ids(plan).await, vec![0, 1]);
+    }
+
+    #[tokio::test]
+    async fn query_supports_dotted_column_names() {
+        let index = dotted_column_memory_index();
+        index
+            .write(dotted_column_input_batch(2))
+            .await
+            .expect("write succeeds");
+
+        let plan = index.query_table_provider("q").expect("query plan builds");
+        assert_eq!(collect_ids(Arc::unwrap_or_clone(plan)).await, vec![0, 1]);
+
+        let chunk_metadata_plan = LogicalPlanBuilder::new_from_arc(
+            index.query_table_provider("q").expect("query plan builds"),
+        )
+        .project(vec![ident("_spice.search_field"), ident("CapitalCase")])
+        .expect("metadata projection builds")
+        .build()
+        .expect("metadata plan builds");
+        let context = SessionContext::new();
+        let batches = context
+            .execute_logical_plan(chunk_metadata_plan)
+            .await
+            .expect("metadata query executes")
+            .collect()
+            .await
+            .expect("metadata query collects");
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 2);
     }
 
     #[tokio::test]
