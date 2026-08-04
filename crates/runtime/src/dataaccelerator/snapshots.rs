@@ -441,6 +441,12 @@ mod tests {
             &self.name
         }
 
+        fn connector_name(&self) -> Option<&str> {
+            // These tests exercise snapshot-consistency validation, which never
+            // consults the connector default; `None` resolves to `full`.
+            None
+        }
+
         fn time_column(&self) -> Option<&str> {
             None
         }
