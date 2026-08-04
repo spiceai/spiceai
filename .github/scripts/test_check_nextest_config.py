@@ -167,14 +167,32 @@ class CheckConfigTest(unittest.TestCase):
             problems = check_nextest_config.check_config(write(tmp, config))
         self.assertTrue(any("no longer has retries = 0" in p for p in problems))
 
-    def test_a_slow_timeout_that_never_terminates_is_accepted(self):
-        """A bare period cannot kill a test, so contention cannot fail it."""
+    def test_rejects_removing_the_ceiling_from_a_zero_retry_binary(self):
+        """A bare period cannot kill a test — including a genuinely hung one.
+
+        Dropping `terminate-after` is the other way to make a timeout stop
+        failing, and it satisfies the baseline check by removing the ceiling
+        rather than sizing it. The convergence binaries must keep a real one.
+        """
         config = FIXED_CONFIG.replace(
             'slow-timeout = { period = "120s", terminate-after = 8 }',
             'slow-timeout = "120s"',
         )
         with tempfile.TemporaryDirectory() as tmp:
-            self.assertEqual(check_nextest_config.check_config(write(tmp, config)), [])
+            problems = check_nextest_config.check_config(write(tmp, config))
+        never_terminates = [p for p in problems if "never terminates" in p]
+        self.assertEqual(len(never_terminates), len(check_nextest_config.ZERO_RETRY_BINARIES))
+        self.assertTrue(all("Set terminate-after" in p for p in never_terminates))
+
+    def test_reports_a_slow_timeout_missing_its_period(self):
+        """A `terminate-after` with no `period` is a config problem, not a crash."""
+        config = FIXED_CONFIG.replace(
+            'slow-timeout = { period = "120s", terminate-after = 8 }',
+            "slow-timeout = { terminate-after = 8 }",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            problems = check_nextest_config.check_config(write(tmp, config))
+        self.assertTrue(any("no string period" in p for p in problems), problems)
 
     def test_reports_an_unresolvable_binary_filter(self):
         config = FIXED_CONFIG + """

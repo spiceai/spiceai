@@ -18,6 +18,9 @@ on:
       - '.config/nextest.toml'
       - '.github/scripts/check_nextest_config.py'
       - '.github/scripts/test_check_nextest_config.py'
+      # Self-referencing so an edit to this file is exercised by the gate it
+      # defines, rather than only when one of the paths above also changes.
+      - '.github/workflows/nextest_config_check.yml'
   push:
     branches:
       - trunk
@@ -25,6 +28,9 @@ on:
       - '.config/nextest.toml'
       - '.github/scripts/check_nextest_config.py'
       - '.github/scripts/test_check_nextest_config.py'
+      # Self-referencing so an edit to this file is exercised by the gate it
+      # defines, rather than only when one of the paths above also changes.
+      - '.github/workflows/nextest_config_check.yml'
   workflow_dispatch:
 
 concurrency:

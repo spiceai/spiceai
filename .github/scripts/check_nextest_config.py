@@ -104,7 +104,17 @@ def ceiling_seconds(slow_timeout: object) -> float | None:
     terminate_after = slow_timeout.get("terminate-after")
     if terminate_after is None:
         return None
-    return parse_duration(slow_timeout["period"]) * int(terminate_after)
+    # `period` is mandatory once `terminate-after` is set, but a hand-edited
+    # table can omit it. Report that as a config problem like every other
+    # malformed value here, rather than letting a KeyError escape as a crash.
+    period = slow_timeout.get("period")
+    if not isinstance(period, str):
+        raise ValueError(
+            f"slow-timeout sets terminate-after but no string period: {slow_timeout!r}"
+        )
+    if not isinstance(terminate_after, int) or isinstance(terminate_after, bool):
+        raise ValueError(f"slow-timeout has a non-integer terminate-after: {slow_timeout!r}")
+    return parse_duration(period) * terminate_after
 
 
 def binaries_matched(filter_expr: str) -> set[str]:
@@ -194,15 +204,25 @@ def check_config(config_path: Path) -> list[str]:
             )
             continue
         try:
-            inherits_a_kill = ceiling_seconds(resolve(config, binary, "slow-timeout")) is not None
+            ceiling = ceiling_seconds(resolve(config, binary, "slow-timeout"))
         except ValueError as exc:
             problems.append(f"{name}: {binary}: {exc}")
             continue
-        if inherits_a_kill and not has_override_setting(config, binary, "slow-timeout"):
+        if not has_override_setting(config, binary, "slow-timeout"):
             problems.append(
                 f"{name}: {binary} has retries = 0 but inherits the global slow-timeout. "
                 "With no retries a wall-clock kill is an unrecoverable merge-queue "
                 "failure, so this binary needs a ceiling sized for it explicitly."
+            )
+        elif ceiling is None:
+            # Deleting `terminate-after` would satisfy the baseline check above
+            # by removing the ceiling entirely, which is the wrong way to make a
+            # timeout stop failing: nothing then kills a genuine hang.
+            problems.append(
+                f"{name}: {binary} has retries = 0 and a slow-timeout that never "
+                "terminates, so a hung test is never killed. It would run until the "
+                "job's own timeout, costing the whole run and reporting as an "
+                "infrastructure failure rather than a test one. Set terminate-after."
             )
 
     return problems
