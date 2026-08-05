@@ -109,6 +109,8 @@ jobs:
     runs-on: ${{ matrix.target.builder }}
     needs: [setup-matrix, check_changes]
     if: ${{ needs.check_changes.outputs.relevant_changes == 'true' }}
+    env:
+      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
 
     strategy:
       matrix:
@@ -149,6 +151,18 @@ jobs:
       - name: Install Protoc
         uses: ./.github/actions/install-protoc
 
+      - name: Set up spiceio
+        if: matrix.target.builder == 'spiceai-macos' && env.HAS_SPICEIO_SECRET == 'true'
+        id: setup-spiceio
+        uses: spiceai/spiceio/.github/actions/setup@0870da59576dda1aef80e99c067c3bf14da7307b # v0.6.0
+        with:
+          smb-url: smb://runner@192.168.3.148/ai_platform_dev
+          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          token: ${{ github.token }}
+          bucket: sccache
+          region: us-west-1
+          immutable-objects: "true"
+
       - name: Build spiced and spice CLI
         if: matrix.target.target_os != 'darwin'
         uses: ./.github/actions/build-spiced
@@ -166,6 +180,28 @@ jobs:
           build_cli: 'true'
           upload_artifact: 'true'
           artifact_name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
+
+      - name: Show sccache stats
+        if: always() && matrix.target.builder == 'spiceai-macos' && env.SCCACHE_SETUP == 'true'
+        # `always()`: this is the one step that reports cache health, and without it
+        # it is skipped on exactly the failures it would explain (#12420). The `||`
+        # keeps a diagnostic from ever deciding a verdict — when the cache backend is
+        # gone `--show-stats` cannot answer either, and that is itself the finding.
+        run: |
+          sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
+
+      - name: Kill spiceio
+        if: always() && matrix.target.builder == 'spiceai-macos' && steps.setup-spiceio.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
+
+      - name: Upload spiceio logs
+        if: always() && matrix.target.builder == 'spiceai-macos'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: spiceio-e2e-build-logs
+          path: ${{ runner.temp }}/spiceio.log
+          if-no-files-found: ignore
 
   setup-model-matrix:
     name: Setup model strategy matrix
