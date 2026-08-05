@@ -17571,7 +17571,10 @@ impl CayenneTableProvider {
         // blocked bake pays no listings.
         let max_pass_bytes = self.protected_merge_input_budget_bytes();
         let mut selected_input_bytes: u64 = 0;
-        let mut budget_truncated = false;
+        // Why the prefix stopped short, for the skip log below. A budget stop is
+        // expected steady state; a sizing failure is an I/O problem that must not
+        // masquerade as one.
+        let mut stopped_early: Option<&'static str> = None;
         for id in candidate_ids {
             let files = self
                 .catalog
@@ -17580,22 +17583,34 @@ impl CayenneTableProvider {
                 .unwrap_or_default();
             let threshold = thresholds.get(id).copied().unwrap_or(0);
             if let Some(budget) = max_pass_bytes {
-                // On-disk bytes, sized as the size-tier path sizes its candidates. An
-                // unknown size must NOT count as 0 here: the budget is a memory ceiling,
-                // and counting an unsizeable run as free would let an arbitrarily large
-                // one in and defeat the bound. End the prefix instead; the next tick
-                // retries once it can be sized.
-                let Ok(sizes) = self.list_snapshot_files_with_sizes(id).await else {
-                    budget_truncated = true;
-                    break;
+                // On-disk bytes, sized as the size-tier path sizes its candidates.
+                let candidate_bytes: u64 = match self.list_snapshot_files_with_sizes(id).await {
+                    Ok(sizes) => sizes.iter().map(|(_, sz)| *sz).sum(),
+                    Err(error) => {
+                        // An unknown size must NOT count as 0 here: the budget is a
+                        // memory ceiling, and counting an unsizeable run as free would
+                        // let an arbitrarily large one in and defeat the bound. End the
+                        // prefix instead; the next tick retries once it can be sized.
+                        // Reported at WARN (matching the size-tier path) so a listing
+                        // failure is never mistaken for the budget doing its job.
+                        tracing::warn!(
+                            target: "cayenne::compaction",
+                            table = self.table_metadata.table_name.as_str(),
+                            snapshot_id = id.as_str(),
+                            %error,
+                            "Failed to size seq-prefix bake input; ending the prefix here \
+                             rather than counting it as free against the pass memory budget"
+                        );
+                        stopped_early = Some("sizing_failed");
+                        break;
+                    }
                 };
-                let candidate_bytes: u64 = sizes.iter().map(|(_, sz)| *sz).sum();
                 let next = selected_input_bytes.saturating_add(candidate_bytes);
                 if next > budget {
                     // Stop here. `cutoff` has only accumulated over already-selected
                     // snapshots, so T matches the truncated set; the next tick bakes
                     // the rest.
-                    budget_truncated = true;
+                    stopped_early = Some("over_budget");
                     break;
                 }
                 selected_input_bytes = next;
@@ -17633,7 +17648,7 @@ impl CayenneTableProvider {
                 table = self.table_metadata.table_name.as_str(),
                 candidates = candidate_ids.len(),
                 keep_recent = BAKE_KEEP_RECENT_SNAPSHOTS,
-                budget_truncated,
+                stopped_early = stopped_early.unwrap_or("none"),
                 max_pass_bytes = max_pass_bytes.unwrap_or(u64::MAX),
                 "Skipping seq-prefix bake: fewer than two older snapshots fit the pass memory \
                  budget"
@@ -17656,7 +17671,7 @@ impl CayenneTableProvider {
             deletion_index_len = deletion_snapshot.delete_len(),
             selected_input_bytes,
             max_pass_bytes = max_pass_bytes.unwrap_or(u64::MAX),
-            budget_truncated,
+            stopped_early = stopped_early.unwrap_or("none"),
             "Running seq-prefix bake (consolidating the clean older prefix)"
         );
 
