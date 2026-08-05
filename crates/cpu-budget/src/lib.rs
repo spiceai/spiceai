@@ -180,6 +180,76 @@ impl std::fmt::Display for CpuShare {
     }
 }
 
+/// Watches the cgroup CPU share for movement after the budget was installed.
+///
+/// In-place pod resize is [GA in Kubernetes 1.35](https://kubernetes.io/blog/2025/12/19/kubernetes-v1-35-in-place-pod-resize-ga),
+/// so a VPA-managed pod's `requests.cpu` can change underneath a running process.
+/// The budget resolves once into a `OnceLock` and every consumer captured its
+/// derived quantities at startup, so a fleet silently sized for a request that no
+/// longer exists is not diagnosable from a startup log.
+///
+/// This notices and says so. It cannot act: nothing here re-installs the budget,
+/// so [`Error::AlreadyInstalled`] stays unreachable on this path, and the honest
+/// way to pick up a new size is a restart.
+///
+/// The *raw* share is what makes this sound. Comparing a reading against itself
+/// needs no conversion, so the writer-specific share-to-request mapping (see
+/// [`cgroup::parse_cpu_weight`]) cannot mislead it — and the declared request
+/// cannot serve here at all, because `resourceFieldRef` resolves once at
+/// container creation and does not change on a resize.
+pub struct ShareDriftWatcher {
+    /// The entitlement still in force, rendered once.
+    entitlement: String,
+    /// The last share observed, encoded — see [`encode_share`]. Lock-free because
+    /// this is read on a timer and written only when the value moves.
+    last: std::sync::atomic::AtomicU64,
+}
+
+/// Pack `Option<CpuShare>` into a `u64`: a two-bit tag, then the value.
+///
+/// A weight is at most 10000 and a share at most 262144, so nothing is truncated.
+const fn encode_share(share: Option<CpuShare>) -> u64 {
+    match share {
+        None => 0,
+        Some(CpuShare::Weight(weight)) => (weight << 2) | 1,
+        Some(CpuShare::Shares(shares)) => (shares << 2) | 2,
+    }
+}
+
+/// Render an encoded share the way [`CpuShare`] renders itself.
+fn describe_share(encoded: u64) -> String {
+    match encoded & 0b11 {
+        1 => CpuShare::Weight(encoded >> 2).to_string(),
+        2 => CpuShare::Shares(encoded >> 2).to_string(),
+        _ => "unset".to_string(),
+    }
+}
+
+impl ShareDriftWatcher {
+    /// The message to log when the share has moved since the last observation.
+    ///
+    /// Returns `Some` once per change rather than on every poll: an unchanged
+    /// reading is silent, and a *further* change is new information and speaks
+    /// again.
+    #[must_use]
+    pub fn observe(&self, current: Option<CpuShare>) -> Option<String> {
+        let current = encode_share(current);
+        let previous = self
+            .last
+            .swap(current, std::sync::atomic::Ordering::Relaxed);
+        if previous == current {
+            return None;
+        }
+        Some(format!(
+            "This pod's CPU share changed from {before} to {after} after startup; spiced is still \
+             sized for {entitlement}. Restart to apply the new request. See: {DOCS_URL}",
+            before = describe_share(previous),
+            after = describe_share(current),
+            entitlement = self.entitlement,
+        ))
+    }
+}
+
 /// What the host reports about this process's CPU entitlement.
 ///
 /// Split out from [`CpuBudget::resolve`] so the whole detection ladder is a pure
@@ -834,6 +904,19 @@ impl CpuBudget {
             entitlement = format_millicores(self.millicores),
             origin = self.origin(),
         ))
+    }
+
+    /// A watcher seeded with the cgroup share this budget was resolved against.
+    ///
+    /// Poll it on a timer with a fresh [`detect_cpu_share`] and log whatever it
+    /// returns — see [`ShareDriftWatcher`] for why the share rather than the
+    /// declared request.
+    #[must_use]
+    pub fn share_drift_watcher(&self) -> ShareDriftWatcher {
+        ShareDriftWatcher {
+            entitlement: format_millicores(self.millicores),
+            last: std::sync::atomic::AtomicU64::new(encode_share(self.cpu_share)),
+        }
     }
 
     // ---- the entitlement ----
@@ -1624,6 +1707,86 @@ mod tests {
     fn new_sources_are_labelled() {
         assert_eq!(CpuSource::RequestBurst.as_str(), "request_burst");
         assert_eq!(CpuSource::AllCores.as_str(), "all_cores");
+    }
+
+    /// Drift speaks once per change, stays silent otherwise, and never resizes
+    /// anything.
+    #[test]
+    fn share_drift_is_reported_once_per_change() {
+        let budget = CpuBudget::resolve(
+            &CpuConfig::default(),
+            &HostReadings {
+                affinity_cores: 64,
+                cpu_share: Some(CpuShare::Weight(174)),
+                declared_request_millicores: Some(4000),
+                kubernetes: true,
+                ..HostReadings::default()
+            },
+        )
+        .expect("valid");
+        let watcher = budget.share_drift_watcher();
+
+        // The reading it was seeded with is not a change.
+        assert_eq!(watcher.observe(Some(CpuShare::Weight(174))), None);
+        assert_eq!(watcher.observe(Some(CpuShare::Weight(174))), None);
+
+        // A resize moves it, and the message names both readings plus the size
+        // still in force.
+        let drift = watcher
+            .observe(Some(CpuShare::Weight(303)))
+            .expect("a moved share must be reported");
+        assert!(drift.contains("weight 174"), "{drift}");
+        assert!(drift.contains("weight 303"), "{drift}");
+        assert!(drift.contains("8 cores"), "still sized for the old value: {drift}");
+        assert!(drift.contains("Restart"), "{drift}");
+        // Never converts the share to cores, and never claims a new entitlement.
+        assert!(!drift.contains("2.5"), "{drift}");
+
+        // Once, not on every poll.
+        assert_eq!(watcher.observe(Some(CpuShare::Weight(303))), None);
+        assert_eq!(watcher.observe(Some(CpuShare::Weight(303))), None);
+
+        // A further change is new information.
+        assert!(watcher.observe(Some(CpuShare::Weight(59))).is_some());
+
+        // Disappearing and reappearing are both changes, rendered as "unset".
+        let gone = watcher.observe(None).expect("a vanished share is a change");
+        assert!(gone.contains("to unset"), "{gone}");
+        let back = watcher
+            .observe(Some(CpuShare::Shares(2048)))
+            .expect("a returning share is a change");
+        assert!(back.contains("from unset"), "{back}");
+        assert!(back.contains("2048 shares"), "{back}");
+
+        // The budget itself is untouched — the watcher cannot resize anything, so
+        // `AlreadyInstalled` is unreachable from here.
+        assert_eq!(budget.cores(), 8);
+        assert_eq!(budget.source(), CpuSource::RequestBurst);
+    }
+
+    /// The encoding is only sound if it round-trips every reading the kernel can
+    /// produce, including the extremes of both ranges.
+    #[test]
+    fn share_encoding_round_trips() {
+        for share in [
+            None,
+            Some(CpuShare::Weight(1)),
+            Some(CpuShare::Weight(100)),
+            Some(CpuShare::Weight(10_000)),
+            Some(CpuShare::Shares(2)),
+            Some(CpuShare::Shares(1024)),
+            Some(CpuShare::Shares(262_144)),
+        ] {
+            let described = describe_share(encode_share(share));
+            let expected = share.map_or_else(|| "unset".to_string(), |s| s.to_string());
+            assert_eq!(described, expected, "{share:?} must survive encoding");
+        }
+
+        // A weight and a share of the same number must not collide.
+        assert_ne!(
+            encode_share(Some(CpuShare::Weight(100))),
+            encode_share(Some(CpuShare::Shares(100)))
+        );
     }
 
     #[test]
