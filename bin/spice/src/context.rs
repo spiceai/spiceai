@@ -23,6 +23,7 @@ use crate::error::{
 };
 use snafu::ResultExt;
 use spice_cloud_client::endpoints::data_endpoint as spice_cloud_data_endpoint;
+use spice_cloud_client::redirect::same_origin_redirect_policy;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
@@ -34,51 +35,14 @@ const SPICED_FILENAME: &str = "spiced";
 const SPICEPODS_DIR: &str = "spicepods";
 const WSL_ENV_KEYS: [&str; 2] = ["WSL_DISTRO_NAME", "WSL_INTEROP"];
 
-/// How many same-origin redirects to follow before giving up, matching `reqwest`'s own
-/// default depth.
+/// Treat a blank credential as absent.
 ///
-/// Compared the way `reqwest::redirect::Policy::limited` compares it — `previous().len()`
-/// counts the initial URL as well, so the bound is exclusive.
-const MAX_REDIRECTS: usize = 10;
-
-/// Whether two URLs share an origin: scheme, host and effective port.
-///
-/// `port_or_known_default` is what makes `http://host` and `http://host:80` the same
-/// origin; `Url` has already lowercased the host by the time it gets here.
-fn is_same_origin(previous: &reqwest::Url, next: &reqwest::Url) -> bool {
-    previous.scheme() == next.scheme()
-        && previous.host_str() == next.host_str()
-        && previous.port_or_known_default() == next.port_or_known_default()
-}
-
-/// A redirect policy that follows same-origin redirects and refuses to leave the origin.
-///
-/// Every CLI request carries the API key in an `X-API-Key` header. On a cross-origin
-/// redirect `reqwest` strips only the standard credential headers — `Authorization`,
-/// `Cookie`, `Cookie2`, `Proxy-Authorization`, `WWW-Authenticate` — so a custom header
-/// rides along to whatever the `Location` names. A runtime, proxy or ingress answering
-/// with an off-origin `Location` would therefore be handed the key (#12495).
-///
-/// Stopping (rather than erroring) hands the 3xx back to the caller as a response, which
-/// keeps a redirect a diagnosable condition instead of a transport failure.
-#[must_use]
-pub fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
-    reqwest::redirect::Policy::custom(|attempt| {
-        let Some(previous) = attempt.previous().last() else {
-            // No previous hop to compare against: nothing proves this stays on origin.
-            return attempt.stop();
-        };
-
-        if !is_same_origin(previous, attempt.url()) {
-            return attempt.stop();
-        }
-
-        if attempt.previous().len() > MAX_REDIRECTS {
-            return attempt.stop();
-        }
-
-        attempt.follow()
-    })
+/// A credential that is empty or whitespace-only cannot authenticate anything, so
+/// carrying it as `Some` only means an empty header goes out on the wire and any
+/// fallback that keys off `is_none` is suppressed. The value is otherwise kept
+/// verbatim -- only the all-blank case is discarded.
+fn normalize_credential(value: Option<String>) -> Option<String> {
+    value.filter(|key| !key.trim().is_empty())
 }
 
 /// Runtime context holding paths and configuration for CLI operations.
@@ -181,7 +145,7 @@ impl RuntimeContext {
             ctx.cloud_region = Some(region.to_string());
         }
 
-        ctx.api_key = api_key;
+        ctx.api_key = normalize_credential(api_key);
         ctx.tls_root_certificate_file = tls_root_certificate_file;
 
         // Load API key from .env if not provided
@@ -202,8 +166,42 @@ impl RuntimeContext {
         )
     }
 
-    /// Load API key from .env or .env.local file.
+    /// Load API key from the environment or a .env / .env.local file.
+    ///
+    /// `SPICE_API_KEY` is checked before the files because `--api-key` is declared
+    /// with `env = "SPICE_API_KEY"`: clap resolves that variable itself whenever the
+    /// flag is omitted, so consulting it first here is what makes a blank
+    /// `--api-key` resolve to the same key that omitting the flag would.
     fn load_api_key_from_env(&self) -> Option<String> {
+        self.resolve_api_key(|key| std::env::var(key).ok())
+    }
+
+    /// `load_api_key_from_env` with the environment lookup injected, so the precedence
+    /// between the process environment and the app's .env files is testable without
+    /// mutating this process's environment.
+    fn resolve_api_key<F>(&self, mut get_env: F) -> Option<String>
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        if let Some(api_key) = normalize_credential(get_env("SPICE_API_KEY")) {
+            return Some(api_key);
+        }
+
+        if let Some(api_key) = self.load_api_key_from_env_files() {
+            return Some(api_key);
+        }
+
+        normalize_credential(get_env("SPICE_SPICEAI_API_KEY"))
+    }
+
+    /// Load API key from the app's .env.local or .env file.
+    ///
+    /// The first matching entry wins, exactly as before -- .env.local outranks .env,
+    /// and within a file the earlier line wins. A blank value is authoritative but is
+    /// never a credential: `spice login` writes `SPICE_SPICEAI_API_KEY=` for an app
+    /// that has no key, so a blank resolves to `None` rather than falling through to
+    /// an older key in a lower-precedence file.
+    fn load_api_key_from_env_files(&self) -> Option<String> {
         // Try .env.local first, then .env
         let env_files = [".env.local", ".env"];
 
@@ -214,16 +212,13 @@ impl RuntimeContext {
             {
                 for item in env_map.flatten() {
                     if item.0 == "SPICE_SPICEAI_API_KEY" || item.0 == "SPICE_API_KEY" {
-                        return Some(item.1);
+                        return normalize_credential(Some(item.1));
                     }
                 }
             }
         }
 
-        // Also check environment variables
-        std::env::var("SPICE_API_KEY")
-            .or_else(|_| std::env::var("SPICE_SPICEAI_API_KEY"))
-            .ok()
+        None
     }
 
     /// Get the Spice runtime directory (~/.spice).
@@ -539,33 +534,151 @@ impl RuntimeContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{TcpListener, TcpStream};
     use tempfile::TempDir;
 
-    fn url(value: &str) -> reqwest::Url {
-        reqwest::Url::parse(value).expect("test URL should parse")
+    /// How long a request that must not hang is given before the test fails it. Well under
+    /// the context client's own 30-second timeout, so a regression fails fast instead of
+    /// stalling.
+    const TEST_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// Read the request head so the client's write completes before we reply. Closing a
+    /// socket with unread request data still buffered can surface as a reset rather than the
+    /// response under test, which on Windows is packetisation dependent and so intermittent.
+    fn drain_request_head(stream: &mut TcpStream) {
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+            if line == "\r\n" || line == "\n" {
+                return;
+            }
+        }
     }
 
-    /// The origin check is what keeps the API key on the runtime it was meant for: the CLI
-    /// sends it in an `X-API-Key` header, and `reqwest` strips only the standard credential
-    /// headers when a redirect crosses origin, so a custom one would ride along (#12495).
-    #[test]
-    fn test_is_same_origin_matches_scheme_host_and_effective_port() {
-        let base = url("http://host:8090/v1/status");
-        assert!(is_same_origin(&base, &url("http://host:8090/v1/ready")));
+    fn serve_once(listener: &TcpListener, response: &str) {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        drain_request_head(&mut stream);
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    }
 
-        // An implicit default port is the same origin as the explicit one.
-        let implicit_http = url("http://host/a");
-        let explicit_http = url("http://host:80/b");
-        assert!(is_same_origin(&implicit_http, &explicit_http));
+    fn localhost_listener() -> TcpListener {
+        TcpListener::bind("127.0.0.1:0").expect("test listener should bind")
+    }
 
-        let implicit_https = url("https://host/a");
-        let explicit_https = url("https://host:443/b");
-        assert!(is_same_origin(&implicit_https, &explicit_https));
+    fn local_port(listener: &TcpListener) -> u16 {
+        listener
+            .local_addr()
+            .expect("listener should have a local address")
+            .port()
+    }
 
-        // A different port, host or scheme is a different origin — the key must not follow.
-        assert!(!is_same_origin(&base, &url("http://host:9090/v1")));
-        assert!(!is_same_origin(&base, &url("http://elsewhere:8090/v1")));
-        assert!(!is_same_origin(&implicit_http, &implicit_https));
+    /// Every request the CLI makes through this context carries the API key in an
+    /// `X-API-Key` header, which `reqwest` does not strip on a cross-origin redirect. A
+    /// runtime, proxy or ingress answering with an off-origin `Location` must therefore be
+    /// refused rather than handed the key (#12495).
+    ///
+    /// Goes through `with_args` so the client under test is the one `RuntimeContext::new`
+    /// builds — a test that assembled its own client would still pass if the policy were
+    /// dropped from the constructor.
+    #[tokio::test]
+    async fn test_context_client_does_not_follow_a_cross_origin_redirect() {
+        let runtime = localhost_listener();
+        let elsewhere = localhost_listener();
+        let elsewhere_port = local_port(&elsewhere);
+        let runtime_port = local_port(&runtime);
+
+        // Nothing should ever connect here; poll without blocking after the call returns.
+        elsewhere
+            .set_nonblocking(true)
+            .expect("listener should go non-blocking");
+
+        let response = format!(
+            "HTTP/1.1 307 Temporary Redirect\r\n\
+             Location: http://127.0.0.1:{elsewhere_port}/collect\r\n\
+             Content-Length: 0\r\n\
+             Connection: close\r\n\r\n"
+        );
+        let server = std::thread::spawn(move || serve_once(&runtime, &response));
+
+        let ctx = RuntimeContext::with_args(
+            Some(format!("http://127.0.0.1:{runtime_port}")),
+            Some("SECRETKEY".to_string()),
+            None,
+            None,
+        )
+        .expect("context should build");
+
+        // On the default policy the client follows the hop and then waits on a listener that
+        // never answers, so without this bound the regression surfaces only as a stall.
+        let got = tokio::time::timeout(TEST_REQUEST_TIMEOUT, ctx.get("/v1/status"))
+            .await
+            .expect("a refused redirect must return promptly, not hang")
+            .expect("the 307 should come back as a response");
+
+        // Stopped at the redirect rather than followed, and the 3xx is still diagnosable.
+        assert_eq!(got.status().as_u16(), 307);
+
+        // `WouldBlock` specifically: any other error would mean the listener itself failed,
+        // which is not evidence that nothing ever connected to it.
+        let contacted = elsewhere.accept();
+        let refused_kind = contacted.as_ref().err().map(std::io::Error::kind);
+        assert_eq!(
+            refused_kind,
+            Some(std::io::ErrorKind::WouldBlock),
+            "the off-origin listener must never be contacted"
+        );
+
+        server.join().expect("server thread should not panic");
+    }
+
+    /// The policy must not break a legitimate same-origin redirect on a runtime endpoint.
+    #[tokio::test]
+    async fn test_context_client_follows_a_same_origin_redirect() {
+        let listener = localhost_listener();
+        let port = local_port(&listener);
+
+        let redirect = format!(
+            "HTTP/1.1 307 Temporary Redirect\r\n\
+             Location: http://127.0.0.1:{port}/v1/status/retry\r\n\
+             Content-Length: 0\r\n\
+             Connection: close\r\n\r\n"
+        );
+        let ok = "HTTP/1.1 200 OK\r\n\
+                  Content-Type: application/json\r\n\
+                  Content-Length: 11\r\n\
+                  Connection: close\r\n\r\n\
+                  {\"ok\":true}";
+        let server = std::thread::spawn(move || {
+            serve_once(&listener, &redirect);
+            serve_once(&listener, ok);
+        });
+
+        let ctx = RuntimeContext::with_args(
+            Some(format!("http://127.0.0.1:{port}")),
+            Some("SECRETKEY".to_string()),
+            None,
+            None,
+        )
+        .expect("context should build");
+
+        let got = tokio::time::timeout(TEST_REQUEST_TIMEOUT, ctx.get("/v1/status"))
+            .await
+            .expect("the same-origin redirect chain must not hang")
+            .expect("the followed redirect should return a response");
+
+        assert_eq!(got.status().as_u16(), 200);
+
+        server.join().expect("server thread should not panic");
     }
 
     /// Helper to create a `RuntimeContext` with a mocked spiced binary for testing.
@@ -973,6 +1086,152 @@ mod tests {
             .expect("with_args should succeed");
 
         assert_eq!(ctx.api_key(), Some("test-key"));
+    }
+
+    #[test]
+    fn test_normalize_credential_discards_blank_values() {
+        assert_eq!(normalize_credential(None), None);
+        assert_eq!(normalize_credential(Some(String::new())), None);
+        assert_eq!(normalize_credential(Some("   ".to_string())), None);
+        assert_eq!(normalize_credential(Some("\t\r\n".to_string())), None);
+    }
+
+    #[test]
+    fn test_normalize_credential_keeps_a_real_key_verbatim() {
+        assert_eq!(
+            normalize_credential(Some("real-key".to_string())),
+            Some("real-key".to_string())
+        );
+        // Surrounding whitespace decides only whether the value is blank; a key that
+        // has any content is passed through exactly as supplied.
+        assert_eq!(
+            normalize_credential(Some(" real-key ".to_string())),
+            Some(" real-key ".to_string())
+        );
+    }
+
+    #[test]
+    fn test_with_args_treats_an_empty_api_key_as_absent() {
+        // Regression: `--api-key ""` used to be carried as Some("") -- it suppressed the
+        // .env fallback and every authenticated request went out with a blank credential.
+        // The resolved key may legitimately come from the environment here, so what is
+        // asserted is that the blank flag itself is never what gets carried.
+        for blank in ["", "   ", "\t"] {
+            let ctx = RuntimeContext::with_args(None, Some(blank.to_string()), None, None)
+                .expect("with_args should succeed");
+
+            assert_ne!(
+                ctx.api_key(),
+                Some(blank),
+                "an explicitly blank --api-key must not be carried verbatim"
+            );
+            assert!(
+                ctx.api_key().is_none_or(|key| !key.trim().is_empty()),
+                "a blank --api-key must never resolve to a blank credential"
+            );
+        }
+    }
+
+    /// A context whose app dir is an isolated temp dir, for the .env lookup tests.
+    /// The `TempDir` must be kept alive for the test.
+    fn create_test_context_with_app_dir() -> (RuntimeContext, TempDir) {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let mut ctx = create_test_context();
+        ctx.app_dir = temp_dir.path().to_path_buf();
+
+        (ctx, temp_dir)
+    }
+
+    /// Write one of the app dir's env files for a .env lookup test.
+    fn write_env_file(dir: &TempDir, name: &str, contents: &str) {
+        std::fs::write(dir.path().join(name), contents).expect("write env file");
+    }
+
+    #[test]
+    fn test_load_api_key_from_env_files_returns_a_stored_key() {
+        let (ctx, temp_dir) = create_test_context_with_app_dir();
+        write_env_file(&temp_dir, ".env", "SPICE_API_KEY=real-key\n");
+
+        assert_eq!(
+            ctx.load_api_key_from_env_files(),
+            Some("real-key".to_string())
+        );
+    }
+
+    #[test]
+    fn test_load_api_key_from_env_files_prefers_env_local() {
+        let (ctx, temp_dir) = create_test_context_with_app_dir();
+        write_env_file(&temp_dir, ".env.local", "SPICE_API_KEY=local-key\n");
+        write_env_file(&temp_dir, ".env", "SPICE_API_KEY=plain-key\n");
+
+        assert_eq!(
+            ctx.load_api_key_from_env_files(),
+            Some("local-key".to_string())
+        );
+    }
+
+    #[test]
+    fn test_load_api_key_from_env_files_treats_a_stored_blank_as_no_key() {
+        let (ctx, temp_dir) = create_test_context_with_app_dir();
+        // `spice login` writes SPICE_SPICEAI_API_KEY= for an app that has no key, so a
+        // blank is a deliberate "no key" -- it must resolve to None rather than either
+        // becoming a blank credential or resurrecting an older key from .env.
+        write_env_file(&temp_dir, ".env.local", "SPICE_SPICEAI_API_KEY=\n");
+        write_env_file(&temp_dir, ".env", "SPICE_API_KEY=older-key\n");
+
+        assert_eq!(ctx.load_api_key_from_env_files(), None);
+    }
+
+    #[test]
+    fn test_load_api_key_from_env_files_without_any_env_file() {
+        let (ctx, _temp_dir) = create_test_context_with_app_dir();
+
+        assert_eq!(ctx.load_api_key_from_env_files(), None);
+    }
+
+    /// An env lookup for the resolve tests: `name` is set to `value`, nothing else is.
+    fn only_env(name: &'static str, value: &'static str) -> impl FnMut(&str) -> Option<String> {
+        move |key| (key == name).then(|| value.to_string())
+    }
+
+    #[test]
+    fn test_resolve_api_key_prefers_the_process_environment() {
+        // --api-key is declared `env = "SPICE_API_KEY"`, so clap resolves that variable
+        // itself when the flag is omitted. This fallback has to agree with clap:
+        // otherwise a blank --api-key would resolve to the .env key while omitting the
+        // flag resolved to the environment's, silently selecting a different credential.
+        let (ctx, temp_dir) = create_test_context_with_app_dir();
+        write_env_file(&temp_dir, ".env.local", "SPICE_API_KEY=file-key\n");
+
+        let api_key = ctx.resolve_api_key(only_env("SPICE_API_KEY", "env-key"));
+
+        assert_eq!(api_key, Some("env-key".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_api_key_prefers_files_over_the_legacy_variable() {
+        let (ctx, temp_dir) = create_test_context_with_app_dir();
+        write_env_file(&temp_dir, ".env", "SPICE_API_KEY=file-key\n");
+
+        // A blank primary variable falls through to the files, and a stored key outranks
+        // the legacy variable -- together with the two tests either side of this one,
+        // that pins the whole order: SPICE_API_KEY > .env files > SPICE_SPICEAI_API_KEY.
+        let api_key = ctx.resolve_api_key(|key| match key {
+            "SPICE_API_KEY" => Some("   ".to_string()),
+            "SPICE_SPICEAI_API_KEY" => Some("legacy-key".to_string()),
+            _ => None,
+        });
+
+        assert_eq!(api_key, Some("file-key".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_api_key_uses_the_legacy_variable_last() {
+        let (ctx, _temp_dir) = create_test_context_with_app_dir();
+
+        let api_key = ctx.resolve_api_key(only_env("SPICE_SPICEAI_API_KEY", "legacy-key"));
+
+        assert_eq!(api_key, Some("legacy-key".to_string()));
     }
 
     #[test]

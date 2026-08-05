@@ -171,6 +171,25 @@ impl Embeddings {
     }
 }
 
+/// The revision a model id returned by [`Embeddings::get_model_id`] pins, if any.
+///
+/// Only an `org/model:rev` shape pins one — this defers to
+/// [`HUGGINGFACE_PATH_REGEX`], the same definition the `huggingface:` arm of
+/// `get_model_id` uses, so the two cannot disagree about what a revision is.
+/// Anything the regex does not match has none, which is what keeps a local
+/// filesystem path (including a Windows `C:/models/…`, whose colon is not a
+/// revision separator) out of this.
+///
+/// Callers whose loader cannot pass a revision downstream use this to reject the
+/// configuration with that as the stated reason, rather than sending the whole
+/// `org/model:rev` string to the Hub as a repository name and surfacing the 401
+/// that comes back (#12445).
+#[must_use]
+pub fn pinned_revision(model_id: &str) -> Option<&str> {
+    let caps = HUGGINGFACE_PATH_REGEX.captures(model_id)?;
+    caps.name("revision").map(|m| m.as_str())
+}
+
 pub enum EmbeddingPrefix {
     OpenAi,
     Azure,
@@ -333,6 +352,83 @@ pub struct ColumnEmbeddingConfig {
 mod tests {
     use super::*;
     use crate::component::model::split_hf_model_id;
+
+    fn embedding(from: &str) -> Embeddings {
+        Embeddings::new(from, "test")
+    }
+
+    #[test]
+    fn pinned_revision_reads_the_revision_off_a_hub_id() {
+        for (id, want) in [
+            ("organization/model-name:v1", "v1"),
+            ("organization/model-name:latest", "latest"),
+            ("organization/model-name:my-branch", "my-branch"),
+            ("organization/model-name:v1.2-beta.3", "v1.2-beta.3"),
+            ("organization/my-model.v2:v1", "v1"),
+            // A commit SHA is just another revision as far as the id is concerned.
+            ("minishlab/potion-base-8M:9f1a2b3c4d5e", "9f1a2b3c4d5e"),
+        ] {
+            assert_eq!(
+                pinned_revision(id),
+                Some(want),
+                "expected {id} to pin revision {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_revision_is_none_when_nothing_is_pinned() {
+        for id in [
+            "minishlab/potion-base-8M",
+            "organization/my-model.v2",
+            // Not a hub id at all: a bare name, and the local filesystem paths
+            // `StaticModel::from_pretrained` also accepts. The colon in a Windows
+            // path is a drive separator, not a revision separator — reading it as
+            // one would reject a working local model.
+            "potion-base-8M",
+            "/absolute/path/to/model",
+            "./relative/path/to/model",
+            "C:/models/potion-base-8M",
+            "C:/models",
+            r"C:\models\potion-base-8M",
+            "",
+        ] {
+            assert_eq!(pinned_revision(id), None, "{id} pins nothing");
+        }
+    }
+
+    /// The shape of #12445: `get_model_id` hands the loader an id with the
+    /// revision still glued on, because the `model2vec:` arm is a bare
+    /// `strip_prefix`. The loader has no revision parameter to pass it to, so it
+    /// has to detect this and say so rather than send the whole string to the Hub
+    /// as a repository name and surface the 401 that comes back.
+    #[test]
+    fn a_pinned_model2vec_id_keeps_its_revision_through_get_model_id() {
+        let id = embedding("model2vec:minishlab/potion-base-8M:v1").get_model_id();
+        assert_eq!(id.as_deref(), Some("minishlab/potion-base-8M:v1"));
+        assert_eq!(id.as_deref().and_then(pinned_revision), Some("v1"));
+    }
+
+    #[test]
+    fn an_unpinned_model2vec_id_pins_nothing() {
+        let id = embedding("model2vec:minishlab/potion-base-8M").get_model_id();
+        assert_eq!(id.as_deref(), Some("minishlab/potion-base-8M"));
+        assert_eq!(id.as_deref().and_then(pinned_revision), None);
+    }
+
+    /// The `huggingface:` arm splits and rejoins the id, so a revision survives
+    /// there too — it just has somewhere to go downstream (#12430). Asserted here
+    /// so both arms are visibly held to one notion of a revision.
+    #[test]
+    fn the_huggingface_arm_agrees_about_what_a_revision_is() {
+        let from = "huggingface:huggingface.co/sentence-transformers/all-MiniLM-L6-v2:v1";
+        let id = embedding(from).get_model_id();
+        assert_eq!(
+            id.as_deref(),
+            Some("sentence-transformers/all-MiniLM-L6-v2:v1")
+        );
+        assert_eq!(id.as_deref().and_then(pinned_revision), Some("v1"));
+    }
 
     /// A revision-pinned `HuggingFace` embedding must survive the round trip through
     /// `get_model_id`. `get_model_id` re-joins the revision onto the repo id, so a loader has

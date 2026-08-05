@@ -30,7 +30,10 @@ use runtime_table_partition::provider::PartitionTableProvider;
 use util::RetryError;
 
 use crate::{
-    accelerated_table::{refresh_task::retry_from_df_error, sink::finalize_indexes},
+    accelerated_table::{
+        refresh_task::retry_from_df_error,
+        sink::{finalize_indexes, prepare_indexes, rollback_indexes},
+    },
     datafusion::error::find_datafusion_root,
     dataupdate::StreamingDataUpdateExecutionPlan,
     schema_evolution::SCHEMA_EVOLUTION_DETECTED,
@@ -199,18 +202,14 @@ impl TableSink {
             .flat_map(IndexedTableProvider::get_all_indexes)
             .collect();
 
-        for index in provider_indexes_before
-            .iter()
-            .chain(self.sink_indexes.iter())
-        {
-            tracing::debug!("Running on_write_start for index '{}'", index.name());
-            if let Err(e) = index.on_write_start().await {
-                tracing::warn!(
-                    "TableSink: on_write_start failed for index '{}': {e}. Continuing with write.",
-                    index.name()
-                );
-            }
-        }
+        prepare_indexes(
+            "TableSink",
+            provider_indexes_before
+                .iter()
+                .chain(self.sink_indexes.iter()),
+        )
+        .await
+        .map_err(retry_from_df_error)?;
 
         let collect_start = std::time::Instant::now();
         if let Err(e) = collect(insertion_plan, ctx.task_ctx()).await {
@@ -280,14 +279,11 @@ async fn run_on_write_failed(
         .flat_map(IndexedTableProvider::get_all_indexes)
         .collect();
 
-    for index in provider_indexes.iter().chain(sink_indexes.iter()) {
-        if let Err(e) = index.on_write_failed().await {
-            tracing::warn!(
-                "TableSink: on_write_failed failed for index '{}': {e}. Index write state may need manual cleanup.",
-                index.name()
-            );
-        }
-    }
+    rollback_indexes(
+        "TableSink",
+        provider_indexes.iter().chain(sink_indexes.iter()),
+    )
+    .await;
 }
 
 #[cfg(test)]

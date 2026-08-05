@@ -92,6 +92,8 @@ const CAYENNE_METASTORE_WAL_AUTOCHECKPOINT_PAGES_PARAM: &str =
 const CAYENNE_METASTORE_WAL_TRUNCATE_THRESHOLD_MB_PARAM: &str =
     "cayenne_metastore_wal_truncate_threshold_mb";
 const CAYENNE_METASTORE_AUTO_VACUUM_PARAM: &str = "cayenne_metastore_auto_vacuum";
+const CAYENNE_METASTORE_INCREMENTAL_VACUUM_PAGES_PARAM: &str =
+    "cayenne_metastore_incremental_vacuum_pages";
 
 /// Runtime param: fraction of `runtime.query.memory_limit` carved into a
 /// dedicated Cayenne compaction memory pool when Cayenne acceleration is
@@ -117,6 +119,7 @@ const KNOWN_CAYENNE_RUNTIME_PARAMS: &[&str] = &[
     CAYENNE_METASTORE_WAL_AUTOCHECKPOINT_PAGES_PARAM,
     CAYENNE_METASTORE_WAL_TRUNCATE_THRESHOLD_MB_PARAM,
     CAYENNE_METASTORE_AUTO_VACUUM_PARAM,
+    CAYENNE_METASTORE_INCREMENTAL_VACUUM_PAGES_PARAM,
     CAYENNE_GOAL_REPLICATION_LAG_PARAM,
     CAYENNE_GOAL_FRESHNESS_PARAM,
     CAYENNE_GOAL_QUERY_LATENCY_PARAM,
@@ -447,6 +450,13 @@ impl RuntimeBuilder {
                         cayenne::SqliteAutoVacuum::None
                     }
                 };
+            }
+            if let Some(v) = parse_usize_runtime_param(
+                &spicepod_rt.params,
+                CAYENNE_METASTORE_INCREMENTAL_VACUUM_PAGES_PARAM,
+            ) {
+                metastore_cfg.incremental_vacuum_pages =
+                    u32::try_from(v).unwrap_or(metastore_cfg.incremental_vacuum_pages);
             }
             cayenne::set_sqlite_metastore_config(metastore_cfg);
         }

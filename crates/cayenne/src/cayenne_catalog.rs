@@ -180,6 +180,14 @@ impl MetastoreImpl {
         }
     }
 
+    pub(crate) async fn incremental_vacuum(&self) -> CatalogResult<u64> {
+        match self {
+            MetastoreImpl::Sqlite(m) => m.incremental_vacuum().await,
+            #[cfg(feature = "turso")]
+            MetastoreImpl::Turso(m) => m.incremental_vacuum().await,
+        }
+    }
+
     /// Begin a transaction on the underlying metastore.
     ///
     /// Each backend sends the appropriate BEGIN statement (e.g. `BEGIN TRANSACTION`
@@ -1822,6 +1830,10 @@ impl MetadataCatalog for CayenneCatalog {
     /// PASSIVE checkpoint (delegated to the backend).
     async fn checkpoint_wal(&self) -> CatalogResult<()> {
         self.metastore.checkpoint_wal().await
+    }
+
+    async fn incremental_vacuum(&self) -> CatalogResult<u64> {
+        self.metastore.incremental_vacuum().await
     }
 
     async fn list_table_names(&self) -> CatalogResult<Vec<String>> {
