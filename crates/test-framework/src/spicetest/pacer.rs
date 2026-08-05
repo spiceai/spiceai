@@ -42,17 +42,35 @@ pub struct QueryPacer {
 }
 
 impl QueryPacer {
+    /// Interval floor. Above ~1e9 queries per second `1 / target_qps` rounds to
+    /// a zero interval, which would leave `next_slot` permanently in the past
+    /// and silently drop pacing; a nanosecond keeps the schedule advancing.
+    const MIN_INTERVAL: Duration = Duration::from_nanos(1);
+
+    /// Interval ceiling. `1 / target_qps` grows without bound as the rate
+    /// approaches zero — far enough to overflow `Duration`, and then to overflow
+    /// the `Instant` arithmetic in [`Self::acquire`]. A day between queries is
+    /// already not a load test, so clamping here costs nothing real and keeps
+    /// both the constructor and the schedule total.
+    const MAX_INTERVAL: Duration = Duration::from_hours(24);
+
     /// Build a pacer for `target_qps` queries per second across the whole test.
     ///
     /// Returns `None` for a non-positive rate, which is how callers spell "run
-    /// closed-loop" — the historical behaviour.
+    /// closed-loop" — the historical behaviour. Any positive rate yields a
+    /// pacer: an out-of-range one is clamped rather than rejected, since
+    /// falling back to closed-loop would hand the caller an unbounded rate when
+    /// they asked for a bounded one.
     #[must_use]
     pub fn new(target_qps: f64) -> Option<Arc<Self>> {
         if !target_qps.is_finite() || target_qps <= 0.0 {
             return None;
         }
+        let interval = Duration::try_from_secs_f64(1.0 / target_qps)
+            .unwrap_or(Duration::MAX)
+            .clamp(Self::MIN_INTERVAL, Self::MAX_INTERVAL);
         Some(Arc::new(Self {
-            interval: Duration::from_secs_f64(1.0 / target_qps),
+            interval,
             next_slot: Mutex::new(Instant::now()),
         }))
     }
@@ -90,6 +108,30 @@ mod tests {
         assert!(QueryPacer::new(-5.0).is_none());
         assert!(QueryPacer::new(f64::NAN).is_none());
         assert!(QueryPacer::new(1000.0).is_some());
+    }
+
+    /// Both ends of the rate range have to stay on the rails: the constructor is
+    /// reachable from a `--target-qps` the user typed.
+    #[test]
+    fn an_out_of_range_rate_is_clamped_rather_than_fatal() {
+        // `1 / f64::MIN_POSITIVE` is infinite and cannot be a `Duration` at all.
+        let too_slow = QueryPacer::new(f64::MIN_POSITIVE).expect("pacer");
+        assert_eq!(too_slow.interval, QueryPacer::MAX_INTERVAL);
+
+        // `1 / 1e18` rounds to a zero interval, which would disable pacing.
+        let too_fast = QueryPacer::new(1e18).expect("pacer");
+        assert_eq!(too_fast.interval, QueryPacer::MIN_INTERVAL);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_clamped_interval_still_schedules_without_overflowing() {
+        let pacer = QueryPacer::new(f64::MIN_POSITIVE).expect("pacer");
+        let start = Instant::now();
+        // The first slot is immediate; the second is one clamped interval out,
+        // and computing it must not overflow the `Instant`.
+        pacer.acquire().await;
+        pacer.acquire().await;
+        assert_eq!(start.elapsed(), QueryPacer::MAX_INTERVAL);
     }
 
     #[tokio::test(start_paused = true)]
