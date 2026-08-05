@@ -2157,10 +2157,19 @@ mod tests {
             "should fetch all data as 3 seconds is enough to cover all time span in source with millis",
         )
         .await;
+        // `duplicated_incoming_data` serves the source batch twice, so the source holds two
+        // copies of every row in 4..=10 - 14 rows - against the four already stored. Only
+        // `9` is stored, and the dedup subtracts the stored rows as a multiset, so it
+        // cancels *one* of the two incoming `9`s and the other is appended: 4 + 13 = 17.
+        //
+        // This expected 16 until #12499. That came from the dedup dropping an incoming row
+        // if any stored row matched it, which cancelled both copies of `9` and lost one row
+        // the source really did hold twice - the defect, not a replay guarantee. Every other
+        // duplicated value survives twice here, so 16 was not even self-consistent about it.
         test(
             vec![4, 5, 6, 7, 8, 9, 10],
             vec![1, 2, 3, 9],
-            16, // all the data
+            17, // all the data, with one of the two incoming `9`s cancelled by the stored one
             Some(TimeFormat::UnixMillis),
             Some(Duration::from_secs(3)),
             true,

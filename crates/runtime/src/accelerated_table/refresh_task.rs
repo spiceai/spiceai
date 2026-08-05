@@ -2718,31 +2718,44 @@ fn filter_records(
                 .collect::<Result<Vec<_>, super::Error>>()?,
         );
 
-        comparators.push(
+        comparators.push((
+            existing.num_rows(),
             make_comparator(
                 &update_struct_array,
                 &existing_struct_array,
                 SortOptions::default(),
             )
             .context(super::FailedToFilterUpdatesSnafu)?,
-        );
+        ));
     }
 
-    // `zip` below would silently ignore existing batches beyond the end of `used`, which
-    // would under-subtract rather than fail. The row counts come from the same batches, so a
-    // mismatch is a caller bug, not input the runtime should tolerate quietly.
-    debug_assert_eq!(
-        comparators.len(),
-        used.len(),
-        "one set of used-flags per existing batch"
-    );
+    // The caller builds `used` from these same batches, so a mismatch is a bug here rather
+    // than bad input - but it must not be a silent one. Too few sets and the `zip` below
+    // would skip existing batches, under-subtracting; a set longer than its batch would
+    // hand the comparator a row index that batch does not have.
+    if used.len() != comparators.len()
+        || comparators
+            .iter()
+            .zip(used.iter())
+            .any(|((rows, _), used_rows)| *rows != used_rows.len())
+    {
+        return Err(ArrowError::ComputeError(format!(
+            "append de-duplication state does not describe the rows being compared: \
+             {} existing batches holding {} rows, against {} sets of {} claim flags",
+            comparators.len(),
+            comparators.iter().map(|(rows, _)| rows).sum::<usize>(),
+            used.len(),
+            used.iter().map(Vec::len).sum::<usize>(),
+        )))
+        .context(super::FailedToFilterUpdatesSnafu);
+    }
 
     for i in 0..update_data.num_rows() {
         let mut not_matched = true;
         // An existing row cancels at most one incoming row: the first still-unused match
         // claims it. Whole-row equality makes all matches interchangeable, so which one is
         // claimed cannot change how many rows survive.
-        'existing: for (compare, used_rows) in comparators.iter().zip(used.iter_mut()) {
+        'existing: for ((_, compare), used_rows) in comparators.iter().zip(used.iter_mut()) {
             for (j, used_row) in used_rows.iter_mut().enumerate() {
                 if !*used_row && compare(i, j) == Ordering::Equal {
                     *used_row = true;
@@ -3910,6 +3923,47 @@ mod tests {
             dedup_surviving_ids_streamed(&[&[(1, 1)], &[(1, 1)]], &[&[(1, 1)]]),
             vec![1],
             "the single stored copy is cancelled by the first batch, not again by the second"
+        );
+    }
+
+    /// A row matched in a later batch must not strand an unused match in an earlier one: the
+    /// labelled break leaves the batch loop, and the next incoming row restarts at the first.
+    #[test]
+    fn filter_records_can_claim_an_earlier_batch_after_matching_a_later_one() {
+        assert!(
+            dedup_surviving_ids(&[(2, 2), (1, 1)], &[&[(1, 1)], &[(2, 2)]]).is_empty(),
+            "both stored rows are claimed whatever order the incoming rows arrive in"
+        );
+    }
+
+    /// `make_comparator` reports two NULLs in the same position as equal, so a NULL-bearing
+    /// row takes part in the subtraction like any other - cancelled once, not once per copy.
+    #[test]
+    fn filter_records_subtracts_a_null_bearing_row_once() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("day", DataType::Int32, true),
+            Field::new("id", DataType::Int32, false),
+        ]));
+        let null_days = |rows: usize| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int32Array::from(vec![None::<i32>; rows])),
+                    Arc::new(Int32Array::from(vec![7; rows])),
+                ],
+            )
+            .expect("null-bearing batch")
+        };
+
+        let existing = vec![null_days(1)];
+        let mut used = vec![vec![false; 1]];
+        let filtered = filter_records(&null_days(2), &existing, &schema, &mut used)
+            .expect("filter_records should succeed");
+
+        assert_eq!(
+            dedup_ids(&filtered),
+            vec![7],
+            "the one stored NULL-day row cancels one of the two incoming copies"
         );
     }
 
