@@ -151,10 +151,6 @@ loom = { workspace = true }
 
 [[bench]]
 harness = false
-name = "selective_join_pk_probe"
-
-[[bench]]
-harness = false
 name = "zorder_clustering"
 
 [[bench]]
@@ -400,6 +396,11 @@ name = "apply_partial_filter_empty_alloc"
 [[bench]]
 harness = false
 name = "pk_lookup_file_group_fanout"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "selective_join_pk_probe"
 required-features = ["duckdb-bench"]
 
 [[bench]]

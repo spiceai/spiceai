@@ -297,22 +297,30 @@ async fn join_driven_lookup_costs_the_same_as_a_literal_lookup() -> TestResult {
     // The join plan contains TWO scans (parent and child). Compare only the
     // parent's, identified by its projection — counting both would measure the
     // child's scan, not the fan-out under test.
-    let probe_groups = |plan: &str| -> usize {
+    //
+    // `None` rather than a fallback count when the plan cannot be read: a
+    // defaulted number would let the comparison below pass against something
+    // the plan never said, so a change to the EXPLAIN format would silently
+    // stop this test from measuring anything.
+    let probe_groups = |plan: &str| -> Option<usize> {
         plan.split("DataSourceExec")
             .find(|frag| frag.contains("projection=[id, value"))
-            .map_or(0, |frag| {
+            .and_then(|frag| {
                 frag.split_once("file_groups={")
                     .and_then(|(_, tail)| tail.split_once(" group"))
                     .and_then(|(n, _)| n.trim().parse::<usize>().ok())
-                    .unwrap_or(1)
             })
     };
-    let literal_groups = probe_groups(&literal_plan);
-    let join_groups = probe_groups(&join_plan);
-    assert!(
-        literal_groups > 0 && join_groups > 0,
-        "could not locate the probe scan in one of the plans.\n\nliteral:\n{literal_plan}\n\njoin:\n{join_plan}"
-    );
+    let (Some(literal_groups), Some(join_groups)) =
+        (probe_groups(&literal_plan), probe_groups(&join_plan))
+    else {
+        panic!(
+            "could not read the probe scan's file-group count from one of the plans — \
+             it is located by its `projection=[id, value` and its `file_groups={{N group`, \
+             so either the scan is gone or EXPLAIN no longer renders it that way.\
+             \n\nliteral:\n{literal_plan}\n\njoin:\n{join_plan}"
+        )
+    };
 
     assert!(
         join_groups <= literal_groups,

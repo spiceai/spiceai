@@ -233,7 +233,15 @@ async fn load_pair(payload_bytes: usize, file_count: usize) -> (CayenneFixture, 
             cols.push(Arc::new(StringArray::from(payloads)));
         }
         let batch = RecordBatch::try_new(Arc::clone(&p_schema), cols).expect("parent chunk");
-        let _ = cayenne_insert(&parent.table, batch).await;
+        // Assert the acknowledged count: the lanes are sized against an exact
+        // row count (the `wide` lane splits at 16 partitions only because it
+        // clears 10 MB), so an insert that lands short would still benchmark,
+        // just against a table this file's reasoning no longer describes.
+        let acked = cayenne_insert(&parent.table, batch).await;
+        assert_eq!(
+            acked, per as u64,
+            "parent chunk {f} acknowledged {acked} of {per} rows"
+        );
     }
 
     let child = setup_cayenne_custom(
@@ -246,7 +254,13 @@ async fn load_pair(payload_bytes: usize, file_count: usize) -> (CayenneFixture, 
         Arc::new(datafusion::execution::runtime_env::RuntimeEnv::default()),
     )
     .await;
-    let _ = cayenne_insert(&child.table, child_batch(child_schema(), CHILD_ROWS)).await;
+    // A short child would break the premise that `sel = 'sel_K'` matches
+    // exactly one row, which is what makes the build side one row.
+    let acked = cayenne_insert(&child.table, child_batch(child_schema(), CHILD_ROWS)).await;
+    assert_eq!(
+        acked, CHILD_ROWS as u64,
+        "child acknowledged {acked} of {CHILD_ROWS} rows"
+    );
 
     (parent, child)
 }
@@ -345,7 +359,7 @@ async fn load_fact_and_dim(inline: bool) -> (CayenneFixture, CayenneFixture) {
     let ids: Vec<i64> = (0..PARENT_ROWS as i64).collect();
     let dim_ids: Vec<i64> = ids.iter().map(|i| i % DIM_ROWS as i64).collect();
     let values: Vec<i64> = ids.iter().map(|i| i * 7).collect();
-    let _ = cayenne_insert(
+    let acked = cayenne_insert(
         &fact.table,
         RecordBatch::try_new(
             f_schema,
@@ -358,6 +372,10 @@ async fn load_fact_and_dim(inline: bool) -> (CayenneFixture, CayenneFixture) {
         .expect("fact batch"),
     )
     .await;
+    assert_eq!(
+        acked, PARENT_ROWS as u64,
+        "fact acknowledged {acked} of {PARENT_ROWS} rows"
+    );
 
     // The ONLY difference between the lanes. `0` bars admission, so the same
     // rows are written as a Vortex file instead of a metastore row.
@@ -379,7 +397,10 @@ async fn load_fact_and_dim(inline: bool) -> (CayenneFixture, CayenneFixture) {
     .await;
     let d_ids: Vec<i64> = (0..DIM_ROWS as i64).collect();
     let labels: Vec<String> = d_ids.iter().map(|i| format!("label_{i}")).collect();
-    let _ = cayenne_insert(
+    // Both lanes must hold the SAME dimension content — that is the whole point
+    // of the pair — so a short insert on either would make the comparison
+    // measure the row count instead of the tier.
+    let acked = cayenne_insert(
         &dim.table,
         RecordBatch::try_new(
             dim_join_schema(),
@@ -391,6 +412,10 @@ async fn load_fact_and_dim(inline: bool) -> (CayenneFixture, CayenneFixture) {
         .expect("dim batch"),
     )
     .await;
+    assert_eq!(
+        acked, DIM_ROWS as u64,
+        "dimension acknowledged {acked} of {DIM_ROWS} rows (inline={inline})"
+    );
 
     (fact, dim)
 }
