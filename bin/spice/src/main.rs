@@ -738,9 +738,9 @@ fn apply_machine_cloud_mode(command: &mut cloud::CloudCommands) {
             cloud::OrgCommands::Current(args) => args.output = OutputFormat::Json,
             cloud::OrgCommands::Clear => {}
         },
-        cloud::CloudCommands::Runtime(command) => match command {
-            cloud::RuntimeCommands::Status(args) => args.output = OutputFormat::Json,
-            cloud::RuntimeCommands::Datasets(args) => args.output = OutputFormat::Json,
+        cloud::CloudCommands::Instance(command) => match command {
+            cloud::InstanceCommands::Status(args) => args.output = OutputFormat::Json,
+            cloud::InstanceCommands::Datasets(args) => args.output = OutputFormat::Json,
         },
         cloud::CloudCommands::Login(_)
         | cloud::CloudCommands::Logout(_)
@@ -899,10 +899,10 @@ fn is_json_output(cmd: &Commands) -> bool {
             cloud::CloudCommands::Org(cloud::OrgCommands::Current(x)) => {
                 x.output == OutputFormat::Json
             }
-            cloud::CloudCommands::Runtime(cloud::RuntimeCommands::Status(x)) => {
+            cloud::CloudCommands::Instance(cloud::InstanceCommands::Status(x)) => {
                 x.output == OutputFormat::Json
             }
-            cloud::CloudCommands::Runtime(cloud::RuntimeCommands::Datasets(x)) => {
+            cloud::CloudCommands::Instance(cloud::InstanceCommands::Datasets(x)) => {
                 x.output == OutputFormat::Json
             }
             cloud::CloudCommands::Org(cloud::OrgCommands::Clear)

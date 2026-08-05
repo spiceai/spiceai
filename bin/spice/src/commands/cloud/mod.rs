@@ -61,6 +61,7 @@ EXAMPLES
   spice cloud deploy --app spicehq/team-app --wait
   spice cloud deployments --app spicehq/team-app
   spice cloud logs --app spicehq/team-app --level error
+  spice cloud instance status --app spicehq/team-app   # Component readiness
   spice cloud link spicehq/team-app         # Default this directory to an app
 
 Docs: https://spiceai.org/docs/spice-cloud"#
@@ -153,9 +154,9 @@ pub enum CloudCommands {
     /// Show metrics for an app's pods
     Metrics(MetricsArgs),
 
-    /// Inspect the running runtime for an app
+    /// Inspect a running app instance
     #[command(subcommand)]
-    Runtime(RuntimeCommands),
+    Instance(InstanceCommands),
 }
 
 // ============================================================================
@@ -232,16 +233,16 @@ pub struct OrgCurrentArgs {
 }
 
 #[derive(Subcommand, Debug)]
-pub enum RuntimeCommands {
-    /// Show pod and component readiness for a deployed app
-    Status(RuntimeStatusArgs),
+pub enum InstanceCommands {
+    /// Show component readiness for a running app instance
+    Status(InstanceStatusArgs),
 
-    /// Show dataset load state for a deployed app
-    Datasets(RuntimeDatasetsArgs),
+    /// Show dataset load state for a running app instance
+    Datasets(InstanceDatasetsArgs),
 }
 
 #[derive(Args, Debug)]
-pub struct RuntimeStatusArgs {
+pub struct InstanceStatusArgs {
     /// App name in org/app format (uses linked app if not specified)
     #[arg(long)]
     pub app: Option<String>,
@@ -252,7 +253,7 @@ pub struct RuntimeStatusArgs {
 }
 
 #[derive(Args, Debug)]
-pub struct RuntimeDatasetsArgs {
+pub struct InstanceDatasetsArgs {
     /// App name in org/app format (uses linked app if not specified)
     #[arg(long)]
     pub app: Option<String>,
@@ -894,7 +895,7 @@ pub async fn execute(ctx: &RuntimeContext, args: &CloudArgs) -> Result<()> {
         CloudCommands::Inspect(inspect_args) => execute_inspect(inspect_args, org).await,
         CloudCommands::ApiKeys(api_keys_args) => execute_api_keys(api_keys_args, org).await,
         CloudCommands::Metrics(metrics_args) => execute_metrics(metrics_args, org).await,
-        CloudCommands::Runtime(runtime_cmd) => execute_runtime(ctx, runtime_cmd, org).await,
+        CloudCommands::Instance(instance_cmd) => execute_instance(ctx, instance_cmd, org).await,
     }
 }
 
@@ -2890,7 +2891,7 @@ async fn execute_inspect(args: &InspectArgs, flag_org: Option<&str>) -> Result<(
         for pod in &pods {
             println!("  {pod}");
         }
-        println!("  Component readiness: spice cloud runtime status --app {target}");
+        println!("  Component readiness: spice cloud instance status --app {target}");
     }
 
     Ok(())
@@ -3069,26 +3070,26 @@ fn parse_window(s: &str) -> std::result::Result<String, String> {
 // Runtime inspection (data plane)
 // ============================================================================
 
-/// A component reported by the runtime's `/v1/status` endpoint.
+/// A component reported by an app instance's `/v1/status` endpoint.
 ///
 /// This endpoint reports connection endpoints only — `http`, `flight`,
 /// `metrics`, `opentelemetry`. Dataset state comes from `/v1/datasets`.
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
-struct RuntimeComponentStatus {
+struct InstanceComponentStatus {
     name: String,
     status: String,
     #[serde(default)]
     endpoint: Option<String>,
 }
 
-/// A dataset reported by the runtime's `/v1/datasets?status=true` endpoint.
+/// A dataset reported by an app instance's `/v1/datasets?status=true` endpoint.
 ///
 /// Mirrors the fields of `runtime_api_types::v1::datasets::DatasetInfo` that
 /// matter for diagnosis. Declared locally rather than depending on the runtime
 /// crate: the CLI must not pull in the runtime's dependency tree, and unknown
 /// fields are ignored so a runtime newer than the CLI still parses.
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
-struct RuntimeDatasetInfo {
+struct InstanceDatasetInfo {
     name: String,
     from: String,
     #[serde(default)]
@@ -3101,14 +3102,14 @@ struct RuntimeDatasetInfo {
     error_message: Option<String>,
 }
 
-async fn execute_runtime(
+async fn execute_instance(
     ctx: &RuntimeContext,
-    cmd: &RuntimeCommands,
+    cmd: &InstanceCommands,
     flag_org: Option<&str>,
 ) -> Result<()> {
     let (app_flag, output) = match cmd {
-        RuntimeCommands::Status(args) => (args.app.as_deref(), args.output),
-        RuntimeCommands::Datasets(args) => (args.app.as_deref(), args.output),
+        InstanceCommands::Status(args) => (args.app.as_deref(), args.output),
+        InstanceCommands::Datasets(args) => (args.app.as_deref(), args.output),
     };
 
     let target = resolve_app_target(app_flag, flag_org)?;
@@ -3120,7 +3121,7 @@ async fn execute_runtime(
     let region = app.region.clone().ok_or_else(|| {
         Error::cloud_with_hint(
             CloudErrorCode::NotFound,
-            format!("App {target} does not report a region, so its runtime endpoint is unknown."),
+            format!("App {target} does not report a region, so its instance endpoint is unknown."),
             format!("Check the app with 'spice cloud inspect --app {target}'."),
         )
     })?;
@@ -3134,7 +3135,7 @@ async fn execute_runtime(
     let api_key = api_key.ok_or_else(|| {
         Error::cloud_with_hint(
             CloudErrorCode::Forbidden,
-            format!("No API key is available for app {target}, so its runtime cannot be queried."),
+            format!("No API key is available for app {target}, so its instance cannot be queried."),
             format!("Generate one with 'spice cloud api-keys --app {target} --regenerate 1'."),
         )
     })?;
@@ -3155,32 +3156,32 @@ async fn execute_runtime(
     )?;
 
     match cmd {
-        RuntimeCommands::Status(_) => {
-            let components = fetch_runtime_json::<Vec<RuntimeComponentStatus>>(
+        InstanceCommands::Status(_) => {
+            let components = fetch_instance_json::<Vec<InstanceComponentStatus>>(
                 &runtime_ctx,
                 "/v1/status",
                 &target,
             )
             .await?;
-            print_runtime_status(&components, &target, output)
+            print_instance_status(&components, &target, output)
         }
-        RuntimeCommands::Datasets(_) => {
+        InstanceCommands::Datasets(_) => {
             // `/v1/status` reports only connection endpoints (http, flight,
             // metrics, opentelemetry) — never datasets. Dataset state lives on
             // the datasets route, and only when `status=true` is requested.
-            let datasets = fetch_runtime_json::<Vec<RuntimeDatasetInfo>>(
+            let datasets = fetch_instance_json::<Vec<InstanceDatasetInfo>>(
                 &runtime_ctx,
                 "/v1/datasets?status=true",
                 &target,
             )
             .await?;
-            print_runtime_datasets(&datasets, &target, output)
+            print_instance_datasets(&datasets, &target, output)
         }
     }
 }
 
-/// Read `/v1/status` from a deployed app's runtime.
-async fn fetch_runtime_json<T: serde::de::DeserializeOwned>(
+/// Read a JSON document from a running app instance.
+async fn fetch_instance_json<T: serde::de::DeserializeOwned>(
     ctx: &RuntimeContext,
     path: &str,
     target: &AppTarget,
@@ -3188,7 +3189,7 @@ async fn fetch_runtime_json<T: serde::de::DeserializeOwned>(
     let response = ctx.get(path).await.map_err(|err| {
         Error::cloud_with_hint(
             CloudErrorCode::NotFound,
-            format!("Could not reach the runtime for app {target}: {err}"),
+            format!("Could not reach the instance for app {target}: {err}"),
             format!("The app may not be running yet — check 'spice cloud inspect --app {target}'."),
         )
     })?;
@@ -3206,8 +3207,8 @@ async fn fetch_runtime_json<T: serde::de::DeserializeOwned>(
         })
 }
 
-fn print_runtime_status(
-    components: &[RuntimeComponentStatus],
+fn print_instance_status(
+    components: &[InstanceComponentStatus],
     target: &AppTarget,
     output: OutputFormat,
 ) -> Result<()> {
@@ -3216,7 +3217,7 @@ fn print_runtime_status(
     }
 
     if components.is_empty() {
-        println!("The runtime for app {target} reported no components.");
+        println!("App instance {target} reported no components.");
         return Ok(());
     }
 
@@ -3233,7 +3234,7 @@ fn print_runtime_status(
     }
     table.print();
 
-    let unhealthy: Vec<&RuntimeComponentStatus> = components
+    let unhealthy: Vec<&InstanceComponentStatus> = components
         .iter()
         .filter(|component| !component.status.eq_ignore_ascii_case("Ready"))
         .collect();
@@ -3249,8 +3250,8 @@ fn print_runtime_status(
     Ok(())
 }
 
-fn print_runtime_datasets(
-    datasets: &[RuntimeDatasetInfo],
+fn print_instance_datasets(
+    datasets: &[InstanceDatasetInfo],
     target: &AppTarget,
     output: OutputFormat,
 ) -> Result<()> {
@@ -3259,7 +3260,7 @@ fn print_runtime_datasets(
     }
 
     if datasets.is_empty() {
-        println!("The runtime for app {target} has no datasets configured.");
+        println!("App instance {target} has no datasets configured.");
         return Ok(());
     }
 
@@ -3280,7 +3281,7 @@ fn print_runtime_datasets(
     }
     table.print();
 
-    let unhealthy: Vec<&RuntimeDatasetInfo> = datasets
+    let unhealthy: Vec<&InstanceDatasetInfo> = datasets
         .iter()
         .filter(|dataset| dataset_needs_attention(dataset.status.as_deref()))
         .collect();

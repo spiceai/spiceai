@@ -187,8 +187,8 @@ spice cloud org use spicehq
 spice cloud deploy --app spicehq/team-app --wait --timeout 10m
 spice cloud deployments --app spicehq/team-app          # id, status, commit, error
 spice cloud inspect     --app spicehq/team-app          # app, latest deployment, pods
-spice cloud runtime status   --app spicehq/team-app     # per-component readiness
-spice cloud runtime datasets --app spicehq/team-app     # dataset load state
+spice cloud instance status   --app spicehq/team-app    # per-component readiness
+spice cloud instance datasets --app spicehq/team-app    # dataset load state
 spice cloud logs --app spicehq/team-app --level error --tail 200
 ```
 
@@ -198,7 +198,7 @@ on a terminal failure, so it can gate a script. Statuses the CLI does not
 recognize are treated as **still running**: waiting longer is recoverable,
 declaring an in-flight deploy finished is not.
 
-`runtime status` / `runtime datasets` reach the app's own runtime rather than the
+`instance status` / `instance datasets` reach the app's own runtime rather than the
 management API, because the management API does not expose runtime state. The
 CLI resolves the app's region and API key through the management API and then
 calls the regional data endpoint. That means these two commands need an app API
@@ -222,7 +222,7 @@ without further CLI changes once the API lands.
 | ---- | -------- | ----------------------- |
 | Enumerate a user's orgs | `GET /v1/orgs` | A 404 is treated as "cannot enumerate", not "no orgs". `spice cloud orgs` falls back to the credential's own org plus any org with a stored credential, and prints a note explaining the listing is partial. `whoami` omits the org count. |
 | One credential across orgs | `X-Org-Name` honored on management routes, with a membership check | The header is already sent on every request. Until it is honored, acting on a second org requires a credential minted for that org (an org-owned OAuth client works today via `spice cloud login api --org <org>`). |
-| Runtime status / logs via management API | e.g. pods and component health on `/v1/apps/{id}/…` | `spice cloud runtime …` uses the data plane with the app's API key. |
+| Instance status / logs via management API | e.g. pods and component health on `/v1/apps/{id}/…` | `spice cloud instance …` uses the data plane with the app's API key. |
 
 `spice cloud orgs` marks each row's `CREDENTIAL` column `stored` when the org has
 its own credential, which is how an operator can tell a fully-working org from

@@ -961,7 +961,7 @@ fn test_cloud_help_lists_all_subcommands() {
         // `rollback` is intentionally absent from the current CloudCommands enum.
         .stdout(predicate::str::contains("api-keys"))
         .stdout(predicate::str::contains("metrics"))
-        .stdout(predicate::str::contains("runtime"));
+        .stdout(predicate::str::contains("instance"));
 }
 
 // ============================================================================
