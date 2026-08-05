@@ -449,15 +449,6 @@ pub fn detect_cpu_share() -> Option<CpuShare> {
 /// is shared between a countable number of plans.
 const QUERIES_PER_CORE: usize = 4;
 
-/// A CPU request at or above this fraction of the effective core count is close
-/// enough not to warn about. A half is loose enough to absorb cgroup
-/// quantization (a `requests.cpu: 1` lands at 974m under cgroup v2), and tight
-/// enough that a warning means the runtime sized itself for at least twice the
-/// CPU the scheduler guarantees.
-const REQUEST_SHORTFALL_NUM: u64 = 1;
-/// Denominator of [`REQUEST_SHORTFALL_NUM`].
-const REQUEST_SHORTFALL_DEN: u64 = 2;
-
 /// How far above its CPU request a burstable pod sizes itself.
 ///
 /// A request is a scheduling floor, not a ceiling, so sizing *at* the request
@@ -489,20 +480,6 @@ const REQUEST_DERIVED_FLOOR_MILLICORES: u64 = 2000;
 /// range is worth remarking on. Ten leaves the smallest requests anyone actually
 /// writes — `50m`, `100m` — well clear.
 const SUSPECT_CORE_SHAPED_MILLICORES: u64 = 10;
-
-/// Below this fraction of what the host reports, a request-derived entitlement
-/// is worth saying out loud — see [`CpuBudget::sizing_notice`].
-///
-/// A judgement call rather than a tuned number, and deliberately not a quarter.
-/// The recommended shape — a CPU request with no limit — lands at exactly
-/// `factor / cores_on_the_node`, so a 4-core request on a 64-core host derives
-/// 1/8 of it. Warning there would fire on the configuration this enhancement
-/// tells operators to adopt, on every restart, with nothing to fix. An eighth
-/// keeps that quiet while still speaking up for the order-of-magnitude case a
-/// `100m` request produces: 2 cores of 64 is 1/32, and 2 of 18 is 1/9.
-const SIZING_NOTICE_NUM: u64 = 1;
-/// Denominator of [`SIZING_NOTICE_NUM`].
-const SIZING_NOTICE_DEN: u64 = 8;
 
 /// The process-wide CPU entitlement and every sizing decision derived from it.
 #[derive(Debug, Clone)]
@@ -677,16 +654,11 @@ impl CpuBudget {
     pub fn log_summary(&self) {
         tracing::info!("{}", self.summary_line());
         tracing::info!("{}", self.derived_sizing_line());
-        // Both notices report a consequence of something the operator chose, so
-        // they are INFO: the job is to make the choice apparent to whoever is
-        // debugging, not to claim it was a mistake. The warning below is different
-        // — a request that exists and did not arrive is a gap, not a decision.
-        if let Some(notice) = self.request_shortfall_notice() {
-            tracing::info!("{notice}");
-        }
-        if let Some(notice) = self.sizing_notice() {
-            tracing::info!("{notice}");
-        }
+        // Only faults are reported beyond the two lines above. Anything that is a
+        // consequence of a choice — which entitlement the request derived, how it
+        // compares to the host — is already in the summary, which names the rung, the
+        // multiplier, the request, the share and the limit; a notice restating it
+        // added a second line and no fact.
         if let Some(warning) = self.undeclared_request_warning() {
             tracing::warn!("{warning}");
         }
@@ -812,107 +784,15 @@ impl CpuBudget {
         )
     }
 
-    /// An INFO note when the *declared* CPU request sits well below the core
-    /// count the runtime sized itself for, i.e. when sizing leans on CPU the
-    /// scheduler does not guarantee.
-    ///
-    /// States the discrepancy and which rung produced the number, and stops
-    /// there. Both values were chosen by an operator, and which of them is wrong
-    /// is their call, so this exists to make the pairing visible to whoever is
-    /// debugging — not to claim a mistake, which is why it is not a warning.
-    ///
-    /// Fires for every source, and names the one responsible: a value read from
-    /// an explicit `limits.cpu`, a value configured by hand, and — the case that
-    /// motivates this crate — a request with no limit at all, where detection
-    /// falls back to every CPU the process may use. An over-large configured value
-    /// is just as wrong as an over-large inferred one, so the check is on the
-    /// effective core count rather than on any particular rung of the ladder.
-    ///
-    /// Compares against [`HostReadings::declared_request_millicores`] and never
-    /// the cgroup share. A share is not a request: every cgroup carries one, so
-    /// driving this from the share told every bare-metal host with more than ~5
-    /// cores that its correct budget was misconfigured.
-    ///
-    /// Reachable only for [`CpuSource::Configured`] and
-    /// [`CpuSource::CgroupQuota`]. A declared request otherwise derives the
-    /// entitlement itself, and both derived sources are suppressed below.
-    ///
-    /// `None` when no request was declared, or when the request is at or above
-    /// [`REQUEST_SHORTFALL_NUM`]/[`REQUEST_SHORTFALL_DEN`] of the effective core
-    /// count.
-    #[must_use]
-    pub fn request_shortfall_notice(&self) -> Option<String> {
-        // `request_burst` is a multiple of the request by construction, and
-        // `all_cores` is an operator who already said they want more than it — so
-        // neither is sizing for CPU nobody asked for, which is what this warns
-        // about. Left unsuppressed, the floor alone would make it fire on the
-        // runtime's own default: a `100m` request derives 2 cores, and 200 is
-        // below half of 2000.
-        if matches!(self.source, CpuSource::RequestBurst | CpuSource::AllCores) {
-            return None;
-        }
-        let request = self.declared_request_millicores?;
-        if request.saturating_mul(REQUEST_SHORTFALL_DEN)
-            >= self.millicores.saturating_mul(REQUEST_SHORTFALL_NUM)
-        {
-            return None;
-        }
-        Some(format!(
-            "This pod's CPU request is {request}, below the {effective} sized for (from {origin}). \
-             See: {DOCS_URL}",
-            request = format_millicores(request),
-            effective = format_millicores(self.millicores),
-            origin = self.origin(),
-        ))
-    }
-
-    /// An INFO note when a request-derived entitlement is far below what the host
-    /// reports.
-    ///
-    /// Using 4 cores of a 64-core node is a *choice*: the pod asked for it. This
-    /// exists so the choice is apparent to someone who did not realise they had
-    /// made it — a `requests.cpu: 100m` pod goes from 64 target partitions to 2,
-    /// and the pod it happens to is the one whose logs have rolled by the time
-    /// anyone asks why a query is slow. It states what happened and stops; the
-    /// knob is in the docs, and recommending `limits.cpu` would trade this for CFS
-    /// throttling and scheduling friction.
-    ///
-    /// Only fires for [`CpuSource::RequestBurst`], which means any explicit
-    /// `runtime.cpu.cores` silences it: reaching this rung at all requires that
-    /// nothing was configured.
-    #[must_use]
-    pub fn sizing_notice(&self) -> Option<String> {
-        if !matches!(self.source, CpuSource::RequestBurst) {
-            return None;
-        }
-        let request = self.declared_request_millicores?;
-        let detected_millicores = u64::try_from(self.detected_cores)
-            .unwrap_or(u64::MAX)
-            .saturating_mul(1000);
-        if self.millicores.saturating_mul(SIZING_NOTICE_DEN)
-            >= detected_millicores.saturating_mul(SIZING_NOTICE_NUM)
-        {
-            return None;
-        }
-        Some(format!(
-            "Sized for {entitlement} from this pod's CPU request of {request} (x{factor}); the host \
-             reports {detected} cores. See: {DOCS_URL}",
-            entitlement = format_millicores(self.millicores),
-            request = format_millicores(request),
-            factor = CPU_REQUEST_BURST_FACTOR,
-            detected = self.detected_cores,
-        ))
-    }
-
     /// A warning when the declared CPU request looks like whole cores that lost
     /// their unit.
     ///
     /// The 1000x failure this cannot rule out by parsing: a surface that omits
     /// `divisor: 1m` sends `4` for a four-core request, which is a legal reading as
     /// four millicores. The 2-core floor keeps that from starving the runtime, but
-    /// silently — and on a host small enough that two cores is not a steep
-    /// downsize, [`Self::sizing_notice`] does not fire either, so nothing would say
-    /// anything at all.
+    /// silently: on a small host the summary line reads unremarkably — two cores of
+    /// four looks like an ordinary entitlement — so without this nothing names the
+    /// cause.
     ///
     /// Phrased as a conditional, because `requests.cpu: 4m` is legal and would land
     /// here too. It names the whole-core reading so an operator who wrote that can
@@ -1377,133 +1257,6 @@ mod tests {
         assert_eq!(CpuShare::Shares(2048).to_string(), "2048 shares");
     }
 
-    /// After the request rung exists, this warns for exactly two sources: an
-    /// over-large *configured* value, and a CPU limit far above the request. A
-    /// declared request with no limit derives its own entitlement instead, so
-    /// there is nothing left to warn about there.
-    #[test]
-    fn a_request_far_below_the_effective_cores_warns() {
-        // A hard limit four times the request: sizing leans on CPU the scheduler
-        // does not guarantee, and the limit is what chose it.
-        let capped =
-            CpuBudget::resolve(&CpuConfig::default(), &quota_and_request(64, 16_000, 4000))
-                .expect("detection cannot fail")
-                .request_shortfall_notice()
-                .expect("a request far under the limit must warn");
-        assert!(capped.contains("4 cores"), "{capped}");
-        assert!(capped.contains("16 cores"), "{capped}");
-        assert!(capped.contains("cgroup CPU limit"), "{capped}");
-
-        // An over-large configured value is as wrong as an over-large inferred
-        // one, and names the surface that set it.
-        let configured = CpuBudget::resolve(
-            &CpuConfig::from_sources(None, None, Some("384")),
-            &request_only(384, 4000),
-        )
-        .expect("valid")
-        .request_shortfall_notice()
-        .expect("384 configured cores against a 4-core request must warn");
-        assert!(
-            configured.contains(CpuConfig::SPICEPOD_SETTING),
-            "{configured}"
-        );
-        assert!(configured.contains("384 cores"), "{configured}");
-
-        // Never claims the machine's total: a cpuset can pin this process to a
-        // subset of it.
-        for warning in [&capped, &configured] {
-            assert!(!warning.contains("host CPU count"), "{warning}");
-        }
-    }
-
-    /// The warning states the discrepancy and its source, and stops there — no
-    /// remedy, since which of the two numbers is wrong is the operator's call.
-    #[test]
-    fn the_warning_carries_no_guidance() {
-        let warning =
-            CpuBudget::resolve(&CpuConfig::default(), &quota_and_request(64, 16_000, 4000))
-                .expect("detection cannot fail")
-                .request_shortfall_notice()
-                .expect("must warn");
-
-        for advice in ["Lower", "Set ", "instead", "Raise", "raise"] {
-            assert!(
-                !warning.contains(advice),
-                "the warning must not advise ({advice:?}): {warning}"
-            );
-        }
-    }
-
-    /// An over-large *configured* value is as wrong as an over-large inferred
-    /// one, so the warning fires there too, naming the surface that set it.
-    #[test]
-    fn an_oversized_configured_value_warns_against_the_request() {
-        let configured = CpuBudget::resolve(
-            &CpuConfig::from_sources(None, None, Some("384")),
-            &request_only(18, 4000),
-        )
-        .expect("valid");
-
-        let warning = configured
-            .request_shortfall_notice()
-            .expect("384 configured cores against a 4-core request must warn");
-        assert!(warning.contains(CpuConfig::SPICEPOD_SETTING), "{warning}");
-        assert!(warning.contains("384 cores"), "{warning}");
-
-        // The CLI surface names itself rather than the spicepod field.
-        let via_cli = CpuBudget::resolve(
-            &CpuConfig::from_sources(Some("384"), None, None),
-            &request_only(18, 4000),
-        )
-        .expect("valid")
-        .request_shortfall_notice()
-        .expect("must warn");
-        assert!(via_cli.contains(CpuConfig::CLI_SETTING), "{via_cli}");
-    }
-
-    #[test]
-    fn a_request_close_to_the_effective_cores_is_quiet() {
-        // Matching the effective core count: no warning.
-        let matched = CpuBudget::resolve(&CpuConfig::default(), &request_only(4, 4000))
-            .expect("detection cannot fail");
-        assert_eq!(matched.request_shortfall_notice(), None);
-
-        // cgroup v2 quantizes `requests.cpu: 1` to 974m; that must not warn.
-        let quantized = CpuBudget::resolve(&CpuConfig::default(), &request_only(1, 974))
-            .expect("detection cannot fail");
-        assert_eq!(quantized.request_shortfall_notice(), None);
-
-        // Nothing to compare against.
-        assert_eq!(budget(16).request_shortfall_notice(), None);
-    }
-
-    /// The threshold is *below* half, so exactly half stays quiet and a hair
-    /// under it warns. Pinning both sides keeps a later refactor from drifting
-    /// the comparison to `<=` and warning on every evenly-halved request.
-    #[test]
-    fn the_threshold_is_strictly_below_half_the_effective_cores() {
-        // A limit of 8 cores; a request of exactly 4 is half, so quiet. Measured
-        // against a quota rather than a request-derived budget, because a request
-        // with no limit now derives its own entitlement and is suppressed.
-        let exactly_half =
-            CpuBudget::resolve(&CpuConfig::default(), &quota_and_request(64, 8000, 4000))
-                .expect("detection cannot fail");
-        assert_eq!(
-            exactly_half.request_shortfall_notice(),
-            None,
-            "a request at exactly half the effective cores must stay quiet"
-        );
-
-        // One millicore under half must warn.
-        let just_under =
-            CpuBudget::resolve(&CpuConfig::default(), &quota_and_request(64, 8000, 3999))
-                .expect("detection cannot fail");
-        assert!(
-            just_under.request_shortfall_notice().is_some(),
-            "a request just under half the effective cores must warn"
-        );
-    }
-
     /// The request rung: `min(max(2 cores, R x 2), affinity)`.
     #[test]
     fn a_declared_request_derives_a_bounded_burst() {
@@ -1661,121 +1414,6 @@ mod tests {
             as_if_undeclared.derived_sizing(),
             "`all` must reproduce the pre-rung sizing in full, not just the core count"
         );
-
-        // And it stays silent: an operator who has stated the intent is not told
-        // about it on every restart.
-        assert_eq!(preserved.sizing_notice(), None);
-        assert_eq!(preserved.request_shortfall_notice(), None);
-    }
-
-    /// The sizing notice speaks for a pod sized an order of magnitude below its
-    /// host and stays quiet otherwise, and any explicit setting silences it by
-    /// never reaching the rung.
-    #[test]
-    fn the_sizing_notice_fires_only_on_a_steep_downsize() {
-        let steep =
-            CpuBudget::resolve(&CpuConfig::default(), &request_only(64, 100)).expect("valid");
-        let notice = steep
-            .sizing_notice()
-            .expect("2 cores on a 64-core host must be noticed");
-        // The three facts needed to understand what happened: what it sized for,
-        // what it derived that from, and what the machine actually has.
-        assert!(notice.contains("2 cores"), "{notice}");
-        assert!(notice.contains("100m"), "{notice}");
-        assert!(notice.contains("64 cores"), "{notice}");
-        // ...and nothing else. It reports a choice; it does not argue with it, and
-        // it never suggests `limits.cpu`, which would trade sizing for throttling.
-        for advice in ["set ", "Set ", "should", "limits.cpu", "silence"] {
-            assert!(
-                !notice.contains(advice),
-                "the notice must not advise ({advice:?}): {notice}"
-            );
-        }
-        assert!(notice.len() < 160, "keep it one readable line: {notice}");
-
-        // 8 of 18 cores is within shouting distance: quiet.
-        assert_eq!(
-            CpuBudget::resolve(&CpuConfig::default(), &request_only(18, 4000))
-                .expect("valid")
-                .sizing_notice(),
-            None
-        );
-
-        // The recommended shape on a large node — a 4-core request, no limit —
-        // derives exactly an eighth of it. That is the configuration this change
-        // tells operators to adopt, so it must not warn about itself.
-        let recommended =
-            CpuBudget::resolve(&CpuConfig::default(), &request_only(64, 4000)).expect("valid");
-        assert_eq!(recommended.cores(), 8);
-        assert_eq!(
-            recommended.sizing_notice(),
-            None,
-            "the recommended configuration must not warn on every restart"
-        );
-        // One millicore less crosses the line.
-        assert!(
-            CpuBudget::resolve(&CpuConfig::default(), &request_only(64, 3999))
-                .expect("valid")
-                .sizing_notice()
-                .is_some()
-        );
-
-        // Any explicit setting silences it, including `all`.
-        for value in ["all", "2", "auto"] {
-            let cfg = CpuConfig::from_sources(None, None, Some(value));
-            let resolved = CpuBudget::resolve(&cfg, &request_only(64, 100)).expect("valid");
-            if value == "auto" {
-                // `auto` is "detect", so it still reaches the rung and still speaks.
-                assert!(resolved.sizing_notice().is_some(), "auto still derives");
-            } else {
-                assert_eq!(resolved.sizing_notice(), None, "`{value}` must silence it");
-            }
-        }
-
-        // Rungs that are not request-derived never emit it.
-        assert_eq!(budget(64).sizing_notice(), None);
-        assert_eq!(
-            CpuBudget::resolve(&CpuConfig::default(), &quota(64, 1000))
-                .expect("valid")
-                .sizing_notice(),
-            None
-        );
-    }
-
-    /// The shortfall warning must not fire on the runtime's own default. Both
-    /// request-derived sources are headroom by construction, and the 2-core floor
-    /// would otherwise trip the 1/2 threshold for any request below 1 core.
-    #[test]
-    fn the_shortfall_warning_is_suppressed_for_derived_sources() {
-        let floored =
-            CpuBudget::resolve(&CpuConfig::default(), &request_only(64, 100)).expect("valid");
-        assert_eq!(floored.source(), CpuSource::RequestBurst);
-        assert_eq!(
-            floored.request_shortfall_notice(),
-            None,
-            "a 100m request derives 2 cores; 200 is below half of 2000, so only the \
-             source check keeps this quiet"
-        );
-
-        let all = CpuBudget::resolve(
-            &CpuConfig::from_sources(None, None, Some("all")),
-            &request_only(64, 100),
-        )
-        .expect("valid");
-        assert_eq!(all.source(), CpuSource::AllCores);
-        assert_eq!(all.request_shortfall_notice(), None);
-
-        // Still fires where sizing genuinely leans on CPU nobody asked for.
-        assert!(
-            CpuBudget::resolve(
-                &CpuConfig::from_sources(None, None, Some("384")),
-                &request_only(18, 4000)
-            )
-            .expect("valid")
-            .request_shortfall_notice()
-            .is_some(),
-            "an over-large configured value must still warn"
-        );
     }
 
     /// Every source has a stable metric label and a human origin.
@@ -1899,15 +1537,11 @@ mod tests {
             .expect("still remarked on");
         assert!(on_tiny.contains("1-core minimum"), "{on_tiny}");
 
-        // This is the host size that made the warning necessary: two cores of four
-        // is not a steep downsize, so the sizing notice stays quiet and this is the
-        // only thing that speaks.
+        // This is the host size that made the warning necessary. The floor caught the
+        // mistake, but two cores of four is an unremarkable-looking entitlement, so a
+        // reader of the summary line has nothing to notice; this names the cause.
         assert_eq!(mistyped.cores(), 2, "the floor caught it");
-        assert_eq!(
-            mistyped.sizing_notice(),
-            None,
-            "on a small host nothing else would mention this"
-        );
+        assert_eq!(mistyped.detected_cores(), 4);
 
         // Requests anyone actually writes are unambiguous and silent.
         for request in [10_u64, 50, 100, 500, 1000, 4000] {
@@ -2192,11 +1826,6 @@ mod tests {
     #[test]
     fn a_cgroup_share_is_never_treated_as_a_declared_request() {
         let resolved = CpuBudget::resolve(&CpuConfig::default(), &bare_metal(18)).expect("valid");
-        assert_eq!(
-            resolved.request_shortfall_notice(),
-            None,
-            "a cgroup share must never produce a shortfall warning"
-        );
         // Dropped as an input, not as output: still reported, still raw.
         assert_eq!(resolved.cpu_share(), Some(CpuShare::Weight(100)));
         assert_eq!(resolved.declared_request_millicores(), None);
