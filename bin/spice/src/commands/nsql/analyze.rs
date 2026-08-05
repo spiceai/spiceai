@@ -324,8 +324,9 @@ async fn send_nsql_request_with_trace(
         model: model.to_string(),
     };
 
+    // Text-to-SQL is a model round trip, so its duration is the model's.
     let mut request = ctx
-        .http_client()
+        .inference_http_client()
         .post(&url)
         .header("Content-Type", "application/json")
         .header("Accept", "application/sql")

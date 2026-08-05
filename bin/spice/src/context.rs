@@ -39,6 +39,51 @@ const SPICED_FILENAME: &str = "spiced";
 const SPICEPODS_DIR: &str = "spicepods";
 const WSL_ENV_KEYS: [&str; 2] = ["WSL_DISTRO_NAME", "WSL_INTEROP"];
 
+/// How long a request waits for the connection itself to be established.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The deadline for the control-plane calls — health, dataset listings, the model list,
+/// registry downloads. Their duration is a function of the network, so a whole-request
+/// deadline is the right shape and a short one is a useful failure signal.
+const CONTROL_PLANE_DEADLINE: Deadline = Deadline::Total(Duration::from_secs(30));
+
+/// The deadline for requests whose duration is set by model inference — a chat completion,
+/// a text-to-SQL translation, a search that has to embed the query.
+///
+/// These have no useful upper bound: a long answer, a tool-calling chain, or a large local
+/// model on modest hardware all legitimately take minutes, and none of that is a failure.
+/// What is a failure is the endpoint going quiet, so the deadline measures silence. It is
+/// generous because the first byte can trail the request by a whole prompt evaluation.
+const INFERENCE_DEADLINE: Deadline = Deadline::Silence(Duration::from_secs(300));
+
+/// What an HTTP client's deadline measures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Deadline {
+    /// The whole request, from connecting until the response body has finished. Fires on a
+    /// healthy response that is simply long.
+    Total(Duration),
+    /// The gap between reads, reset by each one — so it fires only when nothing arrives,
+    /// whether that is before the response head or between two chunks of the body.
+    Silence(Duration),
+}
+
+/// Build an HTTP client for the CLI.
+///
+/// Every client the CLI uses is built here, so a setting that has to hold for all of them
+/// belongs on this builder rather than at a call site.
+fn build_http_client(user_agent: String, deadline: Deadline) -> reqwest::Client {
+    let builder = reqwest::Client::builder()
+        .user_agent(user_agent)
+        .connect_timeout(CONNECT_TIMEOUT);
+
+    let builder = match deadline {
+        Deadline::Total(duration) => builder.timeout(duration),
+        Deadline::Silence(duration) => builder.read_timeout(duration),
+    };
+
+    builder.build().unwrap_or_default()
+}
+
 /// Treat a blank credential as absent.
 ///
 /// A credential that is empty or whitespace-only cannot authenticate anything, so
@@ -84,8 +129,12 @@ pub struct RuntimeContext {
     /// Extra headers for HTTP requests
     extra_headers: HashMap<String, String>,
 
-    /// HTTP client with default timeout
+    /// HTTP client for the control-plane calls, under a whole-request deadline
     http_client: reqwest::Client,
+
+    /// HTTP client for requests whose duration is set by model inference, under a
+    /// silence deadline
+    inference_http_client: reqwest::Client,
 
     /// TLS root certificate file path
     tls_root_certificate_file: Option<String>,
@@ -105,12 +154,9 @@ impl RuntimeContext {
         let app_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let pods_dir = app_dir.join(SPICEPODS_DIR);
 
-        let http_client = reqwest::Client::builder()
-            .user_agent(Self::default_user_agent())
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            .build()
-            .unwrap_or_default();
+        let http_client = build_http_client(Self::default_user_agent(), CONTROL_PLANE_DEADLINE);
+        let inference_http_client =
+            build_http_client(Self::default_user_agent(), INFERENCE_DEADLINE);
 
         Ok(Self {
             spice_runtime_dir,
@@ -124,8 +170,41 @@ impl RuntimeContext {
             user_agent: Self::default_user_agent(),
             extra_headers: HashMap::new(),
             http_client,
+            inference_http_client,
             tls_root_certificate_file: None,
         })
+    }
+
+    /// Create a context pointed at `http_endpoint` whose two HTTP clients carry the given
+    /// deadlines.
+    ///
+    /// The production deadlines are tens of seconds apart, so which client a call site
+    /// reached for is only observable after a request that runs that long. Shrinking both
+    /// makes the same difference observable in milliseconds.
+    #[cfg(test)]
+    pub(crate) fn with_deadlines_for_test(
+        http_endpoint: &str,
+        control_plane: Deadline,
+        inference: Deadline,
+    ) -> Self {
+        Self {
+            spice_runtime_dir: PathBuf::from("/test/.spice"),
+            spice_bin_dir: PathBuf::from("/test/.spice/bin"),
+            app_dir: PathBuf::from("/test/app"),
+            pods_dir: PathBuf::from("/test/app/spicepods"),
+            http_endpoint: http_endpoint.to_string(),
+            http_endpoint_chosen: true,
+            api_key: None,
+            cloud_region: None,
+            user_agent: "spice/test (test; test)".to_string(),
+            extra_headers: HashMap::new(),
+            http_client: build_http_client("spice/test (test; test)".to_string(), control_plane),
+            inference_http_client: build_http_client(
+                "spice/test (test; test)".to_string(),
+                inference,
+            ),
+            tls_root_certificate_file: None,
+        }
     }
 
     /// Create a runtime context from CLI arguments.
@@ -290,10 +369,20 @@ impl RuntimeContext {
         self.cloud_region.as_deref()
     }
 
-    /// Get the HTTP client.
+    /// Get the HTTP client for the control-plane calls.
     #[must_use]
     pub fn http_client(&self) -> &reqwest::Client {
         &self.http_client
+    }
+
+    /// Get the HTTP client for requests whose duration is set by model inference.
+    ///
+    /// Use this for anything that reaches a model — a chat completion, a text-to-SQL
+    /// translation, a search that embeds its query. [`RuntimeContext::http_client`] caps the
+    /// whole request, which cuts off a long answer that is still arriving.
+    #[must_use]
+    pub fn inference_http_client(&self) -> &reqwest::Client {
+        &self.inference_http_client
     }
 
     /// Get the user agent string.
@@ -550,7 +639,97 @@ impl RuntimeContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::SlowServer;
     use tempfile::TempDir;
+
+    /// A response that takes ten times the deadline under test to arrive, without ever being
+    /// quiet for longer than a fifth of it.
+    fn slow_but_never_quiet(deadline: Duration) -> SlowServer {
+        SlowServer::dribbling(
+            std::iter::repeat_n("data: token\n\n".to_string(), 10).collect(),
+            deadline / 5,
+        )
+    }
+
+    /// Read a response body in full, so a body-phase deadline is exercised rather than just
+    /// the wait for the response head.
+    async fn read_body(client: &reqwest::Client, url: &str) -> reqwest::Result<String> {
+        client.get(url).send().await?.text().await
+    }
+
+    #[tokio::test]
+    async fn a_total_deadline_cuts_off_a_response_that_is_still_arriving() {
+        let deadline = Duration::from_millis(500);
+        let server = slow_but_never_quiet(deadline);
+        let client = build_http_client("spice/test".to_string(), Deadline::Total(deadline));
+
+        let error = read_body(&client, server.url())
+            .await
+            .expect_err("a total deadline should fire on a response that outlasts it");
+
+        assert!(
+            error.is_timeout(),
+            "expected a timeout, got: {error} ({error:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_silence_deadline_lets_a_slow_response_finish() {
+        let deadline = Duration::from_millis(500);
+        let server = slow_but_never_quiet(deadline);
+        let client = build_http_client("spice/test".to_string(), Deadline::Silence(deadline));
+
+        let body = read_body(&client, server.url())
+            .await
+            .expect("a response that keeps arriving should be read in full");
+
+        assert_eq!(
+            body.matches("data: token").count(),
+            10,
+            "every chunk should have been read: {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_silence_deadline_still_fires_when_the_response_goes_quiet() {
+        let deadline = Duration::from_millis(300);
+        let server = SlowServer::stalling();
+        let client = build_http_client("spice/test".to_string(), Deadline::Silence(deadline));
+
+        let started = std::time::Instant::now();
+        let error = read_body(&client, server.url())
+            .await
+            .expect_err("a silence deadline should fire on a response that never arrives");
+
+        assert!(
+            error.is_timeout(),
+            "expected a timeout, got: {error} ({error:?})"
+        );
+        assert!(
+            started.elapsed() < deadline * 10,
+            "the deadline should have fired promptly, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn the_inference_deadline_measures_silence_and_outlasts_the_control_plane_one() {
+        let Deadline::Silence(inference) = INFERENCE_DEADLINE else {
+            panic!(
+                "inference requests must not carry a whole-request deadline: {INFERENCE_DEADLINE:?}"
+            );
+        };
+        let Deadline::Total(control_plane) = CONTROL_PLANE_DEADLINE else {
+            panic!("control-plane requests should stay under a whole-request deadline");
+        };
+
+        // The silence deadline also bounds the wait for the response head, which for a
+        // model is a whole prompt evaluation — so it has to be the more generous of the two.
+        assert!(
+            inference > control_plane,
+            "a {inference:?} silence deadline is tighter than the {control_plane:?} deadline it replaces"
+        );
+    }
 
     /// Helper to create a `RuntimeContext` with a mocked spiced binary for testing.
     fn create_test_context() -> RuntimeContext {
@@ -566,6 +745,7 @@ mod tests {
             user_agent: "spice/test (test; test)".to_string(),
             extra_headers: HashMap::new(),
             http_client: reqwest::Client::new(),
+            inference_http_client: reqwest::Client::new(),
             tls_root_certificate_file: None,
         }
     }
@@ -591,6 +771,7 @@ mod tests {
             user_agent: "spice/test (test; test)".to_string(),
             extra_headers: HashMap::new(),
             http_client: reqwest::Client::new(),
+            inference_http_client: reqwest::Client::new(),
             tls_root_certificate_file: None,
         };
 

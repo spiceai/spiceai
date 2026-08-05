@@ -32,6 +32,9 @@ pub mod manifest;
 pub mod output;
 pub mod registry;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 pub use context::RuntimeContext;
 pub use error::{Error, Result};
 pub use output::TableRow;

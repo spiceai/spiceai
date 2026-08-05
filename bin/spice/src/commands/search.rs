@@ -249,8 +249,9 @@ async fn send_search_request(
         model: args.model.clone(),
     };
 
+    // A search embeds its query before it can run, so its duration is a model's.
     let mut request = ctx
-        .http_client()
+        .inference_http_client()
         .post(&url)
         .header("Content-Type", "application/json")
         .header("Cache-Control", &args.cache_control)

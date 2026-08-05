@@ -507,8 +507,10 @@ async fn send_chat_streaming(
         }),
     };
 
+    // The streamed answer's duration is the model's, not the network's, so this must not
+    // go out under the control-plane client's whole-request deadline.
     let mut request = ctx
-        .http_client()
+        .inference_http_client()
         .post(&url)
         .header("Content-Type", "application/json")
         .header("Accept", "text/event-stream")
@@ -620,6 +622,69 @@ async fn send_chat_streaming(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::Deadline;
+    use crate::test_support::SlowServer;
+    use std::time::Duration;
+
+    /// A streamed answer that keeps arriving must not be cut off for taking longer than the
+    /// control-plane deadline — the failure reported in
+    /// <https://github.com/spiceai/spiceai/issues/12583>.
+    ///
+    /// Both deadlines are shrunk from their production values so the difference between them
+    /// is observable in under a second; the production gap is 30 seconds.
+    #[tokio::test]
+    async fn a_streamed_answer_outlives_the_control_plane_deadline() {
+        let control_plane = Duration::from_millis(400);
+        let chunk = r#"data: {"choices":[{"delta":{"content":"token "}}]}"#.to_string();
+        let server = SlowServer::dribbling(
+            std::iter::repeat_n(format!("{chunk}\n\n"), 8).collect(),
+            control_plane / 4,
+        );
+
+        let ctx = RuntimeContext::with_deadlines_for_test(
+            server.url(),
+            Deadline::Total(control_plane),
+            Deadline::Silence(control_plane),
+        );
+
+        // Positive control: the same response, over the control-plane client, is the bug.
+        // Without it a green test could mean the server simply answered quickly.
+        let cut_off = ctx
+            .http_client()
+            .get(server.url())
+            .send()
+            .await
+            .expect("the response head arrives promptly")
+            .text()
+            .await
+            .expect_err("the control-plane deadline should cut this response off");
+        assert!(
+            cut_off.is_timeout(),
+            "expected the control-plane client to time out, got: {cut_off}"
+        );
+
+        let config = ChatConfig {
+            model: "test-model",
+            temperature: None,
+            endpoint: None,
+            custom_headers: &[],
+        };
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: "hello".to_string(),
+        }];
+
+        let response = send_chat_streaming(&ctx, &config, &messages, false, false)
+            .await
+            .expect("a streamed answer that keeps arriving should be read to the end");
+
+        assert_eq!(response.content, "token ".repeat(8));
+        assert!(
+            response.total_duration > control_plane,
+            "the answer should have outlasted the control-plane deadline, took {:?}",
+            response.total_duration
+        );
+    }
 
     #[test]
     fn select_single_available_model_uses_only_model() {
