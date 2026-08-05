@@ -300,6 +300,13 @@ static GLOBAL_MEMORY_BUDGET: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(target_os = "linux")]
 static CGROUP_V2_MEMORY_CURRENT_PATH: OnceLock<Option<String>> = OnceLock::new();
+/// Resolved once: cgroup v2 `memory.stat`, for attributing a pressure reading to
+/// anonymous memory versus reclaimable page cache.
+#[cfg(target_os = "linux")]
+static CGROUP_V2_MEMORY_STAT_PATH: OnceLock<Option<String>> = OnceLock::new();
+/// Resolved once: cgroup v2 `memory.pressure` (PSI).
+#[cfg(target_os = "linux")]
+static CGROUP_V2_MEMORY_PRESSURE_PATH: OnceLock<Option<String>> = OnceLock::new();
 
 #[cfg(target_os = "linux")]
 static CGROUP_V1_MEMORY_USAGE_PATH: OnceLock<Option<String>> = OnceLock::new();
@@ -455,6 +462,113 @@ fn current_memory_bytes() -> Option<u64> {
     cgroup_v2_memory_current()
         .or_else(cgroup_v1_memory_current)
         .or_else(proc_self_rss_bytes)
+}
+
+/// How the cgroup's accounted memory splits, so a pressure reading can be
+/// attributed rather than guessed at.
+///
+/// `memory.current` counts reclaimable page cache alongside anonymous memory, so
+/// a file-writing workload can read as near-exhausted while its actual demand is
+/// far lower. `anon` is the part that cannot be reclaimed under pressure;
+/// `inactive_file` is the part Kubernetes and cAdvisor subtract to form a working
+/// set. Exported so the difference is measurable instead of inferred.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct MemoryComposition {
+    pub anon: u64,
+    pub file: u64,
+    pub inactive_file: u64,
+    pub active_file: u64,
+    pub slab_reclaimable: u64,
+}
+
+impl MemoryComposition {
+    /// The Kubernetes/cAdvisor working set: usage minus cold page cache.
+    #[must_use]
+    pub(crate) fn working_set(self, current: u64) -> u64 {
+        current.saturating_sub(self.inactive_file)
+    }
+}
+
+/// Parse the requested fields out of a cgroup `memory.stat`-style file, which is
+/// `"<key> <value>"` per line. Absent keys read as zero.
+fn parse_memory_stat(contents: &str) -> MemoryComposition {
+    let field = |name: &str| -> u64 {
+        contents
+            .lines()
+            .find_map(|line| {
+                let (key, value) = line.split_once(' ')?;
+                (key == name).then(|| value.trim().parse().ok())?
+            })
+            .unwrap_or(0)
+    };
+    MemoryComposition {
+        anon: field("anon"),
+        file: field("file"),
+        inactive_file: field("inactive_file"),
+        active_file: field("active_file"),
+        slab_reclaimable: field("slab_reclaimable"),
+    }
+}
+
+/// Read the cgroup v2 memory composition; `None` when `memory.stat` is
+/// unreadable (non-Linux, cgroup v1, or a restricted mount).
+#[cfg(target_os = "linux")]
+pub(crate) fn memory_composition() -> Option<MemoryComposition> {
+    let path = CGROUP_V2_MEMORY_STAT_PATH
+        .get_or_init(resolve_cgroup_v2_memory_stat_path)
+        .as_deref()?;
+    Some(parse_memory_stat(&std::fs::read_to_string(path).ok()?))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn memory_composition() -> Option<MemoryComposition> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_cgroup_v2_memory_stat_path() -> Option<String> {
+    let cgroup_path = process_cgroup_v2_path()?;
+    let mountpoint = cgroup2_mountpoint().unwrap_or_else(|| "/sys/fs/cgroup".to_string());
+    Some(cgroup_file_path(&mountpoint, &cgroup_path, "memory.stat"))
+}
+
+/// Parse `some avg10=<f>` out of a cgroup v2 `memory.pressure` (PSI) file — the
+/// share of wall clock at least one task spent stalled on memory reclaim.
+///
+/// This measures whether memory scarcity is actually costing time, which is the
+/// question a controller wants answered; a usage ratio only proxies it, and
+/// proxies badly when the usage is reclaimable cache.
+fn parse_memory_pressure_some_avg10(contents: &str) -> Option<f64> {
+    contents
+        .lines()
+        .find(|line| line.starts_with("some "))?
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("avg10=")?.parse().ok())
+}
+
+/// Read cgroup v2 memory PSI (`some avg10`); `None` when unavailable.
+#[cfg(target_os = "linux")]
+pub(crate) fn memory_psi_some_avg10() -> Option<f64> {
+    let path = CGROUP_V2_MEMORY_PRESSURE_PATH
+        .get_or_init(resolve_cgroup_v2_memory_pressure_path)
+        .as_deref()?;
+    parse_memory_pressure_some_avg10(&std::fs::read_to_string(path).ok()?)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn memory_psi_some_avg10() -> Option<f64> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_cgroup_v2_memory_pressure_path() -> Option<String> {
+    let cgroup_path = process_cgroup_v2_path()?;
+    let mountpoint = cgroup2_mountpoint().unwrap_or_else(|| "/sys/fs/cgroup".to_string());
+    Some(cgroup_file_path(
+        &mountpoint,
+        &cgroup_path,
+        "memory.pressure",
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -618,7 +732,50 @@ pub(crate) fn sample_mem_pressure(stats: &IngestStats) {
         && budget > 0
     {
         stats.set_mem_pressure(u64_to_f64(used) / u64_to_f64(budget));
+        log_memory_attribution(budget, used);
     }
+}
+
+/// Log how a pressure reading decomposes, rate-limited to one line per interval.
+///
+/// `memory.current` counts reclaimable page cache, so the ratio the controller
+/// acts on can approach 1.0 while anonymous demand is a fraction of the budget.
+/// Emitting the split (plus the working set and PSI) makes that attributable from
+/// a run's logs rather than requiring a live host.
+fn log_memory_attribution(budget: u64, used: u64) {
+    const INTERVAL: Duration = Duration::from_secs(30);
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+
+    {
+        let mut last = LAST.lock();
+        let now = Instant::now();
+        if last.is_some_and(|t| now.duration_since(t) < INTERVAL) {
+            return;
+        }
+        *last = Some(now);
+    }
+
+    let Some(c) = memory_composition() else {
+        return;
+    };
+    let frac = |v: u64| 100.0 * u64_to_f64(v) / u64_to_f64(budget);
+    tracing::info!(
+        budget_bytes = budget,
+        current_bytes = used,
+        current_pct = frac(used),
+        anon_bytes = c.anon,
+        anon_pct = frac(c.anon),
+        file_bytes = c.file,
+        inactive_file_bytes = c.inactive_file,
+        active_file_bytes = c.active_file,
+        slab_reclaimable_bytes = c.slab_reclaimable,
+        working_set_bytes = c.working_set(used),
+        working_set_pct = frac(c.working_set(used)),
+        psi_some_avg10 = memory_psi_some_avg10().unwrap_or(-1.0),
+        "Cayenne memory attribution: the tuner acts on current/budget; anon is the \
+         non-reclaimable part and psi_some_avg10 is the share of wall clock stalled \
+         on reclaim (-1 = unavailable)"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -4062,6 +4219,67 @@ mod tests {
             adaptive_mem_tier_bounds_for_budget(0, Some(64 * gib)),
             (0, 0)
         );
+    }
+
+    #[test]
+    fn memory_stat_attributes_usage_to_anon_versus_cache() {
+        // A file-writing workload: 40 GiB anonymous, 200 GiB page cache. The raw
+        // `memory.current` a controller divides by its budget counts all of it,
+        // while only `anon` is unreclaimable — this is the gap that makes a usage
+        // ratio read as exhausted when demand is not.
+        let gib = 1024 * 1024 * 1024;
+        let stat = format!(
+            "anon {}\nfile {}\nkernel {}\nslab_reclaimable {}\ninactive_file {}\nactive_file {}\nslab {}\n",
+            40 * gib,
+            200 * gib,
+            2 * gib,
+            3 * gib,
+            180 * gib,
+            20 * gib,
+            4 * gib
+        );
+        let c = parse_memory_stat(&stat);
+        assert_eq!(c.anon, 40 * gib);
+        assert_eq!(c.file, 200 * gib);
+        assert_eq!(c.inactive_file, 180 * gib);
+        assert_eq!(c.active_file, 20 * gib);
+        assert_eq!(c.slab_reclaimable, 3 * gib);
+
+        // Working set subtracts only COLD cache, matching Kubernetes/cAdvisor, so
+        // the 20 GiB of hot cache stays counted — the reason a working set alone
+        // may not fully explain a write-heavy workload's apparent pressure.
+        let current = 242 * gib;
+        assert_eq!(c.working_set(current), current - 180 * gib);
+        assert!(c.working_set(current) > c.anon);
+
+        // Absent keys read as zero rather than failing the whole parse.
+        let sparse = parse_memory_stat("anon 123\n");
+        assert_eq!(sparse.anon, 123);
+        assert_eq!(sparse.inactive_file, 0);
+        // A never-underflowing working set: cache larger than usage clamps at zero.
+        assert_eq!(parse_memory_stat("inactive_file 10\n").working_set(4), 0);
+    }
+
+    #[test]
+    fn memory_pressure_psi_reads_some_avg10() {
+        // PSI reports the share of wall clock stalled on reclaim. Near-zero `some`
+        // alongside a high usage ratio is the signature of reclaimable cache: the
+        // cgroup looks full but nothing is actually waiting on memory.
+        let psi = "some avg10=0.00 avg60=0.12 avg300=1.50 total=12345\n\
+                   full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n";
+        assert_eq!(parse_memory_pressure_some_avg10(psi), Some(0.00));
+
+        let stalling = "some avg10=42.75 avg60=30.00 avg300=10.00 total=999\n";
+        assert_eq!(parse_memory_pressure_some_avg10(stalling), Some(42.75));
+
+        // `full` must never be mistaken for `some`, and junk yields None rather
+        // than a misleading zero.
+        assert_eq!(
+            parse_memory_pressure_some_avg10("full avg10=9.0 total=1\n"),
+            None
+        );
+        assert_eq!(parse_memory_pressure_some_avg10(""), None);
+        assert_eq!(parse_memory_pressure_some_avg10("some total=1\n"), None);
     }
 
     #[cfg(target_os = "linux")]
