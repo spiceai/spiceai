@@ -43,7 +43,7 @@ pub enum Error {
     NoExpressions { expr_len: usize },
 }
 
-/// What a [`TableSink`] write window does to the rows already in the table.
+/// What a `TableSink` write window does to the rows already in the table.
 ///
 /// A replacing write removes rows by simply not re-sending them: it announces no deletions, so
 /// neither [`Index::compute_index`] (which only ever sees the rows that *are* present) nor
@@ -89,7 +89,7 @@ pub trait Index: Debug + Send + Sync + 'static {
         Ok(batches)
     }
 
-    /// Called before data is written via the [`TableSink`] path (full refresh or append).
+    /// Called before data is written via the `TableSink` path (full refresh or append).
     ///
     /// `window` tells the index whether this write replaces the table's contents
     /// ([`WriteWindow::ReplaceAll`]) or adds to them ([`WriteWindow::Append`]). An index whose
