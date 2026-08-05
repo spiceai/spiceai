@@ -8107,8 +8107,7 @@ impl CayenneTableProvider {
         // snapshot flip together under the write fence, so listing cold after the
         // fence is dropped can pair a post-promotion manifest with the
         // pre-promotion warm snapshot and fold a cold-resident key twice.
-        let fold_cold_manifest =
-            fold_cold && self.table_metadata.vortex_config.cold_tier_enabled();
+        let fold_cold_manifest = fold_cold && self.table_metadata.vortex_config.cold_tier_enabled();
         let (mem_snapshots, protected_snapshots, current_snapshot_id, cold_files) = {
             let _fence = self.listing_fence.read().await;
             let mem_snapshots: Vec<Arc<crate::provider::mem_tier::MemTier>> = self
