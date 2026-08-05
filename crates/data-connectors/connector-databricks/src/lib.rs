@@ -789,6 +789,7 @@ async fn reserve_databricks_rate_controller<S: std::hash::BuildHasher>(
     runtime_rate_control_params: Option<&HashMap<String, String, S>>,
     rate_control_registry: Arc<http_rate_control::HttpRateControlRegistry>,
     component: &ConnectorComponent,
+    spicepod_name: &str,
 ) -> DataConnectorResult<Option<http_rate_control::SharedRateControllerReservation>> {
     let ConnectorComponent::Dataset(dataset) = component else {
         return Ok(None);
@@ -808,15 +809,21 @@ async fn reserve_databricks_rate_controller<S: std::hash::BuildHasher>(
             message: source.to_string(),
         }
     })?;
-    let rate_control = http_rate_control::resolve_config(
+    let rate_control = http_rate_control::resolve_config_for_component(
         params,
         runtime_rate_control_params,
-        dataset,
+        component,
         CONNECTOR_NAME,
     )?;
 
     Arc::clone(&rate_control_registry)
-        .reserve_shared_rate_controller(&base_url, &rate_control, dataset, CONNECTOR_NAME)
+        .reserve_shared_rate_controller_for_component(
+            &base_url,
+            &rate_control,
+            spicepod_name,
+            component,
+            CONNECTOR_NAME,
+        )
         .await
         .map(Some)
 }
@@ -848,7 +855,7 @@ impl DataConnectorFactory for DatabricksFactory {
         &self,
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
-        if let Some(runtime) = params.runtime {
+        if let Some(context) = params.context.clone() {
             let aws_region = params
                 .parameters
                 .get("aws_region")
@@ -858,6 +865,9 @@ impl DataConnectorFactory for DatabricksFactory {
             let param_map = params.parameters.to_secret_map();
 
             Box::pin(async move {
+                let app = context.app();
+                let runtime = context.runtime();
+
                 // Initialize AWS SDK credentials if not using explicit credentials
                 if !aws_sdk_credential_bridge::has_explicit_credentials(
                     &param_map,
@@ -899,13 +909,12 @@ impl DataConnectorFactory for DatabricksFactory {
                     None
                 };
 
-                let runtime_rate_control_params =
-                    params.app.as_ref().map(|app| app.runtime.params.clone());
                 let rate_control_reservation = reserve_databricks_rate_controller(
                     &params.parameters,
-                    runtime_rate_control_params.as_ref(),
+                    Some(&app.runtime.params),
                     runtime.http_rate_control_registry(),
                     &params.component,
+                    app.name.as_str(),
                 )
                 .await?;
                 let rate_controller = rate_control_reservation

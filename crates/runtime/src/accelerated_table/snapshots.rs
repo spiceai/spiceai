@@ -16,8 +16,9 @@ use crate::accelerated_table::refresh::Refresh;
 use crate::dataaccelerator::AccelerationSource;
 use crate::dataaccelerator::DataAccelerator;
 use crate::dataaccelerator::ReloadProviderFactory;
+use crate::dataaccelerator::spice_sys::is_shutdown_cancellation;
 use crate::dataaccelerator::swappable::SwappableTableProvider;
-use crate::status::RuntimeStatus;
+use crate::status::{RuntimeStatus, WaitOutcome};
 use arrow_schema::{FieldRef, Schema, SchemaRef};
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
@@ -244,8 +245,11 @@ pub fn spawn_snapshot_interval_task(
     );
 
     Some(tokio::spawn(async move {
-        // Wait for the runtime to become ready
-        runtime_status.wait_for_ready().await;
+        // Wait for the runtime to become ready. A shutdown that starts first
+        // means the runtime never became ready, so there is nothing to snapshot.
+        if runtime_status.wait_for_ready().await == WaitOutcome::ShuttingDown {
+            return;
+        }
 
         // Determine the initial delay based on last checkpoint time
         let initial_delay = if bootstrap_status.is_bootstrapped() {
@@ -371,7 +375,9 @@ pub fn create_periodic_snapshot_callback(
             let accelerator_clone = accelerator.clone();
             let refresh_clone = Arc::clone(&refresh);
             tokio::spawn(async move {
-                runtime_status.wait_for_ready().await;
+                if runtime_status.wait_for_ready().await == WaitOutcome::ShuttingDown {
+                    return;
+                }
                 if !bootstrap_status.is_bootstrapped() {
                     let refresh_sql = refresh_clone
                         .read()
@@ -486,7 +492,15 @@ pub async fn create_checkpoint_and_snapshot(
         .checkpoint(checkpoint_schema, refresh_sql)
         .await
     {
-        tracing::warn!("Failed to checkpoint dataset {dataset_name}: {e}");
+        if is_shutdown_cancellation(e.as_ref()) {
+            // Expected under shutdown — reporting it at `warn` makes a clean stop
+            // look like a failure. See `is_shutdown_cancellation`.
+            tracing::debug!(
+                "Did not checkpoint dataset {dataset_name}: the runtime is shutting down ({e})"
+            );
+        } else {
+            tracing::warn!("Failed to checkpoint dataset {dataset_name}: {e}");
+        }
         return;
     }
 
@@ -515,6 +529,12 @@ pub async fn create_checkpoint_and_snapshot(
             .await
         {
             Ok(_) => {}
+            Err(e) if is_shutdown_cancellation(&e) => {
+                // The snapshot engines carry a cancelled `JoinError` up this path
+                // too, in the same shutdown window as the checkpoint above. Not a
+                // snapshot failure, so it is not counted as one either.
+                tracing::debug!(dataset = %dataset_name, error = %e, "Did not create snapshot: the runtime is shutting down");
+            }
             Err(e) => {
                 let dataset_label = dataset_name.to_string();
                 snapshot_metrics::record_snapshot_failure(&dataset_label);

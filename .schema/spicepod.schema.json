@@ -135,6 +135,12 @@
         "schemaRef": "#/$defs/AbfsDataset"
       },
       {
+        "name": "cdc",
+        "prefix": "cdc",
+        "paramsRef": "#/$defs/CdcDataConnectorParams",
+        "schemaRef": "#/$defs/CdcDataset"
+      },
+      {
         "name": "clickhouse",
         "prefix": "clickhouse",
         "paramsRef": "#/$defs/ClickhouseDataConnectorParams",
@@ -475,6 +481,12 @@
         "prefix": "google",
         "paramsRef": "#/$defs/GoogleModelParams",
         "schemaRef": "#/$defs/GoogleModel"
+      },
+      {
+        "name": "spiceai",
+        "prefix": "spiceai",
+        "paramsRef": "#/$defs/SpiceaiModelParams",
+        "schemaRef": "#/$defs/SpiceaiModel"
       }
     ]
   },
@@ -633,6 +645,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/Query"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cpu": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Cpu"
             },
             {
               "type": "null"
@@ -1019,7 +1041,7 @@
           "default": {}
         },
         "metric_prefix": {
-          "description": "Optional prefix prepended to every exported metric name.\n\nUseful for namespacing Spice metrics in shared backends (e.g. Datadog,\nGrafana Cloud) so they don't collide with metrics from other services.\nFor example, with `metric_prefix: \"spiceai.\"` the runtime metric\n`query_duration_ms` is exported as `spiceai.query_duration_ms`.\n\nThe prefix is applied via an `OpenTelemetry` `View` on the runtime's\n`MeterProvider`, so it affects every metric reader attached to that\nprovider — the Prometheus scrape endpoint (`--metrics`), the cluster\non-demand OTLP reader, and the `otel_exporter` push reader.\n`OpenTelemetry` 0.31's SDK does not support per-reader name transforms,\nso this knob is intentionally placed at the telemetry level rather\nthan under any single exporter.",
+          "description": "Optional prefix prepended to every exported metric name.\n\nUseful for namespacing Spice metrics in shared backends (e.g. Datadog,\nGrafana Cloud) so they don't collide with metrics from other services.\nFor example, with `metric_prefix: \"spiceai.\"` the runtime metric\n`query_duration_ms` is exported as `spiceai.query_duration_ms`.\n\nThe prefix is applied via an `OpenTelemetry` `View` on the runtime's\n`MeterProvider`, so it affects every metric reader attached to that\nprovider — the Prometheus scrape endpoint (`--metrics`), the cluster\non-demand OTLP reader, and the `otel_exporter` push reader.\n`OpenTelemetry` 0.31's SDK does not support per-reader name transforms,\nso this knob is intentionally placed at the telemetry level rather\nthan under any single exporter.\n\nValidated against the `OpenTelemetry` instrument name syntax so prefixed\nnames stay valid for OTLP backends and remain sanitizable to Prometheus\nlegacy names (`[a-zA-Z_:][a-zA-Z0-9_:]*`). Must start with an ASCII\nletter, contain only ASCII letters, digits, `_`, `.`, `-`, or `/`, and\nbe at most [`METRIC_PREFIX_MAX_LEN`] characters (128; ≥127 characters of\nheadroom remain under the 255-char `OpenTelemetry` instrument name\nlimit for the base metric name). A trailing `.` or `_` is recommended\n(e.g. `spiceai.`).\nSee: <https://spiceai.org/docs/reference/spicepod/runtime#runtimetelemetrymetric_prefix>",
           "type": [
             "string",
             "null"
@@ -1408,7 +1430,7 @@
           "minimum": 0
         },
         "max_concurrent_queries": {
-          "description": "Bounds the number of query-executing plans that may run concurrently —\nordinary queries, DDL/DML, and `EXECUTE`; lightweight session-state\nstatements (`PREPARE`/`DEALLOCATE`/`SET`) are not gated. Excess plans wait\n(admission control) rather than oversubscribing the shared query runtime\nand memory pool and starving each other under load (e.g. analytical\nqueries alongside CDC ingestion and compaction). The permit is held for\nthe plan's full execution and result-streaming lifetime; a results-cache\nhit is never gated. Unset = unbounded (the prior behavior). A configured\nvalue is clamped to a minimum of `1` in the runtime builder, so `0` means\none concurrent query (not unbounded).",
+          "description": "Bounds the number of query-executing plans that may run concurrently —\nordinary queries, DDL/DML, and `EXECUTE`; lightweight session-state\nstatements (`PREPARE`/`DEALLOCATE`/`SET`) are not gated. Excess plans wait\n(admission control) rather than oversubscribing the shared query runtime\nand memory pool and starving each other under load (e.g. analytical\nqueries alongside CDC ingestion and compaction). The permit is held for\nthe plan's full execution and result-streaming lifetime; a results-cache\nhit is never gated.\n\nUnset sizes the bound from the CPU budget (four plans per core). `0` opts\nout and leaves admission unbounded. Any other value is that limit.",
           "type": [
             "integer",
             "null"
@@ -1464,6 +1486,28 @@
         "lz4_frame",
         "uncompressed"
       ]
+    },
+    "Cpu": {
+      "description": "How many CPUs the runtime should behave as though it has.\n\nDetection reads a cgroup CPU *quota* and otherwise falls back to the node's\ncore count, so a Kubernetes pod that sets `resources.requests.cpu` without a\nmatching `resources.limits.cpu` is sized for the whole node. This section is\nthe explicit override, in the `GOMAXPROCS` / `-XX:ActiveProcessorCount`\nidiom: one entitlement that feeds every thread pool, the query fan-out, and\naccelerator concurrency coherently.",
+      "type": "object",
+      "properties": {
+        "cores": {
+          "description": "The CPU entitlement, as a Kubernetes CPU quantity: `4`, `3.5`, `3500m`.\n`auto` (the default) detects it. Applied at startup only — the thread\npools it sizes cannot be resized on a spicepod reload.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CpuQuantity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "CpuQuantity": {
+      "description": "A CPU quantity, held verbatim so it can be echoed back in an error message.\n\nAccepts a YAML number (`cores: 4`, `cores: 3.5`) or a string\n(`cores: 3500m`, `cores: auto`); it always serializes as a string, so\n`--set-runtime cpu.cores=…` round-trips through YAML unchanged. Validation\nlives in `cpu_budget`, which is where the value is used.",
+      "type": "string"
     },
     "Metrics": {
       "type": "object",
@@ -1899,6 +1943,22 @@
         "refresh_mode": {
           "description": "Required and explicit: there is no catalog-level default, since the\nonly supported value today is `changes` (CDC).",
           "$ref": "#/$defs/CatalogRefreshMode"
+        },
+        "mode": {
+          "description": "Storage mode applied to every table this catalog accelerates, with the\nsame meaning as a dataset's `acceleration.mode`.\n\nDefaults to `memory`, which is **not durable**: nothing is written to\ndisk, so the accelerator starts empty on every restart and each table\nre-runs its initial snapshot from the source. Use a file mode (with\n`params.cayenne_file_path`) to keep the acceleration across restarts and\nresume from the replication slot instead of re-snapshotting.\n\nNot to be confused with `params.cayenne_cdc_durability: memory`, which\nkeeps a *file-backed* acceleration and only defers its durable write —\nCDC changes buffer in RAM but still drain to disk. `mode` decides whether\nthe acceleration is persisted at all; `cayenne_cdc_durability` decides\nwhen. For RAM-speed writes that survive a restart, use a file `mode`\ntogether with `cayenne_cdc_durability: memory`.",
+          "$ref": "#/$defs/Mode",
+          "default": "memory"
+        },
+        "params": {
+          "description": "Engine parameters applied to every table this catalog accelerates (e.g.\n`cayenne_file_path`), with the same meaning as a dataset's\n`acceleration.params`. Each table gets its own subdirectory under a\nconfigured `cayenne_file_path`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Params"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false,
@@ -1918,6 +1978,31 @@
       "type": "string",
       "enum": [
         "changes"
+      ]
+    },
+    "Mode": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "memory"
+          ]
+        },
+        {
+          "description": "Open an existing file if it exists, otherwise create a new one.\nThis is the default file behavior that preserves data across restarts.",
+          "type": "string",
+          "const": "file"
+        },
+        {
+          "description": "Always create a new file, truncating/overwriting any existing file on startup.\nUse this when you want a fresh acceleration on each startup.",
+          "type": "string",
+          "const": "file_create"
+        },
+        {
+          "description": "Open an existing file if it exists, then check schema compatibility on refresh.\nIf the source schema is incompatible (non-additive change), snapshot (if enabled)\nand recreate the acceleration file from scratch.",
+          "type": "string",
+          "const": "file_update"
+        }
       ]
     },
     "ComponentReference": {
@@ -2110,6 +2195,12 @@
             "check_availability": {
               "$ref": "#/$defs/CheckAvailability"
             },
+            "check_availability_interval": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "mode": {
               "$ref": "#/$defs/AccessMode"
             }
@@ -2129,6 +2220,18 @@
           },
           "then": {
             "$ref": "#/$defs/AbfsDataset"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^cdc:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/CdcDataset"
           }
         },
         {
@@ -3207,31 +3310,6 @@
         }
       ]
     },
-    "Mode": {
-      "oneOf": [
-        {
-          "type": "string",
-          "enum": [
-            "memory"
-          ]
-        },
-        {
-          "description": "Open an existing file if it exists, otherwise create a new one.\nThis is the default file behavior that preserves data across restarts.",
-          "type": "string",
-          "const": "file"
-        },
-        {
-          "description": "Always create a new file, truncating/overwriting any existing file on startup.\nUse this when you want a fresh acceleration on each startup.",
-          "type": "string",
-          "const": "file_create"
-        },
-        {
-          "description": "Open an existing file if it exists, then check schema compatibility on refresh.\nIf the source schema is incompatible (non-additive change), snapshot (if enabled)\nand recreate the acceleration file from scratch.",
-          "type": "string",
-          "const": "file_update"
-        }
-      ]
-    },
     "RefreshOnStartup": {
       "oneOf": [
         {
@@ -3987,6 +4065,18 @@
           },
           "then": {
             "$ref": "#/$defs/GoogleModel"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^spiceai:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/SpiceaiModel"
           }
         }
       ]
@@ -4839,6 +4929,21 @@
       },
       "additionalProperties": true
     },
+    "CdcDataConnectorParams": {
+      "title": "CdcParams",
+      "type": "object",
+      "properties": {
+        "cdc_schema_registry_url": {
+          "description": "Confluent-compatible Schema Registry base URL for Avro CDC ingest (Confluent wire format).",
+          "type": "string"
+        },
+        "cdc_avro_schema": {
+          "description": "Avro schema JSON used when the request body is raw Avro (not Confluent wire format). Can also be sent per-request via the X-Avro-Schema header.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
     "ClickhouseDataConnectorParams": {
       "title": "ClickhouseParams",
       "type": "object",
@@ -5045,6 +5150,17 @@
           "type": "string",
           "default": "true"
         },
+        "databricks_auth_mode": {
+          "description": "The authentication mode to use: 'token' for a personal access token, 'm2m' for machine-to-machine service principal credentials, 'u2m' for user-to-machine OAuth, or 'auto' (default) to select from the credentials that are set. Set this explicitly to keep a credential auto-loaded from the environment from selecting another mode.\n\nSee: https://spiceai.org/docs/components/data-connectors/databricks",
+          "type": "string",
+          "default": "auto",
+          "enum": [
+            "auto",
+            "token",
+            "m2m",
+            "u2m"
+          ]
+        },
         "databricks_client_id": {
           "description": "The client ID of the Databricks service principal.",
           "type": "string"
@@ -5066,6 +5182,11 @@
         },
         "databricks_aws_secret_access_key": {
           "description": "The AWS secret access key to use for S3 storage.",
+          "type": "string",
+          "x-secret": true
+        },
+        "databricks_aws_session_token": {
+          "description": "The AWS session token to use for S3 storage. Required with temporary (STS) credentials.",
           "type": "string",
           "x-secret": true
         },
@@ -5360,6 +5481,11 @@
           "type": "string",
           "x-secret": true
         },
+        "ducklake_aws_session_token": {
+          "description": "The AWS session token for S3 storage. Required with temporary (STS) credentials.",
+          "type": "string",
+          "x-secret": true
+        },
         "ducklake_aws_endpoint": {
           "description": "Custom S3-compatible endpoint URL (e.g. for MinIO).",
           "type": "string",
@@ -5441,19 +5567,41 @@
           "type": "string",
           "default": "2006-01-02T15:04:05.000Z07:00"
         },
+        "dynamodb_replication_ready_lag": {
+          "description": "For `refresh_mode: changes`, the dataset is marked Ready once its replication lag (now minus the newest applied source-commit time) falls below this. It stays not-ready while snapshotting or draining a backlog, so it never serves stale data. Default: 2s.",
+          "type": "string"
+        },
         "ready_lag": {
-          "description": "When using Streams, once tables reaches this lag, it will be reported as Ready",
+          "description": "**DEPRECATED**: Renamed to 'dynamodb_replication_ready_lag'.\n\n[deprecated] Use `dynamodb_replication_ready_lag` instead.",
           "type": "string",
-          "default": "2s"
+          "deprecated": true
         },
         "endpoint_url": {
           "description": "Custom endpoint URL for DynamoDB-compatible services (e.g., DynamoDB Local, ScyllaDB Alternator).",
           "type": "string"
         },
-        "lag_exceeds_shard_retention_behavior": {
-          "description": "Behavior when stream lag exceeds shard retention (24h). 'error' marks dataset as Error, 'ready_before_load' marks Ready then re-bootstraps, 'ready_after_load' re-bootstraps then marks Ready",
+        "dynamodb_replication_initial_snapshot": {
+          "description": "When `refresh_mode: changes` first loads the table's existing items: 'auto' (default) scans when no resumable stream checkpoint exists and resumes without a scan when one does; 'disabled' streams changes only, from the current stream tip; 'always' scans on every start, discarding any persisted checkpoint. Default: auto.",
           "type": "string",
-          "default": "error"
+          "default": "auto",
+          "enum": [
+            "auto",
+            "always",
+            "disabled"
+          ]
+        },
+        "dynamodb_replication_invalid_checkpoint_behavior": {
+          "description": "Behavior when the persisted stream checkpoint can no longer be honored (past the ~24h shard retention). 'error' (default) marks the dataset as Error; 'restart' re-bootstraps from a fresh scan. Default: error.",
+          "type": "string",
+          "enum": [
+            "error",
+            "restart"
+          ]
+        },
+        "lag_exceeds_shard_retention_behavior": {
+          "description": "**DEPRECATED**: Renamed to 'dynamodb_replication_invalid_checkpoint_behavior'; 'ready_after_load' -> 'restart', and 'ready_before_load' is removed (maps to 'restart').\n\n[deprecated] Use `dynamodb_replication_invalid_checkpoint_behavior` (error|restart) instead. 'ready_after_load' maps to 'restart'; 'ready_before_load' is removed and also maps to 'restart'.",
+          "type": "string",
+          "deprecated": true
         },
         "write_parallelism": {
           "description": "Number of parallel operations for writing and deleting data to DynamoDB",
@@ -6553,7 +6701,7 @@
           "x-secret": true
         },
         "http_headers": {
-          "description": "Custom HTTP headers to include in requests. Format: 'Header1: Value1, Header2: Value2'. Headers are applied to all requests.",
+          "description": "Custom HTTP headers to include in requests. Format: 'Header1: Value1, Header2: Value2'. Headers are applied to all requests. Applies to dynamic JSON API endpoints only; structured HTTP file datasets ignore these headers.",
           "type": "string"
         },
         "max_retries": {
@@ -6674,23 +6822,35 @@
           "type": "string"
         },
         "auth_token_url": {
-          "description": "OAuth2 token endpoint URL. When set together with http_auth_refresh_token, the connector exchanges the refresh token for short-lived access tokens (RFC 6749 §6) and attaches 'Authorization: Bearer <token>' to all data requests. Applies to JSON API endpoints only.",
+          "description": "OAuth2 token endpoint URL. Enables OAuth2: the connector acquires short-lived access tokens (refresh-token grant by default, or client_credentials via auth_grant_type) and attaches them to data requests ('Authorization: Bearer <token>' by default, or the bare token under a custom auth_header_name). Applies to dynamic JSON API endpoints only; structured HTTP file datasets reject OAuth2 params.",
           "type": "string"
         },
+        "auth_grant_type": {
+          "description": "OAuth2 grant type: 'refresh_token' (default, RFC 6749 §6) or 'client_credentials' (RFC 6749 §4.4). client_credentials authenticates with client_id/client_secret and issues no refresh token, re-exchanging before expiry (e.g. Shopify Admin API).",
+          "type": "string",
+          "enum": [
+            "refresh_token",
+            "client_credentials"
+          ]
+        },
         "http_auth_refresh_token": {
-          "description": "OAuth2 refresh token exchanged against auth_token_url to obtain access tokens. Required when auth_token_url is set.",
+          "description": "OAuth2 refresh token exchanged against auth_token_url to obtain access tokens. Required when auth_token_url is set and auth_grant_type is 'refresh_token' (the default). Not used by the client_credentials grant.",
           "type": "string",
           "x-secret": true
         },
         "http_auth_client_id": {
-          "description": "OAuth2 client_id presented to the token endpoint. Required for confidential clients; optional for public clients. Paired with http_auth_client_secret.",
+          "description": "OAuth2 client_id presented to the token endpoint. Required for confidential clients and for the client_credentials grant; optional for public clients. Paired with http_auth_client_secret.",
           "type": "string",
           "x-secret": true
         },
         "http_auth_client_secret": {
-          "description": "OAuth2 client_secret presented to the token endpoint. Required when the client is confidential; must be set together with http_auth_client_id.",
+          "description": "OAuth2 client_secret presented to the token endpoint. Required for confidential clients and for the client_credentials grant; must be set together with http_auth_client_id.",
           "type": "string",
           "x-secret": true
+        },
+        "auth_header_name": {
+          "description": "HTTP header name that carries the access token. Default: 'Authorization', which sends 'Bearer <token>'. Any other header name (e.g. 'X-Shopify-Access-Token') sends the bare token instead.",
+          "type": "string"
         },
         "auth_scopes": {
           "description": "Space-separated OAuth2 scopes to request when refreshing. Omit to inherit the scopes bound to the refresh token. Optional.",
@@ -6903,7 +7063,7 @@
           "x-secret": true
         },
         "http_headers": {
-          "description": "Custom HTTP headers to include in requests. Format: 'Header1: Value1, Header2: Value2'. Headers are applied to all requests.",
+          "description": "Custom HTTP headers to include in requests. Format: 'Header1: Value1, Header2: Value2'. Headers are applied to all requests. Applies to dynamic JSON API endpoints only; structured HTTP file datasets ignore these headers.",
           "type": "string"
         },
         "max_retries": {
@@ -7024,23 +7184,35 @@
           "type": "string"
         },
         "auth_token_url": {
-          "description": "OAuth2 token endpoint URL. When set together with http_auth_refresh_token, the connector exchanges the refresh token for short-lived access tokens (RFC 6749 §6) and attaches 'Authorization: Bearer <token>' to all data requests. Applies to JSON API endpoints only.",
+          "description": "OAuth2 token endpoint URL. Enables OAuth2: the connector acquires short-lived access tokens (refresh-token grant by default, or client_credentials via auth_grant_type) and attaches them to data requests ('Authorization: Bearer <token>' by default, or the bare token under a custom auth_header_name). Applies to dynamic JSON API endpoints only; structured HTTP file datasets reject OAuth2 params.",
           "type": "string"
         },
+        "auth_grant_type": {
+          "description": "OAuth2 grant type: 'refresh_token' (default, RFC 6749 §6) or 'client_credentials' (RFC 6749 §4.4). client_credentials authenticates with client_id/client_secret and issues no refresh token, re-exchanging before expiry (e.g. Shopify Admin API).",
+          "type": "string",
+          "enum": [
+            "refresh_token",
+            "client_credentials"
+          ]
+        },
         "http_auth_refresh_token": {
-          "description": "OAuth2 refresh token exchanged against auth_token_url to obtain access tokens. Required when auth_token_url is set.",
+          "description": "OAuth2 refresh token exchanged against auth_token_url to obtain access tokens. Required when auth_token_url is set and auth_grant_type is 'refresh_token' (the default). Not used by the client_credentials grant.",
           "type": "string",
           "x-secret": true
         },
         "http_auth_client_id": {
-          "description": "OAuth2 client_id presented to the token endpoint. Required for confidential clients; optional for public clients. Paired with http_auth_client_secret.",
+          "description": "OAuth2 client_id presented to the token endpoint. Required for confidential clients and for the client_credentials grant; optional for public clients. Paired with http_auth_client_secret.",
           "type": "string",
           "x-secret": true
         },
         "http_auth_client_secret": {
-          "description": "OAuth2 client_secret presented to the token endpoint. Required when the client is confidential; must be set together with http_auth_client_id.",
+          "description": "OAuth2 client_secret presented to the token endpoint. Required for confidential clients and for the client_credentials grant; must be set together with http_auth_client_id.",
           "type": "string",
           "x-secret": true
+        },
+        "auth_header_name": {
+          "description": "HTTP header name that carries the access token. Default: 'Authorization', which sends 'Bearer <token>'. Any other header name (e.g. 'X-Shopify-Access-Token') sends the bare token instead.",
+          "type": "string"
         },
         "auth_scopes": {
           "description": "Space-separated OAuth2 scopes to request when refreshing. Omit to inherit the scopes bound to the refresh token. Optional.",
@@ -7613,14 +7785,14 @@
           "description": "The server_id this replica registers on the source with for `refresh_mode: changes`. Must be unique among all replicas attached to the same source. Default: derived from the dataset name and process.\n\nSee: https://spiceai.org/docs/components/data-connectors/mysql",
           "type": "string"
         },
-        "mysql_replication_snapshot_mode": {
-          "description": "When `refresh_mode: changes` loads the table's existing rows: 'auto' (default) snapshots when no resumable binlog position exists; 'never' streams changes only; 'always' re-snapshots on every start.\n\nSee: https://spiceai.org/docs/components/data-connectors/mysql",
+        "mysql_replication_initial_snapshot": {
+          "description": "When `refresh_mode: changes` loads the table's existing rows: 'auto' (default) snapshots when no resumable binlog position exists and resumes without a snapshot when one does; 'disabled' streams changes only; 'always' re-snapshots on every start, discarding any persisted position. Default: auto.\n\nSee: https://spiceai.org/docs/components/data-connectors/mysql",
           "type": "string",
           "default": "auto",
           "enum": [
             "auto",
-            "never",
-            "always"
+            "always",
+            "disabled"
           ]
         },
         "mysql_replication_checkpoint_interval": {
@@ -7633,14 +7805,19 @@
           "type": "string",
           "default": "8192"
         },
-        "mysql_replication_invalid_position_behavior": {
-          "description": "What to do when the persisted binlog position was purged from the source: 'error' (default) surfaces an actionable error; 'rebootstrap' drops the saved position and re-snapshots the table.\n\nSee: https://spiceai.org/docs/components/data-connectors/mysql",
+        "mysql_replication_invalid_checkpoint_behavior": {
+          "description": "What to do when the persisted binlog position was purged from the source: 'error' (default) surfaces an actionable error; 'restart' drops the saved position and re-snapshots the table. Default: error.\n\nSee: https://spiceai.org/docs/components/data-connectors/mysql",
           "type": "string",
           "default": "error",
           "enum": [
             "error",
-            "rebootstrap"
+            "restart"
           ]
+        },
+        "mysql_replication_ready_lag": {
+          "description": "For `refresh_mode: changes`, the dataset is marked Ready once its replication lag (now minus the newest applied commit's binlog-header timestamp) falls below this. It stays not-ready while snapshotting or draining a backlog on resume, so it never serves stale data. Default: 2s.\n\nSee: https://spiceai.org/docs/components/data-connectors/mysql",
+          "type": "string",
+          "default": "2s"
         }
       },
       "additionalProperties": true
@@ -7685,10 +7862,11 @@
       "type": "object",
       "properties": {
         "pg_connection_string": {
-          "description": "Full libpq-style connection string. Overrides other connection params if set.\n\nSee: https://spiceai.org/docs/components/data-connectors/postgres",
+          "description": "Full libpq-style connection string (key=value or postgres:// URI). Overrides other connection params if set.\n\nSee: https://spiceai.org/docs/components/data-connectors/postgres",
           "type": "string",
           "examples": [
-            "host=db.example.com port=5432 dbname=app user=ro sslmode=require"
+            "host=db.example.com port=5432 dbname=app user=ro sslmode=require",
+            "postgresql://ro@db.example.com:5432/app?sslmode=require"
           ],
           "x-secret": true
         },
@@ -7756,7 +7934,7 @@
           "default": "5"
         },
         "pg_replication_slot": {
-          "description": "Name of the Postgres replication slot to create/reuse for this dataset. Defaults to `spice_<dataset>_<dataset-hash>_<instance-hash>`. Datasets on the same connection that name the same slot SHARE it: one replication connection, one publication, with decoded changes routed per table. Each Spice replica MUST have its own unique slot.",
+          "description": "Name of the Postgres replication slot to create/reuse for this dataset. Must match [a-z0-9_]{1,63} (lowercase letters, digits, underscores only) and must not be the reserved name `pg_conflict_detection`. Defaults to `spice_<dataset>_<dataset-hash>_<instance-hash>`. Datasets on the same connection that name the same slot SHARE it: one replication connection, one publication, with decoded changes routed per table. Each Spice replica MUST have its own unique slot.",
           "type": "string"
         },
         "pg_publication": {
@@ -7764,19 +7942,24 @@
           "type": "string"
         },
         "pg_replication_initial_snapshot": {
-          "description": "Whether to take an initial snapshot of the table's existing rows on first connection, before streaming WAL changes. Default: true.",
+          "description": "When `refresh_mode: changes` first loads the table's existing rows: 'auto' (default) snapshots a freshly-created replication slot and resumes an existing one without a snapshot (a non-persistent accelerator still re-snapshots on every start); 'disabled' streams WAL changes only; 'always' snapshots on every start, including slot resume. The legacy booleans 'true'/'false' map to 'auto'/'disabled'. Default: auto.",
           "type": "string",
-          "default": "true"
+          "default": "auto"
         },
         "pg_replication_temporary_slot": {
-          "description": "If true, create a temporary replication slot that is dropped when the Spice process disconnects. Default: false (durable slot).",
+          "description": "**DEPRECATED**: `pg_replication_temporary_slot` is ignored and the replication slot is always durable. A temporary slot belongs to the Postgres session that creates it, and the slot is created on the short-lived setup connection, so Postgres dropped it before START_REPLICATION could attach and the stream could never start. Remove the parameter; to stop an unused slot retaining WAL on the source, drop it with `SELECT pg_drop_replication_slot('<slot_name>')`. See: https://spiceai.org/docs/components/data-connectors/postgres\n\nIgnored. The replication slot is always durable. Remove this parameter.",
           "type": "string",
-          "default": "false"
+          "deprecated": true
         },
         "pg_replication_status_interval": {
           "description": "How often to send StandbyStatusUpdate to Postgres (e.g. '10s'). Default: 10s.",
           "type": "string",
           "default": "10s"
+        },
+        "pg_replication_ready_lag": {
+          "description": "For `refresh_mode: changes`, the dataset is marked Ready once its replication lag (now minus the newest applied commit's source time) falls below this. It stays not-ready while snapshotting or draining a backlog on resume, so it never serves stale data. Default: 2s.",
+          "type": "string",
+          "default": "2s"
         },
         "pg_replication_bootstrap_batch_size": {
           "description": "Rows per emitted batch during the initial replication snapshot. Default: 8192. Maximum: 1048576.",
@@ -7784,7 +7967,7 @@
           "default": "8192"
         },
         "pg_replication_member_channel_capacity": {
-          "description": "Shared-slot only: envelopes buffered per member table before the shared replication pump back-pressures. Too small a value lets one member's transient stall block the whole slot (head-of-line blocking). Default: 1024. Maximum: 1048576.",
+          "description": "Shared-slot only: envelopes buffered per member table before the shared replication pump back-pressures. Adjacent changes for one table coalesce into a single envelope, so this bounds the buffered envelope count rather than the source transaction count, and the pump blocks only once the buffer can neither coalesce nor admit another envelope. Too small a value lets one member's transient stall block the whole slot (head-of-line blocking). Default: 1024. Maximum: 1048576.",
           "type": "string",
           "default": "1024"
         }
@@ -8893,6 +9076,14 @@
           "description": "Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id').",
           "type": "string"
         },
+        "cayenne_sort_columns_origin": {
+          "description": "Provenance of 'sort_columns'. Normally set by schema inference rather than by hand: 'user' (the default when absent) means the sort order was configured explicitly and is authoritative, while 'inferred' means schema inference filled it from the source's declared order (the primary key, for most CDC tables), which is a guess and is outranked by the filter columns actually observed on scans, so the adaptive layout can cluster for the real workload. Setting it explicitly is supported and is useful for reproducing the inferred configuration in a benchmark or test.",
+          "type": "string",
+          "enum": [
+            "user",
+            "inferred"
+          ]
+        },
         "cayenne_shard_key_columns": {
           "description": "Comma-separated list of columns to hash-cluster rows by during intra-write sharding (the parallel encode fan-out), e.g. 'tenant_id'. When unset, the shard key derives from the primary key (PK-hash clustering); tables without a primary key shard round-robin. Schema inference fills this from the source's declared partition/shard key when the user leaves it unset. Ignored for sorted tables: sort_columns forces a single serial writer.",
           "type": "string"
@@ -8931,11 +9122,11 @@
           ]
         },
         "cayenne_upload_concurrency": {
-          "description": "Maximum number of concurrent file uploads when writing multiple Vortex files. 'auto' (or unset) uses available CPU parallelism. The aggregate encode concurrency across all Cayenne tables is separately bounded by a process-global budget sized to the host core count.",
+          "description": "Maximum number of concurrent file uploads when writing multiple Vortex files. 'auto' (or unset) uses the runtime's CPU budget (see `runtime.cpu.cores`). The aggregate encode concurrency across all Cayenne tables is separately bounded by a process-global budget sized from that same value.",
           "type": "string"
         },
         "cayenne_write_concurrency": {
-          "description": "Writer partition override (parallel encoders) for unsorted Cayenne ingests. 'auto' (or unset) uses a small fixed default of 4, capped at the host core count (= runtime.query.target_partitions) and the process-global encode budget — deliberately not the full core count, because each table is sized independently and the per-table values sum across tables under concurrent CDC. Raise it explicitly for a table that needs more encode parallelism.",
+          "description": "Writer partition override (parallel encoders) for unsorted Cayenne ingests. 'auto' (or unset) uses a small fixed default of 4, capped at the runtime's CPU budget (= runtime.query.target_partitions) and the process-global encode budget — deliberately not the full core count, because each table is sized independently and the per-table values sum across tables under concurrent CDC. Raise it explicitly for a table that needs more encode parallelism.",
           "type": "string"
         },
         "cayenne_compaction_trigger_files": {
@@ -9084,6 +9275,10 @@
         "duckdb_memory_limit": {
           "type": "string"
         },
+        "duckdb_threads": {
+          "description": "The size of DuckDB's own thread pool for this instance. Defaults to the runtime's CPU budget (see `runtime.cpu.cores`); DuckDB would otherwise size it from the host core count, over-committing a CPU-constrained container.",
+          "type": "string"
+        },
         "duckdb_preserve_insertion_order": {
           "type": "string"
         },
@@ -9101,6 +9296,10 @@
           "type": "string"
         },
         "on_refresh_sort_columns": {
+          "type": "string"
+        },
+        "on_full_refresh": {
+          "description": "How a full refresh writes into a file-mode DuckDB acceleration: 'reuse_file' (default) keeps writing into the current database file; 'replace_file' writes a new database file, checkpoints it, and atomically replaces the live file with it, bounding database file growth; 'checkpoint_file' keeps the current file but checkpoints it after each refresh commit, returning dropped table generations to the free list.",
           "type": "string"
         },
         "optimizer_duckdb_aggregate_pushdown": {
@@ -9366,6 +9565,11 @@
           "type": "string",
           "x-secret": true
         },
+        "unity_catalog_aws_session_token": {
+          "description": "The AWS session token to use for S3 storage. Required with temporary (STS) credentials.",
+          "type": "string",
+          "x-secret": true
+        },
         "unity_catalog_aws_endpoint": {
           "description": "The AWS endpoint to use for S3 storage.",
           "type": "string",
@@ -9503,6 +9707,17 @@
           "description": "Maximum random delay added before Databricks HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_max when set. Accepts durations such as '10ms' or '0ms'. Defaults to 10ms when a request-rate limit is configured, otherwise 0ms.",
           "type": "string"
         },
+        "databricks_auth_mode": {
+          "description": "The authentication mode to use: 'token' for a personal access token, 'm2m' for machine-to-machine service principal credentials, 'u2m' for user-to-machine OAuth, or 'auto' (default) to select from the credentials that are set. Set this explicitly to keep a credential auto-loaded from the environment from selecting another mode.",
+          "type": "string",
+          "default": "auto",
+          "enum": [
+            "auto",
+            "token",
+            "m2m",
+            "u2m"
+          ]
+        },
         "databricks_client_id": {
           "description": "The client ID of the Databricks service principal.",
           "type": "string"
@@ -9524,6 +9739,11 @@
         },
         "databricks_aws_secret_access_key": {
           "description": "The AWS secret access key to use for S3 storage.",
+          "type": "string",
+          "x-secret": true
+        },
+        "databricks_aws_session_token": {
+          "description": "The AWS session token to use for S3 storage. Required with temporary (STS) credentials.",
           "type": "string",
           "x-secret": true
         },
@@ -10094,7 +10314,7 @@
           ]
         },
         "distributed_backend": {
-          "description": "Run the model tensor-parallel across multiple nodes (a Spice enterprise feature; standard builds are single-node only). Set to 'ring' to pool the model over the `nodes` list (the 'ring' backend currently supports exactly 2 nodes); omit or 'none' for single-node.",
+          "description": "Run the model tensor-parallel across multiple nodes (a Spice enterprise feature; standard builds are single-node only). Set to 'ring' to pool the model over the `nodes` list; omit or 'none' for single-node.",
           "type": "string",
           "default": "none",
           "enum": [
@@ -10107,8 +10327,21 @@
           "type": "string"
         },
         "nodes": {
-          "description": "Comma-separated, rank-ordered node addresses for distributed inference (e.g. '10.0.0.1,10.0.0.2'). Identical on every node; only `node_rank` differs. The node count (world size) must be a power of two; the 'ring' backend requires exactly 2.",
+          "description": "Comma-separated, rank-ordered node addresses for distributed inference (e.g. '10.0.0.1,10.0.0.2,10.0.0.3'). Identical on every node; only `node_rank` differs. Two or more nodes. Whether a given model can be split across that many nodes depends on the model and is reported when it loads.",
           "type": "string"
+        },
+        "context_length": {
+          "description": "Sequence-length budget, in tokens, for a locally served model: it plans cross-device layer placement and sizes the KV cache. Defaults to the engine default (4096) when unset. It does not raise the context the weights were trained for, and larger values need proportionally more KV-cache memory.",
+          "type": "string"
+        },
+        "paged_attention": {
+          "description": "Attention implementation for a locally served model. 'auto' (the default) uses PagedAttention wherever the build supports it, and the engine falls back to dense attention for architectures with no paged kernel, such as the Multi-head Latent Attention GGUFs. 'disabled' forces dense attention with a contiguous KV cache.",
+          "type": "string",
+          "default": "auto",
+          "enum": [
+            "auto",
+            "disabled"
+          ]
         },
         "tools": {
           "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery without data sampling tools, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
@@ -10567,7 +10800,7 @@
           "type": "string"
         },
         "distributed_backend": {
-          "description": "Run the model tensor-parallel across multiple nodes (a Spice enterprise feature; standard builds are single-node only). Set to 'ring' to pool the model over the `nodes` list (the 'ring' backend currently supports exactly 2 nodes); omit or 'none' for single-node.",
+          "description": "Run the model tensor-parallel across multiple nodes (a Spice enterprise feature; standard builds are single-node only). Set to 'ring' to pool the model over the `nodes` list; omit or 'none' for single-node.",
           "type": "string",
           "default": "none",
           "enum": [
@@ -10580,7 +10813,7 @@
           "type": "string"
         },
         "nodes": {
-          "description": "Comma-separated, rank-ordered node addresses for distributed inference (e.g. '10.0.0.1,10.0.0.2'). Identical on every node; only `node_rank` differs. The node count (world size) must be a power of two; the 'ring' backend requires exactly 2.",
+          "description": "Comma-separated, rank-ordered node addresses for distributed inference (e.g. '10.0.0.1,10.0.0.2,10.0.0.3'). Identical on every node; only `node_rank` differs. Two or more nodes. Whether a given model can be split across that many nodes depends on the model and is reported when it loads.",
           "type": "string"
         },
         "tools": {
@@ -11722,6 +11955,234 @@
       },
       "additionalProperties": true
     },
+    "SpiceaiModelParams": {
+      "title": "SpiceaiParams",
+      "type": "object",
+      "properties": {
+        "spiceai_api_key": {
+          "description": "The API key for the Spice.ai Cloud Platform, or for the Spice runtime serving the model. Required for the Spice.ai Cloud Platform.",
+          "type": "string",
+          "x-secret": true
+        },
+        "spiceai_endpoint": {
+          "description": "The endpoint serving the model: the Spice.ai Cloud Platform, or another Spice runtime.",
+          "type": "string",
+          "default": "https://data.spiceai.io",
+          "examples": [
+            "https://data.spiceai.io",
+            "http://localhost:8090"
+          ]
+        },
+        "tools": {
+          "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery without data sampling tools, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
+          "type": "string"
+        },
+        "tool_embedding_model": {
+          "description": "Embedding model name to use for searchable tool discovery. tools: search_registry requires a model configured in the embeddings section and uses it when only one embedding model is configured; tools: auto falls back to direct tools if embeddings are unavailable.",
+          "type": "string"
+        },
+        "system_prompt": {
+          "description": "An additional system prompt used for all chat completions to this model.",
+          "type": "string"
+        },
+        "parameterized_prompt": {
+          "type": "string"
+        },
+        "max_concurrency": {
+          "description": "Maximum number of concurrent requests for this model. Overrides provider defaults.",
+          "type": "string"
+        },
+        "requests_per_minute_limit": {
+          "description": "Maximum requests per minute for this model. Overrides provider defaults.",
+          "type": "string"
+        },
+        "spiceai_frequency_penalty": {
+          "type": "string"
+        },
+        "spiceai_logit_bias": {
+          "type": "string"
+        },
+        "spiceai_logprobs": {
+          "type": "string"
+        },
+        "spiceai_top_logprobs": {
+          "type": "string"
+        },
+        "spiceai_max_completion_tokens": {
+          "type": "string"
+        },
+        "spiceai_reasoning_effort": {
+          "type": "string"
+        },
+        "spiceai_store": {
+          "type": "string"
+        },
+        "spiceai_metadata": {
+          "type": "string"
+        },
+        "spiceai_n": {
+          "type": "string"
+        },
+        "spiceai_presence_penalty": {
+          "type": "string"
+        },
+        "spiceai_response_format": {
+          "type": "string"
+        },
+        "spiceai_seed": {
+          "type": "string"
+        },
+        "spiceai_stop": {
+          "type": "string"
+        },
+        "spiceai_stream": {
+          "type": "string"
+        },
+        "spiceai_stream_options": {
+          "type": "string"
+        },
+        "spiceai_temperature": {
+          "type": "string"
+        },
+        "spiceai_top_p": {
+          "type": "string"
+        },
+        "spiceai_tools": {
+          "type": "string"
+        },
+        "spiceai_tool_choice": {
+          "type": "string"
+        },
+        "spiceai_parallel_tool_calls": {
+          "type": "string"
+        },
+        "spiceai_prompt_cache_key": {
+          "type": "string"
+        },
+        "spiceai_prompt_cache_retention": {
+          "type": "string"
+        },
+        "spiceai_user": {
+          "type": "string"
+        },
+        "openai_frequency_penalty": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_logit_bias": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_logprobs": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_top_logprobs": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_max_completion_tokens": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_reasoning_effort": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_store": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_metadata": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_n": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_presence_penalty": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_response_format": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_seed": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_stop": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_stream": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_stream_options": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_temperature": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_top_p": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_tools": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_tool_choice": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_parallel_tool_calls": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_prompt_cache_key": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_prompt_cache_retention": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        },
+        "openai_user": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
+        }
+      },
+      "additionalProperties": true
+    },
     "AbfsDataset": {
       "type": "object",
       "properties": {
@@ -11892,6 +12353,199 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mode": {
+          "$ref": "#/$defs/AccessMode"
+        }
+      },
+      "required": [
+        "from",
+        "name"
+      ],
+      "additionalProperties": false
+    },
+    "CdcDataset": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "description": "Data source path for cdc connector. Format: cdc:<path>",
+          "type": "string",
+          "pattern": "^cdc:"
+        },
+        "name": {
+          "type": "string"
+        },
+        "params": {
+          "description": "Connection parameters for the cdc data connector.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CdcDataConnectorParams"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "columns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Column"
+          }
+        },
+        "access": {
+          "$ref": "#/$defs/AccessMode"
+        },
+        "has_metadata_table": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "replication": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Replication"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_format": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_partition_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_partition_format": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "acceleration": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Acceleration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "embeddings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ColumnEmbeddingConfig"
+          }
+        },
+        "dependsOn": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "invalid_type_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InvalidTypeAction"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "deprecated": true
+        },
+        "unsupported_type_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UnsupportedTypeAction"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "on_schema_change": {
+          "$ref": "#/$defs/OnSchemaChange"
+        },
+        "ready_state": {
+          "$ref": "#/$defs/ReadyState"
+        },
+        "metrics": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Metrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "vectors": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VectorStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "check_availability": {
+          "$ref": "#/$defs/CheckAvailability"
+        },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -12074,6 +12728,12 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -12254,6 +12914,12 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -12436,6 +13102,12 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -12616,6 +13288,12 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -12798,6 +13476,12 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -12978,6 +13662,12 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -13160,6 +13850,12 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -13340,6 +14036,12 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -13522,6 +14224,12 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -13702,6 +14410,12 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -13884,6 +14598,12 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -14064,6 +14784,12 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -14246,6 +14972,12 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -14426,6 +15158,12 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -14608,6 +15346,12 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -14788,6 +15532,12 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -14970,6 +15720,12 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -15150,6 +15906,12 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -15332,6 +16094,12 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -15512,6 +16280,12 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -15694,6 +16468,12 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -15874,6 +16654,12 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -16056,6 +16842,12 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -16236,6 +17028,12 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -16418,6 +17216,12 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -16598,6 +17402,12 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -16780,6 +17590,12 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -16960,6 +17776,12 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -17142,6 +17964,12 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -17322,6 +18150,12 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -17504,6 +18338,12 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -17684,6 +18524,12 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -17866,6 +18712,12 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -18046,6 +18898,12 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -18228,6 +19086,12 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -18408,6 +19272,12 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -18590,6 +19460,12 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -18770,6 +19646,12 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -18961,6 +19843,12 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -19150,6 +20038,12 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -19341,6 +20235,12 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -19530,6 +20430,12 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -19721,6 +20627,12 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -19910,6 +20822,12 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -20900,6 +21818,73 @@
       ],
       "additionalProperties": false
     },
+    "SpiceaiModel": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "description": "Model source for spiceai provider. Format: spiceai:<model_id>",
+          "type": "string",
+          "pattern": "^spiceai:"
+        },
+        "name": {
+          "type": "string"
+        },
+        "params": {
+          "description": "Configuration parameters for the spiceai model provider.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SpiceaiModelParams"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ModelFile"
+          }
+        },
+        "datasets": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "dependsOn": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "metrics": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Metrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "from",
+        "name"
+      ],
+      "additionalProperties": false
+    },
     "GenericDataset": {
       "description": "Generic dataset for custom or unknown connectors.",
       "type": "object",
@@ -21069,6 +22054,12 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"

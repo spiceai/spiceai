@@ -38,8 +38,25 @@ jobs:
         env:
           MSSQL_SA_PASSWORD: S3cretP@ssw0rd
           DB_NAME: tpch_sf1
+      # Local, ephemeral PostgreSQL for the postgres catalog connector, mirroring
+      # what the bench workflow does for SF1/SF10 (see #11730). Catalog discovery
+      # reads pg_catalog, so it needs the tables to exist but not their rows -
+      # the seed step below creates the schema only. Excludes
+      # ducklake[postgres+s3], which provisions its own postgres catalog DB on the
+      # same port.
+      postgres_tpch:
+        image: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake')) && 'postgres:16' || '' }}
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_PASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -195,6 +212,24 @@ jobs:
           connection.close()
           PY
 
+      # Catalog discovery enumerates tables from pg_catalog, so the schema is all
+      # this needs - no TPC-H data is generated or loaded. tpch-kit is cloned only
+      # for dss.ddl, which pg-init applies.
+      - name: Create the postgres TPC-H schema
+        if: ${{ contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') }}
+        env:
+          PGHOST: 127.0.0.1
+          PGPASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
+        run: |
+          set -e
+          sudo apt-get update -y
+          sudo apt-get install -y postgresql-client git make
+          cd test/tpc-bench
+          make tpch-clone
+          DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=tpch_sf1 make pg-init
+          psql -U postgres -d tpch_sf1 -tAc \
+            "SELECT 'tables in public: ' || count(*) FROM information_schema.tables WHERE table_schema = 'public';"
+
       - name: Run the schema test - ${{ github.event.inputs.spicepod_path }}
         run: |
           rm -rf .spice/data
@@ -229,7 +264,7 @@ jobs:
           MYSQL_USER: ${{ secrets.TEST_MYSQL_USERNAME }}
           MYSQL_PASSWORD: ${{ secrets.TEST_MYSQL_PASSWORD }}
           MYSQL_DB: ${{ vars.TEST_MYSQL_DB }}
-          POSTGRES_HOST: ${{ vars.TEST_POSTGRES_HOST }}
+          POSTGRES_HOST: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake')) && '127.0.0.1' || vars.TEST_POSTGRES_HOST }}
           POSTGRES_PASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
           SPICEAI_TEST_ENDPOINT: ${{ vars.SPICE_SECRET_SPICEAI_TEST_ENDPOINT }}
           SPICEAI_TEST_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCH_BENCHMARK_KEY }}
@@ -273,7 +308,12 @@ jobs:
             if git ls-remote --exit-code --heads origin ${BRANCH_NAME}; then
               git pull --rebase origin ${BRANCH_NAME}
             fi
-            git push origin ${BRANCH_NAME}
+            # The checkout persists no credentials, so authenticate the push
+            # itself rather than leaving a token in the local git config for the
+            # rest of the job. Without this the push fails ("could not read
+            # Username for https://github.com") and, because no schema snapshot
+            # is committed yet, every run creates one and so every run failed here.
+            git push "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}" "HEAD:${BRANCH_NAME}"
 
             PR_URL="$(gh pr list --head "${BRANCH_NAME}" --state open --json url --jq .[].url)"
             if [[ -n "${PR_URL}" ]]; then

@@ -10,10 +10,13 @@ members = [
     "crates/aws-sdk-credential-bridge",
     "crates/chunking",
     "crates/cloud-connect-crypto",
+    "crates/cpu-budget",
+    "crates/data-accelerator-api",
     "crates/data-connectors/*",
     "crates/datafusion-ddl",
     "crates/datafusion-dml",
     "crates/datafusion-optimizer-rules",
+    "crates/data-connector-api",
     "crates/data_components",
     "crates/dataformat-json",
     "crates/document_parse",
@@ -58,6 +61,7 @@ members = [
     "crates/runtime-parameters-derive",
     "crates/runtime-secrets",
     "crates/runtime-status",
+    "crates/runtime-udfs-api",
     "crates/runtime-table-partition",
     "crates/runtime-rate-control",
     "crates/runtime-request-context",
@@ -142,6 +146,11 @@ redundant_clone = "deny"
 todo = "deny"
 assertions_on_result_states = "deny"
 allow_attributes = "deny"
+# The list of forbidden methods lives in `clippy.toml` (a clippy config, not a
+# lint level). Denying the lint here is what makes a direct CPU-detection call
+# fail a scoped `cargo clippy -p <crate>` and show up in rust-analyzer, rather
+# than only under the `-Dwarnings` CI gate.
+disallowed_methods = "deny"
 # Pedantic members we opt out of (priority 0 overrides the group deny above).
 module_name_repetitions = "allow"
 large_futures = "allow"
@@ -165,7 +174,7 @@ arrow-json = "58.0.0"
 arrow-odbc = "22" # crates.io 22+ accepts arrow ">=29, <59" so it resolves to the workspace Arrow 58 (the prior git pin v21 was capped at arrow <58, which forced a separate Arrow-57 subtree + an IPC bridge)
 arrow-row = "58.0.0"
 arrow-schema = "58.0.0"
-async-openai = { git = "https://github.com/spiceai/async-openai", rev = "526bdd24d569c2082624daff2b2859d03960dd5b", features = [
+async-openai = { git = "https://github.com/spiceai/async-openai", rev = "6bda5533dd118afcf80aa6f5ef59ad35277627a7", features = [
     "byot",
     "embedding",
     "chat-completion",
@@ -206,15 +215,16 @@ bigdecimal = "0.4.7"
 blake3 = "1.5"
 byte-unit = "5.1.4"
 bytes = "1.10.0"
-candle = { git = "https://github.com/spiceai/candle.git", rev = "6ee27a4d621a3470cbf83596722c16de7cf97f12", package = "candle-core" } # branch: spiceai
-candle-core = { git = "https://github.com/spiceai/candle.git", rev = "6ee27a4d621a3470cbf83596722c16de7cf97f12" } # branch: spiceai
-candle-kernels = { git = "https://github.com/spiceai/candle.git", rev = "6ee27a4d621a3470cbf83596722c16de7cf97f12", package = "candle-kernels" } # branch: spiceai
-candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "6ee27a4d621a3470cbf83596722c16de7cf97f12", package = "candle-metal-kernels" } # branch: spiceai
-candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "6ee27a4d621a3470cbf83596722c16de7cf97f12", package = "candle-nn" } # branch: spiceai
-candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "6ee27a4d621a3470cbf83596722c16de7cf97f12", package = "candle-transformers" } # branch: spiceai
+candle = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6", package = "candle-core" } # branch: lukim/spiceai-0.11.0 (candle 0.11 + i-quant; refresh to merged SHA)
+candle-core = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6" } # branch: lukim/spiceai-0.11.0 (candle 0.11 + i-quant; refresh to merged SHA)
+candle-kernels = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6", package = "candle-kernels" } # branch: lukim/spiceai-0.11.0 (candle 0.11 + i-quant; refresh to merged SHA)
+candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6", package = "candle-metal-kernels" } # branch: lukim/spiceai-0.11.0 (candle 0.11 + i-quant; refresh to merged SHA)
+candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6", package = "candle-nn" } # branch: lukim/spiceai-0.11.0 (candle 0.11 + i-quant; refresh to merged SHA)
+candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6", package = "candle-transformers" } # branch: lukim/spiceai-0.11.0 (candle 0.11 + i-quant; refresh to merged SHA)
 charset = "0.1.5"
 chrono = "0.4.44"
 clap = { version = "4.5.60", features = ["derive", "env"] }
+crash-handler = "0.8"
 clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0.2.2", features = [
     "tokio_io",
     "tls",
@@ -241,7 +251,7 @@ datafusion-proto-common = "54.1.0"
 datafusion-pruning = "54.1.0"
 datafusion-spark = "54.1.0"
 datafusion-substrait = "54.1.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "ccdc1aaae359b9b4066fd4fbad19638b9176d5fa" } # spiceai-54
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "1b83cbf0e131fc30e53663ed519f077a5ee65917" } # spiceai-54
 delta_kernel = { version = "0.23.0", features = [
     "default-engine-rustls",
     "arrow-58",
@@ -250,7 +260,7 @@ delta_kernel = { version = "0.23.0", features = [
 derive_builder = "0.20.2"
 dotenv = { path = "crates/dotenv" }
 duration-parse = { path = "crates/duration-parse" }
-duckdb = "1.10503" # 1.10503.x corresponds to DuckDB v1.5.3
+duckdb = "1.10505" # 1.10505.x corresponds to DuckDB v1.5.5
 dyn-hash = "1.0.0"
 encoding_rs = "0.8.34"
 fundu = "2.0.1"
@@ -363,6 +373,7 @@ serde_json = "1"
 sha2 = "0.10.8"
 snafu = "0.8.6"
 cloud-connect-crypto = { path = "crates/cloud-connect-crypto" }
+cpu-budget = { path = "crates/cpu-budget" }
 runtime-cloud-connect = { path = "crates/runtime-cloud-connect" }
 spice-cloud-client = { path = "crates/spice-cloud-client" }
 snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "744ffd77fe82171a805562ce001a341a94d52541" } # branch: spiceai-58
@@ -409,14 +420,14 @@ tracing = "0.1.43"
 tracing-futures = { version = "0.2.5", features = ["futures-03"] }
 tracing-opentelemetry = "0.33"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
-turso = { version = "0.7.1", default-features = false }
+turso = { version = "0.7.2", default-features = false }
 turso-shared = { path = "crates/turso-shared" }
 twox-hash = "2.1.2"
 url = { version = "2.5", features = ["serde"] }
 util = { path = "crates/util", default-features = false }
 utoipa = { version = "5" }
 uuid = "1"
-wasmtime = { version = "44.0.1", default-features = false, features = ["cranelift", "runtime", "std"] }
+wasmtime = { version = "47.0.3", default-features = false, features = ["cranelift", "runtime", "std"] }
 wat = "1.248.0"
 
 flatbuffers = "25.2.10"
@@ -424,13 +435,13 @@ flatbuffers = "25.2.10"
 # Vortex tagged releases publish version 0.1.0 in their Cargo.toml, not the actual release version,
 # so we specify git deps here directly. The [patch.crates-io] entries below exist to override
 # transitive vortex dependencies pulled in by other patched crates.
-vortex = { git = "https://github.com/spiceai/vortex.git", rev = "1b0f1d2a05c555ceaccda991bccfeeaf24aa169b" } # branch: spiceai-54 (vortex 0.79.0)
-vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "1b0f1d2a05c555ceaccda991bccfeeaf24aa169b" } # branch: spiceai-54 (vortex 0.79.0)
-vortex-btrblocks = { git = "https://github.com/spiceai/vortex.git", rev = "1b0f1d2a05c555ceaccda991bccfeeaf24aa169b" } # branch: spiceai-54 (vortex 0.79.0)
+vortex = { git = "https://github.com/spiceai/vortex.git", rev = "5b4bee10822a2b008e628251f95980b9feba5dd0" } # branch: spiceai-54 (vortex 0.79.0)
+vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "5b4bee10822a2b008e628251f95980b9feba5dd0" } # branch: spiceai-54 (vortex 0.79.0)
+vortex-btrblocks = { git = "https://github.com/spiceai/vortex.git", rev = "5b4bee10822a2b008e628251f95980b9feba5dd0" } # branch: spiceai-54 (vortex 0.79.0)
 vortex-datafusion = { path = "crates/vortex" }
-vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "1b0f1d2a05c555ceaccda991bccfeeaf24aa169b" } # branch: spiceai-54 (vortex 0.79.0)
-vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "1b0f1d2a05c555ceaccda991bccfeeaf24aa169b" } # branch: spiceai-54 (vortex 0.79.0)
-vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "1b0f1d2a05c555ceaccda991bccfeeaf24aa169b" } # branch: spiceai-54 (vortex 0.79.0)
+vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "5b4bee10822a2b008e628251f95980b9feba5dd0" } # branch: spiceai-54 (vortex 0.79.0)
+vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "5b4bee10822a2b008e628251f95980b9feba5dd0" } # branch: spiceai-54 (vortex 0.79.0)
+vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "5b4bee10822a2b008e628251f95980b9feba5dd0" } # branch: spiceai-54 (vortex 0.79.0)
 
 x509-certificate = "0.25.0"
 spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "93b75c3c7d1a812b23d00b45adf537d7a2415496" } # spiceai/spice-rs#77
@@ -512,14 +523,14 @@ mysql-common-derive = { path = "vendor/mysql-common-derive" }
 
 # Redirect candle-core / kernels / nn / transformers to the spiceai fork;
 # this matches the git rev pinned in [workspace.dependencies] above.
-candle-core = { git = "https://github.com/spiceai/candle.git", rev = "6ee27a4d621a3470cbf83596722c16de7cf97f12" } # spiceai
-candle-kernels = { git = "https://github.com/spiceai/candle.git", rev = "6ee27a4d621a3470cbf83596722c16de7cf97f12" } # spiceai
-candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "6ee27a4d621a3470cbf83596722c16de7cf97f12" } # spiceai
-candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "6ee27a4d621a3470cbf83596722c16de7cf97f12" } # spiceai
-candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "6ee27a4d621a3470cbf83596722c16de7cf97f12" } # spiceai
+candle-core = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6" } # spiceai
+candle-kernels = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6" } # spiceai
+candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6" } # spiceai
+candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6" } # spiceai
+candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6" } # spiceai
 # candle-index-select-cu is crates.io-sourced by text-embeddings-inference;
-# point it at the spiceai fork's candle-0.10-compatible fallback shim.
-candle-index-select-cu = { git = "https://github.com/spiceai/candle-index-select-cu.git", rev = "397d733869484e21c61a6137f75489d0eca71f5f" } # spiceai
+# point it at the spiceai fork, which builds against candle 0.11.
+candle-index-select-cu = { git = "https://github.com/spiceai/candle-index-select-cu.git", rev = "75fc0b689b33a327907d36dd479f7d242640ca71" } # spiceai (candle 0.11)
 
 # datafusion-table-providers v0.11.0 pulls crates.io datafusion-federation, while the rest of the
 # workspace uses the spiceai fork (DF53-compatible). Redirect crates.io to the fork so the whole
@@ -529,7 +540,7 @@ datafusion-federation = { git = "https://github.com/spiceai/datafusion-federatio
 
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "714d64fd5369efc4835109be0fd718db5a3be0aa" } # branch: spiceai-0.23.0
 
-duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "4387e69564d85a411802e0782bc503b53577c50d" } # branch: spiceai-58-arrow58
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "7229b20daf24765c84d294c52cf4b4165ca79073" } # branch: spiceai-1.5.5
 rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd" } # master @ tip (PR #2 merged: rusqlite 0.40.1 + bundled-decimal)
 tokio-rusqlite = { git = "https://github.com/spiceai/tokio-rusqlite.git", rev = "b10df82e3bbc4f4700562a14a3a00714cbc2f0c7" }
 
@@ -562,9 +573,9 @@ arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a4037
 arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a40370d014a0f8eed12ee0d5a914e8cb2070d8" } # branch: lukim/spiceai-58.3.0
 parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a40370d014a0f8eed12ee0d5a914e8cb2070d8" }      # branch: lukim/spiceai-58.3.0
 
-vortex = { git = "https://github.com/spiceai/vortex.git", rev = "1b0f1d2a05c555ceaccda991bccfeeaf24aa169b" } # branch: spiceai-54 (vortex 0.79.0)
-vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "1b0f1d2a05c555ceaccda991bccfeeaf24aa169b" } # branch: spiceai-54 (vortex 0.79.0)
+vortex = { git = "https://github.com/spiceai/vortex.git", rev = "5b4bee10822a2b008e628251f95980b9feba5dd0" } # branch: spiceai-54 (vortex 0.79.0)
+vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "5b4bee10822a2b008e628251f95980b9feba5dd0" } # branch: spiceai-54 (vortex 0.79.0)
 vortex-datafusion = { path = "crates/vortex" }
-vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "1b0f1d2a05c555ceaccda991bccfeeaf24aa169b" } # branch: spiceai-54 (vortex 0.79.0)
-vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "1b0f1d2a05c555ceaccda991bccfeeaf24aa169b" } # branch: spiceai-54 (vortex 0.79.0)
-vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "1b0f1d2a05c555ceaccda991bccfeeaf24aa169b" } # branch: spiceai-54 (vortex 0.79.0)
+vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "5b4bee10822a2b008e628251f95980b9feba5dd0" } # branch: spiceai-54 (vortex 0.79.0)
+vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "5b4bee10822a2b008e628251f95980b9feba5dd0" } # branch: spiceai-54 (vortex 0.79.0)
+vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "5b4bee10822a2b008e628251f95980b9feba5dd0" } # branch: spiceai-54 (vortex 0.79.0)

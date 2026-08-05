@@ -23,6 +23,7 @@ on:
           - 'append'
           - 'http-consistency'
           - 'nas'
+          - 'schema'
           - 'text-to-sql'
           - 'streaming-bench'
           - 'streaming-correctness'
@@ -54,7 +55,7 @@ jobs:
       group: testoperator-dispatch-scheduled-${{ matrix.branch }}-${{ github.event.schedule || github.event.ref }}
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           ref: ${{ matrix.branch }}
@@ -185,6 +186,17 @@ jobs:
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
+      # Catalog-connector discovery tests. Only the dispatch configs that declare a
+      # `schema` block are dispatched, so this is the catalog spicepods.
+      - name: Dispatch Testoperator - Scheduled Schema - TPCH - SF1
+        if: ${{ steps.sched.outputs.name == 'daily-main' }}
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/tpch/sf1 --workflow schema
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ matrix.branch }}
+
       - name: Dispatch Testoperator - Scheduled Append - TPCH - SF1
         if: ${{ steps.sched.outputs.name == 'daily-main' }}
         run: |
@@ -249,7 +261,7 @@ jobs:
       group: testoperator-dispatch-${{ github.event.ref }}
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 

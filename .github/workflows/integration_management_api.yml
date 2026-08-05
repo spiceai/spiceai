@@ -33,7 +33,7 @@ jobs:
     name: Test Management API Integration
     runs-on: 'spiceai-macos'
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           ref: ${{ github.sha }}
@@ -45,8 +45,11 @@ jobs:
       - name: Authenticate with Spice Cloud dev API
         uses: ./.github/actions/management-login
         with:
-          client-id: ${{ secrets.MANAGEMENT_OAUTH_CLIENT_ID }}
-          client-secret: ${{ secrets.MANAGEMENT_OAUTH_CLIENT_SECRET }}
+          # The dev credentials that pair with SPICE_CLOUD_API_URL below.
+          # testoperator_run_cluster_bench.yml uses the _PROD pair the same way.
+          token-url: https://dev.spice.ai/api/oauth/token
+          client-id: ${{ secrets.SPICE_MANAGEMENT_CLIENT_ID_DEV }}
+          client-secret: ${{ secrets.SPICE_MANAGEMENT_CLIENT_SECRET_DEV }}
           env-name: SPICE_SPICEAI_TOKEN
 
       - name: Run management API integration tests

@@ -299,10 +299,14 @@ fn main() {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
     };
 
+    // The subscriber writes to stdout, so stdout's terminal-ness decides colour.
+    // The builder default would honour `NO_COLOR` but still paint a redirected
+    // stdout; this is the same decision the CLI's own painted output already uses.
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
         .without_time()
+        .with_ansi(ansi_colors::colors_enabled_for(ansi_colors::Target::Stdout))
         .init();
 
     // Version banner: stderr-only so it doesn't foul pipes, and only for interactive stderr.
@@ -767,6 +771,7 @@ fn machine_error_code(error: &spice::error::Error) -> &'static str {
         spice::error::Error::ConnectionFailed { .. } => "connection_failed",
         spice::error::Error::HttpRequestFailed { .. } => "http_request_failed",
         spice::error::Error::InvalidResponse { .. } => "invalid_response",
+        spice::error::Error::Registry { .. } => "registry",
         spice::error::Error::ConfigIo { .. } => "config_io",
         spice::error::Error::ConfigParse { .. } => "config_parse",
         spice::error::Error::CreateDirectory { .. } => "create_directory",
@@ -782,6 +787,7 @@ fn machine_error_code(error: &spice::error::Error) -> &'static str {
         spice::error::Error::ModelNotFound { .. } => "model_not_found",
         spice::error::Error::NoModelsConfigured => "no_models_configured",
         spice::error::Error::CloudConnectIo { .. } => "cloud_connect_io",
+        spice::error::Error::CloudConnectEnroll { .. } => "cloud_connect_enroll",
     }
 }
 

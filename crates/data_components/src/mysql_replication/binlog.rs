@@ -45,10 +45,13 @@ limitations under the License.
 use std::time::{Duration, SystemTime};
 
 use arrow::datatypes::SchemaRef;
-use mysql_async::binlog::events::{RowsEventData, TableMapEvent};
+use bitvec::slice::BitSlice;
+use mysql_async::binlog::events::{OptionalMetaExtractor, RowsEventData, TableMapEvent};
 use mysql_async::binlog::row::BinlogRow;
+use mysql_async::binlog::value::BinlogValue;
 use mysql_async::consts::ColumnType;
 use mysql_async::{BinlogStream, BinlogStreamRequest, Conn, Value};
+use mysql_common::io::ParseBuf;
 
 use super::config::{BinlogPosition, ReplicationParams};
 use super::gtid::GtidSet;
@@ -121,7 +124,7 @@ pub(super) async fn open_binlog_stream(
 }
 
 /// Decode a rows event for the subscribed table into the transaction buffer.
-pub(super) fn buffer_rows_event(
+pub fn buffer_rows_event(
     rows_data: &RowsEventData<'_>,
     tme: &TableMapEvent<'_>,
     layout: &TableLayout,
@@ -170,6 +173,173 @@ pub(super) fn buffer_rows_event(
             RowOp::Delete => {
                 let before = required_image(before, "delete", "before")?;
                 buffer.push_delete(binlog_row_to_values(before, layout)?);
+                metrics.inc_delete();
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Per-table row-image decoder prepared from a `TableMapEvent`.
+///
+/// It stores the column types, per-column metadata, and signedness needed to
+/// parse row values without rebuilding that metadata for every row image.
+/// Values still route through [`normalize_binlog_value`], so this path keeps
+/// the same value normalization as [`buffer_rows_event`].
+///
+/// `pub` (not `pub(super)`) so `benches/mysql_binlog_replay.rs` can exercise
+/// this exact decoder against the walk.
+pub struct TableMapRowDecoder {
+    /// Per source column: (binlog type, owned column metadata, unsigned).
+    cols: Vec<(ColumnType, Vec<u8>, bool)>,
+}
+
+impl TableMapRowDecoder {
+    /// Build from the route's `TableMapEvent`. Fails when the optional
+    /// metadata does not parse or a column type is absent; callers can fall
+    /// back to the [`buffer_rows_event`] walk for the same table map.
+    pub fn try_new(tme: &TableMapEvent<'_>) -> Result<Self> {
+        let decode_err = |message: String| Error::Decode { message };
+        let extractor = OptionalMetaExtractor::new(tme.iter_optional_meta())
+            .map_err(|e| decode_err(format!("table-map optional metadata: {e}")))?;
+        let mut signedness = extractor.iter_signedness();
+        let n = usize::try_from(tme.columns_count())
+            .map_err(|_| decode_err("column count exceeds usize".to_string()))?;
+        let mut cols = Vec::with_capacity(n);
+        for i in 0..n {
+            let ty = tme
+                .get_column_type(i)
+                .map_err(|e| decode_err(format!("column #{i} type: {e}")))?
+                .ok_or_else(|| decode_err(format!("column #{i} type missing")))?;
+            let meta = tme.get_column_metadata(i).unwrap_or(&[]).to_vec();
+            let unsigned = ty
+                .is_numeric_type()
+                .then(|| signedness.next())
+                .flatten()
+                .unwrap_or_default();
+            cols.push((ty, meta, unsigned));
+        }
+        Ok(Self { cols })
+    }
+
+    /// Decode one row image off `buf`. Spice requires `binlog_row_image = FULL`
+    /// (enforced the same way the walk does: a missing column is a decode
+    /// error), so `included` must cover every column.
+    fn decode_image<'a>(
+        &'a self,
+        buf: &mut ParseBuf<'a>,
+        included: &BitSlice<u8>,
+        layout: &TableLayout,
+    ) -> Result<Vec<Value>> {
+        let num_included = included.count_ones();
+        if num_included != self.cols.len() {
+            return Err(Error::Decode {
+                message: format!(
+                    "row image carries {num_included} of {} columns. Spice requires \
+                     `binlog_row_image = FULL` — a writer session overrode it.",
+                    self.cols.len()
+                ),
+            });
+        }
+        let bitmap_bytes = num_included.div_ceil(8);
+        let bitmap_buf: &[u8] = buf.parse(bitmap_bytes).map_err(|e| Error::Decode {
+            message: format!("row null bitmap: {e}"),
+        })?;
+        let null_bitmap: &BitSlice<u8> = BitSlice::from_slice(bitmap_buf);
+        let mut out = Vec::with_capacity(self.cols.len());
+        for (idx, (ty, meta, unsigned)) in self.cols.iter().enumerate() {
+            let column = layout.columns.get(idx).ok_or_else(|| Error::Decode {
+                message: format!(
+                    "row image has more columns than the validated layout ({})",
+                    layout.columns.len()
+                ),
+            })?;
+            let value: BinlogValue<'_> =
+                if null_bitmap.get(idx).as_deref().copied().unwrap_or_default() {
+                    BinlogValue::Value(Value::NULL)
+                } else {
+                    buf.parse((*ty, meta.as_slice(), *unsigned, false))
+                        .map_err(|e| Error::Decode {
+                            message: format!("column #{idx} (`{}`) value parse: {e}", column.name),
+                        })?
+                };
+            out.push(normalize_binlog_value(column, value)?);
+        }
+        Ok(out)
+    }
+}
+
+/// [`buffer_rows_event`] on the fast decode path: same op classification,
+/// buffering, and metrics, with the per-row images parsed by the cached
+/// [`TableMapRowDecoder`] instead of `mysql_common`'s per-image metadata rebuild.
+pub fn buffer_rows_event_fast(
+    rows_data: &RowsEventData<'_>,
+    decoder: &TableMapRowDecoder,
+    layout: &TableLayout,
+    pk_source_indexes: &[usize],
+    buffer: &mut TransactionBuffer,
+    metrics: &MetricsCollector,
+) -> Result<()> {
+    enum FastOp {
+        Insert,
+        Update,
+        Delete,
+    }
+    if layout.columns.len() != decoder.cols.len() {
+        return Err(Error::Decode {
+            message: format!(
+                "row image has {} columns but the validated layout has {} — the source \
+                 table was altered. Restart the dataset to re-validate the schema.",
+                decoder.cols.len(),
+                layout.columns.len()
+            ),
+        });
+    }
+    let op = match rows_data {
+        RowsEventData::WriteRowsEvent(_) | RowsEventData::WriteRowsEventV1(_) => FastOp::Insert,
+        RowsEventData::UpdateRowsEvent(_) | RowsEventData::UpdateRowsEventV1(_) => FastOp::Update,
+        RowsEventData::DeleteRowsEvent(_) | RowsEventData::DeleteRowsEventV1(_) => FastOp::Delete,
+        RowsEventData::PartialUpdateRowsEvent(_) => {
+            return Err(Error::Decode {
+                message: "partial-JSON row images are not supported. Set \
+                          `binlog_row_value_options = ''` on the source server."
+                    .to_string(),
+            });
+        }
+    };
+    let before_cols = rows_data.columns_before_image();
+    let after_cols = rows_data.columns_after_image();
+    let mut buf = ParseBuf(rows_data.rows_data());
+    while !buf.0.is_empty() {
+        let before = before_cols
+            .map(|included| decoder.decode_image(&mut buf, included, layout))
+            .transpose()?;
+        let after = after_cols
+            .map(|included| decoder.decode_image(&mut buf, included, layout))
+            .transpose()?;
+        match op {
+            FastOp::Insert => {
+                let after = after.ok_or_else(|| Error::Decode {
+                    message: "write event is missing its after row image".to_string(),
+                })?;
+                buffer.push_insert(after);
+                metrics.inc_insert();
+            }
+            FastOp::Update => {
+                let before = before.ok_or_else(|| Error::Decode {
+                    message: "update event is missing its before row image".to_string(),
+                })?;
+                let after = after.ok_or_else(|| Error::Decode {
+                    message: "update event is missing its after row image".to_string(),
+                })?;
+                buffer.push_update(pk_source_indexes, before, after);
+                metrics.inc_update();
+            }
+            FastOp::Delete => {
+                let before = before.ok_or_else(|| Error::Decode {
+                    message: "delete event is missing its before row image".to_string(),
+                })?;
+                buffer.push_delete(before);
                 metrics.inc_delete();
             }
         }

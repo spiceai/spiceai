@@ -134,6 +134,16 @@ impl AccelerationSource for IcebergDdlAccelerationSource {
         &self.name
     }
 
+    fn connector_name(&self) -> Option<&str> {
+        // A table created by Iceberg DDL has no `from:` — it is reached through the
+        // Iceberg catalog, and no `DataConnector` resolves its refresh mode. So no
+        // connector default applies, and `None` resolves to `full`, matching what
+        // this DDL path itself does with an unset mode (see
+        // `runtime_accel.refresh_mode.unwrap_or(RefreshMode::Full)` in
+        // `create_accelerated_iceberg_table`).
+        None
+    }
+
     fn time_column(&self) -> Option<&str> {
         self.time_column.as_deref()
     }

@@ -35,9 +35,51 @@ use deferred::DeferredCatalogProvider;
 use snafu::prelude::*;
 use tokio::sync::Mutex;
 
+/// Render `err` together with every error in its `source()` chain, on one line.
+///
+/// Database clients routinely keep the useful part of a failure off the outermost
+/// error: `tokio_postgres::Error` displays as just `db error`, with the SQLSTATE and
+/// the server's message reachable only through its source. Displaying the outer error
+/// alone turns a missing database, a bad password and an unreachable host into the
+/// same unactionable text, so walk the chain and keep what it says.
+///
+/// Causes already quoted by an outer message are skipped, since wrappers commonly
+/// interpolate `{source}` themselves and would otherwise repeat it verbatim. That
+/// check is a suffix match, not a substring one: `{source}` interpolation puts the
+/// cause at the end, whereas a substring test would silently drop a short cause that
+/// merely appears somewhere in the outer text — dropping "host" from "cannot resolve
+/// host name", say, which is precisely the detail this is here to keep. Repeating a
+/// cause is only noisy; losing one defeats the purpose, so the bias is toward keeping.
+fn error_with_causes(err: &dyn std::error::Error) -> String {
+    fn one_line(err: &dyn std::error::Error) -> String {
+        err.to_string()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    let mut message = one_line(err);
+    let mut cause = err.source();
+    while let Some(current) = cause {
+        let text = one_line(current);
+        // Ignore trailing punctuation so "… : bad password." still counts as already
+        // quoting a "bad password" cause.
+        let quoted = message.trim_end_matches(['.', '!', ' ']).ends_with(&text);
+        if !text.is_empty() && !quoted {
+            message.push_str(": ");
+            message.push_str(&text);
+        }
+        cause = current.source();
+    }
+    message
+}
+
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to setup the {connector_component} ({connector}). {source}"))]
+    #[snafu(display(
+        "Failed to setup the {connector_component} ({connector}). {}",
+        error_with_causes(source.as_ref())
+    ))]
     UnableToGetCatalogProvider {
         connector: String,
         connector_component: ConnectorComponent,
@@ -401,6 +443,105 @@ mod tests {
 
     static REGISTRY_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
         LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    #[derive(Debug)]
+    struct ChainedError {
+        message: String,
+        source: Option<Box<ChainedError>>,
+    }
+
+    impl std::fmt::Display for ChainedError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.message)
+        }
+    }
+
+    impl std::error::Error for ChainedError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.source
+                .as_ref()
+                .map(|s| s.as_ref() as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    fn chained(messages: &[&str]) -> ChainedError {
+        let mut iter = messages.iter().rev();
+        let last = iter.next().unwrap_or(&"");
+        let mut err = ChainedError {
+            message: (*last).to_string(),
+            source: None,
+        };
+        for message in iter {
+            err = ChainedError {
+                message: (*message).to_string(),
+                source: Some(Box::new(err)),
+            };
+        }
+        err
+    }
+
+    #[test]
+    fn error_with_causes_keeps_the_cause_the_outer_error_hides() {
+        // The shape this exists for: tokio_postgres::Error displays as "db error"
+        // and the connection pool's own message spans lines, so the outermost text
+        // alone cannot distinguish a missing database from bad credentials.
+        let err = chained(&[
+            "PostgreSQL connection failed.\ndb error",
+            "db error",
+            "FATAL: database \"tpch_sf1\" does not exist",
+        ]);
+        assert_eq!(
+            super::error_with_causes(&err),
+            "PostgreSQL connection failed. db error: FATAL: database \"tpch_sf1\" does not exist"
+        );
+    }
+
+    #[test]
+    fn error_with_causes_is_single_line_and_skips_repeats() {
+        // Every message collapses to one line — a multi-line error would break
+        // one-line-per-event log parsing.
+        let err = chained(&["outer\n  spanning lines", "inner"]);
+        assert_eq!(
+            super::error_with_causes(&err),
+            "outer spanning lines: inner"
+        );
+
+        // Wrappers that already interpolate `{source}` must not repeat it.
+        let err = chained(&["connect failed: bad password", "bad password"]);
+        assert_eq!(
+            super::error_with_causes(&err),
+            "connect failed: bad password"
+        );
+
+        // …including when the wrapper punctuates after the interpolated source.
+        let err = chained(&["connect failed: bad password.", "bad password"]);
+        assert_eq!(
+            super::error_with_causes(&err),
+            "connect failed: bad password."
+        );
+
+        // A lone error with no chain is unchanged.
+        let err = chained(&["standalone"]);
+        assert_eq!(super::error_with_causes(&err), "standalone");
+    }
+
+    #[test]
+    fn error_with_causes_keeps_a_cause_that_is_only_a_substring() {
+        // A short cause that merely appears inside the outer text is NOT already
+        // quoted, and dropping it would discard the root cause this exists to keep.
+        let err = chained(&["cannot resolve host name for cluster", "host"]);
+        assert_eq!(
+            super::error_with_causes(&err),
+            "cannot resolve host name for cluster: host"
+        );
+
+        // Same for a cause repeated mid-message rather than interpolated at the end.
+        let err = chained(&["timeout while waiting: retrying", "timeout"]);
+        assert_eq!(
+            super::error_with_causes(&err),
+            "timeout while waiting: retrying: timeout"
+        );
+    }
 
     #[tokio::test]
     async fn test_catalog_connector_registry_lifecycle() {

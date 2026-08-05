@@ -64,7 +64,7 @@ jobs:
     outputs:
       relevant_changes: ${{ steps.check.outputs.relevant_changes == 'true' || github.event_name == 'workflow_dispatch' }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
@@ -115,7 +115,7 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 1 # Shallow clone for faster checkout
@@ -210,7 +210,7 @@ jobs:
       matrix:
         target: ${{ fromJson(needs.setup-model-matrix.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 1
@@ -239,9 +239,9 @@ jobs:
           spice run &> spice.log &
 
       - name: Wait for Spice runtime is ready
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          timeout: '60'
 
       - name: Install expect (linux)
         if: matrix.target.target_os == 'linux'
@@ -272,16 +272,7 @@ jobs:
 
       - name: Stop spice and check logs
         if: always()
-        run: |
-          if command -v pkill >/dev/null 2>&1; then
-            pkill -x spice || true
-          elif command -v killall >/dev/null 2>&1; then
-            killall spice || true
-          fi
-
-          if [ -f spice.log ]; then
-            cat spice.log
-          fi
+        uses: ./.github/actions/stop-spice
 
   test_hf_model:
     name: 'huggingface model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
@@ -300,7 +291,7 @@ jobs:
             target_os: 'darwin'
             target_arch: 'aarch64'
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 1
@@ -321,6 +312,103 @@ jobs:
           cp ./test/models/spicepod_hf.yml ./spicepod.yaml
           cat ./spicepod.yaml
 
+      # The Hub credential lives where hf-hub looks for it, rather than being threaded
+      # through the spicepod as an `hf_token` param. Two reasons: it authenticates the
+      # chat model and the embedding model with one mechanism, and an unset secret
+      # leaves no file behind instead of setting an empty token, which the Hub answers
+      # with 401 — worse than no token at all.
+      - name: Authenticate the Hugging Face cache
+        env:
+          SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
+        run: |
+          set -uo pipefail
+          umask 077
+
+          # hf-hub caches artifacts under $HOME/.cache/huggingface/hub and reads its
+          # credential from the sibling `token` file. $HOME persists between jobs on
+          # these self-hosted runners while the _work tree does not, so once the ~3B
+          # chat model and the embedding model are on disk, later runs need no Hub
+          # round-trip at all.
+          mkdir -p "${HOME}/.cache/huggingface/hub"
+          token_file="${HOME}/.cache/huggingface/token"
+
+          # $HOME is shared by every job that lands on this host, and it outlives this
+          # one. So a token we write here must not be left behind for an unrelated job
+          # to read, and a token the host already owns must not be clobbered:
+          #   - file already present -> use it, touch nothing.
+          #   - absent + secret set  -> write it, and mark it for removal in cleanup.
+          #   - absent + no secret   -> warn; downloads are anonymous.
+          if [ -s "${token_file}" ]; then
+            echo "Using the Hugging Face token already present on this runner."
+          elif [ -n "${SPICE_HF_TOKEN:-}" ]; then
+            printf '%s' "${SPICE_HF_TOKEN}" > "${token_file}"
+            chmod 600 "${token_file}"
+            echo "SPICE_REMOVE_HF_TOKEN=${token_file}" >> "$GITHUB_ENV"
+            echo "Wrote a job-scoped Hugging Face token for hf-hub to pick up."
+          else
+            echo "::warning::No Hugging Face token available. Downloads will be anonymous, and anonymous requests share a per-IP quota across this whole runner pool — exhausting it surfaces as HTTP 401 on model config files."
+          fi
+
+      # Fail here, in seconds and by name, rather than as an unexplained five-minute
+      # readiness timeout. The retries ride out the transient per-IP 401/429 responses
+      # the pool draws from the Hub; this retries a *download*, never an assertion.
+      - name: Pre-flight the Hugging Face components
+        timeout-minutes: 5
+        run: |
+          set -uo pipefail
+
+          repos="$(sed -n 's|^[[:space:]]*-\{0,1\}[[:space:]]*from:[[:space:]]*huggingface:huggingface\.co/\([^[:space:]]*\).*$|\1|p' ./spicepod.yaml)"
+          if [ -z "${repos}" ]; then
+            echo "No Hugging Face components in the spicepod; nothing to pre-flight."
+            exit 0
+          fi
+
+          token_file="${HOME}/.cache/huggingface/token"
+
+          # The token goes to curl through a config on stdin rather than an -H argument,
+          # so it never appears in this process's argv. `printf` is a shell builtin, so
+          # it spawns nothing that could carry it either. curl drops the header on a
+          # cross-host redirect by default, which is what keeps `-L` safe here.
+          probe() {
+            if [ -s "${token_file}" ]; then
+              printf 'header = "Authorization: Bearer %s"\n' "$(cat "${token_file}")" |
+                curl -K - -sSL -o /dev/null -w '%{http_code}' --max-time 30 "$1" 2>/dev/null
+            else
+              curl -sSL -o /dev/null -w '%{http_code}' --max-time 30 "$1" 2>/dev/null
+            fi
+          }
+
+          rc=0
+          while IFS= read -r repo; do
+            [ -n "${repo}" ] || continue
+            code=""
+            for attempt in 1 2 3 4 5; do
+              code="$(probe "https://huggingface.co/${repo}/resolve/main/config.json")" || code="000"
+              if [ "${code}" -lt 400 ] 2>/dev/null; then
+                echo "  ok    ${repo} (HTTP ${code}, attempt ${attempt})"
+                break
+              fi
+              echo "  retry ${repo}: HTTP ${code} (attempt ${attempt}/5)"
+              sleep $((attempt * 3))
+            done
+
+            if ! { [ "${code}" -lt 400 ]; } 2>/dev/null; then
+              case "${code}" in
+                401|403)
+                  echo "::error::Hugging Face returned ${code} for ${repo} after 5 attempts. This is a Hub access/quota failure, not a code failure in this branch — anonymous downloads share a per-IP quota across the whole self-hosted pool. Set the SPICE_SECRET_HF_TOKEN secret, or run 'huggingface-cli login' on the runner." ;;
+                429)
+                  echo "::error::Hugging Face rate-limited ${repo} (429) after 5 attempts. Not a code failure in this branch." ;;
+                *)
+                  echo "::error::Could not reach Hugging Face for ${repo} (HTTP ${code}) after 5 attempts. Not a code failure in this branch." ;;
+              esac
+              rc=1
+            fi
+          # A here-string, not a pipe: a pipe would run the loop in a subshell and `rc`
+          # would never make it back out, so every failure would exit 0.
+          done <<< "${repos}"
+
+          exit "${rc}"
+
       - name: Start spice runtime
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -329,9 +417,9 @@ jobs:
           spice run &> spice.log &
 
       - name: Wait for Spice runtime is ready
-        timeout-minutes: 5
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          timeout: '300'
 
       - name: Install expect (linux)
         if: matrix.target.target_os == 'linux'
@@ -362,16 +450,16 @@ jobs:
 
       - name: Stop spice and check logs
         if: always()
-        run: |
-          if command -v pkill >/dev/null 2>&1; then
-            pkill -x spice || true
-          elif command -v killall >/dev/null 2>&1; then
-            killall spice || true
-          fi
+        uses: ./.github/actions/stop-spice
 
-          if [ -f spice.log ]; then
-            cat spice.log
-          fi
+      # Only fires when the step above wrote the token itself; a credential the runner
+      # already owned is left alone. Without this, a secret would outlive the job in a
+      # $HOME that every later job on this host can read.
+      - name: Remove the job-scoped Hugging Face token
+        if: always() && env.SPICE_REMOVE_HF_TOKEN != ''
+        run: |
+          rm -f "${SPICE_REMOVE_HF_TOKEN}"
+          echo "Removed the job-scoped Hugging Face token."
 
   test_quickstart_dremio:
     name: 'Test Dremio quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
@@ -388,7 +476,7 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -432,10 +520,10 @@ jobs:
           cat spicepod.yaml
 
       - name: Wait for dataset to be ready
-        working-directory: test_app
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: test_app
+          timeout: '60'
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -443,11 +531,10 @@ jobs:
           name: taxi_trips
 
       - name: Stop spice and check logs
-        working-directory: test_app
         if: always()
-        run: |
-          killall spice || true
-          cat spice.log
+        uses: ./.github/actions/stop-spice
+        with:
+          working-directory: test_app
 
   test_quickstart_spiceai:
     name: 'Test Spice.ai quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
@@ -464,7 +551,7 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -498,10 +585,10 @@ jobs:
           sleep 10
 
       - name: Wait for dataset to be ready
-        working-directory: test_app
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: test_app
+          timeout: '60'
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -509,11 +596,10 @@ jobs:
           name: taxi_trips
 
       - name: Stop spice and check logs
-        working-directory: test_app
         if: always()
-        run: |
-          killall spice || true
-          cat spice.log
+        uses: ./.github/actions/stop-spice
+        with:
+          working-directory: test_app
 
   test_quickstart_s3:
     name: 'Test S3 quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}; acceleration: ${{ matrix.acceleration.engine }})'
@@ -532,7 +618,7 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -593,10 +679,10 @@ jobs:
           sleep 10
 
       - name: Wait for dataset to be ready
-        working-directory: test_app
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: test_app
+          timeout: '60'
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -604,11 +690,10 @@ jobs:
           name: test_parquet_table
 
       - name: Stop spice and check logs
-        working-directory: test_app
         if: always()
-        run: |
-          killall spice || true
-          cat spice.log
+        uses: ./.github/actions/stop-spice
+        with:
+          working-directory: test_app
 
   test_quickstart_data_postgres:
     name: 'Test PostgreSQL quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}; acceleration: ${{ matrix.acceleration.engine }})'
@@ -644,7 +729,7 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install PostgreSQL
         uses: ./.github/actions/install-postgres
@@ -767,10 +852,10 @@ jobs:
           sleep 10
 
       - name: Wait for dataset to be ready
-        working-directory: test_app
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: test_app
+          timeout: '60'
 
       - name: Verify dataset1
         uses: ./.github/actions/verify-dataset
@@ -785,15 +870,10 @@ jobs:
           expected-rows-count: ${{ matrix.acceleration.engine != '' && 2 || 3 }}
 
       - name: Stop spice and check logs
-        working-directory: test_app
         if: always()
-        run: |
-          killall spice || true
-          cat spice.log
-          if grep -iE "(failed|error)" spice.log; then
-            echo "Failures detected in spice.log"
-            exit 1
-          fi
+        uses: ./.github/actions/check-spice-log
+        with:
+          working-directory: test_app
 
   test_quickstart_data_mysql:
     name: 'Test MySQL quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}; acceleration: ${{ matrix.acceleration.engine }})'
@@ -829,7 +909,7 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install PostgreSQL
         if: matrix.acceleration.engine == 'postgres'
@@ -981,10 +1061,10 @@ jobs:
           sleep 10
 
       - name: Wait for dataset to be ready
-        working-directory: test_app
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: test_app
+          timeout: '60'
 
       - name: Verify dataset1
         uses: ./.github/actions/verify-dataset
@@ -999,15 +1079,10 @@ jobs:
           expected-rows-count: ${{ matrix.acceleration.engine != '' && 2 || 3 }}
 
       - name: Stop spice and check logs
-        working-directory: test_app
         if: always()
-        run: |
-          killall spice || true
-          cat spice.log
-          if grep -iE "(failed|error)" spice.log; then
-            echo "Failures detected in spice.log"
-            exit 1
-          fi
+        uses: ./.github/actions/check-spice-log
+        with:
+          working-directory: test_app
 
   test_quickstart_clickhouse:
     name: 'Test Clickhouse quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
@@ -1022,7 +1097,7 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Clickhouse
         if: matrix.target.target_os == 'linux'
@@ -1099,10 +1174,10 @@ jobs:
           sleep 10
 
       - name: Wait for dataset to be ready
-        working-directory: test_app
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: test_app
+          timeout: '60'
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -1110,11 +1185,10 @@ jobs:
           name: test_clickhouse_table
 
       - name: Stop spice and check logs
-        working-directory: test_app
         if: always()
-        run: |
-          killall spice || true
-          cat spice.log
+        uses: ./.github/actions/stop-spice
+        with:
+          working-directory: test_app
 
   test_quickstart_duckdb:
     env:
@@ -1131,7 +1205,7 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install DuckDB
         if: matrix.target.target_os == 'linux'
@@ -1184,10 +1258,10 @@ jobs:
           sleep 5
 
       - name: Wait for dataset to be ready
-        working-directory: duckdb-app
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: duckdb-app
+          timeout: '60'
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -1196,10 +1270,9 @@ jobs:
 
       - name: Stop spice and check logs
         if: always()
-        working-directory: duckdb-app
-        run: |
-          killall spice || true
-          cat spice.log
+        uses: ./.github/actions/stop-spice
+        with:
+          working-directory: duckdb-app
 
   test_local_acceleration:
     name: 'Test acceleration on ${{ matrix.target.name }} using ${{ matrix.acceleration.engine }} (${{ matrix.acceleration.mode }})'
@@ -1227,7 +1300,7 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install PostgreSQL
         uses: ./.github/actions/install-postgres
@@ -1300,10 +1373,10 @@ jobs:
           sleep 10
 
       - name: Wait for dataset to be ready
-        working-directory: test_app
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: test_app
+          timeout: '60'
 
       - name: Manually refresh dataset (no params)
         working-directory: test_app
@@ -1344,11 +1417,10 @@ jobs:
           expected-rows-count: 2
 
       - name: Stop spice and check logs
-        working-directory: test_app
         if: always()
-        run: |
-          killall spice || true
-          cat spice.log
+        uses: ./.github/actions/stop-spice
+        with:
+          working-directory: test_app
 
   test_results_caching:
     name: 'Test results caching on ${{ matrix.target.name }}'
@@ -1363,7 +1435,7 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -1410,10 +1482,10 @@ jobs:
           sleep 10
 
       - name: Wait for dataset to be ready
-        working-directory: test_app
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: test_app
+          timeout: '60'
 
       - name: Run SQL query and check Miss cache header
         working-directory: test_app
@@ -1495,11 +1567,10 @@ jobs:
           fi
 
       - name: Stop spice and check logs
-        working-directory: test_app
         if: always()
-        run: |
-          killall spice || true
-          cat spice.log
+        uses: ./.github/actions/stop-spice
+        with:
+          working-directory: test_app
 
   gh_connector_quickstart:
     name: 'Test GitHub connector on ${{ matrix.target.name }}'
@@ -1518,7 +1589,7 @@ jobs:
               target_os: 'darwin'
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -1593,10 +1664,10 @@ jobs:
           sleep 20
 
       - name: Wait for dataset to be ready
-        working-directory: test_app
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: test_app
+          timeout: '60'
 
       - name: Run test query (issues)
         env:
@@ -1639,11 +1710,10 @@ jobs:
           query: 'select * from spiceai.stargazers limit 10;'
 
       - name: Stop spice and check logs
-        working-directory: test_app
         if: always()
-        run: |
-          killall spice || true
-          cat spice.log
+        uses: ./.github/actions/stop-spice
+        with:
+          working-directory: test_app
 
   mssql_connector_quickstart:
     name: 'Test MS SQL connector on ${{ matrix.target.name }}'
@@ -1671,7 +1741,7 @@ jobs:
           SA_PASSWORD: 1StrongPwd!!
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install mssql-tools
         run: |
@@ -1732,10 +1802,10 @@ jobs:
           sleep 20
 
       - name: Wait for dataset to be ready
-        working-directory: test_app
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: test_app
+          timeout: '60'
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -1751,15 +1821,10 @@ jobs:
           query: 'select * from test_mssql_table;'
 
       - name: Stop spice and check logs
-        working-directory: test_app
         if: always()
-        run: |
-          killall spice || true
-          cat spice.log
-          if grep -iE "(failed|error)" spice.log; then
-            echo "Failures detected in spice.log"
-            exit 1
-          fi
+        uses: ./.github/actions/check-spice-log
+        with:
+          working-directory: test_app
 
   databricks_delta_catalog_connector_quickstart:
     name: 'Test Databricks catalog connector (mode: delta_lake) on ${{ matrix.target.name }}'
@@ -1774,7 +1839,7 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -1824,10 +1889,10 @@ jobs:
           sleep 20
 
       - name: Wait for dataset to be ready
-        working-directory: test_app
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: test_app
+          timeout: '60'
 
       - name: Run test query (tpch)
         env:
@@ -1846,11 +1911,10 @@ jobs:
           query: 'select * from db_uc.tpcds.store limit 1;'
 
       - name: Stop spice and check logs
-        working-directory: test_app
         if: always()
-        run: |
-          killall spice || true
-          cat spice.log
+        uses: ./.github/actions/stop-spice
+        with:
+          working-directory: test_app
 
   graceful_shutdown_test_append:
     name: '${{ matrix.spicepod }} acceleration and graceful shutdown on ${{ matrix.target.name }}'
@@ -1859,6 +1923,21 @@ jobs:
       - build
       - setup-matrix
     timeout-minutes: 10
+
+    # `simulate_append_data.sh` rewrites `.spice/service_data.parquet` every 3s; a
+    # refresh tick that races the rename observes a half-published file and the
+    # runtime logs a WARN before retrying on the next tick. DuckDB surfaces the
+    # truncated read as one of two errors depending on which part of the file it
+    # reaches first: "TProtocolException: Invalid data" (corrupt Thrift footer) or
+    # "don't know what type: <token>", where the token is whatever bytes happen to
+    # sit where the schema element's type has not been written yet — empty, or an
+    # arbitrary byte such as 0x0e (see run 30534651210). Both log checks in this job
+    # tolerate both variants of that specific transient.
+    env:
+      PARQUET_RENAME_RACE_ALLOW: |
+        WARN +runtime::accelerated_table::refresh_task: Failed to load data for dataset
+        ^Invalid Error: TProtocolException: Invalid data$
+        ^Invalid Error: don't know what type:
 
     strategy:
       fail-fast: false
@@ -1876,7 +1955,7 @@ jobs:
               target_os: 'darwin'
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -1947,10 +2026,10 @@ jobs:
           spice run &> spice.log &
 
       - name: Wait for Spice runtime to be ready
-        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
+          timeout: '60'
 
       - name: Verify data_upsert dataset is queryable
         uses: ./.github/actions/verify-dataset
@@ -1993,8 +2072,16 @@ jobs:
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         timeout-minutes: 2
         run: |
-          killall spice || true
-          while pgrep -x spice > /dev/null; do sleep 1; done
+          # `spice run` spawns `spiced`, and `spiced` is the process that holds the
+          # ports and the data — SIGTERM to the CLI alone left it running, so the
+          # graceful-shutdown path under test never ran (#12058). Reuse the shared
+          # stopper so this signals both, and only processes belonging to this
+          # runner instance: several instances share one machine.
+          #
+          # A grace longer than the step timeout on purpose. This step exists to
+          # verify the runtime exits cleanly on SIGTERM, so one that does not must
+          # trip the step timeout rather than be SIGKILLed into looking healthy.
+          SPICE_STOP_GRACE=600 bash "$GITHUB_WORKSPACE/.github/actions/stop-spice/stop_spice.sh"
           # Allow filesystem to sync after process exits
           sleep 2
 
@@ -2018,33 +2105,16 @@ jobs:
             exit 1
           fi
 
-      - name: Check logs
-        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
+      - name: Stop the append simulator
         if: always()
-        run: |
-          killall spice || true
-          pkill -f simulate_append_data || true
-          cat spice.log
-          # `simulate_append_data.sh` rewrites `.spice/service_data.parquet`
-          # every 3s; a refresh tick that races the rename observes a
-          # half-published file and the runtime logs a WARN before
-          # retrying on the next tick. DuckDB surfaces the truncated read as
-          # one of two errors depending on which part of the file it reaches
-          # first: "TProtocolException: Invalid data" (corrupt Thrift footer)
-          # or "don't know what type:" with an empty type (schema element not
-          # yet written). Tolerate both variants of that specific transient.
-          #
-          # Strip ANSI first: spiced logs with_ansi(true), so whitelist
-          # patterns like `WARN +runtime::...` miss `WARN\e[0m \e[2mruntime::...`
-          # and the same transient fails the job (see run 29659183104).
-          if sed $'s/\x1b\\[[0-9;]*m//g' spice.log \
-             | grep -iE "(failed|error)" \
-             | grep -vE "WARN +runtime::accelerated_table::refresh_task: Failed to load data for dataset" \
-             | grep -vE "^Invalid Error: TProtocolException: Invalid data$" \
-             | grep -vE "^Invalid Error: don't know what type: *$"; then
-            echo "Failures detected in spice.log"
-            exit 1
-          fi
+        run: pkill -f simulate_append_data || true
+
+      - name: Check logs
+        if: always()
+        uses: ./.github/actions/check-spice-log
+        with:
+          working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
+          allow: ${{ env.PARQUET_RENAME_RACE_ALLOW }}
 
       - name: Restart Spice runtime
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
@@ -2054,10 +2124,10 @@ jobs:
           spice run &> spice.log &
 
       - name: Wait for dataset to be ready
-        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
+          timeout: '60'
 
       - name: Verify data_upsert dataset
         uses: ./.github/actions/verify-dataset
@@ -2070,23 +2140,11 @@ jobs:
           name: data_drop
 
       - name: Check logs
-        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         if: always()
-        run: |
-          killall spice || true
-          cat spice.log
-          # See note above: strip ANSI, then tolerate transient parquet-rename
-          # races emitted at WARN level by the refresh task (both the
-          # "TProtocolException: Invalid data" and empty-type "don't know what
-          # type:" variants).
-          if sed $'s/\x1b\\[[0-9;]*m//g' spice.log \
-             | grep -iE "(failed|error)" \
-             | grep -vE "WARN +runtime::accelerated_table::refresh_task: Failed to load data for dataset" \
-             | grep -vE "^Invalid Error: TProtocolException: Invalid data$" \
-             | grep -vE "^Invalid Error: don't know what type: *$"; then
-            echo "Failures detected in spice.log"
-            exit 1
-          fi
+        uses: ./.github/actions/check-spice-log
+        with:
+          working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
+          allow: ${{ env.PARQUET_RENAME_RACE_ALLOW }}
 
   graceful_shutdown_test_full:
     name: '${{ matrix.spicepod }} acceleration and graceful shutdown on ${{ matrix.target.name }}'
@@ -2112,7 +2170,7 @@ jobs:
               target_os: 'darwin'
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -2157,10 +2215,10 @@ jobs:
           spice run &> spice.log &
 
       - name: Wait for dataset to be ready
-        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
-        timeout-minutes: 3
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
+          timeout: '180'
 
       - name: Run test workfload for 120s
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
@@ -2172,8 +2230,16 @@ jobs:
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         timeout-minutes: 2
         run: |
-          killall spice || true
-          while pgrep -x spice > /dev/null; do sleep 1; done
+          # `spice run` spawns `spiced`, and `spiced` is the process that holds the
+          # ports and the data — SIGTERM to the CLI alone left it running, so the
+          # graceful-shutdown path under test never ran (#12058). Reuse the shared
+          # stopper so this signals both, and only processes belonging to this
+          # runner instance: several instances share one machine.
+          #
+          # A grace longer than the step timeout on purpose. This step exists to
+          # verify the runtime exits cleanly on SIGTERM, so one that does not must
+          # trip the step timeout rather than be SIGKILLed into looking healthy.
+          SPICE_STOP_GRACE=600 bash "$GITHUB_WORKSPACE/.github/actions/stop-spice/stop_spice.sh"
           sleep 2
 
       - name: Verify local DuckDB database
@@ -2197,15 +2263,10 @@ jobs:
           fi
 
       - name: Check logs
-        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         if: always()
-        run: |
-          killall spice || true
-          cat spice.log
-          if grep -iE "(failed|error)" spice.log; then
-            echo "Failures detected in spice.log"
-            exit 1
-          fi
+        uses: ./.github/actions/check-spice-log
+        with:
+          working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
 
       - name: Restart Spice runtime
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
@@ -2216,10 +2277,10 @@ jobs:
           spice run &> spice.log &
 
       - name: Wait for dataset to be ready
-        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
-        timeout-minutes: 3
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
+          timeout: '180'
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -2227,15 +2288,10 @@ jobs:
           name: customer
 
       - name: Check logs
-        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         if: always()
-        run: |
-          killall spice || true
-          cat spice.log
-          if grep -iE "(failed|error)" spice.log; then
-            echo "Failures detected in spice.log"
-            exit 1
-          fi
+        uses: ./.github/actions/check-spice-log
+        with:
+          working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
 
   # Stable, matrix-proof summary check. On pull requests, the upstream jobs are
   # skipped and this lightweight gate reports the required context. In the merge

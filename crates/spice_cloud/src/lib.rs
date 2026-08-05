@@ -132,8 +132,7 @@ impl SpiceExtension {
     }
 
     async fn get_spice_api_key(&self, runtime: &Runtime) -> Result<String, Error> {
-        let secret = runtime.secrets();
-        let secret = secret.read().await;
+        let secret = Secrets::snapshot(&runtime.secrets()).await;
         let api_key = secret
             .get_secret("spiceai_api_key")
             .await
@@ -330,7 +329,7 @@ async fn get_spiceai_table_provider(
     dataset.access = AccessMode::ReadWrite;
     dataset.replication = Some(Replication { enabled: true });
 
-    let params = ConnectorParamsBuilder::new(name.into(), (&dataset).into())
+    let params = ConnectorParamsBuilder::for_dataset(name.into(), &dataset)
         .build(secrets, io_runtime)
         .await
         .context(UnableToCreateDataConnectorSnafu)?;

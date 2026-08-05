@@ -125,22 +125,24 @@ pub fn duckdb_total_reservation_bytes() -> u64 {
 }
 
 /// A deduped-by-instance summary of the `DuckDB` accelerators in an app. Built by a
-/// thin adapter over `app.datasets` (see `builder::duckdb_budget_inputs`); the
-/// planner takes only these numbers so it stays pure and testable.
+/// thin adapter over `app.datasets` and `app.views` — either can carry an
+/// `acceleration` block, and every `DuckDB` instance they declare is counted here
+/// (see `builder::duckdb_budget_inputs`). The planner takes only these numbers so it
+/// stays pure and testable.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DuckDbBudgetInputs {
     /// Distinct `DuckDB` instances with NO explicit `duckdb_memory_limit` on any of
-    /// their datasets.
+    /// the datasets or views sharing them.
     pub num_unset_instances: u32,
     /// Distinct `DuckDB` instances with an explicit `duckdb_memory_limit`.
     pub num_explicit_instances: u32,
-    /// Sum of the explicit ceilings — one per explicit instance (the max value if
-    /// datasets on the same instance disagree).
+    /// Sum of the explicit ceilings — one per explicit instance (the max value if the
+    /// components on the same instance disagree).
     pub sum_explicit_bytes: u64,
     /// Some instance has an inconsistent `duckdb_memory_limit` across the datasets
-    /// that share it — mixed set/unset, or different explicit values. `DuckDB`'s
-    /// `memory_limit` is per-instance (last dataset created wins), so the effective
-    /// limit is ambiguous — surfaced in the warning.
+    /// and views that share it — mixed set/unset, or different explicit values.
+    /// `DuckDB`'s `memory_limit` is per-instance (last one created wins), so the
+    /// effective limit is ambiguous — surfaced in the warning.
     pub has_mixed_instance: bool,
     /// Human labels (in-memory / file path) of the un-limited instances, for the warning.
     pub unset_instance_labels: Vec<String>,
@@ -215,10 +217,11 @@ pub fn duckdb_default_per_instance_bytes(host_memory: u64) -> u64 {
 ///   instance, from HOST RAM (see [`duckdb_default_per_instance_bytes`]) so the
 ///   projection is correct in containers, not the cgroup total.
 /// * `base_query_budget` — what the query pool WOULD be with no `DuckDB` coordination,
-///   i.e. `effective_query_memory_limit(None, cayenne_active, cdc, None)` — 90% of
-///   RAM (non-Cayenne) or the reduced 70%-based Cayenne region. Splitting *this*
-///   (not `total`) confines `DuckDB` to the query region and preserves the Cayenne
-///   tier/headroom.
+///   i.e. `effective_query_memory_limit(None, cayenne_cdc_active, reservation, None)`
+///   — 90% of RAM, less any Cayenne off-pool cache reservation, or the reduced
+///   70%-based region when a Cayenne table can reach the in-memory CDC tier.
+///   Splitting *this* (not `total`) confines `DuckDB` to the query region and
+///   preserves the Cayenne tier/headroom.
 /// * `query_explicit` — parsed `runtime.query.memory_limit` (`Some` ⇒ honored verbatim).
 /// * `inputs` — the deduped `DuckDB` instance summary.
 #[must_use]

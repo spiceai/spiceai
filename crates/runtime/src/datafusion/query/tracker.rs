@@ -28,6 +28,10 @@ use runtime_metrics::query as metrics;
 
 #[derive(Clone)]
 pub(crate) struct QueryTracker {
+    /// Whether this query's detail row is written to `runtime.task_history`.
+    /// Metrics are recorded either way; when `false` the tracker skips only the
+    /// work that table consumes: the events and the captured-output preview.
+    pub(crate) task_history_enabled: bool,
     pub(crate) schema: Option<SchemaRef>,
     pub(crate) query_duration_secs: Option<f32>,
     pub(crate) query_execution_duration_secs: Option<f32>,
@@ -51,10 +55,10 @@ impl QueryTracker {
         tracing::debug!("Query finished with error: {error_message}; code: {error_code}",);
         self.error_message = Some(error_message);
         self.error_code = Some(error_code);
-        self.finish(request_context, &Arc::from(""));
+        self.finish(request_context, "");
     }
 
-    pub fn finish(mut self, request_context: &RequestContext, captured_output: &Arc<str>) {
+    pub fn finish(mut self, request_context: &RequestContext, captured_output: &str) {
         let query_duration = self.query_duration_timer.elapsed();
         let query_execution_duration = self.query_execution_duration_timer.elapsed();
 
@@ -138,7 +142,9 @@ impl QueryTracker {
             metrics::FAILURES.add(1, &labels);
         }
 
-        trace_query(request_context, &self, captured_output, &datasets_label);
+        if self.task_history_enabled {
+            trace_query(request_context, &self, captured_output, &datasets_label);
+        }
     }
 
     #[must_use]

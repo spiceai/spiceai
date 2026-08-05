@@ -854,7 +854,7 @@ impl DataConnectorFactory for GithubFactory {
             None
         } else {
             match resolve_runtime_github_concurrent_connections_limit(
-                params.app.as_deref(),
+                params.app().as_deref(),
                 &connector_component,
             ) {
                 Ok(value) => value,
@@ -1905,6 +1905,7 @@ mod tests {
     };
     use runtime::Runtime;
     use runtime::component::dataset::builder::DatasetBuilder;
+    use runtime::dataconnector::parameters::RuntimeConnectorContext;
     use runtime::dataconnector::{
         ConnectorComponent, ConnectorParams, DataConnectorError, DataConnectorFactory,
     };
@@ -1969,8 +1970,7 @@ mod tests {
             parameters,
             unsupported_type_action: None,
             component: ConnectorComponent::from(&dataset),
-            app: Some(app),
-            runtime: Some(runtime),
+            context: Some(Arc::new(RuntimeConnectorContext::new(app, runtime))),
             io_runtime: tokio::runtime::Handle::current(),
         }
     }

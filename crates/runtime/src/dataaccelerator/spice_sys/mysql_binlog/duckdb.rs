@@ -32,11 +32,18 @@ fn migrate_columns() -> [String; 2] {
 }
 
 impl MySqlBinlogSys {
+    /// Blocking: takes the pool's write gate. Callers must reach this through
+    /// `spawn_duckdb_blocking`, never directly from an async worker.
     pub(super) fn upsert_duckdb(
-        &self,
+        dataset_name: &str,
         pool: &Arc<DuckDbConnectionPool>,
         checkpoint: &MySqlBinlogCheckpoint,
     ) -> Result<()> {
+        let write_gate = pool.write_gate();
+        let _write_guard = write_gate
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
         let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
             .map_err(Error::external)?
@@ -81,7 +88,7 @@ impl MySqlBinlogSys {
             .execute(
                 &upsert,
                 duckdb::params![
-                    self.dataset_name,
+                    dataset_name,
                     checkpoint.binlog_file,
                     Self::position_to_i64(checkpoint.binlog_pos),
                     checkpoint.schema_json,
@@ -94,11 +101,21 @@ impl MySqlBinlogSys {
         Ok(())
     }
 
+    /// Blocking: takes the pool's write gate (the column migrations issue DDL).
+    /// Callers must reach this through `spawn_duckdb_blocking_opt`,
+    /// never directly from an async worker.
     pub(super) fn get_duckdb(
-        &self,
+        dataset_name: &str,
         pool: &Arc<DuckDbConnectionPool>,
     ) -> Option<MySqlBinlogCheckpoint> {
         use std::time::{Duration, UNIX_EPOCH};
+
+        // The column migrations below issue DDL, so this read path is also a
+        // writer to the shared acceleration file and takes the write gate.
+        let write_gate = pool.write_gate();
+        let _write_guard = write_gate
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let mut db_conn = Arc::clone(pool).connect_sync().ok()?;
         let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
@@ -116,7 +133,7 @@ impl MySqlBinlogSys {
             "SELECT binlog_file, binlog_pos, schema_json, gtid_executed, cursor_type, CAST(epoch(updated_at) AS DOUBLE) FROM {MYSQL_BINLOG_TABLE_NAME} WHERE dataset_name = ?"
         );
         let mut stmt = duckdb_conn.prepare(&query).ok()?;
-        let mut rows = stmt.query([&self.dataset_name]).ok()?;
+        let mut rows = stmt.query([dataset_name]).ok()?;
 
         if let Some(row) = rows.next().ok()? {
             let binlog_file: String = row.get(0).ok()?;
@@ -141,7 +158,17 @@ impl MySqlBinlogSys {
         }
     }
 
-    pub(super) fn delete_duckdb(&self, pool: &Arc<DuckDbConnectionPool>) -> Result<()> {
+    /// Blocking: takes the pool's write gate. Callers must reach this through
+    /// `spawn_duckdb_blocking`, never directly from an async worker.
+    pub(super) fn delete_duckdb(
+        dataset_name: &str,
+        pool: &Arc<DuckDbConnectionPool>,
+    ) -> Result<()> {
+        let write_gate = pool.write_gate();
+        let _write_guard = write_gate
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
         let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
             .map_err(Error::external)?
@@ -149,7 +176,7 @@ impl MySqlBinlogSys {
 
         let delete = format!("DELETE FROM {MYSQL_BINLOG_TABLE_NAME} WHERE dataset_name = ?");
         duckdb_conn
-            .execute(&delete, [&self.dataset_name])
+            .execute(&delete, [dataset_name])
             .map_err(Error::external)?;
 
         Ok(())

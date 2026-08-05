@@ -49,7 +49,7 @@ jobs:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 1
@@ -60,13 +60,14 @@ jobs:
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@973bc49a7be396ec9430255ad0f7ed684d7a1317 # v0.5.8
+        uses: spiceai/spiceio/.github/actions/setup@dc53e1f5e2a92e64bfc785923b8f9471c42fbf46 # v0.5.10
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
+          immutable-objects: "true"
 
       - name: Set up make
         uses: ./.github/actions/setup-make
@@ -131,8 +132,13 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Show sccache stats
-        if: runner.os == 'macOS' && env.SCCACHE_SETUP == 'true' && steps.setup-spiceio.outputs.endpoint != ''
-        run: sccache --show-stats
+        if: always() && (runner.os == 'macOS' && env.SCCACHE_SETUP == 'true' && steps.setup-spiceio.outputs.endpoint != '')
+        # `always()`: this is the one step that reports cache health, and without it
+        # it is skipped on exactly the failures it would explain (#12420). The `||`
+        # keeps a diagnostic from ever deciding a verdict — when the cache backend is
+        # gone `--show-stats` cannot answer either, and that is itself the finding.
+        run: |
+          sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
 
       - name: Kill spiceio
         if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''

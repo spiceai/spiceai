@@ -21,11 +21,18 @@ use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConne
 use super::{Error, MONGODB_TABLE_NAME, MongoCheckpointMetadata, MongoSys, Result};
 
 impl MongoSys {
+    /// Blocking: takes the pool's write gate. Callers must reach this through
+    /// `spawn_duckdb_blocking`, never directly from an async worker.
     pub(super) fn upsert_duckdb(
-        &self,
+        dataset_name: &str,
         pool: &Arc<DuckDbConnectionPool>,
         metadata: &MongoCheckpointMetadata,
     ) -> Result<()> {
+        let write_gate = pool.write_gate();
+        let _write_guard = write_gate
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
         let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
             .map_err(Error::external)?
@@ -60,7 +67,7 @@ impl MongoSys {
             .execute(
                 &upsert,
                 duckdb::params![
-                    self.dataset_name,
+                    dataset_name,
                     metadata.resume_token_json,
                     metadata.cluster_time_ts,
                     metadata.schema_json,
@@ -71,8 +78,10 @@ impl MongoSys {
         Ok(())
     }
 
+    /// Blocking `DuckDB` I/O. Callers must reach this through
+    /// `spawn_duckdb_blocking_opt`, never directly from an async worker.
     pub(super) fn get_duckdb(
-        &self,
+        dataset_name: &str,
         pool: &Arc<DuckDbConnectionPool>,
     ) -> Option<MongoCheckpointMetadata> {
         use std::time::{Duration, UNIX_EPOCH};
@@ -86,7 +95,7 @@ impl MongoSys {
             "SELECT resume_token_json, cluster_time_ts, schema_json, CAST(epoch(updated_at) AS DOUBLE) FROM {MONGODB_TABLE_NAME} WHERE dataset_name = ?"
         );
         let mut stmt = duckdb_conn.prepare(&query).ok()?;
-        let mut rows = stmt.query([&self.dataset_name]).ok()?;
+        let mut rows = stmt.query([dataset_name]).ok()?;
 
         if let Some(row) = rows.next().ok()? {
             let resume_token_json: String = row.get(0).ok()?;
@@ -107,7 +116,17 @@ impl MongoSys {
         }
     }
 
-    pub(super) fn delete_duckdb(&self, pool: &Arc<DuckDbConnectionPool>) -> Result<()> {
+    /// Blocking: takes the pool's write gate. Callers must reach this through
+    /// `spawn_duckdb_blocking`, never directly from an async worker.
+    pub(super) fn delete_duckdb(
+        dataset_name: &str,
+        pool: &Arc<DuckDbConnectionPool>,
+    ) -> Result<()> {
+        let write_gate = pool.write_gate();
+        let _write_guard = write_gate
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
         let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
             .map_err(Error::external)?
@@ -115,7 +134,7 @@ impl MongoSys {
 
         let delete = format!("DELETE FROM {MONGODB_TABLE_NAME} WHERE dataset_name = ?");
         duckdb_conn
-            .execute(&delete, [&self.dataset_name])
+            .execute(&delete, [dataset_name])
             .map_err(Error::external)?;
 
         Ok(())

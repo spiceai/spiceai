@@ -184,6 +184,12 @@ impl AccelerationSource for Dataset {
         &self.name
     }
 
+    fn connector_name(&self) -> Option<&str> {
+        // `DatasetSpec::source()` is the authoritative `from:` parse: it recognizes
+        // `://`, `:` AND `/` as delimiters and maps an empty value to `sink`.
+        Some(DatasetSpec::source(self))
+    }
+
     fn time_column(&self) -> Option<&str> {
         self.time_column.as_deref()
     }

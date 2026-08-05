@@ -15,15 +15,19 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
-use std::{any::Any, fmt::Debug};
+use std::{any::Any, fmt::Debug, sync::Arc};
 
 use datafusion::arrow::array::RecordBatch;
+use datafusion::catalog::{Session, TableProvider};
 use datafusion::error::Result;
+use datafusion::prelude::Expr;
 use snafu::prelude::*;
 
 pub mod analyzer;
+mod delete;
 mod provider;
 pub mod util;
+pub use delete::{build_key_match_predicate, resolve_keys_matching_predicate};
 pub use provider::*;
 pub use util::{INDEXED_INNER, InnerProviderFn, find_concrete_table_provider_with};
 
@@ -76,6 +80,114 @@ pub trait Index: Debug + Send + Sync + 'static {
     /// `DuckDB` VSS on each insert.
     async fn on_write_complete(&self) -> Result<()> {
         Ok(())
+    }
+
+    /// Delete index entries for the given primary-key rows.
+    ///
+    /// Default is a no-op — correct for indexes whose entries live inside the accelerated
+    /// table row itself (co-located; removed automatically when the accelerator deletes the
+    /// row). Implementations backed by a separate store (S3 Vectors, Elasticsearch) must
+    /// override this to remove the corresponding entries there.
+    ///
+    /// `keys` may carry more columns than an implementation's own primary key (see
+    /// [`Index::resolve_delete_keys`]'s default, which resolves on [`Index::required_columns`]
+    /// rather than a narrower key) — implementations must look up their own known key column(s)
+    /// by name and ignore anything else present, rather than assuming `keys`' schema is exactly
+    /// their key.
+    ///
+    /// Full/both-scope by convention: a wrapper composing several backing indexes (e.g. a
+    /// writethrough+fallback pair) must fan this out to every index it composes.
+    async fn delete_by_keys(&self, keys: RecordBatch) -> Result<()> {
+        let _ = keys;
+        Ok(())
+    }
+
+    /// Whether [`Index::delete_by_keys`] removes *every* entry matching the key columns it finds
+    /// in `keys`, even when those are a strict subset of this index's own primary key.
+    ///
+    /// Defaults to `false`: an index addressed by an exact key (S3 Vectors keys each vector by
+    /// its full composite key) cannot act on a partial one, so a caller holding only part of the
+    /// key must resolve the complete keys first. `true` says the store filters by field value and
+    /// so deletes the whole matching group in one operation — Elasticsearch's `_delete_by_query`.
+    ///
+    /// The caller this exists for is `ChunkedSearchIndex`: it knows the base row key but not the
+    /// chunk ids stored under it, and every chunk of a deleted row has to go. When this is `true`
+    /// it hands that base key straight to [`Index::delete_by_keys`]; when `false` it must first
+    /// enumerate the index's chunk-keyed entries itself.
+    ///
+    /// Wrapper implementations MUST forward this to the index they wrap — inheriting the default
+    /// silently sends a partial-key-capable inner index down the enumerate-first path.
+    fn deletes_by_partial_key(&self) -> bool {
+        false
+    }
+
+    /// Resolves the primary-key rows of `table` matching `filters`, for a later
+    /// [`Index::delete_by_keys`] call — the read half of [`Index::delete_by_predicate`], split
+    /// out so a caller can run it *before* an authoritative row delete (while the matching rows
+    /// still exist to resolve) and defer the actual [`Index::delete_by_keys`] call until after
+    /// that row delete has succeeded.
+    ///
+    /// Default: resolves `filters` against `table` (scanning under the *original* predicate,
+    /// before any row is actually removed — there is nothing left to resolve once they're gone),
+    /// projected down to [`Index::required_columns`]. Returns `Ok(None)` when nothing matched.
+    /// This is deliberately robust to `filters` referencing columns this index knows nothing
+    /// about: the filter is evaluated against `table`'s *own* full schema (`table` is generally
+    /// the real base/accelerated table, which has every column), and only the *projection* is
+    /// narrowed to this index's columns — so an unrelated filter column never needs to exist in
+    /// this index's own store, only on `table`.
+    ///
+    /// Override to return `Ok(None)` unconditionally for indexes whose [`Index::delete_by_keys`]
+    /// stays the default no-op (co-located indexes — see `NativeVectorIndex`, the `DuckDB` VSS
+    /// index) so a delete doesn't pay for a pointless resolve scan.
+    async fn resolve_delete_keys(
+        &self,
+        table: &Arc<dyn TableProvider>,
+        session: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> Result<Option<RecordBatch>> {
+        let keys =
+            resolve_keys_matching_predicate(table, session, filters, &self.required_columns())
+                .await?;
+        if keys.num_rows() == 0 {
+            return Ok(None);
+        }
+        Ok(Some(keys))
+    }
+
+    /// Delete index entries matching `filters` — the same predicate shape
+    /// [`TableProvider::delete_from`] receives.
+    ///
+    /// Default: [`Index::resolve_delete_keys`] then [`Index::delete_by_keys`] with the result.
+    ///
+    /// Most implementations should not need to override this — override [`Index::delete_by_keys`]
+    /// instead (or [`Index::resolve_delete_keys`] to skip a pointless resolve scan). Override this
+    /// only when composing other indexes (see `CompoundSearchIndex`'s fan-out) or when an index's
+    /// `required_columns` includes columns not visible to a consistent `delete_by_keys` shape.
+    async fn delete_by_predicate(
+        &self,
+        table: &Arc<dyn TableProvider>,
+        session: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> Result<()> {
+        let Some(keys) = self.resolve_delete_keys(table, session, filters).await? else {
+            return Ok(());
+        };
+        self.delete_by_keys(keys).await
+    }
+
+    /// Whether a failure in [`Index::on_write_start`] must fail the write.
+    ///
+    /// Defaults to `false` (best-effort), matching indexes whose start step only tunes
+    /// something the write does not depend on — Elasticsearch's `refresh_interval`
+    /// override is the example: the write is still indexed correctly without it. An
+    /// index that *prepares state the write depends on* returns `true`: for those,
+    /// writing anyway leaves the index and the rows it indexes diverged, with only a
+    /// warning to say so.
+    ///
+    /// Wrapper implementations MUST forward this to the index they wrap — inheriting
+    /// the default silently downgrades a fatal inner index to best-effort.
+    fn write_start_failure_is_fatal(&self) -> bool {
+        false
     }
 
     /// Whether a failure in [`Index::on_write_complete`] must fail the write.

@@ -267,6 +267,13 @@ impl Index for DuckDBVectorIndex {
         let index = self.clone();
         let ctx = ctx.clone();
         tokio::task::spawn_blocking(move || {
+            // Writers acquire the pool's write gate (before the connection
+            // checkout) so index creation cannot race a database file swap.
+            let write_gate = ctx.pool.write_gate();
+            let _write_guard = write_gate
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+
             let mut db_conn = Arc::clone(&ctx.pool)
                 .connect_sync()
                 .map_err(to_execution_error)?;
@@ -277,6 +284,19 @@ impl Index for DuckDBVectorIndex {
         })
         .await
         .map_err(|e| DataFusionError::Execution(format!("HNSW index creation task failed: {e}")))?
+    }
+
+    // Co-located: embeddings live in the DuckDB-accelerated table itself, kept in sync by
+    // DuckDB VSS whenever the table's own rows are deleted — `delete_by_keys` stays the default
+    // no-op. Override `resolve_delete_keys` too so a delete doesn't pay for a pointless resolve
+    // scan.
+    async fn resolve_delete_keys(
+        &self,
+        _table: &Arc<dyn datafusion::catalog::TableProvider>,
+        _session: &dyn datafusion::catalog::Session,
+        _filters: Vec<datafusion::prelude::Expr>,
+    ) -> DataFusionResult<Option<RecordBatch>> {
+        Ok(None)
     }
 }
 

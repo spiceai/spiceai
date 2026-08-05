@@ -40,6 +40,7 @@ use secrecy::ExposeSecret;
 use secrecy::SecretString;
 use snafu::prelude::*;
 use std::error::Error as StdError;
+use std::time::Duration;
 use tonic::IntoRequest;
 use tonic::IntoStreamingRequest;
 use tonic::transport::{Channel, Endpoint};
@@ -53,12 +54,29 @@ pub const MAX_DECODING_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
 pub const HTTP2_INITIAL_STREAM_WINDOW_SIZE: u32 = 16 * 1024 * 1024;
 pub const HTTP2_INITIAL_CONNECTION_WINDOW_SIZE: u32 = 64 * 1024 * 1024;
 
-/// Applies shared HTTP/2 flow-control settings for high-throughput Flight streams.
+/// How often to send an HTTP/2 PING on a pooled Flight channel.
+pub const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long to wait for a PING ack before treating the channel as dead.
+pub const HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Applies shared HTTP/2 flow-control and keepalive settings for Flight channels.
+///
+/// The keepalive pings matter because these channels are pooled and long-lived. A load
+/// balancer between the client and a Flight endpoint resets connections that go idle,
+/// and the client is not told: the reset only surfaces when the next request is written,
+/// which then fails while the replacement connection is established for the request
+/// after it. Pinging while idle keeps the connection from being reaped in the first
+/// place, so a query or availability probe arriving after a quiet period still lands on
+/// a live channel.
 #[must_use]
 pub fn configure_endpoint_for_high_throughput(endpoint: Endpoint) -> Endpoint {
     endpoint
         .initial_stream_window_size(HTTP2_INITIAL_STREAM_WINDOW_SIZE)
         .initial_connection_window_size(HTTP2_INITIAL_CONNECTION_WINDOW_SIZE)
+        .http2_keep_alive_interval(HTTP2_KEEP_ALIVE_INTERVAL)
+        .keep_alive_timeout(HTTP2_KEEP_ALIVE_TIMEOUT)
+        .keep_alive_while_idle(true)
 }
 
 #[derive(Debug)]

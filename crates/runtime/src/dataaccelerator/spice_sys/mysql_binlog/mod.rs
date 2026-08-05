@@ -50,7 +50,10 @@ limitations under the License.
 //! );
 //! ```
 
-use super::{AccelerationConnection, Error, Result, acceleration_connection};
+use super::{
+    AccelerationConnection, Error, Result, UPSERT_MAX_RETRIES, UPSERT_MAX_RETRY_DELAY,
+    acceleration_connection, is_retryable_lock_error,
+};
 use crate::{component::dataset::Dataset, dataaccelerator::spice_sys::OpenOption};
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
@@ -114,16 +117,26 @@ impl MySqlBinlogSys {
     }
 
     #[cfg_attr(
-        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        not(any(
+            feature = "sqlite",
+            feature = "duckdb",
+            feature = "postgres-accel",
+            feature = "turso"
+        )),
         expect(
             clippy::unused_async,
-            reason = "async only when an async accelerator backend is compiled in; DuckDB helpers are synchronous"
+            reason = "async only when an accelerator backend is compiled in; with none, every arm errors immediately"
         )
     )]
     pub async fn get(&self) -> Option<MySqlBinlogCheckpoint> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => self.get_duckdb(pool),
+            AccelerationConnection::DuckDB(pool) => {
+                let pool = std::sync::Arc::clone(pool);
+                let dataset_name = self.dataset_name.clone();
+                super::spawn_duckdb_blocking_opt(move || Self::get_duckdb(&dataset_name, &pool))
+                    .await
+            }
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.get_postgres(pool).await,
             #[cfg(feature = "sqlite")]
@@ -178,10 +191,15 @@ impl MySqlBinlogSys {
     }
 
     #[cfg_attr(
-        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        not(any(
+            feature = "sqlite",
+            feature = "duckdb",
+            feature = "postgres-accel",
+            feature = "turso"
+        )),
         expect(
             clippy::unused_async,
-            reason = "async only when an async accelerator backend is compiled in; DuckDB helpers are synchronous"
+            reason = "async only when an accelerator backend is compiled in; with none, every arm errors immediately"
         )
     )]
     async fn upsert_once(
@@ -199,7 +217,15 @@ impl MySqlBinlogSys {
     ) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => self.upsert_duckdb(pool, checkpoint),
+            AccelerationConnection::DuckDB(pool) => {
+                let pool = std::sync::Arc::clone(pool);
+                let dataset_name = self.dataset_name.clone();
+                let checkpoint = checkpoint.clone();
+                super::spawn_duckdb_blocking(move || {
+                    Self::upsert_duckdb(&dataset_name, &pool, &checkpoint)
+                })
+                .await
+            }
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.upsert_postgres(pool, checkpoint).await,
             #[cfg(feature = "sqlite")]
@@ -219,16 +245,26 @@ impl MySqlBinlogSys {
     }
 
     #[cfg_attr(
-        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        not(any(
+            feature = "sqlite",
+            feature = "duckdb",
+            feature = "postgres-accel",
+            feature = "turso"
+        )),
         expect(
             clippy::unused_async,
-            reason = "async only when an async accelerator backend is compiled in; DuckDB helpers are synchronous"
+            reason = "async only when an accelerator backend is compiled in; with none, every arm errors immediately"
         )
     )]
     pub async fn delete(&self) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => self.delete_duckdb(pool),
+            AccelerationConnection::DuckDB(pool) => {
+                let pool = std::sync::Arc::clone(pool);
+                let dataset_name = self.dataset_name.clone();
+                super::spawn_duckdb_blocking(move || Self::delete_duckdb(&dataset_name, &pool))
+                    .await
+            }
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.delete_postgres(pool).await,
             #[cfg(feature = "sqlite")]
@@ -283,39 +319,4 @@ impl MySqlBinlogSys {
     fn position_to_i64(pos: u64) -> i64 {
         i64::try_from(pos).unwrap_or(i64::MAX)
     }
-}
-
-/// Retries for a checkpoint upsert contending with the accelerator's writer
-/// lock, on top of the initial attempt. Bounded and short: paired with
-/// [`UPSERT_MAX_RETRY_DELAY`] the worst-case added latency stays well under one
-/// checkpoint interval, and a persistent lock just retries on the next interval
-/// anyway.
-const UPSERT_MAX_RETRIES: usize = 4;
-
-/// Per-attempt cap on the [`FibonacciBackoffBuilder`] delay for
-/// [`MySqlBinlogSys::upsert`] retries. The shared Fibonacci schedule starts at
-/// 1s, far longer than a transient writer-lock hand-off needs, so clamp each
-/// delay to keep the whole retry budget (~4 × 100ms) short relative to the
-/// checkpoint interval.
-const UPSERT_MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
-
-/// Whether a sidecar write failure is a transient lock/contention error worth
-/// retrying rather than surfacing.
-///
-/// Deliberately a string heuristic over the boxed engine error (rusqlite,
-/// Turso, `DuckDB`, and tokio-postgres all report contention differently),
-/// mirroring the reconnect classifier in
-/// `data_components::mysql_replication::resilience`. Slight over-matching is
-/// harmless: retries are bounded, so a misclassified non-lock error only costs
-/// a few short sleeps before it is returned unchanged.
-fn is_retryable_lock_error(err: &Error) -> bool {
-    const MARKERS: &[&str] = &[
-        "database is locked",
-        "database table is locked",
-        "sqlite_busy",
-        "sqlite_locked",
-        "deadlock",
-    ];
-    let msg = err.to_string().to_ascii_lowercase();
-    MARKERS.iter().any(|marker| msg.contains(marker))
 }

@@ -89,6 +89,9 @@ pub struct Runtime {
     pub query: Option<Query>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<Cpu>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -998,6 +1001,82 @@ pub enum OutputLevel {
     VeryVerbose,
 }
 
+/// How many CPUs the runtime should behave as though it has.
+///
+/// Detection reads a cgroup CPU *quota* and otherwise falls back to the node's
+/// core count, so a Kubernetes pod that sets `resources.requests.cpu` without a
+/// matching `resources.limits.cpu` is sized for the whole node. This section is
+/// the explicit override, in the `GOMAXPROCS` / `-XX:ActiveProcessorCount`
+/// idiom: one entitlement that feeds every thread pool, the query fan-out, and
+/// accelerator concurrency coherently.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub struct Cpu {
+    /// The CPU entitlement, as a Kubernetes CPU quantity: `4`, `3.5`, `3500m`.
+    /// `auto` (the default) detects it. Applied at startup only — the thread
+    /// pools it sizes cannot be resized on a spicepod reload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cores: Option<CpuQuantity>,
+}
+
+/// A CPU quantity, held verbatim so it can be echoed back in an error message.
+///
+/// Accepts a YAML number (`cores: 4`, `cores: 3.5`) or a string
+/// (`cores: 3500m`, `cores: auto`); it always serializes as a string, so
+/// `--set-runtime cpu.cores=…` round-trips through YAML unchanged. Validation
+/// lives in `cpu_budget`, which is where the value is used.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(transparent)]
+pub struct CpuQuantity(String);
+
+impl CpuQuantity {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for CpuQuantity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for CpuQuantity {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ScalarVisitor;
+
+        impl serde::de::Visitor<'_> for ScalarVisitor {
+            type Value = CpuQuantity;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a CPU quantity such as 4, 3.5, 3500m, or auto")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(CpuQuantity(v.to_string()))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(CpuQuantity(v.to_string()))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                Ok(CpuQuantity(v.to_string()))
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+                Ok(CpuQuantity(v.to_string()))
+            }
+        }
+
+        deserializer.deserialize_any(ScalarVisitor)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -1027,9 +1106,10 @@ pub struct Query {
     /// and memory pool and starving each other under load (e.g. analytical
     /// queries alongside CDC ingestion and compaction). The permit is held for
     /// the plan's full execution and result-streaming lifetime; a results-cache
-    /// hit is never gated. Unset = unbounded (the prior behavior). A configured
-    /// value is clamped to a minimum of `1` in the runtime builder, so `0` means
-    /// one concurrent query (not unbounded).
+    /// hit is never gated.
+    ///
+    /// Unset sizes the bound from the CPU budget (four plans per core). `0` opts
+    /// out and leaves admission unbounded. Any other value is that limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent_queries: Option<usize>,
 
@@ -1253,6 +1333,8 @@ pub struct RuntimeDeserializer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<Query>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<Cpu>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduler: Option<Scheduler>,
@@ -1340,6 +1422,7 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             } else {
                 Some(query)
             },
+            cpu: deserializer.cpu,
             metrics: deserializer.metrics,
             scheduler: deserializer.scheduler,
             source_rate_control: deserializer.source_rate_control,
@@ -1512,6 +1595,50 @@ mod tests {
             result.is_err(),
             "unknown fields in mcp section should be rejected due to deny_unknown_fields"
         );
+    }
+
+    /// `cores` must accept every shape an operator (or the Helm downward API)
+    /// writes it in — a YAML integer, a YAML float, and a quoted millicore or
+    /// `auto` string — and must always serialize back as a string so
+    /// `--set-runtime cpu.cores=…` round-trips through YAML unchanged.
+    #[test]
+    fn test_cpu_cores_accepts_every_quantity_shape() {
+        for (input, expected) in [
+            ("cores: 4", "4"),
+            ("cores: 3.5", "3.5"),
+            ("cores: 3500m", "3500m"),
+            ("cores: auto", "auto"),
+            ("cores: \"2\"", "2"),
+        ] {
+            let parsed: Cpu = yaml::from_str(input).expect("parses");
+            assert_eq!(
+                parsed.cores.as_ref().map(CpuQuantity::as_str),
+                Some(expected),
+                "{input}"
+            );
+            let round_tripped: Cpu =
+                yaml::from_value(yaml::to_value(&parsed).expect("serializes")).expect("re-parses");
+            assert_eq!(round_tripped, parsed, "{input}");
+        }
+    }
+
+    #[test]
+    fn test_cpu_section_parses_from_runtime() {
+        let runtime: Runtime = yaml::from_str("cpu:\n  cores: 3500m\n").expect("parses");
+        assert_eq!(
+            runtime
+                .cpu
+                .as_ref()
+                .and_then(|cpu| cpu.cores.as_ref())
+                .map(CpuQuantity::as_str),
+            Some("3500m")
+        );
+
+        // Absent by default, and absent from the serialized form.
+        let empty: Runtime = yaml::from_str("{}").expect("parses");
+        assert_eq!(empty.cpu, None);
+        let serialized = yaml::to_string(&empty).expect("serializes");
+        assert!(!serialized.contains("cpu"), "{serialized}");
     }
 
     #[test]

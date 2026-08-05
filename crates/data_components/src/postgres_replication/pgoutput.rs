@@ -22,6 +22,7 @@ limitations under the License.
 //! Reference: <https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html>
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use bytes::{Buf, Bytes};
 use snafu::ensure;
@@ -138,9 +139,13 @@ pub enum Value {
 }
 
 /// Stateful decoder that caches `Relation` messages across calls.
+///
+/// Cached relations are refcounted so a consumer can hold the exact generation
+/// its raw tuple bytes were decoded against without a deep copy, and compare
+/// generations by pointer. See [`Self::relation`].
 #[derive(Default)]
 pub struct Decoder {
-    relations: HashMap<RelationId, Relation>,
+    relations: HashMap<RelationId, Arc<Relation>>,
 }
 
 impl Decoder {
@@ -150,14 +155,20 @@ impl Decoder {
     }
 
     /// Look up a previously-seen relation by id.
+    ///
+    /// Returns the refcounted generation, so a caller buffering raw tuple bytes
+    /// pays a refcount bump rather than deep-copying the namespace, table name,
+    /// and per-column names. Two buffers built from the same generation share
+    /// one pointer, which is what lets them be merged (`Arc::ptr_eq`) without
+    /// re-comparing the column layout.
     #[must_use]
-    pub fn relation(&self, id: RelationId) -> Option<&Relation> {
+    pub fn relation(&self, id: RelationId) -> Option<&Arc<Relation>> {
         self.relations.get(&id)
     }
 
     /// Iterate over cached relations (insertion order not preserved).
     pub fn relation_iter(&self) -> impl Iterator<Item = &Relation> {
-        self.relations.values()
+        self.relations.values().map(AsRef::as_ref)
     }
 
     /// Rewrite the cached relation's key flags to the dataset-declared primary
@@ -170,7 +181,11 @@ impl Decoder {
         }
 
         if let Some(rel) = self.relations.get_mut(&id) {
-            for col in &mut rel.columns {
+            // `make_mut` copies only while an already-published buffer still
+            // holds this generation, which is exactly when it must: that buffer's
+            // rows were decoded against the pre-rewrite key flags and must keep
+            // them, while the cache moves on to the rewritten generation.
+            for col in &mut Arc::make_mut(rel).columns {
                 col.is_key = declared_pks.iter().any(|pk| pk == &col.name);
             }
         }
@@ -195,7 +210,8 @@ impl Decoder {
             b'C' => decode_commit(&mut buf),
             b'R' => {
                 let rel = decode_relation(&mut buf)?;
-                self.relations.insert(rel.relation_id, rel.clone());
+                self.relations
+                    .insert(rel.relation_id, Arc::new(rel.clone()));
                 Ok(DecodedMessage::Relation(rel))
             }
             b'I' => decode_insert(&mut buf),

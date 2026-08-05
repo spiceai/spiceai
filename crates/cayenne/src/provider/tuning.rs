@@ -626,18 +626,20 @@ pub(crate) fn sample_mem_pressure(stats: &IngestStats) {
 // ---------------------------------------------------------------------------
 
 /// Sample process-wide CPU busy-fraction into the global [`CPU_PRESSURE_MILLI`]:
-/// cgroup v2 `cpu.stat` `usage_usec` (v1 `cpuacct.usage` fallback), as a delta
-/// busy-fraction `Δusage / (Δwall × cores)`. Needs the previous sample; a too-close
-/// interval (< 0.5 s) is skipped so a double-call can't divide by ~0. Called on the
-/// background tick. Linux-only; elsewhere a no-op (pressure stays unknown → the CPU
-/// rule is inert). Process-global because CPU is shared across all per-table loops.
+/// cgroup v2 `cpu.stat` `usage_usec` (v1 `cpuacct.usage` fallback), divided by the
+/// runtime's CPU *entitlement* rather than the host's core count — on a 4-core
+/// entitlement misread as 18 cores a fully saturated process reports ~0.22, and the
+/// controller then makes CPU-stealing moves believing CPU is idle. Needs the previous
+/// sample; a too-close interval (< 0.5 s) is skipped so a double-call can't divide by
+/// ~0. Called on the background tick. Linux-only; elsewhere a no-op (pressure stays
+/// unknown → the CPU rule is inert). Process-global because CPU is shared across all
+/// per-table loops.
 #[cfg(target_os = "linux")]
 pub(crate) fn sample_cpu_pressure() {
     let Some(now_usage) = cgroup_cpu_usage_usec() else {
         return;
     };
     let now = Instant::now();
-    let cores = cpu_cores_f64();
     let mut prev = CPU_PREV_SAMPLE.lock();
     match *prev {
         Some((prev_usage, prev_at)) => {
@@ -645,9 +647,11 @@ pub(crate) fn sample_cpu_pressure() {
             // Skip samples < 0.5 s apart: a tiny denominator makes the ratio noisy
             // (two ticks can fire close together on a multi-table host). Keep `prev`
             // and wait for a wider window.
-            if wall_secs >= 0.5 && cores > 0.0 {
+            if wall_secs >= 0.5 {
                 let busy_secs = u64_to_f64(now_usage.saturating_sub(prev_usage)) / 1_000_000.0;
-                store_cpu_pressure(busy_secs / (wall_secs * cores));
+                store_cpu_pressure(
+                    cpu_budget::cpu_budget().cpu_busy_fraction(busy_secs, wall_secs),
+                );
                 *prev = Some((now_usage, now));
             }
         }
@@ -670,12 +674,6 @@ fn store_cpu_pressure(frac: f64) {
     if let Some(milli) = pressure_to_milli(frac) {
         CPU_PRESSURE_MILLI.store(milli, Ordering::Relaxed);
     }
-}
-
-#[cfg(target_os = "linux")]
-fn cpu_cores_f64() -> f64 {
-    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-    u64_to_f64(u64::try_from(cores).unwrap_or(1))
 }
 
 /// Cumulative CPU usage in microseconds — cgroup v2 `cpu.stat` `usage_usec`, then
@@ -2362,15 +2360,21 @@ pub(crate) fn decide_with_goals(
                     reason: "falling behind: enlarge the in-memory CDC tier (fewer writer-blocking spills)",
                 });
             }
-            // 3. Buffers maxed (or memory tight) and queries are NOT read-amp-bound
-            //    → add encode parallelism. Gated on low read-amp because more shards
-            //    mean more files; ALSO withheld when the stream is delete-heavy,
-            //    where extra shards multiply the per-burst small-file fan-out and
-            //    worsen delete routing off the in-memory tier.
-            // 3. ... Also withheld when CPU-bound (more shards steal query threads)
-            //    or I/O-/publish-bound (more shards = more files, uploads, and
-            //    metastore commits — the slow-storage/EBS bias).
+            // 3. Buffers maxed and queries are NOT read-amp-bound → add encode
+            //    parallelism. Gated on low read-amp because more shards mean more
+            //    files; ALSO withheld when the stream is delete-heavy, where extra
+            //    shards multiply the per-burst small-file fan-out and worsen delete
+            //    routing off the in-memory tier.
+            //    Also withheld when CPU-bound (more shards steal query threads),
+            //    I/O-/publish-bound (more shards = more files, uploads, and
+            //    metastore commits — the slow-storage/EBS bias), and under memory
+            //    pressure: every extra shard is another in-flight encode buffer and
+            //    inline memtable, so this lever buys lag relief with resident bytes
+            //    — near the budget that trade is an OOM kill, not a recovery
+            //    (measured at SF-1000 under a 96 GiB cgroup cap: the tuner raised
+            //    shards at 0.98 pressure and the kernel ended the process).
             if s.read_amp <= READ_AMP_LOW
+                && mem_ok
                 && !mutation_heavy
                 && cpu_ok
                 && !io_bound
@@ -2749,8 +2753,13 @@ fn decide_goal(
                 reason: "replication-lag goal: enlarge the in-memory CDC tier (fewer writer-blocking spills)",
             });
         }
+        // Withheld under memory pressure for the same reason as every other
+        // grow move: each extra shard is another in-flight encode buffer and
+        // inline memtable, so near the budget this lever converts a lag
+        // violation into an OOM kill.
         if !query_violated
             && s.read_amp <= READ_AMP_LOW
+            && mem_ok
             && !mutation_heavy
             && cpu_ok
             && !io_bound
@@ -3552,6 +3561,32 @@ mod tests {
     }
 
     #[test]
+    fn memory_pressure_withholds_the_write_concurrency_raise() {
+        // Falling behind with buffers already maxed would normally add encode
+        // parallelism — but every extra shard is more resident bytes, so under
+        // memory pressure the raise must be withheld. Pressure between OK and
+        // HIGH: no shrink tier fires, and the raise must not either. Regression
+        // test for the SF-1000/96G OOMs where shards were raised at 0.98.
+        let s = IngestSnapshot {
+            apply_vs_arrival: 1.5,
+            mem_pressure: Some(f64::midpoint(MEM_PRESSURE_OK, MEM_PRESSURE_HIGH)),
+            ..snap()
+        };
+        let buffers_maxed = ActuatorValues {
+            inline_flush_max_bytes: bounds().inline_flush_max_bytes.1,
+            mem_tier_max_bytes: bounds().mem_tier_max_bytes.1,
+            ..actuators()
+        };
+        if let Some(adj) = decide_fresh(&s, &buffers_maxed, &bounds()) {
+            assert_ne!(
+                adj.actuator,
+                Actuator::WriteConcurrency,
+                "must not add shards (resident bytes) under memory pressure"
+            );
+        }
+    }
+
+    #[test]
     fn memory_pressure_shrinks_memtable_and_overrides_growth() {
         // Even falling behind (which would normally GROW the memtable), high
         // memory pressure forces a SHRINK — memory is the hard constraint.
@@ -4071,6 +4106,33 @@ mod tests {
 
     fn lag_goal(target_secs: f64) -> Goals {
         Goals::from_targets(Some(target_secs), None, None, None, Duration::from_mins(1))
+    }
+
+    #[test]
+    fn goal_path_withholds_write_concurrency_raise_under_memory_pressure() {
+        // Replication-lag goal violated, buffers maxed, CPU/IO/read-amp all
+        // permissive — the one blocking condition is memory pressure between
+        // OK and HIGH. The goal path must withhold the shard raise exactly
+        // like the legacy ladder does. Regression test for the SF-1000/96G
+        // OOMs where the lag goal raised write concurrency at 0.98 pressure.
+        let s = IngestSnapshot {
+            replication_lag_secs: Some(120.0),
+            apply_vs_arrival: 1.5,
+            mem_pressure: Some(f64::midpoint(MEM_PRESSURE_OK, MEM_PRESSURE_HIGH)),
+            ..snap()
+        };
+        let buffers_maxed = ActuatorValues {
+            inline_flush_max_bytes: bounds().inline_flush_max_bytes.1,
+            mem_tier_max_bytes: bounds().mem_tier_max_bytes.1,
+            ..actuators()
+        };
+        if let Some(adj) = goal_decide(&s, &buffers_maxed, &bounds(), &lag_goal(5.0)) {
+            assert_ne!(
+                adj.actuator,
+                Actuator::WriteConcurrency,
+                "the lag goal must not add shards (resident bytes) under memory pressure"
+            );
+        }
     }
 
     #[test]

@@ -19,15 +19,19 @@ use std::{any::Any, sync::Arc};
 use arrow::array::RecordBatch;
 use arrow_schema::Field;
 use async_trait::async_trait;
-use datafusion::{error::DataFusionError, logical_expr::LogicalPlan};
+use datafusion::{
+    error::{DataFusionError, Result as DataFusionResult},
+    logical_expr::LogicalPlan,
+};
 use futures::future::try_join_all;
 use runtime_datafusion_index::Index;
 
 use crate::index::{SearchIndex, VectorIndex};
 
 use super::{
-    CompoundReadMode, Error, compound_on_write_start, compound_required_columns, compound_write,
-    fallback::fallback_on_empty_plan, validate_compatibility,
+    CompoundReadMode, Error, compound_delete_by_keys, compound_on_write_start,
+    compound_required_columns, compound_write, fallback::fallback_on_empty_plan,
+    validate_compatibility,
 };
 
 /// A [`VectorIndex`] counterpart of [`super::CompoundSearchIndex`]: writes through to two
@@ -75,6 +79,11 @@ impl CompoundVectorIndex {
             secondary,
             read_mode,
         }
+    }
+
+    #[must_use]
+    pub fn primary(&self) -> &Arc<dyn VectorIndex> {
+        &self.primary
     }
 
     #[must_use]
@@ -153,6 +162,22 @@ impl Index for CompoundVectorIndex {
             self.secondary.on_write_complete()
         );
         primary_result.and(secondary_result)
+    }
+
+    async fn delete_by_keys(&self, keys: RecordBatch) -> DataFusionResult<()> {
+        compound_delete_by_keys(self.primary.as_ref(), self.secondary.as_ref(), keys).await
+    }
+
+    fn deletes_by_partial_key(&self) -> bool {
+        // `delete_by_keys` fans out to both halves, so a partial key only clears this compound
+        // index when *both* halves act on one.
+        self.primary.deletes_by_partial_key() && self.secondary.deletes_by_partial_key()
+    }
+
+    fn write_start_failure_is_fatal(&self) -> bool {
+        // `compound_on_write_start` fails if either half fails to start, so either half
+        // treating that as fatal makes it fatal for this compound index.
+        self.primary.write_start_failure_is_fatal() || self.secondary.write_start_failure_is_fatal()
     }
 
     fn write_complete_failure_is_fatal(&self) -> bool {
