@@ -393,6 +393,33 @@ failure", which blamed the branch for the volume.
 Set `SIGNOFF_MIN_FREE_GIB` to change the floor. Locally both checks only warn and
 the output is not watched — your own disk is yours to manage.
 
+### "Compiler cache unreachable — checks did not complete"
+
+The pool's runners compile through `sccache` (`RUSTC_WRAPPER`, configured by
+`.github/actions/setup-sccache`) against an S3-compatible endpoint on the host.
+When that endpoint stops answering, sccache's server cannot start and *every*
+`rustc` invocation from that moment on dies before compiling anything:
+
+```
+sccache: error: Server startup failed: cache storage failed to read: …
+  error sending request for url (http://127.0.0.1:8333/sccache/…/.sccache_check):
+  tcp connect error: Connection refused (os error 61)
+error: process didn't exit successfully: `sccache …/rustc -vV` (exit status: 2)
+```
+
+**Re-dispatch it.** Your branch was never compiled, so nothing in that run is a
+statement about it. If it recurs on the same runner, that machine's sccache
+storage service is what needs attention.
+
+The same watcher that reads the out-of-disk signature reads this one, so the same
+rules apply: only sccache's own `error:` channel counts (a build that merely
+*mentions* sccache and then fails to compile is still a check failure), the
+verdict is only worth something on a run that armed the watch, and disk outranks
+cache when both appear — a volume at zero can break the cache endpoint too, and
+reclaiming space is then the remedy that fixes both. Unlike disk there is no
+after-the-fact backstop: the endpoint may well be answering again by the time the
+run ends, so the only evidence is what the build said while it was failing.
+
 ### External contributors (forks)
 
 Posting a commit status requires write access to this repository, so
