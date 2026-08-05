@@ -916,9 +916,11 @@ describe_check_failure() {
   case "$(failure_kind "$check_status")" in
     signalled)
       # Publish nothing. Nothing judged this branch — the process tree was
-      # signalled — so the `pending` this run posted before it started is still
-      # the truthful status, and it is already what the workflow's "Resolve an
-      # incomplete sign-off" step is there to describe.
+      # signalled — so the status this run left on its way in is still the most
+      # this run can honestly claim: the `pending` it posted before starting, or
+      # an earlier `success` post_pending_status declined to overwrite. A leftover
+      # `pending` is already what the workflow's "Resolve an incomplete sign-off"
+      # step is there to describe.
       #
       # Any verdict written here would assert something nothing established:
       # "checks failed" about a suite the log shows still passing when the
@@ -928,7 +930,7 @@ describe_check_failure() {
       # expiry is a *failed* step by #12343's design — so the only safe moment to
       # decline is here.
       SIGNOFF_FAILURE_STATUS_DESC=""
-      SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Did not complete** after ${elapsed}s — the run was signalled (its step budget expired, or the job was stopped), so **the checks reached no verdict**. This is not a code failure and the diff is not implicated. The \`${STATUS_CONTEXT}\` status is left as this run found it; sign off again."$'\n'
+      SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Did not complete** after ${elapsed}s — the run was signalled (its step budget expired, or the job was stopped), so **the checks reached no verdict** and no failure status is published. Nothing reported a failure; equally, nothing cleared the branch. The \`${STATUS_CONTEXT}\` status stands as this run left it — the \`pending\` posted at the start, or an earlier \`success\` this run declined to overwrite. Sign off again: a branch that repeatedly exhausts the budget is either contending for the pool or has lengthened the build itself."$'\n'
       SIGNOFF_FAILURE_MESSAGE="sign-off did not complete: the run was signalled after ${elapsed}s, so the checks reached no verdict — sign off again"
       ;;
     disk)
