@@ -2100,10 +2100,12 @@ fn default_credential_keys() -> Vec<String> {
 /// The keychain is cleared too: `read_credential` consults it before the env
 /// file, so clearing only the file leaves a working credential behind.
 fn remove_env_keys(keys: &[String]) -> Result<bool> {
-    use crate::commands::login::{env_file_path, env_file_vars};
+    use crate::commands::login::env_file_path;
 
     let mut removed = false;
 
+    // The keychain is consulted before the env file when reading a credential,
+    // so clearing only the file would leave a working credential behind.
     for key in keys {
         if let Ok(entry) = keyring::Entry::new(key, "spice")
             && entry.delete_credential().is_ok()
@@ -2112,38 +2114,48 @@ fn remove_env_keys(keys: &[String]) -> Result<bool> {
         }
     }
 
-    let mut vars = env_file_vars();
-    for key in keys {
-        removed |= vars.remove(key).is_some();
-    }
-
     let path = std::path::Path::new(env_file_path());
     if !path.exists() {
         return Ok(removed);
     }
 
-    if vars.is_empty() {
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let prefixes: Vec<String> = keys.iter().map(|key| format!("{key}=")).collect();
+
+    // Drop only the lines that assign a removed key, and keep every other line
+    // byte-for-byte. Round-tripping the file through a parsed map instead would
+    // discard comments, blank lines, and ordering, collapse duplicate keys, and
+    // truncate any multi-line value (a PEM block) to its first line.
+    //
+    // Trim before matching so an indented assignment is removable — the reader
+    // trims too, and matching raw text left such a credential readable but not
+    // removable, so logout reported success while it stayed live.
+    let mut kept: Vec<&str> = Vec::new();
+    for line in content.lines() {
+        let assigns_removed_key = prefixes
+            .iter()
+            .any(|prefix| line.trim_start().starts_with(prefix.as_str()));
+        if assigns_removed_key {
+            removed = true;
+        } else {
+            kept.push(line);
+        }
+    }
+
+    // Only discard the file once nothing but comments and blank lines remain.
+    if kept
+        .iter()
+        .all(|line| line.trim().is_empty() || line.trim_start().starts_with('#'))
+    {
         let _ = std::fs::remove_file(path);
         return Ok(removed);
     }
 
-    let mut lines: Vec<String> = vars
-        .iter()
-        .map(|(key, value)| {
-            if value.contains(' ')
-                || value.contains('"')
-                || value.contains('\'')
-                || value.contains('=')
-            {
-                format!("{key}=\"{}\"", value.replace('"', "\\\""))
-            } else {
-                format!("{key}={value}")
-            }
-        })
-        .collect();
-    lines.sort();
-
-    std::fs::write(path, lines.join("\n") + "\n").map_err(|e| crate::error::Error::ConfigIo {
+    let mut updated = kept.join("\n");
+    if content.ends_with('\n') {
+        updated.push('\n');
+    }
+    std::fs::write(path, updated).map_err(|e| crate::error::Error::ConfigIo {
         operation: "write",
         path: path.to_path_buf(),
         source: e,
@@ -2644,8 +2656,9 @@ async fn execute_deployments(args: &DeploymentsArgs, flag_org: Option<&str>) -> 
 /// Abbreviate a commit SHA to the 7 characters operators actually compare.
 fn short_commit(sha: Option<&str>) -> String {
     match sha {
-        Some(sha) if sha.len() > 7 => sha[..7].to_string(),
-        Some(sha) if !sha.is_empty() => sha.to_string(),
+        // Char-wise, not byte-wise: `commit_sha` comes from the API, and
+        // slicing bytes would abort the command on a multi-byte boundary.
+        Some(sha) if !sha.is_empty() => sha.chars().take(7).collect(),
         _ => "-".to_string(),
     }
 }
@@ -4425,6 +4438,17 @@ mod tests {
         assert_eq!(short_commit(Some("abc")), "abc");
         assert_eq!(short_commit(None), "-");
         assert_eq!(short_commit(Some("")), "-");
+    }
+
+    #[test]
+    fn short_commit_does_not_split_a_multi_byte_character() {
+        // `commit_sha` is server-supplied. Byte-slicing it aborted the whole
+        // command when a multi-byte character straddled byte 7.
+        assert_eq!(short_commit(Some("abcdéfghij")), "abcdéfg");
+        assert_eq!(
+            short_commit(Some("日本語のコミット")),
+            "日本語のコミット".chars().take(7).collect::<String>()
+        );
     }
 
     #[test]
