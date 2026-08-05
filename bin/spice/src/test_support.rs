@@ -32,7 +32,15 @@ use std::time::Duration;
 #[derive(Debug, Clone)]
 enum Behaviour {
     /// Send the response head, then each body chunk with `gap` of quiet before it.
-    Dribble { chunks: Vec<String>, gap: Duration },
+    ///
+    /// When `then_hold` is set the connection is held open afterwards instead of being
+    /// closed, so a client that waits for EOF rather than for the protocol's own terminator
+    /// is left waiting.
+    Dribble {
+        chunks: Vec<String>,
+        gap: Duration,
+        then_hold: bool,
+    },
     /// Send the response head and then nothing at all, holding the connection open.
     StallAfterHead,
     /// Send nothing at all, not even the response head, holding the connection open.
@@ -57,7 +65,21 @@ impl SlowServer {
     /// The response is therefore never quiet for longer than `gap`, but takes
     /// `gap * chunks.len()` in total — the shape that separates the two deadlines.
     pub(crate) fn dribbling(chunks: Vec<String>, gap: Duration) -> Self {
-        Self::start(Behaviour::Dribble { chunks, gap })
+        Self::start(Behaviour::Dribble {
+            chunks,
+            gap,
+            then_hold: false,
+        })
+    }
+
+    /// As [`SlowServer::dribbling`], but hold the connection open once the chunks are sent
+    /// rather than closing it — a server under no obligation to hang up promptly.
+    pub(crate) fn dribbling_then_holding(chunks: Vec<String>, gap: Duration) -> Self {
+        Self::start(Behaviour::Dribble {
+            chunks,
+            gap,
+            then_hold: true,
+        })
     }
 
     /// Answer each request with a response head and then silence, so a deadline is exercised
@@ -177,7 +199,11 @@ fn serve(
     }
 
     match behaviour {
-        Behaviour::Dribble { chunks, gap } => {
+        Behaviour::Dribble {
+            chunks,
+            gap,
+            then_hold,
+        } => {
             for chunk in chunks {
                 thread::sleep(*gap);
                 // Chunked transfer encoding: the length in hex, then the bytes.
@@ -186,8 +212,12 @@ fn serve(
                     return;
                 }
             }
-            let _ = writer.write_all(b"0\r\n\r\n");
-            let _ = writer.flush();
+            if *then_hold {
+                hold_open(running);
+            } else {
+                let _ = writer.write_all(b"0\r\n\r\n");
+                let _ = writer.flush();
+            }
         }
         Behaviour::StallAfterHead => hold_open(running),
         // Handled before the response head was written.

@@ -725,6 +725,54 @@ mod tests {
         );
     }
 
+    /// `data: [DONE]` is the protocol's terminator, so the answer is complete when it arrives.
+    /// Reading on for an EOF the server is under no obligation to send promptly leaves the CLI
+    /// looking hung after it already has the whole answer.
+    #[tokio::test]
+    async fn a_completed_answer_does_not_wait_for_the_server_to_hang_up() {
+        let mut chunks: Vec<String> = std::iter::repeat_n(
+            format!(
+                "{}\n\n",
+                r#"data: {"choices":[{"delta":{"content":"token "}}]}"#
+            ),
+            3,
+        )
+        .collect();
+        chunks.push("data: [DONE]\n\n".to_string());
+
+        // The connection stays open after `[DONE]`, so only the terminator can end the read.
+        let server = SlowServer::dribbling_then_holding(chunks, Duration::from_millis(20));
+
+        let ctx = RuntimeContext::with_deadlines_for_test(
+            server.url(),
+            Deadline::Total(Duration::from_secs(30)),
+            Deadline::Silence(Duration::from_secs(30)),
+        );
+
+        let config = ChatConfig {
+            model: "test-model",
+            temperature: None,
+            endpoint: None,
+            custom_headers: &[],
+        };
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: "hello".to_string(),
+        }];
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            send_chat_streaming(&ctx, &config, &messages, false, false),
+        )
+        .await;
+
+        let Ok(result) = outcome else {
+            panic!("the CLI kept reading after [DONE] instead of returning the finished answer");
+        };
+        let response = result.expect("the answer arrived in full before the terminator");
+        assert_eq!(response.content, "token ".repeat(3));
+    }
+
     /// The runtime keeps an SSE stream alive with a comment every 30 seconds
     /// (`KEEP_ALIVE_INTERVAL` in `crates/runtime/src/http/v1/chat.rs`), and each one resets the
     /// client's read deadline. So a model that stops producing but never closes would hold the
