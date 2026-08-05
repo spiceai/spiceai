@@ -170,12 +170,66 @@ const STAGED_WRITE_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// parallelism. See `snapshot_write_concurrency`.
 pub(crate) const DEFAULT_WRITE_CONCURRENCY: usize = 4;
 const TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT: usize = 256;
-/// Upper bound on maintained-aggregate retained index entries (per-PK
-/// contributions plus distinct `MIN`/`MAX` multiset nodes); exceeding it fails
-/// the registry safe to a base-table rebuild so memory stays bounded.
-/// TODO: derive from `runtime.query.memory_limit` once the budget is threaded to
-/// the provider (Pattern 9 — budget-derived caps).
-const MAINTAINED_AGGREGATE_MAX_INDEX_ENTRIES: usize = 5_000_000;
+/// Fraction of the query memory pool the maintained-aggregate retained indexes
+/// (per-PK contributions plus distinct `MIN`/`MAX` multiset nodes) may occupy.
+///
+/// The indexes are plain allocations rather than pool reservations — they live on
+/// the CDC write path, where a reservation failure would have to fail the write
+/// rather than the aggregate — so this fraction is what keeps them inside the
+/// operator's `runtime.query.memory_limit` contract. Deliberately a minority
+/// share: the pool's primary job is serving queries, and an over-cap index fails
+/// safe to a base-table scan, which is slower but always correct.
+const MAINTAINED_AGGREGATE_INDEX_POOL_FRACTION: f64 = 0.10;
+
+/// Retained-index budget used when the query memory pool is unbounded, and the
+/// ceiling applied to the derived fraction on a very large pool. An unbounded
+/// pool still needs *some* bound, or an index on a large table grows until the
+/// host OOMs.
+const MAINTAINED_AGGREGATE_MAX_INDEX_BYTES_DEFAULT: usize = 512 * 1024 * 1024;
+
+/// How many mem-tier checkpoints pass between attempts to rebuild a stale
+/// maintained-aggregate registry. A rebuild is a full visible-state scan, and on
+/// a table that genuinely exceeds its retained-index budget it will re-stale, so
+/// the retry must be a trickle rather than a loop. The first stale checkpoint
+/// attempts immediately, so a transient failure recovers at once.
+const MAINTAINED_AGGREGATE_REARM_TICK_INTERVAL: u64 = 32;
+
+/// Floor for the derived retained-index budget. Below this an index is too small
+/// to serve any useful table, so a tiny pool disables maintained aggregates by
+/// failing them safe rather than thrashing rebuild attempts.
+const MAINTAINED_AGGREGATE_MIN_INDEX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Resolve the maintained-aggregate retained-index byte budget from the query
+/// memory pool, so the index cannot grow past the operator's
+/// `runtime.query.memory_limit`. An unbounded/unknown pool falls back to
+/// [`MAINTAINED_AGGREGATE_MAX_INDEX_BYTES_DEFAULT`].
+fn maintained_aggregate_max_index_bytes(
+    runtime_env: &datafusion::execution::runtime_env::RuntimeEnv,
+) -> usize {
+    use datafusion::execution::memory_pool::MemoryPool;
+    let derived = match MemoryPool::memory_limit(&*runtime_env.memory_pool) {
+        datafusion::execution::memory_pool::MemoryLimit::Finite(limit) => {
+            // `f64` round-trip is exact enough for a budget fraction; the
+            // saturating cast floors a non-finite product at 0, which the
+            // `max` below lifts to the floor.
+            #[expect(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "budget fraction; result is clamped to [MIN, DEFAULT]"
+            )]
+            let scaled = (limit as f64 * MAINTAINED_AGGREGATE_INDEX_POOL_FRACTION) as usize;
+            scaled.min(MAINTAINED_AGGREGATE_MAX_INDEX_BYTES_DEFAULT)
+        }
+        // No knowable ceiling to derive from — fall back to the standalone
+        // default rather than leaving the index unbounded.
+        datafusion::execution::memory_pool::MemoryLimit::Infinite
+        | datafusion::execution::memory_pool::MemoryLimit::Unknown => {
+            MAINTAINED_AGGREGATE_MAX_INDEX_BYTES_DEFAULT
+        }
+    };
+    derived.max(MAINTAINED_AGGREGATE_MIN_INDEX_BYTES)
+}
 /// Bounded depth of the per-table maintained-aggregate apply queue. The CDC
 /// write path enqueues maintenance here and continues, so registry maintenance
 /// runs off the replication critical path while the background applier drains it
@@ -2003,6 +2057,11 @@ pub struct CayenneTableProvider {
     /// aggregates are configured. Cloned (never re-spawned) onto provider
     /// clones so every clone feeds the one ordered applier.
     maintained_aggregate_tx: Option<tokio::sync::mpsc::Sender<MaintainedAggregateApply>>,
+    /// Counts checkpoints observed while the maintained-aggregate registry is
+    /// stale, so the rebuild that recovers it runs on a bounded trickle rather
+    /// than on every checkpoint. Shared across clones — one table, one attempt
+    /// cadence. See [`Self::try_rearm_maintained_aggregates`].
+    maintained_aggregate_rearm_ticks: Arc<AtomicU64>,
     /// Per-table background compaction task, populated by
     /// [`Self::spawn_background_compaction`]. Held by `Arc<OnceLock<…>>` so it
     /// survives [`Self::clone_for_write`] and shares its drop signal across
@@ -5475,7 +5534,7 @@ impl CayenneTableProvider {
                 &maintained_aggregate_specs,
                 &table_metadata.schema,
                 &pk_column_indices,
-                MAINTAINED_AGGREGATE_MAX_INDEX_ENTRIES,
+                maintained_aggregate_max_index_bytes(context.runtime_env()),
             )
             .map_err(|source| CatalogError::InvalidOperation {
                 message: format!(
@@ -5702,6 +5761,7 @@ impl CayenneTableProvider {
             maintained_aggregate_epoch: Arc::new(AtomicU64::new(0)),
             maintained_aggregate_visibility_sequence: Arc::new(AtomicU64::new(0)),
             maintained_aggregate_tx,
+            maintained_aggregate_rearm_ticks: Arc::new(AtomicU64::new(0)),
             background_compactor: Arc::new(std::sync::OnceLock::new()),
             background_mem_tier_checkpointer: Arc::new(std::sync::OnceLock::new()),
             background_cold_tier_promoter: Arc::new(std::sync::OnceLock::new()),
@@ -6871,6 +6931,7 @@ impl CayenneTableProvider {
             // Clone the sender (never re-spawn): all provider clones feed the one
             // ordered background applier spawned by the original constructor.
             maintained_aggregate_tx: self.maintained_aggregate_tx.clone(),
+            maintained_aggregate_rearm_ticks: Arc::clone(&self.maintained_aggregate_rearm_ticks),
             background_compactor: Arc::clone(&self.background_compactor),
             // Shared so the single periodic checkpoint task (spawned on the
             // original `Arc`) survives writer clones and its drop signal is shared.
@@ -18196,6 +18257,12 @@ impl CayenneTableProvider {
 
         let ctx = self.create_session_context();
         let session_state = Arc::new(ctx.state());
+        // NOTE: the scan is deliberately unprojected. The views resolve their
+        // group-by, aggregate-input, and PK columns as indices into the TABLE
+        // schema (`ResolvedAggregateSpec`), so a projected scan would renumber
+        // the columns out from under them. Projecting requires re-resolving every
+        // view against the projected schema; until that lands, correctness wins
+        // over the wasted materialization.
         let plan =
             <Self as TableProvider>::scan(self, session_state.as_ref(), None, &[], None).await?;
         let batches = collect(plan, session_state.task_ctx()).await?;
@@ -18222,6 +18289,65 @@ impl CayenneTableProvider {
             "Initialized maintained aggregate state from visible table snapshot"
         );
         Ok(())
+    }
+
+    /// Rebuild a stale maintained-aggregate registry, rate-limited.
+    ///
+    /// Every maintained-aggregate fail-safe (retained-index cap exceeded,
+    /// apply-queue overflow, accumulator overflow, epoch gap) lands in `Stale`,
+    /// and only a rebuild clears it. Without this, the first such failure would
+    /// disable maintained aggregates for the rest of the provider's life —
+    /// silently, since a stale registry simply serves base-table scans. A CDC
+    /// provider is long-lived, so "recovers at next open" means "never".
+    ///
+    /// Rate-limited because a rebuild is a full visible-state scan: on a table
+    /// that is over its retained-index budget the rebuild will trip the cap and
+    /// re-stale, so retrying it in a tight loop would burn the pool on a failure
+    /// that repeats. One attempt per interval bounds that to a background trickle
+    /// while still recovering promptly from a transient failure.
+    async fn try_rearm_maintained_aggregates(&self) {
+        if self.maintained_aggregates.is_empty() || !self.maintained_aggregates.is_stale() {
+            return;
+        }
+
+        // Tick-counted rather than clock-based: checkpoints are already periodic,
+        // so counting them gives a bounded cadence with no wall-clock dependency
+        // (and no way for a clock jump to stall recovery). The first stale tick
+        // attempts immediately; the rest trickle.
+        let tick = self
+            .maintained_aggregate_rearm_ticks
+            .fetch_add(1, Ordering::AcqRel);
+        if !tick.is_multiple_of(MAINTAINED_AGGREGATE_REARM_TICK_INTERVAL) {
+            return;
+        }
+
+        let (retained, budget) = self.maintained_aggregates.retained_bytes_and_budget();
+        match self
+            .rebuild_maintained_aggregates_from_visible_state()
+            .await
+        {
+            Ok(()) if !self.maintained_aggregates.is_stale() => {
+                tracing::info!(
+                    table = %self.table_metadata.table_name,
+                    "Maintained aggregate state rebuilt after staleness; queries are served from maintained state again"
+                );
+            }
+            Ok(()) => {
+                tracing::warn!(
+                    table = %self.table_metadata.table_name,
+                    retained_bytes = retained,
+                    budget_bytes = budget,
+                    "Maintained aggregate rebuild re-staled: the table's retained index does not fit its memory budget. Queries continue on base table scans. Raise 'runtime.query.memory_limit' or narrow the maintained aggregate's filter."
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    table = %self.table_metadata.table_name,
+                    error = %error,
+                    "Maintained aggregate rebuild failed; queries continue on base table scans and the rebuild will be retried"
+                );
+            }
+        }
     }
 
     fn wrap_scan_plan_with_cayenne_metadata(
@@ -22381,11 +22507,18 @@ impl CayenneTableProvider {
     /// or tier clearing fails. The source slot is not advanced on failure.
     #[doc(hidden)]
     pub async fn checkpoint_mem_tier(&self) -> Result<u64> {
-        let mut guards = self.acquire_capture_locks_blocking().await;
-        // Keep `guards` alive so `mem_checkpoint_lock` spans the whole lifecycle;
-        // pass only the capture-scoped `write` guard to `inner`.
-        let write = guards.write.take();
-        self.checkpoint_mem_tier_inner(write).await
+        let rows = {
+            let mut guards = self.acquire_capture_locks_blocking().await;
+            // Keep `guards` alive so `mem_checkpoint_lock` spans the whole
+            // lifecycle; pass only the capture-scoped `write` guard to `inner`.
+            let write = guards.write.take();
+            self.checkpoint_mem_tier_inner(write).await?
+        };
+        // Recover a stale maintained-aggregate registry, rate-limited. Deliberately
+        // OUTSIDE the capture locks: the rebuild scans visible state and must not
+        // hold the checkpoint fence while it does.
+        self.try_rearm_maintained_aggregates().await;
+        Ok(rows)
     }
 
     /// BEST-EFFORT counterpart to [`Self::checkpoint_mem_tier`]: returns

@@ -791,12 +791,40 @@ pub fn changes_schema(table_schema: &Schema) -> Schema {
     ])
 }
 
+/// The change-event schema extended with the row's **before-image**: the values
+/// the row held prior to an `UPDATE`/`DELETE`.
+///
+/// A source that can supply it builds its batches in this schema; every other
+/// source keeps [`changes_schema`] and behaves exactly as before.
+/// [`ChangeBatch`] accepts both, so this is additive. The sources that can:
+/// `MySQL`, which Spice pins to `binlog_row_image = FULL`, and `PostgreSQL`
+/// under `REPLICA IDENTITY FULL`.
+///
+/// Carrying the before-image lets a downstream incremental-aggregate maintainer
+/// retract a row's prior contribution directly from the change event. Without
+/// it, the maintainer has to retain every live row's values just to reconstruct
+/// them on update, which makes its state O(live rows) instead of O(groups).
+#[must_use]
+pub fn changes_schema_with_before(table_schema: &Schema) -> Schema {
+    let mut fields = changes_schema(table_schema).fields().to_vec();
+    fields.push(Arc::new(Field::new(
+        "before",
+        DataType::Struct(table_schema.fields().clone()),
+        true,
+    )));
+    Schema::new(fields)
+}
+
 #[derive(Clone, Debug)]
 pub struct ChangeBatch {
     pub record: RecordBatch,
     op_idx: usize,
     primary_keys_idx: usize,
     data_idx: usize,
+    /// Column index of the optional before-image struct ([`changes_schema_with_before`]).
+    /// `None` for batches in the base [`changes_schema`], whose sources cannot
+    /// supply the row's prior values.
+    before_idx: Option<usize>,
     /// Newest upstream COMMIT timestamp in this batch (milliseconds since the Unix
     /// epoch — a wall clock, NOT a monotonic `Instant`), when the source provides
     /// one; `None` otherwise. Lets a downstream consumer compute true end-to-end
@@ -855,12 +883,15 @@ impl ChangeBatch {
         let Some((data_idx, _)) = schema.column_with_name("data") else {
             unreachable!("The schema is validated to have a 'data' field")
         };
+        // Absent for the base `changes_schema`; validation already accepted both.
+        let before_idx = schema.column_with_name("before").map(|(idx, _)| idx);
 
         Ok(Self {
             record,
             op_idx,
             primary_keys_idx,
             data_idx,
+            before_idx,
             source_commit_ts_ms: None,
         })
     }
@@ -989,6 +1020,64 @@ impl ChangeBatch {
         record_batch
     }
 
+    /// Whether this batch carries a before-image column
+    /// ([`changes_schema_with_before`]). Callers that can exploit prior row
+    /// values must branch on this rather than assuming it — most sources cannot
+    /// supply one.
+    #[must_use]
+    pub fn has_before_image(&self) -> bool {
+        self.before_idx.is_some()
+    }
+
+    /// The row's before-image — the values it held prior to an `UPDATE`/`DELETE`
+    /// — as a single-row `RecordBatch`.
+    ///
+    /// `None` when the batch carries no before-image column, and also when this
+    /// row's before-image is null (an `INSERT` has no prior values, and a source
+    /// may omit it per-row). A `Some` batch may still hold nulls in individual
+    /// columns where the source sent only key columns — `PostgreSQL` under
+    /// `REPLICA IDENTITY DEFAULT` does exactly that — so a caller needing
+    /// complete prior values must check the columns it reads.
+    #[must_use]
+    pub fn before(&self, row: usize) -> Option<RecordBatch> {
+        let before_idx = self.before_idx?;
+        let before_col = self.record.column(before_idx);
+        if before_col.is_null(row) {
+            return None;
+        }
+        let Some(before_array) = before_col.as_any().downcast_ref::<StructArray>() else {
+            unreachable!("The schema is validated to have a 'before' field which is a StructArray");
+        };
+        Some(before_array.slice(row, 1).into())
+    }
+
+    /// The whole before-image column as a `RecordBatch` aligned row-for-row with
+    /// [`Self::data_batch`]. `None` when the batch carries no before-image.
+    ///
+    /// Rows without prior values (inserts) are null in the struct array; the
+    /// caller pairs each row with its `op` to know which retract.
+    #[must_use]
+    pub fn before_batch(&self) -> Option<RecordBatch> {
+        let before_idx = self.before_idx?;
+        let before_col = self.record.column(before_idx);
+        let Some(before_array) = before_col.as_any().downcast_ref::<StructArray>() else {
+            unreachable!("The schema is validated to have a 'before' field which is a StructArray");
+        };
+        let DataType::Struct(fields) = before_array.data_type() else {
+            unreachable!("The schema is validated to have a 'before' field which is a StructArray");
+        };
+        let Ok(record_batch) = RecordBatch::try_new(
+            Arc::new(Schema::new(fields.clone())),
+            before_array.columns().to_vec(),
+        ) else {
+            unreachable!("The 'before' struct's columns are validated to share one row count");
+        };
+        Some(record_batch)
+    }
+
+    /// Accepts both the base [`changes_schema`] and the before-image-carrying
+    /// [`changes_schema_with_before`], so a source that gains before-images does
+    /// not break consumers (or sources) that never had them.
     fn validate_schema(schema: SchemaRef) -> Result<(), ChangeBatchError> {
         let Some(data_col) = schema.fields().iter().find(|field| field.name() == "data") else {
             return SchemaMismatchSnafu {
@@ -1009,8 +1098,9 @@ impl ChangeBatch {
             }
         };
 
-        let expected_schema = changes_schema(&data_schema);
-        if *schema != expected_schema {
+        if *schema != changes_schema(&data_schema)
+            && *schema != changes_schema_with_before(&data_schema)
+        {
             return SchemaMismatchSnafu {
                 detail: "Schema didn't match expected change batch format",
                 schema,
@@ -1098,6 +1188,138 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow_array::{Int32Array, StringArray};
     use std::sync::Arc;
+
+    fn before_image_test_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("amount", DataType::Int32, true),
+        ])
+    }
+
+    /// Builds a two-row change batch in the before-image schema: row 0 is an
+    /// INSERT (no prior values), row 1 an UPDATE carrying its before-image.
+    fn before_image_batch() -> ChangeBatch {
+        use arrow_array::StructArray;
+        use arrow_array::builder::{ListBuilder, StringBuilder};
+
+        let table = before_image_test_schema();
+        let wrapper = changes_schema_with_before(&table);
+
+        let data = StructArray::from(vec![
+            (
+                Arc::new(Field::new("id", DataType::Int32, true)),
+                Arc::new(Int32Array::from(vec![1, 2])) as arrow_array::ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("amount", DataType::Int32, true)),
+                Arc::new(Int32Array::from(vec![10, 25])) as arrow_array::ArrayRef,
+            ),
+        ]);
+        // Row 0 (insert) has no before-image; row 1 (update) held amount=20.
+        let before = StructArray::try_new(
+            table.fields().clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![None, Some(2)])),
+                Arc::new(Int32Array::from(vec![None, Some(20)])),
+            ],
+            Some(vec![false, true].into()),
+        )
+        .expect("before-image struct should be valid");
+
+        // `primary_keys` is List<Utf8> with a non-null item field; both rows carry
+        // a single key name.
+        let mut pk_builder = ListBuilder::new(StringBuilder::new())
+            .with_field(Arc::new(Field::new("item", DataType::Utf8, false)));
+        for _ in 0..2 {
+            pk_builder.values().append_value("id");
+            pk_builder.append(true);
+        }
+
+        let record = RecordBatch::try_new(
+            Arc::new(wrapper),
+            vec![
+                Arc::new(StringArray::from(vec!["c", "u"])),
+                Arc::new(pk_builder.finish()) as arrow_array::ArrayRef,
+                Arc::new(data),
+                Arc::new(before),
+            ],
+        )
+        .expect("before-image test batch must match the wrapper schema");
+        ChangeBatch::try_new(record).expect("before-image batch should validate")
+    }
+
+    /// The base schema must keep validating unchanged: sources that cannot supply
+    /// a before-image (and the connectors that build batches for them) must not
+    /// break when the field is added.
+    #[test]
+    fn base_change_schema_still_validates_without_before_image() {
+        let table = before_image_test_schema();
+        let record = RecordBatch::new_empty(Arc::new(changes_schema(&table)));
+        let batch = ChangeBatch::try_new(record).expect("base schema must still validate");
+        assert!(
+            !batch.has_before_image(),
+            "a base-schema batch carries no before-image"
+        );
+        assert!(
+            batch.before_batch().is_none(),
+            "before_batch must be None when the column is absent"
+        );
+    }
+
+    #[test]
+    fn before_image_schema_validates_and_exposes_prior_values() {
+        let batch = before_image_batch();
+        assert!(batch.has_before_image(), "the before column must be seen");
+
+        // Row 0 is an insert: no prior values to retract.
+        assert!(
+            batch.before(0).is_none(),
+            "an insert has no before-image, so retraction must have nothing to read"
+        );
+
+        // Row 1 is an update: the prior amount is what a maintained aggregate
+        // subtracts, and it is exactly what the per-row index existed to store.
+        let before = batch.before(1).expect("an update carries its before-image");
+        assert_eq!(before.num_rows(), 1);
+        let amount = before
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("amount column is Int32");
+        assert_eq!(
+            amount.value(0),
+            20,
+            "the before-image must carry the row's prior value, not the new one"
+        );
+
+        // And the new value still arrives through `data`, unchanged.
+        let data = batch.data(1);
+        let new_amount = data
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("amount column is Int32");
+        assert_eq!(new_amount.value(0), 25, "data still carries the new value");
+    }
+
+    #[test]
+    fn before_batch_aligns_row_for_row_with_data_batch() {
+        let batch = before_image_batch();
+        let data = batch.data_batch();
+        let before = batch
+            .before_batch()
+            .expect("a before-image batch exposes the whole column");
+        assert_eq!(
+            data.num_rows(),
+            before.num_rows(),
+            "before-image rows must align with data rows so each row pairs with its op"
+        );
+        assert_eq!(
+            data.schema().fields().len(),
+            before.schema().fields().len(),
+            "before-image and data share the table schema"
+        );
+    }
 
     #[test]
     fn noop_committer_does_not_support_deferral() {
