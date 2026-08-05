@@ -407,19 +407,21 @@ mod tests {
                 );
             }
 
-            // The draw is random and unseeded, so these bounds are noise margins
-            // rather than accuracy targets. Each count is binomial over `draws`
-            // trials, so a two-sided five-standard-deviation band fails by chance
-            // about once in 580,000 runs while still catching any real
-            // mis-weighting: the band is ±14% of the mean on the heaviest arm,
-            // widening to ±39% on the lightest, which is the one whose count is
-            // smallest and so proportionally noisiest.
+            // Regression test for #12537. The draw is random and unseeded, so
+            // these bounds are noise margins rather than accuracy targets, and a
+            // margin sized by eye is a flaky test: this suite runs on every
+            // sign-off, so a bound only a couple of standard deviations wide reds
+            // out PRs that touch nothing in this crate.
             //
-            // The bounds this replaces were one-sided (`count_4 - 2 * count_2 <
-            // n / 10` constrained the heaviest arm being over-selected but never
-            // under-selected) and, on that arm, only 2.4 standard deviations wide,
-            // so they failed roughly one run in 128 and took unrelated PRs'
-            // sign-offs down with them. See #12537.
+            // Each count is binomial over `draws` trials, so the tolerance is
+            // derived from the weights rather than hardcoded — five standard
+            // deviations, two-sided, which fails by chance about once in 580,000
+            // runs. That is still tight enough to catch a real mis-weighting: the
+            // band is ±14% of the mean on the heaviest arm, widening to ±39% on
+            // the lightest, whose count is smallest and so proportionally
+            // noisiest. Two-sided matters as much as the width — an arm selected
+            // far too *rarely* is as much a weighting bug as one selected too
+            // often.
             let draws = f64::from(n - 1);
 
             for (from, weight, count) in &arms {
