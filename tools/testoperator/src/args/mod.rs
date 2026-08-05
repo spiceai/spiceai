@@ -32,7 +32,7 @@ pub mod dispatch;
 use dispatch::DispatchArgs;
 
 mod search;
-pub use search::SearchTestArgs;
+pub use search::{SearchDatasetArg, SearchTestArgs};
 
 mod text_to_sql;
 pub use text_to_sql::TextToSqlArgs;
