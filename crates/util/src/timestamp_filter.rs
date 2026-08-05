@@ -387,8 +387,8 @@ mod tests {
     }
 
     /// The #12528 regression: Iceberg maps every `timestamptz` to the fixed offset
-    /// `+00:00`, which the DuckDB unparser renders as `AT TIME ZONE '+00:00'` —
-    /// rejected by DuckDB's ICU resolver, so the dataset never became ready. The
+    /// `+00:00`, which the `DuckDB` unparser renders as `AT TIME ZONE '+00:00'` —
+    /// rejected by `DuckDB`'s ICU resolver, so the dataset never became ready. The
     /// zone is named in a spelling every engine knows instead.
     #[test]
     fn a_fixed_offset_utc_column_is_named_utc() {
