@@ -257,7 +257,7 @@ async fn selective_join_pushes_a_dynamic_filter_to_the_probe_impl(
 /// a literal — so the suppression cannot engage on the join path.
 ///
 /// At THIS scale both paths yield one group and the test passes, because
-/// DataFusion only byte-range splits when each resulting group would still clear
+/// `DataFusion` only byte-range splits when each resulting group would still clear
 /// `repartition_file_min_size` (10 MB): a ~12 MB parent is never split into 16.
 /// The divergence therefore needs a parent in the hundreds of MB, which belongs
 /// in `benches/selective_join_pk_probe.rs` rather than here — it was measured at
@@ -437,7 +437,8 @@ async fn mixed_tier_join_keeps_the_inlined_side_in_the_metastore_impl(
         .await?;
     let groups: usize = rows.iter().map(RecordBatch::num_rows).sum();
     assert_eq!(
-        groups, DIM_ROWS as usize,
+        groups,
+        usize::try_from(DIM_ROWS).expect("DIM_ROWS fits usize"),
         "a join across the inline/file tier boundary must not drop or duplicate groups"
     );
     let total: i64 = rows
