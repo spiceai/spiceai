@@ -67,12 +67,10 @@ EXAMPLES
 Docs: https://spiceai.org/docs/spice-cloud"#
 )]
 pub struct CloudArgs {
-    /// Organization to act on for this invocation (overrides `SPICE_CLOUD_ORG`
-    /// and the active org).
-    ///
-    /// Deliberately not bound to the env var via Clap: the CLI reads
-    /// `SPICE_CLOUD_ORG` itself so it can tell the user which source chose the
-    /// org, and so a flag and the env var can be ranked rather than merged.
+    /// Organization to act on, overriding `SPICE_CLOUD_ORG` and the active org
+    // Deliberately not bound to the env var via Clap's `env`: the CLI reads
+    // `SPICE_CLOUD_ORG` itself so it can report which source chose the org, and
+    // so the flag and the env var can be ranked rather than merged.
     #[arg(long, global = true, value_name = "ORG")]
     pub org: Option<String>,
 
