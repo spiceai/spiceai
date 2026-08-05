@@ -13948,6 +13948,25 @@ impl CayenneTableProvider {
         // maintenance debounce, which fires whenever a write schedules
         // maintenance — i.e. continuously under CDC load — so the WAL drains
         // promptly even though the inline backstop is off.
+        // Reclaim a bounded slice of the metastore freelist, BEFORE the
+        // checkpoint below. A high-update upsert table frees pages as it
+        // supersedes rows; under the default auto-vacuum mode those stay on the
+        // freelist and are reused, so the file plateaus and this is a no-op. A
+        // deployment that opted into INCREMENTAL wants the space back instead,
+        // and this tick is the only safe place to take it: the pragma holds the
+        // write lock while it relocates pages, so it must never run on the hot
+        // path. Ordering is load-bearing — the relocation is written as WAL
+        // frames and the file only shrinks when a checkpoint copies them back,
+        // so vacuuming after the checkpoint would defer the truncation a whole
+        // tick. Best-effort, like the checkpoint: logged, never propagated to
+        // fail the originating write.
+        if let Err(e) = self.catalog.incremental_vacuum().await {
+            tracing::warn!(
+                table = self.table_metadata.table_name.as_str(),
+                "Background metastore incremental vacuum failed: {e}"
+            );
+        }
+
         if let Err(e) = self.catalog.checkpoint_wal().await {
             tracing::warn!(
                 table = self.table_metadata.table_name.as_str(),

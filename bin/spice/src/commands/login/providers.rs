@@ -444,18 +444,9 @@ async fn msal_device_code_flow(
 
     let scope_string = scopes.join(" ");
 
-    // Step 1: Request device code
-    let client = reqwest::Client::builder()
-        .user_agent(format!(
-            "spice/{} ({}; {})",
-            env!("CARGO_PKG_VERSION"),
-            std::env::consts::OS,
-            std::env::consts::ARCH
-        ))
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .unwrap_or_default();
+    // Step 1: Request device code. The token poll below posts the device code in the
+    // request body, so this client must not follow a redirect off the origin.
+    let client = super::credentialed_client()?;
     let device_response = client
         .post(&device_code_url)
         .form(&[("client_id", client_id), ("scope", &scope_string)])
@@ -541,6 +532,19 @@ async fn msal_device_code_flow(
             .map_err(|e| crate::error::Error::InvalidResponse {
                 message: format!("Token request failed: {e}"),
             })?;
+
+        // A 3xx here means the redirect policy refused to follow it, so this body is the
+        // redirecting origin's, not the target's. Fail instead of parsing it: an unchecked
+        // body could be read as a token, or as `authorization_pending` and keep polling.
+        let token_status = token_response.status();
+        if token_status.is_redirection() {
+            return Err(crate::error::Error::InvalidResponse {
+                message: format!(
+                    "The token endpoint answered {token_status}. The redirect was not \
+                     followed because it leaves the origin the device code was issued for."
+                ),
+            });
+        }
 
         let token_data: serde_json::Value =
             token_response

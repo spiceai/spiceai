@@ -246,13 +246,14 @@ fn detect_request_millicores() -> Option<u64> {
 /// is shared between a countable number of plans.
 const QUERIES_PER_CORE: usize = 4;
 
-/// A CPU request at or above this fraction of the budget is close enough not to
-/// warn about. A quarter is loose enough to absorb cgroup quantization (a
-/// `requests.cpu: 1` lands at 974m under cgroup v2) while still catching a
-/// request that is a different order of magnitude from the budget.
-const REQUEST_SHORTFALL_NUM: u64 = 3;
+/// A CPU request at or above this fraction of the effective core count is close
+/// enough not to warn about. A half is loose enough to absorb cgroup
+/// quantization (a `requests.cpu: 1` lands at 974m under cgroup v2), and tight
+/// enough that a warning means the runtime sized itself for at least twice the
+/// CPU the scheduler guarantees.
+const REQUEST_SHORTFALL_NUM: u64 = 1;
 /// Denominator of [`REQUEST_SHORTFALL_NUM`].
-const REQUEST_SHORTFALL_DEN: u64 = 4;
+const REQUEST_SHORTFALL_DEN: u64 = 2;
 
 /// The process-wide CPU entitlement and every sizing decision derived from it.
 #[derive(Debug, Clone)]
@@ -456,8 +457,12 @@ impl CpuBudget {
                 Some(setting) => setting,
                 None => CpuConfig::SPICEPOD_SETTING,
             },
-            CpuSource::CgroupQuota => "cgroup CPU quota",
-            CpuSource::Affinity => "detected CPUs",
+            CpuSource::CgroupQuota => "cgroup CPU limit",
+            // `available_parallelism`: the CPU affinity mask on Linux, the logical
+            // CPU count elsewhere. Not the host's total either way — a cpuset or
+            // `taskset` pins the process to a subset — so this names what the
+            // process may use rather than what the machine has.
+            CpuSource::Affinity => "the CPUs available to this process",
             CpuSource::Fallback => "fallback",
         }
     }
@@ -485,18 +490,24 @@ impl CpuBudget {
         )
     }
 
-    /// A warning when the CPU request sits well below the budget the runtime
-    /// chose, i.e. when sizing leans on CPU the scheduler does not guarantee.
+    /// A warning when the CPU request sits well below the core count the runtime
+    /// sized itself for, i.e. when sizing leans on CPU the scheduler does not
+    /// guarantee.
+    ///
+    /// States the discrepancy and where the effective value came from, and stops
+    /// there: which of the two numbers is wrong is the operator's call, and both
+    /// answers (lower the setting, or raise the request) are legitimate.
     ///
     /// Fires for every source, and names the one responsible: a value read from
     /// an explicit `limits.cpu`, a value configured by hand, and — the case that
-    /// motivates this crate — a request with no limit at all, where the budget
-    /// falls back to the node's cores. An over-large configured value is just as
-    /// wrong as an over-large inferred one, so the check is on the effective
-    /// budget rather than on any particular rung of the ladder.
+    /// motivates this crate — a request with no limit at all, where detection
+    /// falls back to every CPU the process may use. An over-large configured value is just as
+    /// wrong as an over-large inferred one, so the check is on the effective core
+    /// count rather than on any particular rung of the ladder.
     ///
     /// `None` when there is no request to compare against, or when the request is
-    /// within [`REQUEST_SHORTFALL_NUM`]/[`REQUEST_SHORTFALL_DEN`] of the budget.
+    /// at or above [`REQUEST_SHORTFALL_NUM`]/[`REQUEST_SHORTFALL_DEN`] of the
+    /// effective core count.
     #[must_use]
     pub fn request_shortfall_warning(&self) -> Option<String> {
         let request = self.request_millicores?;
@@ -505,27 +516,23 @@ impl CpuBudget {
         {
             return None;
         }
-        // Telling an operator to set the surface they already set is no advice at
-        // all, so the remedy depends on whether the value was chosen or detected.
-        let remedy = if matches!(self.source, CpuSource::Configured) {
-            format!(
-                "Lower {origin} to match the request, or raise the pod's CPU request to match it.",
-                origin = self.origin()
-            )
+        // Detection is reached only when no limit was found, and that is the fact
+        // behind this warning: a request with nothing capping it sizes for every CPU
+        // the process may use. "detected" rather than "set" because a quota that
+        // exists but cannot be read degrades to the same `None` as one that was
+        // never set (see `detect_quota_millicores`), and the warning must not claim
+        // the pod has no limit when it may only be unreadable. `summary_line`
+        // carries the same fact, so the qualifier belongs here, not in `origin`.
+        let unlimited = if matches!(self.source, CpuSource::Affinity) {
+            ", no CPU limit detected"
         } else {
-            format!(
-                "Set {spicepod} (or {env}, or {cli}) to size for the request instead.",
-                spicepod = CpuConfig::SPICEPOD_SETTING,
-                env = CpuConfig::ENV_SETTING,
-                cli = CpuConfig::CLI_SETTING,
-            )
+            ""
         };
         Some(format!(
-            "CPU request {request} is well below the CPU budget of {budget} taken from {origin}: \
-             the runtime is sized for CPU the scheduler does not guarantee, so every CPU-derived \
-             pool may be too large for what this process actually gets. {remedy}",
+            "Detected a cgroup CPU request of {request}, which is below the {effective} in effect \
+             (from {origin}{unlimited})",
             request = format_millicores(request),
-            budget = format_millicores(self.millicores),
+            effective = format_millicores(self.millicores),
             origin = self.origin(),
         ))
     }
@@ -845,17 +852,44 @@ mod tests {
     }
 
     #[test]
-    fn a_request_far_below_the_budget_warns() {
-        // The shape this crate exists for: a request, no limit, so the budget
+    fn a_request_far_below_the_effective_cores_warns() {
+        // The shape this crate exists for: a request, no limit, so detection
         // falls back to the node and dwarfs what the scheduler guarantees.
         let burstable = CpuBudget::resolve(&CpuConfig::default(), &request_only(64, 4000))
             .expect("detection cannot fail");
         let warning = burstable
             .request_shortfall_warning()
-            .expect("4 cores requested against a 64-core budget must warn");
+            .expect("4 cores requested against 64 effective cores must warn");
         assert!(warning.contains("4 cores"), "{warning}");
         assert!(warning.contains("64 cores"), "{warning}");
-        assert!(warning.contains(CpuConfig::SPICEPOD_SETTING), "{warning}");
+        // No configuration surface and no limit set this one — detection did, and
+        // the warning names that rather than a setting the operator never touched,
+        // plus the absent limit that sent sizing to the machine in the first place.
+        assert!(
+            warning.contains("the CPUs available to this process"),
+            "{warning}"
+        );
+        assert!(warning.contains("no CPU limit detected"), "{warning}");
+        // Never "the host CPU count": a cpuset can pin this process to a subset of
+        // the machine, and never "no CPU limit set": an unreadable quota degrades
+        // to the same `None` as an absent one, so neither claim is ours to make.
+        assert!(!warning.contains("host CPU count"), "{warning}");
+        assert!(!warning.contains("no CPU limit set"), "{warning}");
+
+        // Under an explicit limit the value is capped, so the qualifier must not
+        // appear — it would contradict the limit the warning just named.
+        let limited = CpuBudget::resolve(
+            &CpuConfig::default(),
+            &HostReadings {
+                affinity_cores: 64,
+                quota_millicores: Some(16_000),
+                request_millicores: Some(4000),
+            },
+        )
+        .expect("detection cannot fail")
+        .request_shortfall_warning()
+        .expect("must warn");
+        assert!(!limited.contains("no CPU limit detected"), "{limited}");
 
         // A request under an explicit limit warns the same way.
         let capped = CpuBudget::resolve(
@@ -870,12 +904,28 @@ mod tests {
         let capped = capped
             .request_shortfall_warning()
             .expect("a request far under the limit must warn");
-        assert!(capped.contains("cgroup CPU quota"), "{capped}");
+        assert!(capped.contains("cgroup CPU limit"), "{capped}");
+    }
+
+    /// The warning states the discrepancy and its source, and stops there — no
+    /// remedy, since which of the two numbers is wrong is the operator's call.
+    #[test]
+    fn the_warning_carries_no_guidance() {
+        let warning = CpuBudget::resolve(&CpuConfig::default(), &request_only(64, 4000))
+            .expect("detection cannot fail")
+            .request_shortfall_warning()
+            .expect("must warn");
+
+        for advice in ["Lower", "Set ", "instead", "Raise", "raise"] {
+            assert!(
+                !warning.contains(advice),
+                "the warning must not advise ({advice:?}): {warning}"
+            );
+        }
     }
 
     /// An over-large *configured* value is as wrong as an over-large inferred
-    /// one, so the warning fires there too — naming the surface that set it, and
-    /// advising something other than "set the setting you already set".
+    /// one, so the warning fires there too, naming the surface that set it.
     #[test]
     fn an_oversized_configured_value_warns_against_the_request() {
         let configured = CpuBudget::resolve(
@@ -889,7 +939,6 @@ mod tests {
             .expect("384 configured cores against a 4-core request must warn");
         assert!(warning.contains(CpuConfig::SPICEPOD_SETTING), "{warning}");
         assert!(warning.contains("384 cores"), "{warning}");
-        assert!(warning.contains("Lower"), "{warning}");
 
         // The CLI surface names itself rather than the spicepod field.
         let via_cli = CpuBudget::resolve(
@@ -903,8 +952,8 @@ mod tests {
     }
 
     #[test]
-    fn a_request_close_to_the_budget_is_quiet() {
-        // Within a quarter of the budget: no warning.
+    fn a_request_close_to_the_effective_cores_is_quiet() {
+        // Matching the effective core count: no warning.
         let matched = CpuBudget::resolve(&CpuConfig::default(), &request_only(4, 4000))
             .expect("detection cannot fail");
         assert_eq!(matched.request_shortfall_warning(), None);
@@ -916,6 +965,29 @@ mod tests {
 
         // Nothing to compare against.
         assert_eq!(budget(16).request_shortfall_warning(), None);
+    }
+
+    /// The threshold is *below* half, so exactly half stays quiet and a hair
+    /// under it warns. Pinning both sides keeps a later refactor from drifting
+    /// the comparison to `<=` and warning on every evenly-halved request.
+    #[test]
+    fn the_threshold_is_strictly_below_half_the_effective_cores() {
+        // 8 effective cores; a request of exactly 4 cores is half, so quiet.
+        let exactly_half = CpuBudget::resolve(&CpuConfig::default(), &request_only(8, 4000))
+            .expect("detection cannot fail");
+        assert_eq!(
+            exactly_half.request_shortfall_warning(),
+            None,
+            "a request at exactly half the effective cores must stay quiet"
+        );
+
+        // One millicore under half must warn.
+        let just_under = CpuBudget::resolve(&CpuConfig::default(), &request_only(8, 3999))
+            .expect("detection cannot fail");
+        assert!(
+            just_under.request_shortfall_warning().is_some(),
+            "a request just under half the effective cores must warn"
+        );
     }
 
     #[test]

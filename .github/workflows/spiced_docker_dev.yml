@@ -30,6 +30,11 @@ on:
         required: false
         type: string
         default: ''
+      additional_features:
+        description: 'Optional comma-separated cargo features appended to the variant defaults (e.g. postgres,duckdb). Leave empty for defaults only.'
+        required: false
+        type: string
+        default: ''
   # Mirror the dispatch inputs so other workflows (e.g. the cluster-bench
   # dispatch) can call this as a reusable workflow to build a commit-pinned
   # spiced image and feed the resulting tag into downstream jobs.
@@ -48,6 +53,11 @@ on:
         default: 'models'
       ref:
         description: 'Git ref/SHA to check out for the image build. Defaults to the caller workflow commit.'
+        required: false
+        type: string
+        default: ''
+      additional_features:
+        description: 'Optional comma-separated cargo features appended to the variant defaults (e.g. postgres,duckdb). Leave empty for defaults only.'
         required: false
         type: string
         default: ''
@@ -71,6 +81,7 @@ jobs:
       tag: ${{ steps.set_image_metadata.outputs.tag }}
       revision: ${{ steps.provenance.outputs.revision }}
       on_trunk: ${{ steps.provenance.outputs.on_trunk }}
+      cargo_features: ${{ steps.set_cargo_features.outputs.cargo_features }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -142,6 +153,37 @@ jobs:
               ;;
           esac
 
+      - name: Set cargo features
+        id: set_cargo_features
+        env:
+          VARIANT: ${{ inputs.variant }}
+          ADDITIONAL_FEATURES: ${{ inputs.additional_features }}
+        run: |
+          if [ "$VARIANT" = "models" ]; then
+            features="release,models,spicebench"
+          else
+            features="release,spicebench"
+          fi
+
+          # Append optional extras (comma-separated). Trim whitespace and
+          # collapse empty segments so "postgres, duckdb," → "postgres,duckdb".
+          if [ -n "$ADDITIONAL_FEATURES" ]; then
+            cleaned=$(printf '%s' "$ADDITIONAL_FEATURES" | tr -d '[:space:]' | sed 's/,\+/,/g; s/^,//; s/,$//')
+            if [ -n "$cleaned" ]; then
+              # Cargo feature names are identifiers; reject anything else so a
+              # hostile dispatch input cannot inject shell metacharacters into
+              # later build steps that expand CARGO_FEATURES.
+              if ! printf '%s' "$cleaned" | grep -Eq '^[A-Za-z0-9_,-]+$'; then
+                echo "additional_features contains invalid characters: ${cleaned}" >&2
+                exit 1
+              fi
+              features="${features},${cleaned}"
+            fi
+          fi
+
+          echo "cargo_features=${features}" >> "$GITHUB_OUTPUT"
+          echo "Building with CARGO_FEATURES=${features}"
+
   build-arm64:
     needs: setup
     if: needs.setup.outputs.run_arm64 == 'true'
@@ -198,15 +240,6 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Set cargo features
-        run: |
-          variant="${{ inputs.variant }}"
-          if [ "$variant" = "models" ]; then
-            echo "CARGO_FEATURES=release,models,spicebench" >> $GITHUB_ENV
-          else
-            echo "CARGO_FEATURES=release,spicebench" >> $GITHUB_ENV
-          fi
-
       - name: Build ARM64 image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
@@ -217,7 +250,7 @@ jobs:
           cache-from: type=gha,scope=build-dev-arm64
           cache-to: type=gha,scope=build-dev-arm64,mode=max
           build-args: |
-            CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            CARGO_FEATURES=${{ needs.setup.outputs.cargo_features }}
             RUST_PROFILE=${{ env.RUST_PROFILE }}
           # Provenance labels baked into the image config (survive the multi-arch
           # `imagetools create` in publish, readable via `docker inspect`).
@@ -275,15 +308,6 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Set cargo features
-        run: |
-          variant="${{ inputs.variant }}"
-          if [ "$variant" = "models" ]; then
-            echo "CARGO_FEATURES=release,models,spicebench" >> $GITHUB_ENV
-          else
-            echo "CARGO_FEATURES=release,spicebench" >> $GITHUB_ENV
-          fi
-
       - name: Build AMD64 image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
@@ -294,7 +318,7 @@ jobs:
           cache-from: type=gha,scope=build-dev-amd64
           cache-to: type=gha,scope=build-dev-amd64,mode=max
           build-args: |
-            CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            CARGO_FEATURES=${{ needs.setup.outputs.cargo_features }}
             RUST_PROFILE=${{ env.RUST_PROFILE }}
           # Provenance labels baked into the image config (survive the multi-arch
           # `imagetools create` in publish, readable via `docker inspect`).
@@ -399,12 +423,15 @@ jobs:
         env:
           IMAGE_TAG: ${{ inputs.tag }}
           REL_VERSION: ${{ needs.setup.outputs.rel_version }}
+          CARGO_FEATURES: ${{ needs.setup.outputs.cargo_features }}
         run: |
           echo "## 🐳 Dev Docker Image Published" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Images:**" >> $GITHUB_STEP_SUMMARY
           echo "- \`ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG}\`" >> $GITHUB_STEP_SUMMARY
           echo "- \`ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG}-${REL_VERSION}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Cargo features:** \`${CARGO_FEATURES}\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Pull command:**" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY

@@ -39,7 +39,7 @@ use spicepod::{
 use tokio::sync::RwLock;
 
 use crate::model::EmbeddingModelStore;
-use runtime_parameters::typed::TypedParams as _;
+use runtime_parameters_typed::TypedParams as _;
 use runtime_search::store_params::elasticsearch::{
     ElasticsearchVectorParams, EsDistanceMetric, build_write_options, merge_index_settings,
 };
