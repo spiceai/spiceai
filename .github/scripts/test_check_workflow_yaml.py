@@ -121,6 +121,262 @@ class CheckWorkflowTest(unittest.TestCase):
         )
 
 
+def _workflow_with_budgets(job_budget: str, step_budget: str) -> str:
+    """A one-step workflow, with each budget line omitted when passed empty."""
+    return "".join(
+        [
+            "---\non:\n  workflow_dispatch:\n\njobs:\n  gate:\n    runs-on: ubuntu-24.04\n",
+            f"    timeout-minutes: {job_budget}\n" if job_budget else "",
+            "    steps:\n      - name: Run the checks\n        run: echo hello\n",
+            f"        timeout-minutes: {step_budget}\n" if step_budget else "",
+        ]
+    )
+
+
+class CheckStepBudgetTest(unittest.TestCase):
+    """#12340: a step budget its job's budget pre-empts can never fire."""
+
+    def test_a_step_budget_below_the_jobs_is_accepted(self):
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(_workflow_with_budgets("358", "355")), []
+        )
+
+    def test_a_step_budget_equal_to_the_jobs_is_reported(self):
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(_workflow_with_budgets("358", "358")),
+            [
+                "job `gate` gives `Run the checks` a 358-minute budget that its own "
+                "358-minute budget pre-empts"
+            ],
+        )
+
+    def test_a_step_budget_above_the_jobs_is_reported(self):
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(_workflow_with_budgets("358", "360")),
+            [
+                "job `gate` gives `Run the checks` a 360-minute budget that its own "
+                "358-minute budget pre-empts"
+            ],
+        )
+
+    def test_a_step_budget_without_a_job_budget_is_left_alone(self):
+        """Common and legitimate: a short probe inside an otherwise unbounded job."""
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(_workflow_with_budgets("", "1")), []
+        )
+
+    def test_a_job_budget_without_step_budgets_is_left_alone(self):
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(_workflow_with_budgets("358", "")), []
+        )
+
+    def test_an_unnamed_step_is_reported_by_position(self):
+        workflow = (
+            "---\non:\n  workflow_dispatch:\n\njobs:\n  gate:\n"
+            "    runs-on: ubuntu-24.04\n    timeout-minutes: 5\n"
+            "    steps:\n      - run: echo first\n"
+            "      - run: echo second\n        timeout-minutes: 5\n"
+        )
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(workflow),
+            ["job `gate` gives `step 2` a 5-minute budget that its own 5-minute budget pre-empts"],
+        )
+
+
+def _workflow_with_conditions(job_if: str = "", step_if: str = "") -> str:
+    """A one-step workflow, with each `if:` line omitted when passed empty."""
+    return "".join(
+        [
+            "---\non:\n  workflow_dispatch:\n\njobs:\n  gate:\n    runs-on: ubuntu-24.04\n",
+            f"    if: {job_if}\n" if job_if else "",
+            "    steps:\n      - name: Run the checks\n        run: echo hello\n",
+            f"        if: {step_if}\n" if step_if else "",
+        ]
+    )
+
+
+class CheckConditionContextTest(unittest.TestCase):
+    """#12396: an `if:` naming an unavailable context makes the file unschedulable."""
+
+    def test_secrets_in_a_step_condition_is_reported_with_the_remedy(self):
+        problems = check_workflow_yaml.check_workflow(
+            _workflow_with_conditions(step_if="${{ secrets.SPICE_SECRET_HF_TOKEN != '' }}")
+        )
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("job `gate` step `Run the checks`", problems[0])
+        self.assertIn("naming `secrets`", problems[0])
+        self.assertIn("hoist the test into a job-level `env:`", problems[0])
+
+    def test_secrets_in_a_job_condition_is_reported(self):
+        problems = check_workflow_yaml.check_workflow(
+            _workflow_with_conditions(job_if="${{ secrets.A != '' }}")
+        )
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("job `gate` has an `if:`", problems[0])
+
+    def test_bracket_property_access_is_reported_like_dotted_access(self):
+        """`secrets['A']` is the same unschedulable definition as `secrets.A`."""
+        problems = check_workflow_yaml.check_workflow(
+            _workflow_with_conditions(job_if="${{ secrets['A'] != '' }}")
+        )
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("naming `secrets`", problems[0])
+
+    def test_bracket_access_in_a_step_condition_is_reported_with_the_remedy(self):
+        problems = check_workflow_yaml.check_workflow(
+            _workflow_with_conditions(step_if="${{ secrets['SPICE_SECRET_HF_TOKEN'] != '' }}")
+        )
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("job `gate` step `Run the checks`", problems[0])
+        self.assertIn("hoist the test into a job-level `env:`", problems[0])
+
+    def test_bracket_access_on_an_available_context_is_accepted(self):
+        """The lookbehind must still keep `needs['x'].outputs` from reading as a use."""
+        self.assertEqual(
+            check_workflow_yaml.unavailable_contexts(
+                "needs['setup'].outputs.matrix != ''",
+                check_workflow_yaml.JOB_IF_CONTEXTS,
+            ),
+            [],
+        )
+
+    def test_a_context_name_inside_a_quoted_literal_is_not_a_reference(self):
+        """A literal compared against is text, not property access on a context."""
+        for condition in (
+            "github.event.head_commit.message == 'env.READY'",
+            "contains(github.ref, 'secrets.A')",
+            "github.ref == 'matrix[0]'",
+        ):
+            with self.subTest(condition=condition):
+                self.assertEqual(
+                    check_workflow_yaml.unavailable_contexts(
+                        condition, check_workflow_yaml.JOB_IF_CONTEXTS
+                    ),
+                    [],
+                )
+
+    def test_a_real_reference_beside_a_quoted_literal_is_still_reported(self):
+        """Dropping literals must not swallow the reference next to them."""
+        self.assertEqual(
+            check_workflow_yaml.unavailable_contexts(
+                "github.ref == 'env.READY' && secrets.A != ''",
+                check_workflow_yaml.JOB_IF_CONTEXTS,
+            ),
+            ["secrets"],
+        )
+
+    def test_the_env_indirection_trunk_uses_is_accepted(self):
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(
+                _workflow_with_conditions(step_if="env.HAS_HF_SECRET == 'true'")
+            ),
+            [],
+        )
+
+    def test_env_is_rejected_in_a_job_condition_but_allowed_in_a_step_condition(self):
+        """A job's `if:` is evaluated before the job has an environment."""
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(
+                _workflow_with_conditions(step_if="env.READY == 'true'")
+            ),
+            [],
+        )
+        problems = check_workflow_yaml.check_workflow(
+            _workflow_with_conditions(job_if="env.READY == 'true'")
+        )
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("naming `env`", problems[0])
+
+    def test_steps_matrix_and_runner_are_rejected_in_a_job_condition(self):
+        for context, condition in (
+            ("steps", "steps.probe.outputs.ok == 'true'"),
+            ("matrix", "matrix.target == 'linux'"),
+            ("runner", "runner.os == 'macOS'"),
+        ):
+            with self.subTest(context=context):
+                problems = check_workflow_yaml.check_workflow(
+                    _workflow_with_conditions(job_if=condition)
+                )
+                self.assertEqual(len(problems), 1, problems)
+                self.assertIn(f"naming `{context}`", problems[0])
+
+    def test_contexts_every_condition_may_name_are_accepted(self):
+        for condition in (
+            "github.event_name == 'push'",
+            "needs.build.result == 'success'",
+            "inputs.run_all_tests == 'true'",
+            "vars.FLAG == '1'",
+        ):
+            with self.subTest(condition=condition):
+                self.assertEqual(
+                    check_workflow_yaml.check_workflow(
+                        _workflow_with_conditions(job_if=condition, step_if=condition)
+                    ),
+                    [],
+                )
+
+    def test_a_hyphenated_job_name_is_not_read_as_a_context(self):
+        """`e2e_test_ci.yml` has exactly this: `needs.setup-model-matrix.outputs.matrix`."""
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(
+                _workflow_with_conditions(
+                    job_if="${{ needs.setup-model-matrix.outputs.matrix != '[]' }}"
+                )
+            ),
+            [],
+        )
+
+    def test_a_dotted_path_after_an_allowed_context_is_not_read_as_a_context(self):
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(
+                _workflow_with_conditions(
+                    step_if="github.event.pull_request.user.login == 'dependabot[bot]'"
+                )
+            ),
+            [],
+        )
+
+    def test_every_unavailable_context_in_one_condition_is_named_once(self):
+        problems = check_workflow_yaml.check_workflow(
+            _workflow_with_conditions(job_if="env.A == 'x' && secrets.B != '' && env.C == 'y'")
+        )
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("naming `env`, `secrets`", problems[0])
+
+    def test_an_unknown_dotted_word_is_left_alone(self):
+        """Only real GitHub context names are reported, so a stray string cannot fail CI."""
+        self.assertEqual(
+            check_workflow_yaml.unavailable_contexts(
+                "contains(github.ref, 'refs/heads/release.candidate')",
+                check_workflow_yaml.JOB_IF_CONTEXTS,
+            ),
+            [],
+        )
+
+    def test_a_condition_without_any_if_key_is_not_invented(self):
+        self.assertEqual(check_workflow_yaml.check_workflow(_workflow_with_conditions()), [])
+
+    def test_secrets_in_a_composite_action_step_condition_is_reported(self):
+        action = (
+            "name: Set up thing\ndescription: d\n\nruns:\n  using: composite\n  steps:\n"
+            "    - name: Configure\n      shell: bash\n      if: secrets.TOKEN != ''\n"
+            "      run: echo hello\n"
+        )
+        problems = check_workflow_yaml.check_action(action)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("step `Configure`", problems[0])
+        self.assertIn("naming `secrets`", problems[0])
+
+    def test_a_composite_action_step_may_name_inputs_steps_and_runner(self):
+        action = (
+            "name: Set up thing\ndescription: d\n\nruns:\n  using: composite\n  steps:\n"
+            "    - name: Configure\n      shell: bash\n"
+            "      if: runner.os == 'macOS' && inputs.enabled == 'true' && "
+            "steps.probe.outputs.ok == '1'\n      run: echo hello\n"
+        )
+        self.assertEqual(check_workflow_yaml.check_action(action), [])
+
+
 class CheckActionTest(unittest.TestCase):
     def test_valid_action_has_no_problems(self):
         self.assertEqual(check_workflow_yaml.check_action(VALID_ACTION), [])
