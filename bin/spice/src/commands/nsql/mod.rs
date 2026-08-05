@@ -237,3 +237,39 @@ fn display_result(result: &str, elapsed: f64) {
     println!("{result}");
     println!("\nTime: {elapsed:.6} seconds. {row_count} rows.");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::Deadline;
+    use crate::test_support::SlowServer;
+    use std::time::Duration;
+
+    /// Text-to-SQL is a model round trip, so it must not run under the control-plane
+    /// deadline either — the same defect as
+    /// <https://github.com/spiceai/spiceai/issues/12583>, on a non-streamed response.
+    ///
+    /// The failure this guards against is silent: the body is read with
+    /// `unwrap_or_default`, so a deadline that fires mid-response yields an empty
+    /// translation rather than an error.
+    #[tokio::test]
+    async fn a_slow_translation_outlives_the_control_plane_deadline() {
+        let control_plane = Duration::from_millis(400);
+        let server = SlowServer::dribbling(
+            "SELECT 1".chars().map(|c| c.to_string()).collect(),
+            control_plane / 4,
+        );
+
+        let ctx = RuntimeContext::with_deadlines_for_test(
+            server.url(),
+            Deadline::Total(control_plane),
+            Deadline::Silence(control_plane),
+        );
+
+        let sql = send_nsql_request(&ctx, "how many rows", "test-model")
+            .await
+            .expect("a translation that keeps arriving should be read to the end");
+
+        assert_eq!(sql, "SELECT 1");
+    }
+}
