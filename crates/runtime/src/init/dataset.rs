@@ -355,12 +355,12 @@ impl Runtime {
             .await
         {
             Ok(data_connector) => data_connector,
-            // This is the only failure this function can raise, and reporting it is
+            // This is the only failure this function raises, and reporting it is
             // owned here: the component status, the `LOAD_ERROR` count, and one log
-            // line at the level the failure's permanence warrants. Both callers --
+            // line at the level the failure's permanence warrants. Callers -- both
             // `try_load_dataset_once` and the hot-reload path in `update_dataset` --
-            // used to report the error again on receiving it, which counted one
-            // failure twice and wrote the same status twice. See #12365.
+            // propagate it without reporting it again, so one failure is counted
+            // once and writes one status. See #12365.
             Err(err) => {
                 let ds_name = &ds.name;
                 self.status.update_dataset(
@@ -511,14 +511,12 @@ impl Runtime {
                 tracing::debug!(dataset = %ds.name, duration_ms = connector_start.elapsed().as_millis(), "Dataset connector created");
                 connector
             }
-            // `load_dataset_connector` has already written the status, counted
-            // `LOAD_ERROR`, and logged at the level this failure's permanence
-            // warrants -- repeating any of it here reported one failure twice
-            // (#12365). It raises no other error, so nothing goes unreported.
-            //
-            // The `is_shutdown()` guard went with that block. It only ever
-            // suppressed this duplicate, never the callee's report, so a failure
-            // during teardown counted once before this change and still does.
+            // `load_dataset_connector` owns reporting for this failure -- the
+            // status, the `LOAD_ERROR` count, and a log line at the level its
+            // permanence warrants -- and raises no other error, so propagating it
+            // unreported leaves nothing unreported (#12365). Its reporting is
+            // unconditional, including during teardown, so this arm needs no
+            // `is_shutdown()` guard of its own to keep the count at one.
             Err(err) => return Err(err),
         };
 
@@ -2221,10 +2219,8 @@ mod tests {
     /// A dataset whose `from:` names no registered connector, so building its
     /// connector always fails.
     fn unloadable_dataset(runtime: &Arc<crate::Runtime>) -> Arc<Dataset> {
-        let spec = spicepod::component::dataset::Dataset::new(
-            "not_a_real_connector:any",
-            "reported_once",
-        );
+        let spec =
+            spicepod::component::dataset::Dataset::new("not_a_real_connector:any", "reported_once");
         let app = app::AppBuilder::new("single_load_error_report")
             .with_dataset(spec.clone())
             .build();
