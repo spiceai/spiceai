@@ -459,9 +459,10 @@ impl DataConnector for EmbeddingConnector {
         // above), but when a `FullTextConnector` also exists it peels that layer off before
         // delegating here, so the vector scan is what we see. Mirror `changes_stream`: hand
         // the scan's inner provider down and let the outer connector re-apply the indexes.
-        if let Some(vector_scan) = find_concrete_table_provider_with::<VectorScanTableProvider>(
+        if let Some(vector_scan) = find_concrete_table_provider_in::<VectorScanTableProvider>(
             &table_provider,
-            TRANSPARENT_CDC_WRAPPERS,
+            TABLE_PROVIDER_LAYERS,
+            LayerWalk::CdcDetection,
         ) {
             return self
                 .inner_connector
@@ -830,11 +831,12 @@ mod tests {
         )
     }
 
-    /// Regression test for #12313: `append_stream` had no `VectorScanTableProvider` arm, so
-    /// it fell through to the `EmbeddingTable` lookup, whose `TRANSPARENT_CDC_WRAPPERS` peel
-    /// set cannot see through a vector scan. That returned `None`, and a `refresh_mode:
-    /// append` dataset with no `time_column` then failed registration with
-    /// `AppendRequiresTimeColumn` (or, on Cayenne, silently stopped streaming).
+    /// Regression test for #12313: without its own `VectorScanTableProvider` arm,
+    /// `append_stream` falls through to the `EmbeddingTable` lookup, and
+    /// [`LayerWalk::CdcDetection`] is deliberately opaque at the vector-scan layer, so that
+    /// lookup cannot see through a vector scan. It returns `None`, and a `refresh_mode:
+    /// append` dataset with no `time_column` then fails registration with
+    /// `AppendRequiresTimeColumn` (or, on Cayenne, silently stops streaming).
     ///
     /// `changes_stream` has handled this stack since #12086; the two must not diverge again.
     #[test]
