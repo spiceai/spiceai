@@ -752,11 +752,10 @@ pub fn parse_hadoop_table_url(
         .map(std::iter::Iterator::count)
         .context(UrlParseNoSourceSnafu)?;
 
-    // A Hadoop table URL has to name both a namespace and a table, so the three `count - 2` /
-    // `count - 1` offsets below are only in range from two segments up. Reject a shorter path
-    // here rather than letting the subtraction decide: in debug builds it panics with
-    // `attempt to subtract with overflow`, and in release it only produces this same error by
-    // wrapping to `usize::MAX` and relying on no iterator being able to satisfy that index.
+    // The segment offsets below — `count - 2` for the namespace and the warehouse leaves,
+    // `count - 1` for the nodes — require a path naming both a namespace and a table. Reject a
+    // shorter one explicitly: left to `usize` arithmetic the subtraction decides it instead,
+    // which aborts a debug build and elsewhere depends on the wrap landing out of range.
     if count < 2 {
         return MissingNamespaceSnafu.fail();
     }
@@ -1223,12 +1222,8 @@ mod tests {
         assert!(op.is_err(), "Unsupported scheme should fail");
     }
 
-    /// Regression test for #12539. Each of these URLs has too few path segments to name both a
-    /// namespace and a table, so each reaches the `count - 2` offsets with `count < 2`. Before
-    /// the guard that subtraction panicked with `attempt to subtract with overflow` under
-    /// `debug_assertions` — which is every `cargo test` / `cargo nextest` run — and reached
-    /// `MissingNamespace` in release only by wrapping to `usize::MAX`, an index no iterator can
-    /// satisfy.
+    /// A Hadoop table URL must name both a namespace and a table. Anything shorter is rejected
+    /// as `MissingNamespace`, identically in every build profile. Regression test for #12539.
     #[test]
     fn test_parse_hadoop_table_url_rejects_short_paths() {
         // A warehouse mounted at the filesystem root, or a namespace simply left out.
