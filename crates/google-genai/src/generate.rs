@@ -196,13 +196,13 @@ impl Client {
 
 /// Length of the line terminator beginning at `buf[i]`, or `None` if one does not begin there.
 ///
-/// A `\r` that is the last byte of `buf` reports `None`: it may be the first half of a `\r\n`
-/// whose `\n` has not been read yet, and only more bytes can say which.
-fn terminator_len(buf: &[u8], i: usize) -> Option<usize> {
+/// A `\r` last in `buf` is only a terminator once `at_eof` says no more bytes can arrive to make it
+/// the first half of a `\r\n`; until then which one it is cannot be known.
+fn terminator_len(buf: &[u8], i: usize, at_eof: bool) -> Option<usize> {
     match buf.get(i)? {
         b'\n' => Some(1),
         b'\r' if buf.get(i + 1) == Some(&b'\n') => Some(2),
-        b'\r' if i + 1 < buf.len() => Some(1),
+        b'\r' if i + 1 < buf.len() || at_eof => Some(1),
         _ => None,
     }
 }
@@ -214,16 +214,16 @@ fn terminator_len(buf: &[u8], i: usize) -> Option<usize> {
 /// Searching the bytes - rather than decoding each network read as text and searching that - is
 /// what makes the decode below land on a character boundary: a multi-byte UTF-8 sequence never
 /// contains `\n` or `\r`, so an event never ends inside one.
-fn find_event_boundary(buf: &[u8]) -> Option<(usize, usize)> {
+fn find_event_boundary(buf: &[u8], at_eof: bool) -> Option<(usize, usize)> {
     let mut i = 0;
     while i < buf.len() {
-        let Some(first) = terminator_len(buf, i) else {
+        let Some(first) = terminator_len(buf, i, at_eof) else {
             i += 1;
             continue;
         };
 
         let after = i + first;
-        if let Some(second) = terminator_len(buf, after) {
+        if let Some(second) = terminator_len(buf, after, at_eof) {
             return Some((i, after + second));
         }
 
@@ -269,13 +269,14 @@ fn parse_sse_stream(
     stream: Pin<Box<dyn Stream<Item = std::result::Result<bytes::Bytes, reqwest::Error>> + Send>>,
 ) -> impl Stream<Item = Result<GenerateContentResponse>> + Send {
     futures::stream::unfold(
-        (stream, Vec::<u8>::new()),
-        |(mut stream, mut buffer)| async move {
+        (stream, Vec::<u8>::new(), false),
+        |(mut stream, mut buffer, mut at_eof)| async move {
             loop {
                 // Take every event the buffer already holds before reading again: one read can
                 // carry a comment or keep-alive ahead of a data event, and awaiting another read
                 // would report the end of the stream instead of the event already in hand.
-                while let Some((event_end, next_event_start)) = find_event_boundary(&buffer) {
+                while let Some((event_end, next_event_start)) = find_event_boundary(&buffer, at_eof)
+                {
                     let event = std::str::from_utf8(&buffer[..event_end]).map(str::to_string);
 
                     // Consume the event either way, so a stream carrying one undecodable event
@@ -290,7 +291,7 @@ fn parse_sse_stream(
                                     message: format!("Invalid UTF-8 in SSE event: {e}"),
                                 }
                                 .fail(),
-                                (stream, buffer),
+                                (stream, buffer, at_eof),
                             ));
                         }
                     };
@@ -309,7 +310,27 @@ fn parse_sse_stream(
 
                     let result = serde_json::from_str(&data).context(JsonSnafu);
 
-                    return Some((result, (stream, buffer)));
+                    return Some((result, (stream, buffer, at_eof)));
+                }
+
+                // Every event the body held has been delivered by now, so whatever is left is a
+                // tail the server never terminated. Report it once and end there: consumers
+                // forward each item rather than stopping at the first error, so keeping the tail
+                // would yield this same error on every later poll and the stream would never end.
+                if at_eof {
+                    if buffer.is_empty() {
+                        return None;
+                    }
+
+                    buffer.clear();
+
+                    return Some((
+                        StreamSnafu {
+                            message: "Unexpected end of stream while parsing SSE event".to_string(),
+                        }
+                        .fail(),
+                        (stream, buffer, at_eof),
+                    ));
                 }
 
                 match stream.next().await {
@@ -320,29 +341,13 @@ fn parse_sse_stream(
                                 message: e.to_string(),
                             }
                             .fail(),
-                            (stream, buffer),
+                            (stream, buffer, at_eof),
                         ));
                     }
-                    None => {
-                        if buffer.is_empty() {
-                            return None;
-                        }
-
-                        // Report the truncated tail once and end there. Consumers forward each
-                        // item rather than stopping at the first error, so leaving the tail in the
-                        // buffer would yield this same error on every later poll: the stream would
-                        // never end.
-                        buffer.clear();
-
-                        return Some((
-                            StreamSnafu {
-                                message: "Unexpected end of stream while parsing SSE event"
-                                    .to_string(),
-                            }
-                            .fail(),
-                            (stream, buffer),
-                        ));
-                    }
+                    // Note the end rather than acting on it, and go back around: a `\r` held back
+                    // as possibly-half-a-`\r\n` is a terminator now that nothing follows it, so a
+                    // complete final event has to be looked for again before the tail is judged.
+                    None => at_eof = true,
                 }
             }
         },
@@ -644,13 +649,43 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_cr_terminated_final_event_is_delivered_at_the_end_of_the_body() {
+        // SSE allows a bare `\r` line ending, so `\r\r` is this body's last blank line and the
+        // event before it is complete - even though nothing follows to prove the second `\r` is
+        // not the first half of a `\r\n`.
+        let event = text_event("Hello").replace("\r\n", "\r");
+
+        let mut parsed_stream = Box::pin(parse_sse_stream(dribble(vec![event.as_bytes()])));
+
+        let first = parsed_stream
+            .next()
+            .await
+            .expect("a CR-terminated final event should be yielded, not reported as truncated")
+            .expect("should parse successfully");
+
+        assert_eq!(text_of(&first), "Hello");
+        assert!(
+            parsed_stream.next().await.is_none(),
+            "the stream should end once the buffer is drained"
+        );
+    }
+
     #[test]
     fn a_trailing_cr_waits_for_the_byte_that_classifies_it() {
-        // `\r` last: it may still grow into the `\r\n` that completes a blank line.
-        assert_eq!(find_event_boundary(b"data: a\r\n\r"), None);
-        assert_eq!(find_event_boundary(b"data: a\r\n\r\n"), Some((7, 11)));
-        // `\r\r` is a blank line in its own right once a following byte proves the second `\r`
-        // is not the start of a `\r\n`.
-        assert_eq!(find_event_boundary(b"data: a\r\rx"), Some((7, 9)));
+        // `\r` last, more bytes still possible: it may grow into the `\r\n` of a blank line.
+        assert_eq!(find_event_boundary(b"data: a\r\n\r", false), None);
+        assert_eq!(
+            find_event_boundary(b"data: a\r\n\r\n", false),
+            Some((7, 11))
+        );
+        // `\r\r` is a blank line in its own right once a following byte proves the second `\r` is
+        // not the start of a `\r\n`...
+        assert_eq!(find_event_boundary(b"data: a\r\rx", false), Some((7, 9)));
+        // ...and the end of the body proves the same thing.
+        assert_eq!(find_event_boundary(b"data: a\r\r", false), None);
+        assert_eq!(find_event_boundary(b"data: a\r\r", true), Some((7, 9)));
+        // One terminator is not a blank line, at the end of the body or anywhere else.
+        assert_eq!(find_event_boundary(b"data: a\r", true), None);
     }
 }
