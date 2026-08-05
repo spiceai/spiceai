@@ -17,11 +17,13 @@ limitations under the License.
 //! Runtime context for managing Spice runtime installation and configuration.
 
 use crate::error::{
-    CreateDirectorySnafu, HomeDirectoryNotFoundSnafu, Result, RuntimeExecutionSnafu,
-    RuntimeNotInstalledSnafu, RuntimeVersionSnafu, WindowsNativeRuntimeUnsupportedSnafu,
+    CreateDirectorySnafu, HomeDirectoryNotFoundSnafu, HttpClientBuildSnafu, Result,
+    RuntimeExecutionSnafu, RuntimeNotInstalledSnafu, RuntimeVersionSnafu,
+    WindowsNativeRuntimeUnsupportedSnafu,
 };
 use snafu::ResultExt;
 use spice_cloud_client::endpoints::data_endpoint as spice_cloud_data_endpoint;
+use spice_cloud_client::redirect::same_origin_redirect_policy;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
@@ -96,7 +98,9 @@ impl RuntimeContext {
     ///
     /// # Errors
     ///
-    /// Returns an error if the home directory cannot be determined.
+    /// Returns an error if the home directory cannot be determined, or if the HTTP client
+    /// cannot be built — the latter is not defaulted past, because a default client would
+    /// not carry the same-origin redirect policy.
     pub fn new() -> Result<Self> {
         let home_dir = dirs::home_dir().ok_or_else(|| HomeDirectoryNotFoundSnafu.build())?;
         let spice_runtime_dir = home_dir.join(DOT_SPICE);
@@ -105,12 +109,16 @@ impl RuntimeContext {
         let app_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let pods_dir = app_dir.join(SPICEPODS_DIR);
 
+        // Every `/v1/*` call the CLI makes goes through this client — the context helpers
+        // and the per-command sites that build their own request from `ctx.http_client()`
+        // alike — so the redirect policy is set once here rather than per call site.
         let http_client = reqwest::Client::builder()
             .user_agent(Self::default_user_agent())
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
+            .redirect(same_origin_redirect_policy())
             .build()
-            .unwrap_or_default();
+            .context(HttpClientBuildSnafu)?;
 
         Ok(Self {
             spice_runtime_dir,
@@ -550,7 +558,152 @@ impl RuntimeContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{TcpListener, TcpStream};
     use tempfile::TempDir;
+
+    /// How long a request that must not hang is given before the test fails it. Well under
+    /// the context client's own 30-second timeout, so a regression fails fast instead of
+    /// stalling.
+    const TEST_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// Read the request head so the client's write completes before we reply. Closing a
+    /// socket with unread request data still buffered can surface as a reset rather than the
+    /// response under test, which on Windows is packetisation dependent and so intermittent.
+    fn drain_request_head(stream: &mut TcpStream) {
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+            if line == "\r\n" || line == "\n" {
+                return;
+            }
+        }
+    }
+
+    fn serve_once(listener: &TcpListener, response: &str) {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        drain_request_head(&mut stream);
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    }
+
+    fn localhost_listener() -> TcpListener {
+        TcpListener::bind("127.0.0.1:0").expect("test listener should bind")
+    }
+
+    fn local_port(listener: &TcpListener) -> u16 {
+        listener
+            .local_addr()
+            .expect("listener should have a local address")
+            .port()
+    }
+
+    /// Every request the CLI makes through this context carries the API key in an
+    /// `X-API-Key` header, which `reqwest` does not strip on a cross-origin redirect. A
+    /// runtime, proxy or ingress answering with an off-origin `Location` must therefore be
+    /// refused rather than handed the key (#12495).
+    ///
+    /// Goes through `with_args` so the client under test is the one `RuntimeContext::new`
+    /// builds — a test that assembled its own client would still pass if the policy were
+    /// dropped from the constructor.
+    #[tokio::test]
+    async fn test_context_client_does_not_follow_a_cross_origin_redirect() {
+        let runtime = localhost_listener();
+        let elsewhere = localhost_listener();
+        let elsewhere_port = local_port(&elsewhere);
+        let runtime_port = local_port(&runtime);
+
+        // Nothing should ever connect here; poll without blocking after the call returns.
+        elsewhere
+            .set_nonblocking(true)
+            .expect("listener should go non-blocking");
+
+        let response = format!(
+            "HTTP/1.1 307 Temporary Redirect\r\n\
+             Location: http://127.0.0.1:{elsewhere_port}/collect\r\n\
+             Content-Length: 0\r\n\
+             Connection: close\r\n\r\n"
+        );
+        let server = std::thread::spawn(move || serve_once(&runtime, &response));
+
+        let ctx = RuntimeContext::with_args(
+            Some(format!("http://127.0.0.1:{runtime_port}")),
+            Some("SECRETKEY".to_string()),
+            None,
+            None,
+        )
+        .expect("context should build");
+
+        // On the default policy the client follows the hop and then waits on a listener that
+        // never answers, so without this bound the regression surfaces only as a stall.
+        let got = tokio::time::timeout(TEST_REQUEST_TIMEOUT, ctx.get("/v1/status"))
+            .await
+            .expect("a refused redirect must return promptly, not hang")
+            .expect("the 307 should come back as a response");
+
+        // Stopped at the redirect rather than followed, and the 3xx is still diagnosable.
+        assert_eq!(got.status().as_u16(), 307);
+
+        // `WouldBlock` specifically: any other error would mean the listener itself failed,
+        // which is not evidence that nothing ever connected to it.
+        let contacted = elsewhere.accept();
+        let refused_kind = contacted.as_ref().err().map(std::io::Error::kind);
+        assert_eq!(
+            refused_kind,
+            Some(std::io::ErrorKind::WouldBlock),
+            "the off-origin listener must never be contacted"
+        );
+
+        server.join().expect("server thread should not panic");
+    }
+
+    /// The policy must not break a legitimate same-origin redirect on a runtime endpoint.
+    #[tokio::test]
+    async fn test_context_client_follows_a_same_origin_redirect() {
+        let listener = localhost_listener();
+        let port = local_port(&listener);
+
+        let redirect = format!(
+            "HTTP/1.1 307 Temporary Redirect\r\n\
+             Location: http://127.0.0.1:{port}/v1/status/retry\r\n\
+             Content-Length: 0\r\n\
+             Connection: close\r\n\r\n"
+        );
+        let ok = "HTTP/1.1 200 OK\r\n\
+                  Content-Type: application/json\r\n\
+                  Content-Length: 11\r\n\
+                  Connection: close\r\n\r\n\
+                  {\"ok\":true}";
+        let server = std::thread::spawn(move || {
+            serve_once(&listener, &redirect);
+            serve_once(&listener, ok);
+        });
+
+        let ctx = RuntimeContext::with_args(
+            Some(format!("http://127.0.0.1:{port}")),
+            Some("SECRETKEY".to_string()),
+            None,
+            None,
+        )
+        .expect("context should build");
+
+        let got = tokio::time::timeout(TEST_REQUEST_TIMEOUT, ctx.get("/v1/status"))
+            .await
+            .expect("the same-origin redirect chain must not hang")
+            .expect("the followed redirect should return a response");
+
+        assert_eq!(got.status().as_u16(), 200);
+
+        server.join().expect("server thread should not panic");
+    }
 
     /// Helper to create a `RuntimeContext` with a mocked spiced binary for testing.
     fn create_test_context() -> RuntimeContext {
