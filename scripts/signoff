@@ -727,6 +727,12 @@ readonly DEFAULT_MIN_FREE_GIB=25
 readonly DISK_CRITICAL_GIB=2
 # run_checks returns this when the preflight refuses to start.
 readonly EXIT_DISK_EXHAUSTED=70
+# Bash reports a foreground child killed by signal N as 128+N, and run_make_step
+# returns make's own status untouched. So a status at or above this means `make`
+# never reached a verdict of its own — the process tree was signalled. That is
+# how a `Sign off` step reads when its `timeout-minutes` budget expires (#12518)
+# and how a cancelled job reads (#12424); a recipe that genuinely fails exits 2.
+readonly EXIT_SIGNAL_BASE=128
 # How the linker's out-of-disk death actually reads in the run log:
 # `ld: write() failed, errno=28 (No space left on device)`. Either spelling is
 # enough; matching both survives a toolchain that words one of them differently.
@@ -849,14 +855,25 @@ disk_is_critical() {
 }
 
 # Names what broke in a check run that did not pass, given run_checks' exit
-# status: "disk" when the work volume is the cause, "checks" for everything
-# else, which is the branch. Three ways to reach "disk", in falling order of
-# authority: the preflight refused to start, the build said so itself, or the
-# volume is at ~0 now. The last is a backstop for a build whose output we did
-# not record — a local run, or a remote one whose watcher died before it could
-# read anything — which is why it is not the only signal.
+# status: "signalled" when nothing judged the branch at all, "disk" when the work
+# volume is the cause, "checks" for everything else, which is the branch. Three
+# ways to reach "disk", in falling order of authority: the preflight refused to
+# start, the build said so itself, or the volume is at ~0 now. The last is a
+# backstop for a build whose output we did not record — a local run, or a remote
+# one whose watcher died before it could read anything — which is why it is not
+# the only signal.
 failure_kind() {
   local check_status="$1"
+
+  # First, because it is the one kind that says the checks reached no verdict
+  # rather than which verdict they reached. The two disk signals below both
+  # describe a `make` that *returned*: the preflight refusing to start (70) and
+  # a build that printed ENOSPC and died. Neither can coexist with a status that
+  # says make itself was killed.
+  if [[ "$check_status" -ge "$EXIT_SIGNAL_BASE" ]]; then
+    echo "signalled"
+    return
+  fi
 
   # The preflight's own refusal needs no corroboration.
   if [[ "$check_status" -eq "$EXIT_DISK_EXHAUSTED" ]]; then
@@ -876,6 +893,57 @@ failure_kind() {
   fi
 
   if disk_is_critical; then echo "disk"; else echo "checks"; fi
+}
+
+# What to publish about a check run that did not pass, given run_checks' exit
+# status, how long it ran, and who dispatched it. Sets three globals rather than
+# returning a packed string, the way run_make_step reports through
+# SIGNOFF_DISK_HIT:
+#
+#   SIGNOFF_FAILURE_STATUS_DESC  the commit-status description, or "" to publish
+#                                no verdict at all
+#   SIGNOFF_FAILURE_SUMMARY      the step summary
+#   SIGNOFF_FAILURE_MESSAGE      what `fail` says on the way out
+#
+# An empty description is the whole point of the "signalled" case and is not an
+# error path: see below.
+SIGNOFF_FAILURE_STATUS_DESC=""
+SIGNOFF_FAILURE_SUMMARY=""
+SIGNOFF_FAILURE_MESSAGE=""
+describe_check_failure() {
+  local check_status="$1" elapsed="$2" user="$3"
+
+  case "$(failure_kind "$check_status")" in
+    signalled)
+      # Publish nothing. Nothing judged this branch — the process tree was
+      # signalled — so the `pending` this run posted before it started is still
+      # the truthful status, and it is already what the workflow's "Resolve an
+      # incomplete sign-off" step is there to describe.
+      #
+      # Any verdict written here would assert something nothing established:
+      # "checks failed" about a suite the log shows still passing when the
+      # 353-minute budget expired (#12518), on a commit that may already carry a
+      # `signoff=success` an earlier run earned (#12520). Neither correction
+      # handler can take it back — both are gated on `cancelled()`, and a budget
+      # expiry is a *failed* step by #12343's design — so the only safe moment to
+      # decline is here.
+      SIGNOFF_FAILURE_STATUS_DESC=""
+      SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Did not complete** after ${elapsed}s — the run was signalled (its step budget expired, or the job was stopped), so **the checks reached no verdict**. This is not a code failure and the diff is not implicated. The \`${STATUS_CONTEXT}\` status is left as this run found it; sign off again."$'\n'
+      SIGNOFF_FAILURE_MESSAGE="sign-off did not complete: the run was signalled after ${elapsed}s, so the checks reached no verdict — sign off again"
+      ;;
+    disk)
+      # An out-of-disk run says nothing useful by default — the commit status is
+      # all most readers see, so it has to carry the distinction itself.
+      SIGNOFF_FAILURE_STATUS_DESC="Runner out of disk after ${elapsed}s — checks did not complete, re-dispatch (triggered by ${user})"
+      SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Infrastructure failure** after ${elapsed}s — the build ran out of disk on the runner work volume, so **the checks did not complete**. Re-dispatch once the runner has space. Only if this recurs for one branch alone is the diff worth suspecting: a build script or dependency change can consume the volume by itself."$'\n'
+      SIGNOFF_FAILURE_MESSAGE="sign-off aborted: the runner ran out of disk (the checks did not complete)"
+      ;;
+    *)
+      SIGNOFF_FAILURE_STATUS_DESC="Sign-off checks failed after ${elapsed}s (triggered by ${user})"
+      SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Failed** after ${elapsed}s."$'\n'
+      SIGNOFF_FAILURE_MESSAGE="sign-off checks failed"
+      ;;
+  esac
 }
 
 # Stop before the Rust checks when the work volume cannot hold them. Fatal only
@@ -1240,26 +1308,18 @@ cmd_signoff() {
     set -e
     if [[ "$check_status" -ne 0 ]]; then
       elapsed=$(( $(date +%s) - start ))
-      local status_desc summary_text fail_message
-      # An out-of-disk run says nothing useful by default — the commit status is
-      # all most readers see, so it has to carry the distinction itself.
-      case "$(failure_kind "$check_status")" in
-        disk)
-          status_desc="Runner out of disk after ${elapsed}s — checks did not complete, re-dispatch (triggered by ${user})"
-          summary_text="### Sign-off"$'\n'"**Infrastructure failure** after ${elapsed}s — the build ran out of disk on the runner work volume, so **the checks did not complete**. Re-dispatch once the runner has space. Only if this recurs for one branch alone is the diff worth suspecting: a build script or dependency change can consume the volume by itself."$'\n'
-          fail_message="sign-off aborted: the runner ran out of disk (the checks did not complete)"
-          ;;
-        *)
-          status_desc="Sign-off checks failed after ${elapsed}s (triggered by ${user})"
-          summary_text="### Sign-off"$'\n'"**Failed** after ${elapsed}s."$'\n'
-          fail_message="sign-off checks failed"
-          ;;
-      esac
+      describe_check_failure "$check_status" "$elapsed" "$user"
       if is_remote_run; then
-        post_failure_status "$repo" "$sha" "$status_desc"
-        append_step_summary "$summary_text"
+        # An empty description means this run reached no verdict, so it has none
+        # to publish — leaving the status it posted at the start untouched. The
+        # summary still goes out: it is where an operator reads *why* the run
+        # ended without one.
+        if [[ -n "$SIGNOFF_FAILURE_STATUS_DESC" ]]; then
+          post_failure_status "$repo" "$sha" "$SIGNOFF_FAILURE_STATUS_DESC"
+        fi
+        append_step_summary "$SIGNOFF_FAILURE_SUMMARY"
       fi
-      fail "$fail_message"
+      fail "$SIGNOFF_FAILURE_MESSAGE"
     fi
     elapsed=$(( $(date +%s) - start ))
     description="Signed off by ${user}${via} — ${SIGNOFF_CHECK_SUMMARY} in ${elapsed}s"
