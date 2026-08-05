@@ -73,6 +73,10 @@ Steps 1-2 exist to fail fast: a lint or test failure in the crate you edited is
 the likeliest outcome, and step 3 is by far the longest, so covering your own
 crates first turns a late failure into an early one.
 `SIGNOFF_SKIP_TARGETED_LINT=1` and `SIGNOFF_SKIP_TARGETED_TESTS=1` opt out.
+Remote sign-off sets both: fail-fast is worth an extra resolve of the changed
+crates' graph only while someone is watching the output, and nobody watches a
+self-hosted runner — dispatch `signoff.yml` with `run_targeted_prechecks=true`
+to get them back.
 
 **The scoped steps build each crate the way the workspace builds it.** The
 features come from a `cargo metadata` resolve of the whole workspace,
@@ -254,10 +258,12 @@ corrupts the measurement.
 
 The Actions workflow:
 
+0. Resolves the dispatch input to a commit, in a small GitHub-hosted `resolve`
+   job, so the sign-off job can key its concurrency group on that commit
 1. Checks out your branch (full history) and fetches `trunk`
-2. Target-lints crates touched by the branch vs `trunk` (GitHub compare API as a
-   fallback when merge-base isn't available), or skips Rust checks when the
-   branch has no Rust-affecting files
+2. Skips Rust checks when the branch has no Rust-affecting files. The targeted
+   pre-lint and unit tests are off here (`run_targeted_prechecks` turns them on,
+   with the GitHub compare API as a fallback when merge-base isn't available)
 3. Runs full `make lint-rust` + `make build-cli-dev nextest` when Rust is affected
 4. Posts pending → success/failure `signoff` statuses (skipping the pending when
    the commit is already signed off), then re-runs **Attestation** if needed
@@ -270,6 +276,15 @@ expired, evicted by a re-dispatch, cancelled — replaces its own `pending` stat
 with a failure; otherwise `scripts/signoff status` and `scripts/signoff mine`
 would keep showing a sign-off in progress for a run that is long gone.
 Re-dispatch against the same HEAD to try again.
+
+Only one sign-off runs per commit. Both dispatch forms — `-f branch=<branch>` and
+`-f pr_number=<N>` — resolve to the same commit before the sign-off job starts,
+and its concurrency group is keyed on that commit, so a second dispatch for a
+commit already being signed off evicts the first rather than duplicating 1-4
+hours of identical work and racing it for the `signoff` status (#12472). Two open
+PRs that happen to share a head commit collapse into one run for the same reason.
+Dispatching after the branch tip has *moved* is a different commit, so it starts
+a fresh run (and the branch-keyed group evicts the run on the stale commit).
 
 Re-dispatching against a HEAD that is *already* signed off leaves that success in
 place: the run skips the in-progress `pending` and only replaces the status once
@@ -431,7 +446,7 @@ merge queue is still the real gate.
 | Stage | Trigger | Checks |
 | --- | --- | --- |
 | Local | `make signoff` | skip Rust if no Rust-affecting files in the branch diff; else targeted `make lint-rust PACKAGES=… FEATURES=…` + `make nextest-packages PACKAGES=… FEATURES=…` (features from the workspace resolve), full `make lint-rust`, `make build-cli-dev nextest` |
-| Remote | `make signoff-remote` | same checks via the self-hosted `signoff.yml` workflow; posts `signoff` |
+| Remote | `make signoff-remote` | the same checks via the self-hosted `signoff.yml` workflow, without the targeted pre-checks (`run_targeted_prechecks=true` restores them); posts `signoff` |
 | Pull request | `pull_request` | **Attestation** (validates the sign-off, or auto-passes a branch with no Rust-affecting files, a pure revert, or a single-commit Dependabot bump) + PR hygiene; merge-queue check names report lightweight skipped/passthrough results |
 | Merge queue | `merge_group` | the full required suite (below) + advisory niche checks |
 
