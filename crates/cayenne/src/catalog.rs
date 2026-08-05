@@ -987,6 +987,16 @@ pub trait MetadataCatalog: Send + Sync {
         Ok(())
     }
 
+    /// Reclaim a bounded slice of the metastore freelist off the hot path,
+    /// returning the pages reclaimed. Called from the same background
+    /// maintenance tick as [`Self::checkpoint_wal`] and immediately before it,
+    /// because the relocation lands in the WAL and the file only shrinks once a
+    /// checkpoint copies it back. A no-op unless the metastore was created in an
+    /// incremental auto-vacuum mode. Default implementation does nothing.
+    async fn incremental_vacuum(&self) -> CatalogResult<u64> {
+        Ok(0)
+    }
+
     /// Drop a table and all its associated metadata (delete files, insert records,
     /// snapshot sequences, partitions).
     ///
