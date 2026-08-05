@@ -122,6 +122,14 @@ pub enum Error {
     ))]
     HomeDirectoryNotFound,
 
+    /// The HTTP client could not be built.
+    ///
+    /// Not recoverable by falling back to a default client: the built one carries the
+    /// same-origin redirect policy that keeps the API key from being forwarded off
+    /// origin, and a default client would not (#12495).
+    #[snafu(display("Could not build the HTTP client: {source}"))]
+    HttpClientBuild { source: reqwest::Error },
+
     /// REPL error
     #[snafu(display("SQL REPL error: {message}"))]
     Repl { message: String },
