@@ -3839,14 +3839,13 @@ mod tests {
         existing: &[&[(i32, i32)]],
     ) -> Vec<i32> {
         let schema = dedup_schema();
-        let existing_batches: Vec<RecordBatch> = existing
-            .iter()
-            .map(|rows| dedup_batch(&schema, rows))
-            .collect();
-        let mut used: Vec<Vec<bool>> = existing_batches
-            .iter()
-            .map(|batch| vec![false; batch.num_rows()])
-            .collect();
+        let mut existing_batches = vec![];
+        let mut used = vec![];
+        for rows in existing {
+            let batch = dedup_batch(&schema, rows);
+            used.push(vec![false; batch.num_rows()]);
+            existing_batches.push(batch);
+        }
 
         let mut surviving = vec![];
         for update in updates {
