@@ -274,7 +274,8 @@ fn parse_sse_stream(
             loop {
                 // Take every event the buffer already holds before reading again: one read can
                 // carry a comment or keep-alive ahead of a data event, and awaiting another read
-                // would report the end of the stream instead of the event already in hand.
+                // would hold that event back until the server happened to send more - or, at the
+                // end of the body, report the stream as truncated instead.
                 while let Some((event_end, next_event_start)) = find_event_boundary(&buffer, at_eof)
                 {
                     let event = std::str::from_utf8(&buffer[..event_end]).map(str::to_string);
@@ -436,6 +437,23 @@ mod tests {
         Box::pin(futures::stream::iter(reads))
     }
 
+    /// The same, but the stream never ends: after the given reads it stays pending, the way a
+    /// server that has sent a keep-alive and nothing since does.
+    fn dribble_then_pending(
+        reads: Vec<&[u8]>,
+    ) -> Pin<Box<dyn Stream<Item = std::result::Result<bytes::Bytes, reqwest::Error>> + Send>> {
+        let reads: Vec<_> = reads
+            .into_iter()
+            .map(|read| Ok(bytes::Bytes::copy_from_slice(read)))
+            .collect();
+
+        // Both `StreamExt` traits in scope carry `chain`, so name the one being used.
+        Box::pin(futures::StreamExt::chain(
+            futures::stream::iter(reads),
+            futures::stream::pending(),
+        ))
+    }
+
     fn text_of(response: &GenerateContentResponse) -> String {
         response
             .candidates
@@ -554,6 +572,23 @@ mod tests {
             parsed_stream.next().await.is_none(),
             "the stream should end once the buffer is drained"
         );
+    }
+
+    #[tokio::test]
+    async fn a_keep_alive_does_not_hold_back_an_event_already_in_the_buffer() {
+        let body = format!(": keep-alive\r\n\r\n{}", text_event("Hello"));
+
+        let mut parsed_stream = Box::pin(parse_sse_stream(dribble_then_pending(vec![
+            body.as_bytes(),
+        ])));
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), parsed_stream.next())
+            .await
+            .expect("the buffered event must be delivered without awaiting another read")
+            .expect("stream should yield one item")
+            .expect("should parse successfully");
+
+        assert_eq!(text_of(&first), "Hello");
     }
 
     #[tokio::test]
