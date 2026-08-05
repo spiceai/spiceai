@@ -199,7 +199,15 @@ fn approx_pk_index_entry_bytes(pk: &[ScalarValue], entry: &RowEntry) -> usize {
         ))
     });
 
+    // `size_of::<RowEntry>()` covers the value's own inline width, including the
+    // `Vec` headers of its group key and inputs. The *key* needs the same
+    // treatment: `pk_bytes` sums only the scalars behind the pointer, so without
+    // this the map's `Vec<ScalarValue>` header goes uncharged and every entry is
+    // undercounted by a fixed amount — a systematic bias in the one direction
+    // that matters, since it lets the index sit over budget while reporting
+    // itself under.
     pk_bytes
+        .saturating_add(std::mem::size_of::<Vec<ScalarValue>>())
         .saturating_add(group_key_bytes)
         .saturating_add(input_bytes)
         .saturating_add(std::mem::size_of::<RowEntry>())
