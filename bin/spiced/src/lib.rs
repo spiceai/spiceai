@@ -375,8 +375,10 @@ pub struct Args {
 
     /// How many CPUs the runtime should behave as though it has, as a
     /// Kubernetes CPU quantity (`4`, `3.5`, `3500m`). `auto` (the default)
-    /// detects it from the cgroup CPU quota, the pod's `requests.cpu`, or the
-    /// host. Takes precedence over `SPICE_CPU_CORES` and `runtime.cpu.cores`.
+    /// detects it from the cgroup CPU limit, a bounded multiple of the pod's
+    /// `requests.cpu`, or the host. `all` uses every available core regardless
+    /// of the request, still respecting a CPU limit. Takes precedence over
+    /// `SPICE_CPU_CORES` and `runtime.cpu.cores`.
     #[arg(long, value_name = "CORES")]
     pub cpu_cores: Option<String>,
 
