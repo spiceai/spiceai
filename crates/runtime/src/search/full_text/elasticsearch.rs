@@ -42,7 +42,7 @@ use crate::federated_table::FederatedTable;
 use crate::search::full_text::table::add_compound_fts_to_table;
 use crate::search::util::find_concrete_table_provider;
 use runtime_metrics::component::MetricsProvider;
-use runtime_parameters::typed::TypedParams as _;
+use runtime_parameters_typed::TypedParams as _;
 use runtime_search::store_params::elasticsearch::{
     ElasticsearchFtsConfig, ElasticsearchFtsParams, normalize_elasticsearch_prefix,
 };

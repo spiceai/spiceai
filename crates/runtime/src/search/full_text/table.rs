@@ -437,7 +437,7 @@ mod tests {
 
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::catalog::MemTable;
-    use runtime_parameters::typed::TypedParams as _;
+    use runtime_parameters_typed::TypedParams as _;
     use runtime_search::store_params::elasticsearch::{
         ElasticsearchFtsConfig, ElasticsearchFtsParams,
     };

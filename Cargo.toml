@@ -59,6 +59,7 @@ members = [
     "crates/runtime-parameter-spec",
     "crates/runtime-parameters",
     "crates/runtime-parameters-derive",
+    "crates/runtime-parameters-typed",
     "crates/runtime-secrets",
     "crates/runtime-status",
     "crates/runtime-udfs-api",
