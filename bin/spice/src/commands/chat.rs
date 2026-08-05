@@ -565,9 +565,8 @@ async fn send_chat_streaming(
     // connection is up, not that anything is being produced.
     let progress_deadline = ctx.inference_deadline().duration();
     let mut last_event = Instant::now();
-    let mut saw_terminator = false;
 
-    while !saw_terminator {
+    'stream: loop {
         let remaining = progress_deadline.saturating_sub(last_event.elapsed());
         let Ok(next) = tokio::time::timeout(remaining, stream.next()).await else {
             if let Some(s) = spinner {
@@ -581,7 +580,9 @@ async fn send_chat_streaming(
             }
             .build());
         };
-        let Some(chunk_result) = next else { break };
+        let Some(chunk_result) = next else {
+            break 'stream;
+        };
 
         let chunk = chunk_result.map_err(|e| {
             InvalidResponseSnafu {
@@ -601,8 +602,7 @@ async fn send_chat_streaming(
                 if data == "[DONE]" {
                     // The protocol's terminator. Reading on would wait for an EOF the server
                     // is under no obligation to send promptly.
-                    saw_terminator = true;
-                    break;
+                    break 'stream;
                 }
 
                 // Parse the JSON chunk
@@ -655,6 +655,26 @@ mod tests {
     use crate::test_support::SlowServer;
     use std::time::Duration;
 
+    /// The one-shot prompt every streaming test sends. The content is irrelevant to all of
+    /// them — what is under test is how the response is read.
+    fn one_shot_prompt() -> Vec<Message> {
+        vec![Message {
+            role: "user".to_string(),
+            content: "hello".to_string(),
+        }]
+    }
+
+    /// A config that leaves the endpoint to the context, so a test's `SlowServer` is what the
+    /// request reaches.
+    const fn test_chat_config() -> ChatConfig<'static> {
+        ChatConfig {
+            model: "test-model",
+            temperature: None,
+            endpoint: None,
+            custom_headers: &[],
+        }
+    }
+
     /// A streamed answer that keeps arriving must not be cut off for taking longer than the
     /// control-plane deadline — the failure reported in
     /// <https://github.com/spiceai/spiceai/issues/12583>.
@@ -692,16 +712,8 @@ mod tests {
             "expected the control-plane client to time out, got: {cut_off}"
         );
 
-        let config = ChatConfig {
-            model: "test-model",
-            temperature: None,
-            endpoint: None,
-            custom_headers: &[],
-        };
-        let messages = vec![Message {
-            role: "user".to_string(),
-            content: "hello".to_string(),
-        }];
+        let config = test_chat_config();
+        let messages = one_shot_prompt();
 
         let response = send_chat_streaming(&ctx, &config, &messages, false, false)
             .await
@@ -749,16 +761,8 @@ mod tests {
             Deadline::Silence(Duration::from_secs(30)),
         );
 
-        let config = ChatConfig {
-            model: "test-model",
-            temperature: None,
-            endpoint: None,
-            custom_headers: &[],
-        };
-        let messages = vec![Message {
-            role: "user".to_string(),
-            content: "hello".to_string(),
-        }];
+        let config = test_chat_config();
+        let messages = one_shot_prompt();
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(2),
@@ -795,16 +799,8 @@ mod tests {
             Deadline::Silence(Duration::from_millis(300)),
         );
 
-        let config = ChatConfig {
-            model: "test-model",
-            temperature: None,
-            endpoint: None,
-            custom_headers: &[],
-        };
-        let messages = vec![Message {
-            role: "user".to_string(),
-            content: "hello".to_string(),
-        }];
+        let config = test_chat_config();
+        let messages = one_shot_prompt();
 
         let progress_deadline = Duration::from_millis(600);
         let started = Instant::now();

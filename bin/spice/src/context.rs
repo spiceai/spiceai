@@ -79,6 +79,10 @@ impl Deadline {
     }
 }
 
+/// The user agent a test context reports, so a server under test can tell it apart.
+#[cfg(test)]
+const TEST_USER_AGENT: &str = "spice/test (test; test)";
+
 /// Build an HTTP client for the CLI.
 ///
 /// Both of the context's clients are built here, so a setting that has to hold for both —
@@ -216,13 +220,10 @@ impl RuntimeContext {
             http_endpoint_chosen: true,
             api_key: None,
             cloud_region: None,
-            user_agent: "spice/test (test; test)".to_string(),
+            user_agent: TEST_USER_AGENT.to_string(),
             extra_headers: HashMap::new(),
-            http_client: build_http_client("spice/test (test; test)".to_string(), control_plane),
-            inference_http_client: build_http_client(
-                "spice/test (test; test)".to_string(),
-                inference,
-            ),
+            http_client: build_http_client(TEST_USER_AGENT.to_string(), control_plane),
+            inference_http_client: build_http_client(TEST_USER_AGENT.to_string(), inference),
             inference_deadline: inference,
             tls_root_certificate_file: None,
         }
