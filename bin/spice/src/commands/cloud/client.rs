@@ -114,19 +114,36 @@ pub struct UpdateProjectParams<'a> {
 impl CloudClient {
     /// Create a new authenticated cloud client that acts on `org`.
     ///
-    /// When an org is named, the credential bound to *that* org is required.
-    /// Falling back to the default credential would run the command against the
-    /// organization that credential belongs to while the CLI reports the one
-    /// that was asked for — so a missing binding is an error, not a fallback.
-    pub fn connect(org: Option<&str>) -> Result<Self> {
+    /// A credential stored for that org wins. Otherwise the default credential
+    /// is used **only when it can be shown to belong to that same org** — the
+    /// invariant is "never use one organization's token for another", not
+    /// "never use the default token", and rejecting a user's own credential for
+    /// their own org would break the single-credential path most people have.
+    ///
+    /// A service-account credential has no user identity to check against. Its
+    /// organization is fixed by the OAuth client that issued it and the server
+    /// authorizes every request, so it is allowed through rather than blocked
+    /// on a check that cannot be performed.
+    pub async fn connect(org: Option<&str>) -> Result<Self> {
         let Some(org) = org else {
             let token = org::default_token().ok_or_else(not_authenticated)?;
             return Self::with_token_for_org(token, None);
         };
 
         org::validate_org_name(org)?;
-        let token = org::token_for_org(org).ok_or_else(|| org_credential_missing(org))?;
-        Self::with_token_for_org(token, Some(org))
+
+        if let Some(token) = org::token_for_org(org) {
+            return Self::with_token_for_org(token, Some(org));
+        }
+
+        let default = org::default_token().ok_or_else(|| org_credential_missing(org))?;
+        let client = Self::with_token_for_org(default, Some(org))?;
+
+        match client.optional_user_auth_context().await? {
+            Some(context) if context.org_name.eq_ignore_ascii_case(org) => Ok(client),
+            Some(context) => Err(default_credential_wrong_org(org, &context.org_name)),
+            None => Ok(client),
+        }
     }
 
     /// Create a new authenticated cloud client with an explicit bearer token,
@@ -607,6 +624,21 @@ fn not_authenticated() -> Error {
         CloudErrorCode::NotAuthenticated,
         "Not authenticated with Spice Cloud.",
         "Run 'spice cloud login' (or set SPICE_SPICEAI_TOKEN) to authenticate.",
+    )
+}
+
+/// The default credential belongs to a different organization than the one
+/// named, so using it would run the command somewhere the caller did not ask
+/// for while reporting the org they did ask for.
+fn default_credential_wrong_org(requested: &str, actual: &str) -> Error {
+    Error::cloud_with_hint(
+        CloudErrorCode::OrgCredentialMissing,
+        format!(
+            "No Spice Cloud credential is stored for organization '{requested}'; your default credential belongs to '{actual}'."
+        ),
+        format!(
+            "Authenticate for it with 'spice cloud login pat --org {requested}' (or 'spice cloud login api --org {requested}' for automation)."
+        ),
     )
 }
 
@@ -1143,6 +1175,26 @@ mod tests {
         });
 
         assert_eq!(err.cloud_code(), Some(CloudErrorCode::Forbidden));
+    }
+
+    #[test]
+    fn a_default_credential_from_another_org_is_refused_by_name() {
+        // The invariant is "never use one org's token for another", not "never
+        // use the default token". When the default credential demonstrably
+        // belongs elsewhere, say so — and name both orgs, because "no
+        // credential" alone sends the user looking for the wrong problem.
+        let err = default_credential_wrong_org("spicehq", "lukekim");
+
+        assert_eq!(err.cloud_code(), Some(CloudErrorCode::OrgCredentialMissing));
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("'spicehq'") && rendered.contains("'lukekim'"),
+            "the error must name the requested and the actual org: {rendered}"
+        );
+        assert!(
+            rendered.contains("login pat --org spicehq"),
+            "the error must say how to authenticate for the requested org: {rendered}"
+        );
     }
 
     #[test]

@@ -1169,7 +1169,7 @@ async fn execute_status(
 ) -> Result<()> {
     let (target, org_source) =
         resolve_project_target_with_source(args.project.as_deref(), flag_org)?;
-    let client = connect_for_target(&target)?;
+    let client = connect_for_target(&target).await?;
 
     let project = client.get_project(&target).await?;
     let deployments = client.list_deployments(&target, 1, None).await?;
@@ -1332,7 +1332,7 @@ async fn execute_datasets(
     flag_org: Option<&str>,
 ) -> Result<()> {
     let target = resolve_project_target(args.project.as_deref(), flag_org)?;
-    let client = connect_for_target(&target)?;
+    let client = connect_for_target(&target).await?;
     let runtime_ctx =
         project_runtime_context(ctx, &client, &target, args.instance.as_deref()).await?;
 
@@ -1544,13 +1544,13 @@ fn resolve_project_target(app_flag: Option<&str>, flag_org: Option<&str>) -> Res
 }
 
 /// Build a client for the org a command acts on.
-fn connect(flag_org: Option<&str>) -> Result<CloudClient> {
-    CloudClient::connect(resolve_org(flag_org)?.as_deref())
+async fn connect(flag_org: Option<&str>) -> Result<CloudClient> {
+    CloudClient::connect(resolve_org(flag_org)?.as_deref()).await
 }
 
 /// Build a client for the org that owns `target`.
-fn connect_for_target(target: &ProjectTarget) -> Result<CloudClient> {
-    CloudClient::connect(target.org.as_deref())
+async fn connect_for_target(target: &ProjectTarget) -> Result<CloudClient> {
+    CloudClient::connect(target.org.as_deref()).await
 }
 
 /// Print the fully-qualified target and where its org came from, before a
@@ -1855,6 +1855,15 @@ async fn save_token_and_print_login_result(token: &str, target: &LoginTarget<'_>
         verify_login_org(&authed_client, target.requested_org, token_org.as_deref()).await?;
 
     store_credential(token, store_org.as_deref())?;
+
+    // File the credential under its own organization too, so naming that org
+    // later resolves without a verification round trip. Skipped when --org
+    // already filed it there, and when the org is unknown.
+    if store_org.is_none()
+        && let Some(token_org) = &token_org
+    {
+        store_credential(token, Some(token_org))?;
+    }
 
     match auth_context_result {
         Ok(context) => {
@@ -2249,7 +2258,7 @@ fn assigns_any(line: &str, keys: &[String]) -> bool {
 
 async fn execute_whoami(args: &WhoamiArgs, flag_org: Option<&str>) -> Result<()> {
     let (effective_org, source) = resolve_org_with_source(flag_org)?;
-    let client = CloudClient::connect(effective_org.as_deref())?;
+    let client = CloudClient::connect(effective_org.as_deref()).await?;
 
     let context = match client.get_auth_context().await {
         Ok(ctx) => ctx,
@@ -2311,7 +2320,7 @@ async fn execute_whoami(args: &WhoamiArgs, flag_org: Option<&str>) -> Result<()>
 
 async fn execute_orgs(args: &OrgsArgs, flag_org: Option<&str>) -> Result<()> {
     let active = resolve_org(flag_org)?;
-    let client = CloudClient::connect(active.as_deref())?;
+    let client = CloudClient::connect(active.as_deref()).await?;
 
     let listed = client.list_orgs().await?;
     let context_org = client
@@ -2437,7 +2446,7 @@ async fn execute_org(cmd: &OrgCommands, flag_org: Option<&str>) -> Result<()> {
             // Only a listing that definitively excludes the org blocks the
             // switch — the server re-checks membership on every request anyway,
             // so an unreachable API must not strand the user in the wrong org.
-            let verified = match CloudClient::connect(Some(&args.org)) {
+            let verified = match CloudClient::connect(Some(&args.org)).await {
                 Ok(client) => match client.list_orgs().await {
                     Ok(Some(orgs)) => {
                         if !orgs
@@ -2528,7 +2537,7 @@ async fn execute_org(cmd: &OrgCommands, flag_org: Option<&str>) -> Result<()> {
 
 async fn execute_link(args: &LinkArgs, flag_org: Option<&str>) -> Result<()> {
     let target = resolve_project_target(Some(&args.project), flag_org)?;
-    let client = connect_for_target(&target)?;
+    let client = connect_for_target(&target).await?;
 
     // Verify the app exists
     let app = client.get_project(&target).await?;
@@ -2605,7 +2614,7 @@ fn execute_unlink() -> Result<()> {
 
 async fn execute_projects(args: &ProjectsArgs, flag_org: Option<&str>) -> Result<()> {
     let active_org = resolve_org(flag_org)?;
-    let client = CloudClient::connect(active_org.as_deref())?;
+    let client = CloudClient::connect(active_org.as_deref()).await?;
     let context = client.optional_user_auth_context().await?;
     let mut apps = client.list_projects().await?;
 
@@ -2699,7 +2708,7 @@ fn display_project_name(app: &spice_cloud_client::types::Project, context_org: &
 
 async fn execute_deployments(args: &DeploymentsArgs, flag_org: Option<&str>) -> Result<()> {
     let target = resolve_project_target(args.project.as_deref(), flag_org)?;
-    let client = connect_for_target(&target)?;
+    let client = connect_for_target(&target).await?;
 
     let deployments = client
         .list_deployments(&target, args.limit, args.status.as_deref())
@@ -2758,7 +2767,7 @@ fn truncate_for_table(value: &str, max: usize) -> String {
 }
 
 async fn execute_regions(args: &RegionsArgs, flag_org: Option<&str>) -> Result<()> {
-    let client = connect(flag_org)?;
+    let client = connect(flag_org).await?;
     let regions_resp = client.list_regions(None).await?;
 
     if args.output == OutputFormat::Json {
@@ -2780,7 +2789,7 @@ async fn execute_regions(args: &RegionsArgs, flag_org: Option<&str>) -> Result<(
 }
 
 async fn execute_images(args: &ImagesArgs, flag_org: Option<&str>) -> Result<()> {
-    let client = connect(flag_org)?;
+    let client = connect(flag_org).await?;
     let images_resp = client
         .list_container_images(args.channel.as_deref())
         .await?;
@@ -2807,7 +2816,7 @@ async fn execute_secrets(cmd: &SecretsCommands, flag_org: Option<&str>) -> Resul
     match cmd {
         SecretsCommands::List(args) => {
             let target = resolve_project_target(args.project.as_deref(), flag_org)?;
-            let client = connect_for_target(&target)?;
+            let client = connect_for_target(&target).await?;
             let secrets = client.list_secrets(&target).await?;
 
             if secrets.is_empty() {
@@ -2832,7 +2841,7 @@ async fn execute_secrets(cmd: &SecretsCommands, flag_org: Option<&str>) -> Resul
             let (target, org_source) =
                 resolve_project_target_with_source(args.project.as_deref(), flag_org)?;
             announce_target("Setting secret on", &target, org_source, args.output);
-            let client = connect_for_target(&target)?;
+            let client = connect_for_target(&target).await?;
             client.set_secret(&target, &args.name, &args.value).await?;
             if args.output == OutputFormat::Json {
                 return write_json(&serde_json::json!({"name": args.name, "status": "set"}));
@@ -2841,7 +2850,7 @@ async fn execute_secrets(cmd: &SecretsCommands, flag_org: Option<&str>) -> Resul
         }
         SecretsCommands::Get(args) => {
             let target = resolve_project_target(args.project.as_deref(), flag_org)?;
-            let client = connect_for_target(&target)?;
+            let client = connect_for_target(&target).await?;
             let secret = client.get_secret(&target, &args.name).await?;
             if args.output == OutputFormat::Json {
                 return write_json(&secret);
@@ -2850,7 +2859,7 @@ async fn execute_secrets(cmd: &SecretsCommands, flag_org: Option<&str>) -> Resul
         }
         SecretsCommands::Delete(args) => {
             let target = resolve_project_target(args.project.as_deref(), flag_org)?;
-            let client = connect_for_target(&target)?;
+            let client = connect_for_target(&target).await?;
             client.delete_secret(&target, &args.name).await?;
             if args.output == OutputFormat::Json {
                 return write_json(&serde_json::json!({"name": args.name, "status": "deleted"}));
@@ -2863,7 +2872,7 @@ async fn execute_secrets(cmd: &SecretsCommands, flag_org: Option<&str>) -> Resul
 
 async fn execute_logs(args: &LogsArgs, flag_org: Option<&str>) -> Result<()> {
     let target = resolve_project_target(args.project.as_deref(), flag_org)?;
-    let client = connect_for_target(&target)?;
+    let client = connect_for_target(&target).await?;
 
     let deployment_id = if let Some(id) = args.deployment {
         id
@@ -2913,7 +2922,7 @@ async fn execute_logs(args: &LogsArgs, flag_org: Option<&str>) -> Result<()> {
 async fn execute_project_create(args: &CreateProjectArgs, flag_org: Option<&str>) -> Result<()> {
     let create_region = validate_create_project_args(args)?;
 
-    let client = connect(flag_org)?;
+    let client = connect(flag_org).await?;
     let spicepod_content = if let Some(path) = args.spicepod.as_deref() {
         Some(read_spicepod_file(path).await?)
     } else {
@@ -3000,7 +3009,7 @@ async fn execute_create_deployment(
     flag_org: Option<&str>,
 ) -> Result<()> {
     let target = resolve_project_target(args.project.as_deref(), flag_org)?;
-    let client = connect_for_target(&target)?;
+    let client = connect_for_target(&target).await?;
     let deployment = client
         .create_deployment(
             &target,
@@ -3059,7 +3068,7 @@ fn validate_create_project_args(args: &CreateProjectArgs) -> Result<String> {
 
 async fn execute_project_get(args: &GetProjectArgs, flag_org: Option<&str>) -> Result<()> {
     let target = resolve_project_target(Some(&args.project), flag_org)?;
-    let client = connect_for_target(&target)?;
+    let client = connect_for_target(&target).await?;
     let app = client.get_project(&target).await?;
 
     if args.output == OutputFormat::Json {
@@ -3085,7 +3094,7 @@ async fn execute_project_get(args: &GetProjectArgs, flag_org: Option<&str>) -> R
 
 async fn execute_project_update(args: &UpdateProjectArgs, flag_org: Option<&str>) -> Result<()> {
     let target = resolve_project_target(args.project.as_deref(), flag_org)?;
-    let client = connect_for_target(&target)?;
+    let client = connect_for_target(&target).await?;
     let spicepod_content = if let Some(path) = args.spicepod.as_deref() {
         Some(read_spicepod_file(path).await?)
     } else {
@@ -3153,7 +3162,7 @@ async fn execute_project_delete(args: &DeleteProjectArgs, flag_org: Option<&str>
         }
     }
 
-    let client = connect_for_target(&target)?;
+    let client = connect_for_target(&target).await?;
     client.delete_project(&target).await?;
     if args.output == OutputFormat::Json {
         return write_json(&serde_json::json!({"app": target.display(), "status": "deleted"}));
@@ -3186,7 +3195,7 @@ async fn execute_deploy(args: &DeployArgs, flag_org: Option<&str>) -> Result<()>
     let (target, org_source) =
         resolve_project_target_with_source(args.project.as_deref(), flag_org)?;
     announce_target("Deploying to", &target, org_source, args.output);
-    let client = connect_for_target(&target)?;
+    let client = connect_for_target(&target).await?;
 
     // Resolve once: create_deployment and the wait loop both need the id.
     let project_id = client.resolve_id(&target).await?;
@@ -3343,7 +3352,7 @@ async fn wait_for_deployment(
 
 async fn execute_api_keys(args: &ApiKeysArgs, flag_org: Option<&str>) -> Result<()> {
     let target = resolve_project_target(args.project.as_deref(), flag_org)?;
-    let client = connect_for_target(&target)?;
+    let client = connect_for_target(&target).await?;
 
     if let Some(key_num) = args.regenerate {
         if key_num != 1 && key_num != 2 {
@@ -3381,7 +3390,7 @@ async fn execute_api_keys(args: &ApiKeysArgs, flag_org: Option<&str>) -> Result<
 
 async fn execute_metrics(args: &MetricsArgs, flag_org: Option<&str>) -> Result<()> {
     let target = resolve_project_target(args.project.as_deref(), flag_org)?;
-    let client = connect_for_target(&target)?;
+    let client = connect_for_target(&target).await?;
     let app = client.get_project(&target).await?;
 
     let response = client

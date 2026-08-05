@@ -92,13 +92,25 @@ name for `merge_auth_config`. Tests assert they agree for both the token and the
 API key — if they drift, a login appears to succeed and every later command
 fails as unauthenticated.
 
-**Lookup fails closed.** `token_for_org(org)` reads only that org's variable and
-does **not** fall back to the default token. Spice Cloud binds a token to one
-org at mint time, so using the personal-org token for a request that names
-another org would run the command against the wrong organization while the CLI
-reports the requested one. A missing binding is `org_credential_missing`, which
-names the org and how to authenticate for it. The default token is used only
-when no org is named — which is exactly the single-org path, unchanged.
+**Lookup fails closed, but only against the wrong org.** The invariant is
+*never use one organization's token for another* — not *never use the default
+token*. Naming an org resolves in this order:
+
+1. a credential stored for that org;
+2. otherwise the default credential, **only when the server confirms it belongs
+   to that same org**;
+3. otherwise `org_credential_missing`, naming both the requested org and the
+   one the default credential actually belongs to.
+
+Step 2 is what keeps the ordinary single-credential path working: a user who
+ran `spice cloud login` and then names their own org is not asked to
+re-authenticate. A service-account credential has no user identity to check
+against; its org is fixed by the OAuth client that issued it and the server
+authorizes every request, so it is allowed through rather than blocked on a
+check that cannot be performed.
+
+`spice cloud login` also files the credential under **its own** org, so step 2's
+verification round trip happens at most once per machine.
 
 The app API key follows the same rule: naming an org reads only that org's
 key. Only a command that names no org reads the default one.

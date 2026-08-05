@@ -1109,18 +1109,19 @@ fn test_cloud_machine_errors_carry_a_stable_code() {
 }
 
 #[test]
-fn test_cloud_named_org_without_a_credential_fails_closed() {
-    // Regression: the CLI used to fall back to the default credential, running
-    // the command against that credential's org while reporting the requested
-    // one. A named org must require a credential bound to it.
+fn test_cloud_named_org_without_any_credential_fails_closed() {
+    // A named org never silently borrows another org's credential. With no
+    // credential at all this is decided locally, so the test stays hermetic;
+    // when a *default* credential exists the CLI asks the server whose org it
+    // is, which needs a live API and is covered by the credentialed tests.
     let temp_dir = tempfile::TempDir::new().expect("should create temp dir");
     let mut cmd = cargo_bin_cmd!("spice");
     let assert = cmd
         .current_dir(temp_dir.path())
         .env("HOME", temp_dir.path())
-        .env("SPICE_SPICEAI_TOKEN", "personal-org-token")
+        .env_remove("SPICE_SPICEAI_TOKEN")
         .env_remove("SPICE_CLOUD_ORG")
-        .args(["--machine", "cloud", "apps", "--org", "spicehq"])
+        .args(["--machine", "cloud", "projects", "--org", "spicehq"])
         .assert()
         .failure();
 
