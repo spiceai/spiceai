@@ -285,7 +285,7 @@ async fn send_search_request(
 
     if !status.is_success() {
         return Err(InvalidResponseSnafu {
-            message: format!("Search failed: {text}"),
+            message: format!("Search failed with status {status}: {text}"),
         }
         .build());
     }

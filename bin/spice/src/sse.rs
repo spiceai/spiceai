@@ -29,10 +29,15 @@ limitations under the License.
 //!
 //! The field grammar is the one from the [HTML standard](https://html.spec.whatwg.org/multipage/server-sent-events.html):
 //! a line of `field: value`, a comment line starting with `:`, and a blank line ending the
-//! event. Line terminators are `\n` and `\r\n`; a lone `\r`, which the standard also allows
-//! but which nothing in this stack emits, is treated as part of the line rather than as a
-//! terminator — recognising it would mean a server that never sends `\n` could hold the
-//! decoder's buffer open indefinitely.
+//! event. All three terminators the standard allows are accepted — `\n`, `\r\n` and a lone
+//! `\r`. The last is not hypothetical: axum's `Event::data` writes the payload's own line
+//! breaks through verbatim, so a value containing a `\r` is framed with one
+//! (`axum::response::sse`, `EventDataWriter::write_buf`), and `sse-starlette`, which serves
+//! many OpenAI-compatible endpoints, can be configured to separate with `\r` throughout.
+//!
+//! Dispatch follows the standard too: a blank line ends an event only if a `data` field was
+//! seen. A frame carrying just `event: ping` is *not* an event — dispatching one would tell
+//! the caller the stream is producing when it is not.
 
 /// The most bytes one event may occupy before the decoder refuses to keep buffering.
 ///
@@ -60,17 +65,32 @@ pub(crate) struct OversizedEvent {
 /// Reassembles [`SseEvent`]s from a byte stream delivered in arbitrary pieces.
 #[derive(Debug, Default)]
 pub(crate) struct SseDecoder {
-    /// Bytes received that are not yet a complete line.
+    /// Bytes received but not yet handed out. Lines are taken by advancing `cursor` rather
+    /// than by draining, so a read carrying many events costs one compaction and not one
+    /// memmove of the remainder per event.
     pending: Vec<u8>,
+    /// How much of `pending` has already been read out.
+    cursor: usize,
     /// The `event:` field of the event being accumulated.
     name: Option<String>,
     /// The `data:` fields of the event being accumulated, already joined.
     data: String,
-    /// Whether any field has been read since the last dispatch. Distinguishes a blank line
-    /// that ends an event from one that separates two events, so a keep-alive comment
-    /// followed by a blank line does not dispatch an empty event.
-    started: bool,
+    /// Whether a `data` field has been read since the last dispatch. The standard dispatches
+    /// on a blank line only when the data buffer has been written to, so a frame of nothing
+    /// but `event:` or a comment ends no event.
+    data_seen: bool,
+    /// How many `data` fields have been read in total. A caller bounding the stream's
+    /// liveness uses this to tell a partly-received event from a stalled one.
+    data_fields: u64,
+    /// Whether a leading byte-order mark has been dealt with.
+    bom_checked: bool,
+    /// Whether the stream has ended, so a held-back `\r` is a terminator rather than half of
+    /// a `\r\n` still arriving.
+    at_eof: bool,
 }
+
+/// The byte-order mark the standard requires be stripped from the head of the stream.
+const BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
 
 impl SseDecoder {
     pub(crate) fn new() -> Self {
@@ -78,71 +98,141 @@ impl SseDecoder {
     }
 
     /// Take another piece of the stream.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`OversizedEvent`] if a single event has grown past [`MAX_EVENT_BYTES`]
-    /// without being terminated.
-    pub(crate) fn push(&mut self, bytes: &[u8]) -> Result<(), OversizedEvent> {
+    pub(crate) fn push(&mut self, bytes: &[u8]) {
+        self.compact();
         self.pending.extend_from_slice(bytes);
+        self.strip_bom();
+    }
 
-        let buffered = self.pending.len() + self.data.len();
-        if buffered > MAX_EVENT_BYTES {
-            return Err(OversizedEvent { bytes: buffered });
+    /// Drop what has already been read out, so the buffer holds only the unread remainder.
+    fn compact(&mut self) {
+        if self.cursor > 0 {
+            self.pending.drain(..self.cursor);
+            self.cursor = 0;
+        }
+    }
+
+    /// The bytes received but not yet read out.
+    fn unread(&self) -> &[u8] {
+        &self.pending[self.cursor..]
+    }
+
+    /// Tell the decoder that no more bytes are coming, so what it is holding is all there is.
+    pub(crate) fn close(&mut self) {
+        self.at_eof = true;
+    }
+
+    /// Whether one unterminated event has grown past [`MAX_EVENT_BYTES`].
+    ///
+    /// Ask this only after draining with [`SseDecoder::next_event`]: before that the buffer
+    /// also holds whole events waiting to be read, and one transport read may carry many of
+    /// them. The limit is on an event the stream never ends, not on how much arrives at once.
+    pub(crate) fn oversized(&self) -> Option<OversizedEvent> {
+        let buffered = self.unread().len() + self.data.len();
+        (buffered > MAX_EVENT_BYTES).then_some(OversizedEvent { bytes: buffered })
+    }
+
+    /// How many `data` fields have been read so far.
+    ///
+    /// This advances when a data line is read, not when the event it belongs to is
+    /// dispatched, so a caller can tell a large event still arriving from a stalled stream.
+    pub(crate) fn data_fields_seen(&self) -> u64 {
+        self.data_fields
+    }
+
+    /// Drop a leading BOM, waiting for as many bytes as it takes to know there is not one.
+    fn strip_bom(&mut self) {
+        if self.bom_checked {
+            return;
         }
 
-        Ok(())
+        if self.unread().len() >= BOM.len() {
+            if self.unread().starts_with(&BOM) {
+                self.cursor += BOM.len();
+            }
+            self.bom_checked = true;
+        } else if !BOM.starts_with(self.unread()) {
+            // What has arrived already rules a BOM out.
+            self.bom_checked = true;
+        }
     }
 
     /// Yield the next event that has arrived in full, if any.
     ///
-    /// Call this until it returns `None`: one read can carry several events.
-    pub(crate) fn next_event(&mut self) -> Option<SseEvent> {
-        while let Some(line) = self.take_line() {
-            if let Some(event) = self.read_field(&line) {
-                return Some(event);
-            }
-        }
-
-        None
-    }
-
-    /// Dispatch what the stream left unterminated at its end.
+    /// Call this until it returns `None`: one read can carry several events. After
+    /// [`SseDecoder::close`] it also yields what the stream left unterminated at its end.
     ///
-    /// The standard discards an event the stream did not terminate. That rule protects a
-    /// consumer that acts on partial data, which this one does not — the payload still has
-    /// to parse as a whole — so the final event of a server that closes without its blank
-    /// line is kept rather than lost, and a genuinely truncated one surfaces as a parse
-    /// failure rather than as a quietly shorter answer.
-    pub(crate) fn finish(&mut self) -> Option<SseEvent> {
-        if !self.pending.is_empty() {
-            let line = String::from_utf8_lossy(&self.pending).into_owned();
-            self.pending.clear();
+    /// The standard discards an event the stream did not terminate. That rule guards a
+    /// consumer that would act on half a payload; this one cannot, because the payload still
+    /// has to parse as a whole. And the tail is only reached after a *complete* HTTP body —
+    /// a body cut short surfaces as a transport error before the stream ends — so a server
+    /// that simply closed without its final blank line has its last event read rather than
+    /// dropped, while a genuinely truncated payload still fails to parse.
+    pub(crate) fn next_event(&mut self) -> Option<SseEvent> {
+        loop {
+            while let Some(line) = self.take_line() {
+                if let Some(event) = self.read_field(&line) {
+                    return Some(event);
+                }
+            }
+
+            if !self.at_eof {
+                return None;
+            }
+
+            if self.unread().is_empty() {
+                return self.data_seen.then(|| self.dispatch());
+            }
+
+            let line = String::from_utf8_lossy(self.unread()).into_owned();
+            self.cursor = self.pending.len();
             if let Some(event) = self.read_field(&line) {
                 return Some(event);
             }
         }
-
-        self.started.then(|| self.dispatch())
     }
 
     /// Split off the next complete line, without its terminator.
+    ///
+    /// All three terminators the standard allows are recognised. A `\r` at the very end of
+    /// the buffer is held back rather than treated as a line ending: the `\n` that would
+    /// make it a `\r\n` may be in the next read, and splitting the pair would invent a blank
+    /// line that ends an event early. Once the stream is closed there is no next read, so the
+    /// `\r` is a terminator of its own.
     fn take_line(&mut self) -> Option<String> {
-        let end = self.pending.iter().position(|byte| *byte == b'\n')?;
-        let mut line: Vec<u8> = self.pending.drain(..=end).collect();
+        let unread = self.unread();
+        let end = unread
+            .iter()
+            .position(|byte| *byte == b'\n' || *byte == b'\r')?;
 
-        line.pop();
-        if line.last() == Some(&b'\r') {
-            line.pop();
+        let carriage_return = unread[end] == b'\r';
+        if carriage_return && end + 1 == unread.len() && !self.at_eof {
+            return None;
         }
 
-        Some(String::from_utf8_lossy(&line).into_owned())
+        let terminator = if carriage_return && unread.get(end + 1) == Some(&b'\n') {
+            2
+        } else {
+            1
+        };
+
+        let line = String::from_utf8_lossy(&unread[..end]).into_owned();
+        self.cursor += end + terminator;
+
+        Some(line)
     }
 
     /// Apply one line to the event being accumulated, returning an event if it ended one.
     fn read_field(&mut self, line: &str) -> Option<SseEvent> {
         if line.is_empty() {
-            return self.started.then(|| self.dispatch());
+            if self.data_seen {
+                return Some(self.dispatch());
+            }
+
+            // The standard clears the buffers and dispatches nothing when the data buffer is
+            // empty, so a frame of only `event:` or comments is not an event.
+            self.name = None;
+            return None;
         }
 
         // A comment. The runtime's keep-alive is one of these: it says the connection is up,
@@ -160,14 +250,14 @@ impl SseDecoder {
 
         match field {
             "data" => {
-                self.started = true;
-                if !self.data.is_empty() {
+                if self.data_seen {
                     self.data.push('\n');
                 }
+                self.data_seen = true;
+                self.data_fields += 1;
                 self.data.push_str(value);
             }
             "event" => {
-                self.started = true;
                 self.name = Some(value.to_string());
             }
             // `id` and `retry` steer reconnection, which this client does not do. Unknown
@@ -180,7 +270,7 @@ impl SseDecoder {
 
     /// Emit the accumulated event and reset for the next one.
     fn dispatch(&mut self) -> SseEvent {
-        self.started = false;
+        self.data_seen = false;
 
         SseEvent {
             name: self.name.take(),
@@ -200,15 +290,20 @@ mod tests {
         let mut events = Vec::new();
 
         for piece in pieces {
-            decoder
-                .push(piece.as_bytes())
-                .expect("test payloads are far below the size cap");
+            decoder.push(piece.as_bytes());
             while let Some(event) = decoder.next_event() {
                 events.push(event);
             }
+            assert!(
+                decoder.oversized().is_none(),
+                "test payloads are far below the size cap"
+            );
         }
 
-        events.extend(decoder.finish());
+        decoder.close();
+        while let Some(event) = decoder.next_event() {
+            events.push(event);
+        }
         events
     }
 
@@ -255,19 +350,11 @@ mod tests {
         let snowman = "☃".as_bytes();
         let mut decoder = SseDecoder::new();
 
-        decoder
-            .push(b"data: ")
-            .expect("the payload is far below the size cap");
-        decoder
-            .push(&snowman[..1])
-            .expect("the payload is far below the size cap");
+        decoder.push(b"data: ");
+        decoder.push(&snowman[..1]);
         assert!(decoder.next_event().is_none());
-        decoder
-            .push(&snowman[1..])
-            .expect("the payload is far below the size cap");
-        decoder
-            .push(b"\n\n")
-            .expect("the payload is far below the size cap");
+        decoder.push(&snowman[1..]);
+        decoder.push(b"\n\n");
 
         let event = decoder.next_event().expect("the event is complete");
         assert_eq!(event.data, "☃");
@@ -361,20 +448,136 @@ mod tests {
         let mut decoder = SseDecoder::new();
         let mut pushed = 0usize;
 
-        loop {
+        while decoder.oversized().is_none() {
             let chunk = vec![b'x'; 1024 * 1024];
-            match decoder.push(&chunk) {
-                Ok(()) => pushed += chunk.len(),
-                Err(oversized) => {
-                    assert!(oversized.bytes > MAX_EVENT_BYTES);
-                    assert!(pushed <= MAX_EVENT_BYTES);
-                    return;
-                }
-            }
+            decoder.push(&chunk);
+            pushed += chunk.len();
             assert!(
-                pushed <= MAX_EVENT_BYTES,
+                pushed <= MAX_EVENT_BYTES + chunk.len(),
                 "the decoder buffered {pushed} bytes without refusing"
             );
         }
+
+        let oversized = decoder.oversized().expect("the loop ended on the cap");
+        assert!(oversized.bytes > MAX_EVENT_BYTES);
+    }
+
+    /// The cap bounds one unterminated event, not one transport read. A read that happens to
+    /// carry many whole small events is ordinary, and rejecting it would report an event the
+    /// stream never ended when in fact every event ended.
+    #[test]
+    fn many_whole_events_in_one_read_are_not_over_the_cap() {
+        let event = "data: {\"choices\":[]}\n\n";
+        let repeats = (MAX_EVENT_BYTES / event.len()) + 16;
+        let mut decoder = SseDecoder::new();
+
+        decoder.push(event.repeat(repeats).as_bytes());
+
+        let mut dispatched = 0usize;
+        while decoder.next_event().is_some() {
+            dispatched += 1;
+        }
+
+        assert_eq!(dispatched, repeats);
+        assert!(
+            decoder.oversized().is_none(),
+            "every event was terminated, so nothing is over the cap"
+        );
+    }
+
+    /// A frame carrying no `data` field is not an event. Dispatching one would tell a caller
+    /// that bounds liveness by events that the stream is producing when it is not.
+    #[test]
+    fn a_frame_with_only_an_event_name_dispatches_nothing() {
+        let events = decode(&["event: ping\n\n", "event: ping\n\n"]);
+
+        assert!(events.is_empty(), "got {events:?}");
+    }
+
+    /// ...and the name it carried must not leak onto the next event.
+    #[test]
+    fn a_name_from_an_undispatched_frame_does_not_leak() {
+        let events = decode(&["event: ping\n\n", "data: real\n\n"]);
+
+        assert_eq!(data_of(&events), vec!["real"]);
+        assert_eq!(events[0].name, None);
+    }
+
+    /// axum writes a payload's own line breaks through verbatim, so a value containing a
+    /// carriage return is framed with a lone `\r`.
+    #[test]
+    fn a_lone_carriage_return_terminates_a_line() {
+        let events = decode(&["data: one\rdata: two\r\r"]);
+
+        assert_eq!(data_of(&events), vec!["one\ntwo"]);
+    }
+
+    /// A `\r` at the end of a read may be the first half of a `\r\n` still arriving.
+    /// Splitting the pair would invent a blank line and end the event early.
+    #[test]
+    fn a_carriage_return_split_from_its_newline_is_not_a_blank_line() {
+        let events = decode(&["data: whole\r", "\ndata: same event\r\n\r\n"]);
+
+        assert_eq!(data_of(&events), vec!["whole\nsame event"]);
+    }
+
+    /// Once the stream is closed there is no next read, so a held-back `\r` is a terminator.
+    #[test]
+    fn a_trailing_carriage_return_at_the_end_of_the_stream_is_a_terminator() {
+        let events = decode(&["data: last\r"]);
+
+        assert_eq!(data_of(&events), vec!["last"]);
+    }
+
+    /// The standard strips a byte-order mark from the head of the stream. Reading it as part
+    /// of the first field name would silently empty the first event.
+    #[test]
+    fn a_leading_byte_order_mark_is_stripped() {
+        let events = decode(&["\u{feff}data: first\n\n"]);
+
+        assert_eq!(data_of(&events), vec!["first"]);
+    }
+
+    #[test]
+    fn a_byte_order_mark_split_across_reads_is_stripped() {
+        let bom = "\u{feff}".as_bytes();
+        let mut decoder = SseDecoder::new();
+
+        decoder.push(&bom[..1]);
+        decoder.push(&bom[1..]);
+        decoder.push(b"data: first\n\n");
+
+        let event = decoder.next_event().expect("the event is complete");
+        assert_eq!(event.data, "first");
+    }
+
+    /// Only at the head of the stream: the same bytes later are the payload's own.
+    #[test]
+    fn a_byte_order_mark_inside_a_payload_is_kept() {
+        let events = decode(&["data: first\n\n", "data: \u{feff}second\n\n"]);
+
+        assert_eq!(data_of(&events), vec!["first", "\u{feff}second"]);
+    }
+
+    /// Progress is a `data` line arriving, not an event completing -- a caller bounding
+    /// liveness must be able to see a large event still being received.
+    #[test]
+    fn a_data_line_counts_as_progress_before_its_event_ends() {
+        let mut decoder = SseDecoder::new();
+        assert_eq!(decoder.data_fields_seen(), 0);
+
+        decoder.push(b"data: still arriving\n");
+        assert!(decoder.next_event().is_none(), "the event has not ended");
+        assert_eq!(
+            decoder.data_fields_seen(),
+            1,
+            "a data line arrived, so the stream is producing"
+        );
+
+        // A comment is not progress: it says the connection is up, not that anything is
+        // being produced.
+        decoder.push(b": keep-alive\n");
+        while decoder.next_event().is_some() {}
+        assert_eq!(decoder.data_fields_seen(), 1);
     }
 }

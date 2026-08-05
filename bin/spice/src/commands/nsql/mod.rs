@@ -214,7 +214,7 @@ async fn send_nsql_request(ctx: &RuntimeContext, query: &str, model: &str) -> Re
 
     if !status.is_success() {
         return Err(InvalidResponseSnafu {
-            message: format!("Query failed: {text}"),
+            message: format!("Query failed with status {status}: {text}"),
         }
         .build());
     }

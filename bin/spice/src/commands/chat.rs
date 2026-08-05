@@ -160,7 +160,12 @@ impl StreamErrorPayload {
 /// A choice in a chat chunk.
 #[derive(Deserialize)]
 struct ChunkChoice {
-    delta: Delta,
+    /// Absent on a choice that carries no content. Azure `OpenAI`'s asynchronous content
+    /// filtering emits annotation choices holding only `content_filter_results`, and those
+    /// arrive on a passing stream too -- so a choice without a delta is an ordinary event
+    /// with nothing to print, not an unreadable one.
+    #[serde(default)]
+    delta: Option<Delta>,
 }
 
 /// Delta content in a streaming response.
@@ -619,8 +624,13 @@ async fn send_chat_streaming(
             // The stream ended. A server that closed without its final blank line still has
             // one event's worth of bytes buffered here, and dropping it would lose the tail
             // of the answer.
-            if let Some(event) = decoder.finish() {
-                apply_event(&event, &url, emit_tokens, start_time, &mut state).await?;
+            decoder.close();
+            while let Some(event) = decoder.next_event() {
+                if apply_event(&event, &url, emit_tokens, start_time, &mut state).await?
+                    == EventOutcome::Stop
+                {
+                    break;
+                }
             }
             break 'stream;
         };
@@ -632,25 +642,35 @@ async fn send_chat_streaming(
             .build()
         })?;
 
-        decoder.push(&chunk).map_err(|oversized| {
-            InvalidResponseSnafu {
-                message: format!(
-                    "The model at {url} sent {} bytes of a single response event without ending it. Check the runtime's logs for the model, then retry. See: https://spiceai.org/docs/components/models",
-                    oversized.bytes
-                ),
-            }
-            .build()
-        })?;
+        let data_before = decoder.data_fields_seen();
+        decoder.push(&chunk);
 
         while let Some(event) = decoder.next_event() {
-            // An event, rather than the keep-alive comment that carries no news.
-            last_event = Instant::now();
-
             if apply_event(&event, &url, emit_tokens, start_time, &mut state).await?
                 == EventOutcome::Stop
             {
                 break 'stream;
             }
+        }
+
+        // Progress is a `data` line arriving, not an event completing: a large event spread
+        // over several reads is the model producing, even before its terminator lands. A
+        // keep-alive comment carries no data field, so it still cannot hold the stream open.
+        if decoder.data_fields_seen() != data_before {
+            last_event = Instant::now();
+        }
+
+        // Asked after draining, so the cap bounds one event the stream never ends rather
+        // than however many whole events happened to arrive in a single read.
+        if let Some(oversized) = decoder.oversized() {
+            state.stop_spinner().await;
+            return Err(InvalidResponseSnafu {
+                message: format!(
+                    "The model at {url} sent {} bytes of a single response event without ending it. Check the runtime's logs for the model, then retry. See: https://spiceai.org/docs/components/models",
+                    oversized.bytes
+                ),
+            }
+            .build());
         }
     }
 
@@ -758,7 +778,11 @@ async fn apply_event(
     }
 
     for choice in &chunk.choices {
-        if let Some(content) = &choice.delta.content {
+        if let Some(content) = choice
+            .delta
+            .as_ref()
+            .and_then(|delta| delta.content.as_ref())
+        {
             // Record first token time and stop spinner
             if state.first_token.is_none() {
                 state.first_token = Some(start_time.elapsed());
@@ -1142,6 +1166,67 @@ data: {"type":"error","message":"the model ran out of context"}"#
             .expect("an empty event is not a failure");
 
         assert_eq!(response.content, "answer");
+    }
+
+    /// Azure `OpenAI`'s asynchronous content filtering emits annotation choices carrying only
+    /// `content_filter_results` and no `delta`, on passing streams as well as filtered ones.
+    /// Treating every payload that is not a plain content chunk as unreadable would stop the
+    /// stream on a valid event and lose every token after it.
+    #[tokio::test]
+    async fn an_annotation_choice_without_a_delta_does_not_stop_the_stream() {
+        let server = SlowServer::dribbling(
+            vec![
+                format!(
+                    "{}\n\n",
+                    r#"data: {"choices":[{"delta":{"content":"before "}}]}"#
+                ),
+                format!(
+                    "{}\n\n",
+                    r#"data: {"choices":[{"index":0,"finish_reason":null,"content_filter_results":{},"content_filter_offsets":{"check_offset":44,"start_offset":44,"end_offset":198}}],"usage":null}"#
+                ),
+                format!(
+                    "{}\n\n",
+                    r#"data: {"choices":[{"delta":{"content":"after"}}]}"#
+                ),
+            ],
+            Duration::from_millis(5),
+        );
+
+        let response = stream_from(&server)
+            .await
+            .expect("an annotation choice is a valid event with nothing to print");
+
+        assert_eq!(response.content, "before after");
+    }
+
+    /// A single event spread over several reads is the model producing, even before its
+    /// terminator arrives. Recording progress only at dispatch times such a stream out.
+    #[tokio::test]
+    async fn a_data_line_keeps_the_stream_alive_before_its_event_ends() {
+        let progress_bound = Duration::from_millis(500);
+        // One multiline event, in three reads. Its data lands well inside the bound each
+        // time, but the terminator does not arrive until after the bound has elapsed.
+        let server = SlowServer::dribbling(
+            vec![
+                "data: {\"choices\":[{\"delta\":\n".to_string(),
+                "data:  {\"content\":\"slow\"}}]}\n".to_string(),
+                "\n".to_string(),
+            ],
+            Duration::from_millis(200),
+        );
+
+        let ctx = RuntimeContext::with_deadlines_for_test(
+            server.url(),
+            Deadline::Total(Duration::from_secs(30)),
+            Deadline::Silence(progress_bound),
+        );
+
+        let response =
+            send_chat_streaming(&ctx, &test_chat_config(), &one_shot_prompt(), false, false)
+                .await
+                .expect("an event still arriving is a stream that is producing");
+
+        assert_eq!(response.content, "slow");
     }
 
     /// A server that hangs up without the blank line terminating its last event still sent
