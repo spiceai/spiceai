@@ -299,10 +299,15 @@ const NANOS_PER_DAY: i64 = 86_400_000_000_000;
 /// (`1969-12-31T23:00Z` floors to some instant late on the 30th), and the day's own
 /// partition would then fail its predicate. `rem_euclid` is never negative, so
 /// subtracting it always rounds toward negative infinity.
+/// `saturating_sub` because the plain subtraction underflows near `i64::MIN`: `rem_euclid`
+/// is non-negative, so subtracting it from a mark within one day of the floor of the range
+/// would panic in debug and wrap in release. Saturating clamps the bound to `i64::MIN`,
+/// which for an inclusive `>=` comparison simply admits everything — safe, and the mark
+/// would have to sit before 1678 to get there at all.
 #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn floor_to_day(timestamp_in_nanos: u128) -> u128 {
     let signed = timestamp_in_nanos as i64;
-    (signed - signed.rem_euclid(NANOS_PER_DAY)) as u128
+    signed.saturating_sub(signed.rem_euclid(NANOS_PER_DAY)) as u128
 }
 
 /// The comparison a high-water mark implies for one column.
@@ -660,6 +665,25 @@ mod tests {
         assert_eq!(
             converter.convert_high_water_mark(mark).to_string(),
             "CAST(ts AS Timestamp(ns)) >= TimestampNanosecond(-86400000000000, None)",
+        );
+    }
+
+    #[test]
+    fn test_high_water_mark_floors_an_extreme_negative_mark_without_underflowing() {
+        // The two's-complement wrap of i64::MIN, written without a signed cast: the floor of
+        // a mark this low is less than i64::MIN, so subtracting the remainder outright would
+        // panic in debug and wrap in release. It saturates instead, and an inclusive bound at
+        // the bottom of the range simply admits every row.
+        let mark = u128::MAX - (1u128 << 63) + 1;
+
+        let format =
+            data_type_to_timestamp_format(&DataType::Date32, None).expect("format resolves");
+        let converter = TimestampFilterConvert::new("ts".to_string(), format, None, None)
+            .with_day_granular_columns(true, false);
+
+        assert_eq!(
+            converter.convert_high_water_mark(mark).to_string(),
+            "CAST(ts AS Timestamp(ns)) >= TimestampNanosecond(-9223372036854775808, None)",
         );
     }
 
