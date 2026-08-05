@@ -32,24 +32,27 @@ def main() -> None:
 
     executable = None
     fresh = None
-    for line in stream.read_text(errors="replace").splitlines():
-        try:
-            msg = json.loads(line)
-        except ValueError:
-            continue  # cargo interleaves non-JSON lines; ignore them
-        if msg.get("reason") != "compiler-artifact":
-            continue
-        target = msg.get("target") or {}
-        if target.get("name") != "spice" or target.get("kind") != ["bin"]:
-            continue
-        # `--tests` builds the bin twice: once for real, once as a `--cfg test`
-        # harness. Both are reported with name `spice` and kind `["bin"]`, and only
-        # `profile.test` tells them apart — the harness answers `--version` with a
-        # libtest error, so matching it would fail this check for the wrong reason.
-        if (msg.get("profile") or {}).get("test"):
-            continue
-        executable = msg.get("executable")
-        fresh = msg.get("fresh")
+    # Stream it: `--message-format json --tests --all` emits a message per unit,
+    # which is megabytes of JSON for this workspace, and only one line matters.
+    with stream.open(encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue  # cargo interleaves non-JSON lines; ignore them
+            if msg.get("reason") != "compiler-artifact":
+                continue
+            target = msg.get("target") or {}
+            if target.get("name") != "spice" or target.get("kind") != ["bin"]:
+                continue
+            # `--tests` builds the bin twice: once for real, once as a `--cfg test`
+            # harness. Both are reported with name `spice` and kind `["bin"]`, and
+            # only `profile.test` tells them apart — the harness answers `--version`
+            # with a libtest error, so matching it would fail for the wrong reason.
+            if (msg.get("profile") or {}).get("test"):
+                continue
+            executable = msg.get("executable")
+            fresh = msg.get("fresh")
 
     if not executable:
         fail(

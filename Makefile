@@ -90,15 +90,10 @@ test:
 ifdef RUST_PROFILE
     CARGO_PROFILE := --profile $(RUST_PROFILE)
     NEXTEST_CARGO_PROFILE := --cargo-profile $(RUST_PROFILE)
-    # Cargo names the `dev` profile's output directory `debug`; every other
-    # profile's directory matches its name.
-    CARGO_PROFILE_DIR := $(if $(filter dev,$(RUST_PROFILE)),debug,$(RUST_PROFILE))
 else
     CARGO_PROFILE := --profile dev
     NEXTEST_CARGO_PROFILE := --cargo-profile dev
-    CARGO_PROFILE_DIR := debug
 endif
-CARGO_TARGET_DIR ?= target
 
 # `libnfs` binds a system library, and on a modern glibc its generated bindings
 # carry a layout assertion for a type the headers only forward-declare, so the
@@ -186,7 +181,8 @@ nextest:
 # so after it this is a fingerprint scan (measured ~2s), not a build.
 .PHONY: verify-cli
 verify-cli:
-	@out="$(CARGO_TARGET_DIR)/verify-cli-artifacts.json"; \
+	@out="$(TARGET_DIR)/verify-cli-artifacts.json"; \
+	mkdir -p "$(TARGET_DIR)"; \
 	cargo test --no-run --message-format json $(CARGO_PROFILE) --tests \
 	  $(NEXTEST_SELECTION) $(NEXTEST_FLAG) > "$$out" || exit $$?; \
 	python3 scripts/verify_cli_build.py "$$out" version.txt
