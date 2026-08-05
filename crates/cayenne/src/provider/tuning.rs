@@ -494,6 +494,15 @@ struct MemoryComposition {
 
 impl MemoryComposition {
     /// The Kubernetes/cAdvisor working set: usage minus cold page cache.
+    ///
+    /// VALIDATE BEFORE USING THIS AS A CONTROL SIGNAL. The LRU counter it depends
+    /// on is not always self-consistent with its own totals: measured on a cgroup
+    /// v2 container under CDC load, `inactive_file` (194 GiB) exceeded the `file`
+    /// total that contains it (61 GiB), and `active_anon` (18.9 GiB) bore no
+    /// relation to `anon` (152.5 GiB) — while `anon + file + kernel` reconciled
+    /// with `memory.current` to within 0.01 GiB. The subtraction then returns less
+    /// than `anon`, which is not a working set. `anon` was the reliable
+    /// unreclaimable figure there.
     fn working_set(self, current: u64) -> u64 {
         current.saturating_sub(self.inactive_file)
     }
