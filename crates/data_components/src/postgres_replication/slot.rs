@@ -827,6 +827,11 @@ async fn create_logical_slot(
 /// and is deliberately short so a slow or unreachable source cannot stall a
 /// graceful shutdown.
 const DROP_SLOT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long to wait for the setup connection used to drop the slot. Separate
+/// from [`DROP_SLOT_BUDGET`], which only covers the retry loop *after* a
+/// connection exists; without this an unreachable source would stall shutdown
+/// for the OS connect timeout.
+const DROP_SLOT_CONNECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 /// How often to retry the drop while the server still reports the slot active.
 const DROP_SLOT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 /// SQLSTATE `55006` (`object_in_use`) — the slot is still marked active because
@@ -847,15 +852,36 @@ const SQLSTATE_UNDEFINED_OBJECT: &str = "42704";
 /// costs only retained WAL, never correctness — the next start re-snapshots
 /// either way. Every failure is therefore logged, not propagated.
 ///
+/// Bounded end to end: [`DROP_SLOT_CONNECT_BUDGET`] caps establishing the
+/// connection and [`DROP_SLOT_BUDGET`] caps the retry loop after it, so an
+/// unreachable source delays shutdown by at most their sum. Bounding only the
+/// retries would leave the connect itself free to hang for the OS timeout —
+/// exactly the case where the source is gone and this cleanup matters least.
+///
 /// Call only *after* the replication connection has been dropped; `PostgreSQL`
 /// refuses to drop a slot an active walsender still holds.
 pub async fn drop_slot_after_shutdown(params: &ReplicationParams) {
-    let (client, connection_task) = match connect_setup(params).await {
-        Ok(pair) => pair,
-        Err(e) => {
+    // Bound the connect explicitly. Everything below is governed by
+    // `DROP_SLOT_BUDGET`, but that budget only starts once a connection exists —
+    // and a source that is unreachable at shutdown (the very case in which this
+    // cleanup matters least) would otherwise hang here for the OS connect
+    // timeout, blocking the pump's exit. Shutdown must never wait on the source.
+    let connected = tokio::time::timeout(DROP_SLOT_CONNECT_BUDGET, connect_setup(params)).await;
+    let (client, connection_task) = match connected {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => {
             tracing::warn!(
                 slot = %params.slot_name,
                 "could not connect to drop the replication slot on shutdown; it will keep retaining WAL on the source until dropped manually: {e}"
+            );
+            return;
+        }
+        Err(_) => {
+            tracing::warn!(
+                slot = %params.slot_name,
+                "timed out after {}s connecting to drop the replication slot on shutdown; it will keep retaining WAL on the source until dropped manually (DROP: `SELECT pg_drop_replication_slot('{}')`)",
+                DROP_SLOT_CONNECT_BUDGET.as_secs(),
+                params.slot_name,
             );
             return;
         }
