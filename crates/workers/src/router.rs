@@ -375,13 +375,24 @@ mod tests {
             let total_weight: f64 = arms.iter().map(|(_, weight, _)| weight).sum();
 
             let n = 1000;
-            for _ in 1..n {
+            // Every draw must land on a known arm. Skipping the ones that don't
+            // would let a draw vanish from the tally, and the bounds below are
+            // noise margins wide enough to absorb a fair number of vanished
+            // draws without noticing — so a `select_from_weighted` that started
+            // returning `None`, or a name outside the fixture, would leave every
+            // count uniformly low and the test still passing. Neither is
+            // reachable for this fixture (`WeightedIndex` accepts these weights,
+            // and it only ever samples an index into them), which is exactly why
+            // a draw that isn't one of them should fail loudly rather than be
+            // dropped.
+            for draw in 1..n {
                 let Some(v) = select_from_weighted(&cfg) else {
-                    continue;
+                    panic!("draw {draw} selected nothing from the fixture");
                 };
-                if let Some((_, _, count)) = arms.iter_mut().find(|(from, _, _)| *from == v) {
-                    *count += 1;
-                }
+                let Some((_, _, count)) = arms.iter_mut().find(|(from, _, _)| *from == v) else {
+                    panic!("draw {draw} selected '{v}', not an arm of the fixture");
+                };
+                *count += 1;
             }
 
             // A heavier arm must be selected more often than a lighter one. The
