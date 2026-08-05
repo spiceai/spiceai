@@ -194,48 +194,126 @@ impl Client {
     }
 }
 
+/// Length of the line terminator beginning at `buf[i]`, or `None` if one does not begin there.
+///
+/// A `\r` that is the last byte of `buf` reports `None`: it may be the first half of a `\r\n`
+/// whose `\n` has not been read yet, and only more bytes can say which.
+fn terminator_len(buf: &[u8], i: usize) -> Option<usize> {
+    match buf.get(i)? {
+        b'\n' => Some(1),
+        b'\r' if buf.get(i + 1) == Some(&b'\n') => Some(2),
+        b'\r' if i + 1 < buf.len() => Some(1),
+        _ => None,
+    }
+}
+
+/// Byte offsets `(event_end, next_event_start)` of the blank line that terminates the first event
+/// in `buf`, or `None` while more bytes could still complete one.
+///
+/// A line ends with `\n`, `\r\n` or `\r`, so the blank line is any two consecutive terminators.
+/// Searching the bytes - rather than decoding each network read as text and searching that - is
+/// what makes the decode below land on a character boundary: a multi-byte UTF-8 sequence never
+/// contains `\n` or `\r`, so an event never ends inside one.
+fn find_event_boundary(buf: &[u8]) -> Option<(usize, usize)> {
+    let mut i = 0;
+    while i < buf.len() {
+        let Some(first) = terminator_len(buf, i) else {
+            i += 1;
+            continue;
+        };
+
+        let after = i + first;
+        if let Some(second) = terminator_len(buf, after) {
+            return Some((i, after + second));
+        }
+
+        // Either the next line carries data, or the buffer stops before a blank line can be told
+        // apart from a terminator that has arrived only halfway.
+        if after >= buf.len() {
+            return None;
+        }
+        i = after;
+    }
+
+    None
+}
+
+/// The payload of one SSE event: the values of its `data:` fields joined by `\n`, or `None` for an
+/// event that carries no `data:` field at all, such as a comment or a bare `event:` line.
+fn event_data(event: &str) -> Option<String> {
+    let mut data: Option<String> = None;
+
+    // Split on either terminator so an event framed with `\r`, `\n` or `\r\n` reads the same way;
+    // the empty segment a `\r\n` leaves behind carries no field and is skipped.
+    for line in event.split(['\r', '\n']) {
+        let Some(value) = line.strip_prefix("data:") else {
+            continue;
+        };
+
+        // One space after the colon is part of the framing, not of the value.
+        let value = value.strip_prefix(' ').unwrap_or(value);
+
+        match &mut data {
+            Some(data) => {
+                data.push('\n');
+                data.push_str(value);
+            }
+            None => data = Some(value.to_string()),
+        }
+    }
+
+    data
+}
+
 fn parse_sse_stream(
     stream: Pin<Box<dyn Stream<Item = std::result::Result<bytes::Bytes, reqwest::Error>> + Send>>,
 ) -> impl Stream<Item = Result<GenerateContentResponse>> + Send {
     futures::stream::unfold(
-        (stream, String::new()),
+        (stream, Vec::<u8>::new()),
         |(mut stream, mut buffer)| async move {
             loop {
-                if let Some(pos) = buffer.find("\n\n") {
-                    let event = buffer[..pos].to_string();
+                // Take every event the buffer already holds before reading again: one read can
+                // carry a comment or keep-alive ahead of a data event, and awaiting another read
+                // would report the end of the stream instead of the event already in hand.
+                while let Some((event_end, next_event_start)) = find_event_boundary(&buffer) {
+                    let event = std::str::from_utf8(&buffer[..event_end]).map(str::to_string);
 
-                    buffer = buffer[pos + 2..].to_string();
+                    // Consume the event either way, so a stream carrying one undecodable event
+                    // reports it once and then continues rather than repeating it forever.
+                    buffer.drain(..next_event_start);
 
-                    for line in event.lines() {
-                        if let Some(data) = line.strip_prefix("data: ") {
-                            if data == "[DONE]" {
-                                return None;
-                            }
-
-                            if data.trim().is_empty() {
-                                continue;
-                            }
-
-                            let result = serde_json::from_str(data).context(JsonSnafu);
-
-                            return Some((result, (stream, buffer)));
+                    let event = match event {
+                        Ok(event) => event,
+                        Err(e) => {
+                            return Some((
+                                StreamSnafu {
+                                    message: format!("Invalid UTF-8 in SSE event: {e}"),
+                                }
+                                .fail(),
+                                (stream, buffer),
+                            ));
                         }
+                    };
+
+                    let Some(data) = event_data(&event) else {
+                        continue;
+                    };
+
+                    if data == "[DONE]" {
+                        return None;
                     }
+
+                    if data.trim().is_empty() {
+                        continue;
+                    }
+
+                    let result = serde_json::from_str(&data).context(JsonSnafu);
+
+                    return Some((result, (stream, buffer)));
                 }
 
                 match stream.next().await {
-                    Some(Ok(bytes)) => {
-                        let text = std::str::from_utf8(&bytes).map_err(|e| {
-                            crate::error::Error::StreamError {
-                                message: format!("Invalid UTF-8: {e}"),
-                            }
-                        });
-
-                        match text {
-                            Ok(t) => buffer.push_str(&t.replace("\r\n", "\n")),
-                            Err(e) => return Some((Err(e), (stream, buffer))),
-                        }
-                    }
+                    Some(Ok(bytes)) => buffer.extend_from_slice(&bytes),
                     Some(Err(e)) => {
                         return Some((
                             StreamSnafu {
@@ -249,6 +327,12 @@ fn parse_sse_stream(
                         if buffer.is_empty() {
                             return None;
                         }
+
+                        // Report the truncated tail once and end there. Consumers forward each
+                        // item rather than stopping at the first error, so leaving the tail in the
+                        // buffer would yield this same error on every later poll: the stream would
+                        // never end.
+                        buffer.clear();
 
                         return Some((
                             StreamSnafu {
@@ -332,5 +416,241 @@ mod tests {
             .expect("stream should yield one item");
 
         chunk.expect_err("chunk should be an error");
+    }
+
+    /// A stream that hands out exactly the byte groups it is given, so a test can put a boundary
+    /// wherever it likes - including inside a multi-byte character or a `\r\n` pair.
+    fn dribble(
+        reads: Vec<&[u8]>,
+    ) -> Pin<Box<dyn Stream<Item = std::result::Result<bytes::Bytes, reqwest::Error>> + Send>> {
+        let reads: Vec<_> = reads
+            .into_iter()
+            .map(|read| Ok(bytes::Bytes::copy_from_slice(read)))
+            .collect();
+
+        Box::pin(futures::stream::iter(reads))
+    }
+
+    fn text_of(response: &GenerateContentResponse) -> String {
+        response
+            .candidates
+            .iter()
+            .flat_map(|candidate| &candidate.content.parts)
+            .map(|part| match part {
+                crate::types::Part::Text { text } => text.clone(),
+                other => panic!("expected a text part, got {other:?}"),
+            })
+            .collect()
+    }
+
+    fn text_event(text: &str) -> String {
+        format!(
+            "data: {{\"candidates\":[{{\"content\":{{\"role\":\"model\",\"parts\":[{{\"text\":\"{text}\"}}]}}}}]}}\r\n\r\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn a_character_split_across_two_reads_survives() {
+        // "é" is two bytes; the read boundary falls between them.
+        let event = text_event("caf\u{e9}");
+        let bytes = event.as_bytes();
+        let split = event
+            .find('\u{e9}')
+            .expect("the event should carry the character")
+            + 1;
+
+        let mut parsed_stream = Box::pin(parse_sse_stream(dribble(vec![
+            &bytes[..split],
+            &bytes[split..],
+        ])));
+
+        let first = parsed_stream
+            .next()
+            .await
+            .expect("stream should yield one item")
+            .expect("a character split across two reads should still parse");
+
+        assert_eq!(text_of(&first), "caf\u{e9}");
+    }
+
+    #[tokio::test]
+    async fn a_four_byte_character_split_across_three_reads_survives() {
+        let event = text_event("hi \u{1f600}");
+        let bytes = event.as_bytes();
+        let start = event
+            .find('\u{1f600}')
+            .expect("the event should carry the character");
+
+        let mut parsed_stream = Box::pin(parse_sse_stream(dribble(vec![
+            &bytes[..=start],
+            &bytes[start + 1..start + 3],
+            &bytes[start + 3..],
+        ])));
+
+        let first = parsed_stream
+            .next()
+            .await
+            .expect("stream should yield one item")
+            .expect("a character split across three reads should still parse");
+
+        assert_eq!(text_of(&first), "hi \u{1f600}");
+    }
+
+    #[tokio::test]
+    async fn a_crlf_split_across_two_reads_still_terminates_the_event() {
+        let event = text_event("Hello");
+        let bytes = event.as_bytes();
+        // Split inside the final `\r\n`, so neither read holds a complete terminator pair.
+        let split = bytes.len() - 1;
+
+        let mut parsed_stream = Box::pin(parse_sse_stream(dribble(vec![
+            &bytes[..split],
+            &bytes[split..],
+        ])));
+
+        let first = parsed_stream
+            .next()
+            .await
+            .expect("stream should yield one item")
+            .expect("an event whose terminator spans two reads should parse");
+
+        assert_eq!(text_of(&first), "Hello");
+    }
+
+    #[tokio::test]
+    async fn a_bare_lf_terminated_event_parses() {
+        let event = text_event("Hello").replace("\r\n", "\n");
+
+        let mut parsed_stream = Box::pin(parse_sse_stream(dribble(vec![event.as_bytes()])));
+
+        let first = parsed_stream
+            .next()
+            .await
+            .expect("stream should yield one item")
+            .expect("an `\\n\\n`-separated event should parse");
+
+        assert_eq!(text_of(&first), "Hello");
+    }
+
+    #[tokio::test]
+    async fn a_keep_alive_ahead_of_the_last_event_does_not_hide_it() {
+        let body = format!(": keep-alive\r\n\r\n{}", text_event("Hello"));
+
+        let mut parsed_stream = Box::pin(parse_sse_stream(dribble(vec![body.as_bytes()])));
+
+        let first = parsed_stream
+            .next()
+            .await
+            .expect("the data event after the keep-alive should still be yielded")
+            .expect("should parse successfully");
+
+        assert_eq!(text_of(&first), "Hello");
+        assert!(
+            parsed_stream.next().await.is_none(),
+            "the stream should end once the buffer is drained"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_events_data_fields_are_joined() {
+        let body = "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\r\ndata: \"parts\":[{\"text\":\"Hello\"}]}}]}\r\n\r\n";
+
+        let mut parsed_stream = Box::pin(parse_sse_stream(dribble(vec![body.as_bytes()])));
+
+        let first = parsed_stream
+            .next()
+            .await
+            .expect("stream should yield one item")
+            .expect("an event split over two data fields should parse as one payload");
+
+        assert_eq!(text_of(&first), "Hello");
+    }
+
+    #[tokio::test]
+    async fn a_data_field_without_a_space_after_the_colon_parses() {
+        let event = text_event("Hello").replace("data: ", "data:");
+
+        let mut parsed_stream = Box::pin(parse_sse_stream(dribble(vec![event.as_bytes()])));
+
+        let first = parsed_stream
+            .next()
+            .await
+            .expect("stream should yield one item")
+            .expect("the space after `data:` is optional");
+
+        assert_eq!(text_of(&first), "Hello");
+    }
+
+    #[tokio::test]
+    async fn a_done_sentinel_ends_the_stream() {
+        let body = format!("{}data: [DONE]\r\n\r\n", text_event("Hello"));
+
+        let mut parsed_stream = Box::pin(parse_sse_stream(dribble(vec![body.as_bytes()])));
+
+        parsed_stream
+            .next()
+            .await
+            .expect("stream should yield one item")
+            .expect("should parse successfully");
+
+        assert!(
+            parsed_stream.next().await.is_none(),
+            "`[DONE]` should end the stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_event_is_reported_once_and_the_next_event_still_arrives() {
+        // A lone continuation byte is invalid wherever it lands, so this is a genuinely broken
+        // event rather than a character waiting for its other half.
+        let mut body = b"data: \x80\r\n\r\n".to_vec();
+        body.extend_from_slice(text_event("Hello").as_bytes());
+
+        let mut parsed_stream = Box::pin(parse_sse_stream(dribble(vec![&body])));
+
+        let error = parsed_stream
+            .next()
+            .await
+            .expect("stream should yield one item")
+            .expect_err("an undecodable event should be an error");
+        assert!(
+            error.to_string().contains("Invalid UTF-8 in SSE event"),
+            "unexpected error: {error}"
+        );
+
+        let second = parsed_stream
+            .next()
+            .await
+            .expect("the following event should still be yielded")
+            .expect("should parse successfully");
+        assert_eq!(text_of(&second), "Hello");
+    }
+
+    #[tokio::test]
+    async fn a_truncated_tail_is_reported_once_and_then_the_stream_ends() {
+        let body = "data: {\"candidates\":[{\"content\":{\"role\":\"model\"";
+
+        let mut parsed_stream = Box::pin(parse_sse_stream(dribble(vec![body.as_bytes()])));
+
+        parsed_stream
+            .next()
+            .await
+            .expect("stream should yield one item")
+            .expect_err("a truncated tail should be an error");
+
+        assert!(
+            parsed_stream.next().await.is_none(),
+            "the stream must end after reporting the tail, not repeat the error forever"
+        );
+    }
+
+    #[test]
+    fn a_trailing_cr_waits_for_the_byte_that_classifies_it() {
+        // `\r` last: it may still grow into the `\r\n` that completes a blank line.
+        assert_eq!(find_event_boundary(b"data: a\r\n\r"), None);
+        assert_eq!(find_event_boundary(b"data: a\r\n\r\n"), Some((7, 11)));
+        // `\r\r` is a blank line in its own right once a following byte proves the second `\r`
+        // is not the start of a `\r\n`.
+        assert_eq!(find_event_boundary(b"data: a\r\rx"), Some((7, 9)));
     }
 }
