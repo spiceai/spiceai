@@ -35,3 +35,4 @@ datasets:
 
 embeddings:
   - from: model2vec:minishlab/potion-multilingual-128M
+    name: potion

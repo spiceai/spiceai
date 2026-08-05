@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: model2vec[potion-multilingual-128M]-cayenne[file]
+name: model2vec[potion-multilingual-128M]-s3_vectors
 datasets:
 
   # MTEB SCIDOCS Retrieval dataset files (*.parquet) are automatically downloaded by the test operator.
@@ -10,8 +10,15 @@ datasets:
     name: corpus
     acceleration:
       enabled: true
-      engine: cayenne
-      mode: file
+    vectors:
+      enabled: true
+      engine: s3_vectors
+      params:
+        s3_vectors_bucket: spice-ci-search-benchmarks-variant-001
+        s3_vectors_index: scidocs
+        s3_vectors_aws_region: us-east-2
+        s3_vectors_aws_access_key_id: ${env:AWS_S3_VECTORS_KEY}
+        s3_vectors_aws_secret_access_key: ${env:AWS_S3_VECTORS_SECRET}
     columns:
       - name: text
         embeddings:
