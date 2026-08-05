@@ -1915,18 +1915,17 @@ impl RefreshTask {
             }
             return true;
         }
-        // Time the deferred-batch build: for sources that defer the decode
-        // (Postgres logical-replication rows), the burst pays one
-        // `spawn_blocking` round-trip here — a cost otherwise invisible between
-        // the recv_wait and coalesce stage timers.
+        // Time the deferred-batch build: sources that defer the decode (MySQL
+        // binlog and Postgres logical-replication rows) pay one `spawn_blocking`
+        // round trip per burst here — a cost otherwise invisible between the
+        // recv_wait and coalesce stage timers.
         let decode_start = Instant::now();
-        // Build the (possibly deferred) batches here, on the per-dataset apply
-        // task — off the source's shared read/route path. A deferred build can
-        // fail on per-row value typing that only surfaces at build time (e.g. an
-        // unmergeable unchanged-TOAST column under REPLICA IDENTITY DEFAULT);
-        // treat it as a terminal error for this dataset, mirroring the eager
-        // path's pump-side fatal. The burst's committers are dropped without
-        // acking, so the source re-streams on reconnect.
+        // Build on the per-dataset apply task, off the source's shared
+        // read/route path. A deferred build can fail on per-row value typing that
+        // only surfaces at build time (e.g. an unmergeable unchanged-TOAST column
+        // under REPLICA IDENTITY DEFAULT); treat it as terminal for this dataset,
+        // mirroring the eager path's pump-side fatal. The burst's committers are
+        // dropped unacked, so the source re-streams on reconnect.
         let envelope_count = envelopes.len();
         let parts = match cdc::into_parts_offloaded_burst(envelopes).await {
             Ok(parts) => parts,

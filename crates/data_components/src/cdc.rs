@@ -580,10 +580,8 @@ impl ChangeEnvelope {
     }
 
     /// Whether the change batch is already built, so [`Self::into_parts`]
-    /// resolves without running a deferred build.
-    ///
-    /// Lets a caller holding a whole burst decide once whether it needs a
-    /// blocking-pool handoff at all — see [`into_parts_offloaded_burst`].
+    /// resolves without running a deferred build. Lets a caller holding a whole
+    /// burst decide once whether it needs a blocking-pool handoff at all.
     #[must_use]
     pub fn is_materialized(&self) -> bool {
         self.change_batch.is_materialized()
@@ -613,26 +611,20 @@ impl ChangeEnvelope {
     }
 }
 
-/// The parts of a consumed [`ChangeEnvelope`]: its committer, its built change
-/// batch, and its dataset-ready flag.
+/// The parts of a consumed [`ChangeEnvelope`]: committer, built change batch,
+/// and dataset-ready flag.
 pub type ChangeEnvelopeParts = (Box<dyn CommitChange + Send + Sync>, ChangeBatch, bool);
 
-/// [`ChangeEnvelope::into_parts_offloaded`] for a whole drained burst, paying at
-/// most **one** blocking-pool handoff for the burst instead of one per envelope.
+/// [`ChangeEnvelope::into_parts_offloaded`] for a whole drained burst: one
+/// blocking-pool handoff for the burst instead of one per envelope.
 ///
-/// The decode work is identical either way; what is amortized is the
-/// `spawn_blocking` dispatch-and-await round trip (~11µs uncontended, and more
-/// when several datasets share the blocking pool). The win therefore scales with
-/// envelopes-per-burst — largest for many small transactions, negligible for
-/// bulk ones.
-///
-/// A burst whose envelopes are all already materialized (an eager source such as
-/// the `MySQL` pump, which decodes on delivery) resolves inline: the builds are
-/// no-ops and a handoff would be pure overhead on that hot path.
+/// The decode work is unchanged; what is amortized is the `spawn_blocking` round
+/// trip, so the win scales with envelopes-per-burst. A burst of
+/// already-materialized envelopes resolves inline, with no handoff at all.
 ///
 /// The first failed build discards the rest of the burst — callers MUST treat
-/// the error as terminal for the dataset (the source re-streams from the last
-/// acked position, since the collected committers are dropped unacked).
+/// the error as terminal for the dataset. The burst's committers are dropped
+/// unacked, so the source re-streams from the last acked position.
 pub async fn into_parts_offloaded_burst(
     envelopes: Vec<ChangeEnvelope>,
 ) -> Result<Vec<ChangeEnvelopeParts>, ChangeBatchError> {
