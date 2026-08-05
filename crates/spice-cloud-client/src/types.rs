@@ -106,6 +106,41 @@ impl std::str::FromStr for AppKind {
 }
 
 // ============================================================================
+// Organizations
+// ============================================================================
+
+/// An organization the authenticated identity can act on.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Org {
+    #[serde(default)]
+    pub id: Option<i64>,
+    pub name: String,
+    #[serde(default, alias = "displayName", alias = "display_name")]
+    pub display_name: Option<String>,
+    /// Membership role (`owner`, `admin`, `member`, ...) when the API reports one.
+    #[serde(default)]
+    pub role: Option<String>,
+}
+
+/// Wire format for org listings. The endpoint may return either a bare array or
+/// an `{"orgs": [...]}` envelope, so accept both.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum OrgsResponse {
+    Wrapped { orgs: Vec<Org> },
+    Bare(Vec<Org>),
+}
+
+impl OrgsResponse {
+    #[must_use]
+    pub fn into_orgs(self) -> Vec<Org> {
+        match self {
+            Self::Wrapped { orgs } | Self::Bare(orgs) => orgs,
+        }
+    }
+}
+
+// ============================================================================
 // Apps
 // ============================================================================
 
@@ -556,6 +591,26 @@ mod tests {
 
         let value = serde_json::to_value(limits).expect("limits should serialize");
         assert_eq!(value, serde_json::json!({ "cpu": "2" }));
+    }
+
+    #[test]
+    fn orgs_response_accepts_wrapped_and_bare_payloads() {
+        let wrapped: OrgsResponse = serde_json::from_str(
+            r#"{"orgs":[{"id":1,"name":"spicehq","displayName":"Spice HQ","role":"owner"}]}"#,
+        )
+        .expect("wrapped org listing should deserialize");
+        let orgs = wrapped.into_orgs();
+        assert_eq!(orgs.len(), 1);
+        assert_eq!(orgs[0].name, "spicehq");
+        assert_eq!(orgs[0].display_name.as_deref(), Some("Spice HQ"));
+        assert_eq!(orgs[0].role.as_deref(), Some("owner"));
+
+        let bare: OrgsResponse = serde_json::from_str(r#"[{"name":"lukekim"}]"#)
+            .expect("bare org listing should deserialize");
+        let orgs = bare.into_orgs();
+        assert_eq!(orgs.len(), 1);
+        assert_eq!(orgs[0].name, "lukekim");
+        assert!(orgs[0].id.is_none());
     }
 
     #[test]

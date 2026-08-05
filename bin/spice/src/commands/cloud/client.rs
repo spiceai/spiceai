@@ -20,20 +20,58 @@ limitations under the License.
 //! constructor logic (base URL selection, token resolution) and converts errors
 //! into the CLI error type.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::error::{InvalidArgumentSnafu, InvalidResponseSnafu, Result};
+use crate::error::{CloudErrorCode, Error, InvalidResponseSnafu, Result};
 
 pub use spice_cloud_client::CloudClient as InnerCloudClient;
 use spice_cloud_client::types::{
     ApiKeysResponse, App, AppExecutor, AppKind, AppResourceLimits, AppResources, AuthContext,
     AuthExchangeResponse, ContainerImagesResponse, CreateAppRequest, CreateDeploymentRequest,
-    Deployment, LogsResponse, MetricsResponse, RegenerateApiKeyResponse, RegionsResponse, Secret,
-    UpdateAppRequest, UpdateChannel,
+    Deployment, LogsResponse, MetricsResponse, Org, RegenerateApiKeyResponse, RegionsResponse,
+    Secret, UpdateAppRequest, UpdateChannel,
 };
+
+use super::org;
 
 const DEV_CLOUD_API_BASE_URL: &str = "https://dev-api.spice.ai";
 const CLOUD_API_BASE_URL: &str = "https://api.spice.ai";
+
+/// The app a command acts on, after `--app`, `--org`, the linked app, and the
+/// active org have been reconciled.
+///
+/// `org` is `None` only when nothing in the invocation named one, in which case
+/// the credential's own org is used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppTarget {
+    pub org: Option<String>,
+    pub app: String,
+}
+
+impl AppTarget {
+    /// Build a target from an explicit org and app name.
+    pub fn new(org: Option<String>, app: impl Into<String>) -> Self {
+        Self {
+            org,
+            app: app.into(),
+        }
+    }
+
+    /// `org/app` when the org is known, otherwise the bare app name.
+    #[must_use]
+    pub fn display(&self) -> String {
+        match &self.org {
+            Some(org) => format!("{org}/{}", self.app),
+            None => self.app.clone(),
+        }
+    }
+}
+
+impl std::fmt::Display for AppTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.display())
+    }
+}
 
 /// CLI wrapper around [`spice_cloud_client::CloudClient`].
 ///
@@ -41,6 +79,19 @@ const CLOUD_API_BASE_URL: &str = "https://api.spice.ai";
 /// authentication token from the CLI environment.
 pub struct CloudClient {
     inner: InnerCloudClient,
+    org: Option<String>,
+}
+
+/// What to deploy. Spice Cloud pulls the spicepod from the app's connected
+/// repository, so an unset `branch`/`commit_sha` means the app's production
+/// branch — the CLI never uploads a local spicepod as part of a deploy.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CreateDeploymentParams<'a> {
+    pub image_tag: Option<&'a str>,
+    pub branch: Option<&'a str>,
+    pub commit_sha: Option<&'a str>,
+    pub replicas: Option<i32>,
+    pub debug: bool,
 }
 
 #[derive(Default)]
@@ -61,26 +112,68 @@ pub struct UpdateAppParams<'a> {
 }
 
 impl CloudClient {
-    /// Create a new authenticated cloud client.
+    /// Create a new authenticated cloud client using the credential's own org.
     pub fn new() -> Result<Self> {
-        let token = get_auth_token()?;
-        Self::with_token(token)
+        Self::connect(None)
+    }
+
+    /// Create a new authenticated cloud client that acts on `org`.
+    ///
+    /// When an org is named, the credential bound to *that* org is required.
+    /// Falling back to the default credential would run the command against the
+    /// organization that credential belongs to while the CLI reports the one
+    /// that was asked for — so a missing binding is an error, not a fallback.
+    pub fn connect(org: Option<&str>) -> Result<Self> {
+        let Some(org) = org else {
+            let token = org::default_token().ok_or_else(not_authenticated)?;
+            return Self::with_token_for_org(token, None);
+        };
+
+        org::validate_org_name(org)?;
+        let token = org::token_for_org(org).ok_or_else(|| org_credential_missing(org))?;
+        Self::with_token_for_org(token, Some(org))
     }
 
     /// Create a new authenticated cloud client with an explicit bearer token.
     pub fn with_token(token: impl Into<String>) -> Result<Self> {
+        Self::with_token_for_org(token, None)
+    }
+
+    /// Create a new authenticated cloud client with an explicit bearer token,
+    /// acting on `org`.
+    pub fn with_token_for_org(token: impl Into<String>, org: Option<&str>) -> Result<Self> {
+        let mut inner = InnerCloudClient::new(&get_base_url())
+            .map_err(map_cloud_error(None))?
+            .with_token(token);
+        if let Some(org) = org {
+            org::validate_org_name(org)?;
+            inner = inner.with_org(org);
+        }
+
         Ok(Self {
-            inner: InnerCloudClient::new(&get_base_url())
-                .map_err(into_cli)?
-                .with_token(token),
+            inner,
+            org: org.map(ToString::to_string),
         })
     }
 
     /// Create a new unauthenticated cloud client (for the login flow).
     pub fn new_unauthenticated() -> Result<Self> {
         Ok(Self {
-            inner: InnerCloudClient::new(&get_base_url()).map_err(into_cli)?,
+            inner: InnerCloudClient::new(&get_base_url()).map_err(map_cloud_error(None))?,
+            org: None,
         })
+    }
+
+    /// The org this client acts on, if one was requested.
+    #[must_use]
+    pub fn org(&self) -> Option<&str> {
+        self.org.as_deref()
+    }
+
+    /// Convert an API error into a CLI error, attributing 403s to the org this
+    /// client requested.
+    fn err(&self, error: spice_cloud_client::error::Error) -> Error {
+        map_cloud_error(self.org.as_deref())(error)
     }
 
     /// Get the auth URL for the login flow.
@@ -90,7 +183,10 @@ impl CloudClient {
 
     /// Exchange an auth code for an access token.
     pub async fn exchange_code(&self, auth_code: &str) -> Result<Option<AuthExchangeResponse>> {
-        self.inner.exchange_code(auth_code).await.map_err(into_cli)
+        self.inner
+            .exchange_code(auth_code)
+            .await
+            .map_err(|error| self.err(error))
     }
 
     /// Exchange `OAuth2` client credentials for an access token.
@@ -103,7 +199,7 @@ impl CloudClient {
             .inner
             .exchange_client_credentials(client_id, client_secret)
             .await
-            .map_err(into_cli)?;
+            .map_err(|error| self.err(error))?;
 
         if response.token_type.eq_ignore_ascii_case("bearer") {
             Ok(response.access_token)
@@ -120,7 +216,10 @@ impl CloudClient {
 
     /// Get the auth context for the current user.
     pub async fn get_auth_context(&self) -> Result<AuthContext> {
-        self.inner.get_auth_context().await.map_err(into_cli)
+        self.inner
+            .get_auth_context()
+            .await
+            .map_err(|error| self.err(error))
     }
 
     /// Returns user auth context when the token supports it.
@@ -147,34 +246,76 @@ impl CloudClient {
         self.inner
             .get_app_metrics(app_id, window)
             .await
-            .map_err(into_cli)
+            .map_err(|error| self.err(error))
     }
 
     pub async fn list_apps(&self) -> Result<Vec<App>> {
-        self.inner.list_apps().await.map_err(into_cli)
+        self.inner
+            .list_apps()
+            .await
+            .map_err(|error| self.err(error))
     }
 
-    pub async fn get_app(&self, org_app: &str) -> Result<App> {
-        let (org, name) = parse_org_app(org_app);
-
-        if org.is_empty() {
-            return InvalidArgumentSnafu {
-                message: format!("App name must be in org/app format, got '{org_app}'"),
-            }
-            .fail();
-        }
-
+    /// Resolve `target` to a single app the credential can see.
+    ///
+    /// The listing is the only place org membership is visible to the CLI, so it
+    /// is also where a "wrong org" mistake is caught: an app that exists under a
+    /// different org produces a switch hint rather than a bare "not found".
+    pub async fn get_app(&self, target: &AppTarget) -> Result<App> {
         let context = self.optional_user_auth_context().await?;
         let apps = self.list_apps().await?;
         let context_org = context.as_ref().map(|c| c.org_name.as_str());
 
-        let app_id = resolve_app_id(&apps, &org, &name, context_org, org_app)?;
+        let app_id = resolve_app_id(&apps, target, context_org)?;
 
         self.get_app_by_id(app_id).await
     }
 
+    // ========================================================================
+    // Organizations
+    // ========================================================================
+
+    /// List the organizations the credential can act on.
+    ///
+    /// Returns `Ok(None)` when the API does not serve an org listing, so callers
+    /// can fall back to what the CLI knows locally instead of claiming the user
+    /// belongs to no orgs.
+    pub async fn list_orgs(&self) -> Result<Option<Vec<Org>>> {
+        match self.inner.list_orgs().await {
+            Ok(orgs) => Ok(Some(orgs)),
+            Err(spice_cloud_client::error::Error::NotFound { .. }) => Ok(None),
+            Err(error) => Err(self.err(error)),
+        }
+    }
+
+    /// Fetch the auth context for `org` rather than the credential's own org.
+    ///
+    /// Doubles as a membership probe: a non-member is rejected by the server.
+    pub async fn get_auth_context_for_org(&self, org: &str) -> Result<AuthContext> {
+        org::validate_org_name(org)?;
+        self.inner
+            .get_auth_context_for_org(Some(org))
+            .await
+            .map_err(|error| match error {
+                spice_cloud_client::error::Error::NotFound { .. } => Error::cloud_with_hint(
+                    CloudErrorCode::OrgNotFound,
+                    format!("Organization '{org}' was not found."),
+                    "Run 'spice cloud orgs' to list the organizations you can access.",
+                ),
+                spice_cloud_client::error::Error::Forbidden { .. } => Error::cloud_with_hint(
+                    CloudErrorCode::OrgForbidden,
+                    format!("You are not a member of organization '{org}'."),
+                    "Ask an owner of that organization to add you, then run 'spice cloud orgs'.",
+                ),
+                error => self.err(error),
+            })
+    }
+
     pub async fn get_app_by_id(&self, app_id: i64) -> Result<App> {
-        self.inner.get_app_by_id(app_id).await.map_err(into_cli)
+        self.inner
+            .get_app_by_id(app_id)
+            .await
+            .map_err(|error| self.err(error))
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -207,11 +348,14 @@ impl CloudClient {
             executor_cpu,
             executor_memory,
         );
-        self.inner.create_app(&request).await.map_err(into_cli)
+        self.inner
+            .create_app(&request)
+            .await
+            .map_err(|error| self.err(error))
     }
 
-    pub async fn update_app(&self, org_app: &str, params: UpdateAppParams<'_>) -> Result<App> {
-        let app = self.get_app(org_app).await?;
+    pub async fn update_app(&self, target: &AppTarget, params: UpdateAppParams<'_>) -> Result<App> {
+        let app = self.get_app(target).await?;
         let resources = build_resources(params.cpu, params.memory);
         // Create and update both send storage size at the app level. The executor field remains
         // in the wire type for API compatibility, but the CLI does not set it.
@@ -236,12 +380,15 @@ impl CloudClient {
         self.inner
             .update_app(app.id, &request)
             .await
-            .map_err(into_cli)
+            .map_err(|error| self.err(error))
     }
 
-    pub async fn delete_app(&self, org_app: &str) -> Result<()> {
-        let app = self.get_app(org_app).await?;
-        self.inner.delete_app(app.id).await.map_err(into_cli)
+    pub async fn delete_app(&self, target: &AppTarget) -> Result<()> {
+        let app = self.get_app(target).await?;
+        self.inner
+            .delete_app(app.id)
+            .await
+            .map_err(|error| self.err(error))
     }
 
     // ========================================================================
@@ -250,63 +397,74 @@ impl CloudClient {
 
     pub async fn list_deployments(
         &self,
-        org_app: &str,
+        target: &AppTarget,
         limit: usize,
         status: Option<&str>,
     ) -> Result<Vec<Deployment>> {
-        let app = self.get_app(org_app).await?;
+        let app = self.get_app(target).await?;
         self.inner
             .list_deployments(app.id, limit, status)
             .await
-            .map_err(into_cli)
+            .map_err(|error| self.err(error))
     }
 
-    pub async fn get_latest_deployment(&self, org_app: &str) -> Result<Deployment> {
-        let deployments = self.list_deployments(org_app, 1, None).await?;
-        deployments
-            .into_iter()
-            .next()
-            .ok_or_else(|| crate::error::Error::InvalidResponse {
-                message: format!("No deployments found for '{org_app}'"),
-            })
+    pub async fn get_latest_deployment(&self, target: &AppTarget) -> Result<Deployment> {
+        let deployments = self.list_deployments(target, 1, None).await?;
+        deployments.into_iter().next().ok_or_else(|| {
+            Error::cloud_with_hint(
+                CloudErrorCode::NotFound,
+                format!("No deployments found for app {target}."),
+                format!("Deploy it first with 'spice cloud deploy --app {target}'."),
+            )
+        })
     }
 
     pub async fn create_deployment(
         &self,
-        org_app: &str,
-        image_tag: Option<&str>,
-        replicas: Option<i32>,
-        debug: bool,
+        target: &AppTarget,
+        params: CreateDeploymentParams<'_>,
     ) -> Result<Deployment> {
-        let app = self.get_app(org_app).await?;
+        let app = self.get_app(target).await?;
         let request = CreateDeploymentRequest {
             image: None,
-            image_tag: image_tag.map(String::from),
-            replicas,
-            branch: None,
-            commit_sha: None,
+            image_tag: params.image_tag.map(String::from),
+            replicas: params.replicas,
+            branch: params.branch.map(String::from),
+            commit_sha: params.commit_sha.map(String::from),
             commit_message: None,
             channel: None,
-            debug,
+            debug: params.debug,
         };
         self.inner
             .create_deployment(app.id, &request)
             .await
-            .map_err(into_cli)
+            .map_err(|error| match error {
+                // The Cloud API rejects a second deployment while one is in
+                // flight; give that its own code so automation can wait and
+                // retry rather than treating it as a hard failure.
+                spice_cloud_client::error::Error::Conflict { message } => Error::cloud_with_hint(
+                    CloudErrorCode::DeployConflict,
+                    format!("A deployment is already in progress for app {target}: {message}"),
+                    format!(
+                        "Check it with 'spice cloud deployments --app {target}', or wait for it to finish."
+                    ),
+                ),
+                error => self.err(error),
+            })
     }
 
     pub async fn get_deployment_logs(
         &self,
-        org_app: &str,
+        target: &AppTarget,
         deployment_id: i64,
         limit: usize,
         since: Option<&str>,
     ) -> Result<LogsResponse> {
-        let app = self.get_app(org_app).await?;
+        let app = self.get_app(target).await?;
         self.inner
             .get_deployment_logs(app.id, deployment_id, limit, since)
             .await
-            .map_err(into_cli)
+            .map_err(|error| self.err(error))
     }
 
     // ========================================================================
@@ -314,7 +472,10 @@ impl CloudClient {
     // ========================================================================
 
     pub async fn list_regions(&self, env: Option<&str>) -> Result<RegionsResponse> {
-        self.inner.list_regions(env).await.map_err(into_cli)
+        self.inner
+            .list_regions(env)
+            .await
+            .map_err(|error| self.err(error))
     }
 
     pub async fn list_container_images(
@@ -324,58 +485,67 @@ impl CloudClient {
         self.inner
             .list_container_images(channel)
             .await
-            .map_err(into_cli)
+            .map_err(|error| self.err(error))
     }
 
     // ========================================================================
     // Secrets
     // ========================================================================
 
-    pub async fn list_secrets(&self, org_app: &str) -> Result<Vec<Secret>> {
-        let app = self.get_app(org_app).await?;
-        self.inner.list_secrets(app.id).await.map_err(into_cli)
+    pub async fn list_secrets(&self, target: &AppTarget) -> Result<Vec<Secret>> {
+        let app = self.get_app(target).await?;
+        self.inner
+            .list_secrets(app.id)
+            .await
+            .map_err(|error| self.err(error))
     }
 
-    pub async fn get_secret(&self, org_app: &str, name: &str) -> Result<Secret> {
-        let app = self.get_app(org_app).await?;
-        self.inner.get_secret(app.id, name).await.map_err(into_cli)
+    pub async fn get_secret(&self, target: &AppTarget, name: &str) -> Result<Secret> {
+        let app = self.get_app(target).await?;
+        self.inner
+            .get_secret(app.id, name)
+            .await
+            .map_err(|error| self.err(error))
     }
 
-    pub async fn set_secret(&self, org_app: &str, name: &str, value: &str) -> Result<Secret> {
-        let app = self.get_app(org_app).await?;
+    pub async fn set_secret(&self, target: &AppTarget, name: &str, value: &str) -> Result<Secret> {
+        let app = self.get_app(target).await?;
         self.inner
             .set_secret(app.id, name, value)
             .await
-            .map_err(into_cli)
+            .map_err(|error| self.err(error))
     }
 
-    pub async fn delete_secret(&self, org_app: &str, name: &str) -> Result<()> {
-        let app = self.get_app(org_app).await?;
+    pub async fn delete_secret(&self, target: &AppTarget, name: &str) -> Result<()> {
+        let app = self.get_app(target).await?;
         self.inner
             .delete_secret(app.id, name)
             .await
-            .map_err(into_cli)
+            .map_err(|error| self.err(error))
     }
 
     // ========================================================================
     // API Keys
     // ========================================================================
 
-    pub async fn get_api_keys(&self, org_app: &str) -> Result<ApiKeysResponse> {
-        let app = self.get_app(org_app).await?;
-        self.inner.get_api_keys(app.id).await.map_err(into_cli)
+    pub async fn get_api_keys(&self, target: &AppTarget) -> Result<ApiKeysResponse> {
+        let app = self.get_app(target).await?;
+        self.inner
+            .get_api_keys(app.id)
+            .await
+            .map_err(|error| self.err(error))
     }
 
     pub async fn regenerate_api_key(
         &self,
-        org_app: &str,
+        target: &AppTarget,
         key_number: u8,
     ) -> Result<RegenerateApiKeyResponse> {
-        let app = self.get_app(org_app).await?;
+        let app = self.get_app(target).await?;
         self.inner
             .regenerate_api_key(app.id, key_number)
             .await
-            .map_err(into_cli)
+            .map_err(|error| self.err(error))
     }
 }
 
@@ -397,102 +567,216 @@ fn get_base_url() -> String {
     CLOUD_API_BASE_URL.to_string()
 }
 
-fn get_auth_token() -> Result<String> {
-    // 1. Check environment variable
-    if let Ok(token) = std::env::var("SPICE_SPICEAI_TOKEN")
-        && !token.is_empty()
-    {
-        return Ok(token);
-    }
+fn not_authenticated() -> Error {
+    Error::cloud_with_hint(
+        CloudErrorCode::NotAuthenticated,
+        "Not authenticated with Spice Cloud.",
+        "Run 'spice cloud login' (or set SPICE_SPICEAI_TOKEN) to authenticate.",
+    )
+}
 
-    // 2. Try platform keychain
-    if let Ok(entry) = keyring::Entry::new("SPICE_SPICEAI_TOKEN", "spice")
-        && let Ok(token) = entry.get_password()
-        && !token.is_empty()
-    {
-        return Ok(token);
-    }
-
-    // 3. Try .env.local first, then .env
-    let env_file = if std::path::Path::new(".env.local").exists() {
-        ".env.local"
+/// An organization was named but no credential is bound to it.
+///
+/// Names the credential's own org when it is known, because "you are logged in
+/// as someone else" is the actual problem and the user cannot see it otherwise.
+fn org_credential_missing(org: &str) -> Error {
+    let current = if org::default_token().is_some() {
+        " Your default credential belongs to a different organization."
     } else {
-        ".env"
+        ""
     };
 
-    if let Ok(content) = std::fs::read_to_string(env_file) {
-        for line in content.lines() {
-            if let Some(value) = line.strip_prefix("SPICE_SPICEAI_TOKEN=") {
-                let token = value.trim_matches('"').trim_matches('\'').to_string();
-                if !token.is_empty() {
-                    return Ok(token);
-                }
-            }
-        }
-    }
-
-    InvalidArgumentSnafu {
-        message: "Not authenticated. Run 'spice cloud login' to authenticate with Spice Cloud",
-    }
-    .fail()
+    Error::cloud_with_hint(
+        CloudErrorCode::OrgCredentialMissing,
+        format!("No Spice Cloud credential is stored for organization '{org}'.{current}"),
+        format!(
+            "Authenticate for it with 'spice cloud login pat --org {org}' (or 'spice cloud login api --org {org}' for automation), or set {}.",
+            org::org_token_var(org)
+        ),
+    )
 }
 
-pub fn parse_org_app(org_app: &str) -> (String, String) {
-    if let Some((org, app)) = org_app.split_once('/') {
-        (org.to_string(), app.to_string())
-    } else {
-        (String::new(), org_app.to_string())
-    }
-}
-
-/// Resolve an app ID from a listed set using `org/name`.
+/// Split a user-supplied `org/app` (or bare `app`) into its parts.
 ///
-/// When app payloads omit `org`, falls back to `context_org` from the auth
-/// context. If org still cannot be resolved, only a uniquely named app may
-/// match; multiple name collisions without org metadata are rejected.
-fn resolve_app_id(
-    apps: &[spice_cloud_client::types::App],
-    org: &str,
-    name: &str,
-    context_org: Option<&str>,
-    display_name: &str,
-) -> Result<i64> {
+/// The org is `None` for a bare name, which the caller resolves from `--org`,
+/// the linked app, or the active org.
+#[must_use]
+pub fn parse_org_app(org_app: &str) -> (Option<String>, String) {
+    match org_app.split_once('/') {
+        Some((org, app)) if !org.is_empty() => (Some(org.to_string()), app.to_string()),
+        Some((_, app)) => (None, app.to_string()),
+        None => (None, org_app.to_string()),
+    }
+}
+
+/// The org an app belongs to: its own when the payload carries one, otherwise
+/// the credential's org, which is the only org `/v1/apps` can be listing.
+fn effective_app_org<'a>(app: &'a App, context_org: Option<&'a str>) -> Option<&'a str> {
+    if app.org.is_empty() {
+        context_org.filter(|org| !org.is_empty())
+    } else {
+        Some(app.org.as_str())
+    }
+}
+
+/// Resolve an app ID from a listing.
+///
+/// When `target.org` is set it must match; an app of the same name under another
+/// visible org is reported as [`CloudErrorCode::WrongOrg`] with the switch to
+/// make, because "not found" sends the operator looking for a typo that is not
+/// there. When no org is known — the credential is a service account and the
+/// listing omits orgs — a uniquely named app still resolves, and an ambiguous
+/// one is refused rather than guessed.
+fn resolve_app_id(apps: &[App], target: &AppTarget, context_org: Option<&str>) -> Result<i64> {
+    let wanted_org = target
+        .org
+        .as_deref()
+        .or(context_org)
+        .filter(|o| !o.is_empty());
+
     let mut org_unknown_matches = Vec::new();
+    let mut other_org_matches = BTreeSet::new();
 
     for app in apps {
-        if app.name != name {
+        if app.name != target.app {
             continue;
         }
 
-        let app_org = if app.org.is_empty() {
-            context_org.unwrap_or("")
-        } else {
-            app.org.as_str()
-        };
-
-        if !app_org.is_empty() {
-            if app_org.eq_ignore_ascii_case(org) {
+        match (effective_app_org(app, context_org), wanted_org) {
+            (Some(app_org), Some(wanted)) if app_org.eq_ignore_ascii_case(wanted) => {
                 return Ok(app.id);
             }
-            continue;
+            (Some(app_org), Some(_)) => {
+                other_org_matches.insert(app_org.to_string());
+            }
+            (Some(_) | None, None) | (None, Some(_)) => org_unknown_matches.push(app.id),
         }
-
-        org_unknown_matches.push(app.id);
     }
 
-    match org_unknown_matches.len() {
-        0 => InvalidResponseSnafu {
-            message: format!("App '{display_name}' not found"),
-        }
-        .fail(),
-        1 => Ok(org_unknown_matches[0]),
-        count => InvalidResponseSnafu {
-            message: format!(
-                "Multiple apps named '{name}' found ({count}) and org could not be verified. \
-                 Use a unique app name or authenticate with a user token so org context is available."
+    if let Some(id) = org_unknown_matches.first()
+        && org_unknown_matches.len() == 1
+    {
+        return Ok(*id);
+    }
+
+    if org_unknown_matches.len() > 1 {
+        return Err(Error::cloud_with_hint(
+            CloudErrorCode::AppNotFound,
+            format!(
+                "Multiple apps named '{}' are visible and none reports an organization.",
+                target.app
             ),
+            "Pass --app <org>/<app>, or authenticate with a user token so org context is available.",
+        ));
+    }
+
+    if !other_org_matches.is_empty() {
+        let others: Vec<String> = other_org_matches.iter().cloned().collect();
+        let requested = wanted_org.unwrap_or("the active organization");
+        return Err(Error::cloud_with_hint(
+            CloudErrorCode::WrongOrg,
+            format!(
+                "App '{}' was not found in organization '{requested}', but exists in {}.",
+                target.app,
+                format_org_list(&others)
+            ),
+            format!(
+                "Run 'spice cloud org use {0}', or pass --app {0}/{1}.",
+                others.first().map_or("<org>", String::as_str),
+                target.app
+            ),
+        ));
+    }
+
+    let visible_orgs: Vec<String> = apps
+        .iter()
+        .filter_map(|app| effective_app_org(app, context_org).map(ToString::to_string))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
+    let hint = match wanted_org {
+        Some(org)
+            if !visible_orgs
+                .iter()
+                .any(|seen| seen.eq_ignore_ascii_case(org)) =>
+        {
+            format!(
+                "This credential can see {}. Run 'spice cloud orgs' to list your organizations, then 'spice cloud org use <org>'.",
+                if visible_orgs.is_empty() {
+                    "no organizations".to_string()
+                } else {
+                    format_org_list(&visible_orgs)
+                }
+            )
         }
-        .fail(),
+        _ => format!(
+            "Run 'spice cloud apps{}' to list the apps you can reach.",
+            wanted_org.map_or(String::new(), |org| format!(" --org {org}"))
+        ),
+    };
+
+    Err(Error::cloud_with_hint(
+        CloudErrorCode::AppNotFound,
+        format!("App '{target}' was not found."),
+        hint,
+    ))
+}
+
+/// Render org names as `'a'`, `'a' and 'b'`, or `'a', 'b', and 'c'`.
+fn format_org_list(orgs: &[String]) -> String {
+    let quoted: Vec<String> = orgs.iter().map(|org| format!("'{org}'")).collect();
+    match quoted.split_last() {
+        None => "no organizations".to_string(),
+        Some((last, [])) => last.clone(),
+        Some((last, [first])) => format!("{first} and {last}"),
+        Some((last, rest)) => format!("{}, and {last}", rest.join(", ")),
+    }
+}
+
+/// Convert an API error into a CLI error carrying a stable code.
+///
+/// `org` is the organization the request asked for, so a 403 can say which
+/// membership check failed instead of a bare "forbidden".
+fn map_cloud_error(org: Option<&str>) -> impl Fn(spice_cloud_client::error::Error) -> Error {
+    let org = org.map(ToString::to_string);
+    move |error| {
+        use spice_cloud_client::error::Error as CloudError;
+        match error {
+            CloudError::Unauthorized { message } => Error::cloud_with_hint(
+                CloudErrorCode::TokenExpired,
+                format!("Spice Cloud rejected the credential: {message}"),
+                "Run 'spice cloud login' to re-authenticate.",
+            ),
+            // A 403 on a management route means "this action is not allowed",
+            // which is usually a missing role or scope rather than a missing
+            // membership. Only the dedicated membership probe can tell the
+            // difference, so it — not this mapping — emits `org_forbidden`.
+            CloudError::Forbidden { message } => Error::cloud_with_hint(
+                CloudErrorCode::Forbidden,
+                match &org {
+                    Some(org) => format!("Not permitted in organization '{org}': {message}"),
+                    None => format!("Not permitted: {message}"),
+                },
+                "Check the credential's role and scopes for this action, or contact your organization admin.",
+            ),
+            CloudError::AuthorizationDenied => Error::DeviceAuthorizationDenied,
+            CloudError::InvalidResponse { message } => Error::InvalidResponse { message },
+            CloudError::NotFound { message } => {
+                Error::cloud(CloudErrorCode::NotFound, format!("Not found: {message}"))
+            }
+            CloudError::Conflict { message } => {
+                Error::cloud(CloudErrorCode::Conflict, format!("Conflict: {message}"))
+            }
+            CloudError::Api { status, message } => Error::cloud(
+                CloudErrorCode::ApiError,
+                format!("Spice Cloud request failed with status {status}: {message}"),
+            ),
+            CloudError::HttpRequest { source } => Error::HttpRequestFailed { source },
+            CloudError::JsonParse { source } => Error::InvalidResponse {
+                message: format!("Failed to parse response: {source}"),
+            },
+        }
     }
 }
 
@@ -576,40 +860,12 @@ fn build_executor(
     })
 }
 
-fn is_unauthorized_auth_context_error(err: &crate::error::Error) -> bool {
-    matches!(
-        err,
-        crate::error::Error::InvalidArgument { message }
-            if message.starts_with("Unauthorized:")
-    )
-}
-
-/// Convert a [`spice_cloud_client::error::Error`] into the CLI error type.
-fn into_cli(e: spice_cloud_client::error::Error) -> crate::error::Error {
-    use spice_cloud_client::error::Error as CloudError;
-    match e {
-        CloudError::Unauthorized { message } => crate::error::Error::InvalidArgument {
-            message: format!("Unauthorized: {message}. Run 'spice cloud login' to re-authenticate"),
-        },
-        CloudError::Forbidden { message } => crate::error::Error::InvalidArgument {
-            message: format!("Forbidden: {message}"),
-        },
-        CloudError::AuthorizationDenied => crate::error::Error::DeviceAuthorizationDenied,
-        CloudError::InvalidResponse { message } => crate::error::Error::InvalidResponse { message },
-        CloudError::NotFound { message } => crate::error::Error::InvalidResponse {
-            message: format!("Not found: {message}"),
-        },
-        CloudError::Conflict { message } => crate::error::Error::InvalidResponse {
-            message: format!("Conflict: {message}"),
-        },
-        CloudError::Api { status, message } => crate::error::Error::InvalidResponse {
-            message: format!("Request failed with status {status}: {message}"),
-        },
-        CloudError::HttpRequest { source } => crate::error::Error::HttpRequestFailed { source },
-        CloudError::JsonParse { source } => crate::error::Error::InvalidResponse {
-            message: format!("Failed to parse response: {source}"),
-        },
-    }
+/// A rejected credential on the auth-context endpoint.
+///
+/// Service-account tokens are valid for the management API but have no user
+/// identity, so callers that only want the identity treat this as "absent".
+pub fn is_unauthorized_auth_context_error(err: &crate::error::Error) -> bool {
+    err.cloud_code() == Some(CloudErrorCode::TokenExpired)
 }
 
 pub fn is_device_authorization_denied_error(error: &crate::error::Error) -> bool {
@@ -691,29 +947,44 @@ mod tests {
         }
     }
 
+    fn target(org: Option<&str>, app: &str) -> AppTarget {
+        AppTarget::new(org.map(ToString::to_string), app)
+    }
+
     #[test]
-    fn resolve_app_id_matches_when_app_org_is_present() {
+    fn parse_org_app_splits_qualified_and_bare_names() {
+        assert_eq!(
+            parse_org_app("spicehq/team-app"),
+            (Some("spicehq".to_string()), "team-app".to_string())
+        );
+        assert_eq!(parse_org_app("team-app"), (None, "team-app".to_string()));
+        // A leading slash names no org, so the caller's org context still applies.
+        assert_eq!(parse_org_app("/team-app"), (None, "team-app".to_string()));
+    }
+
+    #[test]
+    fn resolve_app_id_matches_the_requested_org() {
         let apps = vec![
             test_app(1, "dashboard", "analytics"),
             test_app(2, "dashboard", "other"),
         ];
 
-        let id = resolve_app_id(&apps, "analytics", "dashboard", None, "analytics/dashboard")
+        let id = resolve_app_id(&apps, &target(Some("analytics"), "dashboard"), None)
             .expect("should match org from app payload");
 
         assert_eq!(id, 1);
     }
 
     #[test]
-    fn resolve_app_id_uses_context_org_when_app_org_is_missing() {
+    fn resolve_app_id_uses_context_org_when_the_listing_omits_it() {
+        // `/v1/apps` does not populate `org`, so the credential's own org is
+        // the only evidence of which org the listing describes.
         let apps = vec![test_app(7, "dashboard", "")];
 
         let id = resolve_app_id(
             &apps,
-            "analytics",
-            "dashboard",
+            &target(Some("analytics"), "dashboard"),
             Some("analytics"),
-            "analytics/dashboard",
         )
         .expect("should match via auth context org");
 
@@ -721,38 +992,137 @@ mod tests {
     }
 
     #[test]
-    fn resolve_app_id_rejects_org_mismatch_when_app_org_is_known() {
-        let apps = vec![test_app(1, "dashboard", "other")];
+    fn resolve_app_id_reports_wrong_org_rather_than_not_found() {
+        // Regression guard for the multi-org failure this replaced: asking for
+        // an app that lives in another visible org used to say only "not found",
+        // sending the operator hunting for a typo that was not there.
+        let apps = vec![test_app(1, "team-app", "spicehq")];
 
-        let err = resolve_app_id(&apps, "analytics", "dashboard", None, "analytics/dashboard")
-            .expect_err("org mismatch should not match");
+        let err = resolve_app_id(&apps, &target(Some("lukekim"), "team-app"), None)
+            .expect_err("org mismatch should not resolve");
 
+        assert_eq!(err.cloud_code(), Some(CloudErrorCode::WrongOrg));
+        let rendered = err.to_string();
         assert!(
-            err.to_string().contains("not found"),
-            "unexpected error: {err}"
+            rendered.contains("not found in organization 'lukekim'")
+                && rendered.contains("'spicehq'"),
+            "error should name both orgs: {rendered}"
+        );
+        assert!(
+            rendered.contains("spice cloud org use spicehq"),
+            "error should offer the switch: {rendered}"
         );
     }
 
     #[test]
-    fn resolve_app_id_allows_single_name_match_when_org_unknown() {
+    fn resolve_app_id_suggests_listing_orgs_when_the_org_is_not_visible() {
+        let apps = vec![test_app(1, "other-app", "lukekim")];
+
+        let err = resolve_app_id(&apps, &target(Some("spicehq"), "team-app"), Some("lukekim"))
+            .expect_err("unknown app in an unseen org should fail");
+
+        assert_eq!(err.cloud_code(), Some(CloudErrorCode::AppNotFound));
+        assert!(
+            err.to_string().contains("spice cloud orgs"),
+            "error should point at org discovery: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_app_id_allows_a_unique_match_when_no_org_is_known() {
+        // A service-account credential has no user auth context, so neither the
+        // listing nor the identity reports an org; a single match is unambiguous.
         let apps = vec![test_app(9, "dashboard", "")];
 
-        let id = resolve_app_id(&apps, "analytics", "dashboard", None, "analytics/dashboard")
-            .expect("single unnamed-org app should match");
+        let id = resolve_app_id(&apps, &target(None, "dashboard"), None)
+            .expect("single org-less app should match");
 
         assert_eq!(id, 9);
     }
 
     #[test]
-    fn resolve_app_id_rejects_ambiguous_name_matches_when_org_unknown() {
+    fn resolve_app_id_refuses_to_guess_between_ambiguous_matches() {
         let apps = vec![test_app(1, "dashboard", ""), test_app(2, "dashboard", "")];
 
-        let err = resolve_app_id(&apps, "analytics", "dashboard", None, "analytics/dashboard")
+        let err = resolve_app_id(&apps, &target(None, "dashboard"), None)
             .expect_err("ambiguous apps should fail");
 
+        assert_eq!(err.cloud_code(), Some(CloudErrorCode::AppNotFound));
         assert!(
             err.to_string().contains("Multiple apps named 'dashboard'"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn app_target_displays_qualified_and_bare_names() {
+        assert_eq!(
+            target(Some("spicehq"), "team-app").display(),
+            "spicehq/team-app"
+        );
+        assert_eq!(target(None, "team-app").display(), "team-app");
+    }
+
+    #[test]
+    fn format_org_list_reads_as_prose() {
+        assert_eq!(format_org_list(&["a".to_string()]), "'a'");
+        assert_eq!(
+            format_org_list(&["a".to_string(), "b".to_string()]),
+            "'a' and 'b'"
+        );
+        assert_eq!(
+            format_org_list(&["a".to_string(), "b".to_string(), "c".to_string()]),
+            "'a', 'b', and 'c'"
+        );
+    }
+
+    #[test]
+    fn a_forbidden_action_is_not_reported_as_a_membership_failure() {
+        // A 403 on a management route usually means a missing role or scope,
+        // not a missing membership. Reporting `org_forbidden` for both sent
+        // automation down the wrong remediation path and told a legitimate
+        // member to ask for an invitation they already have.
+        let err = map_cloud_error(Some("spicehq"))(spice_cloud_client::error::Error::Forbidden {
+            message: "requires admin role".to_string(),
+        });
+
+        assert_eq!(err.cloud_code(), Some(CloudErrorCode::Forbidden));
+        assert!(
+            err.to_string().contains("organization 'spicehq'"),
+            "the org is still worth naming for context: {err}"
+        );
+    }
+
+    #[test]
+    fn forbidden_without_org_context_stays_generic() {
+        let err = map_cloud_error(None)(spice_cloud_client::error::Error::Forbidden {
+            message: "missing scope".to_string(),
+        });
+
+        assert_eq!(err.cloud_code(), Some(CloudErrorCode::Forbidden));
+    }
+
+    #[test]
+    fn a_named_org_without_a_credential_fails_closed() {
+        // The credential fallback used to run the command against the default
+        // token's org while reporting the requested one.
+        let err = org_credential_missing("spicehq");
+
+        assert_eq!(err.cloud_code(), Some(CloudErrorCode::OrgCredentialMissing));
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("'spicehq'") && rendered.contains("login pat --org spicehq"),
+            "the error must name the org and how to authenticate for it: {rendered}"
+        );
+    }
+
+    #[test]
+    fn unauthorized_maps_to_token_expired() {
+        let err = map_cloud_error(None)(spice_cloud_client::error::Error::Unauthorized {
+            message: "invalid or expired token".to_string(),
+        });
+
+        assert_eq!(err.cloud_code(), Some(CloudErrorCode::TokenExpired));
+        assert!(is_unauthorized_auth_context_error(&err));
     }
 }

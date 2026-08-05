@@ -327,7 +327,28 @@ fn main() {
         } else {
             tracing::error!("{e}");
         }
-        std::process::exit(1);
+        std::process::exit(exit_code_for(&e));
+    }
+}
+
+/// Exit code for a failed command.
+///
+/// Authentication failures get their own code so automation can re-authenticate
+/// and retry without parsing the message, matching the convention `gh` uses
+/// (<https://cli.github.com/manual/gh_help_exit-codes>).
+fn exit_code_for(error: &spice::error::Error) -> i32 {
+    use spice::error::CloudErrorCode;
+
+    match error.cloud_code() {
+        Some(
+            CloudErrorCode::NotAuthenticated
+            | CloudErrorCode::TokenExpired
+            | CloudErrorCode::OrgCredentialMissing,
+        ) => 4,
+        _ => match error {
+            spice::error::Error::Unauthorized => 4,
+            _ => 1,
+        },
     }
 }
 
@@ -683,6 +704,7 @@ fn apply_machine_acceleration_mode(args: &mut AccelerationArgs) {
 fn apply_machine_cloud_mode(command: &mut cloud::CloudCommands) {
     match command {
         cloud::CloudCommands::Whoami(args) => args.output = OutputFormat::Json,
+        cloud::CloudCommands::Orgs(args) => args.output = OutputFormat::Json,
         cloud::CloudCommands::Apps(args) => args.output = OutputFormat::Json,
         cloud::CloudCommands::Deployments(args) => args.output = OutputFormat::Json,
         cloud::CloudCommands::Regions(args) => args.output = OutputFormat::Json,
@@ -711,8 +733,17 @@ fn apply_machine_cloud_mode(command: &mut cloud::CloudCommands) {
         cloud::CloudCommands::Delete(cloud::DeleteCommands::App(args)) => {
             args.output = OutputFormat::Json;
         }
+        cloud::CloudCommands::Org(command) => match command {
+            cloud::OrgCommands::Use(args) => args.output = OutputFormat::Json,
+            cloud::OrgCommands::Current(args) => args.output = OutputFormat::Json,
+            cloud::OrgCommands::Clear => {}
+        },
+        cloud::CloudCommands::Runtime(command) => match command {
+            cloud::RuntimeCommands::Status(args) => args.output = OutputFormat::Json,
+            cloud::RuntimeCommands::Datasets(args) => args.output = OutputFormat::Json,
+        },
         cloud::CloudCommands::Login(_)
-        | cloud::CloudCommands::Logout
+        | cloud::CloudCommands::Logout(_)
         | cloud::CloudCommands::Link(_)
         | cloud::CloudCommands::Unlink => {}
     }
@@ -744,12 +775,22 @@ fn should_write_machine_clap_error(error: &clap::Error) -> bool {
 }
 
 fn write_machine_error(error: &spice::error::Error) {
+    let mut detail = serde_json::Map::new();
+    detail.insert(
+        "code".to_string(),
+        serde_json::Value::from(machine_error_code(error)),
+    );
+    detail.insert(
+        "message".to_string(),
+        serde_json::Value::from(error.to_string()),
+    );
+    if let Some(hint) = error.hint() {
+        detail.insert("hint".to_string(), serde_json::Value::from(hint));
+    }
+
     let body = serde_json::json!({
         "status": "error",
-        "error": {
-            "code": machine_error_code(error),
-            "message": error.to_string(),
-        }
+        "error": serde_json::Value::Object(detail),
     });
 
     match serde_json::to_string(&body) {
@@ -779,6 +820,7 @@ fn machine_error_code(error: &spice::error::Error) -> &'static str {
         spice::error::Error::RuntimeVersion { .. } => "runtime_version",
         spice::error::Error::Environment { .. } => "environment",
         spice::error::Error::InvalidArgument { .. } => "invalid_argument",
+        spice::error::Error::Cloud { code, .. } => code.as_str(),
         spice::error::Error::DeviceAuthorizationDenied => "device_authorization_denied",
         spice::error::Error::HomeDirectoryNotFound => "home_directory_not_found",
         spice::error::Error::Repl { .. } => "repl",
@@ -852,8 +894,20 @@ fn is_json_output(cmd: &Commands) -> bool {
             cloud::CloudCommands::Delete(cloud::DeleteCommands::App(x)) => {
                 x.output == OutputFormat::Json
             }
-            cloud::CloudCommands::Login(_)
-            | cloud::CloudCommands::Logout
+            cloud::CloudCommands::Orgs(x) => x.output == OutputFormat::Json,
+            cloud::CloudCommands::Org(cloud::OrgCommands::Use(x)) => x.output == OutputFormat::Json,
+            cloud::CloudCommands::Org(cloud::OrgCommands::Current(x)) => {
+                x.output == OutputFormat::Json
+            }
+            cloud::CloudCommands::Runtime(cloud::RuntimeCommands::Status(x)) => {
+                x.output == OutputFormat::Json
+            }
+            cloud::CloudCommands::Runtime(cloud::RuntimeCommands::Datasets(x)) => {
+                x.output == OutputFormat::Json
+            }
+            cloud::CloudCommands::Org(cloud::OrgCommands::Clear)
+            | cloud::CloudCommands::Login(_)
+            | cloud::CloudCommands::Logout(_)
             | cloud::CloudCommands::Link(_)
             | cloud::CloudCommands::Unlink => false,
         },
@@ -1105,6 +1159,7 @@ mod tests {
         let cli = parse_with_machine_mode(&["spice", "--machine", "cloud", "secrets", "list"]);
         let Commands::Cloud(cloud::CloudArgs {
             command: cloud::CloudCommands::Secrets(cloud::SecretsCommands::List(args)),
+            ..
         }) = cli.command
         else {
             panic!("expected cloud secrets list command");
@@ -1613,6 +1668,7 @@ mod tests {
 
         let Commands::Cloud(cloud::CloudArgs {
             command: cloud::CloudCommands::Login(login_args),
+            ..
         }) = cli.command
         else {
             panic!("expected cloud login command");
@@ -1639,6 +1695,7 @@ mod tests {
 
         let Commands::Cloud(cloud::CloudArgs {
             command: cloud::CloudCommands::Login(login_args),
+            ..
         }) = cli.command
         else {
             panic!("expected cloud login command");

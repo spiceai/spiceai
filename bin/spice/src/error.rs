@@ -23,6 +23,77 @@ use std::path::PathBuf;
 /// Result type alias for the Spice CLI.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Stable machine-readable codes for Spice Cloud failures.
+///
+/// Scripts and agents branch on these, so the strings are part of the CLI's
+/// contract: rename one only with the same care as renaming a flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloudErrorCode {
+    /// No Spice Cloud credential is available locally.
+    NotAuthenticated,
+    /// The credential was rejected (401) — expired, revoked, or malformed.
+    TokenExpired,
+    /// Authenticated, but the identity may not perform this action (403).
+    Forbidden,
+    /// The named organization does not exist, or is invisible to this identity.
+    OrgNotFound,
+    /// The identity is not a member of the requested organization.
+    OrgForbidden,
+    /// Two explicit signals named different organizations.
+    OrgConflict,
+    /// An organization was named, but no credential is bound to it.
+    OrgCredentialMissing,
+    /// No app by that name exists in the organization being acted on.
+    AppNotFound,
+    /// The app exists, but under a different organization than the active one.
+    WrongOrg,
+    /// A deployment is already in flight for this app.
+    DeployConflict,
+    /// A deployment reached a terminal failed status.
+    DeployFailed,
+    /// A deployment did not reach a terminal status before the wait elapsed.
+    /// Distinct from [`Self::DeployFailed`]: the deployment may still succeed.
+    DeployTimeout,
+    /// The requested resource does not exist.
+    NotFound,
+    /// The request conflicts with the resource's current state.
+    Conflict,
+    /// The Spice Cloud API returned an unexpected response.
+    ApiError,
+    /// The command's arguments are inconsistent or unusable.
+    InvalidRequest,
+}
+
+impl CloudErrorCode {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotAuthenticated => "not_authenticated",
+            Self::TokenExpired => "token_expired",
+            Self::Forbidden => "forbidden",
+            Self::OrgNotFound => "org_not_found",
+            Self::OrgForbidden => "org_forbidden",
+            Self::OrgConflict => "org_conflict",
+            Self::OrgCredentialMissing => "org_credential_missing",
+            Self::AppNotFound => "app_not_found",
+            Self::WrongOrg => "wrong_org",
+            Self::DeployConflict => "deploy_conflict",
+            Self::DeployFailed => "deploy_failed",
+            Self::DeployTimeout => "deploy_timeout",
+            Self::NotFound => "not_found",
+            Self::Conflict => "conflict",
+            Self::ApiError => "api_error",
+            Self::InvalidRequest => "invalid_request",
+        }
+    }
+}
+
+impl std::fmt::Display for CloudErrorCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Error types for the Spice CLI.
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
@@ -112,6 +183,19 @@ pub enum Error {
     #[snafu(display("Invalid argument: {message}"))]
     InvalidArgument { message: String },
 
+    /// A Spice Cloud operation failed, carrying a stable code scripts can branch on.
+    #[snafu(display(
+        "{message}{}",
+        hint.as_deref().map(|hint| format!(" {hint}")).unwrap_or_default()
+    ))]
+    Cloud {
+        code: CloudErrorCode,
+        message: String,
+        /// Actionable next step, appended to the message for humans and kept
+        /// separate for `--machine` output.
+        hint: Option<String>,
+    },
+
     /// User denied device authorization during cloud login.
     #[snafu(display("Device authorization was denied"))]
     DeviceAuthorizationDenied,
@@ -149,6 +233,50 @@ pub enum Error {
     /// Enrollment against the Spice Cloud control plane failed.
     #[snafu(display("Failed to enroll with Spice Cloud: {message}"))]
     CloudConnectEnroll { message: String },
+}
+
+impl Error {
+    /// Build a Spice Cloud error carrying a stable machine code.
+    #[must_use]
+    pub fn cloud(code: CloudErrorCode, message: impl Into<String>) -> Self {
+        Self::Cloud {
+            code,
+            message: message.into(),
+            hint: None,
+        }
+    }
+
+    /// Build a Spice Cloud error with a stable machine code and a next step.
+    #[must_use]
+    pub fn cloud_with_hint(
+        code: CloudErrorCode,
+        message: impl Into<String>,
+        hint: impl Into<String>,
+    ) -> Self {
+        Self::Cloud {
+            code,
+            message: message.into(),
+            hint: Some(hint.into()),
+        }
+    }
+
+    /// The Spice Cloud code for this error, if it is a cloud failure.
+    #[must_use]
+    pub fn cloud_code(&self) -> Option<CloudErrorCode> {
+        match self {
+            Self::Cloud { code, .. } => Some(*code),
+            _ => None,
+        }
+    }
+
+    /// The actionable hint attached to this error, if any.
+    #[must_use]
+    pub fn hint(&self) -> Option<&str> {
+        match self {
+            Self::Cloud { hint, .. } => hint.as_deref(),
+            _ => None,
+        }
+    }
 }
 
 /// Check an HTTP response status and return an appropriate error for non-success responses.
@@ -205,6 +333,46 @@ mod tests {
             err.to_string(),
             "unauthorized: invalid or missing Spice API key. Run `spice login` or set SPICE_API_KEY."
         );
+    }
+
+    #[test]
+    fn cloud_error_appends_hint_to_the_message_on_one_line() {
+        let err = Error::cloud_with_hint(
+            CloudErrorCode::AppNotFound,
+            "App 'team-app' not found in org 'lukekim'.",
+            "Run 'spice cloud orgs' to see the orgs you can access.",
+        );
+
+        let rendered = err.to_string();
+        assert_eq!(
+            rendered,
+            "App 'team-app' not found in org 'lukekim'. Run 'spice cloud orgs' to see the orgs you can access."
+        );
+        assert!(!rendered.contains('\n'), "error messages stay on one line");
+        assert_eq!(err.cloud_code(), Some(CloudErrorCode::AppNotFound));
+    }
+
+    #[test]
+    fn cloud_error_without_hint_renders_only_the_message() {
+        let err = Error::cloud(CloudErrorCode::TokenExpired, "Unauthorized: token expired.");
+        assert_eq!(err.to_string(), "Unauthorized: token expired.");
+        assert!(err.hint().is_none());
+    }
+
+    #[test]
+    fn cloud_error_codes_are_stable_strings() {
+        // Scripts and agents branch on these; changing one is a breaking change.
+        assert_eq!(
+            CloudErrorCode::NotAuthenticated.as_str(),
+            "not_authenticated"
+        );
+        assert_eq!(CloudErrorCode::TokenExpired.as_str(), "token_expired");
+        assert_eq!(CloudErrorCode::OrgNotFound.as_str(), "org_not_found");
+        assert_eq!(CloudErrorCode::OrgForbidden.as_str(), "org_forbidden");
+        assert_eq!(CloudErrorCode::AppNotFound.as_str(), "app_not_found");
+        assert_eq!(CloudErrorCode::WrongOrg.as_str(), "wrong_org");
+        assert_eq!(CloudErrorCode::DeployConflict.as_str(), "deploy_conflict");
+        assert_eq!(CloudErrorCode::DeployFailed.as_str(), "deploy_failed");
     }
 
     #[test]

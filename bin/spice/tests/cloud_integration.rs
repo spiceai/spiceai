@@ -942,6 +942,8 @@ fn test_cloud_help_lists_all_subcommands() {
         .stdout(predicate::str::contains("login"))
         .stdout(predicate::str::contains("logout"))
         .stdout(predicate::str::contains("whoami"))
+        .stdout(predicate::str::contains("orgs"))
+        .stdout(predicate::str::contains("org"))
         .stdout(predicate::str::contains("link"))
         .stdout(predicate::str::contains("unlink"))
         .stdout(predicate::str::contains("apps"))
@@ -958,7 +960,201 @@ fn test_cloud_help_lists_all_subcommands() {
         .stdout(predicate::str::contains("inspect"))
         // `rollback` is intentionally absent from the current CloudCommands enum.
         .stdout(predicate::str::contains("api-keys"))
-        .stdout(predicate::str::contains("metrics"));
+        .stdout(predicate::str::contains("metrics"))
+        .stdout(predicate::str::contains("runtime"));
+}
+
+// ============================================================================
+// Multi-org surface — no credentials needed
+// ============================================================================
+
+#[test]
+fn test_cloud_org_flag_is_available_on_every_subcommand() {
+    // `--org` is global, so it must reach subcommands whose own args do not
+    // declare it. Without this, selecting an org per-invocation would only work
+    // on whichever commands happened to be updated.
+    for subcommand in [
+        "apps",
+        "deployments",
+        "logs",
+        "deploy",
+        "inspect",
+        "metrics",
+    ] {
+        let mut cmd = cargo_bin_cmd!("spice");
+        cmd.args(["cloud", subcommand, "--help"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("--org"));
+    }
+}
+
+#[test]
+fn test_cloud_org_subcommands_are_wired() {
+    let mut cmd = cargo_bin_cmd!("spice");
+    cmd.args(["cloud", "org", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("use"))
+        .stdout(predicate::str::contains("current"))
+        .stdout(predicate::str::contains("clear"));
+}
+
+#[test]
+fn test_cloud_deploy_help_documents_wait_and_timeout() {
+    let mut cmd = cargo_bin_cmd!("spice");
+    cmd.args(["cloud", "deploy", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--wait"))
+        .stdout(predicate::str::contains("--timeout"));
+}
+
+#[test]
+fn test_cloud_logs_help_documents_filters() {
+    let mut cmd = cargo_bin_cmd!("spice");
+    cmd.args(["cloud", "logs", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--level"))
+        .stdout(predicate::str::contains("--since"))
+        .stdout(predicate::str::contains("--deployment"));
+}
+
+#[test]
+fn test_cloud_invalid_org_fails_before_contacting_the_api() {
+    // An unusable org name must be rejected locally, without a token and
+    // without a request that could leak it into a URL or header.
+    // Human-readable diagnostics go to the tracing subscriber, which writes to
+    // stdout; `--machine` mode is what emits structured errors on stderr.
+    let mut cmd = cargo_bin_cmd!("spice");
+    cmd.env_remove("SPICE_SPICEAI_TOKEN")
+        .env_remove("SPICE_CLOUD_ORG")
+        .args(["cloud", "apps", "--org", "not a valid org"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("Invalid organization name"));
+}
+
+#[test]
+fn test_cloud_machine_errors_carry_a_stable_code() {
+    // Agents branch on `error.code`; unauthenticated must be distinguishable
+    // from every other failure without parsing prose.
+    let temp_dir = tempfile::TempDir::new().expect("should create temp dir");
+    let mut cmd = cargo_bin_cmd!("spice");
+    let assert = cmd
+        .current_dir(temp_dir.path())
+        .env_remove("SPICE_SPICEAI_TOKEN")
+        .env_remove("SPICE_CLOUD_ORG")
+        .env("HOME", temp_dir.path())
+        .args(["--machine", "cloud", "apps"])
+        .assert()
+        .failure();
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    let body: serde_json::Value = serde_json::from_str(stderr.trim())
+        .unwrap_or_else(|e| panic!("machine-mode errors must be JSON: {e}; got: {stderr}"));
+    assert_eq!(
+        body["error"]["code"].as_str(),
+        Some("not_authenticated"),
+        "unexpected machine error: {body}"
+    );
+    assert!(
+        body["error"]["hint"]
+            .as_str()
+            .is_some_and(|hint| hint.contains("spice cloud login")),
+        "the error should carry an actionable hint: {body}"
+    );
+}
+
+#[test]
+fn test_cloud_named_org_without_a_credential_fails_closed() {
+    // Regression: the CLI used to fall back to the default credential, running
+    // the command against that credential's org while reporting the requested
+    // one. A named org must require a credential bound to it.
+    let temp_dir = tempfile::TempDir::new().expect("should create temp dir");
+    let mut cmd = cargo_bin_cmd!("spice");
+    let assert = cmd
+        .current_dir(temp_dir.path())
+        .env("HOME", temp_dir.path())
+        .env("SPICE_SPICEAI_TOKEN", "personal-org-token")
+        .env_remove("SPICE_CLOUD_ORG")
+        .args(["--machine", "cloud", "apps", "--org", "spicehq"])
+        .assert()
+        .failure();
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    let body: serde_json::Value =
+        serde_json::from_str(stderr.trim()).expect("machine errors must be JSON");
+    assert_eq!(
+        body["error"]["code"].as_str(),
+        Some("org_credential_missing"),
+        "unexpected error: {body}"
+    );
+}
+
+#[test]
+fn test_cloud_auth_failures_use_a_dedicated_exit_code() {
+    // Automation branches on the exit code to re-authenticate without parsing
+    // prose, matching the convention `gh` uses.
+    let temp_dir = tempfile::TempDir::new().expect("should create temp dir");
+    let mut cmd = cargo_bin_cmd!("spice");
+    cmd.current_dir(temp_dir.path())
+        .env("HOME", temp_dir.path())
+        .env_remove("SPICE_SPICEAI_TOKEN")
+        .env_remove("SPICE_CLOUD_ORG")
+        .args(["cloud", "apps"])
+        .assert()
+        .code(4);
+}
+
+#[test]
+fn test_cloud_conflicting_explicit_orgs_are_refused() {
+    // Regression: an explicit --org used to lose silently to the app argument
+    // with only a warning, which `--machine` output never shows.
+    let temp_dir = tempfile::TempDir::new().expect("should create temp dir");
+    let mut cmd = cargo_bin_cmd!("spice");
+    let assert = cmd
+        .current_dir(temp_dir.path())
+        .env("HOME", temp_dir.path())
+        .env("SPICE_SPICEAI_TOKEN", "token")
+        .env_remove("SPICE_CLOUD_ORG")
+        .args([
+            "--machine",
+            "cloud",
+            "deploy",
+            "--app",
+            "spicehq/team-app",
+            "--org",
+            "lukekim",
+        ])
+        .assert()
+        .failure();
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    let body: serde_json::Value =
+        serde_json::from_str(stderr.trim()).expect("machine errors must be JSON");
+    assert_eq!(body["error"]["code"].as_str(), Some("org_conflict"));
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("spicehq") && message.contains("lukekim"),
+        "the error must name both organizations: {message}"
+    );
+}
+
+#[test]
+fn test_cloud_app_required_error_names_both_ways_to_supply_one() {
+    let temp_dir = tempfile::TempDir::new().expect("should create temp dir");
+    let mut cmd = cargo_bin_cmd!("spice");
+    cmd.current_dir(temp_dir.path())
+        .env("SPICE_SPICEAI_TOKEN", "placeholder-token")
+        .env_remove("SPICE_CLOUD_ORG")
+        .env("HOME", temp_dir.path())
+        .args(["cloud", "deployments"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("--app"))
+        .stdout(predicate::str::contains("spice cloud link"));
 }
 
 #[test]

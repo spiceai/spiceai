@@ -219,6 +219,12 @@ impl RuntimeContext {
         self.cloud_region.is_some()
     }
 
+    /// Get the TLS root certificate file if one was specified.
+    #[must_use]
+    pub fn tls_root_certificate_file(&self) -> Option<&str> {
+        self.tls_root_certificate_file.as_deref()
+    }
+
     /// Get the cloud region if one was specified.
     #[must_use]
     pub fn cloud_region(&self) -> Option<&str> {
