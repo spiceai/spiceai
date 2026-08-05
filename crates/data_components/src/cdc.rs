@@ -31,7 +31,7 @@ use arrow::error::ArrowError;
 use arrow::{
     array::{Array, ArrayRef, BooleanArray, ListArray, RecordBatch, StringArray, StructArray},
     compute::kernels::nullif::nullif,
-    datatypes::{DataType, Field, Schema, SchemaRef},
+    datatypes::{DataType, Field, Fields, Schema, SchemaRef},
 };
 use arrow_buffer::OffsetBuffer;
 use async_trait::async_trait;
@@ -805,15 +805,38 @@ pub fn changes_schema(table_schema: &Schema) -> Schema {
 /// retract a row's prior contribution directly from the change event. Without
 /// it, the maintainer has to retain every live row's values just to reconstruct
 /// them on update, which makes its state O(live rows) instead of O(groups).
+///
+/// The `before` struct's fields are all nullable even where the table declares
+/// them non-null, because a before-image is partial by nature: `PostgreSQL`
+/// under `REPLICA IDENTITY DEFAULT` sends only the identity columns and leaves
+/// the rest null. Reusing the table's own nullability would make that batch
+/// unconstructible — `StructArray::try_new` rejects a null under a non-nullable
+/// field — so a source could not express what its replication stream actually
+/// carries. `data` keeps the table's nullability: it is a complete row.
 #[must_use]
 pub fn changes_schema_with_before(table_schema: &Schema) -> Schema {
     let mut fields = changes_schema(table_schema).fields().to_vec();
     fields.push(Arc::new(Field::new(
         "before",
-        DataType::Struct(table_schema.fields().clone()),
+        DataType::Struct(nullable_fields(table_schema.fields()).into()),
         true,
     )));
     Schema::new(fields)
+}
+
+/// The before-image's fields, every one marked nullable.
+///
+/// A before-image is partial by nature: an `INSERT` has none at all, and a
+/// source may send only the identity columns — `PostgreSQL` under
+/// `REPLICA IDENTITY DEFAULT` sends exactly those, leaving the rest null even
+/// where the table declares them non-null. Both accessors derive their schema
+/// here so neither hands back a batch whose schema claims a non-nullability its
+/// values do not honour.
+fn nullable_fields(fields: &Fields) -> Vec<Arc<Field>> {
+    fields
+        .iter()
+        .map(|field| Arc::new(field.as_ref().clone().with_nullable(true)))
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -1038,7 +1061,9 @@ impl ChangeBatch {
     /// may omit it per-row). A `Some` batch may still hold nulls in individual
     /// columns where the source sent only key columns — `PostgreSQL` under
     /// `REPLICA IDENTITY DEFAULT` does exactly that — so a caller needing
-    /// complete prior values must check the columns it reads.
+    /// complete prior values must check the columns it reads;
+    /// [`changes_schema_with_before`] declares every before-image field nullable
+    /// so such a batch is representable at all.
     #[must_use]
     pub fn before(&self, row: usize) -> Option<RecordBatch> {
         let before_idx = self.before_idx?;
@@ -1049,7 +1074,17 @@ impl ChangeBatch {
         let Some(before_array) = before_col.as_any().downcast_ref::<StructArray>() else {
             unreachable!("The schema is validated to have a 'before' field which is a StructArray");
         };
-        Some(before_array.slice(row, 1).into())
+        let DataType::Struct(fields) = before_array.data_type() else {
+            unreachable!("The schema is validated to have a 'before' field which is a StructArray");
+        };
+        let row_slice = before_array.slice(row, 1);
+        let Ok(record_batch) = RecordBatch::try_new(
+            Arc::new(Schema::new(fields.clone())),
+            row_slice.columns().to_vec(),
+        ) else {
+            unreachable!("A one-row slice's columns all have exactly one row");
+        };
+        Some(record_batch)
     }
 
     /// The whole before-image column as a `RecordBatch` aligned row-for-row with
@@ -1099,12 +1134,7 @@ impl ChangeBatch {
             before_array.columns().to_vec()
         };
 
-        let nullable_fields = fields
-            .iter()
-            .map(|field| Arc::new(field.as_ref().clone().with_nullable(true)))
-            .collect::<Vec<_>>();
-        let Ok(record_batch) =
-            RecordBatch::try_new(Arc::new(Schema::new(nullable_fields)), columns)
+        let Ok(record_batch) = RecordBatch::try_new(Arc::new(Schema::new(fields.clone())), columns)
         else {
             unreachable!("The 'before' struct's columns are validated to share one row count");
         };
@@ -1221,7 +1251,7 @@ pub fn replace_change_batch_data(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::datatypes::{DataType, Field, Fields, Schema};
     use arrow_array::{Int32Array, StringArray};
     use std::sync::Arc;
 
@@ -1390,9 +1420,10 @@ mod tests {
 
         // Row 0 is an insert: its struct slot is null, yet its child arrays are
         // fully populated — legal Arrow, and exactly what a source that reuses a
-        // scratch buffer produces.
+        // scratch buffer produces. The before-image's fields come from the
+        // wrapper, which declares them nullable however the table declares them.
         let before = StructArray::try_new(
-            table.fields().clone(),
+            Fields::from(nullable_fields(table.fields())),
             vec![
                 Arc::new(Int32Array::from(vec![999, 2])) as arrow_array::ArrayRef,
                 Arc::new(Int32Array::from(vec![777, 20])) as arrow_array::ArrayRef,
@@ -1451,6 +1482,94 @@ mod tests {
         assert!(
             batch.before(0).is_none(),
             "the insert has no before-image at all"
+        );
+
+        // And the per-row accessor reports the same nullability as the
+        // flattened one, so a partial before-image is representable either way.
+        let row = batch
+            .before(1)
+            .expect("the update carries its before-image");
+        assert!(
+            row.schema().field(0).is_nullable(),
+            "before() must report 'id' nullable even though the table declares it non-null"
+        );
+        assert_eq!(
+            row.schema().fields().len(),
+            before_batch.schema().fields().len(),
+            "both accessors expose the same columns"
+        );
+    }
+
+    /// `PostgreSQL` under `REPLICA IDENTITY DEFAULT` sends only the identity
+    /// columns, so a before-image legitimately holds nulls in columns the table
+    /// declares non-null. Building the single-row batch against the table's own
+    /// nullability would misrepresent that.
+    #[test]
+    fn before_row_admits_nulls_in_a_table_non_null_column() {
+        use arrow_array::StructArray;
+        use arrow_array::builder::{ListBuilder, StringBuilder};
+
+        let table = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("amount", DataType::Int32, false),
+        ]);
+        let wrapper = changes_schema_with_before(&table);
+
+        let data = StructArray::try_new(
+            table.fields().clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![2])) as arrow_array::ArrayRef,
+                Arc::new(Int32Array::from(vec![25])) as arrow_array::ArrayRef,
+            ],
+            None,
+        )
+        .expect("data struct should be valid");
+
+        // Identity column present, non-identity column absent — the shape
+        // REPLICA IDENTITY DEFAULT produces.
+        let before = StructArray::try_new(
+            Fields::from(vec![
+                Field::new("id", DataType::Int32, true),
+                Field::new("amount", DataType::Int32, true),
+            ]),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(2)])) as arrow_array::ArrayRef,
+                Arc::new(Int32Array::from(vec![Option::<i32>::None])) as arrow_array::ArrayRef,
+            ],
+            None,
+        )
+        .expect("partial before-image struct should be valid");
+
+        let mut pk_builder = ListBuilder::new(StringBuilder::new())
+            .with_field(Arc::new(Field::new("item", DataType::Utf8, false)));
+        pk_builder.values().append_value("id");
+        pk_builder.append(true);
+
+        let record = RecordBatch::try_new(
+            Arc::new(wrapper),
+            vec![
+                Arc::new(StringArray::from(vec!["u"])),
+                Arc::new(pk_builder.finish()) as arrow_array::ArrayRef,
+                Arc::new(data),
+                Arc::new(before),
+            ],
+        )
+        .expect("partial before-image batch must match the wrapper schema");
+        let batch = ChangeBatch::try_new(record).expect("batch should validate");
+
+        let row = batch.before(0).expect("the update carries a before-image");
+        let amount = row
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("amount column is Int32");
+        assert!(
+            amount.is_null(0),
+            "the column the source omitted stays null rather than being misreported"
+        );
+        assert!(
+            row.schema().field(1).is_nullable(),
+            "the returned schema must admit that null"
         );
     }
 
