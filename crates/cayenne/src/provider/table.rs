@@ -8233,7 +8233,9 @@ impl CayenneTableProvider {
                     "Cold PK bloom was resolved against a superseded snapshot (a promotion raced the keyset rebuild); folding the cold tier exactly instead"
                 );
             }
-            let cold_files = if fold_cold || cold_bloom_is_stale {
+            let cold_files = if self.table_metadata.vortex_config.cold_tier_enabled()
+                && (fold_cold || cold_bloom_is_stale)
+            {
                 Some(
                     self.cold_manifest_under_held_fence(&current_snapshot_id)
                         .await?,
@@ -21018,6 +21020,19 @@ impl CayenneTableProvider {
         &self,
         snapshot_id: &str,
     ) -> datafusion_common::Result<Arc<Vec<crate::metadata::ColdTierFile>>> {
+        // A table without the tier has no manifest rows to pair with anything, and
+        // this runs on the CDC write path's keyset rebuild for EVERY table — so
+        // answering empty here, rather than at each call site, keeps a warm-only
+        // table's rebuild free of a `cayenne_cold_tier_file` round trip even if a
+        // future caller forgets to ask.
+        // A table without the tier has no manifest rows to pair with anything, and
+        // this runs on the CDC write path's keyset rebuild for EVERY table — so
+        // answering empty here, rather than at each call site, keeps a warm-only
+        // table's rebuild free of a `cayenne_cold_tier_file` round trip even if a
+        // future caller forgets to ask.
+        if !self.table_metadata.vortex_config.cold_tier_enabled() {
+            return Ok(Arc::new(Vec::new()));
+        }
         let cached = self.cold_manifest.load_full();
         if let Some(cached) = cached.as_ref()
             && cached.snapshot_id == snapshot_id
@@ -30122,6 +30137,58 @@ mod tests {
     /// data — the silent over-count behind the #11823 correctness-gate failure.
     /// The pass must detect the snapshot flip, discard its output, and return
     /// `false`.
+    /// A table with no cold tier must not pay a `cayenne_cold_tier_file` round trip
+    /// for its keyset rebuild. The rebuild's `fold_cold` is true for every table that
+    /// is not bloom-served — which includes every warm-only table — so the fenced
+    /// cold-manifest resolve has to opt OUT on the tier being disabled rather than in.
+    ///
+    /// `cold_manifest` is the observable: the resolve publishes into it on every read,
+    /// so a populated cache after an upsert (which rebuilds the keyset) is exactly the
+    /// SELECT this asserts did not happen.
+    #[tokio::test]
+    async fn warm_only_table_never_reads_the_cold_manifest() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "warm_only_no_cold_read",
+            ctx.runtime_env(),
+            VortexConfig::default(),
+        )
+        .await;
+        assert!(
+            !provider
+                .table_metadata
+                .vortex_config
+                .cold_tier_enabled(),
+            "fixture must have no cold tier, or this asserts nothing"
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+
+        // Two upserts of the same key: the first builds the keyset, the second
+        // exercises it, so the rebuild path has definitely run.
+        for value in [10, 20] {
+            insert_batch(
+                &provider,
+                id_value_batch(Arc::clone(&schema), &[1], &[value]),
+            )
+            .await;
+        }
+        assert_eq!(
+            query_count_star(&ctx, &provider, "warm_only_no_cold_read").await,
+            1,
+            "the upsert collapsed both writes onto one key (the keyset rebuild ran)"
+        );
+        assert!(
+            provider.cold_manifest.load().is_none(),
+            "a warm-only table's keyset rebuild must not resolve (and therefore must \
+             not read) the cold-tier manifest"
+        );
+    }
+
     #[tokio::test]
     async fn subset_compaction_discards_output_when_snapshot_replaced_mid_pass() {
         use arrow::datatypes::{DataType, Field, Schema};
