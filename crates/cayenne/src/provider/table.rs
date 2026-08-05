@@ -2721,7 +2721,6 @@ impl ProtectedMergeSelection {
     }
 }
 
-
 /// Write shape — encoder fan-out cap and size estimate — for the
 /// subset-merge output (see `compact_protected_snapshots_subset`).
 ///
@@ -29696,8 +29695,9 @@ mod tests {
             }
         );
         // Exactly two fitting is enough to make progress.
-        let pair = select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth, Some(8 * gib))
-            .into_inputs();
+        let pair =
+            select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth, Some(8 * gib))
+                .into_inputs();
         let ids: Vec<&str> = pair.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(ids, vec!["s0", "s1"]);
     }
@@ -29887,12 +29887,9 @@ mod tests {
                 .build()
                 .expect("finite-pool runtime env"),
         );
-        let (finite, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
-            "subset_budget_finite",
-            finite_rt,
-            config(),
-        )
-        .await;
+        let (finite, _catalog, _tmp) =
+            create_cdc_upsert_table_with_vortex_config("subset_budget_finite", finite_rt, config())
+                .await;
         // Six one-row upserts publish six small, same-tier protected snapshots.
         for i in 0..ROWS {
             insert_batch(
