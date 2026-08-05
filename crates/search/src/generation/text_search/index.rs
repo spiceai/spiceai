@@ -617,9 +617,20 @@ impl FullTextDatabaseIndex {
         }
 
         let mut index_writer = self.writer.lock().await;
+        // Read the deferral flag under the writer lock, exactly as `update_index` does. A sink
+        // write window shares this one writer, so committing here would publish whatever that
+        // window has staged: a partially rewritten table, or the whole-index clear that
+        // `on_write_start` stages for a `WriteWindow::ReplaceAll`. Stage the deletes and let the
+        // window's own `on_write_complete` commit publish them together.
+        let defer_commit = self.defer_commit.load(Ordering::Acquire);
         for t in terms_to_delete {
             index_writer.delete_term(t);
         }
+        if defer_commit {
+            // The reader is reloaded once in `on_write_complete`, after the commit.
+            return Ok(());
+        }
+
         let commit_result = index_writer
             .commit()
             .context(FailedToInsertDataIntoIndexSnafu);
@@ -1640,6 +1651,39 @@ mod tests {
         assert!(
             results.contains("dog elephant frog"),
             "a failed refresh must not empty the index, got:\n{results}"
+        );
+    }
+
+    /// `delete_by_keys` shares the one tantivy writer with an open sink window, so it must not
+    /// commit while a window is staged: committing would publish that window's staged
+    /// `ReplaceAll` clear and empty the index. This matters because a window can be abandoned
+    /// without `on_write_failed` running (an upstream stream error returns early from
+    /// `MultiSink::insert_into`), leaving the clear staged until the next `on_write_start`
+    /// rolls it back.
+    #[tokio::test]
+    async fn delete_by_keys_does_not_publish_a_staged_replace_all_clear() {
+        let index = replace_all_tier();
+        write_window(&index, WriteWindow::ReplaceAll, three_rows()).await;
+
+        // Open a replacing window, staging the clear, and never close it.
+        index
+            .on_write_start(WriteWindow::ReplaceAll)
+            .await
+            .expect("on_write_start failed");
+
+        // A delete arrives while that window is open.
+        index
+            .delete_by_keys(record_batch!(("id", Int32, [3])).expect("Failed to create keys"))
+            .await
+            .expect("delete_by_keys failed");
+
+        let search_index = index
+            .full_text_search_field_index("content")
+            .expect("Failed to create FullTextSearchFieldIndex");
+        let results = search_and_format(&search_index, "elephant").await;
+        assert!(
+            results.contains("dog elephant frog"),
+            "a delete must not publish the window's staged clear, got:\n{results}"
         );
     }
 
