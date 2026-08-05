@@ -1,0 +1,172 @@
+version: v1
+kind: Spicepod
+name: mysql-cayenne[file]-adaptive-prefetch512
+
+# Adaptive-tuning variant of the non-tuned postgres-cayenne[file] baseline. Instead of either
+# the static `auto` derivation (the baseline) or a hand-pinned -cdc-tuned-* config, every Cayenne
+# table runs `cayenne_tuning: adaptive`: the runtime still warm-starts each knob from the detected
+# host + inferred schema, then runs the closed-feedback loop that adapts those knobs over time
+# within the environment-derived [floor, ceiling] as the workload shifts.
+#
+# Schema inference (always on) does double duty here, so nothing else is hand-set:
+#   - It auto-detects the primary key (and rough table sizing) from the MySQL source and seeds
+#     an `upsert` on_conflict on the inferred PK — exactly what `refresh_mode: changes` needs to
+#     apply UPDATE/DELETE events. So PK / on_conflict are intentionally NOT declared below;
+#     inference fills them (it is gap-filling only and never overrides a user-set value, so
+#     declaring them would just suppress the very thing we test).
+#   - It supplies inferred row_count/table_bytes that sharpen the adaptive loop's data-aware
+#     warm-start. Adaptive is set explicitly, so it runs regardless; without inferred metadata
+#     the loop just relearns the row width from observed ingest.
+# Background compaction stays at the auto-derived (non-zero) default — the controller rides its
+# tick. No per-ACTUATOR knob value is set anywhere: an explicit knob would *pin* it under adaptive
+# (collapsing its tuning bounds to a point), so the un-pinned baseline gives the loop full freedom.
+# The `cayenne_goal_*` SLOs (set globally under `runtime.params`) are NOT actuator knobs — they
+# are the high-level targets the closed loop converges toward (it still moves the un-pinned
+# actuators freely to hit them).
+#
+# sql_results / task_history stay off to match the baseline and the -cdc-tuned configs, so a
+# comparison isolates the effect of adaptive tuning, not caching/history overhead.
+
+# All `refresh_mode: changes` datasets coalesce onto ONE shared binlog dump
+# (server_id derived from the connection identity - the engine default). The
+# -split variant pins distinct per-dataset server_ids for separate dumps.
+mysql_connection_params: &mysql_params
+  mysql_host: ${env:CHBENCH_MYSQL_HOST}
+  mysql_tcp_port: 3306
+  mysql_db: chbench
+  mysql_user: bench
+  mysql_pass: bench
+  mysql_sslmode: disabled
+
+runtime:
+  flight:
+    ipc_compression: lz4_frame
+  caching:
+    sql_results:
+      enabled: false
+  task_history:
+    enabled: false
+  # Goal-driven adaptive SLOs, set GLOBALLY once here and inherited by every Cayenne
+  # dataset (override per-dataset via the same acceleration.params key). These are the
+  # high-level targets the closed loop converges toward — NOT actuator knobs.
+  # Replication-lag/freshness drive the CDC (changes) tables (inert on the full-refresh
+  # reference tables); query-latency (p99) applies to all. QPH is GLOBAL-ONLY: it is
+  # measured across all datasets (a query/join spans several, counted once), so it
+  # cannot be set per-dataset.
+  params:
+    cayenne_goal_replication_lag: '5s'
+    cayenne_goal_freshness: '30s'
+    cayenne_goal_query_latency: '10s'
+    cayenne_goal_qph: '5000'
+
+datasets:
+  # ---- TPC-C core tables (mutated by OLTP workload) ----
+  # No primary_key / on_conflict: schema inference (always on) detects the PK from the MySQL
+  # source and seeds the upsert on_conflict the CDC (changes) path requires.
+
+  - from: mysql:warehouse
+    name: warehouse
+    params:
+      <<: *mysql_params
+      mysql_replication_initial_snapshot: auto
+    acceleration: &cayenne_accel
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      params: &cayenne_params
+        cayenne_tuning: adaptive
+        # In-memory CDC intra-apply sharding: 4 PK-hash shards validate+append in
+        # parallel within one apply on the memory-tier (changes) tables. Inert on the
+        # full-refresh reference tables that share this anchor (not CDC memory mode).
+        cayenne_cdc_mem_tier_shards: '4'
+        # 512 — the shallowest depth in the sweep (-adaptive pins 16384,
+        # -prefetch4k 4096, -prefetch1k 1024). At n=2 both 4096 and 1024 turned out
+        # bimodal on mem-tier spilling (1024 spanned 1 and 16 spills), so depth is
+        # not a reliable fix for the spill loop; what did hold across all four
+        # shallow runs was QPH (981-1118 vs 856-941 at 16384). This extends the
+        # curve to test whether going shallower still helps QPH, and whether the
+        # spill variance narrows or widens.
+        cdc_prefetch_buffer: '512'
+        cdc_max_coalesced_envelopes: '16384'
+        cdc_max_coalesced_bytes: '536870912'
+        cdc_max_coalesce_age_ms: '2000'
+        # Goal-driven SLOs are set globally under `runtime.params` (above) and
+        # inherited by every dataset, so they are intentionally not repeated here.
+        # (A dataset that needed a sharper target would override the relevant
+        # cayenne_goal_* here; QPH is global-only and cannot be overridden.)
+
+  - from: mysql:district
+    name: district
+    params:
+      <<: *mysql_params
+      mysql_replication_initial_snapshot: auto
+    acceleration: *cayenne_accel
+
+  - from: mysql:customer
+    name: customer
+    params:
+      <<: *mysql_params
+      mysql_replication_initial_snapshot: auto
+    acceleration: *cayenne_accel
+
+  - from: mysql:new_order
+    name: new_order
+    params:
+      <<: *mysql_params
+      mysql_replication_initial_snapshot: auto
+    acceleration: *cayenne_accel
+
+  - from: mysql:oorder
+    name: oorder
+    params:
+      <<: *mysql_params
+      mysql_replication_initial_snapshot: auto
+    acceleration: *cayenne_accel
+
+  - from: mysql:order_line
+    name: order_line
+    params:
+      <<: *mysql_params
+      mysql_replication_initial_snapshot: auto
+    acceleration: *cayenne_accel
+
+  - from: mysql:stock
+    name: stock
+    params:
+      <<: *mysql_params
+      mysql_replication_initial_snapshot: auto
+    acceleration: *cayenne_accel
+
+  # ---- Static reference tables (no OLTP mutations, full refresh) ----
+  # Same: the PK comes from schema inference (always on); on_conflict is seeded only
+  # for CDC (changes) datasets — a full refresh replaces the table and needs no upsert.
+
+  - from: mysql:item
+    name: item
+    params:
+      <<: *mysql_params
+    acceleration: &cayenne_accel_full
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      params: *cayenne_params
+
+  - from: mysql:region
+    name: region
+    params:
+      <<: *mysql_params
+    acceleration: *cayenne_accel_full
+
+  - from: mysql:nation
+    name: nation
+    params:
+      <<: *mysql_params
+    acceleration: *cayenne_accel_full
+
+  - from: mysql:supplier
+    name: supplier
+    params:
+      <<: *mysql_params
+    acceleration: *cayenne_accel_full
