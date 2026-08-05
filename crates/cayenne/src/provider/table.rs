@@ -16868,6 +16868,9 @@ impl CayenneTableProvider {
             let snapshot_at_capture = self.get_current_snapshot_id();
             let protected = self.protected_snapshots.load_full();
             if protected.len() < 2 {
+                // Nothing to merge, so nothing is stalled on the budget (another pass
+                // may have folded the set away). End any episode.
+                self.protected_merge_budget_stall.lock().reset();
                 return Ok(false);
             }
 
@@ -16976,7 +16979,7 @@ impl CayenneTableProvider {
                     consecutive_skips,
                     stalled_for_secs = PROTECTED_MERGE_BUDGET_STALL_WARN_AFTER.as_secs(),
                     "Protected-snapshot compaction is stalled against its memory budget: the \
-                     two smallest runs of a {tier_runs}-run tier need {oldest_pair_bytes} bytes \
+                     two oldest runs of a {tier_runs}-run tier need {oldest_pair_bytes} bytes \
                      but one pass may read {budget}. Protected snapshots will keep accumulating \
                      and every scan pays their read amplification. Raise \
                      `runtime.params.cayenne_compaction_memory_fraction` (or \
@@ -16992,7 +16995,7 @@ impl CayenneTableProvider {
                     oldest_pair_bytes,
                     max_pass_bytes = budget,
                     "Skipping fast protected-snapshot compaction: the qualifying tier's two \
-                     smallest runs exceed the pass memory budget"
+                     oldest runs exceed the pass memory budget"
                 );
             }
             return Ok(false);
@@ -17000,6 +17003,10 @@ impl CayenneTableProvider {
 
         let inputs = selection.into_inputs();
         if inputs.len() < 2 {
+            // No tier qualifies, so nothing is stalled on the budget. End any episode:
+            // a stale one would let the next genuine stall warn immediately, before it
+            // has been sustained for `PROTECTED_MERGE_BUDGET_STALL_WARN_AFTER`.
+            self.protected_merge_budget_stall.lock().reset();
             tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
@@ -17527,6 +17534,8 @@ impl CayenneTableProvider {
             let protected = self.protected_snapshots.load_full();
             // Need at least K newest-to-keep + 2 to merge an older prefix.
             if protected.len() < BAKE_KEEP_RECENT_SNAPSHOTS + 2 {
+                // No settled prefix, so nothing is stalled on the budget.
+                self.protected_merge_budget_stall.lock().reset();
                 return Ok(false);
             }
             let mut ids: Vec<String> = protected.keys().cloned().collect();
@@ -17651,6 +17660,10 @@ impl CayenneTableProvider {
                      https://spiceai.org/docs/components/data-accelerators",
                 );
             } else {
+                if !budget_truncated {
+                    // Not a budget skip, so end any episode (see the size-tier path).
+                    self.protected_merge_budget_stall.lock().reset();
+                }
                 tracing::debug!(
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
@@ -28204,6 +28217,9 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
         let min_inputs = self.context.compaction_trigger_protected_snapshots().max(2);
         let protected_len = self.protected_snapshots.load().len();
         if protected_len < min_inputs {
+            // The pass is not entered, so end any budget-stall episode here — a set
+            // that another pass folded away is no longer stalled.
+            self.protected_merge_budget_stall.lock().reset();
             tracing::trace!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
@@ -29835,7 +29851,9 @@ mod tests {
     /// unbounded-pool control shows the bound is gated on a finite pool.
     ///
     /// The only size assumption is that the budget sits below the two smallest runs,
-    /// checked as a precondition against the real on-disk sizes.
+    /// checked as a precondition against the real on-disk sizes. Smallest, not oldest
+    /// (which is what selection takes and the WARN reports): the smallest pair is the
+    /// minimum possible pair sum, so exceeding the budget proves no pair can fit.
     #[tokio::test]
     async fn subset_compaction_declines_when_no_two_runs_fit_the_pass_memory_budget() {
         use arrow::datatypes::{DataType, Field, Schema};
