@@ -439,3 +439,10 @@ name = "cdc_delete_burst"
 
 [lints]
 workspace = true
+
+# Spice accelerators vs out-of-Spice standalone DuckDB/SQLite — exact SQL results.
+# Separate binary so we do not rebuild the full integration suite.
+[[test]]
+name = "result_correctness"
+path = "tests/result_correctness.rs"
+required-features = ["duckdb", "sqlite"]

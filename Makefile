@@ -102,27 +102,62 @@ endif
 # of the gate agreeing on which crates need system libraries, so a sign-off on
 # such a host fails only for reasons in the branch under test. The crate has no
 # unit tests of its own.
-# Every line below must keep the same package selection. Cargo resolves features per
-# PACKAGE selection, so a narrower `-p <crate>` line gives `runtime` 6 features where
-# the workspace gives it 35 — new fingerprints for `runtime` and hundreds of its
-# dependencies, so the whole graph recompiles (spiceai/spiceai#12381: 42 minutes to
-# run one 0.6s test). TARGET filters (`--lib`, `--test <name>`) do not affect the
-# resolve, so naming an extra test binary on the workspace line is free.
-# `metrics` is named because `--lib` skips `tests/*.rs`: it must own its process to
-# install the OTel meter provider before any `LazyLock` instrument is built.
-# TODO(#12504): the `-p cayenne` line below still re-resolves features that way — 131
-# packages get a different feature set than the workspace line gives them, including
-# tokio, bytes and arrow — so it pays a full rebuild. Folding it in means naming its
-# test targets and changing the features they compile against: its own gate run.
+#
+# One cargo invocation, not one per test group: under `resolver = "2"` the
+# resolved feature set of every crate is a function of which packages are
+# selected, so `--all`, `-p cayenne` and `-p runtime` each resolve a different
+# dependency graph and none of them can reuse another's artifacts
+# (spiceai/spiceai#12337). One selection resolves once, and a nextest filterset
+# decides which of the built tests actually run.
+#
+# `--tests` rather than `--lib` is what brings cayenne's integration tests and
+# the `metrics` binary into that one selection. It builds every test target
+# in the workspace, including ones the filterset never runs. Naming just the
+# wanted targets with `--test <glob>` would build fewer, but a new test file that
+# didn't match the glob would silently stop being covered — cayenne already has
+# a test target that doesn't follow the `*_test` convention its other 55 do.
+#
+# `metrics` is a `tests/` binary rather than a `--lib` test because it needs its
+# own process to control the OTel meter-provider install order. Every metrics
+# test lives in that one binary, so selecting it by name here covers all of them:
+# naming individual binaries is what left two of them built but never run.
+#
+# `kind(=proc-macro)` is the other half of what `--lib` used to select: nextest
+# labels a proc-macro crate's unit tests `proc-macro`, not `lib`, so leaving it
+# out would silently drop runtime-parameters-derive's tests from the gate.
+# `--tests` also builds the 14 bin targets as unit-test harnesses; `--lib` never
+# ran those, and nothing here selects `kind(=bin)`, so it still doesn't.
+#
+# Running cayenne's integration tests under the workspace resolve rather than
+# `-p cayenne` enables its `turso` feature, which brings 304 `*_turso` variants
+# into the gate for the first time. Four of them abort with a stack overflow —
+# they need more than the 2 MiB std gives a tokio worker thread. That is a
+# pre-existing defect in a configuration the gate never executed, not a
+# regression from merging the invocations, so it is tracked in #12436 and
+# excluded by name here; the other 300 run.
+NEXTEST_STACK_OVERFLOW_12436 := test(=prop_sequential_cold_impl_turso) + test(=prop_sequential_key_impl_turso) + test(=prop_sequential_position_impl_turso) + test(=test_cold_tier_promotion_racing_stage_b_finalize_impl_turso)
+NEXTEST_FILTER := (kind(=lib) + kind(=proc-macro) + (package(=cayenne) & kind(=test)) + binary(=metrics)) - ($(NEXTEST_STACK_OVERFLOW_12436))
+# Extra narrowing for callers that can't run everything (CI lacks credentials
+# for some tests). It has to *intersect* the expression above rather than sit
+# beside it: nextest unions repeated `-E` flags, so a second `-E 'not (…)'` would
+# match everything the first one excluded and widen the run instead.
+ifneq ($(strip $(NEXTEST_FILTER_EXTRA)),)
+_NEXTEST_FILTER := ($(NEXTEST_FILTER)) & ($(NEXTEST_FILTER_EXTRA))
+else
+_NEXTEST_FILTER := $(NEXTEST_FILTER)
+endif
+# A filterset smuggled in through NEXTEST_FLAG would silently widen the run for
+# the reason above, and a gate that runs more than it was asked to reads as green.
+ifneq (,$(findstring -E,$(NEXTEST_FLAG))$(findstring --filterset,$(NEXTEST_FLAG)))
+$(error NEXTEST_FLAG carries a nextest filterset — pass it as NEXTEST_FILTER_EXTRA instead, which intersects the gate's own filterset rather than being unioned with it)
+endif
 .PHONY: nextest
 nextest:
-	@cargo nextest run --all --exclude libnfs --lib --test metrics $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
-	@cargo nextest run -p cayenne --tests $(NEXTEST_CARGO_PROFILE)
+	@cargo nextest run --all --exclude libnfs --tests $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG) -E '$(_NEXTEST_FILTER)'
 
 # Unit tests for named packages — the fail-fast pre-check scripts/signoff runs on
-# the crates a branch touched, before the full workspace gate. Its `-p` selection
-# resolves features differently from `nextest`'s workspace selection, so expect it to
-# recompile rather than to warm that run up; the point is to fail on one crate early.
+# the crates a branch touched, before the full workspace gate. Same lib-only
+# scope and profile as `nextest`, so its test binaries carry into that run.
 # Callers must filter out packages without a library target: `--lib` is a fatal
 # `no library targets found` on bin-only crates.
 # --no-tests=pass because a scoped selection legitimately covers crates with no
