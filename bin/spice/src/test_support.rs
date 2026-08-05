@@ -23,8 +23,8 @@ limitations under the License.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -34,7 +34,9 @@ enum Behaviour {
     /// Send the response head, then each body chunk with `gap` of quiet before it.
     Dribble { chunks: Vec<String>, gap: Duration },
     /// Send the response head and then nothing at all, holding the connection open.
-    Stall,
+    StallAfterHead,
+    /// Send nothing at all, not even the response head, holding the connection open.
+    StallBeforeHead,
 }
 
 /// An HTTP/1.1 server that answers every connection the same slow way.
@@ -44,6 +46,9 @@ enum Behaviour {
 pub(crate) struct SlowServer {
     url: String,
     running: Arc<AtomicBool>,
+    /// The request targets seen so far, so a test can assert which endpoint was called. Every
+    /// path is *answered* identically, so without this a test would pass against any route.
+    targets: Arc<Mutex<Vec<String>>>,
 }
 
 impl SlowServer {
@@ -55,14 +60,30 @@ impl SlowServer {
         Self::start(Behaviour::Dribble { chunks, gap })
     }
 
-    /// Answer each request with a response head and then silence.
-    pub(crate) fn stalling() -> Self {
-        Self::start(Behaviour::Stall)
+    /// Answer each request with a response head and then silence, so a deadline is exercised
+    /// during the body.
+    pub(crate) fn stalling_after_head() -> Self {
+        Self::start(Behaviour::StallAfterHead)
+    }
+
+    /// Accept the connection and the request, then send nothing, so a deadline is exercised
+    /// while waiting for the response head — after the connect timeout has already been
+    /// satisfied and so can no longer end the wait.
+    pub(crate) fn stalling_before_head() -> Self {
+        Self::start(Behaviour::StallBeforeHead)
     }
 
     /// The server's base URL. Every path is answered identically.
     pub(crate) fn url(&self) -> &str {
         &self.url
+    }
+
+    /// The request targets received so far, in arrival order.
+    pub(crate) fn targets(&self) -> Vec<String> {
+        self.targets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     fn start(behaviour: Behaviour) -> Self {
@@ -78,6 +99,8 @@ impl SlowServer {
 
         let running = Arc::new(AtomicBool::new(true));
         let accepting = Arc::clone(&running);
+        let targets = Arc::new(Mutex::new(Vec::new()));
+        let recording = Arc::clone(&targets);
 
         thread::spawn(move || {
             while accepting.load(Ordering::Relaxed) {
@@ -85,7 +108,8 @@ impl SlowServer {
                     Ok((stream, _)) => {
                         let behaviour = behaviour.clone();
                         let serving = Arc::clone(&accepting);
-                        thread::spawn(move || serve(&stream, &behaviour, &serving));
+                        let recording = Arc::clone(&recording);
+                        thread::spawn(move || serve(&stream, &behaviour, &serving, &recording));
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
@@ -98,6 +122,7 @@ impl SlowServer {
         Self {
             url: format!("http://127.0.0.1:{port}"),
             running,
+            targets,
         }
     }
 }
@@ -113,12 +138,27 @@ impl Drop for SlowServer {
 /// The request is read to its end before anything is written: replying to a socket that
 /// still holds unread request bytes can surface to the client as a connection reset rather
 /// than as the response, which would make a deadline test fail for the wrong reason.
-fn serve(stream: &TcpStream, behaviour: &Behaviour, running: &AtomicBool) {
+fn serve(
+    stream: &TcpStream,
+    behaviour: &Behaviour,
+    running: &AtomicBool,
+    targets: &Mutex<Vec<String>>,
+) {
     stream
         .set_nonblocking(false)
         .expect("accepted connection should be blocking");
 
-    if read_request(stream).is_err() {
+    let Ok(target) = read_request(stream) else {
+        return;
+    };
+    targets
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(target);
+
+    if matches!(behaviour, Behaviour::StallBeforeHead) {
+        hold_open(running);
+        let _ = stream.shutdown(Shutdown::Both);
         return;
     }
 
@@ -149,27 +189,36 @@ fn serve(stream: &TcpStream, behaviour: &Behaviour, running: &AtomicBool) {
             let _ = writer.write_all(b"0\r\n\r\n");
             let _ = writer.flush();
         }
-        Behaviour::Stall => {
-            // Hold the connection open, sending nothing, until the server is dropped. The
-            // client's deadline is what has to end this.
-            while running.load(Ordering::Relaxed) {
-                thread::sleep(Duration::from_millis(10));
-            }
-        }
+        Behaviour::StallAfterHead => hold_open(running),
+        // Handled before the response head was written.
+        Behaviour::StallBeforeHead => {}
     }
 
     let _ = stream.shutdown(Shutdown::Both);
 }
 
-/// Read a request's head and, when it declares one, its body.
-fn read_request(stream: &TcpStream) -> std::io::Result<()> {
+/// Hold the connection open, sending nothing, until the server is dropped. The client's
+/// deadline is what has to end this.
+fn hold_open(running: &AtomicBool) {
+    while running.load(Ordering::Relaxed) {
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Read a request's head and, when it declares one, its body, and return its target.
+///
+/// Only `Content-Length` bodies are understood, which is all `reqwest` sends here. A body
+/// declared with any other framing would leave unread bytes on the socket, so an unparseable
+/// length is an error rather than a silent zero.
+fn read_request(stream: &TcpStream) -> std::io::Result<String> {
     let mut reader = BufReader::new(stream);
     let mut content_length = 0usize;
+    let mut target = String::new();
 
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line)? == 0 {
-            return Ok(());
+            break;
         }
 
         let line = line.trim_end();
@@ -177,10 +226,21 @@ fn read_request(stream: &TcpStream) -> std::io::Result<()> {
             break;
         }
 
+        if target.is_empty() {
+            // The request line: METHOD SP target SP HTTP/1.1
+            target = line.split(' ').nth(1).unwrap_or_default().to_string();
+            continue;
+        }
+
         if let Some((name, value)) = line.split_once(':')
             && name.eq_ignore_ascii_case("content-length")
         {
-            content_length = value.trim().parse().unwrap_or(0);
+            content_length = value.trim().parse().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("unparseable Content-Length: {value:?}"),
+                )
+            })?;
         }
     }
 
@@ -189,5 +249,5 @@ fn read_request(stream: &TcpStream) -> std::io::Result<()> {
         reader.read_exact(&mut body)?;
     }
 
-    Ok(())
+    Ok(target)
 }

@@ -271,5 +271,8 @@ mod tests {
             .expect("a translation that keeps arriving should be read to the end");
 
         assert_eq!(sql, "SELECT 1");
+        // The server answers every path alike, so without this the test would pass against any
+        // route and would pin only the client, not the endpoint.
+        assert_eq!(server.targets(), vec!["/v1/nsql".to_string()]);
     }
 }

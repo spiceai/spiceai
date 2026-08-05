@@ -54,7 +54,7 @@ const CONTROL_PLANE_DEADLINE: Deadline = Deadline::Total(Duration::from_secs(30)
 /// model on modest hardware all legitimately take minutes, and none of that is a failure.
 /// What is a failure is the endpoint going quiet, so the deadline measures silence. It is
 /// generous because the first byte can trail the request by a whole prompt evaluation.
-const INFERENCE_DEADLINE: Deadline = Deadline::Silence(Duration::from_secs(300));
+pub(crate) const INFERENCE_DEADLINE: Deadline = Deadline::Silence(Duration::from_mins(5));
 
 /// What an HTTP client's deadline measures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,13 +64,27 @@ pub(crate) enum Deadline {
     Total(Duration),
     /// The gap between reads, reset by each one — so it fires only when nothing arrives,
     /// whether that is before the response head or between two chunks of the body.
+    ///
+    /// Note that this counts *bytes*, so on a stream the server keeps alive it never fires;
+    /// a caller that needs the gap between meaningful events has to measure that itself.
     Silence(Duration),
+}
+
+impl Deadline {
+    /// How long this deadline allows, whatever it is measuring.
+    pub(crate) const fn duration(self) -> Duration {
+        match self {
+            Self::Total(duration) | Self::Silence(duration) => duration,
+        }
+    }
 }
 
 /// Build an HTTP client for the CLI.
 ///
-/// Every client the CLI uses is built here, so a setting that has to hold for all of them
-/// belongs on this builder rather than at a call site.
+/// Both of the context's clients are built here, so a setting that has to hold for both —
+/// today the user agent and the connect timeout — belongs on this builder rather than at a
+/// call site. (`commands::login` deliberately builds its own; it carries a credential in the
+/// request body and so refuses cross-origin redirects outright.)
 fn build_http_client(user_agent: String, deadline: Deadline) -> reqwest::Client {
     let builder = reqwest::Client::builder()
         .user_agent(user_agent)
@@ -136,6 +150,11 @@ pub struct RuntimeContext {
     /// silence deadline
     inference_http_client: reqwest::Client,
 
+    /// The deadline `inference_http_client` carries. Held so a caller that has to measure
+    /// progress itself — a streamed response, where the transport's own silence deadline is
+    /// reset by keep-alives — bounds it by the same value rather than a second constant.
+    inference_deadline: Deadline,
+
     /// TLS root certificate file path
     tls_root_certificate_file: Option<String>,
 }
@@ -171,6 +190,7 @@ impl RuntimeContext {
             extra_headers: HashMap::new(),
             http_client,
             inference_http_client,
+            inference_deadline: INFERENCE_DEADLINE,
             tls_root_certificate_file: None,
         })
     }
@@ -203,6 +223,7 @@ impl RuntimeContext {
                 "spice/test (test; test)".to_string(),
                 inference,
             ),
+            inference_deadline: inference,
             tls_root_certificate_file: None,
         }
     }
@@ -383,6 +404,15 @@ impl RuntimeContext {
     #[must_use]
     pub fn inference_http_client(&self) -> &reqwest::Client {
         &self.inference_http_client
+    }
+
+    /// The deadline [`RuntimeContext::inference_http_client`] carries.
+    ///
+    /// A streamed response needs this: the client's deadline is reset by every byte, and the
+    /// runtime keeps an SSE stream alive with a comment every 30 seconds, so the caller has to
+    /// measure the gap between meaningful events against this value itself.
+    pub(crate) const fn inference_deadline(&self) -> Deadline {
+        self.inference_deadline
     }
 
     /// Get the user agent string.
@@ -642,12 +672,16 @@ mod tests {
     use crate::test_support::SlowServer;
     use tempfile::TempDir;
 
-    /// A response that takes ten times the deadline under test to arrive, without ever being
-    /// quiet for longer than a fifth of it.
+    /// A response that takes about twice the deadline under test to arrive, while never being
+    /// quiet for longer than a tenth of it.
+    ///
+    /// The gap is a small fraction of the deadline on purpose: the server sleeps on the wall
+    /// clock, so a loaded CI runner that descheduled it for a moment must not be able to make
+    /// a healthy stream look stalled.
     fn slow_but_never_quiet(deadline: Duration) -> SlowServer {
         SlowServer::dribbling(
-            std::iter::repeat_n("data: token\n\n".to_string(), 10).collect(),
-            deadline / 5,
+            std::iter::repeat_n("data: token\n\n".to_string(), 20).collect(),
+            deadline / 10,
         )
     }
 
@@ -659,7 +693,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_total_deadline_cuts_off_a_response_that_is_still_arriving() {
-        let deadline = Duration::from_millis(500);
+        let deadline = Duration::from_secs(1);
         let server = slow_but_never_quiet(deadline);
         let client = build_http_client("spice/test".to_string(), Deadline::Total(deadline));
 
@@ -675,7 +709,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_silence_deadline_lets_a_slow_response_finish() {
-        let deadline = Duration::from_millis(500);
+        let deadline = Duration::from_secs(1);
         let server = slow_but_never_quiet(deadline);
         let client = build_http_client("spice/test".to_string(), Deadline::Silence(deadline));
 
@@ -685,28 +719,56 @@ mod tests {
 
         assert_eq!(
             body.matches("data: token").count(),
-            10,
+            20,
             "every chunk should have been read: {body:?}"
         );
     }
 
     #[tokio::test]
-    async fn a_silence_deadline_still_fires_when_the_response_goes_quiet() {
+    async fn a_silence_deadline_still_fires_when_the_body_goes_quiet() {
         let deadline = Duration::from_millis(300);
-        let server = SlowServer::stalling();
+        let server = SlowServer::stalling_after_head();
         let client = build_http_client("spice/test".to_string(), Deadline::Silence(deadline));
 
         let started = std::time::Instant::now();
         let error = read_body(&client, server.url())
             .await
-            .expect_err("a silence deadline should fire on a response that never arrives");
+            .expect_err("a silence deadline should fire on a body that never arrives");
 
         assert!(
             error.is_timeout(),
             "expected a timeout, got: {error} ({error:?})"
         );
         assert!(
-            started.elapsed() < deadline * 10,
+            started.elapsed() < deadline * 20,
+            "the deadline should have fired promptly, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The wait for the response head is the one the connect timeout can no longer end: the
+    /// connection is established, so an endpoint that accepts and then blocks while it sets a
+    /// model up is holding an already-connected request. `read_timeout` has to cover it, and
+    /// reqwest's own documentation only promises per-read behaviour — so assert it.
+    #[tokio::test]
+    async fn a_silence_deadline_fires_before_the_response_head_arrives() {
+        let deadline = Duration::from_millis(300);
+        let server = SlowServer::stalling_before_head();
+        let client = build_http_client("spice/test".to_string(), Deadline::Silence(deadline));
+
+        let started = std::time::Instant::now();
+        let error = client
+            .get(server.url())
+            .send()
+            .await
+            .expect_err("a silence deadline should fire while waiting for the response head");
+
+        assert!(
+            error.is_timeout(),
+            "expected a timeout, got: {error} ({error:?})"
+        );
+        assert!(
+            started.elapsed() < deadline * 20,
             "the deadline should have fired promptly, took {:?}",
             started.elapsed()
         );
@@ -746,6 +808,7 @@ mod tests {
             extra_headers: HashMap::new(),
             http_client: reqwest::Client::new(),
             inference_http_client: reqwest::Client::new(),
+            inference_deadline: INFERENCE_DEADLINE,
             tls_root_certificate_file: None,
         }
     }
@@ -772,6 +835,7 @@ mod tests {
             extra_headers: HashMap::new(),
             http_client: reqwest::Client::new(),
             inference_http_client: reqwest::Client::new(),
+            inference_deadline: INFERENCE_DEADLINE,
             tls_root_certificate_file: None,
         };
 

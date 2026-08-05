@@ -559,7 +559,30 @@ async fn send_chat_streaming(
     let mut first_token_time: Option<std::time::Duration> = None;
     let mut usage: Option<Usage> = None;
 
-    while let Some(chunk_result) = stream.next().await {
+    // The client's read deadline counts bytes, and the runtime keeps this stream alive with an
+    // SSE comment every 30 seconds, so it can never fire here however long the model has been
+    // stuck. What has to be bounded is the gap between *events*: a keep-alive says the
+    // connection is up, not that anything is being produced.
+    let progress_deadline = ctx.inference_deadline().duration();
+    let mut last_event = Instant::now();
+    let mut saw_terminator = false;
+
+    while !saw_terminator {
+        let remaining = progress_deadline.saturating_sub(last_event.elapsed());
+        let Ok(next) = tokio::time::timeout(remaining, stream.next()).await else {
+            if let Some(s) = spinner {
+                s.stop().await;
+            }
+            return Err(InvalidResponseSnafu {
+                message: format!(
+                    "The model at {url} sent nothing for {}s. The connection is still open, so the request is being held rather than refused -- check the runtime's logs for the model, then retry. See: https://spiceai.org/docs/components/models",
+                    progress_deadline.as_secs()
+                ),
+            }
+            .build());
+        };
+        let Some(chunk_result) = next else { break };
+
         let chunk = chunk_result.map_err(|e| {
             InvalidResponseSnafu {
                 message: format!("Failed to read stream: {e}"),
@@ -572,8 +595,14 @@ async fn send_chat_streaming(
         // Parse SSE events
         for line in text.lines() {
             if let Some(data) = line.strip_prefix("data: ") {
+                // An event, rather than the keep-alive comment that carries no news.
+                last_event = Instant::now();
+
                 if data == "[DONE]" {
-                    continue;
+                    // The protocol's terminator. Reading on would wait for an EOF the server
+                    // is under no obligation to send promptly.
+                    saw_terminator = true;
+                    break;
                 }
 
                 // Parse the JSON chunk
@@ -683,6 +712,77 @@ mod tests {
             response.total_duration > control_plane,
             "the answer should have outlasted the control-plane deadline, took {:?}",
             response.total_duration
+        );
+        // The server answers every path alike, so without this the test would pass against any
+        // route and would pin only the client, not the endpoint.
+        assert!(
+            server
+                .targets()
+                .iter()
+                .any(|target| target == "/v1/chat/completions"),
+            "expected a request to /v1/chat/completions, saw {:?}",
+            server.targets()
+        );
+    }
+
+    /// The runtime keeps an SSE stream alive with a comment every 30 seconds
+    /// (`KEEP_ALIVE_INTERVAL` in `crates/runtime/src/http/v1/chat.rs`), and each one resets the
+    /// client's read deadline. So a model that stops producing but never closes would hold the
+    /// CLI open forever if the only bound counted bytes; the bound has to count events.
+    #[tokio::test]
+    async fn a_stream_that_only_sends_keep_alives_is_not_waited_on_forever() {
+        // Long enough that a descheduled runner cannot mistake it for a stall, short enough
+        // that many of them arrive inside the progress deadline below.
+        let keep_alive_gap = Duration::from_millis(50);
+        let server = SlowServer::dribbling(
+            std::iter::repeat_n(": keep-alive\n\n".to_string(), 200).collect(),
+            keep_alive_gap,
+        );
+
+        let ctx = RuntimeContext::with_deadlines_for_test(
+            server.url(),
+            Deadline::Total(Duration::from_secs(30)),
+            // The progress bound as well as the client's. A keep-alive resets the client's, so
+            // if that were the only bound this would run until the server ran out of them.
+            Deadline::Silence(Duration::from_millis(300)),
+        );
+
+        let config = ChatConfig {
+            model: "test-model",
+            temperature: None,
+            endpoint: None,
+            custom_headers: &[],
+        };
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: "hello".to_string(),
+        }];
+
+        let progress_deadline = Duration::from_millis(600);
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(
+            progress_deadline,
+            send_chat_streaming(&ctx, &config, &messages, false, false),
+        )
+        .await;
+
+        // The CLI must end this itself. Reaching the outer timeout means it did not.
+        let Ok(result) = outcome else {
+            panic!(
+                "the CLI waited out {progress_deadline:?} of keep-alives without giving up; the progress bound is counting bytes, not events"
+            );
+        };
+        let Err(error) = result else {
+            panic!("a stream carrying no events should not report an answer");
+        };
+        assert!(
+            error.to_string().contains("sent nothing"),
+            "expected the no-progress error, got: {error}"
+        );
+        assert!(
+            started.elapsed() < progress_deadline,
+            "took {:?}",
+            started.elapsed()
         );
     }
 
