@@ -1222,6 +1222,14 @@ async fn prop_harness_stack_headroom_impl(_f: TestFixture) -> TestResult<()> {
     /// out of the optimizer's reach by `black_box`.
     #[inline(never)]
     fn descend(frames: u32) {
+        // Consuming stack is the whole assertion, so the lint's advice to move
+        // this to the heap would leave the test measuring nothing. The size is
+        // deliberate, and it is bounded: 64 KiB × 64 frames against the 16 MiB
+        // `common::TEST_STACK_SIZE` the harness reserves.
+        #[expect(
+            clippy::large_stack_arrays,
+            reason = "the frame must live on the stack for this to test stack headroom"
+        )]
         let mut frame = [0u8; 64 * 1024];
         std::hint::black_box(&mut frame);
         if frames > 0 {
