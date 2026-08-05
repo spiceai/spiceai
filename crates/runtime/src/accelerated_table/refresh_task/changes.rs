@@ -22,14 +22,17 @@ use crate::accelerated_table::refresh_task::deletion::{
 };
 use crate::component::dataset::OnSchemaChange;
 use crate::datafusion::error::{find_datafusion_root, format_datafusion_error};
-use crate::schema_evolution::{emit_schema_evolution_event, evolution_allowed};
+use crate::schema_evolution::{
+    SCHEMA_EVOLUTION_APPLIED, SCHEMA_EVOLUTION_DETECTED, SCHEMA_EVOLUTION_FAILED,
+    emit_schema_evolution_event, evolution_allowed, schema_evolution_labels, widening_plan_kind,
+};
 use crate::{dataupdate::StreamingDataUpdateExecutionPlan, status};
 use arrow::array::{
     Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow_tools::record_batch::try_cast_to;
-use arrow_tools::schema_evolution::{self, EvolutionContext, SchemaEvolution, WideningPlan};
+use arrow_tools::schema_evolution::{self, EvolutionContext, SchemaEvolution};
 use cache::Caching;
 #[cfg(not(windows))]
 use cayenne::{CayenneCdcWrite, CayenneTableProvider};
@@ -53,7 +56,6 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::TableReference;
 use datafusion::{execution::context::SessionContext, physical_plan::collect};
 use futures::{StreamExt, stream};
-use opentelemetry::KeyValue;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_datafusion_index::{IndexedTableProvider, LayerWalk, find_concrete_table_provider_in};
 use runtime_metrics::acceleration as metrics;
@@ -615,64 +617,6 @@ fn schema_evolution_first_warn(key: String) -> bool {
     SCHEMA_EVOLUTION_WARNING_KEYS
         .lock()
         .insert_new(key, SCHEMA_EVOLUTION_WARNING_KEY_LIMIT)
-}
-
-static SCHEMA_EVOLUTION_METER: std::sync::LazyLock<opentelemetry::metrics::Meter> =
-    std::sync::LazyLock::new(|| opentelemetry::global::meter("schema_evolution"));
-
-pub(crate) static SCHEMA_EVOLUTION_DETECTED: std::sync::LazyLock<
-    opentelemetry::metrics::Counter<u64>,
-> = std::sync::LazyLock::new(|| {
-    SCHEMA_EVOLUTION_METER
-        .u64_counter("schema_evolution_detected")
-        .with_description(
-            "Schema changes detected between an incoming source schema and the stored/accelerator schema.",
-        )
-        .build()
-});
-
-pub(crate) static SCHEMA_EVOLUTION_APPLIED: std::sync::LazyLock<
-    opentelemetry::metrics::Counter<u64>,
-> = std::sync::LazyLock::new(|| {
-    SCHEMA_EVOLUTION_METER
-        .u64_counter("schema_evolution_applied")
-        .with_description("Schema evolutions applied to the accelerator or cached source schema.")
-        .build()
-});
-
-pub(crate) static SCHEMA_EVOLUTION_FAILED: std::sync::LazyLock<
-    opentelemetry::metrics::Counter<u64>,
-> = std::sync::LazyLock::new(|| {
-    SCHEMA_EVOLUTION_METER
-        .u64_counter("schema_evolution_failed")
-        .with_description(
-            "Schema changes that were not applied: incompatible, blocked by policy, or requiring a restart.",
-        )
-        .build()
-});
-
-pub(crate) fn schema_evolution_labels(
-    dataset: &str,
-    kind: &'static str,
-    action: &'static str,
-) -> [KeyValue; 3] {
-    [
-        KeyValue::new("dataset", dataset.to_string()),
-        KeyValue::new("kind", kind),
-        KeyValue::new("action", action),
-    ]
-}
-
-/// Dominant change kind of a widening plan for the `kind` metric label.
-#[must_use]
-pub(crate) fn widening_plan_kind(plan: &WideningPlan) -> &'static str {
-    if !plan.widened_columns.is_empty() {
-        "widened_types"
-    } else if !plan.relaxed_nullability.is_empty() {
-        "nullability"
-    } else {
-        "added_columns"
-    }
 }
 
 /// Per-dataset CDC schema-evolution settings, installed at dataset
