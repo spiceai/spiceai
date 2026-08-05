@@ -1091,6 +1091,13 @@ data: {"type":"error","message":"the model ran out of context"}"#
             message.contains("incomplete"),
             "the user should be told the printed answer is partial, got: {message}"
         );
+        // The wording the named branch produces, and the generic unreadable-event branch
+        // does not. Without this the test passes with that branch removed: the payload
+        // falls through to the generic path, which happens to quote the same reason.
+        assert!(
+            message.contains("failed part-way through its answer"),
+            "an error event should be reported as a failed answer, not as an unreadable event: {message}"
+        );
     }
 
     /// The same failure from an OpenAI-compatible server, which nests it under `error` in an
