@@ -27962,6 +27962,7 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
         let snap = self.context.ingest_snapshot();
         let actuators = self.context.live_actuator_values();
         let goals = self.context.goals();
+        let mem_attribution = super::tuning::mem_attribution();
         telemetry::cayenne::track_autotune_state(
             &telemetry::CayenneAutotuneState {
                 rows_per_sec: snap.rows_per_sec,
@@ -27969,6 +27970,13 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
                 apply_vs_arrival: snap.apply_vs_arrival,
                 read_amp: u64::try_from(read_amp).unwrap_or(0),
                 mem_pressure: snap.mem_pressure.unwrap_or(-1.0),
+                // Attribution for the pressure above (-1.0 = not sampled): the
+                // ratio counts reclaimable page cache, so these say how much of it
+                // is real demand. See tuning::sample_mem_attribution.
+                mem_anon_bytes: mem_attribution.anon_bytes,
+                mem_working_set_bytes: mem_attribution.working_set_bytes,
+                mem_active_file_bytes: mem_attribution.active_file_bytes,
+                mem_psi_some_avg10: mem_attribution.psi_some_avg10,
                 apply_ms: snap.apply_ms,
                 inline_flush_max_bytes: u64::try_from(actuators.inline_flush_max_bytes.max(0))
                     .unwrap_or(0),

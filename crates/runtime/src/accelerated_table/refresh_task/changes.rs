@@ -1926,7 +1926,6 @@ impl RefreshTask {
         // under REPLICA IDENTITY DEFAULT); treat it as terminal for this dataset,
         // mirroring the eager path's pump-side fatal. The burst's committers are
         // dropped unacked, so the source re-streams on reconnect.
-        let envelope_count = envelopes.len();
         let parts = match cdc::into_parts_offloaded_burst(envelopes).await {
             Ok(parts) => parts,
             Err(e) => {
@@ -1945,13 +1944,15 @@ impl RefreshTask {
         };
         record_cdc_fixed_cost(context.metric_labels, "decode", decode_start);
 
-        let mut committers: Vec<Box<dyn cdc::CommitChange + Send + Sync>> =
-            Vec::with_capacity(envelope_count);
-        let mut batches: Vec<ChangeBatch> = Vec::with_capacity(envelope_count);
-        for (committer, batch, _is_ready) in parts {
-            committers.push(committer);
-            batches.push(batch);
-        }
+        // Readiness was already folded into `any_ready` before the heartbeat
+        // retain, so the per-envelope flag is spent here.
+        let (committers, batches): (
+            Vec<Box<dyn cdc::CommitChange + Send + Sync>>,
+            Vec<ChangeBatch>,
+        ) = parts
+            .into_iter()
+            .map(|(committer, batch, _is_ready)| (committer, batch))
+            .unzip();
 
         // Mixed-schema runs (mid-stream schema evolution): `concat_change_batches`
         // requires equal schemas. When the dataset's policy allows evolution,

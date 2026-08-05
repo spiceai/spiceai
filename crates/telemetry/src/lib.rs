@@ -637,6 +637,13 @@ pub struct CayenneAutotuneState {
     pub read_amp: u64,
     /// cgroup-aware memory usage fraction of the budget; `< 0` ⇒ unknown.
     pub mem_pressure: f64,
+    /// Attribution for `mem_pressure`, which is `memory.current / budget` and so
+    /// counts reclaimable page cache. Negative means not sampled.
+    pub mem_anon_bytes: f64,
+    pub mem_working_set_bytes: f64,
+    pub mem_active_file_bytes: f64,
+    /// Memory PSI `some avg10`: percentage of wall clock stalled on reclaim.
+    pub mem_psi_some_avg10: f64,
     /// Per-batch apply wall time (EWMA, ms) — the latency the controller weighs
     /// against the offered-load interval.
     pub apply_ms: f64,
@@ -1353,6 +1360,10 @@ pub mod cayenne {
     static AT_APPLY_VS_ARRIVAL: OnceLock<Gauge<f64>> = OnceLock::new();
     static AT_READ_AMP: OnceLock<Gauge<u64>> = OnceLock::new();
     static AT_MEM_PRESSURE: OnceLock<Gauge<f64>> = OnceLock::new();
+    static AT_MEM_ANON_BYTES: OnceLock<Gauge<f64>> = OnceLock::new();
+    static AT_MEM_WORKING_SET_BYTES: OnceLock<Gauge<f64>> = OnceLock::new();
+    static AT_MEM_ACTIVE_FILE_BYTES: OnceLock<Gauge<f64>> = OnceLock::new();
+    static AT_MEM_PSI_SOME_AVG10: OnceLock<Gauge<f64>> = OnceLock::new();
     static AT_APPLY_MS: OnceLock<Gauge<f64>> = OnceLock::new();
     static AT_INLINE_FLUSH_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
     static AT_COMPACTION_INTERVAL_MS: OnceLock<Gauge<u64>> = OnceLock::new();
@@ -1433,6 +1444,49 @@ pub mod cayenne {
                 .build()
         })
         .record(state.mem_pressure, dimensions);
+        AT_MEM_ANON_BYTES
+            .get_or_init(|| {
+                operational_meter()
+                    .f64_gauge("cayenne_ingest_mem_anon_bytes")
+                    .with_description(
+                        "Anonymous (unreclaimable) bytes at the last pressure sample; negative means unknown.",
+                    )
+                    .with_unit("By")
+                    .build()
+            })
+            .record(state.mem_anon_bytes, dimensions);
+        AT_MEM_WORKING_SET_BYTES
+            .get_or_init(|| {
+                operational_meter()
+                    .f64_gauge("cayenne_ingest_mem_working_set_bytes")
+                    .with_description(
+                        "Working set (memory.current minus inactive_file) at the last pressure sample; negative means unknown.",
+                    )
+                    .with_unit("By")
+                    .build()
+            })
+            .record(state.mem_working_set_bytes, dimensions);
+        AT_MEM_ACTIVE_FILE_BYTES
+            .get_or_init(|| {
+                operational_meter()
+                    .f64_gauge("cayenne_ingest_mem_active_file_bytes")
+                    .with_description(
+                        "Hot page cache, which a working set does NOT subtract; negative means unknown.",
+                    )
+                    .with_unit("By")
+                    .build()
+            })
+            .record(state.mem_active_file_bytes, dimensions);
+        AT_MEM_PSI_SOME_AVG10
+            .get_or_init(|| {
+                operational_meter()
+                    .f64_gauge("cayenne_ingest_mem_psi_some_avg10")
+                    .with_description(
+                        "Percentage of wall clock at least one task stalled on memory reclaim; negative means unknown.",
+                    )
+                    .build()
+            })
+            .record(state.mem_psi_some_avg10, dimensions);
         AT_INLINE_FLUSH_BYTES
             .get_or_init(|| {
                 operational_meter()
