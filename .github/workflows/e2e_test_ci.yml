@@ -381,27 +381,41 @@ jobs:
           }
 
           rc=0
-          while IFS= read -r repo; do
-            [ -n "${repo}" ] || continue
+          while IFS= read -r component; do
+            [ -n "${component}" ] || continue
+
+            # `from:` pins a revision by appending it to the repo id as
+            # `org/model:revision`, the same convention the runtime splits back out
+            # before it addresses the Hub. The revision is a path segment of its own:
+            # left joined onto the repo id it asks for a repo that does not exist,
+            # which comes back 404 no matter how reachable the Hub is.
+            repo="${component%%:*}"
+            revision="${component#*:}"
+            if [ "${revision}" = "${component}" ] || [ -z "${revision}" ]; then
+              revision="main"
+            fi
+
             code=""
             for attempt in 1 2 3 4 5; do
-              code="$(probe "https://huggingface.co/${repo}/resolve/main/config.json")" || code="000"
+              code="$(probe "https://huggingface.co/${repo}/resolve/${revision}/config.json")" || code="000"
               if [ "${code}" -lt 400 ] 2>/dev/null; then
-                echo "  ok    ${repo} (HTTP ${code}, attempt ${attempt})"
+                echo "  ok    ${repo}@${revision} (HTTP ${code}, attempt ${attempt})"
                 break
               fi
-              echo "  retry ${repo}: HTTP ${code} (attempt ${attempt}/5)"
+              echo "  retry ${repo}@${revision}: HTTP ${code} (attempt ${attempt}/5)"
               sleep $((attempt * 3))
             done
 
             if ! { [ "${code}" -lt 400 ]; } 2>/dev/null; then
               case "${code}" in
                 401|403)
-                  echo "::error::Hugging Face returned ${code} for ${repo} after 5 attempts. This is a Hub access/quota failure, not a code failure in this branch — anonymous downloads share a per-IP quota across the whole self-hosted pool. Set the SPICE_SECRET_HF_TOKEN secret, or run 'huggingface-cli login' on the runner." ;;
+                  echo "::error::Hugging Face returned ${code} for ${repo}@${revision} after 5 attempts. This is a Hub access/quota failure, not a code failure in this branch — anonymous downloads share a per-IP quota across the whole self-hosted pool. Set the SPICE_SECRET_HF_TOKEN secret, or run 'huggingface-cli login' on the runner." ;;
                 429)
-                  echo "::error::Hugging Face rate-limited ${repo} (429) after 5 attempts. Not a code failure in this branch." ;;
+                  echo "::error::Hugging Face rate-limited ${repo}@${revision} (429) after 5 attempts. Not a code failure in this branch." ;;
+                404)
+                  echo "::error::Hugging Face has no ${repo} at revision ${revision} (404). Unlike the access and quota failures above, this one is in this branch: correct the 'from:' field in the spicepod." ;;
                 *)
-                  echo "::error::Could not reach Hugging Face for ${repo} (HTTP ${code}) after 5 attempts. Not a code failure in this branch." ;;
+                  echo "::error::Could not reach Hugging Face for ${repo}@${revision} (HTTP ${code}) after 5 attempts. Not a code failure in this branch." ;;
               esac
               rc=1
             fi
