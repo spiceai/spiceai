@@ -87,7 +87,6 @@ mod http;
 mod iceberg;
 mod iceberg_api;
 mod json;
-mod vortex_task_cancellation;
 
 #[cfg(feature = "debezium")]
 mod cdc_ingest;

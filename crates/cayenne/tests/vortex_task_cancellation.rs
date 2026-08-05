@@ -25,9 +25,10 @@ limitations under the License.
 //!
 //! This test exists in this repository, rather than only in the Vortex fork, so that bumping
 //! the Vortex pin cannot silently reintroduce the hazard: it drives the cancellation directly,
-//! and so fails on any pin that regresses it. Note that Cargo permits only one revision per
-//! git source, so the `vortex-io` dev-dependency cannot drift away from the pins that the rest
-//! of the workspace uses.
+//! and so fails on any pin that regresses it. It lives in `cayenne` — the crate that builds on
+//! Vortex — because the sign-off and merge-queue gate runs this package's integration tests.
+//! Note that Cargo permits only one revision per git source, so the `vortex-io`
+//! dev-dependency cannot drift away from the pins that the rest of the workspace uses.
 //!
 //! It is a stress test rather than a deterministic one, and it detects the fault by killing
 //! the test process — `SIGSEGV`, or `SIGABRT` via the allocator's heap checks — rather than by
@@ -82,7 +83,7 @@ mod tests {
                         for _ in 0..yields {
                             tokio::task::yield_now().await;
                         }
-                        let acc = (0..spin).fold(0u64, |acc, i| acc.wrapping_add(i));
+                        let acc = (0..spin).fold(0u64, u64::wrapping_add);
                         let out: Payload = [acc; 11];
                         out
                     }));
