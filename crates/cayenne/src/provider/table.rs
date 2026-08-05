@@ -8181,7 +8181,9 @@ impl CayenneTableProvider {
     /// sees a different snapshot, a promotion landed in between and the bloom no
     /// longer covers what warm no longer holds, so the skip is upgraded back to the
     /// exact fold (which reads the manifest resolved in THIS fenced instant and is
-    /// therefore coherent by construction).
+    /// therefore coherent by construction). `fold_cold == false` is therefore a
+    /// REQUEST to skip, not a guarantee: the fold runs whenever this capture ends up
+    /// resolving a manifest, and never for a table without the tier.
     async fn load_existing_pk_index(
         &self,
         pk_indices: &[usize],
@@ -21025,11 +21027,6 @@ impl CayenneTableProvider {
         // answering empty here, rather than at each call site, keeps a warm-only
         // table's rebuild free of a `cayenne_cold_tier_file` round trip even if a
         // future caller forgets to ask.
-        // A table without the tier has no manifest rows to pair with anything, and
-        // this runs on the CDC write path's keyset rebuild for EVERY table — so
-        // answering empty here, rather than at each call site, keeps a warm-only
-        // table's rebuild free of a `cayenne_cold_tier_file` round trip even if a
-        // future caller forgets to ask.
         if !self.table_metadata.vortex_config.cold_tier_enabled() {
             return Ok(Arc::new(Vec::new()));
         }
@@ -30142,9 +30139,11 @@ mod tests {
     /// is not bloom-served — which includes every warm-only table — so the fenced
     /// cold-manifest resolve has to opt OUT on the tier being disabled rather than in.
     ///
-    /// `cold_manifest` is the observable: the resolve publishes into it on every read,
-    /// so a populated cache after an upsert (which rebuilds the keyset) is exactly the
-    /// SELECT this asserts did not happen.
+    /// `cold_manifest` is the observable: [`CayenneTableProvider::cold_manifest_under_held_fence`]
+    /// publishes into it on every read it performs, so a populated cache after an
+    /// upsert (which rebuilds the keyset) is exactly the SELECT this asserts did not
+    /// happen. Scoped to that resolve — the once-per-table `maybe_install_warm_pk_caches`
+    /// probe lists the manifest directly and is unaffected either way.
     #[tokio::test]
     async fn warm_only_table_never_reads_the_cold_manifest() {
         use arrow::datatypes::{DataType, Field, Schema};
