@@ -211,9 +211,18 @@ impl CloudClient {
         self.handle_response(response).await
     }
 
-    /// Get the authentication context for the current token.
+    /// Get the authentication context for the current token — the identity and
+    /// the organization the token itself is bound to.
+    ///
+    /// Deliberately sends no org context, even when this client has one.
+    /// Passing `org_name` turns the call into a *membership* probe ("who am I
+    /// in this org"), whose answer echoes the org that was asked about. A
+    /// caller comparing that answer against the org it requested would learn
+    /// nothing — which is exactly how a credential bound to another
+    /// organization could be accepted. Use [`Self::get_auth_context_for_org`]
+    /// when a membership probe is what you want.
     pub async fn get_auth_context(&self) -> Result<AuthContext> {
-        self.get_auth_context_for_org(self.org.as_deref()).await
+        self.get_auth_context_for_org(None).await
     }
 
     /// Get the authentication context for `org`, rather than the token's own org.
@@ -756,6 +765,54 @@ mod tests {
         assert_eq!(
             client.get_auth_url("ABCD1234"),
             "https://spice.ai/auth/token?code=ABCD1234"
+        );
+    }
+
+    #[test]
+    fn the_identity_probe_does_not_ask_about_a_particular_org() {
+        // `get_auth_context` must report the org the token is *bound to*. If it
+        // forwarded this client's org it would become a membership probe whose
+        // answer echoes the org asked about, and a caller comparing that answer
+        // against its request would accept a credential bound elsewhere.
+        let client = CloudClient::new("https://api.spice.ai")
+            .expect("cloud client should build")
+            .with_token("token")
+            .with_org("spicehq");
+
+        let identity = client
+            .authed(
+                client
+                    .client
+                    .get(format!("{}/api/spice-cli/auth", client.oauth_base_url())),
+            )
+            .build()
+            .expect("request should build");
+        assert!(
+            identity
+                .url()
+                .query()
+                .is_none_or(|q| !q.contains("org_name")),
+            "the identity probe must not pin an org: {}",
+            identity.url()
+        );
+
+        // The explicit membership probe still does.
+        let membership = client
+            .authed(
+                client
+                    .client
+                    .get(format!("{}/api/spice-cli/auth", client.oauth_base_url())),
+            )
+            .query(&[("org_name", "spicehq")])
+            .build()
+            .expect("request should build");
+        assert!(
+            membership
+                .url()
+                .query()
+                .is_some_and(|q| q.contains("org_name=spicehq")),
+            "the membership probe must pin the org: {}",
+            membership.url()
         );
     }
 

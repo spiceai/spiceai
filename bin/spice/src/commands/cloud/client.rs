@@ -137,12 +137,19 @@ impl CloudClient {
         }
 
         let default = org::default_token().ok_or_else(|| org_credential_missing(org))?;
-        let client = Self::with_token_for_org(default, Some(org))?;
 
-        match client.optional_user_auth_context().await? {
-            Some(context) if context.org_name.eq_ignore_ascii_case(org) => Ok(client),
+        // Probe the token's own identity before granting it the requested org.
+        // `get_auth_context` sends no org context precisely so the answer names
+        // the org the token is *bound to*, rather than echoing back the org
+        // being asked about — the latter would accept any credential.
+        let probe = Self::with_token_for_org(default.clone(), None)?;
+        match probe.optional_user_auth_context().await? {
+            Some(context) if context.org_name.eq_ignore_ascii_case(org) => {
+                Self::with_token_for_org(default, Some(org))
+            }
             Some(context) => Err(default_credential_wrong_org(org, &context.org_name)),
-            None => Ok(client),
+            // A service-account credential has no user identity to check.
+            None => Self::with_token_for_org(default, Some(org)),
         }
     }
 
