@@ -1812,13 +1812,37 @@ fn is_permanent_dataset_failure(err: &Error) -> bool {
         | Error::AcceleratedWriteBackWithoutReplication { .. } => true,
         // Connector creation boxes its error, so recover the type the way the
         // catalog load path does before asking it to classify itself.
-        Error::UnableToInitializeDataConnector { source } => source
-            .downcast_ref::<dataconnector::DataConnectorError>()
-            .is_some_and(|err| !err.is_retriable()),
+        Error::UnableToInitializeDataConnector { source } => {
+            is_permanent_dataset_source(source.as_ref())
+        }
         // Registration carries the accelerated-table configuration errors.
         Error::UnableToAttachDataConnector { source, .. } => !source.is_retriable(),
         _ => false,
     }
+}
+
+/// Returns `true` when a boxed connector-construction error is a configuration
+/// error that no retry can clear.
+///
+/// Construction has two failure sources that box into the same variant, and
+/// only one of them is a [`dataconnector::DataConnectorError`]. Parameter
+/// validation runs *before* the connector is created — `ConnectorParamsBuilder`
+/// rejects an out-of-vocabulary `one_of` value or a missing required parameter
+/// — so it raises [`runtime_parameters::Error`] instead. Classifying on the
+/// `DataConnectorError` downcast alone therefore reads a plain Spicepod typo as
+/// transient and retries it for the life of the process. See #12416.
+///
+/// The `runtime_parameters` variant is matched by name rather than accepting
+/// any error of that type, so a future retriable variant does not silently
+/// inherit "permanent" from this arm.
+fn is_permanent_dataset_source(source: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    if let Some(err) = source.downcast_ref::<dataconnector::DataConnectorError>() {
+        return !err.is_retriable();
+    }
+    matches!(
+        source.downcast_ref::<runtime_parameters::Error>(),
+        Some(runtime_parameters::Error::InvalidConfigurationNoSource { .. })
+    )
 }
 
 #[expect(clippy::result_large_err)]
@@ -2211,6 +2235,39 @@ mod tests {
         assert!(
             is_permanent_dataset_failure(&err),
             "full-text search without acceleration cannot resolve itself"
+        );
+    }
+
+    /// The #12416 regression: `ConnectorParamsBuilder` validates parameters
+    /// before the connector is built, so it raises `runtime_parameters::Error`
+    /// rather than a `DataConnectorError`. The original downcast recognised only
+    /// the latter, so a typo'd `one_of` value or a missing required parameter was
+    /// classified transient and retried for the life of the process.
+    #[test]
+    fn a_dataset_parameter_validation_failure_is_permanent() {
+        let source = runtime_parameters::Error::InvalidConfigurationNoSource {
+            component: "dataset taxi_trips".to_string(),
+            message: "'s3_auth' must be one of: public, key, iam_role. Found 'keys'.".to_string(),
+        };
+        let err = Error::UnableToInitializeDataConnector {
+            source: Box::new(source),
+        };
+        assert!(
+            is_permanent_dataset_failure(&err),
+            "an out-of-vocabulary parameter value is a pure function of the Spicepod"
+        );
+    }
+
+    /// An error type neither downcast recognises must not be assumed permanent —
+    /// failing open here would strand a dataset that would have recovered.
+    #[test]
+    fn an_unclassified_boxed_connector_error_stays_retriable() {
+        let err = Error::UnableToInitializeDataConnector {
+            source: "connection reset by peer".into(),
+        };
+        assert!(
+            !is_permanent_dataset_failure(&err),
+            "an unrecognised error is not evidence the configuration is wrong"
         );
     }
 

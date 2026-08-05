@@ -127,6 +127,10 @@ impl Index for ChunkedSearchIndex {
         self.inner.deletes_by_partial_key()
     }
 
+    fn write_start_failure_is_fatal(&self) -> bool {
+        self.inner.write_start_failure_is_fatal()
+    }
+
     fn write_complete_failure_is_fatal(&self) -> bool {
         self.inner.write_complete_failure_is_fatal()
     }
@@ -862,6 +866,10 @@ impl Index for ChunkedVectorIndex {
         self.inner.deletes_by_partial_key()
     }
 
+    fn write_start_failure_is_fatal(&self) -> bool {
+        self.inner.write_start_failure_is_fatal()
+    }
+
     fn write_complete_failure_is_fatal(&self) -> bool {
         self.inner.write_complete_failure_is_fatal()
     }
@@ -1120,6 +1128,8 @@ mod tests {
         search_column: String,
         calls: AtomicUsize,
         row_counts: std::sync::Mutex<Vec<usize>>,
+        /// What this mock reports from [`Index::write_start_failure_is_fatal`].
+        write_start_fatal: bool,
         /// What this mock reports from [`Index::write_complete_failure_is_fatal`].
         write_complete_fatal: bool,
         /// What this mock reports from [`Index::deletes_by_partial_key`].
@@ -1141,6 +1151,7 @@ mod tests {
                 search_column: search_column.to_string(),
                 calls: AtomicUsize::new(0),
                 row_counts: std::sync::Mutex::new(Vec::new()),
+                write_start_fatal: false,
                 write_complete_fatal: false,
                 deletes_partial_key: false,
                 primary_fields: vec![Field::new("id", DataType::Int64, false)],
@@ -1152,6 +1163,13 @@ mod tests {
         fn with_fatal_write_complete(search_column: &str) -> Self {
             Self {
                 write_complete_fatal: true,
+                ..Self::new(search_column)
+            }
+        }
+
+        fn with_fatal_write_start(search_column: &str) -> Self {
+            Self {
+                write_start_fatal: true,
                 ..Self::new(search_column)
             }
         }
@@ -1212,6 +1230,9 @@ mod tests {
         }
         fn deletes_by_partial_key(&self) -> bool {
             self.deletes_partial_key
+        }
+        fn write_start_failure_is_fatal(&self) -> bool {
+            self.write_start_fatal
         }
         fn write_complete_failure_is_fatal(&self) -> bool {
             self.write_complete_fatal
@@ -1380,6 +1401,52 @@ mod tests {
             chunker: chunker(),
         };
         assert!(fatal.write_complete_failure_is_fatal());
+    }
+
+    /// The start-fatality flag has to forward on its own, not ride along with the
+    /// finalize one — a wrapper that forwards only `write_complete` silently downgrades an
+    /// inner index whose *prepare* is load-bearing back to best-effort (#12421).
+    #[test]
+    fn chunked_search_index_forwards_write_start_fatality() {
+        let chunker = || Arc::new(DelimChunker { delim: ' ' }) as Arc<dyn Chunker>;
+
+        let best_effort = ChunkedSearchIndex::new(
+            Arc::new(RecordingInner::new("content")) as Arc<dyn SearchIndex>,
+            chunker(),
+        );
+        assert!(!best_effort.write_start_failure_is_fatal());
+
+        let fatal = ChunkedSearchIndex::new(
+            Arc::new(RecordingInner::with_fatal_write_start("content")) as Arc<dyn SearchIndex>,
+            chunker(),
+        );
+        assert!(fatal.write_start_failure_is_fatal());
+        assert!(
+            !fatal.write_complete_failure_is_fatal(),
+            "a fatal start must not be reported as a fatal finalize"
+        );
+    }
+
+    #[test]
+    fn chunked_vector_index_forwards_write_start_fatality() {
+        let chunker = || Arc::new(DelimChunker { delim: ' ' }) as Arc<dyn Chunker>;
+
+        let best_effort = ChunkedVectorIndex {
+            inner: Arc::new(RecordingInner::new("content")) as Arc<dyn VectorIndex>,
+            chunker: chunker(),
+        };
+        assert!(!best_effort.write_start_failure_is_fatal());
+
+        let fatal = ChunkedVectorIndex {
+            inner: Arc::new(RecordingInner::with_fatal_write_start("content"))
+                as Arc<dyn VectorIndex>,
+            chunker: chunker(),
+        };
+        assert!(fatal.write_start_failure_is_fatal());
+        assert!(
+            !fatal.write_complete_failure_is_fatal(),
+            "a fatal start must not be reported as a fatal finalize"
+        );
     }
 
     fn chunker() -> Arc<dyn Chunker> {
