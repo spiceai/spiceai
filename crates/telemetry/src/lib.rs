@@ -637,8 +637,12 @@ pub struct CayenneAutotuneState {
     pub read_amp: u64,
     /// cgroup-aware memory usage fraction of the budget; `< 0` ⇒ unknown.
     pub mem_pressure: f64,
-    /// Attribution for `mem_pressure`, which is `memory.current / budget` and so
-    /// counts reclaimable page cache. Negative means not sampled.
+    /// Attribution for `mem_pressure`. That ratio's numerator is the best
+    /// available cgroup-aware usage reading — cgroup v2 `memory.current`, else v1
+    /// `memory.usage_in_bytes`, else this process's RSS — so what it includes
+    /// depends on which one answered: the cgroup readings count reclaimable page
+    /// cache (and are scoped to the cgroup, not the process), RSS does not.
+    /// These fields exist to tell those cases apart. Negative means not sampled.
     pub mem_anon_bytes: f64,
     pub mem_working_set_bytes: f64,
     pub mem_active_file_bytes: f64,

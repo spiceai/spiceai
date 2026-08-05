@@ -4,7 +4,8 @@ name: postgres-cayenne[file]-adaptive-prefetch1k
 
 # Default adaptive CH-BenCHmark config, set to the topology + prefetch that won the SF1000
 # benchmark sweep: the 7 CDC tables share FOUR replication slots (not one-per-table), and the CDC prefetch
-# buffers are pinned deep (16384). In that sweep the 1-slot topology failed the data-correctness
+# buffers were pinned deep (16384) — THIS VARIANT DEVIATES: it sets
+# `cdc_prefetch_buffer: 1024` (see below). In that sweep the 1-slot topology failed the data-correctness
 # convergence gate at SF1000 (single apply pump, apply-bound), while the 4-slot grouping converged
 # with the LOWEST replication lag of any config (~320s vs ~440s for slot-per-table) — deep prefetch
 # accounted for most of that gain (4-slot default buffers were ~435s). See the -adaptive-1slot
@@ -32,8 +33,8 @@ name: postgres-cayenne[file]-adaptive-prefetch1k
 #     warm-start. Adaptive is set explicitly, so it runs regardless; without inferred metadata
 #     the loop just relearns the row width from observed ingest.
 # Background compaction stays at the auto-derived (non-zero) default — the controller rides its
-# tick. The pinned CDC knobs under `runtime.params` below are the deep prefetch buffers
-# (`cdc_prefetch_buffer` / `cdc_max_coalesced_envelopes` = 16384, the runtime max) plus the
+# tick. The pinned CDC knobs under `runtime.params` below are the coalescing envelope
+# cap (`cdc_max_coalesced_envelopes` = 16384, the runtime max) plus the
 # higher-coalescing byte budget + linger window (`cdc_max_coalesced_bytes` = 512 MB /
 # `cdc_max_coalesce_age_ms` = 2000): the sweep showed deep prefetch is a clear, stable win and
 # that coalescing is the strongest convergence lever at SF1000, so we fix both here (this
@@ -71,7 +72,7 @@ runtime:
   # cannot be set per-dataset.
   params:
     # Deep prefetch: pin the CDC source-reader→apply channel and coalescing envelope cap to the
-    # runtime max (16384). This was the biggest single lever in the SF1000 benchmark sweep (4-slot
+    # runtime max. Deep prefetch was the biggest single lever in the SF1000 sweep (4-slot
     # replication lag ~435s at default buffers → ~320s deep).
     # 1024, not the 16384 the -adaptive pod pins. The Phase-2 linger deadline is
     # anchored at the previous cycle's start, so once apply cycles exceed

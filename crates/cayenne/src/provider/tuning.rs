@@ -519,8 +519,6 @@ fn stat_field(contents: &str, key: &str) -> Option<u64> {
     })
 }
 
-/// Read the cgroup v2 memory composition; `None` when `memory.stat` is
-/// unreadable (non-Linux, cgroup v1, or a restricted mount).
 /// Read the cgroup v2 memory composition; `None` off cgroup v2 (including
 /// non-Linux) or when `memory.stat` is unreadable.
 fn memory_composition() -> Option<MemoryComposition> {
@@ -738,14 +736,20 @@ pub(crate) fn sample_mem_pressure(stats: &IngestStats) {
 /// Reads two extra small cgroup files; called on the same tick as the pressure
 /// sample so the values line up with it.
 fn sample_mem_attribution(used: u64) {
-    if let Some(c) = memory_composition() {
-        MEM_ANON_BYTES.store(c.anon, Ordering::Relaxed);
-        MEM_WORKING_SET_BYTES.store(c.working_set(used), Ordering::Relaxed);
-        MEM_ACTIVE_FILE_BYTES.store(c.active_file, Ordering::Relaxed);
-    }
-    if let Some(psi) = memory_psi_some_avg10() {
-        MEM_PSI_SOME_AVG10_MILLI.store(psi_to_milli(psi), Ordering::Relaxed);
-    }
+    // Store the sentinel on a failed read rather than leaving the previous
+    // sample: these values exist to be read alongside the pressure ratio from the
+    // same tick, so a stale pair is worse than an explicit "unknown".
+    let (anon, working_set, active_file) = memory_composition()
+        .map_or((u64::MAX, u64::MAX, u64::MAX), |c| {
+            (c.anon, c.working_set(used), c.active_file)
+        });
+    MEM_ANON_BYTES.store(anon, Ordering::Relaxed);
+    MEM_WORKING_SET_BYTES.store(working_set, Ordering::Relaxed);
+    MEM_ACTIVE_FILE_BYTES.store(active_file, Ordering::Relaxed);
+    MEM_PSI_SOME_AVG10_MILLI.store(
+        memory_psi_some_avg10().map_or(i64::MIN, psi_to_milli),
+        Ordering::Relaxed,
+    );
 }
 
 /// The latest memory-pressure attribution, in the telemetry layer's convention:

@@ -2,7 +2,7 @@ version: v1
 kind: Spicepod
 name: mysql-cayenne[file]-adaptive-prefetch512
 
-# Adaptive-tuning variant of the non-tuned postgres-cayenne[file] baseline. Instead of either
+# Adaptive-tuning variant of the non-tuned mysql-cayenne[file] baseline. Instead of either
 # the static `auto` derivation (the baseline) or a hand-pinned -cdc-tuned-* config, every Cayenne
 # table runs `cayenne_tuning: adaptive`: the runtime still warm-starts each knob from the detected
 # host + inferred schema, then runs the closed-feedback loop that adapts those knobs over time
