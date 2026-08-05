@@ -100,8 +100,8 @@ reports the requested one. A missing binding is `org_credential_missing`, which
 names the org and how to authenticate for it. The default token is used only
 when no org is named — which is exactly the single-org path, unchanged.
 
-The app API key *may* fall back to the default, because it is per-app and a
-single-org user has only one.
+The app API key follows the same rule: naming an org reads only that org's
+key. Only a command that names no org reads the default one.
 
 `spice cloud login --org <org>` **verifies before storing**. Spice Cloud fixes a
 token's org at mint time, so `--org` is a claim to check, not a setting to
