@@ -1146,13 +1146,14 @@ data: {"type":"error","message":"the model ran out of context"}"#
         );
     }
 
-    /// An event with no payload — a bare `event:` line, or a keep-alive a proxy reframed —
-    /// is neither content nor a failure, and must not be mistaken for either.
+    /// An event whose data field is empty — the heartbeat some servers send in place of a
+    /// comment — is neither content nor a failure, and must not be mistaken for either.
+    /// (A frame carrying no data field at all is not dispatched at all; `sse` covers that.)
     #[tokio::test]
     async fn an_event_with_no_payload_does_not_end_the_stream() {
         let server = SlowServer::dribbling(
             vec![
-                "event: ping\n\n".to_string(),
+                "data: \n\n".to_string(),
                 format!(
                     "{}\n\n",
                     r#"data: {"choices":[{"delta":{"content":"answer"}}]}"#
