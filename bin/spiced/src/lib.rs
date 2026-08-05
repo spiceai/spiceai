@@ -405,7 +405,7 @@ pub struct Args {
 /// Slow on purpose. A resize is a human- or VPA-scale event, the read is two small
 /// pseudo-files, and the only outcome is a log line — so there is nothing to gain
 /// from noticing it a minute sooner.
-const CPU_SHARE_POLL: Duration = Duration::from_secs(60);
+const CPU_SHARE_POLL: Duration = Duration::from_mins(1);
 
 /// Watch for the pod being resized underneath us, and say so once when it happens.
 ///

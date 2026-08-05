@@ -1320,10 +1320,11 @@ mod tests {
     fn a_request_far_below_the_effective_cores_warns() {
         // A hard limit four times the request: sizing leans on CPU the scheduler
         // does not guarantee, and the limit is what chose it.
-        let capped = CpuBudget::resolve(&CpuConfig::default(), &quota_and_request(64, 16_000, 4000))
-            .expect("detection cannot fail")
-            .request_shortfall_notice()
-            .expect("a request far under the limit must warn");
+        let capped =
+            CpuBudget::resolve(&CpuConfig::default(), &quota_and_request(64, 16_000, 4000))
+                .expect("detection cannot fail")
+                .request_shortfall_notice()
+                .expect("a request far under the limit must warn");
         assert!(capped.contains("4 cores"), "{capped}");
         assert!(capped.contains("16 cores"), "{capped}");
         assert!(capped.contains("cgroup CPU limit"), "{capped}");
@@ -1337,7 +1338,10 @@ mod tests {
         .expect("valid")
         .request_shortfall_notice()
         .expect("384 configured cores against a 4-core request must warn");
-        assert!(configured.contains(CpuConfig::SPICEPOD_SETTING), "{configured}");
+        assert!(
+            configured.contains(CpuConfig::SPICEPOD_SETTING),
+            "{configured}"
+        );
         assert!(configured.contains("384 cores"), "{configured}");
 
         // Never claims the machine's total: a cpuset can pin this process to a
@@ -1351,10 +1355,11 @@ mod tests {
     /// remedy, since which of the two numbers is wrong is the operator's call.
     #[test]
     fn the_warning_carries_no_guidance() {
-        let warning = CpuBudget::resolve(&CpuConfig::default(), &quota_and_request(64, 16_000, 4000))
-            .expect("detection cannot fail")
-            .request_shortfall_notice()
-            .expect("must warn");
+        let warning =
+            CpuBudget::resolve(&CpuConfig::default(), &quota_and_request(64, 16_000, 4000))
+                .expect("detection cannot fail")
+                .request_shortfall_notice()
+                .expect("must warn");
 
         for advice in ["Lower", "Set ", "instead", "Raise", "raise"] {
             assert!(
@@ -1438,28 +1443,32 @@ mod tests {
     #[test]
     fn a_declared_request_derives_a_bounded_burst() {
         // 4-core request on an 18-core host: 8 cores, not 18.
-        let burst = CpuBudget::resolve(&CpuConfig::default(), &request_only(18, 4000))
-            .expect("valid");
+        let burst =
+            CpuBudget::resolve(&CpuConfig::default(), &request_only(18, 4000)).expect("valid");
         assert_eq!(burst.millicores(), 8000);
         assert_eq!(burst.cores(), 8);
         assert_eq!(burst.source(), CpuSource::RequestBurst);
 
         // Clamped by what the process can actually run on: 2 x 16 > 18.
-        let clamped = CpuBudget::resolve(&CpuConfig::default(), &request_only(18, 16_000))
-            .expect("valid");
+        let clamped =
+            CpuBudget::resolve(&CpuConfig::default(), &request_only(18, 16_000)).expect("valid");
         assert_eq!(clamped.cores(), 18, "never above affinity");
 
         // Floored, so a tiny request still overlaps a scan with something.
         for request in [1_u64, 100, 500, 999] {
             let floored = CpuBudget::resolve(&CpuConfig::default(), &request_only(64, request))
                 .expect("valid");
-            assert_eq!(floored.cores(), 2, "a {request}m request must floor at 2 cores");
+            assert_eq!(
+                floored.cores(),
+                2,
+                "a {request}m request must floor at 2 cores"
+            );
             assert!(floored.target_partitions() >= 2);
         }
 
         // The floor yields to a genuinely smaller host.
-        let one_core = CpuBudget::resolve(&CpuConfig::default(), &request_only(1, 100))
-            .expect("valid");
+        let one_core =
+            CpuBudget::resolve(&CpuConfig::default(), &request_only(1, 100)).expect("valid");
         assert_eq!(one_core.cores(), 1, "the floor never invents CPU");
     }
 
@@ -1568,9 +1577,11 @@ mod tests {
         assert_eq!(derived.cores(), 8);
 
         // What every release before the rung did, recovered by one setting.
-        let preserved =
-            CpuBudget::resolve(&CpuConfig::from_sources(None, None, Some("all")), &burstable)
-                .expect("valid");
+        let preserved = CpuBudget::resolve(
+            &CpuConfig::from_sources(None, None, Some("all")),
+            &burstable,
+        )
+        .expect("valid");
         assert_eq!(preserved.cores(), 64, "the node, exactly as before");
         assert_eq!(preserved.target_partitions(), 64);
         assert_eq!(preserved.main_runtime_worker_threads(), 64);
@@ -1597,8 +1608,8 @@ mod tests {
     /// never reaching the rung.
     #[test]
     fn the_sizing_notice_fires_only_on_a_steep_downsize() {
-        let steep = CpuBudget::resolve(&CpuConfig::default(), &request_only(64, 100))
-            .expect("valid");
+        let steep =
+            CpuBudget::resolve(&CpuConfig::default(), &request_only(64, 100)).expect("valid");
         let notice = steep
             .sizing_notice()
             .expect("2 cores on a 64-core host must be noticed");
@@ -1671,8 +1682,8 @@ mod tests {
     /// would otherwise trip the 1/2 threshold for any request below 1 core.
     #[test]
     fn the_shortfall_warning_is_suppressed_for_derived_sources() {
-        let floored = CpuBudget::resolve(&CpuConfig::default(), &request_only(64, 100))
-            .expect("valid");
+        let floored =
+            CpuBudget::resolve(&CpuConfig::default(), &request_only(64, 100)).expect("valid");
         assert_eq!(floored.source(), CpuSource::RequestBurst);
         assert_eq!(
             floored.request_shortfall_notice(),
@@ -1737,7 +1748,10 @@ mod tests {
             .expect("a moved share must be reported");
         assert!(drift.contains("weight 174"), "{drift}");
         assert!(drift.contains("weight 303"), "{drift}");
-        assert!(drift.contains("8 cores"), "still sized for the old value: {drift}");
+        assert!(
+            drift.contains("8 cores"),
+            "still sized for the old value: {drift}"
+        );
         assert!(drift.contains("Restart"), "{drift}");
         // Never converts the share to cores, and never claims a new entitlement.
         assert!(!drift.contains("2.5"), "{drift}");
@@ -1911,13 +1925,19 @@ mod tests {
         let burstable = request_only(64, 4000);
         let budget = CpuBudget::resolve(&CpuConfig::default(), &burstable).expect("valid");
         assert_eq!(budget.source(), CpuSource::RequestBurst);
-        assert_eq!(budget.cores(), 8, "bursts above the request, not to the node");
+        assert_eq!(
+            budget.cores(),
+            8,
+            "bursts above the request, not to the node"
+        );
         assert_eq!(budget.target_partitions(), 8);
 
         // The whole node is still reachable, stated once.
-        let everything =
-            CpuBudget::resolve(&CpuConfig::from_sources(None, None, Some("all")), &burstable)
-                .expect("valid");
+        let everything = CpuBudget::resolve(
+            &CpuConfig::from_sources(None, None, Some("all")),
+            &burstable,
+        )
+        .expect("valid");
         assert_eq!(everything.source(), CpuSource::AllCores);
         assert_eq!(everything.cores(), 64);
 
@@ -2058,8 +2078,8 @@ mod tests {
         // The same number *declared* moves the entitlement, which is the sharpest
         // form of the guard: had the share been wired in, a plain `docker run`
         // would have sized itself for a request nobody made.
-        let declared = CpuBudget::resolve(&CpuConfig::default(), &request_only(18, 2536))
-            .expect("valid");
+        let declared =
+            CpuBudget::resolve(&CpuConfig::default(), &request_only(18, 2536)).expect("valid");
         assert_eq!(declared.source(), CpuSource::RequestBurst);
         assert_eq!(declared.cores(), 6, "2536m x2 = 5072m, rounded up");
         assert_ne!(
@@ -2093,7 +2113,7 @@ mod tests {
         // Wired up: nothing to say.
         let wired = HostReadings {
             declared_request_millicores: Some(4000),
-            ..unwired.clone()
+            ..unwired
         };
         assert_eq!(
             CpuBudget::resolve(&CpuConfig::default(), &wired)
