@@ -805,4 +805,158 @@ tests:
             serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
         assert_eq!(serialized["benchmark_dataset"], "miracl_en_retrieval");
     }
+
+    #[test]
+    fn test_fiqa_search_section_deserialization() {
+        let yaml = "
+tests:
+  search:
+    spicepod_path: test/spicepods/search/mteb/fiqa/full_text_search-duckdb[file].yaml
+    runner_type: spiceai-dev-runners
+    benchmark_dataset: fiqa_retrieval
+    ready_wait: 1800
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+
+        assert!(matches!(
+            test_file.tests.search[0].benchmark_dataset,
+            SearchDatasetArg::FiqaRetrieval
+        ));
+        let serialized =
+            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
+        assert_eq!(serialized["benchmark_dataset"], "fiqa_retrieval");
+    }
+
+    #[test]
+    fn test_trec_covid_search_section_deserialization() {
+        let yaml = "
+tests:
+  search:
+    spicepod_path: test/spicepods/search/mteb/trec_covid/full_text_search-duckdb[file].yaml
+    runner_type: spiceai-dev-runners
+    benchmark_dataset: trec_covid_retrieval
+    ready_wait: 1800
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+
+        assert!(matches!(
+            test_file.tests.search[0].benchmark_dataset,
+            SearchDatasetArg::TrecCovidRetrieval
+        ));
+        let serialized =
+            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
+        assert_eq!(serialized["benchmark_dataset"], "trec_covid_retrieval");
+    }
+
+    #[test]
+    fn test_arguana_search_section_deserialization() {
+        let yaml = "
+tests:
+  search:
+    spicepod_path: test/spicepods/search/mteb/arguana/full_text_search-duckdb[file].yaml
+    runner_type: spiceai-dev-runners
+    benchmark_dataset: arguana_retrieval
+    ready_wait: 1800
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+
+        assert!(matches!(
+            test_file.tests.search[0].benchmark_dataset,
+            SearchDatasetArg::ArguanaRetrieval
+        ));
+        let serialized =
+            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
+        assert_eq!(serialized["benchmark_dataset"], "arguana_retrieval");
+    }
+
+    #[test]
+    fn test_scidocs_search_section_deserialization() {
+        let yaml = "
+tests:
+  search:
+    spicepod_path: test/spicepods/search/mteb/scidocs/full_text_search-duckdb[file].yaml
+    runner_type: spiceai-dev-runners
+    benchmark_dataset: scidocs_retrieval
+    ready_wait: 1800
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+
+        assert!(matches!(
+            test_file.tests.search[0].benchmark_dataset,
+            SearchDatasetArg::ScidocsRetrieval
+        ));
+        let serialized =
+            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
+        assert_eq!(serialized["benchmark_dataset"], "scidocs_retrieval");
+    }
+
+    #[test]
+    fn test_scifact_search_section_deserialization() {
+        let yaml = "
+tests:
+  search:
+    spicepod_path: test/spicepods/search/mteb/scifact/full_text_search-duckdb[file].yaml
+    runner_type: spiceai-dev-runners
+    benchmark_dataset: scifact_retrieval
+    ready_wait: 1800
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+
+        assert!(matches!(
+            test_file.tests.search[0].benchmark_dataset,
+            SearchDatasetArg::ScifactRetrieval
+        ));
+        let serialized =
+            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
+        assert_eq!(serialized["benchmark_dataset"], "scifact_retrieval");
+    }
+
+    #[test]
+    fn test_nfcorpus_search_section_deserialization() {
+        let yaml = "
+tests:
+  search:
+    spicepod_path: test/spicepods/search/mteb/nfcorpus/full_text_search-duckdb[file].yaml
+    runner_type: spiceai-dev-runners
+    benchmark_dataset: nfcorpus_retrieval
+    ready_wait: 1800
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+
+        assert!(matches!(
+            test_file.tests.search[0].benchmark_dataset,
+            SearchDatasetArg::NfcorpusRetrieval
+        ));
+        let serialized =
+            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
+        assert_eq!(serialized["benchmark_dataset"], "nfcorpus_retrieval");
+    }
+
+    #[test]
+    fn test_touche2020_search_section_deserialization() {
+        let yaml = "
+tests:
+  search:
+    spicepod_path: test/spicepods/search/mteb/touche2020/full_text_search-duckdb[file].yaml
+    runner_type: spiceai-dev-runners
+    benchmark_dataset: touche2020_retrieval
+    ready_wait: 1800
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+
+        assert!(matches!(
+            test_file.tests.search[0].benchmark_dataset,
+            SearchDatasetArg::Touche2020Retrieval
+        ));
+        let serialized =
+            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
+        assert_eq!(serialized["benchmark_dataset"], "touche2020_retrieval");
+    }
 }

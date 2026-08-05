@@ -1,0 +1,33 @@
+version: v1
+kind: Spicepod
+name: hf[all-minilm-l6-v2]-arrow
+datasets:
+
+  # MTEB SciFact Retrieval dataset files (*.parquet) are automatically downloaded by the test operator.
+  # https://huggingface.co/datasets/mteb/scifact
+
+  - from: file:./corpus.parquet
+    name: corpus
+    acceleration:
+      enabled: true
+    columns:
+      - name: text
+        embeddings:
+          - from: minilm_embed
+            row_id:
+              - _id
+
+  - from: file:./queries.parquet
+    name: test_queries
+    acceleration:
+      enabled: true
+
+  - from: file:./data.parquet
+    name: relevance_data
+    acceleration:
+      enabled: true
+
+embeddings:
+  - from: huggingface:huggingface.co/sentence-transformers/all-MiniLM-L6-v2
+    name: minilm_embed
+    params:

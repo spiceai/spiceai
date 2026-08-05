@@ -1,10 +1,10 @@
 version: v1
 kind: Spicepod
-name: openai[text-embedding-3-small]-cayenne[file]
+name: model2vec[potion-multilingual-128M]-cayenne[file]
 datasets:
 
-  # MTEB Quora Retrieval dataset files (*.parquet) are automatically downloaded by the test operator.
-  # https://huggingface.co/datasets/mteb/QuoraRetrieval_test_top_250_only_w_correct-v2/tree/main
+  # MTEB SciFact Retrieval dataset files (*.parquet) are automatically downloaded by the test operator.
+  # https://huggingface.co/datasets/mteb/scifact
 
   - from: file:./corpus.parquet
     name: corpus
@@ -15,7 +15,7 @@ datasets:
     columns:
       - name: text
         embeddings:
-          - from: openai_embed
+          - from: potion
             row_id:
               - _id
 
@@ -30,7 +30,4 @@ datasets:
       enabled: true
 
 embeddings:
-  - from: openai:text-embedding-3-small
-    name: openai_embed
-    params:
-      openai_api_key: ${ secrets:OPENAI_API_KEY }
+  - from: model2vec:minishlab/potion-multilingual-128M

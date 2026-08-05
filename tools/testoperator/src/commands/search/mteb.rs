@@ -16,10 +16,13 @@ limitations under the License.
 
 use std::{
     collections::{BTreeMap, HashMap},
-    path::Path,
+    fs::File,
+    path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use hf_hub::{Repo, RepoType, api::tokio::ApiBuilder};
+use parquet::arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder};
 use test_framework::{
     anyhow,
     arrow::{self, array::RecordBatch},
@@ -28,17 +31,68 @@ use test_framework::{
     spicetest::search::{SearchConfig, SearchRequest, SearchResult},
 };
 
-/// Shared logic for MTEB retrieval datasets published in the
-/// `mteb/*_top_250_only_w_correct-v2` Hugging Face layout. Every repository in that family has
-/// the same three files: `corpus/test-*.parquet` and `queries/test-*.parquet` with `_id` and
-/// `text` string columns, and `data/test-*.parquet` relevance judgments with `query-id`,
-/// `corpus-id`, and `score` columns.
+/// Location of an MTEB retrieval dataset on Hugging Face: the repository, the revision, and the
+/// path to each of the three files the loader needs (`corpus`, `queries`, and `qrels`).
 ///
-/// Downloads the dataset files for `hf_repo` (e.g.
-/// `mteb/QuoraRetrieval_test_top_250_only_w_correct-v2`) from Hugging Face and copies them into
-/// the specified `spicepod_dir` directory.
-pub(crate) async fn prepare_dataset(hf_repo: &str, spicepod_dir: &Path) -> anyhow::Result<()> {
-    println!("Preparing MTEB dataset {hf_repo}...");
+/// Every MTEB retrieval dataset exposes the same logical columns regardless of layout: corpus
+/// and queries carry `_id` and `text` string columns, and the relevance judgments carry
+/// `query-id`, `corpus-id`, and `score` columns. Only the file paths and revision differ, so a
+/// single loader serves both layouts. The standard layout adds a `title` string column to the
+/// corpus, which the search index ignores.
+pub(crate) struct MtebRepo {
+    /// Repository id without the `datasets/` prefix, e.g. `mteb/fiqa`.
+    pub repo: &'static str,
+    pub revision: &'static str,
+    /// One entry per corpus parquet shard. A large corpus is split across several files, so the
+    /// loader downloads every shard and concatenates them; reading only the first shard would drop
+    /// documents and understate recall.
+    pub corpus_paths: &'static [&'static str],
+    pub queries_path: &'static str,
+    pub qrels_path: &'static str,
+}
+
+impl MtebRepo {
+    /// The `mteb/*_top_250_only_w_correct-v2` reranking layout. Parquet files are committed on the
+    /// `main` branch, and the relevance judgments live in `data/`. The `score` column is `int64`.
+    pub(crate) const fn top_250(repo: &'static str) -> Self {
+        Self {
+            repo,
+            revision: "main",
+            corpus_paths: &["corpus/test-00000-of-00001.parquet"],
+            queries_path: "queries/test-00000-of-00001.parquet",
+            qrels_path: "data/test-00000-of-00001.parquet",
+        }
+    }
+
+    /// The standard MTEB (BeIR-style) retrieval layout with a single-shard corpus. The source
+    /// repository commits `jsonl`, so the loader reads the parquet that Hugging Face auto-converts
+    /// onto the `refs/convert/parquet` branch: the corpus and queries configs, and the `default`
+    /// config `test` split for the relevance judgments. The `score` column is `float64`.
+    pub(crate) const fn standard(repo: &'static str) -> Self {
+        Self::standard_sharded(repo, &["corpus/corpus/0000.parquet"])
+    }
+
+    /// The standard MTEB retrieval layout for a corpus split across several parquet shards. Pass
+    /// every shard path (e.g. `corpus/corpus/0000.parquet`, `corpus/corpus/0001.parquet`); the
+    /// loader concatenates them into a single `corpus.parquet`.
+    pub(crate) const fn standard_sharded(
+        repo: &'static str,
+        corpus_paths: &'static [&'static str],
+    ) -> Self {
+        Self {
+            repo,
+            revision: "refs/convert/parquet",
+            corpus_paths,
+            queries_path: "queries/queries/0000.parquet",
+            qrels_path: "default/test/0000.parquet",
+        }
+    }
+}
+
+/// Downloads the dataset files for `dataset` from Hugging Face and copies them into the specified
+/// `spicepod_dir` directory as `corpus.parquet`, `queries.parquet`, and `data.parquet`.
+pub(crate) async fn prepare_dataset(dataset: &MtebRepo, spicepod_dir: &Path) -> anyhow::Result<()> {
+    println!("Preparing MTEB dataset {}...", dataset.repo);
 
     let corpus_dest = spicepod_dir.join("corpus.parquet");
     let queries_dest = spicepod_dir.join("queries.parquet");
@@ -55,28 +109,41 @@ pub(crate) async fn prepare_dataset(hf_repo: &str, spicepod_dir: &Path) -> anyho
             anyhow::anyhow!("Failed to initialize api to download huggingface dataset: {e}")
         })?;
 
-    let repo = Repo::new(format!("datasets/{hf_repo}"), RepoType::Model);
+    let repo = Repo::with_revision(
+        format!("datasets/{}", dataset.repo),
+        RepoType::Model,
+        dataset.revision.to_string(),
+    );
 
     let api_repo = hf_api.repo(repo);
 
-    let data_path = api_repo
-        .get("corpus/test-00000-of-00001.parquet")
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to download huggingface file: {e}"))?;
+    let mut corpus_shards = Vec::with_capacity(dataset.corpus_paths.len());
+    for shard_path in dataset.corpus_paths {
+        let shard = api_repo
+            .get(shard_path)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to download huggingface file: {e}"))?;
+        corpus_shards.push(shard);
+    }
 
     let test_queries_path = api_repo
-        .get("queries/test-00000-of-00001.parquet")
+        .get(dataset.queries_path)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to download huggingface file: {e}"))?;
 
     let scores_path = api_repo
-        .get("data/test-00000-of-00001.parquet")
+        .get(dataset.qrels_path)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to download huggingface file: {e}"))?;
 
-    // Copy files to spicepod directory with new names
-    std::fs::copy(&data_path, &corpus_dest)
-        .map_err(|e| anyhow::anyhow!("Failed to copy corpus file: {e}"))?;
+    // Copy files to spicepod directory with new names. A single-shard corpus is copied verbatim to
+    // preserve its exact parquet encoding; a multi-shard corpus is concatenated into one file.
+    if let [single_shard] = corpus_shards.as_slice() {
+        std::fs::copy(single_shard, &corpus_dest)
+            .map_err(|e| anyhow::anyhow!("Failed to copy corpus file: {e}"))?;
+    } else {
+        concat_parquet_files(&corpus_shards, &corpus_dest)?;
+    }
     println!("Corpus data saved to: {}", corpus_dest.display());
 
     std::fs::copy(&test_queries_path, &queries_dest)
@@ -88,6 +155,56 @@ pub(crate) async fn prepare_dataset(hf_repo: &str, spicepod_dir: &Path) -> anyho
     println!("Data saved to: {}", data_dest.display());
 
     Ok(())
+}
+
+/// Concatenates the parquet `shards` into a single parquet file at `dest`. Every shard shares the
+/// same schema (they are shards of one corpus config), so the writer takes the schema of the first
+/// shard and appends the row groups of each shard in turn.
+fn concat_parquet_files(shards: &[PathBuf], dest: &Path) -> anyhow::Result<()> {
+    let mut writer: Option<ArrowWriter<File>> = None;
+
+    for shard in shards {
+        let file = File::open(shard)
+            .map_err(|e| anyhow::anyhow!("Failed to open corpus shard {}: {e}", shard.display()))?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|e| anyhow::anyhow!("Failed to read corpus shard {}: {e}", shard.display()))?;
+
+        // The first shard fixes the schema and creates the writer; later shards append to it.
+        if writer.is_none() {
+            let out = File::create(dest).map_err(|e| {
+                anyhow::anyhow!("Failed to create corpus file {}: {e}", dest.display())
+            })?;
+            let schema = Arc::clone(builder.schema());
+            writer = Some(
+                ArrowWriter::try_new(out, schema, None)
+                    .map_err(|e| anyhow::anyhow!("Failed to write corpus file: {e}"))?,
+            );
+        }
+        let writer = writer.as_mut().ok_or_else(|| {
+            anyhow::anyhow!("Cannot prepare corpus: no corpus shards were provided")
+        })?;
+
+        let reader = builder
+            .build()
+            .map_err(|e| anyhow::anyhow!("Failed to read corpus shard {}: {e}", shard.display()))?;
+        for batch in reader {
+            let batch =
+                batch.map_err(|e| anyhow::anyhow!("Failed to read corpus record batch: {e}"))?;
+            writer
+                .write(&batch)
+                .map_err(|e| anyhow::anyhow!("Failed to write corpus record batch: {e}"))?;
+        }
+    }
+
+    let Some(writer) = writer else {
+        return Err(anyhow::anyhow!(
+            "Cannot prepare corpus: no corpus shards were provided"
+        ));
+    };
+    writer
+        .close()
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("Failed to finalize corpus file: {e}"))
 }
 
 /// Initializes the search benchmark configuration for the `QuoraRetrieval` dataset.
@@ -163,9 +280,12 @@ pub(crate) async fn get_query_relevance_data(
 ) -> anyhow::Result<HashMap<String, HashMap<String, i32>>> {
     let mut spice_client = spiced_instance.spice_client(None, false).await?;
 
+    // Cast `score` to `BIGINT` so the loader handles both the `int64` judgments of the
+    // `_top_250_only_w_correct-v2` layout and the `float64` judgments of the standard MTEB layout.
+    // Relevance judgments are whole numbers, so the cast is exact.
     let records = execute_sql(
         &mut spice_client,
-        r#"SELECT "query-id", "corpus-id", score FROM relevance_data"#,
+        r#"SELECT "query-id", "corpus-id", CAST(score AS BIGINT) AS score FROM relevance_data"#,
     )
     .await?;
 

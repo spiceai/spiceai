@@ -26,18 +26,40 @@ use test_framework::{
     spicetest::search::{SearchConfig, SearchResult},
 };
 
-use super::mteb;
+use super::mteb::{self, MtebRepo};
 
-const QUORA_RETRIEVAL_REPOSITORY: &str = "mteb/QuoraRetrieval_test_top_250_only_w_correct-v2";
-const MIRACL_EN_RETRIEVAL_REPOSITORY: &str = "mteb/MIRACLRetrieval_en_top_250_only_w_correct-v2";
+const QUORA_RETRIEVAL_REPOSITORY: MtebRepo =
+    MtebRepo::top_250("mteb/QuoraRetrieval_test_top_250_only_w_correct-v2");
+const MIRACL_EN_RETRIEVAL_REPOSITORY: MtebRepo =
+    MtebRepo::top_250("mteb/MIRACLRetrieval_en_top_250_only_w_correct-v2");
+const FIQA_RETRIEVAL_REPOSITORY: MtebRepo = MtebRepo::standard("mteb/fiqa");
+const TREC_COVID_RETRIEVAL_REPOSITORY: MtebRepo = MtebRepo::standard("mteb/trec-covid");
+const ARGUANA_RETRIEVAL_REPOSITORY: MtebRepo = MtebRepo::standard("mteb/arguana");
+const SCIDOCS_RETRIEVAL_REPOSITORY: MtebRepo = MtebRepo::standard("mteb/scidocs");
+const SCIFACT_RETRIEVAL_REPOSITORY: MtebRepo = MtebRepo::standard("mteb/scifact");
+const NFCORPUS_RETRIEVAL_REPOSITORY: MtebRepo = MtebRepo::standard("mteb/nfcorpus");
+const TOUCHE2020_RETRIEVAL_REPOSITORY: MtebRepo = MtebRepo::standard_sharded(
+    "mteb/touche2020",
+    &["corpus/corpus/0000.parquet", "corpus/corpus/0001.parquet"],
+);
 
 /// The search benchmark dataset to run against. Each variant owns its own dataset
 /// preparation, search-config construction, relevance-judgment loading, and result
 /// transform, so adding a new dataset means adding a variant here rather than
 /// threading a new string through `search/mod.rs`.
+// The shared `Retrieval` suffix names the MTEB task type and mirrors each variant's
+// `*_retrieval` name, so it is intentional rather than a redundant repeated affix.
+#[expect(clippy::enum_variant_names)]
 pub(crate) enum SearchDataset {
     QuoraRetrieval,
     MiraclEnRetrieval,
+    FiqaRetrieval,
+    TrecCovidRetrieval,
+    ArguanaRetrieval,
+    ScidocsRetrieval,
+    ScifactRetrieval,
+    NfcorpusRetrieval,
+    Touche2020Retrieval,
 }
 
 impl From<SearchDatasetArg> for SearchDataset {
@@ -45,6 +67,13 @@ impl From<SearchDatasetArg> for SearchDataset {
         match arg {
             SearchDatasetArg::QuoraRetrieval => SearchDataset::QuoraRetrieval,
             SearchDatasetArg::MiraclEnRetrieval => SearchDataset::MiraclEnRetrieval,
+            SearchDatasetArg::FiqaRetrieval => SearchDataset::FiqaRetrieval,
+            SearchDatasetArg::TrecCovidRetrieval => SearchDataset::TrecCovidRetrieval,
+            SearchDatasetArg::ArguanaRetrieval => SearchDataset::ArguanaRetrieval,
+            SearchDatasetArg::ScidocsRetrieval => SearchDataset::ScidocsRetrieval,
+            SearchDatasetArg::ScifactRetrieval => SearchDataset::ScifactRetrieval,
+            SearchDatasetArg::NfcorpusRetrieval => SearchDataset::NfcorpusRetrieval,
+            SearchDatasetArg::Touche2020Retrieval => SearchDataset::Touche2020Retrieval,
         }
     }
 }
@@ -54,18 +83,29 @@ impl SearchDataset {
         match self {
             SearchDataset::QuoraRetrieval => "quora_retrieval",
             SearchDataset::MiraclEnRetrieval => "miracl_en_retrieval",
+            SearchDataset::FiqaRetrieval => "fiqa_retrieval",
+            SearchDataset::TrecCovidRetrieval => "trec_covid_retrieval",
+            SearchDataset::ArguanaRetrieval => "arguana_retrieval",
+            SearchDataset::ScidocsRetrieval => "scidocs_retrieval",
+            SearchDataset::ScifactRetrieval => "scifact_retrieval",
+            SearchDataset::NfcorpusRetrieval => "nfcorpus_retrieval",
+            SearchDataset::Touche2020Retrieval => "touche2020_retrieval",
         }
     }
 
     pub(crate) async fn prepare(&self, spicepod_dir: &Path) -> anyhow::Result<()> {
-        match self {
-            SearchDataset::QuoraRetrieval => {
-                mteb::prepare_dataset(QUORA_RETRIEVAL_REPOSITORY, spicepod_dir).await
-            }
-            SearchDataset::MiraclEnRetrieval => {
-                mteb::prepare_dataset(MIRACL_EN_RETRIEVAL_REPOSITORY, spicepod_dir).await
-            }
-        }
+        let dataset = match self {
+            SearchDataset::QuoraRetrieval => &QUORA_RETRIEVAL_REPOSITORY,
+            SearchDataset::MiraclEnRetrieval => &MIRACL_EN_RETRIEVAL_REPOSITORY,
+            SearchDataset::FiqaRetrieval => &FIQA_RETRIEVAL_REPOSITORY,
+            SearchDataset::TrecCovidRetrieval => &TREC_COVID_RETRIEVAL_REPOSITORY,
+            SearchDataset::ArguanaRetrieval => &ARGUANA_RETRIEVAL_REPOSITORY,
+            SearchDataset::ScidocsRetrieval => &SCIDOCS_RETRIEVAL_REPOSITORY,
+            SearchDataset::ScifactRetrieval => &SCIFACT_RETRIEVAL_REPOSITORY,
+            SearchDataset::NfcorpusRetrieval => &NFCORPUS_RETRIEVAL_REPOSITORY,
+            SearchDataset::Touche2020Retrieval => &TOUCHE2020_RETRIEVAL_REPOSITORY,
+        };
+        mteb::prepare_dataset(dataset, spicepod_dir).await
     }
 
     pub(crate) async fn init_search_config(
@@ -73,8 +113,18 @@ impl SearchDataset {
         spiced_instance: &SpicedInstance,
         search_limit: Option<usize>,
     ) -> anyhow::Result<SearchConfig> {
+        // Every MTEB dataset exposes the same `_id`/`text` query columns, so the shared loader
+        // builds the search config for all variants.
         match self {
-            SearchDataset::QuoraRetrieval | SearchDataset::MiraclEnRetrieval => {
+            SearchDataset::QuoraRetrieval
+            | SearchDataset::MiraclEnRetrieval
+            | SearchDataset::FiqaRetrieval
+            | SearchDataset::TrecCovidRetrieval
+            | SearchDataset::ArguanaRetrieval
+            | SearchDataset::ScidocsRetrieval
+            | SearchDataset::ScifactRetrieval
+            | SearchDataset::NfcorpusRetrieval
+            | SearchDataset::Touche2020Retrieval => {
                 mteb::init_search_config(spiced_instance, search_limit).await
             }
         }
@@ -85,7 +135,15 @@ impl SearchDataset {
         spiced_instance: &SpicedInstance,
     ) -> anyhow::Result<HashMap<String, HashMap<String, i32>>> {
         match self {
-            SearchDataset::QuoraRetrieval | SearchDataset::MiraclEnRetrieval => {
+            SearchDataset::QuoraRetrieval
+            | SearchDataset::MiraclEnRetrieval
+            | SearchDataset::FiqaRetrieval
+            | SearchDataset::TrecCovidRetrieval
+            | SearchDataset::ArguanaRetrieval
+            | SearchDataset::ScidocsRetrieval
+            | SearchDataset::ScifactRetrieval
+            | SearchDataset::NfcorpusRetrieval
+            | SearchDataset::Touche2020Retrieval => {
                 mteb::get_query_relevance_data(spiced_instance).await
             }
         }
@@ -96,9 +154,15 @@ impl SearchDataset {
         search: &BTreeMap<String, SearchResult>,
     ) -> HashMap<String, HashMap<String, f64>> {
         match self {
-            SearchDataset::QuoraRetrieval | SearchDataset::MiraclEnRetrieval => {
-                mteb::transform_search_results_for_eval(search)
-            }
+            SearchDataset::QuoraRetrieval
+            | SearchDataset::MiraclEnRetrieval
+            | SearchDataset::FiqaRetrieval
+            | SearchDataset::TrecCovidRetrieval
+            | SearchDataset::ArguanaRetrieval
+            | SearchDataset::ScidocsRetrieval
+            | SearchDataset::ScifactRetrieval
+            | SearchDataset::NfcorpusRetrieval
+            | SearchDataset::Touche2020Retrieval => mteb::transform_search_results_for_eval(search),
         }
     }
 }
