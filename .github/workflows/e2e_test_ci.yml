@@ -314,6 +314,103 @@ jobs:
           cp ./test/models/spicepod_hf.yml ./spicepod.yaml
           cat ./spicepod.yaml
 
+      # The Hub credential lives where hf-hub looks for it, rather than being threaded
+      # through the spicepod as an `hf_token` param. Two reasons: it authenticates the
+      # chat model and the embedding model with one mechanism, and an unset secret
+      # leaves no file behind instead of setting an empty token, which the Hub answers
+      # with 401 — worse than no token at all.
+      - name: Authenticate the Hugging Face cache
+        env:
+          SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
+        run: |
+          set -uo pipefail
+          umask 077
+
+          # hf-hub caches artifacts under $HOME/.cache/huggingface/hub and reads its
+          # credential from the sibling `token` file. $HOME persists between jobs on
+          # these self-hosted runners while the _work tree does not, so once the ~3B
+          # chat model and the embedding model are on disk, later runs need no Hub
+          # round-trip at all.
+          mkdir -p "${HOME}/.cache/huggingface/hub"
+          token_file="${HOME}/.cache/huggingface/token"
+
+          # $HOME is shared by every job that lands on this host, and it outlives this
+          # one. So a token we write here must not be left behind for an unrelated job
+          # to read, and a token the host already owns must not be clobbered:
+          #   - file already present -> use it, touch nothing.
+          #   - absent + secret set  -> write it, and mark it for removal in cleanup.
+          #   - absent + no secret   -> warn; downloads are anonymous.
+          if [ -s "${token_file}" ]; then
+            echo "Using the Hugging Face token already present on this runner."
+          elif [ -n "${SPICE_HF_TOKEN:-}" ]; then
+            printf '%s' "${SPICE_HF_TOKEN}" > "${token_file}"
+            chmod 600 "${token_file}"
+            echo "SPICE_REMOVE_HF_TOKEN=${token_file}" >> "$GITHUB_ENV"
+            echo "Wrote a job-scoped Hugging Face token for hf-hub to pick up."
+          else
+            echo "::warning::No Hugging Face token available. Downloads will be anonymous, and anonymous requests share a per-IP quota across this whole runner pool — exhausting it surfaces as HTTP 401 on model config files."
+          fi
+
+      # Fail here, in seconds and by name, rather than as an unexplained five-minute
+      # readiness timeout. The retries ride out the transient per-IP 401/429 responses
+      # the pool draws from the Hub; this retries a *download*, never an assertion.
+      - name: Pre-flight the Hugging Face components
+        timeout-minutes: 5
+        run: |
+          set -uo pipefail
+
+          repos="$(sed -n 's|^[[:space:]]*-\{0,1\}[[:space:]]*from:[[:space:]]*huggingface:huggingface\.co/\([^[:space:]]*\).*$|\1|p' ./spicepod.yaml)"
+          if [ -z "${repos}" ]; then
+            echo "No Hugging Face components in the spicepod; nothing to pre-flight."
+            exit 0
+          fi
+
+          token_file="${HOME}/.cache/huggingface/token"
+
+          # The token goes to curl through a config on stdin rather than an -H argument,
+          # so it never appears in this process's argv. `printf` is a shell builtin, so
+          # it spawns nothing that could carry it either. curl drops the header on a
+          # cross-host redirect by default, which is what keeps `-L` safe here.
+          probe() {
+            if [ -s "${token_file}" ]; then
+              printf 'header = "Authorization: Bearer %s"\n' "$(cat "${token_file}")" |
+                curl -K - -sSL -o /dev/null -w '%{http_code}' --max-time 30 "$1" 2>/dev/null
+            else
+              curl -sSL -o /dev/null -w '%{http_code}' --max-time 30 "$1" 2>/dev/null
+            fi
+          }
+
+          rc=0
+          while IFS= read -r repo; do
+            [ -n "${repo}" ] || continue
+            code=""
+            for attempt in 1 2 3 4 5; do
+              code="$(probe "https://huggingface.co/${repo}/resolve/main/config.json")" || code="000"
+              if [ "${code}" -lt 400 ] 2>/dev/null; then
+                echo "  ok    ${repo} (HTTP ${code}, attempt ${attempt})"
+                break
+              fi
+              echo "  retry ${repo}: HTTP ${code} (attempt ${attempt}/5)"
+              sleep $((attempt * 3))
+            done
+
+            if ! { [ "${code}" -lt 400 ]; } 2>/dev/null; then
+              case "${code}" in
+                401|403)
+                  echo "::error::Hugging Face returned ${code} for ${repo} after 5 attempts. This is a Hub access/quota failure, not a code failure in this branch — anonymous downloads share a per-IP quota across the whole self-hosted pool. Set the SPICE_SECRET_HF_TOKEN secret, or run 'huggingface-cli login' on the runner." ;;
+                429)
+                  echo "::error::Hugging Face rate-limited ${repo} (429) after 5 attempts. Not a code failure in this branch." ;;
+                *)
+                  echo "::error::Could not reach Hugging Face for ${repo} (HTTP ${code}) after 5 attempts. Not a code failure in this branch." ;;
+              esac
+              rc=1
+            fi
+          # A here-string, not a pipe: a pipe would run the loop in a subshell and `rc`
+          # would never make it back out, so every failure would exit 0.
+          done <<< "${repos}"
+
+          exit "${rc}"
+
       - name: Start spice runtime
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -358,6 +455,15 @@ jobs:
       - name: Stop spice and check logs
         if: always()
         uses: ./.github/actions/stop-spice
+
+      # Only fires when the step above wrote the token itself; a credential the runner
+      # already owned is left alone. Without this, a secret would outlive the job in a
+      # $HOME that every later job on this host can read.
+      - name: Remove the job-scoped Hugging Face token
+        if: always() && env.SPICE_REMOVE_HF_TOKEN != ''
+        run: |
+          rm -f "${SPICE_REMOVE_HF_TOKEN}"
+          echo "Removed the job-scoped Hugging Face token."
 
   test_quickstart_dremio:
     name: 'Test Dremio quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
