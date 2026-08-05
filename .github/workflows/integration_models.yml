@@ -2,43 +2,6 @@
 name: integration tests (models)
 
 on:
-  push:
-    branches:
-      - trunk
-      - release/*
-  pull_request:
-    branches:
-      - trunk
-      - release-*
-      - release/*
-      - feature-*
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'README.md'
-      - 'Makefile'
-      - 'CONTRIBUTING.md'
-      - 'SECURITY.md'
-      - 'LICENSE'
-      - '.github/**'
-      - 'version.txt'
-      - '.schema/**'
-      - '.vscode/**'
-      - 'deploy/**'
-      - 'install/**'
-      - 'media/**'
-      - 'monitoring/**'
-      - 'acknowledgements.md'
-      - 'Dockerfile*'
-      - 'bin/spice/**'
-
-  merge_group:
-    branches:
-      - trunk
-      - release-*
-      - release/*
-      - feature-*
-
   schedule:
     - cron: '0 0 * * *' # Daily at midnight UTC
 
@@ -191,6 +154,11 @@ jobs:
     runs-on: spiceai-macos
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+      HAS_OPENAI_SECRET: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY != '' }}
+      HAS_ANTHROPIC_SECRET: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY != '' }}
+      HAS_XAI_SECRET: ${{ secrets.SPICE_SECRET_XAI_API_KEY != '' }}
+      HAS_HF_SECRET: ${{ secrets.SPICE_SECRET_HF_TOKEN != '' }}
+      HAS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_KEY != '' && secrets.AWS_S3_VECTORS_SECRET != '' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -239,7 +207,7 @@ jobs:
 
       # OpenAI tests
       - name: Run OpenAI integration test
-        if: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY != '' }}
+        if: env.HAS_OPENAI_SECRET == 'true'
         env:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
@@ -251,7 +219,7 @@ jobs:
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- openai_test
 
       - name: Run OpenAI Beta functionality embeddings test
-        if: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY != '' }}
+        if: env.HAS_OPENAI_SECRET == 'true'
         env:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
@@ -264,7 +232,7 @@ jobs:
 
       # AI UDF tests
       - name: Run AI UDF basic test
-        if: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY != '' && secrets.SPICE_SECRET_ANTHROPIC_API_KEY != '' }}
+        if: env.HAS_OPENAI_SECRET == 'true' && env.HAS_ANTHROPIC_SECRET == 'true'
         env:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
@@ -281,7 +249,7 @@ jobs:
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- test_ai_udf_basic
 
       - name: Run AI UDF with dataset test
-        if: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY != '' && secrets.SPICE_SECRET_ANTHROPIC_API_KEY != '' && secrets.SPICE_SECRET_XAI_API_KEY != '' }}
+        if: env.HAS_OPENAI_SECRET == 'true' && env.HAS_ANTHROPIC_SECRET == 'true' && env.HAS_XAI_SECRET == 'true'
         env:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
@@ -304,7 +272,7 @@ jobs:
 
       # NOTE: Step-level `if:` conditionals on secret-requiring AI test steps (OpenAI, workers, search, xAI/HF UDFs, etc.) cause the step to report "skipped" (neutral, job succeeds) on PRs where secrets are intentionally unavailable for security (forks/external PRs). When a step *does* execute (schedule/workflow_dispatch with secrets present), an explicit fast-fail guard at the start of `run:` errors immediately if a required key is missing, preserving the original intent. This is intentional and confirmed for schedule + workflow_dispatch (incl. `run_all_tests`). See Copilot review threads for context; prevents spurious reds unrelated to code.
       - name: Run AI UDF LEFT truncate test
-        if: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY != '' && secrets.SPICE_SECRET_ANTHROPIC_API_KEY != '' && secrets.SPICE_SECRET_XAI_API_KEY != '' }}
+        if: env.HAS_OPENAI_SECRET == 'true' && env.HAS_ANTHROPIC_SECRET == 'true' && env.HAS_XAI_SECRET == 'true'
         env:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
@@ -325,7 +293,7 @@ jobs:
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- local_embeddings_beta_requirements
 
       - name: Run AI UDF with local model test
-        if: ${{ secrets.SPICE_SECRET_HF_TOKEN != '' }}
+        if: env.HAS_HF_SECRET == 'true'
         env:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
@@ -334,7 +302,7 @@ jobs:
 
       # Workers tests
       - name: Run workers integration test
-        if: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY != '' }}
+        if: env.HAS_OPENAI_SECRET == 'true'
         env:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
@@ -347,7 +315,7 @@ jobs:
 
       # Search tests
       - name: Run search integration test
-        if: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY != '' && secrets.AWS_S3_VECTORS_KEY != '' && secrets.AWS_S3_VECTORS_SECRET != '' }}
+        if: env.HAS_OPENAI_SECRET == 'true' && env.HAS_S3_VECTORS_SECRET == 'true'
         env:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
@@ -377,6 +345,7 @@ jobs:
     runs-on: spiceai-macos
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+      HAS_HF_SECRET: ${{ secrets.SPICE_SECRET_HF_TOKEN != '' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -418,7 +387,7 @@ jobs:
           path: ./integration_test
 
       - name: Run integration test
-        if: ${{ secrets.SPICE_SECRET_HF_TOKEN != '' }}
+        if: env.HAS_HF_SECRET == 'true'
         env:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
@@ -430,7 +399,7 @@ jobs:
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- huggingface_test
 
       - name: Run Beta functionality embedding tests
-        if: ${{ secrets.SPICE_SECRET_HF_TOKEN != '' }}
+        if: env.HAS_HF_SECRET == 'true'
         env:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
