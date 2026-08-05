@@ -2678,7 +2678,7 @@ fn ensure_dedup_column_type(
 /// the overlap window. This is a documented one-time effect, not a defect.
 fn filter_records(
     update_data: &RecordBatch,
-    existing_records: &Vec<RecordBatch>,
+    existing_records: &[RecordBatch],
     filter_schema: &SchemaRef,
     used: &mut [Vec<bool>],
 ) -> super::Result<RecordBatch> {
