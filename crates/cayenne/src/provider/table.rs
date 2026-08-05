@@ -2668,9 +2668,10 @@ fn select_protected_snapshot_merge_tier(
             return ProtectedMergeSelection::Merge(selected);
         }
 
-        // The budget cut a qualifying tier below a pair: its runs are too large to
-        // merge even two at a time, which makes the tier settled. Every higher tier
-        // holds strictly larger runs, so stop rather than walking up.
+        // The oldest-first walk could not fit two runs of a qualifying tier, so the
+        // tier is settled (see `OverPassBudget` for why we do not hunt for a smaller
+        // fitting pair). Every higher tier holds strictly larger runs, so stop rather
+        // than walking up.
         let oldest_pair_bytes = indices
             .iter()
             .take(2)
@@ -2694,9 +2695,16 @@ enum ProtectedMergeSelection {
     Merge(Vec<(String, i64)>),
     /// No size tier has accumulated `min_runs` same-size runs yet.
     NoQualifyingTier,
-    /// A tier has enough runs, but not even its two oldest fit `max_pass_bytes`.
-    /// The tier is settled: its runs are large enough that merging them buys one
-    /// scan branch for a very large rewrite, so the pass declines.
+    /// A tier has enough runs, but its two OLDEST do not fit `max_pass_bytes`, so
+    /// the oldest-first walk cannot form a pair and the pass declines.
+    ///
+    /// Note this is the oldest pair, not the smallest: a tier spans a byte range
+    /// (up to `growth`×), so a smaller pair in the same tier could still fit. The
+    /// walk deliberately does not go looking for one. Runs this large buy one scan
+    /// branch for a very large rewrite — the pass's worst-value work — and merging
+    /// out of creation order widens the merged manifest's sequence range, which
+    /// makes the bake's clean-prefix gate more likely to block. Declining is the
+    /// better trade; a run that later levels up or shrinks becomes eligible again.
     OverPassBudget {
         tier_runs: usize,
         oldest_pair_bytes: u64,
@@ -16914,6 +16922,9 @@ impl CayenneTableProvider {
         // distribution (e.g. one carried-forward merged snapshot dwarfing the
         // small new deltas). This is diagnostic I/O outside the fence.
         let sizing_start = std::time::Instant::now();
+        // Resolved before sizing: under a finite budget an unsizeable candidate must be
+        // DROPPED, not counted as free (see the per-candidate arm below).
+        let max_pass_bytes = self.protected_merge_input_budget_bytes();
         let mut sized_candidates: Vec<(String, i64, u64)> = Vec::with_capacity(candidates.len());
         for (snapshot_id, threshold) in &candidates {
             let bytes = match self.list_snapshot_files_with_sizes(snapshot_id).await {
@@ -16923,10 +16934,19 @@ impl CayenneTableProvider {
                         target: "cayenne::compaction",
                         table = self.table_metadata.table_name.as_str(),
                         snapshot_id = snapshot_id,
-                        "Failed to size protected-snapshot merge input for tiering: {e}"
+                        budgeted = max_pass_bytes.is_some(),
+                        "Failed to size protected-snapshot merge input: {e}"
                     );
-                    // Treat as tier 0 (unknown/small) so it stays a merge
-                    // candidate rather than being skipped as "large".
+                    if max_pass_bytes.is_some() {
+                        // The budget is a memory ceiling, so an unknown size cannot be
+                        // treated as small: counting it as 0 would let an arbitrarily
+                        // large run in for free and defeat the bound. Drop it as a
+                        // candidate instead; a later pass retries once it can be sized.
+                        continue;
+                    }
+                    // No budget to defeat, so keep the historical treat-as-tier-0
+                    // behavior: the run stays a candidate rather than being skipped
+                    // as "large".
                     0
                 }
             };
@@ -16941,10 +16961,10 @@ impl CayenneTableProvider {
         // only when its tier fills up and it levels up) and read amplification
         // to at most `min_runs - 1` un-merged runs per tier — instead of folding
         // the large carried-forward blob back in on every pass.
+        // `max_pass_bytes` (resolved above) is the absolute per-pass input ceiling above
+        // the relative size tiers, so a tier of very large runs consolidates a few at a
+        // time (issue #12013).
         let min_runs = self.context.compaction_trigger_protected_snapshots().max(2);
-        // Absolute per-pass input ceiling above the relative size tiers, so a tier
-        // of very large runs consolidates a few at a time (issue #12013).
-        let max_pass_bytes = self.protected_merge_input_budget_bytes();
         let selection = select_protected_snapshot_merge_tier(
             &sized_candidates,
             min_runs,
@@ -17560,13 +17580,16 @@ impl CayenneTableProvider {
                 .unwrap_or_default();
             let threshold = thresholds.get(id).copied().unwrap_or(0);
             if let Some(budget) = max_pass_bytes {
-                // On-disk bytes, sized as the size-tier path sizes its candidates. A
-                // listing failure counts as 0 (treat-as-small) so it cannot wedge the
-                // bake, matching that path.
-                let candidate_bytes: u64 = match self.list_snapshot_files_with_sizes(id).await {
-                    Ok(sizes) => sizes.iter().map(|(_, sz)| *sz).sum(),
-                    Err(_) => 0,
+                // On-disk bytes, sized as the size-tier path sizes its candidates. An
+                // unknown size must NOT count as 0 here: the budget is a memory ceiling,
+                // and counting an unsizeable run as free would let an arbitrarily large
+                // one in and defeat the bound. End the prefix instead; the next tick
+                // retries once it can be sized.
+                let Ok(sizes) = self.list_snapshot_files_with_sizes(id).await else {
+                    budget_truncated = true;
+                    break;
                 };
+                let candidate_bytes: u64 = sizes.iter().map(|(_, sz)| *sz).sum();
                 let next = selected_input_bytes.saturating_add(candidate_bytes);
                 if next > budget {
                     // Stop here. `cutoff` has only accumulated over already-selected
@@ -29662,6 +29685,32 @@ mod tests {
             .into_inputs();
         let ids: Vec<&str> = pair.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(ids, vec!["s0", "s1"]);
+    }
+
+    #[test]
+    fn select_merge_tier_reports_the_oldest_pair_not_the_smallest() {
+        // A tier spans a byte range, so the oldest pair can be larger than a later
+        // pair. The walk is oldest-first and declines rather than hunting for a
+        // fitting pair (see `OverPassBudget`); the reported bytes are the oldest pair,
+        // which is what the skip log must quote.
+        let base = 8 * 1024 * 1024;
+        let growth = 8;
+        let gib = 1024 * 1024 * 1024;
+        // All tier 3 (> 8 MiB * 8^2 = 512 MiB): 4 GiB, 4 GiB, then two 1 GiB runs.
+        let inputs = vec![
+            sized("old_a", 4 * gib),
+            sized("old_b", 4 * gib),
+            sized("new_a", gib),
+            sized("new_b", gib),
+        ];
+        assert_eq!(
+            select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth, Some(3 * gib)),
+            ProtectedMergeSelection::OverPassBudget {
+                tier_runs: 4,
+                oldest_pair_bytes: 8 * gib,
+            },
+            "the two 1 GiB runs would fit, but the walk is oldest-first by design"
+        );
     }
 
     #[test]
