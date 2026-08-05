@@ -286,7 +286,7 @@ async fn login_spiceai(
 /// Matches the Spice Cloud device flow in [`crate::commands::cloud`]; the
 /// Microsoft device-code flow in [`providers`] bounds itself the same way, off
 /// the `expires_in` its authorization server returns.
-const LOGIN_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+const LOGIN_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(5);
 
 /// How long to wait between token-exchange attempts.
 const LOGIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
@@ -322,8 +322,18 @@ impl std::fmt::Debug for ExchangeOutcome {
 
 /// Classify the HTTP status of a token-exchange attempt.
 ///
-/// Returns `None` for a success status, meaning the body decides the outcome.
+/// Returns `None` for a success status that can carry a body, meaning the body
+/// decides the outcome.
 fn classify_exchange_status(status: reqwest::StatusCode) -> Option<ExchangeOutcome> {
+    // A 204 promises no content, so there is no body to decide anything and no
+    // status a token could arrive under. Read it the same way as a 200 whose body
+    // carries no token -- the user has not finished authorizing yet -- rather than
+    // letting it reach `json()` and be reported as an unparseable success, which
+    // would put a parse error in the debug log and in the timeout's last error.
+    if status == reqwest::StatusCode::NO_CONTENT {
+        return Some(ExchangeOutcome::Pending);
+    }
+
     if status.is_success() {
         return None;
     }
@@ -609,9 +619,19 @@ mod tests {
     }
 
     #[test]
-    fn a_success_status_defers_to_the_body() {
+    fn a_success_status_with_a_body_defers_to_the_body() {
         assert_eq!(classify_exchange_status(status(200)), None);
-        assert_eq!(classify_exchange_status(status(204)), None);
+    }
+
+    /// A 204 carries no body, so deferring to one would classify every such
+    /// response as an unparseable success. It says the same thing a 200 with no
+    /// token says: keep polling.
+    #[test]
+    fn a_no_content_status_is_pending() {
+        assert_eq!(
+            classify_exchange_status(status(204)),
+            Some(ExchangeOutcome::Pending)
+        );
     }
 
     #[test]
