@@ -136,6 +136,7 @@ pub mod cluster;
 mod secrets_preflight;
 pub mod spice_metrics;
 pub mod status;
+pub(crate) mod table_layers;
 pub mod task_history;
 pub mod tls;
 pub mod token_providers;
