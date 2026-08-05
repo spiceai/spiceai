@@ -21,7 +21,7 @@ mod analyze;
 use crate::context::RuntimeContext;
 use crate::error::{
     ConnectionFailedSnafu, InvalidResponseSnafu, ModelNotFoundSnafu, NoModelsConfiguredSnafu,
-    Result,
+    Result, read_response,
 };
 use clap::{Args, Subcommand};
 use repl::util::{Spinner, create_editor_with_history, save_history};
@@ -210,8 +210,7 @@ async fn send_nsql_request(ctx: &RuntimeContext, query: &str, model: &str) -> Re
         .await
         .context(ConnectionFailedSnafu { endpoint: &url })?;
 
-    let status = response.status();
-    let text = response.text().await.unwrap_or_default();
+    let (status, text) = read_response(response, &url).await?;
 
     if !status.is_success() {
         return Err(InvalidResponseSnafu {
@@ -274,5 +273,37 @@ mod tests {
         // The server answers every path alike, so without this the test would pass against any
         // route and would pin only the client, not the endpoint.
         assert_eq!(server.targets(), vec!["/v1/nsql".to_string()]);
+    }
+
+    /// A `200` whose body stops part-way through is not an empty translation — the defect
+    /// reported in <https://github.com/spiceai/spiceai/issues/12587>. Reading the body with
+    /// `unwrap_or_default` returned `Ok("")` here, which is indistinguishable from a model
+    /// that legitimately produced nothing.
+    #[tokio::test]
+    async fn a_truncated_translation_is_an_error_not_an_empty_one() {
+        let server = SlowServer::truncating(
+            vec!["SELECT ".to_string(), "1".to_string()],
+            Duration::from_millis(5),
+        );
+
+        let ctx = RuntimeContext::with_deadlines_for_test(
+            server.url(),
+            Deadline::Total(Duration::from_secs(30)),
+            Deadline::Silence(Duration::from_secs(30)),
+        );
+
+        let error = send_nsql_request(&ctx, "how many rows", "test-model")
+            .await
+            .expect_err("a body that stopped part-way through is not a translation");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("Failed to read the response"),
+            "expected the read failure to be reported, got: {message}"
+        );
+        assert!(
+            message.contains("/v1/nsql"),
+            "the error should name the endpoint, got: {message}"
+        );
     }
 }

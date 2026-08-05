@@ -17,7 +17,7 @@ limitations under the License.
 //! Error types for the Spice CLI.
 
 use reqwest::StatusCode;
-use snafu::Snafu;
+use snafu::{IntoError, Snafu};
 use std::path::PathBuf;
 
 /// Result type alias for the Spice CLI.
@@ -71,6 +71,15 @@ pub enum Error {
     /// Invalid HTTP response
     #[snafu(display("Invalid HTTP response: {message}"))]
     InvalidResponse { message: String },
+
+    /// A response the runtime reported as successful did not arrive in full
+    #[snafu(display(
+        "Failed to read the response from {endpoint}: {source}. The request was accepted, so the result may be incomplete rather than empty -- check the runtime's logs, then retry. See: https://spiceai.org/docs/api"
+    ))]
+    ResponseIncomplete {
+        endpoint: String,
+        source: reqwest::Error,
+    },
 
     /// A Spicepod registry failed to serve a pod. The message is already fully formed, so it is
     /// displayed verbatim rather than blamed on the user's argument.
@@ -194,9 +203,101 @@ pub async fn check_response(
     .build())
 }
 
+/// Read a response's status and body, distinguishing a body that failed to arrive from one
+/// that was empty.
+///
+/// On a non-success status the body only decorates a message that already reports the
+/// failure, so a read error there yields an empty string rather than replacing the status
+/// the caller is about to report. On a success status the body *is* the result: a read that
+/// stopped part-way — a deadline firing mid-response, a reset connection, a truncated
+/// response — must be reported rather than defaulted to an empty success.
+pub async fn read_response(
+    response: reqwest::Response,
+    endpoint: &str,
+) -> Result<(StatusCode, String)> {
+    let status = response.status();
+    match response.text().await {
+        Ok(body) => Ok((status, body)),
+        Err(_) if !status.is_success() => Ok((status, String::new())),
+        Err(source) => Err(ResponseIncompleteSnafu {
+            endpoint: endpoint.to_string(),
+        }
+        .into_error(source)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A response whose body fails part-way through, under the caller's choice of status.
+    fn response_with_unreadable_body(status: StatusCode) -> reqwest::Response {
+        let failure = std::io::Error::other("the connection went away mid-body");
+        let body = reqwest::Body::wrap_stream(futures::stream::once(async {
+            Err::<Vec<u8>, std::io::Error>(failure)
+        }));
+
+        let response = http::Response::builder()
+            .status(status)
+            .body(body)
+            .expect("a response with a status and a body is well-formed");
+
+        reqwest::Response::from(response)
+    }
+
+    /// A body that stopped part-way through is not an empty result: reading it with
+    /// `unwrap_or_default` reported an empty success, which is
+    /// <https://github.com/spiceai/spiceai/issues/12587>.
+    #[tokio::test]
+    async fn a_body_that_fails_on_a_success_status_is_an_error() {
+        let response = response_with_unreadable_body(StatusCode::OK);
+
+        let error = read_response(response, "http://runtime/v1/nsql")
+            .await
+            .expect_err("a body that did not arrive is not a result");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("http://runtime/v1/nsql"),
+            "the error should name the endpoint, got: {message}"
+        );
+        assert!(
+            matches!(error, Error::ResponseIncomplete { .. }),
+            "expected an incomplete-response error, got: {message}"
+        );
+    }
+
+    /// On a failing status the body is only decoration for a message that already reports the
+    /// failure, so a body that could not be read must not replace the status with a transport
+    /// error — the caller still has to be able to say what the server answered.
+    #[tokio::test]
+    async fn a_body_that_fails_on_an_error_status_keeps_the_status() {
+        let response = response_with_unreadable_body(StatusCode::INTERNAL_SERVER_ERROR);
+
+        let (status, body) = read_response(response, "http://runtime/v1/nsql")
+            .await
+            .expect("the status is the result here, not the body");
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body, "");
+    }
+
+    #[tokio::test]
+    async fn a_body_that_arrives_is_returned_with_its_status() {
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .status(StatusCode::OK)
+                .body("SELECT 1")
+                .expect("a response with a status and a body is well-formed"),
+        );
+
+        let (status, body) = read_response(response, "http://runtime/v1/nsql")
+            .await
+            .expect("a body that arrived in full is a result");
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "SELECT 1");
+    }
 
     #[test]
     fn test_unauthorized_error_message() {

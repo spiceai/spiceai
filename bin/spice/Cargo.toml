@@ -118,6 +118,7 @@ release = []
 
 [dev-dependencies]
 assert_cmd = "2"
+http.workspace = true
 insta = { workspace = true, features = ["filters", "json"] }
 predicates = "3"
 rstest = "0.26.1"
