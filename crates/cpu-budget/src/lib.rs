@@ -24,20 +24,25 @@ limitations under the License.
 //! the detected core count, so a runtime sized for more cores than it can use
 //! reports itself idle while saturated.
 //!
-//! Detection itself is unchanged — with nothing configured this resolves to the
-//! same value `available_parallelism` returned (a cgroup quota, capped by
-//! `sched_getaffinity`). What is new is that the value has one owner, a named
-//! source, and an explicit override for deployments the host cannot describe.
+//! With nothing configured and no CPU request declared, this resolves to the same
+//! value `available_parallelism` returned (a cgroup quota, capped by
+//! `sched_getaffinity`) — so every bare-metal deployment and every benchmark keeps
+//! the whole host. What is new is that the value has one owner, a named source, and
+//! an explicit override for deployments the host cannot describe.
 //!
-//! Sizing deliberately follows only a cgroup CPU *quota*, never a CPU *share*.
-//! Under Kubernetes the kubelet derives the share from `requests.cpu`, but a
-//! request is a scheduling floor, not a ceiling: a burstable pod is entitled to
-//! every idle core on its node, and sizing from the request would take that
-//! away. An operator who wants the runtime sized to the request says so
-//! explicitly with `runtime.cpu.cores`. The share is still *read*, so the
-//! startup log and the metrics can show the request and the limit next to the
-//! budget actually chosen — that comparison is what makes a mis-sized pod
-//! diagnosable.
+//! A pod that declares a CPU request and no CPU limit is sized from that request
+//! instead: a request is a scheduling floor rather than a ceiling, so sizing *at*
+//! it would take away the bursting that is the reason the limit was omitted, and
+//! sizing for the node hands the runtime a machine it does not own. The
+//! entitlement is a bounded multiple of the request — see
+//! [`CPU_REQUEST_BURST_FACTOR`] — and `runtime.cpu.cores: all` opts out for the
+//! deployment that packs many mostly-idle instances onto one node.
+//!
+//! The request must be *declared*, through [`CPU_REQUEST_ENV`]. A cgroup CPU
+//! *share* is never an input: every cgroup carries one whether or not a request was
+//! expressed, and the conversion back to a request varies by writer, so it is read
+//! for reporting and for noticing a resize, never for sizing. See
+//! [`HostReadings::cpu_share`].
 //!
 //! This crate owns both halves of the fix: [`HostReadings`] +
 //! [`CpuBudget::resolve`] decide the entitlement, and the methods on

@@ -400,6 +400,35 @@ pub struct Args {
 ///
 /// On Windows or other targets without SIGHUP semantics this is a
 /// no-op: rotation still works via the polling filesystem watcher.
+fn spawn_sighup_reload_task(control: std::sync::Arc<runtime::tls::TlsControl>) {
+    #[cfg(unix)]
+    {
+        tokio::spawn(async move {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut sighup = match signal(SignalKind::hangup()) {
+                Ok(s) => s,
+                Err(err) => {
+                    tracing::warn!("TLS reload: failed to install SIGHUP handler: {err}");
+                    return;
+                }
+            };
+            tracing::debug!("TLS reload: SIGHUP handler installed");
+            while sighup.recv().await.is_some() {
+                tracing::info!("TLS reload: SIGHUP received, reloading TLS material");
+                if let Err(err) = control.reload_all() {
+                    tracing::warn!("TLS reload: SIGHUP reload failed: {err}");
+                }
+            }
+        });
+    }
+    #[cfg(not(unix))]
+    {
+        // Non-Unix platforms have no SIGHUP equivalent; rotation still
+        // works via the polling filesystem watcher.
+        let _ = control;
+    }
+}
+
 /// How often to re-read the cgroup CPU share looking for an in-place pod resize.
 ///
 /// Slow on purpose. A resize is a human- or VPA-scale event, the read is two small
@@ -437,35 +466,6 @@ fn spawn_cpu_share_drift_task() {
             }
         }
     });
-}
-
-fn spawn_sighup_reload_task(control: std::sync::Arc<runtime::tls::TlsControl>) {
-    #[cfg(unix)]
-    {
-        tokio::spawn(async move {
-            use tokio::signal::unix::{SignalKind, signal};
-            let mut sighup = match signal(SignalKind::hangup()) {
-                Ok(s) => s,
-                Err(err) => {
-                    tracing::warn!("TLS reload: failed to install SIGHUP handler: {err}");
-                    return;
-                }
-            };
-            tracing::debug!("TLS reload: SIGHUP handler installed");
-            while sighup.recv().await.is_some() {
-                tracing::info!("TLS reload: SIGHUP received, reloading TLS material");
-                if let Err(err) = control.reload_all() {
-                    tracing::warn!("TLS reload: SIGHUP reload failed: {err}");
-                }
-            }
-        });
-    }
-    #[cfg(not(unix))]
-    {
-        // Non-Unix platforms have no SIGHUP equivalent; rotation still
-        // works via the polling filesystem watcher.
-        let _ = control;
-    }
 }
 
 /// The parsed spicepod, plus the load error tolerated in pods-watcher mode.

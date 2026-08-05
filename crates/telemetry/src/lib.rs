@@ -504,7 +504,7 @@ pub fn register_cpu_budget_metrics(
         let _ = meter
             .u64_observable_gauge("spiced_cpu_request_millicores")
             .with_description(
-                "The pod's own CPU request (Kubernetes requests.cpu), as declared by the surface that wrote the pod spec. Reported only; never used for sizing.",
+                "The pod's own CPU request (Kubernetes requests.cpu), as declared by the surface that wrote the pod spec. Sizing derives from it when no CPU limit is set; compare against spiced_cpu_budget_millicores to see what it produced.",
             )
             .with_unit("{millicpu}")
             .with_callback(move |obs| obs.observe(declared, &[]))
