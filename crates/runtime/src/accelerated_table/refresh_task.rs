@@ -193,7 +193,7 @@ struct RefreshStat {
 }
 
 /// Formats memory size for log line, labeled as `uncompressed` since it
-/// is the in-memory Arrow size. Empty when the size is unknown (`0`).
+/// is the in-memory Arrow size. Returns an empty string when the size is `0`.
 fn format_loaded_memory_size(memory_size: usize) -> String {
     if memory_size > 0 {
         format!(" ({} uncompressed)", util::human_readable_bytes(memory_size))
