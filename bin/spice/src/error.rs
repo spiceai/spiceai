@@ -43,9 +43,9 @@ pub enum CloudErrorCode {
     OrgConflict,
     /// An organization was named, but no credential is bound to it.
     OrgCredentialMissing,
-    /// No app by that name exists in the organization being acted on.
-    AppNotFound,
-    /// The app exists, but under a different organization than the active one.
+    /// No project by that name exists in the organization being acted on.
+    ProjectNotFound,
+    /// The project exists, but under a different organization than the active one.
     WrongOrg,
     /// A deployment is already in flight for this app.
     DeployConflict,
@@ -75,7 +75,7 @@ impl CloudErrorCode {
             Self::OrgForbidden => "org_forbidden",
             Self::OrgConflict => "org_conflict",
             Self::OrgCredentialMissing => "org_credential_missing",
-            Self::AppNotFound => "app_not_found",
+            Self::ProjectNotFound => "project_not_found",
             Self::WrongOrg => "wrong_org",
             Self::DeployConflict => "deploy_conflict",
             Self::DeployFailed => "deploy_failed",
@@ -338,7 +338,7 @@ mod tests {
     #[test]
     fn cloud_error_appends_hint_to_the_message_on_one_line() {
         let err = Error::cloud_with_hint(
-            CloudErrorCode::AppNotFound,
+            CloudErrorCode::ProjectNotFound,
             "App 'team-app' not found in org 'lukekim'.",
             "Run 'spice cloud orgs' to see the orgs you can access.",
         );
@@ -349,7 +349,7 @@ mod tests {
             "App 'team-app' not found in org 'lukekim'. Run 'spice cloud orgs' to see the orgs you can access."
         );
         assert!(!rendered.contains('\n'), "error messages stay on one line");
-        assert_eq!(err.cloud_code(), Some(CloudErrorCode::AppNotFound));
+        assert_eq!(err.cloud_code(), Some(CloudErrorCode::ProjectNotFound));
     }
 
     #[test]
@@ -369,7 +369,10 @@ mod tests {
         assert_eq!(CloudErrorCode::TokenExpired.as_str(), "token_expired");
         assert_eq!(CloudErrorCode::OrgNotFound.as_str(), "org_not_found");
         assert_eq!(CloudErrorCode::OrgForbidden.as_str(), "org_forbidden");
-        assert_eq!(CloudErrorCode::AppNotFound.as_str(), "app_not_found");
+        assert_eq!(
+            CloudErrorCode::ProjectNotFound.as_str(),
+            "project_not_found"
+        );
         assert_eq!(CloudErrorCode::WrongOrg.as_str(), "wrong_org");
         assert_eq!(CloudErrorCode::DeployConflict.as_str(), "deploy_conflict");
         assert_eq!(CloudErrorCode::DeployFailed.as_str(), "deploy_failed");

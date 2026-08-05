@@ -23,11 +23,11 @@ use snafu::ResultExt;
 
 use crate::error::{self, HttpRequestSnafu, Result};
 use crate::types::{
-    ApiKeysResponse, App, AppsResponse, AuthContext, AuthContextRaw, AuthExchangeRequest,
-    AuthExchangeResponse, ContainerImagesResponse, CreateAppRequest, CreateDeploymentRequest,
-    Deployment, DeploymentsResponse, LogsResponse, MetricsResponse, OAuthTokenRequest,
-    OAuthTokenResponse, Org, OrgsResponse, RegenerateApiKeyRequest, RegenerateApiKeyResponse,
-    RegionsResponse, Secret, SecretsResponse, SetSecretRequest, UpdateAppRequest,
+    ApiKeysResponse, AuthContext, AuthContextRaw, AuthExchangeRequest, AuthExchangeResponse,
+    ContainerImagesResponse, CreateDeploymentRequest, CreateProjectRequest, Deployment,
+    DeploymentsResponse, LogsResponse, MetricsResponse, OAuthTokenRequest, OAuthTokenResponse, Org,
+    OrgsResponse, Project, ProjectsResponse, RegenerateApiKeyRequest, RegenerateApiKeyResponse,
+    RegionsResponse, Secret, SecretsResponse, SetSecretRequest, UpdateProjectRequest,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.spice.ai";
@@ -255,11 +255,17 @@ impl CloudClient {
     }
 
     // ========================================================================
-    // Apps
+    // Projects
     // ========================================================================
 
-    /// List all apps visible to the current token.
-    pub async fn list_apps(&self) -> Result<Vec<App>> {
+    /// List all projects visible to the current token.
+    ///
+    /// Uses `/v1/apps`, which Spice Cloud preserves as a permanent alias of
+    /// `/v1/projects` specifically so existing CLI, Terraform, and SDK clients
+    /// keep working across the rename. The response envelope differs by path
+    /// (`apps` vs `projects`); [`ProjectsResponse`] accepts either, so moving
+    /// to the canonical path later is a one-line change.
+    pub async fn list_projects(&self) -> Result<Vec<Project>> {
         let url = format!("{}/v1/apps", self.base_url);
         let response = self
             .authed(self.client.get(&url))
@@ -267,13 +273,13 @@ impl CloudClient {
             .await
             .context(HttpRequestSnafu)?;
 
-        let apps: AppsResponse = self.handle_response(response).await?;
-        Ok(apps.apps)
+        let projects: ProjectsResponse = self.handle_response(response).await?;
+        Ok(projects.into_projects())
     }
 
-    /// Get a single app by numeric ID.
-    pub async fn get_app_by_id(&self, app_id: i64) -> Result<App> {
-        let url = format!("{}/v1/apps/{}", self.base_url, app_id);
+    /// Get a single project by numeric ID.
+    pub async fn get_project_by_id(&self, project_id: i64) -> Result<Project> {
+        let url = format!("{}/v1/apps/{}", self.base_url, project_id);
         let response = self
             .authed(self.client.get(&url))
             .send()
@@ -283,8 +289,8 @@ impl CloudClient {
         self.handle_response(response).await
     }
 
-    /// Create a new app.
-    pub async fn create_app(&self, request: &CreateAppRequest) -> Result<App> {
+    /// Create a new project.
+    pub async fn create_project(&self, request: &CreateProjectRequest) -> Result<Project> {
         let url = format!("{}/v1/apps", self.base_url);
         let response = self
             .authed(self.client.post(&url))
@@ -296,9 +302,13 @@ impl CloudClient {
         self.handle_response(response).await
     }
 
-    /// Update an existing app.
-    pub async fn update_app(&self, app_id: i64, request: &UpdateAppRequest) -> Result<App> {
-        let url = format!("{}/v1/apps/{}", self.base_url, app_id);
+    /// Update an existing project.
+    pub async fn update_project(
+        &self,
+        project_id: i64,
+        request: &UpdateProjectRequest,
+    ) -> Result<Project> {
+        let url = format!("{}/v1/apps/{}", self.base_url, project_id);
         let response = self
             .authed(self.client.put(&url))
             .json(request)
@@ -309,9 +319,9 @@ impl CloudClient {
         self.handle_response(response).await
     }
 
-    /// Delete (soft-delete) an app.
-    pub async fn delete_app(&self, app_id: i64) -> Result<()> {
-        let url = format!("{}/v1/apps/{}", self.base_url, app_id);
+    /// Delete (soft-delete) a project.
+    pub async fn delete_project(&self, project_id: i64) -> Result<()> {
+        let url = format!("{}/v1/apps/{}", self.base_url, project_id);
         let response = self
             .authed(self.client.delete(&url))
             .send()
@@ -325,10 +335,10 @@ impl CloudClient {
     // Deployments
     // ========================================================================
 
-    /// List deployments for an app.
+    /// List deployments for a project.
     pub async fn list_deployments(
         &self,
-        app_id: i64,
+        project_id: i64,
         limit: usize,
         status: Option<&str>,
     ) -> Result<Vec<Deployment>> {
@@ -336,7 +346,7 @@ impl CloudClient {
 
         let mut url = format!(
             "{}/v1/apps/{}/deployments?limit={}",
-            self.base_url, app_id, limit
+            self.base_url, project_id, limit
         );
         if let Some(s) = status {
             let _ = write!(url, "&status={s}");
@@ -355,10 +365,10 @@ impl CloudClient {
     /// Create a new deployment.
     pub async fn create_deployment(
         &self,
-        app_id: i64,
+        project_id: i64,
         request: &CreateDeploymentRequest,
     ) -> Result<Deployment> {
-        let url = format!("{}/v1/apps/{}/deployments", self.base_url, app_id);
+        let url = format!("{}/v1/apps/{}/deployments", self.base_url, project_id);
         let response = self
             .authed(self.client.post(&url))
             .json(request)
@@ -372,7 +382,7 @@ impl CloudClient {
     /// Get deployment logs.
     pub async fn get_deployment_logs(
         &self,
-        app_id: i64,
+        project_id: i64,
         deployment_id: i64,
         limit: usize,
         since: Option<&str>,
@@ -381,7 +391,7 @@ impl CloudClient {
 
         let mut url = format!(
             "{}/v1/apps/{}/deployments/{}/logs?limit={}",
-            self.base_url, app_id, deployment_id, limit
+            self.base_url, project_id, deployment_id, limit
         );
         if let Some(s) = since {
             let _ = write!(url, "&since={s}");
@@ -443,9 +453,9 @@ impl CloudClient {
     // Secrets
     // ========================================================================
 
-    /// List secrets for an app.
-    pub async fn list_secrets(&self, app_id: i64) -> Result<Vec<Secret>> {
-        let url = format!("{}/v1/apps/{}/secrets", self.base_url, app_id);
+    /// List secrets for a project.
+    pub async fn list_secrets(&self, project_id: i64) -> Result<Vec<Secret>> {
+        let url = format!("{}/v1/apps/{}/secrets", self.base_url, project_id);
         let response = self
             .authed(self.client.get(&url))
             .send()
@@ -457,8 +467,8 @@ impl CloudClient {
     }
 
     /// Get a single secret by name.
-    pub async fn get_secret(&self, app_id: i64, name: &str) -> Result<Secret> {
-        let url = format!("{}/v1/apps/{}/secrets/{}", self.base_url, app_id, name);
+    pub async fn get_secret(&self, project_id: i64, name: &str) -> Result<Secret> {
+        let url = format!("{}/v1/apps/{}/secrets/{}", self.base_url, project_id, name);
         let response = self
             .authed(self.client.get(&url))
             .send()
@@ -469,8 +479,8 @@ impl CloudClient {
     }
 
     /// Create or update a secret.
-    pub async fn set_secret(&self, app_id: i64, name: &str, value: &str) -> Result<Secret> {
-        let url = format!("{}/v1/apps/{}/secrets", self.base_url, app_id);
+    pub async fn set_secret(&self, project_id: i64, name: &str, value: &str) -> Result<Secret> {
+        let url = format!("{}/v1/apps/{}/secrets", self.base_url, project_id);
         let request = SetSecretRequest {
             name: name.to_string(),
             value: value.to_string(),
@@ -487,8 +497,8 @@ impl CloudClient {
     }
 
     /// Delete a secret.
-    pub async fn delete_secret(&self, app_id: i64, name: &str) -> Result<()> {
-        let url = format!("{}/v1/apps/{}/secrets/{}", self.base_url, app_id, name);
+    pub async fn delete_secret(&self, project_id: i64, name: &str) -> Result<()> {
+        let url = format!("{}/v1/apps/{}/secrets/{}", self.base_url, project_id, name);
         let response = self
             .authed(self.client.delete(&url))
             .send()
@@ -502,9 +512,9 @@ impl CloudClient {
     // API Keys
     // ========================================================================
 
-    /// Get API keys for an app.
-    pub async fn get_api_keys(&self, app_id: i64) -> Result<ApiKeysResponse> {
-        let url = format!("{}/v1/apps/{}/api-keys", self.base_url, app_id);
+    /// Get API keys for a project.
+    pub async fn get_api_keys(&self, project_id: i64) -> Result<ApiKeysResponse> {
+        let url = format!("{}/v1/apps/{}/api-keys", self.base_url, project_id);
         let response = self
             .authed(self.client.get(&url))
             .send()
@@ -517,10 +527,10 @@ impl CloudClient {
     /// Regenerate an API key.
     pub async fn regenerate_api_key(
         &self,
-        app_id: i64,
+        project_id: i64,
         key_number: u8,
     ) -> Result<RegenerateApiKeyResponse> {
-        let url = format!("{}/v1/apps/{}/api-keys", self.base_url, app_id);
+        let url = format!("{}/v1/apps/{}/api-keys", self.base_url, project_id);
         let request = RegenerateApiKeyRequest { key_number };
 
         let response = self
@@ -537,13 +547,13 @@ impl CloudClient {
     // Metrics
     // ========================================================================
 
-    /// Get metrics for an app's pods.
-    pub async fn get_app_metrics(
+    /// Get metrics for a project's instances.
+    pub async fn get_project_metrics(
         &self,
-        app_id: i64,
+        project_id: i64,
         window: Option<&str>,
     ) -> Result<MetricsResponse> {
-        let url = format!("{}/v1/apps/{}/metrics", self.base_url, app_id);
+        let url = format!("{}/v1/apps/{}/metrics", self.base_url, project_id);
         let mut request = self.authed(self.client.get(&url));
         if let Some(w) = window {
             request = request.query(&[("window", w)]);

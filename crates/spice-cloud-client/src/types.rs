@@ -42,7 +42,7 @@ pub enum ParseCloudEnumError {
     ))]
     InvalidUpdateChannel { input: String },
     #[snafu(display("invalid kind '{input}'. Expected one of: set, cluster"))]
-    InvalidAppKind { input: String },
+    InvalidProjectKind { input: String },
 }
 
 impl std::fmt::Display for UpdateChannel {
@@ -72,17 +72,17 @@ impl std::str::FromStr for UpdateChannel {
     }
 }
 
-/// App kind — determines whether the app is a `SpicepodSet` or `SpicepodCluster`.
+/// Project kind — determines whether the project is a `SpicepodSet` or `SpicepodCluster`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum AppKind {
+pub enum ProjectKind {
     /// Standard scheduler-only deployment.
     Set,
     /// Distributed deployment with separate scheduler and executor pods.
     Cluster,
 }
 
-impl std::fmt::Display for AppKind {
+impl std::fmt::Display for ProjectKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Set => write!(f, "set"),
@@ -91,14 +91,14 @@ impl std::fmt::Display for AppKind {
     }
 }
 
-impl std::str::FromStr for AppKind {
+impl std::str::FromStr for ProjectKind {
     type Err = ParseCloudEnumError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
             "set" | "spicepodset" => Ok(Self::Set),
             "cluster" | "spicepodcluster" => Ok(Self::Cluster),
-            _ => Err(ParseCloudEnumError::InvalidAppKind {
+            _ => Err(ParseCloudEnumError::InvalidProjectKind {
                 input: s.to_string(),
             }),
         }
@@ -141,11 +141,11 @@ impl OrgsResponse {
 }
 
 // ============================================================================
-// Apps
+// Projects
 // ============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct App {
+pub struct Project {
     pub id: i64,
     pub name: String,
     #[serde(default)]
@@ -156,10 +156,10 @@ pub struct App {
     pub region: Option<String>,
     pub production_branch: Option<String>,
     #[serde(default)]
-    pub config: Option<AppConfig>,
+    pub config: Option<ProjectConfig>,
 }
 
-impl App {
+impl Project {
     #[must_use]
     pub fn full_name(&self) -> String {
         if self.org.is_empty() {
@@ -170,31 +170,48 @@ impl App {
     }
 }
 
+/// Wire format for a project listing.
+///
+/// Spice Cloud renamed apps to projects and serves both spellings: the
+/// canonical `/v1/projects` answers with a `projects` envelope, while the
+/// preserved `/v1/apps` alias keeps its original `apps` envelope. Accept
+/// either so the CLI reads the same on both paths and across the rename.
 #[derive(Debug, Deserialize)]
-pub struct AppsResponse {
-    pub apps: Vec<App>,
+#[serde(untagged)]
+pub enum ProjectsResponse {
+    Projects { projects: Vec<Project> },
+    Apps { apps: Vec<Project> },
+}
+
+impl ProjectsResponse {
+    #[must_use]
+    pub fn into_projects(self) -> Vec<Project> {
+        match self {
+            Self::Projects { projects } | Self::Apps { apps: projects } => projects,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AppExecutor {
+pub struct ProjectExecutor {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replicas: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub resources: Option<AppResources>,
+    pub resources: Option<ProjectResources>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_size_gb: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AppConfig {
+pub struct ProjectConfig {
     pub spicepod: Option<serde_json::Value>,
     pub registry: Option<String>,
     pub image: Option<String>,
     pub image_tag: Option<String>,
     pub update_channel: Option<String>,
     pub replicas: Option<i32>,
-    pub resources: Option<AppResources>,
-    pub executor: Option<AppExecutor>,
+    pub resources: Option<ProjectResources>,
+    pub executor: Option<ProjectExecutor>,
     pub region: Option<String>,
     pub node_group: Option<String>,
     pub storage_size_gb: Option<f64>,
@@ -203,14 +220,14 @@ pub struct AppConfig {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AppResources {
-    pub limits: AppResourceLimits,
+pub struct ProjectResources {
+    pub limits: ProjectResourceLimits,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub requests: Option<AppResourceRequests>,
+    pub requests: Option<ProjectResourceRequests>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AppResourceLimits {
+pub struct ProjectResourceLimits {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu: Option<String>,
     /// Omitted when the caller leaves memory unspecified; Cloud API treats the missing field as
@@ -222,7 +239,7 @@ pub struct AppResourceLimits {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AppResourceRequests {
+pub struct ProjectResourceRequests {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -230,7 +247,7 @@ pub struct AppResourceRequests {
 }
 
 #[derive(Debug, Serialize)]
-pub struct CreateAppRequest {
+pub struct CreateProjectRequest {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -248,15 +265,15 @@ pub struct CreateAppRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replicas: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub resources: Option<AppResources>,
+    pub resources: Option<ProjectResources>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub executor: Option<AppExecutor>,
+    pub executor: Option<ProjectExecutor>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_size_gb: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Default)]
-pub struct UpdateAppRequest {
+pub struct UpdateProjectRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -272,9 +289,9 @@ pub struct UpdateAppRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spicepod: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub resources: Option<AppResources>,
+    pub resources: Option<ProjectResources>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub executor: Option<AppExecutor>,
+    pub executor: Option<ProjectExecutor>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_size_gb: Option<f64>,
 }
@@ -575,15 +592,18 @@ mod tests {
     #[test]
     fn app_kind_parse_error_is_typed() {
         let error = "worker"
-            .parse::<AppKind>()
+            .parse::<ProjectKind>()
             .expect_err("invalid app kind should fail");
 
-        assert!(matches!(error, ParseCloudEnumError::InvalidAppKind { .. }));
+        assert!(matches!(
+            error,
+            ParseCloudEnumError::InvalidProjectKind { .. }
+        ));
     }
 
     #[test]
     fn resource_limits_omit_unspecified_memory() {
-        let limits = AppResourceLimits {
+        let limits = ProjectResourceLimits {
             cpu: Some("2".to_string()),
             memory: None,
             ephemeral_storage: None,
@@ -591,6 +611,23 @@ mod tests {
 
         let value = serde_json::to_value(limits).expect("limits should serialize");
         assert_eq!(value, serde_json::json!({ "cpu": "2" }));
+    }
+
+    #[test]
+    fn project_listings_parse_on_both_sides_of_the_rename() {
+        // Spice Cloud serves `/v1/projects` with a `projects` envelope and
+        // keeps `/v1/apps` with its original `apps` envelope for existing
+        // clients. The CLI must read the same from either, so switching paths
+        // later is a one-line change and never a parse failure in the field.
+        let projects: ProjectsResponse =
+            serde_json::from_str(r#"{"projects":[{"id":1,"name":"team-app","org":"spicehq"}]}"#)
+                .expect("projects envelope should deserialize");
+        assert_eq!(projects.into_projects()[0].name, "team-app");
+
+        let apps: ProjectsResponse =
+            serde_json::from_str(r#"{"apps":[{"id":1,"name":"team-app","org":"spicehq"}]}"#)
+                .expect("legacy apps envelope should deserialize");
+        assert_eq!(apps.into_projects()[0].name, "team-app");
     }
 
     #[test]
@@ -615,7 +652,7 @@ mod tests {
 
     #[test]
     fn app_config_preserves_unknown_update_channel() {
-        let config = serde_json::from_value::<AppConfig>(serde_json::json!({
+        let config = serde_json::from_value::<ProjectConfig>(serde_json::json!({
             "update_channel": "next"
         }))
         .expect("unknown update channels should deserialize");

@@ -705,7 +705,7 @@ fn apply_machine_cloud_mode(command: &mut cloud::CloudCommands) {
     match command {
         cloud::CloudCommands::Whoami(args) => args.output = OutputFormat::Json,
         cloud::CloudCommands::Orgs(args) => args.output = OutputFormat::Json,
-        cloud::CloudCommands::Apps(args) => args.output = OutputFormat::Json,
+        cloud::CloudCommands::Projects(args) => args.output = OutputFormat::Json,
         cloud::CloudCommands::Deployments(args) => args.output = OutputFormat::Json,
         cloud::CloudCommands::Regions(args) => args.output = OutputFormat::Json,
         cloud::CloudCommands::Images(args) => args.output = OutputFormat::Json,
@@ -721,16 +721,16 @@ fn apply_machine_cloud_mode(command: &mut cloud::CloudCommands) {
             cloud::SecretsCommands::Delete(args) => args.output = OutputFormat::Json,
         },
         cloud::CloudCommands::Create(command) => match command {
-            cloud::CreateCommands::App(args) => args.output = OutputFormat::Json,
+            cloud::CreateCommands::Project(args) => args.output = OutputFormat::Json,
             cloud::CreateCommands::Deployment(args) => args.output = OutputFormat::Json,
         },
-        cloud::CloudCommands::Get(cloud::GetCommands::App(args)) => {
+        cloud::CloudCommands::Get(cloud::GetCommands::Project(args)) => {
             args.output = OutputFormat::Json;
         }
-        cloud::CloudCommands::Update(cloud::UpdateCommands::App(args)) => {
+        cloud::CloudCommands::Update(cloud::UpdateCommands::Project(args)) => {
             args.output = OutputFormat::Json;
         }
-        cloud::CloudCommands::Delete(cloud::DeleteCommands::App(args)) => {
+        cloud::CloudCommands::Delete(cloud::DeleteCommands::Project(args)) => {
             args.output = OutputFormat::Json;
         }
         cloud::CloudCommands::Org(command) => match command {
@@ -860,7 +860,7 @@ fn is_json_output(cmd: &Commands) -> bool {
         }) => *output == OutputFormat::Json,
         Commands::Cloud(a) => match &a.command {
             cloud::CloudCommands::Whoami(x) => x.output == OutputFormat::Json,
-            cloud::CloudCommands::Apps(x) => x.output == OutputFormat::Json,
+            cloud::CloudCommands::Projects(x) => x.output == OutputFormat::Json,
             cloud::CloudCommands::Regions(x) => x.output == OutputFormat::Json,
             cloud::CloudCommands::Images(x) => x.output == OutputFormat::Json,
             cloud::CloudCommands::Deployments(x) => x.output == OutputFormat::Json,
@@ -882,17 +882,19 @@ fn is_json_output(cmd: &Commands) -> bool {
             cloud::CloudCommands::Secrets(cloud::SecretsCommands::Delete(x)) => {
                 x.output == OutputFormat::Json
             }
-            cloud::CloudCommands::Create(cloud::CreateCommands::App(x)) => {
+            cloud::CloudCommands::Create(cloud::CreateCommands::Project(x)) => {
                 x.output == OutputFormat::Json
             }
             cloud::CloudCommands::Create(cloud::CreateCommands::Deployment(x)) => {
                 x.output == OutputFormat::Json
             }
-            cloud::CloudCommands::Get(cloud::GetCommands::App(x)) => x.output == OutputFormat::Json,
-            cloud::CloudCommands::Update(cloud::UpdateCommands::App(x)) => {
+            cloud::CloudCommands::Get(cloud::GetCommands::Project(x)) => {
                 x.output == OutputFormat::Json
             }
-            cloud::CloudCommands::Delete(cloud::DeleteCommands::App(x)) => {
+            cloud::CloudCommands::Update(cloud::UpdateCommands::Project(x)) => {
+                x.output == OutputFormat::Json
+            }
+            cloud::CloudCommands::Delete(cloud::DeleteCommands::Project(x)) => {
                 x.output == OutputFormat::Json
             }
             cloud::CloudCommands::Orgs(x) => x.output == OutputFormat::Json,
@@ -1733,7 +1735,7 @@ mod tests {
         // must cause the banner to be suppressed, otherwise piping to `jq` breaks.
         let json_producing: &[&[&str]] = &[
             &["spice", "cloud", "whoami", "--output", "json"],
-            &["spice", "cloud", "apps", "--output", "json"],
+            &["spice", "cloud", "projects", "--output", "json"],
             &["spice", "cloud", "regions", "--output", "json"],
             &["spice", "cloud", "images", "--output", "json"],
             &["spice", "cloud", "deployments", "--output", "json"],
@@ -1756,7 +1758,7 @@ mod tests {
                 "spice",
                 "cloud",
                 "create",
-                "app",
+                "project",
                 "name",
                 "--region",
                 "us-east-1",
@@ -1765,11 +1767,24 @@ mod tests {
             ],
             &["spice", "cloud", "create", "deployment", "--output", "json"],
             &[
-                "spice", "cloud", "get", "app", "org/app", "--output", "json",
+                "spice",
+                "cloud",
+                "get",
+                "project",
+                "org/project",
+                "--output",
+                "json",
             ],
-            &["spice", "cloud", "update", "app", "--output", "json"],
+            &["spice", "cloud", "update", "project", "--output", "json"],
             &[
-                "spice", "cloud", "delete", "app", "org/app", "--yes", "--output", "json",
+                "spice",
+                "cloud",
+                "delete",
+                "project",
+                "org/project",
+                "--yes",
+                "--output",
+                "json",
             ],
         ];
         for argv in json_producing {

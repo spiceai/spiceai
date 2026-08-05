@@ -26,10 +26,10 @@ use crate::error::{CloudErrorCode, Error, InvalidResponseSnafu, Result};
 
 pub use spice_cloud_client::CloudClient as InnerCloudClient;
 use spice_cloud_client::types::{
-    ApiKeysResponse, App, AppExecutor, AppKind, AppResourceLimits, AppResources, AuthContext,
-    AuthExchangeResponse, ContainerImagesResponse, CreateAppRequest, CreateDeploymentRequest,
-    Deployment, LogsResponse, MetricsResponse, Org, RegenerateApiKeyResponse, RegionsResponse,
-    Secret, UpdateAppRequest, UpdateChannel,
+    ApiKeysResponse, AuthContext, AuthExchangeResponse, ContainerImagesResponse,
+    CreateDeploymentRequest, CreateProjectRequest, Deployment, LogsResponse, MetricsResponse, Org,
+    Project, ProjectExecutor, ProjectKind, ProjectResourceLimits, ProjectResources,
+    RegenerateApiKeyResponse, RegionsResponse, Secret, UpdateChannel, UpdateProjectRequest,
 };
 
 use super::org;
@@ -37,37 +37,37 @@ use super::org;
 const DEV_CLOUD_API_BASE_URL: &str = "https://dev-api.spice.ai";
 const CLOUD_API_BASE_URL: &str = "https://api.spice.ai";
 
-/// The app a command acts on, after `--app`, `--org`, the linked app, and the
-/// active org have been reconciled.
+/// The project a command acts on, after `--project`, `--org`, the linked
+/// project, and the active org have been reconciled.
 ///
 /// `org` is `None` only when nothing in the invocation named one, in which case
 /// the credential's own org is used.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AppTarget {
+pub struct ProjectTarget {
     pub org: Option<String>,
-    pub app: String,
+    pub project: String,
 }
 
-impl AppTarget {
-    /// Build a target from an explicit org and app name.
-    pub fn new(org: Option<String>, app: impl Into<String>) -> Self {
+impl ProjectTarget {
+    /// Build a target from an explicit org and project name.
+    pub fn new(org: Option<String>, project: impl Into<String>) -> Self {
         Self {
             org,
-            app: app.into(),
+            project: project.into(),
         }
     }
 
-    /// `org/app` when the org is known, otherwise the bare app name.
+    /// `org/project` when the org is known, otherwise the bare project name.
     #[must_use]
     pub fn display(&self) -> String {
         match &self.org {
-            Some(org) => format!("{org}/{}", self.app),
-            None => self.app.clone(),
+            Some(org) => format!("{org}/{}", self.project),
+            None => self.project.clone(),
         }
     }
 }
 
-impl std::fmt::Display for AppTarget {
+impl std::fmt::Display for ProjectTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.display())
     }
@@ -95,7 +95,7 @@ pub struct CreateDeploymentParams<'a> {
 }
 
 #[derive(Default)]
-pub struct UpdateAppParams<'a> {
+pub struct UpdateProjectParams<'a> {
     pub description: Option<&'a str>,
     pub visibility: Option<&'a str>,
     pub replicas: Option<i32>,
@@ -238,20 +238,20 @@ impl CloudClient {
     // Apps
     // ========================================================================
 
-    pub async fn get_app_metrics(
+    pub async fn get_project_metrics(
         &self,
-        app_id: i64,
+        project_id: i64,
         window: Option<&str>,
     ) -> Result<MetricsResponse> {
         self.inner
-            .get_app_metrics(app_id, window)
+            .get_project_metrics(project_id, window)
             .await
             .map_err(|error| self.err(error))
     }
 
-    pub async fn list_apps(&self) -> Result<Vec<App>> {
+    pub async fn list_projects(&self) -> Result<Vec<Project>> {
         self.inner
-            .list_apps()
+            .list_projects()
             .await
             .map_err(|error| self.err(error))
     }
@@ -261,14 +261,14 @@ impl CloudClient {
     /// The listing is the only place org membership is visible to the CLI, so it
     /// is also where a "wrong org" mistake is caught: an app that exists under a
     /// different org produces a switch hint rather than a bare "not found".
-    pub async fn get_app(&self, target: &AppTarget) -> Result<App> {
+    pub async fn get_project(&self, target: &ProjectTarget) -> Result<Project> {
         let context = self.optional_user_auth_context().await?;
-        let apps = self.list_apps().await?;
+        let apps = self.list_projects().await?;
         let context_org = context.as_ref().map(|c| c.org_name.as_str());
 
-        let app_id = resolve_app_id(&apps, target, context_org)?;
+        let project_id = resolve_project_id(&apps, target, context_org)?;
 
-        self.get_app_by_id(app_id).await
+        self.get_project_by_id(project_id).await
     }
 
     // ========================================================================
@@ -311,19 +311,19 @@ impl CloudClient {
             })
     }
 
-    pub async fn get_app_by_id(&self, app_id: i64) -> Result<App> {
+    pub async fn get_project_by_id(&self, project_id: i64) -> Result<Project> {
         self.inner
-            .get_app_by_id(app_id)
+            .get_project_by_id(project_id)
             .await
             .map_err(|error| self.err(error))
     }
 
     #[expect(clippy::too_many_arguments)]
-    pub async fn create_app(
+    pub async fn create_project(
         &self,
         name: &str,
         region: &str,
-        kind: AppKind,
+        kind: ProjectKind,
         description: Option<&str>,
         visibility: &str,
         replicas: Option<i32>,
@@ -333,8 +333,8 @@ impl CloudClient {
         executor_replicas: Option<i32>,
         executor_cpu: Option<i32>,
         executor_memory: Option<NumBytes>,
-    ) -> Result<App> {
-        let request = build_create_app_request(
+    ) -> Result<Project> {
+        let request = build_create_project_request(
             name,
             region,
             kind,
@@ -349,13 +349,17 @@ impl CloudClient {
             executor_memory,
         );
         self.inner
-            .create_app(&request)
+            .create_project(&request)
             .await
             .map_err(|error| self.err(error))
     }
 
-    pub async fn update_app(&self, target: &AppTarget, params: UpdateAppParams<'_>) -> Result<App> {
-        let app = self.get_app(target).await?;
+    pub async fn update_project(
+        &self,
+        target: &ProjectTarget,
+        params: UpdateProjectParams<'_>,
+    ) -> Result<Project> {
+        let app = self.get_project(target).await?;
         let resources = build_resources(params.cpu, params.memory);
         // Create and update both send storage size at the app level. The executor field remains
         // in the wire type for API compatibility, but the CLI does not set it.
@@ -365,7 +369,7 @@ impl CloudClient {
             params.executor_memory,
         );
 
-        let request = UpdateAppRequest {
+        let request = UpdateProjectRequest {
             description: params.description.map(String::from),
             visibility: params.visibility.map(String::from),
             replicas: params.replicas,
@@ -378,15 +382,15 @@ impl CloudClient {
             spicepod: params.spicepod,
         };
         self.inner
-            .update_app(app.id, &request)
+            .update_project(app.id, &request)
             .await
             .map_err(|error| self.err(error))
     }
 
-    pub async fn delete_app(&self, target: &AppTarget) -> Result<()> {
-        let app = self.get_app(target).await?;
+    pub async fn delete_project(&self, target: &ProjectTarget) -> Result<()> {
+        let app = self.get_project(target).await?;
         self.inner
-            .delete_app(app.id)
+            .delete_project(app.id)
             .await
             .map_err(|error| self.err(error))
     }
@@ -397,18 +401,18 @@ impl CloudClient {
 
     pub async fn list_deployments(
         &self,
-        target: &AppTarget,
+        target: &ProjectTarget,
         limit: usize,
         status: Option<&str>,
     ) -> Result<Vec<Deployment>> {
-        let app = self.get_app(target).await?;
+        let app = self.get_project(target).await?;
         self.inner
             .list_deployments(app.id, limit, status)
             .await
             .map_err(|error| self.err(error))
     }
 
-    pub async fn get_latest_deployment(&self, target: &AppTarget) -> Result<Deployment> {
+    pub async fn get_latest_deployment(&self, target: &ProjectTarget) -> Result<Deployment> {
         let deployments = self.list_deployments(target, 1, None).await?;
         deployments.into_iter().next().ok_or_else(|| {
             Error::cloud_with_hint(
@@ -421,10 +425,10 @@ impl CloudClient {
 
     pub async fn create_deployment(
         &self,
-        target: &AppTarget,
+        target: &ProjectTarget,
         params: CreateDeploymentParams<'_>,
     ) -> Result<Deployment> {
-        let app = self.get_app(target).await?;
+        let app = self.get_project(target).await?;
         let request = CreateDeploymentRequest {
             image: None,
             image_tag: params.image_tag.map(String::from),
@@ -455,12 +459,12 @@ impl CloudClient {
 
     pub async fn get_deployment_logs(
         &self,
-        target: &AppTarget,
+        target: &ProjectTarget,
         deployment_id: i64,
         limit: usize,
         since: Option<&str>,
     ) -> Result<LogsResponse> {
-        let app = self.get_app(target).await?;
+        let app = self.get_project(target).await?;
         self.inner
             .get_deployment_logs(app.id, deployment_id, limit, since)
             .await
@@ -492,32 +496,37 @@ impl CloudClient {
     // Secrets
     // ========================================================================
 
-    pub async fn list_secrets(&self, target: &AppTarget) -> Result<Vec<Secret>> {
-        let app = self.get_app(target).await?;
+    pub async fn list_secrets(&self, target: &ProjectTarget) -> Result<Vec<Secret>> {
+        let app = self.get_project(target).await?;
         self.inner
             .list_secrets(app.id)
             .await
             .map_err(|error| self.err(error))
     }
 
-    pub async fn get_secret(&self, target: &AppTarget, name: &str) -> Result<Secret> {
-        let app = self.get_app(target).await?;
+    pub async fn get_secret(&self, target: &ProjectTarget, name: &str) -> Result<Secret> {
+        let app = self.get_project(target).await?;
         self.inner
             .get_secret(app.id, name)
             .await
             .map_err(|error| self.err(error))
     }
 
-    pub async fn set_secret(&self, target: &AppTarget, name: &str, value: &str) -> Result<Secret> {
-        let app = self.get_app(target).await?;
+    pub async fn set_secret(
+        &self,
+        target: &ProjectTarget,
+        name: &str,
+        value: &str,
+    ) -> Result<Secret> {
+        let app = self.get_project(target).await?;
         self.inner
             .set_secret(app.id, name, value)
             .await
             .map_err(|error| self.err(error))
     }
 
-    pub async fn delete_secret(&self, target: &AppTarget, name: &str) -> Result<()> {
-        let app = self.get_app(target).await?;
+    pub async fn delete_secret(&self, target: &ProjectTarget, name: &str) -> Result<()> {
+        let app = self.get_project(target).await?;
         self.inner
             .delete_secret(app.id, name)
             .await
@@ -528,8 +537,8 @@ impl CloudClient {
     // API Keys
     // ========================================================================
 
-    pub async fn get_api_keys(&self, target: &AppTarget) -> Result<ApiKeysResponse> {
-        let app = self.get_app(target).await?;
+    pub async fn get_api_keys(&self, target: &ProjectTarget) -> Result<ApiKeysResponse> {
+        let app = self.get_project(target).await?;
         self.inner
             .get_api_keys(app.id)
             .await
@@ -538,10 +547,10 @@ impl CloudClient {
 
     pub async fn regenerate_api_key(
         &self,
-        target: &AppTarget,
+        target: &ProjectTarget,
         key_number: u8,
     ) -> Result<RegenerateApiKeyResponse> {
-        let app = self.get_app(target).await?;
+        let app = self.get_project(target).await?;
         self.inner
             .regenerate_api_key(app.id, key_number)
             .await
@@ -601,7 +610,7 @@ fn org_credential_missing(org: &str) -> Error {
 /// The org is `None` for a bare name, which the caller resolves from `--org`,
 /// the linked app, or the active org.
 #[must_use]
-pub fn parse_org_app(org_app: &str) -> (Option<String>, String) {
+pub fn parse_org_project(org_app: &str) -> (Option<String>, String) {
     match org_app.split_once('/') {
         Some((org, app)) if !org.is_empty() => (Some(org.to_string()), app.to_string()),
         Some((_, app)) => (None, app.to_string()),
@@ -611,7 +620,7 @@ pub fn parse_org_app(org_app: &str) -> (Option<String>, String) {
 
 /// The org an app belongs to: its own when the payload carries one, otherwise
 /// the credential's org, which is the only org `/v1/apps` can be listing.
-fn effective_app_org<'a>(app: &'a App, context_org: Option<&'a str>) -> Option<&'a str> {
+fn effective_project_org<'a>(app: &'a Project, context_org: Option<&'a str>) -> Option<&'a str> {
     if app.org.is_empty() {
         context_org.filter(|org| !org.is_empty())
     } else {
@@ -627,7 +636,11 @@ fn effective_app_org<'a>(app: &'a App, context_org: Option<&'a str>) -> Option<&
 /// there. When no org is known — the credential is a service account and the
 /// listing omits orgs — a uniquely named app still resolves, and an ambiguous
 /// one is refused rather than guessed.
-fn resolve_app_id(apps: &[App], target: &AppTarget, context_org: Option<&str>) -> Result<i64> {
+fn resolve_project_id(
+    apps: &[Project],
+    target: &ProjectTarget,
+    context_org: Option<&str>,
+) -> Result<i64> {
     let wanted_org = target
         .org
         .as_deref()
@@ -638,11 +651,11 @@ fn resolve_app_id(apps: &[App], target: &AppTarget, context_org: Option<&str>) -
     let mut other_org_matches = BTreeSet::new();
 
     for app in apps {
-        if app.name != target.app {
+        if app.name != target.project {
             continue;
         }
 
-        match (effective_app_org(app, context_org), wanted_org) {
+        match (effective_project_org(app, context_org), wanted_org) {
             (Some(app_org), Some(wanted)) if app_org.eq_ignore_ascii_case(wanted) => {
                 return Ok(app.id);
             }
@@ -661,10 +674,10 @@ fn resolve_app_id(apps: &[App], target: &AppTarget, context_org: Option<&str>) -
 
     if org_unknown_matches.len() > 1 {
         return Err(Error::cloud_with_hint(
-            CloudErrorCode::AppNotFound,
+            CloudErrorCode::ProjectNotFound,
             format!(
                 "Multiple apps named '{}' are visible and none reports an organization.",
-                target.app
+                target.project
             ),
             "Pass --app <org>/<app>, or authenticate with a user token so org context is available.",
         ));
@@ -676,21 +689,21 @@ fn resolve_app_id(apps: &[App], target: &AppTarget, context_org: Option<&str>) -
         return Err(Error::cloud_with_hint(
             CloudErrorCode::WrongOrg,
             format!(
-                "App '{}' was not found in organization '{requested}', but exists in {}.",
-                target.app,
+                "Project '{}' was not found in organization '{requested}', but exists in {}.",
+                target.project,
                 format_org_list(&others)
             ),
             format!(
                 "Run 'spice cloud org use {0}', or pass --app {0}/{1}.",
                 others.first().map_or("<org>", String::as_str),
-                target.app
+                target.project
             ),
         ));
     }
 
     let visible_orgs: Vec<String> = apps
         .iter()
-        .filter_map(|app| effective_app_org(app, context_org).map(ToString::to_string))
+        .filter_map(|app| effective_project_org(app, context_org).map(ToString::to_string))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
@@ -717,8 +730,8 @@ fn resolve_app_id(apps: &[App], target: &AppTarget, context_org: Option<&str>) -
     };
 
     Err(Error::cloud_with_hint(
-        CloudErrorCode::AppNotFound,
-        format!("App '{target}' was not found."),
+        CloudErrorCode::ProjectNotFound,
+        format!("Project '{target}' was not found."),
         hint,
     ))
 }
@@ -783,10 +796,10 @@ fn map_cloud_error(org: Option<&str>) -> impl Fn(spice_cloud_client::error::Erro
 use super::bytes::NumBytes;
 
 #[expect(clippy::too_many_arguments)]
-fn build_create_app_request(
+fn build_create_project_request(
     name: &str,
     region: &str,
-    kind: AppKind,
+    kind: ProjectKind,
     description: Option<&str>,
     visibility: &str,
     replicas: Option<i32>,
@@ -796,20 +809,20 @@ fn build_create_app_request(
     executor_replicas: Option<i32>,
     executor_cpu: Option<i32>,
     executor_memory: Option<NumBytes>,
-) -> CreateAppRequest {
+) -> CreateProjectRequest {
     let resources = build_resources(cpu, memory);
     let executor = build_executor(executor_replicas, executor_cpu, executor_memory);
 
     let (tags, replicas) = match kind {
-        AppKind::Cluster => {
+        ProjectKind::Cluster => {
             let mut tags = BTreeMap::new();
             tags.insert("kind".to_string(), "cluster".to_string());
             (Some(tags), Some(1))
         }
-        AppKind::Set => (None, replicas),
+        ProjectKind::Set => (None, replicas),
     };
 
-    CreateAppRequest {
+    CreateProjectRequest {
         name: name.to_string(),
         description: description.map(String::from),
         visibility: visibility.to_string(),
@@ -825,15 +838,15 @@ fn build_create_app_request(
     }
 }
 
-/// Build an [`AppResources`] from optional CPU (vCPUs) and a parsed [`NumBytes`] memory value.
+/// Build an [`ProjectResources`] from optional CPU (vCPUs) and a parsed [`NumBytes`] memory value.
 ///
 /// Returns `None` if neither is provided.
-fn build_resources(cpu: Option<i32>, memory: Option<NumBytes>) -> Option<AppResources> {
+fn build_resources(cpu: Option<i32>, memory: Option<NumBytes>) -> Option<ProjectResources> {
     if cpu.is_none() && memory.is_none() {
         return None;
     }
-    Some(AppResources {
-        limits: AppResourceLimits {
+    Some(ProjectResources {
+        limits: ProjectResourceLimits {
             cpu: cpu.map(|v| v.to_string()),
             memory: memory.map(NumBytes::to_resource_string),
             ephemeral_storage: None,
@@ -842,18 +855,18 @@ fn build_resources(cpu: Option<i32>, memory: Option<NumBytes>) -> Option<AppReso
     })
 }
 
-/// Build an [`AppExecutor`] from optional executor params.
+/// Build an [`ProjectExecutor`] from optional executor params.
 ///
 /// Returns `None` if no executor-related fields are provided.
 fn build_executor(
     replicas: Option<i32>,
     cpu: Option<i32>,
     memory: Option<NumBytes>,
-) -> Option<AppExecutor> {
+) -> Option<ProjectExecutor> {
     if replicas.is_none() && cpu.is_none() && memory.is_none() {
         return None;
     }
-    Some(AppExecutor {
+    Some(ProjectExecutor {
         replicas,
         resources: build_resources(cpu, memory),
         storage_size_gb: None,
@@ -905,11 +918,11 @@ mod tests {
     }
 
     #[test]
-    fn create_app_request_sends_region_as_cname() {
-        let request = build_create_app_request(
+    fn create_project_request_sends_region_as_cname() {
+        let request = build_create_project_request(
             "app",
             "us-east-1-prod-aws-data",
-            AppKind::Set,
+            ProjectKind::Set,
             None,
             "private",
             None,
@@ -933,8 +946,8 @@ mod tests {
         );
     }
 
-    fn test_app(id: i64, name: &str, org: &str) -> App {
-        App {
+    fn test_app(id: i64, name: &str, org: &str) -> Project {
+        Project {
             id,
             name: name.to_string(),
             org: org.to_string(),
@@ -947,41 +960,47 @@ mod tests {
         }
     }
 
-    fn target(org: Option<&str>, app: &str) -> AppTarget {
-        AppTarget::new(org.map(ToString::to_string), app)
+    fn target(org: Option<&str>, app: &str) -> ProjectTarget {
+        ProjectTarget::new(org.map(ToString::to_string), app)
     }
 
     #[test]
-    fn parse_org_app_splits_qualified_and_bare_names() {
+    fn parse_org_project_splits_qualified_and_bare_names() {
         assert_eq!(
-            parse_org_app("spicehq/team-app"),
+            parse_org_project("spicehq/team-app"),
             (Some("spicehq".to_string()), "team-app".to_string())
         );
-        assert_eq!(parse_org_app("team-app"), (None, "team-app".to_string()));
+        assert_eq!(
+            parse_org_project("team-app"),
+            (None, "team-app".to_string())
+        );
         // A leading slash names no org, so the caller's org context still applies.
-        assert_eq!(parse_org_app("/team-app"), (None, "team-app".to_string()));
+        assert_eq!(
+            parse_org_project("/team-app"),
+            (None, "team-app".to_string())
+        );
     }
 
     #[test]
-    fn resolve_app_id_matches_the_requested_org() {
+    fn resolve_project_id_matches_the_requested_org() {
         let apps = vec![
             test_app(1, "dashboard", "analytics"),
             test_app(2, "dashboard", "other"),
         ];
 
-        let id = resolve_app_id(&apps, &target(Some("analytics"), "dashboard"), None)
+        let id = resolve_project_id(&apps, &target(Some("analytics"), "dashboard"), None)
             .expect("should match org from app payload");
 
         assert_eq!(id, 1);
     }
 
     #[test]
-    fn resolve_app_id_uses_context_org_when_the_listing_omits_it() {
+    fn resolve_project_id_uses_context_org_when_the_listing_omits_it() {
         // `/v1/apps` does not populate `org`, so the credential's own org is
         // the only evidence of which org the listing describes.
         let apps = vec![test_app(7, "dashboard", "")];
 
-        let id = resolve_app_id(
+        let id = resolve_project_id(
             &apps,
             &target(Some("analytics"), "dashboard"),
             Some("analytics"),
@@ -992,13 +1011,13 @@ mod tests {
     }
 
     #[test]
-    fn resolve_app_id_reports_wrong_org_rather_than_not_found() {
+    fn resolve_project_id_reports_wrong_org_rather_than_not_found() {
         // Regression guard for the multi-org failure this replaced: asking for
         // an app that lives in another visible org used to say only "not found",
         // sending the operator hunting for a typo that was not there.
         let apps = vec![test_app(1, "team-app", "spicehq")];
 
-        let err = resolve_app_id(&apps, &target(Some("lukekim"), "team-app"), None)
+        let err = resolve_project_id(&apps, &target(Some("lukekim"), "team-app"), None)
             .expect_err("org mismatch should not resolve");
 
         assert_eq!(err.cloud_code(), Some(CloudErrorCode::WrongOrg));
@@ -1015,13 +1034,13 @@ mod tests {
     }
 
     #[test]
-    fn resolve_app_id_suggests_listing_orgs_when_the_org_is_not_visible() {
+    fn resolve_project_id_suggests_listing_orgs_when_the_org_is_not_visible() {
         let apps = vec![test_app(1, "other-app", "lukekim")];
 
-        let err = resolve_app_id(&apps, &target(Some("spicehq"), "team-app"), Some("lukekim"))
+        let err = resolve_project_id(&apps, &target(Some("spicehq"), "team-app"), Some("lukekim"))
             .expect_err("unknown app in an unseen org should fail");
 
-        assert_eq!(err.cloud_code(), Some(CloudErrorCode::AppNotFound));
+        assert_eq!(err.cloud_code(), Some(CloudErrorCode::ProjectNotFound));
         assert!(
             err.to_string().contains("spice cloud orgs"),
             "error should point at org discovery: {err}"
@@ -1029,25 +1048,25 @@ mod tests {
     }
 
     #[test]
-    fn resolve_app_id_allows_a_unique_match_when_no_org_is_known() {
+    fn resolve_project_id_allows_a_unique_match_when_no_org_is_known() {
         // A service-account credential has no user auth context, so neither the
         // listing nor the identity reports an org; a single match is unambiguous.
         let apps = vec![test_app(9, "dashboard", "")];
 
-        let id = resolve_app_id(&apps, &target(None, "dashboard"), None)
+        let id = resolve_project_id(&apps, &target(None, "dashboard"), None)
             .expect("single org-less app should match");
 
         assert_eq!(id, 9);
     }
 
     #[test]
-    fn resolve_app_id_refuses_to_guess_between_ambiguous_matches() {
+    fn resolve_project_id_refuses_to_guess_between_ambiguous_matches() {
         let apps = vec![test_app(1, "dashboard", ""), test_app(2, "dashboard", "")];
 
-        let err = resolve_app_id(&apps, &target(None, "dashboard"), None)
+        let err = resolve_project_id(&apps, &target(None, "dashboard"), None)
             .expect_err("ambiguous apps should fail");
 
-        assert_eq!(err.cloud_code(), Some(CloudErrorCode::AppNotFound));
+        assert_eq!(err.cloud_code(), Some(CloudErrorCode::ProjectNotFound));
         assert!(
             err.to_string().contains("Multiple apps named 'dashboard'"),
             "unexpected error: {err}"

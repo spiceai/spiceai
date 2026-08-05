@@ -29,11 +29,13 @@ use dialoguer::{Input, Password, Select, theme::ColorfulTheme};
 use snafu::ResultExt;
 use std::{fmt, io::IsTerminal};
 
-pub use client::{AppTarget, CloudClient, is_device_authorization_denied_error, parse_org_app};
+pub use client::{
+    CloudClient, ProjectTarget, is_device_authorization_denied_error, parse_org_project,
+};
 pub use config::{CloudLink, get_linked_app, load_cloud_link, remove_cloud_link, save_cloud_link};
 use spice_cloud_client::{
     endpoints::{data_region_name, normalize_data_region},
-    types::{AppKind, Deployment, IngestionMetrics, PodMetrics, UpdateChannel},
+    types::{Deployment, IngestionMetrics, PodMetrics, ProjectKind, UpdateChannel},
 };
 
 /// Arguments for the cloud command.
@@ -97,16 +99,17 @@ pub enum CloudCommands {
     #[command(subcommand)]
     Org(OrgCommands),
 
-    /// Link current directory to a Spice Cloud app
+    /// Link the current directory to a Spice Cloud project
     Link(LinkArgs),
 
-    /// Unlink current directory from Spice Cloud app
+    /// Unlink the current directory from its Spice Cloud project
     Unlink,
 
-    /// List all apps
-    Apps(AppsArgs),
+    /// List all projects
+    #[command(alias = "apps")]
+    Projects(ProjectsArgs),
 
-    /// List deployments for an app
+    /// List deployments for a project
     Deployments(DeploymentsArgs),
 
     /// List available regions
@@ -115,7 +118,7 @@ pub enum CloudCommands {
     /// List available container images
     Images(ImagesArgs),
 
-    /// Manage secrets for an app
+    /// Manage secrets for a project
     #[command(subcommand)]
     Secrets(SecretsCommands),
 
@@ -142,14 +145,14 @@ pub enum CloudCommands {
     // shadow the long help that documents where the spicepod comes from.
     Deploy(DeployArgs),
 
-    /// Inspect current deployment status
+    /// Inspect a project's current deployment
     Inspect(InspectArgs),
 
-    /// Show API keys for an app
+    /// Show API keys for a project
     #[command(name = "api-keys")]
     ApiKeys(ApiKeysArgs),
 
-    /// Show metrics for an app's pods
+    /// Show resource usage for a project's instances
     Metrics(MetricsArgs),
 
     // `about`/`long_about` live on `InstanceCommands`; a doc comment here would
@@ -170,7 +173,7 @@ pub struct WhoamiArgs {
 }
 
 #[derive(Args, Debug)]
-pub struct AppsArgs {
+pub struct ProjectsArgs {
     /// Output format
     #[arg(long, short = 'o', default_value = "table")]
     pub output: OutputFormat,
@@ -233,8 +236,8 @@ pub struct OrgCurrentArgs {
 
 #[derive(Subcommand, Debug)]
 #[command(
-    about = "Inspect the instances serving a deployed app",
-    long_about = r#"Inspect the instances serving a deployed app.
+    about = "Inspect the instances serving a project",
+    long_about = r#"Inspect the instances serving a project.
 
 An app runs one or more instances (replicas). Without --instance, commands ask
 the app's general endpoint, which answers for the deployment as a whole. With
@@ -248,22 +251,22 @@ EXAMPLES
   spice cloud instance datasets --app spicehq/team-app"#
 )]
 pub enum InstanceCommands {
-    /// List the instances serving an app
+    /// List the instances serving a project
     #[command(visible_alias = "ls")]
     List(InstanceListArgs),
 
-    /// Show component readiness for an app
+    /// Show component readiness for a project
     Status(InstanceStatusArgs),
 
-    /// Show dataset load state for an app
+    /// Show dataset load state for a project
     Datasets(InstanceDatasetsArgs),
 }
 
 #[derive(Args, Debug)]
 pub struct InstanceListArgs {
-    /// App name in org/app format (uses linked app if not specified)
-    #[arg(long)]
-    pub app: Option<String>,
+    /// Project name in org/project format (uses the linked project if omitted)
+    #[arg(long, alias = "app", value_name = "ORG/PROJECT")]
+    pub project: Option<String>,
 
     /// Output format
     #[arg(long, short = 'o', default_value = "table")]
@@ -272,9 +275,9 @@ pub struct InstanceListArgs {
 
 #[derive(Args, Debug)]
 pub struct InstanceStatusArgs {
-    /// App name in org/app format (uses linked app if not specified)
-    #[arg(long)]
-    pub app: Option<String>,
+    /// Project name in org/project format (uses the linked project if omitted)
+    #[arg(long, alias = "app", value_name = "ORG/PROJECT")]
+    pub project: Option<String>,
 
     /// Pin the request to one instance (default: the app's general endpoint)
     #[arg(long, value_name = "NAME")]
@@ -287,9 +290,9 @@ pub struct InstanceStatusArgs {
 
 #[derive(Args, Debug)]
 pub struct InstanceDatasetsArgs {
-    /// App name in org/app format (uses linked app if not specified)
-    #[arg(long)]
-    pub app: Option<String>,
+    /// Project name in org/project format (uses the linked project if omitted)
+    #[arg(long, alias = "app", value_name = "ORG/PROJECT")]
+    pub project: Option<String>,
 
     /// Pin the request to one instance (default: the app's general endpoint)
     #[arg(long, value_name = "NAME")]
@@ -417,15 +420,15 @@ impl fmt::Debug for ApiLoginArgs {
 
 #[derive(Args, Debug)]
 pub struct LinkArgs {
-    /// App name in org/app format
-    pub app: String,
+    /// Project name in org/project format
+    pub project: String,
 }
 
 #[derive(Args, Debug)]
 pub struct DeploymentsArgs {
-    /// App name in org/app format (uses linked app if not specified)
-    #[arg(long)]
-    pub app: Option<String>,
+    /// Project name in org/project format (uses the linked project if omitted)
+    #[arg(long, alias = "app", value_name = "ORG/PROJECT")]
+    pub project: Option<String>,
 
     /// Maximum number of deployments to show
     #[arg(long, default_value = "10")]
@@ -481,9 +484,9 @@ impl LogLevelFilter {
 
 #[derive(Args, Debug)]
 pub struct LogsArgs {
-    /// App name in org/app format (uses linked app if not specified)
-    #[arg(long)]
-    pub app: Option<String>,
+    /// Project name in org/project format (uses the linked project if omitted)
+    #[arg(long, alias = "app", value_name = "ORG/PROJECT")]
+    pub project: Option<String>,
 
     /// Deployment ID (uses latest if not specified)
     #[arg(long)]
@@ -512,7 +515,7 @@ pub struct LogsArgs {
 
 #[derive(Args, Debug)]
 #[command(
-    about = "Deploy the app",
+    about = "Deploy a project",
     long_about = r#"Deploy an app on Spice Cloud.
 
 Spice Cloud pulls the spicepod from the app's connected git repository — by
@@ -526,9 +529,9 @@ EXAMPLES
   spice cloud deploy --app spicehq/team-app --branch release --replicas 2"#
 )]
 pub struct DeployArgs {
-    /// App name in org/app format (uses linked app if not specified)
-    #[arg(long)]
-    pub app: Option<String>,
+    /// Project name in org/project format (uses the linked project if omitted)
+    #[arg(long, alias = "app", value_name = "ORG/PROJECT")]
+    pub project: Option<String>,
 
     /// Container image tag to deploy
     #[arg(long)]
@@ -565,9 +568,9 @@ pub struct DeployArgs {
 
 #[derive(Args, Debug)]
 pub struct InspectArgs {
-    /// App name in org/app format (uses linked app if not specified)
-    #[arg(long)]
-    pub app: Option<String>,
+    /// Project name in org/project format (uses the linked project if omitted)
+    #[arg(long, alias = "app", value_name = "ORG/PROJECT")]
+    pub project: Option<String>,
 
     /// Output format
     #[arg(long, short = 'o', default_value = "table")]
@@ -576,9 +579,9 @@ pub struct InspectArgs {
 
 #[derive(Args, Debug)]
 pub struct ApiKeysArgs {
-    /// App name in org/app format (uses linked app if not specified)
-    #[arg(long)]
-    pub app: Option<String>,
+    /// Project name in org/project format (uses the linked project if omitted)
+    #[arg(long, alias = "app", value_name = "ORG/PROJECT")]
+    pub project: Option<String>,
 
     /// Regenerate API key (1 or 2)
     #[arg(long)]
@@ -591,9 +594,9 @@ pub struct ApiKeysArgs {
 
 #[derive(Args, Debug)]
 pub struct MetricsArgs {
-    /// App name in org/app format (uses linked app if not specified)
-    #[arg(long)]
-    pub app: Option<String>,
+    /// Project name in org/project format (uses the linked project if omitted)
+    #[arg(long, alias = "app", value_name = "ORG/PROJECT")]
+    pub project: Option<String>,
 
     /// Window for counter metrics (e.g. 1m, 5m, 1h). Parsed as a duration.
     #[arg(long, value_parser = parse_window)]
@@ -626,9 +629,9 @@ pub enum SecretsCommands {
 
 #[derive(Args, Debug)]
 pub struct SecretsListArgs {
-    /// App name in org/app format (uses linked app if not specified)
-    #[arg(long)]
-    pub app: Option<String>,
+    /// Project name in org/project format (uses the linked project if omitted)
+    #[arg(long, alias = "app", value_name = "ORG/PROJECT")]
+    pub project: Option<String>,
 
     /// Output format
     #[arg(long, short = 'o', default_value = "table")]
@@ -637,9 +640,9 @@ pub struct SecretsListArgs {
 
 #[derive(Args, Debug)]
 pub struct SecretsSetArgs {
-    /// App name in org/app format (uses linked app if not specified)
-    #[arg(long)]
-    pub app: Option<String>,
+    /// Project name in org/project format (uses the linked project if omitted)
+    #[arg(long, alias = "app", value_name = "ORG/PROJECT")]
+    pub project: Option<String>,
 
     /// Secret name
     pub name: String,
@@ -654,9 +657,9 @@ pub struct SecretsSetArgs {
 
 #[derive(Args, Debug)]
 pub struct SecretsGetArgs {
-    /// App name in org/app format (uses linked app if not specified)
-    #[arg(long)]
-    pub app: Option<String>,
+    /// Project name in org/project format (uses the linked project if omitted)
+    #[arg(long, alias = "app", value_name = "ORG/PROJECT")]
+    pub project: Option<String>,
 
     /// Secret name
     pub name: String,
@@ -668,9 +671,9 @@ pub struct SecretsGetArgs {
 
 #[derive(Args, Debug)]
 pub struct SecretsDeleteArgs {
-    /// App name in org/app format (uses linked app if not specified)
-    #[arg(long)]
-    pub app: Option<String>,
+    /// Project name in org/project format (uses the linked project if omitted)
+    #[arg(long, alias = "app", value_name = "ORG/PROJECT")]
+    pub project: Option<String>,
 
     /// Secret name
     pub name: String,
@@ -686,31 +689,31 @@ pub struct SecretsDeleteArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum CreateCommands {
-    /// Create a new app
-    App(CreateAppArgs),
+    /// Create a new project
+    Project(CreateProjectArgs),
 
     /// Create a new deployment
     Deployment(CreateDeploymentArgs),
 }
 
 #[derive(Args, Debug)]
-pub struct CreateAppArgs {
-    /// App name
+pub struct CreateProjectArgs {
+    /// Project name
     pub name: String,
 
     /// Deployment region (e.g. us-east-1-prod-aws-data)
-    #[arg(long, value_parser = parse_create_app_region)]
+    #[arg(long, value_parser = parse_create_project_region)]
     pub region: String,
 
-    /// App kind (set or cluster)
-    #[arg(long, value_parser = clap::value_parser!(AppKind), default_value = "set")]
-    pub kind: AppKind,
+    /// Project kind (set or cluster)
+    #[arg(long, value_parser = clap::value_parser!(ProjectKind), default_value = "set")]
+    pub kind: ProjectKind,
 
-    /// App description
+    /// Project description
     #[arg(long)]
     pub description: Option<String>,
 
-    /// App visibility (public or private)
+    /// Project visibility (public or private)
     #[arg(long, default_value = "private")]
     pub visibility: String,
 
@@ -757,9 +760,9 @@ pub struct CreateAppArgs {
 
 #[derive(Args, Debug)]
 pub struct CreateDeploymentArgs {
-    /// App name in org/app format (uses linked app if not specified)
-    #[arg(long)]
-    pub app: Option<String>,
+    /// Project name in org/project format (uses the linked project if omitted)
+    #[arg(long, alias = "app", value_name = "ORG/PROJECT")]
+    pub project: Option<String>,
 
     /// Container image tag
     #[arg(long)]
@@ -784,14 +787,14 @@ pub struct CreateDeploymentArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum GetCommands {
-    /// Get app details
-    App(GetAppArgs),
+    /// Get project details
+    Project(GetProjectArgs),
 }
 
 #[derive(Args, Debug)]
-pub struct GetAppArgs {
-    /// App name in org/app format
-    pub app: String,
+pub struct GetProjectArgs {
+    /// Project name in org/project format
+    pub project: String,
 
     /// Output format
     #[arg(long, short = 'o', default_value = "table")]
@@ -804,15 +807,15 @@ pub struct GetAppArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum UpdateCommands {
-    /// Update an app
-    App(UpdateAppArgs),
+    /// Update a project
+    Project(UpdateProjectArgs),
 }
 
 #[derive(Args, Debug)]
-pub struct UpdateAppArgs {
-    /// App name in org/app format (uses linked app if not specified)
-    #[arg(long)]
-    pub app: Option<String>,
+pub struct UpdateProjectArgs {
+    /// Project name in org/project format (uses the linked project if omitted)
+    #[arg(long, alias = "app", value_name = "ORG/PROJECT")]
+    pub project: Option<String>,
 
     /// New description
     #[arg(long)]
@@ -877,14 +880,14 @@ pub struct UpdateAppArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum DeleteCommands {
-    /// Delete an app
-    App(DeleteAppArgs),
+    /// Delete a project
+    Project(DeleteProjectArgs),
 }
 
 #[derive(Args, Debug)]
-pub struct DeleteAppArgs {
-    /// App name in org/app format
-    pub app: String,
+pub struct DeleteProjectArgs {
+    /// Project name in org/project format
+    pub project: String,
 
     /// Skip confirmation prompt
     #[arg(long, short)]
@@ -918,7 +921,7 @@ pub async fn execute(ctx: &RuntimeContext, args: &CloudArgs) -> Result<()> {
         CloudCommands::Org(org_cmd) => execute_org(org_cmd, org).await,
         CloudCommands::Link(link_args) => execute_link(link_args, org).await,
         CloudCommands::Unlink => execute_unlink(),
-        CloudCommands::Apps(apps_args) => execute_apps(apps_args, org).await,
+        CloudCommands::Projects(apps_args) => execute_projects(apps_args, org).await,
         CloudCommands::Deployments(deploy_args) => execute_deployments(deploy_args, org).await,
         CloudCommands::Regions(regions_args) => execute_regions(regions_args, org).await,
         CloudCommands::Images(images_args) => execute_images(images_args, org).await,
@@ -977,7 +980,7 @@ impl OrgSource {
 }
 
 /// The organization in effect, and where it came from, ignoring any `org/app`
-/// argument (which [`resolve_app_target`] layers on top).
+/// argument (which [`resolve_project_target`] layers on top).
 ///
 /// Precedence: `--org` flag, then `SPICE_CLOUD_ORG`, then the persisted active
 /// org. When none of those name an org the credential's own org is used and
@@ -1015,15 +1018,15 @@ fn resolve_org(flag_org: Option<&str>) -> Result<Option<String>> {
 /// <org>/<app>` and `--org` name different orgs, or a linked directory
 /// disagrees with an explicit `--org`, the command fails and names both. A
 /// wrong-organization deploy is not recoverable by re-reading the scrollback.
-fn resolve_app_target_with_source(
+fn resolve_project_target_with_source(
     app_flag: Option<&str>,
     flag_org: Option<&str>,
-) -> Result<(AppTarget, OrgSource)> {
+) -> Result<(ProjectTarget, OrgSource)> {
     let (context_org, context_source) = resolve_org_with_source(flag_org)?;
 
     // An `<org>/<app>` argument names the app completely and outranks everything.
     if let Some(app_flag) = app_flag {
-        let (path_org, app) = parse_org_app(app_flag);
+        let (path_org, app) = parse_org_project(app_flag);
         if app.is_empty() {
             return Err(Error::cloud_with_hint(
                 CloudErrorCode::InvalidRequest,
@@ -1034,7 +1037,7 @@ fn resolve_app_target_with_source(
 
         let Some(path_org) = path_org else {
             // A bare app name inherits whatever org is in effect.
-            return Ok((AppTarget::new(context_org, app), context_source));
+            return Ok((ProjectTarget::new(context_org, app), context_source));
         };
 
         org::validate_org_name(&path_org)?;
@@ -1044,7 +1047,10 @@ fn resolve_app_target_with_source(
             context_org.as_deref(),
             context_source,
         )?;
-        return Ok((AppTarget::new(Some(path_org), app), OrgSource::AppArgument));
+        return Ok((
+            ProjectTarget::new(Some(path_org), app),
+            OrgSource::AppArgument,
+        ));
     }
 
     // No app named: fall back to the directory's linked app.
@@ -1057,7 +1063,7 @@ fn resolve_app_target_with_source(
     };
 
     let Some(link_org) = (!link.org.is_empty()).then(|| link.org.clone()) else {
-        return Ok((AppTarget::new(context_org, link.app), context_source));
+        return Ok((ProjectTarget::new(context_org, link.app), context_source));
     };
 
     org::validate_org_name(&link_org)?;
@@ -1073,12 +1079,12 @@ fn resolve_app_target_with_source(
                 context_source,
             )?;
             Ok((
-                AppTarget::new(Some(link_org), link.app),
+                ProjectTarget::new(Some(link_org), link.app),
                 OrgSource::LinkedApp,
             ))
         }
         _ => Ok((
-            AppTarget::new(Some(link_org), link.app),
+            ProjectTarget::new(Some(link_org), link.app),
             OrgSource::LinkedApp,
         )),
     }
@@ -1120,8 +1126,8 @@ fn ensure_orgs_agree(
 }
 
 /// Resolve which app a command acts on.
-fn resolve_app_target(app_flag: Option<&str>, flag_org: Option<&str>) -> Result<AppTarget> {
-    Ok(resolve_app_target_with_source(app_flag, flag_org)?.0)
+fn resolve_project_target(app_flag: Option<&str>, flag_org: Option<&str>) -> Result<ProjectTarget> {
+    Ok(resolve_project_target_with_source(app_flag, flag_org)?.0)
 }
 
 /// Build a client for the org a command acts on.
@@ -1130,7 +1136,7 @@ fn connect(flag_org: Option<&str>) -> Result<CloudClient> {
 }
 
 /// Build a client for the org that owns `target`.
-fn connect_for_target(target: &AppTarget) -> Result<CloudClient> {
+fn connect_for_target(target: &ProjectTarget) -> Result<CloudClient> {
     CloudClient::connect(target.org.as_deref())
 }
 
@@ -1140,7 +1146,7 @@ fn connect_for_target(target: &AppTarget) -> Result<CloudClient> {
 /// A wrong-organization deploy or delete cannot be undone by reading the
 /// scrollback afterwards, and a persisted org is invisible at the call site.
 /// Suppressed in machine mode, where the same facts belong in the JSON result.
-fn announce_target(action: &str, target: &AppTarget, source: OrgSource, output: OutputFormat) {
+fn announce_target(action: &str, target: &ProjectTarget, source: OrgSource, output: OutputFormat) {
     if output == OutputFormat::Json {
         return;
     }
@@ -1765,7 +1771,7 @@ async fn execute_whoami(args: &WhoamiArgs, flag_org: Option<&str>) -> Result<()>
             // The auth-context endpoint requires a user token (subscription
             // or PAT). Service-account tokens (OAuth client credentials) are
             // valid for API calls but do not have a user identity.
-            if client.list_apps().await.is_ok() {
+            if client.list_projects().await.is_ok() {
                 return Err(Error::cloud_with_hint(
                     CloudErrorCode::Forbidden,
                     "User identity is not available for this authentication method. The current credential is a valid service-account token and can be used for API calls, but has no user identity.",
@@ -1805,7 +1811,7 @@ async fn execute_whoami(args: &WhoamiArgs, flag_org: Option<&str>) -> Result<()>
         println!("Credential org: {}", context.org_name);
     }
     if let Some(app_name) = context.app_name {
-        println!("Default App:  {active_org}/{app_name}");
+        println!("Default Project:  {active_org}/{app_name}");
     }
     match available_orgs {
         Some(orgs) if orgs.len() > 1 => {
@@ -2053,11 +2059,11 @@ async fn execute_org(cmd: &OrgCommands, flag_org: Option<&str>) -> Result<()> {
 }
 
 async fn execute_link(args: &LinkArgs, flag_org: Option<&str>) -> Result<()> {
-    let target = resolve_app_target(Some(&args.app), flag_org)?;
+    let target = resolve_project_target(Some(&args.project), flag_org)?;
     let client = connect_for_target(&target)?;
 
     // Verify the app exists
-    let app = client.get_app(&target).await?;
+    let app = client.get_project(&target).await?;
 
     // The API does not return `org` on app payloads, so fall back to the org the
     // command resolved, which is what later commands will use for this link.
@@ -2071,7 +2077,7 @@ async fn execute_link(args: &LinkArgs, flag_org: Option<&str>) -> Result<()> {
     let link = CloudLink {
         org,
         app: app.name,
-        app_id: Some(app.id),
+        project_id: Some(app.id),
         region: app.region,
         linked_at: Some(chrono::Utc::now().to_rfc3339()),
     };
@@ -2129,11 +2135,11 @@ fn execute_unlink() -> Result<()> {
     Ok(())
 }
 
-async fn execute_apps(args: &AppsArgs, flag_org: Option<&str>) -> Result<()> {
+async fn execute_projects(args: &ProjectsArgs, flag_org: Option<&str>) -> Result<()> {
     let active_org = resolve_org(flag_org)?;
     let client = CloudClient::connect(active_org.as_deref())?;
     let context = client.optional_user_auth_context().await?;
-    let mut apps = client.list_apps().await?;
+    let mut apps = client.list_projects().await?;
 
     if apps.is_empty() {
         match &active_org {
@@ -2157,10 +2163,10 @@ async fn execute_apps(args: &AppsArgs, flag_org: Option<&str>) -> Result<()> {
         .unwrap_or("");
     // The Spice Cloud `/v1/apps` endpoint does not populate `org` per app, so
     // backfill it from the auth-context org — the same fallback the table
-    // rendering applies via `display_app_name`. Without this, `--output json`
+    // rendering applies via `display_project_name`. Without this, `--output json`
     // emitted `"org": ""` while the table showed `<org>/<name>`, breaking
     // format parity and machine-readable scripting (see #11041).
-    backfill_app_orgs(&mut apps, context_org);
+    backfill_project_orgs(&mut apps, context_org);
 
     if args.output == OutputFormat::Json {
         return write_json(&apps);
@@ -2174,7 +2180,7 @@ async fn execute_apps(args: &AppsArgs, flag_org: Option<&str>) -> Result<()> {
         "CREATED",
     ]);
     for app in &apps {
-        let display_name = display_app_name(app, context_org);
+        let display_name = display_project_name(app, context_org);
         table.add_row(vec![
             display_name,
             app.description.clone().unwrap_or_default(),
@@ -2196,12 +2202,12 @@ fn is_cloud_unauthorized_error(err: &crate::error::Error) -> bool {
 
 /// Backfill each app's empty `org` from the auth-context org so machine-readable
 /// (`--output json`) output matches the human-readable table, which already
-/// applies this fallback when rendering via [`display_app_name`]. The Spice
+/// applies this fallback when rendering via [`display_project_name`]. The Spice
 /// Cloud `/v1/apps` endpoint does not populate `org` on each app, so the auth
 /// context is the only source of truth for the user's org. A no-op when
 /// `context_org` is empty (nothing to fall back to) or the app already carries
 /// an org.
-fn backfill_app_orgs(apps: &mut [spice_cloud_client::types::App], context_org: &str) {
+fn backfill_project_orgs(apps: &mut [spice_cloud_client::types::Project], context_org: &str) {
     if context_org.is_empty() {
         return;
     }
@@ -2214,7 +2220,7 @@ fn backfill_app_orgs(apps: &mut [spice_cloud_client::types::App], context_org: &
 
 /// Format an app's display name as `org/name`, falling back to the auth
 /// context org when the app payload does not include one.
-fn display_app_name(app: &spice_cloud_client::types::App, context_org: &str) -> String {
+fn display_project_name(app: &spice_cloud_client::types::Project, context_org: &str) -> String {
     let org = if app.org.is_empty() {
         context_org
     } else {
@@ -2228,7 +2234,7 @@ fn display_app_name(app: &spice_cloud_client::types::App, context_org: &str) -> 
 }
 
 async fn execute_deployments(args: &DeploymentsArgs, flag_org: Option<&str>) -> Result<()> {
-    let target = resolve_app_target(args.app.as_deref(), flag_org)?;
+    let target = resolve_project_target(args.project.as_deref(), flag_org)?;
     let client = connect_for_target(&target)?;
 
     let deployments = client
@@ -2335,7 +2341,7 @@ async fn execute_images(args: &ImagesArgs, flag_org: Option<&str>) -> Result<()>
 async fn execute_secrets(cmd: &SecretsCommands, flag_org: Option<&str>) -> Result<()> {
     match cmd {
         SecretsCommands::List(args) => {
-            let target = resolve_app_target(args.app.as_deref(), flag_org)?;
+            let target = resolve_project_target(args.project.as_deref(), flag_org)?;
             let client = connect_for_target(&target)?;
             let secrets = client.list_secrets(&target).await?;
 
@@ -2359,7 +2365,7 @@ async fn execute_secrets(cmd: &SecretsCommands, flag_org: Option<&str>) -> Resul
         }
         SecretsCommands::Set(args) => {
             let (target, org_source) =
-                resolve_app_target_with_source(args.app.as_deref(), flag_org)?;
+                resolve_project_target_with_source(args.project.as_deref(), flag_org)?;
             announce_target("Setting secret on", &target, org_source, args.output);
             let client = connect_for_target(&target)?;
             client.set_secret(&target, &args.name, &args.value).await?;
@@ -2369,7 +2375,7 @@ async fn execute_secrets(cmd: &SecretsCommands, flag_org: Option<&str>) -> Resul
             println!("\x1b[32m✓ Secret '{}' set successfully\x1b[0m", args.name);
         }
         SecretsCommands::Get(args) => {
-            let target = resolve_app_target(args.app.as_deref(), flag_org)?;
+            let target = resolve_project_target(args.project.as_deref(), flag_org)?;
             let client = connect_for_target(&target)?;
             let secret = client.get_secret(&target, &args.name).await?;
             if args.output == OutputFormat::Json {
@@ -2378,7 +2384,7 @@ async fn execute_secrets(cmd: &SecretsCommands, flag_org: Option<&str>) -> Resul
             println!("{}", secret.value.unwrap_or_default());
         }
         SecretsCommands::Delete(args) => {
-            let target = resolve_app_target(args.app.as_deref(), flag_org)?;
+            let target = resolve_project_target(args.project.as_deref(), flag_org)?;
             let client = connect_for_target(&target)?;
             client.delete_secret(&target, &args.name).await?;
             if args.output == OutputFormat::Json {
@@ -2391,7 +2397,7 @@ async fn execute_secrets(cmd: &SecretsCommands, flag_org: Option<&str>) -> Resul
 }
 
 async fn execute_logs(args: &LogsArgs, flag_org: Option<&str>) -> Result<()> {
-    let target = resolve_app_target(args.app.as_deref(), flag_org)?;
+    let target = resolve_project_target(args.project.as_deref(), flag_org)?;
     let client = connect_for_target(&target)?;
 
     let deployment_id = if let Some(id) = args.deployment {
@@ -2441,8 +2447,8 @@ async fn execute_logs(args: &LogsArgs, flag_org: Option<&str>) -> Result<()> {
 
 async fn execute_create(cmd: &CreateCommands, flag_org: Option<&str>) -> Result<()> {
     match cmd {
-        CreateCommands::App(args) => {
-            let create_region = validate_create_app_args(args)?;
+        CreateCommands::Project(args) => {
+            let create_region = validate_create_project_args(args)?;
 
             let client = connect(flag_org)?;
             let spicepod_content = if let Some(path) = args.spicepod.as_deref() {
@@ -2452,7 +2458,7 @@ async fn execute_create(cmd: &CreateCommands, flag_org: Option<&str>) -> Result<
             };
 
             let app = client
-                .create_app(
+                .create_project(
                     &args.name,
                     &create_region,
                     args.kind,
@@ -2470,7 +2476,7 @@ async fn execute_create(cmd: &CreateCommands, flag_org: Option<&str>) -> Result<
 
             // The create response may omit `org`, so fall back to the org this
             // command acted on — the same org the new app was created in.
-            let created = AppTarget::new(
+            let created = ProjectTarget::new(
                 if app.org.is_empty() {
                     resolve_org(flag_org)?
                 } else {
@@ -2481,12 +2487,12 @@ async fn execute_create(cmd: &CreateCommands, flag_org: Option<&str>) -> Result<
 
             let app = if spicepod_content.is_some() || args.channel.is_some() {
                 match client
-                    .update_app(
+                    .update_project(
                         &created,
-                        client::UpdateAppParams {
+                        client::UpdateProjectParams {
                             spicepod: spicepod_content,
                             channel: args.channel,
-                            ..client::UpdateAppParams::default()
+                            ..client::UpdateProjectParams::default()
                         },
                     )
                     .await
@@ -2494,7 +2500,7 @@ async fn execute_create(cmd: &CreateCommands, flag_org: Option<&str>) -> Result<
                     Ok(updated_app) => updated_app,
                     Err(error) => {
                         let update_error = error.to_string();
-                        let cleanup_result = client.delete_app(&created).await;
+                        let cleanup_result = client.delete_project(&created).await;
                         let cleanup_message = match cleanup_result {
                             Ok(()) => {
                                 "The app was deleted to roll back the failed create.".to_string()
@@ -2526,7 +2532,7 @@ async fn execute_create(cmd: &CreateCommands, flag_org: Option<&str>) -> Result<
             }
         }
         CreateCommands::Deployment(args) => {
-            let target = resolve_app_target(args.app.as_deref(), flag_org)?;
+            let target = resolve_project_target(args.project.as_deref(), flag_org)?;
             let client = connect_for_target(&target)?;
             let deployment = client
                 .create_deployment(
@@ -2551,10 +2557,10 @@ async fn execute_create(cmd: &CreateCommands, flag_org: Option<&str>) -> Result<
     Ok(())
 }
 
-fn validate_create_app_args(args: &CreateAppArgs) -> Result<String> {
-    let region = normalize_create_app_region(&args.region)?;
+fn validate_create_project_args(args: &CreateProjectArgs) -> Result<String> {
+    let region = normalize_create_project_region(&args.region)?;
 
-    if args.kind == AppKind::Cluster {
+    if args.kind == ProjectKind::Cluster {
         if args.replicas != Some(1) {
             return Err(crate::error::Error::InvalidArgument {
                 message: "Cluster apps require --replicas 1".to_string(),
@@ -2587,10 +2593,10 @@ fn validate_create_app_args(args: &CreateAppArgs) -> Result<String> {
 
 async fn execute_get(cmd: &GetCommands, flag_org: Option<&str>) -> Result<()> {
     match cmd {
-        GetCommands::App(args) => {
-            let target = resolve_app_target(Some(&args.app), flag_org)?;
+        GetCommands::Project(args) => {
+            let target = resolve_project_target(Some(&args.project), flag_org)?;
             let client = connect_for_target(&target)?;
-            let app = client.get_app(&target).await?;
+            let app = client.get_project(&target).await?;
 
             if args.output == OutputFormat::Json {
                 return write_json(&app);
@@ -2616,8 +2622,8 @@ async fn execute_get(cmd: &GetCommands, flag_org: Option<&str>) -> Result<()> {
 
 async fn execute_update(cmd: &UpdateCommands, flag_org: Option<&str>) -> Result<()> {
     match cmd {
-        UpdateCommands::App(args) => {
-            let target = resolve_app_target(args.app.as_deref(), flag_org)?;
+        UpdateCommands::Project(args) => {
+            let target = resolve_project_target(args.project.as_deref(), flag_org)?;
             let client = connect_for_target(&target)?;
             let spicepod_content = if let Some(path) = args.spicepod.as_deref() {
                 Some(read_spicepod_file(path).await?)
@@ -2626,9 +2632,9 @@ async fn execute_update(cmd: &UpdateCommands, flag_org: Option<&str>) -> Result<
             };
 
             let app = client
-                .update_app(
+                .update_project(
                     &target,
-                    client::UpdateAppParams {
+                    client::UpdateProjectParams {
                         description: args.description.as_deref(),
                         visibility: args.visibility.as_deref(),
                         replicas: args.replicas,
@@ -2659,8 +2665,9 @@ async fn execute_delete(cmd: &DeleteCommands, flag_org: Option<&str>) -> Result<
     use std::io::Write;
 
     match cmd {
-        DeleteCommands::App(args) => {
-            let (target, org_source) = resolve_app_target_with_source(Some(&args.app), flag_org)?;
+        DeleteCommands::Project(args) => {
+            let (target, org_source) =
+                resolve_project_target_with_source(Some(&args.project), flag_org)?;
 
             if !args.yes {
                 // Confirm against the fully-qualified name and say where the org
@@ -2690,7 +2697,7 @@ async fn execute_delete(cmd: &DeleteCommands, flag_org: Option<&str>) -> Result<
             }
 
             let client = connect_for_target(&target)?;
-            client.delete_app(&target).await?;
+            client.delete_project(&target).await?;
             if args.output == OutputFormat::Json {
                 return write_json(
                     &serde_json::json!({"app": target.display(), "status": "deleted"}),
@@ -2722,7 +2729,8 @@ fn deployment_outcome(status: &str) -> Option<bool> {
 }
 
 async fn execute_deploy(args: &DeployArgs, flag_org: Option<&str>) -> Result<()> {
-    let (target, org_source) = resolve_app_target_with_source(args.app.as_deref(), flag_org)?;
+    let (target, org_source) =
+        resolve_project_target_with_source(args.project.as_deref(), flag_org)?;
     announce_target("Deploying to", &target, org_source, args.output);
     let client = connect_for_target(&target)?;
 
@@ -2774,7 +2782,7 @@ async fn execute_deploy(args: &DeployArgs, flag_org: Option<&str>) -> Result<()>
 /// so `spice cloud deploy --wait` can gate a script.
 async fn wait_for_deployment(
     client: &CloudClient,
-    target: &AppTarget,
+    target: &ProjectTarget,
     mut deployment: Deployment,
     timeout: &str,
     quiet: bool,
@@ -2866,15 +2874,15 @@ async fn wait_for_deployment(
 }
 
 async fn execute_inspect(args: &InspectArgs, flag_org: Option<&str>) -> Result<()> {
-    let target = resolve_app_target(args.app.as_deref(), flag_org)?;
+    let target = resolve_project_target(args.project.as_deref(), flag_org)?;
     let client = connect_for_target(&target)?;
 
-    let app = client.get_app(&target).await?;
+    let app = client.get_project(&target).await?;
     let deployments = client.list_deployments(&target, 1, None).await?;
     // Metrics report one row per pod, which is the closest the management API
     // gets to "how many replicas are actually up".
     let pods = client
-        .get_app_metrics(app.id, None)
+        .get_project_metrics(app.id, None)
         .await
         .map(|metrics| metrics.metrics.keys().cloned().collect::<Vec<_>>())
         .unwrap_or_default();
@@ -2888,7 +2896,7 @@ async fn execute_inspect(args: &InspectArgs, flag_org: Option<&str>) -> Result<(
         }));
     }
 
-    println!("App:    {target}");
+    println!("Project:    {target}");
     if let Some(region) = app.region {
         println!("Region: {region}");
     }
@@ -2935,7 +2943,7 @@ async fn execute_inspect(args: &InspectArgs, flag_org: Option<&str>) -> Result<(
 }
 
 async fn execute_api_keys(args: &ApiKeysArgs, flag_org: Option<&str>) -> Result<()> {
-    let target = resolve_app_target(args.app.as_deref(), flag_org)?;
+    let target = resolve_project_target(args.project.as_deref(), flag_org)?;
     let client = connect_for_target(&target)?;
 
     if let Some(key_num) = args.regenerate {
@@ -2973,12 +2981,12 @@ async fn execute_api_keys(args: &ApiKeysArgs, flag_org: Option<&str>) -> Result<
 }
 
 async fn execute_metrics(args: &MetricsArgs, flag_org: Option<&str>) -> Result<()> {
-    let target = resolve_app_target(args.app.as_deref(), flag_org)?;
+    let target = resolve_project_target(args.project.as_deref(), flag_org)?;
     let client = connect_for_target(&target)?;
-    let app = client.get_app(&target).await?;
+    let app = client.get_project(&target).await?;
 
     let response = client
-        .get_app_metrics(app.id, args.window.as_deref())
+        .get_project_metrics(app.id, args.window.as_deref())
         .await?;
 
     if args.output == OutputFormat::Json {
@@ -3062,7 +3070,7 @@ fn format_bytes(bytes: u64) -> String {
     bytes::NumBytes::from_bytes(bytes).to_string()
 }
 
-fn normalize_create_app_region(region: &str) -> Result<String> {
+fn normalize_create_project_region(region: &str) -> Result<String> {
     let Some(endpoint_region) = normalize_data_region(region) else {
         return Err(crate::error::Error::InvalidArgument {
             message: format!(
@@ -3076,8 +3084,8 @@ fn normalize_create_app_region(region: &str) -> Result<String> {
     })
 }
 
-fn parse_create_app_region(region: &str) -> std::result::Result<String, String> {
-    normalize_create_app_region(region).map_err(|error| match error {
+fn parse_create_project_region(region: &str) -> std::result::Result<String, String> {
+    normalize_create_project_region(region).map_err(|error| match error {
         crate::error::Error::InvalidArgument { message } => message,
         error => error.to_string(),
     })
@@ -3244,25 +3252,31 @@ async fn execute_instance(
     flag_org: Option<&str>,
 ) -> Result<()> {
     let (app_flag, output, pinned_instance) = match cmd {
-        InstanceCommands::List(args) => (args.app.as_deref(), args.output, None),
-        InstanceCommands::Status(args) => {
-            (args.app.as_deref(), args.output, args.instance.as_deref())
-        }
-        InstanceCommands::Datasets(args) => {
-            (args.app.as_deref(), args.output, args.instance.as_deref())
-        }
+        InstanceCommands::List(args) => (args.project.as_deref(), args.output, None),
+        InstanceCommands::Status(args) => (
+            args.project.as_deref(),
+            args.output,
+            args.instance.as_deref(),
+        ),
+        InstanceCommands::Datasets(args) => (
+            args.project.as_deref(),
+            args.output,
+            args.instance.as_deref(),
+        ),
     };
 
-    let target = resolve_app_target(app_flag, flag_org)?;
+    let target = resolve_project_target(app_flag, flag_org)?;
     let client = connect_for_target(&target)?;
-    let app = client.get_app(&target).await?;
+    let app = client.get_project(&target).await?;
 
     // The management API does not expose runtime state, so ask the app's own
     // runtime, authenticating with the app API key the management API holds.
     let region = app.region.clone().ok_or_else(|| {
         Error::cloud_with_hint(
             CloudErrorCode::NotFound,
-            format!("App {target} does not report a region, so its instance endpoint is unknown."),
+            format!(
+                "Project {target} does not report a region, so its instance endpoint is unknown."
+            ),
             format!("Check the app with 'spice cloud inspect --app {target}'."),
         )
     })?;
@@ -3285,7 +3299,7 @@ async fn execute_instance(
         spice_cloud_client::endpoints::normalize_data_region(&region).ok_or_else(|| {
             Error::cloud(
                 CloudErrorCode::InvalidRequest,
-                format!("App {target} reports an unrecognized region '{region}'."),
+                format!("Project {target} reports an unrecognized region '{region}'."),
             )
         })?;
 
@@ -3345,16 +3359,16 @@ async fn execute_instance(
 ///
 /// Without this an operator cannot tell whether "Ready" describes their whole
 /// deployment or one replica of several.
-fn describe_scope(target: &AppTarget, pinned_instance: Option<&str>) -> String {
+fn describe_scope(target: &ProjectTarget, pinned_instance: Option<&str>) -> String {
     match pinned_instance {
         Some(instance) => format!("Instance {instance} of app {target}"),
-        None => format!("App {target}"),
+        None => format!("Project {target}"),
     }
 }
 
 fn print_instance_list(
     instances: &[InstanceStatus],
-    target: &AppTarget,
+    target: &ProjectTarget,
     output: OutputFormat,
 ) -> Result<()> {
     if output == OutputFormat::Json {
@@ -3362,7 +3376,7 @@ fn print_instance_list(
     }
 
     if instances.is_empty() {
-        println!("App {target} has no instances running.");
+        println!("Project {target} has no instances running.");
         return Ok(());
     }
 
@@ -3395,7 +3409,7 @@ fn print_instance_list(
 async fn fetch_instance_json<T: serde::de::DeserializeOwned>(
     ctx: &RuntimeContext,
     path: &str,
-    target: &AppTarget,
+    target: &ProjectTarget,
 ) -> Result<T> {
     let response = ctx.get(path).await.map_err(|err| {
         Error::cloud_with_hint(
@@ -3420,7 +3434,7 @@ async fn fetch_instance_json<T: serde::de::DeserializeOwned>(
 
 fn print_instance_status(
     components: &[InstanceComponentStatus],
-    target: &AppTarget,
+    target: &ProjectTarget,
     pinned_instance: Option<&str>,
     output: OutputFormat,
 ) -> Result<()> {
@@ -3468,7 +3482,7 @@ fn print_instance_status(
 
 fn print_instance_datasets(
     datasets: &[InstanceDatasetInfo],
-    target: &AppTarget,
+    target: &ProjectTarget,
     pinned_instance: Option<&str>,
     output: OutputFormat,
 ) -> Result<()> {
@@ -3713,8 +3727,8 @@ mod tests {
         assert_eq!(value, "from-env");
     }
 
-    fn create_app_args(kind: AppKind, replicas: Option<i32>) -> CreateAppArgs {
-        CreateAppArgs {
+    fn create_project_args(kind: ProjectKind, replicas: Option<i32>) -> CreateProjectArgs {
+        CreateProjectArgs {
             name: "app".to_string(),
             region: "us-east-1-prod-aws-data".to_string(),
             kind,
@@ -3733,8 +3747,8 @@ mod tests {
         }
     }
 
-    fn cluster_app_args(replicas: Option<i32>) -> CreateAppArgs {
-        let mut args = create_app_args(AppKind::Cluster, replicas);
+    fn cluster_app_args(replicas: Option<i32>) -> CreateProjectArgs {
+        let mut args = create_project_args(ProjectKind::Cluster, replicas);
         args.executor_replicas = Some(1);
         args.executor_cpu = Some(1);
         args.executor_memory = Some(bytes::NumBytes::from_bytes(1024));
@@ -3743,7 +3757,7 @@ mod tests {
 
     #[test]
     fn create_cluster_requires_explicit_single_replica() {
-        let err = validate_create_app_args(&create_app_args(AppKind::Cluster, None))
+        let err = validate_create_project_args(&create_project_args(ProjectKind::Cluster, None))
             .expect_err("cluster without replicas should fail");
 
         assert_eq!(
@@ -3754,7 +3768,7 @@ mod tests {
 
     #[test]
     fn create_cluster_requires_executor_configuration() {
-        let err = validate_create_app_args(&create_app_args(AppKind::Cluster, Some(1)))
+        let err = validate_create_project_args(&create_project_args(ProjectKind::Cluster, Some(1)))
             .expect_err("cluster without executor configuration should fail");
 
         assert_eq!(
@@ -3765,35 +3779,35 @@ mod tests {
 
     #[test]
     fn create_cluster_accepts_one_replica() {
-        validate_create_app_args(&cluster_app_args(Some(1)))
+        validate_create_project_args(&cluster_app_args(Some(1)))
             .expect("cluster with one scheduler replica should pass");
     }
 
     #[test]
-    fn create_app_rejects_invalid_region_syntax() {
-        let mut args = create_app_args(AppKind::Set, None);
+    fn create_project_rejects_invalid_region_syntax() {
+        let mut args = create_project_args(ProjectKind::Set, None);
         args.region = "bad_region".to_string();
 
-        let err = validate_create_app_args(&args).expect_err("invalid region should fail");
+        let err = validate_create_project_args(&args).expect_err("invalid region should fail");
 
         assert!(err.to_string().contains("Invalid region 'bad_region'"));
     }
 
     #[test]
-    fn create_app_region_accepts_short_and_data_region_names() {
+    fn create_project_region_accepts_short_and_data_region_names() {
         assert_eq!(
-            normalize_create_app_region("us-east-1").expect("short region should normalize"),
+            normalize_create_project_region("us-east-1").expect("short region should normalize"),
             "us-east-1-prod-aws-data"
         );
         assert_eq!(
-            normalize_create_app_region("us-east-1-prod-aws-data")
+            normalize_create_project_region("us-east-1-prod-aws-data")
                 .expect("data region should normalize"),
             "us-east-1-prod-aws-data"
         );
     }
 
-    fn test_app(org: &str, name: &str) -> spice_cloud_client::types::App {
-        spice_cloud_client::types::App {
+    fn test_app(org: &str, name: &str) -> spice_cloud_client::types::Project {
+        spice_cloud_client::types::Project {
             id: 1,
             name: name.to_string(),
             org: org.to_string(),
@@ -3807,44 +3821,50 @@ mod tests {
     }
 
     #[test]
-    fn display_app_name_uses_app_org_when_present() {
+    fn display_project_name_uses_app_org_when_present() {
         let app = test_app("analytics", "dashboard");
-        assert_eq!(display_app_name(&app, "fallback"), "analytics/dashboard");
+        assert_eq!(
+            display_project_name(&app, "fallback"),
+            "analytics/dashboard"
+        );
     }
 
     #[test]
-    fn display_app_name_falls_back_to_context_org_when_app_org_is_empty() {
+    fn display_project_name_falls_back_to_context_org_when_app_org_is_empty() {
         let app = test_app("", "dashboard");
-        assert_eq!(display_app_name(&app, "analytics"), "analytics/dashboard");
+        assert_eq!(
+            display_project_name(&app, "analytics"),
+            "analytics/dashboard"
+        );
     }
 
     #[test]
-    fn display_app_name_omits_leading_slash_when_org_unavailable() {
+    fn display_project_name_omits_leading_slash_when_org_unavailable() {
         let app = test_app("", "dashboard");
-        assert_eq!(display_app_name(&app, ""), "dashboard");
+        assert_eq!(display_project_name(&app, ""), "dashboard");
     }
 
     #[test]
-    fn backfill_app_orgs_fills_empty_org_from_context() {
+    fn backfill_project_orgs_fills_empty_org_from_context() {
         let mut apps = vec![test_app("", "ltd-mint"), test_app("", "zippy-cayenne")];
-        backfill_app_orgs(&mut apps, "Jeadie");
+        backfill_project_orgs(&mut apps, "Jeadie");
         assert_eq!(apps[0].org, "Jeadie");
         assert_eq!(apps[1].org, "Jeadie");
     }
 
     #[test]
-    fn backfill_app_orgs_preserves_existing_org() {
+    fn backfill_project_orgs_preserves_existing_org() {
         let mut apps = vec![test_app("analytics", "dashboard"), test_app("", "ltd-mint")];
-        backfill_app_orgs(&mut apps, "Jeadie");
+        backfill_project_orgs(&mut apps, "Jeadie");
         // An app that already carries an org keeps it; only empty orgs are filled.
         assert_eq!(apps[0].org, "analytics");
         assert_eq!(apps[1].org, "Jeadie");
     }
 
     #[test]
-    fn backfill_app_orgs_noop_when_context_empty() {
+    fn backfill_project_orgs_noop_when_context_empty() {
         let mut apps = vec![test_app("", "ltd-mint")];
-        backfill_app_orgs(&mut apps, "");
+        backfill_project_orgs(&mut apps, "");
         assert_eq!(apps[0].org, "");
     }
 
@@ -4142,8 +4162,8 @@ mod tests {
     fn output_names_what_actually_answered() {
         // "Ready" means something different for one replica than for a whole
         // deployment, so the scope has to be stated either way.
-        let target = AppTarget::new(Some("spicehq".to_string()), "team-app");
-        assert_eq!(describe_scope(&target, None), "App spicehq/team-app");
+        let target = ProjectTarget::new(Some("spicehq".to_string()), "team-app");
+        assert_eq!(describe_scope(&target, None), "Project spicehq/team-app");
         assert_eq!(
             describe_scope(&target, Some("spicepod-team-app-abc-0-0")),
             "Instance spicepod-team-app-abc-0-0 of app spicehq/team-app"
@@ -4272,7 +4292,7 @@ mod tests {
         // serialized JSON must carry the context org, matching the table's
         // `<org>/<name>` display.
         let mut apps = vec![test_app("", "ltd-mint")];
-        backfill_app_orgs(&mut apps, "Jeadie");
+        backfill_project_orgs(&mut apps, "Jeadie");
         let value = serde_json::to_value(&apps[0]).expect("app should serialize to JSON");
         assert_eq!(
             value.get("org").and_then(serde_json::Value::as_str),

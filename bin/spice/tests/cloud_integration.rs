@@ -946,7 +946,7 @@ fn test_cloud_help_lists_all_subcommands() {
         .stdout(predicate::str::contains("org"))
         .stdout(predicate::str::contains("link"))
         .stdout(predicate::str::contains("unlink"))
-        .stdout(predicate::str::contains("apps"))
+        .stdout(predicate::str::contains("projects"))
         .stdout(predicate::str::contains("deployments"))
         .stdout(predicate::str::contains("regions"))
         .stdout(predicate::str::contains("images"))
@@ -1175,6 +1175,6 @@ fn test_cloud_create_help() {
     cmd.args(["cloud", "create", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("app"))
+        .stdout(predicate::str::contains("project"))
         .stdout(predicate::str::contains("deployment"));
 }
