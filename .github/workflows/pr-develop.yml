@@ -59,13 +59,14 @@ jobs:
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@da41a0d5fb3245c6fd0bff8bc1b6613a14666261 # v0.5.9
+        uses: spiceai/spiceio/.github/actions/setup@0870da59576dda1aef80e99c067c3bf14da7307b # v0.6.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
+          immutable-objects: "true"
 
       - name: Set up sccache
         if: runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != ''
@@ -93,8 +94,13 @@ jobs:
           BRANCH: spiceai-54
 
       - name: Show sccache stats
-        if: runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != ''
-        run: sccache --show-stats
+        if: always() && (runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != '')
+        # `always()`: this is the one step that reports cache health, and without it
+        # it is skipped on exactly the failures it would explain (#12420). The `||`
+        # keeps a diagnostic from ever deciding a verdict — when the cache backend is
+        # gone `--show-stats` cannot answer either, and that is itself the finding.
+        run: |
+          sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
 
       - name: Kill spiceio
         if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
@@ -127,13 +133,14 @@ jobs:
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@da41a0d5fb3245c6fd0bff8bc1b6613a14666261 # v0.5.9
+        uses: spiceai/spiceio/.github/actions/setup@0870da59576dda1aef80e99c067c3bf14da7307b # v0.6.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
+          immutable-objects: "true"
 
       - name: Set up sccache
         if: runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != ''
@@ -158,7 +165,13 @@ jobs:
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           RUST_PROFILE: ${{ env.RUST_PROFILE }}
-          NEXTEST_FLAG: "--exclude libnfs --exclude connector-nfs -E 'not (package(aws-sdk-credential-bridge) | package(object_store_occ))'"
+          # `libnfs` is already excluded by the `nextest` target itself; only the
+          # CI-specific exclusion belongs here.
+          NEXTEST_FLAG: "--exclude connector-nfs"
+          # Intersected with the gate's own filterset by the Makefile. Passing it
+          # as a second `-E` would union with that filterset and widen the run,
+          # because that is how nextest composes repeated `-E` flags.
+          NEXTEST_FILTER_EXTRA: "not (package(aws-sdk-credential-bridge) | package(object_store_occ))"
 
       - name: Build testoperator
         env:
@@ -166,8 +179,13 @@ jobs:
         run: cargo build -p testoperator --all-features --locked
 
       - name: Show sccache stats
-        if: runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != ''
-        run: sccache --show-stats
+        if: always() && (runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != '')
+        # `always()`: this is the one step that reports cache health, and without it
+        # it is skipped on exactly the failures it would explain (#12420). The `||`
+        # keeps a diagnostic from ever deciding a verdict — when the cache backend is
+        # gone `--show-stats` cannot answer either, and that is itself the finding.
+        run: |
+          sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
 
       - name: Check if Cargo.lock is updated
         run: |

@@ -215,6 +215,21 @@ pub trait Index: Debug + Send + Sync + 'static {
         self.delete_by_keys(keys).await
     }
 
+    /// Whether a failure in [`Index::on_write_start`] must fail the write.
+    ///
+    /// Defaults to `false` (best-effort), matching indexes whose start step only tunes
+    /// something the write does not depend on — Elasticsearch's `refresh_interval`
+    /// override is the example: the write is still indexed correctly without it. An
+    /// index that *prepares state the write depends on* returns `true`: for those,
+    /// writing anyway leaves the index and the rows it indexes diverged, with only a
+    /// warning to say so.
+    ///
+    /// Wrapper implementations MUST forward this to the index they wrap — inheriting
+    /// the default silently downgrades a fatal inner index to best-effort.
+    fn write_start_failure_is_fatal(&self) -> bool {
+        false
+    }
+
     /// Whether a failure in [`Index::on_write_complete`] must fail the write.
     ///
     /// Defaults to `false` (best-effort), matching indexes whose finalize step has

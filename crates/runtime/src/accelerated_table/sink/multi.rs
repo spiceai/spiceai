@@ -41,7 +41,8 @@ use runtime_datafusion_index::{Index, WriteWindow};
 
 use crate::{
     accelerated_table::{
-        refresh_task::retry_from_df_error, sink::finalize_indexes,
+        refresh_task::retry_from_df_error,
+        sink::{finalize_indexes, prepare_indexes, rollback_indexes},
         synchronized_table::SynchronizedTable,
     },
     datafusion::error::find_datafusion_root,
@@ -152,22 +153,19 @@ impl MultiSink {
         let (parent_complete_tx, parent_complete_rx) = watch::channel(false);
         let child_barrier = Arc::new(Barrier::new(self.synchronized_tables.len()));
 
-        // Run on_write_start for all sink_indexes before any write begins. A replacing write
-        // drops source rows by not re-sending them, so an index backed by its own store has to
-        // be told to clear rather than upsert (#12066).
-        let write_window = WriteWindow::from(overwrite);
-        for index in &self.sink_indexes {
-            tracing::debug!(
-                "MultiSink: running on_write_start for index '{}'",
-                index.name()
-            );
-            if let Err(e) = index.on_write_start(write_window).await {
-                tracing::warn!(
-                    "MultiSink: on_write_start failed for index '{}': {e}. Continuing with write.",
-                    index.name()
-                );
-            }
-        }
+        // Run on_write_start for all sink_indexes before any write begins. A fatal start
+        // failure returns here, before any task is spawned, so no data is written.
+        //
+        // The window comes from `overwrite`: a replacing write drops source rows by not
+        // re-sending them, so an index backed by its own store has to be told to clear
+        // rather than upsert (#12066).
+        prepare_indexes(
+            "MultiSink",
+            self.sink_indexes.iter(),
+            WriteWindow::from(overwrite),
+        )
+        .await
+        .map_err(retry_from_df_error)?;
 
         // Spawn primary task
         let primary_provider = Arc::clone(&self.original_table_provider);
@@ -223,14 +221,7 @@ impl MultiSink {
 
         if let Some(first_error) = errors.into_iter().next() {
             // Run on_write_failed for all sink_indexes.
-            for index in &self.sink_indexes {
-                if let Err(e) = index.on_write_failed().await {
-                    tracing::warn!(
-                        "MultiSink: on_write_failed failed for index '{}': {e}. Index write state may need manual cleanup.",
-                        index.name()
-                    );
-                }
-            }
+            rollback_indexes("MultiSink", self.sink_indexes.iter()).await;
             return Err(first_error);
         }
 

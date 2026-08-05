@@ -81,8 +81,13 @@ jobs:
       #   make release
 
       - name: Show sccache stats
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
-        run: sccache --show-stats
+        if: always() && (env.HAS_TEST_MINIO_SECRET == 'true')
+        # `always()`: this is the one step that reports cache health, and without it
+        # it is skipped on exactly the failures it would explain (#12420). The `||`
+        # keeps a diagnostic from ever deciding a verdict — when the cache backend is
+        # gone `--show-stats` cannot answer either, and that is itself the finding.
+        run: |
+          sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@f205ea1c3313d32999d8d6a48b4f6530d4437b38 # v4
