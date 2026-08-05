@@ -927,12 +927,14 @@ impl CpuBudget {
             return None;
         }
         Some(format!(
-            "Declared CPU request of {request_m} is implausibly small; if this pod requests \
-             {request_m_as_cores} cores, {CPU_REQUEST_ENV} is missing `divisor: 1m` and is 1000x \
-             too small. Sized for {entitlement}. See: {DOCS_URL}",
+            "Declared CPU request of {request_m} seems small; if this pod requests \
+             {request_as_cores} cores, {CPU_REQUEST_ENV} is missing `divisor: 1m` and is 1000x too \
+             small. Sizing for the {minimum}-core minimum. See: {DOCS_URL}",
             request_m = format_millicores(request),
-            request_m_as_cores = request,
-            entitlement = format_millicores(self.millicores),
+            request_as_cores = request,
+            // The floor, or the host if it is smaller than the floor — either way
+            // the minimum available, so the wording holds on a 1-core host too.
+            minimum = self.cores(),
         ))
     }
 
@@ -1886,6 +1888,16 @@ mod tests {
             warning.contains("divisor"),
             "names the likely cause: {warning}"
         );
+        assert!(warning.contains("2-core minimum"), "{warning}");
+
+        // A genuinely 1-core host gets 1, because the floor yields to a smaller
+        // machine — so the "minimum" wording has to track the value, not the const.
+        let tiny = CpuBudget::resolve(&CpuConfig::default(), &request_only(1, 4)).expect("valid");
+        assert_eq!(tiny.cores(), 1);
+        let on_tiny = tiny
+            .core_shaped_request_warning()
+            .expect("still remarked on");
+        assert!(on_tiny.contains("1-core minimum"), "{on_tiny}");
 
         // This is the host size that made the warning necessary: two cores of four
         // is not a steep downsize, so the sizing notice stays quiet and this is the
