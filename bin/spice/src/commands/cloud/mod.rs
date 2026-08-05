@@ -118,6 +118,10 @@ pub enum CloudCommands {
     /// List available container images
     Images(ImagesArgs),
 
+    /// Create, inspect, and change one project
+    #[command(subcommand)]
+    Project(ProjectCommands),
+
     /// Manage secrets for a project
     #[command(subcommand)]
     Secrets(SecretsCommands),
@@ -125,28 +129,15 @@ pub enum CloudCommands {
     /// View deployment logs
     Logs(LogsArgs),
 
-    /// Create a new resource
-    #[command(subcommand)]
-    Create(CreateCommands),
-
-    /// Get details of a resource
-    #[command(subcommand)]
-    Get(GetCommands),
-
-    /// Update a resource
-    #[command(subcommand)]
-    Update(UpdateCommands),
-
-    /// Delete a resource
-    #[command(subcommand)]
-    Delete(DeleteCommands),
-
     // `about`/`long_about` live on `DeployArgs`; a doc comment here would
     // shadow the long help that documents where the spicepod comes from.
     Deploy(DeployArgs),
 
-    /// Inspect a project's current deployment
-    Inspect(InspectArgs),
+    // `about`/`long_about` live on `StatusArgs`.
+    Status(StatusArgs),
+
+    /// Show dataset load state for a project
+    Datasets(DatasetsArgs),
 
     /// Show API keys for a project
     #[command(name = "api-keys")]
@@ -155,10 +146,44 @@ pub enum CloudCommands {
     /// Show resource usage for a project's instances
     Metrics(MetricsArgs),
 
-    // `about`/`long_about` live on `InstanceCommands`; a doc comment here would
-    // shadow the long help that explains instance pinning.
-    #[command(subcommand)]
+    // ── Superseded spellings ────────────────────────────────────────────────
+    // Hidden from help but still parsed, so scripts written against the old
+    // surface keep working for one release. Each warns and delegates to its
+    // replacement rather than duplicating behavior — two implementations of one
+    // command is how they drift apart.
+    #[command(subcommand, hide = true)]
+    Create(CreateCommands),
+
+    #[command(subcommand, hide = true)]
+    Get(GetCommands),
+
+    #[command(subcommand, hide = true)]
+    Update(UpdateCommands),
+
+    #[command(subcommand, hide = true)]
+    Delete(DeleteCommands),
+
+    #[command(hide = true)]
+    Inspect(InspectArgs),
+
+    #[command(subcommand, hide = true)]
     Instance(InstanceCommands),
+}
+
+/// Operations on a single project.
+#[derive(Subcommand, Debug)]
+pub enum ProjectCommands {
+    /// Create a new project
+    Create(CreateProjectArgs),
+
+    /// Show a project's configuration
+    Get(GetProjectArgs),
+
+    /// Change a project's configuration
+    Update(UpdateProjectArgs),
+
+    /// Delete a project
+    Delete(DeleteProjectArgs),
 }
 
 // ============================================================================
@@ -174,6 +199,51 @@ pub struct WhoamiArgs {
 
 #[derive(Args, Debug)]
 pub struct ProjectsArgs {
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
+}
+
+#[derive(Args, Debug)]
+#[command(
+    about = "Show whether a project is healthy",
+    long_about = r#"Show whether a project is healthy.
+
+Answers the whole "why is my project red?" question in one place: the project,
+its latest deployment, every instance serving it with per-instance health, and
+any dataset that is not loading. Without --instance the report comes from the
+project's general endpoint and describes the deployment as a whole; with
+--instance it is pinned to one instance.
+
+EXAMPLES
+  spice cloud status
+  spice cloud status --project spicehq/team-app
+  spice cloud status --project spicehq/team-app --instance spicepod-team-app-abc-0-0"#
+)]
+pub struct StatusArgs {
+    /// Project name in org/project format (uses the linked project if omitted)
+    #[arg(long, alias = "app", value_name = "ORG/PROJECT")]
+    pub project: Option<String>,
+
+    /// Pin the report to one instance (default: the project's general endpoint)
+    #[arg(long, value_name = "NAME")]
+    pub instance: Option<String>,
+
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
+}
+
+#[derive(Args, Debug)]
+pub struct DatasetsArgs {
+    /// Project name in org/project format (uses the linked project if omitted)
+    #[arg(long, alias = "app", value_name = "ORG/PROJECT")]
+    pub project: Option<String>,
+
+    /// Pin the report to one instance (default: the project's general endpoint)
+    #[arg(long, value_name = "NAME")]
+    pub instance: Option<String>,
+
     /// Output format
     #[arg(long, short = 'o', default_value = "table")]
     pub output: OutputFormat,
@@ -925,18 +995,275 @@ pub async fn execute(ctx: &RuntimeContext, args: &CloudArgs) -> Result<()> {
         CloudCommands::Deployments(deploy_args) => execute_deployments(deploy_args, org).await,
         CloudCommands::Regions(regions_args) => execute_regions(regions_args, org).await,
         CloudCommands::Images(images_args) => execute_images(images_args, org).await,
+        CloudCommands::Project(project_cmd) => execute_project(project_cmd, org).await,
         CloudCommands::Secrets(secrets_cmd) => execute_secrets(secrets_cmd, org).await,
         CloudCommands::Logs(logs_args) => execute_logs(logs_args, org).await,
-        CloudCommands::Create(create_cmd) => execute_create(create_cmd, org).await,
-        CloudCommands::Get(get_cmd) => execute_get(get_cmd, org).await,
-        CloudCommands::Update(update_cmd) => execute_update(update_cmd, org).await,
-        CloudCommands::Delete(delete_cmd) => execute_delete(delete_cmd, org).await,
         CloudCommands::Deploy(deploy_args) => execute_deploy(deploy_args, org).await,
-        CloudCommands::Inspect(inspect_args) => execute_inspect(inspect_args, org).await,
+        CloudCommands::Status(status_args) => execute_status(ctx, status_args, org).await,
+        CloudCommands::Datasets(datasets_args) => execute_datasets(ctx, datasets_args, org).await,
         CloudCommands::ApiKeys(api_keys_args) => execute_api_keys(api_keys_args, org).await,
         CloudCommands::Metrics(metrics_args) => execute_metrics(metrics_args, org).await,
-        CloudCommands::Instance(instance_cmd) => execute_instance(ctx, instance_cmd, org).await,
+
+        // Superseded spellings: warn, then delegate to the replacement.
+        CloudCommands::Create(create_cmd) => match create_cmd {
+            CreateCommands::Project(args) => {
+                warn_superseded("create project", "project create");
+                execute_project_create(args, org).await
+            }
+            CreateCommands::Deployment(args) => {
+                warn_superseded("create deployment", "deploy");
+                execute_create_deployment(args, org).await
+            }
+        },
+        CloudCommands::Get(GetCommands::Project(args)) => {
+            warn_superseded("get project", "project get");
+            execute_project_get(args, org).await
+        }
+        CloudCommands::Update(UpdateCommands::Project(args)) => {
+            warn_superseded("update project", "project update");
+            execute_project_update(args, org).await
+        }
+        CloudCommands::Delete(DeleteCommands::Project(args)) => {
+            warn_superseded("delete project", "project delete");
+            execute_project_delete(args, org).await
+        }
+        CloudCommands::Inspect(inspect_args) => {
+            warn_superseded("inspect", "status");
+            execute_status(
+                ctx,
+                &StatusArgs {
+                    project: inspect_args.project.clone(),
+                    instance: None,
+                    output: inspect_args.output,
+                },
+                org,
+            )
+            .await
+        }
+        CloudCommands::Instance(instance_cmd) => {
+            let replacement = match instance_cmd {
+                InstanceCommands::List(_) | InstanceCommands::Status(_) => "status",
+                InstanceCommands::Datasets(_) => "datasets",
+            };
+            warn_superseded("instance", replacement);
+            match instance_cmd {
+                InstanceCommands::List(args) => {
+                    execute_status(
+                        ctx,
+                        &StatusArgs {
+                            project: args.project.clone(),
+                            instance: None,
+                            output: args.output,
+                        },
+                        org,
+                    )
+                    .await
+                }
+                InstanceCommands::Status(args) => {
+                    execute_status(
+                        ctx,
+                        &StatusArgs {
+                            project: args.project.clone(),
+                            instance: args.instance.clone(),
+                            output: args.output,
+                        },
+                        org,
+                    )
+                    .await
+                }
+                InstanceCommands::Datasets(args) => {
+                    execute_datasets(
+                        ctx,
+                        &DatasetsArgs {
+                            project: args.project.clone(),
+                            instance: args.instance.clone(),
+                            output: args.output,
+                        },
+                        org,
+                    )
+                    .await
+                }
+            }
+        }
     }
+}
+
+async fn execute_project(cmd: &ProjectCommands, flag_org: Option<&str>) -> Result<()> {
+    match cmd {
+        ProjectCommands::Create(args) => execute_project_create(args, flag_org).await,
+        ProjectCommands::Get(args) => execute_project_get(args, flag_org).await,
+        ProjectCommands::Update(args) => execute_project_update(args, flag_org).await,
+        ProjectCommands::Delete(args) => execute_project_delete(args, flag_org).await,
+    }
+}
+
+/// One report answering "is this project healthy?".
+///
+/// Aggregates what previously took five commands — project metadata, the latest
+/// deployment, every instance with its health, and any dataset that is not
+/// loading. Aggregation is the default and narrowing is the flag, matching
+/// `kubectl describe --show-events` and `fly status`; an operator diagnosing an
+/// outage should not have to know which of five commands holds the answer.
+async fn execute_status(
+    ctx: &RuntimeContext,
+    args: &StatusArgs,
+    flag_org: Option<&str>,
+) -> Result<()> {
+    let (target, org_source) =
+        resolve_project_target_with_source(args.project.as_deref(), flag_org)?;
+    let client = connect_for_target(&target)?;
+
+    let project = client.get_project(&target).await?;
+    let deployments = client.list_deployments(&target, 1, None).await?;
+    let latest = deployments.first();
+
+    // Instance and dataset health live on the data plane. Treat them as
+    // best-effort: a project that has never deployed has no runtime to ask, and
+    // that must read as "not deployed yet", not as a command failure.
+    let runtime = project_runtime_context(ctx, &client, &target, args.instance.as_deref()).await;
+    let (instances, datasets) = match &runtime {
+        Ok(runtime_ctx) => {
+            let instances = fetch_instance_json::<SpicepodStatusResponse>(
+                runtime_ctx,
+                "/v1/spice_runtime",
+                &target,
+            )
+            .await
+            .map(|response| response.status.pod_statuses)
+            .unwrap_or_default();
+            let datasets = fetch_instance_json::<Vec<InstanceDatasetInfo>>(
+                runtime_ctx,
+                "/v1/datasets?status=true",
+                &target,
+            )
+            .await
+            .unwrap_or_default();
+            (instances, datasets)
+        }
+        Err(_) => (Vec::new(), Vec::new()),
+    };
+
+    let unhealthy: Vec<&InstanceDatasetInfo> = datasets
+        .iter()
+        .filter(|dataset| dataset_needs_attention(dataset.status.as_deref()))
+        .collect();
+
+    if args.output == OutputFormat::Json {
+        return write_json(&serde_json::json!({
+            "project": project,
+            "org": target.org,
+            "instance": args.instance,
+            "latest_deployment": latest,
+            "instances": instances,
+            "datasets_total": datasets.len(),
+            "datasets_unhealthy": unhealthy,
+        }));
+    }
+
+    println!("{}", describe_scope(&target, args.instance.as_deref()));
+    if target.org.is_some() && org_source != OrgSource::ProjectArgument {
+        println!("  organization from {}", org_source.label());
+    }
+    if let Some(region) = &project.region {
+        println!("  region {region}");
+    }
+
+    match latest {
+        Some(deployment) => {
+            let age = deployment
+                .created_at
+                .as_deref()
+                .map_or(String::new(), |created| format!(" ({created})"));
+            println!("  deployment {} {}{age}", deployment.id, deployment.status);
+            if let Some(error) = &deployment.error_message {
+                println!("  error: {error}");
+            }
+        }
+        None => println!("  no deployments yet"),
+    }
+
+    println!();
+    if instances.is_empty() {
+        println!("No instances are running.");
+    } else {
+        let mut table = TableOutput::new(vec!["INSTANCE", "STATUS", "DEPLOYMENT", "STARTED"]);
+        for instance in &instances {
+            table.add_row(vec![
+                instance.name.clone(),
+                instance.status().to_string(),
+                instance.deployment_id().unwrap_or("-").to_string(),
+                instance
+                    .start_time
+                    .clone()
+                    .unwrap_or_else(|| "-".to_string()),
+            ]);
+        }
+        table.print();
+        let serving = instances.iter().filter(|i| i.is_serving()).count();
+        println!("{serving}/{} instances serving.", instances.len());
+    }
+
+    if !datasets.is_empty() {
+        println!();
+        if unhealthy.is_empty() {
+            println!("{} datasets, all loaded.", datasets.len());
+        } else {
+            // Only the datasets that need attention: a full listing here would
+            // bury the one that is broken. `spice cloud datasets` shows them all.
+            println!(
+                "{}/{} datasets need attention:",
+                unhealthy.len(),
+                datasets.len()
+            );
+            for dataset in &unhealthy {
+                let detail = dataset
+                    .error_message
+                    .as_deref()
+                    .map_or(String::new(), |error| {
+                        format!(" — {}", truncate_for_table(error, 60))
+                    });
+                println!(
+                    "  {} {}{detail}",
+                    dataset.name,
+                    dataset.status.as_deref().unwrap_or("unknown")
+                );
+            }
+            println!();
+            println!("  Logs: spice cloud logs --project {target} --level error");
+        }
+    }
+
+    Ok(())
+}
+
+async fn execute_datasets(
+    ctx: &RuntimeContext,
+    args: &DatasetsArgs,
+    flag_org: Option<&str>,
+) -> Result<()> {
+    let target = resolve_project_target(args.project.as_deref(), flag_org)?;
+    let client = connect_for_target(&target)?;
+    let runtime_ctx =
+        project_runtime_context(ctx, &client, &target, args.instance.as_deref()).await?;
+
+    let datasets = fetch_instance_json::<Vec<InstanceDatasetInfo>>(
+        &runtime_ctx,
+        "/v1/datasets?status=true",
+        &target,
+    )
+    .await?;
+
+    print_instance_datasets(&datasets, &target, args.instance.as_deref(), args.output)
+}
+
+/// Tell the user a spelling has moved, once, before the command runs.
+///
+/// Written through `tracing` so `--machine` mode (which sets the filter to
+/// `off`) keeps stdout a single clean JSON document.
+fn warn_superseded(old: &str, new: &str) {
+    tracing::warn!(
+        "'spice cloud {old}' is now 'spice cloud {new}'. The old spelling still works but will be removed in a future release."
+    );
 }
 
 // ============================================================================
@@ -951,7 +1278,7 @@ pub async fn execute(ctx: &RuntimeContext, args: &CloudArgs) -> Result<()> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrgSource {
     /// The `<org>/<app>` argument named it outright.
-    AppArgument,
+    ProjectArgument,
     /// The `--org` flag.
     Flag,
     /// The `SPICE_CLOUD_ORG` environment variable.
@@ -969,7 +1296,7 @@ impl OrgSource {
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
-            Self::AppArgument => "app argument",
+            Self::ProjectArgument => "project argument",
             Self::Flag => "--org flag",
             Self::Environment => org::ACTIVE_ORG_VAR,
             Self::LinkedApp => "linked app",
@@ -1049,7 +1376,7 @@ fn resolve_project_target_with_source(
         )?;
         return Ok((
             ProjectTarget::new(Some(path_org), app),
-            OrgSource::AppArgument,
+            OrgSource::ProjectArgument,
         ));
     }
 
@@ -1152,7 +1479,7 @@ fn announce_target(action: &str, target: &ProjectTarget, source: OrgSource, outp
     }
 
     println!("{action} {target}");
-    if target.org.is_some() && source != OrgSource::AppArgument {
+    if target.org.is_some() && source != OrgSource::ProjectArgument {
         println!("  organization from {}", source.label());
     }
 }
@@ -2445,9 +2772,9 @@ async fn execute_logs(args: &LogsArgs, flag_org: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-async fn execute_create(cmd: &CreateCommands, flag_org: Option<&str>) -> Result<()> {
-    match cmd {
-        CreateCommands::Project(args) => {
+async fn execute_project_create(args: &CreateProjectArgs, flag_org: Option<&str>) -> Result<()> {
+    {
+        {
             let create_region = validate_create_project_args(args)?;
 
             let client = connect(flag_org)?;
@@ -2531,7 +2858,16 @@ async fn execute_create(cmd: &CreateCommands, flag_org: Option<&str>) -> Result<
                 println!("\nSave this key - it won't be shown again.");
             }
         }
-        CreateCommands::Deployment(args) => {
+    }
+    Ok(())
+}
+
+async fn execute_create_deployment(
+    args: &CreateDeploymentArgs,
+    flag_org: Option<&str>,
+) -> Result<()> {
+    {
+        {
             let target = resolve_project_target(args.project.as_deref(), flag_org)?;
             let client = connect_for_target(&target)?;
             let deployment = client
@@ -2591,9 +2927,9 @@ fn validate_create_project_args(args: &CreateProjectArgs) -> Result<String> {
     Ok(region)
 }
 
-async fn execute_get(cmd: &GetCommands, flag_org: Option<&str>) -> Result<()> {
-    match cmd {
-        GetCommands::Project(args) => {
+async fn execute_project_get(args: &GetProjectArgs, flag_org: Option<&str>) -> Result<()> {
+    {
+        {
             let target = resolve_project_target(Some(&args.project), flag_org)?;
             let client = connect_for_target(&target)?;
             let app = client.get_project(&target).await?;
@@ -2620,9 +2956,9 @@ async fn execute_get(cmd: &GetCommands, flag_org: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-async fn execute_update(cmd: &UpdateCommands, flag_org: Option<&str>) -> Result<()> {
-    match cmd {
-        UpdateCommands::Project(args) => {
+async fn execute_project_update(args: &UpdateProjectArgs, flag_org: Option<&str>) -> Result<()> {
+    {
+        {
             let target = resolve_project_target(args.project.as_deref(), flag_org)?;
             let client = connect_for_target(&target)?;
             let spicepod_content = if let Some(path) = args.spicepod.as_deref() {
@@ -2661,11 +2997,11 @@ async fn execute_update(cmd: &UpdateCommands, flag_org: Option<&str>) -> Result<
     Ok(())
 }
 
-async fn execute_delete(cmd: &DeleteCommands, flag_org: Option<&str>) -> Result<()> {
+async fn execute_project_delete(args: &DeleteProjectArgs, flag_org: Option<&str>) -> Result<()> {
     use std::io::Write;
 
-    match cmd {
-        DeleteCommands::Project(args) => {
+    {
+        {
             let (target, org_source) =
                 resolve_project_target_with_source(Some(&args.project), flag_org)?;
 
@@ -2871,75 +3207,6 @@ async fn wait_for_deployment(
         }
         deployment = refreshed;
     }
-}
-
-async fn execute_inspect(args: &InspectArgs, flag_org: Option<&str>) -> Result<()> {
-    let target = resolve_project_target(args.project.as_deref(), flag_org)?;
-    let client = connect_for_target(&target)?;
-
-    let app = client.get_project(&target).await?;
-    let deployments = client.list_deployments(&target, 1, None).await?;
-    // Metrics report one row per pod, which is the closest the management API
-    // gets to "how many replicas are actually up".
-    let pods = client
-        .get_project_metrics(app.id, None)
-        .await
-        .map(|metrics| metrics.metrics.keys().cloned().collect::<Vec<_>>())
-        .unwrap_or_default();
-
-    if args.output == OutputFormat::Json {
-        return write_json(&serde_json::json!({
-            "app": app,
-            "org": target.org,
-            "latest_deployment": deployments.first(),
-            "pods": pods,
-        }));
-    }
-
-    println!("Project:    {target}");
-    if let Some(region) = app.region {
-        println!("Region: {region}");
-    }
-    if let Some(branch) = app.production_branch {
-        println!("Branch: {branch}");
-    }
-
-    if let Some(deployment) = deployments.first() {
-        println!();
-        println!("Latest Deployment:");
-        println!("  ID:       {}", deployment.id);
-        println!("  Status:   {}", deployment.status);
-        if let Some(image) = &deployment.image_tag {
-            println!("  Image:    {image}");
-        }
-        if let Some(replicas) = deployment.replicas {
-            println!("  Replicas: {replicas}");
-        }
-        if let Some(commit) = &deployment.commit_sha {
-            println!("  Commit:   {}", short_commit(Some(commit)));
-        }
-        if let Some(created) = &deployment.created_at {
-            println!("  Created:  {created}");
-        }
-        if let Some(error) = &deployment.error_message {
-            println!("  Error:    {error}");
-        }
-    } else {
-        println!("\nNo deployments found.");
-    }
-
-    println!();
-    if pods.is_empty() {
-        println!("Pods: none reporting metrics");
-    } else {
-        println!("Pods ({}):", pods.len());
-        for pod in &pods {
-            println!("  {pod}");
-        }
-        println!("  Component readiness: spice cloud instance status --app {target}");
-    }
-
-    Ok(())
 }
 
 async fn execute_api_keys(args: &ApiKeysArgs, flag_org: Option<&str>) -> Result<()> {
@@ -3214,19 +3481,7 @@ impl InstanceStatus {
     }
 }
 
-/// A component reported by an app instance's `/v1/status` endpoint.
-///
-/// This endpoint reports connection endpoints only — `http`, `flight`,
-/// `metrics`, `opentelemetry`. Dataset state comes from `/v1/datasets`.
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
-struct InstanceComponentStatus {
-    name: String,
-    status: String,
-    #[serde(default)]
-    endpoint: Option<String>,
-}
-
-/// A dataset reported by an app instance's `/v1/datasets?status=true` endpoint.
+/// A dataset reported by an instance's `/v1/datasets?status=true` endpoint.
 ///
 /// Mirrors the fields of `runtime_api_types::v1::datasets::DatasetInfo` that
 /// matter for diagnosis. Declared locally rather than depending on the runtime
@@ -3246,55 +3501,30 @@ struct InstanceDatasetInfo {
     error_message: Option<String>,
 }
 
-async fn execute_instance(
+/// Build a client for one project's running instances.
+///
+/// The management API does not expose runtime state, so this resolves the
+/// project's region and API key through it and then targets the regional data
+/// endpoint. `instance` pins the request to a single instance; unset, the
+/// request reaches the project's general endpoint and describes the deployment
+/// as a whole.
+async fn project_runtime_context(
     ctx: &RuntimeContext,
-    cmd: &InstanceCommands,
-    flag_org: Option<&str>,
-) -> Result<()> {
-    let (app_flag, output, pinned_instance) = match cmd {
-        InstanceCommands::List(args) => (args.project.as_deref(), args.output, None),
-        InstanceCommands::Status(args) => (
-            args.project.as_deref(),
-            args.output,
-            args.instance.as_deref(),
-        ),
-        InstanceCommands::Datasets(args) => (
-            args.project.as_deref(),
-            args.output,
-            args.instance.as_deref(),
-        ),
-    };
+    client: &CloudClient,
+    target: &ProjectTarget,
+    instance: Option<&str>,
+) -> Result<RuntimeContext> {
+    let project = client.get_project(target).await?;
 
-    let target = resolve_project_target(app_flag, flag_org)?;
-    let client = connect_for_target(&target)?;
-    let app = client.get_project(&target).await?;
-
-    // The management API does not expose runtime state, so ask the app's own
-    // runtime, authenticating with the app API key the management API holds.
-    let region = app.region.clone().ok_or_else(|| {
+    let region = project.region.clone().ok_or_else(|| {
         Error::cloud_with_hint(
             CloudErrorCode::NotFound,
             format!(
                 "Project {target} does not report a region, so its instance endpoint is unknown."
             ),
-            format!("Check the app with 'spice cloud inspect --app {target}'."),
+            format!("Check it with 'spice cloud status --project {target}'."),
         )
     })?;
-    // Prefer the key the management API reports for this app; fall back to a
-    // key stored for the same org only if the API withholds one. Never reach
-    // for another org's key.
-    let api_key = match client.get_api_keys(&target).await?.api_key {
-        Some(api_key) => Some(api_key),
-        None => org::api_key_for_org(target.org.as_deref()),
-    };
-    let api_key = api_key.ok_or_else(|| {
-        Error::cloud_with_hint(
-            CloudErrorCode::Forbidden,
-            format!("No API key is available for app {target}, so its instance cannot be queried."),
-            format!("Generate one with 'spice cloud api-keys --app {target} --regenerate 1'."),
-        )
-    })?;
-
     let region =
         spice_cloud_client::endpoints::normalize_data_region(&region).ok_or_else(|| {
             Error::cloud(
@@ -3303,6 +3533,23 @@ async fn execute_instance(
             )
         })?;
 
+    // Prefer the key the management API reports for this project; fall back to
+    // a key stored for the same org only if the API withholds one. Never reach
+    // for another org's key.
+    let api_key = match client.get_api_keys(target).await?.api_key {
+        Some(api_key) => Some(api_key),
+        None => org::api_key_for_org(target.org.as_deref()),
+    };
+    let api_key = api_key.ok_or_else(|| {
+        Error::cloud_with_hint(
+            CloudErrorCode::Forbidden,
+            format!(
+                "No API key is available for project {target}, so its instances cannot be queried."
+            ),
+            format!("Generate one with 'spice cloud api-keys --project {target} --regenerate 1'."),
+        )
+    })?;
+
     let mut runtime_ctx = RuntimeContext::with_args(
         None,
         Some(api_key),
@@ -3310,99 +3557,25 @@ async fn execute_instance(
         ctx.tls_root_certificate_file().map(ToString::to_string),
     )?;
 
-    // Pin to one instance only when the caller named one. Unpinned, the request
-    // reaches the app's general endpoint and answers for the deployment as a
-    // whole — which is the right default, because an app is usually several
-    // replicas and an arbitrary one is not a useful answer.
-    if let Some(instance) = pinned_instance {
+    if let Some(instance) = instance {
         runtime_ctx.add_headers(std::collections::HashMap::from([(
             TARGET_INSTANCE_HEADER.to_string(),
             instance.to_string(),
         )]));
     }
 
-    match cmd {
-        InstanceCommands::List(_) => {
-            let runtime = fetch_instance_json::<SpicepodStatusResponse>(
-                &runtime_ctx,
-                "/v1/spice_runtime",
-                &target,
-            )
-            .await?;
-            print_instance_list(&runtime.status.pod_statuses, &target, output)
-        }
-        InstanceCommands::Status(_) => {
-            let components = fetch_instance_json::<Vec<InstanceComponentStatus>>(
-                &runtime_ctx,
-                "/v1/status",
-                &target,
-            )
-            .await?;
-            print_instance_status(&components, &target, pinned_instance, output)
-        }
-        InstanceCommands::Datasets(_) => {
-            // `/v1/status` reports only connection endpoints (http, flight,
-            // metrics, opentelemetry) — never datasets. Dataset state lives on
-            // the datasets route, and only when `status=true` is requested.
-            let datasets = fetch_instance_json::<Vec<InstanceDatasetInfo>>(
-                &runtime_ctx,
-                "/v1/datasets?status=true",
-                &target,
-            )
-            .await?;
-            print_instance_datasets(&datasets, &target, pinned_instance, output)
-        }
-    }
+    Ok(runtime_ctx)
 }
 
-/// Name what answered a request: one pinned instance, or the app as a whole.
+/// Name what a report describes: one pinned instance, or the project as a whole.
 ///
-/// Without this an operator cannot tell whether "Ready" describes their whole
-/// deployment or one replica of several.
+/// Without this an operator cannot tell whether "ready" describes their whole
+/// deployment or one instance of several.
 fn describe_scope(target: &ProjectTarget, pinned_instance: Option<&str>) -> String {
     match pinned_instance {
-        Some(instance) => format!("Instance {instance} of app {target}"),
+        Some(instance) => format!("Instance {instance} of project {target}"),
         None => format!("Project {target}"),
     }
-}
-
-fn print_instance_list(
-    instances: &[InstanceStatus],
-    target: &ProjectTarget,
-    output: OutputFormat,
-) -> Result<()> {
-    if output == OutputFormat::Json {
-        return write_json(&instances);
-    }
-
-    if instances.is_empty() {
-        println!("Project {target} has no instances running.");
-        return Ok(());
-    }
-
-    let mut table = TableOutput::new(vec!["INSTANCE", "STATUS", "PHASE", "DEPLOYMENT", "STARTED"]);
-    for instance in instances {
-        table.add_row(vec![
-            instance.name.clone(),
-            instance.status().to_string(),
-            instance.phase.clone(),
-            instance.deployment_id().unwrap_or("-").to_string(),
-            instance
-                .start_time
-                .clone()
-                .unwrap_or_else(|| "-".to_string()),
-        ]);
-    }
-    table.print();
-
-    let serving = instances.iter().filter(|i| i.is_serving()).count();
-    println!();
-    println!("{serving} of {} instances serving.", instances.len());
-    if serving < instances.len() {
-        println!("  Inspect one: spice cloud instance status --app {target} --instance <name>");
-    }
-
-    Ok(())
 }
 
 /// Read a JSON document from a running app instance.
@@ -3430,54 +3603,6 @@ async fn fetch_instance_json<T: serde::de::DeserializeOwned>(
         .map_err(|err| crate::error::Error::InvalidResponse {
             message: format!("Failed to parse {path} for app {target}: {err}"),
         })
-}
-
-fn print_instance_status(
-    components: &[InstanceComponentStatus],
-    target: &ProjectTarget,
-    pinned_instance: Option<&str>,
-    output: OutputFormat,
-) -> Result<()> {
-    if output == OutputFormat::Json {
-        return write_json(&components);
-    }
-
-    if components.is_empty() {
-        println!(
-            "{} reported no components.",
-            describe_scope(target, pinned_instance)
-        );
-        return Ok(());
-    }
-
-    println!("{}", describe_scope(target, pinned_instance));
-    let mut table = TableOutput::new(vec!["COMPONENT", "STATUS", "ENDPOINT"]);
-    for component in components {
-        table.add_row(vec![
-            component.name.clone(),
-            component.status.clone(),
-            component
-                .endpoint
-                .clone()
-                .unwrap_or_else(|| "-".to_string()),
-        ]);
-    }
-    table.print();
-
-    let unhealthy: Vec<&InstanceComponentStatus> = components
-        .iter()
-        .filter(|component| !component.status.eq_ignore_ascii_case("Ready"))
-        .collect();
-    if !unhealthy.is_empty() {
-        println!();
-        println!(
-            "{} of {} components are not Ready. Check 'spice cloud logs --app {target} --level error'.",
-            unhealthy.len(),
-            components.len()
-        );
-    }
-
-    Ok(())
 }
 
 fn print_instance_datasets(
@@ -4166,7 +4291,7 @@ mod tests {
         assert_eq!(describe_scope(&target, None), "Project spicehq/team-app");
         assert_eq!(
             describe_scope(&target, Some("spicepod-team-app-abc-0-0")),
-            "Instance spicepod-team-app-abc-0-0 of app spicehq/team-app"
+            "Instance spicepod-team-app-abc-0-0 of project spicehq/team-app"
         );
     }
 

@@ -705,6 +705,14 @@ fn apply_machine_cloud_mode(command: &mut cloud::CloudCommands) {
     match command {
         cloud::CloudCommands::Whoami(args) => args.output = OutputFormat::Json,
         cloud::CloudCommands::Orgs(args) => args.output = OutputFormat::Json,
+        cloud::CloudCommands::Status(args) => args.output = OutputFormat::Json,
+        cloud::CloudCommands::Datasets(args) => args.output = OutputFormat::Json,
+        cloud::CloudCommands::Project(command) => match command {
+            cloud::ProjectCommands::Create(args) => args.output = OutputFormat::Json,
+            cloud::ProjectCommands::Get(args) => args.output = OutputFormat::Json,
+            cloud::ProjectCommands::Update(args) => args.output = OutputFormat::Json,
+            cloud::ProjectCommands::Delete(args) => args.output = OutputFormat::Json,
+        },
         cloud::CloudCommands::Projects(args) => args.output = OutputFormat::Json,
         cloud::CloudCommands::Deployments(args) => args.output = OutputFormat::Json,
         cloud::CloudCommands::Regions(args) => args.output = OutputFormat::Json,
@@ -882,22 +890,29 @@ fn is_json_output(cmd: &Commands) -> bool {
             cloud::CloudCommands::Secrets(cloud::SecretsCommands::Delete(x)) => {
                 x.output == OutputFormat::Json
             }
-            cloud::CloudCommands::Create(cloud::CreateCommands::Project(x)) => {
-                x.output == OutputFormat::Json
-            }
             cloud::CloudCommands::Create(cloud::CreateCommands::Deployment(x)) => {
                 x.output == OutputFormat::Json
             }
-            cloud::CloudCommands::Get(cloud::GetCommands::Project(x)) => {
-                x.output == OutputFormat::Json
-            }
-            cloud::CloudCommands::Update(cloud::UpdateCommands::Project(x)) => {
-                x.output == OutputFormat::Json
-            }
-            cloud::CloudCommands::Delete(cloud::DeleteCommands::Project(x)) => {
-                x.output == OutputFormat::Json
-            }
             cloud::CloudCommands::Orgs(x) => x.output == OutputFormat::Json,
+            cloud::CloudCommands::Status(x) => x.output == OutputFormat::Json,
+            cloud::CloudCommands::Datasets(x) => x.output == OutputFormat::Json,
+            // Each superseded spelling shares its replacement's argument type.
+            cloud::CloudCommands::Project(cloud::ProjectCommands::Create(x))
+            | cloud::CloudCommands::Create(cloud::CreateCommands::Project(x)) => {
+                x.output == OutputFormat::Json
+            }
+            cloud::CloudCommands::Project(cloud::ProjectCommands::Get(x))
+            | cloud::CloudCommands::Get(cloud::GetCommands::Project(x)) => {
+                x.output == OutputFormat::Json
+            }
+            cloud::CloudCommands::Project(cloud::ProjectCommands::Update(x))
+            | cloud::CloudCommands::Update(cloud::UpdateCommands::Project(x)) => {
+                x.output == OutputFormat::Json
+            }
+            cloud::CloudCommands::Project(cloud::ProjectCommands::Delete(x))
+            | cloud::CloudCommands::Delete(cloud::DeleteCommands::Project(x)) => {
+                x.output == OutputFormat::Json
+            }
             cloud::CloudCommands::Org(cloud::OrgCommands::Use(x)) => x.output == OutputFormat::Json,
             cloud::CloudCommands::Org(cloud::OrgCommands::Current(x)) => {
                 x.output == OutputFormat::Json

@@ -952,16 +952,13 @@ fn test_cloud_help_lists_all_subcommands() {
         .stdout(predicate::str::contains("images"))
         .stdout(predicate::str::contains("secrets"))
         .stdout(predicate::str::contains("logs"))
-        .stdout(predicate::str::contains("create"))
-        .stdout(predicate::str::contains("get"))
-        .stdout(predicate::str::contains("update"))
-        .stdout(predicate::str::contains("delete"))
+        .stdout(predicate::str::contains("project"))
         .stdout(predicate::str::contains("deploy"))
-        .stdout(predicate::str::contains("inspect"))
+        .stdout(predicate::str::contains("status"))
+        .stdout(predicate::str::contains("datasets"))
         // `rollback` is intentionally absent from the current CloudCommands enum.
         .stdout(predicate::str::contains("api-keys"))
-        .stdout(predicate::str::contains("metrics"))
-        .stdout(predicate::str::contains("instance"));
+        .stdout(predicate::str::contains("metrics"));
 }
 
 // ============================================================================
@@ -987,6 +984,50 @@ fn test_cloud_org_flag_is_available_on_every_subcommand() {
             .success()
             .stdout(predicate::str::contains("--org"));
     }
+}
+
+#[test]
+fn test_cloud_superseded_spellings_still_parse() {
+    // Scripts written against the previous surface must keep working for a
+    // release. These are hidden from help but still accepted.
+    for argv in [
+        vec!["cloud", "create", "project", "--help"],
+        vec!["cloud", "get", "project", "--help"],
+        vec!["cloud", "update", "project", "--help"],
+        vec!["cloud", "delete", "project", "--help"],
+        vec!["cloud", "inspect", "--help"],
+        vec!["cloud", "instance", "status", "--help"],
+        vec!["cloud", "apps", "--help"],
+    ] {
+        let mut cmd = cargo_bin_cmd!("spice");
+        cmd.args(&argv).assert().success();
+    }
+}
+
+#[test]
+fn test_cloud_superseded_spellings_are_hidden_from_help() {
+    // Accepted, but not advertised — help should teach only the current shape.
+    let mut cmd = cargo_bin_cmd!("spice");
+    let assert = cmd.args(["cloud", "--help"]).assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+
+    let commands = stdout
+        .split("Commands:")
+        .nth(1)
+        .unwrap_or_default()
+        .split("Options:")
+        .next()
+        .unwrap_or_default()
+        .to_string();
+
+    for hidden in ["inspect", "instance"] {
+        assert!(
+            !commands.contains(&format!("  {hidden} ")),
+            "'{hidden}' should be hidden from the command list, got:\n{commands}"
+        );
+    }
+    assert!(commands.contains("status"), "status should be listed");
+    assert!(commands.contains("project"), "project should be listed");
 }
 
 #[test]
