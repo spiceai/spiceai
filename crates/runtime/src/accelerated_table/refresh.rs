@@ -1749,7 +1749,11 @@ mod tests {
         )
         .await;
 
-        // Known limitation, doesn't dedup
+        // The source holds `11:11:15Z` twice against the one copy the accelerator stored, so
+        // the multiset subtraction cancels one and appends the other: 4 + 1 = 5. Set
+        // subtraction used to drop both and leave 4, which is the defect in #12499 - the
+        // second copy is a row the source really does have and the accelerator really is
+        // missing. Sibling coverage for the `UnixMillis` case below.
         test(
             vec!["2012-12-01T11:11:15Z", "2012-12-01T11:11:15Z"],
             vec![
@@ -1758,8 +1762,8 @@ mod tests {
                 "2012-12-01T11:11:12Z",
                 "2012-12-01T11:11:15Z",
             ],
-            4,
-            "should not apply same timestamp data",
+            5,
+            "should apply the incoming copy the accelerator does not already hold",
         )
         .await;
     }
