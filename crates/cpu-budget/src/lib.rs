@@ -478,6 +478,18 @@ const CPU_REQUEST_BURST_FACTOR: u64 = 2;
 /// reason, deriving `GOMAXPROCS` as `max(2, ceil(limit))`.
 const REQUEST_DERIVED_FLOOR_MILLICORES: u64 = 2000;
 
+/// Below this, a declared CPU request is more likely a whole-core value that lost
+/// its unit than a real request.
+///
+/// A deployment surface that writes `resourceFieldRef` without `divisor: 1m` sends
+/// whole cores, so `requests.cpu: 1` through `9` arrive as `1` through `9` and are
+/// read as single-digit *millicores* — the request under-stated by 1000x. Nothing
+/// in the value says which was meant (see [`CPU_REQUEST_ENV`]), but Kubernetes'
+/// own floor is `1m` and nothing runs `spiced` in single-digit millicores, so the
+/// range is worth remarking on. Ten leaves the smallest requests anyone actually
+/// writes — `50m`, `100m` — well clear.
+const SUSPECT_CORE_SHAPED_MILLICORES: u64 = 10;
+
 /// Below this fraction of what the host reports, a request-derived entitlement
 /// is worth saying out loud — see [`CpuBudget::sizing_notice`].
 ///
@@ -676,6 +688,9 @@ impl CpuBudget {
             tracing::info!("{notice}");
         }
         if let Some(warning) = self.undeclared_request_warning() {
+            tracing::warn!("{warning}");
+        }
+        if let Some(warning) = self.core_shaped_request_warning() {
             tracing::warn!("{warning}");
         }
     }
@@ -886,6 +901,38 @@ impl CpuBudget {
             request = format_millicores(request),
             factor = CPU_REQUEST_BURST_FACTOR,
             detected = self.detected_cores,
+        ))
+    }
+
+    /// A warning when the declared CPU request looks like whole cores that lost
+    /// their unit.
+    ///
+    /// The 1000x failure this cannot rule out by parsing: a surface that omits
+    /// `divisor: 1m` sends `4` for a four-core request, which is a legal reading as
+    /// four millicores. The 2-core floor keeps that from starving the runtime, but
+    /// silently — and on a host small enough that two cores is not a steep
+    /// downsize, [`Self::sizing_notice`] does not fire either, so nothing would say
+    /// anything at all.
+    ///
+    /// Phrased as a conditional, because `requests.cpu: 4m` is legal and would land
+    /// here too. It names the whole-core reading so an operator who wrote that can
+    /// recognise their own value.
+    ///
+    /// `None` when no request was declared, or when it is large enough to be
+    /// unambiguous.
+    #[must_use]
+    pub fn core_shaped_request_warning(&self) -> Option<String> {
+        let request = self.declared_request_millicores?;
+        if request >= SUSPECT_CORE_SHAPED_MILLICORES {
+            return None;
+        }
+        Some(format!(
+            "Declared CPU request of {request_m} is implausibly small; if this pod requests \
+             {request_m_as_cores} cores, {CPU_REQUEST_ENV} is missing `divisor: 1m` and is 1000x \
+             too small. Sized for {entitlement}. See: {DOCS_URL}",
+            request_m = format_millicores(request),
+            request_m_as_cores = request,
+            entitlement = format_millicores(self.millicores),
         ))
     }
 
@@ -1816,6 +1863,61 @@ mod tests {
         assert_ne!(
             encode_share(Some(CpuShare::Weight(100))),
             encode_share(Some(CpuShare::Shares(100)))
+        );
+    }
+
+    /// The 1000x case parsing cannot catch, and the one host size where nothing
+    /// else would mention it.
+    #[test]
+    fn a_core_shaped_request_is_remarked_on() {
+        // Four cores requested, divisor dropped, so it arrives as four millicores.
+        let mistyped =
+            CpuBudget::resolve(&CpuConfig::default(), &request_only(4, 4)).expect("valid");
+        let warning = mistyped
+            .core_shaped_request_warning()
+            .expect("4m on a 4-core host must be remarked on");
+        assert!(warning.contains("4m"), "{warning}");
+        assert!(
+            warning.contains("4 cores"),
+            "names the whole-core reading: {warning}"
+        );
+        assert!(warning.contains(CPU_REQUEST_ENV), "{warning}");
+        assert!(
+            warning.contains("divisor"),
+            "names the likely cause: {warning}"
+        );
+
+        // This is the host size that made the warning necessary: two cores of four
+        // is not a steep downsize, so the sizing notice stays quiet and this is the
+        // only thing that speaks.
+        assert_eq!(mistyped.cores(), 2, "the floor caught it");
+        assert_eq!(
+            mistyped.sizing_notice(),
+            None,
+            "on a small host nothing else would mention this"
+        );
+
+        // Requests anyone actually writes are unambiguous and silent.
+        for request in [10_u64, 50, 100, 500, 1000, 4000] {
+            assert_eq!(
+                CpuBudget::resolve(&CpuConfig::default(), &request_only(64, request))
+                    .expect("valid")
+                    .core_shaped_request_warning(),
+                None,
+                "{request}m must not be remarked on"
+            );
+        }
+
+        // Nothing declared, nothing to say.
+        assert_eq!(budget(64).core_shaped_request_warning(), None);
+
+        // It fires on the value regardless of which rung won, because the declared
+        // value is suspect either way.
+        assert!(
+            CpuBudget::resolve(&CpuConfig::default(), &quota_and_request(64, 8000, 4))
+                .expect("valid")
+                .core_shaped_request_warning()
+                .is_some()
         );
     }
 
