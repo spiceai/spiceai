@@ -23,7 +23,7 @@ use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::ScalarValue;
 use datafusion::datasource::DefaultTableSource;
 use datafusion::error::Result;
-use datafusion::logical_expr::{Expr, LogicalPlanBuilder, col};
+use datafusion::logical_expr::{Expr, LogicalPlanBuilder, ident};
 use datafusion::physical_plan::collect;
 
 /// Resolves the rows of `table` that currently match `filters`, projected down to
@@ -71,7 +71,10 @@ pub async fn resolve_keys_matching_predicate(
     for filter in filters {
         builder = builder.filter(filter)?;
     }
-    let projection: Vec<Expr> = key_columns.iter().map(|name| col(name.as_str())).collect();
+    let projection: Vec<Expr> = key_columns
+        .iter()
+        .map(|name| ident(name.as_str()))
+        .collect();
     let plan = builder.project(projection)?.build()?;
 
     let physical_plan = session.create_physical_plan(&plan).await?;
@@ -114,7 +117,7 @@ pub fn build_key_match_predicate(
         let mut eq_exprs = Vec::with_capacity(key_columns.len());
         for (name, array) in key_columns.iter().zip(&arrays) {
             let value = ScalarValue::try_from_array(array.as_ref(), row)?;
-            eq_exprs.push(col(name.as_str()).eq(Expr::Literal(value, None)));
+            eq_exprs.push(ident(name.as_str()).eq(Expr::Literal(value, None)));
         }
         if let Some(row_condition) = balanced_binary(eq_exprs, Expr::and) {
             row_conditions.push(row_condition);
@@ -151,6 +154,9 @@ mod tests {
     use datafusion::arrow::array::{Int64Array, StringArray};
     use datafusion::arrow::datatypes::DataType;
     use datafusion::datasource::MemTable;
+    // The dot-splitting constructor, kept here rather than at module scope: the tests use
+    // it deliberately for undotted filter columns, while the code under test must not.
+    use datafusion::logical_expr::col;
     use datafusion::prelude::SessionContext;
 
     fn id_name_batch(ids: &[i64], names: &[&str]) -> RecordBatch {
@@ -293,5 +299,87 @@ mod tests {
             .expect("resolve should succeed");
 
         assert_eq!(keys.num_rows(), 0);
+    }
+
+    /// A chunked index's primary keys include `_spice.chunk_id`, and a flattened `JSON`
+    /// column is named like `message.body`. Both are single columns whose *name*
+    /// contains a dot — not a `relation.column` reference.
+    fn dotted_key_batch(chunk_ids: &[&str], ids: &[i64]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_spice.chunk_id", DataType::Utf8, false),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(chunk_ids.to_vec())),
+                Arc::new(Int64Array::from(ids.to_vec())),
+            ],
+        )
+        .expect("valid batch")
+    }
+
+    /// Regression test: `col(name)` routes through `Column::from_qualified_name`, which
+    /// splits on `.`, so projecting a dotted key asked for column `chunk_id` of relation
+    /// `_spice`. The scan is built as relation `t`, so planning failed with
+    /// `No field named _spice.chunk_id` and a delete on a chunked index could resolve no
+    /// rows at all.
+    #[tokio::test]
+    async fn resolve_keys_matching_predicate_projects_a_dotted_key_column() {
+        let batch = dotted_key_batch(&["c1", "c2", "c3"], &[1, 2, 3]);
+        let schema = batch.schema();
+        let table: Arc<dyn TableProvider> =
+            Arc::new(MemTable::try_new(schema, vec![vec![batch]]).expect("mem table"));
+
+        let ctx = SessionContext::new();
+        let filters = vec![col("id").gt(datafusion::logical_expr::lit(1_i64))];
+        let key_columns = vec!["_spice.chunk_id".to_string()];
+
+        let keys = resolve_keys_matching_predicate(&table, &ctx.state(), filters, &key_columns)
+            .await
+            .expect("a dotted key column must resolve, not be read as relation.column");
+
+        assert_eq!(keys.num_columns(), 1);
+        assert_eq!(
+            keys.schema().field(0).name(),
+            "_spice.chunk_id",
+            "the projected field keeps its whole name"
+        );
+        let chunk_ids = keys
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("chunk id column is Utf8");
+        let mut values: Vec<&str> = chunk_ids.iter().flatten().collect();
+        values.sort_unstable();
+        assert_eq!(values, vec!["c2", "c3"]);
+    }
+
+    /// The same split in `build_key_match_predicate`. Asserted by *planning* the predicate
+    /// rather than by rendering it: `Expr`'s display is `_spice.chunk_id` either way, so
+    /// only resolution against a real schema tells the two apart.
+    #[tokio::test]
+    async fn build_key_match_predicate_keeps_a_dotted_key_name_whole() {
+        let keys = dotted_key_batch(&["c1", "c2"], &[1, 2]);
+        let key_columns = vec!["_spice.chunk_id".to_string()];
+        let predicate = build_key_match_predicate(&keys, &key_columns)
+            .expect("should not error")
+            .expect("non-empty batch produces a predicate");
+
+        let schema = keys.schema();
+        let mem = MemTable::try_new(schema, vec![vec![keys]]).expect("mem table");
+        let table: Arc<dyn TableProvider> = Arc::new(mem);
+        let table_source = Arc::new(DefaultTableSource::new(table));
+        let plan = LogicalPlanBuilder::scan("t", table_source, None)
+            .expect("scan builds")
+            .filter(predicate)
+            .expect("the predicate must resolve against the scanned relation")
+            .build()
+            .expect("plan builds");
+
+        assert!(
+            format!("{plan:?}").contains("_spice.chunk_id"),
+            "the filter must reference the whole dotted name: {plan:?}"
+        );
     }
 }

@@ -23,10 +23,63 @@ cayenne-property-tests = { max-threads = 2 }
 # (e.g. the post-compaction duplicate-row race that surfaced as a masked "flake"
 # under CI load). Give them zero retries so any single failure is a hard failure,
 # never a silently-recovered flake.
+#
+# `slow-timeout` here raises only the WALL-CLOCK ceiling, from the global 360s
+# (120s x 3) to 960s (120s x 8). `retries = 0` is deliberately unchanged: an
+# assertion failure still fails hard on its first occurrence and is never retried
+# into a pass. The two are independent, and only the former carries no
+# correctness signal.
+#
+# Why 960s. The global 360s cap sits inside this family's noise band rather than
+# above it, so it measures pool load instead of the diff under test. The same
+# tests, on a quiet pool (run 30833882620) vs. a pool running six concurrent
+# sign-offs (run 30858006237):
+#
+#   cayenne::…                                      quiet   contended   factor
+#   mutation_property prop_concurrent_mixed_position 239.5s  killed 360s  >1.5x
+#   mutation_property prop_concurrent_mixed_key      192.0s      356.1s   1.85x
+#   mutation_property mixed_dense_position           122.8s      208.6s   1.70x
+#   partition_chunking …timestamp_partition…         247.9s      308.1s   1.24x
+#
+# In that contended run `prop_concurrent_mixed_key` PASSED at 356.1s while its
+# matched sibling `prop_concurrent_mixed_position` was killed at 360.015s — a
+# 1.1% margin deciding a merge gate. Merge-queue run 30723487049 is the far end:
+# `prop_concurrent_upsert_only_key` passed at 338.0s against a 92.0s quiet
+# baseline, a 3.7x contention factor, and five tests in this binary were killed
+# at the cap with no assertion failure or panic anywhere in the log.
+#
+# So the slowest test here intrinsically needs ~240s and contention has been
+# measured multiplying that by up to 3.7x, while the cap allowed only 1.5x.
+# 960s clears 240s x 3.7 with headroom. A genuine hang is still caught, just at
+# 16 minutes instead of 6.
+#
+# This is a ceiling, not a target: if these tests get slower on a QUIET pool,
+# that is a regression to investigate, not a reason to raise this again.
 [[profile.default.overrides]]
 filter = 'binary(=mutation_property_test) | binary(=cdc_compaction_delete_race_test) | binary(=maintained_aggregate_filter_test)'
 test-group = 'cayenne-property-tests'
 retries = 0
+slow-timeout = { period = "120s", terminate-after = 8 }
+
+# The same wall-clock margin, for the long-running cayenne binaries that are NOT
+# in the zero-retry group above. These keep the default retries, so a timeout is
+# recoverable rather than a hard gate failure — but recovering costs up to
+# 5 x 360s = 30 minutes of runner time for a test that only ever needed wall
+# clock. That is not hypothetical: in merge-queue run 30723487049
+# `partition_chunking_test …timestamp_partition_with_date_part` hit the cap on
+# tries 1-5 and then passed on try 6 at 305.5s.
+#
+# Quiet-pool baselines (run 30833882620) against the 3.7x contention factor
+# measured above: partition_chunking 247.9s, layout_pruning_ab 170.1s,
+# mutation_model 107.1s — all of which exceed 360s once multiplied, so all three
+# sit in the same band as the group above for the same reason.
+#
+# Spelled out as its own block rather than folded into the filter above so that
+# `retries = 0` stays visibly scoped to the three convergence binaries that need
+# it. These binaries must NOT inherit it.
+[[profile.default.overrides]]
+filter = 'binary(=partition_chunking_test) | binary(=layout_pruning_ab_test) | binary(=mutation_model_test)'
+slow-timeout = { period = "120s", terminate-after = 8 }
 
 # Same reasoning for the MySQL CDC convergence tests: a retry that passes hides a lost update.
 [[profile.default.overrides]]

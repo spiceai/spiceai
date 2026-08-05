@@ -1943,6 +1943,22 @@
         "refresh_mode": {
           "description": "Required and explicit: there is no catalog-level default, since the\nonly supported value today is `changes` (CDC).",
           "$ref": "#/$defs/CatalogRefreshMode"
+        },
+        "mode": {
+          "description": "Storage mode applied to every table this catalog accelerates, with the\nsame meaning as a dataset's `acceleration.mode`.\n\nDefaults to `memory`, which is **not durable**: nothing is written to\ndisk, so the accelerator starts empty on every restart and each table\nre-runs its initial snapshot from the source. Use a file mode (with\n`params.cayenne_file_path`) to keep the acceleration across restarts and\nresume from the replication slot instead of re-snapshotting.\n\nNot to be confused with `params.cayenne_cdc_durability: memory`, which\nkeeps a *file-backed* acceleration and only defers its durable write —\nCDC changes buffer in RAM but still drain to disk. `mode` decides whether\nthe acceleration is persisted at all; `cayenne_cdc_durability` decides\nwhen. For RAM-speed writes that survive a restart, use a file `mode`\ntogether with `cayenne_cdc_durability: memory`.",
+          "$ref": "#/$defs/Mode",
+          "default": "memory"
+        },
+        "params": {
+          "description": "Engine parameters applied to every table this catalog accelerates (e.g.\n`cayenne_file_path`), with the same meaning as a dataset's\n`acceleration.params`. Each table gets its own subdirectory under a\nconfigured `cayenne_file_path`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Params"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false,
@@ -1962,6 +1978,31 @@
       "type": "string",
       "enum": [
         "changes"
+      ]
+    },
+    "Mode": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "memory"
+          ]
+        },
+        {
+          "description": "Open an existing file if it exists, otherwise create a new one.\nThis is the default file behavior that preserves data across restarts.",
+          "type": "string",
+          "const": "file"
+        },
+        {
+          "description": "Always create a new file, truncating/overwriting any existing file on startup.\nUse this when you want a fresh acceleration on each startup.",
+          "type": "string",
+          "const": "file_create"
+        },
+        {
+          "description": "Open an existing file if it exists, then check schema compatibility on refresh.\nIf the source schema is incompatible (non-additive change), snapshot (if enabled)\nand recreate the acceleration file from scratch.",
+          "type": "string",
+          "const": "file_update"
+        }
       ]
     },
     "ComponentReference": {
@@ -3266,31 +3307,6 @@
               }
             }
           }
-        }
-      ]
-    },
-    "Mode": {
-      "oneOf": [
-        {
-          "type": "string",
-          "enum": [
-            "memory"
-          ]
-        },
-        {
-          "description": "Open an existing file if it exists, otherwise create a new one.\nThis is the default file behavior that preserves data across restarts.",
-          "type": "string",
-          "const": "file"
-        },
-        {
-          "description": "Always create a new file, truncating/overwriting any existing file on startup.\nUse this when you want a fresh acceleration on each startup.",
-          "type": "string",
-          "const": "file_create"
-        },
-        {
-          "description": "Open an existing file if it exists, then check schema compatibility on refresh.\nIf the source schema is incompatible (non-additive change), snapshot (if enabled)\nand recreate the acceleration file from scratch.",
-          "type": "string",
-          "const": "file_update"
         }
       ]
     },
@@ -6685,7 +6701,7 @@
           "x-secret": true
         },
         "http_headers": {
-          "description": "Custom HTTP headers to include in requests. Format: 'Header1: Value1, Header2: Value2'. Headers are applied to all requests.",
+          "description": "Custom HTTP headers to include in requests. Format: 'Header1: Value1, Header2: Value2'. Headers are applied to all requests. Applies to dynamic JSON API endpoints only; structured HTTP file datasets ignore these headers.",
           "type": "string"
         },
         "max_retries": {
@@ -6806,7 +6822,7 @@
           "type": "string"
         },
         "auth_token_url": {
-          "description": "OAuth2 token endpoint URL. Enables OAuth2: the connector acquires short-lived access tokens (refresh-token grant by default, or client_credentials via auth_grant_type) and attaches them to data requests ('Authorization: Bearer <token>' by default, or the bare token under a custom auth_header_name). Applies to JSON API endpoints only.",
+          "description": "OAuth2 token endpoint URL. Enables OAuth2: the connector acquires short-lived access tokens (refresh-token grant by default, or client_credentials via auth_grant_type) and attaches them to data requests ('Authorization: Bearer <token>' by default, or the bare token under a custom auth_header_name). Applies to dynamic JSON API endpoints only; structured HTTP file datasets reject OAuth2 params.",
           "type": "string"
         },
         "auth_grant_type": {
@@ -7047,7 +7063,7 @@
           "x-secret": true
         },
         "http_headers": {
-          "description": "Custom HTTP headers to include in requests. Format: 'Header1: Value1, Header2: Value2'. Headers are applied to all requests.",
+          "description": "Custom HTTP headers to include in requests. Format: 'Header1: Value1, Header2: Value2'. Headers are applied to all requests. Applies to dynamic JSON API endpoints only; structured HTTP file datasets ignore these headers.",
           "type": "string"
         },
         "max_retries": {
@@ -7168,7 +7184,7 @@
           "type": "string"
         },
         "auth_token_url": {
-          "description": "OAuth2 token endpoint URL. Enables OAuth2: the connector acquires short-lived access tokens (refresh-token grant by default, or client_credentials via auth_grant_type) and attaches them to data requests ('Authorization: Bearer <token>' by default, or the bare token under a custom auth_header_name). Applies to JSON API endpoints only.",
+          "description": "OAuth2 token endpoint URL. Enables OAuth2: the connector acquires short-lived access tokens (refresh-token grant by default, or client_credentials via auth_grant_type) and attaches them to data requests ('Authorization: Bearer <token>' by default, or the bare token under a custom auth_header_name). Applies to dynamic JSON API endpoints only; structured HTTP file datasets reject OAuth2 params.",
           "type": "string"
         },
         "auth_grant_type": {
@@ -10298,7 +10314,7 @@
           ]
         },
         "distributed_backend": {
-          "description": "Run the model tensor-parallel across multiple nodes (a Spice enterprise feature; standard builds are single-node only). Set to 'ring' to pool the model over the `nodes` list (the 'ring' backend currently supports exactly 2 nodes); omit or 'none' for single-node.",
+          "description": "Run the model tensor-parallel across multiple nodes (a Spice enterprise feature; standard builds are single-node only). Set to 'ring' to pool the model over the `nodes` list; omit or 'none' for single-node.",
           "type": "string",
           "default": "none",
           "enum": [
@@ -10311,8 +10327,21 @@
           "type": "string"
         },
         "nodes": {
-          "description": "Comma-separated, rank-ordered node addresses for distributed inference (e.g. '10.0.0.1,10.0.0.2'). Identical on every node; only `node_rank` differs. The node count (world size) must be a power of two; the 'ring' backend requires exactly 2.",
+          "description": "Comma-separated, rank-ordered node addresses for distributed inference (e.g. '10.0.0.1,10.0.0.2,10.0.0.3'). Identical on every node; only `node_rank` differs. Two or more nodes. Whether a given model can be split across that many nodes depends on the model and is reported when it loads.",
           "type": "string"
+        },
+        "context_length": {
+          "description": "Sequence-length budget, in tokens, for a locally served model: it plans cross-device layer placement and sizes the KV cache. Defaults to the engine default (4096) when unset. It does not raise the context the weights were trained for, and larger values need proportionally more KV-cache memory.",
+          "type": "string"
+        },
+        "paged_attention": {
+          "description": "Attention implementation for a locally served model. 'auto' (the default) uses PagedAttention wherever the build supports it, and the engine falls back to dense attention for architectures with no paged kernel, such as the Multi-head Latent Attention GGUFs. 'disabled' forces dense attention with a contiguous KV cache.",
+          "type": "string",
+          "default": "auto",
+          "enum": [
+            "auto",
+            "disabled"
+          ]
         },
         "tools": {
           "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery without data sampling tools, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
@@ -10771,7 +10800,7 @@
           "type": "string"
         },
         "distributed_backend": {
-          "description": "Run the model tensor-parallel across multiple nodes (a Spice enterprise feature; standard builds are single-node only). Set to 'ring' to pool the model over the `nodes` list (the 'ring' backend currently supports exactly 2 nodes); omit or 'none' for single-node.",
+          "description": "Run the model tensor-parallel across multiple nodes (a Spice enterprise feature; standard builds are single-node only). Set to 'ring' to pool the model over the `nodes` list; omit or 'none' for single-node.",
           "type": "string",
           "default": "none",
           "enum": [
@@ -10784,7 +10813,7 @@
           "type": "string"
         },
         "nodes": {
-          "description": "Comma-separated, rank-ordered node addresses for distributed inference (e.g. '10.0.0.1,10.0.0.2'). Identical on every node; only `node_rank` differs. The node count (world size) must be a power of two; the 'ring' backend requires exactly 2.",
+          "description": "Comma-separated, rank-ordered node addresses for distributed inference (e.g. '10.0.0.1,10.0.0.2,10.0.0.3'). Identical on every node; only `node_rank` differs. Two or more nodes. Whether a given model can be split across that many nodes depends on the model and is reported when it loads.",
           "type": "string"
         },
         "tools": {

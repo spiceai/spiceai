@@ -203,7 +203,7 @@ assert_failure_post() {
   local output rc
   output="$(PATH="$stub_dir:$PATH" STUB_POSTS="$posts" STUB_RERUNS="$reruns" \
     STUB_RUN="$run" STUB_POST_RC="$post_rc" \
-    bash -c 'source "$1"; post_failure_status spiceai/spiceai "$2" someone 42' \
+    bash -c 'source "$1"; post_failure_status spiceai/spiceai "$2" "Sign-off checks failed after 42s (triggered by someone)"' \
     _ "$subject" "$fake_sha" 2>&1)"
   rc=$?
 
@@ -256,6 +256,31 @@ assert_attestation_refresh() {
   fi
 
   assert_reruns "$name" "$reruns" "$want_rerun" "$output"
+}
+
+# The description post_failure_status is handed is what the commit status must
+# carry: the caller distinguishes an out-of-disk runner from a failing branch,
+# and that wording is all most readers ever see. Asserts it round-trips verbatim.
+assert_failure_description() {
+  local name="$1" description="$2"
+  tests_run=$((tests_run + 1))
+
+  local posts="$stub_dir/posts" reruns="$stub_dir/reruns"
+  : >"$posts"
+  : >"$reruns"
+
+  PATH="$stub_dir:$PATH" STUB_POSTS="$posts" STUB_RERUNS="$reruns" \
+    STUB_RUN="4242 completed success" STUB_POST_RC=0 \
+    bash -c 'source "$1"; post_failure_status spiceai/spiceai "$2" "$3"' \
+    _ "$subject" "$fake_sha" "$description" >/dev/null 2>&1
+
+  local posted
+  posted="$(cat "$posts")"
+  if [[ "$posted" != "failure"$'\t'"signoff"$'\t'"$description"* ]]; then
+    fail_test "$name: expected the posted description to be '${description}', got '${posted}'"
+    return
+  fi
+  echo "  ok: $name"
 }
 
 # Shared tail of the two helpers above: exactly the expected run was re-run.
@@ -343,6 +368,13 @@ assert_failure_post "an in-flight Attestation is not re-run" \
   "4242 in_progress null" failure
 assert_failure_post "a commit with no Attestation run is not re-run" \
   "" failure
+
+# An out-of-disk run and a failing branch reach this helper by the same path and
+# are told apart only by the description, so it must not be rewritten en route.
+assert_failure_description "an out-of-disk verdict keeps its own wording" \
+  "Runner out of disk after 42s — checks did not complete, re-dispatch (triggered by someone)"
+assert_failure_description "an ordinary check failure keeps its own wording" \
+  "Sign-off checks failed after 42s (triggered by someone)"
 
 # The success path's short-circuit is the behaviour the failure path inverts:
 # both directions are asserted so neither can drift into the other.
