@@ -25414,6 +25414,7 @@ impl CayenneTableProvider {
     /// manifest with an OLD warm snapshot and double-count every promoted row.
     /// The promotion's own rewrite session overrides it with an explicit
     /// [`super::cold_partition::ColdScanFiles`] set.
+    #[expect(clippy::too_many_arguments)]
     async fn build_cold_tier_scan_plan(
         &self,
         state: &dyn Session,
