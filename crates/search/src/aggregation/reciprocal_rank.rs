@@ -139,10 +139,11 @@ impl CandidateAggregation for ReciprocalRankFusion {
                 primary_key.as_slice(),
             ));
 
-            let data = collect_batches(stream).await.context(DatafusionSnafu)?;
+            let mut data = collect_batches(stream).await.context(DatafusionSnafu)?;
+            data.retain(|batch| batch.num_rows() > 0);
 
             // If data is empty, don't use.
-            if data.first().is_none_or(|rb| rb.num_rows() == 0) {
+            if data.is_empty() {
                 continue;
             }
 
@@ -623,10 +624,17 @@ mod tests {
     }
 
     fn stream_from_batch(batch: RecordBatch) -> SendableRecordBatchStream {
-        let schema = batch.schema();
+        stream_from_batches(vec![batch])
+    }
+
+    fn stream_from_batches(batches: Vec<RecordBatch>) -> SendableRecordBatchStream {
+        let schema = batches
+            .first()
+            .expect("candidate stream should contain at least one batch")
+            .schema();
         Box::pin(RecordBatchStreamAdapter::new(
             schema,
-            stream::iter(vec![Ok(batch)]),
+            stream::iter(batches.into_iter().map(Ok)),
         ))
     }
 
@@ -704,6 +712,66 @@ mod tests {
         assert!(
             b_row.contains("0.032786885245901"),
             "expected B's fused score ≈ 2/61, got:\n{b_row}"
+        );
+    }
+
+    /// Regression test for #12239: an empty batch must not discard later candidates from a stream.
+    #[tokio::test]
+    async fn reciprocal_rank_fusion_uses_candidates_after_an_empty_first_batch() {
+        let make_batch = |scores: Vec<f64>, values: Vec<&str>, ids: Vec<&str>| {
+            RecordBatch::try_from_iter(vec![
+                (
+                    SEARCH_SCORE_COLUMN_NAME,
+                    Arc::new(arrow::array::Float64Array::from(scores)) as _,
+                ),
+                (
+                    SEARCH_VALUE_COLUMN_NAME,
+                    Arc::new(arrow::array::StringArray::from(values)) as _,
+                ),
+                ("id", Arc::new(arrow::array::StringArray::from(ids)) as _),
+            ])
+            .expect("valid record batch")
+        };
+
+        let stream_0 = VectorSearchGenerationResult {
+            data: stream_from_batch(make_batch(vec![10.0], vec!["A-from-s0"], vec!["A"])),
+            derived_from: "body".to_string(),
+        };
+        let stream_1 = VectorSearchGenerationResult {
+            data: stream_from_batches(vec![
+                make_batch(vec![], vec![], vec![]),
+                make_batch(
+                    vec![9.0, 8.0],
+                    vec!["A-from-s1", "B-from-s1"],
+                    vec!["A", "B"],
+                ),
+            ]),
+            derived_from: "body".to_string(),
+        };
+
+        let result = ReciprocalRankFusion
+            .aggregate(vec![stream_0, stream_1], vec![Column::from_name("id")], 10)
+            .await
+            .expect("rrf aggregation should succeed");
+
+        let batches = collect_batches(result.data)
+            .await
+            .expect("should collect fused batches");
+        let formatted = arrow::util::pretty::pretty_format_batches(&batches)
+            .expect("should format output")
+            .to_string();
+
+        assert!(
+            formatted.contains("| B  |"),
+            "expected candidate unique to the later batch, got:\n{formatted}"
+        );
+        let a_row = formatted
+            .lines()
+            .find(|line| line.contains("| A  |"))
+            .unwrap_or_else(|| panic!("expected A row in:\n{formatted}"));
+        assert!(
+            a_row.contains("0.032786885245901"),
+            "expected A's fused score ≈ 2/61, got:\n{a_row}"
         );
     }
 
