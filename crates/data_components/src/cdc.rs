@@ -29,7 +29,8 @@ pub use config::{
 
 use arrow::error::ArrowError;
 use arrow::{
-    array::{Array, ArrayRef, ListArray, RecordBatch, StringArray, StructArray},
+    array::{Array, ArrayRef, BooleanArray, ListArray, RecordBatch, StringArray, StructArray},
+    compute::kernels::nullif::nullif,
     datatypes::{DataType, Field, Schema, SchemaRef},
 };
 use arrow_buffer::OffsetBuffer;
@@ -1054,8 +1055,14 @@ impl ChangeBatch {
     /// The whole before-image column as a `RecordBatch` aligned row-for-row with
     /// [`Self::data_batch`]. `None` when the batch carries no before-image.
     ///
-    /// Rows without prior values (inserts) are null in the struct array; the
-    /// caller pairs each row with its `op` to know which retract.
+    /// Rows without prior values (inserts) read back as null in every column, so
+    /// a caller can retract from this batch alone; pairing each row with its `op`
+    /// still tells it which rows are *meant* to retract.
+    ///
+    /// Every field is reported nullable regardless of how the table declares it:
+    /// a before-image is absent on insert, and a source may send only the key
+    /// columns (`PostgreSQL` under `REPLICA IDENTITY DEFAULT` does exactly that),
+    /// so nulls are expected in columns the table itself marks non-null.
     #[must_use]
     pub fn before_batch(&self) -> Option<RecordBatch> {
         let before_idx = self.before_idx?;
@@ -1066,10 +1073,39 @@ impl ChangeBatch {
         let DataType::Struct(fields) = before_array.data_type() else {
             unreachable!("The schema is validated to have a 'before' field which is a StructArray");
         };
-        let Ok(record_batch) = RecordBatch::try_new(
-            Arc::new(Schema::new(fields.clone())),
-            before_array.columns().to_vec(),
-        ) else {
+
+        // A `RecordBatch` has no struct-level validity to carry, and Arrow lets a
+        // null struct slot hold arbitrary values underneath it. Returning the
+        // child arrays as-is would therefore let a row the source marked as
+        // having *no* prior values read back as real ones — and a maintained
+        // aggregate would retract a contribution that was never made. Push the
+        // struct's nulls down into every column so the batch says what the struct
+        // said.
+        let columns = if let Some(struct_nulls) = before_array.nulls() {
+            let row_is_null = BooleanArray::new(!struct_nulls.inner(), None);
+            before_array
+                .columns()
+                .iter()
+                .map(|column| {
+                    let Ok(masked) = nullif(column.as_ref(), &row_is_null) else {
+                        unreachable!(
+                            "The mask is this struct's own validity, so it shares the column's row count"
+                        );
+                    };
+                    masked
+                })
+                .collect()
+        } else {
+            before_array.columns().to_vec()
+        };
+
+        let nullable_fields = fields
+            .iter()
+            .map(|field| Arc::new(field.as_ref().clone().with_nullable(true)))
+            .collect::<Vec<_>>();
+        let Ok(record_batch) =
+            RecordBatch::try_new(Arc::new(Schema::new(nullable_fields)), columns)
+        else {
             unreachable!("The 'before' struct's columns are validated to share one row count");
         };
         Some(record_batch)
@@ -1318,6 +1354,103 @@ mod tests {
             data.schema().fields().len(),
             before.schema().fields().len(),
             "before-image and data share the table schema"
+        );
+    }
+
+    /// A null struct slot means "this row has no prior values", but Arrow lets the
+    /// child arrays hold anything underneath it. `before_batch` flattens the
+    /// struct into a `RecordBatch`, which has no struct-level validity to carry,
+    /// so it must push that null down into every column — otherwise a maintained
+    /// aggregate reads the values hiding under an insert as real prior values and
+    /// retracts a contribution that was never made.
+    ///
+    /// The table also declares `id` non-null, so this covers the second half: the
+    /// mask introduces nulls into a column the table marks non-nullable, and the
+    /// returned schema has to admit them.
+    #[test]
+    fn before_batch_masks_columns_hidden_under_a_null_struct_slot() {
+        use arrow_array::StructArray;
+        use arrow_array::builder::{ListBuilder, StringBuilder};
+
+        let table = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("amount", DataType::Int32, true),
+        ]);
+        let wrapper = changes_schema_with_before(&table);
+
+        let data = StructArray::try_new(
+            table.fields().clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])) as arrow_array::ArrayRef,
+                Arc::new(Int32Array::from(vec![10, 25])) as arrow_array::ArrayRef,
+            ],
+            None,
+        )
+        .expect("data struct should be valid");
+
+        // Row 0 is an insert: its struct slot is null, yet its child arrays are
+        // fully populated — legal Arrow, and exactly what a source that reuses a
+        // scratch buffer produces.
+        let before = StructArray::try_new(
+            table.fields().clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![999, 2])) as arrow_array::ArrayRef,
+                Arc::new(Int32Array::from(vec![777, 20])) as arrow_array::ArrayRef,
+            ],
+            Some(vec![false, true].into()),
+        )
+        .expect("before-image struct should be valid");
+
+        let mut pk_builder = ListBuilder::new(StringBuilder::new())
+            .with_field(Arc::new(Field::new("item", DataType::Utf8, false)));
+        for _ in 0..2 {
+            pk_builder.values().append_value("id");
+            pk_builder.append(true);
+        }
+
+        let record = RecordBatch::try_new(
+            Arc::new(wrapper),
+            vec![
+                Arc::new(StringArray::from(vec!["c", "u"])),
+                Arc::new(pk_builder.finish()) as arrow_array::ArrayRef,
+                Arc::new(data),
+                Arc::new(before),
+            ],
+        )
+        .expect("before-image test batch must match the wrapper schema");
+        let batch = ChangeBatch::try_new(record).expect("before-image batch should validate");
+
+        let before_batch = batch
+            .before_batch()
+            .expect("a before-image batch exposes the whole column");
+        for (column, name) in [(0, "id"), (1, "amount")] {
+            let values = before_batch
+                .column(column)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("before-image columns are Int32");
+            assert!(
+                values.is_null(0),
+                "{name} must read back null for the insert, not the value hidden under the null struct slot"
+            );
+        }
+
+        // The update's prior values still survive the mask.
+        let amount = before_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("amount column is Int32");
+        assert_eq!(
+            amount.value(1),
+            20,
+            "the update's before-image must be untouched by the mask"
+        );
+
+        // Per-row access agrees with the flattened batch.
+        assert!(
+            batch.before(0).is_none(),
+            "the insert has no before-image at all"
         );
     }
 

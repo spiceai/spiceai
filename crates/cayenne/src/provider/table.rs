@@ -194,9 +194,12 @@ const MAINTAINED_AGGREGATE_MAX_INDEX_BYTES_DEFAULT: usize = 512 * 1024 * 1024;
 /// attempts immediately, so a transient failure recovers at once.
 const MAINTAINED_AGGREGATE_REARM_TICK_INTERVAL: u64 = 32;
 
-/// Floor for the derived retained-index budget. Below this an index is too small
-/// to serve any useful table, so a tiny pool disables maintained aggregates by
-/// failing them safe rather than thrashing rebuild attempts.
+/// Floor for the derived retained-index budget, applied only where the pool can
+/// afford it. Below this an index is too small to serve any useful table, so a
+/// modest pool is lifted to the floor rather than left with a share no index can
+/// fit. The lift is still capped by the pool limit itself — see
+/// [`maintained_aggregate_max_index_bytes`] — because a floor that exceeded the
+/// pool would breach the very budget it exists to enforce.
 const MAINTAINED_AGGREGATE_MIN_INDEX_BYTES: usize = 8 * 1024 * 1024;
 
 /// Resolve the maintained-aggregate retained-index byte budget from the query
@@ -207,19 +210,31 @@ fn maintained_aggregate_max_index_bytes(
     runtime_env: &datafusion::execution::runtime_env::RuntimeEnv,
 ) -> usize {
     use datafusion::execution::memory_pool::MemoryPool;
-    let derived = match MemoryPool::memory_limit(&*runtime_env.memory_pool) {
+    match MemoryPool::memory_limit(&*runtime_env.memory_pool) {
         datafusion::execution::memory_pool::MemoryLimit::Finite(limit) => {
             // `f64` round-trip is exact enough for a budget fraction; the
             // saturating cast floors a non-finite product at 0, which the
-            // `max` below lifts to the floor.
+            // clamp below lifts to the floor.
             #[expect(
                 clippy::cast_precision_loss,
                 clippy::cast_possible_truncation,
                 clippy::cast_sign_loss,
-                reason = "budget fraction; result is clamped to [MIN, DEFAULT]"
+                reason = "budget fraction; result is clamped to [MIN, DEFAULT] and capped at the pool limit"
             )]
             let scaled = (limit as f64 * MAINTAINED_AGGREGATE_INDEX_POOL_FRACTION) as usize;
-            scaled.min(MAINTAINED_AGGREGATE_MAX_INDEX_BYTES_DEFAULT)
+            // The floor lifts a modest pool's share to something an index can
+            // fit, but never past the pool itself: on a pool smaller than the
+            // floor the lift would hand the index more memory than
+            // `runtime.query.memory_limit` allows (a 4MiB pool would get an 8MiB
+            // budget). Capping at `limit` leaves such a pool a budget any real
+            // index overruns, so maintained aggregates fail safe to base-table
+            // scans — the intended outcome for a pool that cannot afford them.
+            scaled
+                .clamp(
+                    MAINTAINED_AGGREGATE_MIN_INDEX_BYTES,
+                    MAINTAINED_AGGREGATE_MAX_INDEX_BYTES_DEFAULT,
+                )
+                .min(limit)
         }
         // No knowable ceiling to derive from — fall back to the standalone
         // default rather than leaving the index unbounded.
@@ -227,8 +242,7 @@ fn maintained_aggregate_max_index_bytes(
         | datafusion::execution::memory_pool::MemoryLimit::Unknown => {
             MAINTAINED_AGGREGATE_MAX_INDEX_BYTES_DEFAULT
         }
-    };
-    derived.max(MAINTAINED_AGGREGATE_MIN_INDEX_BYTES)
+    }
 }
 /// Bounded depth of the per-table maintained-aggregate apply queue. The CDC
 /// write path enqueues maintenance here and continues, so registry maintenance
@@ -18326,6 +18340,12 @@ impl CayenneTableProvider {
     /// while still recovering promptly from a transient failure.
     async fn try_rearm_maintained_aggregates(&self) {
         if self.maintained_aggregates.is_empty() || !self.maintained_aggregates.is_stale() {
+            // Rearm the counter while the registry is healthy so the interval is
+            // measured per staleness episode. A lifetime counter would leave the
+            // next episode starting mid-interval and delay its first attempt by
+            // up to `MAINTAINED_AGGREGATE_REARM_TICK_INTERVAL - 1` checkpoints.
+            self.maintained_aggregate_rearm_ticks
+                .store(0, Ordering::Release);
             return;
         }
 
@@ -28554,6 +28574,67 @@ mod tests {
             row_cap < exact_key_budget,
             "row cap ({row_cap}) must leave headroom below the exact key budget ({exact_key_budget})"
         );
+    }
+
+    /// The retained index is a plain allocation, not a pool reservation, so its
+    /// budget is the only thing keeping it inside `runtime.query.memory_limit`.
+    /// A budget above the pool would breach the contract the derivation exists to
+    /// enforce — the floor must never lift past what the pool can afford.
+    #[test]
+    fn maintained_aggregate_index_budget_never_exceeds_the_query_pool() {
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+
+        // A pool below the floor: lifting to the floor would hand the index twice
+        // the entire pool.
+        const TINY_POOL: usize = 4 * 1024 * 1024;
+
+        let budget_for = |pool_bytes: usize| {
+            let runtime_env = RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::new(GreedyMemoryPool::new(pool_bytes)))
+                .build()
+                .expect("finite-pool runtime env");
+            maintained_aggregate_max_index_bytes(&runtime_env)
+        };
+
+        // Such a pool keeps a budget any real index overruns, so maintained
+        // aggregates fail safe to base-table scans.
+        assert!(
+            budget_for(TINY_POOL) <= TINY_POOL,
+            "a pool below the floor must not yield a budget larger than the pool"
+        );
+
+        // A pool whose derived share lands under the floor but that can afford the
+        // floor: the lift applies, because 8MiB of a 32MiB pool is still a
+        // minority share.
+        assert_eq!(
+            budget_for(32 * 1024 * 1024),
+            MAINTAINED_AGGREGATE_MIN_INDEX_BYTES,
+            "a pool that can afford the floor is lifted to it"
+        );
+
+        // A large pool takes the fraction, capped by the standalone default.
+        assert_eq!(
+            budget_for(8 * 1024 * 1024 * 1024),
+            MAINTAINED_AGGREGATE_MAX_INDEX_BYTES_DEFAULT,
+            "a large pool is capped at the standalone default"
+        );
+
+        // The invariant across the range, including degenerate pools.
+        for pool_bytes in [
+            1,
+            1024,
+            TINY_POOL,
+            32 * 1024 * 1024,
+            256 * 1024 * 1024,
+            8 * 1024 * 1024 * 1024,
+        ] {
+            let budget = budget_for(pool_bytes);
+            assert!(
+                budget <= pool_bytes,
+                "budget {budget} for a {pool_bytes}B pool must stay within the pool"
+            );
+        }
     }
 
     /// Mark-and-sweep core: an orphan (on store, not in manifest) is marked on
