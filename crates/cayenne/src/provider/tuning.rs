@@ -584,15 +584,16 @@ fn cgroup_v1_memory_current() -> Option<u64> {
     )
 }
 
+/// Resolve `memory.current` through the same helper as `memory.stat` and
+/// `memory.pressure`.
+///
+/// All three MUST come from one cgroup: the pressure ratio divides
+/// `memory.current` by the budget while the attribution decomposes
+/// `memory.stat`, so resolving them through separate mountpoint parsers can
+/// silently mix scopes and make the parts exceed the whole.
 #[cfg(target_os = "linux")]
 fn resolve_cgroup_v2_memory_current_path() -> Option<String> {
-    let cgroup_path = process_cgroup_v2_path()?;
-    let mountpoint = cgroup2_mountpoint().unwrap_or_else(|| "/sys/fs/cgroup".to_string());
-    Some(cgroup_file_path(
-        &mountpoint,
-        &cgroup_path,
-        "memory.current",
-    ))
+    cgroup_v2_file_path("memory.current")
 }
 
 #[cfg(target_os = "linux")]
