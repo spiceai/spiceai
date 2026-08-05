@@ -8045,26 +8045,6 @@ impl CayenneTableProvider {
         Ok(ColdKeysetSource::Bloom)
     }
 
-    /// List the cold-tier manifest for the keyset rebuild's fenced capture.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the metastore cannot serve the manifest. There is no
-    /// directory-listing fallback for the cold tier, so a rebuild must fail rather
-    /// than continue with a keyset missing every cold-resident key (which would let
-    /// an upsert false-negative and leak the prior copy of the row).
-    async fn list_cold_files_for_keyset_rebuild(
-        &self,
-    ) -> Result<Vec<crate::metadata::ColdTierFile>> {
-        self.catalog
-            .list_cold_tier_files(&self.table_metadata.table_id)
-            .await
-            .map_err(|e| Error::Internal {
-                table: self.table_metadata.table_name.clone(),
-                message: format!("keyset rebuild could not list the cold manifest: {e}"),
-            })
-    }
-
     /// Rebuild the PK existence index from durable state in ONE bounded
     /// streaming pass: every scanned key routes straight to its shard
     /// ([`BoundedShardedPkIndexBuilder`]), and an upsert table whose exact
@@ -8120,7 +8100,9 @@ impl CayenneTableProvider {
             let protected_snapshots = self.protected_snapshots.load_full();
             let current_snapshot_id = self.get_current_snapshot_id();
             let cold_files = if fold_cold_manifest {
-                self.list_cold_files_for_keyset_rebuild().await?
+                self.catalog
+                    .list_cold_tier_files(&self.table_metadata.table_id)
+                    .await?
             } else {
                 Vec::new()
             };
