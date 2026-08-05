@@ -2034,11 +2034,6 @@ pub struct CayenneTableProvider {
     /// every `cold_tier_gc_interval_ms` regardless of the (finer) promotion tick
     /// cadence. `None` until the first sweep.
     cold_gc_last_run: Arc<ParkingMutex<Option<Instant>>>,
-    /// Tracks a protected-snapshot merge stalled against its per-pass memory
-    /// budget, so an episode sustained past
-    /// [`PROTECTED_MERGE_BUDGET_STALL_WARN_AFTER`] warns once. Shared by the
-    /// size-tier merge and the seq-prefix bake — same condition, same remedy.
-    protected_merge_budget_stall: Arc<ParkingMutex<ResourceStarvationTracker>>,
     /// `DataFusion` table constraints advertising the primary key (unverified),
     /// so runtime features gated on `TableProvider::constraints()` — e.g.
     /// append-mode refresh's primary-key dedup path — can see it. `None` when
@@ -2393,16 +2388,32 @@ const PROTECTED_MERGE_MAX_WIDTH: usize = 32;
 /// Bytes of merge input one protected-snapshot pass may select, per byte of the
 /// memory pool it accounts against.
 ///
+/// This pass is meant to be the *fast* consolidation path, and the work it was
+/// doing without this bound was both heavy and poor value. Heavy:
 /// [`PROTECTED_MERGE_MAX_WIDTH`] bounds the run count but not the run size, and
-/// the size tiers are relative: they grow geometrically and saturate on overflow,
-/// so arbitrarily large runs collapse into one top tier and merge as same-size
-/// peers. The pass streams, but its footprint is not size-independent — every
-/// selected input is scanned concurrently, and the Vortex encode cascade holds
-/// decompressed Arrow chunks the memory pool does not account. Unbounded, that
-/// combination OOM-killed the process on a small-RAM host (issue #12013).
+/// the size tiers are relative — they grow geometrically and saturate on
+/// overflow, so arbitrarily large runs collapse into one top tier and merge as
+/// same-size peers. The pass streams, but its footprint is not size-independent:
+/// every selected input is scanned concurrently, and the Vortex encode cascade
+/// holds decompressed Arrow chunks the memory pool does not account. Unbounded,
+/// that combination OOM-killed the process on a small-RAM host (issue #12013).
+///
+/// Poor value: a merge buys exactly one fewer scan branch (`scan_protected_snapshots`
+/// unions one branch per protected snapshot), which is the same whether the runs
+/// are 8 MiB or 8 GiB, while its cost is the bytes it rewrites. Benefit is per
+/// run, cost is per byte — so the largest runs are the worst merges available,
+/// and bounding by bytes drops the least valuable work first rather than
+/// sacrificing something worth having.
 ///
 /// 4× keeps a pass proportional to the budget the operator gave compaction while
-/// still allowing genuinely large runs to consolidate.
+/// still letting a moderately large tier consolidate.
+///
+/// This bounds the work; it does not make it unnecessary. The rewrite exists only
+/// to apply each input's own deletions (`delete_seq > threshold_at_creation`), so
+/// a run needing none could be referenced in place instead of re-encoded — and
+/// cross-snapshot manifest references already exist and are honored by physical-file
+/// GC (see [`Self::manifest_file_relative_path`]). That is the change that would
+/// make this path fast rather than merely bounded; it is out of scope here.
 const PROTECTED_MERGE_INPUT_BYTES_PER_POOL_BYTE: u64 = 4;
 
 /// Per-pass merge-input budget for a pool of `pool_limit` (extracted for unit
@@ -2658,8 +2669,8 @@ fn select_protected_snapshot_merge_tier(
         }
 
         // The budget cut a qualifying tier below a pair: its runs are too large to
-        // merge even two at a time. Every higher tier holds strictly larger runs, so
-        // stop rather than walking up, and report it so a stall is not silent.
+        // merge even two at a time, which makes the tier settled. Every higher tier
+        // holds strictly larger runs, so stop rather than walking up.
         let oldest_pair_bytes = indices
             .iter()
             .take(2)
@@ -2675,16 +2686,17 @@ fn select_protected_snapshot_merge_tier(
 }
 
 /// Outcome of [`select_protected_snapshot_merge_tier`], distinguishing "nothing
-/// has accumulated yet" from "a tier is stalled against the pass memory budget" —
-/// the caller escalates only the latter.
+/// has accumulated yet" from "the qualifying tier's runs are too large to pair
+/// within the pass budget" — the caller logs the two differently.
 #[derive(Debug, PartialEq, Eq)]
 enum ProtectedMergeSelection {
     /// Consolidate these runs: always at least 2, oldest-first.
     Merge(Vec<(String, i64)>),
     /// No size tier has accumulated `min_runs` same-size runs yet.
     NoQualifyingTier,
-    /// A tier has enough runs, but not even its two oldest fit `max_pass_bytes`,
-    /// so the pass declines rather than risking the host.
+    /// A tier has enough runs, but not even its two oldest fit `max_pass_bytes`.
+    /// The tier is settled: its runs are large enough that merging them buys one
+    /// scan branch for a very large rewrite, so the pass declines.
     OverPassBudget {
         tier_runs: usize,
         oldest_pair_bytes: u64,
@@ -2701,16 +2713,6 @@ impl ProtectedMergeSelection {
     }
 }
 
-/// How long a protected-snapshot merge must stay stalled against its per-pass
-/// memory budget before the skip escalates from DEBUG to WARN.
-///
-/// While the stall holds, protected snapshots accumulate and every scan pays
-/// their read amplification, which Cayenne's default WARN-only logging would
-/// otherwise hide. Wall-clock-bounded and one-shot per episode, like the
-/// position-delete starvation WARN in the same pass: the compaction cadence is
-/// dynamically tuned, so a denial count alone carries no information. Set well
-/// above the default interval so a transient stall stays quiet.
-const PROTECTED_MERGE_BUDGET_STALL_WARN_AFTER: Duration = Duration::from_mins(10);
 
 /// Write shape — encoder fan-out cap and size estimate — for the
 /// subset-merge output (see `compact_protected_snapshots_subset`).
@@ -5794,9 +5796,6 @@ impl CayenneTableProvider {
             position_compaction_skip_streak: Arc::new(ParkingMutex::new(
                 ResourceStarvationTracker::new(POSITION_COMPACTION_SKIP_WARN_AFTER),
             )),
-            protected_merge_budget_stall: Arc::new(ParkingMutex::new(
-                ResourceStarvationTracker::new(PROTECTED_MERGE_BUDGET_STALL_WARN_AFTER),
-            )),
             new_files_since_last_compaction: Arc::new(AtomicUsize::new(0)),
             last_small_file_compact_path: Arc::new(AtomicU8::new(
                 LastSmallFileCompactPath::None as u8,
@@ -6962,7 +6961,6 @@ impl CayenneTableProvider {
             snapshot_last_listed: Arc::clone(&self.snapshot_last_listed),
             snapshot_scan_refs: Arc::clone(&self.snapshot_scan_refs),
             position_compaction_skip_streak: Arc::clone(&self.position_compaction_skip_streak),
-            protected_merge_budget_stall: Arc::clone(&self.protected_merge_budget_stall),
             new_files_since_last_compaction: Arc::clone(&self.new_files_since_last_compaction),
             last_small_file_compact_path: Arc::clone(&self.last_small_file_compact_path),
             current_dir_generation: Arc::clone(&self.current_dir_generation),
@@ -16868,9 +16866,6 @@ impl CayenneTableProvider {
             let snapshot_at_capture = self.get_current_snapshot_id();
             let protected = self.protected_snapshots.load_full();
             if protected.len() < 2 {
-                // Nothing to merge, so nothing is stalled on the budget (another pass
-                // may have folded the set away). End any episode.
-                self.protected_merge_budget_stall.lock().reset();
                 return Ok(false);
             }
 
@@ -16964,49 +16959,31 @@ impl CayenneTableProvider {
             oldest_pair_bytes,
         } = &selection
         {
-            // The tier has the runs to merge but they no longer fit one pass, so the
-            // protected set — and every scan's read amplification — stops shrinking.
-            // A sustained episode warns once; a transient one stays at DEBUG.
-            let budget = max_pass_bytes.unwrap_or(u64::MAX);
-            if let Some(consecutive_skips) = self.protected_merge_budget_stall.lock().record_denial()
-            {
-                tracing::warn!(
-                    target: "cayenne::compaction",
-                    table = self.table_metadata.table_name.as_str(),
-                    tier_runs,
-                    oldest_pair_bytes,
-                    max_pass_bytes = budget,
-                    consecutive_skips,
-                    stalled_for_secs = PROTECTED_MERGE_BUDGET_STALL_WARN_AFTER.as_secs(),
-                    "Protected-snapshot compaction is stalled against its memory budget: the \
-                     two oldest runs of a {tier_runs}-run tier need {oldest_pair_bytes} bytes \
-                     but one pass may read {budget}. Protected snapshots will keep accumulating \
-                     and every scan pays their read amplification. Raise \
-                     `runtime.params.cayenne_compaction_memory_fraction` (or \
-                     `runtime.query.memory_limit`) to give compaction a larger pass budget, or \
-                     lower `cayenne_target_file_size_mb` so runs settle smaller. See: \
-                     https://spiceai.org/docs/components/data-accelerators",
-                );
-            } else {
-                tracing::debug!(
-                    target: "cayenne::compaction",
-                    table = self.table_metadata.table_name.as_str(),
-                    tier_runs,
-                    oldest_pair_bytes,
-                    max_pass_bytes = budget,
-                    "Skipping fast protected-snapshot compaction: the qualifying tier's two \
-                     oldest runs exceed the pass memory budget"
-                );
-            }
+            // Declining here costs less than it appears. A merge's benefit is one fewer
+            // scan branch, which is the same whether the runs are 8 MiB or 8 GiB; its
+            // cost is the bytes it rewrites. So a large-run tier is the worst-value work
+            // this pass can do, and leaving it settled is the same call the
+            // current-snapshot picker makes for files at or above the target size.
+            //
+            // The alarm for the read amplification that remains belongs to the read
+            // path, which already WARNs at `8 x compaction_trigger_protected_snapshots`
+            // protected snapshots (`scan_protected_snapshots`) — on the harm itself
+            // rather than on this proxy for it. This line is the cause, for whoever
+            // investigates that warning.
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                tier_runs,
+                oldest_pair_bytes,
+                max_pass_bytes = max_pass_bytes.unwrap_or(u64::MAX),
+                "Skipping fast protected-snapshot compaction: the qualifying tier's two oldest \
+                 runs exceed the pass memory budget"
+            );
             return Ok(false);
         }
 
         let inputs = selection.into_inputs();
         if inputs.len() < 2 {
-            // No tier qualifies, so nothing is stalled on the budget. End any episode:
-            // a stale one would let the next genuine stall warn immediately, before it
-            // has been sustained for `PROTECTED_MERGE_BUDGET_STALL_WARN_AFTER`.
-            self.protected_merge_budget_stall.lock().reset();
             tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
@@ -17018,8 +16995,6 @@ impl CayenneTableProvider {
             );
             return Ok(false);
         }
-        // A tier fit the budget, so any stall episode is over.
-        self.protected_merge_budget_stall.lock().reset();
 
         // Diagnostics over the SELECTED (single-tier) input set.
         let selected_ids: std::collections::HashSet<&str> =
@@ -17534,8 +17509,6 @@ impl CayenneTableProvider {
             let protected = self.protected_snapshots.load_full();
             // Need at least K newest-to-keep + 2 to merge an older prefix.
             if protected.len() < BAKE_KEEP_RECENT_SNAPSHOTS + 2 {
-                // No settled prefix, so nothing is stalled on the budget.
-                self.protected_merge_budget_stall.lock().reset();
                 return Ok(false);
             }
             let mut ids: Vec<String> = protected.keys().cloned().collect();
@@ -17632,52 +17605,18 @@ impl CayenneTableProvider {
         }
 
         if selected.len() < 2 {
-            // Distinguish a routine "no settled prefix yet" from a prefix that does
-            // not fit the pass budget. The latter is the same stall the size-tier path
-            // reports, so it shares that one-shot-per-episode tracker; here it also
-            // blocks the deletion index's only shrink, leaving the OOM backstop that
-            // forces this bake unable to make progress.
-            let escalate = budget_truncated
-                && self
-                    .protected_merge_budget_stall
-                    .lock()
-                    .record_denial()
-                    .is_some();
-            if escalate {
-                tracing::warn!(
-                    target: "cayenne::compaction",
-                    table = self.table_metadata.table_name.as_str(),
-                    candidates = candidate_ids.len(),
-                    keep_recent = BAKE_KEEP_RECENT_SNAPSHOTS,
-                    max_pass_bytes = max_pass_bytes.unwrap_or(u64::MAX),
-                    stalled_for_secs = PROTECTED_MERGE_BUDGET_STALL_WARN_AFTER.as_secs(),
-                    "Seq-prefix bake is stalled against its memory budget: no two older \
-                     protected snapshots fit one pass, so the deletion index cannot shrink and \
-                     read amplification will keep growing. Raise \
-                     `runtime.params.cayenne_compaction_memory_fraction` (or \
-                     `runtime.query.memory_limit`) to give compaction a larger pass budget, or \
-                     lower `cayenne_target_file_size_mb` so runs settle smaller. See: \
-                     https://spiceai.org/docs/components/data-accelerators",
-                );
-            } else {
-                if !budget_truncated {
-                    // Not a budget skip, so end any episode (see the size-tier path).
-                    self.protected_merge_budget_stall.lock().reset();
-                }
-                tracing::debug!(
-                    target: "cayenne::compaction",
-                    table = self.table_metadata.table_name.as_str(),
-                    candidates = candidate_ids.len(),
-                    keep_recent = BAKE_KEEP_RECENT_SNAPSHOTS,
-                    budget_truncated,
-                    max_pass_bytes = max_pass_bytes.unwrap_or(u64::MAX),
-                    "Skipping seq-prefix bake: fewer than two older snapshots to bake"
-                );
-            }
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                candidates = candidate_ids.len(),
+                keep_recent = BAKE_KEEP_RECENT_SNAPSHOTS,
+                budget_truncated,
+                max_pass_bytes = max_pass_bytes.unwrap_or(u64::MAX),
+                "Skipping seq-prefix bake: fewer than two older snapshots fit the pass memory \
+                 budget"
+            );
             return Ok(false);
         }
-        // A prefix fit the budget, so any stall episode is over.
-        self.protected_merge_budget_stall.lock().reset();
         // `cutoff` is now the seq-prefix cutoff T (the max max_sequence over the
         // selected older prefix). It was raised above from `i64::MIN` by at least
         // one selected file, so it is a real sequence.
@@ -28217,9 +28156,6 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
         let min_inputs = self.context.compaction_trigger_protected_snapshots().max(2);
         let protected_len = self.protected_snapshots.load().len();
         if protected_len < min_inputs {
-            // The pass is not entered, so end any budget-stall episode here — a set
-            // that another pass folded away is no longer stalled.
-            self.protected_merge_budget_stall.lock().reset();
             tracing::trace!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
