@@ -102,7 +102,10 @@ pub(crate) fn create_factory() -> DuckDBTableProviderFactory {
                 .with_setting(Box::new(OrderByNonIntegerLiteral))
                 .with_setting(Box::new(settings::IndexScanPercentage))
                 .with_setting(Box::new(settings::IndexScanMaxCount))
-                .with_setting(Box::new(settings::TimeZone)),
+                .with_setting(Box::new(settings::TimeZone))
+                // Sizes DuckDB's own thread pool from the runtime's CPU budget
+                // whenever the operator did not set `duckdb_threads`.
+                .with_setting(Box::new(settings::Threads)),
         )
 }
 
@@ -636,6 +639,9 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("file"),
     ParameterSpec::component("data_dir"),
     ParameterSpec::component("memory_limit"),
+    ParameterSpec::component("threads").description(
+        "The size of DuckDB's own thread pool for this instance. Defaults to the runtime's CPU budget (see `runtime.cpu.cores`); DuckDB would otherwise size it from the host core count, over-committing a CPU-constrained container.",
+    ),
     ParameterSpec::component("preserve_insertion_order"),
     ParameterSpec::component("index_scan_percentage"),
     ParameterSpec::component("index_scan_max_count"),

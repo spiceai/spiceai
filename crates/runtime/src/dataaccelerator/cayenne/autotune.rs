@@ -32,7 +32,7 @@ limitations under the License.
 //! ## Coherence (knobs working together)
 //!
 //! * **CPU.** The aggregate Vortex encode concurrency across *all* tables is
-//!   bounded by a process-global semaphore sized to the host core count (see
+//!   bounded by a process-global semaphore sized to the CPU budget (see
 //!   [`crate::dataaccelerator::cayenne`] startup wiring and
 //!   `cayenne::provider::write_budget`). Per-table `write_concurrency` is then a
 //!   request against that shared budget rather than an independent core grab, so
@@ -134,7 +134,8 @@ impl MemTierCaps {
 ///
 /// All are cheap to read and container-aware where the OS exposes it:
 /// [`crate::resource_monitor::get_total_memory`] honors cgroup v1/v2 memory
-/// limits, and `std::thread::available_parallelism` honors CPU quotas on Linux.
+/// limits, and the core count comes from [`cpu_budget::cpu_budget`], which
+/// honors a cgroup CPU quota, a Kubernetes CPU request, and `runtime.cpu.cores`.
 /// Construct via [`HardwareProfile::detect`] in production or
 /// [`HardwareProfile::new`] in tests.
 ///
@@ -205,7 +206,7 @@ impl HardwareProfile {
         data_path: &str,
         metastore_path: &str,
     ) -> Self {
-        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        let cores = cpu_budget::cpu_budget().cayenne_write_concurrency_ceiling();
         let total_mem_bytes = crate::resource_monitor::get_total_memory();
         // The two storage classifications, the two calibration probes (cloud-agnostic,
         // memoized per volume — the only storage signal for a memory-tier table that

@@ -69,6 +69,10 @@ impl From<&DataFusionError> for ErrorCode {
             | DataFusionError::Execution(..) => ErrorCode::QueryExecutionError,
             DataFusionError::ResourcesExhausted(..) => ErrorCode::ResourcesExhausted,
             DataFusionError::Context(_, err) => ErrorCode::from(err.as_ref()),
+            // A join wraps its build-side failure in `Shared` before handing it
+            // to each probe partition (datafusion physical-plan joins/utils.rs).
+            // Without this arm a join's memory refusal is `InternalError`.
+            DataFusionError::Shared(err) => ErrorCode::from(err.as_ref()),
             _ => ErrorCode::InternalError,
         }
     }
@@ -78,6 +82,7 @@ impl From<&DataFusionError> for ErrorCode {
 mod tests {
     use super::ErrorCode;
     use datafusion::error::DataFusionError;
+    use std::sync::Arc;
 
     /// A memory-pool refusal must not be labelled `InternalError`: that is the
     /// label for "spiced has a bug", and conflating the two leaves an operator
@@ -104,6 +109,61 @@ mod tests {
         );
 
         assert_eq!(ErrorCode::from(&err), ErrorCode::ResourcesExhausted);
+    }
+
+    /// A join's build-side refusal reaches the runtime wrapped in `Shared`, and
+    /// must classify the same as a bare one.
+    #[test]
+    fn resources_exhausted_is_found_through_shared() {
+        let err = DataFusionError::Shared(Arc::new(DataFusionError::ResourcesExhausted(
+            "Additional allocation failed for HashJoinInput[135]".to_string(),
+        )));
+
+        assert_eq!(ErrorCode::from(&err), ErrorCode::ResourcesExhausted);
+    }
+
+    /// `Shared` and `Context` nest in both orders, so the recursion has to
+    /// survive either.
+    #[test]
+    fn resources_exhausted_is_found_through_shared_and_context() {
+        let shared_in_context = DataFusionError::Context(
+            "Join Error".to_string(),
+            Box::new(DataFusionError::Shared(Arc::new(
+                DataFusionError::ResourcesExhausted("out of memory".to_string()),
+            ))),
+        );
+        assert_eq!(
+            ErrorCode::from(&shared_in_context),
+            ErrorCode::ResourcesExhausted
+        );
+
+        let context_in_shared = DataFusionError::Shared(Arc::new(DataFusionError::Context(
+            "Join Error".to_string(),
+            Box::new(DataFusionError::ResourcesExhausted(
+                "out of memory".to_string(),
+            )),
+        )));
+        assert_eq!(
+            ErrorCode::from(&context_in_shared),
+            ErrorCode::ResourcesExhausted
+        );
+    }
+
+    /// Unwrapping `Shared` must not flatten every shared failure to one code.
+    #[test]
+    fn shared_preserves_the_inner_code() {
+        assert_eq!(
+            ErrorCode::from(&DataFusionError::Shared(Arc::new(
+                DataFusionError::Execution("boom".to_string())
+            ))),
+            ErrorCode::QueryExecutionError
+        );
+        assert_eq!(
+            ErrorCode::from(&DataFusionError::Shared(Arc::new(
+                DataFusionError::Internal("bug".to_string())
+            ))),
+            ErrorCode::InternalError
+        );
     }
 
     /// The codes are a stable external surface, so a new variant must not
