@@ -1032,6 +1032,20 @@ struct RawScanInput {
     /// Current snapshot id captured under the read fence — the file set the scan
     /// reads. Pinned against GC by [`Self::scan_guard`].
     current_snapshot_id: String,
+    /// Cold-tier manifest belonging to [`Self::current_snapshot_id`], resolved under
+    /// the SAME held read fence (see
+    /// [`CayenneTableProvider::cold_manifest_under_held_fence`]). `None` when the
+    /// cold tier is disabled.
+    ///
+    /// A promotion publishes the cold manifest and the warm snapshot flip together
+    /// under `listing_fence.write()`, so both halves of a cross-tier read must be
+    /// captured in one fenced instant: a scan that pairs a warm snapshot captured
+    /// before that publish with a cold manifest read after it counts every promoted
+    /// row TWICE. Carrying the file set on the capture is what makes the pair
+    /// atomic — every plan branch descends from this one instant. Needs no separate
+    /// [`ScanViewKey`] component: a cold-manifest change always mints a new snapshot
+    /// id, which the key already carries.
+    cold_files: Option<Arc<Vec<crate::metadata::ColdTierFile>>>,
     /// Inline-memtable structural epoch (`inlined_structural_epoch`) observed at
     /// capture. Part of the [`Self::changed`] key — the same key the retired memos
     /// used, so a build is skipped iff no scan-visible state moved.
@@ -1076,6 +1090,49 @@ impl RawScanInput {
             inlined_view_ptr: Arc::as_ptr(&self.inlined_view).addr(),
         }
     }
+}
+
+/// The cold-tier manifest as published alongside ONE warm snapshot id.
+///
+/// Every mutation of `cayenne_cold_tier_file` mints a new warm snapshot id in the
+/// same metastore transaction: a promotion commits through
+/// [`MetadataCatalog::commit_overwrite_to_cold`], and that runs the same
+/// `commit_overwrite_in_txn` an overwrite / truncate clear does — which deletes the
+/// table's cold rows. A snapshot id therefore names exactly one cold manifest
+/// state, which is what makes it a sound cache key: an entry whose `snapshot_id`
+/// still equals the live one cannot be stale, and one that does not is simply a
+/// miss that re-reads. No path can leave a mismatched pair servable, so the cache
+/// needs no invalidation hook on the paths that clear the manifest.
+///
+/// The key is a snapshot id THIS process published: `current_snapshot_id` is in-memory
+/// state advanced by its own publishes (shared across writer clones by `Arc`), so the
+/// pairing is sound for the single-writer-per-table deployment Cayenne targets. It does
+/// not extend to two processes promoting the same table: on a cache miss the metastore
+/// SELECT returns whatever is committed, including a foreign promotion this provider's
+/// warm snapshot id predates, and the entry is then tagged with that local id. Reading
+/// the manifest live would pair a local warm snapshot with the freshest foreign cold on
+/// EVERY scan, so tagging by snapshot id is strictly narrower exposure — but it is not a
+/// cross-process guarantee.
+struct ColdManifestForSnapshot {
+    /// Warm snapshot id this manifest was published with.
+    snapshot_id: String,
+    /// Every live cold file for the table at that snapshot.
+    files: Arc<Vec<crate::metadata::ColdTierFile>>,
+}
+
+/// Inputs for [`CayenneTableProvider::build_cold_tier_scan_plan`], grouped the way
+/// [`ProtectedSnapshotScan`] groups the protected-snapshot branch's.
+struct ColdTierScan<'a> {
+    state: &'a dyn Session,
+    projection: Option<&'a Vec<usize>>,
+    filters: &'a [Expr],
+    limit: Option<usize>,
+    scan_config: &'a SessionConfig,
+    read_schema_override: Option<SchemaRef>,
+    /// The manifest the CALLER captured, in the same fenced instant as the warm
+    /// snapshot the rest of its scan reads. Never re-read inside the branch — see
+    /// [`RawScanInput::cold_files`].
+    cold_files: &'a [crate::metadata::ColdTierFile],
 }
 
 /// Identity of a [`RawScanInput`] capture — the cache key for its built [`ScanView`].
@@ -1474,6 +1531,15 @@ pub struct CayenneTableProvider {
     /// Uses `RwLock` for concurrent reads during normal operations with occasional
     /// writes on compaction. The lock is held briefly for string operations.
     current_snapshot_id: Arc<RwLock<String>>,
+    /// Cold-tier manifest paired with the warm snapshot id it was published with,
+    /// so a cross-tier read captures BOTH tiers' file sets in one fenced instant
+    /// ([`Self::cold_manifest_under_held_fence`]). `None` until the first resolve.
+    ///
+    /// Published by [`Self::promote_warm_to_cold`] inside the same
+    /// `listing_fence.write()` that commits the manifest and flips the snapshot, so
+    /// the capture that follows a promotion pays no metastore read. Shared across
+    /// writer clones of the same table.
+    cold_manifest: Arc<ArcSwap<Option<ColdManifestForSnapshot>>>,
     /// Test-only seam fired between the catalog CAS commit and the fenced
     /// in-memory publish of the subset-merge/seq-prefix-bake passes, so a test
     /// can commit a snapshot replacement (overwrite/promotion) inside the exact
@@ -2186,6 +2252,25 @@ enum ColdKeysetSource {
     /// incomplete; the rebuild folds cold via the exact scan for the whole
     /// table.
     Scan,
+}
+
+/// A [`ColdKeysetSource`] plus the warm snapshot id it was decided against.
+///
+/// The keyset rebuild runs OFF `write_lock` (`prepare_stream_for_insert` precedes
+/// the Stage-A guard), so a cold promotion can commit between this decision and the
+/// rebuild's own fenced capture. That is only dangerous in the [`ColdKeysetSource::Bloom`]
+/// direction, and it is dangerous in a way the tier accounting cannot detect later:
+/// the promoted keys would be absent from the pre-promotion bloom AND from the
+/// post-promotion warm snapshot, so an upsert of one would find no existing key,
+/// record no supersede tombstone, and leak the prior cold copy — a durable
+/// over-count. Carrying the snapshot id lets the rebuild notice the move and fold
+/// the cold tier exactly instead (see [`CayenneTableProvider::load_existing_pk_index`]).
+struct ColdKeysetPlan {
+    source: ColdKeysetSource,
+    /// Warm snapshot id the cold manifest — and any bloom published from it — was
+    /// resolved under the listing fence with. `None` when the cold tier contributes
+    /// nothing (disabled, or a non-upsert table), where there is nothing to pair.
+    resolved_at_snapshot: Option<String>,
 }
 
 struct CayenneTableProviderOpenOptions {
@@ -5658,6 +5743,7 @@ impl CayenneTableProvider {
             // scan does not advertise ordering until the sorted compactor attests
             // a snapshot.
             current_sorted_snapshot: Arc::new(ArcSwap::from_pointee(None)),
+            cold_manifest: Arc::new(ArcSwap::from_pointee(None)),
             mem_checkpoint_lock: Arc::new(tokio::sync::Mutex::new(())),
             mem_tier_publish_locks: (0..mem_tier_shards)
                 .map(|_| tokio::sync::Mutex::new(()))
@@ -6833,6 +6919,9 @@ impl CayenneTableProvider {
             // Shared so the sorted-rewrite attestation set by any (compaction)
             // clone is observed by scanning clones, and cleared for all on a write.
             current_sorted_snapshot: Arc::clone(&self.current_sorted_snapshot),
+            // Shared so a writer clone's promotion publishes the manifest every
+            // clone's scans resolve against.
+            cold_manifest: Arc::clone(&self.cold_manifest),
             mem_checkpoint_lock: Arc::clone(&self.mem_checkpoint_lock),
             // Shared across clones so EVERY writer serializes on the one publish
             // lock (the seq-ordering invariant requires a single lock per table).
@@ -7965,34 +8054,39 @@ impl CayenneTableProvider {
     /// would run its cold scan), so the two stay coupled: NO object-store I/O —
     /// the per-file blooms come straight from the manifest rows.
     ///
-    /// See [`ColdKeysetSource`] for the three outcomes; `cold_pk_existence` is
-    /// populated only for [`ColdKeysetSource::Bloom`] and cleared otherwise.
-    async fn resolve_cold_keyset_source(&self) -> Result<ColdKeysetSource> {
+    /// See [`ColdKeysetSource`] for the three outcomes. [`ColdKeysetSource::Bloom`]
+    /// always comes with the view published; the no-usable-bloom case clears it. A
+    /// resolve whose snapshot was superseded before it could publish leaves the slot
+    /// untouched — whatever is there belongs to a snapshot at least as new as its own
+    /// — and downgrades itself to [`ColdKeysetSource::Scan`].
+    async fn resolve_cold_keyset_source(&self) -> Result<ColdKeysetPlan> {
         if !self.table_metadata.vortex_config.cold_tier_enabled() || !self.upsert_bloom_eligible() {
             self.store_cold_pk_existence(None);
-            return Ok(ColdKeysetSource::None);
+            return Ok(ColdKeysetPlan {
+                source: ColdKeysetSource::None,
+                resolved_at_snapshot: None,
+            });
         }
 
-        let cold_files = self
-            .catalog
-            .list_cold_tier_files(&self.table_metadata.table_id)
-            .await?;
+        // Resolve the manifest and the warm snapshot id it belongs to together under
+        // the read fence, and report that snapshot id to the caller: a `Bloom`
+        // outcome tells the rebuild to skip the cold scan and let this bloom stand
+        // in for the cold-resident keys, which is only sound while the rebuild's own
+        // capture sees the SAME snapshot. See `ColdKeysetPlan::resolved_at_snapshot`.
+        let (snapshot_id, cold_files) = {
+            let _fence = self.listing_fence.read().await;
+            let snapshot_id = self.get_current_snapshot_id();
+            let cold_files = self.cold_manifest_under_held_fence(&snapshot_id).await?;
+            (snapshot_id, cold_files)
+        };
         // Liveness is size-based, NOT row_count-based: promotion commits files
         // with `row_count = 0` when footer stats inference fails. Such files
         // carry no bloom, so keeping them live routes to the exact-scan fallback
         // instead of silently dropping their keys.
         let live: Vec<_> = cold_files
-            .into_iter()
+            .iter()
             .filter(|f| f.file_size_bytes > 0)
             .collect();
-        if live.is_empty() {
-            // No cold-resident keys: an EMPTY existence view (never probes true)
-            // is complete and correct, so skip the scan. Stored (not cleared) to
-            // keep the invariant "`Bloom` ⇒ view present".
-            self.store_cold_pk_existence(Some(Arc::new(ColdPkExistence::new(Vec::new()))));
-            return Ok(ColdKeysetSource::Bloom);
-        }
-
         let mut blooms = Vec::with_capacity(live.len());
         for f in &live {
             if let Some(bloom) = f.pk_bloom.as_deref().and_then(PkBloom::from_bytes) {
@@ -8002,7 +8096,9 @@ impl CayenneTableProvider {
                 // the per-file cap, or corrupt) means the union would omit
                 // that file's keys. Missing a cold key would let an upsert
                 // false-negative and double-count, so fall back to the exact
-                // cold scan for the whole table.
+                // cold scan for the whole table. Nothing to publish and nothing
+                // to pair: the exact fold reads the manifest under the rebuild's
+                // own fence.
                 tracing::debug!(
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
@@ -8010,20 +8106,57 @@ impl CayenneTableProvider {
                     "Cold-tier file has no PK bloom; keyset rebuild falls back to the exact cold scan"
                 );
                 self.store_cold_pk_existence(None);
-                return Ok(ColdKeysetSource::Scan);
+                return Ok(ColdKeysetPlan {
+                    source: ColdKeysetSource::Scan,
+                    resolved_at_snapshot: Some(snapshot_id),
+                });
             }
         }
-
+        // An EMPTY view (no live cold files) never probes true, which is complete
+        // and correct — stored rather than cleared to keep the invariant
+        // "`Bloom` ⇒ view present".
         let existence = Arc::new(ColdPkExistence::new(blooms));
+
+        // `cold_pk_existence` is a SHARED slot that the on-conflict apply probes
+        // directly, with no snapshot id of its own, so publishing a bloom built for
+        // a superseded snapshot poisons every consumer that does not rebuild first.
+        // Two rebuilds running concurrently off `write_lock` are enough: the one that
+        // resolved before a promotion can store its pre-promotion bloom AFTER the one
+        // that resolved after it stored a post-promotion keyset, leaving the keys that
+        // promotion moved in neither half — an upsert of one then records no supersede
+        // tombstone and leaks its prior cold copy. Publish only while the snapshot the
+        // bloom was built for is still live, under the fence that makes a promotion's
+        // flip atomic; a losing resolve leaves the slot alone (whatever is there is at
+        // least as new) and folds the cold tier exactly instead.
+        let published = {
+            let _fence = self.listing_fence.read().await;
+            let still_live = self.get_current_snapshot_id() == snapshot_id;
+            if still_live {
+                self.store_cold_pk_existence(Some(existence));
+            }
+            still_live
+        };
+        if !published {
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                "Cold PK existence view was built against a snapshot that has since been superseded; folding the cold tier exactly instead of publishing it"
+            );
+            return Ok(ColdKeysetPlan {
+                source: ColdKeysetSource::Scan,
+                resolved_at_snapshot: Some(snapshot_id),
+            });
+        }
         tracing::debug!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
             cold_files = live.len(),
-            approx_bytes = existence.approx_bytes(),
             "Built cold-tier PK existence view from manifest blooms; keyset rebuild skips the cold scan"
         );
-        self.store_cold_pk_existence(Some(existence));
-        Ok(ColdKeysetSource::Bloom)
+        Ok(ColdKeysetPlan {
+            source: ColdKeysetSource::Bloom,
+            resolved_at_snapshot: Some(snapshot_id),
+        })
     }
 
     /// Rebuild the PK existence index from durable state in ONE bounded
@@ -8042,11 +8175,19 @@ impl CayenneTableProvider {
     /// `false` skips that O(cold-rows) scan because the cold contribution is
     /// served by the [`ColdPkExistence`] bloom (`resolve_cold_keyset_source`).
     /// Immaterial when the cold tier is disabled (the pass is a no-op).
+    ///
+    /// `cold_bloom_snapshot` is [`ColdKeysetPlan::resolved_at_snapshot`] — the warm
+    /// snapshot a `fold_cold == false` decision was made against. If this capture
+    /// sees a different snapshot, a promotion landed in between and the bloom no
+    /// longer covers what warm no longer holds, so the skip is upgraded back to the
+    /// exact fold (which reads the manifest resolved in THIS fenced instant and is
+    /// therefore coherent by construction).
     async fn load_existing_pk_index(
         &self,
         pk_indices: &[usize],
         converter: &RowConverter,
         fold_cold: bool,
+        cold_bloom_snapshot: Option<&str>,
         shards: usize,
     ) -> Result<ShardedPkIndex> {
         // Capture the snapshot LIST — un-checkpointed mem-tier shards, the
@@ -8063,7 +8204,12 @@ impl CayenneTableProvider {
         // mem-tier snapshot stays inside the same fence so a concurrent
         // off-`write_lock` checkpoint cannot hide a live key either: it is in this
         // snapshot or already durable in the scan that follows.
-        let (mem_snapshots, protected_snapshots, current_snapshot_id) = {
+        // The cold manifest joins that same fenced instant when the cold fold runs:
+        // a promotion publishes its manifest commit and its warm snapshot flip
+        // together under the WRITE fence, so resolving cold after this block would
+        // let the rebuild fold the promoted rows from BOTH the pre-promotion warm
+        // snapshot and the post-promotion cold manifest.
+        let (mem_snapshots, protected_snapshots, current_snapshot_id, cold_files) = {
             let _fence = self.listing_fence.read().await;
             let mem_snapshots: Vec<Arc<crate::provider::mem_tier::MemTier>> = self
                 .mem_tier
@@ -8074,7 +8220,33 @@ impl CayenneTableProvider {
             // Wait-free Arc::clone — the inner HashMap is shared, not cloned.
             let protected_snapshots = self.protected_snapshots.load_full();
             let current_snapshot_id = self.get_current_snapshot_id();
-            (mem_snapshots, protected_snapshots, current_snapshot_id)
+            // A bloom resolved against a DIFFERENT snapshot cannot stand in for the
+            // cold tier here: the promotion that moved the snapshot on also moved
+            // the promoted keys out of this warm capture, so trusting it would drop
+            // them from the keyset entirely. Fold cold exactly instead.
+            let cold_bloom_is_stale =
+                cold_bloom_snapshot.is_some_and(|resolved_at| resolved_at != current_snapshot_id);
+            if cold_bloom_is_stale && !fold_cold {
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    "Cold PK bloom was resolved against a superseded snapshot (a promotion raced the keyset rebuild); folding the cold tier exactly instead"
+                );
+            }
+            let cold_files = if fold_cold || cold_bloom_is_stale {
+                Some(
+                    self.cold_manifest_under_held_fence(&current_snapshot_id)
+                        .await?,
+                )
+            } else {
+                None
+            };
+            (
+                mem_snapshots,
+                protected_snapshots,
+                current_snapshot_id,
+                cold_files,
+            )
         };
 
         let ctx = self.create_session_context();
@@ -8189,16 +8361,17 @@ impl CayenneTableProvider {
         // Skipped when `fold_cold` is false: the cold contribution is then
         // served by the `ColdPkExistence` bloom, avoiding this O(cold-rows)
         // object-store scan entirely.
-        if fold_cold
+        if let Some(cold_files) = cold_files.as_ref()
             && let Some(cold_plan) = self
-                .build_cold_tier_scan_plan(
-                    &ctx.state(),
-                    Some(&pk_projection),
-                    &[],
-                    None,
-                    &ctx.copied_config(),
-                    None,
-                )
+                .build_cold_tier_scan_plan(ColdTierScan {
+                    state: &ctx.state(),
+                    projection: Some(&pk_projection),
+                    filters: &[],
+                    limit: None,
+                    scan_config: &ctx.copied_config(),
+                    read_schema_override: None,
+                    cold_files: cold_files.as_slice(),
+                })
                 .await?
         {
             let scan_start = Instant::now();
@@ -8518,10 +8691,18 @@ impl CayenneTableProvider {
     /// essential in `cdc_durability: memory`, where a key written after the
     /// checkpoint lives only in RAM — omitting it false-negatives that key's next
     /// update and leaks the prior copy, a durable over-count).
+    ///
+    /// `cold_bloom_snapshot` is [`ColdKeysetPlan::resolved_at_snapshot`]: this path
+    /// never scans the cold tier, so the cold-resident keys are served entirely by
+    /// the bloom published for that snapshot. A snapshot move since then means a
+    /// promotion landed, and the keys it moved are in neither that bloom nor this
+    /// checkpoint's warm coverage — so fail closed to the full rebuild, which folds
+    /// cold exactly.
     async fn try_load_persisted_pk_index(
         &self,
         pk_indices: &[usize],
         converter: &RowConverter,
+        cold_bloom_snapshot: Option<&str>,
     ) -> Result<Option<CachedPkIndex>> {
         if !self.upsert_bloom_eligible() {
             return Ok(None);
@@ -8572,7 +8753,10 @@ impl CayenneTableProvider {
 
         // Gate on the snapshot tag: the bloom covers the full current snapshot
         // only if nothing rewrote it since the checkpoint (compaction re-persists).
-        if checkpoint_snapshot != current_snapshot_id {
+        // The cold bloom is gated on the same id for the reason in the doc comment.
+        if checkpoint_snapshot != current_snapshot_id
+            || cold_bloom_snapshot.is_some_and(|resolved_at| resolved_at != current_snapshot_id)
+        {
             return Ok(None);
         }
         let Some((mut bloom, blob_snapshot)) = deserialize_pk_bloom_sidecar(&bytes) else {
@@ -8884,26 +9068,42 @@ impl CayenneTableProvider {
         // cold PK existence bloom from the manifest, no object-store I/O).
         // `Bloom` skips the cold scan; `Scan` forces a full rebuild (the
         // warm-only checkpoint can't cover the incomplete-bloom case).
-        let cold_source = self.resolve_cold_keyset_source().await?;
-        let fold_cold = !matches!(cold_source, ColdKeysetSource::Bloom);
-        let allow_checkpoint = !matches!(cold_source, ColdKeysetSource::Scan);
+        let cold_plan = self.resolve_cold_keyset_source().await?;
+        let fold_cold = !matches!(cold_plan.source, ColdKeysetSource::Bloom);
+        let allow_checkpoint = !matches!(cold_plan.source, ColdKeysetSource::Scan);
+        // Only a `Bloom` outcome makes the rebuild depend on the snapshot the bloom
+        // was resolved against; the exact fold reads the manifest under its own
+        // fence and needs no pairing check.
+        let cold_bloom_snapshot = matches!(cold_plan.source, ColdKeysetSource::Bloom)
+            .then_some(cold_plan.resolved_at_snapshot.as_deref())
+            .flatten();
         // Fast path: reconstruct the index from the persisted bloom checkpoint
         // (+ bounded post-checkpoint delta) and skip the full-table keyset
         // scan. Falls back to the full scan on any miss/mismatch/corruption.
         let existing_keys = if allow_checkpoint {
             match self
-                .try_load_persisted_pk_index(pk_indices, converter)
+                .try_load_persisted_pk_index(pk_indices, converter, cold_bloom_snapshot)
                 .await
             {
                 Ok(Some(index)) => index,
                 _ => {
-                    self.load_existing_pk_index_serial(pk_indices, converter, fold_cold)
-                        .await?
+                    self.load_existing_pk_index_serial(
+                        pk_indices,
+                        converter,
+                        fold_cold,
+                        cold_bloom_snapshot,
+                    )
+                    .await?
                 }
             }
         } else {
-            self.load_existing_pk_index_serial(pk_indices, converter, fold_cold)
-                .await?
+            self.load_existing_pk_index_serial(
+                pk_indices,
+                converter,
+                fold_cold,
+                cold_bloom_snapshot,
+            )
+            .await?
         };
         record_cayenne_write_phase(
             self.table_metadata.table_name.as_str(),
@@ -8928,9 +9128,10 @@ impl CayenneTableProvider {
         pk_indices: &[usize],
         converter: &RowConverter,
         fold_cold: bool,
+        cold_bloom_snapshot: Option<&str>,
     ) -> Result<CachedPkIndex> {
         let index = self
-            .load_existing_pk_index(pk_indices, converter, fold_cold, 1)
+            .load_existing_pk_index(pk_indices, converter, fold_cold, cold_bloom_snapshot, 1)
             .await?;
         Ok(match index {
             ShardedPkIndex::Exact(keysets) => CachedPkIndex::Exact(
@@ -9057,9 +9258,14 @@ impl CayenneTableProvider {
         // Resolve the datalake (cold) tier contribution first (rebuilds the cold
         // PK existence bloom from the manifest, no object-store I/O), coupled
         // with the sharded rebuild the same way the serial path couples it.
-        let cold_source = self.resolve_cold_keyset_source().await?;
-        let fold_cold = !matches!(cold_source, ColdKeysetSource::Bloom);
-        let allow_checkpoint = !matches!(cold_source, ColdKeysetSource::Scan);
+        let cold_plan = self.resolve_cold_keyset_source().await?;
+        let fold_cold = !matches!(cold_plan.source, ColdKeysetSource::Bloom);
+        let allow_checkpoint = !matches!(cold_plan.source, ColdKeysetSource::Scan);
+        // See the serial path: only a bloom-served cold tier has to be paired with
+        // the snapshot it was resolved against.
+        let cold_bloom_snapshot = matches!(cold_plan.source, ColdKeysetSource::Bloom)
+            .then_some(cold_plan.resolved_at_snapshot.as_deref())
+            .flatten();
 
         // Cold rebuild. Try the persisted single bloom only at n==1 (it can't be
         // split). All paths route through `load_existing_pk_index`, which folds
@@ -9080,7 +9286,7 @@ impl CayenneTableProvider {
         if n == 1 {
             let index = if allow_checkpoint {
                 match self
-                    .try_load_persisted_pk_index(pk_indices, converter)
+                    .try_load_persisted_pk_index(pk_indices, converter, cold_bloom_snapshot)
                     .await
                 {
                     Ok(Some(CachedPkIndex::Exact(keyset))) => {
@@ -9097,8 +9303,14 @@ impl CayenneTableProvider {
             let index = match index {
                 Some(index) => index,
                 None => {
-                    self.load_existing_pk_index(pk_indices, converter, fold_cold, 1)
-                        .await?
+                    self.load_existing_pk_index(
+                        pk_indices,
+                        converter,
+                        fold_cold,
+                        cold_bloom_snapshot,
+                        1,
+                    )
+                    .await?
                 }
             };
             record_cayenne_write_phase(
@@ -9110,7 +9322,7 @@ impl CayenneTableProvider {
         }
 
         let index = self
-            .load_existing_pk_index(pk_indices, converter, fold_cold, n)
+            .load_existing_pk_index(pk_indices, converter, fold_cold, cold_bloom_snapshot, n)
             .await?;
         record_cayenne_write_phase(
             self.table_metadata.table_name.as_str(),
@@ -16487,12 +16699,12 @@ impl CayenneTableProvider {
             Self::ensure_snapshot_dir_exists(&dir).await?;
         }
         // A cold promotion has TWO visibility publication points: the metastore
-        // commit (scans list cold files straight from `cayenne_cold_tier_file`)
-        // and the in-memory snapshot flip (scans read the warm snapshot id from
-        // memory). Publishing them at different times lets a concurrent fenced
-        // scan pair the OLD warm snapshot with the NEW cold manifest and count
-        // the promoted rows twice. Hold ONE `listing_fence` write across both so
-        // they flip atomically w.r.t. scans — the deliberate exception to
+        // commit (the cold manifest a scan's capture resolves) and the in-memory
+        // snapshot flip (the warm snapshot id it captures). Publishing them at
+        // different times lets a concurrent fenced scan pair the OLD warm snapshot
+        // with the NEW cold manifest and count the promoted rows twice. Hold ONE
+        // `listing_fence` write across both so they flip atomically w.r.t. scans —
+        // the deliberate exception to
         // "no `.await` under the fence": for cold, the metastore commit IS a
         // visibility flip. The hold is BOUNDED: the commit's write-conflict
         // retry loop is capped at DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS (4)
@@ -16506,6 +16718,7 @@ impl CayenneTableProvider {
             table = self.table_metadata.table_name.as_str(),
             "Committing the datalake manifest + snapshot flip under fence"
         );
+        let cold_files = Arc::new(cold_files);
         {
             let _fence = self.listing_fence.write().await;
             self.catalog
@@ -16516,6 +16729,11 @@ impl CayenneTableProvider {
                 )
                 .await?;
             self.publish_overwrite_snapshot_fenced(&new_snapshot_id, new_listing_table);
+            // The third publication step, under the same fence: hand the manifest
+            // this commit just wrote to the scan path as the cold half of the new
+            // snapshot. Every subsequent capture then resolves both halves with no
+            // metastore read, and no capture can observe one half without the other.
+            self.store_cold_manifest(&new_snapshot_id, &cold_files);
         }
         if let Err(error) = self.prune_snapshot_manifest_to(&new_snapshot_id).await {
             tracing::warn!(
@@ -20636,6 +20854,11 @@ impl CayenneTableProvider {
                 ))
             })?;
         }
+        // Same shape for the cold manifest: warm it OFF the fence so the resolve
+        // under the fence is an `Arc` clone. A snapshot flip landing after this
+        // read just makes that resolve miss and read again under the fence, which
+        // is correct, only slower.
+        self.warm_cold_manifest_cache().await;
 
         // Hold listing_fence.read() for the capture so the deletion snapshot, the
         // protected_snapshots set, and the current snapshot's file listing are all
@@ -20728,6 +20951,22 @@ impl CayenneTableProvider {
         let current_snapshot_id = self.get_current_snapshot_id();
         let structural_epoch = self.inlined_structural_epoch.load(Ordering::Relaxed);
 
+        // The cold half of the file set, resolved under the SAME held fence as the
+        // warm snapshot id above so the two are one instant. A promotion publishes
+        // the cold-manifest commit and the warm snapshot flip together under
+        // `listing_fence.write()`, so a cross-tier read has to capture both halves
+        // inside one fence: a manifest resolved any later can belong to a promotion
+        // this warm snapshot predates, and pairing the two counts every promoted row
+        // twice.
+        let cold_files = if self.table_metadata.vortex_config.cold_tier_enabled() {
+            Some(
+                self.cold_manifest_under_held_fence(&current_snapshot_id)
+                    .await?,
+            )
+        } else {
+            None
+        };
+
         // Capture the (gated) read schema under the SAME held fence + seqlock-validated
         // window, so it is consistent with the data captured above and every scan-plan
         // branch can build from this one schema instead of re-reading the live
@@ -20754,10 +20993,99 @@ impl CayenneTableProvider {
             protected_map,
             inlined_view,
             current_snapshot_id,
+            cold_files,
             structural_epoch,
             scan_guard,
             read_schema,
         })
+    }
+
+    /// Resolve the cold-tier manifest that belongs to `snapshot_id`, for a caller
+    /// that is holding `listing_fence.read()`.
+    ///
+    /// The cache entry is only usable when it names the live snapshot id, and a
+    /// cold-manifest change always mints a new one (see
+    /// [`ColdManifestForSnapshot`]) — so a hit is provably the manifest paired with
+    /// `snapshot_id`, and a miss reads the metastore. That read is a deliberate
+    /// `.await` under the held read fence, in the same spirit as the write side's
+    /// documented exception: for cold, listing the manifest IS reading a visibility
+    /// flip, so it has to happen inside the fence that makes the flip atomic. It is
+    /// bounded (one table-scoped indexed SELECT) and rare — [`Self::promote_warm_to_cold`]
+    /// publishes the manifest it just committed, `warm_cold_manifest_cache` warms
+    /// every other flip off the fence, and the capture already awaits metastore I/O
+    /// under this same fence for the inline corpus.
+    async fn cold_manifest_under_held_fence(
+        &self,
+        snapshot_id: &str,
+    ) -> datafusion_common::Result<Arc<Vec<crate::metadata::ColdTierFile>>> {
+        let cached = self.cold_manifest.load_full();
+        if let Some(cached) = cached.as_ref()
+            && cached.snapshot_id == snapshot_id
+        {
+            return Ok(Arc::clone(&cached.files));
+        }
+        let files = self.fetch_cold_manifest().await?;
+        self.store_cold_manifest(snapshot_id, &files);
+        Ok(files)
+    }
+
+    /// Read the table's cold-tier manifest from the metastore.
+    ///
+    /// No directory-listing fallback exists for cold (unlike the warm manifest), so a
+    /// metastore error must fail the query rather than silently drop cold rows.
+    async fn fetch_cold_manifest(
+        &self,
+    ) -> datafusion_common::Result<Arc<Vec<crate::metadata::ColdTierFile>>> {
+        self.catalog
+            .list_cold_tier_files(&self.table_metadata.table_id)
+            .await
+            .map(Arc::new)
+            .map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to list cold-tier files for table {}: {e}",
+                    self.table_metadata.table_name
+                ))
+            })
+    }
+
+    /// Publish `files` as the cold manifest belonging to `snapshot_id`.
+    fn store_cold_manifest(
+        &self,
+        snapshot_id: &str,
+        files: &Arc<Vec<crate::metadata::ColdTierFile>>,
+    ) {
+        self.cold_manifest
+            .store(Arc::new(Some(ColdManifestForSnapshot {
+                snapshot_id: snapshot_id.to_string(),
+                files: Arc::clone(files),
+            })));
+    }
+
+    /// Populate the cold-manifest cache for the live snapshot id BEFORE a capture
+    /// takes the listing fence, so the fenced resolve is an `Arc` clone.
+    ///
+    /// Best-effort: a failure (or a flip that lands during the read) leaves the
+    /// cache as it was, and the fenced resolve reads again and reports the error.
+    /// The entry is only stored when the snapshot id is unchanged across the read,
+    /// so this can never publish a manifest under an id it does not belong to.
+    async fn warm_cold_manifest_cache(&self) {
+        if !self.table_metadata.vortex_config.cold_tier_enabled() {
+            return;
+        }
+        let snapshot_id = self.get_current_snapshot_id();
+        let cached = self.cold_manifest.load_full();
+        if cached
+            .as_ref()
+            .as_ref()
+            .is_some_and(|cached| cached.snapshot_id == snapshot_id)
+        {
+            return;
+        }
+        if let Ok(files) = self.fetch_cold_manifest().await
+            && self.get_current_snapshot_id() == snapshot_id
+        {
+            self.store_cold_manifest(&snapshot_id, &files);
+        }
     }
 
     /// Compute the scan-ready [`ScanView`] from a [`RawScanInput`] capture: the KDI
@@ -25326,21 +25654,28 @@ impl CayenneTableProvider {
     /// tier is disabled or empty (no added plan nodes — byte-identical to a
     /// warm-only scan).
     ///
-    /// Cold files come from the `cayenne_cold_tier_file` metastore manifest
-    /// (table-scoped, absolute object-store URLs), and each row carries its
-    /// serialized Vortex `FileStatistics` blob — so listing-time pruning runs
-    /// with NO object-store round-trip. The returned plan is a Vortex
-    /// `DataSourceExec`; the caller wraps it with the key-based (`Ignore`)
-    /// deletion filter and unions it into the scan tree.
+    /// `cold_files` is the caller's CAPTURED `cayenne_cold_tier_file` manifest
+    /// (table-scoped, absolute object-store URLs) — resolved in the same fenced
+    /// instant as the warm snapshot the rest of the scan reads, never re-read here:
+    /// a manifest read after the caller's capture can belong to a later promotion,
+    /// and pairing it with the captured warm snapshot double-counts every promoted
+    /// row. Each row carries its serialized Vortex `FileStatistics` blob, so
+    /// listing-time pruning runs with NO object-store round-trip. The returned plan
+    /// is a Vortex `DataSourceExec`; the caller wraps it with the key-based
+    /// (`Ignore`) deletion filter and unions it into the scan tree.
     async fn build_cold_tier_scan_plan(
         &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-        scan_config: &SessionConfig,
-        read_schema_override: Option<SchemaRef>,
+        scan: ColdTierScan<'_>,
     ) -> datafusion_common::Result<Option<Arc<dyn ExecutionPlan>>> {
+        let ColdTierScan {
+            state,
+            projection,
+            filters,
+            limit,
+            scan_config,
+            read_schema_override,
+            cold_files,
+        } = scan;
         // Cold tier disabled (no location) → no branch.
         if !self.table_metadata.vortex_config.cold_tier_enabled() {
             return Ok(None);
@@ -25356,31 +25691,18 @@ impl CayenneTableProvider {
             Self::register_object_store_if_needed(state.runtime_env(), cold_config);
         }
 
-        let cold_files = self
-            .catalog
-            .list_cold_tier_files(&self.table_metadata.table_id)
-            .await
-            .map_err(|e| {
-                // No directory-listing fallback exists for cold (unlike the warm
-                // manifest), so a metastore error must fail the query rather than
-                // silently drop cold rows.
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to list cold-tier files for table {}: {e}",
-                    self.table_metadata.table_name
-                ))
-            })?;
         // Carry-forward promotion: the promotion's PRIVATE session carries a
         // `ColdScanFileSubset` config extension restricting this branch to the
         // dirty files being rewritten (clean files are carried forward by
         // manifest reference, never re-read). User-query sessions never carry
-        // the extension, so queries always see the full manifest.
-        let cold_files =
+        // the extension, so queries always see the full captured manifest.
+        let cold_files: Vec<&crate::metadata::ColdTierFile> =
             match scan_config.get_extension::<super::cold_partition::ColdScanFileSubset>() {
                 Some(subset) => cold_files
-                    .into_iter()
+                    .iter()
                     .filter(|f| subset.0.contains(&f.file_url))
                     .collect(),
-                None => cold_files,
+                None => cold_files.iter().collect(),
             };
         // No early all-empty guard needed: the per-file loop skips zero-size
         // files and the `object_store_url is None` / `kept.is_empty()` checks
@@ -26678,6 +27000,9 @@ impl TableProvider for CayenneTableProvider {
         let protected_map = Arc::clone(&scan_view.raw.protected_map);
         let inlined_view = Arc::clone(&scan_view.raw.inlined_view);
         let current_snapshot_id = scan_view.raw.current_snapshot_id.clone();
+        // The cold file set captured in the SAME fenced instant as
+        // `current_snapshot_id`, so the cross-tier union cannot straddle a promotion.
+        let cold_files = scan_view.raw.cold_files.as_ref().map(Arc::clone);
         let scan_guard = Arc::clone(&scan_view.raw.scan_guard);
         let deletion_snapshot = scan_view.merged_deletions.clone();
         let visible_segments = Arc::clone(&scan_view.visible_segments);
@@ -26903,21 +27228,22 @@ impl TableProvider for CayenneTableProvider {
             })
             .await?;
 
-        // Build the COLD object-store tier branch (storage-cascade bottom tier).
-        // Cold files hold OLD, fully-superseded data, so they take the
-        // `Ignore`-re-inserts deletion treatment (`apply_deletion_filter`) — the
-        // same camp as protected snapshots. Using the `Apply` variant here would
+        // Build the COLD object-store tier branch (storage-cascade bottom tier) from
+        // the CAPTURED manifest. Cold files hold OLD, fully-superseded data, so they
+        // take the `Ignore`-re-inserts deletion treatment (`apply_deletion_filter`) —
+        // the same camp as protected snapshots. Using the `Apply` variant here would
         // resurrect a stale cold row for a key re-inserted after deletion.
         // `Ok(None)` (disabled / empty / all-pruned) adds zero plan nodes.
         let cold_plan: Option<Arc<dyn ExecutionPlan>> = self
-            .build_cold_tier_scan_plan(
+            .build_cold_tier_scan_plan(ColdTierScan {
                 state,
-                effective_projection.as_ref(),
-                scan_filters,
+                projection: effective_projection.as_ref(),
+                filters: scan_filters,
                 limit,
-                scan_listing_config,
-                Some(Arc::clone(&read_schema)),
-            )
+                scan_config: scan_listing_config,
+                read_schema_override: Some(Arc::clone(&read_schema)),
+                cold_files: cold_files.as_ref().map_or(&[], |files| files.as_slice()),
+            })
             .await?
             .map(|cold| {
                 self.apply_deletion_filter(cold, &pk_indices_in_projection, &deletion_snapshot)
@@ -42890,7 +43216,7 @@ mod tests {
             .build_pk_converter(&pk_indices)
             .expect("build pk converter");
         let index = provider
-            .load_existing_pk_index_serial(&pk_indices, &pk_converter, true)
+            .load_existing_pk_index_serial(&pk_indices, &pk_converter, true, None)
             .await
             .expect("cold keyset rebuild");
         provider.store_cached_pk_index(index);
@@ -43645,7 +43971,7 @@ mod tests {
             .expect("table has a primary key");
         let converter = reopened.build_pk_converter(&pk_indices).expect("converter");
         let loaded = reopened
-            .try_load_persisted_pk_index(&pk_indices, &converter)
+            .try_load_persisted_pk_index(&pk_indices, &converter, None)
             .await
             .expect("load persisted index");
         assert!(
@@ -43739,7 +44065,7 @@ mod tests {
             .expect("table has a primary key");
         let converter = provider.build_pk_converter(&pk_indices).expect("converter");
         let loaded = provider
-            .try_load_persisted_pk_index(&pk_indices, &converter)
+            .try_load_persisted_pk_index(&pk_indices, &converter, None)
             .await
             .expect("load persisted index")
             .expect("persisted bloom present after compaction");
