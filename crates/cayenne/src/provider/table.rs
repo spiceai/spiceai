@@ -194,6 +194,17 @@ const MAINTAINED_AGGREGATE_MAX_INDEX_BYTES_DEFAULT: usize = 512 * 1024 * 1024;
 /// attempts immediately, so a transient failure recovers at once.
 const MAINTAINED_AGGREGATE_REARM_TICK_INTERVAL: u64 = 32;
 
+/// How many times a rebuild may fail before the table stops attempting it.
+///
+/// Distinct from re-staling, which is the byte budget working as designed and is
+/// always worth retrying. A rebuild that *errors* is a fault, and the faults that
+/// reach it are usually permanent — a filter that does not type-check against the
+/// table fails the same way on every batch. Since each attempt rescans the whole
+/// visible state, retrying such a failure forever costs a full table scan per
+/// interval and recovers nothing. A few attempts still absorb a transient I/O
+/// error.
+const MAINTAINED_AGGREGATE_REBUILD_MAX_FAILURES: u64 = 3;
+
 /// Floor for the derived retained-index budget, applied only where the pool can
 /// afford it. Below this an index is too small to serve any useful table, so a
 /// modest pool is lifted to the floor rather than left with a share no index can
@@ -2076,6 +2087,10 @@ pub struct CayenneTableProvider {
     /// than on every checkpoint. Shared across clones — one table, one attempt
     /// cadence. See [`Self::try_rearm_maintained_aggregates`].
     maintained_aggregate_rearm_ticks: Arc<AtomicU64>,
+    /// Consecutive rebuild *faults*, latching the rearm off at
+    /// [`MAINTAINED_AGGREGATE_REBUILD_MAX_FAILURES`]. Separate from the tick
+    /// counter because re-staling is not a fault and must keep retrying.
+    maintained_aggregate_rebuild_failures: Arc<AtomicU64>,
     /// Per-table background compaction task, populated by
     /// [`Self::spawn_background_compaction`]. Held by `Arc<OnceLock<…>>` so it
     /// survives [`Self::clone_for_write`] and shares its drop signal across
@@ -5776,6 +5791,7 @@ impl CayenneTableProvider {
             maintained_aggregate_visibility_sequence: Arc::new(AtomicU64::new(0)),
             maintained_aggregate_tx,
             maintained_aggregate_rearm_ticks: Arc::new(AtomicU64::new(0)),
+            maintained_aggregate_rebuild_failures: Arc::new(AtomicU64::new(0)),
             background_compactor: Arc::new(std::sync::OnceLock::new()),
             background_mem_tier_checkpointer: Arc::new(std::sync::OnceLock::new()),
             background_cold_tier_promoter: Arc::new(std::sync::OnceLock::new()),
@@ -6946,6 +6962,9 @@ impl CayenneTableProvider {
             // ordered background applier spawned by the original constructor.
             maintained_aggregate_tx: self.maintained_aggregate_tx.clone(),
             maintained_aggregate_rearm_ticks: Arc::clone(&self.maintained_aggregate_rearm_ticks),
+            maintained_aggregate_rebuild_failures: Arc::clone(
+                &self.maintained_aggregate_rebuild_failures,
+            ),
             background_compactor: Arc::clone(&self.background_compactor),
             // Shared so the single periodic checkpoint task (spawned on the
             // original `Arc`) survives writer clones and its drop signal is shared.
@@ -18349,6 +18368,17 @@ impl CayenneTableProvider {
             return;
         }
 
+        // A rebuild that has already failed its budget of attempts stays failed:
+        // the cause does not heal on its own, and each retry rescans the whole
+        // visible state. Stop rather than burn a scan per interval forever.
+        if self
+            .maintained_aggregate_rebuild_failures
+            .load(Ordering::Acquire)
+            >= MAINTAINED_AGGREGATE_REBUILD_MAX_FAILURES
+        {
+            return;
+        }
+
         // Tick-counted rather than clock-based: checkpoints are already periodic,
         // so counting them gives a bounded cadence with no wall-clock dependency
         // (and no way for a clock jump to stall recovery). The first stale tick
@@ -18380,11 +18410,35 @@ impl CayenneTableProvider {
                 );
             }
             Err(error) => {
-                tracing::warn!(
-                    table = %self.table_metadata.table_name,
-                    error = %error,
-                    "Maintained aggregate rebuild failed; queries continue on base table scans and the rebuild will be retried"
-                );
+                // A rebuild that errors is not the budget doing its job — that is
+                // the `Ok` arm above, and it is worth retrying because the table's
+                // size moves. This is a fault, and the ones that reach here are
+                // overwhelmingly permanent: a filter whose types do not line up
+                // fails identically on every batch, forever. Each attempt is a
+                // full visible-state scan, so retrying one of those buys nothing
+                // and costs a scan of the whole table every interval.
+                //
+                // Give it a few tries — an I/O blip deserves them — then stop and
+                // say so once, with what an operator would need to act.
+                let failures = self
+                    .maintained_aggregate_rebuild_failures
+                    .fetch_add(1, Ordering::AcqRel)
+                    .saturating_add(1);
+                if failures >= MAINTAINED_AGGREGATE_REBUILD_MAX_FAILURES {
+                    tracing::error!(
+                        table = %self.table_metadata.table_name,
+                        error = %error,
+                        failures,
+                        "Maintained aggregate rebuild failed {failures} times and will not be retried; queries continue on base table scans for the life of this table. This is usually a maintained aggregate whose filter or aggregate columns do not type-check against the table — check 'maintained_aggregates' in the spicepod, then restart to re-arm."
+                    );
+                } else {
+                    tracing::warn!(
+                        table = %self.table_metadata.table_name,
+                        error = %error,
+                        failures,
+                        "Maintained aggregate rebuild failed; queries continue on base table scans and the rebuild will be retried"
+                    );
+                }
             }
         }
     }

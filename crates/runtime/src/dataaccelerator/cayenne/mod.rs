@@ -243,16 +243,22 @@ fn parse_maintained_aggregate_filter(
                 "Cayenne maintained_aggregates filter '{sql}' is not a valid SQL predicate over the table columns: {source}"
             )),
         })?;
-    let physical = datafusion::physical_expr::create_physical_expr(
-        &logical,
-        &df_schema,
-        &datafusion_expr::execution_props::ExecutionProps::new(),
-    )
-    .map_err(|source| Error::InvalidConfiguration {
-        detail: Arc::from(format!(
-            "Cayenne maintained_aggregates filter '{sql}' could not be planned: {source}"
-        )),
-    })?;
+    // Plan through the session rather than calling `create_physical_expr`
+    // directly: the session coerces the expression against the schema first, and
+    // a filter written the way SQL is normally written needs that. A predicate
+    // like `ts_col > '2007-01-02 00:00:00'` parses to a `Timestamp` compared
+    // against a `Utf8` literal, which builds a physical expression happily and
+    // then fails at evaluation with "Invalid comparison operation:
+    // Timestamp(µs) > Utf8" — the maintained aggregate goes stale on its first
+    // delta, and every query silently falls back to a base-table scan for the
+    // life of the process.
+    let physical = context
+        .create_physical_expr(logical, &df_schema)
+        .map_err(|source| Error::InvalidConfiguration {
+            detail: Arc::from(format!(
+                "Cayenne maintained_aggregates filter '{sql}' could not be planned: {source}"
+            )),
+        })?;
     // A filter is a `WHERE` condition, so it must evaluate to Boolean. Reject a
     // non-Boolean predicate (e.g. `filter: 1`) at config time with a clear error,
     // rather than letting it fail later during maintenance.
@@ -4207,6 +4213,61 @@ fn normalize_cayenne_tuning(raw: Option<&str>) -> (Option<String>, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A timestamp column compared against a string literal is how such a filter
+    /// is normally written, and it must survive all the way to *evaluation*.
+    /// Planning it is not enough: without coercion the physical expression builds
+    /// fine and then fails on the first batch with "Invalid comparison operation:
+    /// Timestamp(µs) > Utf8", which takes the maintained aggregate stale on its
+    /// first delta and silently drops every query back to a base-table scan.
+    #[test]
+    fn a_timestamp_filter_against_a_string_literal_evaluates() {
+        use arrow::array::{Int32Array, TimestampMicrosecondArray};
+        use arrow::datatypes::TimeUnit;
+        use arrow::record_batch::RecordBatch;
+
+        let schema = Schema::new(vec![
+            Field::new(
+                "ol_delivery_d",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
+            Field::new("ol_quantity", DataType::Int32, true),
+        ]);
+
+        let filter = parse_maintained_aggregate_filter(
+            "ol_delivery_d > '2007-01-02 00:00:00.000000'",
+            &schema,
+        )
+        .expect("a timestamp-vs-string filter must be accepted");
+
+        // 2007-01-01 (before the bound) and 2008-01-01 (after it).
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![
+                Arc::new(TimestampMicrosecondArray::from(vec![
+                    1_167_609_600_000_000,
+                    1_199_145_600_000_000,
+                ])),
+                Arc::new(Int32Array::from(vec![1, 2])),
+            ],
+        )
+        .expect("test batch");
+
+        // The assertion that matters: evaluating does not error.
+        let evaluated = filter
+            .evaluate(&batch)
+            .expect("the filter must evaluate, not just plan");
+        let mask = evaluated
+            .into_array(batch.num_rows())
+            .expect("filter yields an array");
+        let mask = mask
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .expect("a WHERE predicate evaluates to Boolean");
+        assert!(!mask.value(0), "2007-01-01 is not after the bound");
+        assert!(mask.value(1), "2008-01-01 is after the bound");
+    }
 
     #[test]
     fn normalize_cayenne_tuning_folds_invalid_to_auto() {
