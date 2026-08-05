@@ -1,4 +1,4 @@
-# `spice cloud` — Organization Context
+# `spice cloud` — Organization Context and Command Surface
 
 Internal reference for how the CLI decides **which Spice Cloud organization a
 command acts on**, where per-org credentials live, and which parts of the
@@ -40,14 +40,14 @@ teammate who does not share that org.
 The standard CLI configuration ladder — flags beat the environment, which beats
 project config, which beats user config ([clig.dev](https://clig.dev/#configuration)):
 
-1. the org in an `<org>/<app>` argument (`--app spicehq/team-app`);
+1. the org in an `<org>/<project>` argument (`--project spicehq/team-app`);
 2. `--org`;
 3. `SPICE_CLOUD_ORG`;
-4. the org recorded by `spice cloud link` in `.spice/cloud.json` (project);
+4. the org recorded by `spice cloud link` in `.spice/cloud.json` (directory);
 5. the persisted active org from `spice cloud org use` (user);
 6. the credential's own org — no org is sent, and the server decides.
 
-**Two explicit signals are never silently ranked.** If an `<org>/<app>` argument
+**Two explicit signals are never silently ranked.** If an `<org>/<project>` argument
 and `--org` name different orgs — or a linked directory disagrees with an
 explicit `--org`/`SPICE_CLOUD_ORG` — the command fails with `org_conflict` and
 names both. Levels 4 and 5 are standing defaults, so any explicit signal
@@ -64,7 +64,7 @@ Implemented in `resolve_app_target_with_source` and `ensure_orgs_agree` in
 
 `spice cloud whoami` is the single source of truth for what a command will do:
 it prints the org in effect and where that choice came from. Mutating commands
-(`deploy`, `delete app`, `secrets set`) echo the same provenance before acting.
+(`deploy`, `project delete`, `secrets set`) echo the same provenance before acting.
 
 ## Credential storage
 
@@ -144,8 +144,8 @@ into a structured envelope on **stderr**:
 {
   "status": "error",
   "error": {
-    "code": "app_not_found",
-    "message": "App 'spicehq/team-app' was not found. …",
+    "code": "project_not_found",
+    "message": "Project 'spicehq/team-app' was not found. …",
     "hint": "Run 'spice cloud orgs' to list your organizations, then 'spice cloud org use <org>'."
   }
 }
@@ -163,8 +163,8 @@ breaking change. The set lives in `CloudErrorCode` (`bin/spice/src/error.rs`):
 | `org_forbidden` | Not a member of the requested org — emitted **only** by the membership probe, never inferred from a 403 |
 | `org_conflict` | Two explicit signals named different orgs |
 | `org_credential_missing` | An org was named, but no credential is bound to it |
-| `app_not_found` | No such app in the org being acted on |
-| `wrong_org` | App exists, but under a different visible org |
+| `project_not_found` | No such project in the org being acted on |
+| `wrong_org` | Project exists, but under a different visible org |
 | `deploy_conflict` | A deployment is already in flight (409) |
 | `deploy_failed` | Deployment reached a terminal failed status |
 | `deploy_timeout` | `--wait` elapsed; the deployment is **still running** and may yet succeed |
@@ -180,18 +180,29 @@ retry without parsing the message; every other failure exits 1.
 Human-readable diagnostics go through `tracing`, which this CLI configures to
 write to **stdout**. Machine mode is the contract for scripting.
 
+## Command surface
+
+One grammar, matching the rest of the CLI: a **plural noun lists**
+(`spice cloud projects`, like `spice datasets`), a **singular noun manages one**
+(`spice cloud project create`, like `spice dataset`). `spice cloud status` is
+the aggregated health view, mirroring `spice status` for a local runtime.
+
+Superseded spellings — `create`/`get`/`update`/`delete <noun>`, `inspect`,
+`instance`, `apps`, `--app` — are hidden from help but still parse. Each warns
+once and delegates to its replacement; the replacement holds the
+implementation, because two implementations of one command is how they drift
+apart. They are removable in a later release.
+
 ## Diagnosing a deploy without the portal
 
 ```bash
 spice cloud org use spicehq
-spice cloud deploy --app spicehq/team-app --wait --timeout 10m
-spice cloud deployments --app spicehq/team-app          # id, status, commit, error
-spice cloud inspect     --app spicehq/team-app          # app, latest deployment, pods
-spice cloud instance list     --app spicehq/team-app    # instances + serving count
-spice cloud instance status   --app spicehq/team-app    # component readiness
-spice cloud instance status   --app spicehq/team-app --instance <name>
-spice cloud instance datasets --app spicehq/team-app    # dataset load state
-spice cloud logs --app spicehq/team-app --level error --tail 200
+spice cloud deploy  --project spicehq/team-app --wait --timeout 10m
+spice cloud status  --project spicehq/team-app          # the whole picture, one command
+spice cloud status  --project spicehq/team-app --instance <name>
+spice cloud deployments --project spicehq/team-app      # id, status, commit, error
+spice cloud datasets    --project spicehq/team-app      # every dataset's load state
+spice cloud logs --project spicehq/team-app --level error --tail 200
 ```
 
 `deploy --wait` polls the deployment's real status with backoff (2 s → 15 s)
@@ -200,7 +211,7 @@ on a terminal failure, so it can gate a script. Statuses the CLI does not
 recognize are treated as **still running**: waiting longer is recoverable,
 declaring an in-flight deploy finished is not.
 
-`spice cloud instance …` reaches the app's data plane rather than the management
+`spice cloud status` and `spice cloud datasets` reach the project's data plane rather than the management
 API, because the management API does not expose runtime state. The CLI resolves
 the app's region and API key through the management API and then calls the
 regional data endpoint. These commands therefore need an app API key to exist;
@@ -213,15 +224,15 @@ load-balances across them. **Which instance answers is part of the question**:
 
 | Invocation | Header | Answered by |
 | ---------- | ------ | ----------- |
-| `instance status --app org/app` | none | the app's general endpoint — the deployment as a whole |
-| `instance status --app org/app --instance <name>` | `SCP-Target-Instance: <name>` | that one instance |
+| `status --project org/project` | none | the project's general endpoint — the deployment as a whole |
+| `status --project org/project --instance <name>` | `SCP-Target-Instance: <name>` | that one instance |
 
 Unpinned is the default because an arbitrary replica is not a useful answer: a
 healthy one reports Ready while a sick one beside it is why the app is down.
 Pinning is how you find the sick one. Every command prints which scope answered,
 so "Ready" is never ambiguous between one replica and the whole deployment.
 
-`spice cloud instance list` enumerates instances from `GET /v1/spice_runtime`
+`spice cloud status` enumerates instances from `GET /v1/spice_runtime`
 (`status.podStatuses`), reporting each instance's status, phase, deployment, and
 start time, plus a serving count.
 
@@ -257,7 +268,7 @@ without further CLI changes once the API lands.
 | ---- | -------- | ----------------------- |
 | Enumerate a user's orgs | `GET /v1/orgs` | A 404 is treated as "cannot enumerate", not "no orgs". `spice cloud orgs` falls back to the credential's own org plus any org with a stored credential, and prints a note explaining the listing is partial. `whoami` omits the org count. |
 | One credential across orgs | `X-Org-Name` honored on management routes, with a membership check | The header is already sent on every request. Until it is honored, acting on a second org requires a credential minted for that org (an org-owned OAuth client works today via `spice cloud login api --org <org>`). |
-| Instance status / logs via management API | e.g. pods and component health on `/v1/apps/{id}/…` | `spice cloud instance …` uses the data plane with the app's API key. |
+| Instance status / logs via management API | e.g. instance health on `/v1/projects/{id}/…` | `spice cloud status` uses the data plane with the project's API key. |
 
 `spice cloud orgs` marks each row's `CREDENTIAL` column `stored` when the org has
 its own credential, which is how an operator can tell a fully-working org from
