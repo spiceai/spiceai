@@ -152,7 +152,8 @@ pub enum CloudCommands {
     /// Show metrics for an app's pods
     Metrics(MetricsArgs),
 
-    /// Inspect a running app instance
+    // `about`/`long_about` live on `InstanceCommands`; a doc comment here would
+    // shadow the long help that explains instance pinning.
     #[command(subcommand)]
     Instance(InstanceCommands),
 }
@@ -231,12 +232,42 @@ pub struct OrgCurrentArgs {
 }
 
 #[derive(Subcommand, Debug)]
+#[command(
+    about = "Inspect the instances serving a deployed app",
+    long_about = r#"Inspect the instances serving a deployed app.
+
+An app runs one or more instances (replicas). Without --instance, commands ask
+the app's general endpoint, which answers for the deployment as a whole. With
+--instance, the request is pinned to that one instance, which is how you tell
+a single sick replica from a healthy fleet.
+
+EXAMPLES
+  spice cloud instance list     --app spicehq/team-app
+  spice cloud instance status   --app spicehq/team-app
+  spice cloud instance status   --app spicehq/team-app --instance spicepod-team-app-abc-0-0
+  spice cloud instance datasets --app spicehq/team-app"#
+)]
 pub enum InstanceCommands {
-    /// Show component readiness for a running app instance
+    /// List the instances serving an app
+    #[command(visible_alias = "ls")]
+    List(InstanceListArgs),
+
+    /// Show component readiness for an app
     Status(InstanceStatusArgs),
 
-    /// Show dataset load state for a running app instance
+    /// Show dataset load state for an app
     Datasets(InstanceDatasetsArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct InstanceListArgs {
+    /// App name in org/app format (uses linked app if not specified)
+    #[arg(long)]
+    pub app: Option<String>,
+
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
 }
 
 #[derive(Args, Debug)]
@@ -244,6 +275,10 @@ pub struct InstanceStatusArgs {
     /// App name in org/app format (uses linked app if not specified)
     #[arg(long)]
     pub app: Option<String>,
+
+    /// Pin the request to one instance (default: the app's general endpoint)
+    #[arg(long, value_name = "NAME")]
+    pub instance: Option<String>,
 
     /// Output format
     #[arg(long, short = 'o', default_value = "table")]
@@ -255,6 +290,10 @@ pub struct InstanceDatasetsArgs {
     /// App name in org/app format (uses linked app if not specified)
     #[arg(long)]
     pub app: Option<String>,
+
+    /// Pin the request to one instance (default: the app's general endpoint)
+    #[arg(long, value_name = "NAME")]
+    pub instance: Option<String>,
 
     /// Output format
     #[arg(long, short = 'o', default_value = "table")]
@@ -3068,6 +3107,105 @@ fn parse_window(s: &str) -> std::result::Result<String, String> {
 // Runtime inspection (data plane)
 // ============================================================================
 
+/// Header that pins a data-plane request to one instance.
+///
+/// Absent, the request goes to the app's general endpoint and is answered by
+/// the deployment as a whole.
+const TARGET_INSTANCE_HEADER: &str = "SCP-Target-Instance";
+
+/// Annotation carrying the deployment an instance belongs to.
+const DEPLOYMENT_ID_ANNOTATION: &str = "spice.ai/deployment-id";
+
+/// `GET /v1/spice_runtime` — every instance serving the app.
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct SpicepodStatusResponse {
+    #[serde(default)]
+    status: SpicepodStatus,
+}
+
+#[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
+struct SpicepodStatus {
+    #[serde(rename = "createTime", default)]
+    create_time: Option<String>,
+    #[serde(rename = "podStatuses", default)]
+    pod_statuses: Vec<InstanceStatus>,
+}
+
+/// One instance (pod) serving the app.
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct InstanceStatus {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    phase: String,
+    #[serde(rename = "startTime", default)]
+    start_time: Option<String>,
+    #[serde(rename = "spicedStatus", default)]
+    spiced_status: Option<SpicedStatus>,
+    #[serde(default)]
+    annotations: Option<std::collections::HashMap<String, String>>,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct SpicedStatus {
+    #[serde(default)]
+    health: Option<String>,
+    #[serde(default)]
+    ready: Option<bool>,
+    #[serde(default)]
+    terminating: Option<bool>,
+}
+
+impl InstanceStatus {
+    /// The deployment this instance belongs to.
+    fn deployment_id(&self) -> Option<&str> {
+        self.annotations
+            .as_ref()?
+            .get(DEPLOYMENT_ID_ANNOTATION)
+            .map(String::as_str)
+    }
+
+    /// The instance's lifecycle status.
+    ///
+    /// Mirrors the Spice Cloud portal's canonical derivation so the CLI reports
+    /// the same word for the same state. Resolution order — first match wins:
+    /// terminating, failed, deploying (spiced not reporting yet), then
+    /// ready/unhealthy, then loading. `loading` is a real phase in Spice: the
+    /// runtime loads its initial datasets before it becomes ready, and calling
+    /// that "not ready" would read as a fault.
+    fn status(&self) -> &'static str {
+        let Some(spiced) = &self.spiced_status else {
+            // A pod Kubernetes already reports as Failed is not merely starting.
+            return if self.phase == "Failed" {
+                "failed"
+            } else {
+                "deploying"
+            };
+        };
+
+        if spiced.terminating == Some(true) {
+            return "terminating";
+        }
+        if self.phase == "Failed" {
+            return "failed";
+        }
+        if spiced.ready == Some(true) {
+            return if spiced.health.as_deref() == Some("unhealthy") {
+                "unhealthy"
+            } else {
+                "ready"
+            };
+        }
+        "loading"
+    }
+
+    /// Whether this instance counts as a serving replica — ready, or ready but
+    /// reporting a degraded health check.
+    fn is_serving(&self) -> bool {
+        matches!(self.status(), "ready" | "unhealthy")
+    }
+}
+
 /// A component reported by an app instance's `/v1/status` endpoint.
 ///
 /// This endpoint reports connection endpoints only — `http`, `flight`,
@@ -3105,9 +3243,14 @@ async fn execute_instance(
     cmd: &InstanceCommands,
     flag_org: Option<&str>,
 ) -> Result<()> {
-    let (app_flag, output) = match cmd {
-        InstanceCommands::Status(args) => (args.app.as_deref(), args.output),
-        InstanceCommands::Datasets(args) => (args.app.as_deref(), args.output),
+    let (app_flag, output, pinned_instance) = match cmd {
+        InstanceCommands::List(args) => (args.app.as_deref(), args.output, None),
+        InstanceCommands::Status(args) => {
+            (args.app.as_deref(), args.output, args.instance.as_deref())
+        }
+        InstanceCommands::Datasets(args) => {
+            (args.app.as_deref(), args.output, args.instance.as_deref())
+        }
     };
 
     let target = resolve_app_target(app_flag, flag_org)?;
@@ -3146,14 +3289,34 @@ async fn execute_instance(
             )
         })?;
 
-    let runtime_ctx = RuntimeContext::with_args(
+    let mut runtime_ctx = RuntimeContext::with_args(
         None,
         Some(api_key),
         Some(&region),
         ctx.tls_root_certificate_file().map(ToString::to_string),
     )?;
 
+    // Pin to one instance only when the caller named one. Unpinned, the request
+    // reaches the app's general endpoint and answers for the deployment as a
+    // whole — which is the right default, because an app is usually several
+    // replicas and an arbitrary one is not a useful answer.
+    if let Some(instance) = pinned_instance {
+        runtime_ctx.add_headers(std::collections::HashMap::from([(
+            TARGET_INSTANCE_HEADER.to_string(),
+            instance.to_string(),
+        )]));
+    }
+
     match cmd {
+        InstanceCommands::List(_) => {
+            let runtime = fetch_instance_json::<SpicepodStatusResponse>(
+                &runtime_ctx,
+                "/v1/spice_runtime",
+                &target,
+            )
+            .await?;
+            print_instance_list(&runtime.status.pod_statuses, &target, output)
+        }
         InstanceCommands::Status(_) => {
             let components = fetch_instance_json::<Vec<InstanceComponentStatus>>(
                 &runtime_ctx,
@@ -3161,7 +3324,7 @@ async fn execute_instance(
                 &target,
             )
             .await?;
-            print_instance_status(&components, &target, output)
+            print_instance_status(&components, &target, pinned_instance, output)
         }
         InstanceCommands::Datasets(_) => {
             // `/v1/status` reports only connection endpoints (http, flight,
@@ -3173,9 +3336,59 @@ async fn execute_instance(
                 &target,
             )
             .await?;
-            print_instance_datasets(&datasets, &target, output)
+            print_instance_datasets(&datasets, &target, pinned_instance, output)
         }
     }
+}
+
+/// Name what answered a request: one pinned instance, or the app as a whole.
+///
+/// Without this an operator cannot tell whether "Ready" describes their whole
+/// deployment or one replica of several.
+fn describe_scope(target: &AppTarget, pinned_instance: Option<&str>) -> String {
+    match pinned_instance {
+        Some(instance) => format!("Instance {instance} of app {target}"),
+        None => format!("App {target}"),
+    }
+}
+
+fn print_instance_list(
+    instances: &[InstanceStatus],
+    target: &AppTarget,
+    output: OutputFormat,
+) -> Result<()> {
+    if output == OutputFormat::Json {
+        return write_json(&instances);
+    }
+
+    if instances.is_empty() {
+        println!("App {target} has no instances running.");
+        return Ok(());
+    }
+
+    let mut table = TableOutput::new(vec!["INSTANCE", "STATUS", "PHASE", "DEPLOYMENT", "STARTED"]);
+    for instance in instances {
+        table.add_row(vec![
+            instance.name.clone(),
+            instance.status().to_string(),
+            instance.phase.clone(),
+            instance.deployment_id().unwrap_or("-").to_string(),
+            instance
+                .start_time
+                .clone()
+                .unwrap_or_else(|| "-".to_string()),
+        ]);
+    }
+    table.print();
+
+    let serving = instances.iter().filter(|i| i.is_serving()).count();
+    println!();
+    println!("{serving} of {} instances serving.", instances.len());
+    if serving < instances.len() {
+        println!("  Inspect one: spice cloud instance status --app {target} --instance <name>");
+    }
+
+    Ok(())
 }
 
 /// Read a JSON document from a running app instance.
@@ -3208,6 +3421,7 @@ async fn fetch_instance_json<T: serde::de::DeserializeOwned>(
 fn print_instance_status(
     components: &[InstanceComponentStatus],
     target: &AppTarget,
+    pinned_instance: Option<&str>,
     output: OutputFormat,
 ) -> Result<()> {
     if output == OutputFormat::Json {
@@ -3215,10 +3429,14 @@ fn print_instance_status(
     }
 
     if components.is_empty() {
-        println!("App instance {target} reported no components.");
+        println!(
+            "{} reported no components.",
+            describe_scope(target, pinned_instance)
+        );
         return Ok(());
     }
 
+    println!("{}", describe_scope(target, pinned_instance));
     let mut table = TableOutput::new(vec!["COMPONENT", "STATUS", "ENDPOINT"]);
     for component in components {
         table.add_row(vec![
@@ -3251,6 +3469,7 @@ fn print_instance_status(
 fn print_instance_datasets(
     datasets: &[InstanceDatasetInfo],
     target: &AppTarget,
+    pinned_instance: Option<&str>,
     output: OutputFormat,
 ) -> Result<()> {
     if output == OutputFormat::Json {
@@ -3258,10 +3477,14 @@ fn print_instance_datasets(
     }
 
     if datasets.is_empty() {
-        println!("App instance {target} has no datasets configured.");
+        println!(
+            "{} has no datasets configured.",
+            describe_scope(target, pinned_instance)
+        );
         return Ok(());
     }
 
+    println!("{}", describe_scope(target, pinned_instance));
     let mut table = TableOutput::new(vec!["DATASET", "FROM", "STATUS", "ACCELERATED", "ERROR"]);
     for dataset in datasets {
         table.add_row(vec![
@@ -3834,6 +4057,124 @@ mod tests {
         let keys = default_credential_keys();
         assert!(keys.contains(&org::DEFAULT_TOKEN_VAR.to_string()));
         assert!(keys.contains(&org::DEFAULT_API_KEY_VAR.to_string()));
+    }
+
+    fn instance(phase: &str, spiced: Option<SpicedStatus>) -> InstanceStatus {
+        InstanceStatus {
+            name: "spicepod-app-abc-0-0".to_string(),
+            phase: phase.to_string(),
+            start_time: None,
+            spiced_status: spiced,
+            annotations: None,
+        }
+    }
+
+    fn spiced(
+        ready: Option<bool>,
+        health: Option<&str>,
+        terminating: Option<bool>,
+    ) -> SpicedStatus {
+        SpicedStatus {
+            health: health.map(ToString::to_string),
+            ready,
+            terminating,
+        }
+    }
+
+    #[test]
+    fn instance_status_matches_the_portal_resolution_order() {
+        // The portal documents this derivation as the single source of truth
+        // and warns against re-deriving it inline, because ad-hoc versions
+        // drifted and labelled the same pod state differently per surface.
+        // Terminating wins over everything, including a Failed phase.
+        assert_eq!(
+            instance("Failed", Some(spiced(Some(true), None, Some(true)))).status(),
+            "terminating"
+        );
+        assert_eq!(
+            instance("Failed", Some(spiced(Some(false), None, None))).status(),
+            "failed"
+        );
+        // spiced not reporting yet — the container is still coming up.
+        assert_eq!(instance("Pending", None).status(), "deploying");
+        // ...but a Failed pod that never reported is failed, not deploying.
+        assert_eq!(instance("Failed", None).status(), "failed");
+        assert_eq!(
+            instance("Running", Some(spiced(Some(true), Some("healthy"), None))).status(),
+            "ready"
+        );
+        assert_eq!(
+            instance("Running", Some(spiced(Some(true), Some("unhealthy"), None))).status(),
+            "unhealthy"
+        );
+        // Up but not ready is `loading`, a real phase in Spice — the runtime
+        // loads its initial datasets before becoming ready.
+        assert_eq!(
+            instance("Running", Some(spiced(Some(false), None, None))).status(),
+            "loading"
+        );
+    }
+
+    #[test]
+    fn serving_replicas_include_degraded_but_ready_instances() {
+        // A degraded instance is still taking traffic, so it counts toward the
+        // serving total; counting it as down would misreport capacity.
+        assert!(
+            instance("Running", Some(spiced(Some(true), Some("unhealthy"), None))).is_serving()
+        );
+        assert!(instance("Running", Some(spiced(Some(true), None, None))).is_serving());
+        assert!(!instance("Running", Some(spiced(Some(false), None, None))).is_serving());
+        assert!(!instance("Pending", None).is_serving());
+    }
+
+    #[test]
+    fn the_deployment_annotation_ties_an_instance_to_its_deployment() {
+        let mut with_annotation = instance("Running", None);
+        with_annotation.annotations = Some(std::collections::HashMap::from([(
+            "spice.ai/deployment-id".to_string(),
+            "4821".to_string(),
+        )]));
+        assert_eq!(with_annotation.deployment_id(), Some("4821"));
+        assert_eq!(instance("Running", None).deployment_id(), None);
+    }
+
+    #[test]
+    fn output_names_what_actually_answered() {
+        // "Ready" means something different for one replica than for a whole
+        // deployment, so the scope has to be stated either way.
+        let target = AppTarget::new(Some("spicehq".to_string()), "team-app");
+        assert_eq!(describe_scope(&target, None), "App spicehq/team-app");
+        assert_eq!(
+            describe_scope(&target, Some("spicepod-team-app-abc-0-0")),
+            "Instance spicepod-team-app-abc-0-0 of app spicehq/team-app"
+        );
+    }
+
+    #[test]
+    fn instance_listing_parses_the_runtime_payload() {
+        let body = r#"{
+            "status": {
+                "createTime": "2026-08-04T21:00:00Z",
+                "podStatuses": [
+                    {"uid":"u1","name":"spicepod-app-abc-0-0","phase":"Running","ip":"10.0.0.1","port":8090,
+                     "startTime":"2026-08-04T21:01:00Z",
+                     "spicedStatus":{"health":"healthy","ready":true},
+                     "annotations":{"spice.ai/deployment-id":"4821"}},
+                    {"uid":"u2","name":"spicepod-app-abc-0-1","phase":"Pending","ip":"","port":8090}
+                ]
+            }
+        }"#;
+
+        let parsed: SpicepodStatusResponse =
+            serde_json::from_str(body).expect("runtime payload should deserialize");
+        let instances = parsed.status.pod_statuses;
+
+        assert_eq!(instances.len(), 2);
+        assert_eq!(instances[0].status(), "ready");
+        assert_eq!(instances[0].deployment_id(), Some("4821"));
+        // The second pod omits spicedStatus entirely — it must not fail to parse.
+        assert_eq!(instances[1].status(), "deploying");
+        assert_eq!(instances.iter().filter(|i| i.is_serving()).count(), 1);
     }
 
     #[test]

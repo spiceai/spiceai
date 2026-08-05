@@ -187,7 +187,9 @@ spice cloud org use spicehq
 spice cloud deploy --app spicehq/team-app --wait --timeout 10m
 spice cloud deployments --app spicehq/team-app          # id, status, commit, error
 spice cloud inspect     --app spicehq/team-app          # app, latest deployment, pods
-spice cloud instance status   --app spicehq/team-app    # per-component readiness
+spice cloud instance list     --app spicehq/team-app    # instances + serving count
+spice cloud instance status   --app spicehq/team-app    # component readiness
+spice cloud instance status   --app spicehq/team-app --instance <name>
 spice cloud instance datasets --app spicehq/team-app    # dataset load state
 spice cloud logs --app spicehq/team-app --level error --tail 200
 ```
@@ -198,19 +200,52 @@ on a terminal failure, so it can gate a script. Statuses the CLI does not
 recognize are treated as **still running**: waiting longer is recoverable,
 declaring an in-flight deploy finished is not.
 
-`instance status` / `instance datasets` reach the app's own runtime rather than the
-management API, because the management API does not expose runtime state. The
-CLI resolves the app's region and API key through the management API and then
-calls the regional data endpoint. That means these two commands need an app API
-key to exist; `P6` below would remove that hop.
+`spice cloud instance …` reaches the app's data plane rather than the management
+API, because the management API does not expose runtime state. The CLI resolves
+the app's region and API key through the management API and then calls the
+regional data endpoint. These commands therefore need an app API key to exist;
+`P6` below would remove that hop.
 
-The two commands use **different** routes, and this matters: `/v1/status`
+### Instance targeting
+
+An app runs one or more instances (replicas), and the data endpoint
+load-balances across them. **Which instance answers is part of the question**:
+
+| Invocation | Header | Answered by |
+| ---------- | ------ | ----------- |
+| `instance status --app org/app` | none | the app's general endpoint — the deployment as a whole |
+| `instance status --app org/app --instance <name>` | `SCP-Target-Instance: <name>` | that one instance |
+
+Unpinned is the default because an arbitrary replica is not a useful answer: a
+healthy one reports Ready while a sick one beside it is why the app is down.
+Pinning is how you find the sick one. Every command prints which scope answered,
+so "Ready" is never ambiguous between one replica and the whole deployment.
+
+`spice cloud instance list` enumerates instances from `GET /v1/spice_runtime`
+(`status.podStatuses`), reporting each instance's status, phase, deployment, and
+start time, plus a serving count.
+
+Instance status uses the **same six-state vocabulary as the Spice Cloud portal**
+— `deploying`, `loading`, `ready`, `unhealthy`, `terminating`, `failed` — with
+the portal's resolution order: terminating, then failed, then deploying (spiced
+not reporting yet), then ready/unhealthy, then loading. The portal documents its
+derivation as the single source of truth and warns against re-deriving it
+inline, because ad-hoc versions drifted and labelled the same pod state
+differently per surface; `InstanceStatus::status` mirrors it deliberately and is
+covered by tests. **If the portal's rule changes, change this with it.**
+`loading` is a real phase in Spice — the runtime loads its initial datasets
+before becoming ready — so it is reported as its own state, not as "not ready".
+
+### Routes
+
+The three commands use **different** routes, and this matters: `/v1/status`
 reports connection endpoints only (`http`, `flight`, `metrics`,
 `opentelemetry`) and never datasets. Dataset state comes from
 `/v1/datasets?status=true` — the `status`, `error`, and `error_message` fields
-are populated only when that query parameter is set. Both responses are
-status-checked before deserializing, so an unauthorized or errored reply cannot
-decode to an empty list and read as "this app has no datasets."
+are populated only when that query parameter is set. Instance inventory comes
+from `/v1/spice_runtime`. All responses are status-checked before
+deserializing, so an unauthorized or errored reply cannot decode to an empty
+list and read as "this app has no datasets."
 
 ## What still depends on Cloud API work
 

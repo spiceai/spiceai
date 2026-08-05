@@ -739,6 +739,7 @@ fn apply_machine_cloud_mode(command: &mut cloud::CloudCommands) {
             cloud::OrgCommands::Clear => {}
         },
         cloud::CloudCommands::Instance(command) => match command {
+            cloud::InstanceCommands::List(args) => args.output = OutputFormat::Json,
             cloud::InstanceCommands::Status(args) => args.output = OutputFormat::Json,
             cloud::InstanceCommands::Datasets(args) => args.output = OutputFormat::Json,
         },
@@ -897,6 +898,9 @@ fn is_json_output(cmd: &Commands) -> bool {
             cloud::CloudCommands::Orgs(x) => x.output == OutputFormat::Json,
             cloud::CloudCommands::Org(cloud::OrgCommands::Use(x)) => x.output == OutputFormat::Json,
             cloud::CloudCommands::Org(cloud::OrgCommands::Current(x)) => {
+                x.output == OutputFormat::Json
+            }
+            cloud::CloudCommands::Instance(cloud::InstanceCommands::List(x)) => {
                 x.output == OutputFormat::Json
             }
             cloud::CloudCommands::Instance(cloud::InstanceCommands::Status(x)) => {
