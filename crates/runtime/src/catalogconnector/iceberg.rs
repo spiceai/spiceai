@@ -786,10 +786,10 @@ pub fn parse_hadoop_table_url(
         // nodes includes the inferred namespace, which needs to be excluded from the inferred base URI.
         //
         // `warehouse_leaves` never carries a leading `/`, so a host-less URL needs the third
-        // slash written back explicitly. Emitting `file://{leaves}` instead re-parses with the
-        // first path segment as the authority, which then silently vanishes from the path:
-        // `file:///home/u/wh/db/t` came back as `file://home/u/wh`, and every consumer that
-        // reads `.path()` off it saw `/u/wh`.
+        // slash written back explicitly. With only two, the result re-parses with the first
+        // path segment as the authority and that segment then disappears from the path:
+        // `file:///home/u/wh/db/t` would yield `file://home/u/wh`, leaving every consumer
+        // that reads `.path()` off it with `/u/wh`.
         format!("{}:///{warehouse_leaves}", parsed.scheme())
     };
 
