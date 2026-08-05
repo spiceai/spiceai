@@ -1175,31 +1175,51 @@ async fn execute_status(
     let deployments = client.list_deployments(&target, 1, None).await?;
     let latest = deployments.first();
 
-    // Instance and dataset health live on the data plane. Treat them as
-    // best-effort: a project that has never deployed has no runtime to ask, and
-    // that must read as "not deployed yet", not as a command failure.
+    // Instance and dataset health live on the data plane. A project that has
+    // never deployed has no runtime to ask, and that legitimately reads as an
+    // empty fleet. Every other failure — unreachable, unauthorized, malformed
+    // — is reported: rendering it as "no instances are running" would make the
+    // diagnosis command lie about the thing it exists to diagnose.
+    let never_deployed = latest.is_none();
+    let mut runtime_error: Option<String> = None;
+
     let (instances, datasets) =
         match project_runtime_context(ctx, &client, &target, args.instance.as_deref()).await {
             Ok(runtime_ctx) => {
-                let runtime_ctx = &runtime_ctx;
                 let instances = fetch_instance_json::<SpicepodStatusResponse>(
-                    runtime_ctx,
+                    &runtime_ctx,
                     "/v1/spice_runtime",
                     &target,
                 )
-                .await
-                .map(|response| response.status.pod_statuses)
-                .unwrap_or_default();
+                .await;
                 let datasets = fetch_instance_json::<Vec<InstanceDatasetInfo>>(
-                    runtime_ctx,
+                    &runtime_ctx,
                     "/v1/datasets?status=true",
                     &target,
                 )
-                .await
-                .unwrap_or_default();
-                (instances, datasets)
+                .await;
+
+                for failure in [instances.as_ref().err(), datasets.as_ref().err()] {
+                    if let Some(err) = failure
+                        && runtime_error.is_none()
+                    {
+                        runtime_error = Some(err.to_string());
+                    }
+                }
+
+                (
+                    instances
+                        .map(|response| response.status.pod_statuses)
+                        .unwrap_or_default(),
+                    datasets.unwrap_or_default(),
+                )
             }
-            Err(_) => (Vec::new(), Vec::new()),
+            Err(err) => {
+                if !never_deployed {
+                    runtime_error = Some(err.to_string());
+                }
+                (Vec::new(), Vec::new())
+            }
         };
 
     let unhealthy: Vec<&InstanceDatasetInfo> = datasets
@@ -1216,6 +1236,7 @@ async fn execute_status(
             "instances": instances,
             "datasets_total": datasets.len(),
             "datasets_unhealthy": unhealthy,
+            "runtime_error": runtime_error,
         }));
     }
 
@@ -1242,8 +1263,18 @@ async fn execute_status(
     }
 
     println!();
+    if let Some(err) = &runtime_error {
+        // Say the fleet is unknown rather than empty.
+        println!("Could not read instance or dataset health: {err}");
+        println!("  Instance and dataset state below may be incomplete.");
+        println!();
+    }
     if instances.is_empty() {
-        println!("No instances are running.");
+        if runtime_error.is_some() {
+            println!("Instances: unknown.");
+        } else {
+            println!("No instances are running.");
+        }
     } else {
         let mut table = TableOutput::new(vec!["INSTANCE", "STATUS", "DEPLOYMENT", "STARTED"]);
         for instance in &instances {
@@ -1320,8 +1351,12 @@ async fn execute_datasets(
 /// Written through `tracing` so `--machine` mode (which sets the filter to
 /// `off`) keeps stdout a single clean JSON document.
 fn warn_superseded(old: &str, new: &str) {
-    tracing::warn!(
-        "'spice cloud {old}' is now 'spice cloud {new}'. The old spelling still works but will be removed in a future release."
+    // Deliberately stderr, not `tracing`: this CLI's subscriber writes to
+    // stdout, so a superseded command run with `-o json` would emit this line
+    // before its JSON and break `jq` — the exact compatibility the superseded
+    // spellings exist to preserve.
+    eprintln!(
+        "warning: 'spice cloud {old}' is now 'spice cloud {new}'. The old spelling still works but will be removed in a future release."
     );
 }
 
@@ -2024,6 +2059,7 @@ fn print_post_login_help() {
 
 fn execute_logout(args: &LogoutArgs, flag_org: Option<&str>) -> Result<()> {
     let mut cleared = Vec::new();
+    let mut already_logged_out: Option<String> = None;
 
     match args.scope {
         LogoutScope::All => {
@@ -2035,26 +2071,33 @@ fn execute_logout(args: &LogoutArgs, flag_org: Option<&str>) -> Result<()> {
             remove_env_keys(&default_credential_keys())?;
             org::clear_active_org()?;
         }
-        LogoutScope::Active => {
-            match resolve_org(flag_org)? {
-                // An org with its own credential loses only that credential;
-                // the personal-org session in the same directory survives.
-                Some(org) if org::has_org_token(&org) => {
-                    if remove_env_keys(&[org::org_token_var(&org), org::org_api_key_var(&org)])? {
-                        cleared.push(org.clone());
-                    }
-                    if resolve_org(None)?.is_some_and(|active| active.eq_ignore_ascii_case(&org)) {
-                        org::clear_active_org()?;
-                    }
+        LogoutScope::Active => match resolve_org(flag_org)? {
+            // An org with its own credential loses only that credential; the
+            // personal-org session in the same directory survives.
+            Some(org) if org::has_org_token(&org) => {
+                if remove_env_keys(&[org::org_token_var(&org), org::org_api_key_var(&org)])? {
+                    cleared.push(org.clone());
                 }
-                _ => {
-                    if remove_env_keys(&default_credential_keys())? {
-                        cleared.push("default".to_string());
-                    }
+                if resolve_org(None)?.is_some_and(|active| active.eq_ignore_ascii_case(&org)) {
                     org::clear_active_org()?;
                 }
             }
-        }
+            // An org was named but holds no credential of its own. It is
+            // already logged out. Falling through to the default credentials
+            // here would destroy a *different* organization's session — the
+            // default credential belongs to whichever org minted it, and named
+            // orgs deliberately never fall back to it.
+            Some(org) => {
+                already_logged_out = Some(org);
+            }
+            // No org named: clear the default session.
+            None => {
+                if remove_env_keys(&default_credential_keys())? {
+                    cleared.push("default".to_string());
+                }
+                org::clear_active_org()?;
+            }
+        },
     }
 
     // Say exactly what was discarded. "Logged out" over a no-op would leave a
@@ -2072,9 +2115,10 @@ fn execute_logout(args: &LogoutArgs, flag_org: Option<&str>) -> Result<()> {
         (LogoutScope::Active, Some(_)) => {
             println!("\x1b[32m✓ Successfully logged out from Spice Cloud\x1b[0m");
         }
-        (LogoutScope::Active, None) => {
-            println!("\x1b[32m✓ Already logged out\x1b[0m");
-        }
+        (LogoutScope::Active, None) => match &already_logged_out {
+            Some(org) => println!("\x1b[32m✓ No stored credential for organization {org}\x1b[0m"),
+            None => println!("\x1b[32m✓ Already logged out\x1b[0m"),
+        },
     }
 
     Ok(())
@@ -2106,12 +2150,34 @@ fn remove_env_keys(keys: &[String]) -> Result<bool> {
 
     // The keychain is consulted before the env file when reading a credential,
     // so clearing only the file would leave a working credential behind.
+    //
+    // A failure here must not abort: aborting would skip the env file too and
+    // leave *more* credentials live than before. Instead keep going and report
+    // what could not be cleared, so the user knows to remove it by hand rather
+    // than believing a clean logout. `NoEntry` and an unavailable backend both
+    // mean there is nothing stored to clear — headless and containerized hosts
+    // legitimately have no keychain at all.
+    let mut keychain_failures = Vec::new();
     for key in keys {
-        if let Ok(entry) = keyring::Entry::new(key, "spice")
-            && entry.delete_credential().is_ok()
-        {
-            removed = true;
+        match keyring::Entry::new(key, "spice").map(|entry| entry.delete_credential()) {
+            Ok(Ok(())) => removed = true,
+            // Nothing stored to clear: either no entry, or no usable keychain
+            // at all — headless and containerized hosts legitimately have none.
+            Ok(Err(
+                keyring::Error::NoEntry
+                | keyring::Error::NoStorageAccess(_)
+                | keyring::Error::PlatformFailure(_),
+            ))
+            | Err(_) => {}
+            Ok(Err(err)) => keychain_failures.push(format!("{key} ({err})")),
         }
+    }
+
+    if !keychain_failures.is_empty() {
+        tracing::warn!(
+            "Could not remove {} from the keychain; remove them manually — the credential may still be usable.",
+            keychain_failures.join(", ")
+        );
     }
 
     let path = std::path::Path::new(env_file_path());
@@ -2119,23 +2185,22 @@ fn remove_env_keys(keys: &[String]) -> Result<bool> {
         return Ok(removed);
     }
 
-    let content = std::fs::read_to_string(path).unwrap_or_default();
-    let prefixes: Vec<String> = keys.iter().map(|key| format!("{key}=")).collect();
+    // Never rewrite or delete the file on a failed read. Treating an unreadable
+    // or non-UTF-8 file as empty would delete it wholesale, taking every
+    // unrelated setting with it.
+    let content = std::fs::read_to_string(path).map_err(|e| crate::error::Error::ConfigIo {
+        operation: "read",
+        path: path.to_path_buf(),
+        source: e,
+    })?;
 
-    // Drop only the lines that assign a removed key, and keep every other line
-    // byte-for-byte. Round-tripping the file through a parsed map instead would
-    // discard comments, blank lines, and ordering, collapse duplicate keys, and
-    // truncate any multi-line value (a PEM block) to its first line.
-    //
-    // Trim before matching so an indented assignment is removable — the reader
-    // trims too, and matching raw text left such a credential readable but not
-    // removable, so logout reported success while it stayed live.
+    // Keep every line that does not assign a removed key, byte-for-byte.
+    // Rebuilding the file from a parsed map instead would drop comments and
+    // blank lines, collapse duplicate keys, and truncate a multi-line value
+    // such as a PEM block to its first line.
     let mut kept: Vec<&str> = Vec::new();
     for line in content.lines() {
-        let assigns_removed_key = prefixes
-            .iter()
-            .any(|prefix| line.trim_start().starts_with(prefix.as_str()));
-        if assigns_removed_key {
+        if assigns_any(line, keys) {
             removed = true;
         } else {
             kept.push(line);
@@ -2147,7 +2212,11 @@ fn remove_env_keys(keys: &[String]) -> Result<bool> {
         .iter()
         .all(|line| line.trim().is_empty() || line.trim_start().starts_with('#'))
     {
-        let _ = std::fs::remove_file(path);
+        std::fs::remove_file(path).map_err(|e| crate::error::Error::ConfigIo {
+            operation: "delete",
+            path: path.to_path_buf(),
+            source: e,
+        })?;
         return Ok(removed);
     }
 
@@ -2162,6 +2231,20 @@ fn remove_env_keys(keys: &[String]) -> Result<bool> {
     })?;
 
     Ok(removed)
+}
+
+/// Whether an env-file line assigns one of `keys`.
+///
+/// Splits on the first `=` and trims the left side, matching how the reader
+/// parses keys. Comparing raw text instead missed the spaced `KEY = value`
+/// form the reader accepts, leaving such a credential readable but not
+/// removable — so logout reported success while it stayed live.
+fn assigns_any(line: &str, keys: &[String]) -> bool {
+    let Some((lhs, _)) = line.split_once('=') else {
+        return false;
+    };
+    let name = lhs.trim().trim_start_matches("export ").trim();
+    keys.iter().any(|key| key == name)
 }
 
 async fn execute_whoami(args: &WhoamiArgs, flag_org: Option<&str>) -> Result<()> {
@@ -4438,6 +4521,38 @@ mod tests {
         assert_eq!(short_commit(Some("abc")), "abc");
         assert_eq!(short_commit(None), "-");
         assert_eq!(short_commit(Some("")), "-");
+    }
+
+    #[test]
+    fn logout_matches_every_assignment_form_the_reader_accepts() {
+        // The reader trims around `=`, so all of these are readable
+        // credentials. Matching raw text missed the spaced forms, leaving them
+        // live while logout reported success — twice, since the first fix
+        // handled indentation but not spacing around `=`.
+        let keys = vec!["SPICE_SPICEAI_TOKEN".to_string()];
+        for line in [
+            "SPICE_SPICEAI_TOKEN=abc",
+            "  SPICE_SPICEAI_TOKEN=abc",
+            "SPICE_SPICEAI_TOKEN =abc",
+            "SPICE_SPICEAI_TOKEN = abc",
+            "\texport SPICE_SPICEAI_TOKEN=abc",
+        ] {
+            assert!(assigns_any(line, &keys), "should match: {line:?}");
+        }
+    }
+
+    #[test]
+    fn logout_does_not_match_an_unrelated_or_prefixed_key() {
+        let keys = vec!["SPICE_SPICEAI_TOKEN".to_string()];
+        for line in [
+            "DATABASE_URL=postgres://localhost/db",
+            "# SPICE_SPICEAI_TOKEN=commented-out",
+            "SPICE_SPICEAI_TOKEN_SPICEHQ=other-org",
+            "MY_SPICE_SPICEAI_TOKEN=different",
+            "no equals sign here",
+        ] {
+            assert!(!assigns_any(line, &keys), "should not match: {line:?}");
+        }
     }
 
     #[test]
