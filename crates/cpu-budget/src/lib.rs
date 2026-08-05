@@ -789,10 +789,12 @@ impl CpuBudget {
     ///
     /// The 1000x failure this cannot rule out by parsing: a surface that omits
     /// `divisor: 1m` sends `4` for a four-core request, which is a legal reading as
-    /// four millicores. The 2-core floor keeps that from starving the runtime, but
-    /// silently: on a small host the summary line reads unremarkably — two cores of
-    /// four looks like an ordinary entitlement — so without this nothing names the
-    /// cause.
+    /// four millicores. When the request rung wins, the 2-core floor keeps that from
+    /// starving the runtime, but silently: on a small host the summary line reads
+    /// unremarkably — two cores of four looks like an ordinary entitlement — so
+    /// without this nothing names the cause. Fires whichever rung won, because a
+    /// request that lost to a quota today is still wrong, and reports the resolved
+    /// entitlement rather than calling it a minimum.
     ///
     /// Phrased as a conditional, because `requests.cpu: 4m` is legal and would land
     /// here too. It names the whole-core reading so an operator who wrote that can
@@ -809,12 +811,13 @@ impl CpuBudget {
         Some(format!(
             "Declared CPU request of {request_m} seems small; if this pod requests \
              {request_as_cores} cores, {CPU_REQUEST_ENV} is missing `divisor: 1m` and is 1000x too \
-             small. Sizing for the {minimum}-core minimum. See: {DOCS_URL}",
+             small. Sized for {entitlement}. See: {DOCS_URL}",
             request_m = format_millicores(request),
             request_as_cores = request,
-            // The floor, or the host if it is smaller than the floor — either way
-            // the minimum available, so the wording holds on a 1-core host too.
-            minimum = self.cores(),
+            // The resolved value, not "the minimum": this fires on the declared
+            // request whichever rung won, and a quota or an explicit setting can
+            // outrank it. The summary line above names which one did.
+            entitlement = format_millicores(self.millicores),
         ))
     }
 
@@ -877,11 +880,12 @@ impl CpuBudget {
         self.limit_millicores
     }
 
-    /// The cgroup CPU share in millicores, when one can be read.
+    /// The cgroup CPU share as the kernel reports it — a `cpu.weight` or a
+    /// `cpu.shares`, never converted to cores — when one can be read.
     ///
-    /// Reported so an operator can see it next to the budget; it is never an
-    /// input to the detection ladder, and never compared against the budget —
-    /// see [`HostReadings::cpu_share`].
+    /// Reported so an operator can see it next to the budget; it is never an input
+    /// to the detection ladder, and its value is never interpreted — see
+    /// [`HostReadings::cpu_share`] and [`CpuShare`].
     #[must_use]
     pub const fn cpu_share(&self) -> Option<CpuShare> {
         self.cpu_share
@@ -1526,7 +1530,7 @@ mod tests {
             warning.contains("divisor"),
             "names the likely cause: {warning}"
         );
-        assert!(warning.contains("2-core minimum"), "{warning}");
+        assert!(warning.contains("Sized for 2 cores"), "{warning}");
 
         // A genuinely 1-core host gets 1, because the floor yields to a smaller
         // machine — so the "minimum" wording has to track the value, not the const.
@@ -1535,7 +1539,7 @@ mod tests {
         let on_tiny = tiny
             .core_shaped_request_warning()
             .expect("still remarked on");
-        assert!(on_tiny.contains("1-core minimum"), "{on_tiny}");
+        assert!(on_tiny.contains("Sized for 1 core"), "{on_tiny}");
 
         // This is the host size that made the warning necessary. The floor caught the
         // mistake, but two cores of four is an unremarkable-looking entitlement, so a
@@ -1558,13 +1562,16 @@ mod tests {
         assert_eq!(budget(64).core_shaped_request_warning(), None);
 
         // It fires on the value regardless of which rung won, because the declared
-        // value is suspect either way.
-        assert!(
+        // value is suspect either way — and it reports the resolved entitlement
+        // rather than calling it a minimum, which would have described a quota's
+        // 8 cores as a floor.
+        let under_quota =
             CpuBudget::resolve(&CpuConfig::default(), &quota_and_request(64, 8000, 4))
                 .expect("valid")
                 .core_shaped_request_warning()
-                .is_some()
-        );
+                .expect("a suspect request is worth naming under a quota too");
+        assert!(under_quota.contains("Sized for 8 cores"), "{under_quota}");
+        assert!(!under_quota.contains("minimum"), "{under_quota}");
     }
 
     #[test]
