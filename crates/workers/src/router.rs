@@ -373,9 +373,34 @@ mod tests {
             assert!(count_2 > count_1);
             assert!(count_4 > count_2);
 
-            // An integer approximation to check that weights are approximately correct.
-            assert!(count_2 - 2 * count_1 < n / 10);
-            assert!(count_4 - 2 * count_2 < n / 10);
+            // The draw is random and unseeded, so these bounds are noise margins
+            // rather than accuracy targets. Each count is binomial over `draws`
+            // trials, so a two-sided five-standard-deviation band fails by chance
+            // about once in 580,000 runs while still catching any real
+            // mis-weighting: the band is ±14% of the mean on the heaviest arm,
+            // widening to ±39% on the lightest, which is the one whose count is
+            // smallest and so proportionally noisiest.
+            //
+            // The bounds this replaces were one-sided (`count_4 - 2 * count_2 <
+            // n / 10` constrained the heaviest arm being over-selected but never
+            // under-selected) and, on that arm, only 2.4 standard deviations wide,
+            // so they failed roughly one run in 128 and took unrelated PRs'
+            // sign-offs down with them. See #12537.
+            let draws = f64::from(n - 1);
+            let total_weight = 7.0;
+
+            for (count, weight) in [(count_1, 1.0), (count_2, 2.0), (count_4, 4.0)] {
+                let share = weight / total_weight;
+                let expected = draws * share;
+                let deviation = (f64::from(count) - expected).abs();
+                let tolerance = 5.0 * (draws * share * (1.0 - share)).sqrt();
+
+                assert!(
+                    deviation < tolerance,
+                    "weight {weight} selected {count} times, {deviation:.1} away from the \
+                     expected {expected:.1} (tolerance {tolerance:.1})"
+                );
+            }
         }
     }
 
