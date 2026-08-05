@@ -752,6 +752,15 @@ pub fn parse_hadoop_table_url(
         .map(std::iter::Iterator::count)
         .context(UrlParseNoSourceSnafu)?;
 
+    // A Hadoop table URL has to name both a namespace and a table, so the three `count - 2` /
+    // `count - 1` offsets below are only in range from two segments up. Reject a shorter path
+    // here rather than letting the subtraction decide: in debug builds it panics with
+    // `attempt to subtract with overflow`, and in release it only produces this same error by
+    // wrapping to `usize::MAX` and relying on no iterator being able to satisfy that index.
+    if count < 2 {
+        return MissingNamespaceSnafu.fail();
+    }
+
     let table_name = parsed
         .path_segments()
         .and_then(std::iter::Iterator::last)
@@ -1212,5 +1221,43 @@ mod tests {
         let props = HashMap::new();
         let op = build_opendal_operator("ftp://my-host/path", &props);
         assert!(op.is_err(), "Unsupported scheme should fail");
+    }
+
+    /// Regression test for #12539. Each of these URLs has too few path segments to name both a
+    /// namespace and a table, so each reaches the `count - 2` offsets with `count < 2`. Before
+    /// the guard that subtraction panicked with `attempt to subtract with overflow` under
+    /// `debug_assertions` — which is every `cargo test` / `cargo nextest` run — and reached
+    /// `MissingNamespace` in release only by wrapping to `usize::MAX`, an index no iterator can
+    /// satisfy.
+    #[test]
+    fn test_parse_hadoop_table_url_rejects_short_paths() {
+        // A warehouse mounted at the filesystem root, or a namespace simply left out.
+        for url in [
+            "file:///events",
+            "file:///",
+            "s3a://my-bucket/table-with-no-namespace",
+            "s3a://my-bucket/",
+        ] {
+            let Err(err) = parse_hadoop_table_url(url, None) else {
+                panic!("{url} names no namespace and must be rejected");
+            };
+            assert!(
+                matches!(err, Error::MissingNamespace),
+                "{url} should be rejected as MissingNamespace, got: {err}"
+            );
+        }
+
+        // Supplying a warehouse URI does not rescue a short table URL: the namespace is read
+        // from the table URL before the warehouse is consulted at all.
+        let Err(err) = parse_hadoop_table_url("file:///events", Some("file:///")) else {
+            panic!("an explicit warehouse does not supply the missing namespace");
+        };
+        assert!(matches!(err, Error::MissingNamespace), "got: {err}");
+
+        // The shortest path that does name both still parses, so the guard is not off by one.
+        let (_, namespace, table_name) =
+            parse_hadoop_table_url("s3a://my-bucket/ns/tbl", None).expect("two segments parse");
+        assert_eq!(namespace.name().to_url_string().as_str(), "ns");
+        assert_eq!(table_name, "tbl");
     }
 }
