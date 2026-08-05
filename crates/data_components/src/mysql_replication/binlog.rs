@@ -156,7 +156,7 @@ pub(super) async fn open_binlog_stream(
     {
         if let Err(e) = mysql_async::prelude::Queryable::query_drop(&mut conn, sql.as_str()).await {
             if warn_on_error {
-                tracing::warn!(dataset = %dataset_name, statement = %sql, error = %e, "Failed to configure the MySQL binlog dump session: one dataset's slow apply loop can now abort the shared binlog connection, delaying changes for every changes-mode dataset on this connection. Grant the replication user permission to set session variables, or raise the source's net_write_timeout. See: https://spiceai.org/docs/components/data-connectors/mysql");
+                tracing::warn!(dataset = %dataset_name, statement = %sql, error = %e, "Failed to configure the MySQL binlog dump session: the source can still abort the shared binlog connection when one dataset's apply loop stalls, delaying changes for every changes-mode dataset on this connection. Grant the replication user permission to set session variables, or raise the source's net_write_timeout. See: https://spiceai.org/docs/components/data-connectors/mysql");
             } else {
                 tracing::debug!(dataset = %dataset_name, statement = %sql, error = %e, "failed to set a binlog dump session variable");
             }
