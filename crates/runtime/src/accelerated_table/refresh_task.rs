@@ -192,6 +192,16 @@ struct RefreshStat {
     pub memory_size: usize,
 }
 
+/// Formats memory size for log line, labeled as `uncompressed` since it
+/// is the in-memory Arrow size. Empty when the size is unknown (`0`).
+fn format_loaded_memory_size(memory_size: usize) -> String {
+    if memory_size > 0 {
+        format!(" ({} uncompressed)", util::human_readable_bytes(memory_size))
+    } else {
+        String::new()
+    }
+}
+
 /// Synchronous traversal: walks a provider chain and collects indexes from every
 /// [`IndexedTableProvider`] layer. Kept as a plain fn (not async) so that the
 /// `HashSet<*const ()>` used for dedup never appears inside an async fn and cannot
@@ -1541,11 +1551,7 @@ impl RefreshTask {
         if let Ok(elapsed) = util::humantime_elapsed(start_time) {
             let dataset_name = &self.dataset_name;
             let num_rows = util::pretty_print_number(num_rows);
-            let memory_size = if memory_size > 0 {
-                format!(" ({})", util::human_readable_bytes(memory_size))
-            } else {
-                String::new()
-            };
+            let memory_size = format_loaded_memory_size(memory_size);
 
             let component_type = self.component_type();
 
@@ -2787,6 +2793,16 @@ mod tests {
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
+    }
+
+    #[test]
+    fn format_loaded_memory_size_annotates_uncompressed() {
+        assert_eq!(format_loaded_memory_size(0), "");
+        assert_eq!(
+            format_loaded_memory_size(1024 * 1024),
+            " (1.00 MiB uncompressed)"
+        );
+        assert_eq!(format_loaded_memory_size(512), " (512.00 B uncompressed)");
     }
 
     #[test]
