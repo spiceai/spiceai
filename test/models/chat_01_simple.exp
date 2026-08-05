@@ -9,14 +9,15 @@ spawn spice chat --temperature 0
 
 proc chat {message}  {
     global timeout
+    global repl_error_re
 
     repl_send "$message\r"
 
     expect {
-        " ERROR " {
+        -re $repl_error_re {
             # allow stream to complete
             sleep 2
-            send_user "Error detected\n"
+            send_user "The REPL reported an error answering \"$message\"\n"
             exit 1
         }
         "chat> " {

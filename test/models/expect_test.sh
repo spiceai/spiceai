@@ -210,6 +210,53 @@ assert_status 0
 assert_reports 'REACHED THE END'
 assert_silent_about 'no longer running'
 
+# The error label is what tells a failed turn from an answered one, and the
+# scripts see it with its colour escapes intact.
+helper_case 'recognises the REPL error label' '
+spawn sh -c {printf "\033[31mError\033[0m Invalid HTTP response: Failed to read stream\r\n"; sleep 5}
+set timeout 5
+expect {
+    -re $repl_error_re {
+        send_user "ERROR LABEL MATCHED\n"
+        exit 0
+    }
+    eof {
+        send_user "ERROR LABEL MISSED\n"
+        exit 1
+    }
+    timeout {
+        send_user "ERROR LABEL MISSED\n"
+        exit 1
+    }
+}
+'
+assert_status 0
+assert_reports 'ERROR LABEL MATCHED'
+
+# Search results and chat answers quote issue text, which contains the word
+# "Error" often enough that matching it alone would fail healthy runs.
+helper_case 'does not treat quoted model text as an error' '
+spawn sh -c {printf "1  a1b2  Error handling is described in the docs  0.75  spice.public.issues\r\n"; sleep 3}
+set timeout 2
+expect {
+    -re $repl_error_re {
+        send_user "FALSE POSITIVE\n"
+        exit 1
+    }
+    eof {
+        send_user "QUOTED TEXT IGNORED\n"
+        exit 0
+    }
+    timeout {
+        send_user "QUOTED TEXT IGNORED\n"
+        exit 0
+    }
+}
+'
+assert_status 0
+assert_reports 'QUOTED TEXT IGNORED'
+assert_silent_about 'FALSE POSITIVE'
+
 # CI can give live model operations a longer deadline without slowing down the
 # stand-in tests, which run on the per-script defaults. Invalid values must fail
 # before a REPL is spawned.
@@ -266,6 +313,7 @@ set -u
 mode=$1
 exit_before=${SPICE_FAKE_EXIT_BEFORE_TURN:-0}
 exit_after=${SPICE_FAKE_EXIT_AFTER_TURN:-0}
+error_on=${SPICE_FAKE_ERROR_ON_TURN:-0}
 
 prompt='chat> '
 if [ "$mode" = 'search' ]; then
@@ -280,6 +328,15 @@ while IFS= read -r line; do
 
   if [ "$exit_before" -ne 0 ] && [ "$turn" -ge "$exit_before" ]; then
     exit 44
+  fi
+
+  # A turn the runtime failed: the REPL prints its error label and goes straight
+  # back to the prompt, staying alive. Nothing but the label distinguishes this
+  # from an answer.
+  if [ "$error_on" -ne 0 ] && [ "$turn" -ge "$error_on" ]; then
+    printf '\033[31mError\033[0m Invalid HTTP response: Failed to read stream: error decoding response body\r\n'
+    printf '%s' "$prompt"
+    continue
   fi
 
   if [ "$mode" = 'search' ]; then
@@ -350,6 +407,27 @@ script_case 'chat_01.exp when the REPL exits while idle' chat_01.exp \
 assert_status 1
 assert_reports 'Checking the chat REPL is still running'
 assert_reports 'exited with status 44'
+
+# A turn the runtime failed. The REPL prints its error label and returns to the
+# prompt, so a script that waits only for the prompt reports the failure as an
+# answer and exits 0.
+script_case 'chat_01.exp when the model errors' chat_01.exp \
+  SPICE_FAKE_ERROR_ON_TURN=1
+assert_status 1
+assert_reports 'The REPL reported an error listing the datasets'
+assert_silent_about 'Model confirmed access to all datasets'
+
+script_case 'chat_01_simple.exp when the model errors' chat_01_simple.exp \
+  SPICE_FAKE_ERROR_ON_TURN=1
+assert_status 1
+assert_reports 'The REPL reported an error answering'
+assert_silent_about 'Model returned expected response'
+
+script_case 'search_01.exp when the search errors' search_01.exp \
+  SPICE_FAKE_ERROR_ON_TURN=1
+assert_status 1
+assert_reports 'The REPL reported an error searching for "Spice runtime error"'
+assert_silent_about 'Search returned expected result'
 
 if [ "$failures" -ne 0 ]; then
   printf '\n%s check(s) failed\n' "$failures"

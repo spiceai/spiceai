@@ -11,6 +11,18 @@
 # Every `expect` block in these scripts therefore needs an `eof` branch calling
 # `repl_died`, and every `send` goes through `repl_send`.
 
+# Matches the label the REPL prints when a turn fails: a red "Error", then the
+# message — `\033[31mError\033[0m Invalid HTTP response: ...`.
+#
+# The escape sequence is part of the pattern on purpose. A turn that fails still
+# returns to the prompt, so a script watching only for the prompt reports the
+# failed turn as a successful one; but matching the bare word would misread the
+# model's own output, which quotes issue text and search results that contain
+# "Error". The label is what distinguishes the REPL's own diagnostics from
+# anything it is relaying, and expect always drives the REPL over a pty, so the
+# colour is always present.
+set repl_error_re {\x1b\[31mError}
+
 # Returns the configured response timeout, or the script-specific default.
 proc repl_timeout {default_timeout} {
     if {![info exists ::env(SPICE_REPL_TIMEOUT_SECONDS)]} {

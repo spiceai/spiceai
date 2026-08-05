@@ -9,6 +9,7 @@ spawn spice chat --temperature 0
 
 proc verify_datasets_access {} {
     global timeout
+    global repl_error_re
 
     set taxi_trips_available 0
     set gh_issues_available 0
@@ -29,10 +30,10 @@ proc verify_datasets_access {} {
             set catalog_page_available 1
             exp_continue
         }
-        " ERROR " {
+        -re $repl_error_re {
             # allow stream to complete
             sleep 2
-            send_user "Error detected\n"
+            send_user "The REPL reported an error listing the datasets\n"
             exit 1
         }
         "chat> " {
@@ -57,14 +58,15 @@ proc verify_datasets_access {} {
 
 proc verify_num_issues {} {
     global timeout
+    global repl_error_re
 
     repl_send "How many issues stored in database?\r"
 
     expect {
-        " ERROR " {
+        -re $repl_error_re {
             # allow stream to complete
             sleep 2
-            send_user "Error detected\n"
+            send_user "The REPL reported an error counting the issues\n"
             exit 1
         }
         "chat> " {
@@ -84,6 +86,7 @@ proc verify_num_issues {} {
 
 proc verify_catalog_page {} {
     global timeout
+    global repl_error_re
 
     set original_timeout $timeout
     set timeout 60
@@ -91,10 +94,10 @@ proc verify_catalog_page {} {
     repl_send "find top 3 exclusive deals in catalog pages. Respond with a short bullet list.\r"
 
     expect {
-        " ERROR " {
+        -re $repl_error_re {
             # allow stream to complete
             sleep 2
-            send_user "Error detected\n"
+            send_user "The REPL reported an error finding the catalog page deals\n"
             exit 1
         }
         "chat> " {

@@ -9,6 +9,7 @@ spawn spice search
 
 proc perform_search {search_term expected_term} {
     global timeout
+    global repl_error_re
 
     repl_send "$search_term\r"
 
@@ -18,11 +19,11 @@ proc perform_search {search_term expected_term} {
             sleep 2
             send_user "Search returned expected result\n"
         }
-        # if there is ERROR message before the expected term, then search failed
-        " ERROR " {
+        # An error reported before the expected result means the search failed.
+        -re $repl_error_re {
             # allow stream to complete
             sleep 2
-            send_user "Error detected\n"
+            send_user "The REPL reported an error searching for \"$search_term\"\n"
             exit 1
         }
         eof {
