@@ -17,7 +17,7 @@ limitations under the License.
 //! Error types for the Spice CLI.
 
 use reqwest::StatusCode;
-use snafu::{IntoError, Snafu};
+use snafu::Snafu;
 use std::path::PathBuf;
 
 /// Result type alias for the Spice CLI.
@@ -219,10 +219,10 @@ pub async fn read_response(
     match response.text().await {
         Ok(body) => Ok((status, body)),
         Err(_) if !status.is_success() => Ok((status, String::new())),
-        Err(source) => Err(ResponseIncompleteSnafu {
+        Err(source) => Err(Error::ResponseIncomplete {
             endpoint: endpoint.to_string(),
-        }
-        .into_error(source)),
+            source,
+        }),
     }
 }
 

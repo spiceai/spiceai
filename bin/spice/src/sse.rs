@@ -38,6 +38,14 @@ limitations under the License.
 //! Dispatch follows the standard too: a blank line ends an event only if a `data` field was
 //! seen. A frame carrying just `event: ping` is *not* an event — dispatching one would tell
 //! the caller the stream is producing when it is not.
+//!
+//! `eventsource-stream` is already in this binary's dependency tree (through `async-openai`)
+//! and covers the framing above. It is not used here because it yields whole events and
+//! nothing else, and the three things this decoder is for all live outside that: the caller
+//! needs to know a `data` line arrived *before* its event ends, to tell a large event still
+//! being received from a stalled stream; it needs the event a server left unterminated when
+//! it closed, which that crate drops; and it needs a bound on how much one unterminated event
+//! may buffer, which that crate does not impose.
 
 /// The most bytes one event may occupy before the decoder refuses to keep buffering.
 ///
@@ -47,19 +55,12 @@ limitations under the License.
 pub(crate) const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
 
 /// One dispatched SSE event.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct SseEvent {
     /// The `event:` field, when the stream set one.
     pub(crate) name: Option<String>,
     /// The `data:` fields, joined with newlines as the standard specifies.
     pub(crate) data: String,
-}
-
-/// An event grew past [`MAX_EVENT_BYTES`] without being terminated.
-#[derive(Debug)]
-pub(crate) struct OversizedEvent {
-    /// How many bytes had accumulated when the decoder gave up.
-    pub(crate) bytes: usize,
 }
 
 /// Reassembles [`SseEvent`]s from a byte stream delivered in arbitrary pieces.
@@ -122,14 +123,14 @@ impl SseDecoder {
         self.at_eof = true;
     }
 
-    /// Whether one unterminated event has grown past [`MAX_EVENT_BYTES`].
+    /// How many bytes one unterminated event has grown to, once past [`MAX_EVENT_BYTES`].
     ///
     /// Ask this only after draining with [`SseDecoder::next_event`]: before that the buffer
     /// also holds whole events waiting to be read, and one transport read may carry many of
     /// them. The limit is on an event the stream never ends, not on how much arrives at once.
-    pub(crate) fn oversized(&self) -> Option<OversizedEvent> {
+    pub(crate) fn oversized_bytes(&self) -> Option<usize> {
         let buffered = self.unread().len() + self.data.len();
-        (buffered > MAX_EVENT_BYTES).then_some(OversizedEvent { bytes: buffered })
+        (buffered > MAX_EVENT_BYTES).then_some(buffered)
     }
 
     /// How many `data` fields have been read so far.
@@ -295,7 +296,7 @@ mod tests {
                 events.push(event);
             }
             assert!(
-                decoder.oversized().is_none(),
+                decoder.oversized_bytes().is_none(),
                 "test payloads are far below the size cap"
             );
         }
@@ -448,7 +449,7 @@ mod tests {
         let mut decoder = SseDecoder::new();
         let mut pushed = 0usize;
 
-        while decoder.oversized().is_none() {
+        while decoder.oversized_bytes().is_none() {
             let chunk = vec![b'x'; 1024 * 1024];
             decoder.push(&chunk);
             pushed += chunk.len();
@@ -458,8 +459,10 @@ mod tests {
             );
         }
 
-        let oversized = decoder.oversized().expect("the loop ended on the cap");
-        assert!(oversized.bytes > MAX_EVENT_BYTES);
+        let buffered = decoder
+            .oversized_bytes()
+            .expect("the loop ended on the cap");
+        assert!(buffered > MAX_EVENT_BYTES);
     }
 
     /// The cap bounds one unterminated event, not one transport read. A read that happens to
@@ -480,7 +483,7 @@ mod tests {
 
         assert_eq!(dispatched, repeats);
         assert!(
-            decoder.oversized().is_none(),
+            decoder.oversized_bytes().is_none(),
             "every event was terminated, so nothing is over the cap"
         );
     }

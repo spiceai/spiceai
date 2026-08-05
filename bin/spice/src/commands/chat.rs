@@ -149,11 +149,15 @@ struct NestedStreamError {
 }
 
 impl StreamErrorPayload {
-    /// The most specific message the payload carries.
-    fn message(&self) -> Option<&str> {
-        self.message
+    /// The reason `data` gives for the stream failing, if it reads as a failure and gives one.
+    fn reason_in(data: &str) -> Option<String> {
+        let payload = serde_json::from_str::<Self>(data).ok()?;
+        let message = payload
+            .message
             .as_deref()
-            .or_else(|| self.error.as_ref()?.message.as_deref())
+            .or_else(|| payload.error.as_ref()?.message.as_deref())?;
+
+        Some(message.to_string())
     }
 }
 
@@ -625,13 +629,7 @@ async fn send_chat_streaming(
             // one event's worth of bytes buffered here, and dropping it would lose the tail
             // of the answer.
             decoder.close();
-            while let Some(event) = decoder.next_event() {
-                if apply_event(&event, &url, emit_tokens, start_time, &mut state).await?
-                    == EventOutcome::Stop
-                {
-                    break;
-                }
-            }
+            drain_events(&mut decoder, &url, emit_tokens, start_time, &mut state).await?;
             break 'stream;
         };
 
@@ -645,12 +643,10 @@ async fn send_chat_streaming(
         let data_before = decoder.data_fields_seen();
         decoder.push(&chunk);
 
-        while let Some(event) = decoder.next_event() {
-            if apply_event(&event, &url, emit_tokens, start_time, &mut state).await?
-                == EventOutcome::Stop
-            {
-                break 'stream;
-            }
+        if drain_events(&mut decoder, &url, emit_tokens, start_time, &mut state).await?
+            == EventOutcome::Stop
+        {
+            break 'stream;
         }
 
         // Progress is a `data` line arriving, not an event completing: a large event spread
@@ -662,12 +658,11 @@ async fn send_chat_streaming(
 
         // Asked after draining, so the cap bounds one event the stream never ends rather
         // than however many whole events happened to arrive in a single read.
-        if let Some(oversized) = decoder.oversized() {
+        if let Some(buffered) = decoder.oversized_bytes() {
             state.stop_spinner().await;
             return Err(InvalidResponseSnafu {
                 message: format!(
-                    "The model at {url} sent {} bytes of a single response event without ending it. Check the runtime's logs for the model, then retry. See: https://spiceai.org/docs/components/models",
-                    oversized.bytes
+                    "The model at {url} sent {buffered} bytes of a single response event without ending it. Check the runtime's logs for the model, then retry. See: https://spiceai.org/docs/components/models"
                 ),
             }
             .build());
@@ -684,8 +679,25 @@ async fn send_chat_streaming(
     })
 }
 
+/// Read every event the decoder has ready, stopping early if one ends the stream.
+async fn drain_events(
+    decoder: &mut SseDecoder,
+    url: &str,
+    emit_tokens: bool,
+    start_time: Instant,
+    state: &mut StreamState,
+) -> Result<EventOutcome> {
+    while let Some(event) = decoder.next_event() {
+        if apply_event(&event, url, emit_tokens, start_time, state).await? == EventOutcome::Stop {
+            return Ok(EventOutcome::Stop);
+        }
+    }
+
+    Ok(EventOutcome::Continue)
+}
+
 /// What the stream should do once an event has been read.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 enum EventOutcome {
     /// Keep reading.
     Continue,
@@ -726,9 +738,7 @@ async fn apply_event(
     // parses as nothing, which is how it used to disappear.
     if event.name.as_deref() == Some("error") {
         state.stop_spinner().await;
-        let detail = serde_json::from_str::<StreamErrorPayload>(&event.data)
-            .ok()
-            .and_then(|payload| payload.message().map(ToOwned::to_owned))
+        let detail = StreamErrorPayload::reason_in(&event.data)
             .unwrap_or_else(|| "the server did not say why".to_string());
 
         return Err(InvalidResponseSnafu {
@@ -756,13 +766,10 @@ async fn apply_event(
 
         // An OpenAI-compatible server reports a failure in an unnamed event instead, so the
         // payload gets one more reading before this is called unintelligible.
-        let detail = serde_json::from_str::<StreamErrorPayload>(&event.data)
-            .ok()
-            .and_then(|payload| payload.message().map(ToOwned::to_owned))
-            .map_or_else(
-                || "the response could not be read".to_string(),
-                |message| format!("the model reported: {message}"),
-            );
+        let detail = StreamErrorPayload::reason_in(&event.data).map_or_else(
+            || "the response could not be read".to_string(),
+            |message| format!("the model reported: {message}"),
+        );
 
         return Err(InvalidResponseSnafu {
             message: format!(
@@ -826,6 +833,32 @@ mod tests {
         }
     }
 
+    /// One SSE event carrying `text` as a content delta — the shape of every chunk a chat
+    /// completion stream sends.
+    fn content_event(text: &str) -> String {
+        format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}}}}]}}\n\n")
+    }
+
+    /// One SSE event carrying `payload` verbatim, for the events that are not content.
+    fn raw_event(payload: &str) -> String {
+        format!("data: {payload}\n\n")
+    }
+
+    /// A context whose deadlines are generous enough that only the response itself ends the
+    /// read — most of these tests are about what is read, not about when reading stops.
+    fn unhurried_context(url: &str) -> RuntimeContext {
+        RuntimeContext::with_deadlines_for_test(
+            url,
+            Deadline::Total(Duration::from_secs(30)),
+            Deadline::Silence(Duration::from_secs(30)),
+        )
+    }
+
+    async fn stream_from(server: &SlowServer) -> Result<ChatResponse> {
+        let ctx = unhurried_context(server.url());
+        send_chat_streaming(&ctx, &test_chat_config(), &one_shot_prompt(), false, false).await
+    }
+
     /// A streamed answer that keeps arriving must not be cut off for taking longer than the
     /// control-plane deadline — the failure reported in
     /// <https://github.com/spiceai/spiceai/issues/12583>.
@@ -835,9 +868,8 @@ mod tests {
     #[tokio::test]
     async fn a_streamed_answer_outlives_the_control_plane_deadline() {
         let control_plane = Duration::from_millis(400);
-        let chunk = r#"data: {"choices":[{"delta":{"content":"token "}}]}"#.to_string();
         let server = SlowServer::dribbling(
-            std::iter::repeat_n(format!("{chunk}\n\n"), 8).collect(),
+            std::iter::repeat_n(content_event("token "), 8).collect(),
             control_plane / 4,
         );
 
@@ -893,25 +925,13 @@ mod tests {
     /// looking hung after it already has the whole answer.
     #[tokio::test]
     async fn a_completed_answer_does_not_wait_for_the_server_to_hang_up() {
-        let mut chunks: Vec<String> = std::iter::repeat_n(
-            format!(
-                "{}\n\n",
-                r#"data: {"choices":[{"delta":{"content":"token "}}]}"#
-            ),
-            3,
-        )
-        .collect();
-        chunks.push("data: [DONE]\n\n".to_string());
+        let mut chunks: Vec<String> = std::iter::repeat_n(content_event("token "), 3).collect();
+        chunks.push(raw_event("[DONE]"));
 
         // The connection stays open after `[DONE]`, so only the terminator can end the read.
         let server = SlowServer::dribbling_then_holding(chunks, Duration::from_millis(20));
 
-        let ctx = RuntimeContext::with_deadlines_for_test(
-            server.url(),
-            Deadline::Total(Duration::from_secs(30)),
-            Deadline::Silence(Duration::from_secs(30)),
-        );
-
+        let ctx = unhurried_context(server.url());
         let config = test_chat_config();
         let messages = one_shot_prompt();
 
@@ -981,31 +1001,13 @@ mod tests {
         );
     }
 
-    /// A context whose deadlines are generous enough that only the response itself ends the
-    /// read — every test below is about what is read, not about when reading stops.
-    fn unhurried_context(url: &str) -> RuntimeContext {
-        RuntimeContext::with_deadlines_for_test(
-            url,
-            Deadline::Total(Duration::from_secs(30)),
-            Deadline::Silence(Duration::from_secs(30)),
-        )
-    }
-
-    async fn stream_from(server: &SlowServer) -> Result<ChatResponse> {
-        let ctx = unhurried_context(server.url());
-        send_chat_streaming(&ctx, &test_chat_config(), &one_shot_prompt(), false, false).await
-    }
-
     /// An SSE event is not obliged to arrive in one read. Splitting one mid-payload used to
     /// lose it entirely — the leading fragment is truncated JSON and the trailing one has no
     /// `data:` prefix, so both were discarded without a word. That is
     /// <https://github.com/spiceai/spiceai/issues/12588>.
     #[tokio::test]
     async fn an_event_split_across_two_reads_is_not_dropped() {
-        let event = format!(
-            "{}\n\n",
-            r#"data: {"choices":[{"delta":{"content":"whole"}}]}"#
-        );
+        let event = content_event("whole");
         let split = event.len() / 2;
         let server = SlowServer::dribbling(
             vec![event[..split].to_string(), event[split..].to_string()],
@@ -1023,23 +1025,14 @@ mod tests {
     /// dropped only the split event would still pass the test above if it were the sole event.
     #[tokio::test]
     async fn tokens_either_side_of_a_split_event_keep_their_order() {
-        let split_event = format!(
-            "{}\n\n",
-            r#"data: {"choices":[{"delta":{"content":"middle "}}]}"#
-        );
+        let split_event = content_event("middle ");
         let split = split_event.len() / 2;
         let server = SlowServer::dribbling(
             vec![
-                format!(
-                    "{}\n\n",
-                    r#"data: {"choices":[{"delta":{"content":"first "}}]}"#
-                ),
+                content_event("first "),
                 split_event[..split].to_string(),
                 split_event[split..].to_string(),
-                format!(
-                    "{}\n\n",
-                    r#"data: {"choices":[{"delta":{"content":"last"}}]}"#
-                ),
+                content_event("last"),
             ],
             Duration::from_millis(5),
         );
@@ -1055,10 +1048,7 @@ mod tests {
     /// on its own replaces both halves with U+FFFD, corrupting the answer silently.
     #[tokio::test]
     async fn a_character_split_across_two_reads_is_not_corrupted() {
-        let event = format!(
-            "{}\n\n",
-            r#"data: {"choices":[{"delta":{"content":"café"}}]}"#
-        );
+        let event = content_event("café");
         // Between the two bytes of `é`, which is the last character before the closing quote.
         let split = event
             .find('é')
@@ -1089,15 +1079,9 @@ mod tests {
     async fn an_error_event_ends_the_stream_rather_than_truncating_the_answer() {
         let server = SlowServer::dribbling(
             vec![
-                format!(
-                    "{}\n\n",
-                    r#"data: {"choices":[{"delta":{"content":"partial"}}]}"#
-                ),
-                format!(
-                    "{}\n\n",
-                    r#"event: error
-data: {"type":"error","message":"the model ran out of context"}"#
-                ),
+                content_event("partial"),
+                "event: error\ndata: {\"type\":\"error\",\"message\":\"the model ran out of context\"}\n\n"
+                    .to_string(),
             ],
             Duration::from_millis(5),
         );
@@ -1129,10 +1113,7 @@ data: {"type":"error","message":"the model ran out of context"}"#
     #[tokio::test]
     async fn an_unnamed_error_payload_is_reported_with_its_reason() {
         let server = SlowServer::dribbling(
-            vec![format!(
-                "{}\n\n",
-                r#"data: {"error":{"message":"upstream rate limit"}}"#
-            )],
+            vec![raw_event(r#"{"error":{"message":"upstream rate limit"}}"#)],
             Duration::from_millis(5),
         );
 
@@ -1152,13 +1133,7 @@ data: {"type":"error","message":"the model ran out of context"}"#
     #[tokio::test]
     async fn an_event_with_no_payload_does_not_end_the_stream() {
         let server = SlowServer::dribbling(
-            vec![
-                "data: \n\n".to_string(),
-                format!(
-                    "{}\n\n",
-                    r#"data: {"choices":[{"delta":{"content":"answer"}}]}"#
-                ),
-            ],
+            vec!["data: \n\n".to_string(), content_event("answer")],
             Duration::from_millis(5),
         );
 
@@ -1177,18 +1152,11 @@ data: {"type":"error","message":"the model ran out of context"}"#
     async fn an_annotation_choice_without_a_delta_does_not_stop_the_stream() {
         let server = SlowServer::dribbling(
             vec![
-                format!(
-                    "{}\n\n",
-                    r#"data: {"choices":[{"delta":{"content":"before "}}]}"#
+                content_event("before "),
+                raw_event(
+                    r#"{"choices":[{"index":0,"finish_reason":null,"content_filter_results":{},"content_filter_offsets":{"check_offset":44,"start_offset":44,"end_offset":198}}],"usage":null}"#,
                 ),
-                format!(
-                    "{}\n\n",
-                    r#"data: {"choices":[{"index":0,"finish_reason":null,"content_filter_results":{},"content_filter_offsets":{"check_offset":44,"start_offset":44,"end_offset":198}}],"usage":null}"#
-                ),
-                format!(
-                    "{}\n\n",
-                    r#"data: {"choices":[{"delta":{"content":"after"}}]}"#
-                ),
+                content_event("after"),
             ],
             Duration::from_millis(5),
         );
@@ -1235,7 +1203,7 @@ data: {"type":"error","message":"the model ran out of context"}"#
     #[tokio::test]
     async fn a_final_event_without_its_terminator_is_still_read() {
         let server = SlowServer::dribbling(
-            vec![r#"data: {"choices":[{"delta":{"content":"tail"}}]}"#.to_string()],
+            vec![content_event("tail").trim_end().to_string()],
             Duration::from_millis(5),
         );
 

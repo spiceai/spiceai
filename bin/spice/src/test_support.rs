@@ -75,7 +75,7 @@ impl SlowServer {
     /// The response is therefore never quiet for longer than `gap`, but takes
     /// `gap * chunks.len()` in total — the shape that separates the two deadlines.
     pub(crate) fn dribbling(chunks: Vec<String>, gap: Duration) -> Self {
-        Self::dribbling_bytes(chunks.into_iter().map(String::into_bytes).collect(), gap)
+        Self::dribble(chunks, gap, Ending::Close)
     }
 
     /// As [`SlowServer::dribbling`], but with chunks that need not each be valid UTF-8 — the
@@ -88,24 +88,24 @@ impl SlowServer {
         })
     }
 
-    /// As [`SlowServer::dribbling`], but hold the connection open once the chunks are sent
-    /// rather than closing it — a server under no obligation to hang up promptly.
-    pub(crate) fn dribbling_then_holding(chunks: Vec<String>, gap: Duration) -> Self {
+    fn dribble(chunks: Vec<String>, gap: Duration, ending: Ending) -> Self {
         Self::start(Behaviour::Dribble {
             chunks: chunks.into_iter().map(String::into_bytes).collect(),
             gap,
-            ending: Ending::Hold,
+            ending,
         })
+    }
+
+    /// As [`SlowServer::dribbling`], but hold the connection open once the chunks are sent
+    /// rather than closing it — a server under no obligation to hang up promptly.
+    pub(crate) fn dribbling_then_holding(chunks: Vec<String>, gap: Duration) -> Self {
+        Self::dribble(chunks, gap, Ending::Hold)
     }
 
     /// Send `chunks` and then hang up without ending the chunked body, so the client's read
     /// of an otherwise-successful response fails part-way through.
     pub(crate) fn truncating(chunks: Vec<String>, gap: Duration) -> Self {
-        Self::start(Behaviour::Dribble {
-            chunks: chunks.into_iter().map(String::into_bytes).collect(),
-            gap,
-            ending: Ending::Truncate,
-        })
+        Self::dribble(chunks, gap, Ending::Truncate)
     }
 
     /// Answer each request with a response head and then silence, so a deadline is exercised
