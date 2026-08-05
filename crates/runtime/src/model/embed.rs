@@ -16,7 +16,6 @@ limitations under the License.
 #![allow(clippy::implicit_hasher)]
 
 use crate::embeddings::params as embedding_params;
-use crate::parameters::typed::TypedParams;
 use crate::token_providers::databricks::{DatabricksM2MTokenProvider, DatabricksU2MTokenProvider};
 use bytes::Bytes;
 use cache::CacheProvider;
@@ -32,6 +31,7 @@ use llms::bedrock::{
         nova::NovaTruncationMode,
     },
 };
+use runtime_parameters_typed::TypedParams;
 use runtime_secrets::{Secrets, get_params_with_secrets};
 
 use object_store::ObjectStoreExt;
@@ -64,7 +64,7 @@ pub type EmbeddingModelStore = HashMap<String, Arc<dyn Embed>>;
 
 /// Wraps a typed-params deserialization failure the same way `Parameters`
 /// errors were surfaced for embeddings.
-fn params_err(e: crate::parameters::typed::ParamsError) -> EmbedError {
+fn params_err(e: runtime_parameters_typed::ParamsError) -> EmbedError {
     EmbedError::FailedToInstantiateEmbeddingModel {
         source: Box::new(e),
     }
