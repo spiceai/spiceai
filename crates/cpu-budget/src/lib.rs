@@ -396,13 +396,16 @@ const REQUEST_DERIVED_FLOOR_MILLICORES: u64 = 2000;
 /// Below this fraction of what the host reports, a request-derived entitlement
 /// is worth saying out loud — see [`CpuBudget::sizing_notice`].
 ///
-/// A judgement call rather than a tuned number: quiet for a pod sized within
-/// shouting distance of its host, loud for one sized an order of magnitude below
-/// it. A `100m` request on a 64-core host lands at 1/32 and speaks up; a 4-core
-/// request on an 18-core host lands at 4/9 and stays quiet.
+/// A judgement call rather than a tuned number, and deliberately not a quarter.
+/// The recommended shape — a CPU request with no limit — lands at exactly
+/// `factor / cores_on_the_node`, so a 4-core request on a 64-core host derives
+/// 1/8 of it. Warning there would fire on the configuration this enhancement
+/// tells operators to adopt, on every restart, with nothing to fix. An eighth
+/// keeps that quiet while still speaking up for the order-of-magnitude case a
+/// `100m` request produces: 2 cores of 64 is 1/32, and 2 of 18 is 1/9.
 const SIZING_NOTICE_NUM: u64 = 1;
 /// Denominator of [`SIZING_NOTICE_NUM`].
-const SIZING_NOTICE_DEN: u64 = 4;
+const SIZING_NOTICE_DEN: u64 = 8;
 
 /// The process-wide CPU entitlement and every sizing decision derived from it.
 #[derive(Debug, Clone)]
@@ -795,7 +798,8 @@ impl CpuBudget {
             "CPU budget: {entitlement}, derived from this pod's CPU request of {request} (x{factor}), \
              on a host reporting {detected} cores - query fan-out is {partitions} partitions. If \
              this pod is packed alongside others and should burst across the whole machine, set \
-             {spicepod}: all. Set {spicepod} explicitly to silence this. See: {DOCS_URL}",
+             {spicepod}: all. If {entitlement} is the intended size, set {spicepod} to it and this \
+             stops being reported. See: {DOCS_URL}",
             entitlement = format_millicores(self.millicores),
             request = format_millicores(request),
             factor = CPU_REQUEST_BURST_FACTOR,
@@ -1472,6 +1476,46 @@ mod tests {
         );
     }
 
+    /// `all` is the escape hatch that preserves the behaviour this rung changes:
+    /// a pod with `requests.cpu` and no `limits.cpu` sizing for its whole node.
+    ///
+    /// Pinned against the exact values the pre-rung default produced, so the
+    /// opt-out cannot quietly stop being a faithful one. An operator upgrading
+    /// into the new default has this available as a one-line revert.
+    #[test]
+    fn all_preserves_the_pre_change_whole_node_sizing() {
+        let burstable = request_only(64, 4000);
+
+        // What this rung now does by default.
+        let derived = CpuBudget::resolve(&CpuConfig::default(), &burstable).expect("valid");
+        assert_eq!(derived.source(), CpuSource::RequestBurst);
+        assert_eq!(derived.cores(), 8);
+
+        // What every release before the rung did, recovered by one setting.
+        let preserved =
+            CpuBudget::resolve(&CpuConfig::from_sources(None, None, Some("all")), &burstable)
+                .expect("valid");
+        assert_eq!(preserved.cores(), 64, "the node, exactly as before");
+        assert_eq!(preserved.target_partitions(), 64);
+        assert_eq!(preserved.main_runtime_worker_threads(), 64);
+        assert_eq!(preserved.dedicated_runtime_worker_threads(), 63);
+        assert_eq!(preserved.source(), CpuSource::AllCores);
+
+        // Every derived quantity matches what the same host produces with no
+        // request declared at all — which is what the old behaviour *was*.
+        let as_if_undeclared = CpuBudget::resolve(&CpuConfig::default(), &host(64)).expect("valid");
+        assert_eq!(
+            preserved.derived_sizing(),
+            as_if_undeclared.derived_sizing(),
+            "`all` must reproduce the pre-rung sizing in full, not just the core count"
+        );
+
+        // And it stays silent: an operator who has stated the intent is not told
+        // about it on every restart.
+        assert_eq!(preserved.sizing_notice(), None);
+        assert_eq!(preserved.request_shortfall_warning(), None);
+    }
+
     /// The sizing notice speaks for a pod sized an order of magnitude below its
     /// host and stays quiet otherwise, and any explicit setting silences it by
     /// never reaching the rung.
@@ -1497,6 +1541,25 @@ mod tests {
                 .expect("valid")
                 .sizing_notice(),
             None
+        );
+
+        // The recommended shape on a large node — a 4-core request, no limit —
+        // derives exactly an eighth of it. That is the configuration this change
+        // tells operators to adopt, so it must not warn about itself.
+        let recommended =
+            CpuBudget::resolve(&CpuConfig::default(), &request_only(64, 4000)).expect("valid");
+        assert_eq!(recommended.cores(), 8);
+        assert_eq!(
+            recommended.sizing_notice(),
+            None,
+            "the recommended configuration must not warn on every restart"
+        );
+        // One millicore less crosses the line.
+        assert!(
+            CpuBudget::resolve(&CpuConfig::default(), &request_only(64, 3999))
+                .expect("valid")
+                .sizing_notice()
+                .is_some()
         );
 
         // Any explicit setting silences it, including `all`.
