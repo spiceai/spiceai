@@ -1205,6 +1205,35 @@ fn concurrent_cold() -> Workload {
     }
 }
 
+// --- Harness ---
+
+/// The workloads below plan deeply enough that some need more stack than the
+/// 2 MiB std gives a thread, so `test_with_backends!` runs every body on a
+/// `common::TEST_STACK_SIZE` thread. Assert that headroom directly: it is a
+/// property of the harness, not of any one workload, and without a test of its
+/// own a harness change that dropped it would surface as an unrelated
+/// workload's process aborting on whichever backend happens to plan deepest.
+///
+/// Touches 4 MiB — twice the std default, a quarter of what the harness
+/// reserves — so it overflows without the harness and clears it with room to
+/// spare.
+async fn prop_harness_stack_headroom_impl(_f: TestFixture) -> TestResult<()> {
+    /// 64 KiB per frame, kept out of the caller's frame by `inline(never)` and
+    /// out of the optimizer's reach by `black_box`.
+    #[inline(never)]
+    fn descend(frames: u32) {
+        let mut frame = [0u8; 64 * 1024];
+        std::hint::black_box(&mut frame);
+        if frames > 0 {
+            descend(frames - 1);
+        }
+    }
+
+    descend(63);
+    Ok(())
+}
+test_with_backends!(prop_harness_stack_headroom_impl);
+
 // --- Sequential convergence (GREEN) ---
 async fn prop_sequential_key_impl(f: TestFixture) -> TestResult<()> {
     run_workload(f, sequential(Mode::Key)).await
