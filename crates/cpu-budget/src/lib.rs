@@ -327,11 +327,19 @@ impl HostReadings {
 /// takes the Kubernetes quantity grammar, where a bare `4` means four *cores*,
 /// and the two variables sit one concept apart — so a shared name with unstated
 /// units would put a 1000x difference behind two indistinguishable values.
-/// `divisor: 1` would have avoided that by sending whole cores, but it rounds
-/// up, and this value is *reported*: a `100m` request would arrive as `1` and be
+/// `divisor: 1` would have avoided that by sending whole cores, but it rounds up,
+/// and this value is *reported*: a `100m` request would arrive as `1` and be
 /// logged as one core, misstating by 10x the exact number an operator compares
-/// against the budget. A core-shaped value is therefore rejected rather than
-/// read 1000x too small — see [`parse_declared_request_millicores`].
+/// against the budget.
+///
+/// The name is the whole guard, because parsing cannot be. `4` is a legal value
+/// under both readings — four millicores with the divisor, four cores without it —
+/// so [`parse_declared_request_millicores`] rejects only what cannot be a
+/// millicore count at all (decimals, signs). A surface that omits the divisor
+/// therefore under-states the request by 1000x and is not detectable from the
+/// value alone; what bounds the damage is the 2-core floor
+/// ([`REQUEST_DERIVED_FLOOR_MILLICORES`]), which is also why the floor is not
+/// merely a nicety.
 pub const CPU_REQUEST_ENV: &str = "SPICE_CPU_REQUEST_MILLICORES";
 
 /// The declared `requests.cpu` from [`CPU_REQUEST_ENV`], in millicores.
@@ -356,13 +364,15 @@ fn detect_declared_request_millicores() -> Option<u64> {
 /// Parse [`CPU_REQUEST_ENV`]: a whole number of millicores, with an optional
 /// `m` suffix.
 ///
-/// Deliberately *not* [`parse_cpu_quantity`]. That grammar reads a bare number
-/// as cores, which is the opposite of what `divisor: 1m` produces, so sharing it
-/// would read a correctly-wired `requests.cpu: 4` (`4000`) as 4000 cores. Since
-/// the two grammars disagree on every bare integer, anything core-shaped — a
-/// decimal like `3.5`, or a sign — is rejected instead of guessed at: a
-/// deployment surface that dropped the divisor is a bug to surface, not a value
-/// to interpret 1000x too small.
+/// Deliberately *not* [`parse_cpu_quantity`]. That grammar reads a bare number as
+/// cores, which is the opposite of what `divisor: 1m` produces, so sharing it
+/// would read a correctly-wired `requests.cpu: 4` (`4000`) as 4000 cores.
+///
+/// Rejects what cannot be a whole number of millicores — a decimal like `3.5`, a
+/// sign, anything non-numeric — rather than everything that *might* have been
+/// written in cores. A bare integer cannot be told apart: `4` is four millicores
+/// with the divisor and four cores without it, and both are legal. See
+/// [`CPU_REQUEST_ENV`] for why that puts the unit in the variable's name.
 #[must_use]
 pub fn parse_declared_request_millicores(value: &str) -> Option<u64> {
     let value = value.trim();
@@ -1239,8 +1249,9 @@ mod tests {
     }
 
     /// An unconstrained Linux host: no quota, no declared request, and the cgroup
-    /// CPU share every cgroup has whether or not anyone asked for one. `2536`
-    /// is what cgroup v2's default `cpu.weight: 100` inverts to.
+    /// CPU share every cgroup has whether or not anyone asked for one. `100` is
+    /// cgroup v2's default `cpu.weight`, measured from a `docker run` with no CPU
+    /// flags, and is carried raw — nothing converts it to cores.
     fn bare_metal(affinity_cores: usize) -> HostReadings {
         HostReadings {
             affinity_cores,
@@ -2152,11 +2163,16 @@ mod tests {
     }
 
     /// [`CPU_REQUEST_ENV`] is millicores (`divisor: 1m`), not the core-denominated
-    /// grammar `runtime.cpu.cores` accepts. The two disagree on every bare
-    /// integer, so a core-shaped value must be rejected rather than read 1000x
-    /// too small.
+    /// grammar `runtime.cpu.cores` accepts, so this parses whole millicores and
+    /// rejects everything that cannot be one.
+    ///
+    /// It cannot reject "looks like cores": `4` is four millicores with the divisor
+    /// and four cores without it, and both are legal. That ambiguity is why the
+    /// unit is in the variable's name, and the assertion below pins the accepting
+    /// half of it so the limit of the guard stays visible rather than being read as
+    /// a bug.
     #[test]
-    fn declared_request_parses_millicores_and_rejects_core_quantities() {
+    fn declared_request_parses_whole_millicores_only() {
         // What the downward API actually sends.
         assert_eq!(parse_declared_request_millicores("4000"), Some(4000));
         assert_eq!(parse_declared_request_millicores("100"), Some(100));
@@ -2164,8 +2180,13 @@ mod tests {
         // An explicit unit is accepted and means the same thing.
         assert_eq!(parse_declared_request_millicores("3500m"), Some(3500));
 
-        // Core-shaped, and therefore a surface that dropped `divisor: 1m`.
-        // Reading `3.5` as 3 millicores would under-size by 1000x.
+        // A bare integer is accepted whatever it was meant to be: this is four
+        // millicores, and a surface that dropped the divisor meaning four cores is
+        // indistinguishable. The 2-core floor is what bounds that, not parsing.
+        assert_eq!(parse_declared_request_millicores("4"), Some(4));
+
+        // Not a whole number of millicores, which only a core-denominated value
+        // would be — reading `3.5` as 3 millicores would under-size by 1000x.
         assert_eq!(parse_declared_request_millicores("3.5"), None);
         assert_eq!(parse_declared_request_millicores("0.1"), None);
 
