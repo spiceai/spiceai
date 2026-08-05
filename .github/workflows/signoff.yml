@@ -392,7 +392,7 @@ jobs:
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@dc53e1f5e2a92e64bfc785923b8f9471c42fbf46 # v0.5.10
+        uses: spiceai/spiceio/.github/actions/setup@0870da59576dda1aef80e99c067c3bf14da7307b # v0.6.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -433,14 +433,56 @@ jobs:
           SIGNOFF_SKIP_TARGETED_LINT: "${{ inputs.run_targeted_prechecks && '' || '1' }}"
           SIGNOFF_SKIP_TARGETED_TESTS: "${{ inputs.run_targeted_prechecks && '' || '1' }}"
 
-      # A run that does not reach a verdict — its budget expires, it is evicted
-      # by a re-dispatch, someone cancels it — never gets back to
-      # scripts/signoff, so the `pending` status it posted outlives it. Every
-      # non-success conclusion is handled, because every one of them leaves that
-      # status behind. A run that evicted this one re-posts its own `pending`
-      # after checkout and setup (~25s), well after this step has run.
+      # A cancelled job is killed by signal, so `run_checks` in scripts/signoff returns
+      # non-zero under its `set +e`, falls into the failure branch, and posts
+      # `signoff=failure` — "Sign-off checks failed after Ns" — about a branch nothing
+      # actually judged. Since #12362 Attestation rejects a failed sign-off on the head
+      # commit, so that status turns the PR red claiming a code failure that never
+      # happened, and `cancel-in-progress` above makes it routine: every re-dispatch for
+      # a branch cancels the one before it (99 cancelled runs in the last 7 days).
+      #
+      # `clear-pending` below cannot close this: it acts only on a left-behind `pending`
+      # and deliberately leaves a `failure` alone, so the misleading verdict survives it.
+      #
+      # Overwrite it with the truth. `pending` rather than `error` on purpose: pr.yml
+      # rejects `failure` and `error` but treats `pending` as "not signed off yet", which
+      # is exactly the state a cancelled run leaves behind — so Attestation stays red (it
+      # must; HEAD really is not signed off) and points at the documented remedy of
+      # re-running sign-off instead of at a phantom defect in the diff. See #12424.
+      - name: Correct the sign-off status when this run is cancelled
+        if: cancelled()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+
+          # The commit the cancelled run had checked out, which is what scripts/signoff
+          # posted against. Best-effort throughout: this runs while the job is being
+          # torn down, and failing here must not mask the cancellation itself.
+          sha="$(git rev-parse HEAD 2>/dev/null)" || exit 0
+          [ -n "${sha}" ] || exit 0
+
+          gh api --method POST "repos/${{ github.repository }}/statuses/${sha}" \
+            -f state=pending \
+            -f context=signoff \
+            -f "description=Remote sign-off was cancelled (superseded or stopped) — no checks failed. HEAD is not signed off; re-dispatch." \
+            >/dev/null 2>&1 || true
+          echo "Reset the signoff status on ${sha} to pending — this run was cancelled, not failed."
+
+      # A run that does not reach a verdict — its budget expires, the runner dies —
+      # never gets back to scripts/signoff, so the `pending` status it posted outlives
+      # it. A run that evicted this one re-posts its own `pending` after checkout and
+      # setup (~25s), well after this step has run.
+      #
+      # `!cancelled()` partitions this against the cancellation handler above, which
+      # would otherwise fight it: on a cancelled run that handler writes `pending` and
+      # this one would immediately rewrite that to `failure`, re-asserting the very
+      # verdict #12424 is about. The split is along the grain of #12343's own design —
+      # `timeout-minutes: 353` exists so budget expiry lands here as a *failed step*
+      # rather than a cancellation, leaving this step the incomplete-run cases and the
+      # handler above the externally-cancelled ones.
       - name: Resolve an incomplete sign-off
-        if: always() && steps.sign_off.conclusion != 'success'
+        if: always() && !cancelled() && steps.sign_off.conclusion != 'success'
         run: |
           .trusted-ci/signoff clear-pending \
             "Remote sign-off ended without posting a verdict — sign off again"

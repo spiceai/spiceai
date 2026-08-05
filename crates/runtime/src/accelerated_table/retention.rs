@@ -27,7 +27,7 @@ use crate::{
         is_spice_internal_dataset,
     },
     federated_table::FederatedTable,
-    search::util::{EMBEDDING_INNER, METADATA_ENRICHED_INNER},
+    table_layers::{EMBEDDING_INNER, METADATA_ENRICHED_INNER},
 };
 use arrow::array::{RecordBatch, UInt64Array};
 use cache::Caching;
@@ -47,7 +47,7 @@ use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 
 /// The wrapper layers stripped by [`strip_index_wrapper_layers`] below. Deliberately narrower
-/// than `search::util::DEFAULT_INNER_FNS`: it excludes `ACCELERATED_INNER` (which resolves to the
+/// than [`crate::table_layers::TABLE_PROVIDER_LAYERS`]: it excludes `ACCELERATED_INNER` (which resolves to the
 /// *federated/source* table, not the accelerator — peeling it here would redirect a delete to the
 /// wrong table entirely) and the Iceberg/federated-adaptor accessors (source-side wrappers that
 /// never wrap an accelerator's raw provider; `IcebergDeletionProvider` in particular has real
