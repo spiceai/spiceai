@@ -30157,10 +30157,7 @@ mod tests {
         )
         .await;
         assert!(
-            !provider
-                .table_metadata
-                .vortex_config
-                .cold_tier_enabled(),
+            !provider.table_metadata.vortex_config.cold_tier_enabled(),
             "fixture must have no cold tier, or this asserts nothing"
         );
         let schema = Arc::new(Schema::new(vec![
