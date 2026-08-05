@@ -1032,6 +1032,25 @@ struct RawScanInput {
     /// Current snapshot id captured under the read fence — the file set the scan
     /// reads. Pinned against GC by [`Self::scan_guard`].
     current_snapshot_id: String,
+    /// Cold-tier (datalake) manifest captured under the SAME read fence as
+    /// [`Self::current_snapshot_id`], so the two visibility points a promotion
+    /// publishes cannot be mixed across versions.
+    ///
+    /// A cold promotion publishes BOTH the new cold manifest and the fresh empty
+    /// warm snapshot in one `listing_fence.write()` section. Reading the manifest
+    /// later — during plan-build, off the fence — pairs the OLD warm snapshot
+    /// with the NEW cold manifest and counts every promoted row TWICE. Capturing
+    /// it here makes the pair coherent by construction, and it also drops one
+    /// metastore round-trip per scan (the manifest now rides the cached bundle).
+    ///
+    /// Empty (and not read at all) when the cold tier is disabled.
+    ///
+    /// Needs NO [`ScanViewKey`] component: every write to `cayenne_cold_tier_file`
+    /// happens in the same metastore transaction that moves
+    /// `cayenne_table.current_snapshot_id` (`commit_overwrite_to_cold_in_txn` and
+    /// `commit_overwrite_in_txn`), so the manifest cannot change without
+    /// `current_snapshot_id` — already a key component — changing with it.
+    cold_files: Arc<Vec<crate::metadata::ColdTierFile>>,
     /// Inline-memtable structural epoch (`inlined_structural_epoch`) observed at
     /// capture. Part of the [`Self::changed`] key — the same key the retired memos
     /// used, so a build is skipped iff no scan-visible state moved.
@@ -8026,6 +8045,26 @@ impl CayenneTableProvider {
         Ok(ColdKeysetSource::Bloom)
     }
 
+    /// List the cold-tier manifest for the keyset rebuild's fenced capture.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the metastore cannot serve the manifest. There is no
+    /// directory-listing fallback for the cold tier, so a rebuild must fail rather
+    /// than continue with a keyset missing every cold-resident key (which would let
+    /// an upsert false-negative and leak the prior copy of the row).
+    async fn list_cold_files_for_keyset_rebuild(
+        &self,
+    ) -> Result<Vec<crate::metadata::ColdTierFile>> {
+        self.catalog
+            .list_cold_tier_files(&self.table_metadata.table_id)
+            .await
+            .map_err(|e| Error::Internal {
+                table: self.table_metadata.table_name.clone(),
+                message: format!("keyset rebuild could not list the cold manifest: {e}"),
+            })
+    }
+
     /// Rebuild the PK existence index from durable state in ONE bounded
     /// streaming pass: every scanned key routes straight to its shard
     /// ([`BoundedShardedPkIndexBuilder`]), and an upsert table whose exact
@@ -8063,7 +8102,14 @@ impl CayenneTableProvider {
         // mem-tier snapshot stays inside the same fence so a concurrent
         // off-`write_lock` checkpoint cannot hide a live key either: it is in this
         // snapshot or already durable in the scan that follows.
-        let (mem_snapshots, protected_snapshots, current_snapshot_id) = {
+        // The cold manifest joins the same fenced capture when this rebuild folds
+        // the cold tier: promotion publishes the cold manifest and the warm
+        // snapshot flip together under the write fence, so listing cold after the
+        // fence is dropped can pair a post-promotion manifest with the
+        // pre-promotion warm snapshot and fold a cold-resident key twice.
+        let fold_cold_manifest =
+            fold_cold && self.table_metadata.vortex_config.cold_tier_enabled();
+        let (mem_snapshots, protected_snapshots, current_snapshot_id, cold_files) = {
             let _fence = self.listing_fence.read().await;
             let mem_snapshots: Vec<Arc<crate::provider::mem_tier::MemTier>> = self
                 .mem_tier
@@ -8074,7 +8120,17 @@ impl CayenneTableProvider {
             // Wait-free Arc::clone — the inner HashMap is shared, not cloned.
             let protected_snapshots = self.protected_snapshots.load_full();
             let current_snapshot_id = self.get_current_snapshot_id();
-            (mem_snapshots, protected_snapshots, current_snapshot_id)
+            let cold_files = if fold_cold_manifest {
+                self.list_cold_files_for_keyset_rebuild().await?
+            } else {
+                Vec::new()
+            };
+            (
+                mem_snapshots,
+                protected_snapshots,
+                current_snapshot_id,
+                cold_files,
+            )
         };
 
         let ctx = self.create_session_context();
@@ -8193,6 +8249,7 @@ impl CayenneTableProvider {
             && let Some(cold_plan) = self
                 .build_cold_tier_scan_plan(
                     &ctx.state(),
+                    &cold_files,
                     Some(&pk_projection),
                     &[],
                     None,
@@ -16100,7 +16157,7 @@ impl CayenneTableProvider {
     /// ([`Self::partition_cold_manifest_for_promotion`]), read the canonical
     /// visible stream restricted to warm + dirty cold files (all deletes
     /// applied, single-version per key — the proven rewrite read with a
-    /// [`super::cold_partition::ColdScanFileSubset`] session extension),
+    /// [`super::cold_partition::ColdScanFiles`] session extension),
     /// Z-order cluster it, write read-optimized Vortex to the cold store, then
     /// atomically register the new files PLUS the carried-forward clean
     /// manifest rows + overwrite-clear the warm tier + flip to a fresh empty
@@ -16416,14 +16473,18 @@ impl CayenneTableProvider {
 
         // Canonical visible read (all tiers, all deletes applied, single-version
         // per key) — reuses the proven rewrite read so cold is correct by
-        // construction. The session's `ColdScanFileSubset` extension restricts
-        // its cold branch to the dirty files: clean files stay out of the
-        // stream entirely.
-        let dirty_urls: std::collections::HashSet<String> =
-            dirty_cold.iter().map(|f| f.file_url.clone()).collect();
+        // construction. The session's `ColdScanFiles` extension pins its cold
+        // branch to the dirty files: clean files stay out of the stream entirely.
+        //
+        // The extension carries the classified ROWS, so the rewrite reads exactly
+        // what the classification above decided. Passing only their URLs would
+        // leave the stream to intersect them with whatever manifest the scan
+        // captured, and any disagreement drops a dirty file from the rewrite while
+        // the commit below still retires it — losing its live rows.
+        let dirty_cold = Arc::new(dirty_cold);
         let ctx = self.create_compaction_session_context_with_config(
             SessionConfig::default().with_extension(Arc::new(
-                super::cold_partition::ColdScanFileSubset(dirty_urls),
+                super::cold_partition::ColdScanFiles(Arc::clone(&dirty_cold)),
             )),
         );
         let (stream, _generation_before) = self.visible_file_stream_for_rewrite(&ctx).await?;
@@ -18281,9 +18342,9 @@ impl CayenneTableProvider {
     }
 
     /// [`Self::create_compaction_session_context`] with an explicit config —
-    /// the carry-forward promotion attaches its [`ColdScanFileSubset`]
-    /// extension here so its private session's cold branch reads only the
-    /// dirty files being rewritten.
+    /// the carry-forward promotion attaches its
+    /// [`super::cold_partition::ColdScanFiles`] extension here so its private
+    /// session's cold branch reads only the dirty files being rewritten.
     fn create_compaction_session_context_with_config(
         &self,
         config: SessionConfig,
@@ -20728,6 +20789,36 @@ impl CayenneTableProvider {
         let current_snapshot_id = self.get_current_snapshot_id();
         let structural_epoch = self.inlined_structural_epoch.load(Ordering::Relaxed);
 
+        // The cold-tier manifest, under the SAME held fence as the snapshot id
+        // above. A promotion publishes its metastore commit and its warm snapshot
+        // flip inside one `listing_fence.write()` section precisely so a fenced
+        // reader observes them together; listing cold later (off the fence, during
+        // plan-build) reintroduces the double count this pairing prevents.
+        //
+        // This is a deliberate `.await` under the read fence — the mirror of the
+        // promotion's `.await` under the write fence, and for the same reason: for
+        // the cold tier the metastore commit IS a visibility flip, so both sides
+        // have to reach the metastore inside the fence to agree. The read fence
+        // admits every other scan concurrently and blocks only a promotion's
+        // write acquisition.
+        let cold_files = if self.table_metadata.vortex_config.cold_tier_enabled() {
+            let files = self
+                .catalog
+                .list_cold_tier_files(&self.table_metadata.table_id)
+                .await
+                .map_err(|e| {
+                    // No directory-listing fallback exists for cold, so a
+                    // metastore error fails the scan rather than dropping rows.
+                    datafusion_common::DataFusionError::Execution(format!(
+                        "Failed to list cold-tier files for table {}: {e}",
+                        self.table_metadata.table_name
+                    ))
+                })?;
+            Arc::new(files)
+        } else {
+            Arc::new(Vec::new())
+        };
+
         // Capture the (gated) read schema under the SAME held fence + seqlock-validated
         // window, so it is consistent with the data captured above and every scan-plan
         // branch can build from this one schema instead of re-reading the live
@@ -20754,6 +20845,7 @@ impl CayenneTableProvider {
             protected_map,
             inlined_view,
             current_snapshot_id,
+            cold_files,
             structural_epoch,
             scan_guard,
             read_schema,
@@ -25332,9 +25424,19 @@ impl CayenneTableProvider {
     /// with NO object-store round-trip. The returned plan is a Vortex
     /// `DataSourceExec`; the caller wraps it with the key-based (`Ignore`)
     /// deletion filter and unions it into the scan tree.
+    ///
+    /// `captured_cold_files` is the manifest the CALLER captured coherently with
+    /// the rest of the state its plan reads — this function never lists the
+    /// manifest itself. The cold manifest is one of the two visibility points a
+    /// promotion flips together under `listing_fence.write()`, so a listing taken
+    /// here (after the caller's capture, off the fence) would pair a NEW cold
+    /// manifest with an OLD warm snapshot and double-count every promoted row.
+    /// The promotion's own rewrite session overrides it with an explicit
+    /// [`super::cold_partition::ColdScanFiles`] set.
     async fn build_cold_tier_scan_plan(
         &self,
         state: &dyn Session,
+        captured_cold_files: &[crate::metadata::ColdTierFile],
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
@@ -25356,32 +25458,18 @@ impl CayenneTableProvider {
             Self::register_object_store_if_needed(state.runtime_env(), cold_config);
         }
 
-        let cold_files = self
-            .catalog
-            .list_cold_tier_files(&self.table_metadata.table_id)
-            .await
-            .map_err(|e| {
-                // No directory-listing fallback exists for cold (unlike the warm
-                // manifest), so a metastore error must fail the query rather than
-                // silently drop cold rows.
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to list cold-tier files for table {}: {e}",
-                    self.table_metadata.table_name
-                ))
-            })?;
-        // Carry-forward promotion: the promotion's PRIVATE session carries a
-        // `ColdScanFileSubset` config extension restricting this branch to the
-        // dirty files being rewritten (clean files are carried forward by
-        // manifest reference, never re-read). User-query sessions never carry
-        // the extension, so queries always see the full manifest.
-        let cold_files =
-            match scan_config.get_extension::<super::cold_partition::ColdScanFileSubset>() {
-                Some(subset) => cold_files
-                    .into_iter()
-                    .filter(|f| subset.0.contains(&f.file_url))
-                    .collect(),
-                None => cold_files,
-            };
+        // Carry-forward promotion: the promotion's PRIVATE session pins this
+        // branch to the dirty files it classified for rewrite (clean files are
+        // carried forward by manifest reference, never re-read). Its own listing
+        // is authoritative — the classification and the rewrite must agree on the
+        // exact file set, or the commit retires a dirty file whose rows were never
+        // read. User-query sessions never carry the extension and read the
+        // manifest the caller captured under the listing fence.
+        let pinned = scan_config.get_extension::<super::cold_partition::ColdScanFiles>();
+        let cold_files: &[crate::metadata::ColdTierFile] = match pinned.as_deref() {
+            Some(pinned) => pinned.0.as_slice(),
+            None => captured_cold_files,
+        };
         // No early all-empty guard needed: the per-file loop skips zero-size
         // files and the `object_store_url is None` / `kept.is_empty()` checks
         // below both return `Ok(None)` when nothing survives.
@@ -25407,7 +25495,7 @@ impl CayenneTableProvider {
         let table_name = self.table_metadata.table_name.clone();
         let mut object_store_url: Option<ListingTableUrl> = None;
         let mut kept: Vec<PartitionedFile> = Vec::with_capacity(cold_files.len());
-        for file in &cold_files {
+        for file in cold_files {
             if file.file_size_bytes <= 0 {
                 continue;
             }
@@ -26678,6 +26766,10 @@ impl TableProvider for CayenneTableProvider {
         let protected_map = Arc::clone(&scan_view.raw.protected_map);
         let inlined_view = Arc::clone(&scan_view.raw.inlined_view);
         let current_snapshot_id = scan_view.raw.current_snapshot_id.clone();
+        // The cold manifest from the SAME capture as `current_snapshot_id`: the two
+        // visibility points a promotion flips together must be read together, or a
+        // scan pairs the old warm snapshot with the new cold manifest.
+        let captured_cold_files = Arc::clone(&scan_view.raw.cold_files);
         let scan_guard = Arc::clone(&scan_view.raw.scan_guard);
         let deletion_snapshot = scan_view.merged_deletions.clone();
         let visible_segments = Arc::clone(&scan_view.visible_segments);
@@ -26912,6 +27004,7 @@ impl TableProvider for CayenneTableProvider {
         let cold_plan: Option<Arc<dyn ExecutionPlan>> = self
             .build_cold_tier_scan_plan(
                 state,
+                &captured_cold_files,
                 effective_projection.as_ref(),
                 scan_filters,
                 limit,

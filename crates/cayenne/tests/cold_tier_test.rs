@@ -657,6 +657,99 @@ async fn test_cold_tier_concurrent_scan_during_promotion_impl(
     Ok(())
 }
 
+test_with_backends!(test_cold_promotion_couples_manifest_and_snapshot_impl);
+
+/// A scan captures the cold manifest together with the warm snapshot id under one
+/// `listing_fence.read()`, and the scan-view cache keys that whole bundle on the
+/// snapshot id. Both rest on ONE metastore invariant: a promotion rewrites
+/// `cayenne_cold_tier_file` and repoints `cayenne_table.current_snapshot_id` in
+/// the SAME transaction, so the manifest cannot move without the cache key moving
+/// with it.
+///
+/// A cold-manifest write that left the snapshot id alone would let the cache keep
+/// serving a bundle whose manifest predates its own key, and the cold rows that
+/// write published would stay invisible to scans until something else flipped the
+/// warm snapshot. Pin the coupling directly, on both the fresh-graduation and the
+/// dirty-rewrite commit paths.
+async fn test_cold_promotion_couples_manifest_and_snapshot_impl(
+    fixture: common::TestFixture,
+) -> TestResult<()> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    let cold_dir = fixture.temp_dir.path().join("cold");
+    std::fs::create_dir_all(&cold_dir)?;
+
+    let options = cold_table_options(&fixture, "couple_t", &schema, &cold_dir, 300_000);
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let ctx = SessionContext::new();
+    let table =
+        Arc::new(CayenneTableProvider::create_table(catalog, options, ctx.runtime_env()).await?);
+    ctx.register_table("couple_t", Arc::clone(&table) as Arc<dyn TableProvider>)?;
+
+    insert_id_range(&table, &schema, 0..200).await?;
+    flush_warm(&table).await;
+    let before = fixture
+        .catalog
+        .get_table("couple_t")
+        .await?
+        .current_snapshot_id;
+    assert!(
+        fixture
+            .catalog
+            .list_cold_tier_files(table.table_id())
+            .await?
+            .is_empty(),
+        "no cold files exist before the first promotion"
+    );
+
+    // Fresh graduation: the manifest gains rows, so the snapshot id must move.
+    assert!(table.promote_warm_to_cold().await?, "promotion 1 fires");
+    let after_fresh = fixture
+        .catalog
+        .get_table("couple_t")
+        .await?
+        .current_snapshot_id;
+    assert!(
+        !fixture
+            .catalog
+            .list_cold_tier_files(table.table_id())
+            .await?
+            .is_empty(),
+        "the promotion registered cold files"
+    );
+    assert_ne!(
+        after_fresh, before,
+        "a promotion that writes the cold manifest must repoint current_snapshot_id \
+         in the same commit — the scan-view cache key is what pairs the two"
+    );
+
+    // Dirty rewrite: a tombstone forces the prior cold generation to be replaced,
+    // which rewrites the manifest again — and must move the id again.
+    delete_id(&table, 7).await?;
+    insert_id_range(&table, &schema, 200..203).await?;
+    flush_warm(&table).await;
+    assert!(table.promote_warm_to_cold().await?, "promotion 2 fires");
+    let after_dirty = fixture
+        .catalog
+        .get_table("couple_t")
+        .await?
+        .current_snapshot_id;
+    assert_ne!(
+        after_dirty, after_fresh,
+        "the dirty-rewrite commit must repoint current_snapshot_id too"
+    );
+    assert_eq!(
+        row_count(&ctx, "couple_t").await?,
+        202,
+        "the two promotions must leave every live row visible exactly once"
+    );
+
+    Ok(())
+}
+
 // ============================================================================
 // Restart: reopen a table that has a cold manifest
 // ============================================================================

@@ -44,7 +44,6 @@ limitations under the License.
 //! drains: every tombstone's potential host file is in the rewrite set, so
 //! every tombstone is physically applied.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Array};
@@ -57,12 +56,20 @@ use crate::metadata::ColdTierFile;
 use crate::row_converter::{Row, RowConverter};
 use crate::stats::statistics_from_persisted_blob;
 
-/// `SessionConfig` extension restricting the cold scan branch to a file
-/// subset. Attached ONLY by the promotion's private session so the
-/// carry-forward rewrite reads the dirty files and nothing else; user-query
-/// sessions never carry it, so queries always see the full manifest.
+/// `SessionConfig` extension pinning the cold scan branch to an explicit file
+/// set. Attached ONLY by the promotion's private session so the carry-forward
+/// rewrite reads the dirty files and nothing else.
+///
+/// It carries the manifest ROWS the promotion classified, not just their URLs,
+/// so the rewrite stream is built from the same listing the classification ran
+/// against. Selecting a subset out of whatever listing the scan happened to
+/// capture would let a stale capture silently drop a dirty file from the
+/// rewrite while the commit still retires it from the manifest.
+///
+/// User-query sessions never carry it; they read the manifest captured under
+/// the listing fence with the rest of the scan's visible state.
 #[derive(Debug)]
-pub(crate) struct ColdScanFileSubset(pub HashSet<String>);
+pub(crate) struct ColdScanFiles(pub Arc<Vec<ColdTierFile>>);
 
 /// The cold manifest split for one promotion pass.
 pub(crate) struct ColdFilePartition {
