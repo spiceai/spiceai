@@ -55,9 +55,7 @@ use datafusion::{execution::context::SessionContext, physical_plan::collect};
 use futures::{StreamExt, stream};
 use opentelemetry::KeyValue;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
-use runtime_datafusion_index::{
-    INDEXED_INNER, IndexedTableProvider, InnerProviderFn, find_concrete_table_provider_with,
-};
+use runtime_datafusion_index::{IndexedTableProvider, LayerWalk, find_concrete_table_provider_in};
 use runtime_metrics::acceleration as metrics;
 use runtime_search::embeddings::table::EmbeddingTable;
 use runtime_table_partition::provider::PartitionTableProvider;
@@ -2657,12 +2655,12 @@ impl RefreshTask {
     /// loses pipelined finalization (backgrounded publish, no blocking
     /// `apply_on_conflict_deletions`).
     ///
-    /// Uses [`find_concrete_table_provider_with`] with a *write-transparent* set
-    /// of accessors rather than the runtime-wide `DEFAULT_INNER_FNS`: only
-    /// wrappers whose `insert_into` is a pass-through may be peeled here.
+    /// Uses [`LayerWalk::Write`], which steps only through wrappers whose
+    /// `insert_into` is a pass-through (`PolyTableProvider` to its writer side,
+    /// `IndexedTableProvider`) — see the layer table in [`crate::table_layers`].
     ///
-    /// NOTE: `UpsertDedupTableProvider` is intentionally absent from the set.
-    /// Unlike `PolyTableProvider` (delegates writes) and `IndexedTableProvider`
+    /// NOTE: `UpsertDedupTableProvider` is opaque to the write walk. Unlike
+    /// `PolyTableProvider` (delegates writes) and `IndexedTableProvider`
     /// (`insert_into` is a pass-through), it *rewrites* the write on insert
     /// (dedup / last-write-wins via `UpsertDedupExec`). Routing CDC past it to the
     /// inner provider would bypass that transform, so a dedup-configured table
@@ -2670,15 +2668,10 @@ impl RefreshTask {
     /// semantics) and emits the fallback warning below.
     #[cfg(not(windows))]
     fn cayenne_accelerator(&self) -> Option<&CayenneTableProvider> {
-        /// Peels [`PolyTableProvider`] to its writer side (write-transparent).
-        const POLY_WRITER_INNER: InnerProviderFn = |tbl| {
-            tbl.downcast_ref::<data_components::poly::PolyTableProvider>()
-                .map(data_components::poly::PolyTableProvider::writer_ref)
-        };
-
-        find_concrete_table_provider_with::<CayenneTableProvider>(
+        find_concrete_table_provider_in::<CayenneTableProvider>(
             &self.accelerator,
-            &[POLY_WRITER_INNER, INDEXED_INNER],
+            crate::table_layers::TABLE_PROVIDER_LAYERS,
+            LayerWalk::Write,
         )
     }
 
