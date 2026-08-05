@@ -447,7 +447,9 @@ pub fn track_hash_index_lookup_rows(rows: u64, dimensions: &[KeyValue]) {
 /// `spiced_cpu_budget_*` is the value the runtime *uses*; the rest are the
 /// inputs it was chosen against. Comparing them is what distinguishes a pod
 /// sized for its request from one sized for its whole node. `source` is
-/// `CpuSource::as_str` — the rung of the detection ladder the budget came from.
+/// `CpuSource::as_str` — the rung of the detection ladder the budget came from,
+/// and the only authority on which input actually won: an exported input may
+/// have been outranked by an explicit setting or by a CPU limit.
 ///
 /// `spiced_cpu_request_millicores` is the pod's own `requests.cpu`, exact, as
 /// declared by whatever wrote the pod spec. The cgroup CPU *share* is
@@ -504,7 +506,7 @@ pub fn register_cpu_budget_metrics(
         let _ = meter
             .u64_observable_gauge("spiced_cpu_request_millicores")
             .with_description(
-                "The pod's own CPU request (Kubernetes requests.cpu), as declared by the surface that wrote the pod spec. Sizing derives from it when no CPU limit is set; compare against spiced_cpu_budget_millicores to see what it produced.",
+                "The pod's own CPU request (Kubernetes requests.cpu), as declared by the surface that wrote the pod spec. It drives sizing only when nothing outranks it: no CPU limit, and no explicit runtime.cpu.cores (a quantity or all). spiced_cpu_budget_cores{source} reports whether it did, as source=request_burst.",
             )
             .with_unit("{millicpu}")
             .with_callback(move |obs| obs.observe(declared, &[]))
