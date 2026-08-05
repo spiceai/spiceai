@@ -296,27 +296,13 @@ pub fn read_credential(var: &str) -> Option<String> {
     read_credential_from_env_file(var)
 }
 
-/// Read a credential from `.env.local` (preferred) or `.env` in the working
-/// directory, matching where `spice cloud login` writes them.
+/// Read a credential from the env file `spice cloud login` writes to.
+///
+/// Delegates to the writer's own parser so quoting and `KEY = value` spacing
+/// are handled identically on both sides — a hand-rolled reader here could
+/// find a credential the remover cannot match, leaving it live after logout.
 fn read_credential_from_env_file(var: &str) -> Option<String> {
-    let env_file = if std::path::Path::new(".env.local").exists() {
-        ".env.local"
-    } else {
-        ".env"
-    };
-
-    let content = std::fs::read_to_string(env_file).ok()?;
-    let prefix = format!("{var}=");
-    for line in content.lines() {
-        if let Some(value) = line.trim().strip_prefix(&prefix) {
-            let value = value.trim_matches('"').trim_matches('\'');
-            if !value.is_empty() {
-                return Some(value.to_string());
-            }
-        }
-    }
-
-    None
+    crate::commands::login::read_env_var(var)
 }
 
 /// The credential to use when no organization was named.
@@ -386,18 +372,9 @@ pub fn orgs_with_stored_tokens() -> BTreeSet<String> {
         }
     }
 
-    let env_file = if std::path::Path::new(".env.local").exists() {
-        ".env.local"
-    } else {
-        ".env"
-    };
-    if let Ok(content) = std::fs::read_to_string(env_file) {
-        for line in content.lines() {
-            if let Some((key, value)) = line.trim().split_once('=')
-                && !value.trim_matches('"').trim_matches('\'').is_empty()
-            {
-                collect(key);
-            }
+    for (key, value) in crate::commands::login::env_file_vars() {
+        if !value.is_empty() {
+            collect(&key);
         }
     }
 

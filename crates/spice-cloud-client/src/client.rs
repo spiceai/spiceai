@@ -93,12 +93,6 @@ impl CloudClient {
         self
     }
 
-    /// Return the organization this client requests, if any.
-    #[must_use]
-    pub fn org(&self) -> Option<&str> {
-        self.org.as_deref()
-    }
-
     /// Override the HTTP request timeout (default: 30 s).
     ///
     /// # Errors

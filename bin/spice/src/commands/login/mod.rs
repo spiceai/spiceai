@@ -24,7 +24,9 @@ use crate::error::Result;
 use crate::manifest;
 use clap::{Args, Subcommand};
 
-pub use auth_config::{merge_auth_config, store_keychain};
+pub use auth_config::{
+    env_file_path, env_file_vars, merge_auth_config, read_env_var, store_keychain,
+};
 
 /// Credential storage backend for `spice login`.
 #[derive(Debug, Clone, Default, clap::ValueEnum)]

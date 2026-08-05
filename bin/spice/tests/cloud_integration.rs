@@ -1194,7 +1194,7 @@ fn test_cloud_app_required_error_names_both_ways_to_supply_one() {
         .args(["cloud", "deployments"])
         .assert()
         .failure()
-        .stdout(predicate::str::contains("--app"))
+        .stdout(predicate::str::contains("--project"))
         .stdout(predicate::str::contains("spice cloud link"));
 }
 

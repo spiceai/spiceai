@@ -112,11 +112,6 @@ pub struct UpdateProjectParams<'a> {
 }
 
 impl CloudClient {
-    /// Create a new authenticated cloud client using the credential's own org.
-    pub fn new() -> Result<Self> {
-        Self::connect(None)
-    }
-
     /// Create a new authenticated cloud client that acts on `org`.
     ///
     /// When an org is named, the credential bound to *that* org is required.
@@ -132,11 +127,6 @@ impl CloudClient {
         org::validate_org_name(org)?;
         let token = org::token_for_org(org).ok_or_else(|| org_credential_missing(org))?;
         Self::with_token_for_org(token, Some(org))
-    }
-
-    /// Create a new authenticated cloud client with an explicit bearer token.
-    pub fn with_token(token: impl Into<String>) -> Result<Self> {
-        Self::with_token_for_org(token, None)
     }
 
     /// Create a new authenticated cloud client with an explicit bearer token,
@@ -162,12 +152,6 @@ impl CloudClient {
             inner: InnerCloudClient::new(&get_base_url()).map_err(map_cloud_error(None))?,
             org: None,
         })
-    }
-
-    /// The org this client acts on, if one was requested.
-    #[must_use]
-    pub fn org(&self) -> Option<&str> {
-        self.org.as_deref()
     }
 
     /// Convert an API error into a CLI error, attributing 403s to the org this
@@ -262,13 +246,42 @@ impl CloudClient {
     /// is also where a "wrong org" mistake is caught: an app that exists under a
     /// different org produces a switch hint rather than a bare "not found".
     pub async fn get_project(&self, target: &ProjectTarget) -> Result<Project> {
-        let context = self.optional_user_auth_context().await?;
-        let apps = self.list_projects().await?;
-        let context_org = context.as_ref().map(|c| c.org_name.as_str());
-
-        let project_id = resolve_project_id(&apps, target, context_org)?;
-
+        let project_id = self.resolve_id(target).await?;
         self.get_project_by_id(project_id).await
+    }
+
+    /// Resolve a target to its numeric id without fetching the full project.
+    ///
+    /// Most callers only need the id to address a sub-resource. Fetching the
+    /// whole project for that costs a round trip per call, and the id cannot
+    /// change for the life of a command.
+    pub async fn resolve_id(&self, target: &ProjectTarget) -> Result<i64> {
+        // The listing and the identity are independent; overlap them.
+        let (context, projects) =
+            tokio::try_join!(self.optional_user_auth_context(), self.list_projects())?;
+        let context_org = context.as_ref().map(|c| c.org_name.as_str());
+        resolve_project_id(&projects, target, context_org)
+    }
+
+    /// List deployments for an already-resolved project.
+    pub async fn list_deployments_for_id(
+        &self,
+        project_id: i64,
+        limit: usize,
+        status: Option<&str>,
+    ) -> Result<Vec<Deployment>> {
+        self.inner
+            .list_deployments(project_id, limit, status)
+            .await
+            .map_err(|error| self.err(error))
+    }
+
+    /// Get API keys for an already-resolved project.
+    pub async fn get_api_keys_for_id(&self, project_id: i64) -> Result<ApiKeysResponse> {
+        self.inner
+            .get_api_keys(project_id)
+            .await
+            .map_err(|error| self.err(error))
     }
 
     // ========================================================================
@@ -388,9 +401,9 @@ impl CloudClient {
     }
 
     pub async fn delete_project(&self, target: &ProjectTarget) -> Result<()> {
-        let app = self.get_project(target).await?;
+        let project_id = self.resolve_id(target).await?;
         self.inner
-            .delete_project(app.id)
+            .delete_project(project_id)
             .await
             .map_err(|error| self.err(error))
     }
@@ -405,9 +418,9 @@ impl CloudClient {
         limit: usize,
         status: Option<&str>,
     ) -> Result<Vec<Deployment>> {
-        let app = self.get_project(target).await?;
+        let project_id = self.resolve_id(target).await?;
         self.inner
-            .list_deployments(app.id, limit, status)
+            .list_deployments(project_id, limit, status)
             .await
             .map_err(|error| self.err(error))
     }
@@ -428,7 +441,20 @@ impl CloudClient {
         target: &ProjectTarget,
         params: CreateDeploymentParams<'_>,
     ) -> Result<Deployment> {
-        let app = self.get_project(target).await?;
+        let project_id = self.resolve_id(target).await?;
+        self.create_deployment_for_id(project_id, params, target)
+            .await
+    }
+
+    /// Create a deployment for an already-resolved project.
+    ///
+    /// `target` is carried only for error messages.
+    pub async fn create_deployment_for_id(
+        &self,
+        project_id: i64,
+        params: CreateDeploymentParams<'_>,
+        target: &ProjectTarget,
+    ) -> Result<Deployment> {
         let request = CreateDeploymentRequest {
             image: None,
             image_tag: params.image_tag.map(String::from),
@@ -440,7 +466,7 @@ impl CloudClient {
             debug: params.debug,
         };
         self.inner
-            .create_deployment(app.id, &request)
+            .create_deployment(project_id, &request)
             .await
             .map_err(|error| match error {
                 // The Cloud API rejects a second deployment while one is in
@@ -448,9 +474,9 @@ impl CloudClient {
                 // retry rather than treating it as a hard failure.
                 spice_cloud_client::error::Error::Conflict { message } => Error::cloud_with_hint(
                     CloudErrorCode::DeployConflict,
-                    format!("A deployment is already in progress for app {target}: {message}"),
+                    format!("A deployment is already in progress for project {target}: {message}"),
                     format!(
-                        "Check it with 'spice cloud deployments --app {target}', or wait for it to finish."
+                        "Check it with 'spice cloud deployments --project {target}', or wait for it to finish."
                     ),
                 ),
                 error => self.err(error),
@@ -464,9 +490,9 @@ impl CloudClient {
         limit: usize,
         since: Option<&str>,
     ) -> Result<LogsResponse> {
-        let app = self.get_project(target).await?;
+        let project_id = self.resolve_id(target).await?;
         self.inner
-            .get_deployment_logs(app.id, deployment_id, limit, since)
+            .get_deployment_logs(project_id, deployment_id, limit, since)
             .await
             .map_err(|error| self.err(error))
     }
@@ -497,17 +523,17 @@ impl CloudClient {
     // ========================================================================
 
     pub async fn list_secrets(&self, target: &ProjectTarget) -> Result<Vec<Secret>> {
-        let app = self.get_project(target).await?;
+        let project_id = self.resolve_id(target).await?;
         self.inner
-            .list_secrets(app.id)
+            .list_secrets(project_id)
             .await
             .map_err(|error| self.err(error))
     }
 
     pub async fn get_secret(&self, target: &ProjectTarget, name: &str) -> Result<Secret> {
-        let app = self.get_project(target).await?;
+        let project_id = self.resolve_id(target).await?;
         self.inner
-            .get_secret(app.id, name)
+            .get_secret(project_id, name)
             .await
             .map_err(|error| self.err(error))
     }
@@ -518,17 +544,17 @@ impl CloudClient {
         name: &str,
         value: &str,
     ) -> Result<Secret> {
-        let app = self.get_project(target).await?;
+        let project_id = self.resolve_id(target).await?;
         self.inner
-            .set_secret(app.id, name, value)
+            .set_secret(project_id, name, value)
             .await
             .map_err(|error| self.err(error))
     }
 
     pub async fn delete_secret(&self, target: &ProjectTarget, name: &str) -> Result<()> {
-        let app = self.get_project(target).await?;
+        let project_id = self.resolve_id(target).await?;
         self.inner
-            .delete_secret(app.id, name)
+            .delete_secret(project_id, name)
             .await
             .map_err(|error| self.err(error))
     }
@@ -538,9 +564,9 @@ impl CloudClient {
     // ========================================================================
 
     pub async fn get_api_keys(&self, target: &ProjectTarget) -> Result<ApiKeysResponse> {
-        let app = self.get_project(target).await?;
+        let project_id = self.resolve_id(target).await?;
         self.inner
-            .get_api_keys(app.id)
+            .get_api_keys(project_id)
             .await
             .map_err(|error| self.err(error))
     }
@@ -550,9 +576,9 @@ impl CloudClient {
         target: &ProjectTarget,
         key_number: u8,
     ) -> Result<RegenerateApiKeyResponse> {
-        let app = self.get_project(target).await?;
+        let project_id = self.resolve_id(target).await?;
         self.inner
-            .regenerate_api_key(app.id, key_number)
+            .regenerate_api_key(project_id, key_number)
             .await
             .map_err(|error| self.err(error))
     }
@@ -666,9 +692,7 @@ fn resolve_project_id(
         }
     }
 
-    if let Some(id) = org_unknown_matches.first()
-        && org_unknown_matches.len() == 1
-    {
+    if let [id] = org_unknown_matches.as_slice() {
         return Ok(*id);
     }
 

@@ -59,11 +59,11 @@ EXAMPLES
   spice cloud whoami                        # Identity and active organization
   spice cloud orgs                          # Organizations you can act on
   spice cloud org use spicehq               # Make spicehq the active org
-  spice cloud apps --org spicehq            # List apps in one org
-  spice cloud deploy --app spicehq/team-app --wait
-  spice cloud deployments --app spicehq/team-app
-  spice cloud logs --app spicehq/team-app --level error
-  spice cloud instance status --app spicehq/team-app   # Component readiness
+  spice cloud projects --org spicehq        # List projects in one org
+  spice cloud deploy --project spicehq/team-app --wait
+  spice cloud deployments --project spicehq/team-app
+  spice cloud logs --project spicehq/team-app --level error
+  spice cloud status --project spicehq/team-app        # Health in one command
   spice cloud link spicehq/team-app         # Default this directory to an app
 
 Docs: https://spiceai.org/docs/spice-cloud"#
@@ -168,6 +168,67 @@ pub enum CloudCommands {
 
     #[command(subcommand, hide = true)]
     Instance(InstanceCommands),
+}
+
+impl CloudCommands {
+    /// The command's `--output` setting, when it produces structured output.
+    ///
+    /// Lives beside the enum so adding a subcommand is a one-file change. This
+    /// previously took two exhaustive matches in `main.rs` that had to agree;
+    /// forgetting the second silently printed the startup banner into
+    /// `--machine` stdout and broke `jq`.
+    pub fn output_mut(&mut self) -> Option<&mut OutputFormat> {
+        match self {
+            Self::Whoami(a) => Some(&mut a.output),
+            Self::Orgs(a) => Some(&mut a.output),
+            Self::Projects(a) => Some(&mut a.output),
+            Self::Deployments(a) => Some(&mut a.output),
+            Self::Regions(a) => Some(&mut a.output),
+            Self::Images(a) => Some(&mut a.output),
+            Self::Logs(a) => Some(&mut a.output),
+            Self::Deploy(a) => Some(&mut a.output),
+            Self::Status(a) => Some(&mut a.output),
+            Self::Datasets(a) => Some(&mut a.output),
+            Self::ApiKeys(a) => Some(&mut a.output),
+            Self::Metrics(a) => Some(&mut a.output),
+            Self::Inspect(a) => Some(&mut a.output),
+            Self::Org(OrgCommands::Use(a)) => Some(&mut a.output),
+            Self::Org(OrgCommands::Current(a)) => Some(&mut a.output),
+            Self::Secrets(
+                SecretsCommands::List(SecretsListArgs { output, .. })
+                | SecretsCommands::Get(SecretsGetArgs { output, .. })
+                | SecretsCommands::Delete(SecretsDeleteArgs { output, .. }),
+            ) => Some(output),
+            Self::Secrets(SecretsCommands::Set(a)) => Some(&mut a.output),
+            Self::Project(ProjectCommands::Create(a))
+            | Self::Create(CreateCommands::Project(a)) => Some(&mut a.output),
+            Self::Project(ProjectCommands::Get(a)) | Self::Get(GetCommands::Project(a)) => {
+                Some(&mut a.output)
+            }
+            Self::Project(ProjectCommands::Update(a))
+            | Self::Update(UpdateCommands::Project(a)) => Some(&mut a.output),
+            Self::Project(ProjectCommands::Delete(a))
+            | Self::Delete(DeleteCommands::Project(a)) => Some(&mut a.output),
+            Self::Create(CreateCommands::Deployment(a)) => Some(&mut a.output),
+            Self::Instance(InstanceCommands::List(a)) => Some(&mut a.output),
+            Self::Instance(InstanceCommands::Status(a)) => Some(&mut a.output),
+            Self::Instance(InstanceCommands::Datasets(a)) => Some(&mut a.output),
+            Self::Login(_)
+            | Self::Logout(_)
+            | Self::Link(_)
+            | Self::Unlink
+            | Self::Org(OrgCommands::Clear) => None,
+        }
+    }
+
+    /// Whether this command will emit JSON, so the banner must stay off stdout.
+    ///
+    /// Takes `&mut self` so the single match above stays the only place the
+    /// command tree is enumerated; callers already hold the parsed `Cli`
+    /// mutably at this point.
+    pub fn produces_json(&mut self) -> bool {
+        self.output_mut().is_some_and(|o| *o == OutputFormat::Json)
+    }
 }
 
 /// Operations on a single project.
@@ -306,19 +367,16 @@ pub struct OrgCurrentArgs {
 
 #[derive(Subcommand, Debug)]
 #[command(
-    about = "Inspect the instances serving a project",
-    long_about = r#"Inspect the instances serving a project.
+    about = "Superseded by 'spice cloud status' and 'spice cloud datasets'",
+    long_about = r#"Superseded. Use 'spice cloud status' and 'spice cloud datasets'.
 
-An app runs one or more instances (replicas). Without --instance, commands ask
-the app's general endpoint, which answers for the deployment as a whole. With
---instance, the request is pinned to that one instance, which is how you tell
-a single sick replica from a healthy fleet.
+These spellings still work but will be removed in a future release.
 
-EXAMPLES
-  spice cloud instance list     --app spicehq/team-app
-  spice cloud instance status   --app spicehq/team-app
-  spice cloud instance status   --app spicehq/team-app --instance spicepod-team-app-abc-0-0
-  spice cloud instance datasets --app spicehq/team-app"#
+  spice cloud instance list      →  spice cloud status
+  spice cloud instance status    →  spice cloud status
+  spice cloud instance datasets  →  spice cloud datasets
+
+Both replacements take --instance to pin the report to one instance."#
 )]
 pub enum InstanceCommands {
     /// List the instances serving a project
@@ -594,9 +652,9 @@ default the app's production branch. A local spicepod is NOT uploaded; use
 or `--branch` / `--commit` to deploy a different revision.
 
 EXAMPLES
-  spice cloud deploy --app spicehq/team-app
-  spice cloud deploy --app spicehq/team-app --wait --timeout 15m
-  spice cloud deploy --app spicehq/team-app --branch release --replicas 2"#
+  spice cloud deploy --project spicehq/team-app
+  spice cloud deploy --project spicehq/team-app --wait --timeout 15m
+  spice cloud deploy --project spicehq/team-app --branch release --replicas 2"#
 )]
 pub struct DeployArgs {
     /// Project name in org/project format (uses the linked project if omitted)
@@ -1120,28 +1178,29 @@ async fn execute_status(
     // Instance and dataset health live on the data plane. Treat them as
     // best-effort: a project that has never deployed has no runtime to ask, and
     // that must read as "not deployed yet", not as a command failure.
-    let runtime = project_runtime_context(ctx, &client, &target, args.instance.as_deref()).await;
-    let (instances, datasets) = match &runtime {
-        Ok(runtime_ctx) => {
-            let instances = fetch_instance_json::<SpicepodStatusResponse>(
-                runtime_ctx,
-                "/v1/spice_runtime",
-                &target,
-            )
-            .await
-            .map(|response| response.status.pod_statuses)
-            .unwrap_or_default();
-            let datasets = fetch_instance_json::<Vec<InstanceDatasetInfo>>(
-                runtime_ctx,
-                "/v1/datasets?status=true",
-                &target,
-            )
-            .await
-            .unwrap_or_default();
-            (instances, datasets)
-        }
-        Err(_) => (Vec::new(), Vec::new()),
-    };
+    let (instances, datasets) =
+        match project_runtime_context(ctx, &client, &target, args.instance.as_deref()).await {
+            Ok(runtime_ctx) => {
+                let runtime_ctx = &runtime_ctx;
+                let instances = fetch_instance_json::<SpicepodStatusResponse>(
+                    runtime_ctx,
+                    "/v1/spice_runtime",
+                    &target,
+                )
+                .await
+                .map(|response| response.status.pod_statuses)
+                .unwrap_or_default();
+                let datasets = fetch_instance_json::<Vec<InstanceDatasetInfo>>(
+                    runtime_ctx,
+                    "/v1/datasets?status=true",
+                    &target,
+                )
+                .await
+                .unwrap_or_default();
+                (instances, datasets)
+            }
+            Err(_) => (Vec::new(), Vec::new()),
+        };
 
     let unhealthy: Vec<&InstanceDatasetInfo> = datasets
         .iter()
@@ -1358,7 +1417,7 @@ fn resolve_project_target_with_source(
             return Err(Error::cloud_with_hint(
                 CloudErrorCode::InvalidRequest,
                 format!("Invalid app name '{app_flag}': expected <app> or <org>/<app>."),
-                "Run 'spice cloud apps' to list the apps you can reach.",
+                "Run 'spice cloud projects' to list the apps you can reach.",
             ));
         }
 
@@ -1385,7 +1444,7 @@ fn resolve_project_target_with_source(
         return Err(Error::cloud_with_hint(
             CloudErrorCode::InvalidRequest,
             "No app specified.",
-            "Pass --app <org>/<app>, or run 'spice cloud link <org>/<app>' to set a default for this directory.",
+            "Pass --project <org>/<project>, or run 'spice cloud link <org>/<project>' to set a default for this directory.",
         ));
     };
 
@@ -1397,24 +1456,16 @@ fn resolve_project_target_with_source(
 
     // The link is project-level config, so it loses to a flag or the
     // environment — but only after saying so, never silently.
-    match context_source {
-        OrgSource::Flag | OrgSource::Environment => {
-            ensure_orgs_agree(
-                &link_org,
-                "the linked app",
-                context_org.as_deref(),
-                context_source,
-            )?;
-            Ok((
-                ProjectTarget::new(Some(link_org), link.app),
-                OrgSource::LinkedApp,
-            ))
-        }
-        _ => Ok((
-            ProjectTarget::new(Some(link_org), link.app),
-            OrgSource::LinkedApp,
-        )),
-    }
+    ensure_orgs_agree(
+        &link_org,
+        "the linked project",
+        context_org.as_deref(),
+        context_source,
+    )?;
+    Ok((
+        ProjectTarget::new(Some(link_org), link.app),
+        OrgSource::LinkedApp,
+    ))
 }
 
 /// Refuse to guess when two explicit signals name different organizations.
@@ -1447,7 +1498,7 @@ fn ensure_orgs_agree(
             other_source.label()
         ),
         format!(
-            "Name one organization: pass --app {stated}/<app>, or drop --org and let {stated_source} decide."
+            "Name one organization: pass --project {stated}/<project>, or drop --org and let {stated_source} decide."
         ),
     ))
 }
@@ -1965,9 +2016,9 @@ fn print_post_login_help() {
     println!();
     println!("Quick start:");
     println!("  spice cloud orgs                   - List your organizations");
-    println!("  spice cloud apps                   - List your apps");
-    println!("  spice cloud create app <name>      - Create a new app");
-    println!("  spice cloud deploy --app <org/app> - Deploy your app");
+    println!("  spice cloud projects               - List your projects");
+    println!("  spice cloud project create <name>  - Create a new project");
+    println!("  spice cloud deploy --project <org/project> - Deploy it");
     println!();
 }
 
@@ -2039,62 +2090,75 @@ fn default_credential_keys() -> Vec<String> {
     ]
 }
 
-/// Drop `keys` from the working directory's env file, returning whether any were
-/// present. Removes the file once nothing but comments and blank lines remain.
+/// Drop `keys` from the env file, and from the platform keychain.
+///
+/// Returns whether anything was removed. Uses the writer's own parser rather
+/// than prefix-matching lines, so a credential the reader can find is one this
+/// can remove — matching raw text left `KEY = value` readable but unremovable,
+/// so logout reported success while the credential stayed live.
+///
+/// The keychain is cleared too: `read_credential` consults it before the env
+/// file, so clearing only the file leaves a working credential behind.
 fn remove_env_keys(keys: &[String]) -> Result<bool> {
-    let env_file = if std::path::Path::new(".env.local").exists() {
-        ".env.local"
-    } else {
-        ".env"
-    };
+    use crate::commands::login::{env_file_path, env_file_vars};
 
-    let path = std::path::Path::new(env_file);
-    if !path.exists() {
-        return Ok(false);
+    let mut removed = false;
+
+    for key in keys {
+        if let Ok(entry) = keyring::Entry::new(key, "spice")
+            && entry.delete_credential().is_ok()
+        {
+            removed = true;
+        }
     }
 
-    let content = std::fs::read_to_string(path).unwrap_or_default();
-    let prefixes: Vec<String> = keys.iter().map(|key| format!("{key}=")).collect();
-    let mut removed = false;
-    let lines: Vec<&str> = content
-        .lines()
-        .filter(|line| {
-            // Trim before matching, mirroring the reader. Matching untrimmed
-            // would leave an indented credential readable but unremovable, so
-            // logout would silently leave it behind.
-            let matched = prefixes
-                .iter()
-                .any(|prefix| line.trim_start().starts_with(prefix.as_str()));
-            removed |= matched;
-            !matched
+    let mut vars = env_file_vars();
+    for key in keys {
+        removed |= vars.remove(key).is_some();
+    }
+
+    let path = std::path::Path::new(env_file_path());
+    if !path.exists() {
+        return Ok(removed);
+    }
+
+    if vars.is_empty() {
+        let _ = std::fs::remove_file(path);
+        return Ok(removed);
+    }
+
+    let mut lines: Vec<String> = vars
+        .iter()
+        .map(|(key, value)| {
+            if value.contains(' ')
+                || value.contains('"')
+                || value.contains('\'')
+                || value.contains('=')
+            {
+                format!("{key}=\"{}\"", value.replace('"', "\\\""))
+            } else {
+                format!("{key}={value}")
+            }
         })
         .collect();
+    lines.sort();
 
-    if lines.is_empty()
-        || lines
-            .iter()
-            .all(|l| l.trim().is_empty() || l.starts_with('#'))
-    {
-        let _ = std::fs::remove_file(path);
-    } else {
-        let new_content = lines.join("\n");
-        std::fs::write(path, new_content).map_err(|e| crate::error::Error::ConfigIo {
-            operation: "write",
-            path: path.to_path_buf(),
-            source: e,
-        })?;
-    }
+    std::fs::write(path, lines.join("\n") + "\n").map_err(|e| crate::error::Error::ConfigIo {
+        operation: "write",
+        path: path.to_path_buf(),
+        source: e,
+    })?;
 
     Ok(removed)
 }
 
 async fn execute_whoami(args: &WhoamiArgs, flag_org: Option<&str>) -> Result<()> {
-    let effective_org = resolve_org(flag_org)?;
+    let (effective_org, source) = resolve_org_with_source(flag_org)?;
     let client = CloudClient::connect(effective_org.as_deref())?;
 
     let context = match client.get_auth_context().await {
         Ok(ctx) => ctx,
-        Err(err) if is_cloud_unauthorized_error(&err) => {
+        Err(err) if client::is_unauthorized_auth_context_error(&err) => {
             // The auth-context endpoint requires a user token (subscription
             // or PAT). Service-account tokens (OAuth client credentials) are
             // valid for API calls but do not have a user identity.
@@ -2115,7 +2179,7 @@ async fn execute_whoami(args: &WhoamiArgs, flag_org: Option<&str>) -> Result<()>
     let active_org = effective_org
         .clone()
         .unwrap_or_else(|| context.org_name.clone());
-    let org_source = org_source_label(flag_org, effective_org.as_deref());
+
     let available_orgs = client.list_orgs().await.unwrap_or_default();
 
     if args.output == OutputFormat::Json {
@@ -2124,7 +2188,7 @@ async fn execute_whoami(args: &WhoamiArgs, flag_org: Option<&str>) -> Result<()>
             "email": context.email,
             "org_name": context.org_name,
             "active_org": active_org,
-            "active_org_source": org_source,
+            "active_org_source": source.label(),
             "app_name": context.app_name,
             "available_orgs": available_orgs
                 .as_ref()
@@ -2133,7 +2197,7 @@ async fn execute_whoami(args: &WhoamiArgs, flag_org: Option<&str>) -> Result<()>
     }
 
     println!("Logged in as: {} ({})", context.username, context.email);
-    println!("Active org:   {active_org} (from {org_source})");
+    println!("Active org:   {active_org} (from {})", source.label());
     if !context.org_name.is_empty() && !context.org_name.eq_ignore_ascii_case(&active_org) {
         println!("Credential org: {}", context.org_name);
     }
@@ -2148,24 +2212,6 @@ async fn execute_whoami(args: &WhoamiArgs, flag_org: Option<&str>) -> Result<()>
     }
 
     Ok(())
-}
-
-/// Where the org in effect came from, so `whoami` can answer "why this org?".
-///
-/// Clap fills `--org` from `SPICE_CLOUD_ORG` too, so the two are distinguished
-/// by checking whether the env var supplied the value.
-fn org_source_label(flag_org: Option<&str>, effective_org: Option<&str>) -> &'static str {
-    match (effective_org, flag_org) {
-        (None, _) => "credential",
-        (Some(_), Some(flag)) => {
-            if std::env::var(org::ACTIVE_ORG_VAR).is_ok_and(|env| env == flag) {
-                org::ACTIVE_ORG_VAR
-            } else {
-                "--org"
-            }
-        }
-        (Some(_), None) => "active org",
-    }
 }
 
 async fn execute_orgs(args: &OrgsArgs, flag_org: Option<&str>) -> Result<()> {
@@ -2471,9 +2517,9 @@ async fn execute_projects(args: &ProjectsArgs, flag_org: Option<&str>) -> Result
     if apps.is_empty() {
         match &active_org {
             Some(org) => println!(
-                "No apps found in organization {org}. Create one with: spice cloud create app <name> --org {org}"
+                "No apps found in organization {org}. Create one with: spice cloud project create <name> --org {org}"
             ),
-            None => println!("No apps found. Create one with: spice cloud create app <name>"),
+            None => println!("No apps found. Create one with: spice cloud project create <name>"),
         }
         return Ok(());
     }
@@ -2521,10 +2567,6 @@ async fn execute_projects(args: &ProjectsArgs, flag_org: Option<&str>) -> Result
     table.print();
 
     Ok(())
-}
-
-fn is_cloud_unauthorized_error(err: &crate::error::Error) -> bool {
-    client::is_unauthorized_auth_context_error(err)
 }
 
 /// Backfill each app's empty `org` from the auth-context org so machine-readable
@@ -2773,92 +2815,87 @@ async fn execute_logs(args: &LogsArgs, flag_org: Option<&str>) -> Result<()> {
 }
 
 async fn execute_project_create(args: &CreateProjectArgs, flag_org: Option<&str>) -> Result<()> {
-    {
-        {
-            let create_region = validate_create_project_args(args)?;
+    let create_region = validate_create_project_args(args)?;
 
-            let client = connect(flag_org)?;
-            let spicepod_content = if let Some(path) = args.spicepod.as_deref() {
-                Some(read_spicepod_file(path).await?)
-            } else {
-                None
-            };
+    let client = connect(flag_org)?;
+    let spicepod_content = if let Some(path) = args.spicepod.as_deref() {
+        Some(read_spicepod_file(path).await?)
+    } else {
+        None
+    };
 
-            let app = client
-                .create_project(
-                    &args.name,
-                    &create_region,
-                    args.kind,
-                    args.description.as_deref(),
-                    &args.visibility,
-                    args.replicas,
-                    args.cpu,
-                    args.memory,
-                    args.storage_size_gb,
-                    args.executor_replicas,
-                    args.executor_cpu,
-                    args.executor_memory,
-                )
-                .await?;
+    let app = client
+        .create_project(
+            &args.name,
+            &create_region,
+            args.kind,
+            args.description.as_deref(),
+            &args.visibility,
+            args.replicas,
+            args.cpu,
+            args.memory,
+            args.storage_size_gb,
+            args.executor_replicas,
+            args.executor_cpu,
+            args.executor_memory,
+        )
+        .await?;
 
-            // The create response may omit `org`, so fall back to the org this
-            // command acted on — the same org the new app was created in.
-            let created = ProjectTarget::new(
-                if app.org.is_empty() {
-                    resolve_org(flag_org)?
-                } else {
-                    Some(app.org.clone())
+    // The create response may omit `org`, so fall back to the org this
+    // command acted on — the same org the new app was created in.
+    let created = ProjectTarget::new(
+        if app.org.is_empty() {
+            resolve_org(flag_org)?
+        } else {
+            Some(app.org.clone())
+        },
+        app.name.clone(),
+    );
+
+    let app = if spicepod_content.is_some() || args.channel.is_some() {
+        match client
+            .update_project(
+                &created,
+                client::UpdateProjectParams {
+                    spicepod: spicepod_content,
+                    channel: args.channel,
+                    ..client::UpdateProjectParams::default()
                 },
-                app.name.clone(),
-            );
-
-            let app = if spicepod_content.is_some() || args.channel.is_some() {
-                match client
-                    .update_project(
-                        &created,
-                        client::UpdateProjectParams {
-                            spicepod: spicepod_content,
-                            channel: args.channel,
-                            ..client::UpdateProjectParams::default()
-                        },
-                    )
-                    .await
-                {
-                    Ok(updated_app) => updated_app,
-                    Err(error) => {
-                        let update_error = error.to_string();
-                        let cleanup_result = client.delete_project(&created).await;
-                        let cleanup_message = match cleanup_result {
-                            Ok(()) => {
-                                "The app was deleted to roll back the failed create.".to_string()
-                            }
-                            Err(cleanup_error) => format!(
-                                "The app still exists, and an automatic delete attempt failed: {cleanup_error}. Run 'spice cloud api-keys --app {created}' if you need to inspect its provisioned API keys, or delete the app manually."
-                            ),
-                        };
-                        return Err(crate::error::Error::InvalidResponse {
-                            message: format!(
-                                "Created app {created}, but failed to update spicepod/channel: {update_error}. {cleanup_message}"
-                            ),
-                        });
-                    }
-                }
-            } else {
-                app
-            };
-
-            if args.output == OutputFormat::Json {
-                return write_json(&app);
-            }
-            println!("\x1b[32m✓ Created app {created}\x1b[0m");
-            if let Ok(api_keys) = client.get_api_keys(&created).await
-                && let Some(api_key) = api_keys.api_key
-            {
-                println!("\nAPI Key: {api_key}");
-                println!("\nSave this key - it won't be shown again.");
+            )
+            .await
+        {
+            Ok(updated_app) => updated_app,
+            Err(error) => {
+                let update_error = error.to_string();
+                let cleanup_result = client.delete_project(&created).await;
+                let cleanup_message = match cleanup_result {
+                    Ok(()) => "The app was deleted to roll back the failed create.".to_string(),
+                    Err(cleanup_error) => format!(
+                        "The app still exists, and an automatic delete attempt failed: {cleanup_error}. Run 'spice cloud api-keys --project {created}' if you need to inspect its provisioned API keys, or delete the app manually."
+                    ),
+                };
+                return Err(crate::error::Error::InvalidResponse {
+                    message: format!(
+                        "Created app {created}, but failed to update spicepod/channel: {update_error}. {cleanup_message}"
+                    ),
+                });
             }
         }
+    } else {
+        app
+    };
+
+    if args.output == OutputFormat::Json {
+        return write_json(&app);
     }
+    println!("\x1b[32m✓ Created app {created}\x1b[0m");
+    if let Ok(api_keys) = client.get_api_keys(&created).await
+        && let Some(api_key) = api_keys.api_key
+    {
+        println!("\nAPI Key: {api_key}");
+        println!("\nSave this key - it won't be shown again.");
+    }
+
     Ok(())
 }
 
@@ -2866,30 +2903,27 @@ async fn execute_create_deployment(
     args: &CreateDeploymentArgs,
     flag_org: Option<&str>,
 ) -> Result<()> {
-    {
-        {
-            let target = resolve_project_target(args.project.as_deref(), flag_org)?;
-            let client = connect_for_target(&target)?;
-            let deployment = client
-                .create_deployment(
-                    &target,
-                    client::CreateDeploymentParams {
-                        image_tag: args.image.as_deref(),
-                        replicas: args.replicas,
-                        debug: args.debug,
-                        ..client::CreateDeploymentParams::default()
-                    },
-                )
-                .await?;
-            if args.output == OutputFormat::Json {
-                return write_json(&deployment);
-            }
-            println!(
-                "\x1b[32m✓ Created deployment {} (status: {})\x1b[0m",
-                deployment.id, deployment.status
-            );
-        }
+    let target = resolve_project_target(args.project.as_deref(), flag_org)?;
+    let client = connect_for_target(&target)?;
+    let deployment = client
+        .create_deployment(
+            &target,
+            client::CreateDeploymentParams {
+                image_tag: args.image.as_deref(),
+                replicas: args.replicas,
+                debug: args.debug,
+                ..client::CreateDeploymentParams::default()
+            },
+        )
+        .await?;
+    if args.output == OutputFormat::Json {
+        return write_json(&deployment);
     }
+    println!(
+        "\x1b[32m✓ Created deployment {} (status: {})\x1b[0m",
+        deployment.id, deployment.status
+    );
+
     Ok(())
 }
 
@@ -2928,120 +2962,108 @@ fn validate_create_project_args(args: &CreateProjectArgs) -> Result<String> {
 }
 
 async fn execute_project_get(args: &GetProjectArgs, flag_org: Option<&str>) -> Result<()> {
-    {
-        {
-            let target = resolve_project_target(Some(&args.project), flag_org)?;
-            let client = connect_for_target(&target)?;
-            let app = client.get_project(&target).await?;
+    let target = resolve_project_target(Some(&args.project), flag_org)?;
+    let client = connect_for_target(&target)?;
+    let app = client.get_project(&target).await?;
 
-            if args.output == OutputFormat::Json {
-                return write_json(&app);
-            }
-
-            println!("Name:        {}", app.full_name());
-            if let Some(desc) = app.description {
-                println!("Description: {desc}");
-            }
-            if let Some(visibility) = app.visibility {
-                println!("Visibility:  {visibility}");
-            }
-            if let Some(region) = app.region {
-                println!("Region:      {region}");
-            }
-            if let Some(created) = app.created_at {
-                println!("Created:     {created}");
-            }
-        }
+    if args.output == OutputFormat::Json {
+        return write_json(&app);
     }
+
+    println!("Name:        {}", app.full_name());
+    if let Some(desc) = app.description {
+        println!("Description: {desc}");
+    }
+    if let Some(visibility) = app.visibility {
+        println!("Visibility:  {visibility}");
+    }
+    if let Some(region) = app.region {
+        println!("Region:      {region}");
+    }
+    if let Some(created) = app.created_at {
+        println!("Created:     {created}");
+    }
+
     Ok(())
 }
 
 async fn execute_project_update(args: &UpdateProjectArgs, flag_org: Option<&str>) -> Result<()> {
-    {
-        {
-            let target = resolve_project_target(args.project.as_deref(), flag_org)?;
-            let client = connect_for_target(&target)?;
-            let spicepod_content = if let Some(path) = args.spicepod.as_deref() {
-                Some(read_spicepod_file(path).await?)
-            } else {
-                None
-            };
+    let target = resolve_project_target(args.project.as_deref(), flag_org)?;
+    let client = connect_for_target(&target)?;
+    let spicepod_content = if let Some(path) = args.spicepod.as_deref() {
+        Some(read_spicepod_file(path).await?)
+    } else {
+        None
+    };
 
-            let app = client
-                .update_project(
-                    &target,
-                    client::UpdateProjectParams {
-                        description: args.description.as_deref(),
-                        visibility: args.visibility.as_deref(),
-                        replicas: args.replicas,
-                        image_tag: args.image.as_deref(),
-                        region: args.region.as_deref(),
-                        cpu: args.cpu,
-                        memory: args.memory,
-                        storage_size_gb: args.storage_size_gb,
-                        executor_replicas: args.executor_replicas,
-                        executor_cpu: args.executor_cpu,
-                        executor_memory: args.executor_memory,
-                        spicepod: spicepod_content,
-                        channel: args.channel,
-                    },
-                )
-                .await?;
+    let app = client
+        .update_project(
+            &target,
+            client::UpdateProjectParams {
+                description: args.description.as_deref(),
+                visibility: args.visibility.as_deref(),
+                replicas: args.replicas,
+                image_tag: args.image.as_deref(),
+                region: args.region.as_deref(),
+                cpu: args.cpu,
+                memory: args.memory,
+                storage_size_gb: args.storage_size_gb,
+                executor_replicas: args.executor_replicas,
+                executor_cpu: args.executor_cpu,
+                executor_memory: args.executor_memory,
+                spicepod: spicepod_content,
+                channel: args.channel,
+            },
+        )
+        .await?;
 
-            if args.output == OutputFormat::Json {
-                return write_json(&app);
-            }
-            println!("\x1b[32m✓ Updated app {}\x1b[0m", app.full_name());
-        }
+    if args.output == OutputFormat::Json {
+        return write_json(&app);
     }
+    println!("\x1b[32m✓ Updated app {}\x1b[0m", app.full_name());
+
     Ok(())
 }
 
 async fn execute_project_delete(args: &DeleteProjectArgs, flag_org: Option<&str>) -> Result<()> {
     use std::io::Write;
 
-    {
-        {
-            let (target, org_source) =
-                resolve_project_target_with_source(Some(&args.project), flag_org)?;
+    let (target, org_source) = resolve_project_target_with_source(Some(&args.project), flag_org)?;
 
-            if !args.yes {
-                // Confirm against the fully-qualified name and say where the org
-                // came from: with several orgs in play, the bare app name is not
-                // enough to know what is about to be destroyed.
-                announce_target("About to delete", &target, org_source, args.output);
-                print!("Continue? [y/N] ");
-                std::io::stdout()
-                    .flush()
-                    .context(crate::error::ConfigIoSnafu {
-                        operation: "write",
-                        path: std::path::PathBuf::from("stdout"),
-                    })?;
+    if !args.yes {
+        // Confirm against the fully-qualified name and say where the org
+        // came from: with several orgs in play, the bare app name is not
+        // enough to know what is about to be destroyed.
+        announce_target("About to delete", &target, org_source, args.output);
+        print!("Continue? [y/N] ");
+        std::io::stdout()
+            .flush()
+            .context(crate::error::ConfigIoSnafu {
+                operation: "write",
+                path: std::path::PathBuf::from("stdout"),
+            })?;
 
-                let mut input = String::new();
-                std::io::stdin()
-                    .read_line(&mut input)
-                    .context(crate::error::ConfigIoSnafu {
-                        operation: "read",
-                        path: std::path::PathBuf::from("stdin"),
-                    })?;
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .context(crate::error::ConfigIoSnafu {
+                operation: "read",
+                path: std::path::PathBuf::from("stdin"),
+            })?;
 
-                if input.trim().to_lowercase() != "y" {
-                    println!("Cancelled.");
-                    return Ok(());
-                }
-            }
-
-            let client = connect_for_target(&target)?;
-            client.delete_project(&target).await?;
-            if args.output == OutputFormat::Json {
-                return write_json(
-                    &serde_json::json!({"app": target.display(), "status": "deleted"}),
-                );
-            }
-            println!("\x1b[32m✓ Deleted app {target}\x1b[0m");
+        if input.trim().to_lowercase() != "y" {
+            println!("Cancelled.");
+            return Ok(());
         }
     }
+
+    let client = connect_for_target(&target)?;
+    client.delete_project(&target).await?;
+    if args.output == OutputFormat::Json {
+        return write_json(&serde_json::json!({"app": target.display(), "status": "deleted"}));
+    }
+    println!("\x1b[32m✓ Deleted app {target}\x1b[0m");
+
     Ok(())
 }
 
@@ -3070,9 +3092,11 @@ async fn execute_deploy(args: &DeployArgs, flag_org: Option<&str>) -> Result<()>
     announce_target("Deploying to", &target, org_source, args.output);
     let client = connect_for_target(&target)?;
 
+    // Resolve once: create_deployment and the wait loop both need the id.
+    let project_id = client.resolve_id(&target).await?;
     let deployment = client
-        .create_deployment(
-            &target,
+        .create_deployment_for_id(
+            project_id,
             client::CreateDeploymentParams {
                 image_tag: args.image.as_deref(),
                 branch: args.branch.as_deref(),
@@ -3080,6 +3104,7 @@ async fn execute_deploy(args: &DeployArgs, flag_org: Option<&str>) -> Result<()>
                 replicas: args.replicas,
                 debug: args.debug,
             },
+            &target,
         )
         .await?;
 
@@ -3096,13 +3121,20 @@ async fn execute_deploy(args: &DeployArgs, flag_org: Option<&str>) -> Result<()>
             return write_json(&deployment);
         }
         println!(
-            "  Track it with 'spice cloud deployments --app {target}', or re-run with --wait."
+            "  Track it with 'spice cloud deployments --project {target}', or re-run with --wait."
         );
         return Ok(());
     }
 
-    let final_deployment =
-        wait_for_deployment(&client, &target, deployment, &args.timeout, is_json).await?;
+    let final_deployment = wait_for_deployment(
+        &client,
+        &target,
+        project_id,
+        deployment,
+        &args.timeout,
+        is_json,
+    )
+    .await?;
 
     if is_json {
         return write_json(&final_deployment);
@@ -3119,6 +3151,7 @@ async fn execute_deploy(args: &DeployArgs, flag_org: Option<&str>) -> Result<()>
 async fn wait_for_deployment(
     client: &CloudClient,
     target: &ProjectTarget,
+    project_id: i64,
     mut deployment: Deployment,
     timeout: &str,
     quiet: bool,
@@ -3160,7 +3193,7 @@ async fn wait_for_deployment(
                     deployment.id, deployment.status
                 ),
                 format!(
-                    "Inspect it with 'spice cloud logs --app {target} --deployment {} --level error'.",
+                    "Inspect it with 'spice cloud logs --project {target} --deployment {} --level error'.",
                     deployment.id
                 ),
             ));
@@ -3179,7 +3212,7 @@ async fn wait_for_deployment(
                     deployment.status
                 ),
                 format!(
-                    "Wait longer with --timeout, or check 'spice cloud deployments --app {target}'."
+                    "Wait longer with --timeout, or check 'spice cloud deployments --project {target}'."
                 ),
             ));
         }
@@ -3187,7 +3220,10 @@ async fn wait_for_deployment(
         tokio::time::sleep(interval).await;
         interval = (interval * 2).min(max_interval);
 
-        let deployments = client.list_deployments(target, 20, None).await?;
+        // Poll by id: the project was resolved before the loop and its id
+        // cannot change, so re-resolving by name each tick would repeat the
+        // whole name lookup on every poll for the life of the wait.
+        let deployments = client.list_deployments_for_id(project_id, 20, None).await?;
         let Some(refreshed) = deployments
             .into_iter()
             .find(|candidate| candidate.id == deployment.id)
@@ -3588,7 +3624,9 @@ async fn fetch_instance_json<T: serde::de::DeserializeOwned>(
         Error::cloud_with_hint(
             CloudErrorCode::NotFound,
             format!("Could not reach the instance for app {target}: {err}"),
-            format!("The app may not be running yet — check 'spice cloud inspect --app {target}'."),
+            format!(
+                "The app may not be running yet — check 'spice cloud status --project {target}'."
+            ),
         )
     })?;
 
@@ -3657,7 +3695,7 @@ fn print_instance_datasets(
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        println!("  Logs: spice cloud logs --app {target} --level error");
+        println!("  Logs: spice cloud logs --project {target} --level error");
     }
 
     Ok(())
@@ -3760,7 +3798,7 @@ mod tests {
     fn is_cloud_unauthorized_error_matches_a_rejected_credential() {
         let err = Error::cloud(CloudErrorCode::TokenExpired, "Unauthorized: token expired");
 
-        assert!(is_cloud_unauthorized_error(&err));
+        assert!(client::is_unauthorized_auth_context_error(&err));
     }
 
     #[test]
@@ -3769,7 +3807,7 @@ mod tests {
         // not allowed — that must not be mistaken for a missing user identity.
         let err = Error::cloud(CloudErrorCode::Forbidden, "Forbidden: missing scope");
 
-        assert!(!is_cloud_unauthorized_error(&err));
+        assert!(!client::is_unauthorized_auth_context_error(&err));
     }
 
     #[test]
@@ -4072,13 +4110,6 @@ mod tests {
         assert_eq!(OrgSource::Environment.label(), "SPICE_CLOUD_ORG");
         assert_eq!(OrgSource::LinkedApp.label(), "linked app");
         assert_eq!(OrgSource::ActiveOrg.label(), "active org");
-    }
-
-    #[test]
-    fn whoami_names_where_the_org_came_from() {
-        assert_eq!(org_source_label(None, None), "credential");
-        assert_eq!(org_source_label(None, Some("spicehq")), "active org");
-        assert_eq!(org_source_label(Some("spicehq"), Some("spicehq")), "--org");
     }
 
     #[test]

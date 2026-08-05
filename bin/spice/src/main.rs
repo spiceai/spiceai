@@ -314,7 +314,7 @@ fn main() {
     if std::io::stderr().is_terminal()
         && !cli.machine
         && !matches!(cli.command, Commands::Version(_) | Commands::Completions(_))
-        && !is_json_output(&cli.command)
+        && !is_json_output(&mut cli.command)
     {
         eprintln!("Spice.ai OSS CLI {}", version::cli_version());
     }
@@ -702,59 +702,8 @@ fn apply_machine_acceleration_mode(args: &mut AccelerationArgs) {
 }
 
 fn apply_machine_cloud_mode(command: &mut cloud::CloudCommands) {
-    match command {
-        cloud::CloudCommands::Whoami(args) => args.output = OutputFormat::Json,
-        cloud::CloudCommands::Orgs(args) => args.output = OutputFormat::Json,
-        cloud::CloudCommands::Status(args) => args.output = OutputFormat::Json,
-        cloud::CloudCommands::Datasets(args) => args.output = OutputFormat::Json,
-        cloud::CloudCommands::Project(command) => match command {
-            cloud::ProjectCommands::Create(args) => args.output = OutputFormat::Json,
-            cloud::ProjectCommands::Get(args) => args.output = OutputFormat::Json,
-            cloud::ProjectCommands::Update(args) => args.output = OutputFormat::Json,
-            cloud::ProjectCommands::Delete(args) => args.output = OutputFormat::Json,
-        },
-        cloud::CloudCommands::Projects(args) => args.output = OutputFormat::Json,
-        cloud::CloudCommands::Deployments(args) => args.output = OutputFormat::Json,
-        cloud::CloudCommands::Regions(args) => args.output = OutputFormat::Json,
-        cloud::CloudCommands::Images(args) => args.output = OutputFormat::Json,
-        cloud::CloudCommands::Logs(args) => args.output = OutputFormat::Json,
-        cloud::CloudCommands::Deploy(args) => args.output = OutputFormat::Json,
-        cloud::CloudCommands::Inspect(args) => args.output = OutputFormat::Json,
-        cloud::CloudCommands::ApiKeys(args) => args.output = OutputFormat::Json,
-        cloud::CloudCommands::Metrics(args) => args.output = OutputFormat::Json,
-        cloud::CloudCommands::Secrets(command) => match command {
-            cloud::SecretsCommands::List(args) => args.output = OutputFormat::Json,
-            cloud::SecretsCommands::Set(args) => args.output = OutputFormat::Json,
-            cloud::SecretsCommands::Get(args) => args.output = OutputFormat::Json,
-            cloud::SecretsCommands::Delete(args) => args.output = OutputFormat::Json,
-        },
-        cloud::CloudCommands::Create(command) => match command {
-            cloud::CreateCommands::Project(args) => args.output = OutputFormat::Json,
-            cloud::CreateCommands::Deployment(args) => args.output = OutputFormat::Json,
-        },
-        cloud::CloudCommands::Get(cloud::GetCommands::Project(args)) => {
-            args.output = OutputFormat::Json;
-        }
-        cloud::CloudCommands::Update(cloud::UpdateCommands::Project(args)) => {
-            args.output = OutputFormat::Json;
-        }
-        cloud::CloudCommands::Delete(cloud::DeleteCommands::Project(args)) => {
-            args.output = OutputFormat::Json;
-        }
-        cloud::CloudCommands::Org(command) => match command {
-            cloud::OrgCommands::Use(args) => args.output = OutputFormat::Json,
-            cloud::OrgCommands::Current(args) => args.output = OutputFormat::Json,
-            cloud::OrgCommands::Clear => {}
-        },
-        cloud::CloudCommands::Instance(command) => match command {
-            cloud::InstanceCommands::List(args) => args.output = OutputFormat::Json,
-            cloud::InstanceCommands::Status(args) => args.output = OutputFormat::Json,
-            cloud::InstanceCommands::Datasets(args) => args.output = OutputFormat::Json,
-        },
-        cloud::CloudCommands::Login(_)
-        | cloud::CloudCommands::Logout(_)
-        | cloud::CloudCommands::Link(_)
-        | cloud::CloudCommands::Unlink => {}
+    if let Some(output) = command.output_mut() {
+        *output = OutputFormat::Json;
     }
 }
 
@@ -843,7 +792,7 @@ fn machine_error_code(error: &spice::error::Error) -> &'static str {
 }
 
 /// Returns true if the command will output JSON, so the banner should be suppressed.
-fn is_json_output(cmd: &Commands) -> bool {
+fn is_json_output(cmd: &mut Commands) -> bool {
     match cmd {
         Commands::Status(a) => a.output == OutputFormat::Json,
         Commands::Datasets(a) => a.output == OutputFormat::Json,
@@ -866,72 +815,8 @@ fn is_json_output(cmd: &Commands) -> bool {
                     ..
                 }),
         }) => *output == OutputFormat::Json,
-        Commands::Cloud(a) => match &a.command {
-            cloud::CloudCommands::Whoami(x) => x.output == OutputFormat::Json,
-            cloud::CloudCommands::Projects(x) => x.output == OutputFormat::Json,
-            cloud::CloudCommands::Regions(x) => x.output == OutputFormat::Json,
-            cloud::CloudCommands::Images(x) => x.output == OutputFormat::Json,
-            cloud::CloudCommands::Deployments(x) => x.output == OutputFormat::Json,
-            cloud::CloudCommands::Inspect(x) => x.output == OutputFormat::Json,
-            cloud::CloudCommands::ApiKeys(x) => x.output == OutputFormat::Json,
-            cloud::CloudCommands::Metrics(x) => x.output == OutputFormat::Json,
-            cloud::CloudCommands::Logs(x) => x.output == OutputFormat::Json,
-            cloud::CloudCommands::Deploy(x) => x.output == OutputFormat::Json,
-
-            cloud::CloudCommands::Secrets(cloud::SecretsCommands::List(x)) => {
-                x.output == OutputFormat::Json
-            }
-            cloud::CloudCommands::Secrets(cloud::SecretsCommands::Set(x)) => {
-                x.output == OutputFormat::Json
-            }
-            cloud::CloudCommands::Secrets(cloud::SecretsCommands::Get(x)) => {
-                x.output == OutputFormat::Json
-            }
-            cloud::CloudCommands::Secrets(cloud::SecretsCommands::Delete(x)) => {
-                x.output == OutputFormat::Json
-            }
-            cloud::CloudCommands::Create(cloud::CreateCommands::Deployment(x)) => {
-                x.output == OutputFormat::Json
-            }
-            cloud::CloudCommands::Orgs(x) => x.output == OutputFormat::Json,
-            cloud::CloudCommands::Status(x) => x.output == OutputFormat::Json,
-            cloud::CloudCommands::Datasets(x) => x.output == OutputFormat::Json,
-            // Each superseded spelling shares its replacement's argument type.
-            cloud::CloudCommands::Project(cloud::ProjectCommands::Create(x))
-            | cloud::CloudCommands::Create(cloud::CreateCommands::Project(x)) => {
-                x.output == OutputFormat::Json
-            }
-            cloud::CloudCommands::Project(cloud::ProjectCommands::Get(x))
-            | cloud::CloudCommands::Get(cloud::GetCommands::Project(x)) => {
-                x.output == OutputFormat::Json
-            }
-            cloud::CloudCommands::Project(cloud::ProjectCommands::Update(x))
-            | cloud::CloudCommands::Update(cloud::UpdateCommands::Project(x)) => {
-                x.output == OutputFormat::Json
-            }
-            cloud::CloudCommands::Project(cloud::ProjectCommands::Delete(x))
-            | cloud::CloudCommands::Delete(cloud::DeleteCommands::Project(x)) => {
-                x.output == OutputFormat::Json
-            }
-            cloud::CloudCommands::Org(cloud::OrgCommands::Use(x)) => x.output == OutputFormat::Json,
-            cloud::CloudCommands::Org(cloud::OrgCommands::Current(x)) => {
-                x.output == OutputFormat::Json
-            }
-            cloud::CloudCommands::Instance(cloud::InstanceCommands::List(x)) => {
-                x.output == OutputFormat::Json
-            }
-            cloud::CloudCommands::Instance(cloud::InstanceCommands::Status(x)) => {
-                x.output == OutputFormat::Json
-            }
-            cloud::CloudCommands::Instance(cloud::InstanceCommands::Datasets(x)) => {
-                x.output == OutputFormat::Json
-            }
-            cloud::CloudCommands::Org(cloud::OrgCommands::Clear)
-            | cloud::CloudCommands::Login(_)
-            | cloud::CloudCommands::Logout(_)
-            | cloud::CloudCommands::Link(_)
-            | cloud::CloudCommands::Unlink => false,
-        },
+        // Cloud commands answer for themselves, from the one match in cloud::mod.
+        Commands::Cloud(a) => a.command.produces_json(),
         _ => false,
     }
 }
@@ -1144,7 +1029,7 @@ mod tests {
     }
 
     fn is_json(args: &[&str]) -> bool {
-        is_json_output(&parse(args).command)
+        is_json_output(&mut parse(args).command)
     }
 
     fn parse_with_machine_mode(args: &[&str]) -> Cli {
