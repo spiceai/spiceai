@@ -783,8 +783,14 @@ pub fn parse_hadoop_table_url(
     let mut base_uri = if let Some(host) = parsed.host_str() {
         format!("{}://{host}/{warehouse_leaves}", parsed.scheme())
     } else {
-        // nodes includes the inferred namespace, which needs to be excluded from the inferred base URI
-        format!("{}://{warehouse_leaves}", parsed.scheme())
+        // nodes includes the inferred namespace, which needs to be excluded from the inferred base URI.
+        //
+        // `warehouse_leaves` never carries a leading `/`, so a host-less URL needs the third
+        // slash written back explicitly. Emitting `file://{leaves}` instead re-parses with the
+        // first path segment as the authority, which then silently vanishes from the path:
+        // `file:///home/u/wh/db/t` came back as `file://home/u/wh`, and every consumer that
+        // reads `.path()` off it saw `/u/wh`.
+        format!("{}:///{warehouse_leaves}", parsed.scheme())
     };
 
     let mut namespace = Namespace::new(namespace_ident);
@@ -948,6 +954,59 @@ mod tests {
         let url = "s3a://my-bucket/my-prefix/warehouse/spiceai_sandbox/my_table";
         let result = parse_hadoop_table_url(url, Some("file:///my/local/path/to/warehouse"));
         result.expect_err("should error parsing url");
+    }
+
+    /// Regression test for #12533. Every previously covered host-less case passed a
+    /// `warehouse_uri`, which overwrites `base_uri` outright and hid the inferred form.
+    #[test]
+    fn test_parse_hadoop_table_url_infers_local_warehouse_root() {
+        let url = "file:///var/lib/spice/warehouse/db/events";
+        let (base_uri, namespace, table_name) =
+            parse_hadoop_table_url(url, None).expect("local warehouse path should parse");
+        assert_eq!(base_uri, "file:///var/lib/spice/warehouse");
+        assert_eq!(namespace.name().to_url_string().as_str(), "db");
+        assert_eq!(table_name, "events");
+
+        // The defect was only visible once something re-parsed the result, which both
+        // consumers do: `build_opendal_operator` reads `.path()` into `FsConfig.root`, and
+        // `HadoopCatalogBuilder::with_warehouse_root` checks the root exists. Written with
+        // two slashes, this URI re-parsed as host `var` with path `/lib/spice/warehouse`.
+        let reparsed = Url::parse(&base_uri).expect("inferred base URI should re-parse");
+        assert!(
+            reparsed.host_str().is_none(),
+            "a local warehouse path must not re-parse with an authority"
+        );
+        assert_eq!(reparsed.path(), "/var/lib/spice/warehouse");
+    }
+
+    #[test]
+    fn test_parse_hadoop_table_url_infers_local_warehouse_root_edges() {
+        // Deeper than the namespace/table pair: only the two trailing segments are stripped.
+        let url = "file:///a/b/c/d/e/ns/tbl";
+        let (base_uri, namespace, table_name) =
+            parse_hadoop_table_url(url, None).expect("deep path should parse");
+        assert_eq!(base_uri, "file:///a/b/c/d/e");
+        assert_eq!(namespace.name().to_url_string().as_str(), "ns");
+        assert_eq!(table_name, "tbl");
+
+        // Shortest path that still names a namespace and a table: the warehouse is the
+        // filesystem root, which stays a valid absolute path rather than becoming `file://`.
+        let url = "file:///ns/tbl";
+        let (base_uri, namespace, table_name) =
+            parse_hadoop_table_url(url, None).expect("root warehouse should parse");
+        assert_eq!(base_uri, "file:///");
+        assert_eq!(namespace.name().to_url_string().as_str(), "ns");
+        assert_eq!(table_name, "tbl");
+        let reparsed = Url::parse(&base_uri).expect("root base URI should re-parse");
+        assert_eq!(reparsed.path(), "/");
+
+        // An explicit warehouse still wins over the inferred one, unchanged by this fix.
+        let url = "file:///var/lib/spice/warehouse/db/events";
+        let warehouse = "file:///var/lib/spice/warehouse";
+        let (base_uri, namespace, _) =
+            parse_hadoop_table_url(url, Some(warehouse)).expect("explicit warehouse parses");
+        assert_eq!(base_uri, "file:///var/lib/spice/warehouse");
+        assert_eq!(namespace.name().to_url_string().as_str(), "db");
     }
 
     #[test]
