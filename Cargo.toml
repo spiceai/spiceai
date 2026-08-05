@@ -477,7 +477,7 @@ inherits = "dev"
 lto = "off"
 
 [patch.crates-io]
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "fed13d9b9817aac30891bd96bb88c9b0afedc4c9" } # TEMP branch viktor/spiceai-54 — re-pin to spiceai-54 after spiceai/datafusion#187 merges
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "fed13d9b9817aac30891bd96bb88c9b0afedc4c9" } # spiceai-54
 datafusion-catalog = { git = "https://github.com/spiceai/datafusion.git", rev = "fed13d9b9817aac30891bd96bb88c9b0afedc4c9" }
 datafusion-catalog-listing = { git = "https://github.com/spiceai/datafusion.git", rev = "fed13d9b9817aac30891bd96bb88c9b0afedc4c9" }
 datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "fed13d9b9817aac30891bd96bb88c9b0afedc4c9" }
