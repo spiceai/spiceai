@@ -95,10 +95,11 @@ const DUMP_NET_WRITE_TIMEOUT_SECS: u32 = 180;
 /// One statement issued on the dump connection before `COM_BINLOG_DUMP`.
 struct PreDumpStatement {
     sql: String,
-    /// Whether a rejection deserves a user-visible warning. The heartbeat
-    /// spellings are deliberately tried in pairs and one of them is unknown on
-    /// any given server version, so those stay at debug.
-    warn_on_error: bool,
+    /// What the user loses if the server rejects this statement, when that is
+    /// worth saying. The heartbeat spellings are deliberately tried in pairs
+    /// and one of them is unknown on any given server version, so those carry
+    /// nothing and a rejection stays at debug.
+    rejection_warning: Option<&'static str>,
 }
 
 /// The session setup a dump connection needs, in the order it is issued.
@@ -124,7 +125,7 @@ fn pre_dump_session_statements(checkpoint_interval: Duration) -> Vec<PreDumpStat
             .into_iter()
             .map(|var| PreDumpStatement {
                 sql: format!("SET @{var} = {heartbeat_nanos}"),
-                warn_on_error: false,
+                rejection_warning: None,
             })
             .collect();
     // `net_write_timeout` is a system variable, so it needs the `SESSION`
@@ -137,7 +138,9 @@ fn pre_dump_session_statements(checkpoint_interval: Duration) -> Vec<PreDumpStat
             "SET SESSION net_write_timeout = \
              GREATEST(@@SESSION.net_write_timeout, {DUMP_NET_WRITE_TIMEOUT_SECS})"
         ),
-        warn_on_error: true,
+        rejection_warning: Some(
+            "the source can still abort the shared binlog connection when one dataset's apply loop stalls, delaying changes for every changes-mode dataset on it. Grant the replication user permission to set session variables, or raise the source's net_write_timeout. See: https://spiceai.org/docs/components/data-connectors/mysql",
+        ),
     });
     statements
 }
@@ -151,14 +154,19 @@ pub(super) async fn open_binlog_stream(
 ) -> std::result::Result<BinlogStream, mysql_async::Error> {
     let mut conn = Conn::new(params.opts.clone()).await?;
 
-    for PreDumpStatement { sql, warn_on_error } in
-        pre_dump_session_statements(params.checkpoint_interval)
+    for PreDumpStatement {
+        sql,
+        rejection_warning,
+    } in pre_dump_session_statements(params.checkpoint_interval)
     {
         if let Err(e) = mysql_async::prelude::Queryable::query_drop(&mut conn, sql.as_str()).await {
-            if warn_on_error {
-                tracing::warn!(dataset = %dataset_name, statement = %sql, error = %e, "Failed to configure the MySQL binlog dump session: the source can still abort the shared binlog connection when one dataset's apply loop stalls, delaying changes for every changes-mode dataset on this connection. Grant the replication user permission to set session variables, or raise the source's net_write_timeout. See: https://spiceai.org/docs/components/data-connectors/mysql");
-            } else {
-                tracing::debug!(dataset = %dataset_name, statement = %sql, error = %e, "failed to set a binlog dump session variable");
+            match rejection_warning {
+                Some(consequence) => {
+                    tracing::warn!(dataset = %dataset_name, statement = %sql, error = %e, "Failed to configure the MySQL binlog dump session for dataset {dataset_name}: {consequence}");
+                }
+                None => {
+                    tracing::debug!(dataset = %dataset_name, statement = %sql, error = %e, "failed to set a binlog dump session variable");
+                }
             }
         }
     }
@@ -1024,6 +1032,17 @@ mod tests {
             .map(|statement| statement.sql.as_str())
     }
 
+    /// The warning the statement setting `variable` carries, if it carries one.
+    fn statement_rejection_warning(
+        statements: &[PreDumpStatement],
+        variable: &str,
+    ) -> Option<&'static str> {
+        statements
+            .iter()
+            .find(|statement| statement.sql.contains(variable))
+            .and_then(|statement| statement.rejection_warning)
+    }
+
     #[test]
     fn the_dump_session_raises_net_write_timeout() {
         // Regression test for #12527: without this the source aborts the shared
@@ -1079,12 +1098,18 @@ mod tests {
         let statements = pre_dump_session_statements(Duration::from_secs(10));
         for statement in &statements {
             assert_eq!(
-                statement.warn_on_error,
+                statement.rejection_warning.is_some(),
                 statement.sql.contains("net_write_timeout"),
                 "unexpected error visibility for {}",
                 statement.sql
             );
         }
+        let warning = statement_rejection_warning(&statements, "net_write_timeout")
+            .expect("a rejected net_write_timeout must say what it costs");
+        assert!(
+            warning.contains("https://spiceai.org/docs/"),
+            "the warning must point at the fix: {warning}"
+        );
     }
 
     #[test]
