@@ -126,10 +126,16 @@ Async code must reach an `.await` at least every ~100µs — blocking a runtime 
 
 A new trait method with a default impl silently no-ops in wrapper/decorator impls — it compiles, then regresses at runtime (real case [#10460](https://github.com/spiceai/spiceai/pull/10460): defaulted `register_object_stores` on `DataConnector` was never forwarded by `EmbeddingConnector`/`FullTextConnector`/`DeferredConnector`, so cluster executors hit `BareRedirect` S3 errors). When adding or changing a trait method:
 
-1. Find every wrapper impl: `rg -n "impl\s+(\w+\s+for\s+)?<TraitName>\b" crates/`. Known wrapped traits: `DataConnector` (`EmbeddingConnector`, `FullTextConnector`, `DeferredConnector`); `TableProvider` (`AcceleratedTable`, `FederatedTable`, view/sink/partition providers — including `statistics()`); `Read`, `ReadWrite`, `Catalog`, `SecretStore`, `Chat`, `Embed`, `Nql`.
+1. Find every wrapper impl: `rg -n "impl\s+(\w+\s+for\s+)?<TraitName>\b" crates/`. Known wrapped traits:
+   - `DataConnector` — `EmbeddingConnector`, `FullTextConnector`, `ElasticsearchFullTextConnector`, `DeferredConnector`
+   - `TableProvider` — `AcceleratedTable`, `FederatedTable`, `IndexedTableProvider`, `EnsureSchema`, `PolyTableProvider`, `MetadataEnrichedTableProvider`, view/sink/partition providers — **including `statistics()`**
+   - `Index` — `CompoundSearchIndex`, `CompoundVectorIndex`, `ChunkedSearchIndex`, `ChunkedVectorIndex` (two of its methods carry an explicit "wrappers MUST forward this" note)
+   - `Chat` — `ChatWrapper`, `ToolUsingChat`, `RouterModel`; `Embed` — `TaskEmbed`
+   - `Read`, `ReadWrite`, `CatalogConnector`, `SecretStore`
 2. Explicitly forward the method in each wrapper — inheriting the default is almost always a bug, even a no-op default, because the inner type may have meaningful behavior.
-3. Prefer no default impl on traits with known wrappers so the compiler surfaces them; if back-compat forces a default, comment the forwarding requirement on the trait method.
-4. Add an integration test exercising the wrapped path — unit tests don't catch defaulted no-ops.
+3. Put `#[deny(clippy::missing_trait_methods)]` on every wrapper impl (~35 already carry it, e.g. `EmbeddingConnector`, `FullTextConnector`, `IndexedTableProvider`). It turns "forgot to forward" into a compile error, which is the only check that catches this class mechanically — a wrapper without it is one defaulted method away from a silent regression.
+4. Prefer no default impl on traits with known wrappers so the compiler surfaces them; if back-compat forces a default, comment the forwarding requirement on the trait method.
+5. Add an integration test exercising the wrapped path — unit tests don't catch defaulted no-ops.
 
 ## Testing
 
