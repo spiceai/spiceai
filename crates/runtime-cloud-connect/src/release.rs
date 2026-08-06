@@ -223,11 +223,11 @@ mod tests {
 
     #[test]
     fn release_url_joins_with_and_without_trailing_slash() {
-        for endpoint in ["https://cloud.spice.ai/", "https://cloud.spice.ai"] {
+        for endpoint in ["https://api.spice.ai/", "https://api.spice.ai"] {
             let base = endpoint.trim_end_matches('/');
             assert_eq!(
                 format!("{base}{RELEASE_PATH}"),
-                "https://cloud.spice.ai/v1/cloud-connect/release"
+                "https://api.spice.ai/v1/cloud-connect/release"
             );
         }
     }

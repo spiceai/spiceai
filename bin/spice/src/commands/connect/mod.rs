@@ -144,7 +144,7 @@ pub struct ConnectArgs {
     pub target: Option<String>,
 
     /// Override the Spice Cloud enroll endpoint the adoption code is
-    /// presented to. Defaults to `https://cloud.spice.ai`. Also
+    /// presented to. Defaults to `https://api.spice.ai`. Also
     /// configurable via `SPICE_CLOUD_ENDPOINT`. The gateway (stream)
     /// address is issued by the enroll response, not configured here.
     #[arg(long, value_name = "URL")]

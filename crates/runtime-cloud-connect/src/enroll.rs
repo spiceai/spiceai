@@ -1006,7 +1006,7 @@ mod tests {
 
     #[test]
     fn enroll_attributes_read_the_config() {
-        let mut config = test_config("https://cloud.spice.ai");
+        let mut config = test_config("https://api.spice.ai");
         config.adopt_app_name = Some("edge-fleet".to_string());
         config.adopt_create_app = true;
         config.instance_region = Some("us-west-2".to_string());
@@ -1053,7 +1053,7 @@ mod tests {
         // A skewed clock never reached the cloud, so the adoption code is
         // still live: classifying this as authoritative would burn it.
         let err = Error::CertificateValidity {
-            url: "https://cloud.spice.ai/v1/cloud-connect/enroll".to_string(),
+            url: "https://api.spice.ai/v1/cloud-connect/enroll".to_string(),
             advice: "host clock is 42 minutes behind Spice Cloud".to_string(),
         };
         assert!(!err.is_authoritative_rejection());
@@ -1088,15 +1088,15 @@ mod tests {
 
     #[test]
     fn enroll_urls_join_with_and_without_trailing_slash() {
-        for endpoint in ["https://cloud.spice.ai/", "https://cloud.spice.ai"] {
+        for endpoint in ["https://api.spice.ai/", "https://api.spice.ai"] {
             let client = EnrollClient::new(&test_config(endpoint)).expect("client");
             assert_eq!(
                 client.enroll_url,
-                "https://cloud.spice.ai/v1/cloud-connect/enroll"
+                "https://api.spice.ai/v1/cloud-connect/enroll"
             );
             assert_eq!(
                 client.renew_url,
-                "https://cloud.spice.ai/v1/cloud-connect/renew"
+                "https://api.spice.ai/v1/cloud-connect/renew"
             );
         }
     }
