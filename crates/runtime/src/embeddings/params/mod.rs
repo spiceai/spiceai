@@ -61,6 +61,50 @@ impl FromStr for Pooling {
     }
 }
 
+/// How local (TEI-based) embedding models handle an input longer than the
+/// model's maximum sequence length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Truncation {
+    /// Reject the whole embedding request with an input-validation error,
+    /// rather than silently dropping the tail of an over-long input. Default.
+    #[default]
+    Error,
+    /// Truncate the input to the model's maximum sequence length before
+    /// embedding. Right-truncation (`TruncationDirection::Right`), matching the
+    /// sentence-transformers/MTEB default.
+    Truncate,
+}
+
+impl Truncation {
+    /// Whether an over-long input is truncated (`true`) rather than rejected
+    /// (`false`). This is the value passed to the TEI backend's `embed_pooled`
+    /// `truncate` argument.
+    #[must_use]
+    pub fn truncates(self) -> bool {
+        matches!(self, Truncation::Truncate)
+    }
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Truncation::Error => "error",
+            Truncation::Truncate => "truncate",
+        }
+    }
+}
+
+impl FromStr for Truncation {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "error" => Ok(Truncation::Error),
+            "truncate" => Ok(Truncation::Truncate),
+            other => Err(format!("must be one of: error, truncate. Found {other}")),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,6 +204,7 @@ mod tests {
                 ("hf_token", "hf_abc"),
                 ("pooling", "mean"),
                 ("max_seq_length", "512"),
+                ("truncate", "truncate"),
             ]),
             &empty_secrets(),
         )
@@ -171,6 +216,69 @@ mod tests {
         );
         assert_eq!(typed.pooling, Some(Pooling::Mean));
         assert_eq!(typed.max_seq_length, Some(512));
+        assert_eq!(typed.truncate, Some(Truncation::Truncate));
+    }
+
+    #[tokio::test]
+    async fn huggingface_params_default_truncate_is_absent() {
+        // An omitted `truncate` stays `None`, which the call site resolves to
+        // the default `error` (no silent truncation).
+        let typed = huggingface::HuggingFaceEmbeddingParams::try_from_params(
+            "embedding test",
+            params(&[("hf_token", "hf_abc")]),
+            &empty_secrets(),
+        )
+        .await
+        .expect("huggingface params should deserialize");
+        assert_eq!(typed.truncate, None);
+        assert!(!typed.truncate.unwrap_or_default().truncates());
+    }
+
+    #[tokio::test]
+    async fn file_params_parse_truncate_enum() {
+        let typed = file::FileEmbeddingParams::try_from_params(
+            "embedding test",
+            params(&[("truncate", "error")]),
+            &empty_secrets(),
+        )
+        .await
+        .expect("file params should deserialize");
+        assert_eq!(typed.truncate, Some(Truncation::Error));
+        assert!(!typed.truncate.unwrap_or_default().truncates());
+    }
+
+    #[tokio::test]
+    async fn file_params_reject_unknown_truncate() {
+        let Err(err) = file::FileEmbeddingParams::try_from_params(
+            "embedding test",
+            params(&[("truncate", "sometimes")]),
+            &empty_secrets(),
+        )
+        .await
+        else {
+            panic!("an unknown truncate value should error")
+        };
+        assert!(
+            err.to_string().contains("must be one of: error, truncate"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn truncation_from_str_round_trips_and_maps_to_bool() {
+        assert_eq!(Truncation::default(), Truncation::Error);
+        assert!(!Truncation::Error.truncates());
+        assert!(Truncation::Truncate.truncates());
+
+        for variant in [Truncation::Error, Truncation::Truncate] {
+            assert_eq!(
+                variant.as_str().parse::<Truncation>(),
+                Ok(variant),
+                "{variant:?} should round-trip through its string form"
+            );
+        }
+
+        assert!("nonsense".parse::<Truncation>().is_err());
     }
 
     #[tokio::test]
