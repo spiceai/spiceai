@@ -128,8 +128,9 @@ async fn poison_open_writer_channels(
     };
     for sender in senders.values() {
         let _ = sender
-            .send(Err(DataFusionError::Execution(poison_msg.clone())
-                .context(POISONED_BY_UPSTREAM_TAG)))
+            .send(Err(
+                DataFusionError::Execution(poison_msg.clone()).context(POISONED_BY_UPSTREAM_TAG)
+            ))
             .await;
     }
 }
@@ -187,8 +188,8 @@ fn resolve_write_error(
         Some(WriteFanoutFailure::WriterChannelClosed) => {
             Some(genuine_task_err.or(poisoned_task_err).unwrap_or_else(|| {
                 DataFusionError::Execution(
-                    "partition writer task terminated before stream end, and no writer task \
-                     reported a specific error"
+                    "A partition stopped receiving data before the write finished, and no \
+                     partition reported a specific reason"
                         .to_string(),
                 )
             }))
@@ -208,9 +209,8 @@ async fn get_or_create_partition_provider(
     partitions: &Arc<tokio::sync::RwLock<HashMap<CompositePartitionKey, Partition>>>,
     partition_values: Vec<ScalarValue>,
 ) -> Result<Arc<dyn datafusion::catalog::TableProvider>, DataFusionError> {
-    let partition_key = encode_composite_key(&partition_values).map_err(|e| {
-        DataFusionError::Execution(format!("Failed to encode partition key: {e}"))
-    })?;
+    let partition_key = encode_composite_key(&partition_values)
+        .map_err(|e| DataFusionError::Execution(format!("Failed to encode partition key: {e}")))?;
 
     // Fast path: take a read lock first. Existing partitions hit this
     // path on every subsequent insert, and we MUST NOT serialize those

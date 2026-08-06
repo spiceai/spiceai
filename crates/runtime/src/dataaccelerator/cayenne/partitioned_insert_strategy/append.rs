@@ -57,9 +57,9 @@ use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::{
-    CompositePartitionKey, PARTITION_WRITER_CHANNEL_DEPTH, WriteFanoutFailure,
-    downcast_to_cayenne, get_or_create_partition_provider, join_writer_handles,
-    poison_open_writer_channels, resolve_write_error,
+    CompositePartitionKey, PARTITION_WRITER_CHANNEL_DEPTH, WriteFanoutFailure, downcast_to_cayenne,
+    get_or_create_partition_provider, join_writer_handles, poison_open_writer_channels,
+    resolve_write_error,
 };
 
 /// `DataSink` that fans the input stream out by partition key, stages every
@@ -286,13 +286,19 @@ impl DataSink for CayennePartitionedAppendSink {
         drop(senders);
 
         // Join all writer tasks.
-        let (prepared, genuine_task_err, poisoned_task_err) = join_writer_handles(handles).await;
+        let (mut prepared, genuine_task_err, poisoned_task_err) =
+            join_writer_handles(handles).await;
 
         if let Some(err) = resolve_write_error(fanout_failure, genuine_task_err, poisoned_task_err)
         {
             for prep in prepared {
+                let table_id = prep.table_id().to_string();
                 if let Err(rollback_err) = prep.rollback().await {
-                    tracing::warn!("rollback after stream/writer error failed: {rollback_err}");
+                    tracing::warn!(
+                        table_id,
+                        %rollback_err,
+                        "Failed to roll back a partition's write after a write error elsewhere in the batch"
+                    );
                 }
             }
             return Err(err);
@@ -347,15 +353,20 @@ impl DataSink for CayennePartitionedAppendSink {
             if !same_backend {
                 drop(fence_guards);
                 for receipt in prepared {
+                    let table_id = receipt.table_id().to_string();
                     if let Err(error) = receipt.rollback().await {
                         tracing::warn!(
+                            table_id,
                             %error,
-                            "Failed to roll back deferred append after heterogeneous WAL backend validation"
+                            "Failed to roll back a partition's write after detecting that this \
+                             table's partitions use different write-ahead log storage locations"
                         );
                     }
                 }
                 return Err(DataFusionError::Execution(
-                    "Cannot atomically append across Cayenne partitions configured with different WAL storage backends or prefixes"
+                    "Cannot write to this table because its partitions use different \
+                     write-ahead log storage locations. Every partition of a table must share \
+                     the same storage location for atomic multi-partition writes to work."
                         .to_string(),
                 ));
             }
@@ -371,8 +382,15 @@ impl DataSink for CayennePartitionedAppendSink {
         if let Err(e) = wal_write_result {
             drop(fence_guards);
             for prep in prepared {
-                if let Err(rb) = prep.rollback().await {
-                    tracing::warn!("rollback after top-level WAL write failure: {rb}");
+                let table_id = prep.table_id().to_string();
+                if let Err(rollback_error) = prep.rollback().await {
+                    tracing::warn!(
+                        table_id,
+                        commit_id,
+                        %rollback_error,
+                        "Failed to roll back a partition's write after failing to write this \
+                         table's multi-partition write-ahead log"
+                    );
                 }
             }
             return Err(DataFusionError::from(e));
@@ -396,13 +414,21 @@ impl DataSink for CayennePartitionedAppendSink {
                     PartitionedWal::remove(&self.table_root, &commit_id).await
                 } {
                     tracing::warn!(
-                        "Failed to remove top-level WAL after append preparation failure: {cleanup_error}"
+                        commit_id,
+                        %cleanup_error,
+                        "Failed to remove this table's multi-partition write-ahead log after a \
+                         write preparation failure"
                     );
                 }
                 drop(fence_guards);
                 for receipt in prepared {
+                    let table_id = receipt.table_id().to_string();
                     if let Err(rollback_error) = receipt.rollback().await {
-                        tracing::warn!("Failed to roll back deferred append: {rollback_error}");
+                        tracing::warn!(
+                            table_id,
+                            %rollback_error,
+                            "Failed to roll back a partition's write after a write preparation failure"
+                        );
                     }
                 }
                 return Err(DataFusionError::from(error));
@@ -493,14 +519,19 @@ impl DataSink for CayennePartitionedAppendSink {
                         retain_ambiguous_commit_receipts(&mut prepared, prepared_on_conflicts);
                         drop(fence_guards);
                         return Err(DataFusionError::Execution(format!(
-                            "Cross-partition Cayenne commit returned an error and durable catalog pointers are mixed ({committed} committed, {uncommitted} uncommitted); refusing rollback and retaining every WAL for manual recovery"
+                            "This write to a multi-partition table failed partway through: \
+                             {committed} partition(s) committed and {uncommitted} did not. \
+                             Spice will not automatically roll back; this table needs manual recovery."
                         )));
                     }
                     AppendCommitFailureDisposition::RetainUnknown(classification_error) => {
                         retain_ambiguous_commit_receipts(&mut prepared, prepared_on_conflicts);
                         drop(fence_guards);
                         return Err(DataFusionError::Execution(format!(
-                            "Cross-partition Cayenne commit returned an error and its durable outcome could not be classified ({classification_error}); refusing rollback and retaining every WAL for recovery. Original commit error: {error}"
+                            "This write to a multi-partition table failed, and Spice could not \
+                             determine whether any partition committed ({classification_error}). \
+                             Spice will not automatically roll back; this table needs manual \
+                             recovery. Original error: {error}"
                         )));
                     }
                 }
@@ -510,9 +541,14 @@ impl DataSink for CayennePartitionedAppendSink {
                 }
                 let mut rollback_failed = false;
                 for receipt in prepared {
+                    let table_id = receipt.table_id().to_string();
                     if let Err(rollback_error) = receipt.rollback().await {
                         rollback_failed = true;
-                        tracing::warn!("Failed to roll back deferred append: {rollback_error}");
+                        tracing::warn!(
+                            table_id,
+                            %rollback_error,
+                            "Failed to roll back a partition's write after the multi-partition commit failed"
+                        );
                     }
                 }
                 if !rollback_failed
@@ -525,7 +561,10 @@ impl DataSink for CayennePartitionedAppendSink {
                     }
                 {
                     tracing::warn!(
-                        "Failed to remove top-level WAL after append rollback: {cleanup_error}"
+                        commit_id,
+                        %cleanup_error,
+                        "Failed to remove this table's multi-partition write-ahead log after \
+                         rolling back a failed write"
                     );
                 }
                 return Err(error);
@@ -567,7 +606,8 @@ impl DataSink for CayennePartitionedAppendSink {
                         target_snapshot = receipt.target_snapshot_id(),
                         staging_wal_path = %receipt.staging_wal_path().display(),
                         %error,
-                        "Failed to remove committed partition staging WAL"
+                        "Failed to remove this partition's write-ahead log after its write was \
+                         committed; the write itself succeeded and is not affected"
                     );
                 }
             }
@@ -581,7 +621,8 @@ impl DataSink for CayennePartitionedAppendSink {
                 tracing::warn!(
                     commit_id,
                     %error,
-                    "Failed to remove committed cross-partition WAL; append remains committed"
+                    "Failed to remove this table's multi-partition write-ahead log after the \
+                     write was committed; the write itself succeeded and is not affected"
                 );
             }
 
@@ -589,13 +630,17 @@ impl DataSink for CayennePartitionedAppendSink {
             // returns row count).
             let mut total_rows: u64 = 0;
             for prep in prepared {
+                let table_id = prep.table_id().to_string();
                 prep.finish_deferred_snapshot_maintenance().await;
                 match prep.finish().await {
                     Ok(rows) => total_rows = total_rows.saturating_add(rows),
-                    Err(e) => {
+                    Err(error) => {
                         tracing::warn!(
-                            "finish() for prepared append failed after barrier: {e}; \
-                         in-memory state will reconcile on next scan"
+                            table_id,
+                            %error,
+                            "Failed to update a partition's in-memory state after its write was \
+                             committed; it will catch up automatically the next time this table \
+                             is queried"
                         );
                     }
                 }
@@ -614,7 +659,6 @@ impl DataSink for CayennePartitionedAppendSink {
 }
 
 impl CayennePartitionedAppendSink {
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         catalog: Arc<CayenneCatalog>,
         coordinator_lock: Arc<tokio::sync::Mutex<()>>,
@@ -677,7 +721,10 @@ impl CayennePartitionedAppendSink {
                 // deterministically before this attempt backs off and retries.
                 if let Err(rollback_error) = txn.rollback().await {
                     tracing::warn!(
-                        "Failed to roll back cross-partition append transaction before retry: {rollback_error}"
+                        attempt,
+                        max_attempts,
+                        %rollback_error,
+                        "Failed to roll back the multi-partition commit before retrying"
                     );
                 }
                 if attempt < max_attempts && cayenne::is_retryable_write_conflict(&error) {
@@ -696,7 +743,10 @@ impl CayennePartitionedAppendSink {
                     // deterministically before this attempt backs off and retries.
                     if let Err(rollback_error) = txn.rollback().await {
                         tracing::warn!(
-                            "Failed to roll back cross-partition append transaction before retry: {rollback_error}"
+                            attempt,
+                            max_attempts,
+                            %rollback_error,
+                            "Failed to roll back the multi-partition commit before retrying"
                         );
                     }
                     if attempt < max_attempts && cayenne::is_retryable_write_conflict(&error) {
@@ -722,7 +772,10 @@ impl CayennePartitionedAppendSink {
                     // deterministically before this attempt backs off and retries.
                     if let Err(rollback_error) = txn.rollback().await {
                         tracing::warn!(
-                            "Failed to roll back cross-partition append transaction before retry: {rollback_error}"
+                            attempt,
+                            max_attempts,
+                            %rollback_error,
+                            "Failed to roll back the multi-partition commit before retrying"
                         );
                     }
                     if attempt < max_attempts && cayenne::is_retryable_write_conflict(&error) {
@@ -749,7 +802,8 @@ impl CayennePartitionedAppendSink {
         }
 
         Err(DataFusionError::Execution(format!(
-            "cross-partition append commit exhausted {max_attempts} attempts without success"
+            "Failed to commit this write across all its partitions after {max_attempts} attempts \
+             due to repeated conflicting writes; retry the write"
         )))
     }
 

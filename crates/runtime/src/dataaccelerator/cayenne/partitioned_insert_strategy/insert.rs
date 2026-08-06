@@ -37,9 +37,9 @@ use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::{
-    CompositePartitionKey, PARTITION_WRITER_CHANNEL_DEPTH, WriteFanoutFailure,
-    downcast_to_cayenne, get_or_create_partition_provider, join_writer_handles,
-    poison_open_writer_channels, resolve_write_error,
+    CompositePartitionKey, PARTITION_WRITER_CHANNEL_DEPTH, WriteFanoutFailure, downcast_to_cayenne,
+    get_or_create_partition_provider, join_writer_handles, poison_open_writer_channels,
+    resolve_write_error,
 };
 
 /// `DataSink` that fans the input stream out by partition key, stages every
@@ -185,8 +185,13 @@ impl DataSink for CayennePartitionedOverwriteSink {
         if let Some(err) = resolve_write_error(fanout_failure, genuine_task_err, poisoned_task_err)
         {
             for prep in prepared {
+                let table_id = prep.table_id().to_string();
                 if let Err(rollback_err) = prep.rollback().await {
-                    tracing::warn!("rollback after stream/writer error failed: {rollback_err}");
+                    tracing::warn!(
+                        table_id,
+                        %rollback_err,
+                        "Failed to roll back a partition's write after a write error elsewhere in the batch"
+                    );
                 }
             }
             return Err(err);
@@ -202,9 +207,12 @@ impl DataSink for CayennePartitionedOverwriteSink {
         // the error; the txn is auto-rolled-back when its handle drops.
         if let Err(err) = self.commit_in_one_txn(&prepared).await {
             for prep in prepared {
+                let table_id = prep.table_id().to_string();
                 if let Err(rollback_err) = prep.rollback().await {
                     tracing::warn!(
-                        "rollback of prepared overwrite failed after txn error: {rollback_err}"
+                        table_id,
+                        %rollback_err,
+                        "Failed to roll back a partition's write after the multi-partition commit failed"
                     );
                 }
             }
@@ -217,12 +225,15 @@ impl DataSink for CayennePartitionedOverwriteSink {
         // see the new state via the next scan.
         let mut total_rows: u64 = 0;
         for prep in prepared {
+            let table_id = prep.table_id().to_string();
             match prep.finish().await {
                 Ok(rows) => total_rows = total_rows.saturating_add(rows),
-                Err(e) => {
+                Err(error) => {
                     tracing::warn!(
-                        "finish() for prepared overwrite failed after txn commit: {e}; \
-                         in-memory state will reconcile on next scan"
+                        table_id,
+                        %error,
+                        "Failed to update a partition's in-memory state after its write was \
+                         committed; it will catch up automatically the next time this table is queried"
                     );
                 }
             }
@@ -290,7 +301,7 @@ impl CayennePartitionedOverwriteSink {
                         attempt,
                         max_attempts,
                         ?delay,
-                        "Retrying cross-partition commit after apply_in_txn conflict"
+                        "Retrying the multi-partition commit after a conflicting write"
                     );
                     tokio::time::sleep(delay).await;
                     continue;
@@ -306,7 +317,7 @@ impl CayennePartitionedOverwriteSink {
                         attempt,
                         max_attempts,
                         ?delay,
-                        "Retrying cross-partition commit after txn commit conflict"
+                        "Retrying the multi-partition commit after a conflicting commit"
                     );
                     tokio::time::sleep(delay).await;
                 }
@@ -315,7 +326,8 @@ impl CayennePartitionedOverwriteSink {
         }
 
         Err(DataFusionError::Execution(format!(
-            "cross-partition commit exhausted {max_attempts} attempts without success"
+            "Failed to commit this write across all its partitions after {max_attempts} attempts \
+             due to repeated conflicting writes; retry the write"
         )))
     }
 
