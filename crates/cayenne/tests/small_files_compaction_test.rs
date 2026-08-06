@@ -1320,19 +1320,21 @@ async fn warm_subset_preserves_key_deletes_and_rows(
     Ok(())
 }
 
-// Regression test for #12602: the seed's own appends schedule a post-write
-// compaction on the dedicated compaction runtime, so a fan-out measured right
-// after the writes raced that pass and the tests built on it were flaky.
-// `drain_in_flight_maintenance` is what ends the race; assert it actually
-// leaves nothing running, since every fan-out assertion here now rests on it.
-test_with_backends!(post_write_compaction_is_quiesced_by_the_drain);
-async fn post_write_compaction_is_quiesced_by_the_drain(
+// Regression test for #12602. Pins the hazard every fan-out assertion here rests
+// on: a seed's own appends get consolidated by a post-write pass nobody asked
+// for, so a fan-out listed after the writes is already the compacted one.
+// Reaching that state deliberately — rather than hoping to race into it — is
+// what makes this deterministic: from here a premise listed off the store can
+// never be beaten, because the pass that produced it also spent the one-shot
+// `new_files_since_last_compaction` credit the explicit trigger needs.
+test_with_backends!(a_seed_is_consolidated_before_its_fanout_can_be_listed);
+async fn a_seed_is_consolidated_before_its_fanout_can_be_listed(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = pk_schema();
     let (table, ctx, table_id) = build_table(
         &fixture,
-        "quiesced_fanout",
+        "consolidated_seed",
         Arc::clone(&schema),
         None,
         aggressive_key_deletion_compaction_config(),
@@ -1341,6 +1343,7 @@ async fn post_write_compaction_is_quiesced_by_the_drain(
 
     let batch_rows: i64 = 1500;
     let batches = 12_i64;
+    let seeded_files = usize::try_from(batches).expect("batch count fits usize");
     for batch_idx in 0..batches {
         common::insert_batch(
             &table,
@@ -1349,35 +1352,38 @@ async fn post_write_compaction_is_quiesced_by_the_drain(
         .await?;
     }
 
+    // Let the unasked-for pass finish instead of racing it.
     table.drain_in_flight_maintenance().await?;
 
-    let observe = || async {
-        let snapshot_id = fixture
-            .catalog
-            .get_table("quiesced_fanout")
-            .await
-            .expect("get_table")
-            .current_snapshot_id;
-        let files = count_vortex_files(&fixture.data_path, &table_id, &snapshot_id).await;
-        (snapshot_id, files)
-    };
-
-    // Nothing writes between these two samples, and only a write can schedule a
-    // post-write pass, so a drained table must report the same snapshot and the
-    // same fan-out both times. The wait is deliberate — the property under test
-    // is that no pass lands during it, so it cannot be replaced by polling.
-    let first = observe().await;
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    let second = observe().await;
-    assert_eq!(
-        first, second,
-        "a drained table must not move its snapshot or fan-out (was {first:?}, then {second:?})"
+    let settled_snapshot = fixture
+        .catalog
+        .get_table("consolidated_seed")
+        .await?
+        .current_snapshot_id;
+    let settled_files = count_vortex_files(&fixture.data_path, &table_id, &settled_snapshot).await;
+    assert!(
+        settled_files < seeded_files,
+        "a post-write pass must consolidate the seed unprompted, which is what makes a \
+         listed fan-out unusable as the premise (seeded={seeded_files}, settled={settled_files})"
     );
 
-    // The drain waits for the pass rather than cancelling it, so the rows it
-    // consolidated must all still be readable.
+    // Measured against the seeded count the reduction is still visible from this
+    // already-consolidated state; measured against `settled_files` it could not be.
+    let Some((_post_snap, post_count)) =
+        wait_until_current_snapshot_compacts(&table, &fixture, "consolidated_seed", seeded_files)
+            .await?
+    else {
+        panic!("an already-consolidated seed must still report a reduced fan-out");
+    };
+    assert!(
+        post_count < seeded_files,
+        "fan-out must stay below the seeded count (seeded={seeded_files}, post={post_count})"
+    );
+
+    // The drain waits for the pass rather than cancelling it, so every row it
+    // consolidated must still be readable.
     assert_eq!(
-        count_rows(&ctx, "quiesced_fanout").await,
+        count_rows(&ctx, "consolidated_seed").await,
         batch_rows * batches,
         "draining compaction must preserve every seeded row"
     );
