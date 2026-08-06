@@ -194,6 +194,12 @@ impl Client {
     }
 }
 
+// The reader below is written here rather than taken from a crate. `eventsource-stream` and the
+// `reqwest-eventsource` fork `crates/llms` pins both decode SSE correctly, but both end a stream
+// silently when the body stops mid-event, and reporting that rather than passing off a partial
+// answer as a whole one is the behavior this module exists to keep. Sharing one decoder across the
+// workspace's SSE readers is worth doing - see #12597 - but it belongs in its own change.
+
 /// What begins at `buf[i]`.
 enum Terminator {
     /// A `\n`, or a `\r\n` whose `\n` is present: the line ends here and the next one starts a
@@ -210,9 +216,11 @@ enum Terminator {
 fn terminator_at(buf: &[u8], i: usize) -> Terminator {
     match buf.get(i) {
         Some(b'\n') => Terminator::Complete(1),
-        Some(b'\r') if buf.get(i + 1) == Some(&b'\n') => Terminator::Complete(2),
-        Some(b'\r') if i + 1 < buf.len() => Terminator::Complete(1),
-        Some(b'\r') => Terminator::TrailingCr,
+        Some(b'\r') => match buf.get(i + 1) {
+            Some(b'\n') => Terminator::Complete(2),
+            Some(_) => Terminator::Complete(1),
+            None => Terminator::TrailingCr,
+        },
         _ => Terminator::None,
     }
 }
@@ -324,15 +332,13 @@ fn parse_sse_stream(
         |(mut stream, mut reader)| async move {
             loop {
                 // A boundary that set this leaves the buffer empty, so the byte in question is
-                // always the first one here.
-                if reader.skip_leading_lf {
+                // always the first one here - and once there is one, or there will never be one,
+                // the terminator it belongs to is settled either way.
+                if reader.skip_leading_lf && (!reader.bytes.is_empty() || reader.ended) {
                     if reader.bytes.first() == Some(&b'\n') {
                         reader.bytes.drain(..1);
-                        reader.skip_leading_lf = false;
-                    } else if !reader.bytes.is_empty() || reader.ended {
-                        // Something else arrived, so that terminator really was a bare `\r`.
-                        reader.skip_leading_lf = false;
                     }
+                    reader.skip_leading_lf = false;
                 }
 
                 // Take every event the buffer already holds before reading again: one read can
@@ -340,16 +346,17 @@ fn parse_sse_stream(
                 // would hold that event back until the server happened to send more - or, at the
                 // end of the body, report the stream as truncated instead.
                 while let Some(boundary) = find_event_boundary(&reader.bytes) {
-                    let event =
-                        std::str::from_utf8(&reader.bytes[..boundary.end]).map(str::to_string);
+                    // Read the event's fields while its bytes are still in the buffer, so nothing
+                    // has to be copied out of it first.
+                    let data = std::str::from_utf8(&reader.bytes[..boundary.end]).map(event_data);
 
                     // Consume the event either way, so a stream carrying one undecodable event
                     // reports it once and then continues rather than repeating it forever.
                     reader.bytes.drain(..boundary.next_start);
                     reader.skip_leading_lf = boundary.may_skip_lf;
 
-                    let event = match event {
-                        Ok(event) => event,
+                    let data = match data {
+                        Ok(data) => data,
                         Err(e) => {
                             return Some((
                                 StreamSnafu {
@@ -361,7 +368,7 @@ fn parse_sse_stream(
                         }
                     };
 
-                    let Some(data) = event_data(&event) else {
+                    let Some(data) = data else {
                         continue;
                     };
 
@@ -485,32 +492,28 @@ mod tests {
         chunk.expect_err("chunk should be an error");
     }
 
-    /// A stream that hands out exactly the byte groups it is given, so a test can put a boundary
-    /// wherever it likes - including inside a multi-byte character or a `\r\n` pair.
-    fn dribble(
-        reads: Vec<&[u8]>,
-    ) -> Pin<Box<dyn Stream<Item = std::result::Result<bytes::Bytes, reqwest::Error>> + Send>> {
-        let reads: Vec<_> = reads
+    type ByteStream =
+        Pin<Box<dyn Stream<Item = std::result::Result<bytes::Bytes, reqwest::Error>> + Send>>;
+
+    fn reads_of(reads: Vec<&[u8]>) -> Vec<std::result::Result<bytes::Bytes, reqwest::Error>> {
+        reads
             .into_iter()
             .map(|read| Ok(bytes::Bytes::copy_from_slice(read)))
-            .collect();
+            .collect()
+    }
 
-        Box::pin(futures::stream::iter(reads))
+    /// A stream that hands out exactly the byte groups it is given, so a test can put a boundary
+    /// wherever it likes - including inside a multi-byte character or a `\r\n` pair.
+    fn dribble(reads: Vec<&[u8]>) -> ByteStream {
+        Box::pin(futures::stream::iter(reads_of(reads)))
     }
 
     /// The same, but the stream never ends: after the given reads it stays pending, the way a
     /// server that has sent a keep-alive and nothing since does.
-    fn dribble_then_pending(
-        reads: Vec<&[u8]>,
-    ) -> Pin<Box<dyn Stream<Item = std::result::Result<bytes::Bytes, reqwest::Error>> + Send>> {
-        let reads: Vec<_> = reads
-            .into_iter()
-            .map(|read| Ok(bytes::Bytes::copy_from_slice(read)))
-            .collect();
-
+    fn dribble_then_pending(reads: Vec<&[u8]>) -> ByteStream {
         // Both `StreamExt` traits in scope carry `chain`, so name the one being used.
         Box::pin(futures::StreamExt::chain(
-            futures::stream::iter(reads),
+            futures::stream::iter(reads_of(reads)),
             futures::stream::pending(),
         ))
     }
@@ -532,12 +535,11 @@ mod tests {
         ) -> std::task::Poll<Option<Self::Item>> {
             assert!(!self.finished, "the stream was polled after it ended");
 
-            match self.reads.next() {
-                Some(read) => std::task::Poll::Ready(Some(Ok(read))),
-                None => {
-                    self.finished = true;
-                    std::task::Poll::Ready(None)
-                }
+            if let Some(read) = self.reads.next() {
+                std::task::Poll::Ready(Some(Ok(read)))
+            } else {
+                self.finished = true;
+                std::task::Poll::Ready(None)
             }
         }
     }
