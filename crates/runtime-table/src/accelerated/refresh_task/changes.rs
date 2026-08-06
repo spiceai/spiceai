@@ -1134,7 +1134,7 @@ impl RefreshTask {
                         let send_res = tx.send(item).await;
                         if send_res.is_err() {
                             // Nobody will receive it, so nobody will subtract it.
-                            reader_prefetch_bytes.fetch_sub(queued_bytes, Ordering::Relaxed);
+                            discharge_prefetch_bytes(&reader_prefetch_bytes, queued_bytes);
                         }
                         metrics::CDC_READER_SEND_WAIT_MS.record(elapsed_ms(send_start), send_labels);
                         if send_res.is_err() {
@@ -1300,8 +1300,13 @@ impl RefreshTask {
             // Discharge what this receive took out, before sampling, so the byte
             // gauge and the envelope occupancy below describe the same thing: the
             // backlog still queued, not counting the item now in hand.
-            if let Some(item) = next_item.as_ref() {
-                prefetch_bytes.fetch_sub(cdc_item_budget_bytes(item) as u64, Ordering::Relaxed);
+            //
+            // A CARRIED item is deliberately not discharged here: it left the
+            // channel on the previous iteration's `try_recv` and was discharged
+            // there. Charging it out twice drove the counter below zero, and an
+            // unsigned wrap made the gauge read ~1.8e19.
+            if !from_carried && let Some(item) = next_item.as_ref() {
+                discharge_prefetch_bytes(&prefetch_bytes, cdc_item_budget_bytes(item) as u64);
             }
             // Sample prefetch-channel occupancy at the moment the apply loop wakes
             // (the just-received `first` is out of the buffer; whatever remains is
@@ -1400,7 +1405,9 @@ impl RefreshTask {
                         let item_bytes = cdc_item_budget_bytes(&item);
                         // Out of the channel, so out of the channel's byte count —
                         // whether it joins this burst or is carried to the next.
-                        prefetch_bytes.fetch_sub(item_bytes as u64, Ordering::Relaxed);
+                        // A carried item is discharged HERE and not again when the
+                        // next iteration picks it up.
+                        discharge_prefetch_bytes(&prefetch_bytes, item_bytes as u64);
                         if burst_bytes > 0
                             && item_bytes > 0
                             && burst_bytes.saturating_add(item_bytes) > max_burst_bytes
@@ -1450,7 +1457,8 @@ impl RefreshTask {
                             let item_bytes = cdc_item_budget_bytes(&item);
                             // Out of the channel, so out of the channel's byte
                             // count — burst or carried, it is no longer queued.
-                            prefetch_bytes.fetch_sub(item_bytes as u64, Ordering::Relaxed);
+                            // A carried item is discharged HERE, once.
+                            discharge_prefetch_bytes(&prefetch_bytes, item_bytes as u64);
                             if burst_bytes > 0
                                 && item_bytes > 0
                                 && burst_bytes.saturating_add(item_bytes) > max_burst_bytes
@@ -3085,6 +3093,19 @@ fn cdc_item_budget_bytes(item: &Result<cdc::ChangeEnvelope, cdc::StreamError>) -
     // accumulates before applying; the real Arrow build is deferred to apply
     // time (`into_parts_offloaded_burst`), off the source's shared read path.
     item.as_ref().map_or(0, cdc::ChangeEnvelope::encoded_len)
+}
+
+/// Subtract from the CDC prefetch byte counter without wrapping.
+///
+/// Charge and discharge are meant to be symmetric, but `u64::fetch_sub` past
+/// zero wraps to ~1.8e19, which turns a small accounting slip into a reading no
+/// operator can interpret — and which looks nothing like "slightly wrong". A
+/// gauge that fails should fail toward zero, where the error stays proportional
+/// to the mistake, so saturate rather than wrap.
+fn discharge_prefetch_bytes(counter: &AtomicU64, bytes: u64) {
+    let _previous = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_sub(bytes))
+    });
 }
 
 fn elapsed_ms(start: Instant) -> f64 {

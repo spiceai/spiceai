@@ -1751,7 +1751,23 @@ impl DataFusion {
         // controller tick, long enough that the sampling overhead is negligible.
         const SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
         handle.spawn(async move {
-            let mut ticker = tokio::time::interval(SAMPLE_INTERVAL);
+            // First tick deliberately one interval out, NOT immediate. These
+            // gauges are built lazily on first `record` and then cached, binding
+            // permanently to whatever meter provider is global at that moment —
+            // and this sampler is installed ~10ms BEFORE `init_metrics` brings up
+            // the Prometheus provider. `tokio::time::interval` fires its first
+            // tick immediately, which landed that first `record` inside the gap
+            // and bound `query_memory_pool_used_bytes` and
+            // `cayenne_compaction_memory_pool_used_bytes` to the noop meter for
+            // the life of the process: absent from `/metrics` exactly when an OOM
+            // needed them. (`process_resident_memory_bytes` escaped only because
+            // its `spawn_blocking` round-trip straddled the gap.) Delaying the
+            // first sample makes true the assumption the telemetry accessors
+            // already document.
+            let mut ticker = tokio::time::interval_at(
+                tokio::time::Instant::now() + SAMPLE_INTERVAL,
+                SAMPLE_INTERVAL,
+            );
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 ticker.tick().await;
