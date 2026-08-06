@@ -63,11 +63,14 @@ pub enum Error {
     ClientBuild { source: reqwest::Error },
 
     #[snafu(display(
-        "The local identity cannot be presented as a TLS client certificate: {source}. \
-         The identity file is corrupt — clear it with `spice connect remove` and delete the \
-         instance in the Spice Cloud portal."
+        "Failed to release instance {instance_id} (Spice Cloud): the local identity file is \
+         invalid ({source}). Delete this instance in the Spice Cloud portal to finish removing \
+         it. See: https://spiceai.org/docs"
     ))]
-    Identity { source: reqwest::Error },
+    Identity {
+        instance_id: String,
+        source: reqwest::Error,
+    },
 
     #[snafu(display("Invalid CA certificate PEM for the Spice Cloud release request: {source}"))]
     CaCert { source: reqwest::Error },
@@ -86,10 +89,9 @@ pub enum Error {
     Rejected { status: u16, message: String },
 
     #[snafu(display(
-        "Failed to release instance {instance_id} (Spice Cloud): the stored identity's private \
-         key could not sign the release proof-of-possession ({reason}). The identity file is \
-         unusable, so the cloud cannot be told this instance is gone — delete the instance in \
-         the Spice Cloud portal instead. See: https://spiceai.org/docs"
+        "Failed to release instance {instance_id} (Spice Cloud): the local identity file is \
+         invalid ({reason}). Delete this instance in the Spice Cloud portal to finish removing \
+         it. See: https://spiceai.org/docs"
     ))]
     ProofOfPossession { instance_id: String, reason: String },
 }
@@ -199,7 +201,9 @@ pub async fn release(
     client_pem.push_str(identity.private_key_pem.trim_end());
     client_pem.push('\n');
     let client_identity =
-        reqwest::Identity::from_pem(client_pem.as_bytes()).context(IdentitySnafu)?;
+        reqwest::Identity::from_pem(client_pem.as_bytes()).context(IdentitySnafu {
+            instance_id: identity.identifier.clone(),
+        })?;
 
     let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
