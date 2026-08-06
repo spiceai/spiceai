@@ -4308,6 +4308,17 @@ mod tests {
                 arrival_cv: 2.0,
                 ..snap()
             }),
+            // Lag violated with every *other* condition permissive — low read-amp,
+            // CPU free, no I/O/publish bound, no query goal competing for the move.
+            // The shard-raise branches sit behind exactly that combination, so
+            // without it the sweep never reaches them.
+            pressured(IngestSnapshot {
+                replication_lag_secs: Some(120.0),
+                apply_vs_arrival: 3.0,
+                cpu_pressure: Some(0.1),
+                read_amp: 1,
+                ..snap()
+            }),
         ];
         // The memory buffers sit at their floors so the memory rule has no shrink
         // to make and the tick reaches the growth rules.
