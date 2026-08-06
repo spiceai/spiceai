@@ -36,6 +36,7 @@ runtime-acceleration = { path = "../runtime-acceleration" }
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
 runtime-parameters = { path = "../runtime-parameters" }
+runtime-parameters-typed = { path = "../runtime-parameters-typed" }
 runtime-proto = { path = "../runtime-proto" }
 runtime-query-engine = { path = "../runtime-query-engine" }
 runtime-request-context = { path = "../runtime-request-context" }

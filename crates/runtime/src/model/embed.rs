@@ -16,7 +16,6 @@ limitations under the License.
 #![allow(clippy::implicit_hasher)]
 
 use crate::embeddings::params as embedding_params;
-use crate::parameters::typed::TypedParams;
 use crate::token_providers::databricks::{DatabricksM2MTokenProvider, DatabricksU2MTokenProvider};
 use bytes::Bytes;
 use cache::CacheProvider;
@@ -32,6 +31,7 @@ use llms::bedrock::{
         nova::NovaTruncationMode,
     },
 };
+use runtime_parameters_typed::TypedParams;
 use runtime_secrets::{Secrets, get_params_with_secrets};
 
 use object_store::ObjectStoreExt;
@@ -45,6 +45,8 @@ use llms::openai::DEFAULT_EMBEDDING_MODEL;
 use llms::openai::embed::OpenaiEmbed;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::ResultExt;
+#[cfg(feature = "models")]
+use spicepod::component::embeddings::pinned_revision;
 use spicepod::component::{embeddings::EmbeddingPrefix, model::ModelFileType};
 #[cfg(feature = "models")]
 use std::path::Path;
@@ -62,7 +64,7 @@ pub type EmbeddingModelStore = HashMap<String, Arc<dyn Embed>>;
 
 /// Wraps a typed-params deserialization failure the same way `Parameters`
 /// errors were surfaced for embeddings.
-fn params_err(e: crate::parameters::typed::ParamsError) -> EmbedError {
+fn params_err(e: runtime_parameters_typed::ParamsError) -> EmbedError {
     EmbedError::FailedToInstantiateEmbeddingModel {
         source: Box::new(e),
     }
@@ -236,6 +238,33 @@ fn model2vec(
             model_source: "model2vec".to_string(),
         });
     };
+
+    // `model2vec:` has no revision plumbing: `EmbeddingPrefix::Model2Vec` is a bare
+    // `strip_prefix`, so a trailing `:rev` stays glued to the model id, and
+    // `StaticModel::from_pretrained` takes no revision argument to hand it to. The id
+    // therefore reaches the Hub as part of the *repository name*, which 401s — a bare
+    // auth error for what is really an unsupported-configuration mistake (#12445).
+    //
+    // Say so instead. `pinned_revision` defers to the same regex the `huggingface:`
+    // arm uses rather than splitting on the last ':', so the two agree about what a
+    // revision is: only an `org/model:rev` shape has one, and a local path — the other
+    // thing `from_pretrained` accepts, including a Windows `C:/…` — passes through.
+    //
+    // The `exists()` guard mirrors `from_pretrained`'s own precedence, which tries the
+    // id as a local path before treating it as a repo name. Without it, a directory
+    // that happened to match the `org/model:rev` shape would be rejected here even
+    // though the loader would have opened it — so this only ever rejects ids that
+    // really would have gone to the Hub and 401'd.
+    if let Some(revision) = pinned_revision(&model_id)
+        .filter(|_| !Path::new(&model_id).exists())
+        .map(ToString::to_string)
+    {
+        return Err(EmbedError::RevisionPinningUnsupported {
+            model_source: "model2vec".to_string(),
+            model_id,
+            revision,
+        });
+    }
 
     Model2Vec::from_params(
         &model_id,

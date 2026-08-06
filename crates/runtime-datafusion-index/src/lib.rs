@@ -29,7 +29,11 @@ mod provider;
 pub mod util;
 pub use delete::{build_key_match_predicate, resolve_keys_matching_predicate};
 pub use provider::*;
-pub use util::{INDEXED_INNER, InnerProviderFn, find_concrete_table_provider_with};
+pub use util::{
+    INDEXED_INNER, InnerProviderFn, LayerWalk, RebuildProviderFn, TableProviderLayer,
+    find_concrete_table_provider_in, peel_to_innermost, rebuild_innermost_table_provider,
+    visit_provider_chain,
+};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -173,6 +177,21 @@ pub trait Index: Debug + Send + Sync + 'static {
             return Ok(());
         };
         self.delete_by_keys(keys).await
+    }
+
+    /// Whether a failure in [`Index::on_write_start`] must fail the write.
+    ///
+    /// Defaults to `false` (best-effort), matching indexes whose start step only tunes
+    /// something the write does not depend on — Elasticsearch's `refresh_interval`
+    /// override is the example: the write is still indexed correctly without it. An
+    /// index that *prepares state the write depends on* returns `true`: for those,
+    /// writing anyway leaves the index and the rows it indexes diverged, with only a
+    /// warning to say so.
+    ///
+    /// Wrapper implementations MUST forward this to the index they wrap — inheriting
+    /// the default silently downgrades a fatal inner index to best-effort.
+    fn write_start_failure_is_fatal(&self) -> bool {
+        false
     }
 
     /// Whether a failure in [`Index::on_write_complete`] must fail the write.

@@ -19,6 +19,18 @@ on:
         options:
           - 'spiceai-dev-runners'
           - 'spiceai-dev-large-runners'
+      benchmark_dataset:
+        description: 'Search benchmark dataset to run against'
+        required: true
+        default: 'quora_retrieval'
+        type: choice
+        options:
+          - 'quora_retrieval'
+      ready_wait:
+        description: 'Seconds to wait for the spiced instance to become ready'
+        required: false
+        default: 1800
+        type: number
 
 jobs:
   run-bench:
@@ -83,9 +95,10 @@ jobs:
         run: |
           rm -rf .spice/data
           testoperator run search \
-            --ready-wait 1800 \
+            --ready-wait ${{ github.event.inputs.ready_wait }} \
             --concurrency 10 \
-            --benchmark-dataset quora_retrieval \
+            --benchmark-dataset ${{ github.event.inputs.benchmark_dataset }} \
+            --metrics \
             -p "${{ github.event.inputs.spicepod_path }}"
         env:
           OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}

@@ -3940,6 +3940,13 @@ impl CayennePartitionCreator {
 
 #[async_trait]
 impl PartitionCreator for CayennePartitionCreator {
+    /// Cayenne owns its partition storage, so a partitioned Cayenne table can be
+    /// written to directly. This is what the accelerated dual-write path used to
+    /// establish by downcasting to this type.
+    fn accepts_direct_partition_writes(&self) -> bool {
+        true
+    }
+
     async fn create_partition(
         &self,
         partition_values: Vec<ScalarValue>,

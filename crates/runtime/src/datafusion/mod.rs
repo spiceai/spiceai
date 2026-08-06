@@ -116,9 +116,7 @@ use runtime_acceleration::snapshot::AccelerationLayout;
 ))]
 use runtime_acceleration::snapshot::SnapshotManager;
 use runtime_async::ManagedTokioRuntime;
-use runtime_datafusion_index::IndexedTableProvider;
 use runtime_query_engine::query_engine::Error as QueryEngineError;
-use runtime_search::embeddings::table::EmbeddingTable;
 use runtime_table_partition::provider::PartitionTableProvider;
 use schema::ensure_schema_exists;
 use snafu::prelude::*;
@@ -735,6 +733,14 @@ pub enum Table {
     },
 }
 
+/// Pushes spicepod metadata enrichment to the base of the provider stack,
+/// rebuilding the index, embedding and vector-scan layers around it so each
+/// stays discoverable by downcast. The `IndexTableScan` analyzer and the CDC
+/// changes stream both rely on that discoverability: wrapping one of these
+/// layers opaquely instead hides it, so no changes stream is attached and
+/// `refresh_mode: changes` fails with "a changes stream is required".
+/// Restricted to the layers a registration-time source stack contains; see
+/// the layer table in [`crate::table_layers`].
 pub(crate) fn table_provider_with_spicepod_metadata(
     provider: Arc<dyn TableProvider>,
     table_metadata: &HashMap<String, String>,
@@ -745,57 +751,21 @@ pub(crate) fn table_provider_with_spicepod_metadata(
         return provider;
     }
 
-    // If the provider is an IndexedTableProvider, push the metadata enrichment
-    // inside it so that the IndexTableScan analyzer can still discover it via
-    // downcast_ref::<IndexedTableProvider>().
-    //
-    // Recurse rather than enriching the underlying directly: a dataset with both
-    // `embeddings` and `full_text_search` nests an `EmbeddingTable` or a
-    // `VectorScanTableProvider` under this `IndexedTableProvider`, and those inner
-    // wrappers have the same discoverability requirement (see the arms below).
-    if let Some(indexed) = provider.downcast_ref::<IndexedTableProvider>() {
-        let enriched_underlying = table_provider_with_spicepod_metadata(
-            indexed.get_underlying(),
-            table_metadata,
-            columns,
-        );
-        return Arc::new(IndexedTableProvider::with_indexes(
-            enriched_underlying,
-            indexed.get_all_indexes(),
-        ));
-    }
-
-    // Same reasoning for an EmbeddingTable: push the metadata enrichment onto the
-    // base table so the wrapper stays discoverable via downcast_ref::<EmbeddingTable>().
-    // The CDC changes stream relies on EmbeddingConnector unwrapping this provider to
-    // its base table (see embeddings::connector::EmbeddingConnector::changes_stream);
-    // wrapping the EmbeddingTable opaquely instead hides it, so no changes stream is
-    // attached and `refresh_mode: changes` fails with "a changes stream is required".
-    if let Some(embedding) = provider.downcast_ref::<EmbeddingTable>() {
-        let mut enriched = embedding.clone();
-        enriched.base_table = table_provider_with_spicepod_metadata(
-            Arc::clone(&embedding.base_table),
-            table_metadata,
-            columns,
-        );
-        return Arc::new(enriched);
-    }
-
-    // And for a VectorScanTableProvider, which a dataset with `vectors` enabled nests
-    // under the `IndexedTableProvider`. `EmbeddingConnector::changes_stream` unwraps it
-    // to reach the raw source provider; a metadata layer on top hides it, so the source
-    // never receives a changes stream.
-    if let Some(vector_scan) = provider.downcast_ref::<search::index::VectorScanTableProvider>() {
-        let mut enriched = vector_scan.clone();
-        enriched.table_provider = table_provider_with_spicepod_metadata(
-            Arc::clone(&vector_scan.table_provider),
-            table_metadata,
-            columns,
-        );
-        return Arc::new(enriched);
-    }
-
-    metadata_enriched_table_provider(provider, table_metadata.clone(), field_metadata)
+    runtime_datafusion_index::rebuild_innermost_table_provider(
+        provider,
+        &[
+            crate::table_layers::INDEXED_LAYER,
+            crate::table_layers::EMBEDDING_LAYER,
+            crate::table_layers::VECTOR_SCAN_LAYER,
+        ],
+        &|innermost| {
+            metadata_enriched_table_provider(
+                innermost,
+                table_metadata.clone(),
+                field_metadata.clone(),
+            )
+        },
+    )
 }
 
 fn field_metadata_from_columns(columns: &[Column]) -> FieldMetadata {
@@ -5466,6 +5436,8 @@ mod tests {
     use datafusion::datasource::MemTable;
 
     use crate::builder::RuntimeBuilder;
+    use runtime_datafusion_index::IndexedTableProvider;
+    use runtime_search::embeddings::table::EmbeddingTable;
 
     use super::*;
 

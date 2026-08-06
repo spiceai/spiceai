@@ -24,6 +24,7 @@ limitations under the License.
 mod client;
 pub mod endpoints;
 pub mod error;
+pub mod redirect;
 pub mod types;
 
 pub use client::CloudClient;

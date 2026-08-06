@@ -45,6 +45,16 @@ pub struct DataUpdateReceiver {
 }
 
 impl DataUpdateReceiver {
+    /// Waits for the next update on the channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecvError::Closed`] if no sender remains, or if this receiver was
+    /// built without one; [`RecvError::Lagged`] if updates were dropped because
+    /// this receiver fell behind.
+    ///
+    /// [`RecvError::Closed`]: broadcast::error::RecvError::Closed
+    /// [`RecvError::Lagged`]: broadcast::error::RecvError::Lagged
     pub async fn recv(&mut self) -> Result<DataUpdate, broadcast::error::RecvError> {
         let Some(receiver) = self.receiver.as_mut() else {
             return Err(broadcast::error::RecvError::Closed);
@@ -167,7 +177,7 @@ impl DataUpdateBroadcaster {
     }
 }
 
-use crate::datafusion::error::find_datafusion_root;
+use runtime_datafusion::error::find_datafusion_root;
 
 pub struct StreamingDataUpdate {
     pub data: SendableRecordBatchStream,
@@ -180,6 +190,11 @@ impl StreamingDataUpdate {
         Self { data, update_type }
     }
 
+    /// Drains the stream into an in-memory [`DataUpdate`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the stream's own error if producing a batch fails.
     pub async fn collect_data(self) -> Result<DataUpdate, DataFusionError> {
         let schema = self.data.schema();
         let data = self
@@ -244,6 +259,12 @@ impl StreamingDataUpdateExecutionPlan {
         }
     }
 
+    /// Installs the stream this plan will emit on execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stream's schema differs from the plan's, or if the
+    /// plan is already executing and the stream slot is locked.
     pub fn set_stream(
         &self,
         record_batch_stream: SendableRecordBatchStream,
@@ -272,6 +293,12 @@ impl StreamingDataUpdateExecutionPlan {
         Ok(())
     }
 
+    /// Drops any installed stream, so the plan can be reused.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the plan is already executing and the stream slot is
+    /// locked.
     pub fn clear_stream(&self) -> DataFusionResult<()> {
         let mut stream = self.record_batch_stream.try_lock().map_err(|e| {
             DataFusionError::Execution(format!(

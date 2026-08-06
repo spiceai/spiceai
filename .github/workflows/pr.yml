@@ -655,13 +655,14 @@ jobs:
       - name: Set up spiceio
         if: needs.check_changes.outputs.relevant_changes == 'true' && runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@da41a0d5fb3245c6fd0bff8bc1b6613a14666261 # v0.5.9
+        uses: spiceai/spiceio/.github/actions/setup@97c3578dcf337786923da33cecd350e7335386b6 # v0.7.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
+          immutable-objects: "true"
 
       - name: Set up sccache
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -692,8 +693,13 @@ jobs:
           RUST_PROFILE: ${{ env.RUST_PROFILE }}
 
       - name: Show sccache stats
-        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
-        run: sccache --show-stats
+        if: ${{ always() && (needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true') }}
+        # `always()`: this is the one step that reports cache health, and without it
+        # it is skipped on exactly the failures it would explain (#12420). The `||`
+        # keeps a diagnostic from ever deciding a verdict — when the cache backend is
+        # gone `--show-stats` cannot answer either, and that is itself the finding.
+        run: |
+          sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
 
       - name: Kill spiceio
         if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
@@ -745,13 +751,14 @@ jobs:
       - name: Set up spiceio
         if: needs.check_changes.outputs.relevant_changes == 'true' && runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@da41a0d5fb3245c6fd0bff8bc1b6613a14666261 # v0.5.9
+        uses: spiceai/spiceio/.github/actions/setup@97c3578dcf337786923da33cecd350e7335386b6 # v0.7.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
+          immutable-objects: "true"
 
       - name: Set up sccache
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -803,8 +810,13 @@ jobs:
         run: cargo build -p testoperator --all-features --locked
 
       - name: Show sccache stats
-        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
-        run: sccache --show-stats
+        if: ${{ always() && (needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true') }}
+        # `always()`: this is the one step that reports cache health, and without it
+        # it is skipped on exactly the failures it would explain (#12420). The `||`
+        # keeps a diagnostic from ever deciding a verdict — when the cache backend is
+        # gone `--show-stats` cannot answer either, and that is itself the finding.
+        run: |
+          sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
 
       - name: Check if Cargo.lock is updated
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -856,13 +868,14 @@ jobs:
       - name: Set up spiceio
         if: needs.check_changes.outputs.relevant_changes == 'true' && runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@da41a0d5fb3245c6fd0bff8bc1b6613a14666261 # v0.5.9
+        uses: spiceai/spiceio/.github/actions/setup@97c3578dcf337786923da33cecd350e7335386b6 # v0.7.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
+          immutable-objects: "true"
 
       - name: Set up sccache
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -911,8 +924,13 @@ jobs:
         run: make install-spiced
 
       - name: Show sccache stats
-        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
-        run: sccache --show-stats
+        if: ${{ always() && (needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true') }}
+        # `always()`: this is the one step that reports cache health, and without it
+        # it is skipped on exactly the failures it would explain (#12420). The `||`
+        # keeps a diagnostic from ever deciding a verdict — when the cache backend is
+        # gone `--show-stats` cannot answer either, and that is itself the finding.
+        run: |
+          sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
 
       - name: Kill spiceio
         if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
