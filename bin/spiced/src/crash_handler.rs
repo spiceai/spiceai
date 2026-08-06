@@ -302,7 +302,7 @@ mod tests {
         use std::os::unix::process::ExitStatusExt as _;
 
         if std::env::var_os(CHILD).is_some() {
-            super::install();
+            super::install().expect("install fatal-signal reporting");
             spiced_crash_handler_test_fault();
             unreachable!("the fault must terminate the process");
         }
