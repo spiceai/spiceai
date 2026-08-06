@@ -23,7 +23,7 @@ use std::time::Duration;
 /// plane): the base URL the out-of-band HTTPS `/v1/cloud-connect/enroll`
 /// and `/v1/cloud-connect/renew` requests are made against. The gateway
 /// (stream) address is returned by the enroll response, not configured.
-pub const DEFAULT_ENDPOINT: &str = "https://cloud.spice.ai";
+pub const DEFAULT_ENDPOINT: &str = "https://api.spice.ai";
 
 /// Default lead time before the identity cert's `not_after` at which the
 /// client renews. The cloud issues 24h leaves, so a 12h lead yields the
@@ -76,7 +76,7 @@ fn adoption_code_from_env() -> Option<String> {
 /// Runtime config for the Cloud Connect client.
 #[derive(Debug, Clone)]
 pub struct CloudConnectConfig {
-    /// Cloud enroll endpoint (state plane), e.g. `https://cloud.spice.ai`.
+    /// Cloud enroll endpoint (state plane), e.g. `https://api.spice.ai`.
     /// Base URL for the out-of-band HTTPS `/v1/cloud-connect/enroll` and
     /// `/v1/cloud-connect/renew` requests. This is **not** the stream
     /// endpoint: the gateway address for the mTLS `CloudConnect` stream
