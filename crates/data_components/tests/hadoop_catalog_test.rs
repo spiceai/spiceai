@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::path::Path;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -26,6 +27,7 @@ use iceberg::{Catalog, NamespaceIdent};
 use iceberg_storage_opendal::OpenDalStorageFactory;
 use iceberg_test_utils::set_up;
 use opendal::Configurator;
+use url::Url;
 
 /// Names a directory holding a Hadoop warehouse on the local filesystem, as seeded by
 /// `tests/hadoop_data/setup_file_hadoop.sh`. When it is set, the `file` catalog is
@@ -33,16 +35,25 @@ use opendal::Configurator;
 /// catalogs run. See `tests/hadoop_data/README.md`.
 const FILE_WAREHOUSE_ROOT_ENV: &str = "HADOOP_FILE_WAREHOUSE_ROOT";
 
+/// The warehouse root is a filesystem path, and the catalog wants it as a `file:` URL.
+/// `Url::from_directory_path` is what makes those two agree: it rejects a relative path
+/// instead of emitting `file://relative`, where the first segment would parse as the
+/// authority, and it percent-encodes a Windows path rather than leaving the drive letter
+/// and backslashes raw.
 #[expect(clippy::expect_used)]
-fn get_file_hadoop_catalog(warehouse_root: &str) -> HadoopCatalogBuilder {
+fn get_file_hadoop_catalog(warehouse_root: &Path) -> HadoopCatalogBuilder {
+    let warehouse_url = Url::from_directory_path(warehouse_root).expect(
+        "Should convert the warehouse root to a file URL; it must be an absolute directory path",
+    );
+
     let mut fs_config = opendal::services::FsConfig::default();
-    fs_config.root = Some(warehouse_root.to_string());
+    fs_config.root = Some(warehouse_root.to_string_lossy().into_owned());
     let operator = opendal::Operator::new(fs_config.into_builder())
         .expect("Should build FS operator")
         .finish();
 
     HadoopCatalogBuilder::default()
-        .with_warehouse_root(format!("file://{warehouse_root}"))
+        .with_warehouse_root(warehouse_url.to_string())
         .with_storage_factory(Arc::new(iceberg::io::LocalFsStorageFactory))
         .with_operator(operator)
 }
@@ -126,11 +137,14 @@ async fn build_catalogs() -> Vec<(&'static str, HadoopCatalog)> {
 
     let mut catalogs = Vec::new();
 
-    let warehouse_root = std::env::var(FILE_WAREHOUSE_ROOT_ENV).unwrap_or_default();
+    // Trim before the emptiness test: an all-whitespace value carries no path, so it
+    // selects the `file` backend and then fails on a warehouse root that cannot exist.
+    let warehouse_root_var = std::env::var(FILE_WAREHOUSE_ROOT_ENV).unwrap_or_default();
+    let warehouse_root = warehouse_root_var.trim();
     if !warehouse_root.is_empty() {
         catalogs.push((
             "file",
-            get_file_hadoop_catalog(&warehouse_root)
+            get_file_hadoop_catalog(Path::new(warehouse_root))
                 .build()
                 .await
                 .expect("Should build file catalog"),
