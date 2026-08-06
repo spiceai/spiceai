@@ -1086,8 +1086,14 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     result
 }
 
-/// What `build_app` decided about the deployed spicepod, logged once tracing
-/// exists.
+/// Whether a failed local spicepod load should be tolerated by starting on an
+/// empty spicepod instead of exiting.
+fn tolerates_missing_spicepod(args: &Args, error: &app::Error) -> bool {
+    args.cloud_connect && args.spicepod.is_none() && error.is_spicepod_missing()
+}
+
+/// What `build_app` decided about which spicepod this start serves, logged once
+/// tracing exists.
 enum DeploymentNote {
     /// The runtime started on the deployed spicepod.
     Loaded { path: PathBuf },
@@ -1105,6 +1111,9 @@ enum DeploymentNote {
     /// The watcher is not installed: reconciling the local spicepod into a
     /// deployed app would swap the deployed configuration out from under it.
     PodsWatcherDeclined,
+    /// A cloud-managed instance found no spicepod — neither deployed nor local —
+    /// and started on an empty one.
+    NoSpicepod,
 }
 
 impl DeploymentNote {
@@ -1128,6 +1137,9 @@ impl DeploymentNote {
             ),
             Self::PodsWatcherDeclined => tracing::warn!(
                 "Spice Cloud Connect: --pods-watcher-enabled was ignored because this instance serves a deployed spicepod. Watching the local spicepod.yaml would replace the deployed configuration while the instance kept reporting the deployment as applied. Edit the app in Spice Cloud and deploy it instead."
+            ),
+            Self::NoSpicepod => tracing::warn!(
+                "No existing spicepod was found. Starting Runtime without one."
             ),
         }
     }
@@ -1249,6 +1261,17 @@ pub async fn build_app(args: &Args) -> Result<AppBundle> {
                     local_error: e.to_string(),
                 });
                 None
+            } else if tolerates_missing_spicepod(args, &e) {
+                // A cloud-managed instance that has connected but not yet
+                // received a deployment has no spicepod anywhere: none was
+                // deployed, and `spice connect` writes nothing to the instance
+                // directory. Come up on an empty spicepod so the control plane
+                // can reach it and deploy one, rather than exiting with the
+                // "run spice init" guidance that does not apply here.
+                deployment_note = Some(DeploymentNote::NoSpicepod);
+                let mut app = App::default();
+                app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
+                Some(Arc::new(app))
             } else {
                 // In normal mode, fail immediately if spicepod cannot be loaded
                 return Err(Error::UnableToConstructSpiceApp {
@@ -1641,6 +1664,70 @@ mod tests {
         assert!(!should_warn_telemetry_disabled_setting_ignored(
             None, &config
         ));
+    }
+
+    /// The load failure a directory with no `spicepod.yaml` produces — what a
+    /// freshly connected instance hits on startup.
+    async fn missing_spicepod_error(dir: &std::path::Path) -> app::Error {
+        AppBuilder::build_from_path(dir)
+            .await
+            .err()
+            .expect("a directory with no spicepod.yaml must fail to load")
+    }
+
+    #[tokio::test]
+    async fn cloud_connect_starts_on_an_empty_spicepod_when_none_exists() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let error = missing_spicepod_error(dir.path()).await;
+
+        let args = Args::parse_from(["spiced", "--cloud-connect"]);
+        assert!(tolerates_missing_spicepod(&args, &error));
+    }
+
+    #[tokio::test]
+    async fn a_missing_spicepod_stays_fatal_without_cloud_connect() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let error = missing_spicepod_error(dir.path()).await;
+
+        let args = Args::parse_from(["spiced"]);
+        assert!(!tolerates_missing_spicepod(&args, &error));
+    }
+
+    #[tokio::test]
+    async fn an_explicitly_named_spicepod_stays_fatal_when_absent() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("spicepod.yaml");
+        let error = AppBuilder::build_from_path(&path)
+            .await
+            .err()
+            .expect("a spicepod.yaml that does not exist must fail to load");
+
+        let args = Args::parse_from([
+            std::ffi::OsStr::new("spiced"),
+            std::ffi::OsStr::new("--cloud-connect"),
+            path.as_os_str(),
+        ]);
+        assert_eq!(args.spicepod.as_deref(), Some(path.as_path()));
+        assert!(!tolerates_missing_spicepod(&args, &error));
+    }
+
+    /// A spicepod that exists but does not parse must not be swallowed as
+    /// "no spicepod" — the runtime would silently serve nothing.
+    #[tokio::test]
+    async fn a_malformed_spicepod_stays_fatal_under_cloud_connect() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            dir.path().join("spicepod.yaml"),
+            "version: v1\nkind: Spicepod\nname: broken\ndatasets: 'not a list'\n",
+        )
+        .expect("write spicepod.yaml");
+        let error = AppBuilder::build_from_path(dir.path())
+            .await
+            .err()
+            .expect("a malformed spicepod.yaml must fail to load");
+
+        let args = Args::parse_from(["spiced", "--cloud-connect"]);
+        assert!(!tolerates_missing_spicepod(&args, &error));
     }
 
     #[test]
