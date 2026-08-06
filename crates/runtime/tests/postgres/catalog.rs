@@ -153,9 +153,13 @@ fn string_column_values(batches: &[RecordBatch], column: &str) -> Vec<String> {
     values
 }
 
-/// Seed a plain table, a materialized view over it, and (via `postgres_fdw`) a
-/// foreign table pointed at it, to confirm all three relation kinds are
+/// Seed a plain table, a materialized view over it, and (via `postgres_fdw`)
+/// foreign tables pointed at it, to confirm all three relation kinds are
 /// discovered (#11725).
+///
+/// One foreign table wraps a populated remote table and one wraps an empty one,
+/// so the schema a foreign table reports can be checked independently of whether
+/// it has any rows (#12585).
 async fn seed_matview_and_foreign_table(port: usize) -> Result<(), anyhow::Error> {
     let pool = common::get_postgres_connection_pool(port, None).await?;
     let conn = pool
@@ -165,9 +169,10 @@ async fn seed_matview_and_foreign_table(port: usize) -> Result<(), anyhow::Error
 
     conn.conn
         .simple_query(
-            "CREATE TABLE source_data (id INT PRIMARY KEY, val TEXT); \
-             INSERT INTO source_data (id, val) VALUES (1, 'a'), (2, 'b'); \
-             CREATE MATERIALIZED VIEW mv_source_data AS SELECT * FROM source_data;",
+            "CREATE TABLE source_data (id INT PRIMARY KEY, val TEXT, amount NUMERIC(10,2)); \
+             INSERT INTO source_data (id, val, amount) VALUES (1, 'a', 1.50), (2, 'b', 2.25); \
+             CREATE MATERIALIZED VIEW mv_source_data AS SELECT * FROM source_data; \
+             CREATE TABLE empty_source (id INT, note TEXT);",
         )
         .await?;
 
@@ -178,8 +183,10 @@ async fn seed_matview_and_foreign_table(port: usize) -> Result<(), anyhow::Error
                  OPTIONS (host 'localhost', port '5432', dbname 'postgres'); \
              CREATE USER MAPPING FOR postgres SERVER loopback \
                  OPTIONS (user 'postgres', password '{}'); \
-             CREATE FOREIGN TABLE ft_source_data (id INT, val TEXT) \
-                 SERVER loopback OPTIONS (table_name 'source_data');",
+             CREATE FOREIGN TABLE ft_source_data (id INT, val TEXT, amount NUMERIC(10,2)) \
+                 SERVER loopback OPTIONS (table_name 'source_data'); \
+             CREATE FOREIGN TABLE ft_empty (id INT, note TEXT) \
+                 SERVER loopback OPTIONS (table_name 'empty_source');",
             common::PG_PASSWORD
         ))
         .await?;
@@ -323,11 +330,13 @@ async fn test_materialized_view_and_foreign_table_discovered() -> Result<(), any
             assert_eq!(
                 string_column_values(&tables, "table_name"),
                 vec![
+                    "empty_source".to_string(),
+                    "ft_empty".to_string(),
                     "ft_source_data".to_string(),
                     "mv_source_data".to_string(),
                     "source_data".to_string(),
                 ],
-                "the base table, materialized view, and foreign table should all be registered"
+                "the base tables, materialized view, and foreign tables should all be registered"
             );
 
             let mv_count = run_query(
@@ -343,6 +352,41 @@ async fn test_materialized_view_and_foreign_table_discovered() -> Result<(), any
             )
             .await?;
             assert_batches_eq!(&["+---+", "| n |", "+---+", "| 2 |", "+---+"], &ft_count);
+
+            // A foreign table's schema comes from its local `pg_attribute`
+            // definition, not from sampling its rows, so it carries the declared
+            // types rather than whatever a sample row happened to imply. An empty
+            // foreign table used to register with no columns at all, and a
+            // `NUMERIC(p,s)` column used to widen to the fallback precision.
+            let ft_columns = run_query(
+                &rt,
+                &format!(
+                    "SELECT column_name, data_type FROM information_schema.columns \
+                     WHERE table_catalog = '{CATALOG_NAME}' AND table_schema = 'public' \
+                     AND table_name = 'ft_empty' ORDER BY column_name"
+                ),
+            )
+            .await?;
+            assert_eq!(
+                string_column_values(&ft_columns, "column_name"),
+                vec!["id".to_string(), "note".to_string()],
+                "an empty foreign table must still expose its declared columns"
+            );
+
+            let ft_types = run_query(
+                &rt,
+                &format!(
+                    "SELECT data_type FROM information_schema.columns \
+                     WHERE table_catalog = '{CATALOG_NAME}' AND table_schema = 'public' \
+                     AND table_name = 'ft_source_data' AND column_name = 'amount'"
+                ),
+            )
+            .await?;
+            assert_eq!(
+                string_column_values(&ft_types, "data_type"),
+                vec!["Decimal128(10, 2)".to_string()],
+                "a foreign table must report the declared precision of its remote column"
+            );
 
             Ok(())
         })
