@@ -16907,10 +16907,12 @@ dependencies = [
  "runtime-metrics",
  "runtime-object-store",
  "runtime-parameters",
+ "runtime-parameters-typed",
  "runtime-proto",
  "runtime-query-engine",
  "runtime-rate-control",
  "runtime-request-context",
+ "runtime-resources",
  "runtime-search",
  "runtime-secrets",
  "runtime-status",
@@ -16994,8 +16996,10 @@ dependencies = [
  "hex",
  "object_store 0.13.2",
  "opentelemetry",
+ "runtime-datafusion",
  "runtime-object-store",
  "runtime-parameters",
+ "runtime-query-engine",
  "runtime-secrets",
  "rusqlite",
  "serde",
@@ -17184,12 +17188,15 @@ version = "2.2.0-unstable"
 dependencies = [
  "arrow",
  "arrow-schema",
+ "arrow_tools",
+ "clap",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
  "fundu",
  "globset",
  "logos",
+ "opentelemetry",
  "runtime-acceleration",
  "serde",
  "snafu",
@@ -17355,6 +17362,7 @@ dependencies = [
  "itertools 0.14.0",
  "runtime-parameter-spec",
  "runtime-parameters-derive",
+ "runtime-parameters-typed",
  "runtime-secrets",
  "secrecy",
  "snafu",
@@ -17370,6 +17378,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "runtime-parameters-typed"
+version = "2.2.0-unstable"
+dependencies = [
+ "secrecy",
+ "snafu",
+ "tokio",
+ "tracing",
+ "util",
 ]
 
 [[package]]
@@ -17438,6 +17457,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "runtime-resources"
+version = "2.2.0-unstable"
+dependencies = [
+ "parking_lot",
+ "sysinfo 0.38.4",
+ "telemetry",
+ "tracing",
+ "util",
+]
+
+[[package]]
 name = "runtime-search"
 version = "2.2.0-unstable"
 dependencies = [
@@ -17470,6 +17500,7 @@ dependencies = [
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
  "runtime-parameters",
+ "runtime-parameters-typed",
  "runtime-proto",
  "runtime-query-engine",
  "runtime-request-context",
@@ -17512,7 +17543,8 @@ dependencies = [
  "percent-encoding",
  "rand 0.10.1",
  "reqwest 0.13.4",
- "runtime-parameter-spec",
+ "runtime-parameters-derive",
+ "runtime-parameters-typed",
  "secrecy",
  "serde_json",
  "snafu",

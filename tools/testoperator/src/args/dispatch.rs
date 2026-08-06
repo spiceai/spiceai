@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use test_framework::TestType;
 
 use super::dataset::{QueryOverridesArg, QuerySetArg};
+use super::search::SearchDatasetArg;
 
 #[derive(Parser, Debug, Clone)]
 pub struct DispatchArgs {
@@ -66,6 +67,7 @@ pub enum Workflow {
     Load,
     Append,
     DataConsistency,
+    Search,
     TextToSql,
     StreamingBench,
     StreamingCorrectness,
@@ -81,6 +83,7 @@ impl From<Workflow> for TestType {
             Workflow::Load => TestType::Load,
             Workflow::Append => TestType::Append,
             Workflow::DataConsistency => TestType::DataConsistency,
+            Workflow::Search => TestType::Search,
             Workflow::TextToSql => TestType::TextToSql,
             Workflow::StreamingBench => TestType::Streaming,
             Workflow::StreamingCorrectness => TestType::StreamingCorrectness,
@@ -110,6 +113,8 @@ pub struct DispatchTests {
     pub load: Vec<LoadArgs>,
     #[serde(deserialize_with = "deserialize_single_or_vec", default)]
     pub append: Vec<AppendArgs>,
+    #[serde(deserialize_with = "deserialize_single_or_vec", default)]
+    pub search: Vec<SearchArgs>,
     #[serde(deserialize_with = "deserialize_single_or_vec", default)]
     pub text_to_sql: Vec<TextToSqlArgs>,
     #[serde(deserialize_with = "deserialize_single_or_vec", default)]
@@ -245,6 +250,17 @@ pub struct AppendArgs {
     pub with_conflict_data: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub with_retention_data: Option<bool>,
+}
+
+/// Search benchmark workflow arguments, defined in the test files. Should match inputs in
+/// `.github/workflows/testoperator_run_search.yml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchArgs {
+    pub spicepod_path: PathBuf,
+    pub runner_type: RunnerType,
+    pub benchmark_dataset: SearchDatasetArg,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ready_wait: Option<u64>,
 }
 
 /// Schema test workflow arguments, defined in the test files
@@ -732,5 +748,39 @@ tests:
         let serialized =
             serde_json::to_value(&test_file.tests.htap[0]).expect("Failed to serialize");
         assert_eq!(serialized["runner_type"], "spiceai-dev-xlarge-runners");
+    }
+
+    #[test]
+    fn test_search_section_deserialization() {
+        let yaml = "
+tests:
+  search:
+    spicepod_path: test/spicepods/search/mteb/quora/full_text_search-duckdb[file].yaml
+    runner_type: spiceai-dev-runners
+    benchmark_dataset: quora_retrieval
+    ready_wait: 1800
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+
+        assert_eq!(test_file.tests.search.len(), 1);
+        assert_eq!(
+            test_file.tests.search[0].spicepod_path.to_string_lossy(),
+            "test/spicepods/search/mteb/quora/full_text_search-duckdb[file].yaml"
+        );
+        assert!(matches!(
+            test_file.tests.search[0].runner_type,
+            RunnerType::Dev
+        ));
+        assert!(matches!(
+            test_file.tests.search[0].benchmark_dataset,
+            SearchDatasetArg::QuoraRetrieval
+        ));
+        assert_eq!(test_file.tests.search[0].ready_wait, Some(1800));
+
+        // Verify benchmark_dataset serializes back to the exact string the workflow expects
+        let serialized =
+            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
+        assert_eq!(serialized["benchmark_dataset"], "quora_retrieval");
     }
 }

@@ -183,9 +183,15 @@ runtime-datafusion-index = "foundation"
 runtime-metrics = "foundation"
 runtime-object-store = "foundation"
 runtime-parameter-spec = "foundation"
+runtime-parameters-typed = "foundation"
 runtime-proto = "foundation"
 runtime-query-engine = "foundation"
 runtime-rate-control = "foundation"
+# Host/container resource introspection (cgroup-aware memory totals, process usage
+# monitoring). A leaf utility whose only workspace dep is `util`, so it belongs at
+# foundation — stated explicitly rather than left to `default_tier`, which would
+# silently place it in shared-utility.
+runtime-resources = "foundation"
 runtime-status = "foundation"
 s3_vectors = "foundation"
 s3_vectors_metadata_filter = "foundation"

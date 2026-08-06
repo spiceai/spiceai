@@ -10,6 +10,11 @@
 # credentials: a stub `df` on PATH reports whatever free space a case needs, and a
 # stub `make` prints whatever a case needs the watcher to read.
 #
+# `failure_kind` names a third cause with the same consequence — a run that was
+# signalled and so judged nothing at all — so its cases live here too, alongside
+# `describe_check_failure`, which turns any of the three into what the run
+# publishes.
+#
 # Usage: scripts/test_signoff_disk_guard.sh
 
 set -uo pipefail
@@ -408,6 +413,93 @@ assert_failure_kind "a cache hit without an armed watch does not classify" 101 "
 # inherited cache flag.
 assert_failure_kind "the preflight refusal stays a disk failure with a cache flag set" 70 "disk" \
   SIGNOFF_DISK_WATCH=1 SIGNOFF_CACHE_HIT=1 STUB_FREE_KB="$(gib_to_kb 60)"
+# A signalled run reached no verdict at all, which is a different statement from
+# either disk kind: both of those describe a `make` that returned. The statuses
+# here are what bash reports for a killed foreground child — 128+N — which is how
+# a `Sign off` step whose 353-minute budget expires reads (#12518).
+assert_failure_kind "calls a SIGTERM'd run signalled, not a check failure" 143 "signalled" \
+  STUB_FREE_KB="$(gib_to_kb 200)"
+assert_failure_kind "calls an interrupted run signalled" 130 "signalled" \
+  STUB_FREE_KB="$(gib_to_kb 200)"
+assert_failure_kind "calls a SIGKILL'd run signalled" 137 "signalled" \
+  STUB_FREE_KB="$(gib_to_kb 200)"
+assert_failure_kind "treats 128 itself as signalled" 128 "signalled" \
+  STUB_FREE_KB="$(gib_to_kb 200)"
+# "Signalled" must win over the disk backstop. A budget that expires while the
+# volume happens to be tight is still a run that judged nothing, and telling the
+# author it was disk sends them to reclaim space that was never the problem.
+assert_failure_kind "keeps a signalled run signalled on a near-empty volume" 143 "signalled" \
+  STUB_FREE_KB="$(gib_to_kb 1)"
+# And over the cache verdict, for the same reason: a run that was killed judged
+# nothing, whatever the build had printed about sccache before it died.
+assert_failure_kind "keeps a signalled run signalled with a cache hit recorded" 143 "signalled" \
+  SIGNOFF_DISK_WATCH=1 SIGNOFF_CACHE_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# The boundary in the other direction is the one that protects real verdicts: 2
+# is what make exits when a recipe fails, and 101 is cargo's own. Neither may be
+# excused as "nothing ran".
+assert_failure_kind "leaves make's own recipe failure a check failure" 2 "checks" \
+  STUB_FREE_KB="$(gib_to_kb 200)"
+assert_failure_kind "leaves status 127 a check failure" 127 "checks" \
+  STUB_FREE_KB="$(gib_to_kb 200)"
+
+echo
+echo "describe_check_failure"
+# Asserts what a failed run publishes. An empty SIGNOFF_FAILURE_STATUS_DESC is
+# the contract for "publish no verdict", so it is checked as a value, not as an
+# accident of an unset variable.
+assert_describe() {
+  local name="$1" check_status="$2" want_desc="$3" want_message="$4"
+  shift 4
+  tests_run=$((tests_run + 1))
+
+  # The status is interpolated into the snippet, as assert_failure_kind does:
+  # call_subject's trailing arguments are environment assignments for `env`, so
+  # there is no positional left to pass it through.
+  local result rc output
+  result="$(call_subject \
+    "describe_check_failure ${check_status} 21195 someone
+     printf 'DESC[%s]\nMSG[%s]\nSUM[%s]\n' \
+       \"\$SIGNOFF_FAILURE_STATUS_DESC\" \"\$SIGNOFF_FAILURE_MESSAGE\" \"\$SIGNOFF_FAILURE_SUMMARY\"" \
+    "$@")"
+  rc="${result%%|*}"
+  output="${result#*|}"
+
+  if [[ "$rc" -ne 0 ]]; then
+    fail_test "$name: expected exit 0, got ${rc} (output: ${output})"
+    return
+  fi
+  if [[ "$output" != *"DESC[${want_desc}]"* ]]; then
+    fail_test "$name: expected description '${want_desc}', got: ${output}"
+    return
+  fi
+  if [[ "$output" != *"${want_message}"* ]]; then
+    fail_test "$name: expected '${want_message}' in the output, got: ${output}"
+    return
+  fi
+  echo "  ok: $name"
+}
+
+# The regression, stated as the contract: run 30942941645 on PR #12448 timed out
+# with the suite still passing, and published "Sign-off checks failed after
+# 21195s" — a code failure that had not happened, on top of a `signoff=success`
+# posted seven hours earlier. Publishing nothing is what makes both impossible.
+assert_describe "publishes no verdict for a signalled run" 143 "" \
+  "the checks reached no verdict" STUB_FREE_KB="$(gib_to_kb 200)"
+assert_describe "says the run was signalled rather than that checks failed" 143 "" \
+  "was signalled after 21195s" STUB_FREE_KB="$(gib_to_kb 200)"
+# The two kinds that *did* reach a verdict still publish one. Without these, the
+# guard above could silence every failure and the tests would not notice.
+assert_describe "still publishes the out-of-disk verdict" 101 \
+  "Runner out of disk after 21195s — checks did not complete, re-dispatch (triggered by someone)" \
+  "ran out of disk" SIGNOFF_DISK_WATCH=1 SIGNOFF_DISK_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_describe "still publishes the unreachable-cache verdict" 101 \
+  "Compiler cache unreachable after 21195s — checks did not complete, re-dispatch (triggered by someone)" \
+  "sccache could not reach its storage" \
+  SIGNOFF_DISK_WATCH=1 SIGNOFF_CACHE_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_describe "still publishes a genuine check failure" 101 \
+  "Sign-off checks failed after 21195s (triggered by someone)" \
+  "sign-off checks failed" STUB_FREE_KB="$(gib_to_kb 200)"
+echo
 
 # `08` passes the digit regex, but bash arithmetic reads a leading zero as
 # octal — untreated, the floor becomes an arithmetic error rather than 8.
