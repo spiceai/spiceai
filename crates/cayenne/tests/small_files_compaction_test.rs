@@ -204,19 +204,55 @@ async fn count_rows_matching(ctx: &SessionContext, table_name: &str, where_claus
         .value(0)
 }
 
+/// Wait for `table`'s in-flight maintenance to drain, bounded.
+///
+/// `drain_in_flight_maintenance` has no timeout of its own, so a pass that never
+/// finishes would hang until the much larger harness process timeout, reporting
+/// nothing about where it stopped. `context` names what the caller was about to
+/// do, so the panic identifies which wait wedged.
+async fn drain_in_flight_maintenance_bounded(
+    table: &Arc<CayenneTableProvider>,
+    fixture: &common::TestFixture,
+    table_name: &str,
+    context: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const DRAIN_TIMEOUT: Duration = Duration::from_mins(2);
+
+    let Ok(drained) =
+        tokio::time::timeout(DRAIN_TIMEOUT, table.drain_in_flight_maintenance()).await
+    else {
+        let table_meta = fixture.catalog.get_table(table_name).await?;
+        let snapshot_id = table_meta.current_snapshot_id;
+        let files =
+            count_vortex_files(&fixture.data_path, &table_meta.table_id, &snapshot_id).await;
+        panic!(
+            "draining {table_name}'s in-flight maintenance did not finish within \
+             {DRAIN_TIMEOUT:?} before {context} (snapshot {snapshot_id}, {files} files)"
+        );
+    };
+    drained?;
+
+    Ok(())
+}
+
 /// Report the current snapshot once its file count is below
 /// `uncompacted_file_count`, i.e. once small-file compaction has consolidated
 /// the seeded appends, or `None` if no compaction is reachable.
 ///
-/// `uncompacted_file_count` must be the number of appends the test *seeded*, not
-/// a count listed from the store after the writes. Appends drive
-/// `schedule_post_write_compaction`, which is NOT disabled by
-/// `compaction_background_interval_ms: 0` — that only stops the interval
-/// scheduler — so a pass gets spawned and can consolidate the seed while the test
-/// is still writing it. (These tests install no dedicated compaction runtime, so
-/// that pass lands on the ambient one and interleaves at the test's await points.)
-/// A count listed afterwards may therefore already be the compacted count, making
-/// a further reduction unreachable and this helper's answer depend on that race.
+/// Pass the number of appends the test *seeded* whenever the caller asserts that
+/// compaction fired. Appends drive `schedule_post_write_compaction`, which is NOT
+/// disabled by `compaction_background_interval_ms: 0` — that only stops the
+/// interval scheduler — so a pass gets spawned and can consolidate the seed while
+/// the test is still writing it. (These tests install no dedicated compaction
+/// runtime, so that pass lands on the ambient one and interleaves at the test's
+/// await points.) A count listed from the store after the writes may therefore
+/// already be the compacted count, making a further reduction unreachable and this
+/// helper's answer depend on that race.
+///
+/// A caller for which both answers are correct may still pass a listed count —
+/// `two_phase_compact`'s phase B does, and reads `None` as "post-write already
+/// drained the backlog". What a listed count cannot support is asserting that
+/// `Some` must come back.
 ///
 /// Quiescing first is what makes the answer deterministic. A post-write pass and
 /// this helper both call `compact_current_snapshot_small_files`, so they contend
@@ -229,9 +265,7 @@ async fn count_rows_matching(ctx: &SessionContext, table_name: &str, where_claus
 /// observation below is stable; the bounded loop is a backstop for a staged
 /// append still finalizing, not the mechanism.
 ///
-/// The drain is bounded here because it has none of its own: a pass that never
-/// finishes would otherwise hang until the much larger harness process timeout,
-/// reporting nothing about where it stopped.
+/// The drain is bounded (see [`drain_in_flight_maintenance_bounded`]).
 async fn wait_until_current_snapshot_compacts(
     table: &Arc<CayenneTableProvider>,
     fixture: &common::TestFixture,
@@ -240,22 +274,14 @@ async fn wait_until_current_snapshot_compacts(
 ) -> Result<Option<(String, usize)>, Box<dyn std::error::Error>> {
     const TIMEOUT: Duration = Duration::from_secs(10);
     const POLL_INTERVAL: Duration = Duration::from_millis(50);
-    const DRAIN_TIMEOUT: Duration = Duration::from_mins(2);
 
-    let Ok(drained) =
-        tokio::time::timeout(DRAIN_TIMEOUT, table.drain_in_flight_maintenance()).await
-    else {
-        let table_meta = fixture.catalog.get_table(table_name).await?;
-        let snapshot_id = table_meta.current_snapshot_id;
-        let files =
-            count_vortex_files(&fixture.data_path, &table_meta.table_id, &snapshot_id).await;
-        panic!(
-            "draining {table_name}'s in-flight maintenance did not finish within \
-             {DRAIN_TIMEOUT:?} (snapshot {snapshot_id}, {files} files, \
-             target below {uncompacted_file_count})"
-        );
-    };
-    drained?;
+    drain_in_flight_maintenance_bounded(
+        table,
+        fixture,
+        table_name,
+        &format!("waiting for a fan-out below {uncompacted_file_count}"),
+    )
+    .await?;
 
     let started = Instant::now();
     loop {
@@ -1379,7 +1405,13 @@ async fn a_seed_is_consolidated_before_its_fanout_can_be_listed(
     }
 
     // Let the unasked-for pass finish instead of racing it.
-    table.drain_in_flight_maintenance().await?;
+    drain_in_flight_maintenance_bounded(
+        &table,
+        &fixture,
+        "consolidated_seed",
+        "listing the settled fan-out",
+    )
+    .await?;
 
     let settled_snapshot = fixture
         .catalog
@@ -1427,7 +1459,11 @@ async fn warm_subset_reduces_small_file_fanout(
         "warm_subset_fanout",
         Arc::clone(&schema),
         None,
-        // Append-only + Key mode → subset rewrite (no position full path).
+        // No primary key, so `DeletionMode::Key` resolves to position-based
+        // deletion and `subset_rewrite_eligibility` rejects the subset rewrite
+        // outright — what this exercises is the full-rewrite small-file path.
+        // `warm_subset_preserves_key_deletes_and_rows` builds a real PK table and
+        // is the one that covers subset rewrite.
         aggressive_key_deletion_compaction_config(),
     )
     .await;
