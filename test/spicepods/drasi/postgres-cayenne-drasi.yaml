@@ -1,0 +1,65 @@
+version: v2
+kind: Spicepod
+name: drasi-postgres-cayenne
+
+# Publishes a PostgreSQL logical-replication change stream to a Drasi source
+# while accelerating it locally with Cayenne. Each row becomes one Drasi graph
+# node labelled with its source table, so a continuous query can match it as
+# `MATCH (o:public.orders)`.
+#
+# The Drasi source must already exist and be started — Drasi never auto-creates
+# one, and `drasi_http_endpoint` is the HTTP source's own listener, not the
+# Drasi Server management API port.
+
+common_config:
+  acceleration: &common_acceleration
+    enabled: true
+    engine: cayenne
+    mode: file
+    refresh_mode: changes
+
+  params: &common_params
+    pg_host: ${secrets:PG_HOST}
+    pg_port: ${secrets:PG_PORT}
+    pg_db: ${secrets:PG_DB}
+    pg_user: ${secrets:PG_USER}
+    pg_pass: ${secrets:PG_PASS}
+    pg_sslmode: disable
+
+datasets:
+  - from: postgres:public.orders
+    name: orders
+    acceleration: *common_acceleration
+    params: *common_params
+    drasi:
+      source_id: spice-cdc
+      params:
+        drasi_http_endpoint: ${secrets:DRASI_HTTP_ENDPOINT}
+
+  # Labels default to the source table name; set them explicitly when the
+  # continuous queries were written against a different vocabulary.
+  - from: postgres:public.customers
+    name: customers
+    acceleration: *common_acceleration
+    params: *common_params
+    drasi:
+      source_id: spice-cdc
+      labels: [Customer]
+      params:
+        drasi_http_endpoint: ${secrets:DRASI_HTTP_ENDPOINT}
+        drasi_request_timeout: 10s
+
+  # Redis transport, for a Kubernetes-deployed Drasi whose platform source reads
+  # a stream. `skip` keeps acceleration moving when Drasi is unreachable, at the
+  # cost of Drasi missing those changes.
+  - from: postgres:public.line_items
+    name: line_items
+    acceleration: *common_acceleration
+    params: *common_params
+    drasi:
+      source_id: spice-cdc
+      transport: redis
+      on_delivery_error: skip
+      params:
+        drasi_redis_url: ${secrets:DRASI_REDIS_URL}
+        drasi_stream_key: drasi-events

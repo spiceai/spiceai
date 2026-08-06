@@ -214,8 +214,9 @@ yaml = "foundation"
 #   app, cache, cayenne, data-accelerator-api, data_components, datafusion-ddl,
 #   datafusion-optimizer-rules, llms, package, runtime-acceleration,
 #   runtime-auth, runtime-cluster, runtime-datafusion, runtime-datafusion-udfs,
-#   runtime-parameters, runtime-request-context, runtime-search, runtime-secrets,
-#   runtime-table-partition, runtime-tools, search, test-framework, workers
+#   runtime-drasi, runtime-parameters, runtime-request-context, runtime-search,
+#   runtime-secrets, runtime-table-partition, runtime-tools, search,
+#   test-framework, workers
 #
 # --- extension-utility: connector-specific building blocks that only extensions
 # depend on (never `runtime`). Populated as the data_components monolith is

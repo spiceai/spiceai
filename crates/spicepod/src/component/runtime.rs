@@ -59,6 +59,12 @@ pub struct Runtime {
     #[serde(default, skip_serializing_if = "is_default")]
     pub task_history: TaskHistory,
 
+    /// Forwards writes to the runtime's own tables (`task_history`, `metrics`)
+    /// to a Drasi source, so continuous queries can react to Spice's own
+    /// operational events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drasi: Option<crate::drasi::RuntimeDrasi>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<Auth>,
 
@@ -1302,6 +1308,8 @@ pub struct RuntimeDeserializer {
     #[serde(default, skip_serializing_if = "is_default")]
     pub task_history: TaskHistory,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drasi: Option<crate::drasi::RuntimeDrasi>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<Auth>,
     #[serde(default, skip_serializing_if = "is_default")]
     pub cors: CorsConfig,
@@ -1410,6 +1418,7 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             telemetry: deserializer.telemetry,
             params: deserializer.params,
             task_history: deserializer.task_history,
+            drasi: deserializer.drasi,
             auth: deserializer.auth,
             cors: deserializer.cors,
             flight: deserializer.flight,

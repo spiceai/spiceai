@@ -50,6 +50,7 @@ members = [
     "crates/runtime-cluster",
     "crates/datafusion-flightsql",
     "crates/runtime-datafusion",
+    "crates/runtime-drasi",
     "crates/runtime-query-engine",
     "crates/runtime-search",
     "crates/runtime-tools",

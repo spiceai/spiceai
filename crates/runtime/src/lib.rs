@@ -96,6 +96,7 @@ pub mod dataaccelerator;
 pub mod dataconnector;
 pub mod datafusion;
 pub mod datasets_health_monitor;
+pub mod drasi;
 pub use runtime_acceleration::dataupdate;
 pub(crate) mod egress;
 pub mod embeddings;
@@ -310,6 +311,14 @@ pub enum Error {
         "An accelerated table for {dataset_name} was configured with 'refresh_mode = changes', but the data connector doesn't support a changes stream."
     ))]
     AcceleratedTableInvalidChanges { dataset_name: String },
+
+    #[snafu(display(
+        "Failed to register dataset {dataset_name} (drasi): Drasi forwarding publishes the dataset's change stream, but this dataset has no change stream to publish — it is {reason}. Set 'acceleration.refresh_mode: changes' on a source that supports change data capture, or remove the 'drasi' block. See: https://spiceai.org/docs/reference/spicepod/datasets#drasi"
+    ))]
+    DrasiWithoutChangeStream {
+        dataset_name: String,
+        reason: String,
+    },
 
     #[snafu(display(
         "Failed to register dataset {dataset_name} ({connector}): durable write-back needs a source that can apply a delivered row in one atomic step, and the {connector} connector cannot yet. Delivering as a separate delete and insert lets the deleted state echo back over CDC, which can silently drop a committed write. Remove 'on_conflict' to keep writes on the accelerator, or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
@@ -1641,6 +1650,45 @@ impl Runtime {
         }
     }
 
+    /// Installs the `runtime.drasi` forwarders for the runtime's own tables.
+    ///
+    /// A misconfiguration disables forwarding with a loud warning rather than
+    /// failing startup. These tables carry telemetry, and refusing to start the
+    /// runtime because a downstream reaction engine was misconfigured trades a
+    /// much larger outage for a smaller one.
+    async fn init_drasi_forwarders(self: &Arc<Self>) {
+        let Some(app) = self.read_app().await else {
+            return;
+        };
+        let Some(spec) = app.runtime.drasi.as_ref() else {
+            return;
+        };
+
+        if spec.tables.is_empty() {
+            tracing::warn!(
+                "'runtime.drasi' is configured but names no tables, so nothing is forwarded to Drasi. Add entries under 'runtime.drasi.tables'."
+            );
+            return;
+        }
+
+        match crate::drasi::internal::InternalForwarders::try_new(spec) {
+            Ok(forwarders) => {
+                tracing::warn!(
+                    "Drasi change forwarding (Alpha) is in preview and should not be used in production."
+                );
+                tracing::info!(
+                    "Forwarding {} runtime table(s) to the Drasi source {}",
+                    spec.tables.len(),
+                    spec.source_id
+                );
+                self.df.set_drasi_forwarders(Arc::new(forwarders));
+            }
+            Err(e) => {
+                tracing::warn!("Not forwarding runtime tables to Drasi: {e}");
+            }
+        }
+    }
+
     /// Will load all of the components of the Runtime, including `secret_stores`, `catalogs`, `datasets`, `models`, and `embeddings`.
     ///
     /// The future returned by this function will not resolve until all components have been loaded and marked as ready.
@@ -1649,6 +1697,13 @@ impl Runtime {
         Arc::clone(&self).set_components_initializing().await;
 
         Arc::clone(&self).start_extensions().await;
+
+        // Installed before anything can write: the forwarders resolve a table's
+        // key lazily from the constraints handed to them at write time, so they
+        // do not need the runtime tables to exist yet — and installing them here
+        // rather than alongside `task_history` keeps `runtime.drasi` working
+        // when task history itself is disabled.
+        self.init_drasi_forwarders().await;
 
         // Must be loaded before datasets
         self.load_embeddings().await;

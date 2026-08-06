@@ -376,6 +376,9 @@ pub struct DatasetSpec {
     pub metrics: Metrics,
     pub vectors: Option<VectorStore>,
     pub full_text_search: Option<spicepod::fts::FtsStore>,
+    /// Forwards this dataset's CDC stream to a Drasi source. Requires
+    /// `acceleration.refresh_mode: changes`.
+    pub drasi: Option<spicepod::drasi::Drasi>,
     pub check_availability: CheckAvailability,
     /// How often the availability monitor probes this (non-accelerated)
     /// dataset's source, parsed from the Spicepod duration string at
@@ -408,6 +411,7 @@ impl std::fmt::Debug for DatasetSpec {
             .field("metrics", &self.metrics)
             .field("vectors", &self.vectors)
             .field("full_text_search", &self.full_text_search)
+            .field("drasi", &self.drasi)
             .field("check_availability", &self.check_availability)
             .field(
                 "check_availability_interval",

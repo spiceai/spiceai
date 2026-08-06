@@ -309,6 +309,49 @@ Configured as `.vectors.engine` on a column-level embedding.
 | `duckdb`        | DuckDB with HNSW vector index                                        | Alpha  |
 | `elasticsearch` | Elasticsearch with kNN                                               | Alpha  |
 
+## Change Forwarding to Drasi (Alpha)
+
+> **Alpha** — Drasi support is in preview and should not be used in production.
+
+Configured as `.drasi` on a dataset accelerated with `refresh_mode: changes`. Publishes the dataset's change-data-capture stream to a [Drasi](https://drasi.io) source, so Drasi continuous queries react to the same changes Spice applies to the local accelerator. One row becomes one graph node: the primary key derives the element id, the source table name becomes the node label, and the row's columns become node properties.
+
+Forwarding runs before the change is acknowledged to the source, so delivery is at-least-once — a change is replayed rather than lost if Drasi is unreachable.
+
+```yaml
+datasets:
+  - from: postgres:public.orders
+    name: orders
+    acceleration:
+      enabled: true
+      engine: cayenne
+      refresh_mode: changes
+    drasi:
+      source_id: spice-cdc
+      params:
+        drasi_http_endpoint: http://localhost:9000
+```
+
+| Transport | Description                                                                    | Status |
+| --------- | ------------------------------------------------------------------------------ | ------ |
+| `http`    | Batched POST to a Drasi Server HTTP source                                     | Alpha  |
+| `redis`   | CloudEvents envelopes on the Redis stream a Drasi platform source consumes      | Alpha  |
+
+`on_delivery_error` selects what a delivery failure does to the change stream: `block` (default) retries indefinitely and never loses a change, at the cost of stalling acceleration while Drasi is down; `skip` gives up after a bounded retry budget and lets acceleration continue; `fail` surfaces the failure and stops the stream.
+
+Spice's own operational tables can be forwarded the same way, so continuous queries can react to events like a query exceeding its budget or a refresh failing. These are configured under `runtime` because they are not CDC-fed from an external source, and they default to `on_delivery_error: skip` — blocking the runtime's telemetry writer on a downstream outage buys nothing:
+
+```yaml
+runtime:
+  drasi:
+    source_id: spice-runtime
+    params:
+      drasi_http_endpoint: http://localhost:9000
+    tables:
+      - name: task_history
+```
+
+Only the tables named are forwarded. A table's element id comes from its declared primary key (`task_history` uses `span_id`); a table that declares none — such as `runtime.metrics` — must name its identifying columns with `key:`, since a synthesized id would publish a duplicate node on every delivery retry.
+
 ## Supported Catalogs
 
 Catalog Connectors connect to external catalog providers and make their tables available for federated SQL query in Spice. The schema hierarchy of the external catalog is preserved.

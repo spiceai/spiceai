@@ -24,7 +24,8 @@ use crate::dataaccelerator::spice_sys::is_shutdown_cancellation;
 use crate::init::dataset_initialization::DatasetInitialization;
 use crate::{
     AcceleratedTableInvalidChangesSnafu, AcceleratorEngineNotAvailableSnafu,
-    AcceleratorInitializationFailedSnafu, DurableWriteBackUnsupportedBySourceSnafu, Error,
+    AcceleratorInitializationFailedSnafu, DrasiWithoutChangeStreamSnafu,
+    DurableWriteBackUnsupportedBySourceSnafu, Error,
     FullTextSearchRequiresAccelerationSnafu, LogErrors, OdbcNotInstalledSnafu,
     PermanentDatasetFailureSnafu, Result, Runtime, UnableToAttachDataConnectorSnafu,
     UnableToBuildDatasetSnafu, UnableToCreateAcceleratedTableSnafu,
@@ -793,6 +794,42 @@ impl Runtime {
             return Err(err);
         }
 
+        // A `drasi` block only takes effect through the change stream, so a
+        // dataset without one forwards nothing. Silently publishing no changes
+        // to a configured Drasi source is worse than refusing the dataset: the
+        // continuous queries downstream would simply never fire, with nothing to
+        // point at.
+        if ds.drasi.is_some() {
+            let refresh_mode = ds
+                .acceleration
+                .as_ref()
+                .map(|a| data_connector.resolve_refresh_mode(a.refresh_mode));
+
+            let reason = match refresh_mode {
+                None => Some("not accelerated".to_string()),
+                // Lowercased to match the value as it is spelled in the
+                // Spicepod, which is what the operator has to change.
+                Some(mode) if mode != RefreshMode::Changes => Some(format!(
+                    "accelerated with 'refresh_mode: {}'",
+                    format!("{mode:?}").to_lowercase()
+                )),
+                Some(_) if !data_connector.supports_changes_stream() => Some(format!(
+                    "backed by the {source} connector, which does not support change data capture"
+                )),
+                Some(_) => None,
+            };
+
+            if let Some(reason) = reason {
+                let err = DrasiWithoutChangeStreamSnafu {
+                    dataset_name: ds.name.to_string(),
+                    reason,
+                }
+                .build();
+                warn_spaced!(spaced_tracer, "{}{err}", "");
+                return Err(err);
+            }
+        }
+
         // Durable write-back delivers each committed row to the source. Unless
         // the connector can do that atomically, delivery has to emulate an
         // upsert as a standalone delete plus a separate insert — and because the
@@ -1341,6 +1378,27 @@ impl Runtime {
                 // this lookup; report the same error rather than a second, blunter one.
                 return Err(unknown_data_connector(source).await);
             };
+
+        // Innermost of the stream decorators, so the properties Drasi receives
+        // are the source table's own columns. Wrapping outside the embedding
+        // decorator would instead publish every computed embedding vector as a
+        // node property.
+        if let Some(drasi) = ds.drasi.clone() {
+            tracing::warn!(
+                "Drasi change forwarding (Alpha) is in preview and should not be used in production."
+            );
+
+            let sink = crate::drasi::sink_for_dataset(&ds, &drasi).map_err(|e| {
+                crate::Error::UnableToInitializeDataConnector {
+                    source: Box::new(e),
+                }
+            })?;
+
+            data_connector = Arc::new(crate::drasi::connector::DrasiConnector::new(
+                data_connector,
+                sink,
+            ));
+        }
 
         if ds.has_embeddings() {
             data_connector = Arc::new(EmbeddingConnector::new(
