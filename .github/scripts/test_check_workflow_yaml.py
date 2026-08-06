@@ -262,6 +262,29 @@ class CheckSuiteVisibilityTest(unittest.TestCase):
             [],
         )
 
+    def test_a_status_function_inside_a_quoted_literal_does_not_count(self):
+        """Comparing against the text `'always()'` is not a call to it."""
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(
+                _nightly_with_suites(
+                    ("Run A", ""), ("Run B", "${{ env.MODE == 'always()' }}")
+                )
+            ),
+            [_hidden("Run B")],
+        )
+
+    def test_a_real_status_function_beside_a_quoted_literal_is_accepted(self):
+        """Dropping the literal must not take the genuine call out with it."""
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(
+                _nightly_with_suites(
+                    ("Run A", ""),
+                    ("Run B", "${{ !cancelled() && env.MODE == 'always()' }}"),
+                )
+            ),
+            [],
+        )
+
     def test_a_pr_gate_is_left_alone(self):
         """Stopping at the first failure is the point of a gate; this only covers nightlies."""
         self.assertEqual(

@@ -80,9 +80,9 @@ STEP_IF_CONTEXTS = JOB_IF_CONTEXTS | frozenset(
 CONTEXT_REFERENCE = re.compile(r"(?<![\w.-])([a-z]+)\s*[.\[]")
 
 # A GitHub expression quotes string literals with `'`, doubling the quote to
-# escape it. Literals are dropped before the scan so that a condition comparing
-# against text that happens to lead with a context name — `== 'env.FOO'` — is not
-# read as a use of that context.
+# escape it. Literals are dropped before a condition is scanned so that text which
+# merely reads like an expression is not mistaken for one: `== 'env.FOO'` is not a
+# use of the `env` context, and `== 'always()'` is not a call to `always()`.
 STRING_LITERAL = re.compile(r"'[^']*'")
 
 # `secrets` is the case that has actually bitten, so its diagnosis names the fix
@@ -316,9 +316,16 @@ def _publishes_snapshots(step: dict) -> bool:
 
 
 def _survives_an_earlier_failure(step: dict) -> bool:
-    """Report whether the step's condition lets it run after an earlier one failed."""
+    """Report whether the step's condition lets it run after an earlier one failed.
+
+    String literals are removed first, so a condition that merely compares against
+    the text `'always()'` does not read as a call to it and buy the step an
+    exemption it has not earned.
+    """
     condition = step.get("if")
-    return isinstance(condition, str) and bool(SURVIVES_FAILURE.search(condition))
+    if not isinstance(condition, str):
+        return False
+    return bool(SURVIVES_FAILURE.search(STRING_LITERAL.sub("''", condition)))
 
 
 def check_suite_visibility(jobs: dict, scheduled: bool) -> list[str]:
