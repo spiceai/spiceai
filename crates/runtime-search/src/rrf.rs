@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use ::search::aggregation::reciprocal_rank::DEFAULT_RRF_K;
+use ::search::aggregation::reciprocal_rank::{DEFAULT_RRF_K, rrf_candidate_pool_size};
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
@@ -80,12 +80,6 @@ pub static RRF_FUSED_SCORE_COLUMN_NAME: &str = "_fused_score";
 /// Internal column name for the synthetic row ID used when no user-provided join key exists.
 const RRF_ROW_ID_COLUMN_NAME: &str = "__spice_rrf_row_id";
 
-/// When the user sets a fused-result `limit` on `rrf()`, each underlying search
-/// subquery is asked for `limit * RRF_CANDIDATE_POOL_FACTOR` rows so the
-/// rank-fusion has a wider pool of candidates to combine. The post-fuse
-/// `.limit(0, Some(l))` still caps the final result to exactly `l` rows. This
-/// trades a small amount of extra index work for materially better recall.
-pub const RRF_CANDIDATE_POOL_FACTOR: usize = 4;
 pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| {
     Documentation {
     doc_section: DocSection::default(),
@@ -98,7 +92,7 @@ pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| {
             "Inline text_search or vector_search UDTF invocations".to_string(),
         ),
         ("k".to_string(), "RRF smoothing parameter (default: 60.0)".to_string()),
-        ("limit".to_string(), "Upper bound on fused result rows. Also propagated to any nested search query that does not specify its own limit, reducing work in the underlying search indexes.".to_string()),
+        ("limit".to_string(), "Upper bound on fused result rows. Nested searches without an explicit limit contribute a wider RRF candidate pool before this final limit is applied.".to_string()),
         ("join_key".to_string(), "Column name to use for joining results instead of auto-generated row ID".to_string()),
         ("time_column".to_string(), "Column name containing timestamps for recency boosting".to_string()),
         ("recency_decay".to_string(), "Type of decay function: 'linear' or 'exponential' (default: 'exponential')".to_string()),
@@ -943,7 +937,7 @@ impl ReciprocalRankFusion {
                 // The subquery search providers honor scan-level limits (pushed
                 // down through DataFusion's optimizer), so this reduces work in
                 // the underlying search indexes and network overhead. We
-                // multiply by RRF_CANDIDATE_POOL_FACTOR so the rank-fusion has
+                // use the shared RRF candidate-pool policy so the rank-fusion has
                 // enough overlap candidates to produce a stable top-`l` result;
                 // the final `.limit(0, Some(l))` after fusion still caps the
                 // user-visible output exactly.
@@ -962,7 +956,7 @@ impl ReciprocalRankFusion {
 
                 let df = match args.limit {
                     Some(l) if !subquery_has_explicit_limit => {
-                        let pool = l.saturating_mul(RRF_CANDIDATE_POOL_FACTOR);
+                        let pool = rrf_candidate_pool_size(l);
                         df.limit(0, Some(pool))?
                     }
                     _ => df,
