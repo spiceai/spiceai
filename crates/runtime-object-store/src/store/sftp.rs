@@ -16,9 +16,9 @@ limitations under the License.
 
 use std::{
     io::{Read, Seek, SeekFrom},
-    net::TcpStream,
+    net::{SocketAddr, TcpStream, ToSocketAddrs},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -38,6 +38,9 @@ use super::common::{
 };
 
 const STORE_NAME: &str = "SFTP";
+/// Deadline applied to establishing a session when `client_timeout` is unset.
+/// Matches the documented default for the parameter.
+const DEFAULT_CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 struct SFTPClientConfig {
@@ -77,23 +80,25 @@ impl SFTPClientConfig {
         }
     }
 
+    /// Wall-clock deadline for establishing one usable session.
+    fn deadline(&self) -> Duration {
+        self.timeout.unwrap_or(DEFAULT_CLIENT_TIMEOUT)
+    }
+
     fn connect(&self) -> object_store::Result<Session> {
-        let stream = match self.timeout {
-            Some(timeout) => TcpStream::connect_timeout(
-                &format!("{}:{}", self.host, self.port).parse().map_err(
-                    |e: std::net::AddrParseError| object_store::Error::Generic {
-                        store: "SFTP",
-                        source: e.into(),
-                    },
-                )?,
-                timeout,
-            )
-            .map_err(handle_error)?,
-            None => {
-                TcpStream::connect(format!("{}:{}", self.host, self.port)).map_err(handle_error)?
-            }
-        };
+        let deadline = self.deadline();
+        let addr = format!("{}:{}", self.host, self.port);
+        let stream = connect_within(&addr, deadline)?;
+
         let mut session = Session::new().map_err(handle_error)?;
+        // The SSH banner exchange and the password exchange are what a peer that
+        // completes the TCP handshake and then goes quiet holds open, so bounding
+        // only the connect leaves this blocking-pool thread parked forever. This
+        // bounds every blocking libssh2 wait, including the handshake, the
+        // authentication, and later SFTP reads on the returned session — libssh2
+        // applies it per wait for the socket to become ready, so a transfer that
+        // keeps making progress is not cut off.
+        session.set_timeout(u32::try_from(deadline.as_millis()).unwrap_or(u32::MAX));
         session.set_tcp_stream(stream);
         session.handshake().map_err(handle_error)?;
         session
@@ -102,6 +107,48 @@ impl SFTPClientConfig {
 
         Ok(session)
     }
+}
+
+/// Resolve `host:port` and connect within `deadline`.
+///
+/// `TcpStream::connect_timeout` takes an already-resolved `SocketAddr` and so
+/// cannot accept a hostname; resolving first keeps hostnames working while
+/// still bounding the connect. The deadline covers all resolved candidates
+/// together rather than resetting per candidate.
+fn connect_within(addr: &str, deadline: Duration) -> object_store::Result<TcpStream> {
+    let start = Instant::now();
+    let candidates: Vec<SocketAddr> = addr
+        .to_socket_addrs()
+        .map_err(|e| {
+            generic_error(
+                STORE_NAME,
+                format!("Failed to resolve SFTP server {addr}: {e}"),
+            )
+        })?
+        .collect();
+
+    let mut last_error: Option<String> = None;
+    for candidate in candidates {
+        let Some(remaining) = deadline.checked_sub(start.elapsed()) else {
+            break;
+        };
+        // `connect_timeout` rejects a zero duration.
+        if remaining.is_zero() {
+            break;
+        }
+        match TcpStream::connect_timeout(&candidate, remaining) {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last_error = Some(format!("{candidate}: {e}")),
+        }
+    }
+
+    let detail = last_error.unwrap_or_else(|| format!("no address answered within {deadline:?}"));
+    Err(generic_error(
+        STORE_NAME,
+        format!(
+            "Failed to connect to SFTP server sftp://{addr}: {detail}. Increase 'client_timeout' if the server is simply slow to respond. See: https://spiceai.org/docs/components/data-connectors/sftp"
+        ),
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -408,6 +455,160 @@ mod tests {
         );
         assert_eq!(config.host, "localhost");
         assert!(config.timeout.is_some());
+    }
+
+    /// A peer that completes the TCP handshake and then never sends the SSH
+    /// banner. Returns the port; the accepted sockets are held by the thread.
+    fn stalled_ssh_peer() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        std::thread::spawn(move || {
+            let mut accepted = Vec::new();
+            while let Ok((stream, _)) = listener.accept() {
+                accepted.push(stream);
+            }
+        });
+        port
+    }
+
+    fn config_for(host: &str, port: String, timeout: Option<Duration>) -> SFTPClientConfig {
+        SFTPClientConfig::new(
+            "user".to_string(),
+            "pass".to_string(),
+            host.to_string(),
+            port,
+            timeout,
+        )
+    }
+
+    /// Regression test for #12647: the SSH banner exchange and the password
+    /// exchange must be bounded, not just the TCP connect. Without a session
+    /// timeout this parks a blocking-pool thread for as long as the peer stays
+    /// quiet, and the thread cannot be reclaimed.
+    #[test]
+    fn connect_gives_up_on_a_peer_that_never_sends_a_banner() {
+        let port = stalled_ssh_peer();
+        let config = config_for(
+            "127.0.0.1",
+            port.to_string(),
+            Some(Duration::from_millis(250)),
+        );
+
+        let start = Instant::now();
+        let err = config
+            .connect()
+            .map(|_| ())
+            .expect_err("a peer that never answers must not produce a session");
+
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the handshake should be abandoned at the deadline, took {:?}",
+            start.elapsed()
+        );
+        // libssh2 reports its own timeout, so assert on the outcome rather than
+        // on wording it owns.
+        assert!(
+            format!("{err}").contains("SFTP"),
+            "the error should name the store, got: {err}"
+        );
+    }
+
+    /// Regression test for #12654: setting `client_timeout` used to route the
+    /// connect through `TcpStream::connect_timeout`, which takes an
+    /// already-resolved `SocketAddr`, so any host given as a name failed with
+    /// "invalid socket address syntax" before a packet was sent.
+    #[test]
+    fn a_hostname_is_resolved_when_client_timeout_is_set() {
+        let port = stalled_ssh_peer();
+        let config = config_for(
+            "localhost",
+            port.to_string(),
+            Some(Duration::from_millis(250)),
+        );
+
+        let err = config
+            .connect()
+            .map(|_| ())
+            .expect_err("the stalled peer cannot complete a handshake");
+
+        assert!(
+            !format!("{err}").contains("invalid socket address syntax"),
+            "a hostname must be resolved, not parsed as an address: {err}"
+        );
+    }
+
+    /// Control: a refused port must surface as a connection failure quickly,
+    /// rather than being masked by the deadline.
+    #[test]
+    fn a_refused_port_fails_without_waiting_for_the_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+
+        let config = config_for("127.0.0.1", port.to_string(), Some(Duration::from_secs(30)));
+
+        let start = Instant::now();
+        let err = config
+            .connect()
+            .map(|_| ())
+            .expect_err("nothing is listening");
+
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "a refused connect should fail immediately, took {:?}",
+            start.elapsed()
+        );
+        assert!(
+            format!("{err}").contains("Failed to connect to SFTP server"),
+            "a refused connect should name the server, got: {err}"
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_host_is_reported_as_a_resolution_failure() {
+        // `.invalid` is reserved by RFC 2606 and never resolves.
+        let config = config_for(
+            "no-such-host.invalid",
+            "22".to_string(),
+            Some(Duration::from_millis(250)),
+        );
+
+        let err = config
+            .connect()
+            .map(|_| ())
+            .expect_err("the host cannot resolve");
+        assert!(
+            format!("{err}").contains("Failed to resolve SFTP server"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn an_unset_client_timeout_still_has_a_deadline() {
+        assert_eq!(
+            config_for("sftp.example.com", "22".to_string(), None).deadline(),
+            DEFAULT_CLIENT_TIMEOUT
+        );
+        assert_eq!(
+            config_for(
+                "sftp.example.com",
+                "22".to_string(),
+                Some(Duration::from_secs(3))
+            )
+            .deadline(),
+            Duration::from_secs(3)
+        );
+    }
+
+    #[test]
+    fn an_exhausted_deadline_stops_trying_candidates() {
+        let port = stalled_ssh_peer();
+        let err = connect_within(&format!("127.0.0.1:{port}"), Duration::ZERO)
+            .expect_err("a zero deadline cannot connect");
+        assert!(
+            format!("{err}").contains("no address answered within"),
+            "got: {err}"
+        );
     }
 
     #[test]
