@@ -2275,10 +2275,10 @@ fn scalar_value_to_turso(
             let values = entries.column(MAP_VALUE_COLUMN);
 
             let mut json_map = serde_json::Map::with_capacity(keys.len());
+            let key_type = keys.data_type();
 
             for i in 0..keys.len() {
                 let key_scalar = ScalarValue::try_from_array(keys.as_ref(), i)?;
-                let key_type = key_scalar.data_type();
                 let serde_json::Value::String(key_str) = scalar_value_to_json(key_scalar)? else {
                     return Err(format!(
                         "Failed to write a map value to Turso: map keys must be strings, found {key_type}. \
