@@ -74,8 +74,8 @@ fn chosen_on_command_line(matches: &clap::ArgMatches, id: &str) -> bool {
     matches.value_source(id) == Some(ValueSource::CommandLine)
 }
 
-/// The line every run opens with: it names the build and the allocator every later
-/// line came from.
+/// The line every run opens with: it names the build every later line came from,
+/// plus the allocator when one was compiled in over the default.
 fn log_startup_banner() {
     if let Some(allocator_name) = get_allocator_name() {
         tracing::info!(
