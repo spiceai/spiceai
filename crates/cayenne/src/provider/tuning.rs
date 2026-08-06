@@ -543,11 +543,17 @@ fn reclaimable_page_cache(contents: &str, cache_key: &str, excluded: &[&str]) ->
 }
 
 /// Value for `key` in a cgroup stat body (`"<key> <value>"` per line).
+///
+/// Splits on arbitrary whitespace rather than a single space. The kernel emits one
+/// space today, but a missed key is indistinguishable from an absent one here: the
+/// caller reads `None` as "no reclaimable cache" and falls back to the raw charge —
+/// silently restoring the over-counting this whole path exists to avoid. Being
+/// lenient costs nothing and removes that failure mode.
 #[cfg(target_os = "linux")]
 fn parse_cgroup_stat_key(contents: &str, key: &str) -> Option<u64> {
     contents.lines().find_map(|line| {
-        let (name, value) = line.split_once(' ')?;
-        (name == key).then(|| value.trim().parse().ok())?
+        let mut fields = line.split_whitespace();
+        (fields.next()? == key).then(|| fields.next()?.parse().ok())?
     })
 }
 
@@ -4460,6 +4466,33 @@ mod tests {
             v1_reclaimable_page_cache("cache 1000\nshmem 100\nwriteback 50\n"),
             Some(850)
         );
+    }
+
+    /// Whitespace tolerance in [`parse_cgroup_stat_key`]. The kernel emits a single
+    /// space, but a key missed on a formatting difference reads as "no reclaimable
+    /// cache", which silently restores the raw-charge over-counting — so parse
+    /// leniently rather than relying on the emitted format.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stat_key_parsing_tolerates_whitespace() {
+        for body in [
+            "file 1000\n",
+            "  file   1000  \n",
+            "file\t1000\n",
+            "anon 5\nfile 1000\nshmem 0\n",
+        ] {
+            assert_eq!(
+                parse_cgroup_stat_key(body, "file"),
+                Some(1000),
+                "failed to parse {body:?}"
+            );
+        }
+        // A key that only appears as a *prefix* of another must not match.
+        assert_eq!(parse_cgroup_stat_key("file_dirty 7\n", "file"), None);
+        // Absent, empty, and value-less lines are all "unknown", never 0.
+        assert_eq!(parse_cgroup_stat_key("anon 1\n", "file"), None);
+        assert_eq!(parse_cgroup_stat_key("\n\n", "file"), None);
+        assert_eq!(parse_cgroup_stat_key("file\n", "file"), None);
     }
 
     // ---- goal-driven controller ------------------------------------------
