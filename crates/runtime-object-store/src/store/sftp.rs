@@ -88,6 +88,7 @@ impl SFTPClientConfig {
 
     fn connect(&self) -> object_store::Result<Session> {
         let bound = self.timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT);
+        let started = Instant::now();
         let stream = connect_within(&self.host, &self.port, bound)?;
 
         let mut session = Session::new().map_err(handle_error)?;
@@ -96,8 +97,15 @@ impl SFTPClientConfig {
         // session inherits no deadline from the stream it was given. Without this, a peer
         // that completes the TCP handshake and then sends no SSH version string is waited
         // on for as long as it keeps the socket open.
-        session.set_timeout(session_timeout_ms(bound));
+        //
+        // ssh2 applies the timeout to each blocking operation rather than as one
+        // cumulative deadline, so every stage is armed with what is left of `bound` — the
+        // connect that already happened, and then the handshake — instead of a fresh copy
+        // of it. That is what keeps the attempt inside the single wall-clock bound
+        // `DEFAULT_CONNECT_TIMEOUT` and `client_timeout` describe.
+        session.set_timeout(remaining_session_timeout_ms(bound, started.elapsed())?);
         session.handshake().map_err(handle_error)?;
+        session.set_timeout(remaining_session_timeout_ms(bound, started.elapsed())?);
         session
             .userauth_password(&self.user, &self.password)
             .map_err(handle_error)?;
@@ -278,6 +286,24 @@ fn connect_within(host: &str, port: &str, bound: Duration) -> object_store::Resu
 /// `u32::MAX` milliseconds saturates instead of wrapping.
 fn session_timeout_ms(bound: Duration) -> u32 {
     u32::try_from(bound.as_millis()).unwrap_or(u32::MAX).max(1)
+}
+
+/// Express what is left of `bound` after `elapsed` in the form [`Session::set_timeout`] takes.
+///
+/// A budget already spent is an error rather than a timeout of zero: ssh2 reads `0` as "wait
+/// forever", so clamping an overrun up to 1ms would keep the attempt bounded while clamping
+/// it down to 0 would remove the bound at exactly the point the attempt has run out of time.
+fn remaining_session_timeout_ms(bound: Duration, elapsed: Duration) -> object_store::Result<u32> {
+    let Some(remaining) = bound
+        .checked_sub(elapsed)
+        .filter(|remaining| !remaining.is_zero())
+    else {
+        return Err(handle_error(format!(
+            "connecting timed out after {bound:?}: no budget left for the SSH handshake"
+        )));
+    };
+
+    Ok(session_timeout_ms(remaining))
 }
 
 #[async_trait]
@@ -484,6 +510,48 @@ mod tests {
         assert_eq!(
             session_timeout_ms(Duration::from_secs(u64::from(u32::MAX))),
             u32::MAX
+        );
+    }
+
+    #[test]
+    fn each_stage_is_armed_with_what_is_left_of_the_bound() {
+        // ssh2 times out each blocking operation separately, so arming a stage with the
+        // whole bound after part of it has been spent makes the attempt additive — the
+        // wall clock the caller asked for, once per stage — rather than one deadline.
+        let bound = Duration::from_secs(20);
+
+        assert_eq!(
+            remaining_session_timeout_ms(bound, Duration::ZERO)
+                .expect("an unspent budget should arm the full bound"),
+            20_000
+        );
+        assert_eq!(
+            remaining_session_timeout_ms(bound, Duration::from_secs(15))
+                .expect("a partly spent budget should arm only the remainder"),
+            5_000
+        );
+    }
+
+    #[test]
+    fn a_spent_budget_fails_rather_than_arming_an_unbounded_wait() {
+        let bound = Duration::from_secs(20);
+
+        for elapsed in [bound, Duration::from_secs(21)] {
+            let error = remaining_session_timeout_ms(bound, elapsed)
+                .expect_err("a budget with nothing left must not arm another wait");
+
+            assert!(
+                error.to_string().contains("no budget left"),
+                "the error should name the exhausted budget, got {error}"
+            );
+        }
+
+        // A remainder under a millisecond still has time left, so it is armed as the
+        // shortest deadline ssh2 accepts instead of `0`, which it reads as no deadline.
+        assert_eq!(
+            remaining_session_timeout_ms(bound, bound - Duration::from_micros(500))
+                .expect("a sub-millisecond remainder is still a remainder"),
+            1
         );
     }
 
