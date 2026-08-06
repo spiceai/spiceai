@@ -2,13 +2,17 @@ version: v1
 kind: Spicepod
 name: mysql-cayenne[file]-tuned
 
+# Adaptive tuning with THREE MEMORY KNOBS PINNED — see the TEST REFERENCE CONFIG note on the
+# acceleration params below for what is pinned and why. Everything in this header describes the
+# adaptive behaviour that still applies to every OTHER knob.
+#
 # Adaptive-tuning variant of the non-tuned mysql-cayenne[file] baseline. Instead of either
 # the static `auto` derivation (the baseline) or a hand-pinned -cdc-tuned-* config, every Cayenne
 # table runs `cayenne_tuning: adaptive`: the runtime still warm-starts each knob from the detected
 # host + inferred schema, then runs the closed-feedback loop that adapts those knobs over time
 # within the environment-derived [floor, ceiling] as the workload shifts.
 #
-# Schema inference (always on) does double duty here, so nothing else is hand-set:
+# Schema inference (always on) does double duty here, so PK / on_conflict need no hand-setting:
 #   - It auto-detects the primary key (and rough table sizing) from the MySQL source and seeds
 #     an `upsert` on_conflict on the inferred PK — exactly what `refresh_mode: changes` needs to
 #     apply UPDATE/DELETE events. So PK / on_conflict are intentionally NOT declared below;
@@ -18,8 +22,10 @@ name: mysql-cayenne[file]-tuned
 #     warm-start. Adaptive is set explicitly, so it runs regardless; without inferred metadata
 #     the loop just relearns the row width from observed ingest.
 # Background compaction stays at the auto-derived (non-zero) default — the controller rides its
-# tick. No per-ACTUATOR knob value is set anywhere: an explicit knob would *pin* it under adaptive
-# (collapsing its tuning bounds to a point), so the un-pinned baseline gives the loop full freedom.
+# tick. Apart from the three memory knobs pinned below, no per-ACTUATOR knob value is set: an
+# explicit knob *pins* it under adaptive (collapsing its tuning bounds to a point), so every other
+# actuator keeps full freedom. The three exceptions are deliberate and are what makes this pod a
+# benchmark yardstick rather than a baseline.
 # The `cayenne_goal_*` SLOs (set globally under `runtime.params`) are NOT actuator knobs — they
 # are the high-level targets the closed loop converges toward (it still moves the un-pinned
 # actuators freely to hit them).
