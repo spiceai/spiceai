@@ -119,39 +119,62 @@ impl PartitionTableProvider {
         contains
     }
 
-    /// Returns `true` if the filter exclusively compares partition expressions to
-    /// literal values using equality, and `prune_partition` can fully resolve the
-    /// filter via partition metadata alone.
+    /// The index of the single partition expression this filter resolves against, if the filter is
+    /// built entirely from `<that expression> = <literal>` leaves combined with `AND`/`OR`.
     ///
-    /// Only the shapes that `prune_partition` handles exactly are accepted:
+    /// Accepted shapes:
     /// - Single equality: `partition_expr = literal`
-    /// - OR-chains of equalities: `partition_expr = lit1 OR partition_expr = lit2`
-    /// - AND of partition-expression equalities across different expressions
+    /// - OR/AND chains over the **same** expression: `partition_expr = lit1 OR partition_expr = lit2`
+    ///
+    /// Returns `None` when the filter is not that shape, and — critically — when its leaves span
+    /// **more than one** partition expression. `prune_partition` runs once per partition expression
+    /// and skips any filter referencing a column outside the expression it is currently evaluating,
+    /// so a cross-expression filter is pruned by nobody. Reporting it as exact pushdown would drop
+    /// it from the plan *and* from the data filters, leaving the predicate applied nowhere and the
+    /// whole table returned. A cross-expression `AND` is normally split into separate conjuncts by
+    /// the optimizer before it reaches here, and each conjunct then resolves on its own; a
+    /// cross-expression `OR` is not split, which is how such a filter arrives whole.
     ///
     /// Shapes that are NOT accepted (because `prune_partition` cannot fully
     /// resolve them for transform partition expressions like `bucket()`):
     /// - Inequalities: `partition_expr != lit`, `partition_expr > lit`, etc.
     /// - `InList`: `partition_expr IN (lit1, lit2)` or `NOT IN`
     /// - Base-column filters: `org_id = 100`
-    fn is_partition_expression_filter(filter: &Expr, partition_exprs: &[PartitionedBy]) -> bool {
+    fn resolved_partition_expression_index(
+        filter: &Expr,
+        partition_exprs: &[PartitionedBy],
+    ) -> Option<usize> {
         match filter {
             Expr::BinaryExpr(BinaryExpr { left, op, right }) => match op {
                 Operator::Eq => {
-                    let is_partition_expr_vs_literal = |a: &Expr, b: &Expr| -> bool {
-                        partition_exprs.iter().any(|p| a == &p.expression)
-                            && matches!(b, Expr::Literal(..))
+                    let index_of = |candidate: &Expr, literal: &Expr| -> Option<usize> {
+                        if !matches!(literal, Expr::Literal(..)) {
+                            return None;
+                        }
+                        partition_exprs
+                            .iter()
+                            .position(|p| candidate == &p.expression)
                     };
-                    is_partition_expr_vs_literal(left, right)
-                        || is_partition_expr_vs_literal(right, left)
+                    index_of(left, right).or_else(|| index_of(right, left))
                 }
                 Operator::Or | Operator::And => {
-                    Self::is_partition_expression_filter(left, partition_exprs)
-                        && Self::is_partition_expression_filter(right, partition_exprs)
+                    let left_index =
+                        Self::resolved_partition_expression_index(left, partition_exprs)?;
+                    let right_index =
+                        Self::resolved_partition_expression_index(right, partition_exprs)?;
+                    (left_index == right_index).then_some(left_index)
                 }
-                _ => false,
+                _ => None,
             },
-            _ => false,
+            _ => None,
         }
+    }
+
+    /// Whether `prune_partition` can fully resolve `filter` from partition metadata alone, so the
+    /// filter needs no row-level `FilterExec`. See
+    /// [`Self::resolved_partition_expression_index`] for the accepted shapes.
+    fn is_partition_expression_filter(filter: &Expr, partition_exprs: &[PartitionedBy]) -> bool {
+        Self::resolved_partition_expression_index(filter, partition_exprs).is_some()
     }
 
     /// Creates a new [`PartitionTableProvider`] that partitions the data using
@@ -1767,6 +1790,70 @@ mod tests {
             results[1],
             TableProviderFilterPushDown::Inexact,
             "Base column filter should be Inexact (delegated to creator)"
+        );
+    }
+
+    /// A filter whose leaves span two partition expressions must not be reported `Exact`.
+    ///
+    /// `prune_partition` runs once per partition expression and skips any filter referencing a
+    /// column outside the one it is evaluating, so a cross-expression filter is pruned by nobody.
+    /// Claiming `Exact` also drops it from `data_filters`, so the predicate would be applied
+    /// nowhere and the scan would return every row. A top-level `AND` is split into separate
+    /// conjuncts upstream, but a top-level `OR` is not — which is how such a filter arrives whole.
+    #[tokio::test]
+    async fn test_cross_expression_or_is_not_exact_pushdown() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("year", DataType::Int32, false),
+            Field::new("month", DataType::Int32, false),
+        ]));
+
+        let creator = Arc::new(MockCreator {
+            partitions_data: Arc::new(RwLock::new(vec![])),
+        });
+
+        let provider = PartitionTableProvider::new(
+            creator,
+            vec![
+                PartitionedBy {
+                    name: "year".to_string(),
+                    expression: col("year"),
+                },
+                PartitionedBy {
+                    name: "month".to_string(),
+                    expression: col("month"),
+                },
+            ],
+            Arc::clone(&schema),
+        )
+        .await
+        .expect("failed to create provider");
+
+        // (year = 2024 AND month = 3) OR (year = 2025 AND month = 1)
+        let cross_expression = col("year")
+            .eq(lit(2024i32))
+            .and(col("month").eq(lit(3i32)))
+            .or(col("year").eq(lit(2025i32)).and(col("month").eq(lit(1i32))));
+
+        // An OR chain over a single partition expression stays exactly resolvable.
+        let single_expression = col("year")
+            .eq(lit(2024i32))
+            .or(col("year").eq(lit(2025i32)));
+
+        let results = provider
+            .supports_filters_pushdown(&[&cross_expression, &single_expression])
+            .expect("supports_filters_pushdown failed");
+
+        assert_ne!(
+            results[0],
+            TableProviderFilterPushDown::Exact,
+            "a filter spanning two partition expressions is pruned by nobody, so claiming Exact \
+             drops it from the plan and returns every row"
+        );
+        assert_eq!(
+            results[1],
+            TableProviderFilterPushDown::Exact,
+            "an OR chain over one partition expression is still fully resolved by pruning"
         );
     }
 }
