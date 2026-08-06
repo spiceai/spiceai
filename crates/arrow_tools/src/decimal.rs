@@ -49,6 +49,13 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// `2^127`, the exclusive bound for a value that fits `i128`.
+///
+/// `i128::MIN` is exactly `-2^127`, so it is a valid inclusive lower bound, but `i128::MAX` is
+/// `2^127 - 1`, which `f64` cannot represent — hence comparing against `2^127` exclusively. Both
+/// bounds are powers of two and therefore exact as `f64`.
+const TWO_POW_127: f64 = 170_141_183_460_469_231_731_687_303_715_884_105_728.0;
+
 /// Rescales `unscaled` from `src_scale` decimal places to `dst_scale`.
 ///
 /// # Errors
@@ -122,8 +129,14 @@ pub fn parse_number_to_decimal(n: &serde_json::Number, target_scale: i8) -> Resu
         let scale_factor = 10_i128
             .checked_pow(u32::from(target_scale.cast_unsigned()))
             .context(OverflowSnafu)?;
-        #[expect(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-        return Ok((f * scale_factor as f64).round() as i128);
+        #[expect(clippy::cast_precision_loss)]
+        let scaled = (f * scale_factor as f64).round();
+        // A float-to-int `as` cast saturates rather than wrapping, so an out-of-range value would
+        // silently become `i128::MIN`/`MAX` — a wrong number stored as if it were the real one.
+        // The range also rejects NaN and ±inf, which compare false against both bounds.
+        ensure!((-TWO_POW_127..TWO_POW_127).contains(&scaled), OverflowSnafu);
+        #[expect(clippy::cast_possible_truncation)]
+        return Ok(scaled as i128);
     }
 
     let negative = s.starts_with('-');
@@ -152,7 +165,10 @@ pub fn parse_number_to_decimal(n: &serde_json::Number, target_scale: i8) -> Resu
 
     let scaled_int = rescale_i128(int_val, 0, target_scale)?;
     let scaled_frac = rescale_i128(frac_val, frac_scale, target_scale)?;
-    let result = scaled_int + scaled_frac;
+    // Each half fits `i128` on its own but their sum need not: at `target_scale` 38, "1.8" gives
+    // 1.0e38 + 0.8e38, which is past `i128::MAX` (~1.70e38). The release profile leaves
+    // `overflow-checks` off, so a bare `+` would wrap to a large negative decimal.
+    let result = scaled_int.checked_add(scaled_frac).context(OverflowSnafu)?;
 
     Ok(if negative { -result } else { result })
 }
@@ -238,6 +254,48 @@ mod tests {
         // Normal rescales are unaffected.
         assert_eq!(rescale_i128(5, 0, 2).expect("ok"), 500);
         assert_eq!(rescale_i128(500, 2, 0).expect("ok"), 5);
+    }
+
+    /// The integer and fractional halves can each fit `i128` while their sum does not. With
+    /// `overflow-checks` off in release, an unchecked `+` wraps to a large negative decimal —
+    /// a wrong value stored with no error.
+    #[test]
+    fn sum_of_in_range_halves_that_overflows_is_an_error() {
+        // 1.8 at scale 38 is 1.0e38 + 0.8e38 = 1.8e38, past i128::MAX (~1.70e38).
+        let n: serde_json::Number = serde_json::from_str("1.8").expect("valid JSON number");
+        let r = parse_number_to_decimal(&n, 38);
+        assert!(
+            matches!(r, Err(Error::Overflow)),
+            "expected Overflow for 1.8 at scale 38, got {r:?}"
+        );
+
+        // A value that genuinely fits is unaffected.
+        let n: serde_json::Number = serde_json::from_str("1.8").expect("valid JSON number");
+        assert_eq!(
+            parse_number_to_decimal(&n, 2).expect("1.8 fits at scale 2"),
+            180
+        );
+    }
+
+    /// A float-to-int `as` cast saturates, so an out-of-range scientific-notation value would be
+    /// stored as `i128::MAX`/`MIN` instead of being rejected.
+    #[test]
+    fn out_of_range_scientific_notation_is_an_error() {
+        for s in ["1e40", "-1e40", "1e300"] {
+            let n: serde_json::Number = serde_json::from_str(s).expect("valid JSON number");
+            let r = parse_number_to_decimal(&n, 0);
+            assert!(
+                matches!(r, Err(Error::Overflow)),
+                "expected Overflow for {s} at scale 0, got {r:?}"
+            );
+        }
+
+        // In-range scientific notation still converts.
+        let n: serde_json::Number = serde_json::from_str("1.5e2").expect("valid JSON number");
+        assert_eq!(
+            parse_number_to_decimal(&n, 2).expect("1.5e2 fits at scale 2"),
+            15_000
+        );
     }
 
     #[test]
