@@ -22,14 +22,17 @@ use crate::accelerated_table::refresh_task::deletion::{
 };
 use crate::component::dataset::OnSchemaChange;
 use crate::datafusion::error::{find_datafusion_root, format_datafusion_error};
-use crate::schema_evolution::{emit_schema_evolution_event, evolution_allowed};
+use crate::schema_evolution::{
+    SCHEMA_EVOLUTION_APPLIED, SCHEMA_EVOLUTION_DETECTED, SCHEMA_EVOLUTION_FAILED,
+    emit_schema_evolution_event, evolution_allowed, schema_evolution_labels, widening_plan_kind,
+};
 use crate::{dataupdate::StreamingDataUpdateExecutionPlan, status};
 use arrow::array::{
     Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow_tools::record_batch::try_cast_to;
-use arrow_tools::schema_evolution::{self, EvolutionContext, SchemaEvolution, WideningPlan};
+use arrow_tools::schema_evolution::{self, EvolutionContext, SchemaEvolution};
 use cache::Caching;
 #[cfg(not(windows))]
 use cayenne::{CayenneCdcWrite, CayenneTableProvider};
@@ -53,11 +56,8 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::TableReference;
 use datafusion::{execution::context::SessionContext, physical_plan::collect};
 use futures::{StreamExt, stream};
-use opentelemetry::KeyValue;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
-use runtime_datafusion_index::{
-    INDEXED_INNER, IndexedTableProvider, InnerProviderFn, find_concrete_table_provider_with,
-};
+use runtime_datafusion_index::{IndexedTableProvider, LayerWalk, find_concrete_table_provider_in};
 use runtime_metrics::acceleration as metrics;
 use runtime_search::embeddings::table::EmbeddingTable;
 use runtime_table_partition::provider::PartitionTableProvider;
@@ -617,64 +617,6 @@ fn schema_evolution_first_warn(key: String) -> bool {
     SCHEMA_EVOLUTION_WARNING_KEYS
         .lock()
         .insert_new(key, SCHEMA_EVOLUTION_WARNING_KEY_LIMIT)
-}
-
-static SCHEMA_EVOLUTION_METER: std::sync::LazyLock<opentelemetry::metrics::Meter> =
-    std::sync::LazyLock::new(|| opentelemetry::global::meter("schema_evolution"));
-
-pub(crate) static SCHEMA_EVOLUTION_DETECTED: std::sync::LazyLock<
-    opentelemetry::metrics::Counter<u64>,
-> = std::sync::LazyLock::new(|| {
-    SCHEMA_EVOLUTION_METER
-        .u64_counter("schema_evolution_detected")
-        .with_description(
-            "Schema changes detected between an incoming source schema and the stored/accelerator schema.",
-        )
-        .build()
-});
-
-pub(crate) static SCHEMA_EVOLUTION_APPLIED: std::sync::LazyLock<
-    opentelemetry::metrics::Counter<u64>,
-> = std::sync::LazyLock::new(|| {
-    SCHEMA_EVOLUTION_METER
-        .u64_counter("schema_evolution_applied")
-        .with_description("Schema evolutions applied to the accelerator or cached source schema.")
-        .build()
-});
-
-pub(crate) static SCHEMA_EVOLUTION_FAILED: std::sync::LazyLock<
-    opentelemetry::metrics::Counter<u64>,
-> = std::sync::LazyLock::new(|| {
-    SCHEMA_EVOLUTION_METER
-        .u64_counter("schema_evolution_failed")
-        .with_description(
-            "Schema changes that were not applied: incompatible, blocked by policy, or requiring a restart.",
-        )
-        .build()
-});
-
-pub(crate) fn schema_evolution_labels(
-    dataset: &str,
-    kind: &'static str,
-    action: &'static str,
-) -> [KeyValue; 3] {
-    [
-        KeyValue::new("dataset", dataset.to_string()),
-        KeyValue::new("kind", kind),
-        KeyValue::new("action", action),
-    ]
-}
-
-/// Dominant change kind of a widening plan for the `kind` metric label.
-#[must_use]
-pub(crate) fn widening_plan_kind(plan: &WideningPlan) -> &'static str {
-    if !plan.widened_columns.is_empty() {
-        "widened_types"
-    } else if !plan.relaxed_nullability.is_empty() {
-        "nullability"
-    } else {
-        "added_columns"
-    }
 }
 
 /// Per-dataset CDC schema-evolution settings, installed at dataset
@@ -2655,12 +2597,12 @@ impl RefreshTask {
     /// loses pipelined finalization (backgrounded publish, no blocking
     /// `apply_on_conflict_deletions`).
     ///
-    /// Uses [`find_concrete_table_provider_with`] with a *write-transparent* set
-    /// of accessors rather than the runtime-wide `DEFAULT_INNER_FNS`: only
-    /// wrappers whose `insert_into` is a pass-through may be peeled here.
+    /// Uses [`LayerWalk::Write`], which steps only through wrappers whose
+    /// `insert_into` is a pass-through (`PolyTableProvider` to its writer side,
+    /// `IndexedTableProvider`) — see the layer table in [`crate::table_layers`].
     ///
-    /// NOTE: `UpsertDedupTableProvider` is intentionally absent from the set.
-    /// Unlike `PolyTableProvider` (delegates writes) and `IndexedTableProvider`
+    /// NOTE: `UpsertDedupTableProvider` is opaque to the write walk. Unlike
+    /// `PolyTableProvider` (delegates writes) and `IndexedTableProvider`
     /// (`insert_into` is a pass-through), it *rewrites* the write on insert
     /// (dedup / last-write-wins via `UpsertDedupExec`). Routing CDC past it to the
     /// inner provider would bypass that transform, so a dedup-configured table
@@ -2668,15 +2610,10 @@ impl RefreshTask {
     /// semantics) and emits the fallback warning below.
     #[cfg(not(windows))]
     fn cayenne_accelerator(&self) -> Option<&CayenneTableProvider> {
-        /// Peels [`PolyTableProvider`] to its writer side (write-transparent).
-        const POLY_WRITER_INNER: InnerProviderFn = |tbl| {
-            tbl.downcast_ref::<data_components::poly::PolyTableProvider>()
-                .map(data_components::poly::PolyTableProvider::writer_ref)
-        };
-
-        find_concrete_table_provider_with::<CayenneTableProvider>(
+        find_concrete_table_provider_in::<CayenneTableProvider>(
             &self.accelerator,
-            &[POLY_WRITER_INNER, INDEXED_INNER],
+            crate::table_layers::TABLE_PROVIDER_LAYERS,
+            LayerWalk::Write,
         )
     }
 

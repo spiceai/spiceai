@@ -277,6 +277,19 @@ with a failure; otherwise `scripts/signoff status` and `scripts/signoff mine`
 would keep showing a sign-off in progress for a run that is long gone.
 Re-dispatch against the same HEAD to try again.
 
+That replacement is the workflow's job, not the dying script's. Being signalled is
+how a run learns its budget expired: `run_checks` returns `make`'s status and bash
+reports a killed child as 128+N, so the script classifies that as reaching **no
+verdict** and publishes nothing at all, saying why in its step summary. Treating it
+as a check result instead would assert a code failure nothing established — on a
+suite the log shows still passing, and over a `signoff=success` an earlier run may
+already have earned ([#12518](https://github.com/spiceai/spiceai/issues/12518),
+[#12520](https://github.com/spiceai/spiceai/issues/12520)). Declining to write is
+what leaves the `pending` for `Resolve an incomplete sign-off` to describe honestly,
+and leaves an existing success alone. The correction handlers cannot cover this case
+after the fact: both are gated on `cancelled()`, and a budget expiry is a *failed*
+step by the design above.
+
 Only one sign-off runs per commit. Both dispatch forms — `-f branch=<branch>` and
 `-f pr_number=<N>` — resolve to the same commit before the sign-off job starts,
 and its concurrency group is keyed on that commit, so a second dispatch for a
@@ -383,6 +396,12 @@ that reached no verdict rather than one that saw nothing. That disarms the watch
 and hands classification back to the free-space backstop; treating its silence as
 "not disk" would blame the branch for the volume just as surely as the unwritable
 marker did.
+
+Classification has a third answer, ranked above both disk signals: a run that was
+*signalled* judged nothing at all, where the two disk cases both describe a `make`
+that returned. That ordering matters when a budget expires on a tight volume —
+calling it disk would send you to reclaim space that was never the problem. See
+the budget paragraph above for what a signalled run publishes.
 
 The watch keeps its answer in a shell variable, not a file. Recording it on disk
 needed an allocation at the one moment allocation is failing — and on macOS

@@ -115,6 +115,15 @@ pub enum Error {
     ))]
     ModelNotProvided { model_source: String },
 
+    #[snafu(display(
+        "The model '{model_id}' pins revision '{revision}', but source '{model_source}' cannot load a pinned revision. Remove ':{revision}' to load the repository's default revision, and try again."
+    ))]
+    RevisionPinningUnsupported {
+        model_source: String,
+        model_id: String,
+        revision: String,
+    },
+
     #[snafu(display("Embedding rate limit exceeded. Retry after a short delay: {source}"))]
     FailedToAcquireRateControllerPermit { source: runtime_rate_control::Error },
 

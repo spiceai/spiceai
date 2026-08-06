@@ -39,39 +39,52 @@ pub struct RetrievalMetrics {
 /// * `results` - Search results mapping `query_id` -> (`doc_id` -> `similarity_score`)
 /// * `k` - Rank cutoff shared by all four metrics
 ///
+/// Every judged query in `qrels` contributes to each average. A query the search returned
+/// nothing for scores 0.0 rather than being dropped — dropping it would raise the mean
+/// instead of lowering it.
+///
+/// # Errors
+/// Returns an error when `qrels` is empty: an average over zero queries is undefined.
+///
 /// # Reference
 /// MTEB `RetrievalEvaluator`: <https://github.com/embeddings-benchmark/mteb/blob/03347ebfe4809056e0fd2894fcae69dcdd2ed964/mteb/evaluation/evaluators/RetrievalEvaluator.py#L500>
-#[must_use]
 pub(crate) fn calculate_retrieval_metrics<S: ::std::hash::BuildHasher>(
     qrels: &HashMap<String, HashMap<String, i32, S>, S>,
     results: &HashMap<String, HashMap<String, f64, S>, S>,
     k: usize,
-) -> RetrievalMetrics {
-    let mut ndcg_values = Vec::new();
-    let mut recall_values = Vec::new();
-    let mut mrr_values = Vec::new();
-    let mut precision_values = Vec::new();
+) -> anyhow::Result<RetrievalMetrics> {
+    anyhow::ensure!(
+        !qrels.is_empty(),
+        "Cannot calculate retrieval metrics: no query relevance judgments were provided"
+    );
+
+    let mut ndcg_values = Vec::with_capacity(qrels.len());
+    let mut recall_values = Vec::with_capacity(qrels.len());
+    let mut mrr_values = Vec::with_capacity(qrels.len());
+    let mut precision_values = Vec::with_capacity(qrels.len());
 
     for (query_id, relevance) in qrels {
-        let Some(ranked_results) = results.get(query_id) else {
+        // An unanswered query ranks nothing, which scores 0.0 for all four metrics
+        // through the same code path as a ranking that retrieved nothing relevant.
+        let ranked_relevance = if let Some(ranked_results) = results.get(query_id) {
+            score_sorted_relevance(ranked_results, relevance)
+        } else {
             println!("No search results found for test query {query_id}");
-            continue;
+            Vec::new()
         };
 
-        let ranked_relevance = score_sorted_relevance(ranked_results, relevance);
-
-        ndcg_values.push(ndcg_at_k(&ranked_relevance, k));
+        ndcg_values.push(ndcg_at_k(&ranked_relevance, relevance, k));
         recall_values.push(recall_at_k(&ranked_relevance, relevance, k));
         mrr_values.push(mrr_at_k(&ranked_relevance, k));
         precision_values.push(precision_at_k(&ranked_relevance, k));
     }
 
-    RetrievalMetrics {
+    Ok(RetrievalMetrics {
         ndcg: average(&ndcg_values),
         recall: average(&recall_values),
         mrr: average(&mrr_values),
         precision: average(&precision_values),
-    }
+    })
 }
 
 /// Computes [`RetrievalMetrics`] at every rank cutoff `k` in `1..=n`, where `n` is the largest
@@ -114,7 +127,7 @@ pub(crate) fn calculate_retrieval_metrics_at_all_k<S: ::std::hash::BuildHasher>(
         let mut precision_values = Vec::with_capacity(per_query.len());
 
         for (ranked_relevance, relevance) in &per_query {
-            ndcg_values.push(ndcg_at_k(ranked_relevance, k));
+            ndcg_values.push(ndcg_at_k(ranked_relevance, relevance, k));
             recall_values.push(recall_at_k(ranked_relevance, relevance, k));
             mrr_values.push(mrr_at_k(ranked_relevance, k));
             precision_values.push(precision_at_k(ranked_relevance, k));
@@ -150,6 +163,8 @@ fn score_sorted_relevance<S: ::std::hash::BuildHasher>(
         .collect()
 }
 
+/// Mean of `values`. Never called with an empty slice: `calculate_retrieval_metrics`
+/// rejects empty `qrels` and pushes exactly one value per judged query.
 #[expect(clippy::cast_precision_loss)]
 fn average(values: &[f64]) -> f64 {
     values.iter().sum::<f64>() / values.len() as f64
@@ -165,19 +180,29 @@ fn dcg_at_k(relevance_scores: &[f64], k: usize) -> f64 {
         .sum()
 }
 
-fn idcg_at_k(relevance_scores: &[f64], k: usize) -> f64 {
-    let mut sorted_relevance_scores = relevance_scores.to_owned();
-    sorted_relevance_scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-    dcg_at_k(&sorted_relevance_scores, k)
+/// Ideal DCG@k: every document judged for this query, ranked by relevance grade. Taken from
+/// `relevance` rather than from what search returned, so a result set that misses relevant
+/// documents scores below 1.0 — deriving it from the retrieved documents makes any ranking
+/// of them look perfect, however much it left behind.
+fn ideal_dcg_at_k<S: ::std::hash::BuildHasher>(
+    relevance: &HashMap<String, i32, S>,
+    k: usize,
+) -> f64 {
+    let mut grades: Vec<f64> = relevance.values().map(|&grade| f64::from(grade)).collect();
+    grades.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    dcg_at_k(&grades, k)
 }
 
-fn ndcg_at_k(relevance_scores: &[f64], k: usize) -> f64 {
-    let dcg = dcg_at_k(relevance_scores, k);
-    let idcg = idcg_at_k(relevance_scores, k);
+fn ndcg_at_k<S: ::std::hash::BuildHasher>(
+    ranked_relevance: &[f64],
+    relevance: &HashMap<String, i32, S>,
+    k: usize,
+) -> f64 {
+    let idcg = ideal_dcg_at_k(relevance, k);
     if idcg == 0.0 {
         return 0.0;
     }
-    dcg / idcg
+    dcg_at_k(ranked_relevance, k) / idcg
 }
 
 /// Fraction of all relevant documents (per `relevance`, not just those retrieved) that appear
@@ -265,7 +290,8 @@ mod tests {
     fn ndcg_sorts_results_by_score_before_scoring() {
         let (qrels, results) = perfectly_ranked_query();
 
-        let metrics = calculate_retrieval_metrics(&qrels, &results, 6);
+        let metrics = calculate_retrieval_metrics(&qrels, &results, 6)
+            .expect("metrics are calculable for a non-empty qrels");
         assert!(
             (metrics.ndcg - 1.0).abs() < 1e-9,
             "expected a perfect NDCG@6 of 1.0 when search scores exactly match relevance order, got {}",
@@ -279,7 +305,8 @@ mod tests {
 
         // All 6 relevant docs are retrieved within the top 6, and the top-ranked
         // result is relevant.
-        let metrics = calculate_retrieval_metrics(&qrels, &results, 6);
+        let metrics = calculate_retrieval_metrics(&qrels, &results, 6)
+            .expect("metrics are calculable for a non-empty qrels");
         assert!(
             (metrics.recall - 1.0).abs() < 1e-9,
             "recall = {}",
@@ -298,7 +325,8 @@ mod tests {
         let (qrels, results) = perfectly_ranked_query();
 
         // Only the top 3 of 6 relevant docs are within the cutoff.
-        let metrics = calculate_retrieval_metrics(&qrels, &results, 3);
+        let metrics = calculate_retrieval_metrics(&qrels, &results, 3)
+            .expect("metrics are calculable for a non-empty qrels");
         assert!(
             (metrics.recall - 0.5).abs() < 1e-9,
             "recall@3 = {}",
@@ -326,7 +354,8 @@ mod tests {
             ]),
         )]);
 
-        let metrics = calculate_retrieval_metrics(&qrels, &results, 3);
+        let metrics = calculate_retrieval_metrics(&qrels, &results, 3)
+            .expect("metrics are calculable for a non-empty qrels");
         assert!(
             (metrics.mrr - (1.0 / 3.0)).abs() < 1e-9,
             "expected MRR@3 = 1/3 for a relevant doc at rank 3, got {}",
@@ -360,7 +389,8 @@ mod tests {
         for (&k, metrics) in &all_k {
             assert_eq!(
                 *metrics,
-                calculate_retrieval_metrics(&qrels, &results, k),
+                calculate_retrieval_metrics(&qrels, &results, k)
+                    .expect("metrics are calculable for a non-empty qrels"),
                 "all-k metrics disagree with single-k metrics at k={k}"
             );
         }
@@ -412,9 +442,86 @@ mod tests {
         for (&k, metrics) in &all_k {
             assert_eq!(
                 *metrics,
-                calculate_retrieval_metrics(&qrels, &results, k),
+                calculate_retrieval_metrics(&qrels, &results, k)
+                    .expect("metrics are calculable for a non-empty qrels"),
                 "all-k metrics disagree with single-k metrics at k={k}"
             );
         }
+    }
+
+    /// The ideal DCG must rank every *judged* document, not just the retrieved ones: search
+    /// returns one of two equally-relevant documents, so NDCG@10 has to fall below 1.0.
+    /// Deriving the ideal from the retrieved set scores this a perfect 1.0.
+    #[test]
+    fn ndcg_penalizes_relevant_documents_the_search_missed() {
+        let qrels: Qrels = HashMap::from([(
+            "q1".to_string(),
+            HashMap::from([("doc0".to_string(), 1), ("doc1".to_string(), 1)]),
+        )]);
+        let results: ScoredResults =
+            HashMap::from([("q1".to_string(), HashMap::from([("doc0".to_string(), 0.9)]))]);
+
+        let metrics = calculate_retrieval_metrics(&qrels, &results, 10)
+            .expect("metrics are calculable for a non-empty qrels");
+
+        // DCG@10 = 1/log2(2) = 1.0; ideal ranks both judged docs:
+        // 1/log2(2) + 1/log2(3).
+        let expected = 1.0 / (1.0 + 1.0 / 3.0f64.log2());
+        assert!(
+            (metrics.ndcg - expected).abs() < 1e-9,
+            "expected NDCG@10 of {expected} when one of two relevant docs is retrieved, got {}",
+            metrics.ndcg
+        );
+        assert!(
+            (metrics.recall - 0.5).abs() < 1e-9,
+            "recall@10 = {}",
+            metrics.recall
+        );
+    }
+
+    /// A judged query the search answered with nothing scores 0.0 and stays in the average.
+    /// Dropping it divides by the answered queries only, which raises every metric.
+    #[test]
+    fn an_unanswered_query_scores_zero_and_stays_in_the_average() {
+        let qrels: Qrels = HashMap::from([
+            ("q1".to_string(), HashMap::from([("doc0".to_string(), 1)])),
+            ("q2".to_string(), HashMap::from([("doc1".to_string(), 1)])),
+        ]);
+        // Only q1 is answered, and perfectly.
+        let results: ScoredResults =
+            HashMap::from([("q1".to_string(), HashMap::from([("doc0".to_string(), 0.9)]))]);
+
+        let metrics = calculate_retrieval_metrics(&qrels, &results, 10)
+            .expect("metrics are calculable for a non-empty qrels");
+
+        // q1 scores a perfect 1.0 and q2 a 0.0, so each average is halved.
+        for (name, value) in [
+            ("ndcg", metrics.ndcg),
+            ("recall", metrics.recall),
+            ("mrr", metrics.mrr),
+        ] {
+            assert!(
+                (value - 0.5).abs() < 1e-9,
+                "expected {name}@10 of 0.5 when one of two judged queries is unanswered, got {value}"
+            );
+        }
+        // Precision@10 divides by k, so q1's single relevant hit is 0.1, averaged with 0.0.
+        assert!(
+            (metrics.precision - 0.05).abs() < 1e-9,
+            "expected precision@10 of 0.05, got {}",
+            metrics.precision
+        );
+    }
+
+    /// An empty `qrels` used to divide by zero and publish `NaN` into the benchmark metrics.
+    #[test]
+    fn empty_qrels_is_an_error_rather_than_nan() {
+        let qrels: Qrels = HashMap::new();
+        let results: ScoredResults = HashMap::new();
+
+        assert!(
+            calculate_retrieval_metrics(&qrels, &results, 10).is_err(),
+            "expected an error when no query relevance judgments are provided"
+        );
     }
 }

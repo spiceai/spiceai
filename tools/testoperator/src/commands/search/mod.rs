@@ -14,7 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+mod dataset;
 mod mteb_quora;
+use self::dataset::SearchDataset;
 use super::{duration_millis_between, get_app_and_start_request};
 use crate::{args::SearchTestArgs, health::HealthMonitor};
 use std::collections::BTreeMap;
@@ -38,28 +40,18 @@ use test_framework::{
 use tokio::time::sleep;
 
 pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
+    let dataset = SearchDataset::from(args.benchmark_dataset);
     let (app, start_request) = get_app_and_start_request(&args.common).await?;
 
-    match args.benchmark_dataset.as_deref() {
-        Some("quora_retrieval") => {
-            mteb_quora::prepare_dataset(
-                &args
-                    .common
-                    .data_dir
-                    .clone()
-                    .unwrap_or(start_request.get_tempdir_path()),
-            )
-            .await?;
-        }
-        Some(ds) => {
-            return Err(anyhow::anyhow!("Unsupported benchmark-dataset: {ds}"));
-        }
-        None => {
-            return Err(anyhow::anyhow!(
-                "Benchmark dataset is required, please specify --benchmark-dataset"
-            ));
-        }
-    }
+    dataset
+        .prepare(
+            &args
+                .common
+                .data_dir
+                .clone()
+                .unwrap_or(start_request.get_tempdir_path()),
+        )
+        .await?;
 
     let started_at = Instant::now();
 
@@ -88,12 +80,9 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
         KeyValue::new("testoperator_commit_sha", git::get_commit_sha()),
         KeyValue::new("branch_name", git::get_branch_name()),
         KeyValue::new("config_name", app.name.clone()),
-        KeyValue::new(
-            "benchmark_dataset",
-            args.benchmark_dataset.clone().unwrap_or_default(),
-        ),
+        KeyValue::new("benchmark_dataset", dataset.name()),
     ];
-    search_attributes.extend(quora_mteb_attributes(&app));
+    search_attributes.extend(search_dataset_attributes(&app));
 
     let search_resource = Resource::builder_empty()
         .with_attributes(search_attributes)
@@ -111,11 +100,12 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
 
     println!("Running search");
 
-    // Only QuoraRetrieval dataset is currently supported; no need to use `benchmark_dataset` function to determine what config to use.
-    let config = mteb_quora::init_search_config(&spiced_instance, Some(10)).await?;
+    let config = dataset
+        .init_search_config(&spiced_instance, Some(10))
+        .await?;
 
     // retrieve query relevance data
-    let qrels = mteb_quora::get_query_relevance_data(&spiced_instance).await?;
+    let qrels = dataset.query_relevance_data(&spiced_instance).await?;
 
     let search_started_at = Instant::now();
 
@@ -144,9 +134,7 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
     let p95 = test.get_p95_response_time_metric()?;
     let rps = test.get_rps_metric()?;
     let retrieval_metrics_at_all_k = test
-        .calculate_search_score_metrics_at_all_k(&qrels, |results| {
-            mteb_quora::transform_search_results_for_eval(results)
-        })?;
+        .calculate_search_score_metrics_at_all_k(&qrels, |results| dataset.transform_results(results))?;
 
     // Report the metric-vs-k curve, then pick the primary cutoff (k=10, matching MTEB; falling back
     // to the largest available k when fewer results were returned) for the fixed-schema run row.
@@ -240,7 +228,7 @@ fn print_retrieval_metrics_table(metrics_by_k: &BTreeMap<usize, RetrievalMetrics
     }
 }
 
-fn quora_mteb_attributes(app: &App) -> Vec<KeyValue> {
+fn search_dataset_attributes(app: &App) -> Vec<KeyValue> {
     let Some(ds) = app.datasets.iter().find(|ds| ds.name == "corpus") else {
         return vec![];
     };
