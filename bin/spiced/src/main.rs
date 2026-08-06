@@ -143,7 +143,7 @@ fn load_and_run(args: spiced::Args) -> Result<(), Box<dyn std::error::Error>> {
     let app_bundle = bootstrap.block_on(spiced::build_app(&args))?;
     drop(bootstrap);
 
-    spiced::install_cpu_budget(&args, app_bundle.0.as_deref())?;
+    spiced::install_cpu_budget(&args, app_bundle.app.as_deref())?;
 
     let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(cpu_budget::cpu_budget().main_runtime_worker_threads())
