@@ -39,6 +39,9 @@ use crate::index::{SearchIndex, VectorIndex};
 /// built from the configured batches; writes and lifecycle callbacks are recorded into a
 /// shared event log tagged with the mock's label.
 #[derive(Debug)]
+// One flag per behavior this double can be asked to exhibit; a state machine would obscure
+// rather than clarify what each test is configuring.
+#[expect(clippy::struct_excessive_bools)]
 struct MockIndex {
     label: &'static str,
     search_column: String,
@@ -53,8 +56,12 @@ struct MockIndex {
     write_output_rows: Option<usize>,
     fail_write: bool,
     fail_on_write_start: bool,
+    /// What this mock reports from `Index::write_start_failure_is_fatal`.
+    write_start_fatal: bool,
     /// What this mock reports from `Index::write_complete_failure_is_fatal`.
     write_complete_fatal: bool,
+    /// What this mock reports from `Index::deletes_by_partial_key`.
+    deletes_partial_key: bool,
     events: Arc<Mutex<Vec<String>>>,
 }
 
@@ -71,7 +78,9 @@ impl MockIndex {
             write_output_rows: None,
             fail_write: false,
             fail_on_write_start: false,
+            write_start_fatal: false,
             write_complete_fatal: false,
+            deletes_partial_key: false,
             events: Arc::clone(events),
         }
     }
@@ -169,6 +178,14 @@ impl Index for MockIndex {
     async fn delete_by_keys(&self, keys: RecordBatch) -> DataFusionResult<()> {
         self.record(&format!("delete_by_keys:{}", keys.num_rows()));
         Ok(())
+    }
+
+    fn deletes_by_partial_key(&self) -> bool {
+        self.deletes_partial_key
+    }
+
+    fn write_start_failure_is_fatal(&self) -> bool {
+        self.write_start_fatal
     }
 
     fn write_complete_failure_is_fatal(&self) -> bool {
@@ -561,6 +578,120 @@ fn write_complete_fatality_is_the_union_of_both_vector_halves() {
     }
 }
 
+/// `compound_on_write_start` fails if either half fails to start, so the start-fatality flag
+/// is the union of both halves rather than the trait default (#12421).
+#[test]
+fn write_start_fatality_is_the_union_of_both_search_halves() {
+    let events = Arc::new(Mutex::new(vec![]));
+
+    for (primary_fatal, secondary_fatal, expected) in [
+        (false, false, false),
+        (true, false, true),
+        (false, true, true),
+        (true, true, true),
+    ] {
+        let mut primary = MockIndex::new("primary", &events);
+        primary.write_start_fatal = primary_fatal;
+        let mut secondary = MockIndex::new("secondary", &events);
+        secondary.write_start_fatal = secondary_fatal;
+
+        let idx = compound(primary, secondary, CompoundReadMode::PrimaryOnly);
+        assert_eq!(
+            idx.write_start_failure_is_fatal(),
+            expected,
+            "primary_fatal={primary_fatal}, secondary_fatal={secondary_fatal}"
+        );
+        assert!(
+            !idx.write_complete_failure_is_fatal(),
+            "a fatal start must not be reported as a fatal finalize"
+        );
+    }
+}
+
+#[test]
+fn write_start_fatality_is_the_union_of_both_vector_halves() {
+    let events = Arc::new(Mutex::new(vec![]));
+
+    for (primary_fatal, secondary_fatal, expected) in [
+        (false, false, false),
+        (true, false, true),
+        (false, true, true),
+        (true, true, true),
+    ] {
+        let mut primary = MockIndex::new("primary", &events);
+        primary.dimension = Some(4);
+        primary.write_start_fatal = primary_fatal;
+        let mut secondary = MockIndex::new("secondary", &events);
+        secondary.dimension = Some(4);
+        secondary.write_start_fatal = secondary_fatal;
+
+        let idx = CompoundVectorIndex::try_new(
+            Arc::new(primary) as Arc<dyn VectorIndex>,
+            Arc::new(secondary) as Arc<dyn VectorIndex>,
+            CompoundReadMode::PrimaryOnly,
+        )
+        .expect("compatible vector indexes");
+
+        assert_eq!(
+            idx.write_start_failure_is_fatal(),
+            expected,
+            "primary_fatal={primary_fatal}, secondary_fatal={secondary_fatal}"
+        );
+        assert!(
+            !idx.write_complete_failure_is_fatal(),
+            "a fatal start must not be reported as a fatal finalize"
+        );
+    }
+}
+
+/// `delete_by_keys` fans out to both halves, so a partial key only clears the whole compound
+/// index when *both* halves delete on one — the intersection, not the trait default.
+#[test]
+fn partial_key_deletion_requires_both_halves() {
+    let events = Arc::new(Mutex::new(vec![]));
+
+    for (primary_partial, secondary_partial, expected) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (true, true, true),
+    ] {
+        let mock = |label: &'static str, partial: bool| {
+            let mut idx = MockIndex::new(label, &events);
+            idx.dimension = Some(4);
+            idx.deletes_partial_key = partial;
+            idx
+        };
+
+        let search = compound(
+            mock("primary", primary_partial),
+            mock("secondary", secondary_partial),
+            CompoundReadMode::PrimaryOnly,
+        );
+        assert_eq!(
+            search.deletes_by_partial_key(),
+            expected,
+            "search: primary={primary_partial}, secondary={secondary_partial}"
+        );
+
+        let (primary, secondary) = (
+            mock("primary", primary_partial),
+            mock("secondary", secondary_partial),
+        );
+        let vector = CompoundVectorIndex::try_new(
+            Arc::new(primary) as Arc<dyn VectorIndex>,
+            Arc::new(secondary) as Arc<dyn VectorIndex>,
+            CompoundReadMode::PrimaryOnly,
+        )
+        .expect("compatible vector indexes");
+        assert_eq!(
+            vector.deletes_by_partial_key(),
+            expected,
+            "vector: primary={primary_partial}, secondary={secondary_partial}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn on_write_start_rolls_back_primary_when_secondary_fails() {
     let events = Arc::new(Mutex::new(vec![]));
@@ -906,13 +1037,13 @@ mod warm_memory {
     use super::*;
     use crate::SEARCH_SCORE_COLUMN_NAME;
     use crate::index::memory::{MemoryDistanceMetric, MemoryVectorIndex};
-    use crate::metadata::MetadataColumns;
+    use crate::metadata::{MetadataColumn, MetadataColumns};
     use arrow::array::{
         FixedSizeListArray, Float32Array, Float32Builder, Float64Array, ListBuilder,
     };
     use datafusion::logical_expr::ColumnarValue;
     use datafusion::scalar::ScalarValue;
-    use datafusion_expr::{Volatility, create_udf};
+    use datafusion_expr::{Volatility, create_udf, ident};
     use llms::embeddings::{Embed, EmbeddingInput};
 
     const DIM: i32 = 3;
@@ -983,6 +1114,51 @@ mod warm_memory {
             MemoryDistanceMetric::Cosine,
         )
         .expect("valid memory index")
+    }
+
+    fn dotted_column_memory_index() -> MemoryVectorIndex {
+        MemoryVectorIndex::try_new(
+            "message.body".to_string(),
+            vec![Field::new("id", DataType::Int64, false)],
+            MetadataColumns::from(vec![
+                MetadataColumn::NonFilterable(Arc::new(Field::new(
+                    "_spice.search_field",
+                    DataType::Utf8,
+                    false,
+                ))),
+                MetadataColumn::NonFilterable(Arc::new(Field::new(
+                    "CapitalCase",
+                    DataType::Utf8,
+                    false,
+                ))),
+            ]),
+            Arc::new(ByteEmbed),
+            embed_udf(),
+            "model_name".to_string(),
+            MemoryDistanceMetric::Cosine,
+        )
+        .expect("valid memory index")
+    }
+
+    fn dotted_column_input_batch(rows: usize) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("message.body", DataType::Utf8, false),
+            Field::new("_spice.search_field", DataType::Utf8, false),
+            Field::new("CapitalCase", DataType::Utf8, false),
+        ]));
+        #[expect(clippy::cast_possible_wrap, reason = "small test row counts")]
+        let ids: Vec<i64> = (0..rows as i64).collect();
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(vec!["text"; rows])),
+                Arc::new(StringArray::from(vec!["message.body"; rows])),
+                Arc::new(StringArray::from(vec!["capital"; rows])),
+            ],
+        )
+        .expect("valid dotted-column input batch")
     }
 
     fn embedding_field() -> Field {
@@ -1120,5 +1296,58 @@ mod warm_memory {
 
         let plan = idx.list_table_provider().expect("list plan builds");
         assert_eq!(collect_ids(plan).await, vec![0, 1]);
+    }
+
+    #[tokio::test]
+    async fn query_supports_dotted_column_names() {
+        let index = dotted_column_memory_index();
+        index
+            .write(dotted_column_input_batch(2))
+            .await
+            .expect("write succeeds");
+
+        let plan = index.query_table_provider("q").expect("query plan builds");
+        assert_eq!(collect_ids(Arc::unwrap_or_clone(plan)).await, vec![0, 1]);
+
+        let chunk_metadata_plan = LogicalPlanBuilder::new_from_arc(
+            index.query_table_provider("q").expect("query plan builds"),
+        )
+        .project(vec![ident("_spice.search_field"), ident("CapitalCase")])
+        .expect("metadata projection builds")
+        .build()
+        .expect("metadata plan builds");
+        let context = SessionContext::new();
+        let batches = context
+            .execute_logical_plan(chunk_metadata_plan)
+            .await
+            .expect("metadata query executes")
+            .collect()
+            .await
+            .expect("metadata query collects");
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 2);
+    }
+
+    #[tokio::test]
+    async fn delete_by_keys_removes_entries_from_warm_memory_tier() {
+        let events = Arc::new(Mutex::new(vec![]));
+        let mut secondary = MockIndex::new("engine", &events);
+        secondary.dimension = Some(DIM);
+        secondary.list_batches = vec![engine_list_batch(&[])];
+        let idx = warm_compound(secondary);
+
+        idx.write(input_batch(2)).await.expect("write succeeds");
+
+        idx.delete_by_keys(delete_keys_batch(1))
+            .await
+            .expect("delete succeeds");
+        let plan = idx.list_table_provider().expect("list plan builds");
+        assert_eq!(collect_ids(plan).await, vec![1]);
+
+        idx.delete_by_keys(delete_keys_batch(2))
+            .await
+            .expect("delete succeeds");
+        let plan = idx.list_table_provider().expect("list plan builds");
+        assert!(collect_ids(plan).await.is_empty());
     }
 }

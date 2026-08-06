@@ -14,36 +14,39 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use runtime_parameter_spec::ParameterSpec;
+use runtime_parameters_derive::TypedParams;
 use secrecy::SecretString;
 
 use crate::SecretStore;
 
 const ENV_SECRET_PREFIX: &str = "SPICE_";
 
-/// Parameters accepted by the `env` secret store.
-pub const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::runtime("file_path")
-    .description("Path to a `.env` file to load secrets from. Defaults to `.env`.")
-    .examples(&[".env", "/etc/spice/secrets.env"])];
+/// Typed `params:` for the `env` secret store.
+#[derive(Debug, TypedParams)]
+#[params(prefix = "env", deny_unknown)]
+pub struct EnvParams {
+    /// Path to a `.env` file to load secrets from. Defaults to `.env`.
+    #[param(runtime)]
+    pub file_path: Option<PathBuf>,
+}
+
+impl EnvParams {
+    /// Builds the resolved [`EnvConfig`].
+    #[must_use]
+    pub fn into_config(self) -> EnvConfig {
+        EnvConfig {
+            file_path: self.file_path,
+        }
+    }
+}
 
 /// Resolved configuration for the `env` secret store.
 #[derive(Debug, Clone, Default)]
 pub struct EnvConfig {
-    pub file_path: Option<String>,
-}
-
-impl EnvConfig {
-    /// Builds an [`EnvConfig`] from a validated parameter map.
-    #[must_use]
-    pub fn from_params(params: &HashMap<String, String>) -> Self {
-        Self {
-            file_path: params.get("file_path").cloned(),
-        }
-    }
+    pub file_path: Option<PathBuf>,
 }
 
 pub struct EnvSecretStoreBuilder {

@@ -7,15 +7,19 @@ inputs:
     required: false
     default: 'fe83ac26d43bffeaf28844bcf5fef303b1bdf345'
   go_version:
-    description: 'Go version to use for building'
+    description: >-
+      Go version to build the driver with. Must satisfy the `go` directive in the
+      pinned commit's go/go.mod — `actions/setup-go` v7 sets `GOTOOLCHAIN=local`,
+      so Go will not download a newer toolchain to cover a shortfall. The build
+      step below asserts the two agree.
     required: false
-    default: '1.24.1'
+    default: '1.26.1'
 
 runs:
   using: 'composite'
   steps:
     - name: Setup Go
-      uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v5
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
         go-version: ${{ inputs.go_version }}
         cache: false
@@ -30,15 +34,45 @@ runs:
 
     - name: Build ADBC BigQuery driver
       shell: bash
+      # Passed through the environment rather than interpolated into the script
+      # text: an input reaching `run:` as source is the shape review rejected on
+      # #12185, and a value the shell reads as data cannot end a quote.
+      env:
+        ADBC_BIGQUERY_COMMIT: ${{ inputs.adbc_bigquery_commit }}
       run: |
         set -eu
         DRIVER_DIR="/etc/adbc/drivers"
 
         git clone --depth=1 https://github.com/adbc-drivers/bigquery.git /tmp/adbc-bigquery
         cd /tmp/adbc-bigquery
-        git fetch --depth=1 origin "${{ inputs.adbc_bigquery_commit }}"
-        git checkout "${{ inputs.adbc_bigquery_commit }}"
+        git fetch --depth=1 origin "$ADBC_BIGQUERY_COMMIT"
+        git checkout "$ADBC_BIGQUERY_COMMIT"
         cd go
+
+        # `actions/setup-go` v7 sets GOTOOLCHAIN=local, so Go no longer downloads
+        # the toolchain go.mod asks for when the installed one is older — it just
+        # refuses. A drift between the pinned commit and `go_version` above is
+        # therefore a hard failure, and `go build`'s own report of it
+        # ("go: go.mod requires go >= X (running go Y; GOTOOLCHAIN=local)") is one
+        # line in the middle of a benchmark log that surfaces only as
+        # "Process completed with exit code 1". Say it up front instead, with both
+        # versions and the file to edit.
+        required_go=$(awk '$1 == "go" { print $2; exit }' go.mod)
+        installed_go=$(go env GOVERSION)
+        installed_go=${installed_go#go}
+        if [ -n "$required_go" ] && awk -v r="$required_go" -v i="$installed_go" 'BEGIN {
+              nr = split(r, R, "."); ni = split(i, I, ".");
+              n = (nr > ni ? nr : ni);
+              for (k = 1; k <= n; k++) {
+                x = (k <= ni ? I[k] + 0 : 0); y = (k <= nr ? R[k] + 0 : 0);
+                if (x < y) exit 0;
+                if (x > y) exit 1;
+              }
+              exit 1 }'; then
+          echo "::error::The pinned ADBC BigQuery driver (${ADBC_BIGQUERY_COMMIT}) needs Go >= ${required_go}, but this action installed ${installed_go}. Raise the go_version default in .github/actions/setup-adbc-bigquery/action.yml to ${required_go} or newer (or pin an older driver commit). This is not a failure of the branch under test."
+          exit 1
+        fi
+
         CGO_ENABLED=1 go build -tags driverlib -buildmode=c-shared \
           -o /tmp/libadbc_driver_bigquery.so ./pkg/
         rm -f /tmp/libadbc_driver_bigquery.h

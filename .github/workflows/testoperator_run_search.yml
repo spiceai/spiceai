@@ -26,6 +26,14 @@ on:
         type: choice
         options:
           - 'quora_retrieval'
+          - 'miracl_en_retrieval'
+          - 'fiqa_retrieval'
+          - 'trec_covid_retrieval'
+          - 'arguana_retrieval'
+          - 'scidocs_retrieval'
+          - 'scifact_retrieval'
+          - 'nfcorpus_retrieval'
+          - 'touche2020_retrieval'
       ready_wait:
         description: 'Seconds to wait for the spiced instance to become ready'
         required: false
@@ -38,7 +46,7 @@ jobs:
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 600
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -98,6 +106,7 @@ jobs:
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --concurrency 10 \
             --benchmark-dataset ${{ github.event.inputs.benchmark_dataset }} \
+            --metrics \
             -p "${{ github.event.inputs.spicepod_path }}"
         env:
           OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}

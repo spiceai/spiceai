@@ -180,6 +180,14 @@ impl MetastoreImpl {
         }
     }
 
+    pub(crate) async fn incremental_vacuum(&self) -> CatalogResult<u64> {
+        match self {
+            MetastoreImpl::Sqlite(m) => m.incremental_vacuum().await,
+            #[cfg(feature = "turso")]
+            MetastoreImpl::Turso(m) => m.incremental_vacuum().await,
+        }
+    }
+
     /// Begin a transaction on the underlying metastore.
     ///
     /// Each backend sends the appropriate BEGIN statement (e.g. `BEGIN TRANSACTION`
@@ -1822,6 +1830,10 @@ impl MetadataCatalog for CayenneCatalog {
     /// PASSIVE checkpoint (delegated to the backend).
     async fn checkpoint_wal(&self) -> CatalogResult<()> {
         self.metastore.checkpoint_wal().await
+    }
+
+    async fn incremental_vacuum(&self) -> CatalogResult<u64> {
+        self.metastore.incremental_vacuum().await
     }
 
     async fn list_table_names(&self) -> CatalogResult<Vec<String>> {
@@ -5267,7 +5279,12 @@ mod tests {
         );
 
         drop(catalog);
-        let _ = std::fs::remove_file(test_db.trim_start_matches("sqlite://"));
+
+        // Cleanup test database
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
     }
 
     #[tokio::test]

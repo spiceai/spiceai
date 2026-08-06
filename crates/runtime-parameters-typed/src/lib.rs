@@ -18,23 +18,33 @@ limitations under the License.
 //!
 //! Support runtime for [`runtime_parameters_derive::TypedParams`]: components
 //! declare a plain Rust struct describing their parameters and derive
-//! [`TypedParams`] to deserialize the secret-injected string map produced by
-//! [`runtime_secrets::get_params_with_secrets`], preserving the semantics of
-//! the [`crate::Parameters`] machinery — per-variant key prefixing,
+//! `TypedParams` to deserialize the secret-injected string map produced by
+//! `runtime_secrets::get_params_with_secrets` into concrete Rust types,
+//! preserving the runtime's parameter semantics — per-variant key prefixing,
 //! unknown-key warnings with typo suggestions, deprecation warnings, string
 //! defaults, and secret autoload from configured secret stores.
 //!
-//! Compared to [`crate::ParameterSpec`] lists, the struct is the single source
-//! of truth: `required` is a non-`Option` field, `default` is an attribute,
+//! Compared to `ParameterSpec` lists, the struct is the single source of
+//! truth: `required` is a non-`Option` field, `default` is an attribute,
 //! `one_of` is a real enum implementing [`std::str::FromStr`], descriptions
 //! are doc comments, and deprecation uses `#[deprecated]`.
+//!
+//! # Layering
+//!
+//! This crate is a foundation leaf with no dependents above it in the graph,
+//! so any crate — regardless of its own tier — can derive `TypedParams`
+//! without risking a cycle. Secret autoload is abstracted behind the
+//! [`SecretAutoload`] trait rather than naming a concrete secrets registry, so
+//! that a lower-tier crate owning its own resolver can implement the trait and
+//! build on the typed-params machinery directly. `runtime-secrets` is simply
+//! the first crate that needed this — the pattern generalizes to any
+//! component's parameters, wherever in the graph it lives.
 
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use runtime_secrets::Secrets;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::Snafu;
 use tokio::sync::RwLock;
@@ -43,7 +53,6 @@ use tokio::sync::RwLock;
 /// not part of the public API.
 #[doc(hidden)]
 pub mod __private {
-    pub use runtime_secrets::Secrets;
     pub use secrecy::SecretString;
     pub use std::collections::HashMap;
     pub use std::sync::Arc;
@@ -54,8 +63,7 @@ pub type Result<T, E = ParamsError> = std::result::Result<T, E>;
 
 /// Errors produced while deserializing component parameters into a typed
 /// struct. Messages carry the user-facing (prefixed) parameter key; callers
-/// wrap them with the component name and connector, matching how
-/// [`crate::Parameters::try_new`] errors are surfaced today.
+/// wrap them with the component name and connector.
 #[derive(Debug, Snafu)]
 pub enum ParamsError {
     #[snafu(display("Missing required parameter: {user_key}.{hint}"))]
@@ -63,6 +71,39 @@ pub enum ParamsError {
 
     #[snafu(display("Invalid value for parameter '{user_key}': {reason}"))]
     InvalidValue { user_key: String, reason: String },
+
+    #[snafu(display("Unknown parameter '{user_key}'. Supported parameters: {supported}."))]
+    UnknownParameter { user_key: String, supported: String },
+}
+
+/// A secret-store resolver consulted for `#[param(autoload_secret)]` fields.
+///
+/// Implemented by `runtime_secrets::Secrets` (the real registry). Abstracting
+/// the lookup keeps this crate a foundation leaf: the typed-params machinery
+/// never names the `Secrets` type directly, so `runtime-secrets` can depend on
+/// this crate without a cycle. Used only as a generic bound (never as `dyn`),
+/// so native async-fn-in-trait is fine here.
+///
+/// Requires `Clone` so [`autoload_secret`] can take a point-in-time snapshot
+/// before the (potentially network-bound) lookup, rather than holding the
+/// registry's read guard across the `.await` — see `Secrets::snapshot`.
+pub trait SecretAutoload: Send + Sync + Clone {
+    /// Looks up an absent parameter by its (already-prefixed) key. Misses and
+    /// store errors both resolve to `None` — autoload is best-effort.
+    fn autoload_get(&self, key: &str) -> impl Future<Output = Option<SecretString>> + Send;
+}
+
+/// A no-op [`SecretAutoload`] for call sites that never autoload (e.g. secret
+/// stores, which must be initialized *before* any secret resolution is
+/// possible). Passing this makes the absence of autoload explicit and costs
+/// nothing.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoSecretResolver;
+
+impl SecretAutoload for NoSecretResolver {
+    async fn autoload_get(&self, _key: &str) -> Option<SecretString> {
+        None
+    }
 }
 
 /// A component parameter struct deserializable from spicepod `params`.
@@ -76,15 +117,15 @@ pub trait TypedParams: Sized {
     const PREFIX: &'static str;
 
     /// Deserializes the secret-injected parameter map (the output of
-    /// [`runtime_secrets::get_params_with_secrets`]) into `Self`.
+    /// `runtime_secrets::get_params_with_secrets`) into `Self`.
     ///
     /// `component_name` is the user-facing resource label used in warnings
     /// (e.g. `"embedding my_embed"`). `secrets` is consulted only for fields
     /// marked `#[param(autoload_secret)]` that are absent from the map.
-    fn try_from_params(
+    fn try_from_params<R: SecretAutoload>(
         component_name: &str,
         params: HashMap<String, SecretString>,
-        secrets: &Arc<RwLock<Secrets>>,
+        secrets: &Arc<RwLock<R>>,
     ) -> impl Future<Output = Result<Self>> + Send;
 }
 
@@ -123,27 +164,29 @@ pub fn parse_param_with<T, E: Display>(
     })
 }
 
-/// Looks up an absent `#[param(autoload_secret)]` parameter in the configured secret
-/// stores by its user-facing (prefixed) key. Mirrors the autoload pass of
-/// [`crate::Parameters::try_new`]: store errors and misses resolve to `None`.
-pub async fn autoload_secret(
-    secrets: &Arc<RwLock<Secrets>>,
+/// Looks up an absent `#[param(autoload_secret)]` parameter in the configured
+/// secret stores by its user-facing (prefixed) key. Store errors and misses
+/// resolve to `None`.
+///
+/// Takes a point-in-time clone of `*secrets` under a brief read lock and
+/// performs the lookup against it, rather than holding the read guard across
+/// the (potentially network-bound) lookup — awaiting under the guard would
+/// stall any writer that swaps the registry.
+pub async fn autoload_secret<R: SecretAutoload>(
+    secrets: &Arc<RwLock<R>>,
     component_name: &str,
     lookup_key: &str,
 ) -> Option<SecretString> {
     tracing::debug!("Attempting to autoload secret for {component_name}: {lookup_key}");
-    let secret_guard = secrets.read().await;
-    match secret_guard.get_secret(lookup_key).await {
-        Ok(Some(secret)) => {
-            tracing::debug!("Autoloading secret for {component_name}: {lookup_key}");
-            Some(secret)
-        }
-        _ => None,
+    let snapshot = secrets.read().await.clone();
+    let secret = snapshot.autoload_get(lookup_key).await;
+    if secret.is_some() {
+        tracing::debug!("Autoloading secret for {component_name}: {lookup_key}");
     }
+    secret
 }
 
-/// Emits the deprecation warning for a present deprecated parameter, matching
-/// the wording of [`crate::Parameters::try_new`].
+/// Emits the deprecation warning for a present deprecated parameter.
 pub fn warn_deprecated(component_name: &str, user_key: &str, note: Option<&str>) {
     if let Some(note) = note {
         tracing::warn!("Parameter '{user_key}' is deprecated for {component_name}: {note}");
@@ -153,9 +196,9 @@ pub fn warn_deprecated(component_name: &str, user_key: &str, note: Option<&str>)
 }
 
 /// Warns about parameters left over after every declared field consumed its
-/// keys, matching the wording of [`crate::Parameters::validate_and_format_key`]:
-/// a wrong-prefix hint when adding/removing the prefix would match a declared
-/// key, otherwise an unknown-parameter warning with a typo suggestion.
+/// keys: a wrong-prefix hint when adding/removing the prefix would match a
+/// declared key, otherwise an unknown-parameter warning with a typo
+/// suggestion.
 pub fn warn_leftover_keys<S: std::hash::BuildHasher>(
     component_name: &str,
     leftover: &HashMap<String, SecretString, S>,
@@ -190,4 +233,35 @@ pub fn warn_leftover_keys<S: std::hash::BuildHasher>(
             tracing::warn!("Ignoring parameter `{key}`: not supported for {component_name}.");
         }
     }
+}
+
+/// Fail-fast counterpart of [`warn_leftover_keys`] for `#[params(deny_unknown)]`:
+/// returns [`ParamsError::UnknownParameter`] for the first leftover key rather
+/// than logging a warning. Silently dropping a misspelled parameter is the
+/// exact failure mode fail-fast validation exists to prevent.
+///
+/// # Errors
+///
+/// Returns [`ParamsError::UnknownParameter`] naming the offending key and the
+/// supported keys when any key remains unconsumed.
+pub fn deny_leftover_keys<S: std::hash::BuildHasher>(
+    leftover: &HashMap<String, SecretString, S>,
+    known_user_keys: &[&str],
+) -> Result<()> {
+    // Iterate the known keys (deterministic order) to build the supported list;
+    // pick any leftover key to name in the error.
+    let Some(user_key) = leftover.keys().next() else {
+        return Ok(());
+    };
+    let mut supported: Vec<&str> = known_user_keys.to_vec();
+    supported.sort_unstable();
+    let supported = if supported.is_empty() {
+        "<none>".to_string()
+    } else {
+        supported.join(", ")
+    };
+    Err(ParamsError::UnknownParameter {
+        user_key: user_key.clone(),
+        supported,
+    })
 }

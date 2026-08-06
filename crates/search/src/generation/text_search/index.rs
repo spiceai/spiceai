@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use std::cmp::min;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{any::Any, collections::HashSet, sync::Arc};
@@ -27,9 +27,12 @@ use datafusion::datasource::{DefaultTableSource, TableProvider};
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder};
 use runtime_datafusion_index::Index;
-use snafu::ResultExt;
+use snafu::{ResultExt, ensure};
 use tantivy::merge_policy::LogMergePolicy;
-use tantivy::schema::{DocParsingError, SchemaBuilder};
+use tantivy::schema::{
+    DocParsingError, FieldEntry, FieldType, IndexRecordOption, Schema, SchemaBuilder,
+    TextFieldIndexing, TextOptions, Type,
+};
 use tantivy::{TantivyDocument, TantivyError};
 use tokio::sync::Mutex;
 
@@ -38,7 +41,8 @@ use crate::generation::text_search::query::FullTextSearchQuery;
 use crate::generation::text_search::util::{array_to_terms, with_json_subset_column};
 use crate::generation::text_search::{
     FailedToInsertDataIntoIndexSnafu, FullTextSearchFieldIndex, IndexCreationSnafu,
-    InvalidIndexingSnafu, TextSearchIndexingSnafu,
+    InvalidIndexingSnafu, PersistedIndexColumnChangedSnafu, PersistedIndexMissingColumnsSnafu,
+    TextSearchIndexingSnafu,
 };
 use crate::generation::util::get_primary_keys;
 use crate::index::SearchIndex;
@@ -48,6 +52,135 @@ use crate::index::SearchIndex;
 /// significantly improving bulk-indexing throughput.
 pub static MEMORY_BUDGET_FOR_INDEX_WRITER: usize = 150 * 1024 * 1024;
 pub static INDEX_UNIQUE_FIELD_NAME: &str = "__spice.unique_field";
+
+/// Tantivy's built-in English Snowball-stemmed tokenizer.
+static EN_STEM_TOKENIZER_NAME: &str = "en_stem";
+
+/// A [`TextOptions`] for [`tantivy::schema::TEXT`] with [`EN_STEM_TOKENIZER_NAME`] tokenization.
+fn tokenized_text_options() -> TextOptions {
+    TextOptions::default().set_indexing_options(
+        TextFieldIndexing::default()
+            .set_index_option(IndexRecordOption::WithFreqsAndPositions)
+            .set_tokenizer(EN_STEM_TOKENIZER_NAME),
+    )
+}
+
+/// Checks the schema a persisted index was created with against the one the current
+/// configuration asks for.
+///
+/// [`tantivy::Index::open_in_dir`] loads the schema recorded in the index directory and the
+/// schema built from the current configuration is discarded, so a configuration change would
+/// otherwise take effect nowhere and say nothing: [`TantivyDocument::from_json_object`] drops
+/// every column the persisted schema does not declare, and the query parser and the
+/// primary-key delete terms are both built from the persisted schema.
+///
+/// A difference that breaks addressing or filtering — a column the index does not have, a
+/// changed value type, an indexed/not-indexed flip, or a tokenized/untokenized flip — is an
+/// error naming the directory to delete, because searches and deletes over that column cannot
+/// work at all. A difference that only changes text analysis (a different tokenizer, e.g. an
+/// index predating a change to the tokenizer the runtime configures) still answers queries
+/// consistently with what was indexed, so it warns and continues rather than refusing to load
+/// a working index.
+///
+/// A column the persisted schema has and the configuration no longer asks for is left alone:
+/// nothing queries it.
+fn ensure_persisted_schema_matches(
+    path: &Path,
+    persisted: &Schema,
+    configured: &Schema,
+) -> Result<(), super::Error> {
+    let path = path.display().to_string();
+
+    let mut missing = Vec::new();
+    let mut shared = Vec::new();
+    for (_, configured_entry) in configured.fields() {
+        match persisted.get_field(configured_entry.name()) {
+            Ok(field) => shared.push((persisted.get_field_entry(field), configured_entry)),
+            Err(_) => missing.push(configured_entry.name().to_string()),
+        }
+    }
+    ensure!(
+        missing.is_empty(),
+        PersistedIndexMissingColumnsSnafu {
+            path: &path,
+            columns: missing,
+        }
+    );
+
+    for (persisted_entry, configured_entry) in shared {
+        ensure!(
+            addressing_shape(persisted_entry) == addressing_shape(configured_entry),
+            PersistedIndexColumnChangedSnafu {
+                path: &path,
+                column: configured_entry.name(),
+                persisted: describe_indexing(persisted_entry),
+                configured: describe_indexing(configured_entry),
+            }
+        );
+
+        let persisted_tokenizer = text_tokenizer(persisted_entry.field_type());
+        let configured_tokenizer = text_tokenizer(configured_entry.field_type());
+        if persisted_tokenizer != configured_tokenizer {
+            tracing::warn!(
+                "The full text search index at '{path}' indexes column '{}' with the '{}' tokenizer, but '{}' is now configured. Queries stay consistent with what the index holds; delete '{path}' so the index is rebuilt with the configured tokenizer.",
+                configured_entry.name(),
+                persisted_tokenizer.unwrap_or("none"),
+                configured_tokenizer.unwrap_or("none"),
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// The properties a persisted field must share with the configured one for term addressing and
+/// filtering to behave as configured. Text analysis (the tokenizer) is deliberately excluded —
+/// see [`ensure_persisted_schema_matches`].
+fn addressing_shape(entry: &FieldEntry) -> (Type, bool, bool) {
+    let field_type = entry.field_type();
+    (
+        field_type.value_type(),
+        field_type.is_indexed(),
+        is_tokenized(field_type),
+    )
+}
+
+/// The tokenizer a text field is analyzed with, or [`None`] for any other field type.
+fn text_tokenizer(field_type: &FieldType) -> Option<&str> {
+    match field_type {
+        FieldType::Str(options) => options
+            .get_indexing_options()
+            .map(TextFieldIndexing::tokenizer),
+        _ => None,
+    }
+}
+
+/// Whether a text field is analyzed into multiple terms, rather than indexed as the single term
+/// that [`tantivy::schema::STRING`] (and so a primary-key lookup) relies on.
+fn is_tokenized(field_type: &FieldType) -> bool {
+    // Compare against tantivy's own untokenized text options rather than naming its tokenizer,
+    // which tantivy does not export.
+    let untokenized = FieldType::Str(tantivy::schema::STRING);
+    match (text_tokenizer(field_type), text_tokenizer(&untokenized)) {
+        (Some(tokenizer), Some(untokenized)) => tokenizer != untokenized,
+        _ => false,
+    }
+}
+
+/// Describes how a field is indexed, for the error naming a column whose indexing changed.
+fn describe_indexing(entry: &FieldEntry) -> String {
+    let field_type = entry.field_type();
+    let indexing = if !field_type.is_indexed() {
+        "not indexed"
+    } else if text_tokenizer(field_type).is_none() {
+        "indexed"
+    } else if is_tokenized(field_type) {
+        "tokenized"
+    } else {
+        "untokenized"
+    };
+    format!("{:?} ({indexing})", field_type.value_type()).to_lowercase()
+}
 
 /// The fraction of a tantivy segment's documents that may be superseded/deleted, but
 /// still physically present, before the segment is rewritten by a merge.
@@ -147,6 +280,15 @@ impl Index for FullTextDatabaseIndex {
         self.delete_terms_for(&keys)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))
+    }
+
+    fn write_start_failure_is_fatal(&self) -> bool {
+        // `on_write_start` rolls the writer back to discard operations an earlier abandoned
+        // window left staged. If that rollback fails those stale operations are still in the
+        // writer, and continuing would sweep them into this window's commit — publishing
+        // index state the write never asked for. The window is also left undeferred, so the
+        // deferral this write is written against is not the one in effect.
+        true
     }
 
     fn write_complete_failure_is_fatal(&self) -> bool {
@@ -253,10 +395,13 @@ impl FullTextDatabaseIndex {
         )?;
 
         let index = if let Some(path) = directory {
-            match tantivy::Index::create_in_dir(path.clone(), tantivy_schema) {
+            match tantivy::Index::create_in_dir(&path, tantivy_schema.clone()) {
                 Ok(idx) => idx,
                 Err(TantivyError::IndexAlreadyExists) => {
-                    tantivy::index::Index::open_in_dir(path).context(TextSearchIndexingSnafu)?
+                    let persisted = tantivy::index::Index::open_in_dir(&path)
+                        .context(TextSearchIndexingSnafu)?;
+                    ensure_persisted_schema_matches(&path, &persisted.schema(), &tantivy_schema)?;
+                    persisted
                 }
                 Err(e) => return Err(e).context(TextSearchIndexingSnafu),
             }
@@ -599,7 +744,7 @@ impl FullTextDatabaseIndex {
         }
 
         for s in search_fields {
-            let mut text_opts = tantivy::schema::TEXT;
+            let mut text_opts = tokenized_text_options();
             if store_field.contains(s) || primary_key.contains(s) {
                 text_opts = text_opts | tantivy::schema::STORED;
             }
@@ -1184,6 +1329,16 @@ mod tests {
         supersede_half_of_a_consolidated_segment(&index).await;
     }
 
+    /// `on_write_start` returns an error precisely so the write is abandoned: the rollback it
+    /// performs is what discards operations an earlier abandoned window left staged. The sink
+    /// only honours that by declaring the failure fatal — without this the sink logs a warning
+    /// and writes anyway, and those stale operations land in this window's commit (#12421).
+    #[tokio::test]
+    async fn test_a_failed_write_start_is_fatal() {
+        let index = new_test_index();
+        assert!(index.write_start_failure_is_fatal());
+    }
+
     #[tokio::test]
     async fn test_compute_index_returns_batches_unchanged() {
         let index = FullTextDatabaseIndex::try_new(
@@ -1477,6 +1632,138 @@ mod tests {
         assert!(
             results.contains("apple banana"),
             "a change-stream document written through a compound must be committed, not staged in the failed window, got:\n{results}"
+        );
+    }
+
+    /// A table with a second text column, so a search configuration can grow by one column
+    /// between two [`FullTextDatabaseIndex`] instances over the same directory.
+    fn create_two_column_test_table() -> Arc<dyn TableProvider> {
+        let batch = record_batch!(
+            ("id", Int32, [1, 2]),
+            ("content", Utf8, ["test content 1", "test content 2"]),
+            ("title", Utf8, ["first title", "second title"])
+        )
+        .expect("failed to create test batch");
+        Arc::new(
+            MemTable::try_new(batch.schema(), vec![vec![batch]])
+                .expect("failed to create test table"),
+        )
+    }
+
+    fn file_backed_index(
+        directory: &Path,
+        search_fields: &[&str],
+        primary_key: &[&str],
+    ) -> Result<FullTextDatabaseIndex, super::super::Error> {
+        FullTextDatabaseIndex::try_new(
+            create_two_column_test_table(),
+            search_fields.iter().map(|f| (*f).to_string()).collect(),
+            Some(primary_key.iter().map(|p| (*p).to_string()).collect()),
+            Some(directory.to_path_buf()),
+            &[],
+        )
+    }
+
+    // Regression test for #12274.
+    #[test]
+    fn test_persisted_index_rejects_a_newly_configured_search_column() {
+        let directory = tempfile::tempdir().expect("failed to create a temporary directory");
+
+        drop(
+            file_backed_index(directory.path(), &["content"], &["id"])
+                .expect("failed to create the index"),
+        );
+
+        // Reopening with `title` added to the search configuration cannot serve a search over
+        // `title`: the persisted schema has no such field, and tantivy silently drops document
+        // values for fields its schema does not declare.
+        let error = file_backed_index(directory.path(), &["content", "title"], &["id"])
+            .expect_err("a persisted index missing a configured search column must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("title"),
+            "the error must name the column the persisted index is missing, got: {message}"
+        );
+        assert!(
+            message.contains(&directory.path().display().to_string()),
+            "the error must name the index directory to delete, got: {message}"
+        );
+        assert!(
+            error.is_user_error(),
+            "a persisted index the configuration no longer matches is fixable from the spicepod"
+        );
+    }
+
+    // Regression test for #12274.
+    #[test]
+    fn test_persisted_index_rejects_a_primary_key_that_became_a_search_column() {
+        let directory = tempfile::tempdir().expect("failed to create a temporary directory");
+
+        // `title` is the primary key and not a search column, so it is indexed untokenized —
+        // what a primary-key term lookup relies on.
+        drop(
+            file_backed_index(directory.path(), &["content"], &["title"])
+                .expect("failed to create the index"),
+        );
+
+        // Configuring `title` as a search column asks for it tokenized instead, so the terms
+        // the persisted index holds for it are no longer the ones a delete would address.
+        let error = file_backed_index(directory.path(), &["content", "title"], &["title"])
+            .expect_err(
+                "a persisted index whose primary key is indexed differently must be rejected",
+            );
+        let message = error.to_string();
+        assert!(
+            message.contains("(untokenized)") && message.contains("(tokenized)"),
+            "the error must say how the column's indexing changed, got: {message}"
+        );
+        assert!(
+            error.is_user_error(),
+            "a persisted index the configuration no longer matches is fixable from the spicepod"
+        );
+    }
+
+    // Regression test for #12274.
+    #[test]
+    fn test_persisted_index_reopens_with_a_compatible_configuration() {
+        let directory = tempfile::tempdir().expect("failed to create a temporary directory");
+
+        drop(
+            file_backed_index(directory.path(), &["content", "title"], &["id"])
+                .expect("failed to create the index"),
+        );
+        drop(
+            file_backed_index(directory.path(), &["content", "title"], &["id"])
+                .expect("reopening an unchanged persisted index must succeed"),
+        );
+
+        // A column the configuration no longer searches is left alone: nothing queries it.
+        drop(
+            file_backed_index(directory.path(), &["content"], &["id"])
+                .expect("dropping a search column must not reject the persisted index"),
+        );
+    }
+
+    // Regression test for #12274: an index created before the runtime changed the tokenizer it
+    // configures still answers queries consistently with what it indexed, so it must keep
+    // loading rather than fail the dataset on upgrade.
+    #[test]
+    fn test_persisted_index_reopens_when_only_the_tokenizer_differs() {
+        let directory = tempfile::tempdir().expect("failed to create a temporary directory");
+
+        // Build the directory with tantivy's stock `TEXT` options — the tokenizer
+        // `tokenized_text_options` replaced.
+        let mut schema_builder = tantivy::schema::Schema::builder();
+        schema_builder.add_i64_field("id", tantivy::schema::STORED | tantivy::schema::INDEXED);
+        schema_builder.add_text_field("content", tantivy::schema::TEXT);
+        drop(
+            tantivy::Index::create_in_dir(directory.path(), schema_builder.build())
+                .expect("failed to create a stock-tokenizer index"),
+        );
+
+        drop(
+            file_backed_index(directory.path(), &["content"], &["id"])
+                .expect("a tokenizer-only difference must not reject the persisted index"),
         );
     }
 }

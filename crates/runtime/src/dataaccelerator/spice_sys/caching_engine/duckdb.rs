@@ -20,7 +20,12 @@ use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConne
 use std::sync::Arc;
 
 impl CachingEngineSys {
-    pub(super) fn update_fetched_at_duckdb(&self, pool: &Arc<DuckDbConnectionPool>) -> Result<()> {
+    /// Blocking: takes the pool's write gate. Callers must reach this through
+    /// `spawn_duckdb_blocking`, never directly from an async worker.
+    pub(super) fn update_fetched_at_duckdb(
+        dataset_name: &str,
+        pool: &Arc<DuckDbConnectionPool>,
+    ) -> Result<()> {
         let write_gate = pool.write_gate();
         let _write_guard = write_gate
             .read()
@@ -33,16 +38,16 @@ impl CachingEngineSys {
 
         let tx = duckdb_conn.transaction().map_err(Error::external)?;
 
-        let has_table = table_exists(&tx, &self.dataset_name)?;
-        let mut internal_tables = list_internal_tables(&tx, &self.dataset_name)?;
+        let has_table = table_exists(&tx, dataset_name)?;
+        let mut internal_tables = list_internal_tables(&tx, dataset_name)?;
 
         // Determine the actual table name (internal or direct)
         let table_name = match (internal_tables.pop(), has_table) {
             (Some((internal_name, _)), _) => internal_name,
-            (None, true) => self.dataset_name.clone(),
+            (None, true) => dataset_name.to_string(),
             (None, false) => {
                 // No table exists yet
-                tracing::warn!("No table found for dataset: {}", self.dataset_name);
+                tracing::warn!("No table found for dataset: {dataset_name}");
                 return Ok(());
             }
         };

@@ -29,7 +29,11 @@ mod provider;
 pub mod util;
 pub use delete::{build_key_match_predicate, resolve_keys_matching_predicate};
 pub use provider::*;
-pub use util::{INDEXED_INNER, InnerProviderFn, find_concrete_table_provider_with};
+pub use util::{
+    INDEXED_INNER, InnerProviderFn, LayerWalk, RebuildProviderFn, TableProviderLayer,
+    find_concrete_table_provider_in, peel_to_innermost, rebuild_innermost_table_provider,
+    visit_provider_chain,
+};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -102,6 +106,25 @@ pub trait Index: Debug + Send + Sync + 'static {
         Ok(())
     }
 
+    /// Whether [`Index::delete_by_keys`] removes *every* entry matching the key columns it finds
+    /// in `keys`, even when those are a strict subset of this index's own primary key.
+    ///
+    /// Defaults to `false`: an index addressed by an exact key (S3 Vectors keys each vector by
+    /// its full composite key) cannot act on a partial one, so a caller holding only part of the
+    /// key must resolve the complete keys first. `true` says the store filters by field value and
+    /// so deletes the whole matching group in one operation — Elasticsearch's `_delete_by_query`.
+    ///
+    /// The caller this exists for is `ChunkedSearchIndex`: it knows the base row key but not the
+    /// chunk ids stored under it, and every chunk of a deleted row has to go. When this is `true`
+    /// it hands that base key straight to [`Index::delete_by_keys`]; when `false` it must first
+    /// enumerate the index's chunk-keyed entries itself.
+    ///
+    /// Wrapper implementations MUST forward this to the index they wrap — inheriting the default
+    /// silently sends a partial-key-capable inner index down the enumerate-first path.
+    fn deletes_by_partial_key(&self) -> bool {
+        false
+    }
+
     /// Resolves the primary-key rows of `table` matching `filters`, for a later
     /// [`Index::delete_by_keys`] call — the read half of [`Index::delete_by_predicate`], split
     /// out so a caller can run it *before* an authoritative row delete (while the matching rows
@@ -154,6 +177,21 @@ pub trait Index: Debug + Send + Sync + 'static {
             return Ok(());
         };
         self.delete_by_keys(keys).await
+    }
+
+    /// Whether a failure in [`Index::on_write_start`] must fail the write.
+    ///
+    /// Defaults to `false` (best-effort), matching indexes whose start step only tunes
+    /// something the write does not depend on — Elasticsearch's `refresh_interval`
+    /// override is the example: the write is still indexed correctly without it. An
+    /// index that *prepares state the write depends on* returns `true`: for those,
+    /// writing anyway leaves the index and the rows it indexes diverged, with only a
+    /// warning to say so.
+    ///
+    /// Wrapper implementations MUST forward this to the index they wrap — inheriting
+    /// the default silently downgrades a fatal inner index to best-effort.
+    fn write_start_failure_is_fatal(&self) -> bool {
+        false
     }
 
     /// Whether a failure in [`Index::on_write_complete`] must fail the write.
