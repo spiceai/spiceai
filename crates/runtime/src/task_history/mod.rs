@@ -39,6 +39,7 @@ use tokio::sync::RwLock;
 
 use crate::accelerated_table::{AcceleratedTable, Retention};
 
+pub mod correlation;
 pub mod federated;
 pub mod otel_exporter;
 

@@ -221,10 +221,6 @@ impl TaskHistoryExporter {
         span_id.len() == 16 && span_id.chars().all(|c| c.is_ascii_hexdigit())
     }
 
-    fn is_valid_traceid(trace_id: &Arc<str>) -> bool {
-        trace_id.len() == 32 && trace_id.chars().all(|c| c.is_ascii_hexdigit())
-    }
-
     /// Captures query plans for spans that meet the threshold.
     ///
     /// Only used for `TaskHistoryCapturedPlan::Explain` (plan-only, no body
@@ -362,12 +358,15 @@ impl TaskHistoryExporter {
                 ),
         );
 
-        let trace_id_override: Option<Arc<str>> = extract_attr!(span, "trace_id")
-            .and_then(|trace_id| if Self::is_valid_traceid(&trace_id) {
-                Some(trace_id)
-            } else {
-                tracing::warn!("User provided 'trace_id'='{}' is invalid. Must be a 32 character hex string.", Arc::clone(&trace_id));
-                None
+        // Validated the same way the header that supplies it is, so one id is
+        // not accepted at the door and rejected here (or vice versa).
+        let trace_id_override: Option<Arc<str>> =
+            extract_attr!(span, "trace_id").and_then(|trace_id: Arc<str>| {
+                let normalized = runtime_request_context::normalize_trace_id(&trace_id);
+                if normalized.is_none() {
+                    tracing::warn!("User provided 'trace_id'='{trace_id}' is invalid. Must be a 32 character hex string.");
+                }
+                normalized
             });
 
         let distributed_parent_id: Option<Arc<str>> = extract_attr!(span, "parent_id")

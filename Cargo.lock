@@ -19332,6 +19332,7 @@ dependencies = [
  "runtime-cloud-connect",
  "runtime-datafusion",
  "runtime-query-engine",
+ "runtime-request-context",
  "rustls",
  "serde_json",
  "snafu",

@@ -61,6 +61,11 @@ pub struct RequestContext {
     auth_principal: OnceLock<AuthPrincipalRef>,
     extensions: RwLock<Extensions>,
     trace_parent: Option<TraceParent>,
+    /// The trace id the client pinned for this request, from either
+    /// [`crate::SPICE_TRACE_ID_HEADER`] or `traceparent`. `None` when the
+    /// client supplied neither, or for a context built without headers — the
+    /// runtime then numbers the request's tasks itself.
+    client_trace_id: Option<Arc<str>>,
     nested_query_level: AtomicI16,
     /// The raw `authorization` header value from the incoming request, if present.
     /// Used to forward credentials when proxying requests (e.g. scheduler → executor).
@@ -311,6 +316,16 @@ impl RequestContext {
         &self.trace_parent
     }
 
+    /// The trace id this request's caller pinned, if any.
+    ///
+    /// `Some` means the id is the client's to correlate on, so it has to be
+    /// written to the `runtime.task_history` row as well as the log. `None`
+    /// means the runtime numbers each task itself.
+    #[must_use]
+    pub fn client_trace_id(&self) -> Option<&Arc<str>> {
+        self.client_trace_id.as_ref()
+    }
+
     /// Returns the raw `authorization` header value from the incoming request, if present.
     #[must_use]
     pub fn authorization_header(&self) -> Option<&str> {
@@ -434,6 +449,7 @@ pub struct RequestContextBuilder {
     baggage: Vec<KeyValue>,
     extensions: Extensions,
     trace_parent: Option<TraceParent>,
+    client_trace_id: Option<Arc<str>>,
     authorization_header: Option<String>,
     cancellation_token: Option<CancellationToken>,
     query_timeout: Option<std::time::Duration>,
@@ -452,6 +468,7 @@ impl RequestContextBuilder {
             baggage: vec![],
             extensions: Extensions::default(),
             trace_parent: None,
+            client_trace_id: None,
             authorization_header: None,
             cancellation_token: None,
             query_timeout: None,
@@ -508,6 +525,13 @@ impl RequestContextBuilder {
             }
         }
 
+        match super::extract_trace_id(headers) {
+            Ok(trace_id) => {
+                self.client_trace_id = trace_id;
+            }
+            Err(e) => tracing::warn!("Received invalid HTTP header: {e}"),
+        }
+
         self
     }
 
@@ -551,6 +575,16 @@ impl RequestContextBuilder {
     #[must_use]
     pub fn with_trace_parent(mut self, trace_parent: Option<TraceParent>) -> Self {
         self.trace_parent = trace_parent;
+        self
+    }
+
+    /// Pins the trace id the runtime records for this request's tasks,
+    /// bypassing both headers. Used to carry a caller's id across a transport
+    /// boundary (scheduler → executor) that does not replay the original
+    /// request's headers.
+    #[must_use]
+    pub fn with_client_trace_id(mut self, client_trace_id: Option<Arc<str>>) -> Self {
+        self.client_trace_id = client_trace_id;
         self
     }
 
@@ -690,6 +724,14 @@ impl RequestContextBuilder {
                 .and_then(|query| query.timeout().ok().flatten())
         });
 
+        // A `traceparent` pins the trace id just as the bare header does; the
+        // bare one is resolved first so it wins when a request carries both.
+        let client_trace_id = self.client_trace_id.or_else(|| {
+            self.trace_parent
+                .as_ref()
+                .map(|tp| Arc::from(tp.trace_id.to_string()))
+        });
+
         RequestContext {
             protocol: AtomicU8::new(self.protocol as u8),
             cache_control,
@@ -699,6 +741,7 @@ impl RequestContextBuilder {
             auth_principal: OnceLock::new(),
             extensions: RwLock::new(self.extensions),
             trace_parent: self.trace_parent,
+            client_trace_id,
             nested_query_level: AtomicI16::new(0),
             authorization_header: self.authorization_header,
             cancellation_token: self.cancellation_token.unwrap_or_default(),
@@ -765,6 +808,100 @@ mod tests {
             rx.await.expect("spawned task reported its context"),
             CacheNamespace::Public
         );
+    }
+
+    const PINNED_TRACE_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+    const TRACEPARENT_TRACE_ID: &str = "0af7651916cd43dd8448eb211c80319c";
+    const TRACEPARENT: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+
+    /// A caller with no trace-context tooling pins the id with the bare header.
+    #[test]
+    fn client_trace_id_comes_from_the_spice_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            crate::SPICE_TRACE_ID_HEADER,
+            HeaderValue::from_static(PINNED_TRACE_ID),
+        );
+
+        let ctx = RequestContextBuilder::new(Protocol::Http)
+            .from_headers(&headers)
+            .build();
+
+        assert_eq!(
+            ctx.client_trace_id().map(AsRef::as_ref),
+            Some(PINNED_TRACE_ID)
+        );
+    }
+
+    /// A `traceparent` on its own still pins the id — that is how the id
+    /// reached `runtime.task_history` before the bare header existed.
+    #[test]
+    fn client_trace_id_falls_back_to_traceparent() {
+        let mut headers = HeaderMap::new();
+        headers.insert("traceparent", HeaderValue::from_static(TRACEPARENT));
+
+        let ctx = RequestContextBuilder::new(Protocol::Http)
+            .from_headers(&headers)
+            .build();
+
+        assert_eq!(
+            ctx.client_trace_id().map(AsRef::as_ref),
+            Some(TRACEPARENT_TRACE_ID)
+        );
+        assert!(
+            ctx.trace_parent().is_some(),
+            "the parent span must survive so the task still records what it is a child of"
+        );
+    }
+
+    /// Both present: the header the caller set deliberately beats the one a
+    /// proxy or APM agent injects, and the parent span is kept regardless.
+    #[test]
+    fn spice_header_wins_over_traceparent() {
+        let mut headers = HeaderMap::new();
+        headers.insert("traceparent", HeaderValue::from_static(TRACEPARENT));
+        headers.insert(
+            crate::SPICE_TRACE_ID_HEADER,
+            HeaderValue::from_static(PINNED_TRACE_ID),
+        );
+
+        let ctx = RequestContextBuilder::new(Protocol::Http)
+            .from_headers(&headers)
+            .build();
+
+        assert_eq!(
+            ctx.client_trace_id().map(AsRef::as_ref),
+            Some(PINNED_TRACE_ID)
+        );
+        assert!(ctx.trace_parent().is_some());
+    }
+
+    /// A malformed id is not the client's to correlate on, so the runtime
+    /// numbers the task itself rather than recording an unusable value.
+    #[test]
+    fn malformed_spice_header_leaves_the_id_to_the_runtime() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            crate::SPICE_TRACE_ID_HEADER,
+            HeaderValue::from_static("not-a-trace-id"),
+        );
+
+        let ctx = RequestContextBuilder::new(Protocol::Http)
+            .from_headers(&headers)
+            .build();
+
+        assert!(ctx.client_trace_id().is_none());
+    }
+
+    /// Nothing pinned — no client id, so nothing is written to the
+    /// `task_history` row on the client's behalf.
+    #[test]
+    fn no_headers_means_no_client_trace_id() {
+        let ctx = RequestContextBuilder::new(Protocol::Http)
+            .from_headers(&HeaderMap::new())
+            .build();
+
+        assert!(ctx.client_trace_id().is_none());
     }
 
     #[test]
