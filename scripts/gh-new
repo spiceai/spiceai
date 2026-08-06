@@ -68,21 +68,40 @@ for org in "${ORGS[@]}"; do
 done
 
 now_iso() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
-epoch_of() { date -j -f "%Y-%m-%dT%H:%M:%SZ" "$1" +%s 2>/dev/null; }
+
+# BSD date (macOS) rejects --version; GNU date (Linux) prints its version and
+# exits 0. Used to pick date's incompatible flags for parsing/offsetting below.
+is_gnu_date=false
+date --version >/dev/null 2>&1 && is_gnu_date=true
+
+epoch_of() {
+  if [[ "$is_gnu_date" == true ]]; then
+    date -u -d "$1" +%s 2>/dev/null
+  else
+    date -j -f "%Y-%m-%dT%H:%M:%SZ" "$1" +%s 2>/dev/null
+  fi
+}
 
 resolve_relative() {
   # "7d" -> 7 days ago, "12h" -> 12 hours ago, "40m" -> 40 minutes ago, as an
-  # ISO8601 UTC timestamp. BSD date's -v flag is case-sensitive per unit:
-  # lowercase d is days, uppercase H is hours, uppercase M is minutes.
-  local spec="$1"
-  if [[ "$spec" =~ ^([0-9]+)d$ ]]; then
-    date -u -v-"${BASH_REMATCH[1]}"d +"%Y-%m-%dT%H:%M:%SZ"
-  elif [[ "$spec" =~ ^([0-9]+)h$ ]]; then
-    date -u -v-"${BASH_REMATCH[1]}"H +"%Y-%m-%dT%H:%M:%SZ"
-  elif [[ "$spec" =~ ^([0-9]+)m$ ]]; then
-    date -u -v-"${BASH_REMATCH[1]}"M +"%Y-%m-%dT%H:%M:%SZ"
+  # ISO8601 UTC timestamp.
+  local spec="$1" n unit
+  [[ "$spec" =~ ^([0-9]+)([dhm])$ ]] || { echo "$spec"; return; }
+  n="${BASH_REMATCH[1]}"; unit="${BASH_REMATCH[2]}"
+  if [[ "$is_gnu_date" == true ]]; then
+    case "$unit" in
+      d) date -u -d "-${n} days" +"%Y-%m-%dT%H:%M:%SZ" ;;
+      h) date -u -d "-${n} hours" +"%Y-%m-%dT%H:%M:%SZ" ;;
+      m) date -u -d "-${n} minutes" +"%Y-%m-%dT%H:%M:%SZ" ;;
+    esac
   else
-    echo "$spec"
+    # BSD date's -v flag is case-sensitive per unit: lowercase d is days,
+    # uppercase H is hours, uppercase M is minutes.
+    case "$unit" in
+      d) date -u -v-"${n}"d +"%Y-%m-%dT%H:%M:%SZ" ;;
+      h) date -u -v-"${n}"H +"%Y-%m-%dT%H:%M:%SZ" ;;
+      m) date -u -v-"${n}"M +"%Y-%m-%dT%H:%M:%SZ" ;;
+    esac
   fi
 }
 
