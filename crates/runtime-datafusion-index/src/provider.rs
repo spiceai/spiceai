@@ -220,3 +220,208 @@ impl TableProvider for IndexedTableProvider {
         self.underlying.truncate(state).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::any::Any;
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::MemTable;
+    use datafusion::logical_expr::{col, lit};
+    use datafusion::physical_plan::empty::EmptyExec;
+    use datafusion::prelude::SessionContext;
+
+    use crate::Index;
+
+    fn id_val_batch(ids: &[i64], vals: &[&str]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("val", DataType::Utf8, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(ids.to_vec())),
+                Arc::new(StringArray::from(vals.to_vec())),
+            ],
+        )
+        .expect("valid batch")
+    }
+
+    /// An underlying table whose reads come from an inner `MemTable`, but whose `delete_from`
+    /// always succeeds without doing the row removal. These tests assert that
+    /// [`IndexedTableProvider::delete_from`] forwards the delete into an attached index; the
+    /// accelerator's own row delete is covered by that accelerator's tests.
+    #[derive(Debug)]
+    struct WritableTable {
+        inner: Arc<MemTable>,
+    }
+
+    impl WritableTable {
+        fn new(batch: RecordBatch) -> Self {
+            let schema = batch.schema();
+            Self {
+                inner: Arc::new(
+                    MemTable::try_new(schema, vec![vec![batch]]).expect("valid mem table"),
+                ),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TableProvider for WritableTable {
+        fn schema(&self) -> SchemaRef {
+            self.inner.schema()
+        }
+
+        fn table_type(&self) -> TableType {
+            self.inner.table_type()
+        }
+
+        async fn scan(
+            &self,
+            state: &dyn Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[Expr],
+            limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            self.inner.scan(state, projection, filters, limit).await
+        }
+
+        async fn delete_from(
+            &self,
+            _state: &dyn Session,
+            _filters: Vec<Expr>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(EmptyExec::new(self.schema())))
+        }
+    }
+
+    /// A fake index that models its store as a set of primary-key values. `delete_by_keys`
+    /// removes the keys it is handed, so a test can assert the surviving set — without depending
+    /// on how [`IndexedTableProvider`] resolves and forwards the delete.
+    #[derive(Debug)]
+    struct KeyTrackingIndex {
+        key_column: String,
+        keys: Arc<Mutex<HashSet<String>>>,
+    }
+
+    impl KeyTrackingIndex {
+        fn new(key_column: &str, seed: &[i64]) -> Self {
+            Self {
+                key_column: key_column.to_string(),
+                keys: Arc::new(Mutex::new(seed.iter().map(i64::to_string).collect())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Index for KeyTrackingIndex {
+        fn name(&self) -> &'static str {
+            "key_tracking_index"
+        }
+
+        fn required_columns(&self) -> Vec<String> {
+            vec![self.key_column.clone()]
+        }
+
+        async fn delete_by_keys(&self, keys: RecordBatch) -> DataFusionResult<()> {
+            let column = keys
+                .column_by_name(&self.key_column)
+                .expect("resolved key batch carries the index's key column");
+            let as_string = datafusion::arrow::compute::cast(column, &DataType::Utf8)
+                .expect("key column casts to Utf8");
+            let values = as_string
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("cast produced a StringArray");
+            let mut set = self.keys.lock().expect("lock");
+            for value in values.iter().flatten() {
+                set.remove(value);
+            }
+            Ok(())
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    fn sorted_keys(keys: &Arc<Mutex<HashSet<String>>>) -> Vec<String> {
+        let mut out: Vec<String> = keys.lock().expect("lock").iter().cloned().collect();
+        out.sort();
+        out
+    }
+
+    #[tokio::test]
+    async fn delete_from_removes_the_resolved_keys_from_an_attached_index() {
+        let index = KeyTrackingIndex::new("id", &[1, 2, 3]);
+        let keys = Arc::clone(&index.keys);
+
+        let provider = IndexedTableProvider::with_indexes(
+            Arc::new(WritableTable::new(id_val_batch(
+                &[1, 2, 3],
+                &["a", "b", "c"],
+            ))),
+            vec![Arc::new(index)],
+        );
+
+        let ctx = SessionContext::new();
+        provider
+            .delete_from(&ctx.state(), vec![col("id").eq(lit(2_i64))])
+            .await
+            .expect("delete should succeed");
+
+        assert_eq!(sorted_keys(&keys), vec!["1", "3"]);
+    }
+
+    #[tokio::test]
+    async fn delete_from_resolves_the_predicate_against_a_non_key_column() {
+        // The predicate filters on `val`, which is not the index's key column. The resolve must
+        // still evaluate it against the full table and forward only the matching `id`s.
+        let index = KeyTrackingIndex::new("id", &[1, 2, 3, 4]);
+        let keys = Arc::clone(&index.keys);
+
+        let provider = IndexedTableProvider::with_indexes(
+            Arc::new(WritableTable::new(id_val_batch(
+                &[1, 2, 3, 4],
+                &["a", "b", "a", "b"],
+            ))),
+            vec![Arc::new(index)],
+        );
+
+        let ctx = SessionContext::new();
+        provider
+            .delete_from(&ctx.state(), vec![col("val").eq(lit("b"))])
+            .await
+            .expect("delete should succeed");
+
+        assert_eq!(sorted_keys(&keys), vec!["1", "3"], "only val = 'b' rows go");
+    }
+
+    #[tokio::test]
+    async fn delete_from_leaves_the_index_untouched_when_nothing_matches() {
+        let index = KeyTrackingIndex::new("id", &[1, 2, 3]);
+        let keys = Arc::clone(&index.keys);
+
+        let provider = IndexedTableProvider::with_indexes(
+            Arc::new(WritableTable::new(id_val_batch(
+                &[1, 2, 3],
+                &["a", "b", "c"],
+            ))),
+            vec![Arc::new(index)],
+        );
+
+        let ctx = SessionContext::new();
+        provider
+            .delete_from(&ctx.state(), vec![col("id").gt(lit(100_i64))])
+            .await
+            .expect("delete should succeed");
+
+        assert_eq!(sorted_keys(&keys), vec!["1", "2", "3"]);
+    }
+}

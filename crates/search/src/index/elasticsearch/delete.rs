@@ -224,17 +224,40 @@ mod tests {
 
     /// Records the `_delete_by_query` bodies it is asked to issue; every other trait method is
     /// an error, so a test that reaches one fails loudly rather than silently passing.
+    ///
+    /// It also models a document store keyed by `_id`: seed it with [`RecordingClient::with_ids`]
+    /// and an `ids` query (the whole-key delete path) removes exactly those documents, so a test
+    /// can assert the surviving set with [`RecordingClient::present_ids`] instead of the query
+    /// body. The store is empty by default, so the many query-shape tests are unaffected.
     #[derive(Debug, Default)]
     struct RecordingClient {
         queries: Mutex<Vec<Value>>,
+        ids: Mutex<Vec<String>>,
     }
 
     impl RecordingClient {
+        fn with_ids(ids: &[&str]) -> Self {
+            Self {
+                ids: Mutex::new(ids.iter().map(|s| (*s).to_string()).collect()),
+                ..Self::default()
+            }
+        }
+
         fn queries(&self) -> Vec<Value> {
             self.queries
                 .lock()
                 .expect("queries mutex should not be poisoned")
                 .clone()
+        }
+
+        fn present_ids(&self) -> Vec<String> {
+            let mut ids = self
+                .ids
+                .lock()
+                .expect("ids mutex should not be poisoned")
+                .clone();
+            ids.sort();
+            ids
         }
     }
 
@@ -252,7 +275,18 @@ mod tests {
                 .lock()
                 .expect("queries mutex should not be poisoned")
                 .push(query.clone());
-            Ok(json!({"deleted": 0}))
+
+            // Apply an `ids` query to the modeled store so a test can assert the surviving set.
+            let mut deleted = 0;
+            if let Some(values) = query["ids"]["values"].as_array() {
+                let doomed: std::collections::HashSet<&str> =
+                    values.iter().filter_map(Value::as_str).collect();
+                let mut ids = self.ids.lock().expect("ids mutex should not be poisoned");
+                let before = ids.len();
+                ids.retain(|id| !doomed.contains(id.as_str()));
+                deleted = before - ids.len();
+            }
+            Ok(json!({ "deleted": deleted }))
         }
 
         async fn get_mapping(&self, _index: &str) -> EsResult<MappingResponse> {
@@ -541,6 +575,25 @@ mod tests {
             client.queries(),
             vec![json!({"ids": {"values": ["7", "8"]}})]
         );
+    }
+
+    /// End-to-end over the modeled store: a whole-key delete removes exactly the addressed
+    /// documents and leaves the rest, whatever the query body looks like.
+    #[tokio::test]
+    async fn a_whole_key_delete_removes_only_the_addressed_documents() {
+        let client = RecordingClient::with_ids(&["ORDER-1024", "ORDER-1025", "ORDER-1026"]);
+
+        delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1025")]),
+        )
+        .await
+        .expect("delete should succeed");
+
+        assert_eq!(client.present_ids(), vec!["ORDER-1024", "ORDER-1026"]);
     }
 
     /// An index with no primary key writes documents under generated `_id`s, so there is no id
