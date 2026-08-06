@@ -42,7 +42,7 @@ use crate::federated_table::FederatedTable;
 use crate::search::full_text::table::add_compound_fts_to_table;
 use crate::search::util::find_concrete_table_provider;
 use runtime_metrics::component::MetricsProvider;
-use runtime_parameters::typed::TypedParams as _;
+use runtime_parameters_typed::TypedParams as _;
 use runtime_search::store_params::elasticsearch::{
     ElasticsearchFtsConfig, ElasticsearchFtsParams, normalize_elasticsearch_prefix,
 };
@@ -144,6 +144,7 @@ impl ElasticsearchFullTextConnector {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl DataConnector for ElasticsearchFullTextConnector {
     fn as_any(&self) -> &dyn Any {
@@ -275,6 +276,10 @@ impl DataConnector for ElasticsearchFullTextConnector {
 
     fn append_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
         self.with_indexed_stream(federated_table, |inner, table| inner.append_stream(table))
+    }
+
+    fn initialization_for_dataset(&self, dataset: &Dataset) -> ComponentInitialization {
+        self.inner_connector.initialization_for_dataset(dataset)
     }
 }
 

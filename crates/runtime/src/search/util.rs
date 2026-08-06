@@ -18,81 +18,23 @@ limitations under the License.
 use std::sync::Arc;
 
 use crate::accelerated_table::AcceleratedTable;
-use data_components::MetadataEnrichedTableProvider;
+use crate::table_layers::TABLE_PROVIDER_LAYERS;
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
-use datafusion_federation::FederatedTableProviderAdaptor;
 use runtime_datafusion_index::{
-    INDEXED_INNER, Index, IndexedTableProvider, InnerProviderFn, find_concrete_table_provider_with,
+    Index, IndexedTableProvider, LayerWalk, find_concrete_table_provider_in,
 };
-use runtime_search::embeddings::table::EmbeddingTable;
 use runtime_search::table_provider_explorer::TableProviderExplorer;
 
-use crate::dataconnector::iceberg_cluster::IcebergClusterTableProvider;
-use data_components::iceberg::delete::IcebergDeletionProvider;
-
-/// Inner-provider accessor for [`FederatedTableProviderAdaptor`].
-pub const FEDERATED_ADAPTOR_INNER: InnerProviderFn = |tbl| {
-    tbl.downcast_ref::<FederatedTableProviderAdaptor>()
-        .and_then(|adaptor| adaptor.table_provider.as_ref())
-};
-
-/// Inner-provider accessor for [`MetadataEnrichedTableProvider`].
-pub const METADATA_ENRICHED_INNER: InnerProviderFn = |tbl| {
-    tbl.downcast_ref::<MetadataEnrichedTableProvider>()
-        .map(MetadataEnrichedTableProvider::get_inner_ref)
-};
-
-/// Inner-provider accessor for [`IcebergClusterTableProvider`].
-pub const ICEBERG_CLUSTER_INNER: InnerProviderFn = |tbl| {
-    tbl.downcast_ref::<IcebergClusterTableProvider>()
-        .map(IcebergClusterTableProvider::inner)
-};
-
-/// Inner-provider accessor for [`IcebergDeletionProvider`].
-pub const ICEBERG_DELETION_INNER: InnerProviderFn = |tbl| {
-    tbl.downcast_ref::<IcebergDeletionProvider>()
-        .map(IcebergDeletionProvider::inner)
-};
-
-/// Inner-provider accessor for [`EmbeddingTable`].
-pub const EMBEDDING_INNER: InnerProviderFn = |tbl| {
-    tbl.downcast_ref::<EmbeddingTable>()
-        .map(EmbeddingTable::get_underlying_ref)
-};
-
-/// Inner-provider accessor for [`AcceleratedTable`]. Resolves to the federated
-/// provider only if it is available synchronously (a deferred provider that is
-/// not yet ready yields `None`).
-pub const ACCELERATED_INNER: InnerProviderFn = |tbl| {
-    tbl.downcast_ref::<AcceleratedTable>()
-        .and_then(|accelerated| {
-            accelerated
-                .get_federated_table_ref()
-                .try_table_provider_sync_ref()
-        })
-};
-
-/// The full set of runtime wrapper layers understood by
-/// [`find_concrete_table_provider`].
-pub const DEFAULT_INNER_FNS: &[InnerProviderFn] = &[
-    INDEXED_INNER,
-    FEDERATED_ADAPTOR_INNER,
-    METADATA_ENRICHED_INNER,
-    ICEBERG_CLUSTER_INNER,
-    ICEBERG_DELETION_INNER,
-    EMBEDDING_INNER,
-    ACCELERATED_INNER,
-];
-
 /// Attempt to return a concrete [`TableProvider`] type from a given
-/// [`impl TableProvider`], unwrapping all known runtime wrapper layers
-/// (including `AcceleratedTable`). See [`find_concrete_table_provider_with`]
-/// to restrict which layers are peeled.
+/// [`impl TableProvider`], stepping through every runtime wrapper layer that
+/// is read-transparent (including `AcceleratedTable`). See
+/// [`crate::table_layers`] for the layer table and
+/// [`find_concrete_table_provider_in`] to walk a restricted layer set.
 pub fn find_concrete_table_provider<T: TableProvider + 'static>(
     tbl: &Arc<dyn TableProvider>,
 ) -> Option<&T> {
-    find_concrete_table_provider_with::<T>(tbl, DEFAULT_INNER_FNS)
+    find_concrete_table_provider_in::<T>(tbl, TABLE_PROVIDER_LAYERS, LayerWalk::Read)
 }
 
 pub fn find_index_in_table_provider<T: Index + 'static>(
@@ -145,8 +87,12 @@ impl TableProviderExplorer for RuntimeTableProviderExplorer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dataconnector::iceberg_cluster::IcebergClusterTableProvider;
+    use crate::table_layers::ICEBERG_CLUSTER_LAYER;
     use arrow_schema::{DataType, Field, Schema};
     use data_components::arrow::write::MemTable;
+    use runtime_datafusion_index::find_concrete_table_provider_in;
+    use runtime_search::embeddings::table::EmbeddingTable;
     use search::generation::text_search::index::FullTextDatabaseIndex;
     use std::sync::Arc;
 
@@ -236,8 +182,34 @@ mod tests {
         );
     }
 
+    /// A vector-enabled dataset nests its source under a
+    /// `VectorScanTableProvider`; read-path discovery (health checks, CDC
+    /// ingest lookup) must see the source through it.
     #[test]
-    fn test_find_concrete_table_provider_with_respects_restricted_layer_set() {
+    fn test_find_concrete_table_provider_peels_vector_scan_wrapper() {
+        use search::index::VectorScanTableProvider;
+
+        let base: Arc<dyn TableProvider> = Arc::new(
+            MemTable::try_new(Arc::new(Schema::empty()), vec![]).expect("failed to make table"),
+        );
+
+        let plan = datafusion::logical_expr::LogicalPlanBuilder::empty(false)
+            .build()
+            .expect("empty logical plan should build");
+        let wrapped: Arc<dyn TableProvider> = Arc::new(VectorScanTableProvider {
+            table_provider: Arc::clone(&base),
+            vector_index_list: Arc::new(plan),
+            primary_key: vec![],
+        });
+
+        assert!(
+            find_concrete_table_provider::<MemTable>(&wrapped).is_some(),
+            "find_concrete_table_provider must peel VectorScanTableProvider"
+        );
+    }
+
+    #[test]
+    fn test_find_concrete_table_provider_in_respects_restricted_layer_set() {
         let base_table: Arc<dyn TableProvider> = Arc::new(
             MemTable::try_new(
                 Arc::new(Schema::new(vec![Field::new(
@@ -267,20 +239,25 @@ mod tests {
         // The default set peels the IndexedTableProvider down to the MemTable.
         assert!(
             find_concrete_table_provider::<MemTable>(&wrapped).is_some(),
-            "default unwrappers must peel IndexedTableProvider"
+            "default layer table must peel IndexedTableProvider"
         );
 
-        // A restricted set that lacks the indexed-table accessor must not peel it.
+        // A restricted set that lacks the indexed-table layer must not peel it.
         assert!(
-            find_concrete_table_provider_with::<MemTable>(&wrapped, &[ICEBERG_CLUSTER_INNER])
-                .is_none(),
-            "restricted accessors must not peel layers outside the provided set"
+            find_concrete_table_provider_in::<MemTable>(
+                &wrapped,
+                &[ICEBERG_CLUSTER_LAYER],
+                LayerWalk::Read
+            )
+            .is_none(),
+            "restricted layer sets must not peel layers outside the provided set"
         );
 
         // The layer itself is still reachable directly under a restricted set.
         assert!(
-            find_concrete_table_provider_with::<IndexedTableProvider>(&wrapped, &[]).is_some(),
-            "an empty unwrapper set must still match the outermost provider"
+            find_concrete_table_provider_in::<IndexedTableProvider>(&wrapped, &[], LayerWalk::Read)
+                .is_some(),
+            "an empty layer set must still match the outermost provider"
         );
     }
 }

@@ -22,6 +22,7 @@ use reqwest::Client;
 use snafu::ResultExt;
 
 use crate::error::{self, HttpRequestSnafu, Result};
+use crate::redirect::same_origin_redirect_policy;
 use crate::types::{
     ApiKeysResponse, App, AppsResponse, AuthContext, AuthContextRaw, AuthExchangeRequest,
     AuthExchangeResponse, ContainerImagesResponse, CreateAppRequest, CreateDeploymentRequest,
@@ -33,6 +34,21 @@ use crate::types::{
 
 const DEFAULT_BASE_URL: &str = "https://api.spice.ai";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Build the underlying HTTP client.
+///
+/// Both constructors go through here so the settings cannot drift apart — in particular the
+/// same-origin redirect policy, which is what keeps a bearer token, and the auth code that
+/// `exchange_code` puts in a request body, from following a `Location` off origin.
+fn build_http_client(timeout: Duration) -> Result<Client> {
+    Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(timeout)
+        .https_only(true)
+        .redirect(same_origin_redirect_policy())
+        .build()
+        .context(HttpRequestSnafu)
+}
 
 /// HTTP client for the Spice Cloud API.
 #[derive(Clone)]
@@ -52,12 +68,7 @@ impl CloudClient {
     /// Use [`Self::with_token`] to set an authentication token, and
     /// [`Self::with_timeout`] to override the default 30-second timeout.
     pub fn new(base_url: &str) -> Result<Self> {
-        let client = Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(DEFAULT_TIMEOUT)
-            .https_only(true)
-            .build()
-            .context(HttpRequestSnafu)?;
+        let client = build_http_client(DEFAULT_TIMEOUT)?;
 
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -84,12 +95,7 @@ impl CloudClient {
     ///
     /// Returns an error if the HTTP client cannot be rebuilt with the given timeout.
     pub fn with_timeout(mut self, timeout: Duration) -> Result<Self> {
-        self.client = Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(timeout)
-            .https_only(true)
-            .build()
-            .context(HttpRequestSnafu)?;
+        self.client = build_http_client(timeout)?;
         Ok(self)
     }
 
@@ -694,6 +700,30 @@ mod tests {
     use super::{CloudClient, auth_exchange_result, auth_exchange_status_is_pending};
     use crate::types::{AuthContext, AuthContextApp, AuthContextOrg, AuthContextRaw};
     use crate::{error, types::AuthExchangeResponse};
+
+    /// Both constructors must install the same-origin redirect policy, or a bearer token —
+    /// and the auth code `exchange_code` puts in a request body — could follow a `Location`
+    /// off origin.
+    ///
+    /// `reqwest` exposes no getter for the policy, but its `Client` `Debug` prints a
+    /// `redirect_policy` field only when the policy is *not* the default, and renders a
+    /// custom one as `Custom`. So the absence of that word is exactly the regression.
+    #[test]
+    fn test_both_constructors_install_the_same_origin_redirect_policy() {
+        let client = CloudClient::new("https://api.spice.ai").expect("client should build");
+        assert!(
+            format!("{:?}", client.client).contains("Custom"),
+            "CloudClient::new must set a non-default redirect policy"
+        );
+
+        let retimed = client
+            .with_timeout(std::time::Duration::from_secs(5))
+            .expect("client should rebuild with a new timeout");
+        assert!(
+            format!("{:?}", retimed.client).contains("Custom"),
+            "CloudClient::with_timeout must preserve the redirect policy"
+        );
+    }
 
     #[test]
     fn oauth_base_url_rewrites_api_hosts() {

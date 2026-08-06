@@ -64,6 +64,17 @@ pub enum Error {
     },
 
     #[snafu(display(
+        "MySQL account {account} is missing privileges required for change data capture: \
+         {missing}. Grant them with: \
+         GRANT REPLICATION SLAVE, REPLICATION CLIENT, SELECT ON *.* TO {grant_target};"
+    ))]
+    MissingPrivileges {
+        account: String,
+        grant_target: String,
+        missing: String,
+    },
+
+    #[snafu(display(
         "Binary logging is not enabled on this MySQL server (`log_bin = OFF`). \
          Start the server with binary logging enabled (`--log-bin`); it is on by \
          default on MySQL 8.0+."

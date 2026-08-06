@@ -63,7 +63,7 @@ use azure_identity::{
 };
 use azure_security_keyvault_secrets::SecretClient;
 use futures::StreamExt;
-use runtime_parameter_spec::ParameterSpec;
+use runtime_parameters_derive::TypedParams;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::Snafu;
 use tokio::sync::{Mutex, Notify, OnceCell, RwLock};
@@ -80,62 +80,63 @@ use crate::SecretStore;
 /// the default chain: implicit IMDS/federated-token probing has noisy
 /// failure modes (timeouts, misleading errors) that make misconfiguration
 /// hard to diagnose when the user actually meant the CLI path.
-pub const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::runtime("auth_method")
-        .description(
-            "Authentication method used to obtain tokens for Key Vault. `default` \
-             uses service principal when `client_secret` is set, otherwise falls back \
-             to the Azure CLI / `azd` developer credential. `managed_identity` and \
-             `workload_identity` are never tried implicitly — select them explicitly \
-             when deploying to Azure VMs / AKS. Explicit modes short-circuit the \
-             chain so misconfiguration fails fast.",
-        )
-        .one_of(&[
-            "default",
-            "service_principal",
-            "managed_identity",
-            "workload_identity",
-            "cli",
-        ])
-        .default("default"),
-    ParameterSpec::runtime("tenant_id")
-        .description(
-            "Azure Entra ID (AAD) tenant ID. Required for `service_principal`. \
-             Optional for `workload_identity` — when omitted, the credential reads it \
-             from the `AZURE_TENANT_ID` environment variable injected by the AKS \
-             workload-identity webhook. Ignored otherwise.",
-        )
-        .examples(&["00000000-0000-0000-0000-000000000000"]),
-    ParameterSpec::runtime("client_id")
-        .description(
-            "Azure application (client) ID. Required for `service_principal`. \
-             Optional for `workload_identity` — when omitted, the credential reads it \
-             from the `AZURE_CLIENT_ID` environment variable injected by the AKS \
-             workload-identity webhook. Optional for `managed_identity` — when set, \
-             selects a user-assigned identity; when omitted, the system-assigned \
-             identity is used.",
-        )
-        .examples(&["00000000-0000-0000-0000-000000000000"]),
-    ParameterSpec::runtime("client_secret")
-        .description(
-            "Azure application client secret for `service_principal` auth. Typically \
-             sourced from env, e.g. `${ env:AZURE_CLIENT_SECRET }`.",
-        )
-        .secret(),
-    ParameterSpec::runtime("endpoint")
-        .description(
-            "Override for the Key Vault endpoint. Accepts either a full URL \
-             (e.g. `https://my-vault.vault.usgovcloudapi.net/`), in which case the \
-             selector vault name is ignored, or a bare DNS suffix \
-             (e.g. `vault.usgovcloudapi.net`) that is combined with the selector \
-             to build the URL. Intended for sovereign clouds (Azure Government, \
-             Azure China) and test environments.",
-        )
-        .examples(&[
-            "https://my-vault.vault.usgovcloudapi.net/",
-            "vault.usgovcloudapi.net",
-        ]),
-];
+#[derive(Debug, TypedParams)]
+#[params(prefix = "azure_keyvault", deny_unknown)]
+pub struct AzureKeyVaultParams {
+    /// Authentication method used to obtain tokens for Key Vault. `default`
+    /// uses service principal when `client_secret` is set, otherwise falls back
+    /// to the Azure CLI / `azd` developer credential. `managed_identity` and
+    /// `workload_identity` are never tried implicitly — select them explicitly
+    /// when deploying to Azure VMs / AKS. Explicit modes short-circuit the
+    /// chain so misconfiguration fails fast. One of: default | `service_principal`
+    /// | `managed_identity` | `workload_identity` | cli.
+    #[param(runtime, default = "default")]
+    pub auth_method: AuthMethod,
+    /// Azure Entra ID (AAD) tenant ID. Required for `service_principal`.
+    /// Optional for `workload_identity` — when omitted, the credential reads it
+    /// from the `AZURE_TENANT_ID` environment variable injected by the AKS
+    /// workload-identity webhook. Ignored otherwise.
+    #[param(runtime)]
+    pub tenant_id: Option<String>,
+    /// Azure application (client) ID. Required for `service_principal`.
+    /// Optional for `workload_identity` — when omitted, the credential reads it
+    /// from the `AZURE_CLIENT_ID` environment variable injected by the AKS
+    /// workload-identity webhook. Optional for `managed_identity` — when set,
+    /// selects a user-assigned identity; when omitted, the system-assigned
+    /// identity is used.
+    #[param(runtime)]
+    pub client_id: Option<String>,
+    /// Azure application client secret for `service_principal` auth. Typically
+    /// sourced from env, e.g. `${ env:AZURE_CLIENT_SECRET }`.
+    #[param(runtime)]
+    pub client_secret: Option<SecretString>,
+    /// Override for the Key Vault endpoint. Accepts either a full URL
+    /// (e.g. `https://my-vault.vault.usgovcloudapi.net/`), in which case the
+    /// selector vault name is ignored, or a bare DNS suffix
+    /// (e.g. `vault.usgovcloudapi.net`) that is combined with the selector
+    /// to build the URL. Intended for sovereign clouds (Azure Government,
+    /// Azure China) and test environments.
+    #[param(runtime)]
+    pub endpoint: Option<String>,
+}
+
+impl AzureKeyVaultParams {
+    /// Builds the resolved [`AzureKeyVaultConfig`] from the `from:` selector
+    /// (the vault name or URL) and the typed params, normalizing blank values
+    /// to `None` so an empty `client_secret` can't flip `default` auth into
+    /// service-principal mode.
+    #[must_use]
+    pub fn into_config(self, vault: String) -> AzureKeyVaultConfig {
+        AzureKeyVaultConfig {
+            vault,
+            auth_method: self.auth_method,
+            tenant_id: crate::params::non_empty(self.tenant_id),
+            client_id: crate::params::non_empty(self.client_id),
+            client_secret: crate::params::non_empty_secret(self.client_secret),
+            endpoint: crate::params::non_empty(self.endpoint),
+        }
+    }
+}
 
 /// Resolved configuration for the `azure_keyvault` secret store.
 ///
@@ -190,57 +191,20 @@ pub enum AuthMethod {
     Cli,
 }
 
-impl AuthMethod {
-    fn parse(raw: &str) -> Self {
-        // `validate_params` already enforces the one_of set, so this match is
-        // total in practice; the fallthrough is defensive.
-        match raw {
-            "service_principal" => Self::ServicePrincipal,
-            "managed_identity" => Self::ManagedIdentity,
-            "workload_identity" => Self::WorkloadIdentity,
-            "cli" => Self::Cli,
-            _ => Self::Default,
-        }
-    }
-}
+impl std::str::FromStr for AuthMethod {
+    type Err = String;
 
-impl AzureKeyVaultConfig {
-    /// Builds an [`AzureKeyVaultConfig`] from the parsed selector and a
-    /// validated parameter map.
-    ///
-    /// Empty-string params are normalized to `None`. Without this,
-    /// `client_secret: ""` would pass Spicepod param validation and then
-    /// flip `auth_method: default` into service-principal mode with an
-    /// empty secret, bypassing [`validate_auth_params`] and failing only
-    /// later inside the Azure SDK with a much less actionable error.
-    ///
-    /// Whitespace-only values (e.g. `tenant_id: "   "`) are also treated
-    /// as missing: if a user meant to supply a value they wouldn't have
-    /// put spaces in, and if they left it blank the SDK's own error is a
-    /// worse experience than a clean `MissingAuthParams`. The stripping
-    /// is surface-only — the stored string has its surrounding whitespace
-    /// trimmed so downstream code sees the same canonical form users see
-    /// when they copy-paste values.
-    #[must_use]
-    pub fn from_params(vault: String, params: &HashMap<String, String>) -> Self {
-        fn non_empty(s: Option<&String>) -> Option<String> {
-            let trimmed = s.map(|v| v.trim())?;
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        }
-        let auth_method = params
-            .get("auth_method")
-            .map_or(AuthMethod::Default, |s| AuthMethod::parse(s.as_str()));
-        Self {
-            vault,
-            auth_method,
-            tenant_id: non_empty(params.get("tenant_id")),
-            client_id: non_empty(params.get("client_id")),
-            client_secret: non_empty(params.get("client_secret")).map(SecretString::from),
-            endpoint: non_empty(params.get("endpoint")),
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "default" => Ok(Self::Default),
+            "service_principal" => Ok(Self::ServicePrincipal),
+            "managed_identity" => Ok(Self::ManagedIdentity),
+            "workload_identity" => Ok(Self::WorkloadIdentity),
+            "cli" => Ok(Self::Cli),
+            other => Err(format!(
+                "must be one of: default, service_principal, managed_identity, \
+                 workload_identity, cli. Found {other}."
+            )),
         }
     }
 }
@@ -393,8 +357,9 @@ impl AzureKeyVault {
         self.client_secret.as_ref().map(ExposeSecret::expose_secret)
     }
 
-    /// Creates a new [`AzureKeyVault`] store from a validated
-    /// [`AzureKeyVaultConfig`] (i.e. one produced by [`crate::validate_params`]).
+    /// Creates a new [`AzureKeyVault`] store from a resolved
+    /// [`AzureKeyVaultConfig`] (i.e. one produced by
+    /// [`AzureKeyVaultParams::into_config`]).
     ///
     /// Validates the vault identifier and auth parameters, but does *not*
     /// touch the network. Use [`AzureKeyVault::init`] to verify credentials.
@@ -1016,7 +981,22 @@ fn boxed<E: std::error::Error + Send + Sync + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use runtime_parameters_typed::{NoSecretResolver, TypedParams as _};
     use secrecy::ExposeSecret;
+
+    /// Parses typed params (no secret autoload) and resolves them against the
+    /// given vault selector, mirroring the load-time pipeline.
+    async fn config_from(vault: &str, entries: &[(&str, &str)]) -> AzureKeyVaultConfig {
+        let map = entries
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), SecretString::from((*v).to_string())))
+            .collect();
+        let no_resolver = Arc::new(RwLock::new(NoSecretResolver));
+        AzureKeyVaultParams::try_from_params("secret store azure_keyvault", map, &no_resolver)
+            .await
+            .expect("azure_keyvault params should deserialize")
+            .into_config(vault.to_string())
+    }
 
     #[test]
     fn rejects_empty_vault_name() {
@@ -1138,14 +1118,17 @@ mod tests {
         assert_eq!(url, "https://[::1]:8443/");
     }
 
-    #[test]
-    fn from_params_normalizes_empty_strings_to_none() {
-        let mut p = HashMap::new();
-        p.insert("auth_method".to_string(), "default".to_string());
-        p.insert("tenant_id".to_string(), String::new());
-        p.insert("client_secret".to_string(), String::new());
-
-        let cfg = AzureKeyVaultConfig::from_params("my-vault".to_string(), &p);
+    #[tokio::test]
+    async fn from_params_normalizes_empty_strings_to_none() {
+        let cfg = config_from(
+            "my-vault",
+            &[
+                ("auth_method", "default"),
+                ("tenant_id", ""),
+                ("client_secret", ""),
+            ],
+        )
+        .await;
         assert!(cfg.tenant_id.is_none(), "empty tenant_id must become None");
         assert!(
             cfg.client_secret.is_none(),
@@ -1158,16 +1141,19 @@ mod tests {
     /// `Some("   ")`, later producing a confusing SDK error. Treat them as
     /// missing and — for non-empty values — strip surrounding whitespace so
     /// copy-paste leaks (e.g. trailing newlines) don't trip the SDK either.
-    #[test]
-    fn from_params_treats_whitespace_only_values_as_missing() {
-        let mut p = HashMap::new();
-        p.insert("auth_method".to_string(), "service_principal".to_string());
-        p.insert("tenant_id".to_string(), "   ".to_string());
-        p.insert("client_id".to_string(), "\t\n".to_string());
-        p.insert("client_secret".to_string(), " ".to_string());
-        p.insert("endpoint".to_string(), "\n".to_string());
-
-        let cfg = AzureKeyVaultConfig::from_params("my-vault".to_string(), &p);
+    #[tokio::test]
+    async fn from_params_treats_whitespace_only_values_as_missing() {
+        let cfg = config_from(
+            "my-vault",
+            &[
+                ("auth_method", "service_principal"),
+                ("tenant_id", "   "),
+                ("client_id", "\t\n"),
+                ("client_secret", " "),
+                ("endpoint", "\n"),
+            ],
+        )
+        .await;
         assert!(cfg.tenant_id.is_none(), "whitespace tenant_id must be None");
         assert!(cfg.client_id.is_none(), "whitespace client_id must be None");
         assert!(
@@ -1177,12 +1163,9 @@ mod tests {
         assert!(cfg.endpoint.is_none(), "whitespace endpoint must be None");
     }
 
-    #[test]
-    fn from_params_trims_surrounding_whitespace_but_keeps_value() {
-        let mut p = HashMap::new();
-        p.insert("tenant_id".to_string(), "  tenant-xyz\n".to_string());
-
-        let cfg = AzureKeyVaultConfig::from_params("my-vault".to_string(), &p);
+    #[tokio::test]
+    async fn from_params_trims_surrounding_whitespace_but_keeps_value() {
+        let cfg = config_from("my-vault", &[("tenant_id", "  tenant-xyz\n")]).await;
         assert_eq!(cfg.tenant_id.as_deref(), Some("tenant-xyz"));
     }
 
@@ -1271,23 +1254,22 @@ mod tests {
 
     #[test]
     fn auth_method_parse_maps_expected_strings() {
-        assert_eq!(AuthMethod::parse("default"), AuthMethod::Default);
+        use std::str::FromStr;
+        assert_eq!(AuthMethod::from_str("default"), Ok(AuthMethod::Default));
         assert_eq!(
-            AuthMethod::parse("service_principal"),
-            AuthMethod::ServicePrincipal
+            AuthMethod::from_str("service_principal"),
+            Ok(AuthMethod::ServicePrincipal)
         );
         assert_eq!(
-            AuthMethod::parse("managed_identity"),
-            AuthMethod::ManagedIdentity
+            AuthMethod::from_str("managed_identity"),
+            Ok(AuthMethod::ManagedIdentity)
         );
         assert_eq!(
-            AuthMethod::parse("workload_identity"),
-            AuthMethod::WorkloadIdentity
+            AuthMethod::from_str("workload_identity"),
+            Ok(AuthMethod::WorkloadIdentity)
         );
-        assert_eq!(AuthMethod::parse("cli"), AuthMethod::Cli);
-        // Unknown values fall back to Default; `validate_params` would have
-        // already rejected anything not in the one_of set.
-        assert_eq!(AuthMethod::parse("bogus"), AuthMethod::Default);
+        assert_eq!(AuthMethod::from_str("cli"), Ok(AuthMethod::Cli));
+        AuthMethod::from_str("bogus").expect_err("Unknown auth method values are rejected");
     }
 
     #[test]

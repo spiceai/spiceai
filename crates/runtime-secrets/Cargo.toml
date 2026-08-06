@@ -22,7 +22,8 @@ secrecy.workspace = true
 serde_json.workspace = true
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
-runtime-parameter-spec = { path = "../runtime-parameter-spec" }
+runtime-parameters-typed = { path = "../runtime-parameters-typed" }
+runtime-parameters-derive = { path = "../runtime-parameters-derive" }
 tracing.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 percent-encoding.workspace = true
@@ -45,8 +46,9 @@ azure_core = { version = "0.31.0", optional = true }
 azure_identity = { version = "0.31.0", optional = true }
 azure_security_keyvault_secrets = { version = "0.10.0", optional = true }
 # `url` is used by `resolve_vault_url` (Azure KeyVault) and `build_base_url`
-# (HashiCorp Vault) to enforce a well-formed URL with a host. Pulled in only
-# under either of those features via the feature block below.
+# (HashiCorp Vault) to enforce a well-formed URL with a host, and by the
+# `aws_secrets_manager` `endpoint_url` param. Pulled in only under those
+# features via the feature block below.
 url = { workspace = true, optional = true }
 keyring = { version = "3.6.3", features = [
     "apple-native",
@@ -66,6 +68,7 @@ aws-secrets-manager = [
     "dep:aws-sdk-credential-bridge",
     "dep:aws-sdk-secretsmanager",
     "dep:aws-sdk-sts",
+    "dep:url",
 ]
 azure-keyvault = [
     "dep:azure_core",

@@ -225,7 +225,7 @@ mod tests {
 
     /// Query metrics are emitted from `QueryTracker::finish`, so the tracker must
     /// be built even when task history is disabled. End-to-end coverage:
-    /// `crates/runtime/tests/query_metrics.rs`.
+    /// `crates/runtime/tests/metrics.rs`.
     #[tokio::test]
     async fn tracker_is_built_when_task_history_is_disabled() {
         let query = QueryBuilder::new("SELECT 1", datafusion_with_task_history(false)).build();

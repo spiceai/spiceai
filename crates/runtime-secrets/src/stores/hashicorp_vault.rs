@@ -46,12 +46,13 @@ limitations under the License.
 //!   invalid addresses fail at config load with a concrete message.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use reqwest::{Client, ClientBuilder, StatusCode};
-use runtime_parameter_spec::ParameterSpec;
+use runtime_parameters_derive::TypedParams;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::{ResultExt, Snafu};
 use tokio::sync::{Mutex, RwLock};
@@ -65,105 +66,121 @@ use crate::SecretStore;
 /// Kubernetes and JWT require `hashicorp_vault_role` and a JWT (Kubernetes can also
 /// read it from `hashicorp_vault_kubernetes_token_path`, defaulting to the in-cluster
 /// service-account token).
-pub const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::runtime("hashicorp_vault_address")
-        .description(
-            "Vault server URL, e.g. `https://vault.example.com:8200`. \
-             Plaintext `http://` is allowed only for `localhost` / `127.0.0.1` \
-             so local dev with `vault server -dev` works without TLS.",
-        )
-        .required()
-        .examples(&["https://vault.example.com:8200", "http://127.0.0.1:8200"]),
-    ParameterSpec::runtime("hashicorp_vault_namespace")
-        .description(
-            "Vault Enterprise namespace, sent as the `X-Vault-Namespace` header. \
-             Leave unset for OSS Vault.",
-        )
-        .examples(&["admin", "admin/team-a"]),
-    ParameterSpec::runtime("hashicorp_vault_mount")
-        .description(
-            "Mount path of the KV secrets engine. Defaults to `secret`, the path \
-             that `vault server -dev` provisions automatically.",
-        )
-        .default("secret"),
-    ParameterSpec::runtime("hashicorp_vault_kv_version")
-        .description(
-            "KV engine version. v2 (the modern default) supports versioning and \
-             rolls the read URL through `/data/`; v1 is the legacy layout.",
-        )
-        .one_of(&["v1", "v2"])
-        .default("v2"),
-    ParameterSpec::runtime("hashicorp_vault_auth_method")
-        .description(
-            "Authentication method used to obtain a Vault client token. \
-             `token` uses the supplied `hashicorp_vault_token` directly. `approle`, \
-             `kubernetes`, and `jwt` perform a login round-trip and cache the \
-             returned client token until its lease expires.",
-        )
-        .one_of(&["token", "approle", "kubernetes", "jwt"])
-        .default("token"),
-    ParameterSpec::runtime("hashicorp_vault_token")
-        .description(
-            "Vault client token for `auth_method: token`. Typically sourced \
-             from env, e.g. `${ env:VAULT_TOKEN }`.",
-        )
-        .secret(),
-    ParameterSpec::runtime("hashicorp_vault_role_id")
-        .description("AppRole `role_id`. Required for `auth_method: approle`."),
-    ParameterSpec::runtime("hashicorp_vault_secret_id")
-        .description(
-            "AppRole `secret_id`. Required for `auth_method: approle`. Typically \
-             sourced from env, e.g. `${ env:VAULT_SECRET_ID }`.",
-        )
-        .secret(),
-    ParameterSpec::runtime("hashicorp_vault_role").description(
-        "Vault role name. Required for `auth_method: kubernetes` and \
-             `auth_method: jwt`.",
-    ),
-    ParameterSpec::runtime("hashicorp_vault_jwt")
-        .description(
-            "JWT/OIDC token presented for `auth_method: jwt`, or the Kubernetes \
-             service-account JWT for `auth_method: kubernetes` when not reading \
-             it from disk. Typically sourced from env.",
-        )
-        .secret(),
-    ParameterSpec::runtime("hashicorp_vault_kubernetes_token_path")
-        .description(
-            "Filesystem path to the service-account JWT for `auth_method: kubernetes`. \
-             Defaults to `/var/run/secrets/kubernetes.io/serviceaccount/token`. \
-             Ignored unless `hashicorp_vault_jwt` is unset.",
-        )
-        .examples(&["/var/run/secrets/kubernetes.io/serviceaccount/token"]),
-    ParameterSpec::runtime("hashicorp_vault_auth_mount").description(
-        "Mount path of the auth backend, *without* the leading `auth/` segment. \
-             Defaults to the auth method name (e.g. `approle`, `kubernetes`, `jwt`). \
-             Override when the backend has been mounted at a non-default path \
-             (e.g. `k8s-prod`). A leading `auth/` is tolerated and stripped.",
-    ),
-    ParameterSpec::runtime("hashicorp_vault_ca_cert")
-        .description(
-            "Filesystem path to a PEM-encoded CA certificate to add to the TLS \
-             trust store. Use for self-signed Vault deployments.",
-        )
-        .examples(&["/etc/ssl/vault-ca.pem"]),
-    ParameterSpec::runtime("hashicorp_vault_tls_skip_verify")
-        .description(
-            "Skip TLS certificate verification. Strongly discouraged outside \
-             local development.",
-        )
-        .is_boolean()
-        .default("false"),
-    ParameterSpec::runtime("hashicorp_vault_request_timeout")
-        .description("Per-request timeout in seconds for Vault HTTP calls. Defaults to 10.")
-        .default("10"),
-];
+#[derive(Debug, TypedParams)]
+#[params(prefix = "hashicorp_vault", deny_unknown)]
+pub struct HashicorpVaultParams {
+    /// Vault server URL, e.g. `https://vault.example.com:8200`. Plaintext
+    /// `http://` is allowed only for `localhost` / `127.0.0.1` so local dev
+    /// with `vault server -dev` works without TLS.
+    pub address: String,
+    /// Vault Enterprise namespace, sent as the `X-Vault-Namespace` header.
+    /// Leave unset for OSS Vault.
+    pub namespace: Option<String>,
+    /// Mount path of the KV secrets engine. Defaults to `secret`, the path
+    /// that `vault server -dev` provisions automatically.
+    #[param(default = "secret")]
+    pub mount: String,
+    /// KV engine version. v2 (the modern default) supports versioning and
+    /// rolls the read URL through `/data/`; v1 is the legacy layout. One of: v1 | v2.
+    #[param(default = "v2")]
+    pub kv_version: KvVersion,
+    /// Authentication method used to obtain a Vault client token. `token` uses
+    /// the supplied `hashicorp_vault_token` directly. `approle`, `kubernetes`,
+    /// and `jwt` perform a login round-trip and cache the returned client token
+    /// until its lease expires. One of: token | approle | kubernetes | jwt.
+    #[param(default = "token")]
+    pub auth_method: AuthMethod,
+    /// Vault client token for `auth_method: token`. Typically sourced from env,
+    /// e.g. `${ env:VAULT_TOKEN }`.
+    pub token: Option<SecretString>,
+    /// `AppRole` `role_id`. Required for `auth_method: approle`.
+    pub role_id: Option<String>,
+    /// `AppRole` `secret_id`. Required for `auth_method: approle`. Typically
+    /// sourced from env, e.g. `${ env:VAULT_SECRET_ID }`.
+    pub secret_id: Option<SecretString>,
+    /// Vault role name. Required for `auth_method: kubernetes` and `auth_method: jwt`.
+    pub role: Option<String>,
+    /// JWT/OIDC token presented for `auth_method: jwt`, or the Kubernetes
+    /// service-account JWT for `auth_method: kubernetes` when not reading it
+    /// from disk. Typically sourced from env.
+    pub jwt: Option<SecretString>,
+    /// Filesystem path to the service-account JWT for `auth_method: kubernetes`.
+    /// Defaults to `/var/run/secrets/kubernetes.io/serviceaccount/token`.
+    /// Ignored unless `hashicorp_vault_jwt` is unset.
+    pub kubernetes_token_path: Option<PathBuf>,
+    /// Mount path of the auth backend, *without* the leading `auth/` segment.
+    /// Defaults to the auth method name (e.g. `approle`, `kubernetes`, `jwt`).
+    /// Override when the backend has been mounted at a non-default path
+    /// (e.g. `k8s-prod`). A leading `auth/` is tolerated and stripped.
+    pub auth_mount: Option<String>,
+    /// Filesystem path to a PEM-encoded CA certificate to add to the TLS trust
+    /// store. Use for self-signed Vault deployments.
+    pub ca_cert: Option<PathBuf>,
+    /// Skip TLS certificate verification. Strongly discouraged outside local
+    /// development.
+    #[param(default = "false", parse_with = parse_tls_skip_verify)]
+    pub tls_skip_verify: bool,
+    /// Per-request timeout for Vault HTTP calls. Defaults to 10 seconds.
+    #[param(rename = "request_timeout", default = "10", parse_with = parse_request_timeout)]
+    pub request_timeout: Duration,
+}
+
+/// Parses `hashicorp_vault_tls_skip_verify`, preserving the historically
+/// lenient semantics: only a case-insensitive `true` enables it; every other
+/// value is treated as `false` and never errors.
+// Returns `Result` (never `Err`) because `#[param(parse_with = ...)]` requires a
+// `fn(&str) -> Result<T, impl Display>` signature.
+#[expect(clippy::unnecessary_wraps)]
+fn parse_tls_skip_verify(raw: &str) -> Result<bool, std::convert::Infallible> {
+    Ok(raw.trim().eq_ignore_ascii_case("true"))
+}
+
+/// Parses `hashicorp_vault_request_timeout` (integer seconds), trimming
+/// surrounding whitespace so a templated `"10 "` still parses.
+fn parse_request_timeout(raw: &str) -> Result<Duration, std::num::ParseIntError> {
+    Ok(Duration::from_secs(raw.trim().parse()?))
+}
+
+impl HashicorpVaultParams {
+    /// Builds the resolved [`HashicorpVaultConfig`] from the `from:` selector
+    /// (the KV path) and the typed params, normalizing blank optional values to
+    /// `None` and blank `mount` back to the `secret` default.
+    #[must_use]
+    pub fn into_config(self, path: String) -> HashicorpVaultConfig {
+        let mount = self.mount.trim();
+        HashicorpVaultConfig {
+            path,
+            address: self.address.trim().to_string(),
+            namespace: crate::params::non_empty(self.namespace),
+            mount: if mount.is_empty() {
+                "secret".to_string()
+            } else {
+                mount.to_string()
+            },
+            kv_version: self.kv_version,
+            auth_method: self.auth_method,
+            auth_mount: crate::params::non_empty(self.auth_mount),
+            token: crate::params::non_empty_secret(self.token),
+            role_id: crate::params::non_empty(self.role_id),
+            secret_id: crate::params::non_empty_secret(self.secret_id),
+            role: crate::params::non_empty(self.role),
+            jwt: crate::params::non_empty_secret(self.jwt),
+            kubernetes_token_path: crate::params::non_empty_path(self.kubernetes_token_path),
+            ca_cert: crate::params::non_empty_path(self.ca_cert),
+            tls_skip_verify: self.tls_skip_verify,
+            request_timeout: self.request_timeout,
+        }
+    }
+}
 
 /// Default cache TTL applied when Vault does not return a `lease_duration`
 /// for the data secret (typical for KV which has no lease itself).
 const DEFAULT_DATA_TTL: Duration = Duration::from_mins(1);
 /// Negative-cache TTL for confirmed-missing paths (404).
 const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(10);
-/// Default request timeout when none is configured.
+/// Mirrors the `#[param(default = "10")]` on `request_timeout` above, for
+/// tests asserting the parsed default.
+#[cfg(test)]
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default mount path for the Kubernetes service-account token, matching
 /// Vault's own default expectation.
@@ -188,13 +205,6 @@ pub enum Error {
          e.g. `https://vault.example.com:8200`."
     ))]
     InvalidAddress { address: String, reason: String },
-
-    #[snafu(display("Invalid value '{value}' for parameter '{parameter}': {reason}."))]
-    InvalidNumericParameter {
-        parameter: String,
-        value: String,
-        reason: String,
-    },
 
     #[snafu(display("Vault auth method '{method}' requires the following parameters: {missing}."))]
     MissingAuthParams { method: String, missing: String },
@@ -270,13 +280,14 @@ pub enum KvVersion {
     V2,
 }
 
-impl KvVersion {
-    fn parse(raw: &str) -> Self {
-        // `validate_params` already enforces the one_of set, so `v1` is the
-        // only non-default outcome; the fallthrough is defensive.
+impl std::str::FromStr for KvVersion {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
         match raw {
-            "v1" => Self::V1,
-            _ => Self::V2,
+            "v1" => Ok(Self::V1),
+            "v2" => Ok(Self::V2),
+            other => Err(format!("must be one of: v1, v2. Found {other}.")),
         }
     }
 }
@@ -299,16 +310,23 @@ pub enum AuthMethod {
     Jwt,
 }
 
-impl AuthMethod {
-    fn parse(raw: &str) -> Self {
+impl std::str::FromStr for AuthMethod {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
         match raw {
-            "approle" => Self::AppRole,
-            "kubernetes" => Self::Kubernetes,
-            "jwt" => Self::Jwt,
-            _ => Self::Token,
+            "token" => Ok(Self::Token),
+            "approle" => Ok(Self::AppRole),
+            "kubernetes" => Ok(Self::Kubernetes),
+            "jwt" => Ok(Self::Jwt),
+            other => Err(format!(
+                "must be one of: token, approle, kubernetes, jwt. Found {other}."
+            )),
         }
     }
+}
 
+impl AuthMethod {
     fn as_str(self) -> &'static str {
         match self {
             Self::Token => "token",
@@ -337,8 +355,8 @@ pub struct HashicorpVaultConfig {
     pub secret_id: Option<SecretString>,
     pub role: Option<String>,
     pub jwt: Option<SecretString>,
-    pub kubernetes_token_path: Option<String>,
-    pub ca_cert: Option<String>,
+    pub kubernetes_token_path: Option<PathBuf>,
+    pub ca_cert: Option<PathBuf>,
     pub tls_skip_verify: bool,
     pub request_timeout: Duration,
 }
@@ -363,80 +381,6 @@ impl std::fmt::Debug for HashicorpVaultConfig {
             .field("tls_skip_verify", &self.tls_skip_verify)
             .field("request_timeout", &self.request_timeout)
             .finish()
-    }
-}
-
-impl HashicorpVaultConfig {
-    /// Builds a [`HashicorpVaultConfig`] from the parsed selector and a validated
-    /// parameter map.
-    ///
-    /// Empty / whitespace-only string params are normalized to `None` so
-    /// users can leave keys defined-but-blank in templated configs without
-    /// silently turning `auth_method: token` + `hashicorp_vault_token: ""` into a
-    /// confusing 400 from Vault.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::InvalidNumericParameter`] if `hashicorp_vault_request_timeout` is
-    ///   present but not a non-negative integer (in seconds). All other
-    ///   semantic checks are deferred to [`HashicorpVault::from_config`] so the
-    ///   spicepod can be loaded with partial configuration in tests.
-    pub fn from_params(path: String, params: &HashMap<String, String>) -> Result<Self> {
-        fn non_empty(s: Option<&String>) -> Option<String> {
-            let trimmed = s.map(|v| v.trim())?;
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        }
-
-        let auth_method = params
-            .get("hashicorp_vault_auth_method")
-            .map_or(AuthMethod::Token, |s| AuthMethod::parse(s.as_str()));
-        let kv_version = params
-            .get("hashicorp_vault_kv_version")
-            .map_or(KvVersion::V2, |s| KvVersion::parse(s.as_str()));
-        let mount =
-            non_empty(params.get("hashicorp_vault_mount")).unwrap_or_else(|| "secret".to_string());
-        let tls_skip_verify = params
-            .get("hashicorp_vault_tls_skip_verify")
-            .is_some_and(|s| s.eq_ignore_ascii_case("true"));
-        let request_timeout = match non_empty(params.get("hashicorp_vault_request_timeout")) {
-            None => DEFAULT_REQUEST_TIMEOUT,
-            Some(raw) => {
-                let parsed = raw
-                    .parse::<u64>()
-                    .map_err(|e| Error::InvalidNumericParameter {
-                        parameter: "hashicorp_vault_request_timeout".to_string(),
-                        value: raw.clone(),
-                        reason: format!("expected a non-negative integer in seconds: {e}"),
-                    })?;
-                Duration::from_secs(parsed)
-            }
-        };
-
-        Ok(Self {
-            path,
-            // `hashicorp_vault_address` is required at the spec level so this is
-            // populated in normal use; the empty default is checked in
-            // `from_config` for a clean error.
-            address: non_empty(params.get("hashicorp_vault_address")).unwrap_or_default(),
-            namespace: non_empty(params.get("hashicorp_vault_namespace")),
-            mount,
-            kv_version,
-            auth_method,
-            auth_mount: non_empty(params.get("hashicorp_vault_auth_mount")),
-            token: non_empty(params.get("hashicorp_vault_token")).map(SecretString::from),
-            role_id: non_empty(params.get("hashicorp_vault_role_id")),
-            secret_id: non_empty(params.get("hashicorp_vault_secret_id")).map(SecretString::from),
-            role: non_empty(params.get("hashicorp_vault_role")),
-            jwt: non_empty(params.get("hashicorp_vault_jwt")).map(SecretString::from),
-            kubernetes_token_path: non_empty(params.get("hashicorp_vault_kubernetes_token_path")),
-            ca_cert: non_empty(params.get("hashicorp_vault_ca_cert")),
-            tls_skip_verify,
-            request_timeout,
-        })
     }
 }
 
@@ -712,9 +656,9 @@ impl HashicorpVault {
         let path = self
             .config
             .kubernetes_token_path
-            .as_deref()
-            .unwrap_or(DEFAULT_K8S_TOKEN_PATH)
-            .to_string();
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_K8S_TOKEN_PATH));
+        let path_display = path.display().to_string();
         // The SA JWT is a small (<2 KiB) file on disk; we use
         // `spawn_blocking` rather than `tokio::fs` to avoid pulling the
         // `fs` feature into `runtime-secrets`'s `tokio` dependency.
@@ -722,10 +666,10 @@ impl HashicorpVault {
         let token = tokio::task::spawn_blocking(move || std::fs::read_to_string(&read_path))
             .await
             .map_err(|e| Error::UnableToReadKubernetesToken {
-                path: path.clone(),
+                path: path_display.clone(),
                 source: std::io::Error::other(e.to_string()),
             })?
-            .with_context(|_| UnableToReadKubernetesTokenSnafu { path: path.clone() })?;
+            .with_context(|_| UnableToReadKubernetesTokenSnafu { path: path_display })?;
         Ok(SecretString::from(token.trim().to_string()))
     }
 
@@ -1041,12 +985,12 @@ fn build_http_client(config: &HashicorpVaultConfig) -> Result<Client> {
         builder = builder.danger_accept_invalid_certs(true);
     }
     if let Some(ca_path) = config.ca_cert.as_deref() {
+        let path_display = ca_path.display().to_string();
         let pem = std::fs::read(ca_path).context(UnableToReadCaCertSnafu {
-            path: ca_path.to_string(),
+            path: path_display.clone(),
         })?;
-        let cert = reqwest::tls::Certificate::from_pem(&pem).context(InvalidCaCertSnafu {
-            path: ca_path.to_string(),
-        })?;
+        let cert = reqwest::tls::Certificate::from_pem(&pem)
+            .context(InvalidCaCertSnafu { path: path_display })?;
         builder = builder.add_root_certificate(cert);
     }
     builder.build().context(ClientBuildSnafu)
@@ -1176,6 +1120,7 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use runtime_parameters_typed::TypedParams as _;
 
     fn base_params() -> HashMap<String, String> {
         let mut p = HashMap::new();
@@ -1187,12 +1132,32 @@ mod tests {
         p
     }
 
+    /// Parses typed params (no secret autoload) and resolves them against the
+    /// given KV path, mirroring the load-time pipeline. The parse never awaits
+    /// (vault declares no autoload fields), so it can be driven synchronously.
+    fn cfg_from(
+        path: &str,
+        params: &HashMap<String, String>,
+    ) -> Result<HashicorpVaultConfig, runtime_parameters_typed::ParamsError> {
+        let map = params
+            .iter()
+            .map(|(k, v)| (k.clone(), SecretString::from(v.clone())))
+            .collect();
+        let no_resolver = Arc::new(RwLock::new(runtime_parameters_typed::NoSecretResolver));
+        futures::executor::block_on(HashicorpVaultParams::try_from_params(
+            "secret store hashicorp_vault",
+            map,
+            &no_resolver,
+        ))
+        .map(|typed| typed.into_config(path.to_string()))
+    }
+
     #[test]
     fn from_params_normalizes_empty_strings_to_none() {
         let mut p = base_params();
         p.insert("hashicorp_vault_namespace".into(), String::new());
         p.insert("hashicorp_vault_role_id".into(), "  ".into());
-        let cfg = HashicorpVaultConfig::from_params("myapp".into(), &p)
+        let cfg = cfg_from("myapp", &p)
             .map_err(|e| e.to_string())
             .expect("from_params");
         assert!(cfg.namespace.is_none());
@@ -1201,7 +1166,7 @@ mod tests {
 
     #[test]
     fn from_params_defaults_mount_and_kv_version() {
-        let cfg = HashicorpVaultConfig::from_params("myapp".into(), &base_params())
+        let cfg = cfg_from("myapp", &base_params())
             .map_err(|e| e.to_string())
             .expect("from_params");
         assert_eq!(cfg.mount, "secret");
@@ -1218,7 +1183,7 @@ mod tests {
         p.insert("hashicorp_vault_auth_method".into(), "approle".into());
         p.insert("hashicorp_vault_role_id".into(), "rid".into());
         p.insert("hashicorp_vault_secret_id".into(), "sid".into());
-        let cfg = HashicorpVaultConfig::from_params("myapp".into(), &p)
+        let cfg = cfg_from("myapp", &p)
             .map_err(|e| e.to_string())
             .expect("from_params");
         assert_eq!(cfg.kv_version, KvVersion::V1);
@@ -1232,12 +1197,18 @@ mod tests {
 
     #[test]
     fn auth_method_parse() {
-        assert_eq!(AuthMethod::parse("approle"), AuthMethod::AppRole);
-        assert_eq!(AuthMethod::parse("kubernetes"), AuthMethod::Kubernetes);
-        assert_eq!(AuthMethod::parse("jwt"), AuthMethod::Jwt);
-        assert_eq!(AuthMethod::parse("token"), AuthMethod::Token);
-        // Unknown defaults to Token (validate_params already rejects unknowns).
-        assert_eq!(AuthMethod::parse("garbage"), AuthMethod::Token);
+        use std::str::FromStr;
+        assert_eq!(AuthMethod::from_str("approle"), Ok(AuthMethod::AppRole));
+        assert_eq!(
+            AuthMethod::from_str("kubernetes"),
+            Ok(AuthMethod::Kubernetes)
+        );
+        assert_eq!(AuthMethod::from_str("jwt"), Ok(AuthMethod::Jwt));
+        assert_eq!(AuthMethod::from_str("token"), Ok(AuthMethod::Token));
+        // Unknown values are now rejected (the typed field's FromStr replaces
+        // the old one_of validation), rather than silently falling back.
+        AuthMethod::from_str("garbage")
+            .expect_err("garbage should be rejected as an unknown auth method");
     }
 
     #[test]
@@ -1282,7 +1253,7 @@ mod tests {
 
     #[test]
     fn validate_auth_params_token() {
-        let mut cfg = HashicorpVaultConfig::from_params("p".into(), &base_params())
+        let mut cfg = cfg_from("p", &base_params())
             .map_err(|e| e.to_string())
             .expect("from_params");
         validate_auth_params(&cfg).expect("token ok");
@@ -1297,7 +1268,7 @@ mod tests {
         let mut p = base_params();
         p.remove("hashicorp_vault_token");
         p.insert("hashicorp_vault_auth_method".into(), "approle".into());
-        let cfg = HashicorpVaultConfig::from_params("p".into(), &p)
+        let cfg = cfg_from("p", &p)
             .map_err(|e| e.to_string())
             .expect("from_params");
         let err = validate_auth_params(&cfg).expect_err("missing both");
@@ -1314,7 +1285,7 @@ mod tests {
         p.remove("hashicorp_vault_token");
         p.insert("hashicorp_vault_auth_method".into(), "kubernetes".into());
         p.insert("hashicorp_vault_role".into(), "myrole".into());
-        let cfg = HashicorpVaultConfig::from_params("p".into(), &p)
+        let cfg = cfg_from("p", &p)
             .map_err(|e| e.to_string())
             .expect("from_params");
         validate_auth_params(&cfg).expect("k8s role ok; jwt resolved at login time");
@@ -1325,7 +1296,7 @@ mod tests {
         let mut p = base_params();
         p.remove("hashicorp_vault_token");
         p.insert("hashicorp_vault_auth_method".into(), "jwt".into());
-        let cfg = HashicorpVaultConfig::from_params("p".into(), &p)
+        let cfg = cfg_from("p", &p)
             .map_err(|e| e.to_string())
             .expect("from_params");
         let err = validate_auth_params(&cfg).expect_err("missing");
@@ -1355,7 +1326,7 @@ mod tests {
         let mut p = base_params();
         p.insert("hashicorp_vault_secret_id".into(), "supersecret".into());
         p.insert("hashicorp_vault_jwt".into(), "jwt-value".into());
-        let cfg = HashicorpVaultConfig::from_params("myapp".into(), &p)
+        let cfg = cfg_from("myapp", &p)
             .map_err(|e| e.to_string())
             .expect("from_params");
         let dbg = format!("{cfg:?}");
@@ -1367,7 +1338,7 @@ mod tests {
 
     #[test]
     fn from_config_empty_path_rejected() {
-        let cfg = HashicorpVaultConfig::from_params("   ".into(), &base_params())
+        let cfg = cfg_from("   ", &base_params())
             .map_err(|e| e.to_string())
             .expect("from_params");
         match HashicorpVault::from_config(cfg) {
@@ -1379,7 +1350,7 @@ mod tests {
 
     #[test]
     fn from_config_normalizes_path_trims_slashes() {
-        let cfg = HashicorpVaultConfig::from_params("/myapp/cfg/".into(), &base_params())
+        let cfg = cfg_from("/myapp/cfg/", &base_params())
             .map_err(|e| e.to_string())
             .expect("from_params");
         let v = HashicorpVault::from_config(cfg)
@@ -1397,7 +1368,7 @@ mod tests {
         let mut p = base_params();
         p.insert("hashicorp_vault_kv_version".into(), "v1".into());
         p.insert("hashicorp_vault_mount".into(), "kv".into());
-        let cfg = HashicorpVaultConfig::from_params("a/b".into(), &p)
+        let cfg = cfg_from("a/b", &p)
             .map_err(|e| e.to_string())
             .expect("from_params");
         let v = HashicorpVault::from_config(cfg)
@@ -1410,15 +1381,12 @@ mod tests {
     fn from_params_invalid_request_timeout_is_rejected() {
         let mut p = base_params();
         p.insert("hashicorp_vault_request_timeout".into(), "ten".into());
-        match HashicorpVaultConfig::from_params("myapp".into(), &p) {
-            Err(Error::InvalidNumericParameter {
-                parameter, value, ..
-            }) => {
-                assert_eq!(parameter, "hashicorp_vault_request_timeout");
-                assert_eq!(value, "ten");
+        match cfg_from("myapp", &p) {
+            Err(runtime_parameters_typed::ParamsError::InvalidValue { user_key, .. }) => {
+                assert_eq!(user_key, "hashicorp_vault_request_timeout");
             }
             Err(e) => panic!("unexpected error: {e}"),
-            Ok(_) => panic!("expected InvalidNumericParameter"),
+            Ok(_) => panic!("expected InvalidValue for a non-numeric timeout"),
         }
     }
 
@@ -1433,7 +1401,7 @@ mod tests {
             p.insert("hashicorp_vault_role_id".into(), "r".into());
             p.insert("hashicorp_vault_secret_id".into(), "s".into());
             p.insert("hashicorp_vault_auth_mount".into(), mount.into());
-            let cfg = HashicorpVaultConfig::from_params("app".into(), &p)
+            let cfg = cfg_from("app", &p)
                 .map_err(|e| e.to_string())
                 .expect("from_params");
             HashicorpVault::from_config(cfg)

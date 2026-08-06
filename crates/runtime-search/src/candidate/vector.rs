@@ -347,7 +347,7 @@ impl ChunkedNonIndexVectorGeneration {
     /// partitioned by pk, so a sibling `row_number() = 1` filter selects
     /// the best-matching element in the same step.
     fn aggregate_score_expr(&self, pks: &[String]) -> Result<LogicalExpr, DataFusionError> {
-        let partition: Vec<LogicalExpr> = pks.iter().map(col).collect();
+        let partition: Vec<LogicalExpr> = pks.iter().map(ident).collect();
         let score_arg = col(SEARCH_SCORE_COLUMN_NAME);
 
         let aggregation = match &self.mode {
@@ -460,7 +460,7 @@ impl ChunkedNonIndexVectorGeneration {
 
         // Then apply the window function in a separate step
         let window_expr = row_number()
-            .partition_by(pks.iter().map(col).collect())
+            .partition_by(pks.iter().map(ident).collect())
             .order_by(vec![col(SEARCH_SCORE_COLUMN_NAME).sort(false, false)])
             .build()?
             .alias("chunk_rank");
@@ -562,7 +562,7 @@ impl ChunkedNonIndexVectorGeneration {
         // Two sibling window functions: one to pick the argmax element
         // (`chunk_rank = 1`), one to compute the aggregated per-pk score.
         let rank_window = row_number()
-            .partition_by(pks.iter().map(col).collect())
+            .partition_by(pks.iter().map(ident).collect())
             .order_by(vec![col(SEARCH_SCORE_COLUMN_NAME).sort(false, false)])
             .build()?
             .alias("chunk_rank");
@@ -665,7 +665,7 @@ impl ChunkedNonIndexVectorGeneration {
         // Step 1: per (pk, q_idx) — MAX cosine (best stored element for
         // this query) and FIRST_VALUE(match element ordered by score).
         let step1_group: Vec<LogicalExpr> =
-            [pks.iter().map(col).collect(), vec![col("q_idx")]].concat();
+            [pks.iter().map(ident).collect(), vec![col("q_idx")]].concat();
         let per_query_best_col = "per_query_best";
         let per_query_match_col = "per_query_match";
 
@@ -683,7 +683,7 @@ impl ChunkedNonIndexVectorGeneration {
 
         // Step 2: per pk — SUM per-query bests (late-interaction total);
         // pick the match element from whichever query scored highest.
-        let step2_group: Vec<LogicalExpr> = pks.iter().map(col).collect();
+        let step2_group: Vec<LogicalExpr> = pks.iter().map(ident).collect();
         let match_sort = vec![col(per_query_best_col).sort(false, false)];
         let aggregated = step1
             .aggregate(
@@ -819,6 +819,31 @@ mod tests {
         assert!(
             matches!(unwrap_alias(&expr), LogicalExpr::WindowFunction(_)),
             "expected WindowFunction, got {expr:?}"
+        );
+    }
+
+    /// Regression test: the per-pk window partition went through `col()`, which routes
+    /// through `Column::from_qualified_name` and splits on `.`, so a chunked index's
+    /// `_spice.chunk_id` key partitioned by column `chunk_id` of relation `_spice`
+    /// instead of by the one column actually named `_spice.chunk_id`. Asserted on the
+    /// resolved column refs, not on the rendered expression: a `Column`'s display is
+    /// `_spice.chunk_id` either way, so only the `relation`/`name` split tells them apart.
+    #[test]
+    fn aggregate_score_expr_partitions_by_a_dotted_primary_key_whole() {
+        let candidate = make_list_multi_gen(EmbeddingAggregation::Max);
+        let expr = candidate
+            .aggregate_score_expr(&["_spice.chunk_id".to_string()])
+            .expect("should not error");
+
+        let refs = expr.column_refs();
+        assert!(
+            refs.iter()
+                .any(|c| c.relation.is_none() && c.name == "_spice.chunk_id"),
+            "the partition key must stay one unqualified column named `_spice.chunk_id`: {refs:?}"
+        );
+        assert!(
+            !refs.iter().any(|c| c.name == "chunk_id"),
+            "the dotted key was split into relation `_spice` + column `chunk_id`: {refs:?}"
         );
     }
 

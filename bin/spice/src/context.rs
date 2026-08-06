@@ -27,11 +27,27 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
+/// The runtime HTTP endpoint the CLI talks to when `--http-endpoint` is not given.
+///
+/// The default lives here rather than on the flag so that not passing the flag is
+/// distinguishable from passing this exact value — see [`RuntimeContext::http_endpoint_chosen`].
+pub const DEFAULT_HTTP_ENDPOINT: &str = "http://127.0.0.1:8090";
+
 /// Constants for Spice paths and filenames
 const DOT_SPICE: &str = ".spice";
 const SPICED_FILENAME: &str = "spiced";
 const SPICEPODS_DIR: &str = "spicepods";
 const WSL_ENV_KEYS: [&str; 2] = ["WSL_DISTRO_NAME", "WSL_INTEROP"];
+
+/// Treat a blank credential as absent.
+///
+/// A credential that is empty or whitespace-only cannot authenticate anything, so
+/// carrying it as `Some` only means an empty header goes out on the wire and any
+/// fallback that keys off `is_none` is suppressed. The value is otherwise kept
+/// verbatim -- only the all-blank case is discarded.
+fn normalize_credential(value: Option<String>) -> Option<String> {
+    value.filter(|key| !key.trim().is_empty())
+}
 
 /// Runtime context holding paths and configuration for CLI operations.
 #[derive(Debug, Clone)]
@@ -50,6 +66,11 @@ pub struct RuntimeContext {
 
     /// HTTP endpoint for runtime API
     http_endpoint: String,
+
+    /// Whether `http_endpoint` came from `--http-endpoint`, rather than the built-in default
+    /// or the cloud region. `spice sql` needs the provenance and not the value: it moves only
+    /// the Flight endpoint, so an HTTP endpoint nobody pointed at that runtime is not it.
+    http_endpoint_chosen: bool,
 
     /// API key for authentication
     api_key: Option<String>,
@@ -96,7 +117,8 @@ impl RuntimeContext {
             spice_bin_dir,
             app_dir,
             pods_dir,
-            http_endpoint: "http://127.0.0.1:8090".to_string(),
+            http_endpoint: DEFAULT_HTTP_ENDPOINT.to_string(),
+            http_endpoint_chosen: false,
             api_key: None,
             cloud_region: None,
             user_agent: Self::default_user_agent(),
@@ -120,14 +142,19 @@ impl RuntimeContext {
 
         if let Some(endpoint) = http_endpoint {
             ctx.http_endpoint = endpoint;
+            ctx.http_endpoint_chosen = true;
         }
 
         if let Some(region) = cloud {
+            // The region replaces whatever `--http-endpoint` asked for, so the endpoint in use
+            // is derived from the region rather than chosen. It is derived alongside the Cloud
+            // Flight endpoint, which is what makes the pair trustworthy.
             ctx.http_endpoint = spice_cloud_data_endpoint(region);
+            ctx.http_endpoint_chosen = false;
             ctx.cloud_region = Some(region.to_string());
         }
 
-        ctx.api_key = api_key;
+        ctx.api_key = normalize_credential(api_key);
         ctx.tls_root_certificate_file = tls_root_certificate_file;
 
         // Load API key from .env if not provided
@@ -148,8 +175,42 @@ impl RuntimeContext {
         )
     }
 
-    /// Load API key from .env or .env.local file.
+    /// Load API key from the environment or a .env / .env.local file.
+    ///
+    /// `SPICE_API_KEY` is checked before the files because `--api-key` is declared
+    /// with `env = "SPICE_API_KEY"`: clap resolves that variable itself whenever the
+    /// flag is omitted, so consulting it first here is what makes a blank
+    /// `--api-key` resolve to the same key that omitting the flag would.
     fn load_api_key_from_env(&self) -> Option<String> {
+        self.resolve_api_key(|key| std::env::var(key).ok())
+    }
+
+    /// `load_api_key_from_env` with the environment lookup injected, so the precedence
+    /// between the process environment and the app's .env files is testable without
+    /// mutating this process's environment.
+    fn resolve_api_key<F>(&self, mut get_env: F) -> Option<String>
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        if let Some(api_key) = normalize_credential(get_env("SPICE_API_KEY")) {
+            return Some(api_key);
+        }
+
+        if let Some(api_key) = self.load_api_key_from_env_files() {
+            return Some(api_key);
+        }
+
+        normalize_credential(get_env("SPICE_SPICEAI_API_KEY"))
+    }
+
+    /// Load API key from the app's .env.local or .env file.
+    ///
+    /// The first matching entry wins, exactly as before -- .env.local outranks .env,
+    /// and within a file the earlier line wins. A blank value is authoritative but is
+    /// never a credential: `spice login` writes `SPICE_SPICEAI_API_KEY=` for an app
+    /// that has no key, so a blank resolves to `None` rather than falling through to
+    /// an older key in a lower-precedence file.
+    fn load_api_key_from_env_files(&self) -> Option<String> {
         // Try .env.local first, then .env
         let env_files = [".env.local", ".env"];
 
@@ -160,16 +221,13 @@ impl RuntimeContext {
             {
                 for item in env_map.flatten() {
                     if item.0 == "SPICE_SPICEAI_API_KEY" || item.0 == "SPICE_API_KEY" {
-                        return Some(item.1);
+                        return normalize_credential(Some(item.1));
                     }
                 }
             }
         }
 
-        // Also check environment variables
-        std::env::var("SPICE_API_KEY")
-            .or_else(|_| std::env::var("SPICE_SPICEAI_API_KEY"))
-            .ok()
+        None
     }
 
     /// Get the Spice runtime directory (~/.spice).
@@ -205,6 +263,13 @@ impl RuntimeContext {
     #[must_use]
     pub fn http_endpoint(&self) -> &str {
         &self.http_endpoint
+    }
+
+    /// Whether the HTTP endpoint came from `--http-endpoint`, rather than the built-in default
+    /// or the cloud region.
+    #[must_use]
+    pub fn http_endpoint_chosen(&self) -> bool {
+        self.http_endpoint_chosen
     }
 
     /// Get the API key if set.
@@ -594,6 +659,7 @@ mod tests {
             app_dir: PathBuf::from("/test/app"),
             pods_dir: PathBuf::from("/test/app/spicepods"),
             http_endpoint: "http://127.0.0.1:8090".to_string(),
+            http_endpoint_chosen: false,
             api_key: None,
             cloud_region: None,
             user_agent: "spice/test (test; test)".to_string(),
@@ -618,6 +684,7 @@ mod tests {
             app_dir: PathBuf::from("/test/app"),
             pods_dir: PathBuf::from("/test/app/spicepods"),
             http_endpoint: "http://127.0.0.1:8090".to_string(),
+            http_endpoint_chosen: false,
             api_key: None,
             cloud_region: None,
             user_agent: "spice/test (test; test)".to_string(),
@@ -1082,12 +1149,192 @@ mod tests {
         assert_eq!(ctx.http_endpoint(), "http://custom:9999");
     }
 
+    /// #11005: `spice sql` moves only the Flight endpoint, so it needs to tell an HTTP endpoint
+    /// somebody chose from the default one nobody pointed anywhere.
+    #[test]
+    fn test_with_args_records_whether_the_http_endpoint_was_chosen() {
+        let chosen =
+            RuntimeContext::with_args(Some("http://custom:9999".to_string()), None, None, None)
+                .expect("with_args should succeed");
+
+        assert!(chosen.http_endpoint_chosen());
+
+        let omitted =
+            RuntimeContext::with_args(None, None, None, None).expect("with_args should succeed");
+
+        assert!(!omitted.http_endpoint_chosen());
+        assert_eq!(omitted.http_endpoint(), DEFAULT_HTTP_ENDPOINT);
+    }
+
+    /// A cloud region replaces the flag's value, so the endpoint in use was derived rather than
+    /// chosen — and it is derived alongside the Cloud Flight endpoint, which is what makes the
+    /// pair trustworthy without either being chosen.
+    #[test]
+    fn test_with_args_treats_a_cloud_endpoint_as_derived() {
+        let ctx = RuntimeContext::with_args(
+            Some("http://custom:9999".to_string()),
+            None,
+            Some("us-east-1"),
+            None,
+        )
+        .expect("with_args should succeed");
+
+        assert!(!ctx.http_endpoint_chosen());
+        assert_ne!(ctx.http_endpoint(), "http://custom:9999");
+    }
+
     #[test]
     fn test_with_args_sets_api_key() {
         let ctx = RuntimeContext::with_args(None, Some("test-key".to_string()), None, None)
             .expect("with_args should succeed");
 
         assert_eq!(ctx.api_key(), Some("test-key"));
+    }
+
+    #[test]
+    fn test_normalize_credential_discards_blank_values() {
+        assert_eq!(normalize_credential(None), None);
+        assert_eq!(normalize_credential(Some(String::new())), None);
+        assert_eq!(normalize_credential(Some("   ".to_string())), None);
+        assert_eq!(normalize_credential(Some("\t\r\n".to_string())), None);
+    }
+
+    #[test]
+    fn test_normalize_credential_keeps_a_real_key_verbatim() {
+        assert_eq!(
+            normalize_credential(Some("real-key".to_string())),
+            Some("real-key".to_string())
+        );
+        // Surrounding whitespace decides only whether the value is blank; a key that
+        // has any content is passed through exactly as supplied.
+        assert_eq!(
+            normalize_credential(Some(" real-key ".to_string())),
+            Some(" real-key ".to_string())
+        );
+    }
+
+    #[test]
+    fn test_with_args_treats_an_empty_api_key_as_absent() {
+        // Regression: `--api-key ""` used to be carried as Some("") -- it suppressed the
+        // .env fallback and every authenticated request went out with a blank credential.
+        // The resolved key may legitimately come from the environment here, so what is
+        // asserted is that the blank flag itself is never what gets carried.
+        for blank in ["", "   ", "\t"] {
+            let ctx = RuntimeContext::with_args(None, Some(blank.to_string()), None, None)
+                .expect("with_args should succeed");
+
+            assert_ne!(
+                ctx.api_key(),
+                Some(blank),
+                "an explicitly blank --api-key must not be carried verbatim"
+            );
+            assert!(
+                ctx.api_key().is_none_or(|key| !key.trim().is_empty()),
+                "a blank --api-key must never resolve to a blank credential"
+            );
+        }
+    }
+
+    /// A context whose app dir is an isolated temp dir, for the .env lookup tests.
+    /// The `TempDir` must be kept alive for the test.
+    fn create_test_context_with_app_dir() -> (RuntimeContext, TempDir) {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let mut ctx = create_test_context();
+        ctx.app_dir = temp_dir.path().to_path_buf();
+
+        (ctx, temp_dir)
+    }
+
+    /// Write one of the app dir's env files for a .env lookup test.
+    fn write_env_file(dir: &TempDir, name: &str, contents: &str) {
+        std::fs::write(dir.path().join(name), contents).expect("write env file");
+    }
+
+    #[test]
+    fn test_load_api_key_from_env_files_returns_a_stored_key() {
+        let (ctx, temp_dir) = create_test_context_with_app_dir();
+        write_env_file(&temp_dir, ".env", "SPICE_API_KEY=real-key\n");
+
+        assert_eq!(
+            ctx.load_api_key_from_env_files(),
+            Some("real-key".to_string())
+        );
+    }
+
+    #[test]
+    fn test_load_api_key_from_env_files_prefers_env_local() {
+        let (ctx, temp_dir) = create_test_context_with_app_dir();
+        write_env_file(&temp_dir, ".env.local", "SPICE_API_KEY=local-key\n");
+        write_env_file(&temp_dir, ".env", "SPICE_API_KEY=plain-key\n");
+
+        assert_eq!(
+            ctx.load_api_key_from_env_files(),
+            Some("local-key".to_string())
+        );
+    }
+
+    #[test]
+    fn test_load_api_key_from_env_files_treats_a_stored_blank_as_no_key() {
+        let (ctx, temp_dir) = create_test_context_with_app_dir();
+        // `spice login` writes SPICE_SPICEAI_API_KEY= for an app that has no key, so a
+        // blank is a deliberate "no key" -- it must resolve to None rather than either
+        // becoming a blank credential or resurrecting an older key from .env.
+        write_env_file(&temp_dir, ".env.local", "SPICE_SPICEAI_API_KEY=\n");
+        write_env_file(&temp_dir, ".env", "SPICE_API_KEY=older-key\n");
+
+        assert_eq!(ctx.load_api_key_from_env_files(), None);
+    }
+
+    #[test]
+    fn test_load_api_key_from_env_files_without_any_env_file() {
+        let (ctx, _temp_dir) = create_test_context_with_app_dir();
+
+        assert_eq!(ctx.load_api_key_from_env_files(), None);
+    }
+
+    /// An env lookup for the resolve tests: `name` is set to `value`, nothing else is.
+    fn only_env(name: &'static str, value: &'static str) -> impl FnMut(&str) -> Option<String> {
+        move |key| (key == name).then(|| value.to_string())
+    }
+
+    #[test]
+    fn test_resolve_api_key_prefers_the_process_environment() {
+        // --api-key is declared `env = "SPICE_API_KEY"`, so clap resolves that variable
+        // itself when the flag is omitted. This fallback has to agree with clap:
+        // otherwise a blank --api-key would resolve to the .env key while omitting the
+        // flag resolved to the environment's, silently selecting a different credential.
+        let (ctx, temp_dir) = create_test_context_with_app_dir();
+        write_env_file(&temp_dir, ".env.local", "SPICE_API_KEY=file-key\n");
+
+        let api_key = ctx.resolve_api_key(only_env("SPICE_API_KEY", "env-key"));
+
+        assert_eq!(api_key, Some("env-key".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_api_key_prefers_files_over_the_legacy_variable() {
+        let (ctx, temp_dir) = create_test_context_with_app_dir();
+        write_env_file(&temp_dir, ".env", "SPICE_API_KEY=file-key\n");
+
+        // A blank primary variable falls through to the files, and a stored key outranks
+        // the legacy variable -- together with the two tests either side of this one,
+        // that pins the whole order: SPICE_API_KEY > .env files > SPICE_SPICEAI_API_KEY.
+        let api_key = ctx.resolve_api_key(|key| match key {
+            "SPICE_API_KEY" => Some("   ".to_string()),
+            "SPICE_SPICEAI_API_KEY" => Some("legacy-key".to_string()),
+            _ => None,
+        });
+
+        assert_eq!(api_key, Some("file-key".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_api_key_uses_the_legacy_variable_last() {
+        let (ctx, _temp_dir) = create_test_context_with_app_dir();
+
+        let api_key = ctx.resolve_api_key(only_env("SPICE_SPICEAI_API_KEY", "legacy-key"));
+
+        assert_eq!(api_key, Some("legacy-key".to_string()));
     }
 
     #[test]
