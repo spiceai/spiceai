@@ -36,6 +36,39 @@ pub type SqlServerConnectionPool = Pool<SqlServerConnectionManager>;
 /// back to the listener from redirecting for as long as the pool will wait.
 const MAX_ROUTING_REDIRECTS: usize = 3;
 
+/// How much of a server-supplied diagnostic to keep when reporting it.
+///
+/// Long enough for a real login rejection, short enough that a peer cannot decide
+/// how much of an operator's log one failed connection occupies.
+const MAX_REPORTED_CHARS: usize = 512;
+
+/// Renders server-supplied diagnostic text as one bounded log line.
+///
+/// A TDS error message and a routing target are both chosen by the peer, and
+/// `tiberius` surfaces them verbatim. Every log record here has to stay on a single
+/// line, so control characters are replaced rather than passed through — otherwise a
+/// peer emitting newlines splits one failure across several records, each of which
+/// reads like an independent event.
+fn as_one_line(text: &str) -> String {
+    let mut reported: String = text
+        .chars()
+        .take(MAX_REPORTED_CHARS)
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    // `nth` rather than `count`: asking how long the whole text is would walk all of it,
+    // which is the work the cap exists to avoid.
+    if text.chars().nth(MAX_REPORTED_CHARS).is_some() {
+        reported.push('…');
+    }
+    reported
+}
+
 #[derive(Clone, Debug)]
 pub struct SqlServerConnectionManager {
     config: Config,
@@ -75,13 +108,17 @@ impl SqlServerConnectionManager {
                     if redirects == MAX_ROUTING_REDIRECTS {
                         return Err(TiberiusError::Protocol(
                             format!(
-                                "the server redirected the connection more than {MAX_ROUTING_REDIRECTS} times without completing a login, most recently to {host}:{port}. Check the availability group's read-only routing list: a list that routes back to the listener redirects for as long as the connection is retried. For details, visit: https://spiceai.org/docs/components/data-connectors/mssql"
+                                "the server redirected the connection more than {MAX_ROUTING_REDIRECTS} times without completing a login, most recently to {}:{port}. Check the availability group's read-only routing list: a list that routes back to the listener redirects for as long as the connection is retried. For details, visit: https://spiceai.org/docs/components/data-connectors/mssql",
+                                as_one_line(&host)
                             )
                             .into(),
                         ));
                     }
                     redirects += 1;
-                    tracing::debug!("SQL Server routed the connection to {host}:{port}");
+                    tracing::debug!(
+                        "SQL Server routed the connection to {}:{port}",
+                        as_one_line(&host)
+                    );
                     config.host(host);
                     config.port(port);
                 }
@@ -104,7 +141,10 @@ struct LogConnectionErrors;
 
 impl ErrorSink<TiberiusError> for LogConnectionErrors {
     fn sink(&self, error: TiberiusError) {
-        tracing::warn!("Failed to connect to SQL Server: {error}. Retrying.");
+        tracing::warn!(
+            "Failed to connect to SQL Server: {}. Retrying.",
+            as_one_line(&error.to_string())
+        );
     }
 
     fn boxed_clone(&self) -> Box<dyn ErrorSink<TiberiusError>> {
@@ -155,8 +195,8 @@ mod tests {
     use parking_lot::Mutex;
 
     use super::{
-        Config, ErrorSink, LogConnectionErrors, MAX_ROUTING_REDIRECTS, SqlServerConnectionManager,
-        TiberiusError,
+        Config, ErrorSink, LogConnectionErrors, MAX_REPORTED_CHARS, MAX_ROUTING_REDIRECTS,
+        SqlServerConnectionManager, TiberiusError,
     };
 
     const LISTENER: &str = "ag-listener";
@@ -186,19 +226,13 @@ mod tests {
     }
 
     impl ScriptedServer {
+        /// Answers the first attempts from `replies`; once they run out, every further
+        /// attempt is redirected back at the listener — the misconfiguration the
+        /// redirect bound exists to terminate.
         fn new(replies: Vec<Result<(), TiberiusError>>) -> Arc<Self> {
             Arc::new(Self {
                 dialled: Mutex::new(Vec::new()),
                 replies: Mutex::new(replies.into()),
-            })
-        }
-
-        /// Replies every attempt with a routing redirect that points back at the listener,
-        /// which is the misconfiguration the redirect bound exists to terminate.
-        fn always_routing() -> Arc<Self> {
-            Arc::new(Self {
-                dialled: Mutex::new(Vec::new()),
-                replies: Mutex::new(VecDeque::new()),
             })
         }
 
@@ -266,7 +300,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_chain_of_redirects_is_bounded_and_reported() {
-        let server = ScriptedServer::always_routing();
+        let server = ScriptedServer::new(Vec::new());
 
         let Err(error) = connect_via(&server).await else {
             panic!("expected a routing list that never settles to fail");
@@ -323,19 +357,22 @@ mod tests {
         }
     }
 
-    #[test]
-    fn every_connection_failure_the_pool_retries_is_reported_once() {
+    /// Runs `emit` against a subscriber that keeps only warnings, and returns what it wrote.
+    fn warnings_from(emit: impl FnOnce()) -> String {
         let logs = CapturedLogs::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(logs.clone())
             .with_max_level(tracing::Level::WARN)
             .finish();
+        tracing::subscriber::with_default(subscriber, emit);
+        logs.contents()
+    }
 
-        tracing::subscriber::with_default(subscriber, || {
+    #[test]
+    fn every_connection_failure_the_pool_retries_is_reported_once() {
+        let contents = warnings_from(|| {
             LogConnectionErrors.sink(routing_to("read-replica", 1444));
         });
-
-        let contents = logs.contents();
         assert_eq!(
             contents.matches("Failed to connect to SQL Server").count(),
             1,
@@ -344,6 +381,35 @@ mod tests {
         assert!(
             contents.contains("read-replica:1444"),
             "the report should carry the underlying error: {contents}"
+        );
+    }
+
+    #[test]
+    fn a_server_supplied_diagnostic_stays_on_one_bounded_line() {
+        // What a hostile — or merely broken — server can put in a TDS error token: line
+        // breaks that would split one failure across several records, and a body long
+        // enough to let the peer decide how much of the log it occupies.
+        let hostile = format!("first line\r\nsecond line\t{}", "A".repeat(4096));
+        let contents = warnings_from(|| {
+            LogConnectionErrors.sink(TiberiusError::Protocol(hostile.into()));
+        });
+        assert_eq!(
+            contents.lines().count(),
+            1,
+            "one failure must be one record: {contents}"
+        );
+        assert!(
+            contents.contains("first line  second line "),
+            "the text should survive with its control characters replaced: {contents}"
+        );
+        assert!(
+            contents.contains('…'),
+            "an over-long diagnostic should be marked as truncated: {contents}"
+        );
+        assert!(
+            contents.chars().count() < 2 * MAX_REPORTED_CHARS,
+            "the record should be bounded by the cap, not by what the peer sent ({} chars)",
+            contents.chars().count()
         );
     }
 }
