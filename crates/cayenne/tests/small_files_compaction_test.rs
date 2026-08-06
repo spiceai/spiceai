@@ -64,9 +64,13 @@ fn aggressive_compaction_config() -> VortexConfig {
         compaction_trigger_files: 4,
         compaction_max_levels: 3,
         compaction_max_files_per_pick: 32,
-        // Disable the background scheduler so tests are deterministic — we
-        // drive compaction explicitly via maybe_compact_small_files() on the
-        // inline path or by triggering it from the test body.
+        // Stops the interval scheduler, so tests drive compaction explicitly via
+        // maybe_compact_small_files() on the inline path or from the test body.
+        // NOTE: it does NOT stop compaction from running on its own. An append
+        // still calls `schedule_post_write_compaction`, which spawns a pass
+        // regardless of this interval, so a test that measures file counts around
+        // its own writes must quiesce first — see
+        // `wait_until_current_snapshot_compacts`.
         compaction_background_interval_ms: 0,
         ..VortexConfig::default()
     }
@@ -132,10 +136,16 @@ fn value_payload(prefix: &str, row_id: i64) -> String {
 }
 
 /// Count `.vortex` files in `<data_path>/<table_id>/<current_snapshot_id>`.
+///
+/// A snapshot dir that does not exist yet holds no files, so that reads as 0. Any
+/// other error is raised: treating it as 0 would read as "compaction consolidated
+/// everything" and pass the very assertions that call this.
 async fn count_vortex_files(data_path: &Path, table_id: &str, snapshot_id: &str) -> usize {
     let snapshot_dir = data_path.join(table_id).join(snapshot_id);
-    let Ok(mut entries) = tokio::fs::read_dir(&snapshot_dir).await else {
-        return 0;
+    let mut entries = match tokio::fs::read_dir(&snapshot_dir).await {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(e) => panic!("read_dir {} failed: {e}", snapshot_dir.display()),
     };
     let mut count = 0;
     while let Some(entry) = entries.next_entry().await.expect("read_dir") {
@@ -198,14 +208,15 @@ async fn count_rows_matching(ctx: &SessionContext, table_name: &str, where_claus
 /// `uncompacted_file_count`, i.e. once small-file compaction has consolidated
 /// the seeded appends, or `None` if no compaction is reachable.
 ///
-/// `uncompacted_file_count` must be the number of files the test *seeded*, not
-/// a count sampled from the store after the writes. Appends drive
+/// `uncompacted_file_count` must be the number of appends the test *seeded*, not
+/// a count listed from the store after the writes. Appends drive
 /// `schedule_post_write_compaction`, which is NOT disabled by
 /// `compaction_background_interval_ms: 0` — that only stops the interval
-/// scheduler — so a post-write pass runs on the dedicated compaction runtime and
-/// can consolidate the seed while the test is still writing it. A count sampled
-/// afterwards may therefore already be the compacted count, making a further
-/// reduction unreachable and this helper's answer depend on that race.
+/// scheduler — so a pass gets spawned and can consolidate the seed while the test
+/// is still writing it. (These tests install no dedicated compaction runtime, so
+/// that pass lands on the ambient one and interleaves at the test's await points.)
+/// A count listed afterwards may therefore already be the compacted count, making
+/// a further reduction unreachable and this helper's answer depend on that race.
 ///
 /// Quiescing first is what makes the answer deterministic. A post-write pass and
 /// this helper both call `compact_current_snapshot_small_files`, so they contend
@@ -217,6 +228,10 @@ async fn count_rows_matching(ctx: &SessionContext, table_name: &str, where_claus
 /// is in flight or scheduled and only a new write could schedule one, so the
 /// observation below is stable; the bounded loop is a backstop for a staged
 /// append still finalizing, not the mechanism.
+///
+/// The drain is bounded here because it has none of its own: a pass that never
+/// finishes would otherwise hang until the much larger harness process timeout,
+/// reporting nothing about where it stopped.
 async fn wait_until_current_snapshot_compacts(
     table: &Arc<CayenneTableProvider>,
     fixture: &common::TestFixture,
@@ -225,8 +240,22 @@ async fn wait_until_current_snapshot_compacts(
 ) -> Result<Option<(String, usize)>, Box<dyn std::error::Error>> {
     const TIMEOUT: Duration = Duration::from_secs(10);
     const POLL_INTERVAL: Duration = Duration::from_millis(50);
+    const DRAIN_TIMEOUT: Duration = Duration::from_secs(120);
 
-    table.drain_in_flight_maintenance().await?;
+    match tokio::time::timeout(DRAIN_TIMEOUT, table.drain_in_flight_maintenance()).await {
+        Ok(drained) => drained?,
+        Err(_) => {
+            let table_meta = fixture.catalog.get_table(table_name).await?;
+            let snapshot_id = table_meta.current_snapshot_id;
+            let files =
+                count_vortex_files(&fixture.data_path, &table_meta.table_id, &snapshot_id).await;
+            panic!(
+                "draining {table_name}'s in-flight maintenance did not finish within \
+                 {DRAIN_TIMEOUT:?} (snapshot {snapshot_id}, {files} files, \
+                 target below {uncompacted_file_count})"
+            );
+        }
+    }
 
     let started = Instant::now();
     loop {
@@ -1007,9 +1036,6 @@ async fn compact_current_after_seed_then_more_preserves_all_rows(
     let expected = small_rows * (seed_batches + more);
     assert_eq!(count_rows(&ctx, "two_phase_compact").await, expected);
 
-    // Quiesce before sampling, so `files_before` is a settled count rather than
-    // one a post-write pass is still moving underneath the comparison below.
-    table.drain_in_flight_maintenance().await?;
     let snap_before = fixture
         .catalog
         .get_table("two_phase_compact")
@@ -1332,18 +1358,18 @@ async fn a_seed_is_consolidated_before_its_fanout_can_be_listed(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = pk_schema();
-    let (table, ctx, table_id) = build_table(
-        &fixture,
-        "consolidated_seed",
-        Arc::clone(&schema),
-        None,
-        aggressive_key_deletion_compaction_config(),
-    )
-    .await;
+    // A real PK (and no `OnConflict`), so the table is not silently resolved to
+    // the position-based strategy the way a PK-less one is.
+    let (table, ctx, table_id) =
+        build_append_only_key_delete_table(&fixture, "consolidated_seed", Arc::clone(&schema))
+            .await;
 
     let batch_rows: i64 = 1500;
     let batches = 12_i64;
-    let seeded_files = usize::try_from(batches).expect("batch count fits usize");
+    // One append of 1500 rows clears `INLINE_MAX_ROWS` and, at ~130 KiB against a
+    // 1 MiB target, is not sharded, so the un-compacted seed is one file per
+    // append. Counted in appends because that is the number the test controls.
+    let seeded_appends = usize::try_from(batches).expect("batch count fits usize");
     for batch_idx in 0..batches {
         common::insert_batch(
             &table,
@@ -1362,22 +1388,22 @@ async fn a_seed_is_consolidated_before_its_fanout_can_be_listed(
         .current_snapshot_id;
     let settled_files = count_vortex_files(&fixture.data_path, &table_id, &settled_snapshot).await;
     assert!(
-        settled_files < seeded_files,
+        settled_files < seeded_appends,
         "a post-write pass must consolidate the seed unprompted, which is what makes a \
-         listed fan-out unusable as the premise (seeded={seeded_files}, settled={settled_files})"
+         listed fan-out unusable as the premise (seeded={seeded_appends}, settled={settled_files})"
     );
 
-    // Measured against the seeded count the reduction is still visible from this
+    // Measured against the seeded appends the reduction is still visible from this
     // already-consolidated state; measured against `settled_files` it could not be.
     let Some((_post_snap, post_count)) =
-        wait_until_current_snapshot_compacts(&table, &fixture, "consolidated_seed", seeded_files)
+        wait_until_current_snapshot_compacts(&table, &fixture, "consolidated_seed", seeded_appends)
             .await?
     else {
         panic!("an already-consolidated seed must still report a reduced fan-out");
     };
     assert!(
-        post_count < seeded_files,
-        "fan-out must stay below the seeded count (seeded={seeded_files}, post={post_count})"
+        post_count < seeded_appends,
+        "fan-out must stay below the seeded appends (seeded={seeded_appends}, post={post_count})"
     );
 
     // The drain waits for the pass rather than cancelling it, so every row it
@@ -1425,23 +1451,27 @@ async fn warm_subset_reduces_small_file_fanout(
         .await?;
     }
 
-    // Each batch is larger than `INLINE_MAX_ROWS`, so an un-compacted seed is
-    // one vortex file per batch. That seeded count — not a count listed after
-    // the writes — is the fan-out compaction has to beat; see
+    // Each append clears `INLINE_MAX_ROWS` and is too small to shard, so an
+    // un-compacted seed is one vortex file per append. That seeded count — not a
+    // count listed after the writes — is the fan-out compaction has to beat; see
     // `wait_until_current_snapshot_compacts` for why a listed count can already
     // be the compacted one.
-    let seeded_files = usize::try_from(batches).expect("batch count fits usize");
-    let Some((post_snap, post_count)) =
-        wait_until_current_snapshot_compacts(&table, &fixture, "warm_subset_fanout", seeded_files)
-            .await?
+    let seeded_appends = usize::try_from(batches).expect("batch count fits usize");
+    let Some((post_snap, post_count)) = wait_until_current_snapshot_compacts(
+        &table,
+        &fixture,
+        "warm_subset_fanout",
+        seeded_appends,
+    )
+    .await?
     else {
-        panic!("warm-subset compaction should fire");
+        panic!("small-file compaction should fire");
     };
 
     assert_ne!(post_snap, pre_snapshot, "compact must advance the snapshot");
     assert!(
-        post_count < seeded_files,
-        "subset compact must strictly reduce fan-out (seeded={seeded_files}, post={post_count})"
+        post_count < seeded_appends,
+        "compaction must strictly reduce fan-out (seeded={seeded_appends}, post={post_count})"
     );
     assert_eq!(
         count_rows(&ctx, "warm_subset_fanout").await,
