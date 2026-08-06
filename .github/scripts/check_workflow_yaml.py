@@ -21,6 +21,11 @@
 # And it rejects an `if:` naming a context GitHub does not make available there,
 # which fails the same way for a different reason: GitHub rejects the definition
 # rather than the expression, so the workflow never schedules (#12396).
+#
+# Finally, it requires a nightly's later test suites to survive an earlier one's
+# failure. A step's default condition is `success()`, so in a job that runs its
+# suites as a sequence of steps the first red suite skips every suite behind it:
+# their state stops being reported and nobody is told it stopped (#12625).
 """Validate the repository's GitHub Actions workflow and composite action YAML."""
 
 from __future__ import annotations
@@ -90,6 +95,20 @@ CONTEXT_REMEDIES = {
 }
 
 
+# A step that runs a test suite. Both spellings reach the same place: a suite
+# whose result the run exists to report.
+SUITE_COMMANDS = ("cargo nextest run", "cargo test")
+
+# The action that publishes a nightly's refreshed snapshots. It is the last step
+# of the jobs below, so a suite that skips it costs the run its whole output.
+SNAPSHOT_ACTION = "push-snap-changes"
+
+# The two status functions that let a step run after an earlier one failed.
+# `always()` also survives cancellation; `!cancelled()` does not, and is the
+# better default — a cancelled run should stop.
+SURVIVES_FAILURE = re.compile(r"(?:!\s*cancelled|always)\s*\(\s*\)")
+
+
 def workflow_files(github_dir: Path) -> list[Path]:
     """Return the workflow definitions under `<github_dir>/workflows`, sorted."""
     workflows = github_dir / "workflows"
@@ -136,6 +155,7 @@ def check_workflow(text: str) -> list[str]:
     else:
         problems.extend(check_step_budgets(jobs))
         problems.extend(check_workflow_conditions(jobs))
+        problems.extend(check_suite_visibility(jobs, is_scheduled(document)))
 
     return problems
 
@@ -271,6 +291,82 @@ def check_step_budgets(jobs: dict) -> list[str]:
                 f"job `{name}` gives `{label}` a {step_budget}-minute budget that its "
                 f"own {job_budget}-minute budget pre-empts"
             )
+    return problems
+
+
+def is_scheduled(document: dict) -> bool:
+    """Report whether the workflow carries a `schedule:` trigger."""
+    for key in TRIGGER_KEYS:
+        triggers = document.get(key)
+        if isinstance(triggers, dict) and "schedule" in triggers:
+            return True
+    return False
+
+
+def _runs_a_suite(step: dict) -> bool:
+    """Report whether the step's `run:` invokes a test suite."""
+    command = step.get("run")
+    return isinstance(command, str) and any(c in command for c in SUITE_COMMANDS)
+
+
+def _publishes_snapshots(step: dict) -> bool:
+    """Report whether the step publishes the run's refreshed snapshots."""
+    action = step.get("uses")
+    return isinstance(action, str) and SNAPSHOT_ACTION in action
+
+
+def _survives_an_earlier_failure(step: dict) -> bool:
+    """Report whether the step's condition lets it run after an earlier one failed."""
+    condition = step.get("if")
+    return isinstance(condition, str) and bool(SURVIVES_FAILURE.search(condition))
+
+
+def check_suite_visibility(jobs: dict, scheduled: bool) -> list[str]:
+    """Report a scheduled job's test suites that an earlier suite's failure hides.
+
+    A step's default condition is `success()`. A job that runs its suites as a
+    sequence of steps therefore reports the first failure and skips everything
+    behind it, so the remaining suites' state goes unobserved while the job's
+    conclusion says only that something failed — one red suite is indistinguishable
+    from nine. That is #12625, where an OpenAI failure skipped eight suites and the
+    search suite's state was unknown for two days.
+
+    The first suite in a job needs no condition: nothing precedes it to hide it.
+    Everything after it does, as does the step that publishes the snapshots, which
+    is what a nightly refresh exists to produce.
+
+    Scoped to scheduled workflows. On a PR gate, stopping at the first failure is
+    the point, and this says nothing about those.
+
+    A suite is recognised by the command in its own `run:`, so a job that reaches
+    its suites through a `make` target or a composite action is not covered — the
+    command lives outside the workflow file. No scheduled job does that today.
+    """
+    if not scheduled:
+        return []
+
+    problems = []
+    for name, job in jobs.items():
+        if not isinstance(job, dict):
+            continue
+        steps = job.get("steps")
+        if not isinstance(steps, list):
+            continue
+
+        a_suite_ran = False
+        for position, step in enumerate(steps, start=1):
+            if not isinstance(step, dict):
+                continue
+            runs_a_suite = _runs_a_suite(step)
+            hideable = runs_a_suite or _publishes_snapshots(step)
+            if hideable and a_suite_ran and not _survives_an_earlier_failure(step):
+                label = step.get("name") or f"step {position}"
+                problems.append(
+                    f"job `{name}` lets an earlier suite's failure skip `{label}`; "
+                    "give it `if: ${{ !cancelled() && <its existing condition> }}` so "
+                    "the job's conclusion reports every suite"
+                )
+            a_suite_ran = a_suite_ran or runs_a_suite
     return problems
 
 

@@ -208,7 +208,7 @@ jobs:
 
       # OpenAI tests
       - name: Run OpenAI integration test
-        if: env.HAS_OPENAI_SECRET == 'true'
+        if: ${{ !cancelled() && env.HAS_OPENAI_SECRET == 'true' }}
         env:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
@@ -220,7 +220,7 @@ jobs:
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- openai_test
 
       - name: Run OpenAI Beta functionality embeddings test
-        if: env.HAS_OPENAI_SECRET == 'true'
+        if: ${{ !cancelled() && env.HAS_OPENAI_SECRET == 'true' }}
         env:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
@@ -233,7 +233,7 @@ jobs:
 
       # AI UDF tests
       - name: Run AI UDF basic test
-        if: env.HAS_OPENAI_SECRET == 'true' && env.HAS_ANTHROPIC_SECRET == 'true'
+        if: ${{ !cancelled() && env.HAS_OPENAI_SECRET == 'true' && env.HAS_ANTHROPIC_SECRET == 'true' }}
         env:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
@@ -250,7 +250,7 @@ jobs:
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- test_ai_udf_basic
 
       - name: Run AI UDF with dataset test
-        if: env.HAS_OPENAI_SECRET == 'true' && env.HAS_ANTHROPIC_SECRET == 'true' && env.HAS_XAI_SECRET == 'true'
+        if: ${{ !cancelled() && env.HAS_OPENAI_SECRET == 'true' && env.HAS_ANTHROPIC_SECRET == 'true' && env.HAS_XAI_SECRET == 'true' }}
         env:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
@@ -273,7 +273,7 @@ jobs:
 
       # NOTE: Step-level `if:` conditionals on secret-requiring AI test steps (OpenAI, workers, search, xAI/HF UDFs, etc.) cause the step to report "skipped" (neutral, job succeeds) on PRs where secrets are intentionally unavailable for security (forks/external PRs). When a step *does* execute (schedule/workflow_dispatch with secrets present), an explicit fast-fail guard at the start of `run:` errors immediately if a required key is missing, preserving the original intent. This is intentional and confirmed for schedule + workflow_dispatch (incl. `run_all_tests`). See Copilot review threads for context; prevents spurious reds unrelated to code.
       - name: Run AI UDF LEFT truncate test
-        if: env.HAS_OPENAI_SECRET == 'true' && env.HAS_ANTHROPIC_SECRET == 'true' && env.HAS_XAI_SECRET == 'true'
+        if: ${{ !cancelled() && env.HAS_OPENAI_SECRET == 'true' && env.HAS_ANTHROPIC_SECRET == 'true' && env.HAS_XAI_SECRET == 'true' }}
         env:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
@@ -288,13 +288,14 @@ jobs:
 
       # Local model tests
       - name: Run local embeddings Beta functionality test
+        if: ${{ !cancelled() }}
         env:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
         run: |
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- local_embeddings_beta_requirements
 
       - name: Run AI UDF with local model test
-        if: env.HAS_HF_SECRET == 'true'
+        if: ${{ !cancelled() && env.HAS_HF_SECRET == 'true' }}
         env:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
@@ -303,7 +304,7 @@ jobs:
 
       # Workers tests
       - name: Run workers integration test
-        if: env.HAS_OPENAI_SECRET == 'true'
+        if: ${{ !cancelled() && env.HAS_OPENAI_SECRET == 'true' }}
         env:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
@@ -316,7 +317,7 @@ jobs:
 
       # Search tests
       - name: Run search integration test
-        if: env.HAS_OPENAI_SECRET == 'true' && env.HAS_S3_VECTORS_SECRET == 'true'
+        if: ${{ !cancelled() && env.HAS_OPENAI_SECRET == 'true' && env.HAS_S3_VECTORS_SECRET == 'true' }}
         env:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
@@ -330,7 +331,7 @@ jobs:
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- search
 
       - name: Push snapshots to branch
-        if: github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule'
+        if: ${{ !cancelled() && (github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule') }}
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -388,7 +389,7 @@ jobs:
           path: ./integration_test
 
       - name: Run integration test
-        if: env.HAS_HF_SECRET == 'true'
+        if: ${{ !cancelled() && env.HAS_HF_SECRET == 'true' }}
         env:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
@@ -400,7 +401,7 @@ jobs:
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- huggingface_test
 
       - name: Run Beta functionality embedding tests
-        if: env.HAS_HF_SECRET == 'true'
+        if: ${{ !cancelled() && env.HAS_HF_SECRET == 'true' }}
         env:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
@@ -412,7 +413,7 @@ jobs:
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- hf_embeddings_beta_requirements
 
       - name: Push snapshots to branch
-        if: github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule'
+        if: ${{ !cancelled() && (github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule') }}
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -477,7 +478,7 @@ jobs:
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- bedrock_test
 
       - name: Push snapshots to branch
-        if: github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule'
+        if: ${{ !cancelled() && (github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule') }}
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}

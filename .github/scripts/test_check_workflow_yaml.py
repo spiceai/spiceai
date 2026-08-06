@@ -183,6 +183,129 @@ class CheckStepBudgetTest(unittest.TestCase):
         )
 
 
+def _nightly_with_suites(*suites: tuple[str, str], trigger: str = "schedule") -> str:
+    """A scheduled job running each `(name, if)` suite in turn; empty `if` omits it."""
+    header = (
+        "---\non:\n"
+        + ("  schedule:\n    - cron: '0 0 * * *'\n" if trigger == "schedule" else "")
+        + ("  workflow_dispatch:\n" if trigger != "schedule" else "")
+        + "\njobs:\n  nightly:\n    runs-on: ubuntu-24.04\n    steps:\n"
+    )
+    body = "".join(
+        f"      - name: {name}\n"
+        + (f"        if: {condition}\n" if condition else "")
+        + "        run: cargo nextest run -- suite\n"
+        for name, condition in suites
+    )
+    return header + body
+
+
+def _hidden(label: str) -> str:
+    return (
+        f"job `nightly` lets an earlier suite's failure skip `{label}`; give it "
+        "`if: ${{ !cancelled() && <its existing condition> }}` so the job's "
+        "conclusion reports every suite"
+    )
+
+
+class CheckSuiteVisibilityTest(unittest.TestCase):
+    """#12625: a nightly's first failing suite skips every suite behind it."""
+
+    def test_the_first_suite_needs_no_condition(self):
+        """Nothing precedes it, so nothing can hide it."""
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(_nightly_with_suites(("Run A", ""))), []
+        )
+
+    def test_a_later_suite_with_no_condition_is_reported(self):
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(
+                _nightly_with_suites(("Run A", ""), ("Run B", ""))
+            ),
+            [_hidden("Run B")],
+        )
+
+    def test_a_later_suite_gated_only_on_a_secret_is_reported(self):
+        """The shape the nightly actually had: a condition that `success()` still gates."""
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(
+                _nightly_with_suites(("Run A", ""), ("Run B", "env.HAS_KEY == 'true'"))
+            ),
+            [_hidden("Run B")],
+        )
+
+    def test_every_hidden_suite_is_reported(self):
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(
+                _nightly_with_suites(("Run A", ""), ("Run B", ""), ("Run C", ""))
+            ),
+            [_hidden("Run B"), _hidden("Run C")],
+        )
+
+    def test_a_not_cancelled_guard_is_accepted(self):
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(
+                _nightly_with_suites(
+                    ("Run A", ""),
+                    ("Run B", "${{ !cancelled() && env.HAS_KEY == 'true' }}"),
+                )
+            ),
+            [],
+        )
+
+    def test_an_always_guard_is_accepted(self):
+        """Weaker than `!cancelled()` — it also survives cancellation — but sufficient."""
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(
+                _nightly_with_suites(("Run A", ""), ("Run B", "${{ always() }}"))
+            ),
+            [],
+        )
+
+    def test_a_pr_gate_is_left_alone(self):
+        """Stopping at the first failure is the point of a gate; this only covers nightlies."""
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(
+                _nightly_with_suites(("Run A", ""), ("Run B", ""), trigger="dispatch")
+            ),
+            [],
+        )
+
+    def test_a_step_that_runs_no_suite_is_left_alone(self):
+        """Setup and teardown steps are not results the run exists to report."""
+        workflow = (
+            "---\non:\n  schedule:\n    - cron: '0 0 * * *'\n\njobs:\n  nightly:\n"
+            "    runs-on: ubuntu-24.04\n    steps:\n"
+            "      - name: Run A\n        run: cargo nextest run -- suite\n"
+            "      - name: Tidy up\n        run: rm -rf ./scratch\n"
+        )
+        self.assertEqual(check_workflow_yaml.check_workflow(workflow), [])
+
+    def test_a_snapshot_push_behind_a_suite_is_reported(self):
+        """The refresh is what a nightly exists to produce, so a red suite must not skip it."""
+        workflow = (
+            "---\non:\n  schedule:\n    - cron: '0 0 * * *'\n\njobs:\n  nightly:\n"
+            "    runs-on: ubuntu-24.04\n    steps:\n"
+            "      - name: Run A\n        run: cargo nextest run -- suite\n"
+            "      - name: Push snapshots to branch\n"
+            "        if: github.event_name == 'schedule'\n"
+            "        uses: ./.github/actions/push-snap-changes\n"
+        )
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(workflow),
+            [_hidden("Push snapshots to branch")],
+        )
+
+    def test_an_unnamed_suite_is_reported_by_position(self):
+        workflow = (
+            "---\non:\n  schedule:\n    - cron: '0 0 * * *'\n\njobs:\n  nightly:\n"
+            "    runs-on: ubuntu-24.04\n    steps:\n"
+            "      - run: cargo test --workspace\n"
+            "      - run: cargo test -p spice\n"
+        )
+        self.assertEqual(check_workflow_yaml.check_workflow(workflow), [_hidden("step 2")])
+
+
 def _workflow_with_conditions(job_if: str = "", step_if: str = "") -> str:
     """A one-step workflow, with each `if:` line omitted when passed empty."""
     return "".join(
