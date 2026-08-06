@@ -37,7 +37,7 @@ pub struct SpiceAiModelParams {
 
 #[cfg(test)]
 mod tests {
-    use runtime_parameters::typed::TypedParams;
+    use runtime_parameters_typed::TypedParams;
     use secrecy::SecretString;
     use std::collections::HashMap;
     use std::sync::Arc;

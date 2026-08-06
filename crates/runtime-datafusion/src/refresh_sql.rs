@@ -14,9 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::fmt::Write;
 use std::sync::Arc;
 
-use crate::datafusion::error::format_datafusion_error;
+use crate::error::format_datafusion_error;
 use arrow_schema::SchemaRef;
 use arrow_tools::schema::schema_meta_get_computed_columns;
 use datafusion::arrow::datatypes::Schema;
@@ -30,7 +31,149 @@ use itertools::Itertools;
 use snafu::prelude::*;
 use sqlparser::ast::Statement as SQLStatement;
 
-use crate::accelerated_table::refresh::{RefreshSQL, RefreshSQLColumns};
+/// Columns selected in the refresh SQL.
+#[derive(Clone, Debug)]
+pub enum RefreshSQLColumns {
+    /// SELECT * — all columns from source.
+    All,
+    /// SELECT col1, col2, ... — specific columns preserving original quoting/case.
+    Named(Vec<sqlparser::ast::Ident>),
+}
+
+/// Structured representation of refresh SQL, decomposed into validated parts.
+/// The user's `refresh_sql` config is parsed into columns + `user_filters` + limit.
+/// System-generated filters (partitions) are stored separately.
+#[derive(Clone, Debug)]
+pub struct RefreshSQL {
+    /// The source table this refresh targets.
+    table: TableReference,
+    /// Column projection (All or specific named columns).
+    columns: RefreshSQLColumns,
+    /// User-provided WHERE predicates from `refresh_sql`, split on top-level `AND`.
+    /// Stored as sqlparser `AST` `Expr`s so they can be recombined with system filters.
+    user_filters: Vec<sqlparser::ast::Expr>,
+    /// LIMIT clause from user SQL, if any.
+    limit: Option<usize>,
+    /// Cluster partition filter expressions (`DataFusion` Exprs), applied as
+    /// `DataFrame` `.filter()` calls at refresh time. Three-state:
+    /// - `None` — the table is not partition-scoped (non-clustered, or this
+    ///   node is not an executor); apply no partition predicate and retrieve
+    ///   everything.
+    /// - `Some(filters)` (non-empty) — apply the assigned partitions' predicate.
+    /// - `Some(empty)` — this executor owns no partition of the table; apply a
+    ///   `false` predicate so no rows are loaded, rather than the whole table.
+    partition_filters: Option<Vec<datafusion_expr::Expr>>,
+}
+
+impl RefreshSQL {
+    /// Create a new `RefreshSQL` with the given parts.
+    #[must_use]
+    pub fn new(
+        table: TableReference,
+        columns: RefreshSQLColumns,
+        user_filters: Vec<sqlparser::ast::Expr>,
+        limit: Option<usize>,
+    ) -> Self {
+        Self {
+            table,
+            columns,
+            user_filters,
+            limit,
+            partition_filters: None,
+        }
+    }
+
+    /// Reconstruct the user SQL from parts: `SELECT {columns} FROM {table} WHERE {user_filters} LIMIT {limit}`.
+    /// This does NOT include partition filters — those are applied as `DataFrame` filters.
+    #[must_use]
+    pub fn to_sql(&self) -> String {
+        let columns_str = match &self.columns {
+            RefreshSQLColumns::All => "*".to_string(),
+            RefreshSQLColumns::Named(idents) => idents
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+        };
+
+        let mut sql = format!("SELECT {columns_str} FROM {}", self.table);
+
+        if !self.user_filters.is_empty() {
+            let where_clause = self
+                .user_filters
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            let _ = write!(sql, " WHERE {where_clause}");
+        }
+
+        if let Some(limit) = self.limit {
+            let _ = write!(sql, " LIMIT {limit}");
+        }
+
+        sql
+    }
+
+    /// The partition filters as stored: `None` when the table is not
+    /// partition-scoped, `Some` (possibly empty) when it is. Callers applying
+    /// the predicate to a refresh should use
+    /// [`Self::extend_effective_partition_filters`], which resolves the
+    /// empty-`Some` case to a `false` predicate.
+    #[must_use]
+    pub fn partition_filters(&self) -> Option<&[datafusion_expr::Expr]> {
+        self.partition_filters.as_deref()
+    }
+
+    /// Set the partition filters. Pass `None` for a non-partition-scoped table,
+    /// or `Some(filters)` for the assigned partitions — where an empty `Vec`
+    /// means this executor owns no partition of the table and should load no
+    /// rows (see [`Self::extend_effective_partition_filters`]).
+    pub fn set_partition_filters(&mut self, filters: Option<Vec<datafusion_expr::Expr>>) {
+        self.partition_filters = filters;
+    }
+
+    /// Append the partition predicate(s) to AND into the refresh query onto
+    /// `out`, resolving the three stored states without allocating a temporary
+    /// `Vec`:
+    /// - `None` → nothing appended (retrieve everything).
+    /// - `Some(filters)` (non-empty) → the assigned partitions' predicate.
+    /// - `Some(empty)` → a single `false` predicate, so an executor with no
+    ///   assigned partition loads no rows instead of the whole table.
+    pub fn extend_effective_partition_filters(&self, out: &mut Vec<datafusion_expr::Expr>) {
+        match &self.partition_filters {
+            None => {}
+            Some(filters) if filters.is_empty() => out.push(datafusion_expr::lit(false)),
+            Some(filters) => out.extend(filters.iter().cloned()),
+        }
+    }
+
+    /// For logging/status display. Shows the user SQL and annotates the
+    /// partition-filter state.
+    #[must_use]
+    pub fn display_sql(&self) -> String {
+        let base = self.to_sql();
+        match &self.partition_filters {
+            None => base,
+            Some(filters) if filters.is_empty() => {
+                format!("{base} [partition filter: no partitions assigned — no rows]")
+            }
+            Some(filters) => format!("{base} [+{} partition filter(s)]", filters.len()),
+        }
+    }
+
+    /// Returns the table reference.
+    #[must_use]
+    pub fn table(&self) -> &TableReference {
+        &self.table
+    }
+
+    /// Returns the columns selection.
+    #[must_use]
+    pub fn columns(&self) -> &RefreshSQLColumns {
+        &self.columns
+    }
+}
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -93,8 +236,15 @@ macro_rules! ensure_no_expr {
     };
 }
 
-/// Parse and validate a refresh SQL string, returning both a structured `RefreshSQL` and the
-/// validated schema. This replaces the old `validate_refresh_sql` which only returned a schema.
+/// Parse and validate a refresh SQL string, returning both a structured
+/// [`RefreshSQL`] and the schema the projection yields.
+///
+/// # Errors
+///
+/// Returns an error if `refresh_sql` is not a single `SELECT` statement, selects
+/// from a table other than `expected_table`, projects a column absent from
+/// `source_schema`, or uses a construct the refresh path cannot honor (`GROUP BY`,
+/// a non-column projection, or an unsupported `LIMIT` clause).
 pub fn parse_refresh_sql(
     expected_table: TableReference,
     refresh_sql: &str,

@@ -27,7 +27,7 @@ limitations under the License.
 //! and feed schema generation — the same roles the old `COMMON_MODEL_PARAMETERS`
 //! `ParameterSpec` lists played.
 
-use runtime_parameters::typed::PassthroughParam;
+use runtime_parameters_typed::PassthroughParam;
 
 /// Deprecation note for the legacy `openai_<param>` override forms accepted by
 /// non-OpenAI providers.

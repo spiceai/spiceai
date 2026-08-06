@@ -19,8 +19,13 @@ use std::future::Future;
 use tracing::{Dispatch, instrument::WithSubscriber, subscriber};
 
 fn fmt_subscriber() -> tracing_subscriber::FmtSubscriber {
+    // Writes to stdout, the same sink the installed global subscriber uses, so
+    // it owes the reader the same answer: escapes on a terminal, plain text in a
+    // redirected log. This subscriber carries `spiced`'s startup banner and its
+    // fatal-error line, which are the two lines a captured log is most often
+    // grepped for.
     tracing_subscriber::FmtSubscriber::builder()
-        .with_ansi(true)
+        .with_ansi(ansi_colors::colors_enabled_for(ansi_colors::Target::Stdout))
         .finish()
 }
 

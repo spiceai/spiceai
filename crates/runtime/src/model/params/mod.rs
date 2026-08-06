@@ -83,7 +83,7 @@ pub fn get_params_spec(source: &ModelSource) -> &'static [ParameterSpec] {
 mod tests {
     use super::*;
     use runtime_parameters::ParameterType;
-    use runtime_parameters::typed::TypedParams;
+    use runtime_parameters_typed::TypedParams;
     use secrecy::{ExposeSecret, SecretString};
     use std::collections::HashMap;
     use std::sync::Arc;

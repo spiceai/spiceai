@@ -44,9 +44,9 @@ use datafusion::{
 
 use s3_vectors::{
     CreateIndexError, CreateIndexInput, CreateVectorBucketError, CreateVectorBucketInput,
-    DistanceMetric, Document, GetIndexError, GetIndexInput, GetIndexOutput, GetVectorBucketError,
-    GetVectorBucketInput, MetadataConfiguration, PUT_VECTORS_MAX_ITEMS, PutInputVector,
-    PutVectorsError, PutVectorsInput, S3Vectors, SdkError, VectorData,
+    DeleteVectorsInput, DistanceMetric, Document, GetIndexError, GetIndexInput, GetIndexOutput,
+    GetVectorBucketError, GetVectorBucketInput, MetadataConfiguration, PUT_VECTORS_MAX_ITEMS,
+    PutInputVector, PutVectorsError, PutVectorsInput, S3Vectors, SdkError, VectorData,
 };
 use s3_vectors_metadata_filter::json_value_to_document;
 use serde_json::Value;
@@ -306,6 +306,12 @@ impl S3VectorsTable {
         client: &Arc<dyn S3Vectors + Send + Sync>,
         id: &S3VectorIdentifier,
     ) -> Result<bool> {
+        // An index ARN identifies an existing index directly. It has no bucket name, so
+        // `GetVectorBucket` cannot validate it; `get_index_if_exists` performs that check next.
+        if matches!(id, S3VectorIdentifier::IndexArn(_)) {
+            return Ok(true);
+        }
+
         let bucket_name_opt = id.bucket_name().map(ToString::to_string);
         match client
             .get_vector_bucket(
@@ -556,6 +562,38 @@ impl S3VectorsTable {
         }
     }
 
+    /// Deletes vectors by key from this single physical index.
+    ///
+    /// Only reaches the index `self` is bound to — a caller managing multiple physical indexes
+    /// for one logical index (spillover, partitioning) is responsible for calling this once per
+    /// relevant target (see `search::index::s3_vectors::S3Vector::delete_target_tables`).
+    pub async fn delete_by_keys(&self, keys: Vec<String>) -> Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+
+        let (index_arn, vector_bucket_name, index_name) = self.idx.index_identifier_variables();
+
+        for chunk in keys.chunks(PUT_VECTORS_MAX_ITEMS) {
+            self.client
+                .delete_vectors(
+                    &DeleteVectorsInput::builder()
+                        .set_index_arn(index_arn.clone())
+                        .set_index_name(index_name.clone())
+                        .set_vector_bucket_name(vector_bucket_name.clone())
+                        .set_keys(Some(chunk.to_vec()))
+                        .build()
+                        .context(S3VectorBuildSnafu)?,
+                )
+                .await
+                .map_err(|e| Error::S3VectorDeleteVectorError {
+                    source: Box::new(e.into_service_error()),
+                })?;
+        }
+
+        Ok(())
+    }
+
     pub(super) fn query_provider_schema(&self) -> SchemaRef {
         let mut base_fields = self.schema.fields().iter().cloned().collect::<Vec<_>>();
 
@@ -694,6 +732,23 @@ mod tests {
                     .ok()
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn index_arn_does_not_check_for_a_bucket() {
+        let mock_client = Arc::new(MockClient::new());
+        let client = Arc::clone(&mock_client) as Arc<dyn S3Vectors + Send + Sync>;
+        let id = S3VectorIdentifier::IndexArn(
+            "arn:aws:s3vectors:us-east-2:123456789012:bucket/test-bucket/index/test-index"
+                .to_string(),
+        );
+
+        let exists = S3VectorsTable::check_if_bucket_exists(&client, &id)
+            .await
+            .expect("an index ARN must bypass bucket validation");
+
+        assert!(exists);
+        assert_eq!(mock_client.get_vector_bucket_call_count(), 0);
     }
 
     #[tokio::test]

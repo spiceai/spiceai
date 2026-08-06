@@ -25,11 +25,17 @@ limitations under the License.
 //! `CloudConnect` is **disabled by default**. It activates only if one of
 //! the following is true at boot:
 //!
-//! 1. `$SPICE_CONFIG_DIR/identity.json` exists.
-//! 2. `SPICE_ADOPT_CODE` env var is set.
-//! 3. `$SPICE_CONFIG_DIR/pending-adopt-code` file exists.
+//! 1. The `--cloud-connect` flag was passed.
+//! 2. `$SPICE_CONFIG_DIR/identity.json` exists.
+//! 3. `SPICE_CONNECT_ADOPT_CODE` env var is set.
+//! 4. `$SPICE_CONFIG_DIR/pending-adopt-code` file exists.
 //!
 //! If none of the above is true, this module never opens a connection.
+//! `--cloud-connect` forces the client on but cannot conjure a credential:
+//! with no identity and no code it logs an actionable warning and the
+//! runtime continues unmanaged. Conversely its absence keeps the
+//! signal-based activation, so instances enrolled before the flag existed
+//! keep connecting after an upgrade.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -43,29 +49,36 @@ use runtime::status::ComponentStatus;
 use runtime_cloud_connect::config::{
     CLOUD_MANAGED_SPICEPOD_FILE, CloudConnectConfig, IDENTITY_FILE, PENDING_ADOPT_CODE_FILE,
 };
-use runtime_cloud_connect::handlers::RuntimeHandle;
+use runtime_cloud_connect::handlers::{
+    Capability, CommandError, RuntimeHandle, RuntimePhase, StatusReport,
+};
 use runtime_cloud_connect::{CloudConnect, identity::IdentityStore};
 
 use crate::log_capture::LogRingBuffer;
 
-/// Default number of log lines returned by `GetPodLogs` when the command
-/// leaves `tail_lines` unset (`0`). Bounded by the ring buffer's capacity.
-const DEFAULT_POD_LOG_TAIL_LINES: usize = 500;
+/// Default number of log lines returned by `GetLogs` when the command leaves
+/// `tail_lines` unset. Bounded by the ring buffer's capacity.
+const DEFAULT_LOG_TAIL_LINES: usize = 500;
 
 /// Cheap probe for whether Spice Cloud Connect is configured for this
-/// instance, using the same signals as [`maybe_start`]: an on-disk identity,
-/// a staged pending adoption code, or the `SPICE_ADOPT_CODE` env var.
+/// instance, using the same signals as [`maybe_start`]: the explicit
+/// `--cloud-connect` flag, an on-disk identity, a staged pending adoption
+/// code, or the `SPICE_CONNECT_ADOPT_CODE` env var.
 ///
 /// Called from `init_tracing` (before [`maybe_start`]) to decide whether to
 /// install the log-capture layer. It runs in the same process — hence the
 /// same working directory — as [`maybe_start`], so both resolve the config
 /// directory identically. This is a lightweight existence check; it does not
 /// read or validate the files (that happens in `maybe_start`).
-pub(crate) fn is_configured() -> bool {
+pub(crate) fn is_configured(cloud_connect_flag: bool) -> bool {
+    if cloud_connect_flag {
+        return true;
+    }
     let config_dir = CloudConnectConfig::default_config_dir();
     config_dir.join(IDENTITY_FILE).exists()
         || config_dir.join(PENDING_ADOPT_CODE_FILE).exists()
-        || std::env::var_os("SPICE_ADOPT_CODE").is_some_and(|v| !v.is_empty())
+        || std::env::var_os(runtime_cloud_connect::config::ADOPT_CODE_ENV)
+            .is_some_and(|v| !v.is_empty())
 }
 
 /// Read the optional `cloud-endpoint` override file written by
@@ -94,7 +107,16 @@ fn build_config(runtime_version: &str) -> CloudConnectConfig {
 /// Start the Cloud Connect client if any of the opt-in conditions are
 /// met. The returned `Option<CloudConnect>` is `None` when `CloudConnect`
 /// is disabled — which is the default for vanilla OSS installs.
-pub async fn maybe_start(runtime_version: &str, runtime: Arc<Runtime>) -> Option<CloudConnect> {
+///
+/// `cloud_connect_flag` is the explicit `--cloud-connect` opt-in: it forces
+/// the client on, but with no identity and no adoption code there is
+/// nothing to connect with — that case logs an actionable warning (instead
+/// of the silent debug skip) and the runtime continues unmanaged.
+pub async fn maybe_start(
+    runtime_version: &str,
+    runtime: Arc<Runtime>,
+    cloud_connect_flag: bool,
+) -> Option<CloudConnect> {
     let config = build_config(runtime_version);
 
     // Quick sanity probe — if no identity AND no adoption code, skip.
@@ -114,10 +136,20 @@ pub async fn maybe_start(runtime_version: &str, runtime: Arc<Runtime>) -> Option
         }
     };
     if !has_identity && config.adoption_code.is_none() {
-        tracing::debug!(
-            "Spice Cloud Connect: disabled (no identity at {} and no adoption code)",
-            config.identity_path.display()
-        );
+        if cloud_connect_flag {
+            tracing::warn!(
+                "Spice Cloud Connect: --cloud-connect was passed but no identity exists at {} and no adoption code is available; \
+                 the runtime is NOT connected to Spice Cloud. Run `spice connect <code>` with a code from the Spice Cloud portal, \
+                 or set {} and restart. See: https://spiceai.org/docs",
+                config.identity_path.display(),
+                runtime_cloud_connect::config::ADOPT_CODE_ENV
+            );
+        } else {
+            tracing::debug!(
+                "Spice Cloud Connect: disabled (no identity at {} and no adoption code)",
+                config.identity_path.display()
+            );
+        }
         return None;
     }
 
@@ -129,7 +161,7 @@ pub async fn maybe_start(runtime_version: &str, runtime: Arc<Runtime>) -> Option
 
     // Hand the runtime handle the log-capture ring buffer (installed by
     // `init_tracing` when Cloud Connect is configured) so it can answer
-    // `GetPodLogs`. `None` if capture wasn't installed — the handler then
+    // `GetLogs`. `None` if capture wasn't installed — the handler then
     // reports logs as unavailable rather than returning an empty blob.
     let logs = crate::log_capture::handle();
     let handle: Arc<dyn RuntimeHandle> = Arc::new(SpicedRuntimeHandle::new(runtime, logs));
@@ -149,7 +181,7 @@ pub async fn maybe_start(runtime_version: &str, runtime: Arc<Runtime>) -> Option
 /// Tracks whether a deployed spicepod carried changes that `apply_app`
 /// cannot hot-reload (see [`restart_required_sections`]) and therefore need a
 /// process restart to take effect. Set by `apply_spicepod` and surfaced by
-/// `get_status` so the control plane can show a "restart required" state until
+/// `status` so the control plane can show a "restart required" state until
 /// the operator restarts spiced (standalone spiced cannot self-restart).
 #[derive(Default)]
 struct RestartState {
@@ -163,7 +195,7 @@ struct RestartState {
 /// without taking a hard dep on the `runtime` crate.
 struct SpicedRuntimeHandle {
     runtime: Arc<Runtime>,
-    /// Recent log lines for `GetPodLogs`. `None` when the capture layer was
+    /// Recent log lines for `GetLogs`. `None` when the capture layer was
     /// not installed (Cloud Connect not configured at tracing-init time).
     logs: Option<LogRingBuffer>,
     /// Pending-restart state accumulated across `apply_spicepod` calls.
@@ -224,6 +256,32 @@ fn restart_required_sections(current: &App, new: &App) -> Vec<&'static str> {
 
 #[async_trait]
 impl RuntimeHandle for SpicedRuntimeHandle {
+    /// What a standalone `spiced` can answer. `Restart` is excluded
+    /// deliberately: there is no supervisor to bring the process back up, so
+    /// the command is not merely unimplemented here — it cannot be
+    /// implemented, and the control plane should not offer it.
+    fn supports(&self, capability: Capability) -> bool {
+        match capability {
+            Capability::ApplySpicepod | Capability::GetStatus => true,
+            // Only when the log-capture layer was installed at startup;
+            // otherwise there is no buffer to read from.
+            Capability::GetLogs => self.logs.is_some(),
+            Capability::Restart | Capability::UpgradeRuntime => false,
+        }
+    }
+
+    fn unsupported_reason(&self, capability: Capability) -> String {
+        match capability {
+            Capability::Restart => "Restart is unsupported on standalone spiced: it has no supervisor to bring the process back up. Restart it via your process manager (systemd/Docker/Kubernetes). Configuration changes apply in-process via ApplySpicepod and do not need a restart.".to_string(),
+            Capability::UpgradeRuntime => "UpgradeRuntime is unsupported on standalone spiced: it cannot replace its own binary. Upgrade it the way you installed it (`spice upgrade`, your container image, or your package manager). See: https://spiceai.org/docs".to_string(),
+            Capability::GetLogs => "Log capture is not enabled for this runtime: Spice Cloud Connect must be configured before startup for spiced to install the log-capture layer. See: https://spiceai.org/docs".to_string(),
+            Capability::ApplySpicepod | Capability::GetStatus => format!(
+                "{} is not supported by this instance",
+                capability.wire_name()
+            ),
+        }
+    }
+
     async fn active_datasets(&self) -> u32 {
         match self.runtime.read_app().await {
             Some(app) => u32::try_from(app.datasets.len()).unwrap_or(u32::MAX),
@@ -288,7 +346,7 @@ impl RuntimeHandle for SpicedRuntimeHandle {
         &self,
         config_dir: &Path,
         spicepod_yaml: &str,
-    ) -> Result<serde_json::Value, String> {
+    ) -> Result<serde_json::Value, CommandError> {
         let (new_app, path) = stage_cloud_managed_spicepod(config_dir, spicepod_yaml).await?;
 
         // Determine which changes can't hot-reload BEFORE apply_app swaps the
@@ -349,58 +407,46 @@ impl RuntimeHandle for SpicedRuntimeHandle {
         }))
     }
 
-    /// Standalone `spiced` cannot self-restart: there is no supervisor to bring
-    /// the process back up, so a self-initiated exit would just take the
-    /// runtime down. Return an error (not `Ok`) so the control plane records
-    /// this as a failed command rather than mistaking an unexecuted restart for
-    /// success — operators restart spiced via their own process manager
-    /// (systemd, Docker, Kubernetes). Configuration changes apply in-process via
-    /// [`RuntimeHandle::apply_spicepod`], so a restart is rarely needed.
-    async fn restart(&self, _graceful: bool) -> Result<serde_json::Value, String> {
-        Err("restart is unsupported on standalone spiced: it has no supervisor to bring the process back up. Restart it via your process manager (systemd/Docker/Kubernetes). Configuration changes apply in-process via ApplySpicepod and do not need a restart.".to_string())
-    }
-
-    /// Return recent captured log lines for a `GetPodLogs` command.
+    /// Return recent captured log lines for a `GetLogs` command.
     ///
     /// A standalone `spiced` has no pod / kube API, so it serves its own
     /// recently-captured log output (see [`crate::log_capture`]) instead. The
-    /// text is returned verbatim to the caller, which places it in
-    /// `CommandResult.payload_json` as a raw string per the gateway contract.
+    /// text is returned verbatim to the caller, which sends it as the `text`
+    /// arm of the result payload.
     ///
-    /// `tail_lines <= 0` returns the last [`DEFAULT_POD_LOG_TAIL_LINES`]
-    /// lines; a positive value returns that many (capped by the ring buffer).
-    /// Returns an error — not an empty string — when capture is unavailable,
-    /// so the control plane can tell "no logs captured" from "logging off".
-    async fn get_pod_logs(&self, tail_lines: i64) -> Result<String, String> {
+    /// An absent `tail_lines` returns the last [`DEFAULT_LOG_TAIL_LINES`]
+    /// lines; a value returns that many (capped by the ring buffer). Returns
+    /// an error — not an empty string — when capture is unavailable, so the
+    /// control plane can tell "no logs captured" from "logging off".
+    async fn get_logs(&self, tail_lines: Option<u32>) -> Result<String, CommandError> {
         let Some(ring) = self.logs.as_ref() else {
-            return Err(
-                "log capture is not enabled for this runtime (Spice Cloud Connect must be configured at startup)".to_string(),
-            );
+            return Err(CommandError::unsupported(
+                self.unsupported_reason(Capability::GetLogs),
+            ));
         };
-        let n = if tail_lines <= 0 {
-            DEFAULT_POD_LOG_TAIL_LINES
-        } else {
-            usize::try_from(tail_lines).unwrap_or(DEFAULT_POD_LOG_TAIL_LINES)
-        };
+        let n = tail_lines.map_or(DEFAULT_LOG_TAIL_LINES, |lines| {
+            usize::try_from(lines).unwrap_or(DEFAULT_LOG_TAIL_LINES)
+        });
         Ok(ring.tail(n))
     }
 
-    /// Build the standalone status document for a `GetStatus` command.
+    /// Report standalone runtime readiness — for `GetStatus`, and for the
+    /// phase stamped on every heartbeat.
     ///
-    /// `phase` follows the control-plane vocabulary:
-    /// - `Failed` — the runtime is shutting down.
-    /// - `Ready` — all registered components have reached readiness
-    ///   (`RuntimeStatus::is_ready`).
-    /// - `Progressing` — otherwise (components still initializing/erroring).
+    /// - [`RuntimePhase::Failed`] — the runtime is shutting down.
+    /// - [`RuntimePhase::Ready`] — all registered components have reached
+    ///   readiness (`RuntimeStatus::is_ready`).
+    /// - [`RuntimePhase::Progressing`] — otherwise (components still
+    ///   initializing/erroring).
     ///
     /// A conservative `Progressing` (rather than `Failed`) is used for
     /// not-yet-ready runtimes because `is_ready` is deliberately lenient — an
     /// accelerated dataset can keep serving from its acceleration layer even
     /// while its source is in error — so a component error is not necessarily
-    /// terminal. Per-component states and any error messages ride in
-    /// `components`/`errors` for detail, and `restart_pending` surfaces a
-    /// deploy that needs a restart (see `apply_spicepod`).
-    async fn get_status(&self) -> Result<serde_json::Value, String> {
+    /// terminal. Per-component states and any error messages ride in the
+    /// `components`/`errors` detail, and `restart_pending` surfaces a deploy
+    /// that needs a restart (see `apply_spicepod`).
+    async fn status(&self) -> Result<StatusReport, CommandError> {
         let status = self.runtime.status();
         let all = status.get_all_statuses();
         let ready = status.is_ready();
@@ -432,14 +478,20 @@ impl RuntimeHandle for SpicedRuntimeHandle {
         not_ready.sort();
 
         let (phase, reason) = if shutting_down {
-            ("Failed", "runtime is shutting down".to_string())
+            (RuntimePhase::Failed, "runtime is shutting down".to_string())
         } else if ready {
-            ("Ready", format!("{ready_count}/{total} components ready"))
+            (
+                RuntimePhase::Ready,
+                format!("{ready_count}/{total} components ready"),
+            )
         } else if total == 0 {
-            ("Progressing", "no components registered yet".to_string())
+            (
+                RuntimePhase::Progressing,
+                "no components registered yet".to_string(),
+            )
         } else {
             (
-                "Progressing",
+                RuntimePhase::Progressing,
                 format!(
                     "{ready_count}/{total} components ready; waiting on: {}",
                     not_ready.join(", ")
@@ -463,17 +515,17 @@ impl RuntimeHandle for SpicedRuntimeHandle {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
 
-        Ok(serde_json::json!({
-            "phase": phase,
-            "reason": reason,
-            "ready": ready,
-            "component_count": total,
-            "ready_count": ready_count,
-            "components": components,
-            "errors": errors,
-            "restart_pending": restart_pending,
-            "restart_pending_sections": restart_pending_sections,
-        }))
+        Ok(
+            StatusReport::new(phase, reason).with_detail(serde_json::json!({
+                "ready": ready,
+                "component_count": total,
+                "ready_count": ready_count,
+                "components": components,
+                "errors": errors,
+                "restart_pending": restart_pending,
+                "restart_pending_sections": restart_pending_sections,
+            })),
+        )
     }
 }
 
@@ -488,21 +540,24 @@ impl RuntimeHandle for SpicedRuntimeHandle {
 ///
 /// Factored out of [`SpicedRuntimeHandle::apply_spicepod`] so the
 /// file-staging + validation can be unit-tested without a running runtime.
+/// A malformed push is the operator's mistake, not the runtime's, so it is
+/// reported as [`CommandError::InvalidArgument`]; a filesystem failure is
+/// something the runtime may recover from, so it is [`CommandError::Failed`].
 async fn stage_cloud_managed_spicepod(
     config_dir: &Path,
     spicepod_yaml: &str,
-) -> Result<(App, std::path::PathBuf), String> {
+) -> Result<(App, std::path::PathBuf), CommandError> {
     let path = config_dir.join(CLOUD_MANAGED_SPICEPOD_FILE);
     tokio::fs::create_dir_all(config_dir)
         .await
-        .map_err(|e| format!("create config dir: {e}"))?;
+        .map_err(|e| CommandError::failed(format!("create config dir: {e}")))?;
 
     // Validate on a temp file first so a bad push never clobbers the last
     // known-good spicepod on disk.
     let incoming = config_dir.join("spicepod-cloud-managed.incoming.yml");
     tokio::fs::write(&incoming, spicepod_yaml)
         .await
-        .map_err(|e| format!("write spicepod: {e}"))?;
+        .map_err(|e| CommandError::failed(format!("write spicepod: {e}")))?;
 
     match AppBuilder::build_from_path(incoming.clone()).await {
         Ok(app) => {
@@ -512,7 +567,9 @@ async fn stage_cloud_managed_spicepod(
         Err(e) => {
             // Best-effort cleanup; ignore failure (temp file is inert).
             let _ = tokio::fs::remove_file(&incoming).await;
-            Err(format!("invalid spicepod: {e}"))
+            Err(CommandError::invalid_argument(format!(
+                "invalid spicepod: {e}"
+            )))
         }
     }
 }
@@ -528,14 +585,14 @@ async fn stage_cloud_managed_spicepod(
 /// success. If the second move fails we restore the backup, so the previous
 /// known-good config survives a mid-swap failure (permissions, a transient
 /// file lock, etc.) instead of being deleted up front.
-async fn replace_canonical_spicepod(incoming: &Path, path: &Path) -> Result<(), String> {
+async fn replace_canonical_spicepod(incoming: &Path, path: &Path) -> Result<(), CommandError> {
     match tokio::fs::rename(incoming, path).await {
         Ok(()) => return Ok(()),
         Err(e) => {
             // A fresh install has no canonical file yet — nothing to preserve,
             // so surface the error directly.
             if !tokio::fs::try_exists(path).await.unwrap_or(false) {
-                return Err(format!("persist spicepod: {e}"));
+                return Err(CommandError::failed(format!("persist spicepod: {e}")));
             }
             // Destination exists (the Windows case): fall through to the
             // backup-and-rollback swap below.
@@ -546,7 +603,7 @@ async fn replace_canonical_spicepod(incoming: &Path, path: &Path) -> Result<(), 
     let _ = tokio::fs::remove_file(&backup).await;
     tokio::fs::rename(path, &backup)
         .await
-        .map_err(|e| format!("persist spicepod (backup current): {e}"))?;
+        .map_err(|e| CommandError::failed(format!("persist spicepod (backup current): {e}")))?;
     match tokio::fs::rename(incoming, path).await {
         Ok(()) => {
             // New config is in place; the backup is no longer needed.
@@ -557,7 +614,7 @@ async fn replace_canonical_spicepod(incoming: &Path, path: &Path) -> Result<(), 
             // Roll the previous known-good file back into place so we never
             // lose the only good copy.
             let _ = tokio::fs::rename(&backup, path).await;
-            Err(format!("persist spicepod: {e}"))
+            Err(CommandError::failed(format!("persist spicepod: {e}")))
         }
     }
 }
@@ -612,7 +669,14 @@ mod tests {
         let err = stage_cloud_managed_spicepod(&dir, INVALID_SPICEPOD)
             .await
             .expect_err("invalid spicepod rejected");
-        assert!(err.contains("invalid spicepod"), "unexpected error: {err}");
+        assert!(
+            matches!(err, CommandError::InvalidArgument { .. }),
+            "a malformed push is the caller's mistake, not a runtime failure: {err}"
+        );
+        assert!(
+            err.to_string().contains("invalid spicepod"),
+            "unexpected error: {err}"
+        );
 
         let on_disk = std::fs::read_to_string(&canonical).expect("canonical still present");
         assert_eq!(on_disk, VALID_SPICEPOD, "previous good config preserved");
@@ -627,7 +691,14 @@ mod tests {
         let err = stage_cloud_managed_spicepod(&dir, INVALID_SPICEPOD)
             .await
             .expect_err("invalid spicepod rejected");
-        assert!(err.contains("invalid spicepod"), "unexpected error: {err}");
+        assert!(
+            matches!(err, CommandError::InvalidArgument { .. }),
+            "a malformed push is the caller's mistake, not a runtime failure: {err}"
+        );
+        assert!(
+            err.to_string().contains("invalid spicepod"),
+            "unexpected error: {err}"
+        );
         // Nothing should have been promoted to the canonical path.
         assert!(!dir.join(CLOUD_MANAGED_SPICEPOD_FILE).exists());
         assert!(!dir.join("spicepod-cloud-managed.incoming.yml").exists());

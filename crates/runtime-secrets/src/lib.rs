@@ -19,11 +19,16 @@ use crate::stores::scheduler_rpc::SchedulerRPCSecretStore;
 use async_trait::async_trait;
 use indexmap::IndexMap;
 use lexer::SecretReplacementMatcher;
+use runtime_parameters_typed::{NoSecretResolver, SecretAutoload, TypedParams};
 pub use secrecy::ExposeSecret;
 use secrecy::SecretString;
 use snafu::prelude::*;
 use spicepod::component::secret::Secret as SpicepodSecret;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    pin::Pin,
+    sync::Arc,
+};
 use stores::env::EnvSecretStoreBuilder;
 use tokio::sync::RwLock;
 
@@ -31,8 +36,7 @@ mod lexer;
 mod params;
 pub mod stores;
 
-pub use params::{ParamError as SecretStoreParamError, expand_bootstrap_refs, validate_params};
-pub use runtime_parameter_spec::{ParameterSpec, ParameterType};
+pub use params::{ParamError as SecretStoreParamError, expand_bootstrap_refs};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -78,6 +82,11 @@ pub enum Error {
 
     #[snafu(display("Invalid secret store params: {source}"))]
     InvalidSecretStoreParams { source: Box<params::ParamError> },
+
+    #[snafu(display("Invalid secret store params: {source}"))]
+    InvalidTypedStoreParams {
+        source: Box<runtime_parameters_typed::ParamsError>,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -149,6 +158,12 @@ pub enum RefStatus {
     UnknownStore { configured: Vec<String> },
 }
 
+/// The configured secret stores, in precedence order.
+///
+/// Cloning copies the store handles (`Arc`s), not the stores themselves, so a
+/// clone is cheap and resolves against exactly the stores that were configured
+/// when it was taken — see [`Secrets::snapshot`].
+#[derive(Clone)]
 pub struct Secrets {
     // Use an IndexMap to maintain the order of the secret stores.
     // This order is the reverse of the order in which the secret stores are defined in the SpicePod.
@@ -159,6 +174,22 @@ pub struct Secrets {
 pub struct ParamStr<'a>(pub &'a str);
 
 impl Secrets {
+    /// Takes a point-in-time copy of the registry under a brief read lock, so
+    /// the caller can run secret lookups without holding the guard.
+    ///
+    /// A lookup is `async` and can take as long as a network round trip — the
+    /// `aws_secrets_manager`, `azure_keyvault`, `hashicorp_vault` and
+    /// cluster-executor `scheduler_rpc` stores all call out. Awaiting one under
+    /// a read guard stalls any writer that swaps the registry (the executor
+    /// bind path installs the `scheduler_rpc` stores that way), and, because
+    /// tokio's `RwLock` is write-preferring, a caller that holds a read guard
+    /// and then takes a second one **deadlocks** as soon as a writer queues
+    /// between the two. Resolving against a snapshot has neither hazard and
+    /// sees the same stores the guard would have pinned.
+    pub async fn snapshot(secrets: &RwLock<Self>) -> Self {
+        secrets.read().await.clone()
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -333,9 +364,57 @@ impl Secrets {
     /// Returns the last store error when every consulted store failed and none
     /// returned a healthy "not found".
     pub async fn get_secret(&self, key: &str) -> AnyErrorResult<Option<SecretString>> {
+        self.get_secret_from(key, |_| true).await
+    }
+
+    /// Gets a secret key, consulting only stores named in `allowed_stores`, in
+    /// the registry's precedence order.
+    ///
+    /// A `${ store:key }` reference names a specific store, but a caller that
+    /// only has the key — e.g. cluster `ExpandSecret`, whose RPC request
+    /// carries no store — can't otherwise honor that scoping: an unscoped
+    /// [`Self::get_secret`] would let a same-named key in an unrelated store
+    /// answer in its place. Restricting the search to the referenced store(s)
+    /// closes that gap.
+    ///
+    /// # Errors
+    ///
+    /// Returns the last store error when every consulted (allowed) store
+    /// failed and none returned a healthy "not found".
+    pub async fn get_secret_from_stores(
+        &self,
+        key: &str,
+        allowed_stores: &HashSet<String>,
+    ) -> AnyErrorResult<Option<SecretString>> {
+        self.get_secret_from(key, |store_name| allowed_stores.contains(store_name))
+            .await
+    }
+
+    /// Shared precedence-order walk behind [`Self::get_secret`] and
+    /// [`Self::get_secret_from_stores`].
+    ///
+    /// A store that errors is logged and skipped so one unhealthy store (an
+    /// expired Vault token, a network blip) cannot mask a key that a
+    /// lower-precedence store can resolve:
+    ///
+    /// - A store returns the value → `Ok(Some(value))`, as before.
+    /// - No value, but at least one store answered healthily (`Ok(None)`) →
+    ///   `Ok(None)`; the key was not found in any healthy store. An erroring
+    ///   store might still hold it — each skipped failure is logged so that
+    ///   outcome stays diagnosable.
+    /// - Every consulted store errored → the last error, so a total outage is
+    ///   reported as an error rather than silently as "not found".
+    async fn get_secret_from(
+        &self,
+        key: &str,
+        allow: impl Fn(&str) -> bool,
+    ) -> AnyErrorResult<Option<SecretString>> {
         let mut last_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
         let mut any_healthy = false;
         for (store_name, store) in &self.stores {
+            if !allow(store_name) {
+                continue;
+            }
             match store.get_secret(key).await {
                 Ok(Some(secret)) => return Ok(Some(secret)),
                 Ok(None) => any_healthy = true,
@@ -492,6 +571,36 @@ impl Default for Secrets {
     }
 }
 
+/// Bridges the [`Secrets`] registry to the typed-params autoload mechanism
+/// (`#[param(autoload_secret)]`). Matching the historical autoload behavior,
+/// store errors and misses both resolve to `None` — autoload is best-effort.
+impl SecretAutoload for Secrets {
+    async fn autoload_get(&self, key: &str) -> Option<SecretString> {
+        self.get_secret(key).await.ok().flatten()
+    }
+}
+
+/// Parses a secret store's typed `params:` struct from the bootstrap-resolved
+/// (plain-string) param map. Secret stores never autoload (they must be
+/// initialized *before* any secret resolution is possible — see
+/// [`params::expand_bootstrap_refs`]), so a [`NoSecretResolver`] is used.
+async fn parse_store_params<P: TypedParams>(
+    store: &str,
+    params: HashMap<String, String>,
+) -> Result<P> {
+    let component_name = format!("secret store {store}");
+    let injected: HashMap<String, SecretString> = params
+        .into_iter()
+        .map(|(k, v)| (k, SecretString::from(v)))
+        .collect();
+    let no_resolver = Arc::new(RwLock::new(NoSecretResolver));
+    P::try_from_params(&component_name, injected, &no_resolver)
+        .await
+        .map_err(|source| Error::InvalidTypedStoreParams {
+            source: Box::new(source),
+        })
+}
+
 /// A single `${ store:key }` reference found in a string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretReference {
@@ -585,27 +694,26 @@ enum SelectorPolicy {
     Forbidden,
 }
 
+/// The boxed future returned by a registration's `configure` callback.
+type ConfigureFuture = Pin<Box<dyn std::future::Future<Output = Result<SecretStoreType>> + Send>>;
+
 /// Everything the crate knows about one secret store type, in one place: the
-/// spicepod-facing name, the selector shape, the `params:` it accepts, and
-/// how to turn validated configuration into a [`SecretStoreType`].
+/// spicepod-facing name, the selector shape, and how to turn the
+/// bootstrap-resolved params (plus the policy-checked selector) into a
+/// [`SecretStoreType`].
 ///
 /// [`known_secret_stores`] and `spicepod_secret_store_type` are both derived
-/// from this table. Previously that knowledge was spread across three
-/// hand-maintained sites (the name list and two per-store `match`es) that
-/// had to agree by discipline alone; adding a store now means one registry
-/// entry, one [`SecretStoreType`] variant, and one (compiler-enforced,
-/// exhaustively matched) `load_secret_store` arm.
+/// from this table. Adding a store means one registry entry, one
+/// [`SecretStoreType`] variant, and one (compiler-enforced, exhaustively
+/// matched) `load_secret_store` arm.
 struct SecretStoreRegistration {
     name: &'static str,
     selector: SelectorPolicy,
-    /// `params:` accepted by this store, validated before `configure` runs.
-    /// `None` skips validation entirely (`scheduler_rpc`, whose params have
-    /// historically been ignored rather than rejected).
-    parameters: Option<&'static [ParameterSpec]>,
-    /// Builds the typed config from the policy-checked selector and the
-    /// validated params. The selector is `Some` iff the policy is
-    /// [`SelectorPolicy::Required`].
-    configure: fn(Option<String>, &HashMap<String, String>) -> Result<SecretStoreType>,
+    /// Parses the store's typed `params:` struct (which validates names,
+    /// defaults, `one_of`, and rejects unknown keys via `deny_unknown`) and
+    /// builds the [`SecretStoreType`] from it and the policy-checked selector.
+    /// The selector is `Some` iff the policy is [`SelectorPolicy::Required`].
+    configure: fn(Option<String>, HashMap<String, String>) -> ConfigureFuture,
 }
 
 /// The secret store registry: one entry per store type compiled into this
@@ -617,77 +725,84 @@ fn store_registry() -> &'static [SecretStoreRegistration] {
         let mut registry = vec![SecretStoreRegistration {
             name: "env",
             selector: SelectorPolicy::Forbidden,
-            parameters: Some(stores::env::PARAMETERS),
-            configure: |_, params| {
-                Ok(SecretStoreType::Env(stores::env::EnvConfig::from_params(
-                    params,
-                )))
+            configure: |_selector, params| -> ConfigureFuture {
+                Box::pin(async move {
+                    let typed: stores::env::EnvParams = parse_store_params("env", params).await?;
+                    Ok(SecretStoreType::Env(typed.into_config()))
+                })
             },
         }];
         #[cfg(feature = "keyring-secret-store")]
         registry.push(SecretStoreRegistration {
             name: "keyring",
             selector: SelectorPolicy::Forbidden,
-            parameters: Some(stores::keyring::PARAMETERS),
-            configure: |_, _| Ok(SecretStoreType::Keyring),
+            configure: |_selector, params| -> ConfigureFuture {
+                Box::pin(async move {
+                    let _typed: stores::keyring::KeyringParams =
+                        parse_store_params("keyring", params).await?;
+                    Ok(SecretStoreType::Keyring)
+                })
+            },
         });
         registry.push(SecretStoreRegistration {
             name: "kubernetes",
             selector: SelectorPolicy::Required,
-            parameters: Some(stores::kubernetes::PARAMETERS),
-            configure: |selector, params| {
-                let secret_name = required_selector("kubernetes", selector)?;
-                Ok(SecretStoreType::Kubernetes(
-                    stores::kubernetes::KubernetesConfig::from_params(secret_name, params),
-                ))
+            configure: |selector, params| -> ConfigureFuture {
+                Box::pin(async move {
+                    let secret_name = required_selector("kubernetes", selector)?;
+                    let typed: stores::kubernetes::KubernetesParams =
+                        parse_store_params("kubernetes", params).await?;
+                    Ok(SecretStoreType::Kubernetes(typed.into_config(secret_name)))
+                })
             },
         });
         #[cfg(feature = "aws-secrets-manager")]
         registry.push(SecretStoreRegistration {
             name: "aws_secrets_manager",
             selector: SelectorPolicy::Required,
-            parameters: Some(stores::aws_secrets_manager::PARAMETERS),
-            configure: |selector, params| {
-                let secret_name = required_selector("aws_secrets_manager", selector)?;
-                Ok(SecretStoreType::AwsSecretsManager(
-                    stores::aws_secrets_manager::AwsSecretsManagerConfig::from_params(
-                        secret_name,
-                        params,
-                    ),
-                ))
+            configure: |selector, params| -> ConfigureFuture {
+                Box::pin(async move {
+                    let secret_name = required_selector("aws_secrets_manager", selector)?;
+                    let typed: stores::aws_secrets_manager::AwsSecretsManagerParams =
+                        parse_store_params("aws_secrets_manager", params).await?;
+                    Ok(SecretStoreType::AwsSecretsManager(
+                        typed.into_config(secret_name),
+                    ))
+                })
             },
         });
         #[cfg(feature = "azure-keyvault")]
         registry.push(SecretStoreRegistration {
             name: "azure_keyvault",
             selector: SelectorPolicy::Required,
-            parameters: Some(stores::azure_keyvault::PARAMETERS),
-            configure: |selector, params| {
-                let vault = required_selector("azure_keyvault", selector)?;
-                Ok(SecretStoreType::AzureKeyVault(
-                    stores::azure_keyvault::AzureKeyVaultConfig::from_params(vault, params),
-                ))
+            configure: |selector, params| -> ConfigureFuture {
+                Box::pin(async move {
+                    let vault = required_selector("azure_keyvault", selector)?;
+                    let typed: stores::azure_keyvault::AzureKeyVaultParams =
+                        parse_store_params("azure_keyvault", params).await?;
+                    Ok(SecretStoreType::AzureKeyVault(typed.into_config(vault)))
+                })
             },
         });
         #[cfg(feature = "hashicorp_vault")]
         registry.push(SecretStoreRegistration {
             name: "hashicorp_vault",
             selector: SelectorPolicy::Required,
-            parameters: Some(stores::hashicorp_vault::PARAMETERS),
-            configure: |selector, params| {
-                let path = required_selector("hashicorp_vault", selector)?;
-                let cfg = stores::hashicorp_vault::HashicorpVaultConfig::from_params(path, params)
-                    .map_err(|e| Error::UnableToInitializeHashicorpVault {
-                        source: Box::new(e),
-                    })?;
-                Ok(SecretStoreType::HashicorpVault(cfg))
+            configure: |selector, params| -> ConfigureFuture {
+                Box::pin(async move {
+                    let path = required_selector("hashicorp_vault", selector)?;
+                    let typed: stores::hashicorp_vault::HashicorpVaultParams =
+                        parse_store_params("hashicorp_vault", params).await?;
+                    Ok(SecretStoreType::HashicorpVault(typed.into_config(path)))
+                })
             },
         });
         registry.push(SecretStoreRegistration {
             name: "scheduler_rpc",
             selector: SelectorPolicy::Forbidden,
-            parameters: None,
-            configure: |_, _| Ok(SecretStoreType::SchedulerRPC),
+            configure: |_selector, _params| -> ConfigureFuture {
+                Box::pin(async move { Ok(SecretStoreType::SchedulerRPC) })
+            },
         });
         registry
     })
@@ -713,9 +828,16 @@ pub async fn get_params_with_secrets(
     secrets: Arc<RwLock<Secrets>>,
     params: &HashMap<String, String>,
 ) -> HashMap<String, SecretString> {
-    let secrets = secrets.read().await;
+    // Callers routinely pass an empty map (a component with no `params:`), and
+    // there is nothing to resolve it against.
+    if params.is_empty() {
+        return HashMap::new();
+    }
 
-    let mut params_with_secrets: HashMap<String, SecretString> = HashMap::new();
+    let secrets = Secrets::snapshot(&secrets).await;
+
+    let mut params_with_secrets: HashMap<String, SecretString> =
+        HashMap::with_capacity(params.len());
 
     // Inject secrets from the user-supplied params.
     // This will replace any instances of `${ store:key }` with the actual secret value.
@@ -771,19 +893,10 @@ async fn spicepod_secret_store_type(
         }
     };
 
-    // Validates user-provided params against the store's static
-    // `ParameterSpec` list. Unknown params return an error rather than being
-    // silently dropped.
-    let params = match registration.parameters {
-        Some(spec) => validate_params(provider, user_params, spec).map_err(|source| {
-            Error::InvalidSecretStoreParams {
-                source: Box::new(source),
-            }
-        })?,
-        None => user_params,
-    };
-
-    (registration.configure)(selector, &params)
+    // The store's typed `params:` struct validates names, defaults, and
+    // `one_of`, and rejects unknown keys (via `deny_unknown`) rather than
+    // silently dropping them.
+    (registration.configure)(selector, user_params).await
 }
 
 fn require_selector(provider: &str, selector: Option<&str>) -> Result<String> {
@@ -838,7 +951,7 @@ async fn load_secret_store(store_type: SecretStoreType) -> Result<Arc<dyn Secret
         SecretStoreType::Env(config) => {
             let mut builder = EnvSecretStoreBuilder::new();
             if let Some(path) = config.file_path {
-                builder = builder.with_path(path.into());
+                builder = builder.with_path(path);
             }
             Ok(Arc::new(builder.build()) as Arc<dyn SecretStore>)
         }
@@ -994,6 +1107,26 @@ mod tests {
         }
     }
 
+    /// A store whose lookup parks until it is released, standing in for the
+    /// network round trip the remote stores (`aws_secrets_manager`,
+    /// `azure_keyvault`, `hashicorp_vault`, `scheduler_rpc`) make on a miss.
+    struct ParkedStore {
+        entered: std::sync::Arc<tokio::sync::Notify>,
+        release: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl super::SecretStore for ParkedStore {
+        async fn get_secret(
+            &self,
+            _key: &str,
+        ) -> super::AnyErrorResult<Option<secrecy::SecretString>> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(Some(secrecy::SecretString::from("resolved")))
+        }
+    }
+
     /// Builds a `Secrets` registry directly from named stores, already in
     /// precedence order (first entry is consulted first).
     fn secrets_with_stores(
@@ -1005,6 +1138,80 @@ mod tests {
                 .map(|(name, store)| (name.to_string(), store))
                 .collect(),
         }
+    }
+
+    /// The registry swap on the executor bind path must not wait behind an
+    /// in-flight expansion. Holding the read guard over the (network-bound)
+    /// lookups stalls the writer for their full duration; a snapshot doesn't.
+    #[tokio::test]
+    async fn test_get_params_with_secrets_does_not_block_a_registry_swap() {
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let secrets = std::sync::Arc::new(super::RwLock::new(secrets_with_stores(vec![(
+            "env",
+            std::sync::Arc::new(ParkedStore {
+                entered: std::sync::Arc::clone(&entered),
+                release: std::sync::Arc::clone(&release),
+            }),
+        )])));
+
+        let params = std::collections::HashMap::from([(
+            "api_key".to_string(),
+            "${ env:API_KEY }".to_string(),
+        )]);
+        let expansion = tokio::spawn({
+            let secrets = std::sync::Arc::clone(&secrets);
+            async move { super::get_params_with_secrets(secrets, &params).await }
+        });
+
+        entered.notified().await;
+
+        drop(
+            tokio::time::timeout(std::time::Duration::from_secs(5), secrets.write())
+                .await
+                .expect("a registry swap must not wait for an in-flight secret lookup"),
+        );
+
+        release.notify_one();
+        let resolved = expansion.await.expect("expansion task should not panic");
+        assert_eq!(
+            "resolved",
+            resolved["api_key"].expose_secret(),
+            "the parked store should still have served the value"
+        );
+    }
+
+    /// A snapshot resolves against the stores configured when it was taken —
+    /// the same view the read guard used to pin — while the live registry
+    /// serves whatever replaced them.
+    #[tokio::test]
+    async fn test_snapshot_resolves_against_the_stores_it_captured() {
+        let secrets = std::sync::Arc::new(super::RwLock::new(secrets_with_stores(vec![(
+            "env",
+            std::sync::Arc::new(MapStore::new(&[("MY_KEY", "before")])),
+        )])));
+
+        let snapshot = super::Secrets::snapshot(&secrets).await;
+
+        *secrets.write().await = secrets_with_stores(vec![(
+            "env",
+            std::sync::Arc::new(MapStore::new(&[("MY_KEY", "after")])),
+        )]);
+
+        let from_snapshot = snapshot
+            .get_secret("MY_KEY")
+            .await
+            .expect("snapshot lookup should succeed")
+            .expect("snapshot should still hold the captured store");
+        assert_eq!("before", from_snapshot.expose_secret());
+
+        let from_live = super::Secrets::snapshot(&secrets)
+            .await
+            .get_secret("MY_KEY")
+            .await
+            .expect("live lookup should succeed")
+            .expect("the swapped-in store holds the key");
+        assert_eq!("after", from_live.expose_secret());
     }
 
     #[tokio::test]
@@ -1384,7 +1591,10 @@ params:
             super::SecretStoreType::AwsSecretsManager(cfg) => {
                 assert_eq!(cfg.secret_name, "my-secret");
                 assert_eq!(cfg.region.as_deref(), Some("eu-west-2"));
-                assert_eq!(cfg.endpoint_url.as_deref(), Some("https://localhost:4566"));
+                assert_eq!(
+                    cfg.endpoint_url,
+                    Some(url::Url::parse("https://localhost:4566/").expect("valid endpoint URL"))
+                );
             }
             _ => panic!("expected AwsSecretsManager variant"),
         }
@@ -1427,6 +1637,7 @@ params:
         use spicepod::component::secret::Secret as SpicepodSecret;
         use spicepod::param::Params;
         use std::collections::HashMap;
+        use std::path::Path;
 
         let mut p = HashMap::new();
         p.insert("file_path".to_string(), "/tmp/spice.env".to_string());
@@ -1445,7 +1656,7 @@ params:
             .expect("validates");
         match resolved {
             super::SecretStoreType::Env(cfg) => {
-                assert_eq!(cfg.file_path.as_deref(), Some("/tmp/spice.env"));
+                assert_eq!(cfg.file_path.as_deref(), Some(Path::new("/tmp/spice.env")));
             }
             _ => panic!("expected Env variant"),
         }
@@ -1492,7 +1703,10 @@ params:
         match resolved {
             super::SecretStoreType::AwsSecretsManager(cfg) => {
                 assert_eq!(cfg.region.as_deref(), Some("ap-south-1"));
-                assert_eq!(cfg.endpoint_url.as_deref(), Some("https://localhost:4566"));
+                assert_eq!(
+                    cfg.endpoint_url,
+                    Some(url::Url::parse("https://localhost:4566/").expect("valid endpoint URL"))
+                );
             }
             _ => panic!("expected AwsSecretsManager variant"),
         }
@@ -1562,7 +1776,12 @@ params:
             .expect("validates");
         match resolved {
             super::SecretStoreType::AwsSecretsManager(cfg) => {
-                assert_eq!(cfg.access_key_id.as_deref(), Some("AKIA_TEST"));
+                assert_eq!(
+                    cfg.access_key_id
+                        .as_ref()
+                        .map(|s| s.expose_secret().to_string()),
+                    Some("AKIA_TEST".to_string())
+                );
                 assert_eq!(
                     cfg.secret_access_key
                         .as_ref()
@@ -1651,7 +1870,7 @@ params:
 
         // A misspelled `tennant_id` must be rejected at load time rather
         // than silently dropped — this is exactly the failure mode the
-        // ParameterSpec validation is meant to prevent.
+        // typed-params `deny_unknown` validation is meant to prevent.
         let mut p = HashMap::new();
         p.insert(
             "tennant_id".to_string(),

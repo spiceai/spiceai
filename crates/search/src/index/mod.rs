@@ -19,7 +19,10 @@ use std::sync::Arc;
 use arrow::array::RecordBatch;
 use arrow_schema::Field;
 use async_trait::async_trait;
-use datafusion::{error::DataFusionError, logical_expr::LogicalPlan};
+use datafusion::{
+    error::DataFusionError,
+    logical_expr::{Expr, LogicalPlan, ident},
+};
 use runtime_datafusion_index::Index;
 
 pub mod chunking;
@@ -35,18 +38,21 @@ pub mod native_vector;
 pub mod s3_vectors;
 
 pub mod vector_table;
+use crate::index::chunking::{ChunkedSearchIndex, ChunkedVectorIndex};
+use crate::index::compound::{CompoundSearchIndex, CompoundVectorIndex};
 #[cfg(feature = "llms")]
 pub(crate) mod write_util;
-use crate::index::chunking::ChunkedVectorIndex;
 #[cfg(feature = "llms")]
 pub use memory::MemoryVectorIndex;
 pub use native_vector::NativeVectorIndex;
 pub use vector_table::VectorScanTableProvider;
 
+#[cfg(feature = "text_search")]
+use crate::generation::text_search::index::FullTextDatabaseIndex;
 #[cfg(feature = "duckdb")]
 use crate::index::duckdb::DuckDBVectorIndex;
 #[cfg(feature = "elasticsearch")]
-use crate::index::elasticsearch::ElasticsearchIndex;
+use crate::index::elasticsearch::{ElasticsearchIndex, ElasticsearchTextIndex};
 #[cfg(feature = "s3_vectors")]
 use crate::index::s3_vectors::S3Vector;
 
@@ -108,11 +114,59 @@ pub fn derived_columns_from_vector_index(
     if let Some(vec) = index.as_any().downcast_ref::<ChunkedVectorIndex>() {
         return Some(vec.derived_columns());
     }
-    if let Some(vec) = index
-        .as_any()
-        .downcast_ref::<crate::index::compound::CompoundVectorIndex>()
-    {
+    if let Some(vec) = index.as_any().downcast_ref::<CompoundVectorIndex>() {
         return Some(vec.derived_columns());
+    }
+    None
+}
+
+/// Borrows a generic [`Index`] as a [`SearchIndex`], if it is one.
+///
+/// [`Index::as_any`] only supports downcasting to a concrete type, and a [`SearchIndex`] cannot
+/// be recovered from `&dyn Any` as an owned `Arc<dyn SearchIndex>` (there is no way to
+/// reconstruct an `Arc` sharing the original allocation from a bare `&dyn Any`). Callers that
+/// hold the original `Arc<dyn Index>` alive for the duration of the borrow — e.g. iterating a
+/// `Vec<Arc<dyn Index + Send + Sync>>` collected off a provider chain — only need a borrowed
+/// `&dyn SearchIndex` to call `primary_fields()`/`query_table_provider()` etc., so this returns
+/// one instead of attempting to manufacture an `Arc`.
+///
+/// Mirrors [`derived_columns_from_vector_index`]'s manual downcast list — extend both together
+/// when a new concrete index type is added.
+pub fn as_search_index(index: &Arc<dyn Index + Send + Sync>) -> Option<&dyn SearchIndex> {
+    if let Some(idx) = index.as_any().downcast_ref::<NativeVectorIndex>() {
+        return Some(idx as &dyn SearchIndex);
+    }
+    if let Some(idx) = index.as_any().downcast_ref::<ChunkedSearchIndex>() {
+        return Some(idx as &dyn SearchIndex);
+    }
+    if let Some(idx) = index.as_any().downcast_ref::<ChunkedVectorIndex>() {
+        return Some(idx as &dyn SearchIndex);
+    }
+    if let Some(idx) = index.as_any().downcast_ref::<CompoundSearchIndex>() {
+        return Some(idx as &dyn SearchIndex);
+    }
+    if let Some(idx) = index.as_any().downcast_ref::<CompoundVectorIndex>() {
+        return Some(idx as &dyn SearchIndex);
+    }
+    #[cfg(feature = "text_search")]
+    if let Some(idx) = index.as_any().downcast_ref::<FullTextDatabaseIndex>() {
+        return Some(idx as &dyn SearchIndex);
+    }
+    #[cfg(feature = "duckdb")]
+    if let Some(idx) = index.as_any().downcast_ref::<DuckDBVectorIndex>() {
+        return Some(idx as &dyn SearchIndex);
+    }
+    #[cfg(feature = "s3_vectors")]
+    if let Some(idx) = index.as_any().downcast_ref::<S3Vector>() {
+        return Some(idx as &dyn SearchIndex);
+    }
+    #[cfg(feature = "elasticsearch")]
+    if let Some(idx) = index.as_any().downcast_ref::<ElasticsearchIndex>() {
+        return Some(idx as &dyn SearchIndex);
+    }
+    #[cfg(feature = "elasticsearch")]
+    if let Some(idx) = index.as_any().downcast_ref::<ElasticsearchTextIndex>() {
+        return Some(idx as &dyn SearchIndex);
     }
     None
 }
@@ -159,6 +213,31 @@ pub trait VectorIndex: SearchIndex {
     /// not be wrapped by [`VectorScanTableProvider`].
     fn list_table_provider(&self) -> Result<LogicalPlan, DataFusionError>;
 
+    /// A [`LogicalPlan`] identifying every entry the index holds, for maintenance paths that must
+    /// resolve *stored* entries rather than serve a read — currently resolving a chunked index's
+    /// chunk-keyed entries so they can be deleted.
+    ///
+    /// Distinct from [`VectorIndex::list_table_provider`], which serves reads and may deliberately
+    /// return less than the index holds: a [`compound`](crate::index::compound) index's read mode
+    /// can restrict listing to its warm primary, which is not authoritative for what is stored.
+    /// Resolving a delete against that narrowed listing silently leaves entries behind.
+    ///
+    /// The plan carries *at least* the [`SearchIndex::primary_fields`] columns, and callers must
+    /// not depend on any other column being present. Keeping the contract to the key columns is
+    /// what lets a multi-store implementation combine its stores: the key fields are the only ones
+    /// guaranteed to agree across them.
+    ///
+    /// **Keys may repeat.** A multi-store implementation combines its stores by union, so an entry
+    /// both stores hold appears once per store. Callers that need each key once must apply their
+    /// own `DISTINCT` — as the chunked delete resolution does, since deleting a key twice is
+    /// wasted work.
+    ///
+    /// Wrapper implementations MUST forward this to the index they wrap — inheriting the default
+    /// silently resolves maintenance work against a read-narrowed listing.
+    fn list_all_entry_keys(&self) -> Result<LogicalPlan, DataFusionError> {
+        self.list_table_provider()
+    }
+
     fn dimension(&self) -> i32;
 
     /// Returns column names in [`VectorIndex::list_table_provider`] and/or [`SearchIndex::query_table_provider`] that
@@ -171,4 +250,59 @@ pub trait VectorIndex: SearchIndex {
 
 fn embedding_col(search_column: &str) -> String {
     format!("{search_column}_embedding")
+}
+
+/// Projection expressions selecting `fields` by name — the key columns
+/// [`VectorIndex::list_all_entry_keys`] promises, used both to narrow a listing to them and to
+/// bring two stores' listings to a common schema before combining them.
+pub(crate) fn primary_key_projection(fields: &[Field]) -> Vec<Expr> {
+    fields.iter().map(|f| ident(f.name())).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::any::Any;
+
+    #[test]
+    fn as_search_index_recognizes_a_known_concrete_type() {
+        let idx: Arc<dyn Index + Send + Sync> = Arc::new(NativeVectorIndex::new(
+            datafusion::sql::TableReference::bare("t"),
+            "embedding".to_string(),
+            vec![Field::new("id", arrow_schema::DataType::Int64, false)],
+            4,
+        ));
+
+        assert!(
+            as_search_index(&idx).is_some(),
+            "NativeVectorIndex is in the known-types list and must be recognized"
+        );
+    }
+
+    /// `as_search_index` works by downcasting to a fixed list of known concrete types (mirroring
+    /// [`derived_columns_from_vector_index`]) — it cannot recognize an `Index` implementation
+    /// outside that list, even one that also implements [`SearchIndex`]. This is a deliberate,
+    /// accepted trade-off (there's no way to recover `&dyn SearchIndex` from `&dyn Any`), not a
+    /// bug — documented here so it isn't "fixed" by surprise later.
+    #[derive(Debug)]
+    struct UnknownIndex;
+
+    #[async_trait]
+    impl Index for UnknownIndex {
+        fn name(&self) -> &'static str {
+            "UnknownIndex"
+        }
+        fn required_columns(&self) -> Vec<String> {
+            vec![]
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[test]
+    fn as_search_index_does_not_recognize_unlisted_types() {
+        let idx: Arc<dyn Index + Send + Sync> = Arc::new(UnknownIndex);
+        assert!(as_search_index(&idx).is_none());
+    }
 }

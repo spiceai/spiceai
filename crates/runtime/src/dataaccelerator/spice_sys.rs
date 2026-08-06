@@ -212,6 +212,176 @@ impl Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Runs a synchronous `DuckDB` sidecar operation on the blocking pool.
+///
+/// Every `spice_sys` `DuckDB` helper takes the connection pool's write gate, and a
+/// `duckdb_on_full_refresh: replace_file` refresh holds that gate **exclusively**
+/// while it copies every co-resident table into the staging file and checkpoints it.
+/// That window scales with the size of the *other* datasets sharing the file, so
+/// waiting on the gate from an async worker parks the whole worker — including
+/// `/health`, which Kubernetes uses to decide the pod is dead — for seconds to
+/// minutes.
+///
+/// The helpers themselves are also plain blocking `DuckDB` I/O, so they belong here
+/// regardless of the gate; `DuckDbBlobCheckpointStore` and the accelerator's
+/// `drop_table`/`evolve_table_schema` already do exactly this.
+#[cfg(feature = "duckdb")]
+async fn spawn_duckdb_blocking<T, F>(f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(Error::external)?
+}
+
+/// [`spawn_duckdb_blocking`] for the read paths that report a failure as `None`
+/// rather than as an error.
+///
+/// A panic is re-raised on this task rather than reported as `None`: these reads
+/// answer "where did this dataset get to", and a `None` the caller believes means
+/// the dataset re-bootstraps from the beginning of the change stream. Running the
+/// read on the blocking pool must not turn a bug into that answer.
+#[cfg(any(feature = "mongodb", feature = "mysql"))]
+async fn spawn_duckdb_blocking_opt<T, F>(f: F) -> Option<T>
+where
+    F: FnOnce() -> Option<T> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(value) => value,
+        Err(join_error) if join_error.is_panic() => {
+            std::panic::resume_unwind(join_error.into_panic())
+        }
+        // Cancellation, i.e. the runtime is shutting down under the read (see
+        // `is_shutdown_cancellation`). Below the default level, but not silent: it
+        // must not pass unremarked for "no checkpoint".
+        Err(join_error) => {
+            tracing::debug!(
+                "Did not read the sidecar checkpoint: the runtime is shutting down ({join_error})"
+            );
+            None
+        }
+    }
+}
+
+/// True when a `spice_sys` failure is the runtime shutting down under a task on the
+/// blocking pool, rather than the operation itself failing.
+///
+/// A sidecar helper that runs on the blocking pool surfaces a shutdown as a
+/// cancelled [`tokio::task::JoinError`] wrapped in [`Error::External`], which
+/// callers see only as an opaque `"Acceleration error: task ... was cancelled"` —
+/// hence classifying by type rather than by message. The task never started, so
+/// there is nothing to retry and nothing an operator can act on; a caller that
+/// reports its failures at `warn` should report this one below the default level.
+///
+/// Prefer this over the `RuntimeStatus::is_shutdown()` guard the refresh task uses
+/// for the same purpose: `is_shutdown()` is only *coincidental* — every failure that
+/// races a shutdown gets quietened, including real ones — whereas the `JoinError`
+/// is a *causal* statement that this specific work did not run.
+///
+/// The condition it reads is "the task was cancelled", and the shutdown reading
+/// holds because a `spawn_blocking` task is cancelled only when the runtime is
+/// dropped with the task still queued; nothing here calls `JoinHandle::abort`. A
+/// caller that starts aborting sidecar tasks (a per-operation timeout, say) has to
+/// revisit that.
+///
+/// The whole source chain is walked, so it holds however deeply the caller has
+/// boxed or wrapped the error. A *panicked* task is deliberately not matched: that
+/// is a bug and must stay loud.
+pub(crate) fn is_shutdown_cancellation(error: &(dyn std::error::Error + 'static)) -> bool {
+    std::iter::successors(Some(error), |error| std::error::Error::source(*error)).any(|error| {
+        error
+            .downcast_ref::<tokio::task::JoinError>()
+            .is_some_and(tokio::task::JoinError::is_cancelled)
+    })
+}
+
+/// Retries for a sidecar write contending with another writer, on top of the
+/// initial attempt. Bounded and short: paired with [`UPSERT_MAX_RETRY_DELAY`] the
+/// worst-case added latency stays well under one checkpoint/commit interval, and a
+/// persistent conflict just retries on the next interval anyway.
+#[cfg(any(feature = "kafka", feature = "debezium", feature = "mysql"))]
+pub(crate) const UPSERT_MAX_RETRIES: usize = 4;
+
+/// Per-attempt cap on the `FibonacciBackoffBuilder` delay for sidecar upsert
+/// retries. The shared Fibonacci schedule starts at 1s, far longer than a
+/// transient writer hand-off needs, so clamp each delay to keep the whole retry
+/// budget (~4 x 100ms) short relative to the commit interval.
+#[cfg(any(feature = "kafka", feature = "debezium", feature = "mysql"))]
+pub(crate) const UPSERT_MAX_RETRY_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(100);
+
+/// Whether a sidecar write failure is a transient lock/contention error worth
+/// retrying rather than surfacing.
+///
+/// Deliberately a string heuristic over the boxed engine error (rusqlite, Turso,
+/// `DuckDB`, and tokio-postgres all report contention differently), mirroring the
+/// reconnect classifier in `data_components::mysql_replication::resilience`. Slight
+/// over-matching is harmless: retries are bounded, so a misclassified non-lock error
+/// only costs a few short sleeps before it is returned unchanged.
+///
+/// The `DuckDB` markers matter because its transaction manager is optimistic — it
+/// reports a write-write conflict instead of blocking, so two sidecar writers
+/// touching the same row surface `TransactionContext Error: Conflict on update!`
+/// rather than serializing. Sidecar writers take the pool's write gate with `read()`
+/// and so do not exclude each other; only a file swap takes it exclusively.
+#[cfg(any(feature = "kafka", feature = "debezium", feature = "mysql"))]
+pub(crate) fn is_retryable_lock_error(err: &Error) -> bool {
+    const MARKERS: &[&str] = &[
+        "database is locked",
+        "database table is locked",
+        "sqlite_busy",
+        "sqlite_locked",
+        "deadlock",
+        // DuckDB's optimistic concurrency control.
+        "conflict on update",
+        "transactioncontext error",
+        "write-write conflict",
+    ];
+    let msg = err.to_string().to_ascii_lowercase();
+    MARKERS.iter().any(|marker| msg.contains(marker))
+}
+
+/// Runs a sidecar write, retrying a transient write conflict a bounded number of
+/// times.
+///
+/// `DuckDB`'s transaction manager is optimistic: two sidecar writers touching the
+/// same row get `Conflict on update!` rather than being serialized, because they
+/// hold the pool's write gate with `read()` and so do not exclude each other. The
+/// attempt is re-run rather than surfaced, matching how a contended write is handled
+/// for the binlog checkpoint.
+#[cfg(any(feature = "kafka", feature = "debezium"))]
+pub(crate) async fn retry_on_write_conflict<F, Fut>(dataset_name: &str, attempt: F) -> Result<()>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
+
+    let backoff = FibonacciBackoffBuilder::new()
+        .max_retries(Some(UPSERT_MAX_RETRIES))
+        .max_duration(Some(UPSERT_MAX_RETRY_DELAY))
+        .build();
+
+    retry(backoff, || async {
+        attempt().await.map_err(|e| {
+            if is_retryable_lock_error(&e) {
+                tracing::debug!(
+                    dataset = %dataset_name,
+                    error = %e,
+                    "sidecar offset upsert hit a transient accelerator write conflict"
+                );
+                RetryError::transient(e)
+            } else {
+                RetryError::permanent(e)
+            }
+        })
+    })
+    .await
+}
+
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum OpenOption {
     CreateIfNotExists,
@@ -529,5 +699,85 @@ async fn acceleration_connection(
             engine: acceleration_settings.engine,
         }
         .fail(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Error, is_shutdown_cancellation};
+
+    #[cfg(any(feature = "mongodb", feature = "mysql"))]
+    #[tokio::test]
+    #[should_panic(expected = "sidecar read panicked")]
+    async fn spawn_duckdb_blocking_opt_does_not_report_a_panic_as_no_checkpoint() {
+        // `None` from a checkpoint read means "this dataset has no recorded position",
+        // which sends the connector back to the start of the change stream. A panic in
+        // the read is a bug and must not be answered that way.
+        let _: Option<()> =
+            super::spawn_duckdb_blocking_opt(|| panic!("sidecar read panicked")).await;
+    }
+
+    #[cfg(any(feature = "mongodb", feature = "mysql"))]
+    #[tokio::test]
+    async fn spawn_duckdb_blocking_opt_passes_through_both_outcomes() {
+        assert_eq!(super::spawn_duckdb_blocking_opt(|| Some(7)).await, Some(7));
+        assert_eq!(
+            super::spawn_duckdb_blocking_opt(|| Option::<u8>::None).await,
+            None
+        );
+    }
+
+    /// A task the runtime dropped before it ran, i.e. what a sidecar write on the
+    /// blocking pool sees when the process is shutting down under it.
+    async fn cancelled_join_error() -> tokio::task::JoinError {
+        let handle = tokio::spawn(std::future::pending::<()>());
+        handle.abort();
+        let join_error = handle
+            .await
+            .expect_err("an aborted task must not complete successfully");
+        assert!(join_error.is_cancelled());
+        join_error
+    }
+
+    /// The chain a checkpoint caller actually sees: `DatasetCheckpointer::checkpoint`
+    /// boxes the `spice_sys` error, whose `External` variant carries the `JoinError`.
+    #[tokio::test]
+    async fn a_cancelled_sidecar_task_is_recognized_through_the_boxed_chain() {
+        let boxed: Box<dyn std::error::Error + Send + Sync> = Box::new(Error::External {
+            source: Box::new(cancelled_join_error().await),
+        });
+        assert!(is_shutdown_cancellation(boxed.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn a_bare_cancellation_is_recognized_without_any_wrapping() {
+        let join_error = cancelled_join_error().await;
+        assert!(is_shutdown_cancellation(&join_error));
+    }
+
+    /// A panicking task is a bug, not a shutdown, and has to keep its `warn`.
+    #[tokio::test]
+    async fn a_panicked_task_is_not_a_shutdown_cancellation() {
+        let handle = tokio::spawn(async { panic!("sidecar write panicked") });
+        let join_error = handle
+            .await
+            .expect_err("a panicking task must not complete successfully");
+        assert!(join_error.is_panic());
+
+        let boxed: Box<dyn std::error::Error + Send + Sync> = Box::new(Error::External {
+            source: Box::new(join_error),
+        });
+        assert!(!is_shutdown_cancellation(boxed.as_ref()));
+    }
+
+    /// An ordinary sidecar failure — the case that must keep reporting at `warn`.
+    #[test]
+    fn an_ordinary_sidecar_failure_is_not_a_shutdown_cancellation() {
+        let boxed: Box<dyn std::error::Error + Send + Sync> = Box::new(Error::External {
+            source: "TransactionContext Error: Conflict on update!".into(),
+        });
+        assert!(!is_shutdown_cancellation(boxed.as_ref()));
+
+        assert!(!is_shutdown_cancellation(&Error::NoAccelerationConnection));
     }
 }

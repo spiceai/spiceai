@@ -139,10 +139,11 @@ pub struct CayenneContext {
 /// batch.
 pub(crate) const DEFAULT_PK_KEYSET_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
 
-/// Hard ceiling on the configurable PK keyset cache budget. The budget doubles as
-/// the bloom allocation size (`PkBloom::with_byte_budget`), so an out-of-range or
-/// typo'd `cayenne_pk_keyset_cache_mb` must not be able to request a
-/// near-`usize::MAX` allocation. Matches the auto-default's 8 GiB ceiling.
+/// Hard ceiling on the configurable PK keyset cache budget. The budget bounds
+/// the exact keyset's resident growth (and caps the right-sized conversion
+/// blooms), so an out-of-range or typo'd `cayenne_pk_keyset_cache_mb` must not
+/// be able to request a near-`usize::MAX` allocation. Matches the
+/// auto-default's 8 GiB ceiling.
 pub(crate) const PK_KEYSET_CACHE_MAX_CONFIGURABLE_BYTES: usize = 8 * 1024 * 1024 * 1024;
 
 impl CayenneContext {
@@ -157,7 +158,7 @@ impl CayenneContext {
         // reads exactly the static value until (and unless) the controller moves
         // it — enabling dynamic tuning is therefore a strict, bounded refinement,
         // never a behavior change on its own.
-        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        let cores = cpu_budget::cpu_budget().cayenne_write_concurrency_ceiling();
         // When `write_concurrency` is unset, seed the live actuator to the SAME value
         // the write path resolves to (`DEFAULT_WRITE_CONCURRENCY` capped by host
         // cores), not 0. The controller grows from this real current value; a 0
@@ -211,7 +212,13 @@ impl CayenneContext {
             } else {
                 inline_flush_bounds
             },
-            compaction_background_interval_ms: if pins.compaction_interval {
+            compaction_background_interval_ms: if pins.compaction_interval
+                || config.compaction_background_interval_ms == 0
+            {
+                // A 0 interval means the background compactor was never spawned
+                // (`spawn_background_compaction` returns early), so letting the
+                // controller raise it off 0 would only make the reported actuator
+                // value disagree with reality. Collapse the range instead.
                 (
                     config.compaction_background_interval_ms,
                     config.compaction_background_interval_ms,

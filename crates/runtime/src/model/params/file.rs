@@ -39,4 +39,10 @@ pub struct FileModelParams {
     /// Comma-separated, rank-ordered node addresses for distributed inference (e.g. '10.0.0.1,10.0.0.2'). Identical on every node; only `node_rank` differs. The node count (world size) must be a power of two; the 'ring' backend requires exactly 2.
     #[param(runtime)]
     pub nodes: Option<String>,
+    /// Sequence-length budget, in tokens, for a locally served model: it plans cross-device layer placement and sizes the KV cache. Defaults to the engine default (4096) when unset. It does not raise the context the weights were trained for, and larger values need proportionally more KV-cache memory.
+    #[param(runtime)]
+    pub context_length: Option<String>,
+    /// Attention implementation for a locally served model. 'auto' (the default) uses PagedAttention wherever the build supports it, and the engine falls back to dense attention for architectures with no paged kernel, such as the Multi-head Latent Attention GGUFs. 'disabled' forces dense attention with a contiguous KV cache.
+    #[param(runtime, default = "auto", one_of = ["auto", "disabled"])]
+    pub paged_attention: String,
 }

@@ -30,15 +30,15 @@ use crate::embeddings::index::table::wrap_table_as_index;
 use crate::federated_table::FederatedTable;
 use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 use crate::model::EmbeddingModelStore;
-use crate::search::util::{EMBEDDING_INNER, FEDERATED_ADAPTOR_INNER, METADATA_ENRICHED_INNER};
 use crate::secrets::Secrets;
+use crate::table_layers::TABLE_PROVIDER_LAYERS;
 use async_trait::async_trait;
 use data_components::cdc::{ChangeEnvelope, ChangesStream, StreamError, replace_change_batch_data};
 use datafusion::datasource::TableProvider;
 use futures::StreamExt;
 use itertools::Itertools;
 use runtime_datafusion_index::{
-    INDEXED_INNER, IndexedTableProvider, InnerProviderFn, find_concrete_table_provider_with,
+    IndexedTableProvider, LayerWalk, find_concrete_table_provider_in, peel_to_innermost,
 };
 use runtime_metrics::component::MetricsProvider;
 use search::generation::text_search::index::FullTextDatabaseIndex;
@@ -55,6 +55,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use runtime_search::embeddings::table::EmbeddingTable;
+use runtime_search::embeddings::warm_index_on_zero_results;
 
 pub struct EmbeddingConnector {
     inner_connector: Arc<dyn DataConnector>,
@@ -121,11 +122,7 @@ impl EmbeddingConnector {
                 });
             }
 
-            let on_zero_results = dataset
-                .acceleration
-                .as_ref()
-                .map(|acceleration| acceleration.on_zero_results.clone())
-                .unwrap_or_default();
+            let on_zero_results = warm_index_on_zero_results(dataset.acceleration.as_ref());
 
             let mut provider = Arc::clone(&inner_table_provider);
             for (effective_vector_store, columns) in vector_index_groups(vector_engine, dataset) {
@@ -138,7 +135,7 @@ impl EmbeddingConnector {
                     dataset.params.get("file_format").map(String::as_str),
                     provider,
                     &effective_vector_store,
-                    &on_zero_results,
+                    on_zero_results,
                 )
                 .await
                 .map_err(|e| {
@@ -352,9 +349,10 @@ impl DataConnector for EmbeddingConnector {
         dataset: &Dataset,
     ) -> Option<ChangesStream> {
         let table_provider = federated_table.try_table_provider_sync()?;
-        if let Some(indexed_table) = find_concrete_table_provider_with::<IndexedTableProvider>(
+        if let Some(indexed_table) = find_concrete_table_provider_in::<IndexedTableProvider>(
             &table_provider,
-            TRANSPARENT_CDC_WRAPPERS,
+            TABLE_PROVIDER_LAYERS,
+            LayerWalk::CdcDetection,
         )
         .cloned()
         {
@@ -395,9 +393,10 @@ impl DataConnector for EmbeddingConnector {
             Some(stream)
 
         // `VectorScanTableProvider` is generally wrapped by a `IndexedTableProvider` (as above), but in the case both [`Self`] and the [`FullTextConnector`] exist, the latter will unwrap the `IndexedTableProvider` first. It will correctly handle indexing vector indexes as that point.
-        } else if let Some(vector_scan) = find_concrete_table_provider_with::<VectorScanTableProvider>(
+        } else if let Some(vector_scan) = find_concrete_table_provider_in::<VectorScanTableProvider>(
             &table_provider,
-            TRANSPARENT_CDC_WRAPPERS,
+            TABLE_PROVIDER_LAYERS,
+            LayerWalk::CdcDetection,
         ) {
             self.inner_connector.changes_stream(
                 Arc::new(FederatedTable::Immediate(Arc::clone(
@@ -405,9 +404,10 @@ impl DataConnector for EmbeddingConnector {
                 ))),
                 dataset,
             )
-        } else if let Some(embedding_table) = find_concrete_table_provider_with::<EmbeddingTable>(
+        } else if let Some(embedding_table) = find_concrete_table_provider_in::<EmbeddingTable>(
             &table_provider,
-            TRANSPARENT_CDC_WRAPPERS,
+            TABLE_PROVIDER_LAYERS,
+            LayerWalk::CdcDetection,
         ) {
             let embedding_table = Arc::new(embedding_table.clone());
             let underlying_table = Arc::clone(&embedding_table.base_table);
@@ -433,9 +433,10 @@ impl DataConnector for EmbeddingConnector {
     fn append_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
         let table_provider = federated_table.try_table_provider_sync()?;
 
-        if let Some(indexed_table) = find_concrete_table_provider_with::<IndexedTableProvider>(
+        if let Some(indexed_table) = find_concrete_table_provider_in::<IndexedTableProvider>(
             &table_provider,
-            TRANSPARENT_CDC_WRAPPERS,
+            TABLE_PROVIDER_LAYERS,
+            LayerWalk::CdcDetection,
         )
         .cloned()
         {
@@ -454,10 +455,27 @@ impl DataConnector for EmbeddingConnector {
             return Some(stream);
         }
 
+        // A `VectorScanTableProvider` is usually wrapped by an `IndexedTableProvider` (as
+        // above), but when a `FullTextConnector` also exists it peels that layer off before
+        // delegating here, so the vector scan is what we see. Mirror `changes_stream`: hand
+        // the scan's inner provider down and let the outer connector re-apply the indexes.
+        if let Some(vector_scan) = find_concrete_table_provider_in::<VectorScanTableProvider>(
+            &table_provider,
+            TABLE_PROVIDER_LAYERS,
+            LayerWalk::CdcDetection,
+        ) {
+            return self
+                .inner_connector
+                .append_stream(Arc::new(FederatedTable::Immediate(Arc::clone(
+                    &vector_scan.table_provider,
+                ))));
+        }
+
         let embedding_table = Arc::new(
-            find_concrete_table_provider_with::<EmbeddingTable>(
+            find_concrete_table_provider_in::<EmbeddingTable>(
                 &table_provider,
-                TRANSPARENT_CDC_WRAPPERS,
+                TABLE_PROVIDER_LAYERS,
+                LayerWalk::CdcDetection,
             )?
             .clone(),
         );
@@ -714,32 +732,14 @@ pub(crate) async fn try_wrap_view_accelerator_with_hnsw(
     Ok(true)
 }
 
-/// Inner-provider accessor for [`VectorScanTableProvider`]: its base table.
-const VECTOR_SCAN_INNER: InnerProviderFn = |tbl| {
-    tbl.downcast_ref::<VectorScanTableProvider>()
-        .map(|v| &v.table_provider)
-};
-
-/// Wrapper layers that carry no meaning for the source changes stream and must
-/// stay transparent to the CDC unwrap.
-///
-/// An outer search connector unwraps to us (e.g. `FullTextConnector` hands its
-/// `IndexedTableProvider`'s underlying to the inner `EmbeddingConnector`), and the
-/// accelerated-table setup wraps the source provider in metadata enrichment on the
-/// read-write path. Peeling only these layers — never our own `IndexedTableProvider`
-/// / `EmbeddingTable` / `VectorScanTableProvider` — lets us still detect which of our
-/// providers sits on top, exactly as `find_concrete_table_provider` does for
-/// full-text search.
-const TRANSPARENT_CDC_WRAPPERS: &[InnerProviderFn] =
-    &[METADATA_ENRICHED_INNER, FEDERATED_ADAPTOR_INNER];
-
 /// Peel an [`IndexedTableProvider`]'s index and enrichment layers down to the raw
 /// source provider, so the source connector's changes stream sees the schema of the
 /// table it actually reads from — only real source columns, never the synthetic
 /// `<col>_embedding` columns that a `VectorScanTableProvider` or `EmbeddingTable` merges
 /// into its schema (which would make the source's bootstrap `SELECT` reference a column
 /// that does not exist in the source table). A metadata-enrichment layer can sit between
-/// the `IndexedTableProvider` and its inner provider, so it is peeled here too.
+/// the `IndexedTableProvider` and its inner provider, so it is peeled too — see
+/// [`LayerWalk::Source`] and the layer table in [`crate::table_layers`].
 ///
 /// This always resolves to a source provider (never `None`): the caller re-applies the
 /// index writes over the returned stream, so a missing source table would otherwise
@@ -747,18 +747,152 @@ const TRANSPARENT_CDC_WRAPPERS: &[InnerProviderFn] =
 fn underlying_federated_table_for_indexed_table(
     src_table_provider: &Arc<dyn TableProvider>,
 ) -> Arc<FederatedTable> {
-    const PEEL: &[InnerProviderFn] = &[
-        INDEXED_INNER,
-        VECTOR_SCAN_INNER,
-        EMBEDDING_INNER,
-        METADATA_ENRICHED_INNER,
-        FEDERATED_ADAPTOR_INNER,
-    ];
+    let source = peel_to_innermost(src_table_provider, TABLE_PROVIDER_LAYERS, LayerWalk::Source);
+    Arc::new(FederatedTable::Immediate(Arc::clone(source)))
+}
 
-    let mut current = src_table_provider;
-    while let Some(inner) = PEEL.iter().find_map(|peel| peel(current.as_ref())) {
-        current = inner;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::record_batch;
+    use datafusion::datasource::MemTable;
+    use datafusion::logical_expr::{EmptyRelation, LogicalPlan};
+
+    /// A source connector that offers both stream kinds, so a `None` from
+    /// [`EmbeddingConnector`] can only come from its own provider resolution.
+    #[derive(Debug)]
+    struct StreamingSource;
+
+    #[async_trait]
+    impl DataConnector for StreamingSource {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        async fn read_provider(
+            &self,
+            _dataset: &Dataset,
+        ) -> DataConnectorResult<Arc<dyn TableProvider>> {
+            Ok(memtable())
+        }
+
+        fn supports_changes_stream(&self) -> bool {
+            true
+        }
+
+        fn changes_stream(
+            &self,
+            _federated_table: Arc<FederatedTable>,
+            _dataset: &Dataset,
+        ) -> Option<ChangesStream> {
+            Some(futures::stream::empty().boxed())
+        }
+
+        fn supports_append_stream(&self) -> bool {
+            true
+        }
+
+        fn append_stream(&self, _federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+            Some(futures::stream::empty().boxed())
+        }
     }
 
-    Arc::new(FederatedTable::Immediate(Arc::clone(current)))
+    fn memtable() -> Arc<dyn TableProvider> {
+        let batch = record_batch!(("id", Int32, [1]), ("content", Utf8, ["seed"]))
+            .expect("failed to create test batch");
+        Arc::new(
+            MemTable::try_new(batch.schema(), vec![vec![batch]])
+                .expect("failed to create test table"),
+        )
+    }
+
+    /// The provider stack an `EmbeddingConnector` is handed when the dataset also has
+    /// full-text search: the outer `FullTextConnector` peels its own `IndexedTableProvider`
+    /// off before delegating, leaving the vector scan on top.
+    fn vector_scan_over_memtable() -> Arc<FederatedTable> {
+        let vector_scan = VectorScanTableProvider {
+            table_provider: memtable(),
+            vector_index_list: Arc::new(LogicalPlan::EmptyRelation(EmptyRelation {
+                produce_one_row: false,
+                schema: Arc::new(datafusion::common::DFSchema::empty()),
+            })),
+            primary_key: vec!["id".to_string()],
+        };
+        Arc::new(FederatedTable::Immediate(
+            Arc::new(vector_scan) as Arc<dyn TableProvider>
+        ))
+    }
+
+    fn embedding_connector() -> EmbeddingConnector {
+        EmbeddingConnector::new(
+            Arc::new(StreamingSource),
+            Arc::new(RwLock::new(EmbeddingModelStore::default())),
+            Arc::new(RwLock::new(Secrets::default())),
+        )
+    }
+
+    /// Regression test for #12313: without its own `VectorScanTableProvider` arm,
+    /// `append_stream` falls through to the `EmbeddingTable` lookup, and
+    /// [`LayerWalk::CdcDetection`] is deliberately opaque at the vector-scan layer, so that
+    /// lookup cannot see through a vector scan. It returns `None`, and a `refresh_mode:
+    /// append` dataset with no `time_column` then fails registration with
+    /// `AppendRequiresTimeColumn` (or, on Cayenne, silently stops streaming).
+    ///
+    /// `changes_stream` has handled this stack since #12086; the two must not diverge again.
+    #[test]
+    fn append_stream_resolves_through_a_vector_scan() {
+        assert!(
+            embedding_connector()
+                .append_stream(vector_scan_over_memtable())
+                .is_some(),
+            "a vector scan must resolve to the source's append stream"
+        );
+    }
+
+    /// The `EmbeddingTable` arm still works, so the new arm did not shadow it.
+    #[test]
+    fn append_stream_resolves_through_an_embedding_table() {
+        let embedding_table = EmbeddingTable {
+            base_table: memtable(),
+            embedded_columns: std::collections::HashMap::new(),
+            embedding_models: Arc::new(RwLock::new(EmbeddingModelStore::default())),
+        };
+        let federated_table = Arc::new(FederatedTable::Immediate(
+            Arc::new(embedding_table) as Arc<dyn TableProvider>
+        ));
+
+        assert!(
+            embedding_connector()
+                .append_stream(federated_table)
+                .is_some(),
+            "an embedding table must still resolve to the source's append stream"
+        );
+    }
+
+    /// The `changes_stream` half of the invariant the test above pins: it has resolved
+    /// this stack since #12086, and nothing asserted it, so the arm could be dropped
+    /// without a failing test. Async and heavier than its `append_stream` twin only
+    /// because `changes_stream` takes a `Dataset`, which owns an `App` and a `Runtime`.
+    #[tokio::test]
+    async fn changes_stream_resolves_through_a_vector_scan() {
+        let spicepod_dataset =
+            spicepod::component::dataset::Dataset::new("test".to_string(), "test".to_string());
+        let app = app::AppBuilder::new("test")
+            .with_dataset(spicepod_dataset.clone())
+            .build();
+        let dataset =
+            crate::component::dataset::builder::DatasetBuilder::try_from(spicepod_dataset)
+                .expect("valid dataset builder")
+                .with_app(Arc::new(app))
+                .with_runtime(Arc::new(crate::Runtime::builder().build().await))
+                .build()
+                .expect("valid dataset");
+
+        assert!(
+            embedding_connector()
+                .changes_stream(vector_scan_over_memtable(), &dataset)
+                .is_some(),
+            "a vector scan must resolve to the source's changes stream"
+        );
+    }
 }

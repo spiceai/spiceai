@@ -30,3 +30,6 @@ anonymous_telemetry = []
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

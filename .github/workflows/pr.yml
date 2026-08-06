@@ -73,6 +73,44 @@ jobs:
       # pulls.listCommits for pure-revert fast-track detection
       pull-requests: read
     steps:
+      # An explicit sign-off verdict on the head commit answers the only question
+      # this job asks, so it is settled before anything below can route around
+      # it. `Inspect developer sign-off` treats a non-success status as an absent
+      # one and walks the first-parent chain, which is right for an intermediate
+      # merge commit — its status says nothing about the tree under review — but
+      # wrong for HEAD: inheritance exists so that merging the base costs no
+      # re-sign-off, not so that it can resurrect a sign-off that HEAD's own run
+      # has already overturned. The fast-track paths below skip the inspection
+      # entirely, and they mean "this head needs no sign-off", not "a failed one
+      # may be ignored". A `pending` status is deliberately not rejected here: it
+      # is not a verdict, and a sign-off still running must not turn Attestation
+      # red on a branch that already has a valid sign-off to inherit. See #12357.
+      - name: Reject a failed sign-off on the head commit
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const headSha = context.payload.pull_request.head.sha;
+
+            // 'signoff' matches the hardcoded STATUS_CONTEXT in scripts/signoff.
+            const { data } = await github.rest.repos.getCombinedStatusForRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: headSha,
+            });
+            const signoff = data.statuses.find((status) => status.context === 'signoff');
+            if (signoff?.state !== 'failure' && signoff?.state !== 'error') {
+              return;
+            }
+
+            const reported = signoff.description ? `: ${signoff.description}` : '';
+            core.setFailed(
+              `The developer sign-off for ${headSha} reported ${signoff.state}${reported}. ` +
+              `Fix what it found and run make signoff again on the pushed HEAD; a sign-off ` +
+              `that has failed on this commit cannot be satisfied by an earlier one. ` +
+              `See docs/dev/ci_signoff.md.`
+            );
+
       # Dependabot dependency bumps are fast-tracked: a PR Dependabot opened that
       # is still exactly the one commit Dependabot pushed carries no
       # human-authored change to sign off on, and the merge queue re-runs the
@@ -183,9 +221,11 @@ jobs:
       # attest a run that did no work. The merge queue's `check_changes` gate
       # applies the same reasoning to the merged result.
       #
-      # KEEP THE PATTERN IN SYNC with branch_has_rust_changes in scripts/signoff.
-      # This one also inspects renames (previous_filename), so it is strictly the
-      # more conservative of the two.
+      # KEEP THE PATTERN IN SYNC with RUST_AFFECTING_PATH_PATTERN in
+      # scripts/signoff, and covered by the check-code-changes filter;
+      # scripts/check_rust_gate_paths.py enforces both. This step also inspects
+      # renames (previous_filename), so it is strictly the more conservative of
+      # the two regexes.
       - name: Fast-track branches with no Rust-affecting files
         id: no_rust
         if: ${{ github.event_name == 'pull_request' && steps.dependabot.outputs.fast_track != 'true' }}
@@ -235,8 +275,7 @@ jobs:
               return;
             }
 
-            const rustAffecting =
-              /(\.rs$|(^|\/)Cargo\.(toml|lock)$|(^|\/)rust-toolchain(\.toml)?$|(^|\/)\.cargo\/)/;
+            const rustAffecting = /(\.rs$|(^|\/)Cargo\.(toml|lock)$|(^|\/)rust-toolchain(\.toml)?$|(^|\/)\.cargo\/|(^|\/)\.?(clippy|rustfmt)\.toml$|(^|\/)nextest\.toml$|(^|\/)layers\.toml$|^scripts\/check_(crate_layers|rust_gate_paths)\.py$|^Makefile$)/;
             for (const file of files) {
               // A rename off a .rs path changes Rust sources even though the new
               // name doesn't match, so both sides of the rename must be clean.
@@ -252,10 +291,12 @@ jobs:
             }
 
             core.setOutput('fast_track', 'true');
+            // Name the pattern rather than a subset of what it matches: the two drift
+            // apart every time a path is added to the gate.
             core.notice(
-              `Fast-tracked ${files.length} changed file(s): no .rs, Cargo, rust-toolchain, ` +
-              `or .cargo/ paths, so a sign-off would run no Rust checks. The full suite ` +
-              `still runs in the merge queue.`
+              `Fast-tracked ${files.length} changed file(s): none matches the ` +
+              `rustAffecting pattern in .github/workflows/pr.yml, so a sign-off would ` +
+              `run no Rust checks. The full suite still runs in the merge queue.`
             );
 
       # Pure reverts are fast-tracked: undoing a commit that already landed on
@@ -461,7 +502,7 @@ jobs:
       # and blobs to reproduce the merge without relying on a lazy network fetch.
       - name: Check out pull request history
         if: ${{ github.event_name == 'pull_request' && steps.signoff.outputs.inheritance_candidate == 'true' }}
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
@@ -566,7 +607,7 @@ jobs:
     outputs:
       relevant_changes: ${{ steps.check.outputs.relevant_changes }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Use fetch-depth 2 for PR change detection (dorny/paths-filter only needs base + head)
           fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 0 }}
@@ -590,7 +631,7 @@ jobs:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
           fetch-depth: 1
@@ -614,13 +655,14 @@ jobs:
       - name: Set up spiceio
         if: needs.check_changes.outputs.relevant_changes == 'true' && runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@973bc49a7be396ec9430255ad0f7ed684d7a1317 # v0.5.8
+        uses: spiceai/spiceio/.github/actions/setup@0870da59576dda1aef80e99c067c3bf14da7307b # v0.6.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
+          immutable-objects: "true"
 
       - name: Set up sccache
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -651,8 +693,13 @@ jobs:
           RUST_PROFILE: ${{ env.RUST_PROFILE }}
 
       - name: Show sccache stats
-        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
-        run: sccache --show-stats
+        if: ${{ always() && (needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true') }}
+        # `always()`: this is the one step that reports cache health, and without it
+        # it is skipped on exactly the failures it would explain (#12420). The `||`
+        # keeps a diagnostic from ever deciding a verdict — when the cache backend is
+        # gone `--show-stats` cannot answer either, and that is itself the finding.
+        run: |
+          sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
 
       - name: Kill spiceio
         if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
@@ -676,7 +723,7 @@ jobs:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
           fetch-depth: 1
@@ -704,13 +751,14 @@ jobs:
       - name: Set up spiceio
         if: needs.check_changes.outputs.relevant_changes == 'true' && runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@973bc49a7be396ec9430255ad0f7ed684d7a1317 # v0.5.8
+        uses: spiceai/spiceio/.github/actions/setup@0870da59576dda1aef80e99c067c3bf14da7307b # v0.6.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
+          immutable-objects: "true"
 
       - name: Set up sccache
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -762,8 +810,13 @@ jobs:
         run: cargo build -p testoperator --all-features --locked
 
       - name: Show sccache stats
-        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
-        run: sccache --show-stats
+        if: ${{ always() && (needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true') }}
+        # `always()`: this is the one step that reports cache health, and without it
+        # it is skipped on exactly the failures it would explain (#12420). The `||`
+        # keeps a diagnostic from ever deciding a verdict — when the cache backend is
+        # gone `--show-stats` cannot answer either, and that is itself the finding.
+        run: |
+          sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
 
       - name: Check if Cargo.lock is updated
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -803,7 +856,7 @@ jobs:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
           fetch-depth: 1
@@ -815,13 +868,14 @@ jobs:
       - name: Set up spiceio
         if: needs.check_changes.outputs.relevant_changes == 'true' && runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@973bc49a7be396ec9430255ad0f7ed684d7a1317 # v0.5.8
+        uses: spiceai/spiceio/.github/actions/setup@0870da59576dda1aef80e99c067c3bf14da7307b # v0.6.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
+          immutable-objects: "true"
 
       - name: Set up sccache
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -870,8 +924,13 @@ jobs:
         run: make install-spiced
 
       - name: Show sccache stats
-        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
-        run: sccache --show-stats
+        if: ${{ always() && (needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true') }}
+        # `always()`: this is the one step that reports cache health, and without it
+        # it is skipped on exactly the failures it would explain (#12420). The `||`
+        # keeps a diagnostic from ever deciding a verdict — when the cache backend is
+        # gone `--show-stats` cannot answer either, and that is itself the finding.
+        run: |
+          sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
 
       - name: Kill spiceio
         if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''

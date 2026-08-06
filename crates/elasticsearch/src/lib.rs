@@ -526,7 +526,8 @@ impl Client {
             .send()
             .await
             .context(HttpRequestSnafu)?;
-        let resp = check_status(resp).await?;
+        // The request body *is* a document, so a 4xx echoing it would report its content.
+        let resp = check_status_without_body(resp).await?;
         resp.json().await.context(JsonParseSnafu)
     }
 
@@ -563,10 +564,29 @@ impl Client {
                 .send()
                 .await
                 .context(HttpRequestSnafu)?;
-            let resp = check_status(resp).await?;
+            let resp = check_status_without_body(resp).await?;
             resp.json().await.context(JsonParseSnafu)
         })
         .await
+    }
+
+    /// Delete every document matching `query` via `POST /<index>/_delete_by_query`.
+    pub async fn delete_by_query(
+        &self,
+        index: &str,
+        query: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let url = format!("{}/{}/_delete_by_query", self.base_url, index);
+        let body = serde_json::json!({ "query": query });
+        let resp = self
+            .auth(self.http.post(&url))
+            .json(&body)
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+        // The query is built from primary keys, so a 4xx echoing it would report them.
+        let resp = check_status_without_body(resp).await?;
+        resp.json().await.context(JsonParseSnafu)
     }
 }
 
@@ -584,6 +604,82 @@ async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response> {
         });
     }
     Ok(resp)
+}
+
+/// Longest `error.type` this client will echo. Elasticsearch exception class names are
+/// short (`mapper_parsing_exception`, `es_rejected_execution_exception`); anything longer
+/// is not one, and is dropped rather than truncated.
+const MAX_ERROR_CLASS_LEN: usize = 64;
+
+/// Stands in for a response body that is not reported. Deliberately neutral about why:
+/// the body may have carried no usable `error.type`, or may not have been readable at
+/// all. An operator cannot act on that difference — the body is withheld either way —
+/// and claiming it was read when it was not would be wrong half the time.
+const UNREPORTED_BODY: &str = "no error class reported (response body can contain document data)";
+
+/// True when `s` has the shape of an Elasticsearch exception class name: a short
+/// `snake_case` run of ASCII lowercase letters, digits and underscores, starting with a
+/// letter.
+///
+/// A shape check rather than an allow-list, so an exception type this build has never
+/// heard of still reaches the operator, while anything that could carry row data — a
+/// quoted document fragment, a key/value pair, whitespace, punctuation, non-ASCII text —
+/// is refused. The leading-letter requirement holds for every Elasticsearch exception
+/// class and drops the all-digit and all-underscore strings the character test alone
+/// would admit, so a row-derived identifier an intermediary put in `error.type` cannot
+/// pass as a class name.
+fn is_error_class_token(s: &str) -> bool {
+    s.len() <= MAX_ERROR_CLASS_LEN
+        && s.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// Pull just the exception class out of an Elasticsearch error envelope.
+///
+/// Everything else the body carries — `error.reason`, `error.caused_by`, the document
+/// `_id`, any fragment of the request a proxy echoed back — is deliberately dropped.
+fn error_class_from_body(body: &str) -> Option<String> {
+    let envelope: serde_json::Value = serde_json::from_str(body).ok()?;
+    let class = envelope.get("error")?.get("type")?.as_str()?;
+    is_error_class_token(class).then(|| class.to_string())
+}
+
+/// Status check for the requests whose body carries row data: `_bulk`, a single-document
+/// index, and delete-by-query — whose query is built from primary keys.
+///
+/// `check_status` copies the whole response body into the error message. For the
+/// metadata and query endpoints that body is the useful diagnostic and carries no row
+/// data, but here it can quote document content: `error.reason` echoes the offending
+/// fragment, and a proxy in front of the cluster may echo part of the request. Document
+/// `_id`s are derived from the row's primary key, so letting the body through puts row
+/// data into an error message, into `with_retry`'s warning on *every* attempt, and into
+/// `runtime.task_history`.
+///
+/// So the body is read only to classify it: the status, and an `error.type` of the right
+/// shape, are all that survive.
+async fn check_status_without_body(resp: reqwest::Response) -> Result<reqwest::Response> {
+    if !(resp.status().is_client_error() || resp.status().is_server_error()) {
+        return Ok(resp);
+    }
+
+    let status = resp.status().as_u16();
+    // Nothing derived from `body` other than the exception class escapes this scope.
+    let class = match resp.text().await {
+        Ok(body) => error_class_from_body(&body),
+        // The body could not be read — a truncated or interrupted response. The status is
+        // still the actionable signal, and there is nothing left to classify; surfacing the
+        // transport error instead would reclassify an HTTP-status failure as a transport one
+        // and change how `is_transient` treats it.
+        Err(_) => None,
+    };
+
+    Err(Error::ElasticsearchError {
+        status,
+        // Still an `ElasticsearchError`, so `is_transient` — and with it the 429/5xx
+        // retry classification in `with_retry` — keeps working unchanged.
+        message: class.unwrap_or_else(|| UNREPORTED_BODY.to_string()),
+    })
 }
 
 // ── Helpers for building common queries ────────────────────────────────────
@@ -652,6 +748,11 @@ pub trait Elasticsearch: std::fmt::Debug + Send + Sync {
         &self,
         index: &str,
         docs: &[(Option<String>, serde_json::Value)],
+    ) -> Result<serde_json::Value>;
+    async fn delete_by_query(
+        &self,
+        index: &str,
+        query: &serde_json::Value,
     ) -> Result<serde_json::Value>;
 }
 
@@ -736,5 +837,299 @@ impl Elasticsearch for Client {
         docs: &[(Option<String>, serde_json::Value)],
     ) -> Result<serde_json::Value> {
         self.bulk_index(index, docs).await
+    }
+
+    async fn delete_by_query(
+        &self,
+        index: &str,
+        query: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        Client::delete_by_query(self, index, query).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Client, ClientOptions, Error, RetryConfig, UNREPORTED_BODY, error_class_from_body,
+        is_error_class_token,
+    };
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// Stands in for document content. A real `_bulk` rejection quotes the offending
+    /// field value, and the `_id` is derived from the row's primary key, so this is the
+    /// shape of thing that must not reach an error, a log line, or `task_history`.
+    const SENTINEL: &str = "SENTINEL-ROW-VALUE-9F3A";
+
+    /// Number of requests a stub served, shared with the test thread.
+    type Hits = Arc<AtomicUsize>;
+
+    /// A blocking HTTP stub that answers `max_conns` requests with the same status and
+    /// body, and reports how many it served.
+    ///
+    /// `std::net` on its own thread rather than `tokio::net`: the workspace's tokio does
+    /// not enable the `net` feature, and a blocking listener needs nothing extra.
+    fn spawn_stub(status_line: &'static str, body: String, max_conns: usize) -> (String, Hits) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+        let addr = listener.local_addr().expect("read the bound address");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let served = Arc::clone(&hits);
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(max_conns) {
+                let Ok(mut stream) = stream else { break };
+                served.fetch_add(1, Ordering::SeqCst);
+
+                // Consume the request head so the client has finished sending before we
+                // answer. The stub never inspects it; the loop exists only to reach the
+                // blank line that ends the head.
+                {
+                    let mut reader = BufReader::new(&mut stream);
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match reader.read_line(&mut line) {
+                            // 0 bytes is EOF, and an error means the peer went away.
+                            Ok(0) | Err(_) => break,
+                            // A bare CRLF ends the request head.
+                            Ok(_) if line == "\r\n" || line == "\n" => break,
+                            Ok(_) => {}
+                        }
+                    }
+                }
+
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}",
+                    len = body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        (format!("http://{addr}"), hits)
+    }
+
+    /// A client pointed at `url` with retries wound down so tests do not sleep.
+    fn stub_client(url: &str, max_retries: u32) -> Client {
+        let opts = ClientOptions {
+            connect_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(5),
+            retry: RetryConfig {
+                max_retries,
+                initial_backoff: Duration::from_millis(1),
+            },
+        };
+        Client::new_with_options(url, None, None, &opts).expect("build the stub client")
+    }
+
+    fn one_doc() -> Vec<(Option<String>, serde_json::Value)> {
+        vec![(Some("row-1".to_string()), serde_json::json!({"body": "x"}))]
+    }
+
+    // ── The shape check ────────────────────────────────────────────────────
+
+    #[test]
+    fn error_class_tokens_admit_class_names_and_refuse_prose() {
+        // Real exception classes, including ones this build has never heard of.
+        assert!(is_error_class_token("mapper_parsing_exception"));
+        assert!(is_error_class_token("es_rejected_execution_exception"));
+        assert!(is_error_class_token("some_future_exception_v2"));
+
+        // Anything that could carry a document fragment.
+        assert!(!is_error_class_token(""));
+        assert!(!is_error_class_token("failed to parse field [amount]"));
+        assert!(!is_error_class_token("ROW-VALUE-9F3A"));
+        assert!(!is_error_class_token("Mapper_Parsing"));
+        assert!(!is_error_class_token("id='row-1'"));
+        assert!(!is_error_class_token("значение"));
+        // Long enough that it is prose wearing a class name's clothes.
+        assert!(!is_error_class_token(&"a".repeat(65)));
+
+        // Shapes the character test alone would admit: no exception class starts with a
+        // digit or an underscore, but a row-derived identifier can look exactly like this.
+        assert!(!is_error_class_token("12345"));
+        assert!(!is_error_class_token("42_7"));
+        assert!(!is_error_class_token("_internal_exception"));
+        assert!(!is_error_class_token("___"));
+    }
+
+    #[test]
+    fn error_class_extraction_keeps_only_the_class() {
+        let body = format!(
+            r#"{{"error":{{"type":"mapper_parsing_exception","reason":"failed to parse [{SENTINEL}]"}},"status":400}}"#
+        );
+        assert_eq!(
+            error_class_from_body(&body).as_deref(),
+            Some("mapper_parsing_exception")
+        );
+
+        // Not JSON at all — an HTML page from a proxy in front of the cluster.
+        assert_eq!(
+            error_class_from_body(&format!("<html><body>{SENTINEL}</body></html>")),
+            None
+        );
+        // `error` as a bare string, which some endpoints return.
+        assert_eq!(
+            error_class_from_body(&format!(r#"{{"error":"{SENTINEL}"}}"#)),
+            None
+        );
+        // A `type` that is prose rather than a class name is refused, not truncated.
+        assert_eq!(
+            error_class_from_body(&format!(r#"{{"error":{{"type":"{SENTINEL} bad"}}}}"#)),
+            None
+        );
+        // An intermediary that puts a row-derived id where the class belongs: digits and
+        // underscores alone pass the character test, so the leading letter is what stops it.
+        assert_eq!(
+            error_class_from_body(r#"{"error":{"type":"90210_44317"}}"#),
+            None
+        );
+    }
+
+    // ── The HTTP paths ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn bulk_index_4xx_reports_the_class_and_not_the_body() {
+        let body = format!(
+            r#"{{"error":{{"type":"mapper_parsing_exception","reason":"failed to parse field [amount] in document id '{SENTINEL}'"}},"status":400}}"#
+        );
+        let (url, hits) = spawn_stub("400 Bad Request", body, 1);
+
+        let err = stub_client(&url, 3)
+            .bulk_index("idx", &one_doc())
+            .await
+            .expect_err("a 400 must surface as an error");
+
+        let rendered = err.to_string();
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the response body reached the error: {rendered}"
+        );
+        assert!(
+            rendered.contains("mapper_parsing_exception"),
+            "the exception class should survive: {rendered}"
+        );
+        // 400 is not transient, so it must not have been retried.
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn bulk_index_429_withholds_the_body_from_every_attempt() {
+        let body = format!(
+            r#"{{"error":{{"type":"es_rejected_execution_exception","reason":"rejected doc '{SENTINEL}'"}},"status":429}}"#
+        );
+        let (url, hits) = spawn_stub("429 Too Many Requests", body, 4);
+
+        let err = stub_client(&url, 3)
+            .bulk_index("idx", &one_doc())
+            .await
+            .expect_err("an exhausted 429 must surface as an error");
+
+        let rendered = err.to_string();
+        // `with_retry` logs the error with `{e}` on every attempt, so this one assertion
+        // covers the retry log as well as the returned error — they render the same value.
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the response body reached the error, and therefore the retry log: {rendered}"
+        );
+        assert!(rendered.contains("es_rejected_execution_exception"));
+        // Still classified transient, so the retry budget was spent: 1 try + 3 retries.
+        let still_es_error = matches!(err, Error::ElasticsearchError { status: 429, .. });
+        assert!(still_es_error, "a 429 must stay an ElasticsearchError");
+        assert_eq!(hits.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn bulk_index_withholds_a_body_it_cannot_classify() {
+        // A proxy's HTML error page: no envelope to pull a class from, so nothing is echoed.
+        let (url, _hits) = spawn_stub(
+            "502 Bad Gateway",
+            format!("<html><body>upstream said {SENTINEL}</body></html>"),
+            1,
+        );
+
+        let err = stub_client(&url, 0)
+            .bulk_index("idx", &one_doc())
+            .await
+            .expect_err("a 502 must surface as an error");
+
+        let rendered = err.to_string();
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the response body reached the error: {rendered}"
+        );
+        assert!(rendered.contains(UNREPORTED_BODY), "got: {rendered}");
+    }
+
+    #[tokio::test]
+    async fn delete_by_query_4xx_does_not_report_the_query() {
+        // The query is built from primary keys, so the echoed query is row data.
+        let body = format!(
+            r#"{{"error":{{"type":"search_phase_execution_exception","reason":"failed on ids ['{SENTINEL}']"}},"status":400}}"#
+        );
+        let (url, _hits) = spawn_stub("400 Bad Request", body, 1);
+        let query = serde_json::json!({"ids": {"values": [SENTINEL]}});
+
+        let err = stub_client(&url, 0)
+            .delete_by_query("idx", &query)
+            .await
+            .expect_err("a 400 must surface as an error");
+
+        let rendered = err.to_string();
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the response body reached the error: {rendered}"
+        );
+        assert!(rendered.contains("search_phase_execution_exception"));
+    }
+
+    #[tokio::test]
+    async fn index_document_4xx_does_not_report_the_document() {
+        let body = format!(
+            r#"{{"error":{{"type":"strict_dynamic_mapping_exception","reason":"mapping set to strict, field [{SENTINEL}] not allowed"}},"status":400}}"#
+        );
+        let (url, _hits) = spawn_stub("400 Bad Request", body, 1);
+        let doc = serde_json::json!({"amount": SENTINEL});
+
+        let err = stub_client(&url, 0)
+            .index_document("idx", "row-1", &doc)
+            .await
+            .expect_err("a 400 must surface as an error");
+
+        let rendered = err.to_string();
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the response body reached the error: {rendered}"
+        );
+        assert!(rendered.contains("strict_dynamic_mapping_exception"));
+    }
+
+    #[tokio::test]
+    async fn the_metadata_endpoints_still_report_their_body() {
+        // The counterpart guard: redaction is scoped to the row-data paths, so an endpoint
+        // whose body is the useful diagnostic keeps reporting it in full.
+        let detail = "unknown setting [index.nope]";
+        let (url, _hits) = spawn_stub(
+            "400 Bad Request",
+            format!(r#"{{"error":{{"type":"illegal_argument_exception","reason":"{detail}"}}}}"#),
+            1,
+        );
+
+        let settings = serde_json::json!({"settings": {}});
+        let err = stub_client(&url, 0)
+            .create_index("idx", &settings)
+            .await
+            .expect_err("a 400 must surface as an error");
+
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains(detail),
+            "the metadata diagnostic was lost: {rendered}"
+        );
     }
 }

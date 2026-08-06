@@ -19,15 +19,19 @@ use std::{any::Any, sync::Arc};
 use arrow::array::RecordBatch;
 use arrow_schema::Field;
 use async_trait::async_trait;
-use datafusion::{error::DataFusionError, logical_expr::LogicalPlan};
+use datafusion::{
+    error::{DataFusionError, Result as DataFusionResult},
+    logical_expr::{LogicalPlan, LogicalPlanBuilder},
+};
 use futures::future::try_join_all;
 use runtime_datafusion_index::Index;
 
-use crate::index::{SearchIndex, VectorIndex};
+use crate::index::{SearchIndex, VectorIndex, primary_key_projection};
 
 use super::{
-    CompoundReadMode, Error, compound_on_write_start, compound_required_columns, compound_write,
-    fallback::fallback_on_empty_plan, validate_compatibility,
+    CompoundReadMode, Error, compound_delete_by_keys, compound_on_write_start,
+    compound_required_columns, compound_write, fallback::fallback_on_empty_plan,
+    validate_compatibility,
 };
 
 /// A [`VectorIndex`] counterpart of [`super::CompoundSearchIndex`]: writes through to two
@@ -78,6 +82,11 @@ impl CompoundVectorIndex {
     }
 
     #[must_use]
+    pub fn primary(&self) -> &Arc<dyn VectorIndex> {
+        &self.primary
+    }
+
+    #[must_use]
     pub fn read_mode(&self) -> CompoundReadMode {
         self.read_mode
     }
@@ -93,6 +102,31 @@ impl VectorIndex for CompoundVectorIndex {
                 fallback_on_empty_plan(primary, secondary)
             }
         }
+    }
+
+    /// Both halves, unioned — never narrowed by [`Self::read_mode`].
+    ///
+    /// `list_table_provider` answers "what should a read see", and for
+    /// [`CompoundReadMode::PrimaryOnly`] that is the warm primary alone; the primary only holds
+    /// rows the write path has passed through it, so it is not authoritative for what is stored.
+    /// A union rather than a fallback because the two halves can disagree in *either* direction:
+    /// an entry either one holds is an entry a delete still has to resolve, and
+    /// [`Index::delete_by_keys`] already fans out to both.
+    ///
+    /// Each half is projected to the key columns *before* the union. [`validate_compatibility`]
+    /// guarantees the halves agree there on name, type and nullability; it guarantees nothing of
+    /// the rest of their listings, which is why [`fallback_on_empty_plan`] has to cast and
+    /// re-project to reconcile them for reads.
+    fn list_all_entry_keys(&self) -> Result<LogicalPlan, DataFusionError> {
+        let keys = |half: &Arc<dyn VectorIndex>| {
+            LogicalPlanBuilder::from(half.list_all_entry_keys()?)
+                .project(primary_key_projection(&half.primary_fields()))?
+                .build()
+        };
+
+        LogicalPlanBuilder::from(keys(&self.primary)?)
+            .union(keys(&self.secondary)?)?
+            .build()
     }
 
     fn dimension(&self) -> i32 {
@@ -153,6 +187,22 @@ impl Index for CompoundVectorIndex {
             self.secondary.on_write_complete()
         );
         primary_result.and(secondary_result)
+    }
+
+    async fn delete_by_keys(&self, keys: RecordBatch) -> DataFusionResult<()> {
+        compound_delete_by_keys(self.primary.as_ref(), self.secondary.as_ref(), keys).await
+    }
+
+    fn deletes_by_partial_key(&self) -> bool {
+        // `delete_by_keys` fans out to both halves, so a partial key only clears this compound
+        // index when *both* halves act on one.
+        self.primary.deletes_by_partial_key() && self.secondary.deletes_by_partial_key()
+    }
+
+    fn write_start_failure_is_fatal(&self) -> bool {
+        // `compound_on_write_start` fails if either half fails to start, so either half
+        // treating that as fatal makes it fatal for this compound index.
+        self.primary.write_start_failure_is_fatal() || self.secondary.write_start_failure_is_fatal()
     }
 
     fn write_complete_failure_is_fatal(&self) -> bool {

@@ -26,7 +26,7 @@ use crate::tools::utils::{create_table_allowlist, get_tools_with_allowlist};
 use llms::chat::Error as LlmError;
 use llms::openai::DEFAULT_LLM_MODEL;
 use llms::responses::Responses;
-use runtime_parameters::typed::TypedParams;
+use runtime_parameters_typed::TypedParams;
 use runtime_secrets::Secrets;
 use runtime_tools::options::SpiceToolsOptions;
 use secrecy::{ExposeSecret, SecretString};

@@ -39,7 +39,6 @@ use snafu::prelude::*;
 use crate::{
     component::dataset::acceleration::{Engine, RefreshMode},
     parameters::ParameterSpec,
-    register_data_accelerator,
 };
 
 use super::{AccelerationSource, DataAccelerator};
@@ -195,4 +194,7 @@ impl DataAccelerator for PartitionedArrowAccelerator {
     }
 }
 
-register_data_accelerator!(Engine::PartitionedArrow, PartitionedArrowAccelerator);
+data_accelerator_api::register_data_accelerator!(
+    Engine::PartitionedArrow,
+    PartitionedArrowAccelerator
+);

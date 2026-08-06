@@ -58,6 +58,7 @@ const MAX_MESSAGE_SIZE: usize = 1_000_000; // 1MB per message
 const MAX_BATCH_SIZE: usize = 1000; // Maximum rows per batch
 
 pub static AI_UDF_NAME: &str = "ai";
+runtime_udfs_api::register_spice_function!(AI_SPICE_FUNCTION, AI_UDF_NAME);
 pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| {
     Documentation {
     doc_section: DocSection::default(),
@@ -538,7 +539,13 @@ impl Ai {
 #[cfg(test)]
 // Allow various lints in test code for simplicity and readability.
 // Test code prioritizes clarity over strict lint compliance.
-#[expect(clippy::clone_on_ref_ptr, clippy::uninlined_format_args)]
+#[expect(
+    clippy::clone_on_ref_ptr,
+    clippy::uninlined_format_args,
+    // Test fixtures pick a concurrency for the mock model; nothing here is
+    // sized from spiced's CPU entitlement.
+    clippy::disallowed_methods
+)]
 mod tests {
     use super::*;
     use arrow_schema::{DataType, Field};

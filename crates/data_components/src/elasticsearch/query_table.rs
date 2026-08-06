@@ -21,12 +21,13 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use chrono::DateTime;
+use chrono::{DateTime, NaiveDate, NaiveDateTime};
 
 use arrow::array::{
-    ArrayRef, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
-    Int64Array, LargeStringBuilder, ListBuilder, RecordBatch, StringArray, StringBuilder,
-    TimestampMicrosecondArray, UInt64Array,
+    ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int8Array,
+    Int16Array, Int32Array, Int64Array, LargeStringBuilder, ListBuilder, RecordBatch, StringArray,
+    StringBuilder, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use async_trait::async_trait;
@@ -400,6 +401,20 @@ pub fn hits_to_record_batch(
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
 }
 
+/// Build the timestamp `ArrayRef` for a given concrete array type, attaching the timezone
+/// from the Arrow `Timestamp(_, tz)` field when present.
+macro_rules! build_timestamp_array {
+    ($arr_ty:ident, $values:expr, $tz:expr) => {{
+        let arr = $arr_ty::from($values);
+        let arr = if let Some(tz_str) = $tz {
+            arr.with_timezone(tz_str.as_ref())
+        } else {
+            arr
+        };
+        Arc::new(arr) as ArrayRef
+    }};
+}
+
 fn build_array_from_hits(
     hits: &[elasticsearch::Hit],
     field_name: &str,
@@ -438,6 +453,41 @@ fn build_array_from_hits(
                 })
                 .collect();
             Ok(Arc::new(UInt64Array::from(values)) as ArrayRef)
+        }
+        // ES `integer`/`long` mappings back a range of Arrow unsigned widths
+        // (see `arrow_type_to_es_mapping`). `_source` stores them as JSON numbers.
+        DataType::UInt32 => {
+            let values: Vec<Option<u32>> = hits
+                .iter()
+                .map(|h| {
+                    extract_field(&h.source, field_name)
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|n| u32::try_from(n).ok())
+                })
+                .collect();
+            Ok(Arc::new(UInt32Array::from(values)) as ArrayRef)
+        }
+        DataType::UInt16 => {
+            let values: Vec<Option<u16>> = hits
+                .iter()
+                .map(|h| {
+                    extract_field(&h.source, field_name)
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|n| u16::try_from(n).ok())
+                })
+                .collect();
+            Ok(Arc::new(UInt16Array::from(values)) as ArrayRef)
+        }
+        DataType::UInt8 => {
+            let values: Vec<Option<u8>> = hits
+                .iter()
+                .map(|h| {
+                    extract_field(&h.source, field_name)
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|n| u8::try_from(n).ok())
+                })
+                .collect();
+            Ok(Arc::new(UInt8Array::from(values)) as ArrayRef)
         }
         DataType::Int32 => {
             let values: Vec<Option<i32>> = hits
@@ -496,9 +546,19 @@ fn build_array_from_hits(
                 .collect();
             Ok(Arc::new(BooleanArray::from(values)) as ArrayRef)
         }
-        DataType::FixedSizeList(_inner_field, dim) => {
-            build_dense_vector_array(hits, field_name, *dim)
-        }
+        // A `FixedSizeList` is either the dense embedding vector (`Float32`, written as a
+        // JSON array of floats) or the chunk offset pair (`Int32`, written as a JSON array
+        // of two ints). Route by inner type so the offset column round-trips as integers
+        // instead of being coerced into a float dense-vector.
+        DataType::FixedSizeList(inner_field, dim) => match inner_field.data_type() {
+            DataType::Float32 | DataType::Float64 => {
+                build_dense_vector_array(hits, field_name, *dim)
+            }
+            DataType::Int32 => build_int32_fixed_size_list_array(hits, field_name, *dim),
+            other => Err(DataFusionError::NotImplemented(format!(
+                "Elasticsearch _source reader cannot decode field '{field_name}': unsupported FixedSizeList inner type {other}."
+            ))),
+        },
         // List<Utf8> or List<LargeUtf8>: ES returns JSON arrays of strings.
         // Use `.with_field` so the inner field name matches the schema exactly.
         DataType::List(inner_field)
@@ -539,52 +599,205 @@ fn build_array_from_hits(
                 Ok(Arc::new(builder.finish()) as ArrayRef)
             }
         }
-        DataType::Timestamp(TimeUnit::Microsecond, tz) => {
-            // Elasticsearch timestamps are ISO 8601 strings or epoch-millis integers.
+        // ES `date` mappings back Arrow `Timestamp` for every `TimeUnit` (arrow-json writes
+        // them as RFC 3339 / ISO 8601 strings; ES may also return epoch-millis integers).
+        DataType::Timestamp(unit, tz) => {
             let values: Vec<Option<i64>> = hits
                 .iter()
                 .map(|h| {
-                    let v = extract_field(&h.source, field_name)?;
-                    if let Some(ms) = v.as_i64() {
-                        // epoch-millis → epoch-microseconds
-                        return ms.checked_mul(1_000);
-                    }
-                    if let Some(ms) = v.as_u64() {
-                        // epoch-millis → epoch-microseconds
-                        return i64::try_from(ms).ok().and_then(|ms| ms.checked_mul(1_000));
-                    }
-                    if let Some(s) = v.as_str() {
-                        return DateTime::parse_from_rfc3339(s)
-                            .ok()
-                            .map(|dt| dt.timestamp_micros());
-                    }
-                    None
+                    extract_field(&h.source, field_name)
+                        .and_then(|v| parse_timestamp_to_unit(v, *unit))
                 })
                 .collect();
-            let arr = TimestampMicrosecondArray::from(values);
-            let arr = if let Some(tz_str) = tz {
-                arr.with_timezone(tz_str.as_ref())
-            } else {
-                arr
+            let arr: ArrayRef = match unit {
+                TimeUnit::Second => build_timestamp_array!(TimestampSecondArray, values, tz),
+                TimeUnit::Millisecond => {
+                    build_timestamp_array!(TimestampMillisecondArray, values, tz)
+                }
+                TimeUnit::Microsecond => {
+                    build_timestamp_array!(TimestampMicrosecondArray, values, tz)
+                }
+                TimeUnit::Nanosecond => {
+                    build_timestamp_array!(TimestampNanosecondArray, values, tz)
+                }
             };
-            Ok(Arc::new(arr) as ArrayRef)
+            Ok(arr)
         }
-        _ => {
-            // Fallback: serialize as JSON string.
+        // ES `date` mappings also back Arrow date types. arrow-json writes `Date32` as a
+        // `YYYY-MM-DD` string and `Date64` as an ISO 8601 datetime string.
+        DataType::Date32 => {
+            let values: Vec<Option<i32>> = hits
+                .iter()
+                .map(|h| extract_field(&h.source, field_name).and_then(parse_date32))
+                .collect();
+            Ok(Arc::new(Date32Array::from(values)) as ArrayRef)
+        }
+        DataType::Date64 => {
+            let values: Vec<Option<i64>> = hits
+                .iter()
+                .map(|h| extract_field(&h.source, field_name).and_then(parse_date64_millis))
+                .collect();
+            Ok(Arc::new(Date64Array::from(values)) as ArrayRef)
+        }
+        // Remaining string-typed fields serialize as JSON strings (plain `Utf8` is handled
+        // above). Anything else is a type `arrow_type_to_es_mapping` only round-trips through
+        // `_source` as an opaque `keyword`; decoding it into a concrete Arrow array here is
+        // not implemented, so fail loudly rather than silently producing a wrong-typed
+        // `Utf8` column.
+        DataType::LargeUtf8 | DataType::Utf8View => {
             let values: Vec<Option<String>> = hits
                 .iter()
                 .map(|h| extract_field(&h.source, field_name).map(json_value_to_string))
                 .collect();
             Ok(Arc::new(StringArray::from(values)) as ArrayRef)
         }
+        other => Err(DataFusionError::NotImplemented(format!(
+            "Elasticsearch _source reader cannot decode field '{field_name}' of type {other}. \
+            Declare this metadata column with a supported type (boolean, integer/float, date/timestamp, string, or list of strings)."
+        ))),
     }
 }
 
-/// Navigate dot-separated field names (e.g. "address.city") into a JSON value.
+/// Parse a JSON `_source` value into an epoch count expressed in `unit`.
+///
+/// Strings are parsed as RFC 3339 / ISO 8601 (arrow-json's write format); numeric values
+/// follow the Elasticsearch convention of epoch-milliseconds.
+fn parse_timestamp_to_unit(v: &serde_json::Value, unit: TimeUnit) -> Option<i64> {
+    let nanos: i64 = if let Some(s) = v.as_str() {
+        parse_datetime_to_nanos(s)?
+    } else if let Some(ms) = v.as_i64() {
+        ms.checked_mul(1_000_000)?
+    } else if let Some(ms) = v.as_u64() {
+        i64::try_from(ms).ok()?.checked_mul(1_000_000)?
+    } else {
+        return None;
+    };
+    Some(match unit {
+        TimeUnit::Second => nanos.div_euclid(1_000_000_000),
+        TimeUnit::Millisecond => nanos.div_euclid(1_000_000),
+        TimeUnit::Microsecond => nanos.div_euclid(1_000),
+        TimeUnit::Nanosecond => nanos,
+    })
+}
+
+/// Parse an RFC 3339 / ISO 8601 datetime (or bare date) string into nanoseconds since the
+/// Unix epoch. Handles both timezone-aware strings and the naive form arrow-json emits for
+/// timezone-less `Timestamp`/`Date64` columns.
+fn parse_datetime_to_nanos(s: &str) -> Option<i64> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return dt.timestamp_nanos_opt();
+    }
+    for fmt in [
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S",
+    ] {
+        if let Ok(ndt) = NaiveDateTime::parse_from_str(s, fmt) {
+            return ndt.and_utc().timestamp_nanos_opt();
+        }
+    }
+    NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .and_then(|ndt| ndt.and_utc().timestamp_nanos_opt())
+}
+
+/// Parse a `_source` value into an Arrow `Date32` (days since the Unix epoch).
+fn parse_date32(v: &serde_json::Value) -> Option<i32> {
+    if let Some(s) = v.as_str() {
+        let date = NaiveDate::parse_from_str(s, "%Y-%m-%d").ok().or_else(|| {
+            DateTime::parse_from_rfc3339(s)
+                .ok()
+                .map(|dt| dt.date_naive())
+        })?;
+        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1)?;
+        return i32::try_from((date - epoch).num_days()).ok();
+    }
+    // Numeric values are interpreted as Arrow's native epoch-days representation.
+    v.as_i64().and_then(|n| i32::try_from(n).ok())
+}
+
+/// Parse a `_source` value into an Arrow `Date64` (milliseconds since the Unix epoch).
+fn parse_date64_millis(v: &serde_json::Value) -> Option<i64> {
+    if let Some(s) = v.as_str() {
+        return parse_datetime_to_nanos(s).map(|ns| ns.div_euclid(1_000_000));
+    }
+    // Numeric values follow the Elasticsearch epoch-milliseconds convention.
+    v.as_i64().or_else(|| i64::try_from(v.as_u64()?).ok())
+}
+
+/// Build a `FixedSizeList(Int32, dim)` array from `_source` JSON int arrays (e.g. the chunk
+/// `{start, end}` offset pair). A missing value yields a NULL row.
+fn build_int32_fixed_size_list_array(
+    hits: &[elasticsearch::Hit],
+    field_name: &str,
+    dim: i32,
+) -> Result<ArrayRef, DataFusionError> {
+    let dim_usize = usize::try_from(dim).map_err(|_| {
+        DataFusionError::Execution(format!(
+            "FixedSizeList field '{field_name}' has a negative dimension {dim}"
+        ))
+    })?;
+    let mut flat_values: Vec<i32> = Vec::with_capacity(hits.len() * dim_usize);
+    let mut null_mask: Vec<bool> = Vec::with_capacity(hits.len());
+
+    for hit in hits {
+        if let Some(arr) = extract_field(&hit.source, field_name).and_then(|v| v.as_array()) {
+            if arr.len() != dim_usize {
+                return Err(DataFusionError::Execution(format!(
+                    "FixedSizeList field '{field_name}' has {len} elements, expected {dim_usize}",
+                    len = arr.len(),
+                )));
+            }
+            for val in arr {
+                let n = val
+                    .as_i64()
+                    .and_then(|n| i32::try_from(n).ok())
+                    .ok_or_else(|| {
+                        DataFusionError::Execution(format!(
+                            "FixedSizeList field '{field_name}' contains a non-Int32 element"
+                        ))
+                    })?;
+                flat_values.push(n);
+            }
+            null_mask.push(true);
+        } else {
+            flat_values.extend(std::iter::repeat_n(0, dim_usize));
+            null_mask.push(false);
+        }
+    }
+
+    let values_array = Arc::new(Int32Array::from(flat_values)) as ArrayRef;
+    let nulls = arrow::buffer::NullBuffer::from(null_mask);
+    let list_array = arrow::array::FixedSizeListArray::try_new(
+        Arc::new(arrow::datatypes::Field::new("item", DataType::Int32, false)),
+        dim,
+        values_array,
+        Some(nulls),
+    )
+    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+
+    Ok(Arc::new(list_array) as ArrayRef)
+}
+
+/// Look up a field in an Elasticsearch `_source` document.
+///
+/// Tries the literal (flat) key first — Elasticsearch preserves the original document shape
+/// in `_source`, so a dotted field name written as a flat key (e.g. `"_spice.chunk_id"`)
+/// stays flat. Falls back to dot-separated nested navigation (e.g. `"address.city"` →
+/// `source["address"]["city"]`) so genuinely nested objects still resolve, and to cover
+/// deployments/configs where Elasticsearch expands dotted names into nested objects.
 fn extract_field<'a>(
     source: &'a serde_json::Value,
     field_name: &str,
 ) -> Option<&'a serde_json::Value> {
+    if let Some(value) = source.get(field_name) {
+        return Some(value);
+    }
+    if !field_name.contains('.') {
+        return None;
+    }
     let mut current = source;
     for part in field_name.split('.') {
         current = current.get(part)?;
@@ -867,6 +1080,14 @@ mod tests {
         ) -> elasticsearch::Result<serde_json::Value> {
             Err(unexpected_call_error("bulk_index"))
         }
+
+        async fn delete_by_query(
+            &self,
+            _index: &str,
+            _query: &serde_json::Value,
+        ) -> elasticsearch::Result<serde_json::Value> {
+            Err(unexpected_call_error("delete_by_query"))
+        }
     }
 
     async fn collect_query_table(
@@ -1113,5 +1334,241 @@ mod tests {
         assert_eq!(strings.value(0), "a");
         assert_eq!(strings.value(1), "b");
         assert_eq!(strings.value(2), "c");
+    }
+
+    // ── Chunked columns: flat dotted chunk_id + Int32 offset pair ────────────────
+
+    /// The chunked warm-index fallback reads `_spice.chunk_id` (written as a flat dotted
+    /// key in `_source`) and the `{col}_offset` `FixedSizeList(Int32, 2)` back out of
+    /// Elasticsearch. `extract_field` must find the flat key rather than dot-navigating into
+    /// a non-existent `{"_spice": {"chunk_id": ..}}`, and the offset must decode as Int32,
+    /// not as a Float32 dense vector.
+    #[test]
+    fn test_chunked_chunk_id_and_offset_round_trip() {
+        use arrow::array::{FixedSizeListArray, Int32Array, UInt64Array};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_spice.chunk_id", DataType::UInt64, false),
+            Field::new(
+                "content_offset",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, false)), 2),
+                false,
+            ),
+        ]));
+        let hits = vec![
+            make_hit(json!({"_spice.chunk_id": 0_u64, "content_offset": [0, 27]})),
+            make_hit(json!({"_spice.chunk_id": 5_u64, "content_offset": [27, 45]})),
+        ];
+        let batch = hits_to_record_batch(&hits, &schema).expect("hits_to_record_batch failed");
+
+        let chunk_ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("chunk_id column should be UInt64Array");
+        assert_eq!(chunk_ids.value(0), 0);
+        assert_eq!(chunk_ids.value(1), 5);
+
+        let offsets = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .expect("offset column should be FixedSizeListArray");
+        assert_eq!(offsets.values().data_type(), &DataType::Int32);
+        let row0 = offsets.value(0);
+        let pair0 = row0
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("offset values should be Int32Array");
+        assert_eq!(pair0.value(0), 0);
+        assert_eq!(pair0.value(1), 27);
+    }
+
+    /// Nested dotted names (`address.city`) must still resolve via dot-navigation when the
+    /// flat key is absent — the flat-first lookup must not regress genuine nesting.
+    #[test]
+    fn test_extract_field_prefers_flat_then_nested() {
+        let flat = json!({"_spice.chunk_id": 7});
+        assert_eq!(
+            extract_field(&flat, "_spice.chunk_id").and_then(serde_json::Value::as_u64),
+            Some(7)
+        );
+
+        let nested = json!({"address": {"city": "Denver"}});
+        assert_eq!(
+            extract_field(&nested, "address.city").and_then(serde_json::Value::as_str),
+            Some("Denver")
+        );
+    }
+
+    // ── Unsigned integer widths ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_unsigned_int_widths_decode() {
+        use arrow::array::{UInt8Array, UInt16Array, UInt32Array};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("u8", DataType::UInt8, true),
+            Field::new("u16", DataType::UInt16, true),
+            Field::new("u32", DataType::UInt32, true),
+        ]));
+        let hits = vec![
+            make_hit(json!({"u8": 255, "u16": 65535, "u32": 4_294_967_295_u32})),
+            make_hit(json!({"u8": 256, "u16": -1, "u32": "nope"})), // out of range / wrong type → null
+        ];
+        let batch = hits_to_record_batch(&hits, &schema).expect("hits_to_record_batch failed");
+
+        let u8s = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt8Array>()
+            .expect("u8 column");
+        assert_eq!(u8s.value(0), 255);
+        assert!(u8s.is_null(1));
+
+        let u16s = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .expect("u16 column");
+        assert_eq!(u16s.value(0), 65535);
+        assert!(u16s.is_null(1));
+
+        let u32s = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .expect("u32 column");
+        assert_eq!(u32s.value(0), 4_294_967_295);
+        assert!(u32s.is_null(1));
+    }
+
+    // ── Date32 / Date64 ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_date32_parses_from_string() {
+        use arrow::array::Date32Array;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("d", DataType::Date32, true)]));
+        // arrow-json writes Date32 as a `YYYY-MM-DD` string.
+        let hits = vec![
+            make_hit(json!({"d": "1970-01-01"})),
+            make_hit(json!({"d": "2024-01-15"})),
+            make_hit(json!({})), // missing → null
+        ];
+        let batch = hits_to_record_batch(&hits, &schema).expect("hits_to_record_batch failed");
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .expect("date32 column");
+        assert_eq!(col.value(0), 0);
+        assert_eq!(col.value(1), 19_737);
+        assert!(col.is_null(2));
+    }
+
+    #[test]
+    fn test_date64_parses_from_datetime_string() {
+        use arrow::array::Date64Array;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("d", DataType::Date64, true)]));
+        // arrow-json writes Date64 as an ISO 8601 datetime string.
+        let hits = vec![make_hit(json!({"d": "2024-01-15T10:30:00"}))];
+        let batch = hits_to_record_batch(&hits, &schema).expect("hits_to_record_batch failed");
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Date64Array>()
+            .expect("date64 column");
+        let expected =
+            chrono::NaiveDateTime::parse_from_str("2024-01-15T10:30:00", "%Y-%m-%dT%H:%M:%S")
+                .expect("valid datetime literal")
+                .and_utc()
+                .timestamp_millis();
+        assert_eq!(col.value(0), expected);
+    }
+
+    // ── Timestamp: all TimeUnits ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_timestamp_all_units_from_naive_string() {
+        use arrow::array::{
+            TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
+        };
+
+        let dt = "2024-01-15T10:30:00";
+        let expected_nanos = chrono::NaiveDateTime::parse_from_str(dt, "%Y-%m-%dT%H:%M:%S")
+            .expect("valid datetime literal")
+            .and_utc()
+            .timestamp_nanos_opt()
+            .expect("in range");
+
+        let sec_schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Second, None),
+            true,
+        )]));
+        let sec = hits_to_record_batch(&[make_hit(json!({"ts": dt}))], &sec_schema)
+            .expect("second batch");
+        assert_eq!(
+            sec.column(0)
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .expect("second array")
+                .value(0),
+            expected_nanos / 1_000_000_000
+        );
+
+        let ms_schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            true,
+        )]));
+        let ms =
+            hits_to_record_batch(&[make_hit(json!({"ts": dt}))], &ms_schema).expect("ms batch");
+        assert_eq!(
+            ms.column(0)
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .expect("ms array")
+                .value(0),
+            expected_nanos / 1_000_000
+        );
+
+        let ns_schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        )]));
+        let ns =
+            hits_to_record_batch(&[make_hit(json!({"ts": dt}))], &ns_schema).expect("ns batch");
+        assert_eq!(
+            ns.column(0)
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .expect("ns array")
+                .value(0),
+            expected_nanos
+        );
+    }
+
+    // ── Unsupported types fail loudly ────────────────────────────────────────────
+
+    /// A declared metadata column of a type the reader cannot decode must produce a
+    /// structured error rather than a silently wrong `Utf8` column.
+    #[test]
+    fn test_unsupported_type_errors() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(10, 2),
+            true,
+        )]));
+        let hits = vec![make_hit(json!({"amount": "1.23"}))];
+        let err =
+            hits_to_record_batch(&hits, &schema).expect_err("decimal decode should be unsupported");
+        assert!(
+            matches!(err, DataFusionError::NotImplemented(_)),
+            "expected NotImplemented, got {err:?}"
+        );
     }
 }

@@ -20,8 +20,8 @@ use crate::model::EmbeddingModelStore;
 use crate::secrets::Secrets;
 use datafusion::datasource::TableProvider;
 use datafusion::{prelude::SessionContext, sql::TableReference};
-#[cfg(feature = "models")]
-use runtime_datafusion_udfs::embed::EMBED_UDF_NAME;
+#[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
+use runtime_datafusion_udfs::EMBED_UDF_NAME;
 use spicepod::vector::VectorStore;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -31,8 +31,6 @@ use spicepod::semantic::Column;
 #[cfg(feature = "duckdb")]
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
 
-#[cfg(feature = "elasticsearch")]
-use search::metadata::MetadataColumns;
 #[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
 use {
     crate::embeddings::construct_chunker,
@@ -64,7 +62,7 @@ pub async fn wrap_table_as_index(
     file_format: Option<&str>,
     inner_table_provider: Arc<dyn TableProvider>,
     vector_store: &VectorStore,
-    on_zero_results: &ZeroResultsAction,
+    on_zero_results: Option<&ZeroResultsAction>,
 ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
     let schema = inner_table_provider.schema();
     for c in columns {
@@ -198,7 +196,7 @@ async fn wrap_table_as_index_s3(
     file_format: Option<&str>,
     inner_table_provider: Arc<dyn TableProvider + 'static>,
     vector_store: &VectorStore,
-    on_zero_results: &ZeroResultsAction,
+    on_zero_results: Option<&ZeroResultsAction>,
 ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
     tracing::info!("S3 Vectors for table {tbl} initializing...");
     let start = std::time::Instant::now();
@@ -413,7 +411,7 @@ async fn wrap_table_as_index_elasticsearch(
     file_format: Option<&str>,
     inner_table_provider: Arc<dyn TableProvider + 'static>,
     vector_store: &VectorStore,
-    on_zero_results: &ZeroResultsAction,
+    on_zero_results: Option<&ZeroResultsAction>,
 ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
     tracing::info!("Elasticsearch vector engine for table {tbl} initializing...");
     let start = std::time::Instant::now();
@@ -448,7 +446,7 @@ async fn wrap_table_as_index_elasticsearch(
             None => (columns.to_vec(), inner_table_provider.schema()),
         };
 
-        let mut es_index = super::elasticsearch::try_from_table(
+        let es_index = super::elasticsearch::try_from_table(
             tbl,
             column.clone(),
             config.clone(),
@@ -461,43 +459,36 @@ async fn wrap_table_as_index_elasticsearch(
         )
         .await?;
 
-        provider = if let Some(chunking) = chunking {
-            tracing::debug!(
-                "[Elasticsearch][table={tbl}] Chunking column {}",
-                es_index.embedded_column
-            );
-            // The Elasticsearch chunked query plan omits the chunk key column, so the
-            // fallback projection from a warm in-memory index onto Elasticsearch results
-            // cannot be built — serve reads from Elasticsearch directly.
-            tracing::debug!(
-                "Not adding an in-memory warm vector index for table {tbl}: chunking is enabled on the Elasticsearch vector engine."
-            );
-            es_index.primary_key = ChunkedSearchIndex::augment_primary_key(es_index.primary_key);
+        // Elasticsearch now mirrors the S3 Vectors engine: its query and list plans expose
+        // the full (augmented, when chunked) primary key plus the metadata columns, so the
+        // in-memory warm index can fall back onto Elasticsearch for both chunked and
+        // non-chunked columns. The chunk-key augmentation happens inside `try_from_table`.
+        let metadata_columns = es_index.metadata_columns.clone();
+        let embedder = Arc::clone(&es_index.compute_query);
+        let similarity = es_index.similarity.clone();
+        let vector_index = with_memory_warm_index(
+            tbl,
+            Arc::new(es_index) as Arc<dyn VectorIndex>,
+            metadata_columns,
+            embedder,
+            &embed_udf,
+            &config.model,
+            similarity.as_str(),
+            on_zero_results,
+        );
 
+        provider = if let Some(chunking) = chunking {
+            tracing::debug!("[Elasticsearch][table={tbl}] Chunking column {column}");
             construct_chunked_vector_index(
                 provider,
                 embedding_models,
                 chunking,
-                Arc::new(es_index) as Arc<dyn SearchIndex>,
+                vector_index as Arc<dyn SearchIndex>,
                 config.model.as_str(),
                 file_format,
             )
             .await?
         } else {
-            // Unlike S3 Vectors, the Elasticsearch list & query plans do not expose
-            // metadata columns, so the warm index must not store any — otherwise the
-            // fallback projection onto the Elasticsearch results cannot be built.
-            let vector_index = with_memory_warm_index(
-                tbl,
-                Arc::new(es_index.clone()) as Arc<dyn VectorIndex>,
-                MetadataColumns::none(),
-                Arc::clone(&es_index.compute_query),
-                &embed_udf,
-                &config.model,
-                es_index.similarity.as_str(),
-                on_zero_results,
-            );
-
             provider.underlying = Arc::new(
                 VectorScanTableProvider::try_new(provider.underlying, &vector_index).boxed()?,
             ) as Arc<dyn TableProvider>;

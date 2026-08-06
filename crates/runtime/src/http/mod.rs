@@ -36,6 +36,7 @@ use runtime_search::search_engine::parse_explicit_primary_keys;
 #[cfg(feature = "openapi")]
 pub use routes::get_api_doc;
 mod mtls;
+mod response_outcome;
 mod routes;
 pub mod traceparent;
 
