@@ -3629,6 +3629,7 @@ dependencies = [
  "vortex",
  "vortex-btrblocks",
  "vortex-datafusion",
+ "vortex-io",
  "vortex-scan",
  "vortex-session",
 ]
@@ -16967,7 +16968,6 @@ dependencies = [
  "uuid 1.23.2",
  "vortex",
  "vortex-datafusion",
- "vortex-io",
  "workers",
  "x509-certificate",
  "yaml",
