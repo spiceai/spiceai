@@ -3443,6 +3443,17 @@ mod tests {
         );
     }
 
+    /// Parses a map value's stored text so an assertion does not depend on the order
+    /// `serde_json::Map` happens to keep. `crates/runtime` enables `serde_json/preserve_order`, and
+    /// cargo unifies that across the workspace, so the key order differs between a scoped
+    /// `cargo test -p data_components` and the `make nextest` gate.
+    fn stored_json(value: &TursoValue) -> serde_json::Value {
+        let TursoValue::Text(text) = value else {
+            panic!("expected a text value, got {value:?}");
+        };
+        serde_json::from_str(text).expect("stored text should be valid JSON")
+    }
+
     /// A map scalar sliced out of a multi-row batch keeps the whole entries child array, so reading
     /// `keys()`/`values()` directly serialized every row's entries into every row.
     #[test]
@@ -3461,8 +3472,8 @@ mod tests {
             .expect("a map value should convert");
 
         assert_eq!(
-            value,
-            TursoValue::Text(r#"{"second":2}"#.to_string()),
+            stored_json(&value),
+            serde_json::json!({"second": 2}),
             "only the scalar's own row entries should be serialized"
         );
     }
@@ -3484,9 +3495,8 @@ mod tests {
         .expect("a map value should convert");
 
         assert_eq!(
-            value,
-            // `serde_json::Map` orders its keys.
-            TursoValue::Text(r#"{"absent":null,"present":1}"#.to_string())
+            stored_json(&value),
+            serde_json::json!({"present": 1, "absent": null})
         );
     }
 
