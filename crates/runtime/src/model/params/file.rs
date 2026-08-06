@@ -43,7 +43,7 @@ pub struct FileModelParams {
     /// Sequence-length budget, in tokens, for a locally served model: it plans cross-device layer placement and sizes the KV cache. Defaults to the engine default (4096) when unset. It does not raise the context the weights were trained for, and larger values need proportionally more KV-cache memory.
     #[param(runtime)]
     pub context_length: Option<String>,
-    /// Attention implementation for a locally served model. 'auto' (the default) uses PagedAttention wherever the build supports it, and the engine falls back to dense attention for architectures with no paged kernel, such as the Multi-head Latent Attention GGUFs. 'disabled' forces dense attention with a contiguous KV cache.
+    /// Attention implementation for a locally served model. 'auto' (the default) uses `PagedAttention` wherever the build supports it, and the engine falls back to dense attention for architectures with no paged kernel, such as the Multi-head Latent Attention GGUFs. 'disabled' forces dense attention with a contiguous KV cache.
     #[param(runtime, default = "auto")]
     pub paged_attention: PagedAttentionMode,
 }

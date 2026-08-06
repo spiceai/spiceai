@@ -17,7 +17,7 @@ limitations under the License.
 #[cfg(feature = "bedrock")]
 use llms::bedrock::chat::{BedrockConverse, guardrail::GuardRail};
 #[cfg(feature = "models")]
-use llms::chat::{DistributedBackendSetting, PagedAttentionMode};
+use llms::chat::DistributedBackendSetting;
 use llms::{
     HealthCheck,
     anthropic::Anthropic,
