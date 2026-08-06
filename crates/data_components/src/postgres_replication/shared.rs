@@ -386,7 +386,7 @@ const RECV_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1
 /// hold. Sized to comfortably cover a runtime loading many datasets — and a
 /// catalog that discovers and attaches its members over several refreshes —
 /// since expiring a hold early costs that dataset a full re-snapshot.
-const UNCLAIMED_RESERVATION_GRACE: std::time::Duration = std::time::Duration::from_secs(300);
+const UNCLAIMED_RESERVATION_GRACE: std::time::Duration = std::time::Duration::from_mins(5);
 
 /// Yield to the Tokio scheduler after draining this many buffered events via the
 /// non-blocking `try_recv` fast path. Most `handle_decoded` branches (Insert /
@@ -1377,6 +1377,11 @@ struct SharedSource {
     /// Whether [`Self::reservations`] has been populated — the decision is
     /// made once per source, by whichever member attaches first.
     reservations_installed: AtomicBool,
+    /// `reservations.len()`, maintained under that mutex so the pump's
+    /// per-event expiry sweep is one relaxed load in the steady state (holds
+    /// exist only between a resume and the last member joining) instead of a
+    /// lock acquisition.
+    outstanding_reservations: AtomicUsize,
 }
 
 impl SharedSource {
@@ -1394,6 +1399,7 @@ impl SharedSource {
             detached: Mutex::new(HashSet::new()),
             reservations: Mutex::new(HashMap::new()),
             reservations_installed: AtomicBool::new(false),
+            outstanding_reservations: AtomicUsize::new(0),
         }
     }
 
@@ -1559,19 +1565,28 @@ impl SharedSource {
         for key in held {
             reservations.insert(key, now);
         }
+        self.outstanding_reservations
+            .store(reservations.len(), Ordering::Relaxed);
     }
 
     /// A member has taken over its reservation (or joined a table that never
     /// had one) — stop tracking it as unclaimed. The ack entry itself is kept:
     /// [`AckTable::register`] hands the held floor to the member.
     fn claim_reservation(&self, key: &MemberKey) {
-        lock(&self.reservations).remove(key);
+        let mut reservations = lock(&self.reservations);
+        reservations.remove(key);
+        self.outstanding_reservations
+            .store(reservations.len(), Ordering::Relaxed);
     }
 
     /// Holds no dataset has claimed within `grace`, removed from tracking as
     /// they are returned: the caller releases each one exactly once, rather
     /// than a per-second sweep re-spawning a release that is already in flight.
     fn take_expired_reservations(&self, grace: std::time::Duration) -> Vec<MemberKey> {
+        // The pump sweeps per decoded event; nothing held is the steady state.
+        if self.outstanding_reservations.load(Ordering::Relaxed) == 0 {
+            return Vec::new();
+        }
         let mut reservations = lock(&self.reservations);
         let expired: Vec<MemberKey> = reservations
             .iter()
@@ -1581,6 +1596,8 @@ impl SharedSource {
         for key in &expired {
             reservations.remove(key);
         }
+        self.outstanding_reservations
+            .store(reservations.len(), Ordering::Relaxed);
         expired
     }
 
@@ -1636,7 +1653,11 @@ impl SharedSource {
                         // Keep the hold and re-arm the grace period so the next
                         // sweep tries again, rather than leaving a table pinning
                         // WAL with nothing watching it.
-                        lock(&source.reservations).insert(key, std::time::Instant::now());
+                        let mut reservations = lock(&source.reservations);
+                        reservations.insert(key, std::time::Instant::now());
+                        source
+                            .outstanding_reservations
+                            .store(reservations.len(), Ordering::Relaxed);
                         tracing::warn!(
                             table = %format!("{schema_name}.{table_name}"),
                             slot = %slot_name,
@@ -4366,7 +4387,11 @@ mod tests {
         // applied it does the slot acknowledge past it.
         ack.promote_ready_members();
         ack.deliver(&key("a"), 500);
-        assert_eq!(ack.flush_lsn(), 100, "in-flight replay still holds the floor");
+        assert_eq!(
+            ack.flush_lsn(),
+            100,
+            "in-flight replay still holds the floor"
+        );
         ack.commit(&key("a"), 500);
         assert_eq!(ack.flush_lsn(), 500);
     }

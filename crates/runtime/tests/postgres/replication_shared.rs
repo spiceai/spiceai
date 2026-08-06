@@ -1094,8 +1094,8 @@ async fn slot_acked_past(
 /// credits idle members, so seeing one after the first joiner has committed
 /// everything proves the credit happened.
 #[tokio::test(flavor = "multi_thread")]
-async fn shared_slot_resume_delivers_gap_changes_to_the_second_joiner()
--> Result<(), anyhow::Error> {
+async fn shared_slot_resume_delivers_gap_changes_to_the_second_joiner() -> Result<(), anyhow::Error>
+{
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
     let port = common::get_random_port()?;
@@ -1176,8 +1176,8 @@ async fn shared_slot_resume_delivers_gap_changes_to_the_second_joiner()
          published table with no member — that WAL is now recyclable (#12609)"
     );
 
-    // --- 5. The second table rejoins after that ack. Its gap row is still
-    // owed to it. ---
+    // --- 5. The second table rejoins after its slot-mate has been credited.
+    // Its gap row is still owed to it. ---
     let mut second_rejoined = start_replication_stream(input_for(port, "resume_gap_second"));
     let gap = next_change_envelope(&mut second_rejoined, "gap row for the second joiner")
         .await
