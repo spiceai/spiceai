@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use app::AppBuilder;
 use arrow::array::RecordBatch;
@@ -94,6 +94,50 @@ async fn get_physical_plan(
     df.create_physical_plan()
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create physical plan: {e}"))
+}
+
+/// How long to give the accelerator to write every partition's rows to a Vortex file
+/// before a plan that renders them as persisted is treated as unreachable.
+const PARTITION_PERSIST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The sanitized plan for `sql`, taken once every partition it scans reads from a
+/// persisted Vortex file.
+///
+/// The snapshots in this file pin the steady state: a partition whose rows have been
+/// written out renders as `files_scanned=1` over a `file_groups` `DataSourceExec`,
+/// while one whose rows are still only in memory renders as `files_scanned=0` over an
+/// in-memory source. Writing them out is asynchronous and `runtime_ready_check` does
+/// not cover it, so the shape a plan reports depends on how far the accelerator has
+/// got by the time it is taken.
+///
+/// Polling for the persisted shape makes that precondition explicit rather than
+/// implicit in host timing, and does not weaken the assertion: the plan returned is
+/// snapshotted exactly as before, and a table that never persists still fails, naming
+/// the plan it was stuck on.
+async fn sanitized_plan_when_persisted(
+    rt: &Arc<Runtime>,
+    sql: &str,
+) -> Result<String, anyhow::Error> {
+    let deadline = tokio::time::Instant::now() + PARTITION_PERSIST_TIMEOUT;
+
+    loop {
+        let plan = get_physical_plan(rt, sql).await?;
+        let plan_str = displayable(plan.as_ref()).indent(true).to_string();
+        let sanitized_plan = sanitize_plan(&plan_str);
+
+        if !sanitized_plan.contains("files_scanned=0") {
+            return Ok(sanitized_plan);
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return Err(anyhow::anyhow!(
+                "`{sql}` still scanned an unpersisted partition after \
+                 {PARTITION_PERSIST_TIMEOUT:?}; last plan:\n{sanitized_plan}"
+            ));
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Test `partition_by` with `bucket()` expression for Cayenne acceleration
@@ -182,9 +226,8 @@ async fn test_cayenne_partition_by_bucket() -> Result<(), anyhow::Error> {
             let count = result.iter().map(RecordBatch::num_rows).sum::<usize>();
             assert_eq!(count, 10, "Should have 10 rows total");
 
-            let plan = get_physical_plan(&rt, "SELECT * FROM bucket_test").await?;
-            let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-            let sanitized_plan = sanitize_plan(&plan_str);
+            let full_scan_sql = "SELECT * FROM bucket_test";
+            let sanitized_plan = sanitized_plan_when_persisted(&rt, full_scan_sql).await?;
             insta::assert_snapshot!("bucket_partition_full_scan", sanitized_plan);
 
             // Test 2: Query with id = 1 filter - should only scan partition containing id=1
@@ -466,9 +509,8 @@ async fn test_cayenne_partition_by_bucket_with_nulls() -> Result<(), anyhow::Err
             let count = result.iter().map(RecordBatch::num_rows).sum::<usize>();
             assert_eq!(count, 10, "Should have 10 rows total including NULLs");
 
-            let plan = get_physical_plan(&rt, "SELECT * FROM null_partition_test").await?;
-            let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-            let sanitized_plan = sanitize_plan(&plan_str);
+            let full_scan_sql = "SELECT * FROM null_partition_test";
+            let sanitized_plan = sanitized_plan_when_persisted(&rt, full_scan_sql).await?;
             insta::assert_snapshot!("null_partition_full_scan", sanitized_plan);
 
             // Test 2: Query rows with NULL names specifically
@@ -626,10 +668,8 @@ async fn test_cayenne_partition_by_bucket_numeric_nulls() -> Result<(), anyhow::
             let count = result.iter().map(RecordBatch::num_rows).sum::<usize>();
             assert_eq!(count, 10, "Should have 10 rows total");
 
-            let plan =
-                get_physical_plan(&rt, "SELECT * FROM numeric_null_partition_test").await?;
-            let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-            let sanitized_plan = sanitize_plan(&plan_str);
+            let full_scan_sql = "SELECT * FROM numeric_null_partition_test";
+            let sanitized_plan = sanitized_plan_when_persisted(&rt, full_scan_sql).await?;
             insta::assert_snapshot!("numeric_null_partition_full_scan", sanitized_plan);
 
             // Test 2: Query rows with NULL scores
@@ -780,9 +820,8 @@ async fn test_cayenne_partition_by_date_part() -> Result<(), anyhow::Error> {
             let count = result.iter().map(RecordBatch::num_rows).sum::<usize>();
             assert_eq!(count, 10, "Should have 10 rows total");
 
-            let plan = get_physical_plan(&rt, "SELECT * FROM date_partition_test").await?;
-            let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-            let sanitized_plan = sanitize_plan(&plan_str);
+            let full_scan_sql = "SELECT * FROM date_partition_test";
+            let sanitized_plan = sanitized_plan_when_persisted(&rt, full_scan_sql).await?;
             insta::assert_snapshot!("date_partition_full_scan", sanitized_plan);
 
             // Test 2: Query with filter on underlying date column
