@@ -157,9 +157,11 @@ fn string_column_values(batches: &[RecordBatch], column: &str) -> Vec<String> {
 /// foreign tables pointed at it, to confirm all three relation kinds are
 /// discovered (#11725).
 ///
-/// One foreign table wraps a populated remote table and one wraps an empty one,
-/// so the schema a foreign table reports can be checked independently of whether
-/// it has any rows (#12585).
+/// Three foreign tables, each isolating a different property (#12585): one wraps
+/// a populated remote table, one wraps an empty one so the reported schema can be
+/// checked independently of whether any rows exist, and one points at a server
+/// that refuses every connection so that resolving its schema at all is only
+/// possible without reading its data.
 async fn seed_matview_and_foreign_table(port: usize) -> Result<(), anyhow::Error> {
     let pool = common::get_postgres_connection_pool(port, None).await?;
     let conn = pool
@@ -189,6 +191,23 @@ async fn seed_matview_and_foreign_table(port: usize) -> Result<(), anyhow::Error
                  SERVER loopback OPTIONS (table_name 'empty_source');",
             common::PG_PASSWORD
         ))
+        .await?;
+
+    // A server that can never be reached: port 1 refuses immediately. A foreign
+    // table's columns are declared locally, so `pg_attribute` can describe this
+    // one in full, but *any* attempt to read its rows fails. Registering it with
+    // its declared schema is therefore only possible without a data query, which
+    // is what makes this table a check of the mechanism rather than the result.
+    // `CREATE SERVER` does not connect, so seeding stays fast.
+    conn.conn
+        .simple_query(
+            "CREATE SERVER unreachable FOREIGN DATA WRAPPER postgres_fdw \
+                 OPTIONS (host 'localhost', port '1', dbname 'postgres'); \
+             CREATE USER MAPPING FOR postgres SERVER unreachable \
+                 OPTIONS (user 'postgres', password 'unused'); \
+             CREATE FOREIGN TABLE ft_unreachable (id INT, label TEXT) \
+                 SERVER unreachable OPTIONS (table_name 'nonexistent');",
+        )
         .await?;
 
     Ok(())
@@ -333,6 +352,7 @@ async fn test_materialized_view_and_foreign_table_discovered() -> Result<(), any
                     "empty_source".to_string(),
                     "ft_empty".to_string(),
                     "ft_source_data".to_string(),
+                    "ft_unreachable".to_string(),
                     "mv_source_data".to_string(),
                     "source_data".to_string(),
                 ],
@@ -386,6 +406,33 @@ async fn test_materialized_view_and_foreign_table_discovered() -> Result<(), any
                 string_column_values(&ft_types, "data_type"),
                 vec!["Decimal128(10, 2)".to_string()],
                 "a foreign table must report the declared precision of its remote column"
+            );
+
+            // `ft_unreachable` points at a server that refuses every connection,
+            // so it can only be described from the catalog. Were discovery to
+            // fall back to reading rows, the read would fail and the table would
+            // be skipped with a warning -- it would be missing above, and have no
+            // columns here. Registering it fully is what proves the schema came
+            // from `pg_attribute` and not from a `SELECT ... LIMIT 1`.
+            let unreachable_columns = run_query(
+                &rt,
+                &format!(
+                    "SELECT column_name, data_type FROM information_schema.columns \
+                     WHERE table_catalog = '{CATALOG_NAME}' AND table_schema = 'public' \
+                     AND table_name = 'ft_unreachable' ORDER BY column_name"
+                ),
+            )
+            .await?;
+            assert_eq!(
+                string_column_values(&unreachable_columns, "column_name"),
+                vec!["id".to_string(), "label".to_string()],
+                "a foreign table whose data is unreachable must still resolve its \
+                 schema, proving discovery issued no data query against it"
+            );
+            assert_eq!(
+                string_column_values(&unreachable_columns, "data_type"),
+                vec!["Int32".to_string(), "Utf8".to_string()],
+                "the unreachable foreign table's declared types must survive too"
             );
 
             Ok(())
