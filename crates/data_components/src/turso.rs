@@ -677,10 +677,10 @@ impl TursoTableProvider {
                     Arc::new(LargeStringArray::from(values))
                 }
                 DataType::Utf8View => {
-                    let values: Vec<Option<String>> = rows
+                    let values: Vec<Option<&str>> = rows
                         .iter()
                         .map(|row| match &row[col_idx] {
-                            TursoValue::Text(s) => Some(s.clone()),
+                            TursoValue::Text(s) => Some(s.as_str()),
                             TursoValue::Null => None,
                             _ => None,
                         })
