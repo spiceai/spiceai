@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+#
+# scripts/gh-new — show new issues and PRs authored by a GitHub user across
+# every repo in the spiceai and spicehq orgs, since the last time this was
+# run for that user.
+#
+# Human mode prints a colored, sectioned summary. --json prints a single
+# structured JSON object (stable field names, no color codes) for agents or
+# other scripts to consume.
+#
+# State (the "last checked" timestamp per user) is cached locally, so repeat
+# runs only show items created since the previous run. Pass --since to
+# override statelessly (useful for agents that don't have this machine's
+# cache, or for re-checking a specific window).
+#
+# Usage:
+#   scripts/gh-new [username]              Human output, default user = @me
+#   scripts/gh-new [username] --json       Structured JSON output
+#   scripts/gh-new [username] --since 3d   Override the "since" window (Nd, Nh, Nm, or ISO8601)
+#   scripts/gh-new [username] --reset      Clear cached state, then run with the default lookback
+#
+# Requires: gh (authenticated, with access to both orgs), jq.
+
+set -euo pipefail
+
+ORGS=(spiceai spicehq)
+DEFAULT_LOOKBACK="7d"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/spice-gh-new"
+
+usage() {
+  echo "Usage: $(basename "$0") [username] [--json] [--since <Nd|Nh|Nm|ISO8601>] [--reset]" >&2
+  exit 1
+}
+
+for bin in gh jq; do
+  command -v "$bin" >/dev/null 2>&1 || { echo "error: '$bin' is required but not found in PATH" >&2; exit 1; }
+done
+
+user=""
+json_output=false
+since_override=""
+reset=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --json) json_output=true; shift ;;
+    --since) since_override="${2:-}"; [[ -n "$since_override" ]] || usage; shift 2 ;;
+    --reset) reset=true; shift ;;
+    -h|--help) usage ;;
+    -*) usage ;;
+    *)
+      [[ -z "$user" ]] || usage
+      user="$1"
+      shift
+      ;;
+  esac
+done
+
+[[ -n "$user" ]] || user="$(gh api user --jq .login)"
+
+mkdir -p "$CACHE_DIR"
+scope_key="$(IFS=+; echo "${ORGS[*]}")"
+state_file="$CACHE_DIR/${scope_key}__${user}.json"
+
+owner_flags=()
+for org in "${ORGS[@]}"; do
+  owner_flags+=(--owner "$org")
+done
+
+now_iso() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+epoch_of() { date -j -f "%Y-%m-%dT%H:%M:%SZ" "$1" +%s 2>/dev/null; }
+
+resolve_relative() {
+  # "7d" -> 7 days ago, "12h" -> 12 hours ago, "40m" -> 40 minutes ago, as an
+  # ISO8601 UTC timestamp. BSD date's -v flag is case-sensitive per unit:
+  # lowercase d is days, uppercase H is hours, uppercase M is minutes.
+  local spec="$1"
+  if [[ "$spec" =~ ^([0-9]+)d$ ]]; then
+    date -u -v-"${BASH_REMATCH[1]}"d +"%Y-%m-%dT%H:%M:%SZ"
+  elif [[ "$spec" =~ ^([0-9]+)h$ ]]; then
+    date -u -v-"${BASH_REMATCH[1]}"H +"%Y-%m-%dT%H:%M:%SZ"
+  elif [[ "$spec" =~ ^([0-9]+)m$ ]]; then
+    date -u -v-"${BASH_REMATCH[1]}"M +"%Y-%m-%dT%H:%M:%SZ"
+  else
+    echo "$spec"
+  fi
+}
+
+first_run=false
+if [[ "$reset" == true ]]; then
+  rm -f "$state_file"
+fi
+
+if [[ -n "$since_override" ]]; then
+  since="$(resolve_relative "$since_override")"
+elif [[ -f "$state_file" ]]; then
+  since="$(jq -r '.last_checked' "$state_file")"
+else
+  first_run=true
+  since="$(resolve_relative "$DEFAULT_LOOKBACK")"
+fi
+
+checked_at="$(now_iso)"
+
+issues_json="$(gh search issues \
+  "${owner_flags[@]}" --author "$user" --created ">$since" --sort created --order asc \
+  --json number,title,url,createdAt,state,assignees,repository --limit 100)"
+
+prs_json="$(gh search prs \
+  "${owner_flags[@]}" --author "$user" --created ">$since" --sort created --order asc \
+  --json number,title,url,createdAt,state,isDraft,repository --limit 100)"
+
+# Only persist state on an unqualified run, so --since/--reset probes never
+# clobber the real "last checked" watermark.
+if [[ -z "$since_override" ]]; then
+  jq -n --arg t "$checked_at" '{last_checked: $t}' > "$state_file"
+fi
+
+if [[ "$json_output" == true ]]; then
+  orgs_json="$(printf '%s\n' "${ORGS[@]}" | jq -R . | jq -s .)"
+  jq -nc \
+    --arg user "$user" \
+    --argjson orgs "$orgs_json" \
+    --arg since "$since" \
+    --arg generated_at "$checked_at" \
+    --argjson first_run "$first_run" \
+    --argjson issues "$issues_json" \
+    --argjson pull_requests "$prs_json" \
+    '
+    def flatten_repo: map(.repository = .repository.nameWithOwner);
+    {
+      user: $user,
+      orgs: $orgs,
+      since: $since,
+      generated_at: $generated_at,
+      first_run: $first_run,
+      counts: { issues: ($issues | length), pull_requests: ($pull_requests | length) },
+      issues: ($issues | flatten_repo),
+      pull_requests: ($pull_requests | flatten_repo)
+    }'
+  exit 0
+fi
+
+# --- Human output ---
+
+tty_output=false
+if [[ -t 1 ]]; then
+  tty_output=true
+  BOLD=$'\033[1m'; DIM=$'\033[2m'; RESET=$'\033[0m'
+  CYAN=$'\033[36m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; MAGENTA=$'\033[35m'; GRAY=$'\033[90m'
+else
+  BOLD=""; DIM=""; RESET=""; CYAN=""; GREEN=""; YELLOW=""; MAGENTA=""; GRAY=""
+fi
+
+# OSC 8 terminal hyperlink around already-padded text, so column alignment
+# isn't thrown off by the (zero-width) escape sequence. Falls back to plain
+# text when stdout isn't a terminal (e.g. redirected to a file).
+link() {
+  local url="$1" label="$2"
+  if [[ "$tty_output" == true ]]; then
+    printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$url" "$label"
+  else
+    printf '%s' "$label"
+  fi
+}
+
+ago() {
+  local ts="$1" then now diff
+  then="$(epoch_of "$ts")" || { echo ""; return; }
+  now="$(date -u +%s)"
+  diff=$(( now - then ))
+  if   (( diff < 3600 ));  then echo "$(( diff / 60 ))m ago"
+  elif (( diff < 86400 )); then echo "$(( diff / 3600 ))h ago"
+  else echo "$(( diff / 86400 ))d ago"
+  fi
+}
+
+state_color() {
+  case "$1" in
+    open) echo "$GREEN" ;;
+    merged) echo "$MAGENTA" ;;
+    closed) echo "$GRAY" ;;
+    *) echo "$RESET" ;;
+  esac
+}
+
+echo "${BOLD}${CYAN}New for ${user} across ${ORGS[*]}${RESET}"
+if [[ "$first_run" == true ]]; then
+  echo "${DIM}first run — showing the last ${DEFAULT_LOOKBACK} (since ${since}). Use --reset to start over.${RESET}"
+elif [[ -n "$since_override" ]]; then
+  echo "${DIM}since ${since}${RESET}"
+else
+  echo "${DIM}since ${since}. Use --since <Nd|Nh|Nm|ISO8601> to check a different window.${RESET}"
+fi
+echo
+
+issue_count="$(jq 'length' <<<"$issues_json")"
+pr_count="$(jq 'length' <<<"$prs_json")"
+
+if (( issue_count == 0 && pr_count == 0 )); then
+  echo "${DIM}Nothing new.${RESET}"
+  exit 0
+fi
+
+# Size the repo column to the longest nameWithOwner actually present (across
+# both issues and PRs), so short repo names don't leave the wrong padding
+# once a longer one like "spiceai/datafusion-table-providers" shows up.
+repo_width="$(jq -n --argjson a "$issues_json" --argjson b "$prs_json" \
+  '([$a[], $b[]] | map(.repository.nameWithOwner | length) | max) // 4')"
+
+if (( issue_count > 0 )); then
+  echo "${BOLD}Issues (${issue_count})${RESET}"
+  jq -r '.[] | [.repository.nameWithOwner, .number, .state, .createdAt, .title, .url] | @tsv' <<<"$issues_json" |
+  while IFS=$'\t' read -r repo number state created title url; do
+    c="$(state_color "$state")"
+    num_link="$(link "$url" "$(printf '#%-6s' "$number")")"
+    printf "  %s%-*s%s %s%s%s %s%-8s%s %-8s %s%s%s\n" \
+      "$GRAY" "$repo_width" "$repo" "$RESET" "$DIM" "$num_link" "$RESET" "$c" "$state" "$RESET" "$(ago "$created")" \
+      "$BOLD" "$title" "$RESET"
+    [[ "$tty_output" == true ]] || printf "    %s%s%s\n" "$GRAY" "$url" "$RESET"
+  done
+  echo
+fi
+
+if (( pr_count > 0 )); then
+  echo "${BOLD}Pull Requests (${pr_count})${RESET}"
+  jq -r '.[] | [.repository.nameWithOwner, .number, .state, (.isDraft|tostring), .createdAt, .title, .url] | @tsv' <<<"$prs_json" |
+  while IFS=$'\t' read -r repo number state is_draft created title url; do
+    c="$(state_color "$state")"
+    label="$state"
+    [[ "$is_draft" == "true" ]] && label="draft"
+    num_link="$(link "$url" "$(printf '#%-6s' "$number")")"
+    printf "  %s%-*s%s %s%s%s %s%-8s%s %-8s %s%s%s\n" \
+      "$GRAY" "$repo_width" "$repo" "$RESET" "$DIM" "$num_link" "$RESET" "$c" "$label" "$RESET" "$(ago "$created")" \
+      "$BOLD" "$title" "$RESET"
+    [[ "$tty_output" == true ]] || printf "    %s%s%s\n" "$GRAY" "$url" "$RESET"
+  done
+  echo
+fi
