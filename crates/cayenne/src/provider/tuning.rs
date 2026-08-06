@@ -48,6 +48,7 @@ limitations under the License.
 //! background task) lives in the provider.
 
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -299,11 +300,6 @@ static GLOBAL_MEMORY_BUDGET: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(target_os = "linux")]
 static CGROUP_V2_MEMORY_CURRENT_PATH: OnceLock<Option<String>> = OnceLock::new();
-/// Resolved once: cgroup v2 `memory.stat`, for attributing a pressure reading to
-/// anonymous memory versus reclaimable page cache.
-static CGROUP_V2_MEMORY_STAT_PATH: OnceLock<Option<String>> = OnceLock::new();
-/// Resolved once: cgroup v2 `memory.pressure` (PSI).
-static CGROUP_V2_MEMORY_PRESSURE_PATH: OnceLock<Option<String>> = OnceLock::new();
 
 #[cfg(target_os = "linux")]
 static CGROUP_V1_MEMORY_USAGE_PATH: OnceLock<Option<String>> = OnceLock::new();
@@ -313,22 +309,6 @@ static CGROUP_V1_MEMORY_USAGE_PATH: OnceLock<Option<String>> = OnceLock::new();
 /// no usable delta yet). Process-global: every per-table loop reads this one value,
 /// because CPU is shared across tables (like the memory budget).
 static CPU_PRESSURE_MILLI: AtomicU64 = AtomicU64::new(u64::MAX);
-
-/// Attribution for the latest memory-pressure sample, process-global like the
-/// pressure itself. `u64::MAX` / `i64::MIN` mean "not sampled yet".
-///
-/// The controller divides cgroup `memory.current` by the budget, and
-/// `memory.current` counts reclaimable page cache, so that ratio can saturate
-/// while actual demand is far lower. These carry the parts needed to tell those
-/// apart on the same tick the pressure was read: anonymous (unreclaimable) bytes,
-/// the Kubernetes/cAdvisor working set, and PSI — the share of wall clock
-/// actually stalled on reclaim.
-static MEM_ANON_BYTES: AtomicU64 = AtomicU64::new(u64::MAX);
-static MEM_WORKING_SET_BYTES: AtomicU64 = AtomicU64::new(u64::MAX);
-/// Hot page cache — the part a working set does NOT subtract, so comparing it
-/// against `anon` says whether subtracting cold cache alone is sufficient.
-static MEM_ACTIVE_FILE_BYTES: AtomicU64 = AtomicU64::new(u64::MAX);
-static MEM_PSI_SOME_AVG10_MILLI: AtomicI64 = AtomicI64::new(i64::MIN);
 
 /// Whether the host is a T-family burstable EC2 instance (detected via IMDS,
 /// installed by the runtime). On a burstable instance CPU credits deplete under
@@ -477,102 +457,6 @@ fn current_memory_bytes() -> Option<u64> {
         .or_else(proc_self_rss_bytes)
 }
 
-/// How the cgroup's accounted memory splits, so a pressure reading can be
-/// attributed rather than guessed at.
-///
-/// `memory.current` counts reclaimable page cache alongside anonymous memory, so
-/// a file-writing workload can read as near-exhausted while its actual demand is
-/// far lower. `anon` is the part that cannot be reclaimed under pressure;
-/// `inactive_file` is the part Kubernetes and cAdvisor subtract to form a working
-/// set. Exported so the difference is measurable instead of inferred.
-#[derive(Debug, Clone, Copy)]
-struct MemoryComposition {
-    anon: u64,
-    inactive_file: u64,
-    active_file: u64,
-}
-
-impl MemoryComposition {
-    /// The Kubernetes/cAdvisor working set: usage minus cold page cache.
-    ///
-    /// VALIDATE BEFORE USING THIS AS A CONTROL SIGNAL. The LRU counter it depends
-    /// on is not always self-consistent with its own totals: measured on a cgroup
-    /// v2 container under CDC load, `inactive_file` (194 GiB) exceeded the `file`
-    /// total that contains it (61 GiB), and `active_anon` (18.9 GiB) bore no
-    /// relation to `anon` (152.5 GiB) — while `anon + file + kernel` reconciled
-    /// with `memory.current` to within 0.01 GiB. The subtraction then returns less
-    /// than `anon`, which is not a working set. `anon` was the reliable
-    /// unreclaimable figure there.
-    fn working_set(self, current: u64) -> u64 {
-        current.saturating_sub(self.inactive_file)
-    }
-}
-
-/// Parse the requested fields out of a cgroup `memory.stat`-style file, which is
-/// `"<key> <value>"` per line. Absent keys read as zero.
-fn parse_memory_stat(contents: &str) -> MemoryComposition {
-    let field = |name: &str| stat_field(contents, name).unwrap_or(0);
-    MemoryComposition {
-        anon: field("anon"),
-        inactive_file: field("inactive_file"),
-        active_file: field("active_file"),
-    }
-}
-
-/// Look up one `"<key> <value>"` line in a cgroup `*.stat` file. Shared by the
-/// `memory.stat` and `cpu.stat` readers so the format is parsed in one place.
-fn stat_field(contents: &str, key: &str) -> Option<u64> {
-    contents.lines().find_map(|line| {
-        let (name, value) = line.split_once(' ')?;
-        (name == key).then_some(value)?.trim().parse().ok()
-    })
-}
-
-/// Read the cgroup v2 memory composition; `None` off cgroup v2 (including
-/// non-Linux) or when `memory.stat` is unreadable.
-fn memory_composition() -> Option<MemoryComposition> {
-    let path = CGROUP_V2_MEMORY_STAT_PATH
-        .get_or_init(|| cgroup_v2_file_path("memory.stat"))
-        .as_deref()?;
-    Some(parse_memory_stat(&std::fs::read_to_string(path).ok()?))
-}
-
-/// Resolve a file inside this process's cgroup v2 directory.
-///
-/// Delegates the mount/path discovery to `cpu_budget::cgroup`, which already owns
-/// it for the CPU entitlement and returns `None` off cgroup v2, so this needs no
-/// platform gating of its own.
-fn cgroup_v2_file_path(filename: &str) -> Option<String> {
-    let (mountpoint, cgroup_path) = cpu_budget::cgroup::v2_mount_and_path()?;
-    Some(cpu_budget::cgroup::cgroup_file_path(
-        &mountpoint,
-        &cgroup_path,
-        filename,
-    ))
-}
-
-/// Parse `some avg10=<f>` out of a cgroup v2 `memory.pressure` (PSI) file — the
-/// share of wall clock at least one task spent stalled on memory reclaim.
-///
-/// This measures whether memory scarcity is actually costing time, which is the
-/// question a controller wants answered; a usage ratio only proxies it, and
-/// proxies badly when the usage is reclaimable cache.
-fn parse_memory_pressure_some_avg10(contents: &str) -> Option<f64> {
-    contents
-        .lines()
-        .find(|line| line.starts_with("some "))?
-        .split_whitespace()
-        .find_map(|field| field.strip_prefix("avg10=")?.parse().ok())
-}
-
-/// Read cgroup v2 memory PSI (`some avg10`); `None` when unavailable.
-fn memory_psi_some_avg10() -> Option<f64> {
-    let path = CGROUP_V2_MEMORY_PRESSURE_PATH
-        .get_or_init(|| cgroup_v2_file_path("memory.pressure"))
-        .as_deref()?;
-    parse_memory_pressure_some_avg10(&std::fs::read_to_string(path).ok()?)
-}
-
 #[cfg(target_os = "linux")]
 fn cgroup_v2_memory_current() -> Option<u64> {
     read_u64_file(
@@ -591,16 +475,15 @@ fn cgroup_v1_memory_current() -> Option<u64> {
     )
 }
 
-/// Resolve `memory.current` through the same helper as `memory.stat` and
-/// `memory.pressure`.
-///
-/// All three MUST come from one cgroup: the pressure ratio divides
-/// `memory.current` by the budget while the attribution decomposes
-/// `memory.stat`, so resolving them through separate mountpoint parsers can
-/// silently mix scopes and make the parts exceed the whole.
 #[cfg(target_os = "linux")]
 fn resolve_cgroup_v2_memory_current_path() -> Option<String> {
-    cgroup_v2_file_path("memory.current")
+    let cgroup_path = process_cgroup_v2_path()?;
+    let mountpoint = cgroup2_mountpoint().unwrap_or_else(|| "/sys/fs/cgroup".to_string());
+    Some(cgroup_file_path(
+        &mountpoint,
+        &cgroup_path,
+        "memory.current",
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -735,57 +618,6 @@ pub(crate) fn sample_mem_pressure(stats: &IngestStats) {
         && budget > 0
     {
         stats.set_mem_pressure(u64_to_f64(used) / u64_to_f64(budget));
-        sample_mem_attribution(used);
-    }
-}
-
-/// Record how the latest pressure sample decomposes, so the reading the
-/// controller acted on can be attributed rather than guessed at.
-///
-/// Reads two extra small cgroup files; called on the same tick as the pressure
-/// sample so the values line up with it.
-fn sample_mem_attribution(used: u64) {
-    // Store the sentinel on a failed read rather than leaving the previous
-    // sample: these values exist to be read alongside the pressure ratio from the
-    // same tick, so a stale pair is worse than an explicit "unknown".
-    let (anon, working_set, active_file) = memory_composition()
-        .map_or((u64::MAX, u64::MAX, u64::MAX), |c| {
-            (c.anon, c.working_set(used), c.active_file)
-        });
-    MEM_ANON_BYTES.store(anon, Ordering::Relaxed);
-    MEM_WORKING_SET_BYTES.store(working_set, Ordering::Relaxed);
-    MEM_ACTIVE_FILE_BYTES.store(active_file, Ordering::Relaxed);
-    MEM_PSI_SOME_AVG10_MILLI.store(
-        memory_psi_some_avg10().map_or(i64::MIN, psi_to_milli),
-        Ordering::Relaxed,
-    );
-}
-
-/// The latest memory-pressure attribution, in the telemetry layer's convention:
-/// `-1.0` for a value not sampled yet.
-///
-/// One accessor rather than four so a reader gets a single consistent snapshot,
-/// and the sentinel encoding lives in one place.
-pub(crate) struct MemAttribution {
-    pub anon_bytes: f64,
-    pub working_set_bytes: f64,
-    pub active_file_bytes: f64,
-    pub psi_some_avg10: f64,
-}
-
-pub(crate) fn mem_attribution() -> MemAttribution {
-    let bytes = |cell: &AtomicU64| match cell.load(Ordering::Relaxed) {
-        u64::MAX => -1.0,
-        v => u64_to_f64(v),
-    };
-    MemAttribution {
-        anon_bytes: bytes(&MEM_ANON_BYTES),
-        working_set_bytes: bytes(&MEM_WORKING_SET_BYTES),
-        active_file_bytes: bytes(&MEM_ACTIVE_FILE_BYTES),
-        psi_some_avg10: match MEM_PSI_SOME_AVG10_MILLI.load(Ordering::Relaxed) {
-            i64::MIN => -1.0,
-            v => i64_to_f64(v) / 1000.0,
-        },
     }
 }
 
@@ -864,7 +696,11 @@ fn cgroup_cpu_usage_usec() -> Option<u64> {
 
 #[cfg(target_os = "linux")]
 fn read_cpu_stat_usage_usec(path: &str) -> Option<u64> {
-    stat_field(&std::fs::read_to_string(path).ok()?, "usage_usec")
+    let contents = std::fs::read_to_string(path).ok()?;
+    contents.lines().find_map(|line| {
+        line.strip_prefix("usage_usec ")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -3222,23 +3058,6 @@ fn u64_to_f64(v: u64) -> f64 {
     v as f64
 }
 
-/// `i64` → `f64` for the ×1000 PSI wire value. Same precision rationale as
-/// [`u64_to_f64`]: PSI is a percentage, so the magnitude is tiny.
-#[expect(clippy::cast_precision_loss)]
-fn i64_to_f64(v: i64) -> f64 {
-    v as f64
-}
-
-/// Encode a PSI percentage as the ×1000 `AtomicI64` wire value. PSI is bounded
-/// 0..=100, so the cast cannot overflow.
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "PSI is a bounded percentage; x1000 stays far inside i64"
-)]
-fn psi_to_milli(psi: f64) -> i64 {
-    (psi.clamp(0.0, 100.0) * 1000.0) as i64
-}
-
 /// Encode a pressure fraction (memory or CPU `used/budget`) as the ×1000
 /// `AtomicU64` wire value shared by the memory and CPU samplers, or `None` to skip
 /// a non-finite/negative sample. Capped at 1000× so the f64→u64 cast can't
@@ -4243,63 +4062,6 @@ mod tests {
             adaptive_mem_tier_bounds_for_budget(0, Some(64 * gib)),
             (0, 0)
         );
-    }
-
-    #[test]
-    fn memory_stat_attributes_usage_to_anon_versus_cache() {
-        // A file-writing workload: 40 GiB anonymous, 200 GiB page cache. The raw
-        // `memory.current` a controller divides by its budget counts all of it,
-        // while only `anon` is unreclaimable — this is the gap that makes a usage
-        // ratio read as exhausted when demand is not.
-        let gib = 1024 * 1024 * 1024;
-        let stat = format!(
-            "anon {}\nfile {}\nkernel {}\ninactive_file {}\nactive_file {}\n",
-            40 * gib,
-            200 * gib,
-            2 * gib,
-            180 * gib,
-            20 * gib
-        );
-        let c = parse_memory_stat(&stat);
-        assert_eq!(c.anon, 40 * gib);
-        assert_eq!(c.inactive_file, 180 * gib);
-        assert_eq!(c.active_file, 20 * gib);
-
-        // Working set subtracts only COLD cache, matching Kubernetes/cAdvisor, so
-        // the 20 GiB of hot cache stays counted — the reason a working set alone
-        // may not fully explain a write-heavy workload's apparent pressure.
-        let current = 242 * gib;
-        assert_eq!(c.working_set(current), current - 180 * gib);
-        assert!(c.working_set(current) > c.anon);
-
-        // Absent keys read as zero rather than failing the whole parse.
-        let sparse = parse_memory_stat("anon 123\n");
-        assert_eq!(sparse.anon, 123);
-        assert_eq!(sparse.inactive_file, 0);
-        // A never-underflowing working set: cache larger than usage clamps at zero.
-        assert_eq!(parse_memory_stat("inactive_file 10\n").working_set(4), 0);
-    }
-
-    #[test]
-    fn memory_pressure_psi_reads_some_avg10() {
-        // PSI reports the share of wall clock stalled on reclaim. Near-zero `some`
-        // alongside a high usage ratio is the signature of reclaimable cache: the
-        // cgroup looks full but nothing is actually waiting on memory.
-        let psi = "some avg10=0.00 avg60=0.12 avg300=1.50 total=12345\n\
-                   full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n";
-        assert_eq!(parse_memory_pressure_some_avg10(psi), Some(0.00));
-
-        let stalling = "some avg10=42.75 avg60=30.00 avg300=10.00 total=999\n";
-        assert_eq!(parse_memory_pressure_some_avg10(stalling), Some(42.75));
-
-        // `full` must never be mistaken for `some`, and junk yields None rather
-        // than a misleading zero.
-        assert_eq!(
-            parse_memory_pressure_some_avg10("full avg10=9.0 total=1\n"),
-            None
-        );
-        assert_eq!(parse_memory_pressure_some_avg10(""), None);
-        assert_eq!(parse_memory_pressure_some_avg10("some total=1\n"), None);
     }
 
     #[cfg(target_os = "linux")]

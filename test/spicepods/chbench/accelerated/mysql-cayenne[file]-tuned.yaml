@@ -76,29 +76,30 @@ datasets:
       refresh_mode: changes
       params: &cayenne_params
         cayenne_tuning: adaptive
-        # Adaptive tuning WITH the three memory knobs pinned at their warm-start
-        # values. Adaptive still owns every other lever; an explicit value collapses
-        # a knob's tuning bounds to a point, so the closed loop cannot move these.
+        # TEST REFERENCE CONFIG — the target the adaptive/auto-tuned variants should
+        # be able to match on their own. Adaptive tuning stays enabled and owns
+        # every other lever; only the three memory knobs are pinned, at the values
+        # adaptive itself warm-starts them to. An explicit value collapses a knob's
+        # tuning bounds to a point, so the closed loop cannot move these three.
         #
-        # Why: at SF1000 the memory-pressure rule drives mem_tier_max_bytes to its
-        # 64MiB floor and inline_flush_max_bytes to its 2MiB floor on every
-        # unpinned run, while target_file_size_mb diverges run to run and climbs
-        # toward the 1GiB ceiling. A tier at its floor feeding files near the
-        # ceiling spills continuously, and each spill blocks the apply loop for
-        # tens of seconds. That is the dominant source of run-to-run variance on
-        # this config, and on MySQL it escalates to dropped binlog connections.
+        # It exists because at SF1000 the memory-pressure rule drives
+        # mem_tier_max_bytes to its 64MiB floor and inline_flush_max_bytes to its
+        # 2MiB floor, while target_file_size_mb climbs toward the 1GiB ceiling. A
+        # tier at its floor feeding files near the ceiling spills continuously, and
+        # each spill blocks the apply loop for tens of seconds — the dominant source
+        # of run-to-run variance here, and on MySQL it escalates to dropped binlog
+        # connections. Root cause: https://github.com/spiceai/spiceai/issues/12531
         #
         # Measured against the same pod unpinned: mem-tier spills 10-24 -> 0,
         # in-load binlog reconnects 0-3 -> 0, worst-P99 freshness 253-563s -> 275s,
-        # applied rows/s 55.6-109.2k -> 108.9k. The pressure signal itself is
-        # unchanged and still reads CRITICAL on 44% of samples — only its effect on
-        # these knobs is blocked.
+        # applied rows/s 55.6-109.2k -> 108.9k. The pressure signal is unchanged and
+        # still reads CRITICAL on 44% of samples; only its effect here is blocked.
         #
-        # Cost: pinning also blocks the tuner's GROWTH levers (the "falling behind
-        # -> enlarge the memtable" rule), which initial catch-up relies on. The
-        # equivalent Postgres pod failed its readiness gate with 2/11 datasets not
-        # caught up inside 900s. Raise ready_wait before reusing this shape on a
-        # source with heavier initial catch-up.
+        # So this is a benchmark yardstick, not a recommended production shape:
+        # pinning also blocks the tuner's growth levers (the "falling behind ->
+        # enlarge the memtable" rule) that initial catch-up relies on. Once 12531 is
+        # fixed, -adaptive should reach these numbers without the pins, and this pod
+        # becomes the regression target that proves it.
         cayenne_cdc_mem_tier_max_bytes: '1073741824'
         cayenne_inline_flush_max_bytes: '134217728'
         cayenne_target_file_size_mb: '256'
