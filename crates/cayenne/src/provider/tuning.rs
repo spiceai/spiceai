@@ -465,10 +465,13 @@ fn adaptive_mem_tier_bounds_for_budget(
 /// demand makes a write-heavy CDC table read as critically short of memory while
 /// its unreclaimable footprint sits far below the budget, and the controller
 /// answers by collapsing the live buffers to their floors, which spills
-/// continuously (issue #12531: 215.6 GiB charged of a 256 GiB limit — ratio 0.842,
-/// above `MEM_PRESSURE_HIGH` — against 152.5 GiB of `anon`, ratio 0.596, below
-/// `MEM_PRESSURE_OK`, with the kernel reporting 50 µs of reclaim stall over the
-/// container's whole life).
+/// continuously. `working_set_excludes_reclaimable_page_cache` carries the
+/// measured cgroup accounting from the run that exposed this (issue #12531).
+///
+/// The numerator is read from THIS cgroup, while the budget it is divided against
+/// ([`global_memory_budget`]) is the tightest `memory.max` along the whole cgroup
+/// path (`telemetry::hardware::cgroup_memory_limit`). Where the binding limit sits
+/// on an ancestor shared with other processes, the ratio reads low.
 #[cfg(target_os = "linux")]
 fn current_memory_bytes() -> Option<u64> {
     cgroup_v2_working_set()
@@ -482,9 +485,12 @@ fn current_memory_bytes() -> Option<u64> {
 #[cfg(target_os = "linux")]
 fn cgroup_v2_working_set() -> Option<u64> {
     let current = cgroup_v2_memory_current()?;
-    let reclaimable = read_cgroup_stat(&CGROUP_V2_MEMORY_STAT_PATH, resolve_cgroup_v2_stat_path)
+    let reclaimable = read_cgroup_file(&CGROUP_V2_MEMORY_STAT_PATH, "memory.stat", true)
         .as_deref()
-        .and_then(parse_cgroup_v2_reclaimable_bytes)
+        // All file-backed cache, less the parts the kernel cannot drop without
+        // first doing work: `shmem` (tmpfs pages need swap) and `file_dirty` /
+        // `file_writeback` (writeback must complete first).
+        .and_then(|stat| reclaimable_page_cache(stat, "file", RECLAIM_EXCLUDED_V2))
         .unwrap_or(0);
     Some(current.saturating_sub(reclaimable))
 }
@@ -492,55 +498,48 @@ fn cgroup_v2_working_set() -> Option<u64> {
 #[cfg(target_os = "linux")]
 fn cgroup_v1_working_set() -> Option<u64> {
     let current = cgroup_v1_memory_current()?;
-    let reclaimable = read_cgroup_stat(&CGROUP_V1_MEMORY_STAT_PATH, resolve_cgroup_v1_stat_path)
+    let reclaimable = read_cgroup_file(&CGROUP_V1_MEMORY_STAT_PATH, "memory.stat", false)
         .as_deref()
-        .and_then(parse_cgroup_v1_reclaimable_bytes)
+        // The `total_*` keys are the hierarchical tallies matching
+        // `memory.usage_in_bytes`; the unprefixed ones are the this-cgroup-only
+        // fallback for a kernel that omits them.
+        .and_then(|stat| {
+            reclaimable_page_cache(stat, "total_cache", RECLAIM_EXCLUDED_V1_TOTAL)
+                .or_else(|| reclaimable_page_cache(stat, "cache", RECLAIM_EXCLUDED_V1))
+        })
         .unwrap_or(0);
     Some(current.saturating_sub(reclaimable))
 }
 
-/// Freely-reclaimable page cache from a cgroup v2 `memory.stat` body: all
-/// file-backed cache (`file`) less the parts the kernel cannot drop without
-/// first doing work — `shmem` (tmpfs pages need swap) and `file_dirty` /
-/// `file_writeback` (writeback must complete first). Everything left over —
-/// `anon`, kernel, socket — stays counted as demand.
+#[cfg(target_os = "linux")]
+const RECLAIM_EXCLUDED_V2: &[&str] = &["shmem", "file_dirty", "file_writeback"];
+#[cfg(target_os = "linux")]
+const RECLAIM_EXCLUDED_V1_TOTAL: &[&str] = &["total_shmem", "total_dirty", "total_writeback"];
+#[cfg(target_os = "linux")]
+const RECLAIM_EXCLUDED_V1: &[&str] = &["shmem", "dirty", "writeback"];
+
+/// Freely-reclaimable page cache from a `memory.stat` body: the `cache_key` total
+/// less the `excluded` keys the kernel cannot drop on demand. Everything the
+/// charge holds beyond this — `anon`, kernel, socket — stays counted as demand.
 ///
 /// Built from the totals, never the `*_file` LRU counters: `inactive_file` has
 /// been observed exceeding the `file` total that contains it (issue #12531), so
 /// the kubelet-style `current - inactive_file` working set is not trustworthy
 /// here.
 #[cfg(target_os = "linux")]
-fn parse_cgroup_v2_reclaimable_bytes(contents: &str) -> Option<u64> {
-    let file = parse_cgroup_stat_key(contents, "file")?;
-    Some(file.saturating_sub(sum_cgroup_stat_keys(
-        contents,
-        &["shmem", "file_dirty", "file_writeback"],
-    )))
-}
-
-/// Same, for cgroup v1 `memory.stat`. The `total_*` keys are the hierarchical
-/// tallies matching `memory.usage_in_bytes`; the unprefixed keys are the
-/// this-cgroup-only fallback for a kernel that omits them.
-#[cfg(target_os = "linux")]
-fn parse_cgroup_v1_reclaimable_bytes(contents: &str) -> Option<u64> {
-    let (cache, keys) = match parse_cgroup_stat_key(contents, "total_cache") {
-        Some(cache) => (cache, ["total_shmem", "total_dirty", "total_writeback"]),
-        None => (
-            parse_cgroup_stat_key(contents, "cache")?,
-            ["shmem", "dirty", "writeback"],
+fn reclaimable_page_cache(contents: &str, cache_key: &str, excluded: &[&str]) -> Option<u64> {
+    let cache = parse_cgroup_stat_key(contents, cache_key)?;
+    Some(
+        cache.saturating_sub(
+            excluded
+                .iter()
+                .filter_map(|key| parse_cgroup_stat_key(contents, key))
+                .fold(0, u64::saturating_add),
         ),
-    };
-    Some(cache.saturating_sub(sum_cgroup_stat_keys(contents, &keys)))
+    )
 }
 
-#[cfg(target_os = "linux")]
-fn sum_cgroup_stat_keys(contents: &str, keys: &[&str]) -> u64 {
-    keys.iter()
-        .filter_map(|key| parse_cgroup_stat_key(contents, key))
-        .fold(0, u64::saturating_add)
-}
-
-/// Value for `key` in a `memory.stat` body (`"<key> <bytes>"` per line).
+/// Value for `key` in a cgroup stat body (`"<key> <value>"` per line).
 #[cfg(target_os = "linux")]
 fn parse_cgroup_stat_key(contents: &str, key: &str) -> Option<u64> {
     contents.lines().find_map(|line| {
@@ -549,65 +548,52 @@ fn parse_cgroup_stat_key(contents: &str, key: &str) -> Option<u64> {
     })
 }
 
+/// Read a per-cgroup file, resolving and caching its path on first use. `v2`
+/// selects the unified hierarchy; otherwise the v1 `memory` controller.
 #[cfg(target_os = "linux")]
-fn read_cgroup_stat(
-    path: &OnceLock<Option<String>>,
-    resolve: fn() -> Option<String>,
+fn read_cgroup_file(
+    cached_path: &OnceLock<Option<String>>,
+    filename: &'static str,
+    v2: bool,
 ) -> Option<String> {
-    std::fs::read_to_string(path.get_or_init(resolve).as_deref()?).ok()
+    let path = cached_path.get_or_init(|| {
+        let (mountpoint, cgroup_path) = if v2 {
+            (
+                cgroup2_mountpoint().unwrap_or_else(|| "/sys/fs/cgroup".to_string()),
+                process_cgroup_v2_path()?,
+            )
+        } else {
+            (
+                cgroup_v1_mountpoint("memory")
+                    .unwrap_or_else(|| "/sys/fs/cgroup/memory".to_string()),
+                process_cgroup_v1_path("memory")?,
+            )
+        };
+        Some(cgroup_file_path(&mountpoint, &cgroup_path, filename))
+    });
+    std::fs::read_to_string(path.as_deref()?).ok()
 }
 
 #[cfg(target_os = "linux")]
 fn cgroup_v2_memory_current() -> Option<u64> {
-    read_u64_file(
-        CGROUP_V2_MEMORY_CURRENT_PATH
-            .get_or_init(resolve_cgroup_v2_memory_current_path)
-            .as_deref()?,
-    )
+    read_cgroup_u64(&CGROUP_V2_MEMORY_CURRENT_PATH, "memory.current", true)
 }
 
 #[cfg(target_os = "linux")]
 fn cgroup_v1_memory_current() -> Option<u64> {
-    read_u64_file(
-        CGROUP_V1_MEMORY_USAGE_PATH
-            .get_or_init(resolve_cgroup_v1_memory_usage_path)
-            .as_deref()?,
-    )
+    read_cgroup_u64(&CGROUP_V1_MEMORY_USAGE_PATH, "memory.usage_in_bytes", false)
 }
 
 #[cfg(target_os = "linux")]
-fn resolve_cgroup_v2_memory_current_path() -> Option<String> {
-    resolve_cgroup_v2_memory_file("memory.current")
-}
-
-#[cfg(target_os = "linux")]
-fn resolve_cgroup_v2_stat_path() -> Option<String> {
-    resolve_cgroup_v2_memory_file("memory.stat")
-}
-
-#[cfg(target_os = "linux")]
-fn resolve_cgroup_v2_memory_file(filename: &str) -> Option<String> {
-    let cgroup_path = process_cgroup_v2_path()?;
-    let mountpoint = cgroup2_mountpoint().unwrap_or_else(|| "/sys/fs/cgroup".to_string());
-    Some(cgroup_file_path(&mountpoint, &cgroup_path, filename))
-}
-
-#[cfg(target_os = "linux")]
-fn resolve_cgroup_v1_memory_usage_path() -> Option<String> {
-    resolve_cgroup_v1_memory_file("memory.usage_in_bytes")
-}
-
-#[cfg(target_os = "linux")]
-fn resolve_cgroup_v1_stat_path() -> Option<String> {
-    resolve_cgroup_v1_memory_file("memory.stat")
-}
-
-#[cfg(target_os = "linux")]
-fn resolve_cgroup_v1_memory_file(filename: &str) -> Option<String> {
-    let cgroup_path = process_cgroup_v1_path("memory")?;
-    let mountpoint =
-        cgroup_v1_mountpoint("memory").unwrap_or_else(|| "/sys/fs/cgroup/memory".to_string());
-    Some(cgroup_file_path(&mountpoint, &cgroup_path, filename))
+fn read_cgroup_u64(
+    cached_path: &OnceLock<Option<String>>,
+    filename: &'static str,
+    v2: bool,
+) -> Option<u64> {
+    read_cgroup_file(cached_path, filename, v2)?
+        .trim()
+        .parse()
+        .ok()
 }
 
 #[cfg(target_os = "linux")]
@@ -809,11 +795,7 @@ fn cgroup_cpu_usage_usec() -> Option<u64> {
 
 #[cfg(target_os = "linux")]
 fn read_cpu_stat_usage_usec(path: &str) -> Option<u64> {
-    let contents = std::fs::read_to_string(path).ok()?;
-    contents.lines().find_map(|line| {
-        line.strip_prefix("usage_usec ")
-            .and_then(|v| v.trim().parse::<u64>().ok())
-    })
+    parse_cgroup_stat_key(&std::fs::read_to_string(path).ok()?, "usage_usec")
 }
 
 #[cfg(target_os = "linux")]
@@ -1670,6 +1652,35 @@ impl Actuator {
             Self::WriteConcurrency => "write_concurrency",
             Self::TargetVortexFileSize => "target_vortex_file_size_bytes",
             Self::QueryAdmissionReserve => "query_admission_reserve",
+        }
+    }
+
+    /// Whether RAISING this actuator increases resident bytes. Every such raise
+    /// must be gated on `mem_ok` — growing memory while the memory rule is busy
+    /// shrinking it puts two rules in opposition, and the memory rule is the one
+    /// holding the hard objective.
+    ///
+    /// An exhaustive match rather than a per-rule convention, so a new actuator
+    /// cannot be added without answering the question, and
+    /// `memory_consuming_actuators_are_never_raised_under_pressure` sweeps the
+    /// decider against it. Test-only: it classifies the actuator set for that
+    /// sweep, and the decider's own gating lives in the rules themselves.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn consumes_memory(self) -> bool {
+        match self {
+            // Live buffers, in-flight encode shards, and the compaction output
+            // buffer: each raise is more resident bytes.
+            Self::InlineFlushBytes
+            | Self::MemTierMaxBytes
+            | Self::WriteConcurrency
+            | Self::TargetVortexFileSize => true,
+            // These spend CPU or I/O, not bytes; they carry `cpu_ok` where the
+            // resource they contend for warrants it.
+            Self::CompactionIntervalMs
+            | Self::CompactionTriggerFiles
+            | Self::BakeDeletionIndexTrigger
+            | Self::QueryAdmissionReserve => false,
         }
     }
 }
@@ -4209,6 +4220,159 @@ mod tests {
         assert_eq!(
             cgroup_file_path("/sys/fs/cgroup", "/", "memory.current"),
             "/sys/fs/cgroup/memory.current"
+        );
+    }
+
+    /// Current value of `actuator`, as the same `u64` an [`Adjustment`] carries,
+    /// so a move can be classified as a raise or a shrink.
+    fn current_value(cur: &ActuatorValues, actuator: Actuator) -> u64 {
+        match actuator {
+            Actuator::InlineFlushBytes => u64::try_from(cur.inline_flush_max_bytes).unwrap_or(0),
+            Actuator::MemTierMaxBytes => u64::try_from(cur.mem_tier_max_bytes).unwrap_or(0),
+            Actuator::TargetVortexFileSize => {
+                u64::try_from(cur.target_vortex_file_size_bytes).unwrap_or(0)
+            }
+            Actuator::CompactionIntervalMs => cur.compaction_background_interval_ms,
+            Actuator::CompactionTriggerFiles => {
+                u64::try_from(cur.compaction_trigger_files).unwrap_or(0)
+            }
+            Actuator::BakeDeletionIndexTrigger => {
+                u64::try_from(cur.bake_deletion_index_trigger).unwrap_or(0)
+            }
+            Actuator::WriteConcurrency => u64::try_from(cur.write_concurrency).unwrap_or(0),
+            Actuator::QueryAdmissionReserve => {
+                u64::try_from(cur.query_admission_reserve).unwrap_or(0)
+            }
+        }
+    }
+
+    /// The invariant behind [`Actuator::consumes_memory`]: no rule, in either
+    /// ladder, may RAISE a memory-consuming actuator while memory is tight. The
+    /// memory rule holds the hard objective (stay within the budget), so a growth
+    /// rule that ignores it puts two rules in opposition — and the growth rule
+    /// wins whenever it is reached first.
+    ///
+    /// A sweep rather than a per-rule test because both known violations were
+    /// single rules missed in a hand audit: the write-concurrency raise and the
+    /// target-file-size raise, each three lines from a gated sibling. Shrinks are
+    /// expected and allowed — only raises are the violation.
+    ///
+    /// The decider returns at most ONE move per call and the memory rule runs
+    /// first, so the buffers it shrinks are pinned at their floors here: with no
+    /// shrink left to make, the tick falls through to the growth rules that are
+    /// the actual subject. Anything left mid-range would mask them behind a
+    /// shrink. `later_levers_exhausted` walks further still, retiring the
+    /// non-memory levers each ladder reaches before its file-size / shard raises.
+    #[test]
+    fn memory_consuming_actuators_are_never_raised_under_pressure() {
+        let b = bounds();
+        // Memory is the one condition held constant: critically tight.
+        let pressured = |s: IngestSnapshot| IngestSnapshot {
+            mem_pressure: Some(0.95),
+            ..s
+        };
+        let snapshots = [
+            pressured(snap()),
+            // Falling behind: the ingest-speed ladder.
+            pressured(IngestSnapshot {
+                apply_vs_arrival: 3.0,
+                ..snap()
+            }),
+            // Read-amp high: the query-health ladder.
+            pressured(IngestSnapshot {
+                read_amp: 40,
+                ..snap()
+            }),
+            // Bursty arrivals: the durability-buffer pre-grow.
+            pressured(IngestSnapshot {
+                arrival_cv: 2.0,
+                ..snap()
+            }),
+            // I/O and publish cliffs: the decisive-backoff fast path.
+            pressured(IngestSnapshot {
+                io_latency_ms: Some(20.0),
+                io_latency_fast_ms: Some(200.0),
+                publish_latency_ms: Some(20.0),
+                publish_latency_fast_ms: Some(200.0),
+                ..snap()
+            }),
+            // Everything at once, CPU free so no CPU gate masks an ungated raise.
+            pressured(IngestSnapshot {
+                replication_lag_secs: Some(120.0),
+                freshness_secs: Some(120.0),
+                query_latency_p99_ms: Some(500.0),
+                qph: Some(1.0),
+                cpu_pressure: Some(0.1),
+                read_amp: 40,
+                apply_vs_arrival: 3.0,
+                arrival_cv: 2.0,
+                ..snap()
+            }),
+        ];
+        // The memory buffers sit at their floors so the memory rule has no shrink
+        // to make and the tick reaches the growth rules.
+        let buffers_at_floor = ActuatorValues {
+            inline_flush_max_bytes: b.inline_flush_max_bytes.0,
+            mem_tier_max_bytes: b.mem_tier_max_bytes.0,
+            ..actuators()
+        };
+        let positions = [
+            buffers_at_floor,
+            // ...and with the CPU/IO levers each ladder tries first also retired,
+            // so the file-size and shard raises beyond them are reachable.
+            ActuatorValues {
+                compaction_background_interval_ms: b.compaction_background_interval_ms.0,
+                compaction_trigger_files: b.compaction_trigger_files.0,
+                bake_deletion_index_trigger: b.bake_deletion_index_trigger.0,
+                // Zero, not the ceiling: a non-zero reserve makes the handback rule
+                // — which runs ahead of the query tier — consume the tick's one move.
+                query_admission_reserve: b.query_admission_reserve.0,
+                write_concurrency: b.write_concurrency.0,
+                ..buffers_at_floor
+            },
+        ];
+        // Each goal alone, then all together: a single-goal tick reaches rules that
+        // an earlier-priority goal would otherwise consume the move for.
+        let window = Duration::from_mins(1);
+        let goal_sets = [
+            Goals::from_targets(Some(5.0), None, None, None, window),
+            Goals::from_targets(None, Some(5.0), None, None, window),
+            Goals::from_targets(None, None, Some(100.0), None, window),
+            Goals::from_targets(None, None, None, Some(10_000.0), window),
+            Goals::from_targets(Some(5.0), Some(5.0), Some(100.0), Some(10_000.0), window),
+        ];
+
+        let mut reached = 0_usize;
+        for s in &snapshots {
+            for cur in &positions {
+                let moves = std::iter::once(("legacy", decide_fresh(s, cur, &b))).chain(
+                    goal_sets
+                        .iter()
+                        .map(|g| ("goal", goal_decide(s, cur, &b, g))),
+                );
+                for (mode, adj) in moves {
+                    let Some(adj) = adj else { continue };
+                    if !adj.actuator.consumes_memory() {
+                        continue;
+                    }
+                    reached += 1;
+                    assert!(
+                        adj.new_value <= current_value(cur, adj.actuator),
+                        "{mode} ladder raised {} from {} to {} at mem_pressure 0.95 (reason: {}) \
+                         — every memory-consuming raise must be gated on `mem_ok`",
+                        adj.actuator.as_str(),
+                        current_value(cur, adj.actuator),
+                        adj.new_value,
+                        adj.reason,
+                    );
+                }
+            }
+        }
+        // Guard against the sweep silently going vacuous: if no combination ever
+        // returns a memory-consuming move, the assertion above proves nothing.
+        assert!(
+            reached > 0,
+            "the sweep never reached a memory-consuming actuator — it is no longer testing anything"
         );
     }
 
