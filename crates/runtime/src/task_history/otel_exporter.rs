@@ -364,7 +364,7 @@ impl TaskHistoryExporter {
             extract_attr!(span, "trace_id").and_then(|trace_id: Arc<str>| {
                 let normalized = runtime_request_context::normalize_trace_id(&trace_id);
                 if normalized.is_none() {
-                    tracing::warn!("User provided 'trace_id'='{trace_id}' is invalid. Must be a 32 character hex string.");
+                    tracing::warn!("User provided 'trace_id'='{trace_id}' is invalid. Expected 32 hexadecimal characters, not all zero.");
                 }
                 normalized
             });
