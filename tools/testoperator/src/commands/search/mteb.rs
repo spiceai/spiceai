@@ -139,18 +139,21 @@ pub(crate) async fn prepare_dataset(dataset: &MtebRepo, spicepod_dir: &Path) -> 
     // Copy files to spicepod directory with new names. A single-shard corpus is copied verbatim to
     // preserve its exact parquet encoding; a multi-shard corpus is concatenated into one file.
     if let [single_shard] = corpus_shards.as_slice() {
-        std::fs::copy(single_shard, &corpus_dest)
+        tokio::fs::copy(single_shard, &corpus_dest)
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to copy corpus file: {e}"))?;
     } else {
         concat_parquet_files(&corpus_shards, &corpus_dest)?;
     }
     println!("Corpus data saved to: {}", corpus_dest.display());
 
-    std::fs::copy(&test_queries_path, &queries_dest)
+    tokio::fs::copy(&test_queries_path, &queries_dest)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to copy queries file: {e}"))?;
     println!("Queries data saved to: {}", queries_dest.display());
 
-    std::fs::copy(&scores_path, &data_dest)
+    tokio::fs::copy(&scores_path, &data_dest)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to copy data file: {e}"))?;
     println!("Data saved to: {}", data_dest.display());
 
