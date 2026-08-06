@@ -2,6 +2,13 @@ version: v1
 kind: Spicepod
 name: postgres-cayenne[file]-adaptive-pinned
 
+# KNOWN FAILING as written: this pod did not pass the readiness gate at SF1000
+# (2/11 datasets not caught up within ready_wait: 900). Pinning the memory knobs
+# also blocks the tuner's growth levers, which initial catch-up depends on, and
+# Postgres catch-up at SF1000 is heavier than MySQL's. Raise ready_wait before
+# reusing it. The MySQL equivalent is mysql-cayenne[file]-tuned.yaml, which does
+# reach readiness. Kept for the comparison, not as a working config.
+
 # Default adaptive CH-BenCHmark config, set to the topology + prefetch that won the SF1000
 # benchmark sweep: the 7 CDC tables share FOUR replication slots (not one-per-table), and the CDC prefetch
 # buffers are pinned deep (16384). In that sweep the 1-slot topology failed the data-correctness
