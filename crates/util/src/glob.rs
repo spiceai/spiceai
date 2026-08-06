@@ -41,7 +41,7 @@ limitations under the License.
 #[must_use]
 pub fn glob_literal_prefix(pattern: &str) -> &str {
     let end = pattern
-        .find(|c| matches!(c, '*' | '?' | '[' | '{' | '\\'))
+        .find(['*', '?', '[', '{', '\\'])
         .unwrap_or(pattern.len());
     &pattern[..end]
 }
@@ -241,8 +241,9 @@ mod tests {
                 let kept = schema_may_contain_selected_table(schema, &[pattern]);
                 for table in tables {
                     let candidate = format!("{schema}.{table}");
+                    let selected = set.is_match(&candidate);
                     assert!(
-                        !(set.is_match(&candidate) && !kept),
+                        !selected || kept,
                         "pattern {pattern:?} selects {candidate:?} but the pre-filter dropped schema {schema:?}"
                     );
                 }
@@ -271,8 +272,9 @@ mod tests {
                 let kept = schema_may_contain_selected_table(schema, patterns);
                 for table in tables {
                     let candidate = format!("{schema}.{table}");
+                    let selected = set.is_match(&candidate);
                     assert!(
-                        !(set.is_match(&candidate) && !kept),
+                        !selected || kept,
                         "{patterns:?} selects {candidate:?} but the pre-filter dropped schema {schema:?}"
                     );
                 }
