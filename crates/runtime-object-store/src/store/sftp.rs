@@ -114,7 +114,11 @@ impl SFTPClientConfig {
 /// `TcpStream::connect_timeout` takes an already-resolved `SocketAddr` and so
 /// cannot accept a hostname; resolving first keeps hostnames working while
 /// still bounding the connect. The deadline covers all resolved candidates
-/// together rather than resetting per candidate.
+/// together rather than resetting per candidate, so a host with several
+/// addresses cannot multiply the wait the operator asked for — at the cost of
+/// possibly not reaching a later address, which is why the error reports how
+/// many were tried. Name resolution itself is bounded by the system resolver,
+/// not by this deadline.
 fn connect_within(addr: &str, deadline: Duration) -> object_store::Result<TcpStream> {
     let start = Instant::now();
     let candidates: Vec<SocketAddr> = addr
@@ -126,16 +130,18 @@ fn connect_within(addr: &str, deadline: Duration) -> object_store::Result<TcpStr
             )
         })?
         .collect();
+    let total = candidates.len();
 
+    let mut tried = 0;
     let mut last_error: Option<String> = None;
     for candidate in candidates {
-        let Some(remaining) = deadline.checked_sub(start.elapsed()) else {
-            break;
-        };
-        // `connect_timeout` rejects a zero duration.
+        // `connect_timeout` rejects a zero duration, and an exhausted deadline
+        // is the answer anyway.
+        let remaining = deadline.saturating_sub(start.elapsed());
         if remaining.is_zero() {
             break;
         }
+        tried += 1;
         match TcpStream::connect_timeout(&candidate, remaining) {
             Ok(stream) => return Ok(stream),
             Err(e) => last_error = Some(format!("{candidate}: {e}")),
@@ -146,7 +152,7 @@ fn connect_within(addr: &str, deadline: Duration) -> object_store::Result<TcpStr
     Err(generic_error(
         STORE_NAME,
         format!(
-            "Failed to connect to SFTP server sftp://{addr}: {detail}. Increase 'client_timeout' if the server is simply slow to respond. See: https://spiceai.org/docs/components/data-connectors/sftp"
+            "Failed to connect to SFTP server sftp://{addr}: {detail} (tried {tried} of {total} resolved addresses within {deadline:?}). Increase 'client_timeout' if the server is simply slow to respond. See: https://spiceai.org/docs/components/data-connectors/sftp"
         ),
     ))
 }
@@ -457,11 +463,17 @@ mod tests {
         assert!(config.timeout.is_some());
     }
 
+    /// Bind a listener on an ephemeral loopback port.
+    fn loopback_listener() -> (std::net::TcpListener, u16) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        (listener, port)
+    }
+
     /// A peer that completes the TCP handshake and then never sends the SSH
     /// banner. Returns the port; the accepted sockets are held by the thread.
     fn stalled_ssh_peer() -> u16 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
-        let port = listener.local_addr().expect("local addr").port();
+        let (listener, port) = loopback_listener();
         std::thread::spawn(move || {
             let mut accepted = Vec::new();
             while let Ok((stream, _)) = listener.accept() {
@@ -541,8 +553,7 @@ mod tests {
     /// rather than being masked by the deadline.
     #[test]
     fn a_refused_port_fails_without_waiting_for_the_deadline() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
-        let port = listener.local_addr().expect("local addr").port();
+        let (listener, port) = loopback_listener();
         drop(listener);
 
         let config = config_for("127.0.0.1", port.to_string(), Some(Duration::from_secs(30)));

@@ -57,6 +57,23 @@ struct FTPConnectionManager {
     config: Arc<FTPClientConfig>,
 }
 
+/// Surfaces the pool's own connection failures, which it reports to a sink
+/// rather than to a caller. `bb8`'s default sink discards them, so a connection
+/// discarded in the background — including one abandoned at its deadline — would
+/// otherwise leave no trace of why.
+#[derive(Debug, Clone, Copy)]
+struct LogErrorSink;
+
+impl bb8::ErrorSink<object_store::Error> for LogErrorSink {
+    fn sink(&self, error: object_store::Error) {
+        tracing::warn!("FTP connection pool discarded a connection: {error}");
+    }
+
+    fn boxed_clone(&self) -> Box<dyn bb8::ErrorSink<object_store::Error>> {
+        Box::new(*self)
+    }
+}
+
 impl bb8::ManageConnection for FTPConnectionManager {
     type Connection = AsyncFtpStream;
     type Error = object_store::Error;
@@ -70,7 +87,8 @@ impl bb8::ManageConnection for FTPConnectionManager {
         &self,
         conn: &mut Self::Connection,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        let deadline = self.config.deadline();
+        let config = Arc::clone(&self.config);
+        let deadline = config.deadline();
         let noop_future = conn.noop();
         Box::pin(async move {
             match tokio::time::timeout(deadline, noop_future).await {
@@ -82,7 +100,8 @@ impl bb8::ManageConnection for FTPConnectionManager {
                 Err(_elapsed) => Err(object_store::Error::Generic {
                     store: STORE_NAME,
                     source: format!(
-                        "The FTP server did not answer a liveness check within {deadline:?}; discarding the connection."
+                        "FTP server ftp://{}:{} did not answer a liveness check within {deadline:?}; discarding the connection.",
+                        config.host, config.port
                     )
                     .into(),
                 }),
@@ -209,6 +228,7 @@ impl FTPInner {
                 };
                 Pool::builder()
                     .max_size(DEFAULT_POOL_SIZE)
+                    .error_sink(Box::new(LogErrorSink))
                     .build(manager)
                     .await
                     .map_err(|e| generic_error(STORE_NAME, e))
@@ -585,6 +605,7 @@ impl ObjectStore for FTPObjectStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bb8::ManageConnection;
     use chrono::Utc;
     use std::time::Instant;
 
@@ -614,6 +635,13 @@ mod tests {
         assert_eq!(cloned.port, "21");
     }
 
+    /// Bind a listener on an ephemeral loopback port.
+    fn loopback_listener() -> (std::net::TcpListener, u16) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        (listener, port)
+    }
+
     /// A peer that completes the TCP handshake and then never answers, so the
     /// FTP greeting and the `USER`/`PASS` exchange stall. Returns the port.
     ///
@@ -621,8 +649,7 @@ mod tests {
     /// `spawn_blocking`, because a blocking task that never returns also blocks
     /// the test runtime's shutdown.
     fn stalled_ftp_peer() -> u16 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
-        let port = listener.local_addr().expect("local addr").port();
+        let (listener, port) = loopback_listener();
         std::thread::spawn(move || {
             // Hold every accepted connection open without writing a byte.
             let mut accepted = Vec::new();
@@ -638,8 +665,7 @@ mod tests {
     fn logged_in_then_quiet_peer() -> u16 {
         use std::io::{BufRead, BufReader, Write};
 
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
-        let port = listener.local_addr().expect("local addr").port();
+        let (listener, port) = loopback_listener();
         std::thread::spawn(move || {
             let mut held = Vec::new();
             while let Ok((stream, _)) = listener.accept() {
@@ -715,8 +741,6 @@ mod tests {
     /// stalled attempt cannot occupy a pool slot indefinitely.
     #[tokio::test]
     async fn pool_manager_gives_up_on_a_peer_that_never_answers() {
-        use bb8::ManageConnection;
-
         let port = stalled_ftp_peer();
         let manager = FTPConnectionManager {
             config: Arc::new(config_for(
@@ -779,8 +803,7 @@ mod tests {
     #[tokio::test]
     async fn a_refused_port_fails_without_waiting_for_the_deadline() {
         // Bind and drop, so the port is almost certainly unused.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
-        let port = listener.local_addr().expect("local addr").port();
+        let (listener, port) = loopback_listener();
         drop(listener);
 
         let config = config_for("127.0.0.1", port.to_string(), Some(Duration::from_secs(30)));
@@ -822,8 +845,6 @@ mod tests {
     /// even after the server recovered.
     #[tokio::test]
     async fn a_liveness_check_against_a_quiet_server_invalidates_the_connection() {
-        use bb8::ManageConnection;
-
         let port = logged_in_then_quiet_peer();
         let manager = FTPConnectionManager {
             config: Arc::new(config_for(
