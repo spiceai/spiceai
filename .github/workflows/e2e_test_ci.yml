@@ -199,7 +199,19 @@ jobs:
 
   test_openai_model:
     name: 'openai model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
-    timeout-minutes: 5
+    # This ceiling is a backstop, not a budget, and at 5 minutes it was below the
+    # job's own floor on the self-hosted macOS pool: downloading the build artifact
+    # and installing the CLI can consume most of it before a test runs, and the
+    # steps below then wait on bounded timeouts of their own — 60s for readiness,
+    # plus the 30s/30s/60s waits inside the expect scripts. The job was therefore
+    # cancelled mid-setup and the E2E gate read the cancellation as a failure,
+    # dequeuing whatever was in the merge queue (#12644). Raising it hides no test
+    # regression — a hung runtime or model still fails on those inner timeouts,
+    # not here — but it does stay the *only* bound on the checkout, artifact
+    # download and install steps, which is why it moves to the sibling's value
+    # rather than somewhere roomier. `test_hf_model` has the same setup on the
+    # same runners and has always been 10.
+    timeout-minutes: 10
     runs-on: ${{ matrix.target.runner }}
     needs:
       - build
