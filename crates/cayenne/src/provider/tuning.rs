@@ -302,7 +302,13 @@ static GLOBAL_MEMORY_BUDGET: AtomicU64 = AtomicU64::new(0);
 static CGROUP_V2_MEMORY_CURRENT_PATH: OnceLock<Option<String>> = OnceLock::new();
 
 #[cfg(target_os = "linux")]
+static CGROUP_V2_MEMORY_STAT_PATH: OnceLock<Option<String>> = OnceLock::new();
+
+#[cfg(target_os = "linux")]
 static CGROUP_V1_MEMORY_USAGE_PATH: OnceLock<Option<String>> = OnceLock::new();
+
+#[cfg(target_os = "linux")]
+static CGROUP_V1_MEMORY_STAT_PATH: OnceLock<Option<String>> = OnceLock::new();
 
 /// Process-wide CPU busy-fraction of available cores (cgroup-aware), stored ×1000.
 /// `u64::MAX` = unknown (non-Linux, unreadable, or the first/too-close sample with
@@ -447,14 +453,108 @@ fn adaptive_mem_tier_bounds_for_budget(
     (MEM_TIER_MIN_BYTES, ceiling.max(initial))
 }
 
-/// Current process/cgroup memory usage in bytes — cgroup v2 (`memory.current`)
-/// then v1 (`memory.usage_in_bytes`); `None` when unavailable. This is the
-/// "detect the environment and adjust" read that closes the loop on memory.
+/// Current process/cgroup memory *demand* in bytes — the unreclaimable working
+/// set, from cgroup v2 then v1, falling back to process RSS; `None` when
+/// unavailable. This is the "detect the environment and adjust" read that closes
+/// the loop on memory.
+///
+/// Demand is the cgroup charge (`memory.current` / `memory.usage_in_bytes`) MINUS
+/// the page cache the kernel can drop on demand. The total charge counts the
+/// file-backed cache left behind by the table's own Vortex writes, which is
+/// reclaimed — not OOM-killed — when the limit is approached: charging it as
+/// demand makes a write-heavy CDC table read as critically short of memory while
+/// its unreclaimable footprint sits far below the budget, and the controller
+/// answers by collapsing the live buffers to their floors, which spills
+/// continuously (issue #12531: 215.6 GiB charged of a 256 GiB limit — ratio 0.842,
+/// above `MEM_PRESSURE_HIGH` — against 152.5 GiB of `anon`, ratio 0.596, below
+/// `MEM_PRESSURE_OK`, with the kernel reporting 50 µs of reclaim stall over the
+/// container's whole life).
 #[cfg(target_os = "linux")]
 fn current_memory_bytes() -> Option<u64> {
-    cgroup_v2_memory_current()
-        .or_else(cgroup_v1_memory_current)
+    cgroup_v2_working_set()
+        .or_else(cgroup_v1_working_set)
         .or_else(proc_self_rss_bytes)
+}
+
+/// cgroup v2 charge less its freely-reclaimable page cache. An unreadable or
+/// unparseable `memory.stat` subtracts nothing, so the estimate degrades to the
+/// raw charge rather than to an unknown signal.
+#[cfg(target_os = "linux")]
+fn cgroup_v2_working_set() -> Option<u64> {
+    let current = cgroup_v2_memory_current()?;
+    let reclaimable = read_cgroup_stat(&CGROUP_V2_MEMORY_STAT_PATH, resolve_cgroup_v2_stat_path)
+        .as_deref()
+        .and_then(parse_cgroup_v2_reclaimable_bytes)
+        .unwrap_or(0);
+    Some(current.saturating_sub(reclaimable))
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_v1_working_set() -> Option<u64> {
+    let current = cgroup_v1_memory_current()?;
+    let reclaimable = read_cgroup_stat(&CGROUP_V1_MEMORY_STAT_PATH, resolve_cgroup_v1_stat_path)
+        .as_deref()
+        .and_then(parse_cgroup_v1_reclaimable_bytes)
+        .unwrap_or(0);
+    Some(current.saturating_sub(reclaimable))
+}
+
+/// Freely-reclaimable page cache from a cgroup v2 `memory.stat` body: all
+/// file-backed cache (`file`) less the parts the kernel cannot drop without
+/// first doing work — `shmem` (tmpfs pages need swap) and `file_dirty` /
+/// `file_writeback` (writeback must complete first). Everything left over —
+/// `anon`, kernel, socket — stays counted as demand.
+///
+/// Built from the totals, never the `*_file` LRU counters: `inactive_file` has
+/// been observed exceeding the `file` total that contains it (issue #12531), so
+/// the kubelet-style `current - inactive_file` working set is not trustworthy
+/// here.
+#[cfg(target_os = "linux")]
+fn parse_cgroup_v2_reclaimable_bytes(contents: &str) -> Option<u64> {
+    let file = parse_cgroup_stat_key(contents, "file")?;
+    Some(file.saturating_sub(sum_cgroup_stat_keys(
+        contents,
+        &["shmem", "file_dirty", "file_writeback"],
+    )))
+}
+
+/// Same, for cgroup v1 `memory.stat`. The `total_*` keys are the hierarchical
+/// tallies matching `memory.usage_in_bytes`; the unprefixed keys are the
+/// this-cgroup-only fallback for a kernel that omits them.
+#[cfg(target_os = "linux")]
+fn parse_cgroup_v1_reclaimable_bytes(contents: &str) -> Option<u64> {
+    let (cache, keys) = match parse_cgroup_stat_key(contents, "total_cache") {
+        Some(cache) => (cache, ["total_shmem", "total_dirty", "total_writeback"]),
+        None => (
+            parse_cgroup_stat_key(contents, "cache")?,
+            ["shmem", "dirty", "writeback"],
+        ),
+    };
+    Some(cache.saturating_sub(sum_cgroup_stat_keys(contents, &keys)))
+}
+
+#[cfg(target_os = "linux")]
+fn sum_cgroup_stat_keys(contents: &str, keys: &[&str]) -> u64 {
+    keys.iter()
+        .filter_map(|key| parse_cgroup_stat_key(contents, key))
+        .fold(0, u64::saturating_add)
+}
+
+/// Value for `key` in a `memory.stat` body (`"<key> <bytes>"` per line).
+#[cfg(target_os = "linux")]
+fn parse_cgroup_stat_key(contents: &str, key: &str) -> Option<u64> {
+    contents.lines().find_map(|line| {
+        let (name, value) = line.split_once(' ')?;
+        (name == key).then(|| value.trim().parse().ok())?
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn read_cgroup_stat(
+    path: &OnceLock<Option<String>>,
+    resolve: fn() -> Option<String>,
+) -> Option<String> {
+    std::fs::read_to_string(path.get_or_init(resolve).as_deref()?).ok()
 }
 
 #[cfg(target_os = "linux")]
@@ -477,25 +577,37 @@ fn cgroup_v1_memory_current() -> Option<u64> {
 
 #[cfg(target_os = "linux")]
 fn resolve_cgroup_v2_memory_current_path() -> Option<String> {
+    resolve_cgroup_v2_memory_file("memory.current")
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_cgroup_v2_stat_path() -> Option<String> {
+    resolve_cgroup_v2_memory_file("memory.stat")
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_cgroup_v2_memory_file(filename: &str) -> Option<String> {
     let cgroup_path = process_cgroup_v2_path()?;
     let mountpoint = cgroup2_mountpoint().unwrap_or_else(|| "/sys/fs/cgroup".to_string());
-    Some(cgroup_file_path(
-        &mountpoint,
-        &cgroup_path,
-        "memory.current",
-    ))
+    Some(cgroup_file_path(&mountpoint, &cgroup_path, filename))
 }
 
 #[cfg(target_os = "linux")]
 fn resolve_cgroup_v1_memory_usage_path() -> Option<String> {
+    resolve_cgroup_v1_memory_file("memory.usage_in_bytes")
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_cgroup_v1_stat_path() -> Option<String> {
+    resolve_cgroup_v1_memory_file("memory.stat")
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_cgroup_v1_memory_file(filename: &str) -> Option<String> {
     let cgroup_path = process_cgroup_v1_path("memory")?;
     let mountpoint =
         cgroup_v1_mountpoint("memory").unwrap_or_else(|| "/sys/fs/cgroup/memory".to_string());
-    Some(cgroup_file_path(
-        &mountpoint,
-        &cgroup_path,
-        "memory.usage_in_bytes",
-    ))
+    Some(cgroup_file_path(&mountpoint, &cgroup_path, filename))
 }
 
 #[cfg(target_os = "linux")]
@@ -610,7 +722,8 @@ fn current_memory_bytes() -> Option<u64> {
     None
 }
 
-/// Sample current memory pressure (cgroup-aware `used / budget`) into `stats`,
+/// Sample current memory pressure (cgroup-aware `used / budget`, where `used` is
+/// the unreclaimable working set — see [`current_memory_bytes`]) into `stats`,
 /// when a budget is installed and usage is readable. Called on the background
 /// tick so the controller can close the loop on memory.
 pub(crate) fn sample_mem_pressure(stats: &IngestStats) {
@@ -2609,17 +2722,24 @@ fn decide_goal(
         }
         // Grow the target Vortex file size so compaction emits fewer, larger files
         // — better scan throughput and per-file stats, and less file fan-out to
-        // probe per query. No memory/CPU gate: it changes the size of the files the
-        // background compactor already writes, not the write rate.
-        if let Some(v) = clamp_move_i64(
-            cur.target_vortex_file_size_bytes,
-            goal_grow_i64(
+        // probe per query. No CPU gate: it changes the size of the files the
+        // background compactor already writes, not the write rate. It does carry
+        // the same `mem_ok` gate as every other grow move, because a larger target
+        // buffers more encoded bytes per output file — and because the memory rule
+        // above drives the mem-tier cap to its floor, so an ungated raise here
+        // leaves a floor-sized tier feeding a ceiling-sized file target, which
+        // spills on nearly every apply.
+        if mem_ok
+            && let Some(v) = clamp_move_i64(
                 cur.target_vortex_file_size_bytes,
+                goal_grow_i64(
+                    cur.target_vortex_file_size_bytes,
+                    b.target_vortex_file_size_bytes,
+                    query_v,
+                ),
                 b.target_vortex_file_size_bytes,
-                query_v,
-            ),
-            b.target_vortex_file_size_bytes,
-        ) {
+            )
+        {
             return Some(Adjustment {
                 actuator: Actuator::TargetVortexFileSize,
                 new_value: u64::try_from(v).unwrap_or(0),
@@ -4092,6 +4212,71 @@ mod tests {
         );
     }
 
+    /// Regression test for #12531: the memory signal must not count the page
+    /// cache the table's own Vortex writes leave behind. Numbers are the live
+    /// cgroup accounting captured from a CH-benCHmark SF-1000 runner mid-run —
+    /// 215.6 GiB charged against a 256 GiB limit (ratio 0.842, already past
+    /// `MEM_PRESSURE_OK` and reaching CRITICAL under load — 19% of the run's
+    /// samples, median 0.951) while unreclaimable demand was 152.5 GiB (0.596)
+    /// and the kernel reported 50 µs of reclaim stall over the whole run.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn working_set_excludes_reclaimable_page_cache() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let stat = "anon 163775418368\n\
+                    file 65558777856\n\
+                    kernel 2179072000\n\
+                    shmem 0\n\
+                    file_dirty 9480785920\n\
+                    file_writeback 0\n\
+                    inactive_file 208657100800\n\
+                    active_anon 20272680960\n";
+        let current = 231_513_268_224_u64; // 215.6 GiB
+        let limit = 256 * GIB;
+
+        let reclaimable =
+            parse_cgroup_v2_reclaimable_bytes(stat).expect("memory.stat carries `file`");
+        // Only the clean, non-tmpfs page cache: `file` less dirty/writeback/shmem.
+        assert_eq!(reclaimable, 65_558_777_856 - 9_480_785_920);
+
+        let pressure = u64_to_f64(current.saturating_sub(reclaimable)) / u64_to_f64(limit);
+        assert!(
+            pressure < MEM_PRESSURE_OK,
+            "unreclaimable demand must read as headroom, got {pressure}"
+        );
+        // The raw charge is what used to drive the collapse.
+        assert!(u64_to_f64(current) / u64_to_f64(limit) > MEM_PRESSURE_OK);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reclaimable_page_cache_parsing_edge_cases() {
+        // v2: `shmem` (needs swap) and in-flight writeback are demand, not cache.
+        assert_eq!(
+            parse_cgroup_v2_reclaimable_bytes("file 1000\nshmem 200\nfile_writeback 300\n"),
+            Some(500)
+        );
+        // Counters that do not reconcile can never inflate the subtraction.
+        assert_eq!(
+            parse_cgroup_v2_reclaimable_bytes("file 100\nshmem 900\n"),
+            Some(0)
+        );
+        // No `file` key at all: unknown, so the caller keeps the raw charge.
+        assert_eq!(parse_cgroup_v2_reclaimable_bytes("anon 100\n"), None);
+        // v1 prefers the hierarchical `total_*` tallies...
+        assert_eq!(
+            parse_cgroup_v1_reclaimable_bytes(
+                "cache 10\ntotal_cache 1000\ntotal_shmem 100\ntotal_dirty 50\n"
+            ),
+            Some(850)
+        );
+        // ...and falls back to the this-cgroup-only keys when they are absent.
+        assert_eq!(
+            parse_cgroup_v1_reclaimable_bytes("cache 1000\nshmem 100\nwriteback 50\n"),
+            Some(850)
+        );
+    }
+
     // ---- goal-driven controller ------------------------------------------
 
     /// `decide_with_goals` past the (goal) dwell and warmup, fresh-sample gate open.
@@ -4248,6 +4433,36 @@ mod tests {
             adj.new_value < 8,
             "latency goal sheds a shard, never grows one"
         );
+    }
+
+    #[test]
+    fn query_latency_goal_withholds_target_file_size_growth_under_memory_pressure() {
+        // Same setup as the growth test below, but memory is tight. The memory
+        // rule drives the mem-tier cap to its floor, so growing the file target
+        // here would leave a floor-sized tier feeding a ceiling-sized target and
+        // spill on nearly every apply (issue #12531: 24 spills, 465 s of a 908 s
+        // window on `order_line`).
+        let s = IngestSnapshot {
+            query_latency_p99_ms: Some(500.0),
+            read_amp: 2,
+            mem_pressure: Some(0.95),
+            ..snap()
+        };
+        let goals = Goals::from_targets(None, None, Some(100.0), None, Duration::from_mins(1));
+        let cur = ActuatorValues {
+            inline_flush_max_bytes: 128 * 1024 * 1024,
+            compaction_background_interval_ms: 2_000,
+            compaction_trigger_files: 2,
+            target_vortex_file_size_bytes: 256 * 1024 * 1024,
+            ..actuators()
+        };
+        if let Some(adj) = goal_decide(&s, &cur, &bounds(), &goals) {
+            assert_ne!(
+                adj.actuator,
+                Actuator::TargetVortexFileSize,
+                "the query goal must not grow the file target while memory is tight"
+            );
+        }
     }
 
     #[test]
