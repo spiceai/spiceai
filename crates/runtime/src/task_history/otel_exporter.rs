@@ -369,11 +369,12 @@ impl TaskHistoryExporter {
                 normalized
             });
 
-        let distributed_parent_id: Option<Arc<str>> = extract_attr!(span, "parent_id")
-            .and_then(|parent_id| if Self::is_valid_span_id(&parent_id) {
-                Some(parent_id)
-            } else {
-                tracing::warn!("User provided 'parent_id'='{}' is a invalid span id. Must be a 32 character hex string.", Arc::clone(&trace_id));
+        let distributed_parent_id: Option<Arc<str>> =
+            extract_attr!(span, "parent_id").and_then(|parent_id: Arc<str>| {
+                if Self::is_valid_span_id(&parent_id) {
+                    return Some(parent_id);
+                }
+                tracing::warn!("User provided 'parent_id'='{parent_id}' is an invalid span id. Expected 16 hexadecimal characters.");
                 None
             });
 
