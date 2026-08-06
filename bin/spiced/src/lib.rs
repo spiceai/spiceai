@@ -1030,18 +1030,6 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
 
 /// Whether a failed local spicepod load should be tolerated by starting on an
 /// empty spicepod instead of exiting.
-///
-/// Three conditions, each excluding a case where exiting is still the right
-/// answer:
-///
-/// - `--cloud-connect` only. A cloud-managed instance gets its configuration
-///   from a deployment, so having none yet is the ordinary freshly-connected
-///   state. Anywhere else, a missing spicepod means the user is in the wrong
-///   directory and should be told so.
-/// - No explicit path. `spiced --spicepod <path>` names a file the user expects
-///   to exist; an absent one is a typo, not a fresh connection.
-/// - Absent, not unloadable. A spicepod that exists but does not parse is still
-///   fatal — coming up empty over a YAML typo would hide it.
 fn tolerates_missing_spicepod(args: &Args, error: &app::Error) -> bool {
     args.cloud_connect && args.spicepod.is_none() && error.is_spicepod_missing()
 }
