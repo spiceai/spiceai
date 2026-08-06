@@ -23,7 +23,11 @@ use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
 use crate::catalogconnector::postgres_accelerated::{
     AcceleratedCatalogProvider, NoEligibleTablesError, SlotInUseError,
 };
-use crate::{Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams};
+use crate::{
+    Runtime,
+    component::catalog::{Catalog, table_selector},
+    dataconnector::parameters::ConnectorParams,
+};
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
 use data_components::postgres::provider::PostgresCatalogProvider;
@@ -133,8 +137,7 @@ impl CatalogConnector for PostgresCatalog {
                     catalog.name.clone(),
                     pool,
                     table_factory,
-                    catalog.include.clone(),
-                    catalog.exclude.clone(),
+                    table_selector(catalog),
                 ))
             };
 

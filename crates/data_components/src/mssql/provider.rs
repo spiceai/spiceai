@@ -19,13 +19,13 @@ limitations under the License.
 //! Discovers schemas and tables in a SQL Server database using
 //! `INFORMATION_SCHEMA` queries and provides them as `DataFusion` catalog/schema providers.
 
+use crate::catalog_filter::TableSelector;
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
 use datafusion::sql::TableReference;
 use futures::StreamExt;
-use globset::GlobSet;
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -58,7 +58,7 @@ const SYSTEM_SCHEMAS: &[&str] = &["INFORMATION_SCHEMA", "sys", "guest"];
 pub struct MssqlCatalogProvider {
     pool: Arc<SqlServerConnectionPool>,
     schemas: RwLock<HashMap<String, Arc<MssqlSchemaProvider>>>,
-    include: Option<Arc<GlobSet>>,
+    selector: TableSelector,
 }
 
 impl std::fmt::Debug for MssqlCatalogProvider {
@@ -70,11 +70,11 @@ impl std::fmt::Debug for MssqlCatalogProvider {
 
 impl MssqlCatalogProvider {
     #[must_use]
-    pub fn new(pool: Arc<SqlServerConnectionPool>, include: Option<GlobSet>) -> Self {
+    pub fn new(pool: Arc<SqlServerConnectionPool>, selector: TableSelector) -> Self {
         Self {
             pool,
             schemas: RwLock::new(HashMap::new()),
-            include: include.map(Arc::new),
+            selector,
         }
     }
 
@@ -86,7 +86,7 @@ impl MssqlCatalogProvider {
             let schema_provider = MssqlSchemaProvider::new(
                 Arc::clone(&self.pool),
                 schema_name.clone(),
-                self.include.clone(),
+                self.selector.clone(),
             );
             schema_provider.refresh_tables().await?;
             schemas.insert(schema_name, Arc::new(schema_provider));
@@ -167,7 +167,7 @@ pub struct MssqlSchemaProvider {
     pool: Arc<SqlServerConnectionPool>,
     schema_name: String,
     tables: RwLock<HashMap<String, Arc<dyn TableProvider>>>,
-    include: Option<Arc<GlobSet>>,
+    selector: TableSelector,
 }
 
 impl std::fmt::Debug for MssqlSchemaProvider {
@@ -183,13 +183,13 @@ impl MssqlSchemaProvider {
     pub fn new(
         pool: Arc<SqlServerConnectionPool>,
         schema_name: String,
-        include: Option<Arc<GlobSet>>,
+        selector: TableSelector,
     ) -> Self {
         Self {
             pool,
             schema_name,
             tables: RwLock::new(HashMap::new()),
-            include,
+            selector,
         }
     }
 
@@ -199,10 +199,10 @@ impl MssqlSchemaProvider {
         let mut tables = HashMap::new();
         for table_name in table_names {
             let schema_with_table = format!("{}.{}", self.schema_name, table_name);
-            if let Some(include) = &self.include
-                && !include.is_match(&schema_with_table)
-            {
-                tracing::debug!("Table {schema_with_table} is not included, skipping");
+            if !self.selector.selects_table(&self.schema_name, &table_name) {
+                tracing::debug!(
+                    "Table {schema_with_table} is not selected by the catalog's include/exclude patterns, skipping"
+                );
                 continue;
             }
 

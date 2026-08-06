@@ -23,12 +23,12 @@ limitations under the License.
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use crate::catalog_filter::TableSelector;
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
 use datafusion::sql::TableReference;
-use globset::GlobSet;
 use snafu::prelude::*;
 
 use super::OracleTableProvider;
@@ -96,7 +96,7 @@ const SYSTEM_SCHEMAS: &[&str] = &[
 pub struct OracleCatalogProvider {
     pool: Arc<OracleConnectionPool>,
     schemas: RwLock<HashMap<String, Arc<OracleSchemaProvider>>>,
-    include: Option<Arc<GlobSet>>,
+    selector: TableSelector,
 }
 
 impl std::fmt::Debug for OracleCatalogProvider {
@@ -108,11 +108,11 @@ impl std::fmt::Debug for OracleCatalogProvider {
 
 impl OracleCatalogProvider {
     #[must_use]
-    pub fn new(pool: Arc<OracleConnectionPool>, include: Option<GlobSet>) -> Self {
+    pub fn new(pool: Arc<OracleConnectionPool>, selector: TableSelector) -> Self {
         Self {
             pool,
             schemas: RwLock::new(HashMap::new()),
-            include: include.map(Arc::new),
+            selector,
         }
     }
 
@@ -124,7 +124,7 @@ impl OracleCatalogProvider {
             let schema_provider = OracleSchemaProvider::new(
                 Arc::clone(&self.pool),
                 schema_name.clone(),
-                self.include.clone(),
+                self.selector.clone(),
             );
             schema_provider.refresh_tables().await?;
             schemas.insert(schema_name, Arc::new(schema_provider));
@@ -209,7 +209,7 @@ pub struct OracleSchemaProvider {
     pool: Arc<OracleConnectionPool>,
     schema_name: String,
     tables: RwLock<HashMap<String, Arc<dyn TableProvider>>>,
-    include: Option<Arc<GlobSet>>,
+    selector: TableSelector,
 }
 
 impl std::fmt::Debug for OracleSchemaProvider {
@@ -225,13 +225,13 @@ impl OracleSchemaProvider {
     pub fn new(
         pool: Arc<OracleConnectionPool>,
         schema_name: String,
-        include: Option<Arc<GlobSet>>,
+        selector: TableSelector,
     ) -> Self {
         Self {
             pool,
             schema_name,
             tables: RwLock::new(HashMap::new()),
-            include,
+            selector,
         }
     }
 
@@ -241,10 +241,10 @@ impl OracleSchemaProvider {
         let mut tables = HashMap::new();
         for table_name in table_names {
             let schema_with_table = format!("{}.{}", self.schema_name, table_name);
-            if let Some(include) = &self.include
-                && !include.is_match(&schema_with_table)
-            {
-                tracing::debug!("Table {schema_with_table} is not included, skipping");
+            if !self.selector.selects_table(&self.schema_name, &table_name) {
+                tracing::debug!(
+                    "Table {schema_with_table} is not selected by the catalog's include/exclude patterns, skipping"
+                );
                 continue;
             }
 
