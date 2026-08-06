@@ -441,6 +441,10 @@ pub type AppBundle = (Option<Arc<App>>, Option<app::Error>);
 /// created: [`cpu_budget::cpu_budget`] lazily detects into the same cell, so a
 /// read beforehand pins the detected value.
 ///
+/// Logs through whatever subscriber the caller holds. That is also before [`run`]
+/// installs the global one, so the caller covers the whole startup window with a
+/// temporary subscriber rather than each step carrying its own.
+///
 /// # Errors
 ///
 /// Fails when the configured value is not a positive CPU quantity or `auto`.
@@ -460,9 +464,9 @@ pub fn install_cpu_budget(args: &Args, app: Option<&App>) -> Result<(), cpu_budg
     );
 
     let budget = cpu_budget::CpuBudget::resolve(&config, &cpu_budget::HostReadings::detect())?;
-    in_tracing_context(|| budget.log_summary());
+    budget.log_summary();
     if let Err(err) = budget.install() {
-        in_tracing_context(|| tracing::warn!("{err}"));
+        tracing::warn!("{err}");
     }
     Ok(())
 }

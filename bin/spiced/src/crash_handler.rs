@@ -32,6 +32,8 @@ limitations under the License.
 
 use std::sync::OnceLock;
 
+use snafu::{ResultExt, Snafu};
+
 /// Kept alive for the process lifetime; dropping a [`CrashHandler`] detaches it.
 static HANDLER: OnceLock<crash_handler::CrashHandler> = OnceLock::new();
 
@@ -43,28 +45,37 @@ static LOAD_BASE: OnceLock<usize> = OnceLock::new();
 /// very different from ones that need hours of load.
 static START: OnceLock<std::time::Instant> = OnceLock::new();
 
+#[derive(Debug, Snafu)]
+#[snafu(display(
+    "Fatal-signal reporting is unavailable; a native crash will produce no diagnostics: {source}"
+))]
+pub struct InstallError {
+    source: crash_handler::Error,
+}
+
 /// Install fatal-signal reporting. Call once, as early in `main` as possible, so
 /// faults during startup are covered.
 ///
-/// A failure to attach is logged and ignored: refusing to start without crash
-/// reporting would be worse than starting without it.
-pub fn install() {
+/// A failure to attach is returned rather than logged, and the caller does nothing
+/// with it beyond reporting it: refusing to start without crash reporting would be
+/// worse than starting without it. It is returned because this runs before any
+/// tracing subscriber exists — a message emitted here would reach no one — so the
+/// caller logs it once there is somewhere for it to go.
+///
+/// # Errors
+///
+/// Fails when the signal handler cannot be attached, most commonly because another
+/// handler already owns the process's fatal signals.
+pub fn install() -> Result<(), InstallError> {
     let _ = START.set(std::time::Instant::now());
     let _ = LOAD_BASE.set(read_load_base().unwrap_or(0));
 
     // SAFETY: the closure is async-signal-safe — see the module docs.
     let event = unsafe { crash_handler::make_crash_event(on_crash) };
 
-    match crash_handler::CrashHandler::attach(event) {
-        Ok(handler) => {
-            let _ = HANDLER.set(handler);
-        }
-        Err(err) => {
-            tracing::warn!(
-                "Fatal-signal reporting is unavailable; a native crash will produce no diagnostics: {err}"
-            );
-        }
-    }
+    let handler = crash_handler::CrashHandler::attach(event).context(InstallSnafu)?;
+    let _ = HANDLER.set(handler);
+    Ok(())
 }
 
 /// The executable's load base, needed to turn a runtime instruction pointer back into
