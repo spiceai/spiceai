@@ -89,6 +89,12 @@ pub struct SharedMemberSetup {
     /// `GENERATED` columns of this member's table — see
     /// [`SlotInfo::generated_columns`].
     pub generated_columns: Vec<String>,
+    /// Every table in the shared publication as `(schema, table)`, read after
+    /// this member was added. On a resuming slot this is the set of tables
+    /// whose changes the slot is still accumulating, whether or not a dataset
+    /// has subscribed yet — the caller holds the ack floor for the ones that
+    /// have not, so their changes are not acked away before they join.
+    pub publication_tables: Vec<(String, String)>,
 }
 
 /// Idempotent setup for one member of a shared slot: validates the table's
@@ -117,11 +123,19 @@ pub async fn setup_shared_member(
                 let table_added =
                     ensure_publication(&client, &params.publication_name, schema_name, table_name)
                         .await?;
+                // After `ensure_publication`, which both adds this member's
+                // table and repairs a publication missing
+                // `publish_via_partition_root` — with that option set,
+                // `pg_publication_tables` reports a partitioned table under its
+                // root, which is the name members subscribe with.
+                let publication_tables =
+                    list_publication_tables(&client, &params.publication_name).await?;
                 let slot = ensure_slot(&client, params).await?;
                 Ok(SharedMemberSetup {
                     slot,
                     table_added,
                     generated_columns,
+                    publication_tables,
                 })
             }
             .await;
@@ -515,6 +529,25 @@ async fn ensure_publish_via_partition_root(
         }
         Err(e) => Err(e).context(SetupExecSnafu),
     }
+}
+
+/// Every table in a publication, as `(schema, table)`. An absent publication
+/// yields an empty list.
+async fn list_publication_tables(
+    client: &tokio_postgres::Client,
+    publication_name: &str,
+) -> Result<Vec<(String, String)>> {
+    let rows = client
+        .query(
+            "SELECT schemaname, tablename FROM pg_publication_tables WHERE pubname = $1",
+            &[&publication_name],
+        )
+        .await
+        .context(SetupExecSnafu)?;
+    Ok(rows
+        .iter()
+        .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+        .collect())
 }
 
 /// Best-effort removal of a table from a (shared) publication. Used when a

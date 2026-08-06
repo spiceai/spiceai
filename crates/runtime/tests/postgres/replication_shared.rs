@@ -1055,32 +1055,21 @@ async fn shared_and_independent_slots_coexist() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// Poll until the slot's `confirmed_flush_lsn` reaches `lsn` — the point at
-/// which Postgres considers everything below it acknowledged and is free to
-/// recycle that WAL.
-async fn wait_for_confirmed_flush_at_least(
+/// Whether the slot has acknowledged everything up to `lsn` — the point past
+/// which Postgres is free to recycle that WAL. Returns the verdict and the
+/// slot's current `confirmed_flush_lsn` for the assertion message.
+async fn slot_acked_past(
     client: &tokio_postgres::Client,
     lsn: &str,
-) -> Result<(), anyhow::Error> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    let mut last = String::from("none");
-    while std::time::Instant::now() < deadline {
-        let row = client
-            .query_one(
-                "SELECT confirmed_flush_lsn::text, confirmed_flush_lsn >= $1::text::pg_lsn \
-                 FROM pg_replication_slots WHERE slot_name = $2",
-                &[&lsn, &SLOT],
-            )
-            .await?;
-        if row.get::<_, bool>(1) {
-            return Ok(());
-        }
-        last = row.get::<_, String>(0);
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    Err(anyhow::anyhow!(
-        "slot {SLOT} never acked past {lsn}; last confirmed_flush_lsn was {last}"
-    ))
+) -> Result<(bool, String), anyhow::Error> {
+    let row = client
+        .query_one(
+            "SELECT confirmed_flush_lsn >= $1::text::pg_lsn, confirmed_flush_lsn::text \
+             FROM pg_replication_slots WHERE slot_name = $2",
+            &[&lsn, &SLOT],
+        )
+        .await?;
+    Ok((row.get(0), row.get(1)))
 }
 
 /// Regression for #12609: on a shared slot that is *resuming* — every member
@@ -1100,9 +1089,10 @@ async fn wait_for_confirmed_flush_at_least(
 ///
 /// Both tables get a row while the slot is idle. The first joiner's row proves
 /// the resume replay works at all; the second joiner's row is the one that goes
-/// missing. The assertion that the slot has acked past both rows before the
-/// second member joins is what makes the failure deterministic — and is itself
-/// the data-loss condition, since that WAL is then eligible for removal.
+/// missing. Idle heartbeats are what make the failure deterministic rather than
+/// join-order luck: they are emitted from the same keepalive branch that
+/// credits idle members, so seeing one after the first joiner has committed
+/// everything proves the credit happened.
 #[tokio::test(flavor = "multi_thread")]
 async fn shared_slot_resume_delivers_gap_changes_to_the_second_joiner()
 -> Result<(), anyhow::Error> {
@@ -1156,11 +1146,35 @@ async fn shared_slot_resume_delivers_gap_changes_to_the_second_joiner()
         .get(0);
 
     // --- 4. The first table rejoins alone, replays its gap row, and is then
-    // credited to the WAL head — carrying the slot's ack past the SECOND
-    // table's gap row, which no member has consumed. ---
+    // credited to the WAL head — past the SECOND table's gap row, which no
+    // member has consumed. ---
     let mut first_rejoined = start_replication_stream(input_for(port, "resume_gap_first"));
     expect_single_change(&mut first_rejoined, "gap row for the first joiner", "c", 2).await?;
-    wait_for_confirmed_flush_at_least(&source, &gap_lsn).await?;
+    // Two idle heartbeats after that commit put the slot in exactly the state
+    // the hazard needs. `credit_idle` runs on every keepalive and skips a
+    // member with an uncommitted envelope, so the heartbeat following our
+    // commit proves the first joiner was credited to the server's WAL end —
+    // which is past both gap rows. (The first heartbeat may have been queued
+    // before the commit landed; the second cannot have been.)
+    for round in 1..=2 {
+        wait_for_ready(
+            &mut first_rejoined,
+            &format!("first joiner idle heartbeat {round}"),
+        )
+        .await?
+        .commit()
+        .await?;
+    }
+
+    // Crediting the first joiner must not carry the SLOT's acknowledgement past
+    // a change no member has consumed: below `confirmed_flush_lsn` Postgres is
+    // free to recycle the WAL, which is what makes the loss unrecoverable.
+    let (acked_past_gap, confirmed_flush) = slot_acked_past(&source, &gap_lsn).await?;
+    anyhow::ensure!(
+        !acked_past_gap,
+        "slot {SLOT} acknowledged up to {confirmed_flush}, past a change (>= {gap_lsn}) owed to a \
+         published table with no member — that WAL is now recyclable (#12609)"
+    );
 
     // --- 5. The second table rejoins after that ack. Its gap row is still
     // owed to it. ---
