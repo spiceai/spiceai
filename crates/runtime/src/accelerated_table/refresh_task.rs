@@ -104,9 +104,9 @@ use util::{RetryError, retry};
 pub(crate) mod changes;
 mod deletion;
 
-// Reuse the single shared schema-evolution instrument (defined in `changes`) rather
-// than registering a same-named counter under a second meter.
-use changes::SCHEMA_EVOLUTION_FAILED;
+// Reuse the single shared schema-evolution instrument rather than registering a
+// same-named counter under a second meter.
+use crate::schema_evolution::SCHEMA_EVOLUTION_FAILED;
 
 const NANOS_TO_MILLIS: u128 = 1_000_000;
 
