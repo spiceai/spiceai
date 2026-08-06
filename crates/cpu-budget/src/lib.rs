@@ -837,10 +837,23 @@ impl CpuBudget {
     /// [`cgroup::parse_cpu_weight`]).
     ///
     /// `None` outside Kubernetes, where a share is just the cgroup default and
-    /// implies nothing, and `None` once the request has been declared.
+    /// implies nothing; `None` once the request has been declared; and `None`
+    /// whenever another rung won, because the request would have been outranked and
+    /// wiring it would not have moved the entitlement.
     #[must_use]
     pub fn undeclared_request_warning(&self) -> Option<String> {
         if !self.kubernetes || self.declared_request_millicores.is_some() {
+            return None;
+        }
+        // Only when sizing actually fell through to the machine. Every other rung
+        // outranks the request rung, so wiring the request would not have changed
+        // the entitlement: a cgroup limit wins outright, an explicit
+        // `runtime.cpu.cores` short-circuits detection, and `all` suppresses the
+        // request rung on purpose. Warning there tells an operator to fix something
+        // that is not broken — and `all` in particular is a deployment stating this
+        // intent deliberately, which is how the Spice Cloud platform expresses an
+        // unlimited-CPU plan.
+        if !matches!(self.source, CpuSource::Affinity) {
             return None;
         }
         let share = self.cpu_share?;
@@ -1896,6 +1909,35 @@ mod tests {
                 .undeclared_request_warning(),
             None,
             "a share outside Kubernetes is not evidence of a request"
+        );
+
+        // Every rung that outranks the request rung: wiring the request would not
+        // have changed the entitlement, so there is nothing to report. `all` is the
+        // case that matters in practice — a platform expressing an unlimited-CPU
+        // plan sets it on every pod, and must not be told to wire a request it is
+        // deliberately ignoring.
+        for cfg in [
+            CpuConfig::from_sources(None, None, Some("all")),
+            CpuConfig::from_sources(None, None, Some("6")),
+        ] {
+            let resolved = CpuBudget::resolve(&cfg, &unwired).expect("valid");
+            assert_eq!(
+                resolved.undeclared_request_warning(),
+                None,
+                "{:?} must not be told to wire a request it would ignore",
+                resolved.source()
+            );
+        }
+        let under_quota = HostReadings {
+            quota_millicores: Some(8000),
+            ..unwired
+        };
+        assert_eq!(
+            CpuBudget::resolve(&CpuConfig::default(), &under_quota)
+                .expect("valid")
+                .undeclared_request_warning(),
+            None,
+            "a limit outranks the request, so nothing would change"
         );
 
         // Kubernetes, but the pod genuinely declared no request: the kubelet
