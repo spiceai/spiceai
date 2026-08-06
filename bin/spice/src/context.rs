@@ -772,6 +772,7 @@ mod tests {
             app_dir: PathBuf::from("/test/app"),
             pods_dir: PathBuf::from("/test/app/spicepods"),
             http_endpoint: "http://127.0.0.1:8090".to_string(),
+            http_endpoint_chosen: false,
             api_key: None,
             cloud_region: None,
             user_agent: "spice/test (test; test)".to_string(),
