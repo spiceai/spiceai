@@ -500,15 +500,18 @@ fn cgroup_v1_working_set() -> Option<u64> {
     let current = cgroup_v1_memory_current()?;
     let reclaimable = read_cgroup_file(&CGROUP_V1_MEMORY_STAT_PATH, "memory.stat", false)
         .as_deref()
-        // The `total_*` keys are the hierarchical tallies matching
-        // `memory.usage_in_bytes`; the unprefixed ones are the this-cgroup-only
-        // fallback for a kernel that omits them.
-        .and_then(|stat| {
-            reclaimable_page_cache(stat, "total_cache", RECLAIM_EXCLUDED_V1_TOTAL)
-                .or_else(|| reclaimable_page_cache(stat, "cache", RECLAIM_EXCLUDED_V1))
-        })
+        .and_then(v1_reclaimable_page_cache)
         .unwrap_or(0);
     Some(current.saturating_sub(reclaimable))
+}
+
+/// [`reclaimable_page_cache`] for a cgroup v1 `memory.stat`: the `total_*` keys are
+/// the hierarchical tallies matching `memory.usage_in_bytes`, with the unprefixed
+/// keys as the this-cgroup-only fallback for a kernel that omits them.
+#[cfg(target_os = "linux")]
+fn v1_reclaimable_page_cache(contents: &str) -> Option<u64> {
+    reclaimable_page_cache(contents, "total_cache", RECLAIM_EXCLUDED_V1_TOTAL)
+        .or_else(|| reclaimable_page_cache(contents, "cache", RECLAIM_EXCLUDED_V1))
 }
 
 #[cfg(target_os = "linux")]
@@ -4409,8 +4412,8 @@ mod tests {
         let current = 231_513_268_224_u64; // 215.6 GiB
         let limit = 256 * GIB;
 
-        let reclaimable =
-            parse_cgroup_v2_reclaimable_bytes(stat).expect("memory.stat carries `file`");
+        let reclaimable = reclaimable_page_cache(stat, "file", RECLAIM_EXCLUDED_V2)
+            .expect("memory.stat carries `file`");
         // Only the clean, non-tmpfs page cache: `file` less dirty/writeback/shmem.
         assert_eq!(reclaimable, 65_558_777_856 - 9_480_785_920);
 
@@ -4428,26 +4431,33 @@ mod tests {
     fn reclaimable_page_cache_parsing_edge_cases() {
         // v2: `shmem` (needs swap) and in-flight writeback are demand, not cache.
         assert_eq!(
-            parse_cgroup_v2_reclaimable_bytes("file 1000\nshmem 200\nfile_writeback 300\n"),
+            reclaimable_page_cache(
+                "file 1000\nshmem 200\nfile_writeback 300\n",
+                "file",
+                RECLAIM_EXCLUDED_V2
+            ),
             Some(500)
         );
         // Counters that do not reconcile can never inflate the subtraction.
         assert_eq!(
-            parse_cgroup_v2_reclaimable_bytes("file 100\nshmem 900\n"),
+            reclaimable_page_cache("file 100\nshmem 900\n", "file", RECLAIM_EXCLUDED_V2),
             Some(0)
         );
         // No `file` key at all: unknown, so the caller keeps the raw charge.
-        assert_eq!(parse_cgroup_v2_reclaimable_bytes("anon 100\n"), None);
+        assert_eq!(
+            reclaimable_page_cache("anon 100\n", "file", RECLAIM_EXCLUDED_V2),
+            None
+        );
         // v1 prefers the hierarchical `total_*` tallies...
         assert_eq!(
-            parse_cgroup_v1_reclaimable_bytes(
+            v1_reclaimable_page_cache(
                 "cache 10\ntotal_cache 1000\ntotal_shmem 100\ntotal_dirty 50\n"
             ),
             Some(850)
         );
         // ...and falls back to the this-cgroup-only keys when they are absent.
         assert_eq!(
-            parse_cgroup_v1_reclaimable_bytes("cache 1000\nshmem 100\nwriteback 50\n"),
+            v1_reclaimable_page_cache("cache 1000\nshmem 100\nwriteback 50\n"),
             Some(850)
         );
     }
