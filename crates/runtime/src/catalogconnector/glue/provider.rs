@@ -473,7 +473,7 @@ mod tests {
                 let kept = database_might_match(database, &orig_include);
                 for table in tables {
                     assert!(
-                        !(is_included(Some(&globset), database, table) && !kept),
+                        !is_included(Some(&globset), database, table) || kept,
                         "pattern {pattern} includes table {database}.{table} but skipped database {database}"
                     );
                 }
