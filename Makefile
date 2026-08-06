@@ -111,14 +111,16 @@ endif
 # decides which of the built tests actually run.
 #
 # `--tests` rather than `--lib` is what brings cayenne's integration tests and
-# the `query_metrics` binary into that one selection. It builds every test target
+# the `metrics` binary into that one selection. It builds every test target
 # in the workspace, including ones the filterset never runs. Naming just the
 # wanted targets with `--test <glob>` would build fewer, but a new test file that
 # didn't match the glob would silently stop being covered — cayenne already has
 # a test target that doesn't follow the `*_test` convention its other 55 do.
 #
-# `query_metrics` is a `tests/` binary rather than a `--lib` test because it
-# needs its own process to control the OTel meter-provider install order.
+# `metrics` is a `tests/` binary rather than a `--lib` test because it needs its
+# own process to control the OTel meter-provider install order. Every metrics
+# test lives in that one binary, so selecting it by name here covers all of them:
+# naming individual binaries is what left two of them built but never run.
 #
 # `kind(=proc-macro)` is the other half of what `--lib` used to select: nextest
 # labels a proc-macro crate's unit tests `proc-macro`, not `lib`, so leaving it
@@ -131,7 +133,7 @@ endif
 # the gate alongside their SQLite siblings. They need more stack than the 2 MiB
 # std gives a thread; `test_with_backends!` reserves it (see
 # `crates/cayenne/tests/common/mod.rs`), so no name needs excluding here.
-NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + (package(=cayenne) & kind(=test)) + binary(=query_metrics)
+NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + (package(=cayenne) & kind(=test)) + binary(=metrics)
 # Extra narrowing for callers that can't run everything (CI lacks credentials
 # for some tests). It has to *intersect* the expression above rather than sit
 # beside it: nextest unions repeated `-E` flags, so a second `-E 'not (…)'` would

@@ -166,7 +166,24 @@ impl Fleet {
         self.clients * self.queries_per_client
     }
 
-    /// Connections the server actually sees.
+    /// Client-side connection slots *provisioned* across the fleet: `clients`
+    /// pools of `connections_per_client` each.
+    ///
+    /// This is the configured size, not a prediction of what the server will
+    /// observe, and the two coincide only under both of these:
+    ///
+    /// - One executor object is one connection on the wire. True for the Flight
+    ///   executor, whose `spiceai::Client` is a single multiplexed HTTP/2 channel
+    ///   however many workers share it. NOT true of a `reqwest`-backed executor,
+    ///   where an executor is an uncapped HTTP/1.1 pool that opens a connection
+    ///   per concurrent in-flight request; [`DatasetTestArgs::validate_fleet`]
+    ///   rejects that combination rather than reporting a figure it cannot
+    ///   establish.
+    /// - Every slot is actually exercised. [`Self::connection_for_worker`] hands a
+    ///   client's threads round-robin over that client's own pool, so a client
+    ///   touches `min(connections_per_client, queries_per_client)` of its slots; an
+    ///   over-provisioned pool leaves the remainder idle and the server sees fewer
+    ///   connections than this returns.
     #[must_use]
     pub fn total_connections(&self) -> usize {
         self.clients * self.connections_per_client
@@ -393,6 +410,25 @@ impl DatasetTestArgs {
                 && fleet.queries_per_client >= 1,
             "--clients, --connections-per-client and --queries-per-client must each be at least 1"
         );
+        // A fleet promises the server sees `clients * connections-per-client`
+        // connections, and its `connections-per-client` dimension only means
+        // anything if a shared executor is a shared connection. That holds for
+        // the Flight executor (one multiplexed HTTP/2 channel per client) but
+        // not for a `reqwest`-backed one: that is a pool with no maximum, so the
+        // threads sharing it each open their own connection and the dimension is
+        // inert. Refuse the combination rather than announce a topology that was
+        // never established.
+        anyhow::ensure!(
+            !self.http_clients && !self.distributed,
+            "--clients/--connections-per-client/--queries-per-client model a connection pool per \
+             client, which needs the Flight executor: an HTTP executor (--http-clients, \
+             --distributed) opens a connection per concurrent request, so \
+             --connections-per-client would not bound anything. Pick one: (1) drop \
+             --http-clients/--distributed and keep the fleet flags to run it over Flight, or (2) \
+             drop the fleet flags and pass --client-connections per-client (one pool per query \
+             thread, which an HTTP executor does honor) — the fleet flags and \
+             --client-connections describe the same topology and cannot be combined"
+        );
         Ok(())
     }
 }
@@ -557,6 +593,67 @@ mod tests {
             .map(|w| f.connection_for_worker(w))
             .collect();
         assert_eq!(conns, vec![0, 1, 0, 1, 0]);
+    }
+
+    /// Parse a `DatasetTestArgs` from flags, defaulting everything the fleet
+    /// tests do not care about. `--query-set` is the one argument with no
+    /// default.
+    fn args_from(flags: &[&str]) -> DatasetTestArgs {
+        let mut argv = vec!["testoperator", "--query-set", "tpch"];
+        argv.extend_from_slice(flags);
+        DatasetTestArgs::try_parse_from(argv).expect("flags parse")
+    }
+
+    const FLEET_FLAGS: [&str; 6] = [
+        "--clients",
+        "4",
+        "--connections-per-client",
+        "2",
+        "--queries-per-client",
+        "32",
+    ];
+
+    #[test]
+    fn a_fleet_is_accepted_for_the_flight_executor() {
+        // The default executor is Flight, where one `spiceai::Client` is one
+        // multiplexed HTTP/2 channel however many workers share it — so
+        // `connections-per-client` really does bound what the server sees.
+        let args = args_from(&FLEET_FLAGS);
+        args.validate_fleet().expect("a Flight fleet is valid");
+        assert_eq!(args.effective_concurrency(), 128);
+    }
+
+    #[test]
+    fn a_fleet_is_rejected_for_http_backed_executors() {
+        // A `reqwest` pool has no maximum, so the threads sharing one open a
+        // connection each and `connections-per-client` bounds nothing. Announcing
+        // "8 connections" for what the server sees as up to 128 would make a
+        // connection-scale run measure something other than what it reports.
+        for http_flag in ["--http-clients", "--distributed"] {
+            let mut flags = FLEET_FLAGS.to_vec();
+            flags.push(http_flag);
+            let err = args_from(&flags)
+                .validate_fleet()
+                .expect_err("a fleet over an HTTP executor must be rejected")
+                .to_string();
+            assert!(
+                err.contains("Flight executor"),
+                "{http_flag} rejection must name the executor that supports a fleet, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn per_client_connections_remain_valid_over_http() {
+        // Deliberately NOT rejected: one pool per query thread means one
+        // in-flight request per pool, so an HTTP executor does establish exactly
+        // the advertised connection per client. Only the fleet's shared-pool
+        // dimension is unrealizable.
+        for http_flag in ["--http-clients", "--distributed"] {
+            let args = args_from(&["--client-connections", "per-client", http_flag]);
+            args.validate_fleet()
+                .expect("per-client over HTTP stays valid");
+        }
     }
 
     #[test]
