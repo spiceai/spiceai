@@ -345,17 +345,9 @@ async fn bedrock(
             bedrock::embed::new_titan_v2(client, normalize, dimensions).set_cache(embeddings_cache),
         ) as Arc<dyn Embed>)
     } else if model_id.starts_with("cohere.embed") {
-        let truncate = if let Some(truncate_str) = params.truncate_mode.as_deref() {
-            CohereEmbeddingTruncate::from_str(truncate_str)
-                .boxed()
-                .map_err(|e| EmbedError::InvalidParamError {
-                    param_key: "truncate_mode",
-                    value: truncate_str.to_string(),
-                    reason: e.to_string(),
-                })?
-        } else {
-            CohereEmbeddingTruncate::default()
-        };
+        let truncate = params
+            .truncate_mode
+            .map_or_else(CohereEmbeddingTruncate::default, Into::into);
         let input_type = params.input_type.clone().unwrap_or_default();
         Ok(Arc::new(
             bedrock::embed::new_cohere(
@@ -385,17 +377,9 @@ async fn bedrock(
 
         let embedding_purpose = params.embedding_purpose.clone().unwrap_or_default();
 
-        let truncate = if let Some(truncate_str) = params.truncate_mode.as_deref() {
-            NovaTruncationMode::from_str(truncate_str)
-                .boxed()
-                .map_err(|e| EmbedError::InvalidParamError {
-                    param_key: "truncate_mode",
-                    value: truncate_str.to_string(),
-                    reason: e.to_string(),
-                })?
-        } else {
-            NovaTruncationMode::default()
-        };
+        let truncate = params
+            .truncate_mode
+            .map_or_else(NovaTruncationMode::default, Into::into);
         Ok(Arc::new(
             bedrock::embed::new_text_only_nova_multimodal(
                 client,
@@ -421,7 +405,7 @@ async fn huggingface(
 ) -> Result<Arc<dyn Embed>, EmbedError> {
     let hf_token = params.hf_token.as_ref().map(ExposeSecret::expose_secret);
     let pooling = params.pooling.map(embedding_params::Pooling::as_str);
-    let truncation = params.truncate.unwrap_or_default();
+    let truncation = params.truncate.unwrap_or_default().direction();
     if let Some(id) = model_id {
         // `get_model_id` joins a pinned revision onto the repo id as `org/model:revision`, so
         // the two halves have to be recovered before the repo id reaches the Hub. Passing the
@@ -436,8 +420,7 @@ async fn huggingface(
                 hf_token,
                 pooling,
                 params.max_seq_length,
-                truncation.truncates(),
-                truncation.direction(),
+                truncation,
             )
             .await?
             .set_cache(embeddings_cache)
@@ -580,7 +563,7 @@ async fn file(
     let pooling = params
         .pooling
         .map(|p| embedding_params::Pooling::as_str(p).to_string());
-    let truncation = params.truncate.unwrap_or_default();
+    let truncation = params.truncate.unwrap_or_default().direction();
     Ok(Arc::new(
         TeiEmbed::from_local(
             Path::new(&weights_path),
@@ -588,8 +571,7 @@ async fn file(
             Path::new(&tokenizer_path),
             pooling,
             params.max_seq_length,
-            truncation.truncates(),
-            truncation.direction(),
+            truncation,
         )
         .await?
         .set_cache(embeddings_cache)

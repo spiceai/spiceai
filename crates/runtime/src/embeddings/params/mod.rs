@@ -80,22 +80,15 @@ pub enum Truncation {
 }
 
 impl Truncation {
-    /// Whether an over-long input is truncated (`true`) rather than rejected
-    /// (`false`). This is the value passed to the TEI backend's `embed_pooled`
-    /// `truncate` argument.
+    /// `None` when an over-long input should be rejected; `Some(direction)`
+    /// when it should instead be truncated in that direction. This is the
+    /// value the TEI backend (`TeiEmbed::from_hf`/`from_local`) takes directly.
     #[must_use]
-    pub fn truncates(self) -> bool {
-        !matches!(self, Truncation::None)
-    }
-
-    /// The direction passed to the TEI backend's `embed_pooled`
-    /// `truncation_direction` argument. Only meaningful when `truncates()` is
-    /// `true`.
-    #[must_use]
-    pub fn direction(self) -> TruncationDirection {
+    pub fn direction(self) -> Option<TruncationDirection> {
         match self {
-            Truncation::Start => TruncationDirection::Left,
-            Truncation::None | Truncation::End => TruncationDirection::Right,
+            Truncation::None => None,
+            Truncation::End => Some(TruncationDirection::Right),
+            Truncation::Start => Some(TruncationDirection::Left),
         }
     }
 
@@ -248,7 +241,7 @@ mod tests {
         .await
         .expect("huggingface params should deserialize");
         assert_eq!(typed.truncate, None);
-        assert!(!typed.truncate.unwrap_or_default().truncates());
+        assert_eq!(typed.truncate.unwrap_or_default().direction(), None);
     }
 
     #[tokio::test]
@@ -261,10 +254,9 @@ mod tests {
         .await
         .expect("file params should deserialize");
         assert_eq!(typed.truncate, Some(Truncation::Start));
-        assert!(typed.truncate.unwrap_or_default().truncates());
         assert_eq!(
             typed.truncate.unwrap_or_default().direction(),
-            TruncationDirection::Left
+            Some(TruncationDirection::Left)
         );
     }
 
@@ -286,13 +278,11 @@ mod tests {
     }
 
     #[test]
-    fn truncation_from_str_round_trips_and_maps_to_bool() {
+    fn truncation_from_str_round_trips_and_maps_to_direction() {
         assert_eq!(Truncation::default(), Truncation::None);
-        assert!(!Truncation::None.truncates());
-        assert!(Truncation::End.truncates());
-        assert!(Truncation::Start.truncates());
-        assert_eq!(Truncation::End.direction(), TruncationDirection::Right);
-        assert_eq!(Truncation::Start.direction(), TruncationDirection::Left);
+        assert_eq!(Truncation::None.direction(), None);
+        assert_eq!(Truncation::End.direction(), Some(TruncationDirection::Right));
+        assert_eq!(Truncation::Start.direction(), Some(TruncationDirection::Left));
 
         for variant in [Truncation::None, Truncation::End, Truncation::Start] {
             assert_eq!(
@@ -419,7 +409,7 @@ mod tests {
         assert_eq!(typed.max_concurrent_invocations, 10);
         assert_eq!(typed.dimensions, Some(1024));
         assert_eq!(typed.normalize, Some(true));
-        assert_eq!(typed.truncate_mode.as_deref(), Some("END"));
+        assert_eq!(typed.truncate_mode, Some(Truncation::End));
         assert!(typed.input_type.is_some());
     }
 }
