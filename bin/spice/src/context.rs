@@ -17,11 +17,13 @@ limitations under the License.
 //! Runtime context for managing Spice runtime installation and configuration.
 
 use crate::error::{
-    CreateDirectorySnafu, HomeDirectoryNotFoundSnafu, Result, RuntimeExecutionSnafu,
-    RuntimeNotInstalledSnafu, RuntimeVersionSnafu, WindowsNativeRuntimeUnsupportedSnafu,
+    CreateDirectorySnafu, HomeDirectoryNotFoundSnafu, HttpClientBuildSnafu, Result,
+    RuntimeExecutionSnafu, RuntimeNotInstalledSnafu, RuntimeVersionSnafu,
+    WindowsNativeRuntimeUnsupportedSnafu,
 };
 use snafu::ResultExt;
 use spice_cloud_client::endpoints::data_endpoint as spice_cloud_data_endpoint;
+use spice_cloud_client::redirect::same_origin_redirect_policy;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
@@ -86,20 +88,30 @@ const TEST_USER_AGENT: &str = "spice/test (test; test)";
 /// Build an HTTP client for the CLI.
 ///
 /// Both of the context's clients are built here, so a setting that has to hold for both —
-/// today the user agent and the connect timeout — belongs on this builder rather than at a
+/// the user agent, the connect timeout, and the same-origin redirect policy — belongs on this
+/// builder rather than at a call site. Every `/v1/*` call the CLI makes goes through one of
+/// these clients, the context helpers and the per-command sites that build their own request
+/// from `ctx.http_client()` alike, so the redirect policy is set once here rather than per
 /// call site. (`commands::login` deliberately builds its own; it carries a credential in the
 /// request body and so refuses cross-origin redirects outright.)
-fn build_http_client(user_agent: String, deadline: Deadline) -> reqwest::Client {
+///
+/// # Errors
+///
+/// Returns an error if the client cannot be built. A default client is not substituted,
+/// because it would carry neither the deadline nor the same-origin redirect policy, and these
+/// clients send the API key in a header.
+fn build_http_client(user_agent: String, deadline: Deadline) -> Result<reqwest::Client> {
     let builder = reqwest::Client::builder()
         .user_agent(user_agent)
-        .connect_timeout(CONNECT_TIMEOUT);
+        .connect_timeout(CONNECT_TIMEOUT)
+        .redirect(same_origin_redirect_policy());
 
     let builder = match deadline {
         Deadline::Total(duration) => builder.timeout(duration),
         Deadline::Silence(duration) => builder.read_timeout(duration),
     };
 
-    builder.build().unwrap_or_default()
+    builder.build().context(HttpClientBuildSnafu)
 }
 
 /// Treat a blank credential as absent.
@@ -168,7 +180,9 @@ impl RuntimeContext {
     ///
     /// # Errors
     ///
-    /// Returns an error if the home directory cannot be determined.
+    /// Returns an error if the home directory cannot be determined, or if the HTTP client
+    /// cannot be built — the latter is not defaulted past, because a default client would
+    /// not carry the same-origin redirect policy.
     pub fn new() -> Result<Self> {
         let home_dir = dirs::home_dir().ok_or_else(|| HomeDirectoryNotFoundSnafu.build())?;
         let spice_runtime_dir = home_dir.join(DOT_SPICE);
@@ -177,9 +191,9 @@ impl RuntimeContext {
         let app_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let pods_dir = app_dir.join(SPICEPODS_DIR);
 
-        let http_client = build_http_client(Self::default_user_agent(), CONTROL_PLANE_DEADLINE);
+        let http_client = build_http_client(Self::default_user_agent(), CONTROL_PLANE_DEADLINE)?;
         let inference_http_client =
-            build_http_client(Self::default_user_agent(), INFERENCE_DEADLINE);
+            build_http_client(Self::default_user_agent(), INFERENCE_DEADLINE)?;
 
         Ok(Self {
             spice_runtime_dir,
@@ -222,8 +236,10 @@ impl RuntimeContext {
             cloud_region: None,
             user_agent: TEST_USER_AGENT.to_string(),
             extra_headers: HashMap::new(),
-            http_client: build_http_client(TEST_USER_AGENT.to_string(), control_plane),
-            inference_http_client: build_http_client(TEST_USER_AGENT.to_string(), inference),
+            http_client: build_http_client(TEST_USER_AGENT.to_string(), control_plane)
+                .expect("the test control-plane client should build"),
+            inference_http_client: build_http_client(TEST_USER_AGENT.to_string(), inference)
+                .expect("the test inference client should build"),
             inference_deadline: inference,
             tls_root_certificate_file: None,
         }
@@ -670,6 +686,9 @@ impl RuntimeContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{TcpListener, TcpStream};
+
     use crate::test_support::SlowServer;
     use tempfile::TempDir;
 
@@ -696,7 +715,8 @@ mod tests {
     async fn a_total_deadline_cuts_off_a_response_that_is_still_arriving() {
         let deadline = Duration::from_secs(1);
         let server = slow_but_never_quiet(deadline);
-        let client = build_http_client("spice/test".to_string(), Deadline::Total(deadline));
+        let client = build_http_client("spice/test".to_string(), Deadline::Total(deadline))
+            .expect("the test client should build");
 
         let error = read_body(&client, server.url())
             .await
@@ -712,7 +732,8 @@ mod tests {
     async fn a_silence_deadline_lets_a_slow_response_finish() {
         let deadline = Duration::from_secs(1);
         let server = slow_but_never_quiet(deadline);
-        let client = build_http_client("spice/test".to_string(), Deadline::Silence(deadline));
+        let client = build_http_client("spice/test".to_string(), Deadline::Silence(deadline))
+            .expect("the test client should build");
 
         let body = read_body(&client, server.url())
             .await
@@ -729,7 +750,8 @@ mod tests {
     async fn a_silence_deadline_still_fires_when_the_body_goes_quiet() {
         let deadline = Duration::from_millis(300);
         let server = SlowServer::stalling_after_head();
-        let client = build_http_client("spice/test".to_string(), Deadline::Silence(deadline));
+        let client = build_http_client("spice/test".to_string(), Deadline::Silence(deadline))
+            .expect("the test client should build");
 
         let started = std::time::Instant::now();
         let error = read_body(&client, server.url())
@@ -755,7 +777,8 @@ mod tests {
     async fn a_silence_deadline_fires_before_the_response_head_arrives() {
         let deadline = Duration::from_millis(300);
         let server = SlowServer::stalling_before_head();
-        let client = build_http_client("spice/test".to_string(), Deadline::Silence(deadline));
+        let client = build_http_client("spice/test".to_string(), Deadline::Silence(deadline))
+            .expect("the test client should build");
 
         let started = std::time::Instant::now();
         let error = client
@@ -1607,5 +1630,148 @@ mod tests {
             cloud_headers.contains_key("User-Agent"),
             "Cloud mode should include User-Agent"
         );
+    }
+
+    /// How long a request that must not hang is given before the test fails it. Well under
+    /// the context client's own 30-second timeout, so a regression fails fast instead of
+    /// stalling.
+    const TEST_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// Read the request head so the client's write completes before we reply. Closing a
+    /// socket with unread request data still buffered can surface as a reset rather than the
+    /// response under test, which on Windows is packetisation dependent and so intermittent.
+    fn drain_request_head(stream: &mut TcpStream) {
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+            if line == "\r\n" || line == "\n" {
+                return;
+            }
+        }
+    }
+
+    fn serve_once(listener: &TcpListener, response: &str) {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        drain_request_head(&mut stream);
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    }
+
+    fn localhost_listener() -> TcpListener {
+        TcpListener::bind("127.0.0.1:0").expect("test listener should bind")
+    }
+
+    fn local_port(listener: &TcpListener) -> u16 {
+        listener
+            .local_addr()
+            .expect("listener should have a local address")
+            .port()
+    }
+
+    /// Every request the CLI makes through this context carries the API key in an
+    /// `X-API-Key` header, which `reqwest` does not strip on a cross-origin redirect. A
+    /// runtime, proxy or ingress answering with an off-origin `Location` must therefore be
+    /// refused rather than handed the key (#12495).
+    ///
+    /// Goes through `with_args` so the client under test is the one `RuntimeContext::new`
+    /// builds — a test that assembled its own client would still pass if the policy were
+    /// dropped from the constructor.
+    #[tokio::test]
+    async fn test_context_client_does_not_follow_a_cross_origin_redirect() {
+        let runtime = localhost_listener();
+        let elsewhere = localhost_listener();
+        let elsewhere_port = local_port(&elsewhere);
+        let runtime_port = local_port(&runtime);
+
+        // Nothing should ever connect here; poll without blocking after the call returns.
+        elsewhere
+            .set_nonblocking(true)
+            .expect("listener should go non-blocking");
+
+        let response = format!(
+            "HTTP/1.1 307 Temporary Redirect\r\n\
+             Location: http://127.0.0.1:{elsewhere_port}/collect\r\n\
+             Content-Length: 0\r\n\
+             Connection: close\r\n\r\n"
+        );
+        let server = std::thread::spawn(move || serve_once(&runtime, &response));
+
+        let ctx = RuntimeContext::with_args(
+            Some(format!("http://127.0.0.1:{runtime_port}")),
+            Some("SECRETKEY".to_string()),
+            None,
+            None,
+        )
+        .expect("context should build");
+
+        // On the default policy the client follows the hop and then waits on a listener that
+        // never answers, so without this bound the regression surfaces only as a stall.
+        let got = tokio::time::timeout(TEST_REQUEST_TIMEOUT, ctx.get("/v1/status"))
+            .await
+            .expect("a refused redirect must return promptly, not hang")
+            .expect("the 307 should come back as a response");
+
+        // Stopped at the redirect rather than followed, and the 3xx is still diagnosable.
+        assert_eq!(got.status().as_u16(), 307);
+
+        // `WouldBlock` specifically: any other error would mean the listener itself failed,
+        // which is not evidence that nothing ever connected to it.
+        let contacted = elsewhere.accept();
+        let refused_kind = contacted.as_ref().err().map(std::io::Error::kind);
+        assert_eq!(
+            refused_kind,
+            Some(std::io::ErrorKind::WouldBlock),
+            "the off-origin listener must never be contacted"
+        );
+
+        server.join().expect("server thread should not panic");
+    }
+
+    /// The policy must not break a legitimate same-origin redirect on a runtime endpoint.
+    #[tokio::test]
+    async fn test_context_client_follows_a_same_origin_redirect() {
+        let listener = localhost_listener();
+        let port = local_port(&listener);
+
+        let redirect = format!(
+            "HTTP/1.1 307 Temporary Redirect\r\n\
+             Location: http://127.0.0.1:{port}/v1/status/retry\r\n\
+             Content-Length: 0\r\n\
+             Connection: close\r\n\r\n"
+        );
+        let ok = "HTTP/1.1 200 OK\r\n\
+                  Content-Type: application/json\r\n\
+                  Content-Length: 11\r\n\
+                  Connection: close\r\n\r\n\
+                  {\"ok\":true}";
+        let server = std::thread::spawn(move || {
+            serve_once(&listener, &redirect);
+            serve_once(&listener, ok);
+        });
+
+        let ctx = RuntimeContext::with_args(
+            Some(format!("http://127.0.0.1:{port}")),
+            Some("SECRETKEY".to_string()),
+            None,
+            None,
+        )
+        .expect("context should build");
+
+        let got = tokio::time::timeout(TEST_REQUEST_TIMEOUT, ctx.get("/v1/status"))
+            .await
+            .expect("the same-origin redirect chain must not hang")
+            .expect("the followed redirect should return a response");
+
+        assert_eq!(got.status().as_u16(), 200);
+
+        server.join().expect("server thread should not panic");
     }
 }

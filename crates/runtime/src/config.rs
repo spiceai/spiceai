@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use clap::{ArgAction, ValueEnum};
+use clap::ArgAction;
 use spicepod::component::caching::{CacheConfig, Caching, SQLResultsCacheConfig};
 use spicepod::component::runtime::Runtime as SpicepodRuntime;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -51,11 +51,7 @@ pub struct Config {
     pub runtime: Option<SpicepodRuntime>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
-pub enum ClusterRole {
-    Scheduler,
-    Executor,
-}
+pub use runtime_component::ClusterRole;
 
 impl Config {
     #[must_use]
