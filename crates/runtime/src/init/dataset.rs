@@ -799,7 +799,7 @@ impl Runtime {
         // to a configured Drasi source is worse than refusing the dataset: the
         // continuous queries downstream would simply never fire, with nothing to
         // point at.
-        if ds.drasi.is_some() {
+        if ds.drasi.as_ref().is_some_and(is_drasi_forwarding) {
             let refresh_mode = ds
                 .acceleration
                 .as_ref()
@@ -1383,12 +1383,12 @@ impl Runtime {
         // are the source table's own columns. Wrapping outside the embedding
         // decorator would instead publish every computed embedding vector as a
         // node property.
-        if let Some(drasi) = ds.drasi.clone() {
+        if let Some(drasi) = ds.drasi.clone().filter(is_drasi_forwarding) {
             tracing::warn!(
                 "Drasi change forwarding (Alpha) is in preview and should not be used in production."
             );
 
-            let sink = crate::drasi::sink_for_dataset(&ds, &drasi).map_err(|e| {
+            let delivery = crate::drasi::sink_for_dataset(&ds, &drasi).map_err(|e| {
                 crate::Error::UnableToInitializeDataConnector {
                     source: Box::new(e),
                 }
@@ -1396,7 +1396,7 @@ impl Runtime {
 
             data_connector = Arc::new(crate::drasi::connector::DrasiConnector::new(
                 data_connector,
-                sink,
+                delivery,
             ));
         }
 
@@ -2350,4 +2350,9 @@ mod tests {
             "contention on an internal lock is transient"
         );
     }
+}
+
+/// Whether a dataset's `drasi:` block is live.
+fn is_drasi_forwarding(drasi: &spicepod::drasi::Drasi) -> bool {
+    drasi.forwarding == spicepod::drasi::DrasiForwarding::Enabled
 }

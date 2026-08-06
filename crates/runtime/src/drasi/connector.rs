@@ -21,7 +21,6 @@ use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
 use datafusion::datasource::TableProvider;
 use futures::StreamExt;
-use runtime_drasi::DrasiSink;
 use runtime_metrics::component::MetricsProvider;
 
 use crate::accelerated_table::{self, AcceleratedTable};
@@ -30,7 +29,7 @@ use crate::component::{
     dataset::{Dataset, acceleration::RefreshMode},
 };
 use crate::dataconnector::{DataConnector, DataConnectorResult};
-use crate::drasi::forward_change_envelope;
+use crate::drasi::{DeliveryMode, forward_change_envelope};
 use crate::federated_table::FederatedTable;
 
 /// A [`DataConnector`] middleware that publishes the wrapped connector's change
@@ -41,24 +40,24 @@ use crate::federated_table::FederatedTable;
 /// to [`DataConnector`] later fails to compile here rather than silently
 /// inheriting a default and dropping the inner connector's behavior.
 #[derive(Debug)]
-pub struct DrasiConnector {
+pub(crate) struct DrasiConnector {
     inner_connector: Arc<dyn DataConnector>,
-    sink: Arc<DrasiSink>,
+    delivery: DeliveryMode,
 }
 
 impl DrasiConnector {
-    pub fn new(inner_connector: Arc<dyn DataConnector>, sink: Arc<DrasiSink>) -> Self {
+    pub(crate) fn new(inner_connector: Arc<dyn DataConnector>, delivery: DeliveryMode) -> Self {
         Self {
             inner_connector,
-            sink,
+            delivery,
         }
     }
 
     fn with_forwarded_stream(&self, stream: Option<ChangesStream>) -> Option<ChangesStream> {
-        let sink = Arc::clone(&self.sink);
+        let delivery = self.delivery.clone();
         Some(
             stream?
-                .then(move |item| forward_change_envelope(item, Arc::clone(&sink)))
+                .then(move |item| forward_change_envelope(item, delivery.clone()))
                 .boxed(),
         )
     }

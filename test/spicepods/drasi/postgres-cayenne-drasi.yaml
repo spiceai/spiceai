@@ -33,6 +33,8 @@ datasets:
     params: *common_params
     drasi:
       source_id: spice-cdc
+      # Replication waits for Drasi, so no change is ever missed.
+      delivery: acknowledged
       params:
         drasi_http_endpoint: ${secrets:DRASI_HTTP_ENDPOINT}
 
@@ -44,6 +46,8 @@ datasets:
     params: *common_params
     drasi:
       source_id: spice-cdc
+      # Replication never waits for Drasi; undelivered batches are dead-lettered.
+      delivery: queued
       labels: [Customer]
       params:
         drasi_http_endpoint: ${secrets:DRASI_HTTP_ENDPOINT}
@@ -63,3 +67,16 @@ datasets:
       params:
         drasi_redis_url: ${secrets:DRASI_REDIS_URL}
         drasi_stream_key: drasi-events
+
+  # Configuration parked with forwarding off: the endpoint, labels and transport
+  # stay put, so turning it back on is a one-word edit.
+  - from: postgres:public.shipments
+    name: shipments
+    acceleration: *common_acceleration
+    params: *common_params
+    drasi:
+      source_id: spice-cdc
+      forwarding: disabled
+      labels: [Shipment]
+      params:
+        drasi_http_endpoint: ${secrets:DRASI_HTTP_ENDPOINT}

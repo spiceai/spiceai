@@ -96,7 +96,7 @@ pub mod dataaccelerator;
 pub mod dataconnector;
 pub mod datafusion;
 pub mod datasets_health_monitor;
-pub mod drasi;
+pub(crate) mod drasi;
 pub use runtime_acceleration::dataupdate;
 pub(crate) mod egress;
 pub mod embeddings;
@@ -1663,6 +1663,11 @@ impl Runtime {
         let Some(spec) = app.runtime.drasi.as_ref() else {
             return;
         };
+
+        if spec.forwarding == spicepod::drasi::DrasiForwarding::Disabled {
+            tracing::debug!("'runtime.drasi' is present but disabled; not forwarding.");
+            return;
+        }
 
         if spec.tables.is_empty() {
             tracing::warn!(

@@ -22,6 +22,7 @@ limitations under the License.
 
 pub mod connector;
 pub(crate) mod internal;
+pub(crate) mod queue;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,6 +35,8 @@ use runtime_drasi::{
     DrasiChangeRows, DrasiSink, DrasiSinkConfig, ElementMapping, OnDeliveryError,
     TransportConfig,
 };
+
+use crate::drasi::queue::{DEFAULT_QUEUE_DEPTH, DeliveryQueue, QueuedBatch};
 use spicepod::drasi::{Drasi as DrasiSpec, DrasiTransport as DrasiTransportSpec};
 
 use crate::component::dataset::Dataset;
@@ -48,18 +51,37 @@ const STREAM_KEY_PARAM: &str = "drasi_stream_key";
 /// # Errors
 ///
 /// Returns an error if a required transport parameter is missing or unusable.
-pub fn sink_for_dataset(
+pub(crate) fn sink_for_dataset(
     dataset: &Dataset,
     spec: &DrasiSpec,
-) -> runtime_drasi::Result<Arc<DrasiSink>> {
-    build_sink(
-        dataset.name.to_string(),
+) -> runtime_drasi::Result<DeliveryMode> {
+    let name = dataset.name.to_string();
+    let sink = build_sink(
+        name.clone(),
         &spec.source_id,
         labels_for(dataset, spec),
         spec.transport,
         on_delivery_error(spec.on_delivery_error),
         spec.params.as_ref(),
-    )
+    )?;
+
+    Ok(match spec.delivery {
+        spicepod::drasi::DrasiDelivery::Acknowledged => DeliveryMode::Acknowledged(sink),
+        spicepod::drasi::DrasiDelivery::Queued => DeliveryMode::Queued(Arc::new(
+            DeliveryQueue::spawn(sink, name, DEFAULT_QUEUE_DEPTH),
+        )),
+    })
+}
+
+/// How a dataset's changes reach Drasi relative to its replication position.
+#[derive(Debug, Clone)]
+pub(crate) enum DeliveryMode {
+    /// Deliver before the change envelope is passed on, so the source's
+    /// replication position is only acknowledged once Drasi has the change.
+    Acknowledged(Arc<DrasiSink>),
+    /// Hand the change to a local queue and pass the envelope on immediately.
+    /// Replication never waits for Drasi.
+    Queued(Arc<DeliveryQueue>),
 }
 
 /// Builds a sink for one forwarded component — a dataset or a runtime table.
@@ -260,12 +282,15 @@ fn primary_key_columns(batch: &ChangeBatch) -> Result<Vec<Vec<&str>>, StreamErro
 
 /// Forwards one change envelope to Drasi, then passes it through unchanged.
 ///
-/// Runs before the envelope is committed, so the source's replication position
-/// is only acknowledged after Drasi has the change — a stall or a crash replays
-/// it rather than losing it.
-pub async fn forward_change_envelope(
+/// Under [`DeliveryMode::Acknowledged`] this runs before the envelope is
+/// committed, so the source's replication position is only acknowledged after
+/// Drasi has the change — a stall or a crash replays it rather than losing it,
+/// at the cost of pacing replication at Drasi's speed. Under
+/// [`DeliveryMode::Queued`] the change is handed to a local queue and the
+/// envelope passed on immediately, so replication never waits.
+pub(crate) async fn forward_change_envelope(
     maybe_envelope: Result<ChangeEnvelope, StreamError>,
-    sink: Arc<DrasiSink>,
+    delivery: DeliveryMode,
 ) -> Result<ChangeEnvelope, StreamError> {
     let envelope = maybe_envelope?;
 
@@ -290,16 +315,39 @@ pub async fn forward_change_envelope(
         // `ChangeBatch::op`, which maps an unrecognized code to
         // `ChangeOperation::Unknown` and renders it as `Unknown(x)` — the raw
         // code is what an "unsupported operation" error needs to name.
-        let rows = DrasiChangeRows {
-            op_codes: op_codes(&batch)?,
-            primary_key_columns: primary_key_columns(&batch)?,
-            data: &data,
-            source_commit_ts_ms: batch.source_commit_ts_ms(),
-        };
+        let op_codes = op_codes(&batch)?;
+        let primary_key_columns = primary_key_columns(&batch)?;
 
-        sink.forward(&rows)
-            .await
-            .map_err(|e| StreamError::External(e.to_string()))?;
+        match &delivery {
+            DeliveryMode::Acknowledged(sink) => {
+                let rows = DrasiChangeRows {
+                    op_codes,
+                    primary_key_columns,
+                    data: &data,
+                    source_commit_ts_ms: batch.source_commit_ts_ms(),
+                };
+
+                // Awaited, so the envelope — and with it the source's
+                // replication position — is only passed on once Drasi has the
+                // change.
+                sink.forward(&rows)
+                    .await
+                    .map_err(|e| StreamError::External(e.to_string()))?;
+            }
+            DeliveryMode::Queued(queue) => {
+                // Hand over owned copies and return: the replication position
+                // advances without waiting for Drasi.
+                queue.enqueue(QueuedBatch {
+                    op_codes: op_codes.into_iter().map(ToString::to_string).collect(),
+                    primary_key_columns: primary_key_columns
+                        .into_iter()
+                        .map(|key| key.into_iter().map(ToString::to_string).collect())
+                        .collect(),
+                    data: data.clone(),
+                    source_commit_ts_ms: batch.source_commit_ts_ms(),
+                });
+            }
+        }
     }
 
     // Re-wrap with the original committer: acknowledging the source's position

@@ -32,25 +32,17 @@ limitations under the License.
 //! backpressure into the runtime.
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use datafusion::common::Constraints;
 use datafusion::sql::TableReference;
-use runtime_drasi::{DrasiChangeRows, DrasiSink, OnDeliveryError};
+use runtime_drasi::OnDeliveryError;
 use runtime_query_engine::query_engine::UpdateType;
 use spicepod::drasi::{RuntimeDrasi, RuntimeDrasiTable};
-use tokio::sync::mpsc;
 
 use crate::datafusion::SPICE_RUNTIME_SCHEMA;
-
-/// Batches a table may have awaiting delivery before new ones are dropped.
-///
-/// Bounded on purpose: the alternative to dropping is holding telemetry batches
-/// in memory for as long as Drasi is unreachable.
-const QUEUE_DEPTH: usize = 64;
+use crate::drasi::queue::{DEFAULT_QUEUE_DEPTH, DeliveryQueue, QueuedBatch};
 
 /// The forwarders configured by `runtime.drasi`, keyed by table.
 #[derive(Debug)]
@@ -60,19 +52,10 @@ pub(crate) struct InternalForwarders {
 
 #[derive(Debug)]
 struct TableForwarder {
-    queue: mpsc::Sender<ForwardJob>,
+    queue: DeliveryQueue,
     /// Key columns from the Spicepod. Empty means "use the table's declared
     /// primary key", which is only knowable once the table is registered.
     configured_key: Vec<String>,
-    /// Batches dropped because the queue was full or the key was unusable.
-    dropped: AtomicU64,
-}
-
-/// One batch handed to a table's delivery task.
-struct ForwardJob {
-    op_code: &'static str,
-    key: Vec<String>,
-    batch: RecordBatch,
 }
 
 impl InternalForwarders {
@@ -102,15 +85,11 @@ impl InternalForwarders {
                 spec.params.as_ref(),
             )?;
 
-            let (queue, jobs) = mpsc::channel(QUEUE_DEPTH);
-            tokio::spawn(deliver(jobs, sink, name));
-
             by_table.insert(
                 table_ref,
                 TableForwarder {
-                    queue,
+                    queue: DeliveryQueue::spawn(sink, name, DEFAULT_QUEUE_DEPTH),
                     configured_key: table.key.clone(),
-                    dropped: AtomicU64::new(0),
                 },
             );
         }
@@ -142,8 +121,7 @@ impl InternalForwarders {
             // it removed, so it cannot be expressed as a set of Drasi element
             // changes — the same limitation truncate has on the CDC path.
             UpdateType::Overwrite => {
-                forwarder.record_drop(
-                    table,
+                forwarder.queue.dead_letter(
                     "an overwrite replaces the table without naming the rows it removes, which has no Drasi equivalent",
                 );
                 return;
@@ -153,7 +131,7 @@ impl InternalForwarders {
         let key = match forwarder.key(constraints, schema) {
             Ok(key) => key,
             Err(message) => {
-                forwarder.record_drop(table, &message);
+                forwarder.queue.dead_letter(&message);
                 return;
             }
         };
@@ -164,19 +142,14 @@ impl InternalForwarders {
             }
 
             // Cloning a `RecordBatch` clones `Arc`s over its arrays, not the
-            // data.
-            let job = ForwardJob {
+            // data. The runtime writes these as they happen, so arrival time is
+            // the event time — letting Drasi stamp it keeps one clock.
+            forwarder.queue.enqueue(QueuedBatch::uniform(
                 op_code,
-                key: key.clone(),
-                batch: batch.clone(),
-            };
-
-            if forwarder.queue.try_send(job).is_err() {
-                forwarder.record_drop(
-                    table,
-                    "the delivery queue is full, so Drasi is not keeping up or is unreachable",
-                );
-            }
+                &key,
+                batch.clone(),
+                None,
+            ));
         }
     }
 }
@@ -217,19 +190,6 @@ impl TableForwarder {
         }
     }
 
-    /// Counts a dropped batch, logging sparsely.
-    ///
-    /// Every one of these conditions persists across writes — a table with no
-    /// key never gains one, and an unreachable Drasi stays unreachable — so
-    /// logging each occurrence would spam the log at telemetry write rate.
-    fn record_drop(&self, table: &TableReference, reason: &str) {
-        let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
-        if dropped == 1 || dropped.is_multiple_of(1000) {
-            tracing::warn!(
-                "Not forwarding {table} to Drasi ({dropped} batch(es) dropped so far): {reason}"
-            );
-        }
-    }
 }
 
 /// Node labels for a runtime table, defaulting to its qualified name.
@@ -259,30 +219,12 @@ fn declared_primary_key(
     }
 }
 
-/// Drains one table's queue, delivering each batch in order.
-async fn deliver(mut jobs: mpsc::Receiver<ForwardJob>, sink: Arc<DrasiSink>, table: String) {
-    while let Some(job) = jobs.recv().await {
-        let key: Vec<&str> = job.key.iter().map(String::as_str).collect();
-        let rows = DrasiChangeRows {
-            op_codes: vec![job.op_code; job.batch.num_rows()],
-            primary_key_columns: vec![key; job.batch.num_rows()],
-            data: &job.batch,
-            // The runtime writes these as they happen, so arrival time is the
-            // event time. Letting Drasi stamp it keeps one clock.
-            source_commit_ts_ms: None,
-        };
-
-        if let Err(e) = sink.forward(&rows).await {
-            tracing::warn!("Failed to forward {table} to Drasi: {e}");
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::common::Constraint;
+    use std::sync::Arc;
 
     fn schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -295,6 +237,7 @@ mod tests {
     fn spec(tables: Vec<RuntimeDrasiTable>) -> RuntimeDrasi {
         RuntimeDrasi {
             source_id: "spice-runtime".to_string(),
+            forwarding: spicepod::drasi::DrasiForwarding::Enabled,
             tables,
             transport: spicepod::drasi::DrasiTransport::Http,
             params: Some(spicepod::param::Params::from_string_map(
@@ -484,7 +427,7 @@ mod tests {
             .by_table
             .get(&table_ref("task_history"))
             .expect("configured");
-        assert_eq!(forwarder.dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(forwarder.queue.dead_lettered(), 1);
     }
 
     /// The writer must hand off and return; a full queue drops rather than
@@ -511,7 +454,7 @@ mod tests {
         .expect("valid batch");
         let constraints = Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![1])]);
 
-        for _ in 0..(QUEUE_DEPTH * 2) {
+        for _ in 0..(DEFAULT_QUEUE_DEPTH * 2) {
             forwarders.forward(
                 &table_ref("task_history"),
                 &UpdateType::Append,
@@ -522,7 +465,7 @@ mod tests {
         }
 
         assert!(
-            forwarder.dropped.load(Ordering::Relaxed) > 0,
+            forwarder.queue.dead_lettered() > 0,
             "a full queue must drop and count rather than block"
         );
     }

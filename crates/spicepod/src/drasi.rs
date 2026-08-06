@@ -45,6 +45,7 @@ use crate::param::Params;
 ///       refresh_mode: changes
 ///     drasi:
 ///       source_id: spice-cdc
+///       forwarding: enabled   # or `disabled`, to park the config
 ///       labels: [public.orders]
 ///       params:
 ///         drasi_http_endpoint: http://localhost:9000
@@ -57,6 +58,11 @@ pub struct Drasi {
     /// Must string-equal the `id` of a source already declared on the Drasi side;
     /// Drasi never auto-creates one, and a mismatch is rejected by the server.
     pub source_id: String,
+
+    /// Whether this block forwards. Defaults to `enabled`; set `disabled` to
+    /// keep the configuration in place without publishing anything.
+    #[serde(default, skip_serializing_if = "crate::component::is_default")]
+    pub forwarding: DrasiForwarding,
 
     /// Node labels applied to every element from this dataset. Drasi continuous
     /// queries match on these (`MATCH (o:public.orders)`).
@@ -71,8 +77,14 @@ pub struct Drasi {
     #[serde(default, skip_serializing_if = "crate::component::is_default")]
     pub transport: DrasiTransport,
 
+    /// When a change counts as handed off. Defaults to `acknowledged`, which
+    /// never loses a change but paces replication at Drasi's speed. Use
+    /// `queued` to decouple them.
+    #[serde(default, skip_serializing_if = "crate::component::is_default")]
+    pub delivery: DrasiDelivery,
+
     /// What the CDC stream does when Drasi cannot accept a change event.
-    /// Defaults to `block`.
+    /// Defaults to `block`. Applies only to `delivery: acknowledged`.
     #[serde(default, skip_serializing_if = "crate::component::is_default")]
     pub on_delivery_error: OnDeliveryError,
 
@@ -91,6 +103,53 @@ pub struct Drasi {
     ///   source reads, e.g. `drasi-events`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Params>,
+}
+
+/// When a change is considered handed off to Drasi.
+///
+/// This is the throughput/durability trade for the CDC path. It exists because
+/// the strict choice makes a reaction engine's availability a ceiling on
+/// replication throughput, which is rarely what an operator wants from a
+/// downstream consumer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum DrasiDelivery {
+    /// A change reaches Drasi before its replication position is acknowledged.
+    ///
+    /// Nothing is lost — a stall or a crash replays from the unacknowledged
+    /// position — but replication only advances as fast as Drasi accepts, so a
+    /// slow or unreachable Drasi slows or stops it, and the source's replication
+    /// log grows behind it. See `on_delivery_error` for what a failure does.
+    #[default]
+    Acknowledged,
+    /// A change is queued locally and its replication position acknowledged
+    /// immediately; delivery is retried in the background.
+    ///
+    /// Replication never waits for Drasi. The cost is that the queue is
+    /// in-memory: batches still undelivered when the runtime stops, and batches
+    /// dropped once the queue fills or retries are exhausted, are gone —
+    /// counted and logged, but not replayable. `on_delivery_error` does not
+    /// apply, since there is no replication position left to hold.
+    Queued,
+}
+
+/// Whether a `drasi:` block actually forwards.
+///
+/// Lets a complete, valid configuration stay in the Spicepod while forwarding is
+/// turned off — so switching it back on is a one-word edit rather than
+/// reconstructing the endpoint, labels and key columns from memory.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum DrasiForwarding {
+    /// Changes are published to the configured Drasi source.
+    #[default]
+    Enabled,
+    /// Nothing is published, and the rest of the block is left unvalidated —
+    /// including the `acceleration.refresh_mode: changes` requirement — so a
+    /// dataset can be parked without its Drasi settings being removed.
+    Disabled,
 }
 
 /// The transport a [`Drasi`] forwarder publishes over.
@@ -165,6 +224,11 @@ pub enum OnDeliveryError {
 pub struct RuntimeDrasi {
     /// The id of the Drasi source to publish into.
     pub source_id: String,
+
+    /// Whether this block forwards. Defaults to `enabled`; set `disabled` to
+    /// keep the configuration in place without publishing anything.
+    #[serde(default, skip_serializing_if = "crate::component::is_default")]
+    pub forwarding: DrasiForwarding,
 
     /// The runtime tables to forward. Nothing is forwarded until a table is
     /// listed, so enabling this never publishes a table the operator did not
@@ -295,6 +359,76 @@ on_delivery_error: skip
         assert_eq!(drasi.on_delivery_error, OnDeliveryError::Block);
         assert!(drasi.labels.is_empty(), "labels default to the table name");
         assert!(drasi.params.is_none());
+    }
+
+    /// A block is live unless it says otherwise, so adding one does what it
+    /// looks like it does.
+    #[test]
+    fn forwarding_defaults_to_enabled_on_both_surfaces() {
+        let dataset: Drasi = yaml::from_str("source_id: cdc-feed").expect("valid drasi config");
+        assert_eq!(dataset.forwarding, DrasiForwarding::Enabled);
+
+        let runtime: RuntimeDrasi =
+            yaml::from_str("source_id: spice-runtime").expect("valid runtime drasi config");
+        assert_eq!(runtime.forwarding, DrasiForwarding::Enabled);
+    }
+
+    /// The point of the toggle: the rest of the block survives being turned off.
+    #[test]
+    fn disabling_keeps_the_rest_of_the_configuration() {
+        let drasi: Drasi = yaml::from_str(
+            r"
+source_id: cdc-feed
+forwarding: disabled
+labels: [public.orders]
+transport: redis
+params:
+  drasi_redis_url: redis://localhost:6379
+  drasi_stream_key: drasi-events
+",
+        )
+        .expect("valid drasi config");
+
+        assert_eq!(drasi.forwarding, DrasiForwarding::Disabled);
+        assert_eq!(drasi.labels, vec!["public.orders".to_string()]);
+        assert_eq!(drasi.transport, DrasiTransport::Redis);
+        assert!(drasi.params.is_some(), "transport params are preserved");
+    }
+
+    #[test]
+    fn runtime_block_can_be_disabled() {
+        let runtime: RuntimeDrasi = yaml::from_str(
+            r"
+source_id: spice-runtime
+forwarding: disabled
+tables:
+  - name: task_history
+",
+        )
+        .expect("valid runtime drasi config");
+
+        assert_eq!(runtime.forwarding, DrasiForwarding::Disabled);
+        assert_eq!(runtime.tables.len(), 1, "table list is preserved");
+    }
+
+    /// The default keeps every change, at the cost of pacing replication at
+    /// Drasi's speed.
+    #[test]
+    fn delivery_defaults_to_acknowledged() {
+        let drasi: Drasi = yaml::from_str("source_id: cdc-feed").expect("valid drasi config");
+        assert_eq!(drasi.delivery, DrasiDelivery::Acknowledged);
+    }
+
+    #[test]
+    fn delivery_can_be_queued() {
+        let drasi: Drasi = yaml::from_str(
+            r"
+source_id: cdc-feed
+delivery: queued
+",
+        )
+        .expect("valid drasi config");
+        assert_eq!(drasi.delivery, DrasiDelivery::Queued);
     }
 
     #[test]

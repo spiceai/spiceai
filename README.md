@@ -327,6 +327,7 @@ datasets:
       refresh_mode: changes
     drasi:
       source_id: spice-cdc
+      delivery: queued          # or `acknowledged` (default)
       params:
         drasi_http_endpoint: http://localhost:9000
 ```
@@ -336,7 +337,16 @@ datasets:
 | `http`    | Batched POST to a Drasi Server HTTP source                                     | Alpha  |
 | `redis`   | CloudEvents envelopes on the Redis stream a Drasi platform source consumes      | Alpha  |
 
-`on_delivery_error` selects what a delivery failure does to the change stream: `block` (default) retries indefinitely and never loses a change, at the cost of stalling acceleration while Drasi is down; `skip` gives up after a bounded retry budget and lets acceleration continue; `fail` surfaces the failure and stops the stream.
+`delivery` selects when a change counts as handed off, which is the throughput/durability trade:
+
+| `delivery` | Replication | On failure |
+| ---------- | ----------- | ---------- |
+| `acknowledged` (default) | Advances only once Drasi has the change, so nothing is lost — a stall or crash replays it. A slow or unreachable Drasi slows or stops replication. | `on_delivery_error`: `block` (default) retries indefinitely; `skip` gives up after a bounded budget and continues; `fail` stops the stream. |
+| `queued` | Never waits for Drasi — the change is queued locally and the replication position acknowledged immediately, with delivery retried in the background. | Batches are retried, then dead-lettered: counted and logged. The queue is in-memory, so anything undelivered when the runtime stops is gone. |
+
+Use `queued` when Drasi is a downstream consumer whose availability should not pace replication; keep `acknowledged` when no change may be missed.
+
+`forwarding: disabled` keeps a whole block in place without publishing anything, so it can be switched off and back on without reconstructing the endpoint, labels and keys.
 
 Spice's own operational tables can be forwarded the same way, so continuous queries can react to events like a query exceeding its budget or a refresh failing. These are configured under `runtime` because they are not CDC-fed from an external source, and they default to `on_delivery_error: skip` — blocking the runtime's telemetry writer on a downstream outage buys nothing:
 
@@ -350,7 +360,7 @@ runtime:
       - name: task_history
 ```
 
-Only the tables named are forwarded. A table's element id comes from its declared primary key (`task_history` uses `span_id`); a table that declares none — such as `runtime.metrics` — must name its identifying columns with `key:`, since a synthesized id would publish a duplicate node on every delivery retry.
+Runtime tables are always queued — they have no replication position to hold, so there is nothing for blocking to protect. Only the tables named are forwarded. A table's element id comes from its declared primary key (`task_history` uses `span_id`); a table that declares none — such as `runtime.metrics` — must name its identifying columns with `key:`, since a synthesized id would publish a duplicate node on every delivery retry.
 
 ## Supported Catalogs
 

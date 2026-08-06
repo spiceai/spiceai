@@ -952,7 +952,7 @@ mod tests {
 
         let drasi = crate::drasi::connector::DrasiConnector::new(
             Arc::clone(&inner),
-            Arc::new(
+            crate::drasi::DeliveryMode::Acknowledged(Arc::new(
                 runtime_drasi::DrasiSink::try_new(runtime_drasi::DrasiSinkConfig {
                     dataset: "test".to_string(),
                     source_id: "test".to_string(),
@@ -965,7 +965,7 @@ mod tests {
                     on_delivery_error: runtime_drasi::OnDeliveryError::Block,
                 })
                 .expect("builds a sink"),
-            ),
+            )),
         );
         assert!(
             drasi.supports_durable_write_back_delivery(),
