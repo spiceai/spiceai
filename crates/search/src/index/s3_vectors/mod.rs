@@ -521,6 +521,8 @@ pub fn s3_vectors_primary_key_cast(primary_key: &[Field]) -> Vec<Expr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::StringArray;
+    use arrow_schema::Schema;
     use datafusion::scalar::ScalarValue;
     use llms::embeddings::EmbeddingInput;
     use s3_vectors::{
@@ -592,6 +594,26 @@ mod tests {
             vec![],
             100,
         )
+    }
+
+    #[tokio::test]
+    async fn write_fails_when_embedding_source_column_is_missing() {
+        let client = Arc::new(MockClient::new()) as Arc<dyn S3Vectors + Send + Sync>;
+        let index = test_s3_vector(client).await;
+        let record = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)])),
+            vec![Arc::new(StringArray::from(vec!["row-1"]))],
+        )
+        .expect("record batch should be valid");
+
+        let err = write::write(&index, &index.table, record, 100)
+            .await
+            .expect_err("missing embedding source column should fail indexing");
+
+        assert_eq!(
+            err.to_string(),
+            "Cannot write to 's3_vector_index' index, data does not have column 'embedding'."
+        );
     }
 
     fn index_names(tables: &[S3VectorsTable]) -> Vec<String> {

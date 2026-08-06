@@ -32,9 +32,9 @@ use mysql_async::{Conn, Row};
 use super::config::{BinlogPosition, ReplicationParams};
 use super::gtid::GtidSet;
 use super::{
-    BinaryLoggingDisabledSnafu, ColumnMissingSnafu, ConnectSnafu, Error, Result, SetupQuerySnafu,
-    SourceTableNotFoundSnafu, UnsupportedBinlogFormatSnafu, UnsupportedBinlogRowImageSnafu,
-    UnsupportedBinlogRowValueOptionsSnafu,
+    BinaryLoggingDisabledSnafu, ColumnMissingSnafu, ConnectSnafu, Error, MissingPrivilegesSnafu,
+    Result, SetupQuerySnafu, SourceTableNotFoundSnafu, UnsupportedBinlogFormatSnafu,
+    UnsupportedBinlogRowImageSnafu, UnsupportedBinlogRowValueOptionsSnafu,
 };
 use snafu::prelude::*;
 
@@ -135,9 +135,226 @@ pub async fn connect(params: &ReplicationParams) -> Result<Conn> {
     Conn::new(params.opts.clone()).await.context(ConnectSnafu)
 }
 
+// Privileges a CDC subscription needs at global (`ON *.*`) scope.
+//
+// `REPLICATION SLAVE` streams the binlog and `REPLICATION CLIENT` reads its
+// position (`SHOW BINARY LOG STATUS`). Both are global-only in MySQL — they
+// cannot be granted per-database — so their absence from an account's `ON *.*`
+// grants is conclusive.
+//
+// MariaDB 10.5 renamed the pair to `REPLICATION REPLICA` and `BINLOG MONITOR`
+// and reports the new spelling from `SHOW GRANTS`, so both must count: treating
+// only the MySQL names as valid would reject a MariaDB account that streams
+// perfectly well today.
+//
+// `SELECT` is deliberately not audited: it is grantable at database, table and
+// column scope, and this check runs before the dataset's table is known, so a
+// perfectly valid per-table grant would read as missing. A missing `SELECT`
+// still surfaces at snapshot time, named against the table that needs it.
+const REPLICATION_SLAVE_ALIASES: [&str; 2] = ["REPLICATION SLAVE", "REPLICATION REPLICA"];
+const REPLICATION_CLIENT_ALIASES: [&str; 2] = ["REPLICATION CLIENT", "BINLOG MONITOR"];
+
+/// What [`audit_grants`] could conclude from a `SHOW GRANTS` result.
+#[derive(Debug, PartialEq, Eq)]
+enum PrivilegeAudit {
+    /// Every required privilege is held (possibly via `ALL PRIVILEGES`).
+    Satisfied,
+    /// The grants were understood in full and these are definitively absent.
+    Missing(Vec<&'static str>),
+    /// The grants contain something this parser does not model — most often a
+    /// role grant, whose constituent privileges `SHOW GRANTS` does not expand.
+    /// No conclusion is drawn, so the check defers to the server rather than
+    /// blocking a dataset that would in fact replicate.
+    Inconclusive,
+}
+
+/// Split `haystack` on the first case-insensitive occurrence of `needle`.
+///
+/// `to_ascii_uppercase` is byte-length preserving, so offsets into the folded
+/// copy index the original safely.
+fn split_once_ignore_ascii_case<'a>(haystack: &'a str, needle: &str) -> Option<(&'a str, &'a str)> {
+    let folded = haystack.to_ascii_uppercase();
+    let at = folded.find(&needle.to_ascii_uppercase())?;
+    Some((haystack.get(..at)?, haystack.get(at + needle.len()..)?))
+}
+
+/// Normalize one privilege token from a `SHOW GRANTS` privilege list.
+fn normalize_privilege(token: &str) -> String {
+    let mut out = String::with_capacity(token.len());
+    for word in token.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&word.to_ascii_uppercase());
+    }
+    out
+}
+
+/// Escape the characters that would end a `MySQL` single-quoted string early.
+///
+/// `MySQL` and `MariaDB` both permit `'` and `\` inside a user or host name, so
+/// interpolating one unescaped would make the suggested `GRANT` unpasteable.
+///
+/// A quote is **doubled** rather than backslash-escaped because doubling is
+/// accepted whatever the session's `NO_BACKSLASH_ESCAPES` `sql_mode` is, whereas
+/// `\'` silently stops being an escape under that mode. A literal backslash has
+/// no such mode-independent spelling — `\\` is correct under the default mode,
+/// and an account name containing one is far rarer than one containing a quote.
+fn escape_quoted(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\'' => out.push_str("''"),
+            '\\' => out.push_str("\\\\"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Render `user@host` (as `CURRENT_USER()` reports it) in `MySQL` account
+/// syntax, so the suggested `GRANT` can be pasted verbatim.
+///
+/// `CURRENT_USER()` flattens the two components into one string with no
+/// escaping, so the last `@` is the only available boundary. That is right for
+/// every host that contains no `@` — every DNS name, IPv4 and IPv6 literal, and
+/// `%` — and misattributes only a proxied account whose host component itself
+/// contains one.
+fn quote_account(account: &str) -> String {
+    match account.rsplit_once('@') {
+        Some((user, host)) => {
+            let (user, host) = (escape_quoted(user), escape_quoted(host));
+            format!("'{user}'@'{host}'")
+        }
+        None => format!("'{}'", escape_quoted(account)),
+    }
+}
+
+/// Whether the audited global grants include any spelling in `aliases`.
+fn holds_any(global: &[String], aliases: &[&str]) -> bool {
+    aliases
+        .iter()
+        .any(|alias| global.iter().any(|held| held.as_str() == *alias))
+}
+
+/// Audit a `SHOW GRANTS` result for the privileges CDC requires.
+fn audit_grants(grants: &[String]) -> PrivilegeAudit {
+    // Every account holds at least `GRANT USAGE ON *.*`, so an empty result is
+    // not "no privileges" — it is a result this parser cannot reason about.
+    if grants.is_empty() {
+        return PrivilegeAudit::Inconclusive;
+    }
+
+    let mut global: Vec<String> = Vec::new();
+    for line in grants {
+        let line = line.trim();
+        let is_grant = line
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("GRANT "));
+        if !is_grant {
+            return PrivilegeAudit::Inconclusive;
+        }
+        let rest = line.get(6..).unwrap_or("");
+        // A role grant (`GRANT `reader`@`%` TO `spice`@`%``) carries no ` ON `
+        // object and never lists the privileges the role confers.
+        let Some((privileges, object)) = split_once_ignore_ascii_case(rest, " ON ") else {
+            return PrivilegeAudit::Inconclusive;
+        };
+        let object = split_once_ignore_ascii_case(object, " TO ")
+            .map_or(object, |(target, _)| target)
+            .trim();
+        // Only `ON *.*` can carry the global-only replication privileges. A
+        // narrower object cannot, and cannot have column-scoped commas either.
+        if object != "*.*" {
+            continue;
+        }
+        for token in privileges.split(',') {
+            global.push(normalize_privilege(token));
+        }
+    }
+
+    let holds_everything = global
+        .iter()
+        .any(|held| held.as_str() == "ALL PRIVILEGES" || held.as_str() == "ALL");
+    if holds_everything {
+        return PrivilegeAudit::Satisfied;
+    }
+
+    let mut missing: Vec<&'static str> = Vec::new();
+    if !holds_any(&global, &REPLICATION_SLAVE_ALIASES) {
+        missing.push("REPLICATION SLAVE");
+    }
+    if !holds_any(&global, &REPLICATION_CLIENT_ALIASES) {
+        missing.push("REPLICATION CLIENT");
+    }
+
+    if missing.is_empty() {
+        PrivilegeAudit::Satisfied
+    } else {
+        PrivilegeAudit::Missing(missing)
+    }
+}
+
+/// Pre-flight the connecting account's replication privileges, so a missing
+/// `GRANT` is reported as one instead of as a bare `Access denied` from the
+/// first replication command.
+///
+/// Only a definitive absence fails. If `SHOW GRANTS` cannot be read, or lists a
+/// role whose privileges it does not expand, the check defers to the server.
+pub async fn check_privileges(conn: &mut Conn) -> Result<()> {
+    let grants: Vec<String> = match conn.query("SHOW GRANTS FOR CURRENT_USER()").await {
+        Ok(grants) => grants,
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "SHOW GRANTS unavailable; skipping the CDC privilege pre-flight"
+            );
+            return Ok(());
+        }
+    };
+
+    let PrivilegeAudit::Missing(missing) = audit_grants(&grants) else {
+        return Ok(());
+    };
+
+    // Typed as `Option<String>`, not `String`, so the fallback below survives a
+    // server that answers with SQL NULL: `query_first` converts rows with the
+    // panicking `FromRow`, so a NULL decoded straight into `String` would panic
+    // instead of falling through to the placeholder. Hence the double flatten —
+    // one for the `Result`, one for the NULL.
+    let current_user = conn
+        .query_first::<Option<String>, _>("SELECT CURRENT_USER()")
+        .await
+        .ok()
+        .flatten()
+        .flatten();
+    let (account, grant_target) = match current_user {
+        Some(user) => {
+            let target = quote_account(&user);
+            (user, target)
+        }
+        None => (
+            "the connecting account".to_string(),
+            "'<user>'@'<host>'".to_string(),
+        ),
+    };
+
+    MissingPrivilegesSnafu {
+        account,
+        grant_target,
+        missing: missing.join(", "),
+    }
+    .fail()
+}
+
 /// Validate that the source server is configured for row-based binlog
 /// replication. Each failure carries the exact server setting to change.
 pub async fn validate_server(conn: &mut Conn) -> Result<()> {
+    // Privileges first: an account without `REPLICATION CLIENT` can still read
+    // the settings below, so checking them first would report a healthy server
+    // and defer the real problem to an opaque `Access denied` at stream start.
+    check_privileges(conn).await?;
+
     let settings: Option<(i64, String, String)> = conn
         .query_first("SELECT @@log_bin, @@binlog_format, @@binlog_row_image")
         .await
@@ -606,5 +823,120 @@ mod tests {
             .column_map(&schema, "db", "t")
             .expect_err("missing column must error");
         assert!(err.to_string().contains("ghost"), "got: {err}");
+    }
+
+    fn grants(lines: &[&str]) -> Vec<String> {
+        lines.iter().map(|l| (*l).to_string()).collect()
+    }
+
+    #[test]
+    fn audit_accepts_the_documented_cdc_grant() {
+        let held =
+            grants(&["GRANT SELECT, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO `spice`@`%`"]);
+        assert_eq!(audit_grants(&held), PrivilegeAudit::Satisfied);
+    }
+
+    #[test]
+    fn audit_reports_the_replication_privileges_a_select_only_account_lacks() {
+        // The reported case: an account with SELECT but no replication grants
+        // previously failed with a bare `Access denied`.
+        let held = grants(&["GRANT SELECT ON *.* TO `spice`@`%`"]);
+        assert_eq!(
+            audit_grants(&held),
+            PrivilegeAudit::Missing(vec!["REPLICATION SLAVE", "REPLICATION CLIENT"])
+        );
+    }
+
+    #[test]
+    fn audit_reports_only_the_privilege_actually_absent() {
+        let held = grants(&["GRANT SELECT, REPLICATION CLIENT ON *.* TO `spice`@`%`"]);
+        assert_eq!(
+            audit_grants(&held),
+            PrivilegeAudit::Missing(vec!["REPLICATION SLAVE"])
+        );
+    }
+
+    #[test]
+    fn audit_accepts_the_mariadb_spelling_of_the_same_privileges() {
+        // MariaDB 10.5+ reports REPLICATION REPLICA / BINLOG MONITOR for the
+        // grants MySQL calls REPLICATION SLAVE / REPLICATION CLIENT. Rejecting
+        // those would break a MariaDB source that replicates today.
+        let held =
+            grants(&["GRANT SELECT, REPLICATION REPLICA, BINLOG MONITOR ON *.* TO `spice`@`%`"]);
+        assert_eq!(audit_grants(&held), PrivilegeAudit::Satisfied);
+    }
+
+    #[test]
+    fn audit_accepts_all_privileges() {
+        let held = grants(&["GRANT ALL PRIVILEGES ON *.* TO `root`@`localhost` WITH GRANT OPTION"]);
+        assert_eq!(audit_grants(&held), PrivilegeAudit::Satisfied);
+    }
+
+    #[test]
+    fn audit_ignores_narrower_objects_when_looking_for_global_privileges() {
+        // Replication privileges are global-only, so a database-scoped grant
+        // cannot supply them — but it must not confuse the parser either.
+        let held = grants(&[
+            "GRANT USAGE ON *.* TO `spice`@`%`",
+            "GRANT SELECT ON `spice_demo`.`orders` TO `spice`@`%`",
+            "GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO `spice`@`%`",
+        ]);
+        assert_eq!(audit_grants(&held), PrivilegeAudit::Satisfied);
+    }
+
+    #[test]
+    fn audit_defers_when_privileges_arrive_through_a_role() {
+        // `SHOW GRANTS` does not expand a role's privileges, so concluding
+        // "missing" here would block an account that can in fact replicate.
+        let held = grants(&[
+            "GRANT USAGE ON *.* TO `spice`@`%`",
+            "GRANT `cdc_reader`@`%` TO `spice`@`%`",
+        ]);
+        assert_eq!(audit_grants(&held), PrivilegeAudit::Inconclusive);
+    }
+
+    #[test]
+    fn audit_defers_on_an_empty_or_unrecognized_result() {
+        assert_eq!(audit_grants(&[]), PrivilegeAudit::Inconclusive);
+        let held = grants(&["REVOKE SELECT ON *.* FROM `spice`@`%`"]);
+        assert_eq!(audit_grants(&held), PrivilegeAudit::Inconclusive);
+    }
+
+    #[test]
+    fn audit_tolerates_lowercase_keywords_and_loose_whitespace() {
+        let held = grants(&["  grant  replication   slave ,replication client on *.* to `s`@`%`"]);
+        assert_eq!(audit_grants(&held), PrivilegeAudit::Satisfied);
+    }
+
+    #[test]
+    fn account_is_quoted_so_the_suggested_grant_can_be_pasted() {
+        assert_eq!(quote_account("spice@%"), "'spice'@'%'");
+        assert_eq!(quote_account("spice@10.0.0.1"), "'spice'@'10.0.0.1'");
+        // A host-less value still yields valid single-quoted SQL.
+        assert_eq!(quote_account("spice"), "'spice'");
+    }
+
+    #[test]
+    fn account_quoting_escapes_characters_that_would_end_the_string_early() {
+        // `MySQL` permits both characters in an account name, and an unescaped
+        // one would close the literal and make the suggested GRANT unpasteable.
+        // A quote is doubled so the result parses under `NO_BACKSLASH_ESCAPES`
+        // too; a backslash has no spelling that is correct under both modes.
+        assert_eq!(quote_account(r"o'brien@%"), r"'o''brien'@'%'");
+        assert_eq!(quote_account(r"spice@ho'st"), r"'spice'@'ho''st'");
+        assert_eq!(quote_account(r"back\slash@%"), r"'back\\slash'@'%'");
+        // The host-less arm escapes on the same path.
+        assert_eq!(quote_account(r"o'brien"), r"'o''brien'");
+    }
+
+    #[test]
+    fn account_quoting_splits_on_the_last_at_sign() {
+        // A username may contain `@`; the host component of a direct connection
+        // never does, so the last `@` is the correct boundary.
+        assert_eq!(quote_account("cdc@corp@10.0.0.1"), "'cdc@corp'@'10.0.0.1'");
+        // An anonymous account reports an empty user part.
+        assert_eq!(quote_account("@localhost"), "''@'localhost'");
+        // An IPv6 host carries `:`, not `@`, so it survives the split intact.
+        assert_eq!(quote_account("spice@::1"), "'spice'@'::1'");
     }
 }

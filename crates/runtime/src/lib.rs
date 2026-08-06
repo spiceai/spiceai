@@ -96,7 +96,7 @@ pub mod dataaccelerator;
 pub mod dataconnector;
 pub mod datafusion;
 pub mod datasets_health_monitor;
-pub mod dataupdate;
+pub use runtime_acceleration::dataupdate;
 pub(crate) mod egress;
 pub mod embeddings;
 pub mod execution_plan;
@@ -120,14 +120,18 @@ pub mod model;
 mod object_store_state;
 mod opentelemetry;
 pub mod otel_push_exporter;
-pub mod resource_monitor;
+// Host/container resource introspection lives in `runtime-resources`; it names
+// nothing from the runtime. Re-exported so `crate::resource_monitor::…` resolves.
+pub mod resource_monitor {
+    pub use runtime_resources::*;
+}
 
 pub use runtime_parameters as parameters;
 
 pub mod podswatcher;
 pub mod request;
 mod scheduling;
-pub(crate) mod schema_evolution;
+pub(crate) use runtime_component::schema_evolution;
 pub mod search;
 pub mod secrets {
     pub use runtime_secrets::*;
@@ -136,6 +140,7 @@ pub mod cluster;
 mod secrets_preflight;
 pub mod spice_metrics;
 pub mod status;
+pub(crate) mod table_layers;
 pub mod task_history;
 pub mod tls;
 pub mod token_providers;

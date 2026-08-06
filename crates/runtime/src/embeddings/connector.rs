@@ -30,15 +30,15 @@ use crate::embeddings::index::table::wrap_table_as_index;
 use crate::federated_table::FederatedTable;
 use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 use crate::model::EmbeddingModelStore;
-use crate::search::util::{EMBEDDING_INNER, FEDERATED_ADAPTOR_INNER, METADATA_ENRICHED_INNER};
 use crate::secrets::Secrets;
+use crate::table_layers::TABLE_PROVIDER_LAYERS;
 use async_trait::async_trait;
 use data_components::cdc::{ChangeEnvelope, ChangesStream, StreamError, replace_change_batch_data};
 use datafusion::datasource::TableProvider;
 use futures::StreamExt;
 use itertools::Itertools;
 use runtime_datafusion_index::{
-    INDEXED_INNER, IndexedTableProvider, InnerProviderFn, find_concrete_table_provider_with,
+    IndexedTableProvider, LayerWalk, find_concrete_table_provider_in, peel_to_innermost,
 };
 use runtime_metrics::component::MetricsProvider;
 use search::generation::text_search::index::FullTextDatabaseIndex;
@@ -349,9 +349,10 @@ impl DataConnector for EmbeddingConnector {
         dataset: &Dataset,
     ) -> Option<ChangesStream> {
         let table_provider = federated_table.try_table_provider_sync()?;
-        if let Some(indexed_table) = find_concrete_table_provider_with::<IndexedTableProvider>(
+        if let Some(indexed_table) = find_concrete_table_provider_in::<IndexedTableProvider>(
             &table_provider,
-            TRANSPARENT_CDC_WRAPPERS,
+            TABLE_PROVIDER_LAYERS,
+            LayerWalk::CdcDetection,
         )
         .cloned()
         {
@@ -392,9 +393,10 @@ impl DataConnector for EmbeddingConnector {
             Some(stream)
 
         // `VectorScanTableProvider` is generally wrapped by a `IndexedTableProvider` (as above), but in the case both [`Self`] and the [`FullTextConnector`] exist, the latter will unwrap the `IndexedTableProvider` first. It will correctly handle indexing vector indexes as that point.
-        } else if let Some(vector_scan) = find_concrete_table_provider_with::<VectorScanTableProvider>(
+        } else if let Some(vector_scan) = find_concrete_table_provider_in::<VectorScanTableProvider>(
             &table_provider,
-            TRANSPARENT_CDC_WRAPPERS,
+            TABLE_PROVIDER_LAYERS,
+            LayerWalk::CdcDetection,
         ) {
             self.inner_connector.changes_stream(
                 Arc::new(FederatedTable::Immediate(Arc::clone(
@@ -402,9 +404,10 @@ impl DataConnector for EmbeddingConnector {
                 ))),
                 dataset,
             )
-        } else if let Some(embedding_table) = find_concrete_table_provider_with::<EmbeddingTable>(
+        } else if let Some(embedding_table) = find_concrete_table_provider_in::<EmbeddingTable>(
             &table_provider,
-            TRANSPARENT_CDC_WRAPPERS,
+            TABLE_PROVIDER_LAYERS,
+            LayerWalk::CdcDetection,
         ) {
             let embedding_table = Arc::new(embedding_table.clone());
             let underlying_table = Arc::clone(&embedding_table.base_table);
@@ -430,9 +433,10 @@ impl DataConnector for EmbeddingConnector {
     fn append_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
         let table_provider = federated_table.try_table_provider_sync()?;
 
-        if let Some(indexed_table) = find_concrete_table_provider_with::<IndexedTableProvider>(
+        if let Some(indexed_table) = find_concrete_table_provider_in::<IndexedTableProvider>(
             &table_provider,
-            TRANSPARENT_CDC_WRAPPERS,
+            TABLE_PROVIDER_LAYERS,
+            LayerWalk::CdcDetection,
         )
         .cloned()
         {
@@ -455,9 +459,10 @@ impl DataConnector for EmbeddingConnector {
         // above), but when a `FullTextConnector` also exists it peels that layer off before
         // delegating here, so the vector scan is what we see. Mirror `changes_stream`: hand
         // the scan's inner provider down and let the outer connector re-apply the indexes.
-        if let Some(vector_scan) = find_concrete_table_provider_with::<VectorScanTableProvider>(
+        if let Some(vector_scan) = find_concrete_table_provider_in::<VectorScanTableProvider>(
             &table_provider,
-            TRANSPARENT_CDC_WRAPPERS,
+            TABLE_PROVIDER_LAYERS,
+            LayerWalk::CdcDetection,
         ) {
             return self
                 .inner_connector
@@ -467,9 +472,10 @@ impl DataConnector for EmbeddingConnector {
         }
 
         let embedding_table = Arc::new(
-            find_concrete_table_provider_with::<EmbeddingTable>(
+            find_concrete_table_provider_in::<EmbeddingTable>(
                 &table_provider,
-                TRANSPARENT_CDC_WRAPPERS,
+                TABLE_PROVIDER_LAYERS,
+                LayerWalk::CdcDetection,
             )?
             .clone(),
         );
@@ -726,32 +732,14 @@ pub(crate) async fn try_wrap_view_accelerator_with_hnsw(
     Ok(true)
 }
 
-/// Inner-provider accessor for [`VectorScanTableProvider`]: its base table.
-const VECTOR_SCAN_INNER: InnerProviderFn = |tbl| {
-    tbl.downcast_ref::<VectorScanTableProvider>()
-        .map(|v| &v.table_provider)
-};
-
-/// Wrapper layers that carry no meaning for the source changes stream and must
-/// stay transparent to the CDC unwrap.
-///
-/// An outer search connector unwraps to us (e.g. `FullTextConnector` hands its
-/// `IndexedTableProvider`'s underlying to the inner `EmbeddingConnector`), and the
-/// accelerated-table setup wraps the source provider in metadata enrichment on the
-/// read-write path. Peeling only these layers — never our own `IndexedTableProvider`
-/// / `EmbeddingTable` / `VectorScanTableProvider` — lets us still detect which of our
-/// providers sits on top, exactly as `find_concrete_table_provider` does for
-/// full-text search.
-const TRANSPARENT_CDC_WRAPPERS: &[InnerProviderFn] =
-    &[METADATA_ENRICHED_INNER, FEDERATED_ADAPTOR_INNER];
-
 /// Peel an [`IndexedTableProvider`]'s index and enrichment layers down to the raw
 /// source provider, so the source connector's changes stream sees the schema of the
 /// table it actually reads from — only real source columns, never the synthetic
 /// `<col>_embedding` columns that a `VectorScanTableProvider` or `EmbeddingTable` merges
 /// into its schema (which would make the source's bootstrap `SELECT` reference a column
 /// that does not exist in the source table). A metadata-enrichment layer can sit between
-/// the `IndexedTableProvider` and its inner provider, so it is peeled here too.
+/// the `IndexedTableProvider` and its inner provider, so it is peeled too — see
+/// [`LayerWalk::Source`] and the layer table in [`crate::table_layers`].
 ///
 /// This always resolves to a source provider (never `None`): the caller re-applies the
 /// index writes over the returned stream, so a missing source table would otherwise
@@ -759,20 +747,8 @@ const TRANSPARENT_CDC_WRAPPERS: &[InnerProviderFn] =
 fn underlying_federated_table_for_indexed_table(
     src_table_provider: &Arc<dyn TableProvider>,
 ) -> Arc<FederatedTable> {
-    const PEEL: &[InnerProviderFn] = &[
-        INDEXED_INNER,
-        VECTOR_SCAN_INNER,
-        EMBEDDING_INNER,
-        METADATA_ENRICHED_INNER,
-        FEDERATED_ADAPTOR_INNER,
-    ];
-
-    let mut current = src_table_provider;
-    while let Some(inner) = PEEL.iter().find_map(|peel| peel(current.as_ref())) {
-        current = inner;
-    }
-
-    Arc::new(FederatedTable::Immediate(Arc::clone(current)))
+    let source = peel_to_innermost(src_table_provider, TABLE_PROVIDER_LAYERS, LayerWalk::Source);
+    Arc::new(FederatedTable::Immediate(Arc::clone(source)))
 }
 
 #[cfg(test)]
@@ -855,11 +831,12 @@ mod tests {
         )
     }
 
-    /// Regression test for #12313: `append_stream` had no `VectorScanTableProvider` arm, so
-    /// it fell through to the `EmbeddingTable` lookup, whose `TRANSPARENT_CDC_WRAPPERS` peel
-    /// set cannot see through a vector scan. That returned `None`, and a `refresh_mode:
-    /// append` dataset with no `time_column` then failed registration with
-    /// `AppendRequiresTimeColumn` (or, on Cayenne, silently stopped streaming).
+    /// Regression test for #12313: without its own `VectorScanTableProvider` arm,
+    /// `append_stream` falls through to the `EmbeddingTable` lookup, and
+    /// [`LayerWalk::CdcDetection`] is deliberately opaque at the vector-scan layer, so that
+    /// lookup cannot see through a vector scan. It returns `None`, and a `refresh_mode:
+    /// append` dataset with no `time_column` then fails registration with
+    /// `AppendRequiresTimeColumn` (or, on Cayenne, silently stops streaming).
     ///
     /// `changes_stream` has handled this stack since #12086; the two must not diverge again.
     #[test]

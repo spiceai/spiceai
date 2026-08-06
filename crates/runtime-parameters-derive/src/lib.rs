@@ -16,7 +16,7 @@ limitations under the License.
 
 //! `#[derive(TypedParams)]` — typed spicepod component parameters.
 //!
-//! Generates an implementation of `runtime_parameters::typed::TypedParams` that
+//! Generates an implementation of `runtime_parameters_typed::TypedParams` that
 //! deserializes the secret-injected string map produced by
 //! `runtime_secrets::get_params_with_secrets` into a plain Rust struct, preserving
 //! the runtime's parameter semantics: per-variant key prefixing, unknown-key
@@ -25,8 +25,12 @@ limitations under the License.
 //!
 //! # Attributes
 //!
-//! Container: `#[params(prefix = "openai")]` (required) — the component prefix
-//! applied to every field key unless the field is marked `runtime`.
+//! Container `#[params(...)]` keys:
+//! - `prefix = "openai"` (required) — the component prefix applied to every
+//!   field key unless the field is marked `runtime`.
+//! - `deny_unknown` — make an unrecognized spicepod key a hard error
+//!   (`ParamsError::UnknownParameter`) instead of a logged warning. Use for
+//!   config that must fail fast on typos (e.g. secret stores).
 //!
 //! Field `#[param(...)]` keys:
 //! - `runtime` — the spicepod key is unprefixed (parity with `ParameterSpec::runtime`).
@@ -46,6 +50,10 @@ limitations under the License.
 //! the corresponding key is present.
 
 use proc_macro::TokenStream;
+// NOTE: generated code targets the `runtime-parameters-typed` foundation leaf
+// (path `::runtime_parameters_typed`), not `runtime-parameters` — so crates
+// below `runtime-parameters` (e.g. `runtime-secrets`) can derive without a
+// dependency cycle. Every deriving crate must depend on `runtime-parameters-typed`.
 use quote::quote;
 use syn::spanned::Spanned;
 use syn::{Data, DeriveInput, Expr, ExprLit, Fields, Lit, Type, parse_macro_input};
@@ -107,7 +115,7 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         ));
     }
 
-    let prefix = parse_prefix(input)?;
+    let (prefix, deny_unknown) = parse_container(input)?;
 
     let Data::Struct(data) = &input.data else {
         return Err(syn::Error::new(
@@ -149,30 +157,47 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let field_idents: Vec<&syn::Ident> = specs.iter().map(|s| &s.ident).collect();
     let expect_deprecated = any_deprecated.then(|| quote! { #[expect(deprecated)] });
 
+    // `params` is only mutated (via `.remove`) when there are fields to consume;
+    // an empty struct (e.g. a store with no params) would otherwise trip `unused_mut`.
+    let params_binding = if specs.is_empty() {
+        quote! { params }
+    } else {
+        quote! { mut params }
+    };
+
+    // Leftover keys either warn (default) or fail fast (`#[params(deny_unknown)]`).
+    let leftover_handling = if deny_unknown {
+        quote! {
+            ::runtime_parameters_typed::deny_leftover_keys(&params, &[#(#known_keys),*])?;
+        }
+    } else {
+        quote! {
+            ::runtime_parameters_typed::warn_leftover_keys(
+                component_name,
+                &params,
+                &[#(#known_keys),*],
+                #prefix,
+            );
+        }
+    };
+
     Ok(quote! {
         #expect_deprecated
-        impl ::runtime_parameters::typed::TypedParams for #struct_ident {
+        impl ::runtime_parameters_typed::TypedParams for #struct_ident {
             const PREFIX: &'static str = #prefix;
 
-            async fn try_from_params(
+            async fn try_from_params<__R: ::runtime_parameters_typed::SecretAutoload>(
                 component_name: &str,
-                mut params: ::runtime_parameters::typed::__private::HashMap<
+                #params_binding: ::runtime_parameters_typed::__private::HashMap<
                     ::std::string::String,
-                    ::runtime_parameters::typed::__private::SecretString,
+                    ::runtime_parameters_typed::__private::SecretString,
                 >,
-                secrets: &::runtime_parameters::typed::__private::Arc<
-                    ::runtime_parameters::typed::__private::RwLock<
-                        ::runtime_parameters::typed::__private::Secrets,
-                    >,
+                secrets: &::runtime_parameters_typed::__private::Arc<
+                    ::runtime_parameters_typed::__private::RwLock<__R>,
                 >,
-            ) -> ::std::result::Result<Self, ::runtime_parameters::typed::ParamsError> {
+            ) -> ::std::result::Result<Self, ::runtime_parameters_typed::ParamsError> {
                 #(#field_stmts)*
-                ::runtime_parameters::typed::warn_leftover_keys(
-                    component_name,
-                    &params,
-                    &[#(#known_keys),*],
-                    #prefix,
-                );
+                #leftover_handling
                 ::std::result::Result::Ok(Self { #(#field_idents),* })
             }
         }
@@ -208,7 +233,7 @@ fn expand_field(
         quote! {
             for __key in [#(#all_keys),*] {
                 if params.contains_key(__key) {
-                    ::runtime_parameters::typed::warn_deprecated(component_name, __key, #note_tokens);
+                    ::runtime_parameters_typed::warn_deprecated(component_name, __key, #note_tokens);
                 }
             }
         }
@@ -229,7 +254,7 @@ fn expand_field(
         raw = quote! {
             match #raw {
                 ::std::option::Option::Some(__v) => ::std::option::Option::Some(__v),
-                ::std::option::Option::None => ::runtime_parameters::typed::autoload_secret(
+                ::std::option::Option::None => ::runtime_parameters_typed::autoload_secret(
                     secrets,
                     component_name,
                     #autoload_key,
@@ -243,7 +268,7 @@ fn expand_field(
     if let Some(default) = &spec.default {
         raw = quote! {
             #raw.or_else(|| ::std::option::Option::Some(
-                ::runtime_parameters::typed::__private::SecretString::from(#default)
+                ::runtime_parameters_typed::__private::SecretString::from(#default)
             ))
         };
     }
@@ -267,11 +292,11 @@ fn expand_field(
         quote! { __v }
     } else if let Some(parse_with) = &spec.parse_with {
         quote! {
-            ::runtime_parameters::typed::parse_param_with(#user_key, &__v, #parse_with)?
+            ::runtime_parameters_typed::parse_param_with(#user_key, &__v, #parse_with)?
         }
     } else {
         quote! {
-            ::runtime_parameters::typed::parse_param::<#inner_ty>(#user_key, &__v)?
+            ::runtime_parameters_typed::parse_param::<#inner_ty>(#user_key, &__v)?
         }
     };
 
@@ -288,7 +313,7 @@ fn expand_field(
                 ::std::option::Option::Some(__v) => #parse_value,
                 ::std::option::Option::None => {
                     return ::std::result::Result::Err(
-                        ::runtime_parameters::typed::ParamsError::MissingRequired {
+                        ::runtime_parameters_typed::ParamsError::MissingRequired {
                             user_key: #user_key.to_string(),
                             hint: #hint.to_string(),
                         },
@@ -304,8 +329,12 @@ fn expand_field(
     })
 }
 
-fn parse_prefix(input: &DeriveInput) -> syn::Result<String> {
+/// Parses the container attribute `#[params(prefix = "...", deny_unknown)]`,
+/// returning `(prefix, deny_unknown)`. `prefix` is required; `deny_unknown` is
+/// an optional flag that makes unknown keys a hard error instead of a warning.
+fn parse_container(input: &DeriveInput) -> syn::Result<(String, bool)> {
     let mut prefix = None;
+    let mut deny_unknown = false;
     for attr in &input.attrs {
         if !attr.path().is_ident("params") {
             continue;
@@ -315,17 +344,22 @@ fn parse_prefix(input: &DeriveInput) -> syn::Result<String> {
                 let lit: syn::LitStr = meta.value()?.parse()?;
                 prefix = Some(lit.value());
                 Ok(())
+            } else if meta.path.is_ident("deny_unknown") {
+                deny_unknown = true;
+                Ok(())
             } else {
-                Err(meta.error("unsupported #[params(...)] key; expected `prefix`"))
+                Err(meta
+                    .error("unsupported #[params(...)] key; expected `prefix` or `deny_unknown`"))
             }
         })?;
     }
-    prefix.ok_or_else(|| {
+    let prefix = prefix.ok_or_else(|| {
         syn::Error::new(
             input.ident.span(),
             "TypedParams requires #[params(prefix = \"...\")]",
         )
-    })
+    })?;
+    Ok((prefix, deny_unknown))
 }
 
 fn parse_field(field: &syn::Field) -> syn::Result<FieldSpec> {
@@ -555,6 +589,42 @@ mod tests {
             out.contains("The OpenAI organization ID."),
             "doc hint missing: {out}"
         );
+    }
+
+    #[test]
+    fn deny_unknown_uses_fail_fast_leftover_handling() {
+        let input: DeriveInput = parse_quote! {
+            #[params(prefix = "x", deny_unknown)]
+            struct P {
+                a: Option<String>,
+            }
+        };
+        let out = expand_str(&input).expect("valid struct should expand");
+        assert!(out.contains("deny_leftover_keys"), "expansion: {out}");
+        assert!(!out.contains("warn_leftover_keys"), "expansion: {out}");
+    }
+
+    #[test]
+    fn default_warns_on_leftover_keys() {
+        let input: DeriveInput = parse_quote! {
+            #[params(prefix = "x")]
+            struct P {
+                a: Option<String>,
+            }
+        };
+        let out = expand_str(&input).expect("valid struct should expand");
+        assert!(out.contains("warn_leftover_keys"), "expansion: {out}");
+        assert!(!out.contains("deny_leftover_keys"), "expansion: {out}");
+    }
+
+    #[test]
+    fn unsupported_container_key_is_an_error() {
+        let input: DeriveInput = parse_quote! {
+            #[params(prefix = "x", bogus)]
+            struct P { a: Option<String> }
+        };
+        let err = expand_str(&input).expect_err("unknown container key should error");
+        assert!(err.contains("deny_unknown"), "unexpected error: {err}");
     }
 
     #[test]

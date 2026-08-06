@@ -183,10 +183,11 @@ impl SpiceTest<Completed> {
 
         #[expect(clippy::cast_precision_loss)]
         let total_requests = self.state.search_results.len() as f64;
-        if total_duration.as_secs() == 0 {
+        let seconds = total_duration.as_secs_f64();
+        if seconds <= 0.0 {
             return Ok(total_requests);
         }
-        Ok(total_requests / total_duration.as_secs_f64())
+        Ok(total_requests / seconds)
     }
 
     /// Calculate retrieval-quality metrics (NDCG, Recall, MRR, Precision, all at the same rank
@@ -203,7 +204,7 @@ impl SpiceTest<Completed> {
     {
         let transformed_results = transform(&self.state.search_results);
         // Matches MTEB's methodology of evaluating retrieval quality at rank cutoff 10.
-        Ok(calculate_retrieval_metrics(qrels, &transformed_results, 10))
+        calculate_retrieval_metrics(qrels, &transformed_results, 10)
     }
 }
 
