@@ -131,9 +131,17 @@ impl CpuSource {
 /// Precedence is `--cpu-cores` > `SPICE_CPU_CORES` > `runtime.cpu.cores` >
 /// detection. A surface set to `auto` still wins over the surfaces below it; it
 /// simply resolves to detection.
+///
+/// `all` is the exception: it says the surface imposes no ceiling of its own, so
+/// it defers to a quantity named below it. That is what lets a platform set
+/// `SPICE_CPU_CORES=all` on every deployment without silencing an operator who
+/// wrote `runtime.cpu.cores: 4`.
 #[derive(Debug, Clone, Default)]
 pub struct CpuConfig {
-    cores: Option<(String, &'static str)>,
+    /// Every surface that was set, in precedence order. All of them are kept
+    /// rather than just the winner, because `all` defers to a quantity named
+    /// below it — see [`CpuBudget::resolve`].
+    surfaces: Vec<(String, &'static str)>,
 }
 
 impl CpuConfig {
@@ -144,11 +152,15 @@ impl CpuConfig {
     /// Resolve the three configuration surfaces in precedence order.
     #[must_use]
     pub fn from_sources(cli: Option<&str>, env: Option<&str>, spicepod: Option<&str>) -> Self {
-        let cores = cli
-            .map(|v| (v.to_string(), Self::CLI_SETTING))
-            .or_else(|| env.map(|v| (v.to_string(), Self::ENV_SETTING)))
-            .or_else(|| spicepod.map(|v| (v.to_string(), Self::SPICEPOD_SETTING)));
-        Self { cores }
+        let surfaces = [
+            (cli, Self::CLI_SETTING),
+            (env, Self::ENV_SETTING),
+            (spicepod, Self::SPICEPOD_SETTING),
+        ]
+        .into_iter()
+        .filter_map(|(value, setting)| value.map(|value| (value.to_string(), setting)))
+        .collect();
+        Self { surfaces }
     }
 
     /// Read `SPICE_CPU_CORES` from the process environment.
@@ -537,16 +549,41 @@ impl CpuBudget {
             .unwrap_or(u64::MAX)
             .saturating_mul(1000);
 
-        let configured = match &cfg.cores {
-            Some((value, setting)) => Some((
-                parse_cpu_quantity(value).context(InvalidCpuQuantitySnafu {
-                    setting: (*setting).to_string(),
-                    value: value.clone(),
-                })?,
-                *setting,
-            )),
-            None => None,
-        };
+        // Precedence is CLI > env > spicepod, with one exception. `all` says the
+        // surface imposes no ceiling of its own, so it defers to an explicit
+        // quantity named below it: a platform that sets `SPICE_CPU_CORES=all` on
+        // every deployment must not thereby ignore an operator who wrote
+        // `runtime.cpu.cores: 4` in their spicepod. It does not defer to `auto`,
+        // which is itself an instruction — "detect it" — rather than the absence of
+        // one.
+        //
+        // Only surfaces that are consulted get parsed, so an invalid value below a
+        // winning quantity stays ignored exactly as before.
+        let mut deferred_all: Option<&'static str> = None;
+        let mut configured: Option<(CpuSetting, &'static str)> = None;
+        for (value, setting) in &cfg.surfaces {
+            let parsed = parse_cpu_quantity(value).context(InvalidCpuQuantitySnafu {
+                setting: (*setting).to_string(),
+                value: value.clone(),
+            })?;
+            match parsed {
+                CpuSetting::Cores(millicores) => {
+                    configured = Some((CpuSetting::Cores(millicores), *setting));
+                    break;
+                }
+                CpuSetting::All => deferred_all = deferred_all.or(Some(*setting)),
+                // Blocks the surfaces below it, unless we are already scanning past
+                // an `all` for a quantity — "detect it" names no ceiling either.
+                CpuSetting::Auto => {
+                    if deferred_all.is_none() {
+                        configured = Some((CpuSetting::Auto, *setting));
+                        break;
+                    }
+                }
+            }
+        }
+        let configured =
+            configured.or_else(|| deferred_all.map(|setting| (CpuSetting::All, setting)));
 
         // `all` is not a rung. It suppresses the request rung and lets the rest of
         // the ladder run, so it resolves exactly as it would on a pod that
@@ -1585,6 +1622,95 @@ mod tests {
                 .expect("a suspect request is worth naming under a quota too");
         assert!(under_quota.contains("Sized for 8 cores"), "{under_quota}");
         assert!(!under_quota.contains("minimum"), "{under_quota}");
+    }
+
+    /// `all` is the weakest setting: it says "no ceiling of my own", so a quantity
+    /// named on a lower-precedence surface wins.
+    ///
+    /// The case this exists for is a platform setting `SPICE_CPU_CORES=all` on
+    /// every deployment to keep pods on the whole machine. Without this, an
+    /// operator writing `runtime.cpu.cores: 4` in their spicepod would be silently
+    /// ignored, and their only way to narrow would be `limits.cpu` — a CFS quota,
+    /// which is the throttling this whole knob exists to avoid.
+    #[test]
+    fn all_defers_to_a_quantity_below_it() {
+        // (cli, env, spicepod) -> resolved cores on a 64-core host with a 100m
+        // declared request.
+        let cases = [
+            // The case this is for: the platform says `all`, the user narrows.
+            (None, Some("all"), Some("4"), 4, CpuSource::Configured),
+            // Nothing below to defer to, so `all` stands.
+            (None, Some("all"), None, 64, CpuSource::AllCores),
+            // `auto` is an instruction, not the absence of one, so `all` outranks it.
+            (None, Some("all"), Some("auto"), 64, CpuSource::AllCores),
+            // A quantity above `all` still wins outright — ordinary precedence.
+            (
+                Some("16"),
+                Some("all"),
+                Some("4"),
+                16,
+                CpuSource::Configured,
+            ),
+            // `all` on the lowest surface behaves as it always did.
+            (None, None, Some("all"), 64, CpuSource::AllCores),
+            // Two `all`s and a quantity: the quantity is the only ceiling named.
+            (
+                Some("all"),
+                Some("all"),
+                Some("4"),
+                4,
+                CpuSource::Configured,
+            ),
+            // Scanning past `all`, an intervening `auto` names no ceiling either.
+            (
+                Some("all"),
+                Some("auto"),
+                Some("4"),
+                4,
+                CpuSource::Configured,
+            ),
+            // Unchanged: ordinary precedence between quantities.
+            (None, Some("8"), Some("4"), 8, CpuSource::Configured),
+            // Unchanged: `auto` above a quantity still blocks it, which is its own
+            // sharp edge but not one `all` introduces.
+            (None, Some("auto"), Some("4"), 2, CpuSource::RequestBurst),
+            // Unchanged: nothing configured at all.
+            (None, None, None, 2, CpuSource::RequestBurst),
+        ];
+
+        for (cli, env, spicepod, expected_cores, expected_source) in cases {
+            let cfg = CpuConfig::from_sources(cli, env, spicepod);
+            let resolved = CpuBudget::resolve(&cfg, &request_only(64, 100)).expect("valid");
+            assert_eq!(
+                (resolved.cores(), resolved.source()),
+                (expected_cores, expected_source),
+                "cli={cli:?} env={env:?} spicepod={spicepod:?}"
+            );
+        }
+    }
+
+    /// A value below a winning quantity is never consulted, so it is never parsed
+    /// — but one below an `all` is, because `all` defers to it.
+    #[test]
+    fn only_consulted_surfaces_are_validated() {
+        // The CLI quantity wins immediately; the garbage below is not reached.
+        let unreached = CpuBudget::resolve(
+            &CpuConfig::from_sources(Some("4"), Some("garbage"), None),
+            &host(18),
+        )
+        .expect("a value below the winning quantity is never parsed");
+        assert_eq!(unreached.cores(), 4);
+
+        // `all` defers downward, so the value it defers to has to be valid.
+        let err = CpuBudget::resolve(
+            &CpuConfig::from_sources(None, Some("all"), Some("garbage")),
+            &host(18),
+        )
+        .expect_err("a consulted value must be validated");
+        assert!(
+            err.to_string().contains(CpuConfig::SPICEPOD_SETTING),
+            "{err}"
+        );
     }
 
     #[test]

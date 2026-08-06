@@ -1018,7 +1018,8 @@ pub struct Cpu {
     /// `auto` (the default) detects it, which on a pod that declares a CPU
     /// request means a bounded multiple of that request. `all` means every
     /// available core regardless of the request — a CPU limit, if one is set, is
-    /// still respected. Applied at startup only — the thread pools it sizes
+    /// still respected, and a value set here still narrows an `all` coming from
+    /// `SPICE_CPU_CORES` or `--cpu-cores`. Applied at startup only — the thread pools it sizes
     /// cannot be resized on a spicepod reload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cores: Option<CpuQuantity>,
