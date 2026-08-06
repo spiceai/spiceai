@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use llms::chat::DistributedBackendSetting;
 use runtime_parameters::TypedParams;
 use secrecy::SecretString;
 
@@ -37,8 +38,8 @@ pub struct HuggingFaceModelParams {
     /// The Huggingface access token.
     pub token: Option<SecretString>,
     /// Run the model tensor-parallel across multiple nodes (a Spice enterprise feature; standard builds are single-node only). Set to 'ring' to pool the model over the `nodes` list (the 'ring' backend currently supports exactly 2 nodes); omit or 'none' for single-node.
-    #[param(runtime, default = "none", one_of = ["none", "ring"])]
-    pub distributed_backend: String,
+    #[param(runtime, default = "none")]
+    pub distributed_backend: DistributedBackendSetting,
     /// This node's 0-indexed rank in the distributed `nodes` list. Rank 0 is the head and serves the API; other ranks are compute replicas.
     #[param(runtime)]
     pub node_rank: Option<String>,

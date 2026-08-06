@@ -47,6 +47,27 @@ pub enum ChatBackend {
     Responses,
 }
 
+impl ChatBackend {
+    /// The values accepted in a Spicepod. The parameter spec validates against this same
+    /// slice, so the documented vocabulary and the parsed one cannot drift.
+    pub const VALUES: &'static [&'static str] = &["enabled", "disabled"];
+}
+
+impl FromStr for ChatBackend {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "disabled" => Ok(Self::ChatCompletions),
+            "enabled" => Ok(Self::Responses),
+            other => Err(format!(
+                "must be one of: {}. Found {other}",
+                Self::VALUES.join(", ")
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UsageTier {
     Free,
@@ -271,5 +292,49 @@ impl<C: Config + Clone> Openai<C> {
             && (self.model.starts_with("gpt-5")
                 || self.model.starts_with("o3")
                 || self.model.starts_with("o4"))
+    }
+}
+
+#[cfg(test)]
+mod chat_backend_tests {
+    use super::ChatBackend;
+
+    #[test]
+    fn parses_the_documented_values_case_insensitively() {
+        for (raw, expected) in [
+            ("disabled", ChatBackend::ChatCompletions),
+            ("Disabled", ChatBackend::ChatCompletions),
+            ("  disabled ", ChatBackend::ChatCompletions),
+            ("enabled", ChatBackend::Responses),
+            ("ENABLED", ChatBackend::Responses),
+        ] {
+            assert_eq!(
+                raw.parse::<ChatBackend>()
+                    .unwrap_or_else(|e| panic!("{raw:?} should parse: {e}")),
+                expected,
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_values_outside_the_spec() {
+        for raw in ["", "legacy", "true", "false"] {
+            assert!(
+                raw.parse::<ChatBackend>().is_err(),
+                "{raw:?} should be rejected"
+            );
+        }
+    }
+
+    /// The parameter spec advertises `VALUES`, so every entry has to parse — otherwise
+    /// config validation accepts a value the parser then rejects.
+    #[test]
+    fn every_advertised_value_parses() {
+        for value in ChatBackend::VALUES {
+            value
+                .parse::<ChatBackend>()
+                .unwrap_or_else(|e| panic!("{value:?} is advertised but does not parse: {e}"));
+        }
     }
 }

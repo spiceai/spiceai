@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use llms::openai::ChatBackend;
 use runtime_parameters::TypedParams;
 use secrecy::SecretString;
 
@@ -42,6 +43,6 @@ pub struct AzureModelParams {
     #[param(runtime, default = "")]
     pub openai_responses_tools: String,
     /// Whether to use the Responses API backend when serving `/v1/chat/completions` for this model. `disabled` proxies to backend `/v1/chat/completions`; `enabled` proxies to backend `/v1/responses`.
-    #[param(runtime, default = "disabled", one_of = ["enabled", "disabled"])]
-    pub responses_api: String,
+    #[param(runtime, default = "disabled")]
+    pub responses_api: ChatBackend,
 }

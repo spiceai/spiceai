@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use llms::chat::{DistributedBackendSetting, PagedAttentionMode, PickleTrust};
 use runtime_parameters::TypedParams;
 
 /// Parameters for `from: file` (local) chat models.
@@ -28,11 +29,11 @@ pub struct FileModelParams {
     #[param(runtime)]
     pub chat_template: Option<String>,
     /// Allow loading pickle-based weight files (.pt / .pth / .ckpt / .bin). These formats execute arbitrary code on load and are disabled by default. Set to 'true' only when the model weights come from a fully trusted source.
-    #[param(runtime, one_of = ["true", "false"])]
-    pub trust_pickle: Option<String>,
+    #[param(runtime, default = "false")]
+    pub trust_pickle: PickleTrust,
     /// Run the model tensor-parallel across multiple nodes (a Spice enterprise feature; standard builds are single-node only). Set to 'ring' to pool the model over the `nodes` list (the 'ring' backend currently supports exactly 2 nodes); omit or 'none' for single-node.
-    #[param(runtime, default = "none", one_of = ["none", "ring"])]
-    pub distributed_backend: String,
+    #[param(runtime, default = "none")]
+    pub distributed_backend: DistributedBackendSetting,
     /// This node's 0-indexed rank in the distributed `nodes` list. Rank 0 is the head and serves the API; other ranks are compute replicas.
     #[param(runtime)]
     pub node_rank: Option<String>,
@@ -43,6 +44,6 @@ pub struct FileModelParams {
     #[param(runtime)]
     pub context_length: Option<String>,
     /// Attention implementation for a locally served model. 'auto' (the default) uses PagedAttention wherever the build supports it, and the engine falls back to dense attention for architectures with no paged kernel, such as the Multi-head Latent Attention GGUFs. 'disabled' forces dense attention with a contiguous KV cache.
-    #[param(runtime, default = "auto", one_of = ["auto", "disabled"])]
-    pub paged_attention: String,
+    #[param(runtime, default = "auto")]
+    pub paged_attention: PagedAttentionMode,
 }

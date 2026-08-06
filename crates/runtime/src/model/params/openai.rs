@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use llms::openai::UsageTier;
+use llms::openai::{ChatBackend, UsageTier};
 use runtime_parameters::TypedParams;
 use secrecy::SecretString;
 
@@ -37,11 +37,11 @@ pub struct OpenAiModelParams {
     /// The `OpenAI` project ID.
     pub project_id: Option<String>,
     /// The current usage tier for the `OpenAI` account associated with the API key: 'free', 'tier1', 'tier2', 'tier3', 'tier4', or 'tier5'.
-    #[param(default = "tier1", one_of = ["free", "tier1", "tier2", "tier3", "tier4", "tier5"])]
+    #[param(default = "tier1")]
     pub usage_tier: UsageTier,
     /// Whether to use the Responses API backend when serving `/v1/chat/completions` for this model. `disabled` proxies to backend `/v1/chat/completions`; `enabled` proxies to backend `/v1/responses`.
-    #[param(runtime, default = "disabled", one_of = ["enabled", "disabled"])]
-    pub responses_api: String,
+    #[param(runtime, default = "disabled")]
+    pub responses_api: ChatBackend,
     /// The `OpenAI` Responses tools to use when calling the model from the Responses API.
     #[param(default = "")]
     pub responses_tools: String,

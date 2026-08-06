@@ -51,8 +51,6 @@ limitations under the License.
 //!   `SecretString` or `Option<SecretString>`.
 //! - `parse_with = path` — custom parser `fn(&str) -> Result<T, impl Display>`
 //!   used instead of `FromStr`.
-//! - `one_of = ["a", "b"]` — allowed values, surfaced by `emit_specs` schema
-//!   generation only; runtime validation remains the field type's `FromStr`.
 //!
 //! Field semantics derived from the type: `Option<T>` fields are optional; all
 //! other fields are required (missing yields an error naming the user-facing,
@@ -90,9 +88,6 @@ struct FieldSpec {
     default: Option<String>,
     parse_with: Option<syn::Path>,
     doc: String,
-    /// Allowed values, carried only for schema generation (`#[param(one_of = [...])]`).
-    /// Runtime validation is the field type's `FromStr`.
-    one_of: Vec<String>,
     /// `Some(note)` when the field carries `#[deprecated]`; empty note for the bare form.
     deprecated: Option<String>,
 }
@@ -318,10 +313,6 @@ fn field_spec_tokens(spec: &FieldSpec) -> proc_macro2::TokenStream {
     if spec.autoload_secret {
         builder = quote! { #builder.secret() };
     }
-    if !spec.one_of.is_empty() {
-        let values = &spec.one_of;
-        builder = quote! { #builder.one_of(&[#(#values),*]) };
-    }
     if let Some(note) = &spec.deprecated
         && !note.is_empty()
     {
@@ -536,7 +527,6 @@ fn parse_field(field: &syn::Field) -> syn::Result<FieldSpec> {
         default: None,
         parse_with: None,
         doc: String::new(),
-        one_of: Vec::new(),
         deprecated: None,
     };
 
@@ -569,20 +559,10 @@ fn parse_field(field: &syn::Field) -> syn::Result<FieldSpec> {
                     spec.default = Some(lit.value());
                 } else if meta.path.is_ident("parse_with") {
                     spec.parse_with = Some(meta.value()?.parse()?);
-                } else if meta.path.is_ident("one_of") {
-                    // `one_of = ["a", "b", ...]` — a bracketed list of string literals,
-                    // carried through to schema generation only.
-                    let value = meta.value()?;
-                    let content;
-                    syn::bracketed!(content in value);
-                    let values = syn::punctuated::Punctuated::<syn::LitStr, syn::Token![,]>::parse_terminated(
-                        &content,
-                    )?;
-                    spec.one_of = values.into_iter().map(|s| s.value()).collect();
                 } else {
                     return Err(meta.error(
                         "unsupported #[param(...)] key; expected one of \
-                         `runtime`, `autoload_secret`, `rename`, `alias`, `default`, `parse_with`, `one_of`",
+                         `runtime`, `autoload_secret`, `rename`, `alias`, `default`, `parse_with`",
                     ));
                 }
                 Ok(())
@@ -784,16 +764,15 @@ mod tests {
                 api_key: Option<SecretString>,
                 #[param(runtime, default = "https://api.openai.com/v1")]
                 endpoint: String,
-                #[param(default = "tier1", one_of = ["free", "tier1"])]
+                #[param(default = "tier1")]
                 usage_tier: String,
             }
         };
         let out = expand_str(&input).expect("valid struct should expand");
         assert!(out.contains("fn parameter_specs"), "expansion: {out}");
-        // secret from autoload_secret, description from doc, one_of carried through.
+        // secret from autoload_secret, description from doc.
         assert!(out.contains(". secret ()"), "expansion: {out}");
         assert!(out.contains("The OpenAI API key."), "expansion: {out}");
-        assert!(out.contains("one_of"), "expansion: {out}");
         // A required (non-Option, no default) field would be `.required()`; here all
         // fields are optional or defaulted, so no `.required()` is emitted.
         assert!(!out.contains(". required ()"), "expansion: {out}");

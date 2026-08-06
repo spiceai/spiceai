@@ -17,13 +17,12 @@ limitations under the License.
 #[cfg(feature = "bedrock")]
 use llms::bedrock::chat::{BedrockConverse, guardrail::GuardRail};
 #[cfg(feature = "models")]
-use llms::chat::PagedAttentionMode;
+use llms::chat::{DistributedBackendSetting, PagedAttentionMode};
 use llms::{
     HealthCheck,
     anthropic::Anthropic,
     chat::{Chat, Error as LlmError},
     google::Google,
-    openai::ChatBackend,
     xai::Xai,
 };
 use llms::{config::GenericAuthMechanism, openai::DEFAULT_LLM_MODEL};
@@ -42,7 +41,7 @@ use tokio::sync::RwLock;
 use super::params::anthropic::AnthropicModelParams;
 use super::params::azure::AzureModelParams;
 #[cfg(feature = "bedrock")]
-use super::params::bedrock::BedrockModelParams;
+use super::params::bedrock::{BedrockModelParams, GuardrailTraceMode};
 use super::params::databricks::DatabricksModelParams;
 #[cfg(feature = "models")]
 use super::params::file::FileModelParams;
@@ -276,7 +275,7 @@ async fn bedrock(
 
     let id = params.guardrail_identifier.as_deref();
     let version = params.guardrail_version.as_deref();
-    let trace = params.trace.as_deref();
+    let trace = params.trace.map(GuardrailTraceMode::as_str);
     let mut converse = BedrockConverse::new(client.into(), model_id);
 
     // Add Guardrail if added by user.
@@ -385,7 +384,7 @@ async fn huggingface(
 
     let chat_template_literal = params.chat_template.as_deref();
     let distributed = parse_distributed_config(
-        &params.distributed_backend,
+        params.distributed_backend,
         params.node_rank.as_deref(),
         params.nodes.as_deref(),
     )?;
@@ -406,12 +405,12 @@ async fn huggingface(
 /// Returns `Ok(None)` when distributed mode is not requested.
 #[cfg(feature = "models")]
 fn parse_distributed_config(
-    distributed_backend: &str,
+    distributed_backend: DistributedBackendSetting,
     node_rank: Option<&str>,
     nodes: Option<&str>,
 ) -> Result<Option<llms::chat::DistributedConfig>, LlmError> {
-    let backend = match distributed_backend.trim().to_ascii_lowercase().as_str() {
-        "" | "none" => {
+    let backend = match distributed_backend {
+        DistributedBackendSetting::None => {
             // Distributed is off: reject orphan topology params so forgetting (or
             // mistyping) `distributed_backend` doesn't silently run single-node
             // while `nodes`/`node_rank` look configured.
@@ -423,13 +422,7 @@ fn parse_distributed_config(
             }
             return Ok(None);
         }
-        "ring" => llms::chat::DistributedBackend::Ring,
-        other => {
-            return Err(LlmError::InvalidParamValueError {
-                param: "distributed_backend".to_string(),
-                message: format!("Must be 'ring' or 'none', got '{other}'"),
-            });
-        }
+        DistributedBackendSetting::Ring => llms::chat::DistributedBackend::Ring,
     };
 
     let node_rank = match node_rank.map(str::trim) {
@@ -623,7 +616,7 @@ fn openai(
     let org_id = params.org_id.as_deref();
     let project_id = params.project_id.as_deref();
     let usage_tier = Some(params.usage_tier);
-    let chat_backend = chat_backend(&params.responses_api)?;
+    let chat_backend = params.responses_api;
 
     validate_temperature(raw_params, "openai")?;
 
@@ -680,7 +673,7 @@ fn azure(
     let deployment_name = params.deployment_name.as_deref();
     let api_key = params.api_key.as_ref().map(ExposeSecret::expose_secret);
     let entra_token = params.entra_token.as_ref().map(ExposeSecret::expose_secret);
-    let chat_backend = chat_backend(&params.responses_api)?;
+    let chat_backend = params.responses_api;
 
     if api_base.is_none() {
         return Err(LlmError::FailedToLoadModel {
@@ -719,21 +712,6 @@ fn azure(
     )) as Arc<dyn Chat>)
 }
 
-fn chat_backend(responses_api: &str) -> Result<ChatBackend, LlmError> {
-    let value = responses_api.trim();
-
-    if value.eq_ignore_ascii_case("disabled") {
-        Ok(ChatBackend::ChatCompletions)
-    } else if value.eq_ignore_ascii_case("enabled") {
-        Ok(ChatBackend::Responses)
-    } else {
-        Err(LlmError::InvalidParamValueError {
-            param: "responses_api".to_string(),
-            message: "Must be 'enabled' or 'disabled'".to_string(),
-        })
-    }
-}
-
 #[cfg(feature = "models")]
 async fn file(
     component: &spicepod::component::model::Model,
@@ -746,24 +724,25 @@ async fn file(
         });
     }
 
-    let trust_pickle = parse_trust_pickle(params)?;
-    llms::chat::reject_unsafe_weight_formats(model_weights.as_slice(), trust_pickle).map_err(
-        |source| LlmError::FailedToLoadModel {
-            source: Box::new(source),
-        },
-    )?;
+    llms::chat::reject_unsafe_weight_formats(
+        model_weights.as_slice(),
+        params.trust_pickle.is_trusted(),
+    )
+    .map_err(|source| LlmError::FailedToLoadModel {
+        source: Box::new(source),
+    })?;
 
     let tokenizer_path = component.find_any_file_path(ModelFileType::Tokenizer);
     let tokenizer_config_path = component.find_any_file_path(ModelFileType::TokenizerConfig);
     let config_path = component.find_any_file_path(ModelFileType::Config);
     let generation_config = component.find_any_file_path(ModelFileType::GenerationConfig);
     let distributed = parse_distributed_config(
-        &params.distributed_backend,
+        params.distributed_backend,
         params.node_rank.as_deref(),
         params.nodes.as_deref(),
     )?;
     let context_length = parse_context_length(params)?;
-    let paged_attention = parse_paged_attention(params)?;
+    let paged_attention = params.paged_attention;
 
     let chat_template_literal = params.chat_template.as_deref();
 
@@ -797,43 +776,6 @@ fn parse_context_length(params: &FileModelParams) -> Result<Option<usize>, LlmEr
         _ => Err(LlmError::InvalidParamValueError {
             param: "context_length".to_string(),
             message: format!("Must be a positive integer number of tokens, got '{raw}'"),
-        }),
-    }
-}
-
-/// Parse the `paged_attention` model parameter. Defaults to `auto`: `PagedAttention`
-/// wherever the build and the model support it, dense attention where they do not —
-/// which covers the Multi-head Latent Attention GGUFs (GLM-4.x/5.x, DeepSeek-V4) whose
-/// loaders reject a `PagedAttention` config outright. `disabled` forces dense attention
-/// for any model.
-#[cfg(feature = "models")]
-fn parse_paged_attention(params: &FileModelParams) -> Result<PagedAttentionMode, LlmError> {
-    params
-        .paged_attention
-        .parse::<PagedAttentionMode>()
-        .map_err(|message| LlmError::InvalidParamValueError {
-            param: "paged_attention".to_string(),
-            message,
-        })
-}
-
-/// Parse the boolean `trust_pickle` model parameter. Defaults to `false`
-/// — pickle weight files (.pt / .pth / .ckpt / .bin) execute arbitrary
-/// code on load, so the runtime refuses them unless the operator opts
-/// in for a fully trusted source.
-#[cfg(feature = "models")]
-fn parse_trust_pickle(params: &FileModelParams) -> Result<bool, LlmError> {
-    let Some(raw) = params.trust_pickle.as_deref() else {
-        return Ok(false);
-    };
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "true" | "yes" | "1" => Ok(true),
-        "false" | "no" | "0" | "" => Ok(false),
-        other => Err(LlmError::InvalidParamValueError {
-            param: "trust_pickle".to_string(),
-            message: format!(
-                "Must be one of 'true', 'false', 'yes', 'no', '1', or '0', got '{other}'"
-            ),
         }),
     }
 }
@@ -917,8 +859,7 @@ mod test {
     #[cfg(feature = "models")]
     async fn paged_attention_defaults_to_auto() {
         assert_eq!(
-            parse_paged_attention(&file_params(&[]).await)
-                .expect("absent paged_attention is valid"),
+            file_params(&[]).await.paged_attention,
             PagedAttentionMode::Auto
         );
     }
@@ -927,10 +868,11 @@ mod test {
     #[cfg(feature = "models")]
     async fn paged_attention_reads_the_configured_mode() {
         // The accepted vocabulary and its case-insensitivity are covered where `FromStr`
-        // lives; what matters here is that the param reaches the parser at all.
+        // lives; what matters here is that the param reaches the struct at all.
         assert_eq!(
-            parse_paged_attention(&file_params(&[("paged_attention", "disabled")]).await)
-                .expect("disabled is a valid mode"),
+            file_params(&[("paged_attention", "disabled")])
+                .await
+                .paged_attention,
             PagedAttentionMode::Disabled
         );
     }
@@ -940,41 +882,14 @@ mod test {
     async fn paged_attention_rejects_values_outside_the_spec() {
         // A Spicepod that spells this `true`/`false` has to fail loudly, naming the values
         // it should have used, rather than have one of them quietly read as a mode.
-        let err = parse_paged_attention(&file_params(&[("paged_attention", "true")]).await)
+        let map: HashMap<String, SecretString> =
+            [("paged_attention".to_string(), SecretString::from("true"))].into();
+        let err = FileModelParams::try_from_params("model file", map, &empty_secrets())
+            .await
             .expect_err("a value outside the spec should be invalid");
-        assert!(
-            matches!(err, LlmError::InvalidParamValueError { ref param, .. } if param == "paged_attention"),
-            "unexpected error: {err}"
-        );
         let message = err.to_string();
         assert!(message.contains("auto"), "{message}");
         assert!(message.contains("disabled"), "{message}");
-    }
-
-    #[test]
-    fn responses_api_defaults_to_chat_completions() {
-        // The `OpenAiModelParams`/`AzureModelParams` `responses_api` field defaults to "disabled".
-        let api = chat_backend("disabled").expect("default responses_api should be valid");
-
-        assert_eq!(api, ChatBackend::ChatCompletions);
-    }
-
-    #[test]
-    fn responses_api_enabled_uses_responses() {
-        let api = chat_backend("enabled").expect("enabled responses_api should be valid");
-
-        assert_eq!(api, ChatBackend::Responses);
-    }
-
-    #[test]
-    fn responses_api_rejects_unknown_value() {
-        let err = chat_backend("legacy").expect_err("unknown responses_api should be invalid");
-
-        assert!(matches!(
-            err,
-            LlmError::InvalidParamValueError { ref param, .. }
-                if param == "responses_api"
-        ));
     }
 
     #[test]
@@ -1071,35 +986,25 @@ mod test {
         );
     }
 
-    /// Runs `parse_distributed_config` from `(key, value)` pairs, applying the
-    /// `distributed_backend` spec default of "none" when absent.
+    /// Runs `parse_distributed_config` from an already-parsed backend plus
+    /// `(key, value)` pairs for `node_rank`/`nodes`. The accepted vocabulary for
+    /// `distributed_backend` itself, and its case-insensitivity, are covered where
+    /// `DistributedBackendSetting`'s `FromStr` lives; this exercises the cross-field
+    /// validation between the backend and the topology params.
     #[cfg(feature = "models")]
     fn parse_dist(
+        backend: DistributedBackendSetting,
         pairs: &[(&str, &str)],
     ) -> Result<Option<llms::chat::DistributedConfig>, LlmError> {
         let get = |k: &str| pairs.iter().find(|(pk, _)| *pk == k).map(|(_, v)| *v);
-        parse_distributed_config(
-            get("distributed_backend").unwrap_or("none"),
-            get("node_rank"),
-            get("nodes"),
-        )
-    }
-
-    #[cfg(feature = "models")]
-    #[test]
-    fn distributed_absent_is_single_node() {
-        assert!(
-            parse_dist(&[])
-                .expect("no distributed params is valid")
-                .is_none()
-        );
+        parse_distributed_config(backend, get("node_rank"), get("nodes"))
     }
 
     #[cfg(feature = "models")]
     #[test]
     fn distributed_none_is_single_node() {
         assert!(
-            parse_dist(&[("distributed_backend", "none")])
+            parse_dist(DistributedBackendSetting::None, &[])
                 .expect("`none` backend is valid")
                 .is_none()
         );
@@ -1108,11 +1013,10 @@ mod test {
     #[cfg(feature = "models")]
     #[test]
     fn distributed_ring_parses_topology() {
-        let cfg = parse_dist(&[
-            ("distributed_backend", "ring"),
-            ("nodes", "10.0.0.1, 10.0.0.2"),
-            ("node_rank", "1"),
-        ])
+        let cfg = parse_dist(
+            DistributedBackendSetting::Ring,
+            &[("nodes", "10.0.0.1, 10.0.0.2"), ("node_rank", "1")],
+        )
         .expect("valid ring config")
         .expect("ring config is Some");
         assert_eq!(cfg.backend, llms::chat::DistributedBackend::Ring);
@@ -1125,31 +1029,8 @@ mod test {
 
     #[cfg(feature = "models")]
     #[test]
-    fn distributed_backend_is_case_insensitive() {
-        let cfg = parse_dist(&[
-            ("distributed_backend", "Ring"),
-            ("nodes", "10.0.0.1,10.0.0.2"),
-        ])
-        .expect("mixed-case backend is valid")
-        .expect("ring config is Some");
-        assert_eq!(cfg.backend, llms::chat::DistributedBackend::Ring);
-    }
-
-    #[cfg(feature = "models")]
-    #[test]
-    fn distributed_rejects_unknown_backend() {
-        let err =
-            parse_dist(&[("distributed_backend", "nccl")]).expect_err("unknown backend is invalid");
-        assert!(matches!(
-            err,
-            LlmError::InvalidParamValueError { ref param, .. } if param == "distributed_backend"
-        ));
-    }
-
-    #[cfg(feature = "models")]
-    #[test]
     fn distributed_ring_requires_nodes() {
-        let err = parse_dist(&[("distributed_backend", "ring")])
+        let err = parse_dist(DistributedBackendSetting::Ring, &[])
             .expect_err("ring without nodes is invalid");
         assert!(matches!(
             err,
@@ -1160,11 +1041,10 @@ mod test {
     #[cfg(feature = "models")]
     #[test]
     fn distributed_rejects_rank_out_of_range() {
-        let err = parse_dist(&[
-            ("distributed_backend", "ring"),
-            ("nodes", "10.0.0.1,10.0.0.2"),
-            ("node_rank", "2"),
-        ])
+        let err = parse_dist(
+            DistributedBackendSetting::Ring,
+            &[("nodes", "10.0.0.1,10.0.0.2"), ("node_rank", "2")],
+        )
         .expect_err("rank >= world size is invalid");
         assert!(matches!(
             err,

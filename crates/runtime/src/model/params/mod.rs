@@ -118,7 +118,10 @@ mod tests {
         .expect("openai params should deserialize");
         assert_eq!(typed.endpoint, "https://api.openai.com/v1");
         assert_eq!(typed.usage_tier, llms::openai::UsageTier::Tier1);
-        assert_eq!(typed.responses_api, "disabled");
+        assert_eq!(
+            typed.responses_api,
+            llms::openai::ChatBackend::ChatCompletions
+        );
         assert_eq!(
             typed.api_key.as_ref().map(ExposeSecret::expose_secret),
             Some("sk-1")
@@ -155,7 +158,10 @@ mod tests {
             Some("hf_abc")
         );
         assert_eq!(typed.model_type.as_deref(), Some("llama"));
-        assert_eq!(typed.distributed_backend, "none");
+        assert_eq!(
+            typed.distributed_backend,
+            llms::chat::DistributedBackendSetting::None
+        );
     }
 
     #[tokio::test]
@@ -183,7 +189,7 @@ mod tests {
             runtime.get("aws_region").map(ExposeSecret::expose_secret),
             Some("us-east-1")
         );
-        assert_eq!(typed.trace.as_deref(), Some("enabled"));
+        assert_eq!(typed.trace, Some(bedrock::GuardrailTraceMode::Enabled));
     }
 
     #[test]
