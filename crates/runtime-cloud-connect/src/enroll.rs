@@ -730,12 +730,27 @@ fn discard_pending_code_file(config: &CloudConnectConfig) {
 /// private key, base64-encoded. This authorizes the rotation — a leaked
 /// certificate alone (which is not a secret) must not be able to renew.
 pub(crate) fn sign_pop(current_private_key_pem: &str, csr_pem: &str) -> Result<String> {
-    let key = pem::parse(current_private_key_pem).map_err(|source| Error::ProofOfPossession {
-        reason: format!("current private key is not valid PEM: {source}"),
-    })?;
     let csr = pem::parse(csr_pem).map_err(|source| Error::ProofOfPossession {
         reason: format!("CSR is not valid PEM: {source}"),
     })?;
+    sign_pop_payload(current_private_key_pem, csr.contents())
+        .map_err(|reason| Error::ProofOfPossession { reason })
+}
+
+/// Sign an arbitrary proof-of-possession payload with an identity's private
+/// key: a DER-encoded ECDSA P-256/SHA-256 signature over `payload`,
+/// base64-encoded. `/renew` signs a CSR's DER bytes ([`sign_pop`]);
+/// `/release` signs its own domain-separated `release\n{instance_id}` payload.
+///
+/// The error is the bare reason rather than a typed error so each flow names
+/// itself in the error it surfaces, instead of nesting one flow's message
+/// inside another's.
+pub(crate) fn sign_pop_payload(
+    private_key_pem: &str,
+    payload: &[u8],
+) -> std::result::Result<String, String> {
+    let key = pem::parse(private_key_pem)
+        .map_err(|source| format!("current private key is not valid PEM: {source}"))?;
 
     // aws-lc-rs is the same backend rcgen generated the keypair with (see
     // Cargo.toml), so the persisted PKCS#8 always round-trips here.
@@ -743,16 +758,11 @@ pub(crate) fn sign_pop(current_private_key_pem: &str, csr_pem: &str) -> Result<S
         &aws_lc_rs::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
         key.contents(),
     )
-    .map_err(|source| Error::ProofOfPossession {
-        reason: format!("current private key is not a PKCS#8 ECDSA P-256 key: {source}"),
-    })?;
+    .map_err(|source| format!("current private key is not a PKCS#8 ECDSA P-256 key: {source}"))?;
     let rng = aws_lc_rs::rand::SystemRandom::new();
-    let signature =
-        key_pair
-            .sign(&rng, csr.contents())
-            .map_err(|source| Error::ProofOfPossession {
-                reason: format!("signing failed: {source}"),
-            })?;
+    let signature = key_pair
+        .sign(&rng, payload)
+        .map_err(|source| format!("signing failed: {source}"))?;
     Ok(base64::engine::general_purpose::STANDARD.encode(signature.as_ref()))
 }
 
