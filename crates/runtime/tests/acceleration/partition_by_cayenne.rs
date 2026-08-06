@@ -100,6 +100,18 @@ async fn get_physical_plan(
 /// before a plan that renders them as persisted is treated as unreachable.
 const PARTITION_PERSIST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// What a scan of a partition whose rows are still only in memory renders in a plan.
+///
+/// The same text is what the snapshots in this file assert, so a plan format that stopped
+/// spelling it this way fails those snapshots rather than silently satisfying the wait.
+const UNPERSISTED_SCAN_MARKER: &str = "files_scanned=0";
+
+/// Bounds on the wait between polls. Each poll builds and formats a whole physical plan, so
+/// the interval grows from the first bound to the second rather than paying that cost at a
+/// fixed rate for as long as the partition takes.
+const PARTITION_PERSIST_POLL_MIN: Duration = Duration::from_millis(50);
+const PARTITION_PERSIST_POLL_MAX: Duration = Duration::from_millis(500);
+
 /// The sanitized plan for `sql`, taken once every partition it scans reads from a
 /// persisted Vortex file.
 ///
@@ -119,13 +131,25 @@ async fn sanitized_plan_when_persisted(
     sql: &str,
 ) -> Result<String, anyhow::Error> {
     let deadline = tokio::time::Instant::now() + PARTITION_PERSIST_TIMEOUT;
+    let mut poll_interval = PARTITION_PERSIST_POLL_MIN;
 
     loop {
-        let plan = get_physical_plan(rt, sql).await?;
+        // Planning is bounded by the same deadline as the wait around it: a
+        // `get_physical_plan` that never returned would otherwise hold this loop open
+        // past the timeout it exists to enforce.
+        let plan = tokio::time::timeout_at(deadline, get_physical_plan(rt, sql))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "planning `{sql}` did not return within \
+                     {PARTITION_PERSIST_TIMEOUT:?}, so the wait for a persisted \
+                     partition could not hold its bound"
+                )
+            })??;
         let plan_str = displayable(plan.as_ref()).indent(true).to_string();
         let sanitized_plan = sanitize_plan(&plan_str);
 
-        if !sanitized_plan.contains("files_scanned=0") {
+        if !sanitized_plan.contains(UNPERSISTED_SCAN_MARKER) {
             return Ok(sanitized_plan);
         }
 
@@ -136,7 +160,10 @@ async fn sanitized_plan_when_persisted(
             ));
         }
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Capped at the deadline so the last wait cannot carry the loop past it.
+        let next_poll = (tokio::time::Instant::now() + poll_interval).min(deadline);
+        tokio::time::sleep_until(next_poll).await;
+        poll_interval = (poll_interval * 2).min(PARTITION_PERSIST_POLL_MAX);
     }
 }
 
