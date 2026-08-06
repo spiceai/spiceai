@@ -135,6 +135,7 @@ impl CatalogConnector for PostgresCatalog {
                     table_factory,
                     catalog.include.clone(),
                     catalog.exclude.clone(),
+                    &catalog.orig_include,
                 ))
             };
 

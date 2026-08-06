@@ -101,6 +101,11 @@ pub struct PostgresCatalogProvider {
     schemas: RwLock<HashMap<String, Arc<PostgresSchemaProvider>>>,
     include: Option<Arc<GlobSet>>,
     exclude: Option<Arc<GlobSet>>,
+    /// Literal prefix of each `include` pattern, used to skip the metadata
+    /// queries for a schema that provably cannot contain a selected table.
+    /// Empty when no `include` patterns are configured, which selects
+    /// everything and so prunes nothing. See [`schema_may_contain_selected_table`].
+    include_literal_prefixes: Vec<String>,
 }
 
 impl std::fmt::Debug for PostgresCatalogProvider {
@@ -111,6 +116,11 @@ impl std::fmt::Debug for PostgresCatalogProvider {
 }
 
 impl PostgresCatalogProvider {
+    /// `include_patterns` are the raw `schema.table` glob strings the compiled
+    /// `include` set was built from. A [`GlobSet`] cannot be introspected, so the
+    /// source patterns are needed to decide which schemas are worth querying at
+    /// all; they must describe the same set as `include` or schemas will be
+    /// skipped that shouldn't be.
     #[must_use]
     pub fn new(
         catalog_name: String,
@@ -118,6 +128,7 @@ impl PostgresCatalogProvider {
         table_creator: Arc<dyn Read>,
         include: Option<GlobSet>,
         exclude: Option<GlobSet>,
+        include_patterns: &[String],
     ) -> Self {
         Self {
             catalog_name,
@@ -126,6 +137,10 @@ impl PostgresCatalogProvider {
             schemas: RwLock::new(HashMap::new()),
             include: include.map(Arc::new),
             exclude: exclude.map(Arc::new),
+            include_literal_prefixes: include_patterns
+                .iter()
+                .map(|pattern| glob_literal_prefix(pattern))
+                .collect(),
         }
     }
 
@@ -134,6 +149,29 @@ impl PostgresCatalogProvider {
 
         let mut schemas = HashMap::new();
         for schema_name in &schema_names {
+            // A schema no `include` pattern can reach cannot contribute a table,
+            // so skip its `list_foreign_keys` + `list_comments` + `list_tables`
+            // round trips. It is still registered, empty, because that is exactly
+            // what interrogating it would have produced -- pruning changes the
+            // queries issued, never the catalog's namespace.
+            if !schema_may_contain_selected_table(schema_name, &self.include_literal_prefixes) {
+                tracing::debug!(
+                    schema = %schema_name,
+                    "Schema cannot match any include pattern, skipping its metadata queries"
+                );
+                schemas.insert(
+                    schema_name.clone(),
+                    Arc::new(PostgresSchemaProvider::new(
+                        Arc::clone(&self.pool),
+                        schema_name.clone(),
+                        Arc::clone(&self.table_creator),
+                        self.include.clone(),
+                        self.exclude.clone(),
+                    )),
+                );
+                continue;
+            }
+
             let foreign_keys = match self.list_foreign_keys(schema_name).await {
                 Ok(fks) => fks,
                 Err(e) => {
@@ -492,6 +530,54 @@ fn foreign_key_target(catalog: &str, schema: &str, table: &str) -> String {
     )
 }
 
+/// The literal prefix of a glob pattern: everything before the first
+/// metacharacter. Every string the pattern matches must begin with this.
+///
+/// A backslash ends the prefix rather than being interpreted, because its
+/// meaning is platform-dependent (an escape on Unix, a separator on Windows).
+/// Stopping early is always safe: a shorter prefix is a weaker necessary
+/// condition, so it can only cause a schema to be kept, never dropped.
+fn glob_literal_prefix(pattern: &str) -> String {
+    let mut prefix = String::new();
+    for c in pattern.chars() {
+        match c {
+            '*' | '?' | '[' | '{' | '\\' => break,
+            other => prefix.push(other),
+        }
+    }
+    prefix
+}
+
+/// Whether any `include` pattern could match a `schema.table` under `schema_name`.
+///
+/// Conservative by construction: it must never answer `false` for a schema that
+/// can contribute a table, because the resulting skip is silent -- the tables
+/// simply never appear. Answering `true` unnecessarily only costs queries.
+///
+/// A pattern matches only strings beginning with its literal prefix `L`. The
+/// candidate is `{schema}.{table}` with `table` unknown, so such a string can
+/// exist only when `L` is a prefix of `"{schema}."` (any table completes it), or
+/// `"{schema}."` is a prefix of `L` (the rest of `L` constrains the table name,
+/// which some table name can satisfy).
+///
+/// This is why a pattern beginning with a metacharacter never prunes: `*.orders`
+/// has an empty literal prefix, and `*` matches `.` in `globset`, so it can match
+/// a table in any schema.
+fn schema_may_contain_selected_table(
+    schema_name: &str,
+    include_literal_prefixes: &[String],
+) -> bool {
+    // No `include` patterns selects every table, so nothing can be ruled out.
+    if include_literal_prefixes.is_empty() {
+        return true;
+    }
+
+    let schema_prefix = format!("{schema_name}.");
+    include_literal_prefixes.iter().any(|literal| {
+        schema_prefix.starts_with(literal.as_str()) || literal.starts_with(&schema_prefix)
+    })
+}
+
 fn is_table_selected(
     schema_name: &str,
     table_name: &str,
@@ -688,8 +774,8 @@ impl SchemaProvider for PostgresSchemaProvider {
 mod tests {
     use super::{
         CommentMap, ForeignKeyConstraint, ForeignKeyMap, SchemaRefreshOutcome, TableComments,
-        build_table_providers_for_schema, foreign_key_target, is_table_selected,
-        schema_refresh_outcome,
+        build_table_providers_for_schema, foreign_key_target, glob_literal_prefix,
+        is_table_selected, schema_may_contain_selected_table, schema_refresh_outcome,
     };
     use crate::{
         DESCRIPTION_METADATA_KEY, FOREIGN_KEYS_METADATA_KEY, Read, SOURCE_TYPE_METADATA_KEY,
@@ -859,6 +945,148 @@ mod tests {
             schema_refresh_outcome(false, false),
             SchemaRefreshOutcome::Skip
         );
+    }
+
+    fn prefixes(patterns: &[&str]) -> Vec<String> {
+        patterns
+            .iter()
+            .map(|pattern| glob_literal_prefix(pattern))
+            .collect()
+    }
+
+    #[test]
+    fn glob_literal_prefix_stops_at_the_first_metacharacter() {
+        assert_eq!(glob_literal_prefix("public.orders"), "public.orders");
+        assert_eq!(glob_literal_prefix("public.*"), "public.");
+        assert_eq!(glob_literal_prefix("sales_*.orders"), "sales_");
+        assert_eq!(glob_literal_prefix("*.orders"), "");
+        assert_eq!(glob_literal_prefix("*"), "");
+        assert_eq!(glob_literal_prefix("{public,sales}.*"), "");
+        assert_eq!(glob_literal_prefix("[ps]ublic.*"), "");
+        assert_eq!(glob_literal_prefix("?ublic.orders"), "");
+        // A backslash ends the prefix rather than being interpreted.
+        assert_eq!(glob_literal_prefix(r"pub\lic.orders"), "pub");
+    }
+
+    #[test]
+    fn schema_prune_keeps_only_schemas_a_literal_pattern_can_reach() {
+        let literal = prefixes(&["public.orders"]);
+        assert!(schema_may_contain_selected_table("public", &literal));
+        assert!(!schema_may_contain_selected_table("sales", &literal));
+
+        // A schema-wildcard pattern still pins the schema component.
+        let schema_wildcard = prefixes(&["public.*"]);
+        assert!(schema_may_contain_selected_table(
+            "public",
+            &schema_wildcard
+        ));
+        assert!(!schema_may_contain_selected_table(
+            "sales",
+            &schema_wildcard
+        ));
+    }
+
+    #[test]
+    fn schema_prune_never_prunes_when_the_schema_component_is_not_literal() {
+        // `*` matches `.` in globset, so these can reach a table in any schema.
+        for pattern in ["*.orders", "*", "*.*", "{public,sales}.*", "?ublic.orders"] {
+            let literal = prefixes(&[pattern]);
+            for schema in ["public", "sales", "anything_at_all"] {
+                assert!(
+                    schema_may_contain_selected_table(schema, &literal),
+                    "pattern {pattern} must not prune schema {schema}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn schema_prune_handles_partial_schema_wildcards() {
+        // `sales_*` can only reach schemas starting with `sales_`...
+        let literal = prefixes(&["sales_*.orders"]);
+        assert!(schema_may_contain_selected_table("sales_east", &literal));
+        assert!(schema_may_contain_selected_table("sales_", &literal));
+        assert!(!schema_may_contain_selected_table("public", &literal));
+        // ...including `sales` itself, since `sales_*.orders` cannot match
+        // `sales.<anything>` -- but keeping it is safe, and `sales` is not a
+        // prefix-compatible candidate, so it prunes.
+        assert!(!schema_may_contain_selected_table("sales", &literal));
+    }
+
+    #[test]
+    fn schema_prune_keeps_a_schema_any_one_pattern_can_reach() {
+        let literal = prefixes(&["public.orders", "sales.*"]);
+        assert!(schema_may_contain_selected_table("public", &literal));
+        assert!(schema_may_contain_selected_table("sales", &literal));
+        assert!(!schema_may_contain_selected_table("audit", &literal));
+
+        // One unprunable pattern keeps every schema.
+        let with_wildcard = prefixes(&["public.orders", "*.audit_log"]);
+        assert!(schema_may_contain_selected_table(
+            "anything",
+            &with_wildcard
+        ));
+    }
+
+    #[test]
+    fn schema_prune_is_disabled_without_include_patterns() {
+        // No `include` selects everything, and `exclude` is subtractive: proving
+        // an exclude set covers *every* table in a schema is a different and much
+        // harder claim, so exclude-only configurations never prune.
+        assert!(schema_may_contain_selected_table("public", &[]));
+        assert!(schema_may_contain_selected_table("anything", &[]));
+    }
+
+    /// The property the prune must never violate: if the compiled `GlobSet`
+    /// selects `schema.table`, the prune must keep `schema`. A violation is
+    /// silent -- the table simply never appears in the catalog -- so this is
+    /// checked exhaustively over pattern shapes rather than by example.
+    #[test]
+    fn schema_prune_never_contradicts_the_compiled_globset() {
+        let pattern_sets: &[&[&str]] = &[
+            &["public.orders"],
+            &["public.*"],
+            &["*.orders"],
+            &["*"],
+            &["*.*"],
+            &["sales_*.orders"],
+            &["sales_*.*"],
+            &["{public,sales}.*"],
+            &["[ps]ublic.*"],
+            &["?ublic.orders"],
+            &["public.order?"],
+            &["public.orders", "sales.*"],
+            &["public.*", "*.audit_log"],
+            &["pg_*.*"],
+        ];
+        let schemas = [
+            "public",
+            "sales",
+            "sales_east",
+            "sales_",
+            "audit",
+            "pg_toast",
+            "s",
+            "",
+        ];
+        let tables = ["orders", "order1", "audit_log", "lineitem", "x", ""];
+
+        for patterns in pattern_sets {
+            let globset = make_globset(patterns);
+            let literal = prefixes(patterns);
+            for schema in schemas {
+                let kept = schema_may_contain_selected_table(schema, &literal);
+                for table in tables {
+                    if is_table_selected(schema, table, Some(&globset), None) {
+                        assert!(
+                            kept,
+                            "patterns {patterns:?} select {schema}.{table}, but the prune \
+                             dropped schema {schema} -- the table would silently disappear"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
