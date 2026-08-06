@@ -153,15 +153,18 @@ async fn sanitized_plan_when_persisted(
             return Ok(sanitized_plan);
         }
 
-        if tokio::time::Instant::now() >= deadline {
+        // Stop once the next poll would land on or past the deadline, which also covers
+        // planning having already consumed it. Sleeping onto the deadline exactly would
+        // leave planning no time, so the next iteration would report the planning bound
+        // and drop the plan the partition was stuck on — the useful half of the failure.
+        let next_poll = tokio::time::Instant::now() + poll_interval;
+        if next_poll >= deadline {
             return Err(anyhow::anyhow!(
                 "`{sql}` still scanned an unpersisted partition after \
                  {PARTITION_PERSIST_TIMEOUT:?}; last plan:\n{sanitized_plan}"
             ));
         }
 
-        // Capped at the deadline so the last wait cannot carry the loop past it.
-        let next_poll = (tokio::time::Instant::now() + poll_interval).min(deadline);
         tokio::time::sleep_until(next_poll).await;
         poll_interval = (poll_interval * 2).min(PARTITION_PERSIST_POLL_MAX);
     }
