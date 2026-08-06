@@ -71,7 +71,7 @@ use crate::{
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_caching_mode_filter_propagation() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
-        "integration=debug,runtime=debug,data_components=trace,runtime::accelerated_table::cache=trace",
+        "integration=debug,runtime=debug,data_components=trace,runtime::accelerated::cache=trace",
     ));
 
     test_request_context()
@@ -203,7 +203,7 @@ async fn test_caching_mode_filter_propagation() -> Result<(), anyhow::Error> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_caching_mode_multi_filter_limitation() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
-        "integration=debug,runtime=debug,data_components=trace,runtime::accelerated_table::cache=trace",
+        "integration=debug,runtime=debug,data_components=trace,runtime::accelerated::cache=trace",
     ));
 
     test_request_context()
@@ -416,7 +416,7 @@ async fn test_caching_mode_multi_filter_limitation() -> Result<(), anyhow::Error
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_caching_mode_multi_filter_ideal() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
-        "integration=info,runtime=info,data_components=info,runtime::accelerated_table::caching=info",
+        "integration=info,runtime=info,data_components=info,runtime::accelerated::caching=info",
     ));
     register_test_connectors().await;
 
@@ -634,7 +634,7 @@ async fn test_caching_mode_multi_filter_ideal() -> Result<(), anyhow::Error> {
 #[cfg(feature = "sqlite")]
 async fn test_caching_mode_multi_filter_cayenne() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
-        "integration=info,runtime=info,data_components=info,runtime::accelerated_table::caching=info",
+        "integration=info,runtime=info,data_components=info,runtime::accelerated::caching=info",
     ));
     register_test_connectors().await;
 
@@ -1358,7 +1358,7 @@ async fn test_caching_mode_empty_results() -> Result<(), anyhow::Error> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_caching_mode_background_refresh_on_miss() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
-        "integration=debug,runtime=debug,data_components=trace,runtime::accelerated_table::caching=debug",
+        "integration=debug,runtime=debug,data_components=trace,runtime::accelerated::caching=debug",
     ));
 
     test_request_context()
@@ -1509,7 +1509,7 @@ async fn test_caching_mode_background_refresh_on_miss() -> Result<(), anyhow::Er
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_caching_mode_background_refresh_on_stale() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
-        "integration=debug,runtime=debug,data_components=debug,runtime::accelerated_table::caching=debug,datafusion_table_providers=debug",
+        "integration=debug,runtime=debug,data_components=debug,runtime::accelerated::caching=debug,datafusion_table_providers=debug",
     ));
 
     test_request_context()
@@ -1700,7 +1700,7 @@ async fn test_caching_mode_background_refresh_on_stale() -> Result<(), anyhow::E
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_caching_mode_interval_refresh_with_retention() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
-        "integration=debug,runtime=debug,data_components=debug,runtime::accelerated_table=debug",
+        "integration=debug,runtime=debug,data_components=debug,runtime_table::accelerated=debug",
     ));
 
     test_request_context()
@@ -1859,7 +1859,7 @@ async fn test_caching_mode_interval_refresh_with_retention() -> Result<(), anyho
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_localpod_caching_synchronization() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
-        "integration=debug,runtime=debug,data_components=trace,runtime::accelerated_table=trace",
+        "integration=debug,runtime=debug,data_components=trace,runtime_table::accelerated=trace",
     ));
 
     test_request_context()
@@ -2006,7 +2006,7 @@ async fn test_localpod_caching_synchronization() -> Result<(), anyhow::Error> {
 async fn test_localpod_caching_initialization_from_existing_parent_data()
 -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
-        "integration=debug,runtime=debug,data_components=trace,runtime::accelerated_table=trace",
+        "integration=debug,runtime=debug,data_components=trace,runtime_table::accelerated=trace",
     ));
 
     test_request_context()
@@ -2353,7 +2353,7 @@ async fn test_caching_mode_query_specific_columns() -> Result<(), anyhow::Error>
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_caching_mode_query_param_order() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
-        "integration=debug,runtime=debug,data_components=trace,runtime::accelerated_table::cache=trace",
+        "integration=debug,runtime=debug,data_components=trace,runtime::accelerated::cache=trace",
     ));
 
     test_request_context()
@@ -2446,7 +2446,7 @@ async fn test_caching_mode_query_param_order() -> Result<(), anyhow::Error> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_caching_mode_http_404_responses_cached() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
-        "integration=debug,runtime=debug,data_components=trace,runtime::accelerated_table::caching=debug",
+        "integration=debug,runtime=debug,data_components=trace,runtime::accelerated::caching=debug",
     ));
 
     test_request_context()

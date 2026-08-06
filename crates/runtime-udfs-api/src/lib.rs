@@ -43,9 +43,10 @@ use datafusion::prelude::SessionContext;
 use datafusion_table_providers::util::supported_functions::{FunctionRestriction, FunctionSupport};
 use linkme::distributed_slice;
 
-/// Re-exported so [`register_spice_function!`] can name it as `$crate::linkme`.
-/// Without this, every crate invoking the macro would need its own `linkme`
-/// dependency just to satisfy the expansion.
+/// Re-exported so a crate invoking [`register_spice_function!`] can bring
+/// `linkme` into scope with `use runtime_udfs_api::linkme;` instead of taking its
+/// own dependency. `$crate` does not resolve inside an attribute-macro path, so
+/// the expansion has to name `linkme` unqualified.
 pub use linkme;
 use parking_lot::RwLock;
 
@@ -93,7 +94,7 @@ pub static SPICE_FUNCTION_REGISTRATIONS: [SpiceFunctionRegistration] = [..];
 #[macro_export]
 macro_rules! register_spice_function {
     ($static_name:ident, $name:expr) => {
-        #[$crate::linkme::distributed_slice($crate::SPICE_FUNCTION_REGISTRATIONS)]
+        #[linkme::distributed_slice($crate::SPICE_FUNCTION_REGISTRATIONS)]
         pub static $static_name: $crate::SpiceFunctionRegistration =
             $crate::SpiceFunctionRegistration::new(|| $name);
     };
@@ -276,5 +277,33 @@ impl<'a> FunctionSupportBuilder<'a> {
 /// every `DataFusion` built-in — the conservative default.
 #[must_use]
 pub fn function_support() -> FunctionSupport {
+    FunctionSupportBuilder::new().build()
+}
+
+/// The functions no remote source may be asked to evaluate: every Spice
+/// function plus every user-registered one. Safe to call from per-query filter
+/// pushdown paths.
+#[must_use]
+pub fn deny_spice_specific_functions() -> std::sync::Arc<FunctionSupport> {
+    std::sync::Arc::new(FunctionSupportBuilder::new().build())
+}
+
+/// As [`deny_spice_specific_functions`], but allowing the functions the target
+/// backend evaluates itself.
+///
+/// `native` is normally that backend's unparser dialect's native-function names,
+/// which is how the deny-list becomes backend-aware: a Spice function the
+/// dialect rewrites into a real remote function pushes down instead of being
+/// denied. User-registered functions are never carved out — no remote source has
+/// an equivalent.
+#[must_use]
+pub fn deny_spice_specific_functions_excluding(native: &[&str]) -> std::sync::Arc<FunctionSupport> {
+    std::sync::Arc::new(FunctionSupportBuilder::new().native(native).build())
+}
+
+/// Full deny-list as a value, for any SQL connector whose unparser dialect has
+/// no Spice-function carve-out. See issue #10703.
+#[must_use]
+pub fn deny_spice_functions_for_table_providers() -> FunctionSupport {
     FunctionSupportBuilder::new().build()
 }

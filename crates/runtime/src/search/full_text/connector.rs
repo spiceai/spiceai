@@ -23,14 +23,14 @@ use search::index::compound::CompoundSearchIndex;
 use std::any::Any;
 use std::sync::Arc;
 
-use crate::accelerated_table::{self, AcceleratedTable};
+use crate::accelerated::{self, AcceleratedTable};
 use crate::changes::{Indexes, index_change_envelope};
 use crate::component::{
     ComponentInitialization,
     dataset::{Dataset, acceleration::RefreshMode},
 };
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
-use crate::federated_table::FederatedTable;
+use crate::federated::FederatedTable;
 use crate::search::full_text::table::add_full_text_search_to_table;
 use crate::search::util::find_concrete_table_provider;
 use futures::StreamExt;
@@ -176,7 +176,7 @@ impl DataConnector for FullTextConnector {
     async fn on_accelerator_setup(
         &self,
         dataset: &Dataset,
-        builder: &mut accelerated_table::Builder,
+        builder: &mut accelerated::Builder,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner_connector
             .on_accelerator_setup(dataset, builder)

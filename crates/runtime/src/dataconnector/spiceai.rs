@@ -50,7 +50,7 @@ use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     ParameterSpec,
 };
-use crate::{component::dataset::Dataset, federated_table::FederatedTable};
+use crate::{component::dataset::Dataset, federated::FederatedTable};
 use data_components::cdc::{
     self, ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange, CommitError,
 };
