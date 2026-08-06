@@ -365,6 +365,19 @@ If you see `signoff=pending` with "Remote sign-off was cancelled", nothing is
 wrong with the branch: dispatch sign-off again. `scripts/test_signoff_cancelled_correction.sh`
 covers both directions.
 
+The correction runs through `.trusted-ci/signoff`, so it can only work if that copy
+understands the subcommand the workflow calls. Both trusted helpers are therefore read
+out of the object database at the workflow file's own commit (`github.sha`) rather than
+copied from the checked-out tree — the tree is the *branch under test*, which for a
+branch older than the helper is a script the workflow's own call sites have outrun. That
+is what left cancelled runs on older branches with a `signoff=failure` they could not
+withdraw (#12657). One consequence worth knowing: a branch that changes `scripts/signoff`
+or `.github/actions/**` is still signed off with the dispatch ref's version of them. To
+exercise a branch's own helper changes, dispatch on that branch —
+`gh workflow run signoff.yml --ref <branch> -f branch=<branch>` — which puts the workflow
+and the helpers on the same commit again. `scripts/test_signoff_trusted_helpers.sh` covers
+the extraction.
+
 ### Jujutsu workspaces
 
 `make signoff` also works in non-colocated JJ workspaces (where there is a
