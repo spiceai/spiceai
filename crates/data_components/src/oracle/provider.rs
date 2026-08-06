@@ -241,7 +241,7 @@ impl OracleSchemaProvider {
         let mut tables = HashMap::new();
         for table_name in table_names {
             let schema_with_table = format!("{}.{}", self.schema_name, table_name);
-            if !self.selector.selects_table(&self.schema_name, &table_name) {
+            if !self.selector.selects(&schema_with_table) {
                 tracing::debug!(
                     "Table {schema_with_table} is not selected by the catalog's include/exclude patterns, skipping"
                 );
