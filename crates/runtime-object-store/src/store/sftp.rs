@@ -18,7 +18,7 @@ use std::{
     io::{Read, Seek, SeekFrom},
     net::{SocketAddr, TcpStream, ToSocketAddrs},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -38,6 +38,15 @@ use super::common::{
 };
 
 const STORE_NAME: &str = "SFTP";
+
+/// Wall-clock bound for one connection attempt — TCP connect, SSH handshake and password
+/// authentication together — when `client_timeout` is not configured.
+///
+/// `connect` runs inside `tokio::task::spawn_blocking`, and the blocking pool is shared
+/// process-wide, so an attempt that never returns costs a thread every other blocking
+/// caller could have used. Matches the FTP store's default so the two connectors give up
+/// in the same window.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Clone)]
 struct SFTPClientConfig {
@@ -78,17 +87,16 @@ impl SFTPClientConfig {
     }
 
     fn connect(&self) -> object_store::Result<Session> {
-        let stream = match self.timeout {
-            Some(timeout) => {
-                let addr = resolve_addr(&self.host, &self.port)?;
-                TcpStream::connect_timeout(&addr, timeout).map_err(handle_error)?
-            }
-            None => {
-                TcpStream::connect(format!("{}:{}", self.host, self.port)).map_err(handle_error)?
-            }
-        };
+        let bound = self.timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT);
+        let stream = connect_within(&self.host, &self.port, bound)?;
+
         let mut session = Session::new().map_err(handle_error)?;
         session.set_tcp_stream(stream);
+        // `handshake` and `userauth_password` are blocking reads on the session, and a
+        // session inherits no deadline from the stream it was given. Without this, a peer
+        // that completes the TCP handshake and then sends no SSH version string is waited
+        // on for as long as it keeps the socket open.
+        session.set_timeout(session_timeout_ms(bound));
         session.handshake().map_err(handle_error)?;
         session
             .userauth_password(&self.user, &self.password)
@@ -217,13 +225,59 @@ fn handle_error<T: Into<Box<dyn std::error::Error + Sync + Send>>>(
 /// Parsing the text as a [`SocketAddr`] instead accepts only a literal IP, so it
 /// rejected every named host — which made configuring `client_timeout` fail the
 /// connection outright rather than bound it.
-fn resolve_addr(host: &str, port: &str) -> object_store::Result<SocketAddr> {
+fn resolve_addrs(host: &str, port: &str) -> object_store::Result<Vec<SocketAddr>> {
     let addr = format!("{host}:{port}");
+    let candidates: Vec<SocketAddr> = addr.to_socket_addrs().map_err(handle_error)?.collect();
 
-    addr.to_socket_addrs()
-        .map_err(handle_error)?
-        .next()
-        .ok_or_else(|| handle_error(format!("{addr} resolved to no addresses")))
+    if candidates.is_empty() {
+        return Err(handle_error(format!("{addr} resolved to no addresses")));
+    }
+
+    Ok(candidates)
+}
+
+/// Open a TCP connection to `host:port` within `bound`.
+///
+/// A name can resolve to several addresses — commonly an IPv6 and an IPv4 form of the
+/// same host — and only some of them may be listening, so each is tried in turn. They
+/// share one budget rather than getting `bound` each, which is what keeps the whole
+/// attempt inside the wall-clock the caller asked for.
+fn connect_within(host: &str, port: &str, bound: Duration) -> object_store::Result<TcpStream> {
+    let started = Instant::now();
+    let candidates = resolve_addrs(host, port)?;
+    let mut last_error = None;
+
+    for candidate in candidates {
+        let Some(remaining) = bound
+            .checked_sub(started.elapsed())
+            .filter(|remaining| !remaining.is_zero())
+        else {
+            break;
+        };
+
+        match TcpStream::connect_timeout(&candidate, remaining) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    match last_error {
+        Some(error) => Err(handle_error(format!(
+            "connecting to {host}:{port} failed: {error}"
+        ))),
+        None => Err(handle_error(format!(
+            "connecting to {host}:{port} timed out after {bound:?}"
+        ))),
+    }
+}
+
+/// Express `bound` as the millisecond count [`Session::set_timeout`] takes.
+///
+/// ssh2 reads `0` as "wait forever", so a sub-millisecond bound is raised to 1ms rather
+/// than being passed through as the one value that means unbounded, and a bound past
+/// `u32::MAX` milliseconds saturates instead of wrapping.
+fn session_timeout_ms(bound: Duration) -> u32 {
+    u32::try_from(bound.as_millis()).unwrap_or(u32::MAX).max(1)
 }
 
 #[async_trait]
@@ -393,22 +447,93 @@ impl ObjectStore for SFTPObjectStore {
 mod tests {
     use super::*;
     use chrono::Utc;
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
 
     #[test]
-    fn resolve_addr_accepts_a_named_host() {
+    fn resolve_addrs_accepts_a_named_host() {
         // A named host is the ordinary case, and the address form this feeds
         // `connect_timeout` cannot be reached by parsing the text as a `SocketAddr`.
-        let addr = resolve_addr("localhost", "22").expect("localhost should resolve");
+        let addrs = resolve_addrs("localhost", "22").expect("localhost should resolve");
 
-        assert_eq!(addr.port(), 22);
-        assert!(addr.ip().is_loopback(), "got {addr}");
+        assert!(!addrs.is_empty());
+        for addr in addrs {
+            assert_eq!(addr.port(), 22);
+            assert!(addr.ip().is_loopback(), "got {addr}");
+        }
     }
 
     #[test]
-    fn resolve_addr_accepts_a_literal_ip() {
-        let addr = resolve_addr("127.0.0.1", "2222").expect("a literal IP should resolve");
+    fn resolve_addrs_accepts_a_literal_ip() {
+        let addrs = resolve_addrs("127.0.0.1", "2222").expect("a literal IP should resolve");
 
-        assert_eq!(addr.to_string(), "127.0.0.1:2222");
+        assert_eq!(
+            addrs.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec!["127.0.0.1:2222".to_string()]
+        );
+    }
+
+    #[test]
+    fn session_timeout_is_never_handed_to_ssh2_as_unbounded() {
+        // ssh2 reads 0 as "wait forever", so rounding a short bound down to it would turn
+        // the tightest request into the absence of a deadline.
+        assert_eq!(session_timeout_ms(Duration::ZERO), 1);
+        assert_eq!(session_timeout_ms(Duration::from_micros(500)), 1);
+        assert_eq!(session_timeout_ms(Duration::from_secs(20)), 20_000);
+        assert_eq!(
+            session_timeout_ms(Duration::from_secs(u64::from(u32::MAX))),
+            u32::MAX
+        );
+    }
+
+    #[test]
+    fn connect_within_reaches_a_listener_through_its_name() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener should bind");
+        let port = listener
+            .local_addr()
+            .expect("the listener should report its address")
+            .port();
+
+        connect_within("localhost", &port.to_string(), Duration::from_secs(5))
+            .expect("a named host that resolves to the listening address should connect");
+    }
+
+    #[test]
+    fn connect_reports_a_peer_that_never_sends_an_ssh_banner() {
+        // Bound but never accepted: the kernel completes the TCP handshake from the
+        // backlog while nothing ever writes an SSH version string, which is the shape
+        // that used to hold a blocking-pool thread for as long as the peer allowed.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("the listener should report its address");
+
+        let config = SFTPClientConfig::new(
+            "user".to_string(),
+            "password".to_string(),
+            addr.ip().to_string(),
+            addr.port().to_string(),
+            Some(Duration::from_millis(500)),
+        );
+
+        // The attempt is blocking, so it is run off-thread: a missing deadline has to
+        // surface as a failed assertion here rather than as a test that never returns.
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(config.connect().err().map(|error| error.to_string()));
+        });
+
+        let outcome = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the handshake must observe a deadline rather than wait on a silent peer");
+
+        assert!(
+            outcome.is_some(),
+            "a peer that sends no SSH banner must not yield a session"
+        );
+
+        drop(listener);
     }
 
     #[test]
