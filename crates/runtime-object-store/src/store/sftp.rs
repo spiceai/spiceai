@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{
     io::{Read, Seek, SeekFrom},
-    net::TcpStream,
+    net::{SocketAddr, TcpStream, ToSocketAddrs},
     sync::Arc,
     time::Duration,
 };
@@ -79,16 +79,10 @@ impl SFTPClientConfig {
 
     fn connect(&self) -> object_store::Result<Session> {
         let stream = match self.timeout {
-            Some(timeout) => TcpStream::connect_timeout(
-                &format!("{}:{}", self.host, self.port).parse().map_err(
-                    |e: std::net::AddrParseError| object_store::Error::Generic {
-                        store: "SFTP",
-                        source: e.into(),
-                    },
-                )?,
-                timeout,
-            )
-            .map_err(handle_error)?,
+            Some(timeout) => {
+                let addr = resolve_addr(&self.host, &self.port)?;
+                TcpStream::connect_timeout(&addr, timeout).map_err(handle_error)?
+            }
             None => {
                 TcpStream::connect(format!("{}:{}", self.host, self.port)).map_err(handle_error)?
             }
@@ -215,6 +209,21 @@ fn handle_error<T: Into<Box<dyn std::error::Error + Sync + Send>>>(
     error: T,
 ) -> object_store::Error {
     generic_error(STORE_NAME, error)
+}
+
+/// Resolve `host:port` for [`TcpStream::connect_timeout`], which unlike
+/// [`TcpStream::connect`] takes an already-resolved address.
+///
+/// Parsing the text as a [`SocketAddr`] instead accepts only a literal IP, so it
+/// rejected every named host — which made configuring `client_timeout` fail the
+/// connection outright rather than bound it.
+fn resolve_addr(host: &str, port: &str) -> object_store::Result<SocketAddr> {
+    let addr = format!("{host}:{port}");
+
+    addr.to_socket_addrs()
+        .map_err(handle_error)?
+        .next()
+        .ok_or_else(|| handle_error(format!("{addr} resolved to no addresses")))
 }
 
 #[async_trait]
@@ -384,6 +393,23 @@ impl ObjectStore for SFTPObjectStore {
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    #[test]
+    fn resolve_addr_accepts_a_named_host() {
+        // A named host is the ordinary case, and the address form this feeds
+        // `connect_timeout` cannot be reached by parsing the text as a `SocketAddr`.
+        let addr = resolve_addr("localhost", "22").expect("localhost should resolve");
+
+        assert_eq!(addr.port(), 22);
+        assert!(addr.ip().is_loopback(), "got {addr}");
+    }
+
+    #[test]
+    fn resolve_addr_accepts_a_literal_ip() {
+        let addr = resolve_addr("127.0.0.1", "2222").expect("a literal IP should resolve");
+
+        assert_eq!(addr.to_string(), "127.0.0.1:2222");
+    }
 
     #[test]
     fn test_sftp_object_store_display() {
