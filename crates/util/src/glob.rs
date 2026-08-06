@@ -67,6 +67,12 @@ pub fn glob_literal_prefix(pattern: &str) -> &str {
 /// constrains the table name, which some table can satisfy). Because
 /// `D + table` must start with `L`, one of those two always holds whenever a
 /// match is possible — comparing lengths shows which.
+///
+/// This assumes the patterns are compiled case-sensitively, as `Glob::new` does
+/// by default. A case-insensitive `GlobSet` could match a candidate that differs
+/// from its own literal prefix in case, so this comparison would have to become
+/// case-insensitive alongside it.
+#[must_use]
 pub fn schema_may_contain_selected_table<S: AsRef<str>>(
     schema: &str,
     include_patterns: &[S],
