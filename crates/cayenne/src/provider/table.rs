@@ -28096,11 +28096,12 @@ impl CayenneTableProvider {
         self.background_compactor.set(compactor).is_ok()
     }
 
-    /// Whether a background compaction task is running for this provider.
+    /// Whether an interval background compactor was spawned for this provider.
     ///
-    /// Post-write compaction is scheduled independently of this task, so a
-    /// provider without one still compacts as it is written to — this reports
-    /// only whether the *interval* compactor was spawned.
+    /// Reports only that the task was spawned, not that it is still running: a
+    /// spawned compactor exits on its own once the shared compaction semaphore
+    /// is closed. Post-write compaction is scheduled independently of it, so a
+    /// provider without one still compacts as it is written to.
     #[must_use]
     pub fn has_background_compactor(&self) -> bool {
         self.background_compactor.get().is_some()
