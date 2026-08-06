@@ -39,6 +39,7 @@ use snafu::prelude::*;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, RwLock};
+use util::glob::schema_may_contain_selected_table;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -310,17 +311,17 @@ impl SchemaProvider for GlueSchemaProvider {
     }
 }
 
+/// Whether a Glue database is worth interrogating for tables, decided from the
+/// raw `include` patterns before any `GetTables` call.
+///
+/// This must be a *necessary* condition for a table of `database` to be
+/// selected: answering `false` skips the database entirely, so a wrong `false`
+/// silently drops tables the compiled `GlobSet` would have matched. The shared
+/// literal-prefix analysis in [`util::glob`] provides that guarantee for every
+/// glob shape; each table is still filtered by [`is_included`] against the
+/// compiled set.
 fn database_might_match(database: &str, patterns: &[String]) -> bool {
-    if patterns.is_empty() {
-        return true;
-    }
-
-    patterns.iter().any(|pattern| {
-        pattern == database
-            || pattern.starts_with(&format!("{database}."))
-            || pattern.starts_with("*.")
-            || pattern == "*.*"
-    })
+    schema_may_contain_selected_table(database, patterns)
 }
 
 fn is_included(include: Option<&globset::GlobSet>, database: &str, table: &str) -> bool {
@@ -402,5 +403,81 @@ mod tests {
         builder.add(Glob::new("*.table1").expect("builder add"));
         let globset = builder.build().expect("builder build");
         assert!(is_included(Some(&globset), "mydb", "table1"));
+    }
+
+    /// Pattern shapes that `database_might_match` used to reject outright, each
+    /// naming a database whose tables `is_included` accepts. Regression test for
+    /// #12630.
+    #[test]
+    fn database_might_match_keeps_partial_wildcard_and_class_shapes() {
+        for (pattern, database) in [
+            ("sales_*.orders", "sales_east"),
+            ("sales_*.*", "sales_east"),
+            ("*", "public"),
+            ("{public,sales}.*", "public"),
+            ("[ps]ublic.*", "public"),
+            ("?ublic.orders", "public"),
+        ] {
+            let patterns = vec![pattern.to_string()];
+            assert!(
+                database_might_match(database, &patterns),
+                "pattern {pattern} must not skip database {database}"
+            );
+        }
+    }
+
+    /// A database no pattern can name is still skipped -- the fix must not turn
+    /// the pre-filter into an unconditional `true`.
+    #[test]
+    fn database_might_match_still_skips_an_unreachable_database() {
+        let patterns = vec![
+            "public.*".to_string(),
+            "sales_*.orders".to_string(),
+            "otherdb".to_string(),
+        ];
+        assert!(!database_might_match("warehouse", &patterns));
+    }
+
+    /// The invariant that ties the two filters together: the raw patterns decide
+    /// which databases are interrogated (`orig_include`) and the compiled set
+    /// decides which tables survive (`include`). Both come from the same
+    /// configured list, so a table `is_included` accepts must live in a database
+    /// `database_might_match` kept -- otherwise it is silently absent from the
+    /// catalog.
+    #[test]
+    fn a_database_holding_an_included_table_is_never_skipped() {
+        let patterns = [
+            "public.orders",
+            "public.*",
+            "*.orders",
+            "*",
+            "*.*",
+            "sales_*.orders",
+            "sales_*.*",
+            "{public,sales}.*",
+            "[ps]ublic.*",
+            "?ublic.orders",
+            "public.ord*",
+            "otherdb.*",
+        ];
+        let databases = ["public", "sales", "sales_east", "salesx", "otherdb", "p"];
+        let tables = ["orders", "line_item", "o"];
+
+        for pattern in patterns {
+            let mut builder = GlobSetBuilder::new();
+            builder.add(Glob::new(pattern).expect("builder add"));
+            let globset = builder.build().expect("builder build");
+            let orig_include = vec![pattern.to_string()];
+
+            for database in databases {
+                let kept = database_might_match(database, &orig_include);
+                for table in tables {
+                    assert!(
+                        !(is_included(Some(&globset), database, table) && !kept),
+                        "pattern {pattern} includes table {database}.{table} but skipped database {database}"
+                    );
+                }
+            }
+        }
     }
 }
