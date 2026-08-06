@@ -421,7 +421,7 @@ async fn huggingface(
 ) -> Result<Arc<dyn Embed>, EmbedError> {
     let hf_token = params.hf_token.as_ref().map(ExposeSecret::expose_secret);
     let pooling = params.pooling.map(embedding_params::Pooling::as_str);
-    let truncate = params.truncate.unwrap_or_default().truncates();
+    let truncation = params.truncate.unwrap_or_default();
     if let Some(id) = model_id {
         // `get_model_id` joins a pinned revision onto the repo id as `org/model:revision`, so
         // the two halves have to be recovered before the repo id reaches the Hub. Passing the
@@ -436,7 +436,8 @@ async fn huggingface(
                 hf_token,
                 pooling,
                 params.max_seq_length,
-                truncate,
+                truncation.truncates(),
+                truncation.direction(),
             )
             .await?
             .set_cache(embeddings_cache)
@@ -579,7 +580,7 @@ async fn file(
     let pooling = params
         .pooling
         .map(|p| embedding_params::Pooling::as_str(p).to_string());
-    let truncate = params.truncate.unwrap_or_default().truncates();
+    let truncation = params.truncate.unwrap_or_default();
     Ok(Arc::new(
         TeiEmbed::from_local(
             Path::new(&weights_path),
@@ -587,7 +588,8 @@ async fn file(
             Path::new(&tokenizer_path),
             pooling,
             params.max_seq_length,
-            truncate,
+            truncation.truncates(),
+            truncation.direction(),
         )
         .await?
         .set_cache(embeddings_cache)

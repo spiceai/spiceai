@@ -29,8 +29,8 @@ pub struct FileEmbeddingParams {
     #[param(runtime)]
     pub max_seq_length: Option<usize>,
     /// How to handle an input longer than the model's maximum sequence length:
-    /// `error` (default) to reject it, or `truncate` to embed a right-truncated
-    /// copy.
+    /// `NONE` (default) to reject it, `END` to discard the end of the input,
+    /// or `START` to discard the start of the input.
     #[param(runtime)]
     pub truncate: Option<Truncation>,
 }

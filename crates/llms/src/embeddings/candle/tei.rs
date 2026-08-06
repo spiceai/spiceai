@@ -53,8 +53,9 @@ pub struct TeiEmbed {
     pub tok: Arc<Tokenizer>, // Used for `chunker` method.
 
     // When true, inputs longer than the model's maximum sequence length are
-    // right-truncated instead of failing the embedding call.
+    // truncated (in `truncation_direction`) instead of failing the embedding call.
     truncate: bool,
+    truncation_direction: TruncationDirection,
 
     // Shared embeddings cache
     cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
@@ -71,6 +72,7 @@ impl TeiEmbed {
         pooling_overwrite: Option<String>,
         max_seq_length_overwrite: Option<usize>,
         truncate: bool,
+        truncation_direction: TruncationDirection,
     ) -> Result<Self> {
         let model_filename = model_path
             .file_name()
@@ -111,7 +113,14 @@ impl TeiEmbed {
             Self::DEFAULT_POOLING_OPERATOR
         };
 
-        Self::from_dir(&model_root, Some(pool), max_seq_length_overwrite, truncate).await
+        Self::from_dir(
+            &model_root,
+            Some(pool),
+            max_seq_length_overwrite,
+            truncate,
+            truncation_direction,
+        )
+        .await
     }
 
     pub async fn from_hf(
@@ -121,6 +130,7 @@ impl TeiEmbed {
         pooling_overwrite: Option<&str>,
         max_seq_length_overwrite: Option<usize>,
         truncate: bool,
+        truncation_direction: TruncationDirection,
     ) -> Result<Self> {
         // Only error if user-provided value is incorrect.
         let pool = pooling_overwrite
@@ -136,7 +146,14 @@ impl TeiEmbed {
             .transpose()?
             .flatten();
         let model_root = download_hf_artifacts(model_id, revision, hf_token).await?;
-        Self::from_dir(&model_root, pool, max_seq_length_overwrite, truncate).await
+        Self::from_dir(
+            &model_root,
+            pool,
+            max_seq_length_overwrite,
+            truncate,
+            truncation_direction,
+        )
+        .await
     }
 
     /// Instantiates a text-embedding-inference service with model, tokenizer, config, etc files in a single directory.
@@ -145,6 +162,7 @@ impl TeiEmbed {
         pooling_overwrite: Option<Pool>,
         max_seq_length_overwrite: Option<usize>,
         truncate: bool,
+        truncation_direction: TruncationDirection,
     ) -> Result<Self> {
         let tokenizer = load_tokenizer(root)?;
         let config = load_config(root)?;
@@ -215,6 +233,7 @@ impl TeiEmbed {
             model_size: config.hidden_size,
             tok: Arc::new(tokenizer),
             truncate,
+            truncation_direction,
             cache: None,
             cache_model_id: None,
         })
@@ -243,6 +262,7 @@ impl TeiEmbed {
         tracing::trace!("Embedding {batch_size} batches");
 
         let truncate = self.truncate;
+        let truncation_direction = self.truncation_direction;
         let mut futures = Vec::with_capacity(batch_size);
         for input in inputs {
             let local_infer = self.infer.clone();
@@ -253,7 +273,7 @@ impl TeiEmbed {
                         input,
                         // When false, an over-long input errors instead of being truncated.
                         truncate,
-                        TruncationDirection::Right,
+                        truncation_direction,
                         None,
                         true,
                         None,
