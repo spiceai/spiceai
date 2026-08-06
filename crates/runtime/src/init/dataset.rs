@@ -1388,7 +1388,7 @@ impl Runtime {
                 "Drasi change forwarding (Alpha) is in preview and should not be used in production."
             );
 
-            let delivery = crate::drasi::sink_for_dataset(&ds, &drasi).map_err(|e| {
+            let delivery = crate::drasi::sink_for_dataset(&ds, &drasi).await.map_err(|e| {
                 crate::Error::UnableToInitializeDataConnector {
                     source: Box::new(e),
                 }

@@ -21,6 +21,7 @@ limitations under the License.
 //! applies is also published to Drasi.
 
 pub mod connector;
+pub(crate) mod dead_letter;
 pub(crate) mod internal;
 pub(crate) mod queue;
 
@@ -36,6 +37,7 @@ use runtime_drasi::{
     TransportConfig,
 };
 
+use crate::drasi::dead_letter::{DEFAULT_MAX_BATCHES, DeadLetterStore, store_path};
 use crate::drasi::queue::{DEFAULT_QUEUE_DEPTH, DeliveryQueue, QueuedBatch};
 use spicepod::drasi::{Drasi as DrasiSpec, DrasiTransport as DrasiTransportSpec};
 
@@ -51,7 +53,7 @@ const STREAM_KEY_PARAM: &str = "drasi_stream_key";
 /// # Errors
 ///
 /// Returns an error if a required transport parameter is missing or unusable.
-pub(crate) fn sink_for_dataset(
+pub(crate) async fn sink_for_dataset(
     dataset: &Dataset,
     spec: &DrasiSpec,
 ) -> runtime_drasi::Result<DeliveryMode> {
@@ -67,10 +69,39 @@ pub(crate) fn sink_for_dataset(
 
     Ok(match spec.delivery {
         spicepod::drasi::DrasiDelivery::Acknowledged => DeliveryMode::Acknowledged(sink),
-        spicepod::drasi::DrasiDelivery::Queued => DeliveryMode::Queued(Arc::new(
-            DeliveryQueue::spawn(sink, name, DEFAULT_QUEUE_DEPTH),
-        )),
+        spicepod::drasi::DrasiDelivery::Queued => {
+            let store = open_dead_letter_store(&name).await;
+            DeliveryMode::Queued(Arc::new(DeliveryQueue::spawn(
+                sink,
+                name,
+                DEFAULT_QUEUE_DEPTH,
+                store,
+            )))
+        }
     })
+}
+
+/// Opens the durable store that retains what Drasi will not accept.
+///
+/// A store that cannot be opened is reported and skipped rather than failing the
+/// component: forwarding without durable retry is a degraded mode, but refusing
+/// to start the dataset over it would be worse.
+pub(crate) async fn open_dead_letter_store(component: &str) -> Option<Arc<DeadLetterStore>> {
+    match DeadLetterStore::open(
+        store_path(component),
+        component.to_string(),
+        DEFAULT_MAX_BATCHES,
+    )
+    .await
+    {
+        Ok(store) => Some(Arc::new(store)),
+        Err(e) => {
+            tracing::warn!(
+                "Drasi changes for {component} will not be retained for redelivery: {e}"
+            );
+            None
+        }
+    }
 }
 
 /// How a dataset's changes reach Drasi relative to its replication position.

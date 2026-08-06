@@ -342,9 +342,11 @@ datasets:
 | `delivery` | Replication | On failure |
 | ---------- | ----------- | ---------- |
 | `acknowledged` (default) | Advances only once Drasi has the change, so nothing is lost — a stall or crash replays it. A slow or unreachable Drasi slows or stops replication. | `on_delivery_error`: `block` (default) retries indefinitely; `skip` gives up after a bounded budget and continues; `fail` stops the stream. |
-| `queued` | Never waits for Drasi — the change is queued locally and the replication position acknowledged immediately, with delivery retried in the background. | Batches are retried, then dead-lettered: counted and logged. The queue is in-memory, so anything undelivered when the runtime stops is gone. |
+| `queued` | Never waits for Drasi — the change is queued locally and the replication position acknowledged immediately, with delivery retried in the background. | Written to a durable dead-letter store under `.spice/data/drasi` and retried until it lands, surviving a restart. |
 
 Use `queued` when Drasi is a downstream consumer whose availability should not pace replication; keep `acknowledged` when no change may be missed.
+
+Under `queued`, the replication log is no longer what replays a failure — the dead-letter store is. Because an insert or update is a full-state replace keyed by element id, redelivery must not be overtaken by newer changes for the same row, so the store is stop-the-line: once anything is pending, later changes queue behind it and delivery resumes only once it drains. Drasi's view of a dataset advances in order or not at all. The store is capped (1024 batches per component); past that the oldest is discarded and counted, since the newest state for a row is the state worth keeping.
 
 `forwarding: disabled` keeps a whole block in place without publishing anything, so it can be switched off and back on without reconstructing the endpoint, labels and keys.
 

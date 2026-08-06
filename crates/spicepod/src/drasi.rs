@@ -126,11 +126,18 @@ pub enum DrasiDelivery {
     /// A change is queued locally and its replication position acknowledged
     /// immediately; delivery is retried in the background.
     ///
-    /// Replication never waits for Drasi. The cost is that the queue is
-    /// in-memory: batches still undelivered when the runtime stops, and batches
-    /// dropped once the queue fills or retries are exhausted, are gone —
-    /// counted and logged, but not replayable. `on_delivery_error` does not
-    /// apply, since there is no replication position left to hold.
+    /// Replication never waits for Drasi. A change Drasi will not accept is
+    /// written to a durable dead-letter store under `.spice/data/drasi` and
+    /// retried until it lands, surviving a restart — so the replication log is
+    /// no longer what replays a failure, this is.
+    ///
+    /// Because an insert or update is a full-state replace keyed by element id,
+    /// redelivery must not be overtaken: once anything is pending, later changes
+    /// for that component queue behind it and delivery resumes only once the
+    /// store drains. Drasi's view therefore advances in order or not at all.
+    ///
+    /// `on_delivery_error` does not apply, since there is no replication
+    /// position left to hold.
     Queued,
 }
 

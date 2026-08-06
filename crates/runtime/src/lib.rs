@@ -1676,7 +1676,7 @@ impl Runtime {
             return;
         }
 
-        match crate::drasi::internal::InternalForwarders::try_new(spec) {
+        match crate::drasi::internal::InternalForwarders::try_new(spec).await {
             Ok(forwarders) => {
                 tracing::warn!(
                     "Drasi change forwarding (Alpha) is in preview and should not be used in production."

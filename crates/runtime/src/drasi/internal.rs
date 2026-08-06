@@ -67,7 +67,7 @@ impl InternalForwarders {
     /// # Errors
     ///
     /// Returns an error if a transport parameter is missing or unusable.
-    pub(crate) fn try_new(spec: &RuntimeDrasi) -> runtime_drasi::Result<Self> {
+    pub(crate) async fn try_new(spec: &RuntimeDrasi) -> runtime_drasi::Result<Self> {
         let mut by_table = HashMap::with_capacity(spec.tables.len());
 
         for table in &spec.tables {
@@ -85,10 +85,17 @@ impl InternalForwarders {
                 spec.params.as_ref(),
             )?;
 
+            let store = super::open_dead_letter_store(&name).await;
+
             by_table.insert(
                 table_ref,
                 TableForwarder {
-                    queue: DeliveryQueue::spawn(sink, name, DEFAULT_QUEUE_DEPTH),
+                    queue: DeliveryQueue::spawn(
+                        sink,
+                        name,
+                        DEFAULT_QUEUE_DEPTH,
+                        store,
+                    ),
                     configured_key: table.key.clone(),
                 },
             );
@@ -268,7 +275,9 @@ mod tests {
     #[tokio::test]
     async fn only_named_tables_are_forwarded() {
         let forwarders =
-            InternalForwarders::try_new(&spec(vec![table("task_history")])).expect("builds");
+            InternalForwarders::try_new(&spec(vec![table("task_history")]))
+                .await
+                .expect("builds");
 
         assert!(forwarders.by_table.contains_key(&table_ref("task_history")));
         assert!(!forwarders.by_table.contains_key(&table_ref("metrics")));
@@ -277,7 +286,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_configured_table_forwards_nothing() {
-        let forwarders = InternalForwarders::try_new(&spec(vec![])).expect("builds");
+        let forwarders = InternalForwarders::try_new(&spec(vec![])).await.expect("builds");
         assert!(forwarders.by_table.is_empty());
     }
 
@@ -317,7 +326,9 @@ mod tests {
     /// refused with an actionable message instead.
     #[tokio::test]
     async fn keyless_table_without_configured_key_is_refused() {
-        let forwarders = InternalForwarders::try_new(&spec(vec![table("metrics")])).expect("builds");
+        let forwarders = InternalForwarders::try_new(&spec(vec![table("metrics")]))
+            .await
+            .expect("builds");
         let forwarder = forwarders
             .by_table
             .get(&table_ref("metrics"))
@@ -334,7 +345,7 @@ mod tests {
     async fn configured_key_overrides_the_declared_primary_key() {
         let mut metrics = table("metrics");
         metrics.key = vec!["trace_id".to_string()];
-        let forwarders = InternalForwarders::try_new(&spec(vec![metrics])).expect("builds");
+        let forwarders = InternalForwarders::try_new(&spec(vec![metrics])).await.expect("builds");
         let forwarder = forwarders
             .by_table
             .get(&table_ref("metrics"))
@@ -355,7 +366,7 @@ mod tests {
     async fn configured_key_column_must_exist() {
         let mut metrics = table("metrics");
         metrics.key = vec!["nope".to_string()];
-        let forwarders = InternalForwarders::try_new(&spec(vec![metrics])).expect("builds");
+        let forwarders = InternalForwarders::try_new(&spec(vec![metrics])).await.expect("builds");
         let forwarder = forwarders
             .by_table
             .get(&table_ref("metrics"))
@@ -373,6 +384,7 @@ mod tests {
         spec.params = None;
 
         let err = InternalForwarders::try_new(&spec)
+            .await
             .expect_err("the http endpoint is required for the http transport");
         assert!(err.to_string().contains("drasi_http_endpoint"));
     }
@@ -397,7 +409,9 @@ mod tests {
     #[tokio::test]
     async fn an_unconfigured_table_is_ignored() {
         let forwarders =
-            InternalForwarders::try_new(&spec(vec![table("task_history")])).expect("builds");
+            InternalForwarders::try_new(&spec(vec![table("task_history")]))
+                .await
+                .expect("builds");
 
         forwarders.forward(
             &TableReference::bare("orders"),
@@ -413,7 +427,9 @@ mod tests {
     #[tokio::test]
     async fn overwrite_is_dropped_and_counted() {
         let forwarders =
-            InternalForwarders::try_new(&spec(vec![table("task_history")])).expect("builds");
+            InternalForwarders::try_new(&spec(vec![table("task_history")]))
+                .await
+                .expect("builds");
 
         forwarders.forward(
             &table_ref("task_history"),
@@ -435,7 +451,9 @@ mod tests {
     #[tokio::test]
     async fn a_full_queue_drops_rather_than_blocking_the_writer() {
         let forwarders =
-            InternalForwarders::try_new(&spec(vec![table("task_history")])).expect("builds");
+            InternalForwarders::try_new(&spec(vec![table("task_history")]))
+                .await
+                .expect("builds");
         let forwarder = forwarders
             .by_table
             .get(&table_ref("task_history"))

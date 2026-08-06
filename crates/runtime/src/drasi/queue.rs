@@ -22,10 +22,12 @@ limitations under the License.
 //! on a reaction engine; on the runtime-table path it means the OpenTelemetry
 //! export loop parks behind a retry budget.
 //!
-//! A batch that still cannot be delivered after the sink exhausts its retries is
-//! **dead-lettered**: counted, logged sparsely, and dropped. Retention and
-//! replay of dead-lettered batches are not implemented — see
-//! [`DeliveryQueue::dead_lettered`].
+//! A batch the sink will not accept is written to a durable
+//! [dead-letter store](crate::drasi::dead_letter) and retried until it lands.
+//! Because both Drasi wire formats treat an insert or update as a full-state
+//! replace, redelivery must not be overtaken by newer changes for the same row —
+//! so once anything is pending, every subsequent batch is appended behind it and
+//! normal delivery resumes only once the store drains.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,6 +35,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use arrow::array::RecordBatch;
 use runtime_drasi::{DrasiChangeRows, DrasiSink};
 use tokio::sync::mpsc;
+
+use crate::drasi::dead_letter::{DeadLetterStore, RETRY_INTERVAL};
 
 /// Batches a component may have awaiting delivery before new ones are dropped.
 ///
@@ -79,19 +83,30 @@ pub(crate) struct DeliveryQueue {
 }
 
 impl DeliveryQueue {
-    /// Starts a delivery task for `sink`.
+    /// Starts a delivery task backed by `store`, which retains and retries what
+    /// Drasi will not accept.
     ///
     /// Must be called from within a Tokio runtime.
-    pub(crate) fn spawn(sink: Arc<DrasiSink>, component: String, depth: usize) -> Self {
+    pub(crate) fn spawn(
+        sink: Arc<DrasiSink>,
+        component: String,
+        depth: usize,
+        store: Option<Arc<DeadLetterStore>>,
+    ) -> Self {
         let (jobs, receiver) = mpsc::channel(depth);
         let dead_lettered = Arc::new(AtomicU64::new(0));
 
         tokio::spawn(deliver(
             receiver,
-            sink,
+            Arc::clone(&sink),
             component.clone(),
             Arc::clone(&dead_lettered),
+            store.clone(),
         ));
+
+        if let Some(store) = store {
+            tokio::spawn(retry_pending(sink, component.clone(), store));
+        }
 
         Self {
             jobs,
@@ -116,13 +131,13 @@ impl DeliveryQueue {
         record_dead_letter(&self.dead_lettered, &self.component, reason);
     }
 
-    /// How many batches have been dropped undelivered.
+    /// How many batches were dropped without reaching the durable store — a
+    /// full in-memory queue, or a store that could not be written.
     ///
-    /// Counted rather than retained: holding undelivered batches would grow
-    /// without bound during an outage, and replaying them needs a durable store
-    /// this does not have. A non-zero count means Drasi's view of this component
-    /// has gaps.
-    #[cfg_attr(not(test), expect(dead_code, reason = "read by tests and future metrics"))]
+    /// Batches the store accepted are retried and are *not* counted here; see
+    /// [`DeadLetterStore::discarded`](crate::drasi::dead_letter::DeadLetterStore::discarded)
+    /// for the ones it gave up on.
+    #[cfg(test)]
     pub(crate) fn dead_lettered(&self) -> u64 {
         self.dead_lettered.load(Ordering::Relaxed)
     }
@@ -141,31 +156,94 @@ fn record_dead_letter(count: &AtomicU64, component: &str, reason: &str) {
     }
 }
 
+/// Delivers one batch, reporting whether it landed.
+async fn forward(sink: &DrasiSink, job: &QueuedBatch) -> Result<(), String> {
+    let op_codes: Vec<&str> = job.op_codes.iter().map(String::as_str).collect();
+    let primary_key_columns: Vec<Vec<&str>> = job
+        .primary_key_columns
+        .iter()
+        .map(|key| key.iter().map(String::as_str).collect())
+        .collect();
+
+    let rows = DrasiChangeRows {
+        op_codes,
+        primary_key_columns,
+        data: &job.data,
+        source_commit_ts_ms: job.source_commit_ts_ms,
+    };
+
+    sink.forward(&rows).await.map_err(|e| e.to_string())
+}
+
 /// Drains one component's queue, delivering each batch in order.
 async fn deliver(
     mut jobs: mpsc::Receiver<QueuedBatch>,
     sink: Arc<DrasiSink>,
     component: String,
     dead_lettered: Arc<AtomicU64>,
+    store: Option<Arc<DeadLetterStore>>,
 ) {
     while let Some(job) = jobs.recv().await {
-        let op_codes: Vec<&str> = job.op_codes.iter().map(String::as_str).collect();
-        let primary_key_columns: Vec<Vec<&str>> = job
-            .primary_key_columns
-            .iter()
-            .map(|key| key.iter().map(String::as_str).collect())
-            .collect();
-
-        let rows = DrasiChangeRows {
-            op_codes,
-            primary_key_columns,
-            data: &job.data,
-            source_commit_ts_ms: job.source_commit_ts_ms,
-        };
-
-        if let Err(e) = sink.forward(&rows).await {
-            record_dead_letter(&dead_lettered, &component, &e.to_string());
+        // Anything already pending is older than this batch. Delivering now
+        // would apply a full-state replace out of order, so queue behind it.
+        if let Some(store) = &store
+            && !store.is_empty().await
+        {
+            if let Err(e) = store.append(&job).await {
+                record_dead_letter(&dead_lettered, &component, &e.to_string());
+            }
+            continue;
         }
+
+        if let Err(message) = forward(&sink, &job).await {
+            match &store {
+                Some(store) => {
+                    if let Err(e) = store.append(&job).await {
+                        record_dead_letter(&dead_lettered, &component, &e.to_string());
+                    } else {
+                        tracing::warn!(
+                            "Retaining a Drasi change batch for {component} for redelivery: {message}"
+                        );
+                    }
+                }
+                None => record_dead_letter(&dead_lettered, &component, &message),
+            }
+        }
+    }
+}
+
+/// Retries whatever the store is holding, until it drains.
+async fn retry_pending(sink: Arc<DrasiSink>, component: String, store: Arc<DeadLetterStore>) {
+    loop {
+        tokio::time::sleep(RETRY_INTERVAL).await;
+
+        if store.is_empty().await {
+            continue;
+        }
+
+        tracing::debug!(
+            "Retrying undelivered Drasi change batches for {component} ({} discarded so far)",
+            store.discarded()
+        );
+
+        let sink = Arc::clone(&sink);
+        store
+            .drain(|job| {
+                let sink = Arc::clone(&sink);
+                let component = component.clone();
+                async move {
+                    match forward(&sink, &job).await {
+                        Ok(()) => true,
+                        Err(message) => {
+                            tracing::debug!(
+                                "Drasi redelivery for {component} still failing: {message}"
+                            );
+                            false
+                        }
+                    }
+                }
+            })
+            .await;
     }
 }
 
@@ -218,7 +296,7 @@ mod tests {
     /// when Drasi is unreachable, so replication is never gated on it.
     #[tokio::test]
     async fn a_full_queue_dead_letters_rather_than_blocking() {
-        let queue = DeliveryQueue::spawn(unreachable_sink(), "orders".to_string(), 4);
+        let queue = DeliveryQueue::spawn(unreachable_sink(), "orders".to_string(), 4, None);
 
         for _ in 0..64 {
             queue.enqueue(QueuedBatch::uniform(
@@ -237,7 +315,7 @@ mod tests {
 
     #[tokio::test]
     async fn dead_letter_is_counted() {
-        let queue = DeliveryQueue::spawn(unreachable_sink(), "orders".to_string(), 4);
+        let queue = DeliveryQueue::spawn(unreachable_sink(), "orders".to_string(), 4, None);
         assert_eq!(queue.dead_lettered(), 0);
 
         queue.dead_letter("test");
