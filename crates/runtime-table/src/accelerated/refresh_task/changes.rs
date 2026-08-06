@@ -3103,9 +3103,23 @@ fn cdc_item_budget_bytes(item: &Result<cdc::ChangeEnvelope, cdc::StreamError>) -
 /// gauge that fails should fail toward zero, where the error stays proportional
 /// to the mistake, so saturate rather than wrap.
 fn discharge_prefetch_bytes(counter: &AtomicU64, bytes: u64) {
-    let _previous = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    let previous = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_sub(bytes))
     });
+    // Saturating in release is the right failure mode for a gauge, but it also
+    // HIDES the bug that motivated it: discharging one envelope twice used to
+    // wrap the counter to ~1.8e19, and saturation would instead quietly clamp to
+    // zero and look plausible. Every charge has exactly one discharge, so a
+    // discharge larger than the balance is a real accounting error - fail loudly
+    // where a test can see it, and stay soft where an operator would only see a
+    // gauge.
+    debug_assert!(
+        previous.is_ok_and(|balance| balance >= bytes),
+        "CDC prefetch byte counter underflowed: discharged {bytes} against a balance of \
+         {previous:?}. Each envelope must be discharged exactly once - a carried item \
+         is discharged at the try_recv that removed it, not again when the next \
+         iteration adopts it."
+    );
 }
 
 fn elapsed_ms(start: Instant) -> f64 {
@@ -6905,6 +6919,50 @@ mod tests {
             .expect("task join")
             .expect("changes stream should succeed");
         // Final invariant: every envelope was committed exactly once, in order.
+        assert_eq!(log.ids().await, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    /// Regression test for the CDC prefetch byte counter.
+    ///
+    /// An envelope pulled from the channel but deferred past the burst byte cap
+    /// is stashed in `carried_item` and adopted by the NEXT iteration. It leaves
+    /// the channel exactly once, at the `try_recv` that removed it, so it must be
+    /// discharged exactly once. Discharging it again when the outer receive
+    /// adopted it drove the counter below zero, and the unsigned wrap made
+    /// `cdc_prefetch_buffer_bytes` report ~1.8e19 for every table with carry-over
+    /// activity - which is how it was found, on a lab run rather than here.
+    ///
+    /// `max_coalesced_bytes: 1` puts every envelope after the first over budget,
+    /// so this drives the carry path on every iteration. The accounting invariant
+    /// is enforced by the `debug_assert!` in `discharge_prefetch_bytes`, which is
+    /// live in test builds: a double discharge panics here rather than saturating
+    /// quietly to zero and looking plausible.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn carried_envelopes_are_discharged_from_the_prefetch_counter_exactly_once() {
+        let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);
+        let log = CommitLog::new();
+
+        let envelopes: Vec<Result<ChangeEnvelope, CdcStreamError>> = (1..=6)
+            .map(|id| Ok(make_tracked_envelope(id, Arc::clone(&log), false)))
+            .collect();
+        let stream: ChangesStream = fstream::iter(envelopes).boxed();
+
+        let cfg = CdcConfig {
+            prefetch_buffer: 128,
+            max_coalesced_envelopes: 256,
+            // Every envelope after the first exceeds this, so each one is carried
+            // rather than folded into the burst - the path under test.
+            max_coalesced_bytes: 1,
+            max_coalesce_age_ms: 0,
+            commit_timeout: Duration::from_secs(30),
+            delete_subbatch_max: CDC_DELETE_SUBBATCH_MAX_DEFAULT,
+        };
+
+        run_changes_stream_with_config(&task, cfg, stream)
+            .await
+            .expect("changes stream should succeed");
+
+        // Carrying must not lose, duplicate, or reorder an envelope either.
         assert_eq!(log.ids().await, vec![1, 2, 3, 4, 5, 6]);
     }
 
