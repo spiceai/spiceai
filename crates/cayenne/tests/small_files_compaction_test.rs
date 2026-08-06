@@ -240,22 +240,22 @@ async fn wait_until_current_snapshot_compacts(
 ) -> Result<Option<(String, usize)>, Box<dyn std::error::Error>> {
     const TIMEOUT: Duration = Duration::from_secs(10);
     const POLL_INTERVAL: Duration = Duration::from_millis(50);
-    const DRAIN_TIMEOUT: Duration = Duration::from_secs(120);
+    const DRAIN_TIMEOUT: Duration = Duration::from_mins(2);
 
-    match tokio::time::timeout(DRAIN_TIMEOUT, table.drain_in_flight_maintenance()).await {
-        Ok(drained) => drained?,
-        Err(_) => {
-            let table_meta = fixture.catalog.get_table(table_name).await?;
-            let snapshot_id = table_meta.current_snapshot_id;
-            let files =
-                count_vortex_files(&fixture.data_path, &table_meta.table_id, &snapshot_id).await;
-            panic!(
-                "draining {table_name}'s in-flight maintenance did not finish within \
-                 {DRAIN_TIMEOUT:?} (snapshot {snapshot_id}, {files} files, \
-                 target below {uncompacted_file_count})"
-            );
-        }
-    }
+    let Ok(drained) =
+        tokio::time::timeout(DRAIN_TIMEOUT, table.drain_in_flight_maintenance()).await
+    else {
+        let table_meta = fixture.catalog.get_table(table_name).await?;
+        let snapshot_id = table_meta.current_snapshot_id;
+        let files =
+            count_vortex_files(&fixture.data_path, &table_meta.table_id, &snapshot_id).await;
+        panic!(
+            "draining {table_name}'s in-flight maintenance did not finish within \
+             {DRAIN_TIMEOUT:?} (snapshot {snapshot_id}, {files} files, \
+             target below {uncompacted_file_count})"
+        );
+    };
+    drained?;
 
     let started = Instant::now();
     loop {
