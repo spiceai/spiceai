@@ -132,6 +132,34 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+impl Error {
+    /// Whether the Spicepod file is absent, as opposed to present but
+    /// unloadable.
+    ///
+    /// A caller that tolerates a missing Spicepod — a Cloud Connect instance
+    /// that has connected but not yet received a deployment — must not also
+    /// tolerate a malformed one: silently serving nothing because of a YAML
+    /// typo hides the mistake instead of reporting it.
+    #[must_use]
+    pub fn is_spicepod_missing(&self) -> bool {
+        match self {
+            Self::SpicepodNotFound { .. } => true,
+            Self::UnableToOpenSpicepod { source, .. } => match source.as_ref() {
+                reader::Error::UnableToOpenPath { source, .. } => {
+                    source.kind() == std::io::ErrorKind::NotFound
+                }
+                #[cfg(feature = "object-store")]
+                reader::Error::UnableToOpenObjectStorePath { source, .. } => {
+                    matches!(source, object_store::Error::NotFound { .. })
+                }
+                #[cfg(feature = "object-store")]
+                reader::Error::UnableToParseObjectStorePath { .. } => false,
+            },
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Spicepod {
     pub version: SpicepodVersion,
@@ -1407,6 +1435,31 @@ mod version_tests {
             .await
             .expect("load_from should find spicepod.yaml in a directory");
         assert_eq!(pod.name, "test_pod");
+    }
+
+    #[tokio::test]
+    async fn is_spicepod_missing_distinguishes_absent_from_unloadable() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+
+        let absent_in_dir = Spicepod::load_from(&reader::StdFileSystem, dir.path())
+            .await
+            .err()
+            .expect("an empty directory has no spicepod.yaml");
+        assert!(absent_in_dir.is_spicepod_missing());
+
+        let absent_file = Spicepod::load_from(&reader::StdFileSystem, dir.path().join("pod.yaml"))
+            .await
+            .err()
+            .expect("a named file that does not exist cannot load");
+        assert!(absent_file.is_spicepod_missing());
+
+        std::fs::write(dir.path().join("spicepod.yaml"), "version: v1\nkind: Spicepod\n")
+            .expect("write spicepod.yaml");
+        let malformed = Spicepod::load_from(&reader::StdFileSystem, dir.path())
+            .await
+            .err()
+            .expect("a spicepod.yaml with no name does not match the schema");
+        assert!(!malformed.is_spicepod_missing());
     }
 
     /// A directory with dots/dashes in its name (e.g. `my.app-sample`)
