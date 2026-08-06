@@ -89,13 +89,13 @@ use std::{fmt, sync::Arc};
 
 use arrow::{
     array::{
-        Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
-        Decimal256Array, DurationMicrosecondArray, DurationMillisecondArray,
+        Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
+        Decimal128Array, Decimal256Array, DurationMicrosecondArray, DurationMillisecondArray,
         DurationNanosecondArray, DurationSecondArray, Float64Array, Int8Array, Int16Array,
         Int32Array, Int32Builder, Int64Array, IntervalDayTimeArray, IntervalMonthDayNanoArray,
         IntervalYearMonthArray, LargeBinaryArray, LargeStringArray, ListBuilder, MapArray,
-        MapBuilder, RecordBatch, StringArray, StringBuilder, Time32MillisecondArray,
-        Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+        MapBuilder, RecordBatch, StringArray, StringBuilder, StringViewArray,
+        Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
         TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
         TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
     },
@@ -676,6 +676,17 @@ impl TursoTableProvider {
                         .collect();
                     Arc::new(LargeStringArray::from(values))
                 }
+                DataType::Utf8View => {
+                    let values: Vec<Option<String>> = rows
+                        .iter()
+                        .map(|row| match &row[col_idx] {
+                            TursoValue::Text(s) => Some(s.clone()),
+                            TursoValue::Null => None,
+                            _ => None,
+                        })
+                        .collect();
+                    Arc::new(StringViewArray::from(values))
+                }
                 DataType::Boolean => {
                     let values: Vec<Option<bool>> = rows
                         .iter()
@@ -708,6 +719,17 @@ impl TursoTableProvider {
                         })
                         .collect();
                     Arc::new(LargeBinaryArray::from(values))
+                }
+                DataType::BinaryView => {
+                    let values: Vec<Option<&[u8]>> = rows
+                        .iter()
+                        .map(|row| match &row[col_idx] {
+                            TursoValue::Blob(b) => Some(b.as_slice()),
+                            TursoValue::Null => None,
+                            _ => None,
+                        })
+                        .collect();
+                    Arc::new(BinaryViewArray::from(values))
                 }
                 DataType::Timestamp(unit, tz) => {
                     // Timestamps can be stored in two formats:
@@ -2102,6 +2124,15 @@ fn convert_timestamp_to_turso(
 ///
 /// A type this function cannot represent returns an error rather than `NULL`, so a column the
 /// accelerator cannot store fails the write instead of reading back as a column of nulls.
+///
+/// # Read support is narrower
+///
+/// [`TursoTableProvider::values_to_record_batch`] reconstructs fewer types than this function
+/// stores: a list only with `Int32` elements, a map only from `Utf8` to `Int32`, and neither
+/// `LargeList`, `FixedSizeList`, `Dictionary`, `Float16` nor `FixedSizeBinary` at all. A column of
+/// one of those types fails its scan with an Arrow schema mismatch whatever is stored for it, so
+/// writing the value faithfully is what makes the stored data correct once the read side catches
+/// up. See #12631.
 #[expect(clippy::match_same_arms)]
 fn scalar_value_to_turso(
     value: ScalarValue,
@@ -2247,16 +2278,14 @@ fn scalar_value_to_turso(
 
             for i in 0..keys.len() {
                 let key_scalar = ScalarValue::try_from_array(keys.as_ref(), i)?;
-                let key_str = match scalar_value_to_json(key_scalar)? {
-                    serde_json::Value::String(key_str) => key_str,
-                    other => {
-                        return Err(format!(
-                            "Failed to write a Map value to Turso: map keys must be strings, found {other}. \
-                            Cast the map's key type to a string, or store the column as text. \
-                            See: https://spiceai.org/docs/components/data-accelerators/turso"
-                        )
-                        .into());
-                    }
+                let key_type = key_scalar.data_type();
+                let serde_json::Value::String(key_str) = scalar_value_to_json(key_scalar)? else {
+                    return Err(format!(
+                        "Failed to write a map value to Turso: map keys must be strings, found {key_type}. \
+                        Cast the map's key type to a string, or accelerate this dataset with a different engine. \
+                        See: https://spiceai.org/docs/components/data-accelerators/turso"
+                    )
+                    .into());
                 };
 
                 let val_scalar = ScalarValue::try_from_array(values.as_ref(), i)?;
@@ -3576,5 +3605,60 @@ mod tests {
         assert_eq!(elements.value(0), 10);
         assert!(elements.is_null(1), "the null element should survive");
         assert_eq!(elements.value(2), 20);
+    }
+    /// A JSON object needs string keys; a non-string key used to be dropped from the object,
+    /// silently losing the entry.
+    #[test]
+    fn test_scalar_value_to_turso_rejects_a_non_string_map_key() {
+        let mut builder = MapBuilder::new(None, Int32Builder::new(), Int32Builder::new());
+        builder.keys().append_value(1);
+        builder.values().append_value(2);
+        builder.append(true).expect("map row should append");
+
+        let Err(e) = scalar_value_to_turso(
+            ScalarValue::Map(Arc::new(builder.finish())),
+            TimestampFormat::default(),
+        ) else {
+            panic!("an integer-keyed map should be rejected, not silently emptied");
+        };
+        assert!(
+            e.to_string().contains("map keys must be strings"),
+            "unexpected error message: {e}"
+        );
+    }
+    /// View-typed strings and binaries round-trip: they are written as their value and read back as
+    /// the view array the schema declares, rather than stored as NULL.
+    #[test]
+    fn test_values_to_record_batch_reads_view_types() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Utf8View, true),
+            Field::new("b", DataType::BinaryView, true),
+        ]));
+        let rows = vec![
+            vec![
+                TursoValue::Text("hello".to_string()),
+                TursoValue::Blob(vec![1, 2, 3]),
+            ],
+            vec![TursoValue::Null, TursoValue::Null],
+        ];
+
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema)
+            .expect("view-typed columns should be read back");
+
+        let strings = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .expect("column should be a string view");
+        assert_eq!(strings.value(0), "hello");
+        assert!(strings.is_null(1));
+
+        let binaries = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<BinaryViewArray>()
+            .expect("column should be a binary view");
+        assert_eq!(binaries.value(0), &[1, 2, 3]);
+        assert!(binaries.is_null(1));
     }
 }
