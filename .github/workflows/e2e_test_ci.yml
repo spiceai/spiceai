@@ -2343,11 +2343,53 @@ jobs:
       - graceful_shutdown_test_full
     steps:
       - name: Verify all E2E jobs succeeded
+        env:
+          # Read through the environment rather than interpolated into the script:
+          # the results are GitHub's own, but keeping workflow expressions out of
+          # `run:` bodies is the habit that stops the next one being attacker-
+          # controlled.
+          E2E_JOB_RESULTS: ${{ toJSON(needs) }}
         run: |
-          failure="${{ contains(needs.*.result, 'failure') }}"
-          cancelled="${{ contains(needs.*.result, 'cancelled') }}"
-          if [ "$failure" = "true" ] || [ "$cancelled" = "true" ]; then
-            echo "::error::One or more E2E Test CI jobs did not succeed"
+          set -uo pipefail
+
+          # `contains(needs.*.result, 'failure')` can answer only *whether*
+          # something went wrong, never which job it was, so this gate used to
+          # fail with a single line — "One or more E2E Test CI jobs did not
+          # succeed" — whichever of the jobs above it was. Since it is the required
+          # merge-queue context standing in for the whole matrix, that line is also
+          # the entire failure summary a dequeued PR gets: whoever triages it has
+          # to open the run and read down the job list to learn anything at all
+          # (#12643). Name the jobs instead. `toJSON(needs)` carries each one's
+          # result, so this needs no extra API call and no token.
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "::error::jq is not available on this runner, so this gate cannot read the E2E job results. Failing closed rather than reporting a pass it did not verify."
             exit 1
           fi
+
+          # A `jq` that dies must not be mistaken for "nothing failed" — that
+          # would turn this gate into a rubber stamp on exactly the runs it exists
+          # to catch. Hence the explicit status check before the emptiness test.
+          # Allow-list the two results that pass rather than deny-listing the two
+          # that fail: an entry whose result were absent, or some state GitHub
+          # adds later, would be silently ignored by a deny-list and this gate
+          # would report a pass it had not established.
+          if ! not_succeeded="$(printf '%s' "$E2E_JOB_RESULTS" | jq -r '
+                to_entries
+                | map(select((.value.result // "missing") as $r
+                             | $r != "success" and $r != "skipped")
+                      | "\(.key) (\(.value.result // "no result"))")
+                | join(", ")
+              ')"; then
+            echo "::error::Could not read the E2E job results, so this gate cannot tell whether the matrix passed. Failing closed."
+            exit 1
+          fi
+
+          if [ -n "$not_succeeded" ]; then
+            # `needs` keys are job ids, and a matrix job reports one result for
+            # the whole matrix — so this names the job to open, not the cell. That
+            # is still the difference between one click and twenty.
+            echo "::error::E2E Test CI jobs did not succeed: ${not_succeeded}"
+            exit 1
+          fi
+
           echo "All E2E Test CI jobs succeeded"
