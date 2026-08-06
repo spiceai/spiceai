@@ -16912,6 +16912,7 @@ dependencies = [
  "runtime-query-engine",
  "runtime-rate-control",
  "runtime-request-context",
+ "runtime-resources",
  "runtime-search",
  "runtime-secrets",
  "runtime-status",
@@ -16995,8 +16996,10 @@ dependencies = [
  "hex",
  "object_store 0.13.2",
  "opentelemetry",
+ "runtime-datafusion",
  "runtime-object-store",
  "runtime-parameters",
+ "runtime-query-engine",
  "runtime-secrets",
  "rusqlite",
  "serde",
@@ -17185,12 +17188,15 @@ version = "2.2.0-unstable"
 dependencies = [
  "arrow",
  "arrow-schema",
+ "arrow_tools",
+ "clap",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
  "fundu",
  "globset",
  "logos",
+ "opentelemetry",
  "runtime-acceleration",
  "serde",
  "snafu",
@@ -17448,6 +17454,17 @@ dependencies = [
  "tokio-util",
  "tracing",
  "winver",
+]
+
+[[package]]
+name = "runtime-resources"
+version = "2.2.0-unstable"
+dependencies = [
+ "parking_lot",
+ "sysinfo 0.38.4",
+ "telemetry",
+ "tracing",
+ "util",
 ]
 
 [[package]]
