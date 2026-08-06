@@ -134,7 +134,9 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
     let p95 = test.get_p95_response_time_metric()?;
     let rps = test.get_rps_metric()?;
     let retrieval_metrics_at_all_k = test
-        .calculate_search_score_metrics_at_all_k(&qrels, |results| dataset.transform_results(results))?;
+        .calculate_search_score_metrics_at_all_k(&qrels, |results| {
+            dataset.transform_results(results)
+        })?;
 
     // Report the metric-vs-k curve, then pick the primary cutoff (k=10, matching MTEB; falling back
     // to the largest available k when fewer results were returned) for the fixed-schema run row.
