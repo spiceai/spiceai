@@ -7842,6 +7842,33 @@ impl CayenneTableProvider {
     /// against the larger query pool. That is consistent (no memory was set aside
     /// for compaction, so it may use the whole pool), but a small-RAM host wanting a
     /// tighter bound should carve the pool.
+    /// Total on-disk bytes of `snapshot_id`, or `None` when it cannot be listed
+    /// (reported at WARN, matching the size-tier path, so a listing failure is never
+    /// mistaken for the budget declining a merge).
+    ///
+    /// Split out of the seq-prefix bake, which `Box::pin`s it. That bake is one of the
+    /// largest async fns in the crate, and inlining this arm — a listing buffer plus a
+    /// `tracing` expansion, both live across the await — grew its future enough to put
+    /// a multi-threaded test worker over the default 2 MiB stack. Issue #12436 records
+    /// the same budget for neighbouring tests in this family; boxing keeps this rarely
+    /// taken I/O arm off the parent frame for one allocation on a background path.
+    async fn snapshot_bytes_for_merge_budget(&self, snapshot_id: &str) -> Option<u64> {
+        match self.list_snapshot_files_with_sizes(snapshot_id).await {
+            Ok(files) => Some(files.iter().map(|(_, sz)| *sz).sum()),
+            Err(error) => {
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    snapshot_id,
+                    %error,
+                    "Failed to size seq-prefix bake input; ending the prefix here rather \
+                     than counting it as free against the pass memory budget"
+                );
+                None
+            }
+        }
+    }
+
     fn protected_merge_input_budget_bytes(&self) -> Option<u64> {
         use datafusion::execution::memory_pool::MemoryPool;
         let env = super::compaction::compaction_runtime_env()
@@ -17488,6 +17515,17 @@ impl CayenneTableProvider {
     /// `run_compaction_trigger`.
     #[doc(hidden)]
     pub async fn bake_seq_prefix_protected_snapshots(&self) -> Result<bool> {
+        // Boxed so the whole bake body lives on the heap rather than in the caller's
+        // frame. This is one of the largest async fns in the crate, and its future is
+        // inlined into every caller's — the compaction trigger, and the property tests
+        // that drive it directly. Growing it by even a small budgeted-selection block
+        // put a `#[tokio::test(flavor = "multi_thread")]` worker over the default 2 MiB
+        // stack; issue #12436 records the same budget for neighbouring tests in this
+        // family. One allocation per pass on a background path.
+        Box::pin(self.bake_seq_prefix_protected_snapshots_inner()).await
+    }
+
+    async fn bake_seq_prefix_protected_snapshots_inner(&self) -> Result<bool> {
         // GATE: key-delete tables only. Position deletes are file-scoped (the
         // prune is a no-op for them) and their subset compaction must serialize
         // against writers — neither is the seq-prefix bake's domain.
@@ -17583,26 +17621,15 @@ impl CayenneTableProvider {
             let threshold = thresholds.get(id).copied().unwrap_or(0);
             if let Some(budget) = max_pass_bytes {
                 // On-disk bytes, sized as the size-tier path sizes its candidates.
-                let candidate_bytes: u64 = match self.list_snapshot_files_with_sizes(id).await {
-                    Ok(sizes) => sizes.iter().map(|(_, sz)| *sz).sum(),
-                    Err(error) => {
-                        // An unknown size must NOT count as 0 here: the budget is a
-                        // memory ceiling, and counting an unsizeable run as free would
-                        // let an arbitrarily large one in and defeat the bound. End the
-                        // prefix instead; the next tick retries once it can be sized.
-                        // Reported at WARN (matching the size-tier path) so a listing
-                        // failure is never mistaken for the budget doing its job.
-                        tracing::warn!(
-                            target: "cayenne::compaction",
-                            table = self.table_metadata.table_name.as_str(),
-                            snapshot_id = id.as_str(),
-                            %error,
-                            "Failed to size seq-prefix bake input; ending the prefix here \
-                             rather than counting it as free against the pass memory budget"
-                        );
-                        stopped_early = Some("sizing_failed");
-                        break;
-                    }
+                // An unknown size must NOT count as 0: the budget is a memory ceiling,
+                // and counting an unsizeable run as free would let an arbitrarily large
+                // one in and defeat the bound. End the prefix instead; the next tick
+                // retries once it can be sized.
+                let Some(candidate_bytes) =
+                    Box::pin(self.snapshot_bytes_for_merge_budget(id)).await
+                else {
+                    stopped_early = Some("sizing_failed");
+                    break;
                 };
                 let next = selected_input_bytes.saturating_add(candidate_bytes);
                 if next > budget {
