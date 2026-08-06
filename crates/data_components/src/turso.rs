@@ -89,15 +89,15 @@ use std::{fmt, sync::Arc};
 
 use arrow::{
     array::{
-        Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
+        Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
         Decimal256Array, DurationMicrosecondArray, DurationMillisecondArray,
         DurationNanosecondArray, DurationSecondArray, Float64Array, Int8Array, Int16Array,
         Int32Array, Int32Builder, Int64Array, IntervalDayTimeArray, IntervalMonthDayNanoArray,
-        IntervalYearMonthArray, LargeBinaryArray, LargeStringArray, ListBuilder, MapBuilder,
-        RecordBatch, StringArray, StringBuilder, Time32MillisecondArray, Time32SecondArray,
-        Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
-        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
-        UInt16Array, UInt32Array,
+        IntervalYearMonthArray, LargeBinaryArray, LargeStringArray, ListBuilder, MapArray,
+        MapBuilder, RecordBatch, StringArray, StringBuilder, Time32MillisecondArray,
+        Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
     },
     datatypes::{
         DataType, Field, IntervalDayTime, IntervalMonthDayNano, Schema, SchemaRef, TimeUnit, i256,
@@ -949,10 +949,13 @@ impl TursoTableProvider {
                         for row in rows {
                             match &row[col_idx] {
                                 TursoValue::Text(json_str) => {
-                                    // Parse JSON array
-                                    if let Ok(values) = serde_json::from_str::<Vec<i32>>(json_str) {
+                                    // Elements are optional: a list holding a null is a list, not a
+                                    // null list.
+                                    if let Ok(values) =
+                                        serde_json::from_str::<Vec<Option<i32>>>(json_str)
+                                    {
                                         for val in values {
-                                            list_builder.values().append_value(val);
+                                            list_builder.values().append_option(val);
                                         }
                                         list_builder.append(true);
                                     } else {
@@ -2094,12 +2097,23 @@ fn convert_timestamp_to_turso(
 /// - `Timestamp*(_, Some(_))` → ERROR
 ///
 /// Configure via spicepod.yaml: `acceleration.params.internal_timestamp_format: "rfc3339"` or `"integer_millis"`
+///
+/// # Unsupported types
+///
+/// A type this function cannot represent returns an error rather than `NULL`, so a column the
+/// accelerator cannot store fails the write instead of reading back as a column of nulls.
 #[expect(clippy::match_same_arms)]
 fn scalar_value_to_turso(
     value: ScalarValue,
     timestamp_format: TimestampFormat,
 ) -> Result<TursoValue, Box<dyn std::error::Error + Send + Sync>> {
-    use arrow::array::{Array, MapArray};
+    use arrow::array::Array;
+
+    // A null of any type stores as SQL NULL. Testing this up front lets the arms below match only
+    // on `Some(..)` and still leave a genuine null distinguishable from an unsupported type.
+    if value.is_null() {
+        return Ok(TursoValue::Null);
+    }
 
     let turso_value = match value {
         ScalarValue::Int64(Some(v)) => TursoValue::Integer(v),
@@ -2118,9 +2132,18 @@ fn scalar_value_to_turso(
         ScalarValue::UInt8(Some(v)) => TursoValue::Integer(i64::from(v)),
         ScalarValue::Float64(Some(v)) => TursoValue::Real(v),
         ScalarValue::Float32(Some(v)) => TursoValue::Real(f64::from(v)),
-        ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)) => TursoValue::Text(v),
+        ScalarValue::Float16(Some(v)) => TursoValue::Real(f64::from(v)),
+        ScalarValue::Utf8(Some(v))
+        | ScalarValue::LargeUtf8(Some(v))
+        | ScalarValue::Utf8View(Some(v)) => TursoValue::Text(v),
         ScalarValue::Boolean(Some(v)) => TursoValue::Integer(i64::from(v)),
-        ScalarValue::Binary(Some(v)) | ScalarValue::LargeBinary(Some(v)) => TursoValue::Blob(v),
+        ScalarValue::Binary(Some(v))
+        | ScalarValue::LargeBinary(Some(v))
+        | ScalarValue::BinaryView(Some(v))
+        | ScalarValue::FixedSizeBinary(_, Some(v)) => TursoValue::Blob(v),
+
+        // A dictionary only encodes how the value is stored, not what it is.
+        ScalarValue::Dictionary(_, inner) => scalar_value_to_turso(*inner, timestamp_format)?,
 
         // Timestamp conversions: Format depends on configuration
         ScalarValue::TimestampSecond(Some(v), tz) => {
@@ -2193,30 +2216,16 @@ fn scalar_value_to_turso(
                 .map_err(|e| format!("Failed to parse Decimal256 value '{v_str}' as f64: {e}"))?;
             TursoValue::Real(v_f64 / scale_factor)
         }
-        ScalarValue::List(list_arr) => {
-            // Serialize list as JSON
-            let mut json_values = Vec::new();
-            for i in 0..list_arr.len() {
-                if list_arr.is_null(i) {
-                    json_values.push(serde_json::Value::Null);
-                } else {
-                    let elem = ScalarValue::try_from_array(list_arr.as_ref(), i)?;
-                    match elem {
-                        ScalarValue::Int32(Some(v)) => json_values.push(serde_json::Value::from(v)),
-                        ScalarValue::Int64(Some(v)) => json_values.push(serde_json::Value::from(v)),
-                        ScalarValue::Utf8(Some(v)) => json_values.push(serde_json::Value::from(v)),
-                        _ => json_values.push(serde_json::Value::Null),
-                    }
-                }
-            }
-            TursoValue::Text(
-                serde_json::to_string(&json_values)
-                    .map_err(|e| format!("Failed to serialize List as JSON: {e}"))?,
-            )
+        // A list scalar holds a one-row array whose single row *is* the list, so the elements to
+        // serialize are that row's values, not the rows of the wrapper.
+        ScalarValue::List(list_arr) => TursoValue::Text(list_elements_to_json(&list_arr.value(0))?),
+        ScalarValue::LargeList(list_arr) => {
+            TursoValue::Text(list_elements_to_json(&list_arr.value(0))?)
+        }
+        ScalarValue::FixedSizeList(list_arr) => {
+            TursoValue::Text(list_elements_to_json(&list_arr.value(0))?)
         }
         ScalarValue::Map(map_arr) => {
-            // Map is a StructArray with "entries" containing keys and values
-            // Serialize as JSON object
             let map_array = map_arr
                 .as_ref()
                 .as_any()
@@ -2228,30 +2237,30 @@ fn scalar_value_to_turso(
                     )) as Box<dyn std::error::Error + Send + Sync>
                 })?;
 
-            let mut json_map = serde_json::Map::new();
+            // `value(0)` applies the row's offsets; `keys()`/`values()` would return the entries of
+            // every row the array was sliced from.
+            let entries = map_array.value(0);
+            let keys = entries.column(MAP_KEY_COLUMN);
+            let values = entries.column(MAP_VALUE_COLUMN);
 
-            // Get keys and values from the map
-            let keys = map_array.keys();
-            let values = map_array.values();
+            let mut json_map = serde_json::Map::with_capacity(keys.len());
 
             for i in 0..keys.len() {
-                if !keys.is_null(i) && !values.is_null(i) {
-                    // Extract key as string
-                    let key_scalar = ScalarValue::try_from_array(keys.as_ref(), i)?;
-                    let ScalarValue::Utf8(Some(key_str)) = key_scalar else {
-                        continue;
-                    };
+                let key_scalar = ScalarValue::try_from_array(keys.as_ref(), i)?;
+                let key_str = match scalar_value_to_json(key_scalar)? {
+                    serde_json::Value::String(key_str) => key_str,
+                    other => {
+                        return Err(format!(
+                            "Failed to write a Map value to Turso: map keys must be strings, found {other}. \
+                            Cast the map's key type to a string, or store the column as text. \
+                            See: https://spiceai.org/docs/components/data-accelerators/turso"
+                        )
+                        .into());
+                    }
+                };
 
-                    // Extract value
-                    let val_scalar = ScalarValue::try_from_array(values.as_ref(), i)?;
-                    let val_json = match val_scalar {
-                        ScalarValue::Int32(Some(v)) => serde_json::Value::from(v),
-                        ScalarValue::Int64(Some(v)) => serde_json::Value::from(v),
-                        _ => serde_json::Value::Null,
-                    };
-
-                    json_map.insert(key_str, val_json);
-                }
+                let val_scalar = ScalarValue::try_from_array(values.as_ref(), i)?;
+                json_map.insert(key_str, scalar_value_to_json(val_scalar)?);
             }
 
             TursoValue::Text(
@@ -2259,10 +2268,102 @@ fn scalar_value_to_turso(
                     .map_err(|e| format!("Failed to serialize Map as JSON: {e}"))?,
             )
         }
-        _ => TursoValue::Null,
+        // Storing an unsupported type as NULL would report a successful write of a column that
+        // reads back empty, so refuse it instead.
+        other => {
+            return Err(format!(
+                "Failed to write a value to Turso: the {} type is not supported by the Turso accelerator. \
+                Cast the column to a supported type, or accelerate this dataset with a different engine. \
+                See: https://spiceai.org/docs/components/data-accelerators/turso",
+                other.data_type()
+            )
+            .into());
+        }
     };
 
     Ok(turso_value)
+}
+
+/// Position of the key column in a `MapArray`'s entries struct.
+const MAP_KEY_COLUMN: usize = 0;
+/// Position of the value column in a `MapArray`'s entries struct.
+const MAP_VALUE_COLUMN: usize = 1;
+
+/// Serializes the elements of one list value as a JSON array, for storage in a `TEXT` column.
+fn list_elements_to_json(
+    elements: &ArrayRef,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let mut json_values = Vec::with_capacity(elements.len());
+    for i in 0..elements.len() {
+        json_values.push(scalar_value_to_json(ScalarValue::try_from_array(
+            elements.as_ref(),
+            i,
+        )?)?);
+    }
+
+    serde_json::to_string(&json_values)
+        .map_err(|e| format!("Failed to serialize List as JSON: {e}").into())
+}
+
+/// Converts a scalar element of a list or map to the JSON value stored for it.
+///
+/// Only the types JSON represents exactly are accepted; anything else is an error rather than a
+/// `null`, so an element the accelerator cannot store cannot be mistaken for one that was null.
+fn scalar_value_to_json(
+    value: ScalarValue,
+) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+    if value.is_null() {
+        return Ok(serde_json::Value::Null);
+    }
+
+    let json_value = match value {
+        ScalarValue::Boolean(Some(v)) => serde_json::Value::from(v),
+        ScalarValue::Int8(Some(v)) => serde_json::Value::from(v),
+        ScalarValue::Int16(Some(v)) => serde_json::Value::from(v),
+        ScalarValue::Int32(Some(v)) => serde_json::Value::from(v),
+        ScalarValue::Int64(Some(v)) => serde_json::Value::from(v),
+        ScalarValue::UInt8(Some(v)) => serde_json::Value::from(v),
+        ScalarValue::UInt16(Some(v)) => serde_json::Value::from(v),
+        ScalarValue::UInt32(Some(v)) => serde_json::Value::from(v),
+        ScalarValue::UInt64(Some(v)) => serde_json::Value::from(v),
+        ScalarValue::Float16(Some(v)) => finite_json_number(f64::from(v))?,
+        ScalarValue::Float32(Some(v)) => finite_json_number(f64::from(v))?,
+        ScalarValue::Float64(Some(v)) => finite_json_number(v)?,
+        ScalarValue::Utf8(Some(v))
+        | ScalarValue::LargeUtf8(Some(v))
+        | ScalarValue::Utf8View(Some(v)) => serde_json::Value::from(v),
+        ScalarValue::Dictionary(_, inner) => scalar_value_to_json(*inner)?,
+        other => {
+            return Err(format!(
+                "Failed to write a nested value to Turso: the {} element type is not supported by the Turso accelerator. \
+                Cast the elements to a number, boolean, or string, or accelerate this dataset with a different engine. \
+                See: https://spiceai.org/docs/components/data-accelerators/turso",
+                other.data_type()
+            )
+            .into());
+        }
+    };
+
+    Ok(json_value)
+}
+
+/// Converts a float to a JSON number, rejecting the values JSON cannot represent.
+///
+/// `serde_json` encodes NaN and the infinities as `null`, which would make them indistinguishable
+/// from a missing element on read.
+fn finite_json_number(
+    value: f64,
+) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+    serde_json::Number::from_f64(value)
+        .map(serde_json::Value::Number)
+        .ok_or_else(|| {
+            format!(
+                "Failed to write a nested value to Turso: {value} has no JSON representation. \
+                Filter out non-finite floats, or accelerate this dataset with a different engine. \
+                See: https://spiceai.org/docs/components/data-accelerators/turso"
+            )
+            .into()
+        })
 }
 
 /// An AST visitor that rewrites numeric `BETWEEN` expressions into explicit
@@ -3107,5 +3208,373 @@ mod tests {
             panic!("in-range seconds value should convert to an integer millis value");
         };
         assert_eq!(millis, 5_000, "5s should convert to 5000ms");
+    }
+    /// Builds a `ScalarValue::List` holding one list of nullable `Int32` elements.
+    fn int32_list_scalar(elements: Vec<Option<i32>>) -> ScalarValue {
+        let mut builder = ListBuilder::new(Int32Builder::new());
+        for element in elements {
+            builder.values().append_option(element);
+        }
+        builder.append(true);
+        ScalarValue::List(Arc::new(builder.finish()))
+    }
+
+    /// Regression test for #12628: a list scalar wraps its elements in a one-row array, so
+    /// iterating the wrapper serialized one null per list instead of the list's contents.
+    #[test]
+    fn test_scalar_value_to_turso_serializes_list_elements() {
+        let value = scalar_value_to_turso(
+            int32_list_scalar(vec![Some(1), Some(2), Some(3)]),
+            TimestampFormat::default(),
+        )
+        .expect("an Int32 list should convert");
+
+        assert_eq!(
+            value,
+            TursoValue::Text("[1,2,3]".to_string()),
+            "the list's elements should be serialized, not the wrapper array"
+        );
+    }
+
+    /// A null *element* is a null inside the list, and must not collapse the whole list to null.
+    #[test]
+    fn test_scalar_value_to_turso_keeps_a_null_list_element() {
+        let value = scalar_value_to_turso(
+            int32_list_scalar(vec![Some(1), None, Some(3)]),
+            TimestampFormat::default(),
+        )
+        .expect("a list with a null element should convert");
+
+        assert_eq!(value, TursoValue::Text("[1,null,3]".to_string()));
+    }
+
+    /// An empty list is distinct from a null list.
+    #[test]
+    fn test_scalar_value_to_turso_serializes_an_empty_list() {
+        let value = scalar_value_to_turso(int32_list_scalar(vec![]), TimestampFormat::default())
+            .expect("an empty list should convert");
+
+        assert_eq!(value, TursoValue::Text("[]".to_string()));
+    }
+
+    /// A null list is SQL NULL, not the text `[]`.
+    #[test]
+    fn test_scalar_value_to_turso_writes_a_null_list_as_null() {
+        let mut builder = ListBuilder::new(Int32Builder::new());
+        builder.append_null();
+        let value = scalar_value_to_turso(
+            ScalarValue::List(Arc::new(builder.finish())),
+            TimestampFormat::default(),
+        )
+        .expect("a null list should convert");
+
+        assert_eq!(value, TursoValue::Null);
+    }
+
+    /// The element types JSON represents exactly must survive; the previous element match accepted
+    /// only `Int32`, `Int64` and `Utf8` and wrote null for everything else.
+    #[test]
+    fn test_scalar_value_to_turso_serializes_non_integer_list_elements() {
+        let mut builder = ListBuilder::new(arrow::array::Float64Builder::new());
+        builder.values().append_value(1.5);
+        builder.values().append_value(-2.25);
+        builder.append(true);
+
+        let value = scalar_value_to_turso(
+            ScalarValue::List(Arc::new(builder.finish())),
+            TimestampFormat::default(),
+        )
+        .expect("a Float64 list should convert");
+
+        assert_eq!(value, TursoValue::Text("[1.5,-2.25]".to_string()));
+    }
+
+    /// `LargeList` and `FixedSizeList` are declared `TEXT` by the accelerator's DDL, so they have
+    /// to serialize like `List` rather than fall through to the unsupported-type arm.
+    #[test]
+    fn test_scalar_value_to_turso_serializes_large_and_fixed_size_lists() {
+        let mut large = arrow::array::LargeListBuilder::new(Int32Builder::new());
+        large.values().append_value(7);
+        large.values().append_value(8);
+        large.append(true);
+        let large_value = scalar_value_to_turso(
+            ScalarValue::LargeList(Arc::new(large.finish())),
+            TimestampFormat::default(),
+        )
+        .expect("a LargeList should convert");
+        assert_eq!(large_value, TursoValue::Text("[7,8]".to_string()));
+
+        let mut fixed = arrow::array::FixedSizeListBuilder::new(Int32Builder::new(), 2);
+        fixed.values().append_value(9);
+        fixed.values().append_value(10);
+        fixed.append(true);
+        let fixed_value = scalar_value_to_turso(
+            ScalarValue::FixedSizeList(Arc::new(fixed.finish())),
+            TimestampFormat::default(),
+        )
+        .expect("a FixedSizeList should convert");
+        assert_eq!(fixed_value, TursoValue::Text("[9,10]".to_string()));
+    }
+
+    /// A non-finite float has no JSON form; `serde_json` encodes it as `null`, which would be
+    /// indistinguishable from a null element.
+    #[test]
+    fn test_scalar_value_to_turso_rejects_a_non_finite_list_element() {
+        let mut builder = ListBuilder::new(arrow::array::Float64Builder::new());
+        builder.values().append_value(f64::NAN);
+        builder.append(true);
+
+        let Err(e) = scalar_value_to_turso(
+            ScalarValue::List(Arc::new(builder.finish())),
+            TimestampFormat::default(),
+        ) else {
+            panic!("a NaN list element should be rejected, not written as null");
+        };
+        assert!(
+            e.to_string().contains("no JSON representation"),
+            "unexpected error message: {e}"
+        );
+    }
+
+    /// A view-typed string or binary carries the same value as its non-view sibling; both were
+    /// written as NULL because neither variant had an arm.
+    #[test]
+    fn test_scalar_value_to_turso_writes_view_types() {
+        assert_eq!(
+            scalar_value_to_turso(
+                ScalarValue::Utf8View(Some("hello".to_string())),
+                TimestampFormat::default()
+            )
+            .expect("a Utf8View should convert"),
+            TursoValue::Text("hello".to_string())
+        );
+        assert_eq!(
+            scalar_value_to_turso(
+                ScalarValue::BinaryView(Some(vec![1, 2, 3])),
+                TimestampFormat::default()
+            )
+            .expect("a BinaryView should convert"),
+            TursoValue::Blob(vec![1, 2, 3])
+        );
+    }
+
+    /// A dictionary describes the encoding, not the value, so it has to store as its inner value.
+    #[test]
+    fn test_scalar_value_to_turso_unwraps_a_dictionary() {
+        let value = scalar_value_to_turso(
+            ScalarValue::Dictionary(
+                Box::new(DataType::Int32),
+                Box::new(ScalarValue::Utf8(Some("encoded".to_string()))),
+            ),
+            TimestampFormat::default(),
+        )
+        .expect("a dictionary value should convert");
+
+        assert_eq!(value, TursoValue::Text("encoded".to_string()));
+    }
+
+    /// A null of any type is still SQL NULL after the unsupported-type arm started returning an
+    /// error.
+    #[test]
+    fn test_scalar_value_to_turso_writes_typed_nulls_as_null() {
+        for null_value in [
+            ScalarValue::Int64(None),
+            ScalarValue::Utf8(None),
+            ScalarValue::Utf8View(None),
+            ScalarValue::Boolean(None),
+            ScalarValue::TimestampMillisecond(None, None),
+            ScalarValue::Null,
+        ] {
+            let described = null_value.to_string();
+            assert_eq!(
+                scalar_value_to_turso(null_value, TimestampFormat::default())
+                    .expect("a null should convert"),
+                TursoValue::Null,
+                "{described} should store as NULL"
+            );
+        }
+    }
+
+    /// An unsupported type used to store as NULL, which reported a successful write of a column
+    /// that reads back empty.
+    #[test]
+    fn test_scalar_value_to_turso_rejects_an_unsupported_type() {
+        let struct_value = ScalarValue::Struct(Arc::new(arrow::array::StructArray::from(vec![(
+            Arc::new(Field::new("a", DataType::Int32, true)),
+            Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+        )])));
+
+        let Err(e) = scalar_value_to_turso(struct_value, TimestampFormat::default()) else {
+            panic!("a struct should be rejected, not silently written as NULL");
+        };
+        assert!(
+            e.to_string()
+                .contains("not supported by the Turso accelerator"),
+            "unexpected error message: {e}"
+        );
+    }
+
+    /// A map scalar sliced out of a multi-row batch keeps the whole entries child array, so reading
+    /// `keys()`/`values()` directly serialized every row's entries into every row.
+    #[test]
+    fn test_scalar_value_to_turso_serializes_only_its_own_map_row() {
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
+        builder.keys().append_value("first");
+        builder.values().append_value(1);
+        builder.append(true).expect("first map row should append");
+        builder.keys().append_value("second");
+        builder.values().append_value(2);
+        builder.append(true).expect("second map row should append");
+        let map_array = builder.finish();
+
+        let second_row = ScalarValue::try_from_array(&map_array, 1).expect("row 1 should convert");
+        let value = scalar_value_to_turso(second_row, TimestampFormat::default())
+            .expect("a map value should convert");
+
+        assert_eq!(
+            value,
+            TursoValue::Text(r#"{"second":2}"#.to_string()),
+            "only the scalar's own row entries should be serialized"
+        );
+    }
+
+    /// A map entry whose value is null is still an entry; it used to be dropped from the object.
+    #[test]
+    fn test_scalar_value_to_turso_keeps_a_null_map_value() {
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
+        builder.keys().append_value("present");
+        builder.values().append_value(1);
+        builder.keys().append_value("absent");
+        builder.values().append_null();
+        builder.append(true).expect("map row should append");
+
+        let value = scalar_value_to_turso(
+            ScalarValue::Map(Arc::new(builder.finish())),
+            TimestampFormat::default(),
+        )
+        .expect("a map value should convert");
+
+        assert_eq!(
+            value,
+            // `serde_json::Map` orders its keys.
+            TursoValue::Text(r#"{"absent":null,"present":1}"#.to_string())
+        );
+    }
+
+    /// End-to-end through the sink: a `List<Int32>` column must reach Turso as its own JSON array,
+    /// which is what the read path parses back into a list.
+    #[tokio::test]
+    async fn test_turso_append_writes_list_column_contents() {
+        let table_name = "append_list_column";
+        let pool = Arc::new(
+            TursoConnectionPool::new(":memory:")
+                .await
+                .expect("in-memory Turso pool should be created"),
+        );
+        let conn = pool
+            .connect()
+            .await
+            .expect("Turso connection should be created");
+        conn.execute(
+            format!(
+                "CREATE TABLE {} (id INTEGER PRIMARY KEY, tags TEXT)",
+                quote_identifier(table_name)
+            ),
+            (),
+        )
+        .await
+        .expect("test table should be created");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                true,
+            ),
+        ]));
+
+        let mut tags = ListBuilder::new(Int32Builder::new());
+        tags.values().append_value(10);
+        tags.values().append_value(20);
+        tags.append(true);
+        tags.append_null();
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(tags.finish()) as ArrayRef,
+            ],
+        )
+        .expect("record batch should be created");
+
+        let sink = TursoDataSink::new(
+            Arc::clone(&pool),
+            table_name.to_string(),
+            Arc::clone(&schema),
+            InsertOp::Append,
+        );
+        let written = sink
+            .write_all(
+                stream(Arc::clone(&schema), vec![batch]),
+                &Arc::new(TaskContext::default()),
+            )
+            .await
+            .expect("write should succeed");
+        assert_eq!(written, 2);
+
+        let mut rows = conn
+            .query(
+                format!(
+                    "SELECT tags FROM {} ORDER BY id",
+                    quote_identifier(table_name)
+                ),
+                (),
+            )
+            .await
+            .expect("query should execute");
+
+        let mut stored = Vec::new();
+        while let Some(row) = rows.next().await.expect("row should be read") {
+            stored.push(row.get_value(0).expect("tags should be present"));
+        }
+
+        assert_eq!(
+            stored,
+            vec![TursoValue::Text("[10,20]".to_string()), TursoValue::Null],
+            "the list's elements should be stored, and a null list should stay NULL"
+        );
+    }
+    /// The read path pairs with the write path: a stored list whose element is null must come back
+    /// as a list holding a null, not as a null list.
+    #[test]
+    fn test_values_to_record_batch_reads_a_null_list_element() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "tags",
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            true,
+        )]));
+        let rows = vec![vec![TursoValue::Text("[10,null,20]".to_string())]];
+
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema)
+            .expect("a stored list should be read back");
+
+        let lists = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::ListArray>()
+            .expect("column should be a list");
+        assert!(lists.is_valid(0), "the list itself is not null");
+
+        let elements = lists.value(0);
+        let elements = elements
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("elements should be Int32");
+        assert_eq!(elements.len(), 3);
+        assert_eq!(elements.value(0), 10);
+        assert!(elements.is_null(1), "the null element should survive");
+        assert_eq!(elements.value(2), 20);
     }
 }
