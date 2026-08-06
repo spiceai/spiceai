@@ -2343,6 +2343,10 @@ jobs:
       - graceful_shutdown_test_full
     steps:
       - name: Verify all E2E jobs succeeded
+        # Named rather than left to the runner default: this gate is the required
+        # merge-queue context, so the shell it reads `set -uo pipefail`, `command -v`
+        # and `$(…)` under must not depend on the image's default staying bash.
+        shell: bash
         env:
           # Read through the environment rather than interpolated into the script:
           # the results are GitHub's own, but keeping workflow expressions out of
@@ -2375,9 +2379,9 @@ jobs:
           # would report a pass it had not established.
           if ! not_succeeded="$(printf '%s' "$E2E_JOB_RESULTS" | jq -r '
                 to_entries
-                | map(select((.value.result // "missing") as $r
-                             | $r != "success" and $r != "skipped")
-                      | "\(.key) (\(.value.result // "no result"))")
+                | map((.value.result // "missing") as $r
+                      | select($r != "success" and $r != "skipped")
+                      | "\(.key) (\($r))")
                 | join(", ")
               ')"; then
             echo "::error::Could not read the E2E job results, so this gate cannot tell whether the matrix passed. Failing closed."
