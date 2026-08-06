@@ -359,6 +359,33 @@ pub static CDC_PREFETCH_BUFFER_CAPACITY: LazyLock<Gauge<u64>> = LazyLock::new(||
         .build()
 });
 
+/// **Bytes** resident in the CDC prefetch channel, as distinct from the envelope
+/// count next to it. The channel is bounded by count, not size, and an envelope
+/// carries a materialized batch whose width the bound says nothing about — so
+/// occupancy in envelopes can sit mid-range while the bytes behind it are large
+/// enough to matter to the process.
+///
+/// Nothing else measures this. The query and compaction pools account for their
+/// own reservations, the mem-tier budget accounts for applied rows, and the
+/// coalescing path is bounded by `cdc_max_coalesced_bytes` — but bytes *waiting*
+/// in this channel, ahead of apply, appear in none of them. At SF-1000 the
+/// declared budgets summed to under half the cgroup limit while the process ran
+/// at 95% of it, which is the gap this closes: not a bound, but the measurement
+/// a bound would need.
+///
+/// Summed from each envelope's `encoded_len()`, which is the same figure
+/// `cdc_max_coalesced_bytes` budgets against and does not force a deferred
+/// envelope to build. Labeled by `dataset`.
+pub static CDC_PREFETCH_BUFFER_BYTES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("dataset_acceleration_cdc_prefetch_buffer_bytes")
+        .with_description(
+            "Encoded bytes resident in the CDC source-reader→apply prefetch channel. The channel is bounded by envelope count, not bytes, and this memory is counted by no other budget.",
+        )
+        .with_unit("By")
+        .build()
+});
+
 /// Counts applied CDC bursts by what ended coalescing (the flush `reason`):
 /// `deadline` (the `cdc_max_coalesce_age_ms` linger timer fired — the batch was
 /// held for freshness-cost time waiting for more rows), `envelope_cap`

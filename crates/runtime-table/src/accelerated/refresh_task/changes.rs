@@ -67,7 +67,7 @@ use snafu::OptionExt;
 use snafu::ResultExt;
 use std::collections::{HashMap, VecDeque};
 use std::hash::BuildHasherDefault;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, RwLock};
@@ -539,8 +539,13 @@ const CDC_PREFETCH_BUFFER_DEFAULT: usize = 128;
 // buffered in this channel. With the old 1024 max the 4096 envelope cap never bound.
 // Raised 1024 -> 16384 so high-throughput tables form larger bursts, amortizing the
 // fixed per-batch publish cost (one EBS directory `sync_all()` per batch per table)
-// over more rows. `max_coalesced_bytes` (128 MiB default) still bounds peak burst memory,
-// and the drain never waits, so low-load latency is unchanged (burst.len()==1).
+// over more rows. `max_coalesced_bytes` (128 MiB default) bounds the burst DRAINED
+// from the channel — not what sits in it. The channel's bound is this envelope
+// count, and an envelope carries a materialized batch of any width, so the bytes
+// queued ahead of apply are bounded by nothing. `cdc_prefetch_buffer_bytes`
+// measures them; treat a large value as real process memory that no budget
+// accounts for. The drain never waits, so low-load latency is unchanged
+// (burst.len()==1).
 const CDC_PREFETCH_BUFFER_MAX: usize = 16384;
 const CDC_MAX_COALESCED_ENVELOPES_DEFAULT: usize = 256;
 // Raised 4096 -> 16384 to match the prefetch ceiling (otherwise it would re-clip the burst).
@@ -1065,8 +1070,11 @@ impl RefreshTask {
         // its source-side offset, the reader task can already be pulling and
         // decoding batch N+1 (network/CPU work that would otherwise be idle).
         // The bounded channel provides natural backpressure: when the apply
-        // loop is the bottleneck, the reader parks on `send` and stops
-        // pulling, so we never accumulate unbounded memory.
+        // loop is the bottleneck, the reader parks on `send` and stops pulling.
+        // That bounds the number of envelopes in flight, not their size — a full
+        // channel holds `prefetch_buffer` batches of whatever width the source
+        // produces, which at a large scale factor is a substantial and otherwise
+        // unmeasured share of the process. `cdc_prefetch_buffer_bytes` reports it.
         let (tx, mut rx) = tokio::sync::mpsc::channel::<
             Result<cdc::ChangeEnvelope, cdc::StreamError>,
         >(cdc_cfg.prefetch_buffer);
@@ -1077,6 +1085,14 @@ impl RefreshTask {
         // while the reader's real sender lives, so it can never resurrect a closed
         // channel.
         let tx_probe = tx.downgrade();
+        // Bytes resident in the channel above. The capacity bound counts
+        // envelopes, so this is not derivable from occupancy: a mid-range
+        // envelope count can hold anything from kilobytes to gigabytes depending
+        // on how wide the source's batches are. The reader adds an envelope's
+        // encoded size as it hands it over and the apply loop subtracts it on
+        // receipt, so the value tracks what is actually queued ahead of apply.
+        let prefetch_bytes = Arc::new(AtomicU64::new(0));
+        let reader_prefetch_bytes = Arc::clone(&prefetch_bytes);
 
         let reader_dataset = dataset_name.clone();
         let reader_metric_labels = metric_labels.clone();
@@ -1102,10 +1118,24 @@ impl RefreshTask {
                     }
                     item = stream.next() => {
                         let Some(item) = item else { return; };
+                        // Charge the envelope before handing it over: once `send`
+                        // returns the apply loop may already have taken it and
+                        // subtracted, and crediting afterwards could then drive
+                        // the counter negative. `encoded_len` does not force a
+                        // deferred envelope to build.
+                        let queued_bytes = match &item {
+                            Ok(envelope) => envelope.encoded_len() as u64,
+                            Err(_) => 0,
+                        };
+                        reader_prefetch_bytes.fetch_add(queued_bytes, Ordering::Relaxed);
                         // Time blocked on send: non-zero => the prefetch channel is
                         // full and the apply loop can't drain fast enough (apply-bound).
                         let send_start = Instant::now();
                         let send_res = tx.send(item).await;
+                        if send_res.is_err() {
+                            // Nobody will receive it, so nobody will subtract it.
+                            reader_prefetch_bytes.fetch_sub(queued_bytes, Ordering::Relaxed);
+                        }
                         metrics::CDC_READER_SEND_WAIT_MS.record(elapsed_ms(send_start), send_labels);
                         if send_res.is_err() {
                             tracing::debug!(
@@ -1267,6 +1297,12 @@ impl RefreshTask {
                 },
             };
             metrics::CDC_SOURCE_RECV_WAIT_MS.record(elapsed_ms(recv_start), recv_wait_labels);
+            // Discharge what this receive took out, before sampling, so the byte
+            // gauge and the envelope occupancy below describe the same thing: the
+            // backlog still queued, not counting the item now in hand.
+            if let Some(item) = next_item.as_ref() {
+                prefetch_bytes.fetch_sub(cdc_item_budget_bytes(item) as u64, Ordering::Relaxed);
+            }
             // Sample prefetch-channel occupancy at the moment the apply loop wakes
             // (the just-received `first` is out of the buffer; whatever remains is
             // the backlog the reader has queued ahead). Near capacity => apply-bound.
@@ -1275,6 +1311,11 @@ impl RefreshTask {
                 let occupancy = capacity.saturating_sub(tx.capacity() as u64);
                 metrics::CDC_PREFETCH_BUFFER_OCCUPANCY.record(occupancy, recv_wait_labels);
                 metrics::CDC_PREFETCH_BUFFER_CAPACITY.record(capacity, recv_wait_labels);
+                // Sampled next to the envelope count deliberately: read together
+                // they say whether a full channel is holding a little or a lot,
+                // which the count alone cannot.
+                metrics::CDC_PREFETCH_BUFFER_BYTES
+                    .record(prefetch_bytes.load(Ordering::Relaxed), recv_wait_labels);
             }
             let Some(first) = next_item else {
                 break;
@@ -1357,6 +1398,9 @@ impl RefreshTask {
                 match rx.try_recv() {
                     Ok(item) => {
                         let item_bytes = cdc_item_budget_bytes(&item);
+                        // Out of the channel, so out of the channel's byte count —
+                        // whether it joins this burst or is carried to the next.
+                        prefetch_bytes.fetch_sub(item_bytes as u64, Ordering::Relaxed);
                         if burst_bytes > 0
                             && item_bytes > 0
                             && burst_bytes.saturating_add(item_bytes) > max_burst_bytes
@@ -1404,6 +1448,9 @@ impl RefreshTask {
                     match tokio::time::timeout(remaining, rx.recv()).await {
                         Ok(Some(item)) => {
                             let item_bytes = cdc_item_budget_bytes(&item);
+                            // Out of the channel, so out of the channel's byte
+                            // count — burst or carried, it is no longer queued.
+                            prefetch_bytes.fetch_sub(item_bytes as u64, Ordering::Relaxed);
                             if burst_bytes > 0
                                 && item_bytes > 0
                                 && burst_bytes.saturating_add(item_bytes) > max_burst_bytes
