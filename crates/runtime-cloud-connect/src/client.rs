@@ -462,7 +462,9 @@ impl ClientDriver {
         // persistence fails, the rotated identity must be used in memory
         // (the old key can no longer renew). `persist_identity` logs the
         // failure; the next successful renewal re-attempts the write.
-        self.persist_identity(&rotated).await;
+        rotated = self
+            .persist_identity_preserving_attachment(rotated, "renewed identity")
+            .await;
         tracing::info!(
             "Cloud Connect: identity renewed for {} (identity and encryption keypairs rotated, valid until {})",
             rotated.identifier,
@@ -498,6 +500,45 @@ impl ClientDriver {
             "Cloud Connect: failed to persist identity at {}: {error}; continuing with the in-memory identity (it will be lost on restart)",
             self.config.identity_path.display()
         );
+    }
+
+    /// Persist a full credential update while retaining the attachment most
+    /// recently written by a command handler.
+    async fn persist_identity_preserving_attachment(
+        &self,
+        identity: Identity,
+        update: &'static str,
+    ) -> Identity {
+        let path = self.config.identity_path.clone();
+        let fallback = identity.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            IdentityStore::store_credential_update(&path, &identity)
+        })
+        .await;
+        match result {
+            Ok(Ok(Some(merged))) => merged,
+            Ok(Ok(None)) => {
+                tracing::error!(
+                    "Cloud Connect: identity disappeared while the {update} was being persisted at {}; continuing with the updated in-memory identity",
+                    self.config.identity_path.display()
+                );
+                fallback
+            }
+            Ok(Err(error)) => {
+                tracing::error!(
+                    "Cloud Connect: failed to persist the {update} at {}: {error}; continuing with the updated in-memory identity (it will be lost on restart)",
+                    self.config.identity_path.display()
+                );
+                fallback
+            }
+            Err(error) => {
+                tracing::error!(
+                    "Cloud Connect: {update} persistence task failed at {}: {error}; continuing with the updated in-memory identity (it will be lost on restart)",
+                    self.config.identity_path.display()
+                );
+                fallback
+            }
+        }
     }
 
     /// Remove the staged pending-adoption-code file, if configured. A
@@ -888,6 +929,22 @@ impl ClientDriver {
                         .await;
                 }
             }
+            proto::control_message::Body::AttachApp(cmd) => {
+                if self
+                    .supported(tx, &command_id, Capability::AttachApp, name)
+                    .await
+                {
+                    let app_id = cmd.app_id.as_deref();
+                    let result = if app_id.is_some_and(str::is_empty) {
+                        Err(CommandError::invalid_argument(
+                            "AttachApp.app_id must be non-empty when present",
+                        ))
+                    } else {
+                        self.runtime.attach_app(app_id).await
+                    };
+                    reply_with_json(tx, &command_id, result).await;
+                }
+            }
             proto::control_message::Body::UpgradeRuntime(cmd) => {
                 if self
                     .supported(tx, &command_id, Capability::UpgradeRuntime, name)
@@ -1268,21 +1325,13 @@ impl ClientDriver {
         if crate::sealed_secrets::opened_with_current(&opened.inner_key_id, &keyring) {
             let mut updated = identity;
             if updated.retire_previous_enc_key() {
-                let path = self.config.identity_path.clone();
-                let to_store = updated.clone();
-                self.identity = Some(updated);
-                // Best-effort: a failed write only means the superseded key
-                // stays on disk until the next successful one.
-                if let Err(err) =
-                    tokio::task::spawn_blocking(move || IdentityStore::store(&path, &to_store))
-                        .await
-                        .map_err(|join| format!("identity persistence task panicked: {join}"))
-                        .and_then(|result| result.map_err(|err| err.to_string()))
-                {
-                    tracing::warn!(
-                        "Cloud Connect: could not persist the retirement of the previous encryption key: {err}"
-                    );
-                }
+                self.identity = Some(
+                    self.persist_identity_preserving_attachment(
+                        updated,
+                        "previous encryption-key retirement",
+                    )
+                    .await,
+                );
             }
         }
 
@@ -1620,6 +1669,7 @@ fn command_name(body: &proto::control_message::Body) -> &'static str {
         Body::GetRuntimeInfo(_) => "GetRuntimeInfo",
         Body::Restart(_) => "Restart",
         Body::ApplySpicepod(_) => "ApplySpicepod",
+        Body::AttachApp(_) => "AttachApp",
         Body::UpgradeRuntime(_) => "UpgradeRuntime",
         Body::Adopt(_) => "Adopt",
         Body::Remove(_) => "Remove",

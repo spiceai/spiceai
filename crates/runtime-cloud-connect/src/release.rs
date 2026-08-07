@@ -356,6 +356,7 @@ mod tests {
             ca_bundle_pem: String::new(),
             gateway_addr: String::new(),
             not_after_unix: None,
+            app_id: None,
             enc_private_key_pem: String::new(),
             enc_public_key_pem: String::new(),
             enc_previous_private_key_pem: String::new(),

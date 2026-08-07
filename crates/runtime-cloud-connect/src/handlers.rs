@@ -160,6 +160,8 @@ pub struct QueryOutcome {
 pub enum Capability {
     /// Apply cloud-managed Spicepod YAML.
     ApplySpicepod,
+    /// Apply the control plane's current app attachment state.
+    AttachApp,
     /// Restart the runtime process.
     Restart,
     /// Upgrade the runtime in place.
@@ -176,6 +178,7 @@ impl Capability {
     /// Every capability this client can advertise, in wire-name order.
     pub const ALL: &'static [Self] = &[
         Self::ApplySpicepod,
+        Self::AttachApp,
         Self::ExecuteQuery,
         Self::GetLogs,
         Self::GetStatus,
@@ -189,6 +192,7 @@ impl Capability {
     pub fn wire_name(self) -> &'static str {
         match self {
             Self::ApplySpicepod => "apply_spicepod",
+            Self::AttachApp => "attach_app",
             Self::Restart => "restart",
             Self::UpgradeRuntime => "upgrade_runtime",
             Self::GetLogs => "get_logs",
@@ -553,6 +557,16 @@ pub trait RuntimeHandle: Send + Sync + 'static {
         Ok(None)
     }
 
+    /// Apply the control plane's current app attachment state.
+    ///
+    /// `None` means detached. A present value is always non-empty; the client
+    /// rejects an empty present value before invoking the handle.
+    async fn attach_app(&self, _app_id: Option<&str>) -> Result<serde_json::Value, CommandError> {
+        Err(CommandError::unsupported(
+            "AttachApp is not implemented in this build",
+        ))
+    }
+
     /// Execute `sql` through the in-process runtime and return at most
     /// `max_rows` rows as a complete Arrow IPC stream.
     ///
@@ -645,6 +659,10 @@ mod tests {
         ));
         assert!(matches!(
             h.status().await,
+            Err(CommandError::Unsupported { .. })
+        ));
+        assert!(matches!(
+            h.attach_app(Some("4002")).await,
             Err(CommandError::Unsupported { .. })
         ));
         assert!(matches!(
@@ -770,6 +788,7 @@ mod tests {
         for capability in Capability::ALL {
             match capability {
                 Capability::ApplySpicepod
+                | Capability::AttachApp
                 | Capability::Restart
                 | Capability::UpgradeRuntime
                 | Capability::GetLogs
@@ -787,6 +806,7 @@ mod tests {
             names,
             BTreeSet::from([
                 "apply_spicepod",
+                "attach_app",
                 "execute_query",
                 "get_logs",
                 "get_status",
