@@ -343,20 +343,37 @@ SSH key access to the host and `gh` auth on that machine.
 
 `signoff.yml` sets `concurrency: signoff-<pr|branch>` with `cancel-in-progress`, so
 re-dispatching sign-off for a branch cancels the run before it. A cancelled job is
-killed by signal, which makes the in-flight `run_checks` return non-zero — and the
-dying script posts `signoff=failure`, "Sign-off checks failed after Ns", about a
-branch nothing actually judged.
+killed by signal, and a run that was signalled judged nothing — so it must publish
+no verdict at all, in either direction: not the `failure` that says the branch's
+checks failed, and not the `success` that would clear a branch whose checks were
+cut short.
 
-So the workflow corrects the record on its way out. When the job ends cancelled it
-runs:
+**The run declines the verdict itself.** That is the first and load-bearing layer:
+the script traps `INT`/`TERM`/`HUP` for the duration of the checks, and a recorded
+signal — or a 128+N status from a `make` that died of one — classifies the run as
+`signalled`, which publishes no status and leaves the `pending` it posted on its
+way in. Deciding in-process is what makes the decision reliable, because the script
+is the one party that observes the signal unambiguously: by exit status alone, a
+`make` that trapped the cancellation and returned a small status is
+indistinguishable from a recipe that genuinely failed, and reading it as one is how
+a cancelled run published "Sign-off checks failed" about a branch nothing judged
+([#12710](https://github.com/spiceai/spiceai/issues/12710)).
+
+**The correction step is the backstop.** A run cannot always decline for itself: a
+`SIGKILL` runs no handler, and the script can be killed in the window between
+`run_checks` returning and the decline being reached — as can an older run, or a
+racing one in the other concurrency group. So when the job ends cancelled the
+workflow still runs:
 
 ```bash
 scripts/signoff correct-cancelled [<sha>] [<owner/repo>]
 ```
 
-which rewrites the status to `pending` — not `success`, because HEAD really is not
-signed off, and not `error`, because `pending` is the state Attestation already
-describes as "re-dispatch sign-off" rather than as a defect in the diff.
+which rewrites a `failure`/`error` left by any of those to `pending` — not
+`success`, because HEAD really is not signed off, and not `error`, because
+`pending` is the state Attestation already describes as "re-dispatch sign-off"
+rather than as a defect in the diff. On a run that declined for itself there is
+nothing to rewrite, and the step says so and exits.
 
 **It rewrites only `failure` and `error`.** A cancelled run can find a legitimate
 `success` on the commit two ways, and overwriting either would throw away checks

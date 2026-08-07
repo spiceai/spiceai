@@ -401,6 +401,13 @@ assert_failure_kind "keeps a signalled run signalled over the preflight's refusa
 # signal the script has, and it must still not overrule "nothing judged it".
 assert_failure_kind "keeps a signalled run signalled under an armed watch" 2 "signalled" \
   SIGNOFF_SIGNALLED=1 SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# Status 0 included, and it is the case that matters most. A trapping recipe can
+# end the checks early and still return 0, which reads as a clean pass — so this
+# is the classification behind cmd_signoff's refusal to publish a `success` a
+# signalled run did not earn. Every other case here withholds a `failure`; this
+# one withholds the verdict that would let an unjudged branch merge.
+assert_failure_kind "calls a signalled run signalled even when make exited 0" 0 "signalled" \
+  SIGNOFF_SIGNALLED=1 STUB_FREE_KB="$(gib_to_kb 200)"
 
 # The flag has to come from somewhere, and a classification test can only show
 # that the reading is right once it is set. This is the other half: arm the

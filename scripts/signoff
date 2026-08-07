@@ -1370,7 +1370,16 @@ cmd_signoff() {
     run_checks "$revision"
     check_status=$?
     set -e
-    if [[ "$check_status" -ne 0 ]]; then
+    # A recorded signal takes this branch even on status 0. `make` returning 0
+    # says the commands that ran succeeded, not that all of them ran: a recipe
+    # line that traps the cancellation and exits 0, or a sub-make that swallows
+    # it, ends the checks early with nothing to distinguish the result from a
+    # clean pass. Falling through would post `signoff=success` — a run that
+    # judged nothing certifying the commit, which is the same mistake as #12710's
+    # false `failure` and the more costly direction of it, since it clears a
+    # branch to merge. The signalled case publishes no verdict either way, so
+    # what stands is the `pending` this run posted on its way in.
+    if [[ "$check_status" -ne 0 || -n "$SIGNOFF_SIGNALLED" ]]; then
       elapsed=$(( $(date +%s) - start ))
       describe_check_failure "$check_status" "$elapsed" "$user"
       if is_remote_run; then
