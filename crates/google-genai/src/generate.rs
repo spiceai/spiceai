@@ -212,8 +212,10 @@ impl Client {
 /// inline. Sizing it under that upper end would turn a valid long response into a failure, which is
 /// the same class of defect as the growth it bounds.
 ///
-/// This bounds the buffer's length. Growing a `Vec` doubles its capacity, so the memory one such
-/// stream holds peaks at roughly twice this.
+/// What this bounds is one unterminated event - the quantity an endpoint can grow without limit.
+/// The buffer as a whole may sit above it in passing, since it also holds whole events waiting to
+/// be drained and its allocation carries spare capacity beyond the bytes in use, so peak memory for
+/// one stream is somewhat above this figure rather than equal to it.
 const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
 
 /// What begins at `buf[i]`.
