@@ -87,6 +87,13 @@ pub(crate) fn calculate_retrieval_metrics<S: ::std::hash::BuildHasher>(
     })
 }
 
+/// One query's precomputed rank-ordered relevance grades (see [`score_sorted_relevance`]),
+/// paired with its full relevance judgments so per-k metrics can be recomputed cheaply.
+struct QueryRankedRelevance<'a, S> {
+    ranked_relevance: Vec<f64>,
+    relevance: &'a HashMap<String, i32, S>,
+}
+
 /// Computes [`RetrievalMetrics`] at every rank cutoff `k` in `1..=n`, where `n` is the largest
 /// number of results returned for any evaluated query. Because the top-`n` results for a query are
 /// already retrieved, evaluating every `k` is pure post-processing over the ranked relevance list —
@@ -105,7 +112,7 @@ pub(crate) fn calculate_retrieval_metrics_at_all_k<S: ::std::hash::BuildHasher>(
     results: &HashMap<String, HashMap<String, f64, S>, S>,
 ) -> BTreeMap<usize, RetrievalMetrics> {
     // Precompute each evaluated query's ranked relevance once, plus the max list length (`n`).
-    let mut per_query: Vec<(Vec<f64>, &HashMap<String, i32, S>)> = Vec::new();
+    let mut per_query: Vec<QueryRankedRelevance<'_, S>> = Vec::new();
     let mut max_k = 0;
 
     for (query_id, relevance) in qrels {
@@ -116,7 +123,10 @@ pub(crate) fn calculate_retrieval_metrics_at_all_k<S: ::std::hash::BuildHasher>(
 
         let ranked_relevance = score_sorted_relevance(ranked_results, relevance);
         max_k = max_k.max(ranked_relevance.len());
-        per_query.push((ranked_relevance, relevance));
+        per_query.push(QueryRankedRelevance {
+            ranked_relevance,
+            relevance,
+        });
     }
 
     let mut metrics_by_k = BTreeMap::new();
@@ -126,11 +136,11 @@ pub(crate) fn calculate_retrieval_metrics_at_all_k<S: ::std::hash::BuildHasher>(
         let mut mrr_values = Vec::with_capacity(per_query.len());
         let mut precision_values = Vec::with_capacity(per_query.len());
 
-        for (ranked_relevance, relevance) in &per_query {
-            ndcg_values.push(ndcg_at_k(ranked_relevance, relevance, k));
-            recall_values.push(recall_at_k(ranked_relevance, relevance, k));
-            mrr_values.push(mrr_at_k(ranked_relevance, k));
-            precision_values.push(precision_at_k(ranked_relevance, k));
+        for query in &per_query {
+            ndcg_values.push(ndcg_at_k(&query.ranked_relevance, query.relevance, k));
+            recall_values.push(recall_at_k(&query.ranked_relevance, query.relevance, k));
+            mrr_values.push(mrr_at_k(&query.ranked_relevance, k));
+            precision_values.push(precision_at_k(&query.ranked_relevance, k));
         }
 
         metrics_by_k.insert(
