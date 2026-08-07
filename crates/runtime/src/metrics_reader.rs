@@ -928,7 +928,9 @@ mod tests {
     /// points would export a payload the log line calls empty.
     #[test]
     fn a_metric_without_points_reports_nothing() {
-        use opentelemetry_proto::tonic::metrics::v1::{ResourceMetrics as OtlpRM, ScopeMetrics, Sum};
+        use opentelemetry_proto::tonic::metrics::v1::{
+            ResourceMetrics as OtlpRM, ScopeMetrics, Sum,
+        };
 
         let declared_only = ExportMetricsServiceRequest {
             resource_metrics: vec![OtlpRM {
