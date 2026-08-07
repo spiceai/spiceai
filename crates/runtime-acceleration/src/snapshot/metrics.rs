@@ -18,10 +18,16 @@ use opentelemetry::{
     metrics::{Counter, Gauge, Histogram, Meter},
 };
 
-// `dataset_acceleration_snapshot_write_duration_ms` is registered here and in `telemetry`, and the
-// exporter drops scope info, so both registrations land in one Prometheus family. Summing over `le`
-// across two different boundary sets yields a non-monotonic cumulative series, so the two have to
-// name the same boundaries — hence the shared constant rather than a copy of it.
+// `dataset_acceleration_snapshot_write_duration_ms` is recorded to two separate pipelines: the
+// instruments below bind to the OpenTelemetry global provider `init_metrics` installs (the
+// operator's `/metrics`, OTLP push and `spice_metrics` readers), while the `telemetry::` calls in
+// each `record_*` bind to `telemetry::meter::METER`, the anonymous-telemetry provider that
+// `anonymous::start` builds and never publishes globally. The two never share an exporter, so this
+// is one observation each rather than a double count.
+//
+// They are still the same measurement, and a quantile is only comparable between them if both name
+// the same boundaries — hence the shared constant rather than a copy of it, which is what let the
+// two sets drift apart in the first place.
 use telemetry::DURATION_MS_HISTOGRAM_BUCKETS;
 
 static METER: LazyLock<Meter> =
