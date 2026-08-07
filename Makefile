@@ -133,6 +133,11 @@ endif
 # the gate alongside their SQLite siblings. They need more stack than the 2 MiB
 # std gives a thread; `test_with_backends!` reserves it (see
 # `crates/cayenne/tests/common/mod.rs`), so no name needs excluding here.
+#
+# Shared so `nextest` and `verify-cli` cannot drift onto different selections:
+# a different selection resolves different features, which would make verify-cli
+# recompile instead of reading the build nextest just did.
+NEXTEST_SELECTION := --all --exclude libnfs
 NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + (package(=cayenne) & kind(=test)) + binary(=metrics)
 # Extra narrowing for callers that can't run everything (CI lacks credentials
 # for some tests). It has to *intersect* the expression above rather than sit
@@ -150,7 +155,7 @@ $(error NEXTEST_FLAG carries a nextest filterset — pass it as NEXTEST_FILTER_E
 endif
 .PHONY: nextest
 nextest:
-	@cargo nextest run --all --exclude libnfs --tests $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG) -E '$(_NEXTEST_FILTER)'
+	@cargo nextest run $(NEXTEST_SELECTION) --tests $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG) -E '$(_NEXTEST_FILTER)'
 
 # Unit tests for named packages — the fail-fast pre-check scripts/signoff runs on
 # the crates a branch touched, before the full workspace gate. Same lib-only
@@ -161,6 +166,27 @@ nextest:
 # unit tests (29 workspace libraries have none). nextest exits 4 on "no tests to
 # run" by default, which would abort the sign-off for a branch that only touched
 # one of them; the full `nextest` run still gates the workspace.
+# The gate does not build the `spice` CLI on its own, because `nextest`'s `--tests`
+# build already emits it: cargo builds a package's bins alongside that package's
+# integration tests, and `spice` has three. A CLI link error therefore fails
+# `nextest` itself, and a separate `cargo build -p spice` only re-resolved the
+# whole graph at a selection no other phase in the gate shares.
+#
+# That is an assumption about cargo's target selection, and it is the quiet kind
+# to lose: removing `spice`'s `tests/` targets would stop its bin from being built,
+# and the gate would drop CLI coverage without a single failure. So ask cargo
+# whether the bin is in that build graph, rather than looking for the file — a warm
+# `target/` would still hold a stale binary from an earlier build, so a file check
+# would pass at exactly the moment coverage was lost. Same selection as `nextest`,
+# so after it this is a fingerprint scan (measured ~2s), not a build.
+.PHONY: verify-cli
+verify-cli:
+	@out="$(TARGET_DIR)/verify-cli-artifacts.json"; \
+	mkdir -p "$(TARGET_DIR)"; \
+	cargo test --no-run --message-format json $(CARGO_PROFILE) --tests \
+	  $(NEXTEST_SELECTION) $(NEXTEST_FLAG) > "$$out" || exit $$?; \
+	python3 scripts/verify_cli_build.py "$$out" version.txt
+
 .PHONY: nextest-packages
 nextest-packages:
 	@test -n "$(strip $(PACKAGES))" || { echo 'nextest-packages requires PACKAGES="crate1 crate2"' >&2; exit 1; }

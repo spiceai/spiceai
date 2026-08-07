@@ -950,22 +950,22 @@ fn deletion_index_tracks_bloom_capacity_field() {
 // path (commit cc953f0262).
 
 const PARTITIONED_INSERT_STRATEGY_SRC: &str =
-    include_str!("../../runtime/src/dataaccelerator/cayenne/partitioned_insert_strategy.rs");
+    include_str!("../../runtime/src/dataaccelerator/cayenne/partitioned_insert_strategy/mod.rs");
 
 #[test]
 fn partition_lookup_uses_read_lock_fast_path() {
     assert!(
-        PARTITIONED_INSERT_STRATEGY_SRC.contains("self.partitions.read().await"),
-        "get_or_create_partition_provider must include a `self.partitions.read().await` \
+        PARTITIONED_INSERT_STRATEGY_SRC.contains("partitions.read().await"),
+        "get_or_create_partition_provider must include a `partitions.read().await` \
          fast-path BEFORE acquiring the write lock. Without it, every per-row \
          partition lookup goes through the exclusive write lock, serializing \
          all writers across the partitioned table."
     );
 
     assert!(
-        PARTITIONED_INSERT_STRATEGY_SRC.contains("self.partitions.write().await"),
+        PARTITIONED_INSERT_STRATEGY_SRC.contains("partitions.write().await"),
         "get_or_create_partition_provider must still acquire \
-         `self.partitions.write().await` on the slow path (partition not yet \
+         `partitions.write().await` on the slow path (partition not yet \
          created). Without it, two concurrent writers creating the same new \
          partition would race."
     );
