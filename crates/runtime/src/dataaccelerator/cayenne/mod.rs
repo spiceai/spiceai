@@ -25,7 +25,7 @@ pub mod snapshot_engine;
 use std::any::Any;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock, RwLock, Weak};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use arrow_schema::{DataType, Schema};
@@ -291,51 +291,25 @@ pub struct CayenneAccelerator {
     footer_cache_mb: Option<usize>,
     /// The process-wide semaphore that bounds concurrent per-table background
     /// compactions, held here so the registration path can hand it to each
-    /// table. Sized at the CPU budget's core count so a fleet of tables can't
-    /// oversubscribe the writer pool. Every Cayenne table in the process draws
+    /// table. Sized at `cpu_budget().cayenne_compaction_permits()` so a fleet of
+    /// tables can't oversubscribe the writer pool. Every Cayenne table draws
     /// on this one budget, including those created by `CREATE TABLE …
     /// PARTITIONED BY`, which belong to no accelerator.
     compaction_semaphore: Arc<tokio::sync::Semaphore>,
-    /// Initial permit count of `compaction_semaphore` (the semaphore itself only
-    /// exposes *available* permits), published for the occupancy gauge's total.
-    compaction_permits_total: usize,
 }
 
-/// A `(weak handle, total permits)` view of the fleet-wide compaction budget,
-/// published when a real table's background compaction is spawned (see
-/// [`Self::create_cayenne_table_provider`]) so the metrics registration
-/// ([`register_cayenne_telemetry`]) can read live occupancy at scrape
-/// time without holding the accelerator alive. Published from the spawn path
-/// rather than the constructor so the gauges stay silent until a table is
-/// actually registered — `CayenneAccelerator::new()` is also called for
-/// throwaway helpers (e.g. `cayenne_data_dir`), which compact nothing. The
-/// budget itself is a process-global owned by the `cayenne` crate, so the
-/// `Weak` upgrades for the life of the process.
-static COMPACTION_SEMAPHORE_FOR_METRICS: RwLock<Option<(Weak<tokio::sync::Semaphore>, usize)>> =
-    RwLock::new(None);
-
-/// Publish the fleet-wide compaction semaphore for the occupancy gauges. Called
-/// from the real table-registration path; idempotent across a fleet of tables
-/// (they share one semaphore).
-fn publish_compaction_semaphore_for_metrics(sem: &Arc<tokio::sync::Semaphore>, total: usize) {
-    // Recover through poisoning: an unrelated panic must not permanently disable the
-    // compaction-permit gauges (the guarded Weak<Semaphore> isn't corrupted by another
-    // thread's panic).
-    let mut guard = COMPACTION_SEMAPHORE_FOR_METRICS
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *guard = Some((Arc::downgrade(sem), total));
-}
-
-/// `(available, total)` permits of the fleet-wide compaction budget, or `None`
-/// before a real table has registered.
-fn compaction_semaphore_snapshot() -> Option<(u64, u64)> {
-    let guard = COMPACTION_SEMAPHORE_FOR_METRICS
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (weak, total) = guard.as_ref()?;
-    let sem = weak.upgrade()?;
-    Some((sem.available_permits() as u64, *total as u64))
+/// `(available, total)` permits of the fleet-wide compaction budget.
+///
+/// Read straight from the `cayenne` crate's process-global budget rather than
+/// from a handle the accelerator publishes, because a `CREATE TABLE …
+/// PARTITIONED BY` table draws on that same budget while belonging to no
+/// accelerator: keying the gauges off accelerator registration would leave them
+/// silent in a process whose only compaction work is DDL-created.
+fn compaction_budget_snapshot() -> (u64, u64) {
+    (
+        cayenne::compaction_budget().available_permits() as u64,
+        cayenne::compaction_budget_permits() as u64,
+    )
 }
 
 /// Register the Cayenne write-path backpressure gauges (pull-based observable
@@ -422,9 +396,8 @@ pub fn register_cayenne_telemetry() {
         )
         .with_unit("{permit}")
         .with_callback(|obs| {
-            if let Some((available, _total)) = compaction_semaphore_snapshot() {
-                obs.observe(available, &[]);
-            }
+            let (available, _total) = compaction_budget_snapshot();
+            obs.observe(available, &[]);
         })
         .build();
     let _ = meter
@@ -432,9 +405,8 @@ pub fn register_cayenne_telemetry() {
         .with_description("Total permits of the fleet-wide Cayenne compaction semaphore.")
         .with_unit("{permit}")
         .with_callback(|obs| {
-            if let Some((_available, total)) = compaction_semaphore_snapshot() {
-                obs.observe(total, &[]);
-            }
+            let (_available, total) = compaction_budget_snapshot();
+            obs.observe(total, &[]);
         })
         .build();
 }
@@ -1032,7 +1004,6 @@ impl CayenneAccelerator {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             footer_cache_mb,
             compaction_semaphore: cayenne::compaction_budget(),
-            compaction_permits_total: cayenne::compaction_budget_permits(),
         }
     }
 
@@ -2495,12 +2466,6 @@ impl CayenneAccelerator {
         // `spawn_blocking` builds + the periodic eviction sweep that releases idle
         // cached views' pinned snapshot dirs for GC). Must run once, after `Arc::new`.
         provider.init_scan_view_cache();
-        // Publish the real, in-use compaction semaphore for the occupancy gauges
-        // (idempotent across the fleet — every table shares this one semaphore).
-        publish_compaction_semaphore_for_metrics(
-            &self.compaction_semaphore,
-            self.compaction_permits_total,
-        );
         // Memory mode never drains to Vortex (no compaction, no mem-tier
         // checkpoint/seal, no cold tier), so skip the background drain tasks
         // entirely; the provider's own guards also no-op them defensively.
