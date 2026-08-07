@@ -704,6 +704,39 @@ mod tests {
         );
     }
 
+    /// Cumulative bucket counts for `count` observations that each took `latency_ms`.
+    fn cumulative_counts_for(bounds: &[f64], latency_ms: f64, count: u64) -> Vec<u64> {
+        bounds
+            .iter()
+            .map(|&bound| if latency_ms <= bound { count } else { 0 })
+            .collect()
+    }
+
+    /// A quantile has to fall in the bucket the observations landed in. When a whole distribution
+    /// shares one bucket, the interpolation inside it is a function of the requested percentile
+    /// alone and reports no latency at all.
+    ///
+    /// Regression test for #12693.
+    #[test]
+    fn sub_millisecond_latencies_are_resolved_by_the_duration_buckets() {
+        use telemetry::DURATION_MS_HISTOGRAM_BUCKETS as BOUNDS;
+
+        // The mean of a real series whose quantiles came back as 50/90/95/99.
+        let latency_ms = 0.2755;
+        let total_count = 11_925;
+        let counts = cumulative_counts_for(&BOUNDS, latency_ms, total_count);
+
+        for percentile in [50.0, 90.0, 95.0, 99.0] {
+            let value = calculate_percentile(&counts, &BOUNDS, total_count, percentile);
+
+            assert!(
+                value > 0.25 && value <= 0.5,
+                "the {percentile}th percentile of {latency_ms}ms observations should land in the \
+                 bucket holding them, got {value}"
+            );
+        }
+    }
+
     #[test]
     fn test_calculate_percentile_edge_cases() {
         let cumulative_counts = vec![0, 100];

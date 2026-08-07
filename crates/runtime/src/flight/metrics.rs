@@ -33,6 +33,11 @@ pub(crate) static FLIGHT_REQUEST_DURATION_MS: LazyLock<Histogram<f64>> = LazyLoc
     METER
         .f64_histogram("flight_request_duration_ms")
         .with_unit("ms")
+        // Naming the shared boundaries puts this on the same scale as the other duration
+        // histograms. The OpenTelemetry defaults start at 5ms, so a point-lookup `do_get`
+        // answered in a fraction of a millisecond reports a quantile drawn from that first
+        // bucket rather than from its own latency.
+        .with_boundaries(telemetry::DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
         .build()
 });
 

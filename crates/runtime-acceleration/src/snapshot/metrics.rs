@@ -18,10 +18,11 @@ use opentelemetry::{
     metrics::{Counter, Gauge, Histogram, Meter},
 };
 
-pub const DURATION_MS_HISTOGRAM_BUCKETS: [f64; 15] = [
-    0.0, 100.0, 250.0, 500.0, 750.0, 1000.0, 2500.0, 5000.0, 7500.0, 10000.0, 25000.0, 50000.0,
-    100_000.0, 250_000.0, 500_000.0,
-];
+// `dataset_acceleration_snapshot_write_duration_ms` is registered here and in `telemetry`, and the
+// exporter drops scope info, so both registrations land in one Prometheus family. Summing over `le`
+// across two different boundary sets yields a non-monotonic cumulative series, so the two have to
+// name the same boundaries — hence the shared constant rather than a copy of it.
+use telemetry::DURATION_MS_HISTOGRAM_BUCKETS;
 
 static METER: LazyLock<Meter> =
     LazyLock::new(|| global::meter("dataset_acceleration_snapshot_metrics"));
