@@ -428,6 +428,9 @@ impl ClientDriver {
             ca_bundle_pem: current.ca_bundle_pem,
             gateway_addr: current.gateway_addr,
             not_after_unix: Some(outcome.not_after_unix),
+            // The app attribution is not part of the credential and /renew
+            // does not re-send it, so it rides across the rotation unchanged.
+            app_id: current.app_id,
             // Seeded with the OUTGOING keypair and rotated by the call below,
             // which shifts it into `enc_previous_private_key_pem` — assigning
             // `material` here instead would leave the retained key equal to the
@@ -616,8 +619,8 @@ impl ClientDriver {
             }
         };
 
-        // Spawn periodic heartbeat + telemetry tasks. They emit through
-        // the same outbound channel. The identifier is shared by RwLock
+        // Spawn the periodic heartbeat, metrics, and telemetry tasks. They emit
+        // through the same outbound channel. The identifier is shared by RwLock
         // so a `Remove` can blank it for frames still in flight on the
         // draining stream.
         let runtime = Arc::clone(&self.runtime);
@@ -643,6 +646,84 @@ impl ClientDriver {
                 };
                 if hb_tx.send(msg).await.is_err() {
                     break;
+                }
+            }
+        });
+
+        // Metrics ride the same stream but not the same delivery guarantee. The
+        // payload carries cumulative totals, so a dropped export costs a data
+        // point and no data — whereas a late heartbeat is read as an instance
+        // going away. This task therefore offers its message and moves on
+        // instead of waiting for room behind one.
+        let met_tx = tx.clone();
+        let met_runtime = Arc::clone(&runtime);
+        let met_identifier = Arc::clone(&identifier);
+        let met_interval = self.config.metrics_interval;
+        // Collecting metrics is CPU work the other periodic tasks do not do, so
+        // this one races the shutdown signal rather than relying on the `abort()`
+        // below: aborting resolves only at an await point, which can leave a
+        // collection running past the shutdown it was supposed to end.
+        let met_shutdown = Arc::clone(&self.shutdown);
+        let met_handle = tokio::spawn(async move {
+            let mut ticker = time::interval(met_interval);
+            ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    () = met_shutdown.wait() => break,
+                    _ = ticker.tick() => {}
+                }
+                // Every interval accounts for itself: one line per tick, whatever
+                // the outcome. An export path that silently stops is
+                // indistinguishable from a runtime with nothing to report, which
+                // is the failure this whole feature exists to remove.
+                let id = met_identifier.read().await.clone();
+                if id.is_empty() {
+                    tracing::debug!(
+                        "Cloud Connect: metrics export skipped — enrollment has not assigned an identifier yet, so nothing could attribute the payload"
+                    );
+                    continue;
+                }
+                let payload = match met_runtime.collect_metrics().await {
+                    Ok(Some(payload)) => payload,
+                    Ok(None) => {
+                        tracing::debug!(
+                            identifier = %id,
+                            "Cloud Connect: metrics export skipped — the runtime reported no metrics to send"
+                        );
+                        continue;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "Failed to export metrics to Spice Cloud: {err}. Runtime will retry the export on the next interval. Metrics may be delayed to appear in Spice Cloud"
+                        );
+                        continue;
+                    }
+                };
+                let bytes = payload.len();
+                let msg = proto::ClientMessage {
+                    body: Some(proto::client_message::Body::ExportMetrics(
+                        proto::ExportMetrics {
+                            identifier: id.clone(),
+                            otlp_request: payload,
+                        },
+                    )),
+                };
+                match met_tx.try_send(msg) {
+                    Ok(()) => {
+                        tracing::debug!(
+                            identifier = %id,
+                            bytes,
+                            "Cloud Connect: metrics export queued to the gateway"
+                        );
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        tracing::warn!(
+                            identifier = %id,
+                            bytes,
+                            "Failed to export metrics to Spice Cloud: the outbound queue is full. Runtime will retry the export on the next interval. Metrics may be delayed to appear in Spice Cloud"
+                        );
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
                 }
             }
         });
@@ -732,6 +813,7 @@ impl ClientDriver {
         // out-of-band exit.
         hb_handle.abort();
         tel_handle.abort();
+        met_handle.abort();
         drop(tx);
 
         Ok(exit_reason)
@@ -924,6 +1006,15 @@ impl ClientDriver {
         cmd: proto::ApplySpicepod,
         session_key: Option<&cloud_connect_crypto::EncryptionKeypair>,
     ) {
+        // The app id is not reported here. Whether one arrived only matters
+        // against what the handle already holds, which only the handle knows, so
+        // it is the handle that says what the deployment did to the attribution.
+        tracing::debug!(
+            command_id,
+            yaml_bytes = cmd.spicepod_yaml.len(),
+            "Spice Cloud Connect: received a Spicepod deployment"
+        );
+
         let delivered = match cmd.sealed_secret_payload.as_ref() {
             None => None,
             Some(payload) => match self
@@ -944,16 +1035,27 @@ impl ClientDriver {
                 config_dir: &self.config.config_dir,
                 spicepod_yaml: &cmd.spicepod_yaml,
                 delivered_secrets: delivered,
+                // An empty app id on the wire means the control plane named no
+                // app, which is a different thing from an app named "".
+                app_id: Some(cmd.app_id.as_str()).filter(|id| !id.is_empty()),
             })
             .await;
 
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(err) => {
+                tracing::warn!(
+                    command_id,
+                    "Failed to apply the Spicepod deployed from Spice Cloud: {err}. This instance keeps serving its current configuration; correct the Spicepod and deploy it again. See: https://spiceai.org/docs"
+                );
                 send_command_error(tx, command_id, &err).await;
                 return;
             }
         };
+        tracing::debug!(
+            command_id,
+            "Spice Cloud Connect: applied the deployed Spicepod"
+        );
 
         send_ok_json(tx, command_id, &outcome.document).await;
 
@@ -1564,6 +1666,7 @@ mod tests {
             enc_public_key_pem: String::new(),
             enc_previous_private_key_pem: String::new(),
             cache_key_b64: String::new(),
+            app_id: None,
         }
     }
 

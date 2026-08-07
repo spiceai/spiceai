@@ -322,6 +322,13 @@ message Restart {
 message ApplySpicepod {
   string spicepod_yaml = 1;
   SealedSecretPayload sealed_secret_payload = 2;
+  // The app this instance's telemetry is attributed to. The control plane knows
+  // which app an instance is attached to and the instance cannot derive it, so
+  // it rides the same command that tells the instance what to run. The runtime
+  // stamps it as `scp_app_id`, the label the metrics backend's app dashboards
+  // filter on; empty means the control plane named none, and an instance that
+  // has never been given one exports no metrics rather than unattributed ones.
+  string app_id = 3;
 }
 
 message UpgradeRuntime {
@@ -443,7 +450,7 @@ message SecretPayload {
 //
 // Unsolicited: the runtime exports on its own cadence rather than answering a
 // command, so this rides on ClientMessage with no command_id and draws no
-// CommandResult. Nothing emits it yet.
+// CommandResult.
 //
 // `otlp_request` is a serialized
 // `opentelemetry.proto.collector.metrics.v1.ExportMetricsServiceRequest` in
