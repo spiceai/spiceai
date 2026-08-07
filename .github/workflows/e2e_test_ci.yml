@@ -235,7 +235,11 @@ jobs:
 
   test_openai_model:
     name: 'openai model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
-    timeout-minutes: 5
+    # A backstop for the whole job, so it has to clear this job's own setup — artifact
+    # download and CLI install on the self-hosted pool — before the steps' bounded waits
+    # (60s readiness, then 30s/30s/60s inside the expect scripts) can report anything.
+    # Matches `test_hf_model`, which has the same setup on the same runners (#12644).
+    timeout-minutes: 10
     runs-on: ${{ matrix.target.runner }}
     needs:
       - build
