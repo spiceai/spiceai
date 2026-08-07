@@ -19,7 +19,7 @@ use runtime_parameters::TypedParams;
 use secrecy::SecretString;
 
 /// Parameters for `from: openai` chat/responses models.
-#[derive(TypedParams)]
+#[derive(Debug, TypedParams)]
 #[params(
     prefix = "openai",
     passthrough = crate::model::params::common::OPENAI_COMMON,

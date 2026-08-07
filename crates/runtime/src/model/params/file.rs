@@ -18,7 +18,7 @@ use llms::chat::{DistributedBackendSetting, PagedAttentionMode, PickleTrust};
 use runtime_parameters::TypedParams;
 
 /// Parameters for `from: file` (local) chat models.
-#[derive(TypedParams)]
+#[derive(Debug, TypedParams)]
 #[params(
     prefix = "file",
     passthrough = crate::model::params::common::PREFIXED_COMMON,

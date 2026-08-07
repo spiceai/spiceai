@@ -800,6 +800,8 @@ pub fn get_openai_request_overrides(model: &Model, prefix: &str) -> Vec<(String,
 #[cfg(test)]
 mod test {
     use super::*;
+    #[cfg(feature = "models")]
+    use llms::chat::PagedAttentionMode;
     use serde_json::Number;
     use spicepod::component::model::Model;
 
@@ -1055,8 +1057,11 @@ mod test {
     #[cfg(feature = "models")]
     #[test]
     fn distributed_rejects_orphan_nodes_without_backend() {
-        let err = parse_dist(&[("nodes", "10.0.0.1,10.0.0.2")])
-            .expect_err("nodes without ring backend is invalid");
+        let err = parse_dist(
+            DistributedBackendSetting::None,
+            &[("nodes", "10.0.0.1,10.0.0.2")],
+        )
+        .expect_err("nodes without ring backend is invalid");
         assert!(matches!(
             err,
             LlmError::InvalidParamValueError { ref param, .. } if param == "distributed_backend"

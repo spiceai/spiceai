@@ -160,46 +160,6 @@ const fn prefixed_common() -> [PassthroughParam; PREFIXED_LEN] {
     out
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn table_lengths_match_legacy_specs() {
-        // Parity with the retired COMMON_MODEL_PARAMETERS (51) and
-        // COMMON_MODEL_PARAMETERS_WITH_DEPRECATED (52) arrays.
-        assert_eq!(OPENAI_COMMON.len(), 51);
-        assert_eq!(PREFIXED_COMMON.len(), 52);
-    }
-
-    fn user_keys(table: &[PassthroughParam], prefix: &str) -> Vec<(String, bool)> {
-        table
-            .iter()
-            .map(|p| (p.user_key(prefix), p.deprecated.is_some()))
-            .collect()
-    }
-
-    #[test]
-    fn openai_accepts_unprefixed_and_deprecated_prefixed_overrides() {
-        let keys = user_keys(OPENAI_COMMON, "openai");
-        assert!(keys.contains(&("temperature".to_string(), false)));
-        assert!(keys.contains(&("openai_temperature".to_string(), true)));
-        assert!(keys.contains(&("tools".to_string(), false)));
-        assert!(keys.contains(&("openai_tools".to_string(), true)));
-    }
-
-    #[test]
-    fn prefixed_accepts_prefixed_and_deprecated_openai_overrides() {
-        let keys = user_keys(PREFIXED_COMMON, "hf");
-        assert!(keys.contains(&("hf_temperature".to_string(), false)));
-        assert!(keys.contains(&("openai_temperature".to_string(), true)));
-        assert!(keys.contains(&("hf_tools".to_string(), false)));
-        assert!(keys.contains(&("openai_tools".to_string(), true)));
-        // Runtime tunables stay unprefixed.
-        assert!(keys.contains(&("system_prompt".to_string(), false)));
-    }
-}
-
 /// `openai_`-prefixed literal names, index-aligned with [`OVERRIDES`].
 const OPENAI_PREFIXED: [&str; 22] = [
     "openai_frequency_penalty",
@@ -251,3 +211,43 @@ const WITHOUT_PREFIX_NOTES: [&str; 22] = [
     "Use 'prompt_cache_retention' without prefix",
     "Use 'user' without prefix",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn table_lengths_match_legacy_specs() {
+        // Parity with the retired COMMON_MODEL_PARAMETERS (51) and
+        // COMMON_MODEL_PARAMETERS_WITH_DEPRECATED (52) arrays.
+        assert_eq!(OPENAI_COMMON.len(), 51);
+        assert_eq!(PREFIXED_COMMON.len(), 52);
+    }
+
+    fn user_keys(table: &[PassthroughParam], prefix: &str) -> Vec<(String, bool)> {
+        table
+            .iter()
+            .map(|p| (p.user_key(prefix), p.deprecated.is_some()))
+            .collect()
+    }
+
+    #[test]
+    fn openai_accepts_unprefixed_and_deprecated_prefixed_overrides() {
+        let keys = user_keys(OPENAI_COMMON, "openai");
+        assert!(keys.contains(&("temperature".to_string(), false)));
+        assert!(keys.contains(&("openai_temperature".to_string(), true)));
+        assert!(keys.contains(&("tools".to_string(), false)));
+        assert!(keys.contains(&("openai_tools".to_string(), true)));
+    }
+
+    #[test]
+    fn prefixed_accepts_prefixed_and_deprecated_openai_overrides() {
+        let keys = user_keys(PREFIXED_COMMON, "hf");
+        assert!(keys.contains(&("hf_temperature".to_string(), false)));
+        assert!(keys.contains(&("openai_temperature".to_string(), true)));
+        assert!(keys.contains(&("hf_tools".to_string(), false)));
+        assert!(keys.contains(&("openai_tools".to_string(), true)));
+        // Runtime tunables stay unprefixed.
+        assert!(keys.contains(&("system_prompt".to_string(), false)));
+    }
+}
