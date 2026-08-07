@@ -22,11 +22,12 @@ limitations under the License.
 //! proof-of-possession carried in the request body. The request presents the
 //! instance's current leaf (`cert_pem`), whose SPIFFE SAN names exactly one
 //! instance, together with a signature made by that leaf's private key
-//! (`pop_sig`) over `release\n{instance_id}`. A certificate is not a secret, so
-//! the signature — not the certificate — is what proves the caller is the
-//! instance; the `release` domain prefix keeps the signature from being
-//! replayable against another endpoint, and the instance id keeps it from being
-//! replayable for another instance.
+//! (`pop_sig`) over `spice-cloud-connect/release/v1\n{instance_id}`. A
+//! certificate is not a secret, so the signature — not the certificate — is
+//! what proves the caller is the instance; the
+//! `spice-cloud-connect/release/v1` domain prefix keeps the signature from
+//! being replayable against another endpoint, and the instance id keeps it from
+//! being replayable for another instance.
 //!
 //! The credential rides in the body rather than the TLS layer for the same
 //! reason `/renew` does: the presented leaf may already be expired, which is
@@ -52,7 +53,7 @@ use crate::identity::Identity;
 pub const RELEASE_PATH: &str = "/v1/cloud-connect/release";
 
 /// Domain-separation prefix of the release proof-of-possession payload.
-const POP_DOMAIN: &str = "release";
+const POP_DOMAIN: &str = "spice-cloud-connect/release/v1";
 
 /// Errors from the host-initiated release call.
 #[derive(Debug, Snafu)]
@@ -112,8 +113,9 @@ struct ReleaseRequest<'a> {
     pop_sig: &'a str,
 }
 
-/// The exact bytes a release proof-of-possession signs: the `release` domain
-/// prefix, a newline, and the instance id. The cloud rebuilds this string from
+/// The exact bytes a release proof-of-possession signs: the
+/// `spice-cloud-connect/release/v1` domain prefix, a newline, and the instance
+/// id. The cloud rebuilds this string from
 /// the presented certificate's SPIFFE SAN and verifies the signature against
 /// that certificate's public key, so the separator must be a real newline
 /// (0x0A) — an escaped `\n` would be two bytes the cloud never signs over.
@@ -432,14 +434,14 @@ mod tests {
     #[test]
     fn pop_payload_separates_the_domain_from_the_instance_with_one_real_newline() {
         let payload = pop_payload("inst_1");
-        assert_eq!(payload, "release\ninst_1");
+        assert_eq!(payload, "spice-cloud-connect/release/v1\ninst_1");
         // The cloud rebuilds these bytes and verifies the signature over them,
         // so the separator must be the single byte 0x0A. A literal backslash-n
         // would be two bytes the cloud never signs, and every release would
         // come back 401.
         assert_eq!(
             payload.as_bytes(),
-            b"release\x0Ainst_1",
+            b"spice-cloud-connect/release/v1\x0Ainst_1",
             "the domain separator must be a real newline byte"
         );
         assert!(!payload.contains('\\'), "the payload must carry no escapes");
@@ -576,7 +578,10 @@ mod tests {
             p256_point_from_spki(spki.contents()),
         );
         key.verify(pop_payload(&identity.identifier).as_bytes(), &sig)
-            .expect("the release signature must verify over `release\\n{instance_id}`");
+            .expect(
+                "the release signature must verify over \
+                 `spice-cloud-connect/release/v1\\n{instance_id}`",
+            );
         // ...and must not verify over anything else, so a captured signature
         // cannot release a different instance.
         key.verify(pop_payload("inst_other").as_bytes(), &sig)

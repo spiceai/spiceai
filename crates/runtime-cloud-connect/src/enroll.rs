@@ -741,7 +741,8 @@ pub(crate) fn sign_pop(current_private_key_pem: &str, csr_pem: &str) -> Result<S
 /// Sign an arbitrary proof-of-possession payload with an identity's private
 /// key: a DER-encoded ECDSA P-256/SHA-256 signature over `payload`,
 /// base64-encoded. `/renew` signs a CSR's DER bytes ([`sign_pop`]);
-/// `/release` signs its own domain-separated `release\n{instance_id}` payload.
+/// `/release` signs its own domain-separated
+/// `spice-cloud-connect/release/v1\n{instance_id}` payload.
 ///
 /// The error is the bare reason rather than a typed error so each flow names
 /// itself in the error it surfaces, instead of nesting one flow's message
