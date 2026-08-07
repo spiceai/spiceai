@@ -368,8 +368,8 @@ async fn start_runtime(catalog: Catalog) -> Result<Arc<Runtime>, anyhow::Error> 
 }
 
 /// How long a synthesized dataset gets to bootstrap -- or, after a restart, to
-/// come back -- before [`wait_for_table_ready`] gives up. Two minutes.
-const TABLE_READY_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+/// come back -- before [`wait_for_table_ready`] gives up.
+const TABLE_READY_TIMEOUT: Duration = Duration::from_mins(2);
 
 /// Interval between readiness polls. Every poll is a full `COUNT(*)` through the
 /// runtime and emits several `task_history` log lines, so a wait that runs to
