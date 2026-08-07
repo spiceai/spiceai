@@ -271,13 +271,35 @@ The Actions workflow:
 The checks run under a 353-minute budget, inside a 358-minute job budget, so a
 run that overruns fails as a failed step rather than being terminated at the
 runner pool's ~360-minute wall (which reports as `cancelled`, with no failed
-step and no chance to clean up). A run that ends without a verdict — budget
-expired, evicted by a re-dispatch, cancelled — replaces its own `pending` status
-with a failure; otherwise `scripts/signoff status` and `scripts/signoff mine`
-would keep showing a sign-off in progress for a run that is long gone.
-Re-dispatch against the same HEAD to try again.
+step and no chance to clean up). A run that ends without a verdict leaves the
+commit at `pending` either way, and never at a failure. Where the two endings
+differ is only which status the handler finds:
 
-That replacement is the workflow's job, not the dying script's. Being signalled is
+| Ending | Handler | Effect |
+| --- | --- | --- |
+| Budget expired, runner died | `Resolve an incomplete sign-off` → `clear-pending` | Restates the `pending`, replacing the "in progress" wording with why the run ended |
+| Externally cancelled, evicted by a re-dispatch | `Correct the sign-off status…` → `correct-cancelled` | Repairs a `failure`/`error` into `pending`; leaves an already-`pending` status as it is |
+
+Either way, re-dispatch against the same HEAD to try again.
+
+The state stays `pending` because nothing judged the diff. `failure` is the one
+state that reads as a code failure: `pr.yml` rejects it, **Attestation** rejects it
+on the head commit ([#12362](https://github.com/spiceai/spiceai/issues/12362)), and
+a red `signoff` never self-clears, so the commit stays disqualified until someone
+re-dispatches by hand ([#12741](https://github.com/spiceai/spiceai/issues/12741)).
+
+`pr.yml` does not reject a `pending` — it is not a verdict — so Attestation decides
+on its own terms rather than being forced red by a dead run. For an ordinary head
+that means red, because HEAD really is not signed off, pointing at re-running
+sign-off instead of at a defect in the diff. A head that `pr.yml` already clears —
+a fast-tracked one, or one whose inheritance chain of verified base merges reaches
+a `success` — stays green, which is the same latitude a cancelled run has always had.
+
+A dormant `pending` is still distinguishable from a live one: `scripts/signoff
+status` reports any non-success as not signed off, and `scripts/signoff mine` takes
+its ⟳ from the in-flight run list, not from the status.
+
+That restatement is the workflow's job, not the dying script's. Being signalled is
 how a run learns its budget expired: `run_checks` returns `make`'s status and bash
 reports a killed child as 128+N, so the script classifies that as reaching **no
 verdict** and publishes nothing at all, saying why in its step summary. Treating it

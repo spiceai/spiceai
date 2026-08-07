@@ -509,13 +509,18 @@ jobs:
       # it. A run that evicted this one re-posts its own `pending` after checkout and
       # setup (~25s), well after this step has run.
       #
-      # `!cancelled()` partitions this against the cancellation handler above, which
-      # would otherwise fight it: on a cancelled run that handler writes `pending` and
-      # this one would immediately rewrite that to `failure`, re-asserting the very
-      # verdict #12424 is about. The split is along the grain of #12343's own design —
-      # `timeout-minutes: 353` exists so budget expiry lands here as a *failed step*
-      # rather than a cancellation, leaving this step the incomplete-run cases and the
-      # handler above the externally-cancelled ones.
+      # `!cancelled()` partitions this against the cancellation handler above, along the
+      # grain of #12343's own design: `timeout-minutes: 353` makes budget expiry land here
+      # as a *failed step* rather than a cancellation, leaving this step the incomplete-run
+      # cases and the handler above the externally-cancelled ones.
+      #
+      # Neither handler writes a verdict, so the two agree on the end state rather than
+      # racing to opposite ones: budget expiry and external cancellation are the same
+      # epistemic state — nothing judged the diff — and `failure` is the one state that
+      # reads as a defect in it instead (#12741). They act on different starting states.
+      # `correct-cancelled` above repairs a `failure`/`error` into `pending`, and leaves
+      # an already-`pending` status untouched; this step restates a `pending` with why
+      # the run ended. A `success` already on the commit is left alone by both.
       - name: Resolve an incomplete sign-off
         if: always() && !cancelled() && steps.sign_off.conclusion != 'success'
         run: |
