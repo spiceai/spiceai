@@ -295,8 +295,33 @@ message Restart {
   RestartMode mode = 1;
 }
 
+// `sealed_secret_payload` carries a standalone instance's app secrets
+// alongside its spicepod, in the same dispatch: applying a spicepod is a
+// restart, so secrets arriving in a separate command would land after the
+// components that needed them had already tried to load.
+//
+// It reuses SealedSecretPayload's shape rather than inlining flat fields, so
+// there is exactly one envelope type and one crypto path in the system — but
+// here it carries the OUTER seal, exactly as ApplySecrets does: the gateway
+// wraps the control plane's inner envelope (itself a SealedSecretPayload,
+// sealed to the instance's enrolled encryption key) in an HPKE seal to the
+// session's announced SecretsKey. A session that has not announced one cannot
+// receive it — the same gate as ApplySecrets, so standalone gets the same
+// double-seal guarantee as an operator-managed cluster.
+//
+// Unlike ApplySecrets there is no namespace/secret_name on this message: a
+// standalone instance has no Kubernetes namespace or Secret to name, so both
+// halves of the AAD are pinned literals every party must hold identically and
+// none of them sends — see `cloud-connect-crypto`, which is the single source
+// for them. Absent means "no secrets with this deploy" and is backward
+// compatible with peers that predate the field.
+//
+// Redelivering a spicepod the instance is already serving is a no-op, not
+// another apply: applying restarts the instance, so an apply-on-redelivery is a
+// restart loop.
 message ApplySpicepod {
   string spicepod_yaml = 1;
+  SealedSecretPayload sealed_secret_payload = 2;
 }
 
 message UpgradeRuntime {
