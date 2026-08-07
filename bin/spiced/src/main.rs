@@ -179,7 +179,7 @@ fn load_and_run(args: spiced::Args) -> Result<(), Box<dyn std::error::Error>> {
         let app_bundle = bootstrap.block_on(spiced::build_app(&args))?;
         drop(bootstrap);
 
-        spiced::install_cpu_budget(&args, app_bundle.0.as_deref())?;
+        spiced::install_cpu_budget(&args, app_bundle.app.as_deref())?;
         Ok::<_, Box<dyn std::error::Error>>(app_bundle)
     })?;
 
