@@ -272,12 +272,22 @@ The checks run under a 353-minute budget, inside a 358-minute job budget, so a
 run that overruns fails as a failed step rather than being terminated at the
 runner pool's ~360-minute wall (which reports as `cancelled`, with no failed
 step and no chance to clean up). A run that ends without a verdict — budget
-expired, evicted by a re-dispatch, cancelled — replaces its own `pending` status
-with a failure; otherwise `scripts/signoff status` and `scripts/signoff mine`
-would keep showing a sign-off in progress for a run that is long gone.
-Re-dispatch against the same HEAD to try again.
+expired, evicted by a re-dispatch, cancelled — restates its own `pending` status,
+keeping it `pending` and replacing the "in progress" wording with why the run
+ended. Re-dispatch against the same HEAD to try again.
 
-That replacement is the workflow's job, not the dying script's. Being signalled is
+It stays `pending` because nothing judged the diff. `failure` is the one state
+that reads as a code failure: `pr.yml` rejects it, **Attestation** rejects it on
+the head commit ([#12362](https://github.com/spiceai/spiceai/issues/12362)), and a
+red `signoff` never self-clears, so the commit stays disqualified until someone
+re-dispatches by hand ([#12741](https://github.com/spiceai/spiceai/issues/12741)).
+`pending` reads as "not signed off yet" instead — Attestation stays red, because
+HEAD really is not signed off, but it points at re-running sign-off rather than at
+a defect in the diff. A dormant `pending` is still distinguishable from a live one:
+`scripts/signoff status` reports any non-success as not signed off, and
+`scripts/signoff mine` takes its ⟳ from the in-flight run list, not from the status.
+
+That restatement is the workflow's job, not the dying script's. Being signalled is
 how a run learns its budget expired: `run_checks` returns `make`'s status and bash
 reports a killed child as 128+N, so the script classifies that as reaching **no
 verdict** and publishes nothing at all, saying why in its step summary. Treating it

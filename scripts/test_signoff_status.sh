@@ -402,10 +402,16 @@ assert_attestation_refresh "an in-flight Attestation is not flagged on the succe
 echo
 echo "scripts/signoff clear-pending"
 
-# The bug: a run terminated mid-check leaves the `pending` it posted on the
-# commit for good, so `status` and `mine` report a sign-off still in progress.
-assert_clear_pending "a pending status is replaced with a failure" \
-  pending failure "a canned reason"
+# A run terminated mid-check leaves the `pending` it posted on the commit with its
+# "in progress" wording, so the description is restated to say the run ended.
+#
+# The state stays `pending` and must not become `failure`: nothing judged the diff,
+# pr.yml reads `failure` as a code failure, Attestation rejects it on the head commit
+# (#12362), and a red `signoff` never self-clears, disqualifying the commit outright.
+# A budget expiry reaches this path as a failed step rather than a cancellation, so
+# `correct-cancelled` never fires to take such a verdict back (#12741).
+assert_clear_pending "an incomplete run is restated as pending, not failed" \
+  pending pending "a canned reason"
 
 # The run reached a verdict — that verdict is the one that counts.
 assert_clear_pending "a successful sign-off is left alone" success

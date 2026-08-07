@@ -25,7 +25,7 @@
 #   scripts/signoff --no-verify     Sign off without running the checks (honor system)
 #   scripts/signoff status          Show the sign-off status of HEAD
 #   scripts/signoff mine            Show attestation status for all your open PRs
-#   scripts/signoff clear-pending   Turn a left-behind pending status into a failure
+#   scripts/signoff clear-pending   Restate a left-behind pending status as incomplete
 #   scripts/signoff preflight-disk  Check the work volume's free space (CI: run
 #                                   before the toolchain setup steps)
 #   scripts/signoff check           Show whether trunk requires sign-off
@@ -1463,14 +1463,28 @@ cmd_correct_cancelled() {
   return 0
 }
 
-# Replace a `pending` sign-off status with a failure.
+# Restate a left-behind `pending` sign-off status as a run that reached no verdict.
 #
 # A remote run posts `pending` before it starts the checks, so a run that never
 # reaches a verdict — the job is terminated at its budget, the runner goes away —
-# leaves that `pending` on the commit for good. `status` and `mine` then render
-# the branch as a sign-off still in progress, which is the one thing it is not.
+# leaves that `pending` on the commit carrying its "in progress" wording, which
+# is the one thing the run is not.
 #
-# Only `pending` is replaced. A run that finished has already posted its own
+# The state stays `pending`; only the description changes. Nothing judged the diff,
+# so `failure` would assert what no check established — pr.yml reads it as a code
+# failure, Attestation rejects it on the head commit (#12362), and a red `signoff`
+# never self-clears, leaving the commit disqualified until someone re-dispatches by
+# hand. `pending` is what this run's own signalled path already leaves standing (see
+# `describe_check_failure`), and pr.yml reads it as "not signed off yet": Attestation
+# stays red, because HEAD really is not signed off, but points at re-running sign-off
+# rather than at a phantom defect in the diff. Same answer as `correct-cancelled`, for
+# the same reason — neither ending is evidence about the diff.
+#
+# A dormant `pending` stays distinguishable from a live one: `mine` takes its ⟳ from
+# the in-flight run list, not from this status, and `status` reports any non-success
+# as "not signed off". The description carries the rest.
+#
+# Only `pending` is rewritten. A run that finished has already posted its own
 # success or failure, and overwriting that would discard the real verdict; the
 # same guard makes this safe to run unconditionally at the end of a job.
 #
@@ -1495,7 +1509,7 @@ cmd_clear_pending() {
     return 0
   fi
 
-  post_commit_status "$repo" "$sha" failure "$reason" \
+  post_commit_status "$repo" "$sha" pending "$reason" \
     || fail "failed to post the sign-off status (do you have write access to ${repo}?)"
   append_step_summary "### Sign-off"$'\n'"**Incomplete** on \`${sha:0:12}\` — ${reason}"$'\n'
   echo "${NO} ${sha:0:12} — ${reason}"
@@ -1838,8 +1852,10 @@ Developers:
   scripts/signoff status       Show the sign-off status of HEAD
   scripts/signoff mine         Show attestation status for all your open PRs
   scripts/signoff clear-pending [reason]
-                               Replace a left-behind '${STATUS_CONTEXT}' pending status
-                               on HEAD with a failure (no-op for any other state)
+                               Restate a left-behind '${STATUS_CONTEXT}' pending status
+                               on HEAD as a run that reached no verdict: it stays
+                               pending, with [reason] as its description (no-op for
+                               any other state)
 
 CI (.github/workflows/signoff.yml):
   scripts/signoff correct-cancelled [<sha>] [<owner/repo>]
