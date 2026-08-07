@@ -475,11 +475,13 @@ jobs:
       # as a *failed step* rather than a cancellation, leaving this step the incomplete-run
       # cases and the handler above the externally-cancelled ones.
       #
-      # Both write `pending`, so the two agree on what they mean rather than racing to
-      # opposite verdicts. Budget expiry and external cancellation are the same epistemic
-      # state — no verdict was reached — and `failure` is the one state that reads as a
-      # defect in the diff instead (#12741). Only the description differs, naming which
-      # way the run ended. A `success` already on the commit is left untouched by both.
+      # Neither handler writes a verdict, so the two agree on the end state rather than
+      # racing to opposite ones: budget expiry and external cancellation are the same
+      # epistemic state — nothing judged the diff — and `failure` is the one state that
+      # reads as a defect in it instead (#12741). They act on different starting states.
+      # `correct-cancelled` above repairs a `failure`/`error` into `pending`, and leaves
+      # an already-`pending` status untouched; this step restates a `pending` with why
+      # the run ended. A `success` already on the commit is left alone by both.
       - name: Resolve an incomplete sign-off
         if: always() && !cancelled() && steps.sign_off.conclusion != 'success'
         run: |
