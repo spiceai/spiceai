@@ -193,6 +193,16 @@ pub async fn create_new_connector(
     Some(factory.connector(params))
 }
 
+/// Whether a catalog connector factory is registered under `name`.
+///
+/// [`create_new_connector`] cannot answer this on its own: it needs the
+/// [`ConnectorParams`], and building those resolves the same factory and fails first.
+/// The load path checks the name here so an unregistered provider is reported as one.
+pub async fn is_registered(name: &str) -> bool {
+    let guard = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
+    guard.contains_key(name)
+}
+
 /// Names of every registered catalog connector, for "did you mean?" suggestions.
 pub async fn registered_catalog_names() -> Vec<String> {
     let guard = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;

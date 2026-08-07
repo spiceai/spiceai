@@ -22,14 +22,17 @@ use crate::accelerated_table::refresh_task::deletion::{
 };
 use crate::component::dataset::OnSchemaChange;
 use crate::datafusion::error::{find_datafusion_root, format_datafusion_error};
-use crate::schema_evolution::{emit_schema_evolution_event, evolution_allowed};
+use crate::schema_evolution::{
+    SCHEMA_EVOLUTION_APPLIED, SCHEMA_EVOLUTION_DETECTED, SCHEMA_EVOLUTION_FAILED,
+    emit_schema_evolution_event, evolution_allowed, schema_evolution_labels, widening_plan_kind,
+};
 use crate::{dataupdate::StreamingDataUpdateExecutionPlan, status};
 use arrow::array::{
     Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow_tools::record_batch::try_cast_to;
-use arrow_tools::schema_evolution::{self, EvolutionContext, SchemaEvolution, WideningPlan};
+use arrow_tools::schema_evolution::{self, EvolutionContext, SchemaEvolution};
 use cache::Caching;
 #[cfg(not(windows))]
 use cayenne::{CayenneCdcWrite, CayenneTableProvider};
@@ -53,7 +56,6 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::TableReference;
 use datafusion::{execution::context::SessionContext, physical_plan::collect};
 use futures::{StreamExt, stream};
-use opentelemetry::KeyValue;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_datafusion_index::{IndexedTableProvider, LayerWalk, find_concrete_table_provider_in};
 use runtime_metrics::acceleration as metrics;
@@ -615,64 +617,6 @@ fn schema_evolution_first_warn(key: String) -> bool {
     SCHEMA_EVOLUTION_WARNING_KEYS
         .lock()
         .insert_new(key, SCHEMA_EVOLUTION_WARNING_KEY_LIMIT)
-}
-
-static SCHEMA_EVOLUTION_METER: std::sync::LazyLock<opentelemetry::metrics::Meter> =
-    std::sync::LazyLock::new(|| opentelemetry::global::meter("schema_evolution"));
-
-pub(crate) static SCHEMA_EVOLUTION_DETECTED: std::sync::LazyLock<
-    opentelemetry::metrics::Counter<u64>,
-> = std::sync::LazyLock::new(|| {
-    SCHEMA_EVOLUTION_METER
-        .u64_counter("schema_evolution_detected")
-        .with_description(
-            "Schema changes detected between an incoming source schema and the stored/accelerator schema.",
-        )
-        .build()
-});
-
-pub(crate) static SCHEMA_EVOLUTION_APPLIED: std::sync::LazyLock<
-    opentelemetry::metrics::Counter<u64>,
-> = std::sync::LazyLock::new(|| {
-    SCHEMA_EVOLUTION_METER
-        .u64_counter("schema_evolution_applied")
-        .with_description("Schema evolutions applied to the accelerator or cached source schema.")
-        .build()
-});
-
-pub(crate) static SCHEMA_EVOLUTION_FAILED: std::sync::LazyLock<
-    opentelemetry::metrics::Counter<u64>,
-> = std::sync::LazyLock::new(|| {
-    SCHEMA_EVOLUTION_METER
-        .u64_counter("schema_evolution_failed")
-        .with_description(
-            "Schema changes that were not applied: incompatible, blocked by policy, or requiring a restart.",
-        )
-        .build()
-});
-
-pub(crate) fn schema_evolution_labels(
-    dataset: &str,
-    kind: &'static str,
-    action: &'static str,
-) -> [KeyValue; 3] {
-    [
-        KeyValue::new("dataset", dataset.to_string()),
-        KeyValue::new("kind", kind),
-        KeyValue::new("action", action),
-    ]
-}
-
-/// Dominant change kind of a widening plan for the `kind` metric label.
-#[must_use]
-pub(crate) fn widening_plan_kind(plan: &WideningPlan) -> &'static str {
-    if !plan.widened_columns.is_empty() {
-        "widened_types"
-    } else if !plan.relaxed_nullability.is_empty() {
-        "nullability"
-    } else {
-        "added_columns"
-    }
 }
 
 /// Per-dataset CDC schema-evolution settings, installed at dataset
@@ -1913,42 +1857,44 @@ impl RefreshTask {
             }
             return true;
         }
-        let mut committers: Vec<Box<dyn cdc::CommitChange + Send + Sync>> =
-            Vec::with_capacity(envelopes.len());
-        let mut batches: Vec<ChangeBatch> = Vec::with_capacity(envelopes.len());
-        // Time the deferred-batch build loop: for sources that defer the decode
-        // (MySQL binlog rows), each envelope pays a `spawn_blocking` round-trip
-        // here — a per-envelope cost otherwise invisible between the recv_wait
-        // and coalesce stage timers.
+        // Time the deferred-batch build: sources that defer the decode (MySQL
+        // binlog and Postgres logical-replication rows) pay one `spawn_blocking`
+        // round trip per burst here — a cost otherwise invisible between the
+        // recv_wait and coalesce stage timers.
         let decode_start = Instant::now();
-        for env in envelopes {
-            // Build the (possibly deferred) batch here, on the per-dataset apply
-            // task — off the source's shared read/route path. A deferred build
-            // can fail on per-row value typing that only surfaces at build time
-            // (e.g. an unmergeable unchanged-TOAST column under REPLICA IDENTITY
-            // DEFAULT); treat it as a terminal error for this dataset, mirroring
-            // the eager path's pump-side fatal. Committers collected so far are
-            // dropped without acking, so the source re-streams on reconnect.
-            let (committer, batch, _is_ready) = match env.into_parts_offloaded().await {
-                Ok(parts) => parts,
-                Err(e) => {
-                    let error_message = format!(
-                        "Failed to build CDC change batch for {}: {e}",
-                        context.dataset_name,
-                    );
-                    tracing::error!("{error_message}");
-                    self.set_refresh_status(
-                        context.refresh_sql,
-                        status::ComponentStatus::error_with_message(error_message),
-                    )
-                    .await;
-                    return false;
-                }
-            };
-            committers.push(committer);
-            batches.push(batch);
-        }
+        // Build on the per-dataset apply task, off the source's shared
+        // read/route path. A deferred build can fail on per-row value typing that
+        // only surfaces at build time (e.g. an unmergeable unchanged-TOAST column
+        // under REPLICA IDENTITY DEFAULT); treat it as terminal for this dataset,
+        // mirroring the eager path's pump-side fatal. The burst's committers are
+        // dropped unacked, so the source re-streams on reconnect.
+        let parts = match cdc::into_parts_offloaded_burst(envelopes).await {
+            Ok(parts) => parts,
+            Err(e) => {
+                let error_message = format!(
+                    "Failed to build CDC change batch for {}: {e}",
+                    context.dataset_name,
+                );
+                tracing::error!("{error_message}");
+                self.set_refresh_status(
+                    context.refresh_sql,
+                    status::ComponentStatus::error_with_message(error_message),
+                )
+                .await;
+                return false;
+            }
+        };
         record_cdc_fixed_cost(context.metric_labels, "decode", decode_start);
+
+        // Readiness was already folded into `any_ready` before the heartbeat
+        // retain, so the per-envelope flag is spent here.
+        let (committers, batches): (
+            Vec<Box<dyn cdc::CommitChange + Send + Sync>>,
+            Vec<ChangeBatch>,
+        ) = parts
+            .into_iter()
+            .map(|(committer, batch, _is_ready)| (committer, batch))
+            .unzip();
 
         // Mixed-schema runs (mid-stream schema evolution): `concat_change_batches`
         // requires equal schemas. When the dataset's policy allows evolution,
@@ -3079,7 +3025,7 @@ fn cdc_item_budget_bytes(item: &Result<cdc::ChangeEnvelope, cdc::StreamError>) -
     // envelope from a schema-aware estimate of its buffered wire size, a built
     // one from its actual Arrow size. Used only to bound how much a single burst
     // accumulates before applying; the real Arrow build is deferred to apply
-    // time (`into_parts_offloaded`), off the source's shared read path.
+    // time (`into_parts_offloaded_burst`), off the source's shared read path.
     item.as_ref().map_or(0, cdc::ChangeEnvelope::encoded_len)
 }
 

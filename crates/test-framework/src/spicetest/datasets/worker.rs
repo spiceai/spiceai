@@ -30,6 +30,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::execution::QueryExecutor;
+use crate::spicetest::pacer::QueryPacer;
 use crate::telemetry::streaming::QueryMetricEvent;
 
 use crate::{
@@ -64,6 +65,9 @@ pub(crate) struct SpiceTestQueryWorker {
     streaming_metrics_sender: Option<mpsc::Sender<QueryMetricEvent>>,
     /// Duration threshold - queries exceeding this are marked as failed in streaming metrics
     query_duration_threshold: Option<Duration>,
+    /// Fleet-wide issue-rate limiter. `None` runs closed-loop, where the offered
+    /// rate is whatever the server's latency allows.
+    pacer: Option<Arc<QueryPacer>>,
 }
 
 pub struct SpiceTestQueryWorkerResult {
@@ -128,6 +132,7 @@ impl SpiceTestQueryWorker {
             shutdown_token: CancellationToken::new(),
             streaming_metrics_sender: None,
             query_duration_threshold: None,
+            pacer: None,
         }
     }
 
@@ -153,6 +158,12 @@ impl SpiceTestQueryWorker {
 
     pub fn with_query_duration_threshold(mut self, threshold: Duration) -> Self {
         self.query_duration_threshold = Some(threshold);
+        self
+    }
+
+    #[must_use]
+    pub fn with_pacer(mut self, pacer: Option<Arc<QueryPacer>>) -> Self {
+        self.pacer = pacer;
         self
     }
 
@@ -451,6 +462,42 @@ impl SpiceTestQueryWorker {
         })
     }
 
+    /// Whether this worker should stop issuing queries: shutdown was requested,
+    /// or a duration-based run has reached its scheduled end.
+    fn should_stop(&self, start: &Instant) -> bool {
+        self.shutdown_token.is_cancelled()
+            || matches!(self.end_condition, EndCondition::Duration(d) if start.elapsed() >= d)
+    }
+
+    /// Wait for this worker's turn in the fleet's issue schedule, giving up if
+    /// the run ends first.
+    ///
+    /// At low target rates a slot can be many seconds out. Sleeping through one
+    /// that will never be used would drag a duration-based run past its
+    /// scheduled end and leave a cancelled run lingering, so the wait races the
+    /// run's own end. Abandoning a reserved slot on the way out costs nothing:
+    /// no further queries are issued either way.
+    async fn await_issue_slot(&self, pacer: &QueryPacer, start: &Instant) {
+        tokio::select! {
+            () = pacer.acquire() => {}
+            () = self.shutdown_token.cancelled() => {}
+            () = Self::sleep_until_scheduled_end(self.end_condition, start) => {}
+        }
+    }
+
+    /// Completes when a duration-based run reaches its scheduled end, and never
+    /// for a run with no deadline to reach.
+    async fn sleep_until_scheduled_end(end_condition: EndCondition, start: &Instant) {
+        match end_condition {
+            EndCondition::Duration(duration) => {
+                tokio::time::sleep(duration.saturating_sub(start.elapsed())).await;
+            }
+            EndCondition::QuerySetCompleted(_) | EndCondition::Unlimited => {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
     // run queries as a duration-based test
     async fn run_query_set(
         &self,
@@ -463,10 +510,20 @@ impl SpiceTestQueryWorker {
         for query in queries {
             // Stop submitting new queries once the duration has elapsed or shutdown
             // was requested, so the test finishes close to the scheduled duration.
-            if self.shutdown_token.is_cancelled()
-                || matches!(self.end_condition, EndCondition::Duration(d) if start.elapsed() >= d)
-            {
+            if self.should_stop(start) {
                 break;
+            }
+
+            // Hold this worker at the fleet's scheduled issue rate before doing
+            // anything else, so the wait is not counted in the query's own
+            // duration below.
+            if let Some(pacer) = &self.pacer {
+                self.await_issue_slot(pacer, start).await;
+                // The wait can end because the run did rather than because the
+                // slot came up.
+                if self.should_stop(start) {
+                    break;
+                }
             }
 
             let QueryRunResult {
