@@ -134,9 +134,14 @@ pub async fn release(
     let client_identity =
         reqwest::Identity::from_pem(client_pem.as_bytes()).context(IdentitySnafu)?;
 
+    // `reqwest::Identity::from_pem` builds a rustls identity, and the workspace
+    // compiles both TLS backends in, so the backend has to be pinned to match:
+    // a builder left on the default resolves to native-tls and rejects the
+    // identity outright. Every other `.identity()` call site pins it the same way.
     let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(10))
+        .use_rustls_tls()
         .identity(client_identity);
     if let Some(ca_pem) = ca_cert_pem {
         for cert in reqwest::Certificate::from_pem_bundle(ca_pem.as_bytes()).context(CaCertSnafu)? {
@@ -263,5 +268,99 @@ mod tests {
         // A multi-byte char straddling the limit must not be split.
         let s = "aa\u{e9}bb";
         assert_eq!(bounded(s, 3), "aa");
+    }
+
+    /// A self-signed leaf plus its key, in the PEM shape an enrolled identity
+    /// holds them. The keypair is rcgen's default (ECDSA P-256, `aws_lc_rs`),
+    /// which is what `IdentityStore::generate_enrollment` produces, so the
+    /// identity here is presented over TLS exactly as a real one is.
+    fn self_signed_identity() -> Identity {
+        let key = rcgen::KeyPair::generate().expect("generate leaf keypair");
+        let params = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .expect("leaf certificate params");
+        let cert = params.self_signed(&key).expect("self-sign the leaf");
+
+        Identity {
+            identifier: "inst_release_test".to_string(),
+            identity_cert_pem: cert.pem(),
+            private_key_pem: key.serialize_pem(),
+            public_key_pem: String::new(),
+            ca_bundle_pem: String::new(),
+            gateway_addr: String::new(),
+            not_after_unix: None,
+            enc_private_key_pem: String::new(),
+            enc_public_key_pem: String::new(),
+            enc_previous_private_key_pem: String::new(),
+            cache_key_b64: String::new(),
+        }
+    }
+
+    // Port 1 is privileged and unbound, so a connection to it is refused well
+    // inside the connect timeout instead of waiting it out.
+    const UNREACHABLE_ENDPOINT: &str = "https://127.0.0.1:1";
+
+    #[tokio::test]
+    async fn release_builds_its_mtls_client_from_a_real_identity() {
+        // `reqwest::Identity::from_pem` yields a rustls identity, and the
+        // workspace compiles native-tls in alongside rustls, so a client
+        // builder that does not pin rustls rejects the identity and the
+        // release fails before it ever reaches the network. Getting as far as
+        // a transport error is what proves the backend and the identity agree.
+        let identity = self_signed_identity();
+
+        let Err(err) = release(UNREACHABLE_ENDPOINT, &identity, None).await else {
+            panic!("release against an unbound port must not succeed");
+        };
+
+        assert!(
+            matches!(err, Error::Http { .. }),
+            "expected a transport error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_builds_its_mtls_client_with_extra_trust_roots() {
+        // The self-hosted path adds root certificates to the same builder, so
+        // it has to agree with the identity's backend too.
+        let ca_key = rcgen::KeyPair::generate().expect("generate CA keypair");
+        let mut ca_params =
+            rcgen::CertificateParams::new(Vec::<String>::new()).expect("CA certificate params");
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_pem = ca_params
+            .self_signed(&ca_key)
+            .expect("self-sign the CA")
+            .pem();
+
+        let identity = self_signed_identity();
+
+        let Err(err) = release(UNREACHABLE_ENDPOINT, &identity, Some(&ca_pem)).await else {
+            panic!("release against an unbound port must not succeed");
+        };
+
+        assert!(
+            matches!(err, Error::Http { .. }),
+            "expected a transport error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_reports_a_truncated_identity_distinctly() {
+        // An identity file missing its key block carries repair advice that the
+        // generic client-build failure does not, so the two must stay
+        // distinguishable. `Identity::from_pem` checks that a certificate block
+        // and a key block are both present, which is what this exercises; it
+        // does not inspect the key's contents, so a well-formed block holding
+        // nonsense is accepted here and only rejected at handshake time.
+        let mut identity = self_signed_identity();
+        identity.private_key_pem = String::new();
+
+        let Err(err) = release(UNREACHABLE_ENDPOINT, &identity, None).await else {
+            panic!("release with a truncated identity must not succeed");
+        };
+
+        assert!(
+            matches!(err, Error::Identity { .. }),
+            "expected the identity error, got: {err}"
+        );
     }
 }
