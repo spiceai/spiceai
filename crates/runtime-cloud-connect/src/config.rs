@@ -38,8 +38,9 @@ pub const DEFAULT_TELEMETRY_INTERVAL: Duration = Duration::from_mins(1);
 
 /// Default cadence for `ExportMetrics` frames on an established stream.
 ///
-/// Matches the heartbeat cadence: the payload carries cumulative totals, so the
-/// interval sets chart resolution rather than what is or is not recorded.
+/// Matches the heartbeat cadence. Each export covers the interval that preceded
+/// it, so this is the resolution of the resulting series — no observation is
+/// lost to a longer interval, it is aggregated into a coarser point.
 pub const DEFAULT_METRICS_INTERVAL: Duration = Duration::from_secs(30);
 
 /// File name (relative to `$SPICE_CONFIG_DIR`) where the cloud-managed

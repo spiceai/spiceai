@@ -650,11 +650,11 @@ impl ClientDriver {
             }
         });
 
-        // Metrics ride the same stream but not the same delivery guarantee. The
-        // payload carries cumulative totals, so a dropped export costs a data
-        // point and no data — whereas a late heartbeat is read as an instance
-        // going away. This task therefore offers its message and moves on
-        // instead of waiting for room behind one.
+        // Each export carries only what was recorded since the last one, so
+        // nothing restates it: an export that does not land takes its interval's
+        // observations with it. This task therefore waits for room on the
+        // outbound channel rather than dropping the payload, and races shutdown
+        // while it waits so a full queue cannot outlive the stream.
         let met_tx = tx.clone();
         let met_runtime = Arc::clone(&runtime);
         let met_identifier = Arc::clone(&identifier);
@@ -708,23 +708,18 @@ impl ClientDriver {
                         },
                     )),
                 };
-                match met_tx.try_send(msg) {
-                    Ok(()) => {
-                        tracing::debug!(
-                            identifier = %id,
-                            bytes,
-                            "Cloud Connect: metrics export queued to the gateway"
-                        );
-                    }
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        tracing::warn!(
-                            identifier = %id,
-                            bytes,
-                            "Failed to export metrics to Spice Cloud: the outbound queue is full. Runtime will retry the export on the next interval. Metrics may be delayed to appear in Spice Cloud"
-                        );
-                    }
-                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                let sent = tokio::select! {
+                    () = met_shutdown.wait() => break,
+                    result = met_tx.send(msg) => result,
+                };
+                if sent.is_err() {
+                    break;
                 }
+                tracing::debug!(
+                    identifier = %id,
+                    bytes,
+                    "Spice Cloud Connect: metrics export queued to the gateway"
+                );
             }
         });
 

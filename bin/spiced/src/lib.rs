@@ -603,13 +603,13 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     // plane. Separate from the cluster reader above rather than shared: each
     // reader registered with the meter provider gets its own pipeline and so
     // sees every data point, whereas two consumers of one reader would divide
-    // them under delta temporality.
+    // them between themselves — each collection drains what it reports.
     //
     // Created here because readers are fixed when the meter provider is built,
     // which happens well before Cloud Connect starts — so the decision is made
     // from the same cheap on-disk/flag probe that gates log capture.
     let cloud_connect_metrics = if cloud_connect::is_configured(args.cloud_connect) {
-        Some(runtime::metrics_reader::MetricsReader::new_cumulative())
+        Some(runtime::metrics_reader::MetricsReader::new_delta())
     } else {
         None
     };
@@ -1362,8 +1362,9 @@ fn init_metrics(
         tracing::debug!("Cluster metrics reader enabled for on-demand OTLP collection");
     }
 
-    // Case 2b: Cloud Connect push. Its own reader, so the cumulative totals it
-    // reports are unaffected by any other consumer collecting.
+    // Case 2b: Cloud Connect push. Its own reader, so the deltas it reports
+    // cover every observation rather than only those no other consumer drained
+    // first.
     if let Some(reader) = cloud_connect_metrics {
         provider_builder = provider_builder.with_reader(reader);
         tracing::debug!("Cloud Connect metrics reader enabled for pushed OTLP export");
