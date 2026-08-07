@@ -62,16 +62,8 @@ use crate::stats::statistics_from_persisted_blob;
 /// sessions never carry it, so queries always see the full captured manifest.
 ///
 /// Carries the classified manifest ROWS, not their URLs, so the rewrite stream
-/// is built from the same listing the classification ran against. Selecting by
-/// URL out of the scan's own capture would make the rewrite set an
-/// intersection of two independent manifest reads: the promotion classifies
-/// against one listing and the scan captures another, and an intersection
-/// silently yields the smaller set. A dirty file missing from the scan's
-/// capture would then be dropped from the rewrite while the promotion's commit
-/// still retires it — its rows carried forward by neither reference (it was
-/// classified dirty) nor rewrite, i.e. silent row loss. Carrying the rows
-/// makes the rewrite input the classified state itself rather than a filter
-/// over whatever the later read returned.
+/// is built from the listing the classification ran against. See
+/// [`cold_files_for_scan`] for why that has to replace the scan's own capture.
 #[derive(Debug)]
 pub(crate) struct ColdScanFiles(pub Arc<Vec<ColdTierFile>>);
 
@@ -80,13 +72,18 @@ pub(crate) struct ColdScanFiles(pub Arc<Vec<ColdTierFile>>);
 /// manifest capture.
 ///
 /// `promotion` REPLACES `captured` — it is deliberately not intersected with
-/// it. `captured` and the promotion's classification are two independent reads
-/// of `cayenne_cold_tier_file` with no lock held across them, so they can
-/// disagree; intersecting silently yields the smaller set, dropping a dirty
-/// file from the rewrite that the promotion's commit still retires. Those rows
-/// would then be carried forward by neither manifest reference nor rewrite.
-/// Every file the promotion classified is one it listed from the manifest, so
+/// it. The two are independent reads of `cayenne_cold_tier_file` with no lock
+/// held across them, so they can disagree, and intersecting silently yields
+/// the smaller set: a file classified dirty but missing from `captured` would
+/// be dropped from the rewrite while the promotion's commit still retires it,
+/// carrying its rows forward by neither manifest reference nor rewrite. Every
+/// file the promotion classified is one it listed from the manifest, so
 /// reading them is always the correct rewrite input.
+///
+/// Should a retired file's object have since been GC'd, the scan fails with a
+/// `NotFound` rather than dropping rows — the same trade
+/// [`super::table::CayenneTableProvider::run_cold_tier_gc_tick`] already makes
+/// for a long-running query, and the right one for an accelerator.
 pub(crate) fn cold_files_for_scan<'a>(
     captured: &'a [ColdTierFile],
     promotion: Option<&'a ColdScanFiles>,
