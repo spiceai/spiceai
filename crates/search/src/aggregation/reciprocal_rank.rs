@@ -49,6 +49,24 @@ pub struct ReciprocalRankFusion;
 /// Default RRF smoothing parameter used across Spice hybrid search.
 pub const DEFAULT_RRF_K: f64 = 60.0;
 
+/// Multiplier for the number of candidates each RRF input must contribute.
+///
+/// RRF ranks and fuses this wider pool before applying the user-visible result
+/// limit. Keeping the pool wider than the final response preserves documents
+/// whose combined ranks make them relevant even when no individual leg ranks
+/// them in the final result set.
+pub const RRF_CANDIDATE_POOL_FACTOR: usize = 4;
+
+/// Returns the number of candidates each RRF input should contribute for a
+/// user-visible result limit.
+///
+/// The multiplication saturates so an unrepresentable pool size still yields
+/// a valid limit rather than wrapping and silently truncating candidates.
+#[must_use]
+pub fn rrf_candidate_pool_size(limit: usize) -> usize {
+    limit.saturating_mul(RRF_CANDIDATE_POOL_FACTOR)
+}
+
 const USIZE_TO_F64_CHUNK_BITS: usize = 16;
 const USIZE_TO_F64_CHUNK_BASE: f64 = 65_536.0;
 const USIZE_TO_F64_CHUNK_MASK: usize = (1usize << USIZE_TO_F64_CHUNK_BITS) - 1;
@@ -96,6 +114,10 @@ where
 
 #[async_trait]
 impl CandidateAggregation for ReciprocalRankFusion {
+    fn candidate_pool_size(&self, limit: usize) -> usize {
+        rrf_candidate_pool_size(limit)
+    }
+
     async fn aggregate(
         &self,
         mut data: Vec<VectorSearchGenerationResult>,
@@ -511,6 +533,15 @@ mod tests {
 
         assert!(search_score > sql_score);
         assert!(sql_score > table_schema_score);
+    }
+
+    /// Regression test for #12242: both HTTP and SQL RRF use this policy to
+    /// fetch candidates before applying the final fused-result limit.
+    #[test]
+    fn rrf_candidate_pool_is_wider_than_final_result_limit() {
+        assert_eq!(rrf_candidate_pool_size(10), 40);
+        assert_eq!(rrf_candidate_pool_size(usize::MAX), usize::MAX);
+        assert_eq!(ReciprocalRankFusion.candidate_pool_size(10), 40);
     }
 
     #[test]
