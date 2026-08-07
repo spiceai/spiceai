@@ -25,6 +25,8 @@ use datafusion::{
 };
 use std::sync::Arc;
 
+use crate::timezone;
+
 /// Timestamp format for a column — determines how target filter expressions
 /// are constructed.
 #[derive(Debug, Clone)]
@@ -79,17 +81,38 @@ fn convert_timestamp_expr(
                 None,
             ),
         ),
-        TimestampFormat::Timestamptz(tz) => binary_expr(
-            cast(
-                ident(time_column),
-                DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, tz.clone()),
-            ),
-            op,
-            Expr::Literal(
-                ScalarValue::TimestampNanosecond(Some(timestamp_in_nanos as i64), tz.to_owned()),
-                None,
-            ),
-        ),
+        TimestampFormat::Timestamptz(tz) => {
+            // The cast carries the accelerator schema's timezone spelling, and the
+            // DuckDB unparser renders `CAST(col AS Timestamp(ns, tz))` as
+            // `col AT TIME ZONE '<tz>'`, which DuckDB resolves through ICU — named
+            // zones only. Iceberg spells every `timestamptz` as the fixed offset
+            // `+00:00`, so carrying that spelling through unchanged gets the whole
+            // filter rejected with `Unknown TimeZone '+00:00'`, leaving the dataset
+            // stuck retrying a refresh that can never bind (#12528).
+            //
+            // Naming the same zone in a spelling every engine knows leaves the
+            // comparison unchanged. A non-UTC offset is left alone: it denotes a
+            // different zone, so rewriting it would move the comparison.
+            let tz = tz.as_ref().map(|tz| {
+                if timezone::is_utc(tz) {
+                    Arc::from(timezone::CANONICAL_UTC)
+                } else {
+                    Arc::clone(tz)
+                }
+            });
+
+            binary_expr(
+                cast(
+                    ident(time_column),
+                    DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, tz.clone()),
+                ),
+                op,
+                Expr::Literal(
+                    ScalarValue::TimestampNanosecond(Some(timestamp_in_nanos as i64), tz),
+                    None,
+                ),
+            )
+        }
     }
 }
 
@@ -485,6 +508,49 @@ mod tests {
         assert_eq!(
             result.to_string(),
             r#"CAST(timestamp AS Timestamp(ns, "UTC")) > TimestampNanosecond(1620000000000000000, Some("UTC"))"#,
+        );
+    }
+
+    /// Builds the filter for a `Timestamp(ns, tz)` column and returns it rendered.
+    fn convert_with_timezone(tz: &str) -> String {
+        let format = data_type_to_timestamp_format(
+            &DataType::Timestamp(TimeUnit::Nanosecond, Some(tz.into())),
+            None,
+        )
+        .expect("should resolve");
+        let converter = TimestampFilterConvert::new("timestamp".to_string(), format, None, None);
+        converter
+            .convert(1_620_000_000_000_000_000, Operator::Gt)
+            .to_string()
+    }
+
+    /// Regression test for #12528. Iceberg maps every `timestamptz` to the fixed
+    /// offset `+00:00`, which the `DuckDB` unparser renders as
+    /// `AT TIME ZONE '+00:00'` — a spelling `DuckDB`'s ICU resolver rejects, so the
+    /// filter has to name the zone in a form every engine accepts.
+    #[test]
+    fn a_fixed_offset_utc_column_is_named_utc() {
+        let expected = r#"CAST(timestamp AS Timestamp(ns, "UTC")) > TimestampNanosecond(1620000000000000000, Some("UTC"))"#;
+
+        for tz in ["+00:00", "-00:00", "+0000", "+00"] {
+            assert_eq!(convert_with_timezone(tz), expected, "{tz} denotes UTC");
+        }
+        for tz in ["Z", "GMT", "Etc/UTC", "utc"] {
+            assert_eq!(convert_with_timezone(tz), expected, "{tz} denotes UTC");
+        }
+    }
+
+    /// A non-UTC zone must survive untouched — rewriting it would move the
+    /// comparison to a different instant.
+    #[test]
+    fn a_non_utc_timezone_is_left_alone() {
+        assert_eq!(
+            convert_with_timezone("America/New_York"),
+            r#"CAST(timestamp AS Timestamp(ns, "America/New_York")) > TimestampNanosecond(1620000000000000000, Some("America/New_York"))"#,
+        );
+        assert_eq!(
+            convert_with_timezone("-05:00"),
+            r#"CAST(timestamp AS Timestamp(ns, "-05:00")) > TimestampNanosecond(1620000000000000000, Some("-05:00"))"#,
         );
     }
 

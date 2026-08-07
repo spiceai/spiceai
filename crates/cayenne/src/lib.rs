@@ -96,6 +96,8 @@ pub use metadata::{
     ObjectStoreConfig, PartitionMetadata, StorageClass, TableMetadata, TableStatistics,
 };
 pub use metastore::sqlite::{SqliteAutoVacuum, SqliteMetastoreConfig, set_sqlite_metastore_config};
+#[cfg(feature = "partition-table-provider")]
+pub use partition_creator::CayennePartitionCreator;
 pub use provider::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME};
 pub use provider::{
     CayenneCdcWrite, CayenneContext, CayenneStagedAppend, CayenneStagedUpsert,
