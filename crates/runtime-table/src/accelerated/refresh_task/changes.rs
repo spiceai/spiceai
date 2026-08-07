@@ -1868,42 +1868,44 @@ impl RefreshTask {
             }
             return true;
         }
-        let mut committers: Vec<Box<dyn cdc::CommitChange + Send + Sync>> =
-            Vec::with_capacity(envelopes.len());
-        let mut batches: Vec<ChangeBatch> = Vec::with_capacity(envelopes.len());
-        // Time the deferred-batch build loop: for sources that defer the decode
-        // (MySQL binlog rows), each envelope pays a `spawn_blocking` round-trip
-        // here — a per-envelope cost otherwise invisible between the recv_wait
-        // and coalesce stage timers.
+        // Time the deferred-batch build: sources that defer the decode (MySQL
+        // binlog and Postgres logical-replication rows) pay one `spawn_blocking`
+        // round trip per burst here — a cost otherwise invisible between the
+        // recv_wait and coalesce stage timers.
         let decode_start = Instant::now();
-        for env in envelopes {
-            // Build the (possibly deferred) batch here, on the per-dataset apply
-            // task — off the source's shared read/route path. A deferred build
-            // can fail on per-row value typing that only surfaces at build time
-            // (e.g. an unmergeable unchanged-TOAST column under REPLICA IDENTITY
-            // DEFAULT); treat it as a terminal error for this dataset, mirroring
-            // the eager path's pump-side fatal. Committers collected so far are
-            // dropped without acking, so the source re-streams on reconnect.
-            let (committer, batch, _is_ready) = match env.into_parts_offloaded().await {
-                Ok(parts) => parts,
-                Err(e) => {
-                    let error_message = format!(
-                        "Failed to build CDC change batch for {}: {e}",
-                        context.dataset_name,
-                    );
-                    tracing::error!("{error_message}");
-                    self.set_refresh_status(
-                        context.refresh_sql,
-                        status::ComponentStatus::error_with_message(error_message),
-                    )
-                    .await;
-                    return false;
-                }
-            };
-            committers.push(committer);
-            batches.push(batch);
-        }
+        // Build on the per-dataset apply task, off the source's shared
+        // read/route path. A deferred build can fail on per-row value typing that
+        // only surfaces at build time (e.g. an unmergeable unchanged-TOAST column
+        // under REPLICA IDENTITY DEFAULT); treat it as terminal for this dataset,
+        // mirroring the eager path's pump-side fatal. The burst's committers are
+        // dropped unacked, so the source re-streams on reconnect.
+        let parts = match cdc::into_parts_offloaded_burst(envelopes).await {
+            Ok(parts) => parts,
+            Err(e) => {
+                let error_message = format!(
+                    "Failed to build CDC change batch for {}: {e}",
+                    context.dataset_name,
+                );
+                tracing::error!("{error_message}");
+                self.set_refresh_status(
+                    context.refresh_sql,
+                    status::ComponentStatus::error_with_message(error_message),
+                )
+                .await;
+                return false;
+            }
+        };
         record_cdc_fixed_cost(context.metric_labels, "decode", decode_start);
+
+        // Readiness was already folded into `any_ready` before the heartbeat
+        // retain, so the per-envelope flag is spent here.
+        let (committers, batches): (
+            Vec<Box<dyn cdc::CommitChange + Send + Sync>>,
+            Vec<ChangeBatch>,
+        ) = parts
+            .into_iter()
+            .map(|(committer, batch, _is_ready)| (committer, batch))
+            .unzip();
 
         // Mixed-schema runs (mid-stream schema evolution): `concat_change_batches`
         // requires equal schemas. When the dataset's policy allows evolution,
@@ -3034,7 +3036,7 @@ fn cdc_item_budget_bytes(item: &Result<cdc::ChangeEnvelope, cdc::StreamError>) -
     // envelope from a schema-aware estimate of its buffered wire size, a built
     // one from its actual Arrow size. Used only to bound how much a single burst
     // accumulates before applying; the real Arrow build is deferred to apply
-    // time (`into_parts_offloaded`), off the source's shared read path.
+    // time (`into_parts_offloaded_burst`), off the source's shared read path.
     item.as_ref().map_or(0, cdc::ChangeEnvelope::encoded_len)
 }
 

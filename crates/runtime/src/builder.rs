@@ -812,6 +812,7 @@ impl RuntimeBuilder {
         let mut rt = Runtime {
             app: shared_app,
             apply_app_lock: Arc::new(tokio::sync::Mutex::new(())),
+            initial_load: Arc::new(crate::InitialLoad::default()),
             df,
             llm_runtime_stores: Arc::new(crate::model::LlmRuntimeStores::default()),
             http_rate_control_registry,

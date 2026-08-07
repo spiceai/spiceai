@@ -225,6 +225,9 @@ candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "e
 candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6", package = "candle-nn" } # branch: lukim/spiceai-0.11.0 (candle 0.11 + i-quant; refresh to merged SHA)
 candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6", package = "candle-transformers" } # branch: lukim/spiceai-0.11.0 (candle 0.11 + i-quant; refresh to merged SHA)
 charset = "0.1.5"
+# AEAD for the at-rest delivered-secrets cache. Already in the tree via `hpke`,
+# which uses the same primitive for the sealed-secret wire format.
+chacha20poly1305 = "0.11"
 chrono = "0.4.44"
 clap = { version = "4.5.60", features = ["derive", "env"] }
 crash-handler = "0.8"
