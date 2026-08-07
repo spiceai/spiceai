@@ -271,16 +271,23 @@ jobs:
           cp ./test/models/spicepod_openai.yml ./spicepod.yaml
           cat ./spicepod.yaml
 
+      # This job runs on the self-hosted pool, where several runner instances
+      # share one host and therefore one network namespace, so spiced's default
+      # 8090/50051 cannot be assumed free (#12419).
+      - name: Allocate Spice runtime ports
+        uses: ./.github/actions/allocate-spice-ports
+
       - name: Start spice runtime
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
         run: |
-          spice run &> spice.log &
+          spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
 
       - name: Wait for Spice runtime is ready
         uses: ./.github/actions/wait-for-spice-ready
         with:
+          url: ${{ env.SPICE_HTTP_ENDPOINT }}/v1/ready
           timeout: '60'
 
       - name: Install expect (linux)
@@ -467,16 +474,21 @@ jobs:
 
           exit "${rc}"
 
+      # Same shared-host constraint as the OpenAI model job above (#12419).
+      - name: Allocate Spice runtime ports
+        uses: ./.github/actions/allocate-spice-ports
+
       - name: Start spice runtime
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
         run: |
-          spice run &> spice.log &
+          spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
 
       - name: Wait for Spice runtime is ready
         uses: ./.github/actions/wait-for-spice-ready
         with:
+          url: ${{ env.SPICE_HTTP_ENDPOINT }}/v1/ready
           timeout: '300'
 
       - name: Install expect (linux)
