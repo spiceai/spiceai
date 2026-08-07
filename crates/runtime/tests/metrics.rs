@@ -226,8 +226,15 @@ fn memory_gauges_are_exported_to_the_operator_metrics_pipeline() {
 /// `tokio::time::interval` fires its first tick immediately, so
 /// `spawn_mem_tier_repartition_sampler` records before `init_metrics` installs
 /// the Prometheus provider. An instrument cached at that moment binds to the
-/// startup noop provider for the life of the process, which is what kept these
-/// three gauges off `/metrics` entirely — regression test for #12667.
+/// startup noop provider for the life of the process, which is what kept
+/// `query_memory_pool_used_bytes` and `cayenne_compaction_memory_pool_used_bytes`
+/// off `/metrics` entirely — regression test for #12667.
+///
+/// `process_resident_memory_bytes` is asserted alongside them even though it was
+/// scrapable, because it was only ever scrapable by accident: it is recorded
+/// after a `spawn_blocking(...).await` in the same loop iteration, and that
+/// round-trip happened to outlast the window. Nothing holds that ordering, so it
+/// is pinned here rather than left to survive on timing.
 ///
 /// [`memory_gauges_are_exported_to_the_operator_metrics_pipeline`] cannot catch
 /// that: it forces [`PROMETHEUS`] first, so it only ever records after the
