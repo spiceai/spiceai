@@ -207,9 +207,14 @@ pub async fn release(
             instance_id: identity.identifier.clone(),
         })?;
 
+    // `reqwest::Identity::from_pem` builds a rustls identity, and the workspace
+    // compiles both TLS backends in, so the backend has to be pinned to match:
+    // a builder left on the default resolves to native-tls and rejects the
+    // identity outright. Every other `.identity()` call site pins it the same way.
     let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(10))
+        .use_rustls_tls()
         .identity(client_identity);
     if let Some(ca_pem) = ca_cert_pem {
         for cert in reqwest::Certificate::from_pem_bundle(ca_pem.as_bytes()).context(CaCertSnafu)? {
