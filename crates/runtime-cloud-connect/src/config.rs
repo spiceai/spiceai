@@ -42,7 +42,7 @@ pub const DEFAULT_TELEMETRY_INTERVAL: Duration = Duration::from_mins(1);
 /// interval sets chart resolution rather than what is or is not recorded.
 pub const DEFAULT_METRICS_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Default ceiling on a single `RunQuery`.
+/// Default ceiling on a single `ExecuteQuery`.
 ///
 /// There is no cancellation command on this contract, and one query runs at a
 /// time, so a query that never finishes would hold the only slot for the life
@@ -182,7 +182,7 @@ pub struct CloudConnectConfig {
     /// renewal loop without waiting hours.
     pub renewal_lead: Duration,
 
-    /// How long a `RunQuery` may run before the instance abandons it and frees
+    /// How long an `ExecuteQuery` may run before the instance abandons it and frees
     /// the query slot. Defaults to [`DEFAULT_QUERY_DEADLINE`]; overridable so
     /// tests can exercise the deadline without waiting it out.
     pub query_deadline: Duration,

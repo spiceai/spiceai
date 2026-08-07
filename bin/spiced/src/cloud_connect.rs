@@ -595,7 +595,7 @@ impl RuntimeHandle for SpicedRuntimeHandle {
             // The handle holds the runtime, so it can always plan and execute
             // a query against whatever the instance currently serves — an
             // empty catalog answers with an error, not an inability.
-            Capability::ApplySpicepod | Capability::GetStatus | Capability::RunQuery => true,
+            Capability::ApplySpicepod | Capability::GetStatus | Capability::ExecuteQuery => true,
             // Only when the log-capture layer was installed at startup;
             // otherwise there is no buffer to read from.
             Capability::GetLogs => self.logs.is_some(),
@@ -608,7 +608,7 @@ impl RuntimeHandle for SpicedRuntimeHandle {
             Capability::Restart => "Restart is unsupported on standalone spiced: it is not a control the runtime offers on demand. A deployment already applies by restarting this instance onto the spicepod it validated; to restart it without deploying, use your process manager (systemd/Docker/Kubernetes). See: https://spiceai.org/docs".to_string(),
             Capability::UpgradeRuntime => "UpgradeRuntime is unsupported on standalone spiced: it cannot replace its own binary. Upgrade it the way you installed it (`spice upgrade`, your container image, or your package manager). See: https://spiceai.org/docs".to_string(),
             Capability::GetLogs => "Log capture is not enabled for this runtime: Spice Cloud Connect must be configured before startup for spiced to install the log-capture layer. See: https://spiceai.org/docs".to_string(),
-            Capability::ApplySpicepod | Capability::GetStatus | Capability::RunQuery => format!(
+            Capability::ApplySpicepod | Capability::GetStatus | Capability::ExecuteQuery => format!(
                 "{} is not supported by this instance",
                 capability.wire_name()
             ),
@@ -1005,7 +1005,7 @@ impl RuntimeHandle for SpicedRuntimeHandle {
             .map_err(|err| CommandError::internal(err.to_string()))
     }
 
-    /// Execute a `RunQuery` against the in-process runtime.
+    /// Execute an `ExecuteQuery` against the in-process runtime.
     ///
     /// The query goes through the same `DataFusion` entry point the local SQL
     /// APIs use, so there is no HTTP hop and no second set of query semantics
@@ -1020,7 +1020,7 @@ impl RuntimeHandle for SpicedRuntimeHandle {
     /// `max_rows` is clamped again here rather than trusted: the caller already
     /// clamps it, and a limit enforced in exactly one place is a limit one
     /// refactor away from being gone.
-    async fn run_query(&self, sql: &str, max_rows: u32) -> Result<QueryOutcome, CommandError> {
+    async fn execute_query(&self, sql: &str, max_rows: u32) -> Result<QueryOutcome, CommandError> {
         let result = self
             .runtime
             .datafusion()
@@ -1430,7 +1430,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------------
-    // RunQuery: row cap, byte cap, and the Arrow IPC the caller decodes.
+    // ExecuteQuery: row cap, byte cap, and the Arrow IPC the caller decodes.
     // ----------------------------------------------------------------------
 
     /// One `Int32` column named `n`, the shape every query test below returns.

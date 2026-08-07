@@ -107,7 +107,7 @@ pub(crate) struct ClientDriver {
     /// paced by [`RENEW_RETRY_INTERVAL`] rather than spinning on a
     /// due-in-the-past `not_after`. Cleared on enrollment.
     renew_not_before: Option<time::Instant>,
-    /// The single `RunQuery` slot. Its one permit is taken by the spawned
+    /// The single `ExecuteQuery` slot. Its one permit is taken by the spawned
     /// query task and released when that task ends, so a second query is
     /// refused as busy before it executes. Held on the driver rather than the
     /// stream so a reconnect cannot hand out a second slot while the first
@@ -927,12 +927,12 @@ impl ClientDriver {
                     }
                 }
             }
-            proto::control_message::Body::RunQuery(cmd) => {
+            proto::control_message::Body::ExecuteQuery(cmd) => {
                 if self
-                    .supported(tx, &command_id, Capability::RunQuery, name)
+                    .supported(tx, &command_id, Capability::ExecuteQuery, name)
                     .await
                 {
-                    self.handle_run_query(tx, &command_id, cmd).await;
+                    self.handle_execute_query(tx, &command_id, cmd).await;
                 }
             }
             proto::control_message::Body::Adopt(cmd) => {
@@ -1008,11 +1008,11 @@ impl ClientDriver {
     /// The query is bounded by `query_deadline` rather than left to run: this
     /// contract has no cancellation command, so a query that never returns
     /// would hold the only slot for the life of the process.
-    async fn handle_run_query(
+    async fn handle_execute_query(
         &self,
         tx: &mpsc::Sender<proto::ClientMessage>,
         command_id: &str,
-        cmd: proto::RunQuery,
+        cmd: proto::ExecuteQuery,
     ) {
         if cmd.sql.trim().is_empty() {
             send_result(
@@ -1051,7 +1051,7 @@ impl ClientDriver {
             let _permit = permit;
 
             let started = time::Instant::now();
-            let outcome = time::timeout(deadline, runtime.run_query(&sql, max_rows)).await;
+            let outcome = time::timeout(deadline, runtime.execute_query(&sql, max_rows)).await;
             let elapsed_ms = started.elapsed().as_millis();
 
             let Ok(outcome) = outcome else {
@@ -1631,7 +1631,7 @@ fn command_name(body: &proto::control_message::Body) -> &'static str {
         Body::ApplySecrets(_) => "ApplySecrets",
         Body::DeleteSecrets(_) => "DeleteSecrets",
         Body::GetLogs(_) => "GetLogs",
-        Body::RunQuery(_) => "RunQuery",
+        Body::ExecuteQuery(_) => "ExecuteQuery",
     }
 }
 

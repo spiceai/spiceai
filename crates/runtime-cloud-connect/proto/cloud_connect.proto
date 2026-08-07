@@ -178,7 +178,7 @@ message ControlMessage {
     Pause pause = 13;
     ApplySecrets apply_secrets = 14;
     DeleteSecrets delete_secrets = 15;
-    RunQuery run_query = 18;
+    ExecuteQuery execute_query = 18;
   }
 
   // Correlates the eventual `CommandResult`. Empty for an unsolicited
@@ -419,7 +419,7 @@ message Pause {
 // There is no cancellation command: a caller that stops waiting releases its
 // own waiter, and the query runs on inside the instance until it finishes or
 // hits the instance's deadline.
-message RunQuery {
+message ExecuteQuery {
   string sql = 1;
   // Requested row cap. Zero means the instance default; the effective cap is
   // min(max_rows, 500) with zero mapping to 500.

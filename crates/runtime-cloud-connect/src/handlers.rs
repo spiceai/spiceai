@@ -114,14 +114,14 @@ impl CommandError {
     }
 }
 
-/// Most rows a [`RuntimeHandle::run_query`] result may carry.
+/// Most rows a [`RuntimeHandle::execute_query`] result may carry.
 pub const MAX_QUERY_ROWS: u32 = 500;
 
-/// Most bytes the complete Arrow IPC stream of a [`RuntimeHandle::run_query`]
+/// Most bytes the complete Arrow IPC stream of a [`RuntimeHandle::execute_query`]
 /// result may occupy on the control stream.
 pub const MAX_QUERY_RESULT_BYTES: usize = 4 * 1024 * 1024;
 
-/// The row cap a `RunQuery` actually gets: its own request bounded by
+/// The row cap an `ExecuteQuery` actually gets: its own request bounded by
 /// [`MAX_QUERY_ROWS`], with zero meaning the full default.
 #[must_use]
 pub fn effective_max_rows(requested: u32) -> u32 {
@@ -132,7 +132,7 @@ pub fn effective_max_rows(requested: u32) -> u32 {
     }
 }
 
-/// A bounded `RunQuery` result.
+/// A bounded `ExecuteQuery` result.
 #[derive(Debug, Clone)]
 pub struct QueryOutcome {
     /// A complete Arrow IPC stream — schema, record batches, end-of-stream —
@@ -169,17 +169,17 @@ pub enum Capability {
     /// Report runtime readiness.
     GetStatus,
     /// Execute a bounded SQL query through the in-process runtime.
-    RunQuery,
+    ExecuteQuery,
 }
 
 impl Capability {
     /// Every capability this client can advertise, in wire-name order.
     pub const ALL: &'static [Self] = &[
         Self::ApplySpicepod,
+        Self::ExecuteQuery,
         Self::GetLogs,
         Self::GetStatus,
         Self::Restart,
-        Self::RunQuery,
         Self::UpgradeRuntime,
     ];
 
@@ -193,7 +193,7 @@ impl Capability {
             Self::UpgradeRuntime => "upgrade_runtime",
             Self::GetLogs => "get_logs",
             Self::GetStatus => "get_status",
-            Self::RunQuery => "run_query",
+            Self::ExecuteQuery => "execute_query",
         }
     }
 }
@@ -574,10 +574,14 @@ pub trait RuntimeHandle: Send + Sync + 'static {
     /// statement fixable.
     ///
     /// The default reports the command as unsupported so a handle that cannot
-    /// query neither advertises `run_query` nor fabricates a result.
-    async fn run_query(&self, _sql: &str, _max_rows: u32) -> Result<QueryOutcome, CommandError> {
+    /// query neither advertises `execute_query` nor fabricates a result.
+    async fn execute_query(
+        &self,
+        _sql: &str,
+        _max_rows: u32,
+    ) -> Result<QueryOutcome, CommandError> {
         Err(CommandError::unsupported(
-            "RunQuery is not implemented in this build",
+            "ExecuteQuery is not implemented in this build",
         ))
     }
 }
@@ -644,30 +648,33 @@ mod tests {
             Err(CommandError::Unsupported { .. })
         ));
         assert!(matches!(
-            h.run_query("SELECT 1", MAX_QUERY_ROWS).await,
+            h.execute_query("SELECT 1", MAX_QUERY_ROWS).await,
             Err(CommandError::Unsupported { .. })
         ));
     }
 
-    /// A handle that can query advertises `run_query`; one that cannot must
+    /// A handle that can query advertises `execute_query`; one that cannot must
     /// not — the control plane rejects unsupported queries on the strength of
     /// this list without a round trip, so a false advertisement is worse than
     /// none.
     #[test]
-    fn run_query_is_advertised_only_by_a_handle_that_can_query() {
+    fn execute_query_is_advertised_only_by_a_handle_that_can_query() {
         struct QueryingHandle;
 
         #[async_trait]
         impl RuntimeHandle for QueryingHandle {
             fn supports(&self, capability: Capability) -> bool {
-                capability == Capability::RunQuery
+                capability == Capability::ExecuteQuery
             }
         }
 
-        assert_eq!(advertised_capabilities(&QueryingHandle), vec!["run_query"]);
+        assert_eq!(
+            advertised_capabilities(&QueryingHandle),
+            vec!["execute_query"]
+        );
         assert!(
-            !advertised_capabilities(&NoopRuntimeHandle).contains(&"run_query".to_string()),
-            "a handle that cannot query must not advertise run_query"
+            !advertised_capabilities(&NoopRuntimeHandle).contains(&"execute_query".to_string()),
+            "a handle that cannot query must not advertise execute_query"
         );
     }
 
@@ -767,7 +774,7 @@ mod tests {
                 | Capability::UpgradeRuntime
                 | Capability::GetLogs
                 | Capability::GetStatus
-                | Capability::RunQuery => {}
+                | Capability::ExecuteQuery => {}
             }
         }
         let names: BTreeSet<&str> = Capability::ALL.iter().map(|c| c.wire_name()).collect();
@@ -780,10 +787,10 @@ mod tests {
             names,
             BTreeSet::from([
                 "apply_spicepod",
+                "execute_query",
                 "get_logs",
                 "get_status",
                 "restart",
-                "run_query",
                 "upgrade_runtime",
             ])
         );

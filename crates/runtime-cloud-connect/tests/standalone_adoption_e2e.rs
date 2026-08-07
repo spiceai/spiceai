@@ -636,7 +636,7 @@ impl RuntimeHandle for E2eRuntime {
 }
 
 // --------------------------------------------------------------------------
-// Runtime handle for the RunQuery path. Records what the client handed it and
+// Runtime handle for the ExecuteQuery path. Records what the client handed it and
 // returns a scripted outcome, so the tests below observe the client's own
 // behavior (clamping, the single slot, the byte cap) rather than a query
 // engine's.
@@ -655,9 +655,9 @@ struct QueryRuntimeState {
 struct QueryRuntime {
     state: Arc<Mutex<QueryRuntimeState>>,
     can_query: bool,
-    /// What `run_query` answers with.
+    /// What `execute_query` answers with.
     reply: Mutex<Option<Result<QueryOutcome, CommandError>>>,
-    /// Released to let an in-flight `run_query` return. `None` returns at once.
+    /// Released to let an in-flight `execute_query` return. `None` returns at once.
     release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
 }
 
@@ -674,7 +674,7 @@ impl QueryRuntime {
         )
     }
 
-    /// A handle that can query but blocks inside `run_query` until the returned
+    /// A handle that can query but blocks inside `execute_query` until the returned
     /// sender fires — how a test holds the single query slot open.
     fn blocking() -> (
         Arc<Self>,
@@ -720,14 +720,14 @@ impl QueryRuntime {
 impl RuntimeHandle for QueryRuntime {
     fn supports(&self, capability: Capability) -> bool {
         match capability {
-            Capability::RunQuery => self.can_query,
+            Capability::ExecuteQuery => self.can_query,
             // GetRuntimeInfo needs no capability, so this keeps the handle to
             // exactly the one command under test.
             _ => false,
         }
     }
 
-    async fn run_query(&self, sql: &str, max_rows: u32) -> Result<QueryOutcome, CommandError> {
+    async fn execute_query(&self, sql: &str, max_rows: u32) -> Result<QueryOutcome, CommandError> {
         {
             let mut state = self.state.lock().await;
             state.max_rows_seen.push(max_rows);
@@ -753,7 +753,7 @@ async fn enroll_query_runtime(
     enroll_query_runtime_with_deadline(harness, runtime, Duration::from_mins(1)).await
 }
 
-/// As [`enroll_query_runtime`], with the `RunQuery` deadline set explicitly so
+/// As [`enroll_query_runtime`], with the `ExecuteQuery` deadline set explicitly so
 /// a test can exercise it without waiting out the production value.
 async fn enroll_query_runtime_with_deadline(
     harness: &Harness,
@@ -809,8 +809,8 @@ async fn advertised_capabilities(captured: &Arc<Mutex<Captured>>) -> Vec<String>
         .expect("a Hello must have been captured")
 }
 
-fn run_query(sql: &str, max_rows: u32) -> proto::control_message::Body {
-    proto::control_message::Body::RunQuery(proto::RunQuery {
+fn execute_query(sql: &str, max_rows: u32) -> proto::control_message::Body {
+    proto::control_message::Body::ExecuteQuery(proto::ExecuteQuery {
         sql: sql.to_string(),
         max_rows,
     })
@@ -820,7 +820,7 @@ fn run_query(sql: &str, max_rows: u32) -> proto::control_message::Body {
 /// runtime encoded — the client is a courier for the Arrow IPC stream, not a
 /// re-encoder of it.
 #[tokio::test]
-async fn run_query_returns_the_runtime_bytes_on_the_binary_arm() {
+async fn execute_query_returns_the_runtime_bytes_on_the_binary_arm() {
     let harness = Harness::new(24 * 60 * 60).await;
     let payload = b"ARROW-IPC-STREAM-BYTES".to_vec();
     let (runtime, state) = QueryRuntime::returning(payload.clone(), 3);
@@ -831,11 +831,11 @@ async fn run_query_returns_the_runtime_bytes_on_the_binary_arm() {
         .outbound
         .lock()
         .await
-        .push_back(ctrl_id("cmd-query", run_query("SELECT 1", 10)));
+        .push_back(ctrl_id("cmd-query", execute_query("SELECT 1", 10)));
 
     let result = await_result(&harness.gateway.captured, "cmd-query")
         .await
-        .expect("the client must answer a RunQuery");
+        .expect("the client must answer an ExecuteQuery");
     assert_eq!(
         result.code,
         proto::ResultCode::Ok as i32,
@@ -856,7 +856,7 @@ async fn run_query_returns_the_runtime_bytes_on_the_binary_arm() {
 /// request above the cap is clamped before the runtime ever sees it. A runtime
 /// handed 500 cannot return 100_000 rows even if the caller asked for them.
 #[tokio::test]
-async fn run_query_clamps_the_row_limit_before_the_runtime_runs() {
+async fn execute_query_clamps_the_row_limit_before_the_runtime_runs() {
     for (requested, expected) in [(0_u32, MAX_QUERY_ROWS), (10, 10), (100_000, MAX_QUERY_ROWS)] {
         let harness = Harness::new(24 * 60 * 60).await;
         let (runtime, state) = QueryRuntime::returning(b"rows".to_vec(), 1);
@@ -867,11 +867,11 @@ async fn run_query_clamps_the_row_limit_before_the_runtime_runs() {
             .outbound
             .lock()
             .await
-            .push_back(ctrl_id("cmd-clamp", run_query("SELECT 1", requested)));
+            .push_back(ctrl_id("cmd-clamp", execute_query("SELECT 1", requested)));
 
         await_result(&harness.gateway.captured, "cmd-clamp")
             .await
-            .expect("the client must answer a RunQuery");
+            .expect("the client must answer an ExecuteQuery");
         assert_eq!(
             state.lock().await.max_rows_seen,
             vec![expected],
@@ -885,7 +885,7 @@ async fn run_query_clamps_the_row_limit_before_the_runtime_runs() {
 /// A second query while one is in flight is refused before it executes — the
 /// runtime handle must be called exactly once, not queued behind the first.
 #[tokio::test]
-async fn run_query_answers_busy_without_executing_a_second_query() {
+async fn execute_query_answers_busy_without_executing_a_second_query() {
     let harness = Harness::new(24 * 60 * 60).await;
     let (runtime, state, release) = QueryRuntime::blocking();
     let (handle, _dir) = enroll_query_runtime(&harness, runtime).await;
@@ -895,7 +895,7 @@ async fn run_query_answers_busy_without_executing_a_second_query() {
         .outbound
         .lock()
         .await
-        .push_back(ctrl_id("cmd-first", run_query("SELECT 1", 10)));
+        .push_back(ctrl_id("cmd-first", execute_query("SELECT 1", 10)));
 
     // Wait until the first query is genuinely inside the handle, so the second
     // one races a held slot rather than an empty one.
@@ -911,7 +911,7 @@ async fn run_query_answers_busy_without_executing_a_second_query() {
         .outbound
         .lock()
         .await
-        .push_back(ctrl_id("cmd-second", run_query("SELECT 2", 10)));
+        .push_back(ctrl_id("cmd-second", execute_query("SELECT 2", 10)));
 
     let second = await_result(&harness.gateway.captured, "cmd-second")
         .await
@@ -960,7 +960,7 @@ async fn heartbeats_and_commands_stay_live_while_a_query_runs() {
         .outbound
         .lock()
         .await
-        .push_back(ctrl_id("cmd-slow", run_query("SELECT 1", 10)));
+        .push_back(ctrl_id("cmd-slow", execute_query("SELECT 1", 10)));
 
     let running = wait_until_async(Duration::from_secs(5), || {
         let state = Arc::clone(&state);
@@ -1001,7 +1001,7 @@ async fn heartbeats_and_commands_stay_live_while_a_query_runs() {
 /// payload at all — a partial result would look to the caller like the whole
 /// answer.
 #[tokio::test]
-async fn run_query_refuses_an_oversized_result_without_partial_data() {
+async fn execute_query_refuses_an_oversized_result_without_partial_data() {
     let harness = Harness::new(24 * 60 * 60).await;
     let oversized = vec![0_u8; MAX_QUERY_RESULT_BYTES + 1];
     let (runtime, _state) = QueryRuntime::returning(oversized, 1);
@@ -1012,7 +1012,7 @@ async fn run_query_refuses_an_oversized_result_without_partial_data() {
         .outbound
         .lock()
         .await
-        .push_back(ctrl_id("cmd-big", run_query("SELECT 1", 10)));
+        .push_back(ctrl_id("cmd-big", execute_query("SELECT 1", 10)));
 
     let result = await_result(&harness.gateway.captured, "cmd-big")
         .await
@@ -1037,7 +1037,7 @@ async fn run_query_refuses_an_oversized_result_without_partial_data() {
 /// forwarded — the whole point of holding the limits at the instance is that
 /// nothing downstream re-checks them.
 #[tokio::test]
-async fn run_query_refuses_a_result_with_more_rows_than_the_limit() {
+async fn execute_query_refuses_a_result_with_more_rows_than_the_limit() {
     let harness = Harness::new(24 * 60 * 60).await;
     // Small payload, but it claims far more rows than the 10 that were asked
     // for — an honest byte count with a dishonest row count.
@@ -1049,7 +1049,7 @@ async fn run_query_refuses_a_result_with_more_rows_than_the_limit() {
         .outbound
         .lock()
         .await
-        .push_back(ctrl_id("cmd-toomany", run_query("SELECT 1", 10)));
+        .push_back(ctrl_id("cmd-toomany", execute_query("SELECT 1", 10)));
 
     let result = await_result(&harness.gateway.captured, "cmd-toomany")
         .await
@@ -1069,10 +1069,10 @@ async fn run_query_refuses_a_result_with_more_rows_than_the_limit() {
     handle.shutdown().await;
 }
 
-/// A runtime that cannot query neither advertises `run_query` nor pretends to
+/// A runtime that cannot query neither advertises `execute_query` nor pretends to
 /// answer one — and the session survives the refusal.
 #[tokio::test]
-async fn run_query_is_unsupported_when_the_runtime_cannot_query() {
+async fn execute_query_is_unsupported_when_the_runtime_cannot_query() {
     let harness = Harness::new(24 * 60 * 60).await;
     let (runtime, state) = QueryRuntime::incapable();
     let (handle, _dir) = enroll_query_runtime(&harness, runtime).await;
@@ -1080,8 +1080,8 @@ async fn run_query_is_unsupported_when_the_runtime_cannot_query() {
     let captured = Arc::clone(&harness.gateway.captured);
     let advertised = advertised_capabilities(&captured).await;
     assert!(
-        !advertised.contains(&"run_query".to_string()),
-        "a runtime that cannot query must not advertise run_query: {advertised:?}"
+        !advertised.contains(&"execute_query".to_string()),
+        "a runtime that cannot query must not advertise execute_query: {advertised:?}"
     );
 
     harness
@@ -1089,7 +1089,7 @@ async fn run_query_is_unsupported_when_the_runtime_cannot_query() {
         .outbound
         .lock()
         .await
-        .push_back(ctrl_id("cmd-nope", run_query("SELECT 1", 10)));
+        .push_back(ctrl_id("cmd-nope", execute_query("SELECT 1", 10)));
 
     let result = await_result(&captured, "cmd-nope")
         .await
@@ -1118,11 +1118,11 @@ async fn run_query_is_unsupported_when_the_runtime_cannot_query() {
     handle.shutdown().await;
 }
 
-/// A capable runtime advertises `run_query` and announces the protocol revision
+/// A capable runtime advertises `execute_query` and announces the protocol revision
 /// that carries it. The gateway gates dispatch on the capability, so the two
 /// must appear together.
 #[tokio::test]
-async fn a_querying_runtime_advertises_run_query() {
+async fn a_querying_runtime_advertises_execute_query() {
     let harness = Harness::new(24 * 60 * 60).await;
     let (runtime, _state) = QueryRuntime::returning(b"rows".to_vec(), 1);
     let (handle, _dir) = enroll_query_runtime(&harness, runtime).await;
@@ -1130,8 +1130,8 @@ async fn a_querying_runtime_advertises_run_query() {
     let captured = Arc::clone(&harness.gateway.captured);
     let advertised = advertised_capabilities(&captured).await;
     assert!(
-        advertised.contains(&"run_query".to_string()),
-        "a querying runtime must advertise run_query: {advertised:?}"
+        advertised.contains(&"execute_query".to_string()),
+        "a querying runtime must advertise execute_query: {advertised:?}"
     );
     let protocol_version = captured
         .lock()
@@ -1143,7 +1143,7 @@ async fn a_querying_runtime_advertises_run_query() {
     assert_eq!(
         protocol_version,
         runtime_cloud_connect::PROTOCOL_VERSION,
-        "the announced revision must be the one that carries run_query"
+        "the announced revision must be the one that carries execute_query"
     );
 
     handle.shutdown().await;
@@ -1153,7 +1153,7 @@ async fn a_querying_runtime_advertises_run_query() {
 /// taken, so a stream of blank queries cannot lock the instance out of real
 /// ones.
 #[tokio::test]
-async fn run_query_rejects_an_empty_statement() {
+async fn execute_query_rejects_an_empty_statement() {
     let harness = Harness::new(24 * 60 * 60).await;
     let (runtime, state) = QueryRuntime::returning(b"rows".to_vec(), 1);
     let (handle, _dir) = enroll_query_runtime(&harness, runtime).await;
@@ -1163,7 +1163,7 @@ async fn run_query_rejects_an_empty_statement() {
         .outbound
         .lock()
         .await
-        .push_back(ctrl_id("cmd-empty", run_query("   \n\t ", 10)));
+        .push_back(ctrl_id("cmd-empty", execute_query("   \n\t ", 10)));
 
     let result = await_result(&harness.gateway.captured, "cmd-empty")
         .await
@@ -1185,7 +1185,7 @@ async fn run_query_rejects_an_empty_statement() {
         .outbound
         .lock()
         .await
-        .push_back(ctrl_id("cmd-real", run_query("SELECT 1", 10)));
+        .push_back(ctrl_id("cmd-real", execute_query("SELECT 1", 10)));
     let real = await_result(&harness.gateway.captured, "cmd-real")
         .await
         .expect("a real query must still run after an empty one");
@@ -1212,7 +1212,7 @@ async fn a_query_that_never_returns_is_abandoned_and_frees_the_slot() {
         .outbound
         .lock()
         .await
-        .push_back(ctrl_id("cmd-hang", run_query("SELECT 1", 10)));
+        .push_back(ctrl_id("cmd-hang", execute_query("SELECT 1", 10)));
 
     let hung = await_result(&harness.gateway.captured, "cmd-hang")
         .await
@@ -1231,7 +1231,7 @@ async fn a_query_that_never_returns_is_abandoned_and_frees_the_slot() {
         .outbound
         .lock()
         .await
-        .push_back(ctrl_id("cmd-after-hang", run_query("SELECT 2", 10)));
+        .push_back(ctrl_id("cmd-after-hang", execute_query("SELECT 2", 10)));
     let after = await_result(&harness.gateway.captured, "cmd-after-hang")
         .await
         .expect("a query after the deadline must be answered");
@@ -1254,7 +1254,7 @@ async fn a_query_that_never_returns_is_abandoned_and_frees_the_slot() {
 /// codes, so the portal can tell a bad statement from a busy instance from a
 /// broken one without reading the English.
 #[tokio::test]
-async fn run_query_maps_runtime_failures_onto_their_own_codes() {
+async fn execute_query_maps_runtime_failures_onto_their_own_codes() {
     for (error, expected) in [
         (
             CommandError::invalid_argument("Query failed: no such column"),
@@ -1282,7 +1282,7 @@ async fn run_query_maps_runtime_failures_onto_their_own_codes() {
             .outbound
             .lock()
             .await
-            .push_back(ctrl_id("cmd-err", run_query("SELECT 1", 10)));
+            .push_back(ctrl_id("cmd-err", execute_query("SELECT 1", 10)));
 
         let result = await_result(&harness.gateway.captured, "cmd-err")
             .await
