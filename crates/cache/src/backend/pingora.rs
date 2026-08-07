@@ -155,13 +155,18 @@ where
     /// least-recently-used set rather than ordering it globally.
     fn evict_to_weight_limit(&self) {
         for (entry, _) in self.cache.evict_to_limit() {
-            self.remove_metadata(entry.key);
-
             // A concurrent `insert` can re-admit the key between its eviction above and
-            // the metadata drop, which would leave a value in the cache that no metadata
-            // points at: unreachable through `get`, uncounted by `len`, and holding its
-            // weight until `clear`. Drop that value so the two stay consistent, taking a
-            // cache miss on the racing insert instead of leaking its weight.
+            // the metadata drop. Holding the shard across both the drop and the re-admit
+            // check serialises this against `insert`, which publishes the value and its
+            // metadata under the same lock: either the insert has already published and
+            // both are dropped here, or it has not started and will publish both after.
+            // Without the lock the insert could slip its metadata write in after this
+            // branch and leave metadata naming a value that was just removed — a key
+            // `len()`/`iter_keys()` still report but `get()` can never serve.
+            let shard_idx = Self::get_shard_index(entry.key);
+            let mut shard = self.metadata_shards[shard_idx].write();
+            shard.remove(&entry.key);
+
             if self.cache.peek(entry.key) {
                 self.cache.remove(entry.key);
             }
@@ -179,20 +184,25 @@ where
         let weight = value.get_memory_size();
         let expires_at = Instant::now() + self.ttl;
 
-        // If key already exists, remove old metadata first to update weight correctly
-        if self.remove_metadata(key).is_some() {
-            // Remove from pingora-lru as well (admit will re-add)
-            let _ = self.cache.remove(key);
-        }
-
-        // Store the value in pingora-lru, keyed so an eviction can find its metadata
-        self.cache.admit(key, KeyedValue { key, value }, weight);
-
-        // Store metadata in appropriate shard
         let shard_idx = Self::get_shard_index(key);
-        self.metadata_shards[shard_idx]
-            .write()
-            .insert(key, KeyMetadata { expires_at });
+        {
+            // Publish the value and its metadata under one hold of the shard so a
+            // concurrent eviction of this key cannot land between them (see
+            // `evict_to_weight_limit`). `remove_metadata` is not reused here because the
+            // lock is not reentrant.
+            let mut shard = self.metadata_shards[shard_idx].write();
+
+            // If key already exists, remove old metadata first to update weight correctly
+            if shard.remove(&key).is_some() {
+                // Remove from pingora-lru as well (admit will re-add)
+                let _ = self.cache.remove(key);
+            }
+
+            // Store the value in pingora-lru, keyed so an eviction can find its metadata
+            self.cache.admit(key, KeyedValue { key, value }, weight);
+
+            shard.insert(key, KeyMetadata { expires_at });
+        }
 
         // Admitting is what pushes the cache over its limit, so bring it back under.
         // A value heavier than the whole limit is evicted again here, as it is on Moka.
