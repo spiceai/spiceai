@@ -73,6 +73,23 @@ use crate::error::{EmptyComponentSnafu, Result, SeparatorInComponentSnafu};
 /// them (see [`SecretAddress::new`]), so the join is unambiguous.
 pub const AAD_SEPARATOR: u8 = 0x00;
 
+/// Pinned `namespace` for a standalone instance's sealed secrets.
+///
+/// A standalone instance is a single host, not a cluster: it has no Kubernetes
+/// namespace or Secret object, so there is nothing for a caller to supply and
+/// nothing to carry on the wire. Every party derives the AAD from this literal
+/// instead, which is why it lives here — beside the seal — rather than at each
+/// call site.
+///
+/// **Must match the control plane's and the gateway's copies byte for byte.**
+/// All three derive the AAD from these constants and never from the message, so
+/// a divergence fails every open with nothing in the error naming the cause.
+pub const STANDALONE_SECRETS_NAMESPACE: &str = "standalone";
+
+/// Pinned `secret_name` for a standalone instance's sealed secrets. See
+/// [`STANDALONE_SECRETS_NAMESPACE`].
+pub const STANDALONE_SECRETS_NAME: &str = "instance-secrets";
+
 /// The canonical, validated fields both AAD forms are built from.
 ///
 /// Holding them in one value is the point: the inner and the outer AAD are
@@ -166,6 +183,26 @@ impl SecretAddress {
     #[must_use]
     pub fn key_id(&self) -> &str {
         &self.key_id
+    }
+
+    /// The address of a **standalone instance's** sealed secrets, with the
+    /// namespace and secret name pinned to
+    /// [`STANDALONE_SECRETS_NAMESPACE`]/[`STANDALONE_SECRETS_NAME`].
+    ///
+    /// Use this rather than passing the literals to [`Self::new`], so a caller
+    /// cannot get one of the two halves wrong and there is one place to look for
+    /// what the standalone AAD is built from.
+    ///
+    /// # Errors
+    /// As [`Self::new`]: returns [`Error::SeparatorInComponent`] when
+    /// `external_id` or `key_id` contains [`AAD_SEPARATOR`].
+    pub fn standalone(external_id: &str, key_id: &str) -> Result<Self> {
+        Self::new(
+            external_id,
+            STANDALONE_SECRETS_NAMESPACE,
+            STANDALONE_SECRETS_NAME,
+            key_id,
+        )
     }
 
     /// The same address, re-pointed at another recipient key. The outer layer
