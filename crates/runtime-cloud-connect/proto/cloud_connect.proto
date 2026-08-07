@@ -94,6 +94,13 @@ enum ResultCode {
   RESULT_CODE_FAILED = 4;
   // The instance hit a fault of its own while handling the command.
   RESULT_CODE_INTERNAL = 5;
+  // A command of this kind is already in flight; this one was refused before
+  // any work started. Retryable once the first one finishes.
+  RESULT_CODE_BUSY = 6;
+  // The command ran but its result exceeds what the control stream carries.
+  // No partial payload accompanies this code — a narrower command may
+  // succeed, an identical retry will not.
+  RESULT_CODE_RESULT_TOO_LARGE = 7;
 }
 
 // Coarse runtime state. The single vocabulary for "how is this runtime
@@ -171,6 +178,7 @@ message ControlMessage {
     Pause pause = 13;
     ApplySecrets apply_secrets = 14;
     DeleteSecrets delete_secrets = 15;
+    RunQuery run_query = 18;
   }
 
   // Correlates the eventual `CommandResult`. Empty for an unsolicited
@@ -380,6 +388,42 @@ message Drain {}
 
 message Pause {
   PauseState state = 1;
+}
+
+// Run a SQL query against the instance's in-process runtime and return the
+// rows as a complete Arrow IPC stream in `CommandResult.binary`.
+//
+// READ-ONLY. The statement is planned and then refused if it carries DDL, DML,
+// COPY, or a write-capable extension: this command arrives from the control
+// plane rather than from someone holding the instance's own credentials, so it
+// reads the instance and never changes it.
+//
+// The instance holds the limits, not the caller: at most 500 rows and at most
+// 4 MiB of Arrow IPC in the single result, one query in flight at a time — a
+// second is answered RESULT_CODE_BUSY before it executes — and a deadline after
+// which the query is abandoned and the slot freed. An oversized result is
+// RESULT_CODE_RESULT_TOO_LARGE with no payload; there is no partial success and
+// no chunking.
+//
+// The SQL text and the result values never leave the instance except as this
+// command's own result: nothing about them reaches the control plane's logs,
+// traces, or metrics, which carry only the command id, duration, row count,
+// byte count, and outcome. The instance still records the statement in its own
+// local query history, the same as for a query it received directly.
+//
+// `CommandResult.message` is the one place caller-derived text rides the wire:
+// on RESULT_CODE_INVALID_ARGUMENT it carries the engine's diagnostic, without
+// which a rejected statement cannot be fixed. It goes to the caller who wrote
+// the query and is not to be logged or retained on the way.
+//
+// There is no cancellation command: a caller that stops waiting releases its
+// own waiter, and the query runs on inside the instance until it finishes or
+// hits the instance's deadline.
+message RunQuery {
+  string sql = 1;
+  // Requested row cap. Zero means the instance default; the effective cap is
+  // min(max_rows, 500) with zero mapping to 500.
+  uint32 max_rows = 2;
 }
 
 // Sealed secrets delivery. A secret value is sealed TWICE with HPKE

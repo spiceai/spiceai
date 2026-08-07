@@ -42,6 +42,14 @@ pub const DEFAULT_TELEMETRY_INTERVAL: Duration = Duration::from_mins(1);
 /// interval sets chart resolution rather than what is or is not recorded.
 pub const DEFAULT_METRICS_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Default ceiling on a single `RunQuery`.
+///
+/// There is no cancellation command on this contract, and one query runs at a
+/// time, so a query that never finishes would hold the only slot for the life
+/// of the process and answer every later query as busy. The deadline is what
+/// bounds that: it releases the slot and abandons the work.
+pub const DEFAULT_QUERY_DEADLINE: Duration = Duration::from_mins(1);
+
 /// File name (relative to `$SPICE_CONFIG_DIR`) where the cloud-managed
 /// spicepod is written when an `ApplySpicepod` command arrives.
 pub const CLOUD_MANAGED_SPICEPOD_FILE: &str = "spicepod-cloud-managed.yml";
@@ -173,6 +181,11 @@ pub struct CloudConnectConfig {
     /// [`DEFAULT_RENEWAL_LEAD`]; overridable so tests can exercise the
     /// renewal loop without waiting hours.
     pub renewal_lead: Duration,
+
+    /// How long a `RunQuery` may run before the instance abandons it and frees
+    /// the query slot. Defaults to [`DEFAULT_QUERY_DEADLINE`]; overridable so
+    /// tests can exercise the deadline without waiting it out.
+    pub query_deadline: Duration,
 }
 
 impl CloudConnectConfig {
@@ -351,6 +364,7 @@ impl CloudConnectConfig {
             telemetry_interval: DEFAULT_TELEMETRY_INTERVAL,
             metrics_interval: DEFAULT_METRICS_INTERVAL,
             renewal_lead: DEFAULT_RENEWAL_LEAD,
+            query_deadline: DEFAULT_QUERY_DEADLINE,
         }
     }
 }

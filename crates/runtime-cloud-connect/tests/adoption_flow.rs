@@ -277,6 +277,7 @@ fn enroll_config(
         telemetry_interval: Duration::from_mins(1),
         metrics_interval: Duration::from_secs(30),
         renewal_lead: Duration::from_mins(1),
+        query_deadline: Duration::from_mins(1),
     }
 }
 
@@ -529,6 +530,7 @@ async fn apply_spicepod_writes_file_and_acks() {
         telemetry_interval: Duration::from_mins(1),
         metrics_interval: Duration::from_secs(30),
         renewal_lead: Duration::from_hours(12),
+        query_deadline: Duration::from_mins(1),
     };
 
     let handle = runtime_cloud_connect::CloudConnect::start(config, runtime)
@@ -678,6 +680,7 @@ async fn unknown_command_is_nacked_rather_than_dropped() {
         telemetry_interval: Duration::from_mins(1),
         metrics_interval: Duration::from_secs(30),
         renewal_lead: Duration::from_hours(12),
+        query_deadline: Duration::from_mins(1),
         adopt_app_name: None,
         adopt_create_app: false,
     };

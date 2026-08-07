@@ -58,6 +58,16 @@ pub enum CommandError {
     /// The instance hit a fault of its own while handling the command.
     #[snafu(display("{message}"))]
     Internal { message: String },
+
+    /// A command of this kind is already in flight and this one was refused
+    /// before any work started. Retryable once the first one finishes.
+    #[snafu(display("{message}"))]
+    Busy { message: String },
+
+    /// The command ran but its result exceeds what the control stream carries.
+    /// Never accompanied by a partial payload.
+    #[snafu(display("{message}"))]
+    ResultTooLarge { message: String },
 }
 
 impl CommandError {
@@ -88,6 +98,49 @@ impl CommandError {
             message: message.into(),
         }
     }
+
+    /// A command of this kind is already in flight.
+    pub fn busy(message: impl Into<String>) -> Self {
+        Self::Busy {
+            message: message.into(),
+        }
+    }
+
+    /// The result is too large to send on the control stream.
+    pub fn result_too_large(message: impl Into<String>) -> Self {
+        Self::ResultTooLarge {
+            message: message.into(),
+        }
+    }
+}
+
+/// Most rows a [`RuntimeHandle::run_query`] result may carry.
+pub const MAX_QUERY_ROWS: u32 = 500;
+
+/// Most bytes the complete Arrow IPC stream of a [`RuntimeHandle::run_query`]
+/// result may occupy on the control stream.
+pub const MAX_QUERY_RESULT_BYTES: usize = 4 * 1024 * 1024;
+
+/// The row cap a `RunQuery` actually gets: its own request bounded by
+/// [`MAX_QUERY_ROWS`], with zero meaning the full default.
+#[must_use]
+pub fn effective_max_rows(requested: u32) -> u32 {
+    if requested == 0 {
+        MAX_QUERY_ROWS
+    } else {
+        requested.min(MAX_QUERY_ROWS)
+    }
+}
+
+/// A bounded `RunQuery` result.
+#[derive(Debug, Clone)]
+pub struct QueryOutcome {
+    /// A complete Arrow IPC stream — schema, record batches, end-of-stream —
+    /// never a fragment and never chunked across results.
+    pub arrow_ipc: Vec<u8>,
+    /// How many rows `arrow_ipc` carries. Reported in telemetry; the values
+    /// themselves are not.
+    pub row_count: u64,
 }
 
 /// An optional command a [`RuntimeHandle`] may or may not implement.
@@ -115,6 +168,8 @@ pub enum Capability {
     GetLogs,
     /// Report runtime readiness.
     GetStatus,
+    /// Execute a bounded SQL query through the in-process runtime.
+    RunQuery,
 }
 
 impl Capability {
@@ -124,6 +179,7 @@ impl Capability {
         Self::GetLogs,
         Self::GetStatus,
         Self::Restart,
+        Self::RunQuery,
         Self::UpgradeRuntime,
     ];
 
@@ -137,6 +193,7 @@ impl Capability {
             Self::UpgradeRuntime => "upgrade_runtime",
             Self::GetLogs => "get_logs",
             Self::GetStatus => "get_status",
+            Self::RunQuery => "run_query",
         }
     }
 }
@@ -495,6 +552,34 @@ pub trait RuntimeHandle: Send + Sync + 'static {
     async fn collect_metrics(&self) -> Result<Option<Vec<u8>>, CommandError> {
         Ok(None)
     }
+
+    /// Execute `sql` through the in-process runtime and return at most
+    /// `max_rows` rows as a complete Arrow IPC stream.
+    ///
+    /// `max_rows` arrives already reduced by [`effective_max_rows`], so an
+    /// implementation caps at the value it is handed rather than re-deriving
+    /// the limit. Serialization must be bounded by
+    /// [`MAX_QUERY_RESULT_BYTES`]: a result that would exceed it returns
+    /// [`CommandError::ResultTooLarge`] rather than a truncated stream, and
+    /// the bytes are never materialized past the cap.
+    ///
+    /// Run it read-only. The command arrives from the control plane rather than
+    /// from someone holding the instance's own credentials, so an
+    /// implementation reads the instance and never changes it.
+    ///
+    /// `sql` and the values it returns are confidential: keep both out of logs,
+    /// traces, and metrics. The returned error message is the one exception —
+    /// it reaches the caller who wrote the query and nobody else, so it carries
+    /// the engine's diagnostic, which is the only thing that makes a rejected
+    /// statement fixable.
+    ///
+    /// The default reports the command as unsupported so a handle that cannot
+    /// query neither advertises `run_query` nor fabricates a result.
+    async fn run_query(&self, _sql: &str, _max_rows: u32) -> Result<QueryOutcome, CommandError> {
+        Err(CommandError::unsupported(
+            "RunQuery is not implemented in this build",
+        ))
+    }
 }
 
 /// The capabilities `runtime` advertises, as the wire names carried in
@@ -558,6 +643,46 @@ mod tests {
             h.status().await,
             Err(CommandError::Unsupported { .. })
         ));
+        assert!(matches!(
+            h.run_query("SELECT 1", MAX_QUERY_ROWS).await,
+            Err(CommandError::Unsupported { .. })
+        ));
+    }
+
+    /// A handle that can query advertises `run_query`; one that cannot must
+    /// not — the control plane rejects unsupported queries on the strength of
+    /// this list without a round trip, so a false advertisement is worse than
+    /// none.
+    #[test]
+    fn run_query_is_advertised_only_by_a_handle_that_can_query() {
+        struct QueryingHandle;
+
+        #[async_trait]
+        impl RuntimeHandle for QueryingHandle {
+            fn supports(&self, capability: Capability) -> bool {
+                capability == Capability::RunQuery
+            }
+        }
+
+        assert_eq!(advertised_capabilities(&QueryingHandle), vec!["run_query"]);
+        assert!(
+            !advertised_capabilities(&NoopRuntimeHandle).contains(&"run_query".to_string()),
+            "a handle that cannot query must not advertise run_query"
+        );
+    }
+
+    #[test]
+    fn zero_requested_rows_means_the_default_cap() {
+        assert_eq!(effective_max_rows(0), MAX_QUERY_ROWS);
+    }
+
+    #[test]
+    fn requested_rows_are_clamped_to_the_cap() {
+        assert_eq!(effective_max_rows(1), 1);
+        assert_eq!(effective_max_rows(MAX_QUERY_ROWS - 1), MAX_QUERY_ROWS - 1);
+        assert_eq!(effective_max_rows(MAX_QUERY_ROWS), MAX_QUERY_ROWS);
+        assert_eq!(effective_max_rows(MAX_QUERY_ROWS + 1), MAX_QUERY_ROWS);
+        assert_eq!(effective_max_rows(u32::MAX), MAX_QUERY_ROWS);
     }
 
     /// The default apply persists the spicepod but cannot make it live, so it
@@ -641,7 +766,8 @@ mod tests {
                 | Capability::Restart
                 | Capability::UpgradeRuntime
                 | Capability::GetLogs
-                | Capability::GetStatus => {}
+                | Capability::GetStatus
+                | Capability::RunQuery => {}
             }
         }
         let names: BTreeSet<&str> = Capability::ALL.iter().map(|c| c.wire_name()).collect();
@@ -657,6 +783,7 @@ mod tests {
                 "get_logs",
                 "get_status",
                 "restart",
+                "run_query",
                 "upgrade_runtime",
             ])
         );

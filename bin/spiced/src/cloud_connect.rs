@@ -59,20 +59,27 @@ limitations under the License.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use app::{App, AppBuilder};
+use arrow::error::ArrowError;
+use arrow::ipc::writer::StreamWriter;
 use async_trait::async_trait;
+use datafusion::error::DataFusionError;
+use datafusion::execution::SendableRecordBatchStream;
+use futures::StreamExt;
 use parking_lot::RwLock;
 use runtime::Runtime;
+use runtime::datafusion::query::Error as QueryError;
 use runtime::metrics_reader::MetricsReader;
 use runtime::status::ComponentStatus;
 use runtime_cloud_connect::config::{
     CLOUD_MANAGED_SPICEPOD_FILE, CloudConnectConfig, IDENTITY_FILE, PENDING_ADOPT_CODE_FILE,
 };
 use runtime_cloud_connect::handlers::{
-    ApplyOutcome, Capability, CommandError, RuntimeHandle, RuntimePhase, SpicepodDeployment,
-    StatusReport,
+    ApplyOutcome, Capability, CommandError, MAX_QUERY_RESULT_BYTES, QueryOutcome, RuntimeHandle,
+    RuntimePhase, SpicepodDeployment, StatusReport, effective_max_rows,
 };
 use runtime_cloud_connect::supervisor::Supervisor;
 use runtime_cloud_connect::{CloudConnect, identity::IdentityStore};
@@ -585,7 +592,10 @@ impl RuntimeHandle for SpicedRuntimeHandle {
     /// for a process that may have no supervisor to come back under.
     fn supports(&self, capability: Capability) -> bool {
         match capability {
-            Capability::ApplySpicepod | Capability::GetStatus => true,
+            // The handle holds the runtime, so it can always plan and execute
+            // a query against whatever the instance currently serves — an
+            // empty catalog answers with an error, not an inability.
+            Capability::ApplySpicepod | Capability::GetStatus | Capability::RunQuery => true,
             // Only when the log-capture layer was installed at startup;
             // otherwise there is no buffer to read from.
             Capability::GetLogs => self.logs.is_some(),
@@ -598,7 +608,7 @@ impl RuntimeHandle for SpicedRuntimeHandle {
             Capability::Restart => "Restart is unsupported on standalone spiced: it is not a control the runtime offers on demand. A deployment already applies by restarting this instance onto the spicepod it validated; to restart it without deploying, use your process manager (systemd/Docker/Kubernetes). See: https://spiceai.org/docs".to_string(),
             Capability::UpgradeRuntime => "UpgradeRuntime is unsupported on standalone spiced: it cannot replace its own binary. Upgrade it the way you installed it (`spice upgrade`, your container image, or your package manager). See: https://spiceai.org/docs".to_string(),
             Capability::GetLogs => "Log capture is not enabled for this runtime: Spice Cloud Connect must be configured before startup for spiced to install the log-capture layer. See: https://spiceai.org/docs".to_string(),
-            Capability::ApplySpicepod | Capability::GetStatus => format!(
+            Capability::ApplySpicepod | Capability::GetStatus | Capability::RunQuery => format!(
                 "{} is not supported by this instance",
                 capability.wire_name()
             ),
@@ -994,6 +1004,198 @@ impl RuntimeHandle for SpicedRuntimeHandle {
             .collect_otlp_export(&app_id)
             .map_err(|err| CommandError::internal(err.to_string()))
     }
+
+    /// Execute a `RunQuery` against the in-process runtime.
+    ///
+    /// The query goes through the same `DataFusion` entry point the local SQL
+    /// APIs use, so there is no HTTP hop and no second set of query semantics
+    /// to keep aligned.
+    ///
+    /// It runs **read-only**: the statement is planned and then rejected if it
+    /// carries DDL, DML, `COPY`, or a write-capable extension. This command
+    /// arrives from the control plane rather than from someone holding the
+    /// instance's own credentials, so it reads the instance and never changes
+    /// it.
+    ///
+    /// `max_rows` is clamped again here rather than trusted: the caller already
+    /// clamps it, and a limit enforced in exactly one place is a limit one
+    /// refactor away from being gone.
+    async fn run_query(&self, sql: &str, max_rows: u32) -> Result<QueryOutcome, CommandError> {
+        let result = self
+            .runtime
+            .datafusion()
+            .query_builder(sql)
+            .read_only(true)
+            .build()
+            .run()
+            .await
+            .map_err(|source| query_error(&source))?;
+        bounded_arrow_ipc(result.data, effective_max_rows(max_rows)).await
+    }
+}
+
+/// Classify a query failure so the portal can tell a bad statement from a
+/// struggling instance without reading the English.
+///
+/// A statement the engine could not parse, plan, or resolve is the caller's to
+/// fix and fails identically on retry — that is `INVALID_ARGUMENT`. An
+/// execution, resource, or I/O fault is the instance's, and may not recur, so
+/// it stays retryable.
+fn query_error(source: &QueryError) -> CommandError {
+    let caller_fault = match source {
+        QueryError::UnableToExecuteQuery { source } | QueryError::BindingParameters { source } => {
+            is_caller_error(source)
+        }
+        QueryError::TableAccessDisallowed { .. } => true,
+        _ => false,
+    };
+    classify(caller_fault, format!("Query failed: {source}"))
+}
+
+/// The same classification for a failure that arrives as a bare
+/// `DataFusionError` — mid-stream, after planning already succeeded.
+fn datafusion_error(source: &DataFusionError) -> CommandError {
+    classify(is_caller_error(source), format!("Query failed: {source}"))
+}
+
+fn classify(caller_fault: bool, message: String) -> CommandError {
+    if caller_fault {
+        CommandError::invalid_argument(message)
+    } else {
+        CommandError::failed(message)
+    }
+}
+
+/// Whether a `DataFusion` error blames the statement rather than the instance.
+fn is_caller_error(source: &DataFusionError) -> bool {
+    match source {
+        DataFusionError::SQL(..)
+        | DataFusionError::Plan(..)
+        | DataFusionError::SchemaError(..)
+        | DataFusionError::NotImplemented(..) => true,
+        // Wrappers that add context around the error that actually happened.
+        DataFusionError::Context(_, inner) | DataFusionError::Diagnostic(_, inner) => {
+            is_caller_error(inner)
+        }
+        DataFusionError::Shared(inner) => is_caller_error(inner),
+        // Only the caller's fault if nothing in the collection is the
+        // instance's: a set holding both blames the instance, since that is the
+        // half a retry might clear.
+        DataFusionError::Collection(errors) => {
+            !errors.is_empty() && errors.iter().all(is_caller_error)
+        }
+        _ => false,
+    }
+}
+
+/// An in-memory sink that refuses to grow past `limit`.
+///
+/// Bounding the *writer* is what makes an oversized result cheap: the encoder
+/// fails on the first write that would cross the cap, so the bytes are never
+/// materialized and then measured. A single row too large to fit trips it the
+/// same way a million small ones do.
+struct BoundedBuffer {
+    bytes: Vec<u8>,
+    limit: usize,
+    /// Set when a write was refused, so the caller can tell the cap apart from
+    /// a genuine encoding fault after the error has been laundered through
+    /// `ArrowError`.
+    overflowed: Arc<AtomicBool>,
+}
+
+impl std::io::Write for BoundedBuffer {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.bytes.len().saturating_add(data.len()) > self.limit {
+            self.overflowed.store(true, Ordering::Relaxed);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "Cloud Connect query result limit exceeded",
+            ));
+        }
+        self.bytes.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Encode at most `max_rows` rows of `stream` as one complete Arrow IPC stream
+/// of at most [`MAX_QUERY_RESULT_BYTES`] bytes.
+///
+/// Truncation is by slicing, which shares the batch's buffers rather than
+/// copying, and the stream is dropped as soon as the row cap is reached so the
+/// rows past it are never fetched. An empty result still produces a valid
+/// stream carrying the schema, so the caller can tell "no rows" from "no
+/// answer".
+async fn bounded_arrow_ipc(
+    mut stream: SendableRecordBatchStream,
+    max_rows: u32,
+) -> Result<QueryOutcome, CommandError> {
+    let schema = stream.schema();
+    let limit = max_rows as usize;
+    let overflowed = Arc::new(AtomicBool::new(false));
+    let sink = BoundedBuffer {
+        bytes: Vec::new(),
+        limit: MAX_QUERY_RESULT_BYTES,
+        overflowed: Arc::clone(&overflowed),
+    };
+
+    let mut writer = StreamWriter::try_new(sink, &schema)
+        .map_err(|source| encode_error(&overflowed, &source))?;
+
+    let mut rows: usize = 0;
+    while rows < limit {
+        let Some(batch) = stream.next().await else {
+            break;
+        };
+        // A failure that surfaces here rather than at planning is usually the
+        // instance's — a federated source going away mid-scan — so it takes the
+        // same classification as one from `run()` rather than being blamed on
+        // the statement.
+        let batch = batch.map_err(|source| datafusion_error(&source))?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let take = (limit - rows).min(batch.num_rows());
+        let batch = if take == batch.num_rows() {
+            batch
+        } else {
+            batch.slice(0, take)
+        };
+        rows += take;
+        writer
+            .write(&batch)
+            .map_err(|source| encode_error(&overflowed, &source))?;
+    }
+
+    writer
+        .finish()
+        .map_err(|source| encode_error(&overflowed, &source))?;
+    let sink = writer
+        .into_inner()
+        .map_err(|source| encode_error(&overflowed, &source))?;
+
+    Ok(QueryOutcome {
+        arrow_ipc: sink.bytes,
+        row_count: rows as u64,
+    })
+}
+
+/// Classify an encoder failure: the byte cap, or a genuine fault.
+///
+/// Neither message repeats the query or a value from it.
+fn encode_error(overflowed: &AtomicBool, source: &ArrowError) -> CommandError {
+    if overflowed.load(Ordering::Relaxed) {
+        return CommandError::result_too_large(format!(
+            "The query result exceeds the {} MiB Cloud Connect limit and was not sent. Return fewer rows or columns (a smaller LIMIT, a narrower projection, or an aggregate) and run it again.",
+            MAX_QUERY_RESULT_BYTES / (1024 * 1024)
+        ));
+    }
+    CommandError::internal(format!(
+        "Failed to encode the query result as Arrow IPC: {source}"
+    ))
 }
 
 /// Validate a cloud-managed spicepod and persist it to disk.
@@ -1090,6 +1292,12 @@ async fn replace_canonical_spicepod(incoming: &Path, path: &Path) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use arrow::array::{Int32Array, RecordBatch, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use arrow::ipc::reader::StreamReader;
+    use datafusion::physical_plan::memory::MemoryStream;
+    use runtime_cloud_connect::handlers::MAX_QUERY_ROWS;
 
     /// Minimal valid spicepod (no components — an empty app is valid).
     const VALID_SPICEPOD: &str = "version: v2\nkind: Spicepod\nname: cloud-managed-test\n";
@@ -1219,5 +1427,260 @@ mod tests {
     #[test]
     fn a_runtime_with_no_deployment_applies_the_first_one() {
         assert_eq!(disposition("", None, VALID_SPICEPOD), Disposition::Apply);
+    }
+
+    // ----------------------------------------------------------------------
+    // RunQuery: row cap, byte cap, and the Arrow IPC the caller decodes.
+    // ----------------------------------------------------------------------
+
+    /// One `Int32` column named `n`, the shape every query test below returns.
+    fn int_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, false)]))
+    }
+
+    /// A batch of `count` rows counting up from `start`.
+    fn int_batch(start: i32, count: i32) -> RecordBatch {
+        let values: Vec<i32> = (start..start + count).collect();
+        RecordBatch::try_new(int_schema(), vec![Arc::new(Int32Array::from(values))])
+            .expect("build int batch")
+    }
+
+    /// A batch of one row holding `bytes` bytes of string, for the byte-cap
+    /// tests.
+    fn wide_batch(bytes: usize) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("blob", DataType::Utf8, false)]));
+        let value = "x".repeat(bytes);
+        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec![value]))])
+            .expect("build wide batch")
+    }
+
+    fn stream_of(schema: SchemaRef, batches: Vec<RecordBatch>) -> SendableRecordBatchStream {
+        Box::pin(MemoryStream::try_new(batches, schema, None).expect("memory stream"))
+    }
+
+    /// Decode an Arrow IPC stream back into batches — what the caller does, so
+    /// the assertion is on a real round trip rather than on a byte count.
+    fn decode(ipc: &[u8]) -> (SchemaRef, Vec<RecordBatch>) {
+        let reader = StreamReader::try_new(std::io::Cursor::new(ipc), None)
+            .expect("the payload must be a complete Arrow IPC stream");
+        let schema = reader.schema();
+        let batches = reader
+            .collect::<Result<Vec<_>, _>>()
+            .expect("every batch must decode");
+        (schema, batches)
+    }
+
+    fn total_rows(batches: &[RecordBatch]) -> usize {
+        batches.iter().map(RecordBatch::num_rows).sum()
+    }
+
+    #[tokio::test]
+    async fn a_query_result_round_trips_through_arrow_ipc() {
+        let outcome = bounded_arrow_ipc(
+            stream_of(int_schema(), vec![int_batch(0, 3), int_batch(3, 2)]),
+            MAX_QUERY_ROWS,
+        )
+        .await
+        .expect("a small result encodes");
+
+        assert_eq!(outcome.row_count, 5);
+        let (schema, batches) = decode(&outcome.arrow_ipc);
+        assert_eq!(schema.field(0).name(), "n");
+        assert_eq!(total_rows(&batches), 5);
+        let values: Vec<i32> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("int column")
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(values, vec![0, 1, 2, 3, 4], "values must survive the trip");
+    }
+
+    /// An empty result is a schema and zero rows, not an absent payload — the
+    /// caller must be able to tell "no rows" from "no answer".
+    #[tokio::test]
+    async fn an_empty_result_still_carries_the_schema() {
+        let outcome = bounded_arrow_ipc(stream_of(int_schema(), vec![]), MAX_QUERY_ROWS)
+            .await
+            .expect("an empty result encodes");
+
+        assert_eq!(outcome.row_count, 0);
+        assert!(
+            !outcome.arrow_ipc.is_empty(),
+            "an empty result must still be a valid stream"
+        );
+        let (schema, batches) = decode(&outcome.arrow_ipc);
+        assert_eq!(schema.field(0).name(), "n");
+        assert_eq!(total_rows(&batches), 0);
+    }
+
+    /// The row cap truncates, and it truncates *mid-batch* — a cap that only
+    /// worked on batch boundaries would return 600 rows for a 600-row batch.
+    #[tokio::test]
+    async fn the_row_cap_truncates_inside_a_batch() {
+        let outcome = bounded_arrow_ipc(
+            stream_of(int_schema(), vec![int_batch(0, 600)]),
+            MAX_QUERY_ROWS,
+        )
+        .await
+        .expect("a truncated result encodes");
+
+        assert_eq!(outcome.row_count, u64::from(MAX_QUERY_ROWS));
+        let (_, batches) = decode(&outcome.arrow_ipc);
+        assert_eq!(
+            total_rows(&batches),
+            MAX_QUERY_ROWS as usize,
+            "the encoded stream must carry no more rows than the cap"
+        );
+    }
+
+    /// The cap is a row count across the whole result, not per batch.
+    #[tokio::test]
+    async fn the_row_cap_spans_batches() {
+        let batches: Vec<RecordBatch> = (0..10).map(|i| int_batch(i * 100, 100)).collect();
+        let outcome = bounded_arrow_ipc(stream_of(int_schema(), batches), 250)
+            .await
+            .expect("a truncated result encodes");
+
+        assert_eq!(outcome.row_count, 250);
+        let (_, decoded) = decode(&outcome.arrow_ipc);
+        assert_eq!(total_rows(&decoded), 250);
+    }
+
+    /// A result over the byte cap fails outright. No partial stream comes back:
+    /// a truncated Arrow IPC payload would look to the caller like a complete,
+    /// smaller answer.
+    #[tokio::test]
+    async fn an_oversized_result_fails_without_partial_data() {
+        // Twenty rows of ~512 KiB each — well past 4 MiB in total, but each one
+        // fits, so the cap has to be enforced across the whole stream.
+        let schema = wide_batch(1).schema();
+        let batches: Vec<RecordBatch> = (0..20).map(|_| wide_batch(512 * 1024)).collect();
+
+        let err = bounded_arrow_ipc(stream_of(schema, batches), MAX_QUERY_ROWS)
+            .await
+            .expect_err("an oversized result must fail");
+        assert!(
+            matches!(err, CommandError::ResultTooLarge { .. }),
+            "an oversized result must be typed result-too-large, got {err:?}"
+        );
+    }
+
+    /// A single row too large to send takes the same path — the caller cannot
+    /// narrow a LIMIT out of it, so it must still be a typed refusal rather
+    /// than a truncated row.
+    #[tokio::test]
+    async fn a_single_oversized_row_fails_the_same_way() {
+        let batch = wide_batch(MAX_QUERY_RESULT_BYTES + 1024);
+        let schema = batch.schema();
+
+        let err = bounded_arrow_ipc(stream_of(schema, vec![batch]), MAX_QUERY_ROWS)
+            .await
+            .expect_err("an oversized row must fail");
+        assert!(
+            matches!(err, CommandError::ResultTooLarge { .. }),
+            "an oversized row must be typed result-too-large, got {err:?}"
+        );
+    }
+
+    /// The refusal names the limit and the way out, and repeats neither the
+    /// query nor a value from it.
+    #[test]
+    fn the_oversized_message_leaks_neither_sql_nor_values() {
+        let overflowed = AtomicBool::new(true);
+        let message = encode_error(
+            &overflowed,
+            &ArrowError::IoError(
+                "ignored".to_string(),
+                std::io::Error::other("Cloud Connect query result limit exceeded"),
+            ),
+        )
+        .to_string();
+        assert!(message.contains("4 MiB"), "must name the limit: {message}");
+        assert!(
+            message.contains("LIMIT"),
+            "must say how to get under it: {message}"
+        );
+    }
+
+    /// A statement the engine could not parse, plan, or resolve is the caller's
+    /// to fix; an execution or I/O fault is the instance's and may not recur.
+    /// Collapsing both into one code leaves the portal unable to tell "your SQL
+    /// is wrong" from "this instance is struggling".
+    #[test]
+    fn query_failures_are_classified_by_who_can_fix_them() {
+        let callers = [
+            DataFusionError::Plan("No field named foo".to_string()),
+            DataFusionError::NotImplemented("LATERAL".to_string()),
+            // The engine wraps planning errors in context/diagnostic layers;
+            // classification has to see through them.
+            DataFusionError::Context(
+                "while planning".to_string(),
+                Box::new(DataFusionError::Plan("bad".to_string())),
+            ),
+        ];
+        for source in callers {
+            assert!(
+                is_caller_error(&source),
+                "must blame the statement: {source}"
+            );
+        }
+
+        let instances = [
+            DataFusionError::Execution("scan failed".to_string()),
+            DataFusionError::ResourcesExhausted("out of memory".to_string()),
+            DataFusionError::Internal("bug".to_string()),
+            DataFusionError::Context(
+                "while scanning".to_string(),
+                Box::new(DataFusionError::Execution("source down".to_string())),
+            ),
+        ];
+        for source in instances {
+            assert!(
+                !is_caller_error(&source),
+                "must blame the instance: {source}"
+            );
+        }
+    }
+
+    /// The classification has to survive the `QueryError` wrapper the runtime
+    /// actually returns, not just a bare `DataFusionError`.
+    #[test]
+    fn a_planning_failure_reaches_the_wire_as_invalid_argument() {
+        let planning = QueryError::UnableToExecuteQuery {
+            source: DataFusionError::Plan("No field named foo".to_string()),
+        };
+        assert!(
+            matches!(query_error(&planning), CommandError::InvalidArgument { .. }),
+            "a planning failure is the caller's mistake"
+        );
+
+        let execution = QueryError::UnableToExecuteQuery {
+            source: DataFusionError::Execution("source unreachable".to_string()),
+        };
+        assert!(
+            matches!(query_error(&execution), CommandError::Failed { .. }),
+            "an execution failure is retryable, not the caller's mistake"
+        );
+    }
+
+    /// A result that fits must never be misreported as oversized.
+    #[tokio::test]
+    async fn a_result_just_under_the_cap_still_sends() {
+        let batch = wide_batch(MAX_QUERY_RESULT_BYTES / 2);
+        let schema = batch.schema();
+
+        let outcome = bounded_arrow_ipc(stream_of(schema, vec![batch]), MAX_QUERY_ROWS)
+            .await
+            .expect("a result under the cap must send");
+        assert_eq!(outcome.row_count, 1);
+        assert!(outcome.arrow_ipc.len() <= MAX_QUERY_RESULT_BYTES);
+        let (_, batches) = decode(&outcome.arrow_ipc);
+        assert_eq!(total_rows(&batches), 1);
     }
 }
