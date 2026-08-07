@@ -718,7 +718,7 @@ const MAX_CATEGORY_LEN: usize = 64;
 /// Rather than copy a network-provided string into an error, a token that does not match the
 /// expected shape is replaced wholesale (never truncated, so no fragment of it survives).
 /// This also keeps the message on one line, as the logging rules require.
-fn categorical_token(value: &str) -> &str {
+pub(super) fn categorical_token(value: &str) -> &str {
     let looks_categorical = !value.is_empty()
         && value.len() <= MAX_CATEGORY_LEN
         && value
@@ -782,7 +782,7 @@ fn describe_bulk_failure(position: usize, op: &Value) -> String {
 /// the interesting cases (an `{"error": …}` envelope from a proxy versus a truncated
 /// response), and each goes through [`categorical_token`] because an unexpected response is
 /// exactly the case where the keys are not Elasticsearch's own.
-fn describe_unexpected_response(resp: &Value) -> String {
+pub(super) fn describe_unexpected_response(resp: &Value) -> String {
     match resp {
         Value::Object(map) => {
             let mut keys: Vec<&str> = map.keys().map(|k| categorical_token(k)).collect();

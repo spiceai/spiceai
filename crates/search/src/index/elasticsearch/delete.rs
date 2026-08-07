@@ -20,10 +20,30 @@ use datafusion::common::ScalarValue;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use elasticsearch::Elasticsearch;
 use serde_json::{Value, json};
-use snafu::ResultExt;
+use snafu::{ResultExt, Snafu};
 
 use super::write;
 use crate::index::chunking::ChunkedSearchIndex;
+
+#[derive(Snafu, Debug)]
+pub enum Error {
+    #[snafu(display(
+        "Failed to delete rows from the search index '{index}' (elasticsearch): Elasticsearch applied the delete only partially — {failures} document failure(s) and {version_conflicts} version conflict(s). First failure: {first}. The index still holds documents for rows the dataset no longer has, so a search can return them. A version conflict means those rows were written concurrently and the delete can simply be re-run; any other failure needs its reported error class resolved on the Elasticsearch index first. See: https://spiceai.org/docs/features/search"
+    ))]
+    DeleteByQueryPartiallyApplied {
+        index: String,
+        failures: usize,
+        version_conflicts: u64,
+        first: String,
+    },
+
+    #[snafu(display(
+        "Failed to delete rows from the search index '{index}' (elasticsearch): the _delete_by_query response carried no `failures` array, so it cannot be confirmed that every matching document was deleted; got {shape}. Check whether a proxy sits in front of Elasticsearch and is rewriting the response. See: https://spiceai.org/docs/features/search"
+    ))]
+    UnexpectedDeleteResponse { index: String, shape: String },
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// The columns to address documents by in [`delete_by_keys`], given an index's `primary_key`.
 ///
@@ -105,14 +125,109 @@ pub async fn delete_by_keys(
             continue;
         };
 
-        client
+        let resp = client
             .delete_by_query(es_index, &query)
             .await
             .boxed()
             .map_err(DataFusionError::External)?;
+        inspect_delete_response(&resp, es_index)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
     }
 
     Ok(())
+}
+
+/// Check a `_delete_by_query` response body and return an error unless every matching document
+/// was deleted.
+///
+/// A `2xx` only means the request ran. `_delete_by_query` snapshots the index when it starts and
+/// then deletes document by document, reporting per-document outcomes in the body: `failures`
+/// carries the ones that errored, and `version_conflicts` counts the ones skipped because their
+/// version moved after the snapshot — which a concurrent write cycle over the same rows produces.
+/// Ignoring the body reports a partial delete as a success, leaving documents behind for rows the
+/// dataset no longer has (#12364), the same observable symptom as #12267 and #12272.
+///
+/// Reports rather than retries. Re-issuing the query here is not a safe repair: the delete
+/// addresses documents by the `_id` derived from the row's primary key, so an upsert that rewrote
+/// that row under the same `_id` is exactly what raises the conflict, and an automatic retry would
+/// delete the document that write just produced. Every caller drives this from a delete it has
+/// already applied to the accelerator and logs the error rather than propagating it, so surfacing
+/// it makes the divergence visible where the retry decision can be made with the source in hand.
+fn inspect_delete_response(resp: &Value, es_index: &str) -> Result<()> {
+    // Elasticsearch and OpenSearch both always include `failures` in a synchronous
+    // `_delete_by_query` response. Its absence means the body is not one — a `wait_for_completion`
+    // task handle, or a proxy's envelope — and neither confirms the delete applied.
+    let Some(failures) = resp.get("failures").and_then(Value::as_array) else {
+        return UnexpectedDeleteResponseSnafu {
+            index: es_index.to_string(),
+            // The body can carry document ids (its `failures` entries do), so it is never
+            // reported — only the shape, which is what distinguishes an async task handle from a
+            // proxy's error envelope.
+            shape: write::describe_unexpected_response(resp),
+        }
+        .fail();
+    };
+
+    let version_conflicts = resp
+        .get("version_conflicts")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    if failures.is_empty() && version_conflicts == 0 {
+        return Ok(());
+    }
+
+    let first = match failures.first() {
+        Some(failure) => describe_delete_failure(failure),
+        // Conflicts alone: `conflicts=abort` (the default) stops the request and reports the
+        // count, and older versions report it without a matching `failures` entry.
+        None => "no failure entry; the delete was stopped by a version conflict".to_string(),
+    };
+
+    DeleteByQueryPartiallyAppliedSnafu {
+        index: es_index.to_string(),
+        failures: failures.len(),
+        version_conflicts,
+        first,
+    }
+    .fail()
+}
+
+/// Describe a `_delete_by_query` failure entry from a whitelist of non-identifying fields.
+///
+/// A failure entry names the document it belongs to (`id` is the row's primary key, see
+/// [`write::extract_primary_key_from_fields`]) and Elasticsearch's free-form `cause.reason` quotes
+/// it too — a version conflict reads `[<_id>]: version conflict, current version [2] is different
+/// than the one provided [1]`. This error is logged by every caller and recorded in
+/// `runtime.task_history`, so only fixed vocabulary is reported: the HTTP `status` and the
+/// exception class names, each through [`write::categorical_token`] — never `reason`, never `id`,
+/// never the entry itself.
+fn describe_delete_failure(failure: &Value) -> String {
+    let mut parts = Vec::with_capacity(3);
+
+    if let Some(status) = failure.get("status").and_then(Value::as_u64) {
+        parts.push(format!("status {status}"));
+    }
+
+    let cause = failure.get("cause");
+    if let Some(kind) = cause.and_then(|c| c.get("type")).and_then(Value::as_str) {
+        parts.push(write::categorical_token(kind).to_string());
+    }
+    if let Some(caused_by) = cause
+        .and_then(|c| c.get("caused_by"))
+        .and_then(|c| c.get("type"))
+        .and_then(Value::as_str)
+    {
+        parts.push(format!("caused by {}", write::categorical_token(caused_by)));
+    }
+
+    if parts.is_empty() {
+        // Neither a status nor a typed cause: say so rather than falling back to stringifying the
+        // entry, which would name the document directly.
+        parts.push("no status or cause type reported".to_string());
+    }
+
+    parts.join(", ")
 }
 
 /// Builds `{"ids": {"values": ["<_id>", ...]}}` — the documents written for `keys`, addressed by
@@ -222,14 +337,54 @@ mod tests {
     use crate::index::chunking::{CHUNKED_INDEX_CHUNK_KEY, ChunkedSearchIndex};
     use arrow::array::{ArrayRef, UInt64Array};
 
-    /// Records the `_delete_by_query` bodies it is asked to issue; every other trait method is
-    /// an error, so a test that reaches one fails loudly rather than silently passing.
-    #[derive(Debug, Default)]
+    /// A fully-applied `_delete_by_query` response, in the shape Elasticsearch returns it.
+    fn clean_delete_response(deleted: u64) -> Value {
+        json!({
+            "took": 1,
+            "timed_out": false,
+            "total": deleted,
+            "deleted": deleted,
+            "batches": 1,
+            "version_conflicts": 0,
+            "noops": 0,
+            "retries": {"bulk": 0, "search": 0},
+            "throttled_millis": 0,
+            "failures": [],
+        })
+    }
+
+    /// Records the `_delete_by_query` bodies it is asked to issue and answers each with a
+    /// configured response; every other trait method is an error, so a test that reaches one
+    /// fails loudly rather than silently passing.
+    #[derive(Debug)]
     struct RecordingClient {
         queries: Mutex<Vec<Value>>,
+        /// One response per request, in order; the last one answers every request beyond it, so a
+        /// single-element list answers a whole multi-request delete the same way.
+        responses: Vec<Value>,
+    }
+
+    impl Default for RecordingClient {
+        fn default() -> Self {
+            Self::answering(clean_delete_response(0))
+        }
     }
 
     impl RecordingClient {
+        /// Answers every request with `response` instead of a fully-applied one.
+        fn answering(response: Value) -> Self {
+            Self::answering_in_turn(vec![response])
+        }
+
+        /// Answers the nth request with the nth response, so a test can make one request in a
+        /// multi-request delete differ from the rest.
+        fn answering_in_turn(responses: Vec<Value>) -> Self {
+            Self {
+                queries: Mutex::new(Vec::new()),
+                responses,
+            }
+        }
+
         fn queries(&self) -> Vec<Value> {
             self.queries
                 .lock()
@@ -248,11 +403,20 @@ mod tests {
     #[async_trait::async_trait]
     impl Elasticsearch for RecordingClient {
         async fn delete_by_query(&self, _index: &str, query: &Value) -> EsResult<Value> {
-            self.queries
-                .lock()
-                .expect("queries mutex should not be poisoned")
-                .push(query.clone());
-            Ok(json!({"deleted": 0}))
+            let issued = {
+                let mut queries = self
+                    .queries
+                    .lock()
+                    .expect("queries mutex should not be poisoned");
+                queries.push(query.clone());
+                queries.len()
+            };
+            let response = self
+                .responses
+                .get(issued - 1)
+                .or_else(|| self.responses.last())
+                .expect("the stub should be configured with at least one response");
+            Ok(response.clone())
         }
 
         async fn get_mapping(&self, _index: &str) -> EsResult<MappingResponse> {
@@ -561,6 +725,276 @@ mod tests {
         .expect("delete should succeed");
 
         assert!(client.queries().is_empty());
+    }
+
+    /// The reported bug (#12364): `_delete_by_query` answers `200` with a populated `failures`
+    /// array when individual documents could not be deleted, so discarding the body reports a
+    /// delete that left documents behind as a success — search keeps returning rows the dataset
+    /// no longer has.
+    #[tokio::test]
+    async fn a_document_failure_is_not_reported_as_a_successful_delete() {
+        let client = RecordingClient::answering(json!({
+            "total": 2,
+            "deleted": 1,
+            "version_conflicts": 0,
+            "failures": [{
+                "index": "idx",
+                "id": "ORDER-1024",
+                "cause": {
+                    "type": "mapper_parsing_exception",
+                    "reason": "[ORDER-1024] failed to parse",
+                    "caused_by": {"type": "illegal_argument_exception"},
+                },
+                "status": 400,
+            }],
+        }));
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024"), Some("ORDER-1025")]),
+        )
+        .await
+        .expect_err("a partially applied delete must not report success");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("1 document failure(s)"),
+            "the error should count the failures: {message}"
+        );
+        assert!(
+            message.contains("status 400")
+                && message.contains("mapper_parsing_exception")
+                && message.contains("caused by illegal_argument_exception"),
+            "the error should name the failure's fixed vocabulary: {message}"
+        );
+    }
+
+    /// A version conflict is the common partial-delete shape: `_delete_by_query` snapshots the
+    /// index at the start of the request and skips a document whose version moved since, which a
+    /// concurrent write cycle over the same rows produces. Elasticsearch reports it as a count,
+    /// so a body with no `failures` entry at all is still a partial delete.
+    #[tokio::test]
+    async fn a_version_conflict_alone_is_not_reported_as_a_successful_delete() {
+        let client = RecordingClient::answering(json!({
+            "total": 3,
+            "deleted": 1,
+            "version_conflicts": 2,
+            "failures": [],
+        }));
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024")]),
+        )
+        .await
+        .expect_err("a delete stopped by a version conflict must not report success");
+
+        assert!(
+            err.to_string().contains("2 version conflict(s)"),
+            "the error should count the conflicts: {err}"
+        );
+    }
+
+    /// The document `_id` is the row's primary key and Elasticsearch's free-form `cause.reason`
+    /// quotes it. Every caller of `delete_by_keys` logs its error and it reaches
+    /// `runtime.task_history`, so neither may appear in the message.
+    #[tokio::test]
+    async fn a_failure_never_reports_the_document_id_or_the_free_form_reason() {
+        let client = RecordingClient::answering(json!({
+            "total": 1,
+            "deleted": 0,
+            "version_conflicts": 1,
+            "failures": [{
+                "index": "idx",
+                "id": "SENTINEL-ROW-VALUE-9F3A",
+                "cause": {
+                    "type": "version_conflict_engine_exception",
+                    "reason": "[SENTINEL-ROW-VALUE-9F3A]: version conflict, current version [2] is different than the one provided [1]",
+                },
+                "status": 409,
+            }],
+        }));
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("SENTINEL-ROW-VALUE-9F3A")]),
+        )
+        .await
+        .expect_err("a partially applied delete must not report success");
+
+        let message = err.to_string();
+        assert!(
+            !message.contains("SENTINEL-ROW-VALUE-9F3A"),
+            "the document id must not reach the error: {message}"
+        );
+        assert!(
+            !message.contains("version conflict, current version"),
+            "the free-form reason must not reach the error: {message}"
+        );
+        assert!(
+            message.contains("version_conflict_engine_exception"),
+            "the exception class is the part that may be reported: {message}"
+        );
+        assert!(
+            !message.contains('\n'),
+            "the message must stay on one line: {message}"
+        );
+    }
+
+    /// A failure entry carrying neither a status nor a typed cause must still be described from
+    /// the whitelist — falling back to stringifying the entry would name the document.
+    #[tokio::test]
+    async fn a_failure_with_no_typed_cause_is_still_described_without_the_entry() {
+        let client = RecordingClient::answering(json!({
+            "total": 1,
+            "deleted": 0,
+            "version_conflicts": 0,
+            "failures": [{"id": "SENTINEL-ROW-VALUE-9F3A"}],
+        }));
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("SENTINEL-ROW-VALUE-9F3A")]),
+        )
+        .await
+        .expect_err("a partially applied delete must not report success");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("no status or cause type reported"),
+            "the error should say the entry carried nothing reportable: {message}"
+        );
+        assert!(
+            !message.contains("SENTINEL-ROW-VALUE-9F3A"),
+            "the document id must not reach the error: {message}"
+        );
+    }
+
+    /// A cause type that does not have the shape of an Elasticsearch exception class is
+    /// network-provided text, so it is replaced wholesale rather than copied into the error.
+    #[tokio::test]
+    async fn a_non_categorical_cause_type_is_replaced_not_copied() {
+        let client = RecordingClient::answering(json!({
+            "total": 1,
+            "deleted": 0,
+            "version_conflicts": 0,
+            "failures": [{
+                "status": 400,
+                "cause": {"type": "rejected: SENTINEL-ROW-VALUE-9F3A"},
+            }],
+        }));
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024")]),
+        )
+        .await
+        .expect_err("a partially applied delete must not report success");
+
+        let message = err.to_string();
+        assert!(
+            !message.contains("SENTINEL-ROW-VALUE-9F3A"),
+            "a non-categorical cause type must not be copied into the error: {message}"
+        );
+        assert!(
+            message.contains("<unrecognized>"),
+            "the rejected token should be replaced: {message}"
+        );
+    }
+
+    /// A body with no `failures` array is not a synchronous `_delete_by_query` response — an
+    /// async task handle, or a proxy's envelope. Neither confirms the delete applied, so it
+    /// cannot be reported as a success.
+    #[tokio::test]
+    async fn a_response_without_a_failures_array_is_not_reported_as_a_successful_delete() {
+        let client = RecordingClient::answering(json!({"task": "node-1:12345"}));
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024")]),
+        )
+        .await
+        .expect_err("an unconfirmable delete must not report success");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("carried no `failures` array")
+                && message.contains("a JSON object with keys: task"),
+            "the error should describe the response by its shape alone: {message}"
+        );
+    }
+
+    /// The happy path stays a success: a fully-applied delete reports `failures: []` and no
+    /// conflicts, and every chunk of a multi-request delete is checked.
+    #[tokio::test]
+    async fn a_fully_applied_delete_succeeds_across_every_chunk() {
+        let client = RecordingClient::answering(clean_delete_response(DELETE_CHUNK_ROWS as u64));
+        let ids: Vec<String> = (0..=DELETE_CHUNK_ROWS).map(|i| i.to_string()).collect();
+
+        delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(ids.iter().map(|s| Some(s.as_str())).collect()),
+        )
+        .await
+        .expect("a fully applied delete should succeed");
+
+        assert_eq!(
+            client.queries().len(),
+            2,
+            "the batch should span two requests, both checked"
+        );
+    }
+
+    /// A later chunk's partial delete is caught too — the check runs per request, not only on
+    /// the first.
+    #[tokio::test]
+    async fn a_partial_delete_in_a_later_chunk_is_still_caught() {
+        let client = RecordingClient::answering_in_turn(vec![
+            clean_delete_response(DELETE_CHUNK_ROWS as u64),
+            json!({"total": 1, "deleted": 0, "version_conflicts": 1, "failures": []}),
+        ]);
+        let ids: Vec<String> = (0..=DELETE_CHUNK_ROWS).map(|i| i.to_string()).collect();
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(ids.iter().map(|s| Some(s.as_str())).collect()),
+        )
+        .await
+        .expect_err("the second chunk's partial delete must surface");
+
+        assert_eq!(
+            client.queries().len(),
+            2,
+            "the first chunk should have been issued and accepted"
+        );
+        assert!(
+            err.to_string().contains("1 version conflict(s)"),
+            "the second chunk's conflict should be the reported one: {err}"
+        );
     }
 
     fn id_field() -> Field {
