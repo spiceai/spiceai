@@ -302,14 +302,15 @@ pub async fn maybe_start(
     // reports logs as unavailable rather than returning an empty blob.
     let logs = crate::log_capture::handle();
 
-    match &persisted_app_id {
-        Some(app_id) => tracing::debug!(
+    if let Some(app_id) = &persisted_app_id {
+        tracing::debug!(
             app_id,
             "Spice Cloud Connect: metrics attribution restored from the stored identity"
-        ),
-        None => tracing::debug!(
+        );
+    } else {
+        tracing::debug!(
             "Spice Cloud Connect: the stored identity names no app; metrics are withheld until a deploy names one"
-        ),
+        );
     }
 
     // Installed before `load_components()` by `restore_delivered_secrets`, so
@@ -347,16 +348,17 @@ pub async fn maybe_start(
     // The cache key is read from the identity on each write, not captured here:
     // an instance enrolling in this very process has no identity yet.
     let identity_path = config.identity_path.clone();
-    let handle: Arc<dyn RuntimeHandle> = Arc::new(SpicedRuntimeHandle::new(
-        runtime,
-        logs,
-        delivered_store,
-        identity_path,
-        running_deployment,
-        supervisor,
-        metrics,
-        persisted_app_id,
-    ));
+    let handle: Arc<dyn RuntimeHandle> =
+        Arc::new(SpicedRuntimeHandle::new(SpicedRuntimeHandleParts {
+            runtime,
+            logs,
+            delivered_secrets: delivered_store,
+            identity_path,
+            running_deployment,
+            supervisor,
+            metrics,
+            app_id: persisted_app_id,
+        }));
 
     match CloudConnect::start(config, handle).await {
         Ok(Some(client)) => Some(client),
@@ -497,17 +499,31 @@ struct SpicedRuntimeHandle {
     app_id: RwLock<Option<String>>,
 }
 
+/// What a [`SpicedRuntimeHandle`] is assembled from, before the deployment is
+/// reduced to the spicepod that is live and the mutable fields are wrapped.
+struct SpicedRuntimeHandleParts {
+    runtime: Arc<Runtime>,
+    logs: Option<LogRingBuffer>,
+    delivered_secrets: Arc<CloudDeliveredSecretStore>,
+    identity_path: std::path::PathBuf,
+    running_deployment: Option<CloudManagedSpicepod>,
+    supervisor: Supervisor,
+    metrics: Option<MetricsReader>,
+    app_id: Option<String>,
+}
+
 impl SpicedRuntimeHandle {
-    fn new(
-        runtime: Arc<Runtime>,
-        logs: Option<LogRingBuffer>,
-        delivered_secrets: Arc<CloudDeliveredSecretStore>,
-        identity_path: std::path::PathBuf,
-        running_deployment: Option<CloudManagedSpicepod>,
-        supervisor: Supervisor,
-        metrics: Option<MetricsReader>,
-        app_id: Option<String>,
-    ) -> Self {
+    fn new(parts: SpicedRuntimeHandleParts) -> Self {
+        let SpicedRuntimeHandleParts {
+            runtime,
+            logs,
+            delivered_secrets,
+            identity_path,
+            running_deployment,
+            supervisor,
+            metrics,
+            app_id,
+        } = parts;
         let live = running_deployment.map_or_else(String::new, |running| running.spicepod_yaml);
         Self {
             runtime,
