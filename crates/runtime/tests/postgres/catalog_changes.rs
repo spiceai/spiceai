@@ -409,18 +409,39 @@ async fn wait_for_table_ready(
     let started = std::time::Instant::now();
     let mut last: Option<Result<i64, String>> = None;
 
-    while started.elapsed() < TABLE_READY_TIMEOUT {
-        match query_count(rt, &sql).await {
-            Ok(n) if n > 0 => return Ok(()),
-            outcome => last = Some(outcome),
+    // Every wait inside the loop is bounded by what is left of the budget, so
+    // the deadline holds even when a poll never returns. A bare
+    // `query_count(..).await` would be unbounded: the loop condition is only
+    // evaluated between polls, so one stalled query -- the failure this
+    // diagnostic exists to describe -- would hang the test past its two minutes
+    // and past the point of emitting anything at all.
+    while let Some(remaining) = TABLE_READY_TIMEOUT.checked_sub(started.elapsed()) {
+        match tokio::time::timeout(remaining, query_count(rt, &sql)).await {
+            Ok(Ok(n)) if n > 0 => return Ok(()),
+            Ok(outcome) => last = Some(outcome),
+            // The budget is spent, so there is nothing left to poll with. Record
+            // the stall as the observation -- it is a distinct cause from a poll
+            // that ran and reported, and the one a bare await would have lost.
+            Err(_) => {
+                last = Some(Err(format!("poll did not return within {remaining:?}")));
+                break;
+            }
         }
-        tokio::time::sleep(TABLE_READY_POLL_INTERVAL).await;
+        // Capped for the same reason: a sleep that outlives the budget would
+        // push the report past the deadline it is reporting on.
+        let left = TABLE_READY_TIMEOUT.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            break;
+        }
+        tokio::time::sleep(TABLE_READY_POLL_INTERVAL.min(left)).await;
     }
 
     let observed = match last {
         Some(Ok(n)) => format!("last poll returned {n} rows"),
         Some(Err(error)) => format!("last poll could not run: {error}"),
-        // Only reachable if the timeout elapses before one query completes.
+        // Defensive: the loop records an outcome on every path out, including a
+        // poll that timed out, so this stands only if the budget was already
+        // spent before the first poll began.
         None => "no poll completed".to_string(),
     };
     anyhow::bail!(
