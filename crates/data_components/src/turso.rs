@@ -94,10 +94,11 @@ use arrow::{
         DurationNanosecondArray, DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray,
         Float64Array, GenericListArray, Int8Array, Int16Array, Int32Array, Int64Array,
         IntervalDayTimeArray, IntervalMonthDayNanoArray, IntervalYearMonthArray, LargeBinaryArray,
-        LargeStringArray, MapArray, RecordBatch, StringArray, StringViewArray, StructArray,
-        Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
-        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-        TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, new_empty_array,
+        LargeStringArray, MapArray, OffsetSizeTrait, RecordBatch, StringArray, StringViewArray,
+        StructArray, Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray,
+        Time64NanosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
+        new_empty_array,
     },
     buffer::{NullBuffer, OffsetBuffer},
     compute::{CastOptions, cast, cast_with_options},
@@ -1012,24 +1013,8 @@ impl TursoTableProvider {
                     }
                 }
             }
-            DataType::List(element_field) => {
-                let decoded = decode_stored_lists(rows, col_idx, element_field)?;
-                Arc::new(GenericListArray::<i32>::try_new(
-                    Arc::clone(element_field),
-                    OffsetBuffer::from_lengths(decoded.lengths),
-                    decoded.elements,
-                    Some(NullBuffer::from(decoded.validity)),
-                )?)
-            }
-            DataType::LargeList(element_field) => {
-                let decoded = decode_stored_lists(rows, col_idx, element_field)?;
-                Arc::new(GenericListArray::<i64>::try_new(
-                    Arc::clone(element_field),
-                    OffsetBuffer::from_lengths(decoded.lengths),
-                    decoded.elements,
-                    Some(NullBuffer::from(decoded.validity)),
-                )?)
-            }
+            DataType::List(element_field) => list_column::<i32>(rows, col_idx, element_field)?,
+            DataType::LargeList(element_field) => list_column::<i64>(rows, col_idx, element_field)?,
             DataType::FixedSizeList(element_field, width) => {
                 let decoded = decode_stored_fixed_size_lists(rows, col_idx, element_field, *width)?;
                 Arc::new(FixedSizeListArray::try_new(
@@ -2413,6 +2398,21 @@ struct DecodedMaps {
     validity: Vec<bool>,
 }
 
+/// Rebuilds a `List` or `LargeList` column, which differ only in the width of their offsets.
+fn list_column<O: OffsetSizeTrait>(
+    rows: &[Vec<TursoValue>],
+    col_idx: usize,
+    element_field: &FieldRef,
+) -> Result<ArrayRef, Box<dyn std::error::Error + Send + Sync>> {
+    let decoded = decode_stored_lists(rows, col_idx, element_field)?;
+    Ok(Arc::new(GenericListArray::<O>::try_new(
+        Arc::clone(element_field),
+        OffsetBuffer::from_lengths(decoded.lengths),
+        decoded.elements,
+        Some(NullBuffer::from(decoded.validity)),
+    )?))
+}
+
 /// Decodes the JSON array stored for each row of a `List` or `LargeList` column, as the inverse of
 /// [`list_elements_to_json`].
 fn decode_stored_lists(
@@ -2459,7 +2459,9 @@ fn decode_stored_fixed_size_lists(
     let element_type = element_field.data_type();
     let unset = ScalarValue::try_from(element_type)?;
 
-    let mut elements: Vec<ScalarValue> = Vec::with_capacity(rows.len().saturating_mul(slots));
+    // The width comes from the schema, so it is not bounded by anything stored: reserve for the
+    // rows and let the element vector grow, rather than trusting `rows * width` as a capacity.
+    let mut elements: Vec<ScalarValue> = Vec::with_capacity(rows.len());
     let mut validity = Vec::with_capacity(rows.len());
 
     for row in rows {
@@ -4030,7 +4032,10 @@ mod tests {
             .downcast_ref::<FixedSizeListArray>()
             .expect("column should be a fixed-size list");
         assert!(lists.is_valid(0), "a list of the declared width is kept");
-        assert!(lists.is_null(1), "a longer list must not be truncated to fit");
+        assert!(
+            lists.is_null(1),
+            "a longer list must not be truncated to fit"
+        );
         assert!(lists.is_null(2), "a shorter list must not be padded to fit");
         assert_eq!(
             TursoTableProvider::count_conversion_failures(&rows, &batch),
@@ -4106,6 +4111,22 @@ mod tests {
             Box::new(DataType::UInt16),
             Box::new(ScalarValue::Int64(Some(-9))),
         ));
+
+        // The value array is built first and then dictionary-encoded, so a NULL has to survive both
+        // steps.
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "c",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            true,
+        )]));
+        let rows = vec![
+            vec![TursoValue::Text("a".to_string())],
+            vec![TursoValue::Null],
+        ];
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema)
+            .expect("a dictionary column should be readable");
+        assert!(batch.column(0).is_valid(0));
+        assert!(batch.column(0).is_null(1), "a NULL should stay NULL");
     }
 
     /// `FixedSizeBinary` had no arm, and a blob of another width cannot fill the cell.
