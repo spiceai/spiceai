@@ -659,11 +659,19 @@ impl ClientDriver {
         let met_runtime = Arc::clone(&runtime);
         let met_identifier = Arc::clone(&identifier);
         let met_interval = self.config.metrics_interval;
+        // Collecting metrics is CPU work the other periodic tasks do not do, so
+        // this one races the shutdown signal rather than relying on the `abort()`
+        // below: aborting resolves only at an await point, which can leave a
+        // collection running past the shutdown it was supposed to end.
+        let met_shutdown = Arc::clone(&self.shutdown);
         let met_handle = tokio::spawn(async move {
             let mut ticker = time::interval(met_interval);
             ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
             loop {
-                ticker.tick().await;
+                tokio::select! {
+                    () = met_shutdown.wait() => break,
+                    _ = ticker.tick() => {}
+                }
                 // Every interval accounts for itself: one line per tick, whatever
                 // the outcome. An export path that silently stops is
                 // indistinguishable from a runtime with nothing to report, which
@@ -686,7 +694,7 @@ impl ClientDriver {
                     }
                     Err(err) => {
                         tracing::warn!(
-                            "Cloud Connect: could not collect metrics to export: {err}; skipping this interval"
+                            "Failed to export metrics to Spice Cloud: {err}. Runtime will retry the export on the next interval. Metrics may be delayed to appear in Spice Cloud"
                         );
                         continue;
                     }
@@ -712,7 +720,7 @@ impl ClientDriver {
                         tracing::warn!(
                             identifier = %id,
                             bytes,
-                            "Cloud Connect: metrics export dropped — the outbound queue is full. The next export carries the same cumulative totals, so no data is lost"
+                            "Failed to export metrics to Spice Cloud: the outbound queue is full. Runtime will retry the export on the next interval. Metrics may be delayed to appear in Spice Cloud"
                         );
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => break,
@@ -998,23 +1006,14 @@ impl ClientDriver {
         cmd: proto::ApplySpicepod,
         session_key: Option<&cloud_connect_crypto::EncryptionKeypair>,
     ) {
-        // Logged on arrival, before anything can fail: the app id rides this
-        // command and nothing else carries it, so whether one arrived is the
-        // first thing to know when metrics are being withheld.
-        if cmd.app_id.is_empty() {
-            tracing::warn!(
-                command_id,
-                yaml_bytes = cmd.spicepod_yaml.len(),
-                "Cloud Connect: ApplySpicepod received with no app id; metrics stay withheld because nothing can attribute them. The control plane sends one only if the instance is attached to an app"
-            );
-        } else {
-            tracing::debug!(
-                command_id,
-                app_id = %cmd.app_id,
-                yaml_bytes = cmd.spicepod_yaml.len(),
-                "Cloud Connect: ApplySpicepod received"
-            );
-        }
+        // The app id is not reported here. Whether one arrived only matters
+        // against what the handle already holds, which only the handle knows, so
+        // it is the handle that says what the deployment did to the attribution.
+        tracing::debug!(
+            command_id,
+            yaml_bytes = cmd.spicepod_yaml.len(),
+            "Spice Cloud Connect: received a Spicepod deployment"
+        );
 
         let delivered = match cmd.sealed_secret_payload.as_ref() {
             None => None,
@@ -1036,19 +1035,27 @@ impl ClientDriver {
                 config_dir: &self.config.config_dir,
                 spicepod_yaml: &cmd.spicepod_yaml,
                 delivered_secrets: delivered,
-                app_id: &cmd.app_id,
+                // An empty app id on the wire means the control plane named no
+                // app, which is a different thing from an app named "".
+                app_id: Some(cmd.app_id.as_str()).filter(|id| !id.is_empty()),
             })
             .await;
 
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(err) => {
-                tracing::warn!(command_id, "Cloud Connect: ApplySpicepod failed: {err}");
+                tracing::warn!(
+                    command_id,
+                    "Failed to apply the Spicepod deployed from Spice Cloud: {err}. This instance keeps serving its current configuration; correct the Spicepod and deploy it again. See: https://spiceai.org/docs"
+                );
                 send_command_error(tx, command_id, &err).await;
                 return;
             }
         };
-        tracing::debug!(command_id, "Cloud Connect: ApplySpicepod applied");
+        tracing::debug!(
+            command_id,
+            "Spice Cloud Connect: applied the deployed Spicepod"
+        );
 
         send_ok_json(tx, command_id, &outcome.document).await;
 

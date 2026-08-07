@@ -534,7 +534,7 @@ impl SpicedRuntimeHandle {
             Err(join) => format!("identity persistence task panicked: {join}"),
         };
         tracing::warn!(
-            "Cloud Connect: could not persist the app id to {}: {error}; metrics stay attributed until this process exits, then are withheld until the next deploy",
+            "Spice Cloud Connect could not save the cloud app ID to {}. Metrics for this instance will not appear in Spice Cloud if the process restarts. Does the runtime have permission to write to that path? {error}",
             self.identity_path.display()
         );
     }
@@ -685,38 +685,41 @@ impl RuntimeHandle for SpicedRuntimeHandle {
         // not about the spicepod being valid. A rejected spicepod would otherwise
         // withhold metrics for a reason that has nothing to do with them.
         //
-        // Empty means the control plane named none. Leave any id already recorded
-        // in place rather than clearing it: the instance's app has not changed,
-        // and clearing would silence metrics that are correctly attributed.
-        if app_id.is_empty() {
-            let held = self.app_id.read().clone();
-            match held {
-                Some(held) => tracing::warn!(
-                    app_id = %held,
-                    "Cloud Connect: ApplySpicepod carried no app id; keeping the one already recorded, so metrics stay attributed"
-                ),
-                None => tracing::warn!(
-                    "Cloud Connect: ApplySpicepod carried no app id and none was recorded before, so metrics stay withheld. Either this instance is attached to no app, or the api that dispatched the deploy does not forward the app id"
-                ),
+        // Leave any id already recorded in place when the deployment names none:
+        // the instance's app has not changed, and clearing would silence metrics
+        // that are correctly attributed.
+        //
+        // Cloned out of the lock rather than read in the scrutinee: a scrutinee
+        // temporary lives until the match ends, so the read guard would still be
+        // held when an arm takes the write lock.
+        let held = self.app_id.read().clone();
+        match (app_id, held) {
+            (None, Some(held)) => tracing::debug!(
+                app_id = %held,
+                "Spice Cloud Connect: the Spicepod deployment named no cloud app; keeping the one already recorded"
+            ),
+            (None, None) => tracing::warn!(
+                "Spice Cloud Connect provided no app ID on Spicepod deployment. Metrics for this instance will not appear in Spice Cloud. Is this instance attached to an app?"
+            ),
+            (Some(app_id), held) => {
+                match held.as_deref() {
+                    Some(held) if held == app_id => tracing::debug!(
+                        app_id,
+                        "Spice Cloud Connect: the Spicepod deployment re-confirmed the cloud app metrics are attributed to"
+                    ),
+                    Some(previous) => tracing::debug!(
+                        app_id,
+                        previous,
+                        "Spice Cloud Connect: the Spicepod deployment moved this instance to a different cloud app; metrics follow it from the next export"
+                    ),
+                    None => tracing::debug!(
+                        app_id,
+                        "Spice Cloud Connect: metrics will be attributed to this cloud app from the next export"
+                    ),
+                }
+                *self.app_id.write() = Some(app_id.to_string());
+                self.persist_app_id(app_id).await;
             }
-        } else {
-            let previous = self.app_id.write().replace(app_id.to_string());
-            match previous.as_deref() {
-                Some(previous) if previous == app_id => tracing::debug!(
-                    app_id,
-                    "Cloud Connect: ApplySpicepod re-confirmed the app metrics are attributed to"
-                ),
-                Some(previous) => tracing::debug!(
-                    app_id,
-                    previous,
-                    "Cloud Connect: ApplySpicepod moved this instance to a different app; metrics follow it from the next export"
-                ),
-                None => tracing::debug!(
-                    app_id,
-                    "Cloud Connect: metrics will be attributed to this app from the next export"
-                ),
-            }
-            self.persist_app_id(app_id).await;
         }
 
         // Cloned out of the lock rather than compared under it: the guard must
@@ -983,7 +986,7 @@ impl RuntimeHandle for SpicedRuntimeHandle {
         let app_id = self.app_id.read().clone();
         let Some(app_id) = app_id else {
             tracing::debug!(
-                "Metrics export: withheld until the control plane names an app (deploy this instance's app to set one)"
+                "Spice Cloud Connect: metrics are withheld until Spice Cloud names an app for this instance; deploy the app it is attached to"
             );
             return Ok(None);
         };

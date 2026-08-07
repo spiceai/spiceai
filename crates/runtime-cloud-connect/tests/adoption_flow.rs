@@ -137,7 +137,7 @@ impl CloudConnect for MockServer {
 
 struct CapturedRuntime {
     /// The config dir, spicepod, and app id of the last apply.
-    applied: Arc<Mutex<Option<(PathBuf, String, String)>>>,
+    applied: Arc<Mutex<Option<(PathBuf, String, Option<String>)>>>,
 }
 
 #[async_trait]
@@ -160,7 +160,7 @@ impl RuntimeHandle for CapturedRuntime {
         *self.applied.lock().await = Some((
             path.clone(),
             deployment.spicepod_yaml.to_string(),
-            deployment.app_id.to_string(),
+            deployment.app_id.map(str::to_string),
         ));
         // `settled`, not `exit_to_apply`: this handle has no process to restart,
         // and asking the client to exit would take the test process with it.
@@ -554,7 +554,7 @@ async fn apply_spicepod_writes_file_and_acks() {
     assert!(written_path.exists(), "file should be on disk");
     // The runtime has no other way to learn its app, and withholds metrics
     // entirely until this arrives.
-    assert_eq!(written_app_id, "4002");
+    assert_eq!(written_app_id.as_deref(), Some("4002"));
 
     // Server should see the CommandResult for the apply. Poll for it with a
     // bounded timeout instead of a fixed sleep so the assertion does not race

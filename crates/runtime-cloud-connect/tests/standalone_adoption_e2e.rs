@@ -556,7 +556,7 @@ async fn spawn_gateway(server: GatewayServer, ca: &TestCa) -> SocketAddr {
 #[derive(Default)]
 struct E2eRuntimeState {
     /// The path, spicepod, and app id of the last apply.
-    applied_spicepod: Option<(std::path::PathBuf, String, String)>,
+    applied_spicepod: Option<(std::path::PathBuf, String, Option<String>)>,
     /// Names of the secrets delivered with the last applied spicepod, never
     /// values. `None` when the deployment carried no payload at all.
     delivered_secret_names: Option<Vec<String>>,
@@ -620,7 +620,7 @@ impl RuntimeHandle for E2eRuntime {
             Some((
                 path.clone(),
                 deployment.spicepod_yaml.to_string(),
-                deployment.app_id.to_string(),
+                deployment.app_id.map(str::to_string),
             ));
         Ok(ApplyOutcome::exit_to_apply(serde_json::json!({
             "path": path.display().to_string(),
@@ -1634,7 +1634,7 @@ async fn apply_spicepod_persists_then_exits_to_restart() {
     assert!(path.exists(), "spicepod file must be on disk");
     // The app id rides the deploy: it is the only way the runtime learns which
     // app to attribute its metrics to, and it exports none until it has one.
-    assert_eq!(app_id, "4002");
+    assert_eq!(app_id.as_deref(), Some("4002"));
 
     handle.shutdown().await;
 }

@@ -210,8 +210,8 @@ pub struct SpicepodDeployment<'a> {
     /// already knows it; a handle that exports metrics records it and stamps it
     /// as `scp_app_id`.
     ///
-    /// Empty means the control plane named no app.
-    pub app_id: &'a str,
+    /// `None` when the control plane named no app.
+    pub app_id: Option<&'a str>,
 }
 
 /// What the client must do once the result of an apply has been sent.
@@ -575,7 +575,7 @@ mod tests {
                 config_dir: &dir,
                 spicepod_yaml: "version: v2\nkind: Spicepod\nname: default-apply\n",
                 delivered_secrets: None,
-                app_id: "",
+                app_id: None,
             })
             .await
             .expect("the default apply writes the spicepod");
@@ -610,7 +610,7 @@ mod tests {
                 config_dir: &dir,
                 spicepod_yaml: "version: v2\nkind: Spicepod\nname: refused\n",
                 delivered_secrets: Some(secrets),
-                app_id: "",
+                app_id: None,
             })
             .await
             .expect_err("a handle that cannot apply secrets must refuse the deployment");

@@ -66,6 +66,9 @@ pub enum Error {
 
     #[snafu(display("Failed to generate enrollment encryption key material: {reason}"))]
     EncKeyGeneration { reason: String },
+
+    #[snafu(display("Failed to remove the identity file: {source}"))]
+    ClearTaskPanicked { source: tokio::task::JoinError },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -458,29 +461,43 @@ impl IdentityStore {
 
     /// Remove the identity file. No-op if it doesn't exist.
     ///
+    /// Takes [`write_lock`] for the same reason [`IdentityStore::store_app_id`]
+    /// does, and it is what makes a release final: an update that read the file
+    /// a moment before the removal would otherwise write it back afterwards,
+    /// resurrecting an instance the control plane just released. Under the lock
+    /// the removal either precedes the read — leaving nothing to update — or
+    /// follows the write, and removes it.
+    ///
     /// # Errors
     ///
     /// Returns an error if the file exists but cannot be removed.
     pub fn clear(path: &Path) -> Result<()> {
-        match std::fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(Error::Io {
-                path: path.to_path_buf(),
-                source: err,
-            }),
-        }
+        let _guard = write_lock();
+        Self::clear_locked(path)
     }
 
     /// Async variant of [`IdentityStore::clear`] for use on the Tokio driver
     /// task, where blocking on synchronous `std::fs` I/O would stall a worker
     /// thread. Same semantics: no-op if the file doesn't exist.
     ///
+    /// Runs on the blocking pool rather than awaiting `tokio::fs` directly: the
+    /// removal has to happen under the same [`write_lock`] every other writer
+    /// takes, and a std mutex must never be held across an `.await`.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the file exists but cannot be removed.
+    /// Returns an error if the file exists but cannot be removed, or if the
+    /// blocking task carrying the removal panicked.
     pub async fn clear_async(path: &Path) -> Result<()> {
-        match tokio::fs::remove_file(path).await {
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || Self::clear(&path))
+            .await
+            .map_err(|source| Error::ClearTaskPanicked { source })?
+    }
+
+    /// The removal itself, with the caller already holding [`write_lock`].
+    fn clear_locked(path: &Path) -> Result<()> {
+        match std::fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(Error::Io {
@@ -809,6 +826,35 @@ mod tests {
         assert!(
             IdentityStore::load_optional(&path).expect("load").is_none(),
             "a released instance must not be resurrected by a metrics label"
+        );
+    }
+
+    /// A release racing app-id updates must win: `store_app_id` reads the file
+    /// and writes it back, so a removal landing between the two would be undone
+    /// and the instance would keep talking to a control plane that released it.
+    /// Both sides take the same writer lock, which leaves only the two orderings
+    /// where the file ends up gone.
+    #[test]
+    fn a_release_wins_over_concurrent_app_id_updates() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        IdentityStore::store(&path, &sample_identity()).expect("store");
+
+        std::thread::scope(|scope| {
+            let updater = scope.spawn(|| {
+                for i in 0..200 {
+                    IdentityStore::store_app_id(&path, &format!("400{i}")).expect("store app id");
+                }
+            });
+            IdentityStore::clear(&path).expect("clear");
+            updater.join().expect("updater thread");
+        });
+
+        // Updates that ran before the clear were removed with the rest of the
+        // identity; those that ran after found no file and did nothing.
+        assert!(
+            IdentityStore::load_optional(&path).expect("load").is_none(),
+            "a released instance must stay released"
         );
     }
 

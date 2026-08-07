@@ -27,7 +27,7 @@ use std::sync::{Arc, Weak};
 use opentelemetry_proto::tonic::{
     collector::metrics::v1::ExportMetricsServiceRequest,
     common::v1::{AnyValue, KeyValue, any_value::Value},
-    metrics::v1::metric::Data,
+    metrics::v1::{Metric, metric::Data},
 };
 use opentelemetry_sdk::metrics::{
     InstrumentKind, ManualReader, Pipeline, Temporality, data::ResourceMetrics,
@@ -39,7 +39,7 @@ use snafu::prelude::*;
 /// Why an on-demand collection produced no payload.
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to collect the runtime's own metrics: {source}"))]
+    #[snafu(display("Failed to collect Runtime metrics: {source}"))]
     Collect {
         source: opentelemetry_sdk::error::OTelSdkError,
     },
@@ -284,14 +284,7 @@ fn summarize(request: &ExportMetricsServiceRequest) -> Summary {
             for metric in &scope_metrics.metrics {
                 metrics += 1;
                 names.insert(metric.name.clone());
-                data_points += match &metric.data {
-                    Some(Data::Gauge(gauge)) => gauge.data_points.len(),
-                    Some(Data::Sum(sum)) => sum.data_points.len(),
-                    Some(Data::Histogram(histogram)) => histogram.data_points.len(),
-                    Some(Data::ExponentialHistogram(histogram)) => histogram.data_points.len(),
-                    Some(Data::Summary(summary)) => summary.data_points.len(),
-                    None => 0,
-                };
+                data_points += data_point_count(metric);
             }
         }
     }
@@ -303,17 +296,37 @@ fn summarize(request: &ExportMetricsServiceRequest) -> Summary {
     }
 }
 
+/// How many data points `metric` carries, across every aggregation OTLP
+/// defines. A metric with no `data` arm carries none.
+fn data_point_count(metric: &Metric) -> usize {
+    match &metric.data {
+        Some(Data::Gauge(gauge)) => gauge.data_points.len(),
+        Some(Data::Sum(sum)) => sum.data_points.len(),
+        Some(Data::Histogram(histogram)) => histogram.data_points.len(),
+        Some(Data::ExponentialHistogram(histogram)) => histogram.data_points.len(),
+        Some(Data::Summary(summary)) => summary.data_points.len(),
+        None => 0,
+    }
+}
+
 /// Whether `request` carries any data point at all.
 ///
 /// Tested on the decoded shape rather than on the encoded length, because a
 /// request with no metrics still encodes its resource attributes and so is not
 /// empty on the wire.
+///
+/// A declared metric is not a reported one: an instrument registered but never
+/// recorded arrives as a `Metric` whose aggregation holds no points, and
+/// exporting that spends a round trip to say nothing. The check therefore
+/// descends to the points rather than stopping at the metric list.
 fn has_data_points(request: &ExportMetricsServiceRequest) -> bool {
     request.resource_metrics.iter().any(|resource_metrics| {
-        resource_metrics
-            .scope_metrics
-            .iter()
-            .any(|scope_metrics| !scope_metrics.metrics.is_empty())
+        resource_metrics.scope_metrics.iter().any(|scope_metrics| {
+            scope_metrics
+                .metrics
+                .iter()
+                .any(|metric| data_point_count(metric) > 0)
+        })
     })
 }
 
@@ -908,6 +921,33 @@ mod tests {
 
         let busy = request_with(&["service_name"], &["protocol"], true);
         assert!(has_data_points(&busy));
+    }
+
+    /// An instrument that was registered but never recorded arrives as a metric
+    /// whose aggregation holds no points. Counting the metric rather than its
+    /// points would export a payload the log line calls empty.
+    #[test]
+    fn a_metric_without_points_reports_nothing() {
+        use opentelemetry_proto::tonic::metrics::v1::{ResourceMetrics as OtlpRM, ScopeMetrics, Sum};
+
+        let declared_only = ExportMetricsServiceRequest {
+            resource_metrics: vec![OtlpRM {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        name: "never_recorded".to_string(),
+                        data: Some(Data::Sum(Sum::default())),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+
+        assert!(
+            !has_data_points(&declared_only),
+            "a metric carrying no points has nothing to report"
+        );
     }
 
     /// The export reader reports cumulative totals, which is what makes a
