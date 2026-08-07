@@ -657,6 +657,66 @@ async fn test_cold_tier_concurrent_scan_during_promotion_impl(
     Ok(())
 }
 
+test_with_backends!(test_cold_tier_stale_tolerant_scan_during_promotion_impl);
+
+/// The double-count seam without any concurrency: a read-only CDC replica scans
+/// at a non-zero freshness tolerance (`with_default_scan_freshness`), so a scan
+/// may be served a `ScanView` captured BEFORE a promotion. The cold file set has
+/// to come from that same captured instant — resolving it live pairs the cached
+/// pre-promotion warm snapshot with the post-promotion cold manifest and counts
+/// every promoted row twice. Single-threaded and deterministic: the promotion
+/// runs to completion between the two queries.
+async fn test_cold_tier_stale_tolerant_scan_during_promotion_impl(
+    fixture: common::TestFixture,
+) -> TestResult<()> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    let cold_dir = fixture.temp_dir.path().join("cold");
+    std::fs::create_dir_all(&cold_dir)?;
+
+    let options = cold_table_options(&fixture, "stale_t", &schema, &cold_dir, 300_000);
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let ctx = SessionContext::new();
+    // A lag far longer than the test runs, so the post-promotion query is
+    // definitely served the cached pre-promotion view (the state under test)
+    // rather than rebuilding — no timing dependence in either direction. It is a
+    // test device, not a supported setting: the runtime derives ~1s for a read-only
+    // CDC replica, comfortably inside the cold-tier GC's orphan grace.
+    let table = Arc::new(
+        CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+            .with_default_scan_freshness(std::time::Duration::from_hours(1))
+            .create(options)
+            .await?,
+    );
+    ctx.register_table("stale_t", Arc::clone(&table) as Arc<dyn TableProvider>)?;
+
+    insert_id_range(&table, &schema, 0..400).await?;
+    flush_warm(&table).await;
+    // Populates the scan-view cache with the pre-promotion state: 400 warm rows,
+    // empty cold manifest.
+    assert_eq!(
+        row_count(&ctx, "stale_t").await?,
+        400,
+        "pre-promotion count over the warm tier"
+    );
+
+    // Graduate all 400 rows to cold. The rows MOVE — the live count is unchanged.
+    assert!(table.promote_warm_to_cold().await?, "promotion fires");
+
+    assert_eq!(
+        row_count(&ctx, "stale_t").await?,
+        400,
+        "a stale-tolerant scan must pair the cold manifest with the warm snapshot it \
+         captured; pairing a cached pre-promotion snapshot with the live post-promotion \
+         manifest counts the promoted rows twice"
+    );
+
+    Ok(())
+}
+
 // ============================================================================
 // Restart: reopen a table that has a cold manifest
 // ============================================================================
