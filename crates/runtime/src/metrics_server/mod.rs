@@ -712,9 +712,8 @@ mod tests {
             .collect()
     }
 
-    /// A quantile has to fall in the bucket the observations landed in. When a whole distribution
-    /// shares one bucket, the interpolation inside it is a function of the requested percentile
-    /// alone and reports no latency at all.
+    /// A quantile has to fall in the bucket the observations landed in, which it cannot do while a
+    /// whole distribution shares one bucket.
     ///
     /// Regression test for #12693.
     #[test]

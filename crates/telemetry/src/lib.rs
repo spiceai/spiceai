@@ -37,14 +37,9 @@ pub const ROWS_RETURNED_HISTOGRAM_BUCKETS: [f64; 18] = [
     50000.0, 100_000.0, 250_000.0, 500_000.0,
 ];
 
-// Boundaries for every millisecond-scale duration histogram, from a sub-millisecond point lookup
-// to a multi-hundred-second refresh. The sub-100ms head resolves the band most requests finish in;
-// without it a 0.1ms lookup and a 99ms one share a bucket, and the interpolated quantile tracks the
-// requested percentile instead of any latency. The head matches `CONTENTION_MS_HISTOGRAM_BUCKETS`;
-// the 500s tail is why the two sets stay separate.
-//
-// New boundaries only subdivide existing buckets, so recorded `le` series keep their meaning —
-// but the quantiles derived from them move by orders of magnitude, which is the point.
+// Boundaries for every millisecond-scale duration histogram. The sub-100ms head resolves the band
+// most requests finish in: without it a 0.1ms lookup and a 99ms one share a bucket, and the
+// quantile interpolated inside it tracks the requested percentile rather than any latency.
 pub const DURATION_MS_HISTOGRAM_BUCKETS: [f64; 24] = [
     0.0, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 750.0, 1000.0,
     2500.0, 5000.0, 7500.0, 10000.0, 25000.0, 50000.0, 100_000.0, 250_000.0, 500_000.0,
@@ -73,12 +68,9 @@ pub const BYTES_HISTOGRAM_BUCKETS: [f64; 16] = [
     8_589_934_592.0,
 ];
 
-// Finer-grained millisecond buckets for sub-second contention timings (metastore
-// writer wait/hold, WAL checkpoint, CDC linger). This shares its head with
-// `DURATION_MS_HISTOGRAM_BUCKETS`, which resolves the same 0.1–50ms band, and
-// stops at 30s: a lock or checkpoint wait that long is already a stall, so the
-// boundaries beyond it that a general duration histogram needs would only cost
-// series here.
+// Finer-grained millisecond buckets for sub-second contention timings (metastore writer
+// wait/hold, WAL checkpoint, CDC linger). Shares its head with `DURATION_MS_HISTOGRAM_BUCKETS`
+// and stops at 30s: a lock or checkpoint wait that long is already a stall.
 pub const CONTENTION_MS_HISTOGRAM_BUCKETS: [f64; 17] = [
     0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0,
     10000.0, 30000.0,
@@ -1987,10 +1979,8 @@ pub mod cayenne {
 mod tests {
     use super::{CONTENTION_MS_HISTOGRAM_BUCKETS, DURATION_MS_HISTOGRAM_BUCKETS};
 
-    /// The first boundary above zero decides the floor of everything derived from a duration
-    /// histogram: observations below it share one bucket, and a quantile drawn from that bucket
-    /// reports the percentile asked for rather than a latency. Requests answered in a fraction of
-    /// a millisecond are ordinary, so the floor has to sit below one.
+    /// The first boundary above zero is the floor of every quantile drawn from these buckets, and
+    /// requests answered in a fraction of a millisecond are ordinary.
     ///
     /// Regression test for #12693.
     #[test]

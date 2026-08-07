@@ -18,10 +18,9 @@ use opentelemetry::{
     metrics::{Counter, Gauge, Histogram, Meter},
 };
 
-// `dataset_acceleration_snapshot_write_duration_ms` reaches two providers that share no
-// exporter — the global one below and `telemetry`'s anonymous one — so it is one observation
-// each, not a double count. Its quantiles are only comparable across them while both name the
-// same boundaries, so share the constant rather than copy it; copying let the two sets drift.
+// The `telemetry::` records in each `record_*` below bind to a provider that shares no exporter
+// with the global one, so their quantiles only compare with these while both name the same
+// boundaries. Hence the shared constant rather than a copy, which is what let the two sets drift.
 use telemetry::DURATION_MS_HISTOGRAM_BUCKETS;
 
 static METER: LazyLock<Meter> =
