@@ -480,7 +480,10 @@ mod tests {
             p256_point_from_spki(spki.contents()),
         );
         key.verify(pop_payload(&identity.identifier).as_bytes(), &sig)
-            .expect("the release signature must verify over `release\\n{instance_id}`");
+            .expect(
+                "the release signature must verify over \
+                 `spice-cloud-connect/release/v1\\n{instance_id}`",
+            );
         // ...and must not verify over anything else, so a captured signature
         // cannot release a different instance.
         key.verify(pop_payload("inst_other").as_bytes(), &sig)
