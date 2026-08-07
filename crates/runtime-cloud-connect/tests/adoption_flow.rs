@@ -135,9 +135,16 @@ impl CloudConnect for MockServer {
     }
 }
 
+/// What the last apply wrote, as the handle saw it.
+#[derive(Clone)]
+struct AppliedSpicepod {
+    path: PathBuf,
+    spicepod_yaml: String,
+    app_id: Option<String>,
+}
+
 struct CapturedRuntime {
-    /// The config dir, spicepod, and app id of the last apply.
-    applied: Arc<Mutex<Option<(PathBuf, String, Option<String>)>>>,
+    applied: Arc<Mutex<Option<AppliedSpicepod>>>,
 }
 
 #[async_trait]
@@ -157,11 +164,11 @@ impl RuntimeHandle for CapturedRuntime {
             .map_err(|e| CommandError::failed(e.to_string()))?;
         std::fs::write(&path, deployment.spicepod_yaml)
             .map_err(|e| CommandError::failed(e.to_string()))?;
-        *self.applied.lock().await = Some((
-            path.clone(),
-            deployment.spicepod_yaml.to_string(),
-            deployment.app_id.map(str::to_string),
-        ));
+        *self.applied.lock().await = Some(AppliedSpicepod {
+            path: path.clone(),
+            spicepod_yaml: deployment.spicepod_yaml.to_string(),
+            app_id: deployment.app_id.map(str::to_string),
+        });
         // `settled`, not `exit_to_apply`: this handle has no process to restart,
         // and asking the client to exit would take the test process with it.
         Ok(ApplyOutcome::settled(
@@ -277,6 +284,7 @@ fn enroll_config(
         telemetry_interval: Duration::from_mins(1),
         metrics_interval: Duration::from_secs(30),
         renewal_lead: Duration::from_mins(1),
+        query_deadline: Duration::from_mins(1),
     }
 }
 
@@ -529,6 +537,7 @@ async fn apply_spicepod_writes_file_and_acks() {
         telemetry_interval: Duration::from_mins(1),
         metrics_interval: Duration::from_secs(30),
         renewal_lead: Duration::from_hours(12),
+        query_deadline: Duration::from_mins(1),
     };
 
     let handle = runtime_cloud_connect::CloudConnect::start(config, runtime)
@@ -549,12 +558,12 @@ async fn apply_spicepod_writes_file_and_acks() {
         "runtime should have received ApplySpicepod within 5s"
     );
 
-    let (written_path, written_yaml, written_app_id) = captured.lock().await.clone().unwrap();
-    assert_eq!(written_yaml, yaml);
-    assert!(written_path.exists(), "file should be on disk");
+    let written = captured.lock().await.clone().unwrap();
+    assert_eq!(written.spicepod_yaml, yaml);
+    assert!(written.path.exists(), "file should be on disk");
     // The runtime has no other way to learn its app, and withholds metrics
     // entirely until this arrives.
-    assert_eq!(written_app_id.as_deref(), Some("4002"));
+    assert_eq!(written.app_id.as_deref(), Some("4002"));
 
     // Server should see the CommandResult for the apply. Poll for it with a
     // bounded timeout instead of a fixed sleep so the assertion does not race
@@ -678,6 +687,7 @@ async fn unknown_command_is_nacked_rather_than_dropped() {
         telemetry_interval: Duration::from_mins(1),
         metrics_interval: Duration::from_secs(30),
         renewal_lead: Duration::from_hours(12),
+        query_deadline: Duration::from_mins(1),
         adopt_app_name: None,
         adopt_create_app: false,
     };

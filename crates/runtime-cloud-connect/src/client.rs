@@ -53,7 +53,7 @@ use std::time::Duration;
 
 use crate::TransportSnafu;
 use snafu::ResultExt;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, Semaphore, mpsc};
 use tokio::time;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Streaming;
@@ -62,8 +62,8 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 use crate::config::CloudConnectConfig;
 use crate::enroll::{EnrollClient, RENEWAL_GRACE};
 use crate::handlers::{
-    Capability, CommandError, PostApply, RestartMode, RuntimeHandle, SpicepodDeployment,
-    advertised_capabilities,
+    Capability, CommandError, MAX_QUERY_RESULT_BYTES, PostApply, RestartMode, RuntimeHandle,
+    SpicepodDeployment, advertised_capabilities, effective_max_rows,
 };
 use crate::heartbeat::{build_heartbeat, build_telemetry, now_unix};
 use crate::identity::{Identity, IdentityStore};
@@ -107,6 +107,12 @@ pub(crate) struct ClientDriver {
     /// paced by [`RENEW_RETRY_INTERVAL`] rather than spinning on a
     /// due-in-the-past `not_after`. Cleared on enrollment.
     renew_not_before: Option<time::Instant>,
+    /// The single `ExecuteQuery` slot. Its one permit is taken by the spawned
+    /// query task and released when that task ends, so a second query is
+    /// refused as busy before it executes. Held on the driver rather than the
+    /// stream so a reconnect cannot hand out a second slot while the first
+    /// query is still running.
+    query_slot: Arc<Semaphore>,
 }
 
 impl ClientDriver {
@@ -122,6 +128,7 @@ impl ClientDriver {
             shutdown,
             identity,
             renew_not_before: None,
+            query_slot: Arc::new(Semaphore::new(1)),
         }
     }
 
@@ -920,6 +927,14 @@ impl ClientDriver {
                     }
                 }
             }
+            proto::control_message::Body::ExecuteQuery(cmd) => {
+                if self
+                    .supported(tx, &command_id, Capability::ExecuteQuery, name)
+                    .await
+                {
+                    self.handle_execute_query(tx, &command_id, cmd).await;
+                }
+            }
             proto::control_message::Body::Adopt(cmd) => {
                 self.handle_adopt(tx, &command_id, cmd, live_identifier)
                     .await;
@@ -978,6 +993,147 @@ impl ClientDriver {
         );
         send_unsupported(tx, command_id, &self.runtime.unsupported_reason(capability)).await;
         false
+    }
+
+    /// Take the query slot and run the query on its own task.
+    ///
+    /// The pump must stay free to answer heartbeats and other commands while a
+    /// query executes, so nothing here awaits the query: the slot permit moves
+    /// into the spawned task and is released when that task ends, which is
+    /// also what makes a concurrent second query busy rather than queued.
+    ///
+    /// An empty statement is refused before the slot is taken, so a caller
+    /// sending blank queries cannot keep a real one out.
+    ///
+    /// The query is bounded by `query_deadline` rather than left to run: this
+    /// contract has no cancellation command, so a query that never returns
+    /// would hold the only slot for the life of the process.
+    async fn handle_execute_query(
+        &self,
+        tx: &mpsc::Sender<proto::ClientMessage>,
+        command_id: &str,
+        cmd: proto::ExecuteQuery,
+    ) {
+        if cmd.sql.trim().is_empty() {
+            send_result(
+                tx,
+                command_id,
+                proto::ResultCode::InvalidArgument,
+                "The query is empty. Send a SQL statement to execute.",
+                None,
+            )
+            .await;
+            return;
+        }
+
+        let Ok(permit) = Arc::clone(&self.query_slot).try_acquire_owned() else {
+            send_result(
+                tx,
+                command_id,
+                proto::ResultCode::Busy,
+                "This instance is already running a query. Cloud Connect runs one query at a time — retry once the running query finishes.",
+                None,
+            )
+            .await;
+            return;
+        };
+
+        let max_rows = effective_max_rows(cmd.max_rows);
+        let sql = cmd.sql;
+        let runtime = Arc::clone(&self.runtime);
+        let tx = tx.clone();
+        let command_id = command_id.to_string();
+        let deadline = self.config.query_deadline;
+
+        tokio::spawn(async move {
+            // Held for the whole query so the slot frees only once the work is
+            // genuinely finished, panic or not.
+            let _permit = permit;
+
+            let started = time::Instant::now();
+            let outcome = time::timeout(deadline, runtime.execute_query(&sql, max_rows)).await;
+            let elapsed_ms = started.elapsed().as_millis();
+
+            let Ok(outcome) = outcome else {
+                // Dropping the query future abandons the work and, with the
+                // permit, frees the slot. Without this a query that never
+                // returns would answer every later one as busy for the life of
+                // the process — there is no cancellation command to rescue it.
+                tracing::warn!(
+                    "Cloud Connect: query {command_id} exceeded the {}s deadline; abandoning the waiter and freeing the query slot",
+                    deadline.as_secs()
+                );
+                send_result(
+                    &tx,
+                    &command_id,
+                    proto::ResultCode::Failed,
+                    &format!(
+                        "The query exceeded this instance's {}s Cloud Connect limit and was abandoned; no result will follow. Narrow it, or run it against the instance directly.",
+                        deadline.as_secs()
+                    ),
+                    None,
+                )
+                .await;
+                return;
+            };
+
+            match outcome {
+                Ok(result) => {
+                    let bytes = result.arrow_ipc.len();
+                    // The handle serializes under the same caps, so these are
+                    // the contract boundary refusing to put an out-of-bounds
+                    // payload on the control stream rather than the primary
+                    // enforcement. A handle that miscounts or ignores the caps
+                    // is refused here instead of being forwarded.
+                    if bytes > MAX_QUERY_RESULT_BYTES {
+                        tracing::warn!(
+                            "Cloud Connect: query {command_id} produced {bytes} bytes, over the {MAX_QUERY_RESULT_BYTES} byte limit; answering result-too-large"
+                        );
+                        send_result(
+                            &tx,
+                            &command_id,
+                            proto::ResultCode::ResultTooLarge,
+                            &result_too_large_message(),
+                            None,
+                        )
+                        .await;
+                        return;
+                    }
+                    if result.row_count > u64::from(max_rows) {
+                        tracing::error!(
+                            "Cloud Connect: query {command_id} returned {} rows against a {max_rows} row limit; refusing the result",
+                            result.row_count
+                        );
+                        send_result(
+                            &tx,
+                            &command_id,
+                            proto::ResultCode::Internal,
+                            "The query result exceeded this instance's row limit and was not sent.",
+                            None,
+                        )
+                        .await;
+                        return;
+                    }
+                    tracing::debug!(
+                        "Cloud Connect: query {command_id} returned {} rows ({bytes} bytes) in {elapsed_ms}ms",
+                        result.row_count
+                    );
+                    send_ok(
+                        &tx,
+                        &command_id,
+                        Some(proto::command_result::Payload::Binary(result.arrow_ipc)),
+                    )
+                    .await;
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        "Cloud Connect: query {command_id} failed after {elapsed_ms}ms: {}",
+                        result_code(&err).as_str_name()
+                    );
+                    send_command_error(&tx, &command_id, &err).await;
+                }
+            }
+        });
     }
 
     /// Handle an `ApplySpicepod`, opening any secrets that rode with it.
@@ -1475,7 +1631,18 @@ fn command_name(body: &proto::control_message::Body) -> &'static str {
         Body::ApplySecrets(_) => "ApplySecrets",
         Body::DeleteSecrets(_) => "DeleteSecrets",
         Body::GetLogs(_) => "GetLogs",
+        Body::ExecuteQuery(_) => "ExecuteQuery",
     }
+}
+
+/// What the control plane is told when a result will not fit on the control
+/// stream. Names the limit and the way out, and repeats neither the query nor
+/// any value from it.
+fn result_too_large_message() -> String {
+    format!(
+        "The query result exceeds the {} MiB Cloud Connect limit and was not sent. Return fewer rows or columns (a smaller LIMIT, a narrower projection, or an aggregate) and run it again.",
+        MAX_QUERY_RESULT_BYTES / (1024 * 1024)
+    )
 }
 
 /// Map the wire restart mode onto the handler-level one. A value a newer
@@ -1498,6 +1665,8 @@ fn result_code(err: &CommandError) -> proto::ResultCode {
         CommandError::InvalidArgument { .. } => proto::ResultCode::InvalidArgument,
         CommandError::Failed { .. } => proto::ResultCode::Failed,
         CommandError::Internal { .. } => proto::ResultCode::Internal,
+        CommandError::Busy { .. } => proto::ResultCode::Busy,
+        CommandError::ResultTooLarge { .. } => proto::ResultCode::ResultTooLarge,
     }
 }
 
