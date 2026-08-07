@@ -87,10 +87,15 @@ fn aggressive_sorted_compaction_config() -> VortexConfig {
 ///
 /// Key deletion is *necessary* for the warm-subset rewrite but not sufficient:
 /// `subset_rewrite_eligibility` also requires the picker's candidate to be a
-/// proper subset of the current files, and this config's
-/// `compaction_max_files_per_pick` of 32 exceeds the file count every test here
-/// builds — so the picker takes them all and the rewrite is the full one.
-/// `p1_subset_path_test.rs` is where the subset path is driven and asserted.
+/// proper subset of the current files. This config does not settle which
+/// rewrite runs, and neither does its file count: `compaction_max_files_per_pick`
+/// caps the files taken from the single tier bucket that fired, not the
+/// snapshot, so a candidate is a proper subset — well under the cap of 32 —
+/// whenever any current file is already settled or sits in the other tier.
+///
+/// So the tests here assert delete/row semantics, never a rewrite path. The
+/// path is observable via `last_small_file_compact_path()`, and
+/// `p1_subset_path_test.rs` is where each one is driven and asserted.
 fn aggressive_key_deletion_compaction_config() -> VortexConfig {
     VortexConfig {
         deletion_mode: cayenne::metadata::DeletionMode::Key,
@@ -1277,11 +1282,12 @@ async fn key_delete_survives_compaction_and_reseed(
     // again. MoR must keep the deleted key hidden and the exact row total must
     // match what we inserted after the delete.
     //
-    // The rewrite this drives is the full one, not the warm subset: the picker's
-    // candidate is never a proper subset here (see
-    // `aggressive_key_deletion_compaction_config`). What the PK buys is the
-    // key-delete topology — a PK-less table resolves to position-based deletion
-    // and a different MoR path.
+    // Which rewrite this drives — full or warm subset — is deliberately not
+    // asserted: the candidate is a proper subset whenever a current file is
+    // settled or in the other tier, and the sizes here do not pin that down
+    // (see `aggressive_key_deletion_compaction_config`). What the PK buys is
+    // the key-delete topology — a PK-less table resolves to position-based
+    // deletion and a different MoR path.
     let schema = pk_schema();
     let (table, ctx, table_id) =
         build_append_only_key_delete_table(&fixture, "key_delete_survives", Arc::clone(&schema))
