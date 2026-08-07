@@ -87,7 +87,27 @@ macro_rules! generate_cache_metrics {
             pub static EVICTIONS: LazyLock<Counter<u64>> = LazyLock::new(|| {
                 METER
                     .u64_counter(concat!($prefix, "_cache_evictions"))
-                    .with_description("Number of cache evictions.")
+                    .with_description(
+                        "Number of entries evicted because they expired or the cache was over capacity. Entries dropped by table invalidation are counted by the invalidations metric instead.",
+                    )
+                    .build()
+            });
+
+            pub static INVALIDATIONS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+                METER
+                    .u64_counter(concat!($prefix, "_cache_invalidations"))
+                    .with_description(
+                        "Number of table invalidations applied to the cache, e.g. by an accelerated refresh or a write. Counts invalidation events, not the entries each one drops.",
+                    )
+                    .build()
+            });
+
+            pub static STALE_REJECTIONS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+                METER
+                    .u64_counter(concat!($prefix, "_cache_stale_rejections"))
+                    .with_description(
+                        "Number of lookups that found an entry but refused to serve it because a table it read had since been invalidated. These are also counted as misses.",
+                    )
                     .build()
             });
 
@@ -155,6 +175,18 @@ pub trait CacheMetrics: Send + Sync {
     fn record_eviction()
     where
         Self: Sized;
+    /// Records one table-invalidation event. Deliberately separate from
+    /// [`Self::record_eviction`]: `moka` reports invalidation as
+    /// `RemovalCause::Explicit`, which `was_evicted()` excludes, so without this
+    /// a refresh that clears thousands of entries is invisible in metrics.
+    fn record_invalidation()
+    where
+        Self: Sized;
+    /// Records a lookup that found an entry but could not serve it because a
+    /// table it read had since been invalidated.
+    fn record_stale_rejection()
+    where
+        Self: Sized;
     fn update_hit_ratio(hits: u64, total: u64)
     where
         Self: Sized;
@@ -198,6 +230,14 @@ impl CacheMetrics for CachedSearchResult {
         search_results::EVICTIONS.add(1, &[]);
     }
 
+    fn record_invalidation() {
+        search_results::INVALIDATIONS.add(1, &[]);
+    }
+
+    fn record_stale_rejection() {
+        search_results::STALE_REJECTIONS.add(1, &[]);
+    }
+
     fn update_hit_ratio(hits: u64, total: u64) {
         let ratio = calculate_hit_ratio(hits, total);
         search_results::HIT_RATIO.record(ratio, &[]);
@@ -233,6 +273,14 @@ impl CacheMetrics for CachedQueryResult {
         sql_results::EVICTIONS.add(1, &[]);
     }
 
+    fn record_invalidation() {
+        sql_results::INVALIDATIONS.add(1, &[]);
+    }
+
+    fn record_stale_rejection() {
+        sql_results::STALE_REJECTIONS.add(1, &[]);
+    }
+
     fn update_hit_ratio(hits: u64, total: u64) {
         let ratio = calculate_hit_ratio(hits, total);
         sql_results::HIT_RATIO.record(ratio, &[]);
@@ -266,6 +314,14 @@ impl CacheMetrics for CachedEmbeddingResult {
 
     fn record_eviction() {
         embeddings::EVICTIONS.add(1, &[]);
+    }
+
+    fn record_invalidation() {
+        embeddings::INVALIDATIONS.add(1, &[]);
+    }
+
+    fn record_stale_rejection() {
+        embeddings::STALE_REJECTIONS.add(1, &[]);
     }
 
     fn update_hit_ratio(hits: u64, total: u64) {

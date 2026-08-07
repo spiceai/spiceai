@@ -423,6 +423,7 @@ impl Query {
                     plan,
                     raw_key,
                     request_context.cache_namespace(),
+                    Arc::clone(&cached_result.input_tables),
                 );
             }
         }
@@ -509,15 +510,26 @@ impl Query {
         )
     }
 
-    /// Prepares query and input tables for background revalidation
+    /// Prepares query and input tables for background revalidation.
+    ///
+    /// `cached_input_tables` is the table set recorded on the entry being
+    /// revalidated. It is the fallback when no [`LogicalPlan`] is available —
+    /// which is the normal case under
+    /// [`spicepod::component::caching::CacheKeyType::Sql`], where the stale hit
+    /// is found on the raw-SQL key before a plan exists. The revalidated entry
+    /// must carry the same table set as the entry it replaces: the set is what
+    /// [`cache::TabledCacheProvider::invalidate_for_table`] matches on, so an
+    /// entry stored with an empty set can never be evicted by an accelerated
+    /// refresh or by DML, and would be served stale until `item_ttl` expired.
     fn prepare_revalidation_query(
         df: &Arc<DataFusion>,
         sql: &str,
         plan: Option<LogicalPlan>,
+        cached_input_tables: Arc<HashSet<TableReference>>,
     ) -> (Query, Arc<HashSet<TableReference>>) {
-        let (query, input_tables) = if let Some(logical_plan) = plan {
+        if let Some(logical_plan) = plan {
             tracing::debug!("Background revalidation: re-executing query with existing plan");
-            let input_tables = cache::get_logical_plan_input_tables(&logical_plan);
+            let input_tables = Arc::new(cache::get_logical_plan_input_tables(&logical_plan));
             (
                 super::Query::from_logical_plan(df, logical_plan),
                 input_tables,
@@ -529,10 +541,9 @@ impl Query {
             );
             (
                 super::QueryBuilder::new(sql, Arc::clone(df)).build(),
-                std::collections::HashSet::new(),
+                cached_input_tables,
             )
-        };
-        (query, Arc::new(input_tables))
+        }
     }
 
     /// Handles caching of query results after background revalidation
@@ -543,8 +554,26 @@ impl Query {
         batches: Vec<arrow::record_batch::RecordBatch>,
         schema: arrow::datatypes::SchemaRef,
         input_tables: Arc<HashSet<TableReference>>,
+        revalidation_started_at: std::time::Instant,
     ) {
         if let Some(cache_provider) = df.results_cache_provider() {
+            // A revalidation runs asynchronously, so an accelerated refresh or
+            // DML may have invalidated one of its tables while it was
+            // executing. Storing the result anyway would recreate the entry
+            // the invalidation just removed, holding data the query may have
+            // read from the pre-invalidation snapshot.
+            //
+            // This is only an early exit that avoids encoding a result already
+            // known to be unservable; correctness comes from the check every
+            // cache hit performs against the entry's `read_started_at`.
+            if cache_provider.tables_invalidated_since(&input_tables, revalidation_started_at) {
+                tracing::debug!(
+                    cache_key = cache_key_u64,
+                    "An input table was invalidated during background revalidation, discarding the result rather than repopulating the cache"
+                );
+                return;
+            }
+
             // Skip cache writes if the revalidation result contains transient HTTP
             // error responses. Preserve the existing stale cache entry instead of
             // storing a partial result set.
@@ -568,6 +597,7 @@ impl Query {
                 schema,
                 input_tables,
                 cached_at,
+                revalidation_started_at,
                 encoder,
             )
             .await
@@ -605,6 +635,7 @@ impl Query {
         plan: Option<&LogicalPlan>,
         cache_key: RawCacheKey,
         namespace: CacheNamespace,
+        cached_input_tables: Arc<HashSet<TableReference>>,
     ) {
         // Static Moka cache to track ongoing revalidation tasks by cache key.
         // This provides built-in single-in-flight semantics - if multiple requests
@@ -645,8 +676,17 @@ impl Query {
                         "Starting background revalidation task"
                     );
 
-                    let (query, input_tables) =
-                        Self::prepare_revalidation_query(&df, &sql_owned, plan_owned);
+                    let (query, input_tables) = Self::prepare_revalidation_query(
+                        &df,
+                        &sql_owned,
+                        plan_owned,
+                        cached_input_tables,
+                    );
+
+                    // Captured before the query reads anything, so any
+                    // invalidation of its tables that lands while it executes
+                    // is ordered after this point and rejects the write.
+                    let revalidation_started_at = std::time::Instant::now();
 
                     let result = background_context
                         .scope(async move { query.run().await })
@@ -673,6 +713,7 @@ impl Query {
                                         batches,
                                         schema,
                                         input_tables,
+                                        revalidation_started_at,
                                     )
                                     .await;
                                 }
@@ -728,14 +769,24 @@ impl Query {
         }
     }
 
+    /// `read_started_at` is when the query began, and gates the cache write
+    /// against any invalidation of `datasets` that lands while it runs — see
+    /// [`to_cached_record_batch_stream`].
     pub(super) fn wrap_stream_with_cache(
         df: &DataFusion,
         stream: SendableRecordBatchStream,
         plan_cache_key: RawCacheKey,
         datasets: Arc<HashSet<TableReference>>,
+        read_started_at: std::time::Instant,
     ) -> SendableRecordBatchStream {
         if let Some(cache_provider) = df.results_cache_provider() {
-            to_cached_record_batch_stream(cache_provider, stream, plan_cache_key, datasets)
+            to_cached_record_batch_stream(
+                cache_provider,
+                stream,
+                plan_cache_key,
+                datasets,
+                read_started_at,
+            )
         } else {
             stream
         }
@@ -989,6 +1040,197 @@ mod tests {
                 );
             })
             .await;
+    }
+
+    /// Runs `sql` to completion under `request_context`, draining the stream so
+    /// any cache write completes, and returns the observed cache status.
+    async fn run_and_drain(
+        df: Arc<DataFusion>,
+        request_context: Arc<RequestContext>,
+        sql: &'static str,
+    ) -> CacheStatus {
+        let query = QueryBuilder::new(sql, df).build();
+        request_context
+            .scope(async move {
+                let result = query.run().await.expect("query should succeed");
+                let cache_status = result.cache_status;
+                let _ = result
+                    .data
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("should drain");
+                cache_status
+            })
+            .await
+    }
+
+    /// Regression test for #12672: a stale-while-revalidate revalidation must
+    /// preserve the input-table set of the entry it replaces.
+    ///
+    /// Under `cache_key_type: sql` the stale hit is found on the raw-SQL key,
+    /// before any `LogicalPlan` exists, so the revalidation path had no plan to
+    /// derive input tables from and substituted an empty set. An entry with an
+    /// empty set matches no table, so `invalidate_for_table` could never evict
+    /// it and it was served stale until `item_ttl` expired — regardless of how
+    /// many accelerated refreshes ran in the meantime.
+    #[tokio::test]
+    async fn test_swr_revalidation_preserves_input_tables() {
+        let df = prepare_runtime(Some(SQLResultsCacheConfig {
+            item_ttl: Some("1s".to_string()),
+            cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
+            stale_while_revalidate_ttl: Some("5m".to_string()),
+            ..Default::default()
+        }))
+        .await;
+
+        // A real table, so the plan records an input table to invalidate on.
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let table = datafusion::datasource::MemTable::try_new(
+            Arc::clone(&schema),
+            vec![vec![arrow::array::RecordBatch::new_empty(schema)]],
+        )
+        .expect("valid mem table");
+        df.ctx
+            .register_table(TableReference::bare("swr_table"), Arc::new(table))
+            .expect("should register table");
+
+        const SQL: &str = "SELECT count(*) FROM swr_table";
+        let request_context =
+            create_test_request_context(CacheControl::Cache(CacheKeyType::Raw), None);
+
+        assert_eq!(
+            run_and_drain(Arc::clone(&df), Arc::clone(&request_context), SQL).await,
+            CacheStatus::CacheMiss
+        );
+
+        // Age the entry past its TTL into the stale-while-revalidate window.
+        // The sleep is the behavior under test (TTL expiry), not a readiness wait.
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+
+        assert_eq!(
+            run_and_drain(Arc::clone(&df), Arc::clone(&request_context), SQL).await,
+            CacheStatus::CacheStaleWhileRevalidate
+        );
+
+        // Poll for the background revalidation instead of sleeping a fixed
+        // interval: a rewritten entry is fresh again, so the status returns to
+        // CacheHit once the revalidation has stored its result.
+        let mut revalidated = false;
+        for _ in 0..100 {
+            if run_and_drain(Arc::clone(&df), Arc::clone(&request_context), SQL).await
+                == CacheStatus::CacheHit
+            {
+                revalidated = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            revalidated,
+            "background revalidation never refreshed the cache entry"
+        );
+
+        // The revalidated entry must still be tied to its input table.
+        df.caching()
+            .invalidate_for_table(TableReference::bare("swr_table"))
+            .expect("invalidation should succeed");
+        if let Some(cache_provider) = df.results_cache_provider() {
+            cache_provider.run_pending_tasks().await;
+        }
+
+        assert_eq!(
+            run_and_drain(df, request_context, SQL).await,
+            CacheStatus::CacheMiss,
+            "a revalidated entry must still be evicted when its input table is invalidated"
+        );
+    }
+
+    /// A background revalidation must not repopulate an entry whose table was
+    /// invalidated *while the revalidation was running*. The revalidation may
+    /// have read the pre-invalidation snapshot, and because invalidation can
+    /// only remove entries that already exist, storing the result afterwards
+    /// resurrects data the refresh (or DML) had just evicted.
+    ///
+    /// Driving `cache_revalidation_result` directly makes the ordering
+    /// deterministic; interleaving a spawned revalidation task with an
+    /// invalidation would be timing-dependent.
+    #[tokio::test]
+    async fn test_swr_revalidation_discards_result_invalidated_mid_flight() {
+        let df = prepare_runtime(Some(SQLResultsCacheConfig {
+            item_ttl: Some("10m".to_string()),
+            cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
+            ..Default::default()
+        }))
+        .await;
+        let cache_provider = df
+            .results_cache_provider()
+            .expect("results cache should be configured");
+
+        let schema: arrow::datatypes::SchemaRef =
+            Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("n", arrow::datatypes::DataType::Int64, false),
+            ]));
+        let batch = arrow::array::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64]))],
+        )
+        .expect("valid record batch");
+
+        // The revalidation begins its read here...
+        let revalidation_started_at = std::time::Instant::now();
+
+        // ...and a refresh invalidates the table before the result is stored.
+        df.caching()
+            .invalidate_for_table(TableReference::bare("revalidated_table"))
+            .expect("invalidation should succeed");
+
+        let invalidated_key = RawCacheKey::new(11);
+        Query::cache_revalidation_result(
+            &df,
+            &invalidated_key,
+            invalidated_key.as_u64(),
+            vec![batch.clone()],
+            Arc::clone(&schema),
+            Arc::new(HashSet::from([TableReference::bare("revalidated_table")])),
+            revalidation_started_at,
+        )
+        .await;
+        cache_provider.run_pending_tasks().await;
+
+        assert!(
+            cache_provider
+                .get_raw_key(&invalidated_key)
+                .await
+                .expect("cache access should succeed")
+                .is_none(),
+            "a revalidation whose table was invalidated mid-flight must not repopulate the cache"
+        );
+
+        // Control: a revalidation for a table nobody invalidated still stores
+        // its result, so the guard is not rejecting every write.
+        let untouched_key = RawCacheKey::new(22);
+        Query::cache_revalidation_result(
+            &df,
+            &untouched_key,
+            untouched_key.as_u64(),
+            vec![batch],
+            schema,
+            Arc::new(HashSet::from([TableReference::bare("untouched_table")])),
+            revalidation_started_at,
+        )
+        .await;
+        cache_provider.run_pending_tasks().await;
+
+        assert!(
+            cache_provider
+                .get_raw_key(&untouched_key)
+                .await
+                .expect("cache access should succeed")
+                .is_some(),
+            "an unaffected revalidation must still populate the cache"
+        );
     }
 
     /// Two distinct principals running the same SQL must each see a cache
