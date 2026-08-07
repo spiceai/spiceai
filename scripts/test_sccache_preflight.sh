@@ -34,9 +34,15 @@ if [[ ! -f "$subject" ]]; then
   exit 1
 fi
 
-# An `sccache` that answers `--show-stats` the way the named condition would.
-# "ok" reports stats and succeeds; "refused" fails the way unreachable storage
-# does, across several lines; "absent" installs no stub at all.
+# An `sccache` that answers the way v0.9.1 does in the named condition.
+#
+# The "refused" stub is deliberately asymmetric, because the real binary is: only
+# commands routed through `connect_or_start_server` (`--zero-stats`,
+# `--start-server`) surface unreachable storage. `--show-stats` calls
+# `connect_to_server` and, when no daemon answers, reports synthesized empty stats
+# and exits 0. A stub that failed every command would let a pre-flight built on
+# `--show-stats` pass here and still miss the outage in production, so the stub
+# has to keep that distinction for the test to mean anything.
 write_sccache_stub() {
   local dir="$1" condition="$2"
   case "$condition" in
@@ -50,6 +56,14 @@ STUB
     refused)
       cat >"$dir/sccache" <<'STUB'
 #!/usr/bin/env bash
+case "${1:-}" in
+  --show-stats)
+    # No daemon: real sccache synthesizes empty stats and succeeds regardless of
+    # whether the storage behind it answers.
+    echo "Compile requests 0"
+    exit 0
+    ;;
+esac
 echo "sccache: error: Server startup failed: cache storage failed to read: Unexpected (temporary) at read => send http request" >&2
 echo "   error sending request for url (http://127.0.0.1:8335/sccache/sccache/.sccache_check): tcp connect error: Connection refused (os error 61)" >&2
 exit 2

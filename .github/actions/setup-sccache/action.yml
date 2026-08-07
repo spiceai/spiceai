@@ -102,21 +102,25 @@ runs:
         $config | Out-File -FilePath "$configDir\config" -Encoding utf8
 
     - name: Confirm the compiler cache answers before wrapping rustc
-      if: runner.os != 'Windows' && env.SCCACHE_SETUP == 'true'
+      if: (runner.os == 'Linux' && inputs.minio_endpoint != '') || (runner.os == 'macOS' && (inputs.minio_endpoint != '' || inputs.spiceio_endpoint != ''))
       shell: bash
       # Invoked through `bash` rather than as `./…` so the step does not depend on
       # the script's executable bit surviving a checkout on every platform.
       run: bash "$GITHUB_ACTION_PATH/verify_compiler_cache.sh"
 
     - name: Confirm the compiler cache answers before wrapping rustc (Windows)
-      if: runner.os == 'Windows' && env.SCCACHE_SETUP == 'true'
+      if: runner.os == 'Windows' && inputs.minio_endpoint != ''
       shell: pwsh
       run: |
+        # `--zero-stats` goes through sccache's connect_or_start_server, so it fails
+        # when the server cannot come up. `--show-stats` does not: with no daemon
+        # running it reports synthesized empty stats and exits 0, succeeding on
+        # exactly the unreachable storage this step exists to catch.
         $ErrorActionPreference = 'Continue'
         $reachable = $false
         $detail = 'sccache was not found on PATH'
         if (Get-Command sccache -ErrorAction SilentlyContinue) {
-          $output = & sccache --show-stats 2>&1 | Out-String
+          $output = & sccache --zero-stats 2>&1 | Out-String
           if ($LASTEXITCODE -eq 0) {
             $reachable = $true
           } else {
