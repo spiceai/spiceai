@@ -1012,16 +1012,36 @@ impl ExecutionPlan for CayenneAccelerationExec {
 /// tracked the cgroup cap (95.8 GiB at 96G, 109.8 GiB at 110G) and was unmoved by
 /// concurrency or by the tuning mode.
 ///
-/// The reservation covers the batch **in flight** — from the moment this stream
-/// yields it until the next poll — rather than the batch's whole downstream
-/// lifetime, which this stream cannot observe. That is the quantity that scales
-/// with scan parallelism and the one that has to be bounded: `partitions x
-/// in-flight batch`. Whatever an operator above retains, it reserves for itself.
+/// The charge is taken **before** each poll and held across it, then settled to
+/// the measured size once the batch exists. Charging afterwards would be a
+/// detector rather than a bound: the decode has already run, so a refusal could
+/// only reject the *next* batch, never the one that exceeded the budget. Holding
+/// it across a `Pending` matters for the same reason — that is the window the
+/// buffers are being expanded in.
 ///
-/// Over budget returns `ResourcesExhausted` from the pool, so a scan that cannot
-/// fit fails fast (or spills, for operators that can) instead of taking the
-/// process past its cgroup limit. That is a deliberate behaviour change: a query
-/// that used to drift toward an OOM kill now errors.
+/// The reservation then covers the batch **in flight** until the next poll,
+/// rather than its whole downstream lifetime, which this stream cannot observe.
+/// Whatever an operator above retains, it reserves for itself.
+///
+/// Over budget returns `ResourcesExhausted` before the decode runs, so a scan
+/// that cannot fit fails without allocating. That is a deliberate behaviour
+/// change: a query that used to drift toward an OOM kill now errors.
+///
+/// # What this does NOT bound
+///
+/// Accounting attaches to the outermost wrapper only (`scan_guard.is_some()`),
+/// so it charges one estimate per output partition. Under a base+delta plan the
+/// inner per-snapshot wrappers and the Vortex `DataSourceExec` beneath them can
+/// decode CONCURRENTLY while the outer stream holds a single charge, which
+/// under-counts by roughly the number of concurrently decoding children. The
+/// pre-poll charge means that window is no longer *unaccounted*, but it is not
+/// accurately accounted either.
+///
+/// Bounding it properly means charging at each materializing leaf, or gating
+/// concurrent decodes behind a shared budget. Both are larger changes than this,
+/// and neither should be inferred from the presence of this type: a plan whose
+/// memory is dominated by fan-out beneath the outermost scan is still able to
+/// exceed `runtime.query.memory_limit`.
 struct MemoryAccountedScanStream<S> {
     inner: S,
     schema: SchemaRef,
@@ -1029,7 +1049,35 @@ struct MemoryAccountedScanStream<S> {
     /// skipped rather than failing the scan, because an unaccounted read is
     /// strictly better than no read at all.
     reservation: Option<MemoryReservation>,
+    /// What to charge BEFORE a poll, since the batch's real size is unknowable
+    /// until the decode that allocates it has already run. Adapted upward to the
+    /// largest batch this stream has produced.
+    ///
+    /// A running max, not the last size: under-reserving is the failure this
+    /// exists to prevent, and batch widths vary run to run, so the estimate
+    /// converges upward and stays there. Over-reserving costs pool headroom;
+    /// under-reserving costs the guarantee.
+    estimate: usize,
+    /// True while the reservation covers an in-progress decode rather than a
+    /// batch already handed downstream. Keeps the charge in place across a
+    /// `Pending`, which is exactly when Vortex is expanding buffers.
+    decode_charged: bool,
 }
+
+/// First-poll charge, before any batch has been measured.
+///
+/// Deliberately small. The charge has to be paid before the first batch's size
+/// can be known, so an estimate that is too large refuses scans that would have
+/// fit — a pool sized for a handful of narrow batches should not be rejected
+/// because the guess was megabytes. It is equally deliberately not zero: a zero
+/// first charge would reopen, for one batch per partition, exactly the hole this
+/// type exists to close.
+///
+/// So the exposure is bounded and explicit: until the running max converges
+/// (from the second batch on), a scan can decode one batch per partition against
+/// this charge rather than its true size. At 1 MiB x 20 partitions that is ~20
+/// MiB of slack, against the tens of GiB this bounds in steady state.
+const INITIAL_BATCH_ESTIMATE_BYTES: usize = 1024 * 1024;
 
 impl<S> MemoryAccountedScanStream<S> {
     fn new(inner: S, schema: SchemaRef, consumer_name: String, context: &Arc<TaskContext>) -> Self {
@@ -1038,6 +1086,8 @@ impl<S> MemoryAccountedScanStream<S> {
             inner,
             schema,
             reservation,
+            estimate: INITIAL_BATCH_ESTIMATE_BYTES,
+            decode_charged: false,
         }
     }
 }
@@ -1052,22 +1102,51 @@ where
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        // Release the previous batch first: it has been handed downstream, so
-        // holding its bytes here would double-count them against whatever
-        // operator above now owns them.
-        if let Some(reservation) = self.reservation.as_mut() {
-            reservation.free();
+        // Charge BEFORE polling. The inner poll is where Vortex canonicalizes
+        // into Arrow, so charging after it would mean the allocation has already
+        // happened and a refusal could only reject the NEXT batch, never the one
+        // that broke the budget — a detector, not a bound.
+        if !self.decode_charged {
+            // The previous batch has been handed downstream; whatever holds it
+            // now reserves for itself, so keeping its bytes here would
+            // double-count them.
+            let estimate = self.estimate;
+            if let Some(reservation) = self.reservation.as_mut() {
+                reservation.free();
+                if let Err(e) = reservation.try_grow(estimate) {
+                    // Refused before the decode runs, so this returns without
+                    // having allocated the batch.
+                    return std::task::Poll::Ready(Some(Err(e)));
+                }
+            }
+            self.decode_charged = true;
         }
 
         let polled = std::pin::Pin::new(&mut self.inner).poll_next(cx);
-        if let std::task::Poll::Ready(Some(Ok(batch))) = &polled
-            && let Some(reservation) = self.reservation.as_mut()
-        {
-            // `get_array_memory_size` counts the buffers this batch actually
-            // holds, which after canonicalization is the expanded Arrow form —
-            // the quantity that matters here, not the compressed on-disk size.
-            if let Err(e) = reservation.try_grow(batch.get_array_memory_size()) {
-                return std::task::Poll::Ready(Some(Err(e)));
+        match &polled {
+            // Decode still in progress: hold the charge across it. This is the
+            // window the buffers are actually being expanded in.
+            std::task::Poll::Pending => {}
+            std::task::Poll::Ready(Some(Ok(batch))) => {
+                // `get_array_memory_size` counts the buffers this batch actually
+                // holds — the expanded Arrow form, not the compressed on-disk
+                // size. Settle the estimate to the truth now that it is known.
+                let actual = batch.get_array_memory_size();
+                self.estimate = self.estimate.max(actual);
+                if let Some(reservation) = self.reservation.as_mut()
+                    && let Err(e) = reservation.try_resize(actual)
+                {
+                    return std::task::Poll::Ready(Some(Err(e)));
+                }
+                // The charge now covers the in-flight batch; the next poll
+                // releases it and re-charges for the following decode.
+                self.decode_charged = false;
+            }
+            std::task::Poll::Ready(Some(Err(_)) | None) => {
+                if let Some(reservation) = self.reservation.as_mut() {
+                    reservation.free();
+                }
+                self.decode_charged = false;
             }
         }
         polled
@@ -1139,6 +1218,69 @@ mod tests {
         );
     }
 
+    /// The charge must land BEFORE the decode, not after it.
+    ///
+    /// Charging afterwards makes the guard a detector rather than a bound: the
+    /// batch has already been materialized, so a refusal can only reject the
+    /// next one. This asserts the inner stream is never polled when the pool
+    /// cannot fit the charge — i.e. that no allocation happened.
+    #[tokio::test]
+    async fn an_over_budget_scan_is_refused_without_polling_the_decode() {
+        use datafusion_execution::memory_pool::GreedyMemoryPool;
+        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let polls = Arc::new(AtomicUsize::new(0));
+
+        // A stream that records every poll. If the charge is taken first and
+        // refused, this must never be polled at all.
+        let counted = {
+            let polls = Arc::clone(&polls);
+            let schema = Arc::clone(&schema);
+            futures::stream::poll_fn(move |_cx| {
+                polls.fetch_add(1, Ordering::SeqCst);
+                let batch = RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(Int64Array::from(vec![1_i64]))],
+                )
+                .expect("batch");
+                std::task::Poll::Ready(Some(Ok(batch)))
+            })
+        };
+
+        // Smaller than INITIAL_BATCH_ESTIMATE_BYTES, so the pre-poll charge is
+        // refused on the very first poll.
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::new(GreedyMemoryPool::new(1024)))
+            .build_arc()
+            .expect("runtime env");
+        let context = Arc::new(TaskContext::default().with_runtime(runtime));
+
+        let mut stream = MemoryAccountedScanStream::new(
+            Box::pin(counted),
+            Arc::clone(&schema),
+            "cayenne_scan[test]".to_string(),
+            &context,
+        );
+
+        let err = stream
+            .next()
+            .await
+            .expect("one item")
+            .expect_err("the pre-poll charge must be refused");
+        assert!(
+            err.to_string().contains("Resources exhausted"),
+            "expected a pool refusal, got: {err}"
+        );
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            0,
+            "the decode must not run when the pool refused the charge - charging \
+             after the poll would mean the batch was already materialized"
+        );
+    }
+
     /// The reservation covers the batch in flight only. Holding every batch for
     /// the stream's lifetime would double-count against whichever operator above
     /// now owns it, and would make a long scan look like a leak.
@@ -1159,10 +1301,13 @@ mod tests {
         };
         let one_batch_bytes = batch().get_array_memory_size();
 
-        // Room for two batches, but ten are streamed: only an in-flight-only
-        // reservation fits, a cumulative one would be refused partway through.
-        let pool: Arc<dyn datafusion_execution::memory_pool::MemoryPool> =
-            Arc::new(GreedyMemoryPool::new(one_batch_bytes * 2));
+        // Sized for the pre-poll charge plus a batch, and no more. Ten batches
+        // are streamed through it: an in-flight-only reservation fits, a
+        // cumulative one is refused partway through. The pre-charge is the floor
+        // here, not the batch size — these batches are far smaller than it.
+        let pool: Arc<dyn datafusion_execution::memory_pool::MemoryPool> = Arc::new(
+            GreedyMemoryPool::new(INITIAL_BATCH_ESTIMATE_BYTES + one_batch_bytes),
+        );
         let runtime = RuntimeEnvBuilder::new()
             .with_memory_pool(Arc::clone(&pool))
             .build_arc()
