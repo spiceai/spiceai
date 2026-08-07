@@ -393,6 +393,55 @@ assert_contains "says whose runtime it is not" "$out" "not this job's runtime"
 assert_not_contains "does not claim our runtime came up" "$out" "Runtime ready after"
 rm -f "$work_dir/spice.log"
 
+# Same case, in the wording the runtime actually uses on the pool (#12642). The
+# Flight server formats its own message with the address in the middle instead of
+# passing the OS error through, so a guard written against the HTTP wording alone
+# never fires on it — and :50051 is the port that collides, because it is Flight
+# that a sibling runner's runtime is already holding. Left unmatched, the wait
+# passes and the job instead goes red much later on a model that "did not return
+# expected response" — a model belonging to a different job's runtime.
+reset_state "201 spiced $THEIRS"
+printf 'ERROR spiced: Unable to start Spice Runtime servers: Unable to start Flight server: Address 127.0.0.1:50051 is already in use by another process. Either stop the existing process or change the address: https://spiceai.org/docs/cli/reference/run\n' \
+  > "$work_dir/spice.log"
+result="$(run_subject "$wait_script" STUB_READY_BODY=ready SPICE_READY_TIMEOUT=5 SPICE_READY_INTERVAL=1)"
+out="${result#*|}"
+assert_eq "refuses a ready when Flight lost the bind" "${result%%|*}" "1"
+assert_contains "recognises the Flight bind wording" "$out" "not this job's runtime"
+assert_not_contains "does not pass a Flight bind failure off as ready" "$out" "Runtime ready after"
+rm -f "$work_dir/spice.log"
+
+# ...and the timeout diagnosis has to recognise it too, so a contended port is
+# still described as a contended port rather than left to the reader.
+reset_state
+printf 'ERROR spiced: Unable to start Flight server: Address 127.0.0.1:50051 is already in use by another process.\n' \
+  > "$work_dir/spice.log"
+result="$(run_subject "$wait_script" SPICE_READY_TIMEOUT=2 SPICE_READY_INTERVAL=1 STUB_PORT_HOLDER=7777)"
+out="${result#*|}"
+assert_eq "times out non-zero on the Flight wording" "${result%%|*}" "1"
+assert_contains "explains the contended port for Flight too" "$out" "already held it"
+rm -f "$work_dir/spice.log"
+
+# A message that merely says something else is already in use must not be read as
+# a bind failure — the runtime says this about replication slots and view names,
+# and neither means our runtime lost a port.
+reset_state "101 spiced $OURS"
+printf "ERROR runtime: Catalog 'pg': replication slot 'spice_slot' is already in use by 12345.\n" \
+  > "$work_dir/spice.log"
+result="$(run_subject "$wait_script" STUB_READY_BODY=ready SPICE_READY_TIMEOUT=5)"
+assert_eq "an unrelated 'already in use' is not a bind failure" "${result%%|*}" "0"
+rm -f "$work_dir/spice.log"
+
+# ...including when the same line carries an address of its own. Tracing renders a
+# line's fields and its message together, so "Address" and "already in use" can
+# appear on one line without the line being about a bind at all. This is the case
+# that pins the two exact alternatives instead of a wildcard between the halves.
+reset_state "101 spiced $OURS"
+printf "ERROR runtime: Address 127.0.0.1:8090 bound. View name is already in use by a dataset.\n" \
+  > "$work_dir/spice.log"
+result="$(run_subject "$wait_script" STUB_READY_BODY=ready SPICE_READY_TIMEOUT=5)"
+assert_eq "an address plus an unrelated 'already in use' still passes" "${result%%|*}" "0"
+rm -f "$work_dir/spice.log"
+
 # ...but a genuine ready alongside an unrelated log must still pass, or the
 # guard above would fail every job whose log merely mentions the phrase.
 reset_state "101 spiced $OURS"
