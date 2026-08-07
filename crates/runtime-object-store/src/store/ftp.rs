@@ -45,8 +45,8 @@ const STORE_NAME: &str = "FTP";
 const MAX_CONCURRENT_LISTINGS: usize = 4;
 /// Default connection pool size.
 const DEFAULT_POOL_SIZE: u32 = 4;
-/// Wall-clock bound for one connection attempt — TCP connect, greeting and login
-/// together — when `client_timeout` is not configured.
+/// Wall-clock bound for one connection attempt — name resolution, TCP connect, greeting
+/// and login together — when `client_timeout` is not configured.
 ///
 /// `bb8` consults its own `connection_timeout` (30s by default) only *after*
 /// `ManageConnection::connect` returns, so an attempt that never returns is never
@@ -80,6 +80,9 @@ async fn with_connect_deadline<T>(
 /// name itself. Handing a pre-parsed `SocketAddr` to `connect_timeout` instead cannot
 /// work for a named host: `"host:port".parse::<SocketAddr>()` accepts only a literal
 /// IP, so configuring `client_timeout` failed the connection rather than bounding it.
+///
+/// Resolving inside `attempt` is also what puts the lookup under the deadline, which the
+/// SFTP store has to arrange for itself because its resolver is the blocking one.
 async fn connect_and_login(
     host: &str,
     port: &str,

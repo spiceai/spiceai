@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use std::{
+    future::Future,
     io::{Read, Seek, SeekFrom},
     net::{SocketAddr, TcpStream, ToSocketAddrs},
     sync::Arc,
@@ -39,8 +40,8 @@ use super::common::{
 
 const STORE_NAME: &str = "SFTP";
 
-/// Wall-clock bound for one connection attempt — TCP connect, SSH handshake and password
-/// authentication together — when `client_timeout` is not configured.
+/// Wall-clock bound for one connection attempt — name resolution, TCP connect, SSH handshake
+/// and password authentication together — when `client_timeout` is not configured.
 ///
 /// `connect` runs inside `tokio::task::spawn_blocking`, and the blocking pool is shared
 /// process-wide, so an attempt that never returns costs a thread every other blocking
@@ -86,10 +87,31 @@ impl SFTPClientConfig {
         }
     }
 
-    fn connect(&self) -> object_store::Result<Session> {
-        let bound = self.timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT);
+    /// Resolve this endpoint's name, charging the lookup against the connection bound.
+    ///
+    /// Kept out of [`Self::connect`] so that the blocking section is handed addresses rather
+    /// than a name: resolution has no deadline of its own, so it can only be bounded from an
+    /// async caller.
+    async fn resolve(&self) -> object_store::Result<ResolvedEndpoint> {
+        resolve_within(
+            &self.host,
+            &self.port,
+            self.timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
+        )
+        .await
+    }
+
+    fn connect(&self, endpoint: &ResolvedEndpoint) -> object_store::Result<Session> {
         let started = Instant::now();
-        let stream = connect_within(&self.host, &self.port, bound)?;
+        // Whatever `resolve` spent, plus however long this attempt waited for a thread of the
+        // shared blocking pool, has already come off the bound the caller asked for.
+        let Some(bound) = endpoint.deadline.checked_duration_since(started) else {
+            return Err(handle_error(format!(
+                "connecting to {} timed out before the connection could be attempted",
+                endpoint.addr
+            )));
+        };
+        let stream = connect_within(&endpoint.addrs, &endpoint.addr, bound)?;
 
         let mut session = Session::new().map_err(handle_error)?;
         session.set_tcp_stream(stream);
@@ -175,11 +197,12 @@ impl SFTPObjectStore {
         &self,
         prefix: Option<String>,
     ) -> object_store::Result<Vec<ObjectMeta>> {
+        let endpoint = self.config.resolve().await?;
         let config = Arc::clone(&self.config);
         let prefix = prefix.unwrap_or_else(|| "/".to_string());
 
         tokio::task::spawn_blocking(move || {
-            let session = config.connect()?;
+            let session = config.connect(&endpoint)?;
             let mut results = Vec::new();
             let mut queue = vec![prefix];
 
@@ -201,6 +224,7 @@ impl SFTPObjectStore {
         &self,
         prefix: Option<&Path>,
     ) -> object_store::Result<ListResult> {
+        let endpoint = self.config.resolve().await?;
         let config = Arc::clone(&self.config);
         let prefix_str = prefix.map_or("/".to_string(), |p| {
             let s = p.to_string();
@@ -212,7 +236,7 @@ impl SFTPObjectStore {
         });
 
         tokio::task::spawn_blocking(move || {
-            let session = config.connect()?;
+            let session = config.connect(&endpoint)?;
             let entries = Self::list_directory_blocking(&session, &prefix_str)?;
             Ok(process_directory_entries_shallow(&prefix_str, entries))
         })
@@ -225,6 +249,39 @@ fn handle_error<T: Into<Box<dyn std::error::Error + Sync + Send>>>(
     error: T,
 ) -> object_store::Error {
     generic_error(STORE_NAME, error)
+}
+
+/// A resolved endpoint and the deadline the rest of its connection attempt has left.
+///
+/// Produced in the async caller and handed to the blocking section, so that one wall-clock
+/// bound covers resolution and connection together rather than starting afresh once the
+/// addresses are known.
+#[derive(Debug)]
+struct ResolvedEndpoint {
+    /// The configured `host:port`, for diagnostics — an address list does not name it.
+    addr: String,
+    addrs: Vec<SocketAddr>,
+    /// When the attempt as a whole runs out of time, counted from before resolution began.
+    deadline: Instant,
+}
+
+/// Apply `bound` to `attempt`, reporting expiry against `addr`.
+///
+/// The FTP store's `with_connect_deadline` is the same shape over its whole connect — there,
+/// resolution is already inside the bounded future, so the two are not one helper with two
+/// callers: this one exists because only the lookup can be bounded from outside the blocking
+/// section, and it names resolution in the error it raises.
+async fn with_resolve_deadline<T>(
+    addr: &str,
+    bound: Duration,
+    attempt: impl Future<Output = object_store::Result<T>>,
+) -> object_store::Result<T> {
+    match tokio::time::timeout(bound, attempt).await {
+        Ok(result) => result,
+        Err(_) => Err(handle_error(format!(
+            "resolving {addr} timed out after {bound:?}"
+        ))),
+    }
 }
 
 /// Resolve `host:port` for [`TcpStream::connect_timeout`], which unlike
@@ -244,18 +301,74 @@ fn resolve_addrs(host: &str, port: &str) -> object_store::Result<Vec<SocketAddr>
     Ok(candidates)
 }
 
-/// Open a TCP connection to `host:port` within `bound`.
+/// Resolve `host:port` within `bound`, returning the addresses and the deadline left for the
+/// connection itself.
+///
+/// [`resolve_addrs`] is the blocking libc resolver and accepts no deadline, so it is run as its
+/// own task and awaited under a timeout. That bounds *this caller*: a lookup that never returns
+/// still holds the blocking-pool thread it was given until libc gives up, which no timeout here
+/// can shorten. What it buys is that the wall clock `client_timeout` describes now covers
+/// resolution, so a stalled lookup can no longer push the attempt past it.
+async fn resolve_within(
+    host: &str,
+    port: &str,
+    bound: Duration,
+) -> object_store::Result<ResolvedEndpoint> {
+    let addr = format!("{host}:{port}");
+    if bound.is_zero() {
+        return Err(handle_error(format!(
+            "connecting to {addr} was given no time to resolve"
+        )));
+    }
+
+    let started = Instant::now();
+    // The deadline is fixed before the lookup so that resolution is charged against the bound
+    // exactly once: taking the remainder off `started` afterwards would deduct it twice.
+    let Some(deadline) = started.checked_add(bound) else {
+        return Err(handle_error(format!(
+            "connecting to {addr} within {bound:?} is further ahead than time can be measured"
+        )));
+    };
+
+    let (lookup_host, lookup_port) = (host.to_string(), port.to_string());
+    let lookup = async move {
+        tokio::task::spawn_blocking(move || resolve_addrs(&lookup_host, &lookup_port))
+            .await
+            .map_err(|error| generic_error(STORE_NAME, error))?
+    };
+
+    let addrs = with_resolve_deadline(&addr, bound, lookup).await?;
+
+    // A lookup can return just as the budget expires, which leaves nothing to connect within.
+    // Reporting that beats handing the blocking section a deadline it has already passed.
+    if Instant::now() >= deadline {
+        return Err(handle_error(format!(
+            "resolving {addr} took the whole {bound:?} bound, leaving none to connect within"
+        )));
+    }
+
+    Ok(ResolvedEndpoint {
+        addr,
+        addrs,
+        deadline,
+    })
+}
+
+/// Open a TCP connection to one of `addrs` within `bound`, reporting failure against `addr`.
 ///
 /// A name can resolve to several addresses — commonly an IPv6 and an IPv4 form of the
 /// same host — and only some of them may be listening, so each is tried in turn. They
 /// share one budget rather than getting `bound` each, which is what keeps the whole
 /// attempt inside the wall-clock the caller asked for.
-fn connect_within(host: &str, port: &str, bound: Duration) -> object_store::Result<TcpStream> {
+fn connect_within(
+    addrs: &[SocketAddr],
+    addr: &str,
+    bound: Duration,
+) -> object_store::Result<TcpStream> {
     let started = Instant::now();
-    let candidates = resolve_addrs(host, port)?;
     let mut last_error = None;
 
-    for candidate in candidates {
+    for candidate in addrs {
         let Some(remaining) = bound
             .checked_sub(started.elapsed())
             .filter(|remaining| !remaining.is_zero())
@@ -263,7 +376,7 @@ fn connect_within(host: &str, port: &str, bound: Duration) -> object_store::Resu
             break;
         };
 
-        match TcpStream::connect_timeout(&candidate, remaining) {
+        match TcpStream::connect_timeout(candidate, remaining) {
             Ok(stream) => return Ok(stream),
             Err(error) => last_error = Some(error),
         }
@@ -271,10 +384,10 @@ fn connect_within(host: &str, port: &str, bound: Duration) -> object_store::Resu
 
     match last_error {
         Some(error) => Err(handle_error(format!(
-            "connecting to {host}:{port} failed: {error}"
+            "connecting to {addr} failed: {error}"
         ))),
         None => Err(handle_error(format!(
-            "connecting to {host}:{port} timed out after {bound:?}"
+            "connecting to {addr} timed out after {bound:?}"
         ))),
     }
 }
@@ -334,12 +447,13 @@ impl ObjectStore for SFTPObjectStore {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
+        let endpoint = self.config.resolve().await?;
         let config = Arc::clone(&self.config);
         let location = location.clone();
 
         // Perform all blocking operations in spawn_blocking, including reading the data
         let (object_meta, start, end, data) = tokio::task::spawn_blocking(move || {
-            let session = config.connect()?;
+            let session = config.connect(&endpoint)?;
             let location_string = format!("/{location}");
             let mut file = session
                 .sftp()
@@ -559,20 +673,126 @@ mod tests {
         );
     }
 
-    #[test]
-    fn connect_within_reaches_a_listener_through_its_name() {
+    #[tokio::test]
+    async fn connect_within_reaches_a_listener_through_its_name() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener should bind");
         let port = listener
             .local_addr()
             .expect("the listener should report its address")
             .port();
 
-        connect_within("localhost", &port.to_string(), Duration::from_secs(5))
+        let endpoint = resolve_within("localhost", &port.to_string(), Duration::from_secs(5))
+            .await
+            .expect("localhost should resolve");
+
+        connect_within(&endpoint.addrs, &endpoint.addr, Duration::from_secs(5))
             .expect("a named host that resolves to the listening address should connect");
     }
 
-    #[test]
-    fn connect_reports_a_peer_that_never_sends_an_ssh_banner() {
+    #[tokio::test]
+    async fn resolving_leaves_the_rest_of_the_bound_to_connect_within() {
+        // The point of resolving in the caller is that the lookup is paid for out of the same
+        // budget: the deadline handed on has to be inside the bound the attempt started with,
+        // not a fresh copy of it taken once the addresses were known.
+        let bound = Duration::from_secs(5);
+        let before = Instant::now();
+
+        let endpoint = resolve_within("localhost", "22", bound)
+            .await
+            .expect("localhost should resolve");
+        let after = Instant::now();
+
+        assert_eq!(endpoint.addr, "localhost:22");
+        assert!(!endpoint.addrs.is_empty());
+
+        let left_to_connect = endpoint
+            .deadline
+            .checked_duration_since(after)
+            .expect("a lookup that resolved promptly must leave time to connect");
+        assert!(
+            left_to_connect < bound,
+            "resolution has to be charged against the bound rather than granted on top of it, \
+             but {left_to_connect:?} of {bound:?} was left afterwards"
+        );
+
+        let whole_bound_from_the_start = before
+            .checked_add(bound)
+            .expect("five seconds ahead is measurable");
+        assert!(
+            endpoint.deadline >= whole_bound_from_the_start,
+            "the deadline is the bound counted once from the start of the attempt, so charging \
+             resolution must not also shorten it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bound_of_zero_is_reported_rather_than_resolved_under() {
+        // `client_timeout: 0s` is configurable, and a zero bound is the one value that cannot
+        // bound anything — the lookup would be started only to be abandoned on the first poll.
+        let error = resolve_within("localhost", "22", Duration::ZERO)
+            .await
+            .expect_err("a bound of zero leaves no time to resolve in");
+
+        assert!(
+            error.to_string().contains("no time to resolve"),
+            "the error should say the bound left no room, got {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lookup_that_outlives_the_bound_is_abandoned_by_its_caller() {
+        // The libc resolver takes no deadline of its own, so the guarantee is that the caller
+        // stops waiting — asserted here against a lookup that never completes at all.
+        let stalled = std::future::pending::<object_store::Result<Vec<SocketAddr>>>();
+
+        let error =
+            with_resolve_deadline("sftp.example.com:22", Duration::from_millis(50), stalled)
+                .await
+                .expect_err("a lookup that never returns must not be waited on forever");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("sftp.example.com:22") && message.contains("timed out"),
+            "the error should name the address it gave up on, got {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deadline_already_passed_is_not_connected_against() {
+        // A resolved endpoint can wait for a thread of the shared blocking pool, so the
+        // connection has to re-check the deadline rather than assume the remainder resolution
+        // measured is still available.
+        let config = SFTPClientConfig::new(
+            "user".to_string(),
+            "password".to_string(),
+            "127.0.0.1".to_string(),
+            "22".to_string(),
+            None,
+        );
+        let endpoint = ResolvedEndpoint {
+            addr: "127.0.0.1:22".to_string(),
+            addrs: vec![([127, 0, 0, 1], 22).into()],
+            deadline: Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("the process has been running for over a second"),
+        };
+
+        // `ssh2::Session` is not `Debug`, so the success arm cannot be unwrapped into a panic
+        // message; naming it here keeps the failure legible.
+        let error = config
+            .connect(&endpoint)
+            .err()
+            .map(|error| error.to_string())
+            .expect("an expired deadline must not start a connection");
+
+        assert!(
+            error.contains("timed out before"),
+            "the error should say the budget was spent before connecting, got {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_reports_a_peer_that_never_sends_an_ssh_banner() {
         // Bound but never accepted: the kernel completes the TCP handshake from the
         // backlog while nothing ever writes an SSH version string, which is the shape
         // that used to hold a blocking-pool thread for as long as the peer allowed.
@@ -588,12 +808,21 @@ mod tests {
             addr.port().to_string(),
             Some(Duration::from_millis(500)),
         );
+        let endpoint = config
+            .resolve()
+            .await
+            .expect("a literal loopback address should resolve");
 
         // The attempt is blocking, so it is run off-thread: a missing deadline has to
         // surface as a failed assertion here rather than as a test that never returns.
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let _ = tx.send(config.connect().err().map(|error| error.to_string()));
+            let _ = tx.send(
+                config
+                    .connect(&endpoint)
+                    .err()
+                    .map(|error| error.to_string()),
+            );
         });
 
         let outcome = rx
