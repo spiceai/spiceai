@@ -260,6 +260,8 @@ lint-rust:
 	python3 scripts/check_crate_layers.py
 	## Rust-gate path-list guard (fast, no compile): the sign-off, Attestation, and merge-queue path lists must agree. See docs/dev/ci_signoff.md
 	python3 scripts/check_rust_gate_paths.py
+	## Unreachable-module guard (fast, no compile): every file under a crate's src/ must be reachable from its crate root, or nothing compiles it
+	python3 scripts/check_module_reachability.py
 	## All except metal, cuda, nfs (nfs requires system libnfs library)
 	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going $(_LINT_TARGET_FLAGS) $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
 		-Dwarnings \

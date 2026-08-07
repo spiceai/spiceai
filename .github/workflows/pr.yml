@@ -277,7 +277,7 @@ jobs:
               return;
             }
 
-            const rustAffecting = /(\.rs$|(^|\/)Cargo\.(toml|lock)$|(^|\/)rust-toolchain(\.toml)?$|(^|\/)\.cargo\/|(^|\/)\.?(clippy|rustfmt)\.toml$|(^|\/)nextest\.toml$|(^|\/)layers\.toml$|^scripts\/check_(crate_layers|rust_gate_paths)\.py$|^Makefile$)/;
+            const rustAffecting = /(\.rs$|(^|\/)Cargo\.(toml|lock)$|(^|\/)rust-toolchain(\.toml)?$|(^|\/)\.cargo\/|(^|\/)\.?(clippy|rustfmt)\.toml$|(^|\/)nextest\.toml$|(^|\/)layers\.toml$|^scripts\/check_(crate_layers|rust_gate_paths|module_reachability)\.py$|^Makefile$)/;
             for (const file of files) {
               // A rename off a .rs path changes Rust sources even though the new
               // name doesn't match, so both sides of the rename must be clean.

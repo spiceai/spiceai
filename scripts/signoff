@@ -726,7 +726,7 @@ post_pending_status() {
 # sync with `rustAffecting` in .github/workflows/pr.yml and covered by the
 # check-code-changes filter; `scripts/check_rust_gate_paths.py` enforces both,
 # and docs/dev/ci_signoff.md explains why each path is here.
-RUST_AFFECTING_PATH_PATTERN='(\.rs$|(^|/)Cargo\.(toml|lock)$|(^|/)rust-toolchain(\.toml)?$|(^|/)\.cargo/|(^|/)\.?(clippy|rustfmt)\.toml$|(^|/)nextest\.toml$|(^|/)layers\.toml$|^scripts/check_(crate_layers|rust_gate_paths)\.py$|^Makefile$)'
+RUST_AFFECTING_PATH_PATTERN='(\.rs$|(^|/)Cargo\.(toml|lock)$|(^|/)rust-toolchain(\.toml)?$|(^|/)\.cargo/|(^|/)\.?(clippy|rustfmt)\.toml$|(^|/)nextest\.toml$|(^|/)layers\.toml$|^scripts/check_(crate_layers|rust_gate_paths|module_reachability)\.py$|^Makefile$)'
 
 # True when the branch delta vs trunk can affect Rust lint/build/tests.
 # Prints nothing. Exit 0 = has Rust-affecting changes (or unknown — run checks).
