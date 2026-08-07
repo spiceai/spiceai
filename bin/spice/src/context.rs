@@ -316,10 +316,42 @@ impl RuntimeContext {
         self.spice_bin_dir.join(SPICED_FILENAME)
     }
 
-    /// Check if the runtime is installed.
+    /// Check if the runtime is installed, in this user's install directory or
+    /// (under `sudo`) the invoking user's — see [`Self::resolve_spiced_path`].
     #[must_use]
     pub fn is_runtime_installed(&self) -> bool {
-        self.spiced_path().exists()
+        self.resolve_spiced_path().is_some()
+    }
+
+    /// Locate the `spiced` binary to use, tolerating `sudo`.
+    ///
+    /// `sudo` resets `HOME` to `/root` on most distributions, so
+    /// [`Self::spiced_path`] — which is derived from `HOME` — points at
+    /// `/root/.spice/bin/spiced` under `sudo` and misses the runtime the
+    /// invoking user actually installed. That matters because
+    /// `sudo spice connect --install` is the documented way to install the
+    /// service: without this, every such run concludes the runtime is missing
+    /// and downloads the latest *release*, which on a machine tracking `trunk`
+    /// silently pairs a dev CLI with a released runtime.
+    ///
+    /// Preference order:
+    /// 1. `$HOME/.spice/bin/spiced` — the ordinary case, and a genuine root
+    ///    login's own install.
+    /// 2. `~<$SUDO_USER>/.spice/bin/spiced` — what the operator installed
+    ///    before elevating.
+    ///
+    /// Returns `None` when neither exists.
+    #[must_use]
+    pub fn resolve_spiced_path(&self) -> Option<PathBuf> {
+        let own = self.spiced_path();
+        if own.exists() {
+            return Some(own);
+        }
+        let candidate = sudo_invoker_home()?
+            .join(DOT_SPICE)
+            .join("bin")
+            .join(SPICED_FILENAME);
+        candidate.exists().then_some(candidate)
     }
 
     fn is_wsl_environment<F>(mut get_env: F) -> bool
@@ -358,11 +390,11 @@ impl RuntimeContext {
     ///
     /// Returns an error if the runtime is not installed or version cannot be determined.
     pub fn runtime_version(&self) -> Result<String> {
-        if !self.is_runtime_installed() {
+        let Some(spiced) = self.resolve_spiced_path() else {
             return Err(RuntimeNotInstalledSnafu.build());
-        }
+        };
 
-        let output = Command::new(self.spiced_path())
+        let output = Command::new(spiced)
             .arg("--version")
             .output()
             .context(RuntimeExecutionSnafu)?;
@@ -391,11 +423,11 @@ impl RuntimeContext {
         args: &[String],
         http_endpoint_override: Option<&str>,
     ) -> Result<Command> {
-        if !self.is_runtime_installed() {
+        let Some(spiced) = self.resolve_spiced_path() else {
             return Err(RuntimeNotInstalledSnafu.build());
-        }
+        };
 
-        let mut cmd = Command::new(self.spiced_path());
+        let mut cmd = Command::new(spiced);
         cmd.arg("--pods-watcher-enabled");
         cmd.args(args);
 
@@ -553,6 +585,73 @@ impl RuntimeContext {
             .await
             .context(crate::error::ConnectionFailedSnafu { endpoint: url })
     }
+}
+
+/// The home directory of the user who invoked `sudo`, or `None` when not
+/// running under `sudo` (or the user cannot be resolved).
+///
+/// Only consulted as a fallback by [`RuntimeContext::resolve_spiced_path`].
+#[cfg(unix)]
+fn sudo_invoker_home() -> Option<PathBuf> {
+    let user = std::env::var("SUDO_USER").ok()?;
+    // `sudo -u root` sets SUDO_USER=root, whose home is the `$HOME` branch we
+    // already tried — nothing new to look at.
+    if user.is_empty() || user == "root" {
+        return None;
+    }
+    passwd_home(&user).map(PathBuf::from)
+}
+
+#[cfg(not(unix))]
+fn sudo_invoker_home() -> Option<PathBuf> {
+    None
+}
+
+/// Absolute paths `getent` ships at, in the order they are tried.
+///
+/// Resolving it through `PATH` would be a privilege-escalation hole: this runs
+/// under `sudo` on the documented `spice connect --install` path, so a `PATH`
+/// entry the invoking user controls would have this process execute their binary
+/// as root. Only these known locations are accepted, and a host with `getent`
+/// somewhere else falls through to reading `/etc/passwd`.
+#[cfg(unix)]
+const GETENT_PATHS: &[&str] = &["/usr/bin/getent", "/bin/getent"];
+
+/// A user's home directory from the passwd database.
+///
+/// Asks `getent` first so NSS sources (LDAP, SSSD, systemd-homed) resolve, and
+/// falls back to parsing `/etc/passwd` for the minimal images that ship no
+/// `getent`. Guessing `/home/<user>` is deliberately not a fallback: a wrong
+/// path would silently look for a runtime that was never there.
+#[cfg(unix)]
+fn passwd_home(user: &str) -> Option<String> {
+    for getent in GETENT_PATHS {
+        if !std::path::Path::new(getent).is_file() {
+            continue;
+        }
+        if let Ok(output) = Command::new(*getent).arg("passwd").arg(user).output()
+            && output.status.success()
+            && let Some(home) = passwd_entry_home(&String::from_utf8_lossy(&output.stdout), user)
+        {
+            return Some(home);
+        }
+    }
+    let contents = std::fs::read_to_string("/etc/passwd").ok()?;
+    passwd_entry_home(&contents, user)
+}
+
+/// Extract `user`'s home (field 6) from passwd-format `contents`.
+#[cfg(unix)]
+fn passwd_entry_home(contents: &str, user: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        if fields.next() != Some(user) {
+            return None;
+        }
+        // name:passwd:uid:gid:gecos:home:shell — home is index 5 of the rest.
+        let home = fields.nth(4)?;
+        (!home.is_empty()).then(|| home.to_string())
+    })
 }
 
 #[cfg(test)]
@@ -748,6 +847,104 @@ mod tests {
         };
 
         (ctx, temp_dir)
+    }
+
+    #[test]
+    fn passwd_entry_home_reads_the_home_field() {
+        let passwd = "root:x:0:0:root:/root:/bin/bash\n\
+                      owner:x:1000:1000:Owner,,,:/home/owner:/usr/bin/zsh\n\
+                      svc:x:998:998::/var/lib/svc:/usr/sbin/nologin\n";
+        assert_eq!(
+            passwd_entry_home(passwd, "owner").as_deref(),
+            Some("/home/owner")
+        );
+        assert_eq!(passwd_entry_home(passwd, "root").as_deref(), Some("/root"));
+        assert_eq!(
+            passwd_entry_home(passwd, "svc").as_deref(),
+            Some("/var/lib/svc"),
+            "an empty GECOS field must not shift the home field"
+        );
+        assert_eq!(passwd_entry_home(passwd, "nobody"), None);
+    }
+
+    #[test]
+    fn passwd_entry_home_ignores_prefix_matches_and_empty_homes() {
+        // `own` must not match the `owner` line — a prefix is not the user.
+        let passwd = "owner:x:1000:1000::/home/owner:/bin/sh\n";
+        assert_eq!(passwd_entry_home(passwd, "own"), None);
+
+        // A user with no home directory has nothing to look in.
+        let no_home = "ghost:x:1:1:::/bin/false\n";
+        assert_eq!(passwd_entry_home(no_home, "ghost"), None);
+    }
+
+    /// `passwd_home` runs `getent` while this process may be root under `sudo`,
+    /// so it must never be resolved through `PATH` — an entry the invoking user
+    /// controls would be executed as root.
+    #[cfg(unix)]
+    #[test]
+    fn getent_is_only_ever_run_from_an_absolute_path() {
+        assert!(!GETENT_PATHS.is_empty());
+        for candidate in GETENT_PATHS {
+            let path = std::path::Path::new(candidate);
+            assert!(
+                path.is_absolute(),
+                "{candidate} must be absolute, or PATH decides which binary runs as root"
+            );
+            assert_eq!(
+                path.file_name().and_then(std::ffi::OsStr::to_str),
+                Some("getent"),
+                "{candidate} must name getent itself"
+            );
+        }
+    }
+
+    /// `sudo` rewrites `HOME` to `/root`, so a runtime installed under the
+    /// invoking user's home must still be found — otherwise
+    /// `sudo spice connect --install` concludes the runtime is missing and
+    /// downloads a release over the operator's build.
+    #[test]
+    fn resolve_spiced_path_prefers_the_contexts_own_install() {
+        let (ctx, _temp) = create_test_context_with_runtime();
+        assert_eq!(
+            ctx.resolve_spiced_path(),
+            Some(ctx.spiced_path()),
+            "an install in this context's own bin dir wins outright"
+        );
+        assert!(ctx.is_runtime_installed());
+    }
+
+    #[test]
+    fn resolve_spiced_path_is_none_when_nothing_is_installed() {
+        // A context whose bin dir holds no runtime, and (in CI) no SUDO_USER
+        // install to fall back to.
+        let temp = TempDir::new().expect("create temp dir");
+        let ctx = RuntimeContext {
+            spice_runtime_dir: temp.path().to_path_buf(),
+            spice_bin_dir: temp.path().join("bin"),
+            app_dir: PathBuf::from("/test/app"),
+            pods_dir: PathBuf::from("/test/app/spicepods"),
+            http_endpoint: "http://127.0.0.1:8090".to_string(),
+            http_endpoint_chosen: false,
+            api_key: None,
+            cloud_region: None,
+            user_agent: "spice/test (test; test)".to_string(),
+            extra_headers: HashMap::new(),
+            http_client: reqwest::Client::new(),
+            tls_root_certificate_file: None,
+        };
+        assert!(!ctx.spiced_path().exists());
+        // Without SUDO_USER there is no second place to look. (When the suite
+        // itself runs under sudo the fallback may legitimately find one, so
+        // assert the invariant rather than a bare `None`.)
+        match ctx.resolve_spiced_path() {
+            None => {}
+            Some(found) => assert_ne!(
+                found,
+                ctx.spiced_path(),
+                "a resolved path must come from the sudo fallback, not the empty bin dir"
+            ),
+        }
     }
 
     /// Convert Command args to a Vec<String> for testing.
