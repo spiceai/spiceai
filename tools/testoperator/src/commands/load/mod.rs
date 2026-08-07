@@ -231,7 +231,11 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         .with_query_executor(executor)
         .with_query_executors(client_executors)
         .with_query_duration_threshold(args.test_args.mark_query_failed_if_exceeds)
-        .with_validate(args.test_args.validate);
+        .with_validate(args.test_args.validate)
+        // Only the load phase is paced. The warm-up and the baseline phase
+        // above stay closed-loop: the baseline exists to report what the
+        // server will do unthrottled, which a pinned rate would erase.
+        .with_target_qps(args.target_qps.unwrap_or(0.0));
 
     // Add streaming metrics sender if exporter is configured
     if let Some(exporter) = &streaming_exporter {

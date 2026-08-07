@@ -23,6 +23,7 @@ use crate::spiced::SpicedInstance;
 #[cfg(feature = "file_append")]
 pub mod append;
 pub mod datasets;
+pub mod pacer;
 pub mod search;
 pub mod text_to_sql;
 
