@@ -29,6 +29,7 @@ use datafusion_common::{DataFusionError, Statistics, stats::Precision};
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::source::DataSourceExec;
+use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_physical_expr::expressions::{Column, DynamicFilterPhysicalExpr};
 use datafusion_physical_expr::{Distribution, OrderingRequirements, PhysicalExpr};
@@ -859,7 +860,9 @@ impl ExecutionPlan for CayenneAccelerationExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> datafusion::error::Result<SendableRecordBatchStream> {
-        let stream = self.inner.execute(partition, context)?;
+        // Cloned rather than moved: the memory-accounted wrapper below needs the
+        // pool from this same context. `Arc::clone` is a refcount bump.
+        let stream = self.inner.execute(partition, Arc::clone(&context))?;
         let schema = stream.schema();
         let mapped = stream.map_err(|e| {
             let msg = e.to_string();
@@ -888,6 +891,19 @@ impl ExecutionPlan for CayenneAccelerationExec {
             let _hold = &scan_guard;
             item
         });
+        // Charge this scan's canonicalized batches against the query pool. Only
+        // the outermost wrapper accounts (`scan_guard.is_some()`): the inner
+        // per-snapshot wrappers feed into this same stream, and registering a
+        // consumer at every layer would count one batch once per layer.
+        if self.scan_guard.is_some() {
+            let accounted = MemoryAccountedScanStream::new(
+                Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), mapped)),
+                schema,
+                format!("cayenne_scan[partition={partition}]"),
+                &context,
+            );
+            return Ok(Box::pin(accounted));
+        }
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, mapped)))
     }
 
@@ -978,6 +994,95 @@ impl ExecutionPlan for CayenneAccelerationExec {
     }
 }
 
+/// Charges a scan's materialized batches against the `DataFusion` memory pool.
+///
+/// Reading Cayenne means canonicalizing Vortex's compressed encodings (RunEnd,
+/// Constant, dictionary) into flat Arrow, and that expansion is the single
+/// largest allocator in the process at scale: a SF-1000 heap profile put ~50 GiB
+/// under `vortex_buffer::BufferMut::with_capacity_preferred_aligned`, reached
+/// through `to_arrow_struct`, `canonical::execute`, `to_arrow_primitive`,
+/// `runend_decode_primitive` and friends.
+///
+/// None of it was accounted. `DataFusion`'s operators reserve for what they hold
+/// and Cayenne's `memory_account` covers long-lived resident state (the PK keyset
+/// and deletion indexes, explicitly *outside* query execution), but the
+/// materialization in between reserved from nothing. So the query pool could sit
+/// at its limit and spill while the scan beneath it kept allocating, and
+/// `runtime.query.memory_limit` did not bound the process: measured peak RSS
+/// tracked the cgroup cap (95.8 GiB at 96G, 109.8 GiB at 110G) and was unmoved by
+/// concurrency or by the tuning mode.
+///
+/// The reservation covers the batch **in flight** — from the moment this stream
+/// yields it until the next poll — rather than the batch's whole downstream
+/// lifetime, which this stream cannot observe. That is the quantity that scales
+/// with scan parallelism and the one that has to be bounded: `partitions x
+/// in-flight batch`. Whatever an operator above retains, it reserves for itself.
+///
+/// Over budget returns `ResourcesExhausted` from the pool, so a scan that cannot
+/// fit fails fast (or spills, for operators that can) instead of taking the
+/// process past its cgroup limit. That is a deliberate behaviour change: a query
+/// that used to drift toward an OOM kill now errors.
+struct MemoryAccountedScanStream<S> {
+    inner: S,
+    schema: SchemaRef,
+    /// `None` when the pool refused to register a consumer; accounting is then
+    /// skipped rather than failing the scan, because an unaccounted read is
+    /// strictly better than no read at all.
+    reservation: Option<MemoryReservation>,
+}
+
+impl<S> MemoryAccountedScanStream<S> {
+    fn new(inner: S, schema: SchemaRef, consumer_name: String, context: &Arc<TaskContext>) -> Self {
+        let reservation = Some(MemoryConsumer::new(consumer_name).register(context.memory_pool()));
+        Self {
+            inner,
+            schema,
+            reservation,
+        }
+    }
+}
+
+impl<S> futures::Stream for MemoryAccountedScanStream<S>
+where
+    S: futures::Stream<Item = Result<arrow::record_batch::RecordBatch>> + Unpin,
+{
+    type Item = Result<arrow::record_batch::RecordBatch>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        // Release the previous batch first: it has been handed downstream, so
+        // holding its bytes here would double-count them against whatever
+        // operator above now owns them.
+        if let Some(reservation) = self.reservation.as_mut() {
+            reservation.free();
+        }
+
+        let polled = std::pin::Pin::new(&mut self.inner).poll_next(cx);
+        if let std::task::Poll::Ready(Some(Ok(batch))) = &polled
+            && let Some(reservation) = self.reservation.as_mut()
+        {
+            // `get_array_memory_size` counts the buffers this batch actually
+            // holds, which after canonicalization is the expanded Arrow form —
+            // the quantity that matters here, not the compressed on-disk size.
+            if let Err(e) = reservation.try_grow(batch.get_array_memory_size()) {
+                return std::task::Poll::Ready(Some(Err(e)));
+            }
+        }
+        polled
+    }
+}
+
+impl<S> datafusion::physical_plan::RecordBatchStream for MemoryAccountedScanStream<S>
+where
+    S: futures::Stream<Item = Result<arrow::record_batch::RecordBatch>> + Unpin,
+{
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -986,6 +1091,106 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::physical_plan::expressions::col;
+
+    /// A scan must charge its canonicalized batches to the query pool, and must
+    /// fail rather than exceed it.
+    ///
+    /// Before this, `runtime.query.memory_limit` did not bound the process:
+    /// `DataFusion` operators reserved for what they held and Cayenne's
+    /// `memory_account` covered long-lived resident state, but the Vortex ->
+    /// Arrow materialization between them reserved from nothing. At SF-1000 that
+    /// was ~50 GiB of the heap, and peak RSS tracked the cgroup cap rather than
+    /// the configured limit.
+    #[tokio::test]
+    async fn a_scan_over_its_pool_budget_fails_instead_of_allocating() {
+        use datafusion_execution::memory_pool::GreedyMemoryPool;
+        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        // Comfortably smaller than one batch's Arrow footprint, so the very
+        // first `try_grow` is refused.
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::new(GreedyMemoryPool::new(64)))
+            .build_arc()
+            .expect("runtime env");
+        let context = Arc::new(TaskContext::default().with_runtime(runtime));
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(
+                (0..4096_i64).collect::<Vec<_>>(),
+            ))],
+        )
+        .expect("batch");
+        let inner = futures::stream::iter(vec![Ok(batch)]);
+
+        let mut stream = MemoryAccountedScanStream::new(
+            Box::pin(inner),
+            Arc::clone(&schema),
+            "cayenne_scan[test]".to_string(),
+            &context,
+        );
+
+        let first = stream.next().await.expect("one item");
+        let err = first.expect_err("a batch larger than the pool must be refused");
+        assert!(
+            err.to_string().contains("Resources exhausted"),
+            "expected a pool refusal, got: {err}"
+        );
+    }
+
+    /// The reservation covers the batch in flight only. Holding every batch for
+    /// the stream's lifetime would double-count against whichever operator above
+    /// now owns it, and would make a long scan look like a leak.
+    #[tokio::test]
+    async fn a_scan_releases_each_batch_before_taking_the_next() {
+        use datafusion_execution::memory_pool::GreedyMemoryPool;
+        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = || {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(
+                    (0..1024_i64).collect::<Vec<_>>(),
+                ))],
+            )
+            .expect("batch")
+        };
+        let one_batch_bytes = batch().get_array_memory_size();
+
+        // Room for two batches, but ten are streamed: only an in-flight-only
+        // reservation fits, a cumulative one would be refused partway through.
+        let pool: Arc<dyn datafusion_execution::memory_pool::MemoryPool> =
+            Arc::new(GreedyMemoryPool::new(one_batch_bytes * 2));
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::clone(&pool))
+            .build_arc()
+            .expect("runtime env");
+        let context = Arc::new(TaskContext::default().with_runtime(runtime));
+
+        let inner = futures::stream::iter((0..10).map(|_| Ok(batch())));
+        let mut stream = MemoryAccountedScanStream::new(
+            Box::pin(inner),
+            Arc::clone(&schema),
+            "cayenne_scan[test]".to_string(),
+            &context,
+        );
+
+        let mut seen = 0;
+        while let Some(item) = stream.next().await {
+            item.expect("an in-flight-only reservation fits a pool sized for two batches");
+            seen += 1;
+        }
+        assert_eq!(seen, 10, "every batch should stream through");
+
+        drop(stream);
+        assert_eq!(
+            pool.reserved(),
+            0,
+            "dropping the stream must return its bytes to the pool"
+        );
+    }
 
     fn one_partition_plan() -> Arc<dyn ExecutionPlan> {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
