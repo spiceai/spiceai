@@ -200,6 +200,22 @@ impl Client {
 // answer as a whole one is the behavior this module exists to keep. Sharing one decoder across the
 // workspace's SSE readers is worth doing - see #12597 - but it belongs in its own change.
 
+/// The most bytes one unterminated event may occupy before the reader refuses to keep buffering.
+///
+/// A server that never terminates an event would otherwise grow the buffer until the process runs
+/// out of memory, and this reader is reached from `crates/llms`, so that growth happens inside
+/// `spiced` rather than only in a CLI.
+///
+/// A Gemini event is normally a few hundred bytes of JSON. The realistic upper end is a candidate
+/// part carrying `inlineData`, which is base64 and so a third larger than the bytes it encodes,
+/// putting this cap above roughly 6 MiB of inline payload - well past what a response returns
+/// inline. Sizing it under that upper end would turn a valid long response into a failure, which is
+/// the same class of defect as the growth it bounds.
+///
+/// This bounds the buffer's length. Growing a `Vec` doubles its capacity, so the memory one such
+/// stream holds peaks at roughly twice this.
+const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
+
 /// What begins at `buf[i]`.
 enum Terminator {
     /// A `\n`, or a `\r\n` whose `\n` is present: the line ends here and the next one starts a
@@ -383,6 +399,29 @@ fn parse_sse_stream(
                     let result = serde_json::from_str(&data).context(JsonSnafu);
 
                     return Some((result, (stream, reader)));
+                }
+
+                // Asked after draining, so this measures one event the server never terminated
+                // rather than however many whole events a single read happened to carry.
+                // Refusing ends the stream: those bytes cannot become an event, and reading on
+                // would resume the growth this bounds.
+                if reader.bytes.len() > MAX_EVENT_BYTES {
+                    let buffered = reader.bytes.len();
+
+                    // Replaced rather than cleared, so the capacity behind those bytes is released
+                    // now instead of being held until the stream is dropped.
+                    reader.bytes = Vec::new();
+                    reader.ended = true;
+
+                    return Some((
+                        StreamSnafu {
+                            message: format!(
+                                "SSE event grew to {buffered} bytes without being terminated"
+                            ),
+                        }
+                        .fail(),
+                        (stream, reader),
+                    ));
                 }
 
                 // Every event the body held has been delivered by now, so whatever is left is a
@@ -771,6 +810,82 @@ mod tests {
         assert!(
             parsed_stream.next().await.is_none(),
             "the stream must end after reporting the tail, not repeat the error forever"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unterminated_event_past_the_cap_ends_the_stream() {
+        // A live connection that keeps sending without ever ending an event. Nothing here is
+        // deliverable, so the only question is whether the reader stops buffering it.
+        let mut body = Vec::with_capacity(MAX_EVENT_BYTES + 1);
+        body.extend_from_slice(b"data: {\"candidates\":[");
+        body.resize(MAX_EVENT_BYTES + 1, b'x');
+
+        let mut parsed_stream = Box::pin(parse_sse_stream(dribble_then_pending(vec![&body])));
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(30), parsed_stream.next())
+            .await
+            .expect("the cap must fire on the bytes already held, not await another read")
+            .expect("stream should yield one item")
+            .expect_err("an event past the cap should be an error");
+
+        assert!(
+            error.to_string().contains("without being terminated"),
+            "the error should say the event was never terminated, got: {error}"
+        );
+
+        // Timed too: the body never ends, so a reader that kept reading it would hang here rather
+        // than fail, and take the whole run's budget with it.
+        let end = tokio::time::timeout(std::time::Duration::from_secs(30), parsed_stream.next())
+            .await
+            .expect("the stream must not read on after refusing");
+
+        assert!(
+            end.is_none(),
+            "the stream must end after refusing, not keep reading the body it refused"
+        );
+    }
+
+    /// The cap bounds one unterminated event, not what a read happens to carry. A read holding
+    /// whole events plus a modest remainder can exceed it in total while no single event does,
+    /// and rejecting that would fail a stream in which every event was properly terminated.
+    #[tokio::test]
+    async fn whole_events_plus_a_small_remainder_are_not_measured_against_the_cap() {
+        // Sized so the event clears the cap by a wide enough margin that the framing `text_event`
+        // adds around the payload cannot silently push it over.
+        let payload = MAX_EVENT_BYTES - (64 * 1024);
+        let big_event = text_event(&"x".repeat(payload));
+        assert!(
+            big_event.len() < MAX_EVENT_BYTES,
+            "the event itself is under the cap"
+        );
+
+        let mut body = big_event.into_bytes();
+        body.extend_from_slice(b"data: {\"candidates\":[");
+        body.resize(body.len() + 2 * 1024 * 1024, b'y');
+
+        assert!(
+            body.len() > MAX_EVENT_BYTES,
+            "the read must exceed the cap in total for this to test anything"
+        );
+
+        let mut parsed_stream = Box::pin(parse_sse_stream(dribble(vec![&body])));
+
+        let first = parsed_stream
+            .next()
+            .await
+            .expect("stream should yield one item")
+            .expect("a terminated event under the cap should parse");
+        assert_eq!(text_of(&first).len(), payload);
+
+        let error = parsed_stream
+            .next()
+            .await
+            .expect("stream should yield one item")
+            .expect_err("the unterminated remainder should be an error");
+        assert!(
+            error.to_string().contains("Unexpected end of stream"),
+            "a remainder under the cap ends as a truncated tail, not a refusal, got: {error}"
         );
     }
 
