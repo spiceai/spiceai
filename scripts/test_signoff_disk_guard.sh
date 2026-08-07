@@ -311,6 +311,56 @@ elif [[ "$broken_output" != *"KIND=disk"* ]]; then
 else
   echo "  ok: a watcher that died disarms the watch and lets free space classify"
 fi
+
+# The case above asserts make's status survives a dead watcher, but its stub
+# make writes a single short line, so whether make finishes writing before the
+# watcher closes the pipe is a race — it reported 141 (SIGPIPE) in roughly one
+# run in fifteen (#12734). The race was the test's, the loss was not: a watcher
+# placed downstream of make and exiting at once takes make's status with it,
+# and the more the step writes, the likelier that is. So this case pins the
+# same guarantee under a make that keeps writing, where the old ordering fails
+# every time rather than occasionally.
+tests_run=$((tests_run + 1))
+chatty_dir="$stub_dir/chatty-writer"
+mkdir -p "$chatty_dir"
+cat >"$chatty_dir/awk" <<STUB
+#!/usr/bin/env bash
+set -uo pipefail
+for arg in "\$@"; do
+  [[ "\$arg" == pat=* ]] && exit 2
+done
+exec "${real_awk}" "\$@"
+STUB
+chmod +x "$chatty_dir/awk"
+# Enough output that a closed reader is certain to be noticed, and an explicit
+# status afterwards so anything other than 101 means make never got to return.
+cat >"$chatty_dir/make" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+for i in $(seq 1 2000); do
+  echo "compiling crate number ${i} with a line long enough to fill a pipe buffer"
+done
+exit 101
+STUB
+chmod +x "$chatty_dir/make"
+
+chatty_output="$(env "PATH=$chatty_dir:$stub_dir:$PATH" SIGNOFF_DISK_WATCH=1 \
+  STUB_FREE_KB="$(gib_to_kb 200)" \
+  bash -c 'source "$1"
+    if run_make_step some-target >/dev/null; then step_rc=0; else step_rc=$?; fi
+    echo "RC=${step_rc}"
+    echo "ARMED=${SIGNOFF_DISK_WATCH:+yes}"' _ "$subject" 2>&1)"
+
+if [[ "$chatty_output" == *"RC=141"* ]]; then
+  fail_test "a watcher that cannot run must not cost make its status to SIGPIPE: '${chatty_output}'"
+elif [[ "$chatty_output" != *"RC=101"* ]]; then
+  fail_test "a chatty step under a dead watcher still reports make's own status: expected RC=101, got '${chatty_output}'"
+elif [[ "$chatty_output" == *"ARMED=yes"* ]]; then
+  fail_test "a watcher that never ran must leave the watch disarmed: '${chatty_output}'"
+else
+  echo "  ok: a step that keeps writing still reports its own status when the watcher cannot run"
+fi
+rm -rf "$chatty_dir"
 rm -rf "$broken_dir"
 
 echo "failure_kind"
