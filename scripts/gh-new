@@ -229,7 +229,7 @@ repo_width="$(jq -n --argjson a "$issues_json" --argjson b "$prs_json" \
 
 if (( issue_count > 0 )); then
   echo "${BOLD}Issues (${issue_count})${RESET}"
-  jq -r '.[] | [.repository.nameWithOwner, .number, .state, .createdAt, .title, .url] | @tsv' <<<"$issues_json" |
+  jq -r 'sort_by(.repository.nameWithOwner, .createdAt) | .[] | [.repository.nameWithOwner, .number, .state, .createdAt, .title, .url] | @tsv' <<<"$issues_json" |
   while IFS=$'\t' read -r repo number state created title url; do
     c="$(state_color "$state")"
     num_link="$(link "$url" "$(printf '#%-6s' "$number")")"
@@ -243,7 +243,7 @@ fi
 
 if (( pr_count > 0 )); then
   echo "${BOLD}Pull Requests (${pr_count})${RESET}"
-  jq -r '.[] | [.repository.nameWithOwner, .number, .state, (.isDraft|tostring), .createdAt, .title, .url] | @tsv' <<<"$prs_json" |
+  jq -r 'sort_by(.repository.nameWithOwner, .createdAt) | .[] | [.repository.nameWithOwner, .number, .state, (.isDraft|tostring), .createdAt, .title, .url] | @tsv' <<<"$prs_json" |
   while IFS=$'\t' read -r repo number state is_draft created title url; do
     c="$(state_color "$state")"
     label="$state"
