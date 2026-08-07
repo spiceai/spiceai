@@ -47,6 +47,12 @@ pub fn ca_certificate_from_param(value: &str) -> CaCertificate {
 ///
 /// Built by the connector from spicepod params; see
 /// `connector-postgres::lib::replication_params_from_connector_params`.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool mirrors an independent user-facing parameter (or a derived \
+              accelerator property); folding them into enums would obscure the 1:1 \
+              mapping to spicepod params"
+)]
 #[derive(Clone)]
 pub struct ReplicationParams {
     pub host: String,
@@ -73,6 +79,23 @@ pub struct ReplicationParams {
     /// the WAL overlap from `confirmed_flush_lsn` replays idempotently via
     /// the PK upsert. `initial_snapshot: false` still disables all snapshots.
     pub snapshot_on_resume: bool,
+    /// `true` when the dataset's accelerator does not survive a process restart
+    /// (the same condition that forces [`Self::snapshot_on_resume`]).
+    ///
+    /// Such a slot has no resume value across restarts — the accelerator boots
+    /// empty and re-snapshots regardless — while a slot left behind keeps
+    /// pinning WAL on the source for as long as Spice is down, which can fill
+    /// the primary's disk. So the shared-slot pump drops the slot on graceful
+    /// shutdown (see `slot::drop_slot_after_shutdown`) — it is the only path
+    /// that observes `cdc::shutdown_epoch`; a per-dataset generated slot still
+    /// outlives the process. An ungraceful exit likewise leaves the slot behind.
+    /// Either way the cost is WAL retention, never correctness, because
+    /// `snapshot_on_resume` re-snapshots on the next start regardless.
+    ///
+    /// Distinct from `snapshot_on_resume`, which a *durable* accelerator can
+    /// also set via `pg_replication_initial_snapshot: always` — dropping that
+    /// slot would be wrong.
+    pub ephemeral_accelerator: bool,
     pub status_interval: Duration,
     /// Lag-based readiness threshold: the dataset is marked Ready once its
     /// replication lag (now minus the newest applied commit's source time)
@@ -109,6 +132,23 @@ pub struct ReplicationParams {
     pub pg_output_format: PgOutputFormat,
 }
 
+impl ReplicationParams {
+    /// Whether this slot carries nothing worth keeping across a restart, so it
+    /// may be released at shutdown and fast-forwarded past a backlog.
+    ///
+    /// Both conditions are required, and the second is the subtle one. An
+    /// ephemeral accelerator boots empty, but that only makes the slot
+    /// disposable if a snapshot is actually going to rebuild it. With
+    /// `pg_replication_initial_snapshot: disabled` no snapshot ever runs -- the
+    /// documented workflow is to pre-seed the accelerator yourself -- and the
+    /// slot is then the *only* thing carrying the changes that happened while
+    /// Spice was down. Dropping it there loses them with no way to replay.
+    #[must_use]
+    pub fn slot_is_disposable(&self) -> bool {
+        self.ephemeral_accelerator && self.snapshot_on_resume
+    }
+}
+
 impl std::fmt::Debug for ReplicationParams {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReplicationParams")
@@ -122,6 +162,7 @@ impl std::fmt::Debug for ReplicationParams {
             .field("publication_name", &self.publication_name)
             .field("initial_snapshot", &self.initial_snapshot)
             .field("snapshot_on_resume", &self.snapshot_on_resume)
+            .field("ephemeral_accelerator", &self.ephemeral_accelerator)
             .field("status_interval", &self.status_interval)
             .field("bootstrap_batch_size", &self.bootstrap_batch_size)
             .field("shared", &self.shared)
@@ -743,6 +784,36 @@ TXTE85+Or9IUwDI9543jsyCvuQ8=
 -----END CERTIFICATE-----
 ";
 
+    /// `slot_is_disposable` gates BOTH releasing the slot at shutdown and
+    /// fast-forwarding it past a backlog, so a wrong `true` discards WAL that
+    /// nothing else will replace. Each condition is asserted individually
+    /// necessary.
+    #[test]
+    fn a_slot_is_disposable_only_with_an_empty_accelerator_and_a_guaranteed_snapshot() {
+        let with = |ephemeral, snapshot_on_resume| {
+            let mut p = verify_full_params(None);
+            p.ephemeral_accelerator = ephemeral;
+            p.snapshot_on_resume = snapshot_on_resume;
+            p.slot_is_disposable()
+        };
+
+        // Boots empty and will re-snapshot: the WAL is genuinely redundant.
+        assert!(with(true, true));
+
+        // Durable accelerator, snapshot forced by `initial_snapshot: always`.
+        // Its snapshot upserts into rows that already exist, so discarding the
+        // WAL that carried the source's deletes would leave them behind.
+        assert!(!with(false, true));
+
+        // Empty accelerator but `initial_snapshot: disabled`, so no snapshot
+        // ever runs -- the operator pre-seeds and the slot is the only thing
+        // carrying the changes from while Spice was down. Regression for the
+        // review finding that the shutdown drop was gated on ephemerality alone.
+        assert!(!with(true, false));
+
+        assert!(!with(false, false));
+    }
+
     /// `verify-full` params — the strictest mode, and the one that actually
     /// consults `sslrootcert`. A weaker mode would build a connector even with
     /// the CA ignored, which is exactly the vacuity this fix is about.
@@ -759,6 +830,7 @@ TXTE85+Or9IUwDI9543jsyCvuQ8=
             publication_name: "pub".to_string(),
             initial_snapshot: true,
             snapshot_on_resume: false,
+            ephemeral_accelerator: false,
             status_interval: Duration::from_secs(5),
             ready_lag: Duration::from_secs(2),
             bootstrap_batch_size: 1024,

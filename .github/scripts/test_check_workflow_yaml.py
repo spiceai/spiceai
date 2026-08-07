@@ -523,6 +523,163 @@ class CheckConditionContextTest(unittest.TestCase):
         self.assertEqual(check_workflow_yaml.check_action(action), [])
 
 
+def _workflow_running_the_runtime(
+    command: str = "cargo nextest run --archive-file ./integration.tar.zst -- openai_test",
+    prelude: str = "",
+    with_cache_setup: bool = True,
+) -> str:
+    """A job that sets up the compiler cache and then runs the Spice runtime."""
+    return "".join(
+        [
+            "---\non:\n  workflow_dispatch:\n\njobs:\n  test-models:\n",
+            "    runs-on: spiceai-macos\n    steps:\n",
+            (
+                "      - name: Set up spiceio\n"
+                "        uses: spiceai/spiceio/.github/actions/setup@0870da5\n"
+                if with_cache_setup
+                else ""
+            ),
+            "      - name: Run OpenAI integration test\n        run: |\n",
+            f"          {prelude}\n" if prelude else "",
+            f"          {command}\n",
+        ]
+    )
+
+
+class CheckCacheEndpointIsolationTest(unittest.TestCase):
+    """#12624: the cache's `AWS_ENDPOINT_URL` redirects the runtime's S3 traffic."""
+
+    EXPECTED = (
+        "job `test-models` step `Run OpenAI integration test` runs the Spice runtime after "
+        "`spiceio/.github/actions/setup` has exported `AWS_ENDPOINT_URL`, which sends every "
+        "`s3://` dataset to the compiler cache — start the step with `unset AWS_ENDPOINT_URL`"
+    )
+
+    def test_a_test_run_after_the_cache_setup_is_reported(self):
+        """The shape trunk shipped on 2026-08-05, before the guard existed."""
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(_workflow_running_the_runtime()),
+            [self.EXPECTED],
+        )
+
+    def test_dropping_the_endpoint_first_is_accepted(self):
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(
+                _workflow_running_the_runtime(prelude="unset AWS_ENDPOINT_URL")
+            ),
+            [],
+        )
+
+    def test_a_spice_run_is_covered_too(self):
+        """The CLI reads the same environment as the archived test binary."""
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(
+                _workflow_running_the_runtime(command="spice run &")
+            ),
+            [self.EXPECTED],
+        )
+
+    def test_a_job_without_the_cache_setup_is_left_alone(self):
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(
+                _workflow_running_the_runtime(with_cache_setup=False)
+            ),
+            [],
+        )
+
+    def test_building_the_archive_still_gets_the_cache(self):
+        """`nextest archive` compiles — that is exactly what the endpoint is for."""
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(
+                _workflow_running_the_runtime(
+                    command="cargo nextest archive -p runtime --archive-file integration.tar.zst"
+                )
+            ),
+            [],
+        )
+
+    def test_a_downloaded_test_binary_is_covered_too(self):
+        """`integration_llms.yml` runs a binary it downloaded, with env prefixes."""
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(
+                _workflow_running_the_runtime(
+                    command='CARGO_MANIFEST_DIR="${PWD}" ./integration_test/llms_integration_test'
+                )
+            ),
+            [self.EXPECTED],
+        )
+
+    def test_the_variable_named_only_in_a_comment_does_not_count(self):
+        """A mention is not a drop; the guard must read the command, not the prose."""
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(
+                _workflow_running_the_runtime(prelude="# unset AWS_ENDPOINT_URL one day")
+            ),
+            [self.EXPECTED],
+        )
+
+    def test_a_runtime_named_only_in_a_comment_is_not_an_invocation(self):
+        """The converse false positive: prose about the command must not fail a step."""
+        workflow = (
+            "---\non:\n  workflow_dispatch:\n\njobs:\n  test-models:\n"
+            "    runs-on: spiceai-macos\n    steps:\n"
+            "      - name: Set up spiceio\n"
+            "        uses: spiceai/spiceio/.github/actions/setup@0870da5\n"
+            "      - name: Note\n        run: |\n"
+            "          # cargo nextest run happens in the next job\n"
+            "          echo noted\n"
+        )
+        self.assertEqual(check_workflow_yaml.check_workflow(workflow), [])
+
+    def test_dropping_it_after_the_runtime_has_started_is_reported(self):
+        """Order matters: the child process is already gone by then."""
+        workflow = (
+            "---\non:\n  workflow_dispatch:\n\njobs:\n  test-models:\n"
+            "    runs-on: spiceai-macos\n    steps:\n"
+            "      - name: Set up spiceio\n"
+            "        uses: spiceai/spiceio/.github/actions/setup@0870da5\n"
+            "      - name: Run OpenAI integration test\n        run: |\n"
+            "          cargo nextest run -- openai_test\n"
+            "          unset AWS_ENDPOINT_URL\n"
+        )
+        self.assertEqual(check_workflow_yaml.check_workflow(workflow), [self.EXPECTED])
+
+    def test_a_drop_inside_a_conditional_is_reported(self):
+        """Indented means it is inside an `if` or a function and may not run."""
+        workflow = (
+            "---\non:\n  workflow_dispatch:\n\njobs:\n  test-models:\n"
+            "    runs-on: spiceai-macos\n    steps:\n"
+            "      - name: Set up spiceio\n"
+            "        uses: spiceai/spiceio/.github/actions/setup@0870da5\n"
+            "      - name: Run OpenAI integration test\n        run: |\n"
+            '          if [ "$CI" = "false" ]; then\n'
+            "            unset AWS_ENDPOINT_URL\n"
+            "          fi\n"
+            "          cargo nextest run -- openai_test\n"
+        )
+        self.assertEqual(check_workflow_yaml.check_workflow(workflow), [self.EXPECTED])
+
+    def test_unset_f_removes_a_function_not_the_variable(self):
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(
+                _workflow_running_the_runtime(prelude="unset -f AWS_ENDPOINT_URL")
+            ),
+            [self.EXPECTED],
+        )
+
+    def test_a_runtime_step_before_the_cache_setup_is_left_alone(self):
+        """The export does not exist yet, so there is nothing to inherit."""
+        workflow = (
+            "---\non:\n  workflow_dispatch:\n\njobs:\n  test-models:\n"
+            "    runs-on: spiceai-macos\n    steps:\n"
+            "      - name: Run OpenAI integration test\n        run: |\n"
+            "          cargo nextest run -- openai_test\n"
+            "      - name: Set up spiceio\n"
+            "        uses: spiceai/spiceio/.github/actions/setup@0870da5\n"
+        )
+        self.assertEqual(check_workflow_yaml.check_workflow(workflow), [])
+
+
 class CheckActionTest(unittest.TestCase):
     def test_valid_action_has_no_problems(self):
         self.assertEqual(check_workflow_yaml.check_action(VALID_ACTION), [])

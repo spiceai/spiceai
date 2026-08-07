@@ -22,6 +22,11 @@
 # which fails the same way for a different reason: GitHub rejects the definition
 # rather than the expression, so the workflow never schedules (#12396).
 #
+# It rejects a step that runs the Spice runtime while the compiler cache's
+# `AWS_ENDPOINT_URL` is still in the job's environment, which redirects the
+# runtime's S3 traffic to the cache and reports as a dataset that never loads
+# (#12624).
+#
 # Finally, it requires a nightly's later test suites to survive an earlier one's
 # failure. A step's default condition is `success()`, so in a job that runs its
 # suites as a sequence of steps the first red suite skips every suite behind it:
@@ -94,6 +99,42 @@ CONTEXT_REMEDIES = {
     ),
 }
 
+# The compiler-cache proxy's setup action, which exports `AWS_ENDPOINT_URL` into
+# `$GITHUB_ENV` for the rest of the job.
+CACHE_SETUP_ACTION = "spiceio/.github/actions/setup"
+
+# Ways a step starts the Spice runtime from the workflow file: `nextest`, a test
+# binary the job downloaded rather than built, and the CLI. All three inherit the
+# step's environment, so all three see the cache endpoint. Optional `KEY=value`
+# prefixes are skipped so the binary form still reads as the command.
+#
+# What this cannot see: a `make` target or a composite action that starts the
+# runtime, because the command is in the Makefile or the action, not here. No job
+# combines those with the cache setup today. If one comes to, the guard has to
+# grow rather than be trusted.
+RUNTIME_INVOCATION = re.compile(
+    r"\bcargo\s+nextest\s+run\b"
+    r"|\bspice\s+run\b"
+    r"|^(?:\S+=\S+[ \t]+)*\./\S*integration_test\S*",
+    re.MULTILINE,
+)
+
+# Dropping it for the step's children. `unset` is the only form that works:
+# writing an empty value back to `$GITHUB_ENV` leaves the variable *set*, and
+# `object_store` then builds a store whose bucket endpoint is the empty string.
+#
+# The command has to sit at the top level of the script — indentation means it is
+# inside an `if` or a function and may not run — must not be `unset -f`, which
+# removes a function of that name and leaves the variable alone, and anything
+# after a `#` is its comment rather than its argument.
+DROPS_CACHE_ENDPOINT = re.compile(
+    r"^unset[ \t]+(?!-)[^\n#]*\bAWS_ENDPOINT_URL\b", re.MULTILINE
+)
+
+# A line whose first non-blank character is `#`. Removed before looking for a
+# runtime invocation, so a command named in a comment does not read as one.
+COMMENT_LINE = re.compile(r"^[ \t]*#[^\n]*$", re.MULTILINE)
+
 
 # A step that runs a test suite. Both spellings reach the same place: a suite
 # whose result the run exists to report.
@@ -155,6 +196,7 @@ def check_workflow(text: str) -> list[str]:
     else:
         problems.extend(check_step_budgets(jobs))
         problems.extend(check_workflow_conditions(jobs))
+        problems.extend(check_cache_endpoint_isolation(jobs))
         problems.extend(check_suite_visibility(jobs, is_scheduled(document)))
 
     return problems
@@ -377,6 +419,64 @@ def check_suite_visibility(jobs: dict, scheduled: bool) -> list[str]:
     return problems
 
 
+def check_cache_endpoint_isolation(jobs: dict) -> list[str]:
+    """Report steps that run the Spice runtime with the compiler cache's S3 endpoint set.
+
+    The cache proxy's setup action exports `AWS_ENDPOINT_URL` into `$GITHUB_ENV`
+    so the steps that follow it — sccache, the AWS CLI — reach the cache. The
+    build steps need that. A step that runs `spiced` must not inherit it:
+    `AmazonS3Builder::from_env()` maps `AWS_ENDPOINT_URL` to the S3 endpoint, so
+    every `s3://` dataset with no explicit endpoint of its own is fetched from
+    the cache, and every S3 Vectors call goes there too.
+
+    Nothing about the resulting failure names S3. The dataset stays unhealthy,
+    the runtime never reports ready, and the test fails on a readiness timeout —
+    #12624, where this took out all three test jobs of the models nightly, and
+    the first one masked the eight suites queued behind it.
+
+    Only steps that follow the setup see the export, so only those are checked,
+    and the drop has to come before the runtime starts to be worth anything. What
+    this does not model is shell semantics: a drop that is later re-exported, or
+    one the guard reads as top-level while a wrapper re-adds the variable, still
+    passes. It is a guard against the mistake that happened, not a proof.
+    """
+    problems = []
+    for name, job in jobs.items():
+        if not isinstance(job, dict):
+            continue
+        steps = job.get("steps")
+        if not isinstance(steps, list):
+            continue
+        setup_at = next(
+            (
+                index
+                for index, step in enumerate(steps)
+                if isinstance(step, dict) and CACHE_SETUP_ACTION in str(step.get("uses", ""))
+            ),
+            None,
+        )
+        if setup_at is None:
+            continue
+        for position, step in enumerate(steps[setup_at + 1 :], start=setup_at + 2):
+            if not isinstance(step, dict):
+                continue
+            # Both searches read the same text so their offsets are comparable.
+            script = COMMENT_LINE.sub("", str(step.get("run", "")))
+            invocation = RUNTIME_INVOCATION.search(script)
+            if invocation is None:
+                continue
+            drop = DROPS_CACHE_ENDPOINT.search(script)
+            if drop is not None and drop.start() < invocation.start():
+                continue
+            label = step.get("name") or f"step {position}"
+            problems.append(
+                f"job `{name}` step `{label}` runs the Spice runtime after `{CACHE_SETUP_ACTION}` "
+                f"has exported `AWS_ENDPOINT_URL`, which sends every `s3://` dataset to the "
+                f"compiler cache — start the step with `unset AWS_ENDPOINT_URL`"
+            )
+    return problems
+
+
 def check_action(text: str) -> list[str]:
     """Return the problems with one composite action definition's contents."""
     document, problems = _parse_mapping(text)
@@ -437,8 +537,9 @@ def main(argv: list[str] | None = None) -> int:
     if failures:
         print(
             f"{len(failures)} GitHub Actions definition problem(s) found. A definition "
-            "GitHub cannot parse or schedule is silently disabled, and a budget it "
-            "pre-empts never fires, so this fails the build:",
+            "GitHub cannot parse or schedule is silently disabled, a budget it "
+            "pre-empts never fires, and a leaked cache endpoint reports as an "
+            "unrelated test failure, so this fails the build:",
             file=sys.stderr,
         )
         for failure in failures:

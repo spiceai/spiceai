@@ -26,9 +26,10 @@ use crate::redirect::same_origin_redirect_policy;
 use crate::types::{
     ApiKeysResponse, App, AppsResponse, AuthContext, AuthContextRaw, AuthExchangeRequest,
     AuthExchangeResponse, ContainerImagesResponse, CreateAppRequest, CreateDeploymentRequest,
-    Deployment, DeploymentsResponse, LogsResponse, MetricsResponse, OAuthTokenRequest,
-    OAuthTokenResponse, RegenerateApiKeyRequest, RegenerateApiKeyResponse, RegionsResponse, Secret,
-    SecretsResponse, SetSecretRequest, UpdateAppRequest,
+    Deployment, DeploymentsResponse, LogsResponse, MetricsResponse, MintAdoptionCodeRequest,
+    MintAdoptionCodeResponse, OAuthTokenRequest, OAuthTokenResponse, RegenerateApiKeyRequest,
+    RegenerateApiKeyResponse, RegionsResponse, Secret, SecretsResponse, SetSecretRequest,
+    UpdateAppRequest,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.spice.ai";
@@ -514,6 +515,36 @@ impl CloudClient {
             .post(&url)
             .bearer_auth(self.token_str())
             .json(&request)
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+
+        self.handle_response(response).await
+    }
+
+    // ========================================================================
+    // Standalone instance adoption codes
+    // ========================================================================
+
+    /// Mint a single-use standalone-instance adoption code.
+    ///
+    /// This is the codeless-connect path: a host already authenticated with
+    /// `spice login` holds an org-scoped credential, so `spice connect` mints
+    /// its own code and redeems it in the same command rather than sending the
+    /// customer to the portal.
+    ///
+    /// Requires org admin/owner. The plaintext code is returned once and must
+    /// never be printed or persisted — the caller consumes it immediately.
+    pub async fn mint_instance_adoption_code(
+        &self,
+        request: &MintAdoptionCodeRequest,
+    ) -> Result<MintAdoptionCodeResponse> {
+        let url = format!("{}/v1/instance-adoption-codes", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(self.token_str())
+            .json(request)
             .send()
             .await
             .context(HttpRequestSnafu)?;
