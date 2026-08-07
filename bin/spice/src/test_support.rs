@@ -31,20 +31,30 @@ use std::time::Duration;
 /// How the server answers a connection.
 #[derive(Debug, Clone)]
 enum Behaviour {
-    /// Send the response head, then each body chunk with `gap` of quiet before it.
-    ///
-    /// When `then_hold` is set the connection is held open afterwards instead of being
-    /// closed, so a client that waits for EOF rather than for the protocol's own terminator
-    /// is left waiting.
+    /// Send the response head, then each body chunk with `gap` of quiet before it, and
+    /// finish the way `ending` says.
     Dribble {
-        chunks: Vec<String>,
+        chunks: Vec<Vec<u8>>,
         gap: Duration,
-        then_hold: bool,
+        ending: Ending,
     },
     /// Send the response head and then nothing at all, holding the connection open.
     StallAfterHead,
     /// Send nothing at all, not even the response head, holding the connection open.
     StallBeforeHead,
+}
+
+/// How a dribbling response ends once its chunks are sent.
+#[derive(Debug, Clone, Copy)]
+enum Ending {
+    /// End the chunked body properly and hang up.
+    Close,
+    /// Hold the connection open, so a client that waits for EOF rather than for the
+    /// protocol's own terminator is left waiting.
+    Hold,
+    /// Hang up without the terminating chunk, so the body the client is reading stops
+    /// part-way through — a truncated response on an already-successful status.
+    Truncate,
 }
 
 /// An HTTP/1.1 server that answers every connection the same slow way.
@@ -65,21 +75,37 @@ impl SlowServer {
     /// The response is therefore never quiet for longer than `gap`, but takes
     /// `gap * chunks.len()` in total — the shape that separates the two deadlines.
     pub(crate) fn dribbling(chunks: Vec<String>, gap: Duration) -> Self {
+        Self::dribble(chunks, gap, Ending::Close)
+    }
+
+    /// As [`SlowServer::dribbling`], but with chunks that need not each be valid UTF-8 — the
+    /// shape a test needs to split a multi-byte character across two reads.
+    pub(crate) fn dribbling_bytes(chunks: Vec<Vec<u8>>, gap: Duration) -> Self {
         Self::start(Behaviour::Dribble {
             chunks,
             gap,
-            then_hold: false,
+            ending: Ending::Close,
+        })
+    }
+
+    fn dribble(chunks: Vec<String>, gap: Duration, ending: Ending) -> Self {
+        Self::start(Behaviour::Dribble {
+            chunks: chunks.into_iter().map(String::into_bytes).collect(),
+            gap,
+            ending,
         })
     }
 
     /// As [`SlowServer::dribbling`], but hold the connection open once the chunks are sent
     /// rather than closing it — a server under no obligation to hang up promptly.
     pub(crate) fn dribbling_then_holding(chunks: Vec<String>, gap: Duration) -> Self {
-        Self::start(Behaviour::Dribble {
-            chunks,
-            gap,
-            then_hold: true,
-        })
+        Self::dribble(chunks, gap, Ending::Hold)
+    }
+
+    /// Send `chunks` and then hang up without ending the chunked body, so the client's read
+    /// of an otherwise-successful response fails part-way through.
+    pub(crate) fn truncating(chunks: Vec<String>, gap: Duration) -> Self {
+        Self::dribble(chunks, gap, Ending::Truncate)
     }
 
     /// Answer each request with a response head and then silence, so a deadline is exercised
@@ -202,21 +228,26 @@ fn serve(
         Behaviour::Dribble {
             chunks,
             gap,
-            then_hold,
+            ending,
         } => {
             for chunk in chunks {
                 thread::sleep(*gap);
                 // Chunked transfer encoding: the length in hex, then the bytes.
-                let framed = format!("{:x}\r\n{chunk}\r\n", chunk.len());
-                if writer.write_all(framed.as_bytes()).is_err() || writer.flush().is_err() {
+                let mut framed = format!("{:x}\r\n", chunk.len()).into_bytes();
+                framed.extend_from_slice(chunk);
+                framed.extend_from_slice(b"\r\n");
+                if writer.write_all(&framed).is_err() || writer.flush().is_err() {
                     return;
                 }
             }
-            if *then_hold {
-                hold_open(running);
-            } else {
-                let _ = writer.write_all(b"0\r\n\r\n");
-                let _ = writer.flush();
+            match ending {
+                Ending::Hold => hold_open(running),
+                Ending::Close => {
+                    let _ = writer.write_all(b"0\r\n\r\n");
+                    let _ = writer.flush();
+                }
+                // Nothing more is written: the body stops mid-stream.
+                Ending::Truncate => {}
             }
         }
         Behaviour::StallAfterHead => hold_open(running),

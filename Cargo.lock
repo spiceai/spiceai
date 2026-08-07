@@ -19192,6 +19192,7 @@ dependencies = [
  "flate2",
  "fundu",
  "futures",
+ "http 1.4.1",
  "humantime",
  "insta",
  "keyring",
