@@ -469,6 +469,14 @@ merge queue is still the real gate.
 | Remote | `make signoff-remote` | the same checks via the self-hosted `signoff.yml` workflow, without the targeted pre-checks (`run_targeted_prechecks=true` restores them); posts `signoff` |
 | Pull request | `pull_request` | **Attestation** (validates the sign-off, or auto-passes a branch with no Rust-affecting files, a pure revert, or a single-commit Dependabot bump) + PR hygiene; merge-queue check names report lightweight skipped/passthrough results |
 | Merge queue | `merge_group` | the full required suite (below) + advisory niche checks |
+| Manual dispatch of `pr.yml` | `workflow_dispatch` | the heavy jobs, and **`Attestation` fails on purpose** — a dispatch carries no pull request payload, so there is no sign-off to read and no verdict it can honestly reach |
+
+`Attestation` failing on a dispatch is deliberate: it is the only gate a pull
+request has, so a green one that inspected nothing would satisfy that gate
+outright. Do not dispatch `pr.yml` to report a missing `Attestation` on a PR —
+it cannot, and the failure it posts lands on that head commit. Push to the
+branch, or re-run the `pull_request`-triggered `pr` run, so the event fires with
+its payload. To re-run the *sign-off* itself, dispatch `signoff.yml` instead.
 
 Required checks in the merge queue (the `trunk` ruleset):
 
