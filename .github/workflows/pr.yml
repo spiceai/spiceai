@@ -615,7 +615,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
         run: |
-          echo "::error::Attestation cannot be established by a ${EVENT_NAME} run: there is no pull request to read a head commit from, and no queue-entry gate behind it. Push to the pull request and run make signoff on the pushed HEAD; see docs/dev/ci_signoff.md."
+          echo "::error::Attestation cannot be established by a ${EVENT_NAME} run: there is no pull request to read a head commit from, and no queue-entry gate behind it. The heavy jobs in this run still report their own results. To get a real verdict on a pull request, run make signoff on the pushed HEAD and re-run the Attestation check on the pull_request run; see docs/dev/ci_signoff.md."
           exit 1
 
   # The jobs below run ONLY in the merge queue (merge_group) and on manual

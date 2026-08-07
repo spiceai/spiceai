@@ -385,6 +385,29 @@ const admittedSteps = (eventName) =>
 /** Whether a step fails the job rather than reporting success. */
 const stepFails = (stepName) => /(^|\n)\s*exit 1\s*(\n|$)/.test(stepLines(job, stepName).join('\n'));
 
+/**
+ * Whether a step admitted for `eventName` is certain to run, rather than merely
+ * able to.
+ *
+ * `admitsEvent` treats a `steps.*.outputs.*` term as possibly true, so an
+ * admitted step is only *maybe* reached. That over-approximation is the wrong
+ * direction for asserting that a trigger hits a step which fails the job: a
+ * refusal gated on some earlier step's output would satisfy the assertion while
+ * a real run skipped it and reported success. Requiring the condition to rest on
+ * `github.event_name` alone closes that gap.
+ */
+function certainlyRuns(stepName, eventName) {
+  const condition = stepCondition(job, stepName);
+  if (!admitsEvent(condition, eventName)) {
+    return false;
+  }
+  if (condition === null) {
+    return true;
+  }
+  const residue = condition.replace(/github\.event_name\s*(?:==|!=)\s*'[^']*'/g, '');
+  return !/steps\.|needs\.|inputs\.|github\./.test(residue);
+}
+
 test('the merge queue passthrough names merge_group instead of negating pull_request', () => {
   const condition = stepCondition(job, PASSTHROUGH_STEP);
   assert.match(
@@ -436,9 +459,9 @@ test('no other trigger can reach a green Attestation', () => {
       `a ${event} run reaches no step at all, so Attestation reports success for free`
     );
     assert.ok(
-      admitted.some((step) => stepFails(step)),
-      `a ${event} run reaches only [${admitted.join(', ')}], none of which fails the job, so ` +
-        `it posts a green required Attestation without inspecting any sign-off`
+      admitted.some((step) => stepFails(step) && certainlyRuns(step, event)),
+      `a ${event} run reaches only [${admitted.join(', ')}], none of which is certain to fail ` +
+        `the job, so it posts a green required Attestation without inspecting any sign-off`
     );
   }
 });
