@@ -427,22 +427,30 @@ async fn build_partitioned_provider(
         expression: partition_expr.clone(),
     }];
 
-    let creator = Arc::new(CayennePartitionCreator::new(
-        metadata_table_name.to_string(),
-        PathBuf::from(table_data_path),
-        partition_by.clone(),
-        Arc::clone(vortex_schema),
-        Arc::clone(metadata_catalog),
-        table_id.to_string(),
-        UnsupportedTypeAction::Error,
-        Vec::new(),
-        None,
-        vortex_config.clone(),
-        None,
-        primary_key.to_vec(),
-        on_conflict,
-        Arc::clone(runtime_env),
-    ));
+    // Draw on the process-wide compaction budget, so a partition that is written
+    // to and then goes quiet still gets consolidated. Post-write compaction only
+    // fires while a partition keeps being appended to; without an interval
+    // compactor an idle partition keeps its small files for the table's lifetime,
+    // and every later scan pays for them.
+    let creator = Arc::new(
+        CayennePartitionCreator::new(
+            metadata_table_name.to_string(),
+            PathBuf::from(table_data_path),
+            partition_by.clone(),
+            Arc::clone(vortex_schema),
+            Arc::clone(metadata_catalog),
+            table_id.to_string(),
+            UnsupportedTypeAction::Error,
+            Vec::new(),
+            None,
+            vortex_config.clone(),
+            None,
+            primary_key.to_vec(),
+            on_conflict,
+            Arc::clone(runtime_env),
+        )
+        .with_background_compaction(crate::provider::compaction_budget()),
+    );
 
     let partition_provider =
         PartitionTableProvider::new(creator, partition_by, Arc::clone(vortex_schema))
@@ -498,10 +506,115 @@ fn parse_label_from_sql(sql: &str) -> Option<String> {
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, TimeUnit};
+    use datafusion::prelude::col;
+    use datafusion::scalar::ScalarValue;
     use tempfile::TempDir;
 
-    use crate::CayenneCatalog;
     use crate::metadata::VortexConfig;
+    use crate::{CayenneCatalog, CayenneTableProvider};
+
+    /// A `CREATE TABLE … PARTITIONED BY` table's partitions must run an interval
+    /// background compactor.
+    ///
+    /// Post-write compaction only fires while a partition keeps being appended
+    /// to, so a partition that is written and then goes quiet consolidates
+    /// nothing without one, and every later scan pays the small-file cost for as
+    /// long as the table lives.
+    #[tokio::test]
+    async fn ddl_partitions_run_interval_background_compaction() {
+        let tmp = TempDir::new().expect("tempdir");
+        let table_data_path = format!("{}/events/", tmp.path().to_string_lossy());
+
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("bucket", DataType::Utf8, false),
+        ]);
+        let vortex_schema = Arc::new(
+            transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
+                .expect("schema transforms for vortex"),
+        );
+
+        let metadata_catalog: Arc<dyn MetadataCatalog> = Arc::new(
+            CayenneCatalog::new(format!("sqlite://{}", tmp.path().join("meta.db").display()))
+                .expect("catalog opens"),
+        );
+        metadata_catalog
+            .init()
+            .await
+            .expect("catalog schema initializes");
+
+        let table_name = "events".to_string();
+        let table_id = metadata_catalog
+            .create_table(CreateTableOptions {
+                table_name: table_name.clone(),
+                schema: Arc::clone(&vortex_schema),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: table_data_path.clone(),
+                partition_column: Some("bucket".to_string()),
+                vortex_config: VortexConfig::default(),
+            })
+            .await
+            .expect("catalog create_table");
+
+        let provider = build_partitioned_provider(
+            &table_name,
+            &table_name,
+            &table_data_path,
+            &col("bucket"),
+            Some("bucket"),
+            None,
+            &vortex_schema,
+            &metadata_catalog,
+            &table_id,
+            &[],
+            None,
+            &VortexConfig::default(),
+            &SessionContext::new().runtime_env(),
+        )
+        .await
+        .expect("partitioned provider builds");
+
+        let partitioned = provider
+            .downcast_ref::<PartitionTableProvider>()
+            .expect("the DDL path builds a PartitionTableProvider");
+
+        let partition = partitioned
+            .get_or_create_partition_provider(vec![ScalarValue::Utf8(Some("a".to_string()))])
+            .await
+            .expect("partition is created");
+
+        let cayenne = partition
+            .downcast_ref::<CayenneTableProvider>()
+            .expect("a Cayenne partition is backed by a CayenneTableProvider");
+
+        assert!(
+            cayenne.has_background_compactor(),
+            "a DDL-created partition must run an interval compactor, not rely on post-write \
+             compaction alone"
+        );
+    }
+
+    /// The compaction budget is one process-wide ceiling. Handing every table a
+    /// fresh semaphore would let concurrent compactions fan out without any
+    /// bound as tables are added.
+    #[test]
+    fn the_compaction_budget_is_one_process_wide_ceiling() {
+        assert!(
+            Arc::ptr_eq(
+                &crate::provider::compaction_budget(),
+                &crate::provider::compaction_budget()
+            ),
+            "every caller must draw on the same compaction budget"
+        );
+        // Not an assertion on `available_permits()`: sibling tests in this binary
+        // spawn compactors that draw on this same budget, so only the ceiling is
+        // stable. A zero ceiling would park every compactor forever.
+        assert!(
+            crate::provider::compaction_budget_permits() > 0,
+            "a zero-permit budget would stall every compaction in the process"
+        );
+    }
 
     /// End-to-end on local FS: a Cayenne table partitioned by a user-supplied
     /// `date_trunc` EXPRESSION over a Timestamp column (explicit `partition_by`

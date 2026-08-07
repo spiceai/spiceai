@@ -289,26 +289,28 @@ pub struct CayenneAccelerator {
     /// one in-memory database.
     instance_id: u64,
     footer_cache_mb: Option<usize>,
-    /// Shared semaphore that bounds the number of concurrent per-table
-    /// background compactions across all Cayenne tables registered with this
-    /// accelerator. Sized at the CPU budget's core count so a fleet of tables
-    /// can't oversubscribe the writer pool.
+    /// The process-wide semaphore that bounds concurrent per-table background
+    /// compactions, held here so the registration path can hand it to each
+    /// table. Sized at the CPU budget's core count so a fleet of tables can't
+    /// oversubscribe the writer pool. Every Cayenne table in the process draws
+    /// on this one budget, including those created by `CREATE TABLE …
+    /// PARTITIONED BY`, which belong to no accelerator.
     compaction_semaphore: Arc<tokio::sync::Semaphore>,
     /// Initial permit count of `compaction_semaphore` (the semaphore itself only
     /// exposes *available* permits), published for the occupancy gauge's total.
     compaction_permits_total: usize,
 }
 
-/// A `(weak handle, total permits)` view of the fleet-wide compaction semaphore,
+/// A `(weak handle, total permits)` view of the fleet-wide compaction budget,
 /// published when a real table's background compaction is spawned (see
 /// [`Self::create_cayenne_table_provider`]) so the metrics registration
 /// ([`register_cayenne_telemetry`]) can read live occupancy at scrape
 /// time without holding the accelerator alive. Published from the spawn path
-/// rather than the constructor because `CayenneAccelerator::new()` is also called
-/// for throwaway helpers (e.g. `cayenne_data_dir`), whose semaphore is dropped
-/// immediately — capturing that one would leave a dead `Weak`. A `RwLock` (not
-/// `OnceLock`) so the live accelerator's semaphore always wins; a `Weak` never
-/// resurrects a dropped semaphore.
+/// rather than the constructor so the gauges stay silent until a table is
+/// actually registered — `CayenneAccelerator::new()` is also called for
+/// throwaway helpers (e.g. `cayenne_data_dir`), which compact nothing. The
+/// budget itself is a process-global owned by the `cayenne` crate, so the
+/// `Weak` upgrades for the life of the process.
 static COMPACTION_SEMAPHORE_FOR_METRICS: RwLock<Option<(Weak<tokio::sync::Semaphore>, usize)>> =
     RwLock::new(None);
 
@@ -325,8 +327,8 @@ fn publish_compaction_semaphore_for_metrics(sem: &Arc<tokio::sync::Semaphore>, t
     *guard = Some((Arc::downgrade(sem), total));
 }
 
-/// `(available, total)` permits of the fleet-wide compaction semaphore, or `None`
-/// before a real table has registered (or after teardown).
+/// `(available, total)` permits of the fleet-wide compaction budget, or `None`
+/// before a real table has registered.
 fn compaction_semaphore_snapshot() -> Option<(u64, u64)> {
     let guard = COMPACTION_SEMAPHORE_FOR_METRICS
         .read()
@@ -1023,16 +1025,14 @@ impl CayenneAccelerator {
 
     #[must_use]
     pub fn with_footer_cache_mb(footer_cache_mb: Option<usize>) -> Self {
-        let permits = cpu_budget::cpu_budget().cayenne_compaction_permits();
-        let compaction_semaphore = Arc::new(tokio::sync::Semaphore::new(permits));
         Self {
             catalog: Arc::new(OnceCell::new()),
             memory_catalog: Arc::new(OnceCell::new()),
             instance_id: CAYENNE_ACCELERATOR_INSTANCE_COUNTER
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             footer_cache_mb,
-            compaction_semaphore,
-            compaction_permits_total: permits,
+            compaction_semaphore: cayenne::compaction_budget(),
+            compaction_permits_total: cayenne::compaction_budget_permits(),
         }
     }
 
