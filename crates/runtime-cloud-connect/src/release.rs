@@ -295,21 +295,23 @@ mod tests {
         }
     }
 
-    // Port 1 is privileged and unbound, so a connection to it is refused well
-    // inside the connect timeout instead of waiting it out.
-    const UNREACHABLE_ENDPOINT: &str = "https://127.0.0.1:1";
+    // A scheme-less endpoint. `release` builds the client before it hands the
+    // URL to reqwest, so the send fails on the URL itself and never opens a
+    // socket: the client build stays the only thing under test, and no listener
+    // that happens to be up on this host can answer in its place.
+    const UNSENDABLE_ENDPOINT: &str = "not-a-url";
 
     #[tokio::test]
     async fn release_builds_its_mtls_client_from_a_real_identity() {
         // `reqwest::Identity::from_pem` yields a rustls identity, and the
         // workspace compiles native-tls in alongside rustls, so a client
         // builder that does not pin rustls rejects the identity and the
-        // release fails before it ever reaches the network. Getting as far as
-        // a transport error is what proves the backend and the identity agree.
+        // release fails before it ever reaches the URL. Getting as far as the
+        // send is what proves the backend and the identity agree.
         let identity = self_signed_identity();
 
-        let Err(err) = release(UNREACHABLE_ENDPOINT, &identity, None).await else {
-            panic!("release against an unbound port must not succeed");
+        let Err(err) = release(UNSENDABLE_ENDPOINT, &identity, None).await else {
+            panic!("release against an unsendable endpoint must not succeed");
         };
 
         assert!(
@@ -333,8 +335,8 @@ mod tests {
 
         let identity = self_signed_identity();
 
-        let Err(err) = release(UNREACHABLE_ENDPOINT, &identity, Some(&ca_pem)).await else {
-            panic!("release against an unbound port must not succeed");
+        let Err(err) = release(UNSENDABLE_ENDPOINT, &identity, Some(&ca_pem)).await else {
+            panic!("release against an unsendable endpoint must not succeed");
         };
 
         assert!(
@@ -354,7 +356,7 @@ mod tests {
         let mut identity = self_signed_identity();
         identity.private_key_pem = String::new();
 
-        let Err(err) = release(UNREACHABLE_ENDPOINT, &identity, None).await else {
+        let Err(err) = release(UNSENDABLE_ENDPOINT, &identity, None).await else {
             panic!("release with a truncated identity must not succeed");
         };
 
