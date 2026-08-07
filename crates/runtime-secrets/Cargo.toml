@@ -14,6 +14,9 @@ base64.workspace = true
 dotenv.workspace = true
 indexmap.workspace = true
 logos.workspace = true
+# Guards the delivered-secrets map. Held only across a map read/clone, never an
+# `.await`, so a sync lock is correct in the async store.
+parking_lot.workspace = true
 reqwest.workspace = true
 secrecy.workspace = true
 serde_json.workspace = true
@@ -25,6 +28,9 @@ tracing.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 percent-encoding.workspace = true
 futures.workspace = true
+# Delivered secret values are held in `Zeroizing` so a freed buffer never leaves
+# plaintext credentials in the heap.
+zeroize = "1.8"
 
 # Optional dependencies for feature-gated secret stores
 aws-config = { workspace = true, optional = true }
