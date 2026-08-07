@@ -3253,7 +3253,7 @@ impl CayenneTableProvider {
 
     /// Whether an overwrite of this table may be inlined at all.
     ///
-    /// Three shapes are refused, and each keeps the Vortex path every overwrite
+    /// Four shapes are refused, and each keeps the Vortex path every overwrite
     /// used before inlining existed:
     ///
     /// * **A mem-tier seal shadow.** Inlining an overwrite advances the inline
@@ -3271,13 +3271,30 @@ impl CayenneTableProvider {
     /// * **retention delete filters** — the same two conditions
     ///   `InlineMutationPolicy::from_blocking_conditions` bars the CDC write path
     ///   on, for the same reasons: an inline entry carries no partition key, and
-    ///   retention filters do not reach into the inline corpus. (A partitioned
-    ///   *dataset*'s child tables each carry `partition_column: None`, so they are
-    ///   unaffected — this is the single-provider partition-aware shape.)
+    ///   retention filters do not reach into the inline corpus. This is the
+    ///   single-provider partition-aware shape.
+    /// * **A coupled writer** — the child table of a partitioned *dataset*. Each
+    ///   child carries `partition_column: None`, so the check above does not
+    ///   reach it, and every child shares one context and therefore the one
+    ///   `try_acquire`-only inline-admission slot
+    ///   ([`CayenneContext::try_acquire_overwrite_inline_admission`]). The
+    ///   children write concurrently under a single routing demux, so exactly one
+    ///   of them would take the slot and inline while its siblings fell back to
+    ///   Vortex — leaving a whole-table replace split across both tiers, with the
+    ///   inlined partition picked by whichever child happened to reach admission
+    ///   first. Widening the slot to admit them all is not the alternative:
+    ///   awaiting it reintroduces the demux hold-and-wait deadlock of
+    ///   spiceai/spiceai#11818, and one permit per child would multiply the
+    ///   buffered-admission memory reservation by a partition count that is not
+    ///   statically bounded (time-based partitions grow indefinitely). Little is
+    ///   given up: a child is already clamped to `write_concurrency = 1`, so a
+    ///   refresh leaves one file per partition and the next overwrite replaces
+    ///   it — not the growing pile of tiny files inlining exists to prevent.
     pub(super) fn inline_overwrite_admissible(&self) -> bool {
         self.mem_tier.is_empty()
             && !self.mem_tier_shadow_present.load(Ordering::Acquire)
             && self.table_metadata.partition_column.is_none()
+            && !self.context().is_coupled_writer()
             && !self.has_retention_delete_filters()
     }
 

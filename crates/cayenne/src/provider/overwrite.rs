@@ -654,6 +654,7 @@ mod tests {
 
     use super::{PreparedOverwrite, SendableRecordBatchStream};
     use crate::metadata::{CreateTableOptions, VortexConfig};
+    use crate::provider::context::CayenneContext;
     use crate::provider::table::{CayenneTableProvider, CayenneTableProviderBuilder};
     use crate::{CayenneCatalog, MetadataCatalog};
 
@@ -824,6 +825,80 @@ mod tests {
         prepared.finish().await.expect("finish");
         assert_eq!(inline_row_count(&catalog, provider).await, 0);
         assert_eq!(scan_ids(provider).await, Vec::<i64>::new());
+    }
+
+    /// Regression for the partition children of a partitioned dataset: they must
+    /// never inline, however small the refresh.
+    ///
+    /// A child carries `partition_column: None` — the partition-column rule reads
+    /// the *table's* own metadata, and a partition is not itself partitioned — so
+    /// that rule alone leaves every child admissible. But the children share one
+    /// `CayenneContext` and therefore its single `try_acquire`-only admission
+    /// slot, and they overwrite concurrently under one routing demux, so exactly
+    /// one of them would take the slot and inline while its siblings wrote Vortex
+    /// files: a whole-table replace split across both tiers, with the inlined
+    /// partition decided by whichever task reached admission first. The
+    /// coupled-writer flag is what actually bars them.
+    ///
+    /// The contrast half of this test is the point — both tables run the same
+    /// refresh through the same caps on the same catalog, so a failure here is the
+    /// flag no longer being consulted, not inlining having been switched off.
+    #[tokio::test]
+    async fn partition_child_overwrite_is_never_inlined() {
+        let (tmp, catalog, tables) = setup(1).await;
+        let ordinary = &tables[0];
+
+        let ctx = SessionContext::new();
+        let child_context = CayenneContext::new_for_partition_child(
+            &VortexConfig::default(),
+            ctx.runtime_env(),
+            "partitioned_parent",
+        );
+        assert!(
+            child_context.is_coupled_writer(),
+            "the partition-child context must be marked coupled — the bar below reads this flag"
+        );
+        let child = CayenneTableProviderBuilder::new(
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+            ctx.runtime_env(),
+        )
+        .with_context(child_context)
+        .create(CreateTableOptions {
+            table_name: "partitioned_parent_p0".to_string(),
+            schema: test_schema(),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: tmp.path().join("data").to_string_lossy().to_string(),
+            // Exactly how the partition creators build a child: a partition is not
+            // itself partitioned, so the partition-column rule cannot see this.
+            partition_column: None,
+            vortex_config: VortexConfig::default(),
+        })
+        .await
+        .expect("create partition child table");
+
+        overwrite(&child, &[1, 2, 3, 4, 5]).await;
+        assert_eq!(
+            inline_row_count(&catalog, &child).await,
+            0,
+            "a partition child must write Vortex files, not inline: its siblings share one \
+             admission slot, so an inlined child leaves the replace split across both tiers with \
+             the inlined partition picked by a race"
+        );
+        assert_eq!(
+            scan_ids(&child).await,
+            vec![1, 2, 3, 4, 5],
+            "taking the Vortex path must still serve the whole replacement set"
+        );
+
+        // Same refresh, same caps, same catalog — only the coupled-writer flag differs.
+        overwrite(ordinary, &[1, 2, 3, 4, 5]).await;
+        assert_eq!(
+            inline_row_count(&catalog, ordinary).await,
+            5,
+            "an unpartitioned table on the same caps must still inline — otherwise this test \
+             would pass with inlining disabled outright"
+        );
     }
 
     /// The acceptance test for the commit/publish gap: an inlined overwrite of an
