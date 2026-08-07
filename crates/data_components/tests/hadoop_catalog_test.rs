@@ -14,15 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#[cfg(feature = "test_hadoop_catalog_docker")]
-use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
-#[cfg(feature = "test_hadoop_catalog_docker")]
-use std::sync::RwLock;
 
 use arrow_array::RecordBatch;
-#[cfg(feature = "test_hadoop_catalog_docker")]
-use ctor::{ctor, dtor};
 use data_components::iceberg::catalog::hadoop::{HadoopCatalog, HadoopCatalogBuilder};
 use futures::TryStreamExt;
 use iceberg::io::{
@@ -30,49 +25,43 @@ use iceberg::io::{
 };
 use iceberg::{Catalog, NamespaceIdent};
 use iceberg_storage_opendal::OpenDalStorageFactory;
-#[cfg(feature = "test_hadoop_catalog_docker")]
-use iceberg_test_utils::docker::DockerCompose;
-#[cfg(feature = "test_hadoop_catalog_docker")]
-use iceberg_test_utils::normalize_test_name;
+use iceberg_test_utils::set_up;
 use opendal::Configurator;
+use url::Url;
 
-#[cfg(feature = "test_hadoop_catalog_docker")]
-const MINIO_PORT: u16 = 9000;
+/// Names a directory holding a Hadoop warehouse on the local filesystem, as seeded by
+/// `tests/hadoop_data/setup_file_hadoop.sh`. When it is set, the `file` catalog is
+/// exercised alongside the MinIO-backed ones; when it is unset, only the MinIO-backed
+/// catalogs run. See `tests/hadoop_data/README.md`.
+const FILE_WAREHOUSE_ROOT_ENV: &str = "HADOOP_FILE_WAREHOUSE_ROOT";
 
-#[cfg(feature = "test_hadoop_catalog_docker")]
-static DOCKER_COMPOSE_ENV: RwLock<Option<DockerCompose>> = RwLock::new(None);
-
-#[cfg(feature = "test_hadoop_catalog_docker")]
+/// The warehouse root is a filesystem path, and the catalog wants it as a `file:` URL.
+/// `Url::from_directory_path` is what makes those two agree: it rejects a relative path
+/// instead of emitting `file://relative`, where the first segment would parse as the
+/// authority, and it percent-encodes a Windows path rather than leaving the drive letter
+/// and backslashes raw.
 #[expect(clippy::expect_used)]
-fn get_file_hadoop_catalog() -> HadoopCatalogBuilder {
+fn get_file_hadoop_catalog(warehouse_root: &Path) -> HadoopCatalogBuilder {
+    let warehouse_url = Url::from_directory_path(warehouse_root).expect(
+        "Should convert the warehouse root to a file URL; it must be an absolute directory path",
+    );
+
     let mut fs_config = opendal::services::FsConfig::default();
-    fs_config.root = Some("/tmp/hadoop_warehouse".to_string());
+    fs_config.root = Some(warehouse_root.to_string_lossy().into_owned());
     let operator = opendal::Operator::new(fs_config.into_builder())
         .expect("Should build FS operator")
         .finish();
 
     HadoopCatalogBuilder::default()
-        .with_warehouse_root("file:///tmp/hadoop_warehouse")
+        .with_warehouse_root(warehouse_url.to_string())
         .with_storage_factory(Arc::new(iceberg::io::LocalFsStorageFactory))
         .with_operator(operator)
 }
 
 #[expect(clippy::expect_used)]
 fn get_s3a_hadoop_catalog() -> HadoopCatalogBuilder {
-    #[cfg(not(feature = "test_hadoop_catalog_docker"))]
     let minio_endpoint = std::env::var("MINIO_ENDPOINT")
         .expect("Should have MINIO_ENDPOINT environment variable set");
-
-    #[cfg(feature = "test_hadoop_catalog_docker")]
-    let minio_endpoint = {
-        let guard = DOCKER_COMPOSE_ENV
-            .read()
-            .expect("Should acquire read lock on DOCKER_COMPOSE_ENV");
-        let docker_compose = guard.as_ref().expect("Should have DockerCompose instance");
-        let minio_ip = docker_compose.get_container_ip("minio");
-        let minio_socket_addr = SocketAddr::new(minio_ip, MINIO_PORT);
-        format!("http://{minio_socket_addr}")
-    };
 
     let access_key = std::env::var("MINIO_ACCESS_KEY_ID").unwrap_or("admin".to_string());
     let secret_key = std::env::var("MINIO_SECRET_ACCESS_KEY").unwrap_or("password".to_string());
@@ -109,20 +98,8 @@ fn get_s3a_hadoop_catalog() -> HadoopCatalogBuilder {
 /// `s3a` scheme from the metadata locations, the storage factory is rebuilt.
 #[expect(clippy::expect_used)]
 fn get_s3_to_s3a_inferred_hadoop_catalog() -> HadoopCatalogBuilder {
-    #[cfg(not(feature = "test_hadoop_catalog_docker"))]
     let minio_endpoint = std::env::var("MINIO_ENDPOINT")
         .expect("Should have MINIO_ENDPOINT environment variable set");
-
-    #[cfg(feature = "test_hadoop_catalog_docker")]
-    let minio_endpoint = {
-        let guard = DOCKER_COMPOSE_ENV
-            .read()
-            .expect("Should acquire read lock on DOCKER_COMPOSE_ENV");
-        let docker_compose = guard.as_ref().expect("Should have DockerCompose instance");
-        let minio_ip = docker_compose.get_container_ip("minio");
-        let minio_socket_addr = SocketAddr::new(minio_ip, MINIO_PORT);
-        format!("http://{minio_socket_addr}")
-    };
 
     let access_key = std::env::var("MINIO_ACCESS_KEY_ID").unwrap_or("admin".to_string());
     let secret_key = std::env::var("MINIO_SECRET_ACCESS_KEY").unwrap_or("password".to_string());
@@ -154,61 +131,43 @@ fn get_s3_to_s3a_inferred_hadoop_catalog() -> HadoopCatalogBuilder {
         .set_property(S3_PATH_STYLE_ACCESS, "true")
 }
 
-#[cfg(feature = "test_hadoop_catalog_docker")]
-#[ctor]
-#[expect(clippy::expect_used)]
-fn before_all() {
-    let mut guard = DOCKER_COMPOSE_ENV
-        .write()
-        .expect("Should acquire write lock on DOCKER_COMPOSE_ENV");
-    let docker_compose = DockerCompose::new(
-        normalize_test_name(module_path!()),
-        format!("{}/tests/hadoop_data", env!("CARGO_MANIFEST_DIR")),
-    );
-    docker_compose.down();
-    docker_compose.up();
-    guard.replace(docker_compose);
-}
-
-#[cfg(feature = "test_hadoop_catalog_docker")]
-#[dtor]
-#[expect(clippy::expect_used)]
-fn after_all() {
-    let mut guard = DOCKER_COMPOSE_ENV
-        .write()
-        .expect("Should acquire write lock on DOCKER_COMPOSE_ENV");
-    let compose = guard.take();
-    if let Some(compose) = compose {
-        compose.down();
-    }
-}
-
 #[expect(clippy::expect_used)]
 async fn build_catalogs() -> Vec<(&'static str, HadoopCatalog)> {
-    vec![
-        #[cfg(feature = "test_hadoop_catalog_docker")]
-        (
+    set_up();
+
+    let mut catalogs = Vec::new();
+
+    // Trim before the emptiness test: an all-whitespace value carries no path, so it
+    // selects the `file` backend and then fails on a warehouse root that cannot exist.
+    let warehouse_root_var = std::env::var(FILE_WAREHOUSE_ROOT_ENV).unwrap_or_default();
+    let warehouse_root = warehouse_root_var.trim();
+    if !warehouse_root.is_empty() {
+        catalogs.push((
             "file",
-            get_file_hadoop_catalog()
+            get_file_hadoop_catalog(Path::new(warehouse_root))
                 .build()
                 .await
                 .expect("Should build file catalog"),
-        ),
-        (
-            "s3a",
-            get_s3a_hadoop_catalog()
-                .build()
-                .await
-                .expect("Should build S3A catalog"),
-        ),
-        (
-            "s3-to-s3a-inferred",
-            get_s3_to_s3a_inferred_hadoop_catalog()
-                .build()
-                .await
-                .expect("Should build S3-to-S3A inferred catalog (regression test for scheme inference rebuilding the storage factory)"),
-        ),
-    ]
+        ));
+    }
+
+    catalogs.push((
+        "s3a",
+        get_s3a_hadoop_catalog()
+            .build()
+            .await
+            .expect("Should build S3A catalog"),
+    ));
+
+    catalogs.push((
+        "s3-to-s3a-inferred",
+        get_s3_to_s3a_inferred_hadoop_catalog()
+            .build()
+            .await
+            .expect("Should build S3-to-S3A inferred catalog (regression test for scheme inference rebuilding the storage factory)"),
+    ));
+
+    catalogs
 }
 
 mod tests {
