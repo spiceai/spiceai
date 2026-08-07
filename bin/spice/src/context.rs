@@ -609,12 +609,20 @@ fn sudo_invoker_home() -> Option<PathBuf> {
 #[cfg(unix)]
 const GETENT_PATHS: &[&str] = &["/usr/bin/getent", "/bin/getent"];
 
+/// Absolute path to `dscl`, which is how macOS answers this question. Not
+/// resolved through `PATH`, for the reason given on [`GETENT_PATHS`].
+#[cfg(target_os = "macos")]
+const DSCL_PATH: &str = "/usr/bin/dscl";
+
 /// A user's home directory from the passwd database.
 ///
-/// Asks `getent` first so NSS sources (LDAP, SSSD, systemd-homed) resolve, and
-/// falls back to parsing `/etc/passwd` for the minimal images that ship no
-/// `getent`. Guessing `/home/<user>` is deliberately not a fallback: a wrong
-/// path would silently look for a runtime that was never there.
+/// Asks `getent` first so NSS sources (LDAP, SSSD, systemd-homed) resolve, then
+/// `dscl`, then falls back to parsing `/etc/passwd` for the minimal images that
+/// ship neither. macOS needs `dscl`: it has no `getent`, and its `/etc/passwd`
+/// holds only system accounts, so every ordinary user resolves through
+/// Directory Services or not at all. Guessing `/home/<user>` is deliberately
+/// not a fallback: a wrong path would silently look for a runtime that was
+/// never there.
 #[cfg(unix)]
 fn passwd_home(user: &str) -> Option<String> {
     for getent in GETENT_PATHS {
@@ -628,8 +636,49 @@ fn passwd_home(user: &str) -> Option<String> {
             return Some(home);
         }
     }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = directory_services_home(user) {
+            return Some(home);
+        }
+    }
+
     let contents = std::fs::read_to_string("/etc/passwd").ok()?;
     passwd_entry_home(&contents, user)
+}
+
+/// A user's home directory from macOS Directory Services.
+#[cfg(target_os = "macos")]
+fn directory_services_home(user: &str) -> Option<String> {
+    if !std::path::Path::new(DSCL_PATH).is_file() {
+        return None;
+    }
+    let output = Command::new(DSCL_PATH)
+        .args([".", "-read"])
+        .arg(format!("/Users/{user}"))
+        .arg("NFSHomeDirectory")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    dscl_home(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Extract the home directory from `dscl . -read /Users/<user> NFSHomeDirectory`.
+///
+/// The answer is one `NFSHomeDirectory: <path>` line, except that `dscl` wraps
+/// a value containing a space onto the line below the key instead.
+#[cfg(target_os = "macos")]
+fn dscl_home(output: &str) -> Option<String> {
+    output
+        .split_once("NFSHomeDirectory:")?
+        .1
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
 }
 
 /// Extract `user`'s home (field 6) from passwd-format `contents`.
@@ -746,10 +795,46 @@ mod tests {
         }
     }
 
-    /// `sudo` rewrites `HOME` to `/root`, so a runtime installed under the
-    /// invoking user's home must still be found — otherwise
-    /// `sudo spice connect --install` concludes the runtime is missing and
-    /// downloads a release over the operator's build.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dscl_home_reads_the_value_however_dscl_wrapped_it() {
+        assert_eq!(
+            dscl_home("NFSHomeDirectory: /Users/ada\n"),
+            Some("/Users/ada".to_string())
+        );
+        // `dscl` puts a value containing a space on its own line.
+        assert_eq!(
+            dscl_home("NFSHomeDirectory:\n /Users/ada lovelace\n"),
+            Some("/Users/ada lovelace".to_string())
+        );
+        assert_eq!(dscl_home("<dscl_cmd> DS Error: -14136\n"), None);
+        assert_eq!(dscl_home("NFSHomeDirectory:\n"), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn passwd_home_resolves_a_user_macos_keeps_out_of_etc_passwd() {
+        // Every ordinary macOS account lives in Directory Services only, so
+        // without the `dscl` step `sudo spice connect --install` cannot find the
+        // runtime the invoking user installed.
+        let Ok(user) = std::env::var("USER") else {
+            return;
+        };
+        let passwd = std::fs::read_to_string("/etc/passwd").unwrap_or_default();
+        if user.is_empty() || passwd.contains(&format!("\n{user}:")) {
+            // An account `/etc/passwd` already answers for proves nothing here.
+            return;
+        }
+        let Some(home) = passwd_home(&user) else {
+            panic!("no home resolved for {user}, who is not in /etc/passwd");
+        };
+        assert!(PathBuf::from(&home).is_dir(), "{home}");
+    }
+
+    /// `sudo` rewrites `HOME`, so a runtime installed under the invoking user's
+    /// home must still be found — otherwise `sudo spice connect --install`
+    /// concludes the runtime is missing and downloads a release over the
+    /// operator's build.
     #[test]
     fn resolve_spiced_path_prefers_the_contexts_own_install() {
         let (ctx, _temp) = create_test_context_with_runtime();
