@@ -36,6 +36,12 @@ pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 /// Default cadence for `Telemetry` frames on an established stream.
 pub const DEFAULT_TELEMETRY_INTERVAL: Duration = Duration::from_mins(1);
 
+/// Default cadence for `ExportMetrics` frames on an established stream.
+///
+/// Matches the heartbeat cadence: the payload carries cumulative totals, so the
+/// interval sets chart resolution rather than what is or is not recorded.
+pub const DEFAULT_METRICS_INTERVAL: Duration = Duration::from_secs(30);
+
 /// File name (relative to `$SPICE_CONFIG_DIR`) where the cloud-managed
 /// spicepod is written when an `ApplySpicepod` command arrives.
 pub const CLOUD_MANAGED_SPICEPOD_FILE: &str = "spicepod-cloud-managed.yml";
@@ -157,6 +163,10 @@ pub struct CloudConnectConfig {
     /// Cadence for `Telemetry` frames once a stream is established.
     /// Defaults to [`DEFAULT_TELEMETRY_INTERVAL`].
     pub telemetry_interval: Duration,
+
+    /// Cadence for `ExportMetrics` frames once a stream is established.
+    /// Defaults to [`DEFAULT_METRICS_INTERVAL`].
+    pub metrics_interval: Duration,
 
     /// Lead time before the identity cert's `not_after` at which the
     /// client renews (fresh keypair + CSR against `/renew`). Defaults to
@@ -339,6 +349,7 @@ impl CloudConnectConfig {
             runtime_version: runtime_version.into(),
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
             telemetry_interval: DEFAULT_TELEMETRY_INTERVAL,
+            metrics_interval: DEFAULT_METRICS_INTERVAL,
             renewal_lead: DEFAULT_RENEWAL_LEAD,
         }
     }

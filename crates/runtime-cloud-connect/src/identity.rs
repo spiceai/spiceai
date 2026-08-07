@@ -151,6 +151,22 @@ pub struct Identity {
     /// cache key yet and the cache is simply unavailable until one is minted.
     #[serde(default)]
     pub cache_key_b64: String,
+    /// The app this instance's telemetry is attributed to, as delivered by
+    /// `ApplySpicepod` and stamped on exported metrics as `scp_app_id`.
+    ///
+    /// The one field here that is not credential material. It lives alongside
+    /// the credential because it shares the credential's lifetime — both are
+    /// control-plane facts about this enrolled instance, and both are cleared
+    /// together when the instance is released.
+    ///
+    /// Persisted rather than held only in memory so a restart does not silence
+    /// the export until the next deploy: the runtime cannot derive the value,
+    /// nothing re-sends it on reconnect, and a deploy may be days away.
+    ///
+    /// `None` means no deploy has ever named an app for this instance, which is
+    /// the state a freshly enrolled instance starts in.
+    #[serde(default)]
+    pub app_id: Option<String>,
 }
 
 /// Read the persisted `not_after_unix`, mapping a missing, null, or `0` value
@@ -339,6 +355,31 @@ fn generate_cache_key_b64() -> std::result::Result<String, getrandom::Error> {
 #[derive(Debug, Clone)]
 pub struct IdentityStore;
 
+/// Serializes writers of the identity file.
+///
+/// [`atomic_write`] already makes any single write all-or-nothing, so no reader
+/// ever sees a half-file. What this adds is protection against a LOST UPDATE:
+/// [`IdentityStore::store_app_id`] reads the file, edits one field, and writes it
+/// back, while the renewal path writes the whole file from the identity it holds.
+/// Interleave those and the rotated credential is silently replaced by the copy
+/// the app-id update read a moment earlier — leaving on disk a key the cloud has
+/// already stopped accepting, which surfaces much later as a renewal that cannot
+/// authenticate.
+///
+/// Process-wide because both writers live in this process. Two `spiced`
+/// processes sharing one config directory would still race, but that is already
+/// unsupported for every other reason.
+///
+/// Poisoning is ignored: the guarded data is the file, not memory, and a panic
+/// mid-write leaves it either fully old or fully new thanks to the atomic
+/// rename. Refusing all later writes would turn a transient fault into a
+/// permanently unrenewable instance.
+fn write_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 impl IdentityStore {
     /// Read an identity file, returning `Ok(None)` if it does not exist.
     ///
@@ -369,6 +410,43 @@ impl IdentityStore {
     /// Returns an error if the parent directory cannot be created, the
     /// identity cannot be serialized, or the file cannot be written.
     pub fn store(path: &Path, identity: &Identity) -> Result<()> {
+        let _guard = write_lock();
+        Self::store_locked(path, identity)
+    }
+
+    /// Record the app this instance's telemetry belongs to, leaving every other
+    /// field as it is on disk.
+    ///
+    /// A read-modify-write, which is why it runs under [`write_lock`]: the
+    /// renewal path rewrites the whole file from the identity it holds in
+    /// memory, so an unsynchronized update here could be read before a renewal
+    /// and written after it, silently reverting the rotated credential. The
+    /// lock makes the two orderings the only possible ones.
+    ///
+    /// `Ok(())` with nothing written when the file does not exist. The app id
+    /// arrives over an established stream, which requires an identity, so this
+    /// means the identity was cleared concurrently (a `Remove`) — and
+    /// re-creating the file from a partial value would resurrect an instance the
+    /// control plane just released.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the existing file cannot be read or parsed, or if the
+    /// updated identity cannot be written.
+    pub fn store_app_id(path: &Path, app_id: &str) -> Result<()> {
+        let _guard = write_lock();
+        let Some(mut identity) = Self::load_optional(path)? else {
+            return Ok(());
+        };
+        if identity.app_id.as_deref() == Some(app_id) {
+            return Ok(());
+        }
+        identity.app_id = Some(app_id.to_string());
+        Self::store_locked(path, &identity)
+    }
+
+    /// The write itself, with the caller already holding [`write_lock`].
+    fn store_locked(path: &Path, identity: &Identity) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).context(IoSnafu {
                 path: parent.to_path_buf(),
@@ -628,6 +706,7 @@ mod tests {
                 .to_string(),
             gateway_addr: "gateway.test.spice.ai:443".to_string(),
             not_after_unix: None,
+            app_id: None,
             enc_private_key_pem:
                 "-----BEGIN PRIVATE KEY-----\nMOCKENC\n-----END PRIVATE KEY-----\n".to_string(),
             enc_public_key_pem: "-----BEGIN PUBLIC KEY-----\nMOCKENC\n-----END PUBLIC KEY-----\n"
@@ -676,6 +755,103 @@ mod tests {
         assert_eq!(loaded.public_key_pem, identity.public_key_pem);
         assert_eq!(loaded.ca_bundle_pem, identity.ca_bundle_pem);
         assert_eq!(loaded.gateway_addr, identity.gateway_addr);
+    }
+
+    /// `store_app_id` is a read-modify-write, and everything it does not touch
+    /// has to come back unchanged — most importantly the credential, since
+    /// overwriting that with a stale copy leaves a key the cloud has stopped
+    /// accepting.
+    #[test]
+    fn store_app_id_records_the_app_and_preserves_the_credential() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        let identity = sample_identity();
+        IdentityStore::store(&path, &identity).expect("store");
+
+        IdentityStore::store_app_id(&path, "4002").expect("store app id");
+
+        let loaded = IdentityStore::load_optional(&path)
+            .expect("load")
+            .expect("present");
+        assert_eq!(loaded.app_id.as_deref(), Some("4002"));
+        assert_eq!(loaded.identity_cert_pem, identity.identity_cert_pem);
+        assert_eq!(loaded.private_key_pem, identity.private_key_pem);
+        assert_eq!(loaded.enc_private_key_pem, identity.enc_private_key_pem);
+        assert_eq!(loaded.not_after_unix, identity.not_after_unix);
+    }
+
+    #[test]
+    fn store_app_id_replaces_a_previous_app() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        IdentityStore::store(&path, &sample_identity()).expect("store");
+
+        IdentityStore::store_app_id(&path, "4002").expect("first");
+        IdentityStore::store_app_id(&path, "3387").expect("second");
+
+        let loaded = IdentityStore::load_optional(&path)
+            .expect("load")
+            .expect("present");
+        assert_eq!(loaded.app_id.as_deref(), Some("3387"));
+    }
+
+    /// The app id arrives over an established stream, which requires an
+    /// identity — so a missing file means one was cleared concurrently by a
+    /// `Remove`. Writing a fresh file here would resurrect an instance the
+    /// control plane just released.
+    #[test]
+    fn store_app_id_does_not_create_an_identity() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+
+        IdentityStore::store_app_id(&path, "4002").expect("no-op on a missing identity");
+
+        assert!(
+            IdentityStore::load_optional(&path).expect("load").is_none(),
+            "a released instance must not be resurrected by a metrics label"
+        );
+    }
+
+    /// A renewal rewrites the whole file from the identity it holds in memory,
+    /// so the app id must ride across the rotation — otherwise every renewal
+    /// silently un-attributes the instance until its next deploy.
+    #[test]
+    fn a_rotation_carries_the_app_id_forward() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        IdentityStore::store(&path, &sample_identity()).expect("store");
+        IdentityStore::store_app_id(&path, "4002").expect("store app id");
+
+        let mut rotated = IdentityStore::load_optional(&path)
+            .expect("load")
+            .expect("present");
+        rotated.private_key_pem = "ROTATED-KEY".to_string();
+        rotated.identity_cert_pem = "ROTATED-CERT".to_string();
+        IdentityStore::store(&path, &rotated).expect("store rotated");
+
+        let loaded = IdentityStore::load_optional(&path)
+            .expect("load")
+            .expect("present");
+        assert_eq!(loaded.private_key_pem, "ROTATED-KEY");
+        assert_eq!(loaded.app_id.as_deref(), Some("4002"));
+    }
+
+    #[test]
+    fn load_tolerates_identity_without_an_app_id() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        let legacy = r#"{
+            "identifier": "inst_legacy",
+            "identity_cert_pem": "CERT",
+            "private_key_pem": "KEY",
+            "public_key_pem": "PUB"
+        }"#;
+        std::fs::write(&path, legacy).expect("write legacy identity");
+
+        let loaded = IdentityStore::load_optional(&path)
+            .expect("load")
+            .expect("present");
+        assert_eq!(loaded.app_id, None);
     }
 
     #[test]

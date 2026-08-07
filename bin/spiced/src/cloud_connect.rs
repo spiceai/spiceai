@@ -65,6 +65,7 @@ use app::{App, AppBuilder};
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use runtime::Runtime;
+use runtime::metrics_reader::MetricsReader;
 use runtime::status::ComponentStatus;
 use runtime_cloud_connect::config::{
     CLOUD_MANAGED_SPICEPOD_FILE, CloudConnectConfig, IDENTITY_FILE, PENDING_ADOPT_CODE_FILE,
@@ -238,6 +239,7 @@ pub async fn maybe_start(
     cloud_connect_flag: bool,
     delivered_secrets: Option<DeliveredSecretsState>,
     running_deployment: Option<CloudManagedSpicepod>,
+    metrics: Option<MetricsReader>,
 ) -> Option<CloudConnect> {
     let config = build_config(runtime_version);
 
@@ -246,8 +248,14 @@ pub async fn maybe_start(
     // rather than silently treating it as "not adopted", so a broken
     // identity file is visible to the operator instead of quietly
     // disabling Cloud Connect.
+    let mut persisted_app_id = None;
     let has_identity = match IdentityStore::load_optional(&config.identity_path) {
-        Ok(opt) => opt.is_some(),
+        Ok(opt) => {
+            // Restores the metrics attribution across a restart. Without it the
+            // instance exports nothing until its next deploy, which may be days.
+            persisted_app_id = opt.as_ref().and_then(|i| i.app_id.clone());
+            opt.is_some()
+        }
         Err(err) => {
             tracing::warn!(
                 "Spice Cloud Connect: could not read identity at {}: {err}; \
@@ -286,6 +294,16 @@ pub async fn maybe_start(
     // `GetLogs`. `None` if capture wasn't installed — the handler then
     // reports logs as unavailable rather than returning an empty blob.
     let logs = crate::log_capture::handle();
+
+    match &persisted_app_id {
+        Some(app_id) => tracing::debug!(
+            app_id,
+            "Spice Cloud Connect: metrics attribution restored from the stored identity"
+        ),
+        None => tracing::debug!(
+            "Spice Cloud Connect: the stored identity names no app; metrics are withheld until a deploy names one"
+        ),
+    }
 
     // Installed before `load_components()` by `restore_delivered_secrets`, so
     // the cached secrets were already in place when components resolved their
@@ -329,6 +347,8 @@ pub async fn maybe_start(
         identity_path,
         running_deployment,
         supervisor,
+        metrics,
+        persisted_app_id,
     ));
 
     match CloudConnect::start(config, handle).await {
@@ -454,6 +474,20 @@ struct SpicedRuntimeHandle {
     persisted: RwLock<Option<String>>,
     /// What will relaunch this process after a deployment exits it.
     supervisor: Supervisor,
+    /// Reader for the metrics pushed to the control plane. `None` when no
+    /// reader was attached to the meter provider, in which case this instance
+    /// reports nothing rather than an empty payload.
+    metrics: Option<MetricsReader>,
+    /// The app this instance's metrics are attributed to, learned from
+    /// `ApplySpicepod` and mirrored into the identity file so it survives a
+    /// restart. `None` until the control plane names one, and metrics are
+    /// withheld for as long as it is: a series with no `scp_app_id` is ingested
+    /// but matches no app dashboard, so exporting one spends the backend's quota
+    /// to produce something nothing can read.
+    ///
+    /// Guarded by a `parking_lot` lock held only for the brief read/write, never
+    /// across an `.await`.
+    app_id: RwLock<Option<String>>,
 }
 
 impl SpicedRuntimeHandle {
@@ -464,6 +498,8 @@ impl SpicedRuntimeHandle {
         identity_path: std::path::PathBuf,
         running_deployment: Option<CloudManagedSpicepod>,
         supervisor: Supervisor,
+        metrics: Option<MetricsReader>,
+        app_id: Option<String>,
     ) -> Self {
         let live = running_deployment.map_or_else(String::new, |running| running.spicepod_yaml);
         Self {
@@ -474,7 +510,33 @@ impl SpicedRuntimeHandle {
             live,
             persisted: RwLock::new(None),
             supervisor,
+            metrics,
+            app_id: RwLock::new(app_id),
         }
+    }
+
+    /// Record the app id alongside the credential so a restart keeps exporting.
+    ///
+    /// Runs on the blocking pool: the identity store is synchronous `std::fs`,
+    /// and this is called from the command dispatch loop.
+    ///
+    /// A failure is logged, not returned. The in-memory value is already set, so
+    /// metrics flow either way — all that is lost is durability across a
+    /// restart, and failing the deploy over that would be the wrong trade.
+    async fn persist_app_id(&self, app_id: &str) {
+        let path = self.identity_path.clone();
+        let app_id = app_id.to_string();
+        let result =
+            tokio::task::spawn_blocking(move || IdentityStore::store_app_id(&path, &app_id)).await;
+        let error = match result {
+            Ok(Ok(())) => return,
+            Ok(Err(err)) => err.to_string(),
+            Err(join) => format!("identity persistence task panicked: {join}"),
+        };
+        tracing::warn!(
+            "Cloud Connect: could not persist the app id to {}: {error}; metrics stay attributed until this process exits, then are withheld until the next deploy",
+            self.identity_path.display()
+        );
     }
 
     /// The local delivered-secrets cache key, read fresh from `identity.json`.
@@ -615,7 +677,47 @@ impl RuntimeHandle for SpicedRuntimeHandle {
             config_dir,
             spicepod_yaml,
             delivered_secrets,
+            app_id,
         } = deployment;
+
+        // Recorded before staging, and independently of whether staging succeeds:
+        // which app this instance belongs to is a fact about the deploy's target,
+        // not about the spicepod being valid. A rejected spicepod would otherwise
+        // withhold metrics for a reason that has nothing to do with them.
+        //
+        // Empty means the control plane named none. Leave any id already recorded
+        // in place rather than clearing it: the instance's app has not changed,
+        // and clearing would silence metrics that are correctly attributed.
+        if app_id.is_empty() {
+            let held = self.app_id.read().clone();
+            match held {
+                Some(held) => tracing::warn!(
+                    app_id = %held,
+                    "Cloud Connect: ApplySpicepod carried no app id; keeping the one already recorded, so metrics stay attributed"
+                ),
+                None => tracing::warn!(
+                    "Cloud Connect: ApplySpicepod carried no app id and none was recorded before, so metrics stay withheld. Either this instance is attached to no app, or the api that dispatched the deploy does not forward the app id"
+                ),
+            }
+        } else {
+            let previous = self.app_id.write().replace(app_id.to_string());
+            match previous.as_deref() {
+                Some(previous) if previous == app_id => tracing::debug!(
+                    app_id,
+                    "Cloud Connect: ApplySpicepod re-confirmed the app metrics are attributed to"
+                ),
+                Some(previous) => tracing::debug!(
+                    app_id,
+                    previous,
+                    "Cloud Connect: ApplySpicepod moved this instance to a different app; metrics follow it from the next export"
+                ),
+                None => tracing::debug!(
+                    app_id,
+                    "Cloud Connect: metrics will be attributed to this app from the next export"
+                ),
+            }
+            self.persist_app_id(app_id).await;
+        }
 
         // Cloned out of the lock rather than compared under it: the guard must
         // not be held across the awaits below.
@@ -870,6 +972,24 @@ impl RuntimeHandle for SpicedRuntimeHandle {
                 "delivered_secrets_persisted": self.cache_key().is_some(),
             })),
         )
+    }
+
+    async fn collect_metrics(&self) -> Result<Option<Vec<u8>>, CommandError> {
+        let Some(reader) = &self.metrics else {
+            return Ok(None);
+        };
+        // Read and release: the collection below is CPU work, and the write side
+        // is an inbound ApplySpicepod that must not queue behind it.
+        let app_id = self.app_id.read().clone();
+        let Some(app_id) = app_id else {
+            tracing::debug!(
+                "Metrics export: withheld until the control plane names an app (deploy this instance's app to set one)"
+            );
+            return Ok(None);
+        };
+        reader
+            .collect_otlp_export(&app_id)
+            .map_err(|err| CommandError::internal(err.to_string()))
     }
 }
 

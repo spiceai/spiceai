@@ -599,6 +599,21 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         None
     };
 
+    // A reader of its own for the metrics Cloud Connect pushes to the control
+    // plane. Separate from the cluster reader above rather than shared: each
+    // reader registered with the meter provider gets its own pipeline and so
+    // sees every data point, whereas two consumers of one reader would divide
+    // them under delta temporality.
+    //
+    // Created here because readers are fixed when the meter provider is built,
+    // which happens well before Cloud Connect starts — so the decision is made
+    // from the same cheap on-disk/flag probe that gates log capture.
+    let cloud_connect_metrics = if cloud_connect::is_configured(args.cloud_connect) {
+        Some(runtime::metrics_reader::MetricsReader::new_cumulative())
+    } else {
+        None
+    };
+
     match resolved_cluster_config {
         Ok(resolved_cluster_config) => {
             // Validate that scheduler mode has state_location configured
@@ -782,8 +797,13 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         .and_then(|c| c.otel_exporter.as_ref())
         .filter(|c| c.enabled);
 
-    let needs_metrics =
-        prometheus_registry.is_some() || otel_config.is_some() || metrics_reader.is_some();
+    // Cloud Connect counts: its reader only produces data once it is attached to
+    // the meter provider built below, and `spiced --cloud-connect` alone sets
+    // none of the other three signals.
+    let needs_metrics = prometheus_registry.is_some()
+        || otel_config.is_some()
+        || metrics_reader.is_some()
+        || cloud_connect_metrics.is_some();
 
     if needs_metrics {
         // Resolve secrets in OTEL exporter headers before initializing metrics
@@ -822,6 +842,7 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
             otel_config,
             resolved_otel_headers,
             metrics_reader,
+            cloud_connect_metrics.clone(),
             resource_attributes,
             metric_prefix,
         )
@@ -999,6 +1020,7 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         cloud_connect_flag,
         delivered_secrets,
         running_deployment,
+        cloud_connect_metrics,
     )
     .await;
 
@@ -1260,6 +1282,7 @@ fn init_metrics(
     otel_config: Option<&app::spicepod::component::runtime::OtelExporterConfig>,
     resolved_otel_headers: std::collections::HashMap<String, String>,
     metrics_reader: Option<runtime::metrics_reader::MetricsReader>,
+    cloud_connect_metrics: Option<runtime::metrics_reader::MetricsReader>,
     resource_attributes: Vec<KeyValue>,
     metric_prefix: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1337,6 +1360,13 @@ fn init_metrics(
     if let Some(reader) = metrics_reader {
         provider_builder = provider_builder.with_reader(reader);
         tracing::debug!("Cluster metrics reader enabled for on-demand OTLP collection");
+    }
+
+    // Case 2b: Cloud Connect push. Its own reader, so the cumulative totals it
+    // reports are unaffected by any other consumer collecting.
+    if let Some(reader) = cloud_connect_metrics {
+        provider_builder = provider_builder.with_reader(reader);
+        tracing::debug!("Cloud Connect metrics reader enabled for pushed OTLP export");
     }
 
     // Case 3: OTEL push exporter

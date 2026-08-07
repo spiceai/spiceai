@@ -205,6 +205,13 @@ pub struct SpicepodDeployment<'a> {
     /// `None` means the deployment carried none, which is distinct from an
     /// empty map — an app whose secrets were all removed.
     pub delivered_secrets: Option<DeliveredSecrets>,
+    /// The app this instance's telemetry is attributed to. It rides the
+    /// deployment because the instance cannot derive it and the control plane
+    /// already knows it; a handle that exports metrics records it and stamps it
+    /// as `scp_app_id`.
+    ///
+    /// Empty means the control plane named no app.
+    pub app_id: &'a str,
 }
 
 /// What the client must do once the result of an apply has been sent.
@@ -367,6 +374,9 @@ pub trait RuntimeHandle: Send + Sync + 'static {
     /// writing the spicepod and dropping them: an adapter that cannot apply
     /// secrets would otherwise report success and then fail every referencing
     /// component with a missing-parameter error that names nothing.
+    ///
+    /// [`SpicepodDeployment::app_id`] is ignored by the default implementation,
+    /// which has no metrics pipeline to attribute.
     async fn apply_spicepod(
         &self,
         deployment: SpicepodDeployment<'_>,
@@ -470,6 +480,21 @@ pub trait RuntimeHandle: Send + Sync + 'static {
             "GetStatus is not implemented in this build",
         ))
     }
+
+    /// The instance's current metrics, as a serialized OTLP
+    /// `ExportMetricsServiceRequest`.
+    ///
+    /// Not a [`Capability`]: the client pushes these on its own cadence rather
+    /// than answering a command, so there is nothing to advertise or dispatch.
+    ///
+    /// `Ok(None)` means this instance has nothing to report — either it does not
+    /// export metrics at all, which is the default, it has none yet, or it has not
+    /// been told which app to attribute them to (see [`Self::apply_spicepod`]). An
+    /// `Err` means collection was attempted and failed; the two are distinct so a
+    /// permanently broken collection cannot pass for an idle runtime.
+    async fn collect_metrics(&self) -> Result<Option<Vec<u8>>, CommandError> {
+        Ok(None)
+    }
 }
 
 /// The capabilities `runtime` advertises, as the wire names carried in
@@ -550,6 +575,7 @@ mod tests {
                 config_dir: &dir,
                 spicepod_yaml: "version: v2\nkind: Spicepod\nname: default-apply\n",
                 delivered_secrets: None,
+                app_id: "",
             })
             .await
             .expect("the default apply writes the spicepod");
@@ -584,6 +610,7 @@ mod tests {
                 config_dir: &dir,
                 spicepod_yaml: "version: v2\nkind: Spicepod\nname: refused\n",
                 delivered_secrets: Some(secrets),
+                app_id: "",
             })
             .await
             .expect_err("a handle that cannot apply secrets must refuse the deployment");
