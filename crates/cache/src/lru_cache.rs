@@ -514,13 +514,6 @@ impl<
         };
         let table_name_arc = Arc::clone(table_name);
 
-        // Counted here rather than in a caller so that every cache built on
-        // this type reports invalidations, not just the SQL results cache.
-        // `moka` reports invalidation as `RemovalCause::Explicit`, which the
-        // eviction listener's `was_evicted()` filter excludes, so nothing else
-        // observes it.
-        V::record_invalidation();
-
         // For Moka backend, use efficient closure-based invalidation
         // For Pingora (when moka_cache is None), we need to fall back to manual iteration
         if let Some(ref moka_cache) = self.moka_cache {
@@ -558,6 +551,14 @@ impl<
                 futures::executor::block_on(backend.remove(&key));
             }
         }
+
+        // Counted here rather than in a caller so that every cache built on this
+        // type reports invalidations, not just the SQL results cache: `moka`
+        // reports invalidation as `RemovalCause::Explicit`, which the eviction
+        // listener's `was_evicted()` filter excludes, so nothing else observes
+        // it. Counted only once the invalidation has actually been applied — an
+        // attempt that returned early above did not invalidate anything.
+        V::record_invalidation();
 
         Ok(())
     }

@@ -660,18 +660,23 @@ impl QueryResultsCacheProvider {
         // caller experiences.
         // `Fn`, not `FnMut`, so the outcome comes back through a flag.
         let rejected_as_stale = std::sync::atomic::AtomicBool::new(false);
+        // Bound to a local rather than passed as `&|…|`: the borrow has to
+        // outlive the await, and an inline temporary leaves that to how the
+        // async body happens to be lowered. `LruCache::get_raw_key` does the
+        // same, where the temporary form does not compile at all.
+        let is_valid = |cached_result: &CachedQueryResult| {
+            if self.tables_invalidated_since(
+                &cached_result.input_tables,
+                cached_result.read_started_at,
+            ) {
+                rejected_as_stale.store(true, std::sync::atomic::Ordering::Relaxed);
+                return false;
+            }
+            true
+        };
         let result = self
             .cache
-            .get_raw_key_validated(&raw_key.as_u64(), &|cached_result| {
-                if self.tables_invalidated_since(
-                    &cached_result.input_tables,
-                    cached_result.read_started_at,
-                ) {
-                    rejected_as_stale.store(true, std::sync::atomic::Ordering::Relaxed);
-                    return false;
-                }
-                true
-            })
+            .get_raw_key_validated(&raw_key.as_u64(), &is_valid)
             .await;
 
         if rejected_as_stale.load(std::sync::atomic::Ordering::Relaxed) {
