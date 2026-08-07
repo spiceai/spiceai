@@ -179,6 +179,7 @@ message ControlMessage {
     ApplySecrets apply_secrets = 14;
     DeleteSecrets delete_secrets = 15;
     ExecuteQuery execute_query = 18;
+    AttachApp attach_app = 19;
   }
 
   // Correlates the eventual `CommandResult`. Empty for an unsolicited
@@ -424,6 +425,12 @@ message ExecuteQuery {
   // Requested row cap. Zero means the instance default; the effective cap is
   // min(max_rows, 500) with zero mapping to 500.
   uint32 max_rows = 2;
+}
+
+// The app this instance is attached to, as the control plane currently sees it.
+// Absent means detached. If present it must be non-empty.
+message AttachApp {
+  optional string app_id = 1;
 }
 
 // Sealed secrets delivery. A secret value is sealed TWICE with HPKE

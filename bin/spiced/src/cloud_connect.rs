@@ -562,6 +562,30 @@ impl SpicedRuntimeHandle {
         );
     }
 
+    async fn persist_attachment(&self, app_id: Option<&str>) -> Result<(), CommandError> {
+        let path = self.identity_path.clone();
+        let app_id = app_id.map(str::to_string);
+        let result = tokio::task::spawn_blocking(move || {
+            IdentityStore::set_app_id(&path, app_id.as_deref())
+        })
+        .await
+        .map_err(|error| {
+            CommandError::failed(format!("Failed to save the cloud app attachment: {error}"))
+        })?
+        .map_err(|error| {
+            CommandError::failed(format!(
+                "Failed to save the cloud app attachment to {}: {error}. Check that the runtime can write this path and retry.",
+                self.identity_path.display()
+            ))
+        })?;
+        if !result {
+            return Err(CommandError::failed(
+                "Failed to save the cloud app attachment because the Cloud Connect identity is missing. Reconnect the instance and retry.",
+            ));
+        }
+        Ok(())
+    }
+
     /// The local delivered-secrets cache key, read fresh from `identity.json`.
     ///
     /// `None` when there is no identity yet, or it predates the cache key — in
@@ -611,7 +635,10 @@ impl RuntimeHandle for SpicedRuntimeHandle {
             // The handle holds the runtime, so it can always plan and execute
             // a query against whatever the instance currently serves — an
             // empty catalog answers with an error, not an inability.
-            Capability::ApplySpicepod | Capability::GetStatus | Capability::ExecuteQuery => true,
+            Capability::ApplySpicepod
+            | Capability::AttachApp
+            | Capability::GetStatus
+            | Capability::ExecuteQuery => true,
             // Only when the log-capture layer was installed at startup;
             // otherwise there is no buffer to read from.
             Capability::GetLogs => self.logs.is_some(),
@@ -624,7 +651,10 @@ impl RuntimeHandle for SpicedRuntimeHandle {
             Capability::Restart => "Restart is unsupported on standalone spiced: it is not a control the runtime offers on demand. A deployment already applies by restarting this instance onto the spicepod it validated; to restart it without deploying, use your process manager (systemd/Docker/Kubernetes). See: https://spiceai.org/docs".to_string(),
             Capability::UpgradeRuntime => "UpgradeRuntime is unsupported on standalone spiced: it cannot replace its own binary. Upgrade it the way you installed it (`spice upgrade`, your container image, or your package manager). See: https://spiceai.org/docs".to_string(),
             Capability::GetLogs => "Log capture is not enabled for this runtime: Spice Cloud Connect must be configured before startup for spiced to install the log-capture layer. See: https://spiceai.org/docs".to_string(),
-            Capability::ApplySpicepod | Capability::GetStatus | Capability::ExecuteQuery => format!(
+            Capability::ApplySpicepod
+            | Capability::AttachApp
+            | Capability::GetStatus
+            | Capability::ExecuteQuery => format!(
                 "{} is not supported by this instance",
                 capability.wire_name()
             ),
@@ -1012,13 +1042,19 @@ impl RuntimeHandle for SpicedRuntimeHandle {
         let app_id = self.app_id.read().clone();
         let Some(app_id) = app_id else {
             tracing::debug!(
-                "Spice Cloud Connect: metrics are withheld until Spice Cloud names an app for this instance; deploy the app it is attached to"
+                "Spice Cloud Connect: metrics are withheld because this instance is not attached to a Spice Cloud app"
             );
             return Ok(None);
         };
         reader
             .collect_otlp_export(&app_id)
             .map_err(|err| CommandError::internal(err.to_string()))
+    }
+
+    async fn attach_app(&self, app_id: Option<&str>) -> Result<serde_json::Value, CommandError> {
+        self.persist_attachment(app_id).await?;
+        *self.app_id.write() = app_id.map(str::to_string);
+        Ok(serde_json::json!({ "app_id": app_id }))
     }
 
     /// Execute an `ExecuteQuery` against the in-process runtime.
