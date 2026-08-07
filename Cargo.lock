@@ -5563,7 +5563,9 @@ version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
 dependencies = [
+ "getrandom 0.4.2",
  "hybrid-array",
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -16912,6 +16914,7 @@ dependencies = [
  "runtime-query-engine",
  "runtime-rate-control",
  "runtime-request-context",
+ "runtime-resources",
  "runtime-search",
  "runtime-secrets",
  "runtime-status",
@@ -16995,8 +16998,10 @@ dependencies = [
  "hex",
  "object_store 0.13.2",
  "opentelemetry",
+ "runtime-datafusion",
  "runtime-object-store",
  "runtime-parameters",
+ "runtime-query-engine",
  "runtime-secrets",
  "rusqlite",
  "serde",
@@ -17111,10 +17116,12 @@ dependencies = [
  "aws-lc-rs",
  "axum",
  "base64 0.22.1",
+ "chacha20poly1305",
  "chrono",
  "cloud-connect-crypto",
  "dirs",
  "gethostname",
+ "getrandom 0.3.4",
  "pem",
  "prost",
  "prost-types",
@@ -17133,6 +17140,7 @@ dependencies = [
  "tonic-prost",
  "tonic-prost-build",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -17185,12 +17193,15 @@ version = "2.2.0-unstable"
 dependencies = [
  "arrow",
  "arrow-schema",
+ "arrow_tools",
+ "clap",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
  "fundu",
  "globset",
  "logos",
+ "opentelemetry",
  "runtime-acceleration",
  "serde",
  "snafu",
@@ -17451,6 +17462,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "runtime-resources"
+version = "2.2.0-unstable"
+dependencies = [
+ "parking_lot",
+ "sysinfo 0.38.4",
+ "telemetry",
+ "tracing",
+ "util",
+]
+
+[[package]]
 name = "runtime-search"
 version = "2.2.0-unstable"
 dependencies = [
@@ -17523,6 +17545,7 @@ dependencies = [
  "indexmap 2.14.0",
  "keyring",
  "logos",
+ "parking_lot",
  "percent-encoding",
  "rand 0.10.1",
  "reqwest 0.13.4",
@@ -17536,6 +17559,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "zeroize",
 ]
 
 [[package]]
@@ -19175,6 +19199,7 @@ dependencies = [
  "flate2",
  "fundu",
  "futures",
+ "gethostname",
  "humantime",
  "insta",
  "keyring",
@@ -19193,6 +19218,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "snafu",
  "spice-cloud-client",
  "spiceai",
@@ -19323,6 +19349,7 @@ dependencies = [
  "opentelemetry-zipkin",
  "opentelemetry_sdk",
  "otel-arrow",
+ "parking_lot",
  "prometheus",
  "repl",
  "reqwest 0.13.4",

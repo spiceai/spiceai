@@ -29,7 +29,11 @@ mod provider;
 pub mod util;
 pub use delete::{build_key_match_predicate, resolve_keys_matching_predicate};
 pub use provider::*;
-pub use util::{INDEXED_INNER, InnerProviderFn, find_concrete_table_provider_with};
+pub use util::{
+    INDEXED_INNER, InnerProviderFn, LayerWalk, RebuildProviderFn, TableProviderLayer,
+    find_concrete_table_provider_in, peel_to_innermost, rebuild_innermost_table_provider,
+    visit_provider_chain,
+};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
