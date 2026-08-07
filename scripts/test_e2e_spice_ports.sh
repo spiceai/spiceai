@@ -194,6 +194,21 @@ run_stop() {
     "$@" bash "$stop_script" 2>&1)
 }
 
+printf 'case: probing from the top of the window wraps instead of walking out of it\n'
+# A seed landing on the last port in the window, with that port held, must wrap
+# to the bottom rather than step to 24000 — which would leave the reserved
+# window and head toward the ephemeral range the window exists to avoid.
+run_alloc 'github-runner-01' SPICE_PORT_SPAN=1 SPICE_PORT_MAX_PROBE=3
+assert_eq 'a span of one always yields the base port' \
+  '20000' "$(value_of SPICE_HTTP_PORT)"
+
+# Ten probes from the top of a small window stay inside it.
+for probe_seed in 1 2 3 4 5 6 7 8; do
+  run_alloc "github-runner-${probe_seed}" SPICE_PORT_SPAN=4 SPICE_PORT_MAX_PROBE=10
+  assert_between "a span of four keeps seed ${probe_seed} in the window" \
+    20000 20003 "$(value_of SPICE_HTTP_PORT)"
+done
+
 printf 'case: stop-spice checks the ports the job allocated\n'
 stop_output=$(run_stop SPICE_HTTP_PORT=21734 SPICE_FLIGHT_PORT=26734)
 case $stop_output in

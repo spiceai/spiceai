@@ -80,25 +80,28 @@ if [ -z "${hash_value}" ]; then
 fi
 
 offset=$((hash_value % SPAN))
-http_port=$((HTTP_BASE + offset))
 
 # Walk both ports together so the pair keeps a constant distance; that way one
 # number in a log identifies the other, and neither walks into the other's
-# window.
+# window. The step wraps within SPAN rather than running past it, so a seed that
+# lands near the top of the window cannot walk out of the range this script
+# promises — and into the ephemeral range it was chosen to avoid.
 probe=0
-while [ "${probe}" -lt "${MAX_PROBE}" ]; do
+while :; do
+  http_port=$((HTTP_BASE + (offset + probe) % SPAN))
   flight_port=$((http_port + FLIGHT_OFFSET))
 
   if ! port_in_use "${http_port}" && ! port_in_use "${flight_port}"; then
     break
   fi
 
-  echo "Port ${http_port}/${flight_port} is already held on this host; trying the next pair."
-  http_port=$((http_port + 1))
   probe=$((probe + 1))
-done
+  if [ "${probe}" -ge "${MAX_PROBE}" ]; then
+    break
+  fi
 
-flight_port=$((http_port + FLIGHT_OFFSET))
+  echo "Port ${http_port}/${flight_port} is already held on this host; trying the next pair."
+done
 
 if [ "${probe}" -ge "${MAX_PROBE}" ]; then
   # Report rather than fail: spiced will refuse to bind and say so, and the
