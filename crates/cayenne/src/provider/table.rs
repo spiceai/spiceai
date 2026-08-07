@@ -16316,7 +16316,7 @@ impl CayenneTableProvider {
     /// ([`Self::partition_cold_manifest_for_promotion`]), read the canonical
     /// visible stream restricted to warm + dirty cold files (all deletes
     /// applied, single-version per key — the proven rewrite read with a
-    /// [`super::cold_partition::ColdScanFileSubset`] session extension),
+    /// [`super::cold_partition::ColdScanFiles`] session extension),
     /// Z-order cluster it, write read-optimized Vortex to the cold store, then
     /// atomically register the new files PLUS the carried-forward clean
     /// manifest rows + overwrite-clear the warm tier + flip to a fresh empty
@@ -16628,18 +16628,23 @@ impl CayenneTableProvider {
         // files' across promotions. Watch `datalake_rewrite_selectivity`; if it
         // ratchets up, the counter-measure is a recluster policy (full rewrite
         // past a dirty-fraction threshold).
-        let (dirty_cold, clean_cold) = (partition.dirty, partition.clean);
+        let (dirty_cold, clean_cold) = (Arc::new(partition.dirty), partition.clean);
 
         // Canonical visible read (all tiers, all deletes applied, single-version
         // per key) — reuses the proven rewrite read so cold is correct by
-        // construction. The session's `ColdScanFileSubset` extension restricts
-        // its cold branch to the dirty files: clean files stay out of the
-        // stream entirely.
-        let dirty_urls: std::collections::HashSet<String> =
-            dirty_cold.iter().map(|f| f.file_url.clone()).collect();
+        // construction. The session's `ColdScanFiles` extension SUPPLIES its
+        // cold branch the dirty files: clean files stay out of the stream
+        // entirely.
+        //
+        // The extension carries the classified rows themselves, so the rewrite
+        // reads exactly the listing this promotion classified. Handing down
+        // their URLs instead would leave the scan to select them out of its own
+        // later manifest capture, and a dirty file absent from that capture
+        // would be dropped from the rewrite while the commit below still
+        // retires it — silent row loss (#12708).
         let ctx = self.create_compaction_session_context_with_config(
             SessionConfig::default().with_extension(Arc::new(
-                super::cold_partition::ColdScanFileSubset(dirty_urls),
+                super::cold_partition::ColdScanFiles(Arc::clone(&dirty_cold)),
             )),
         );
         let (stream, _generation_before) = self.visible_file_stream_for_rewrite(&ctx).await?;
@@ -18503,9 +18508,9 @@ impl CayenneTableProvider {
     }
 
     /// [`Self::create_compaction_session_context`] with an explicit config —
-    /// the carry-forward promotion attaches its [`ColdScanFileSubset`]
-    /// extension here so its private session's cold branch reads only the
-    /// dirty files being rewritten.
+    /// the carry-forward promotion attaches its
+    /// [`super::cold_partition::ColdScanFiles`] extension here so its private
+    /// session's cold branch reads only the dirty files being rewritten.
     fn create_compaction_session_context_with_config(
         &self,
         config: SessionConfig,
@@ -25672,7 +25677,11 @@ impl CayenneTableProvider {
     /// a manifest read after the caller's capture can belong to a later promotion,
     /// and pairing it with the captured warm snapshot double-counts every promoted
     /// row. Each row carries its serialized Vortex `FileStatistics` blob, so
-    /// listing-time pruning runs with NO object-store round-trip. The returned plan
+    /// listing-time pruning runs with NO object-store round-trip.
+    ///
+    /// A promotion's private session overrides `cold_files` entirely with its
+    /// [`super::cold_partition::ColdScanFiles`] extension — see the override
+    /// below for why that is a replacement and not a filter. The returned plan
     /// is a Vortex `DataSourceExec`; the caller wraps it with the key-based
     /// (`Ignore`) deletion filter and unions it into the scan tree.
     async fn build_cold_tier_scan_plan(
@@ -25704,18 +25713,12 @@ impl CayenneTableProvider {
         }
 
         // Carry-forward promotion: the promotion's PRIVATE session carries a
-        // `ColdScanFileSubset` config extension restricting this branch to the
-        // dirty files being rewritten (clean files are carried forward by
-        // manifest reference, never re-read). User-query sessions never carry
-        // the extension, so queries always see the full captured manifest.
-        let cold_files: Vec<&crate::metadata::ColdTierFile> =
-            match scan_config.get_extension::<super::cold_partition::ColdScanFileSubset>() {
-                Some(subset) => cold_files
-                    .iter()
-                    .filter(|f| subset.0.contains(&f.file_url))
-                    .collect(),
-                None => cold_files.iter().collect(),
-            };
+        // `ColdScanFiles` config extension supplying the dirty files being
+        // rewritten. User-query sessions never carry it, so queries always see
+        // the full captured manifest.
+        let promotion_files = scan_config.get_extension::<super::cold_partition::ColdScanFiles>();
+        let cold_files =
+            super::cold_partition::cold_files_for_scan(cold_files, promotion_files.as_deref());
         // No early all-empty guard needed: the per-file loop skips zero-size
         // files and the `object_store_url is None` / `kept.is_empty()` checks
         // below both return `Ok(None)` when nothing survives.
