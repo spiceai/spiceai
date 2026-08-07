@@ -592,9 +592,31 @@ jobs:
         if: ${{ github.event_name == 'pull_request' && steps.revert.outputs.fast_track == 'true' }}
         run: echo "Pure revert fast-tracked past sign-off; the full suite runs on the merged result in the merge queue."
 
+      # `merge_group` is named explicitly rather than negating `pull_request`,
+      # because the passthrough rests on a precondition only the queue has:
+      # entry into it is itself gated on a green Attestation, so the sign-off
+      # was already validated for this tree. No other trigger carries that
+      # precondition. See #12679.
       - name: Merge queue passthrough
-        if: ${{ github.event_name != 'pull_request' }}
+        if: ${{ github.event_name == 'merge_group' }}
         run: echo "Sign-off was validated at queue entry; the full suite runs in this merge_group run."
+
+      # Every other trigger fails closed. Dispatching this workflow by hand is a
+      # legitimate way to run the heavy jobs below, but it establishes nothing
+      # about a sign-off: there is no pull_request payload to read a head SHA
+      # from, so no step above can inspect one, and nothing gates the dispatch
+      # the way queue entry gates a merge_group run. Since Attestation is a
+      # required check, letting a dispatch report success would post the one
+      # green check a PR needs onto a head commit nobody signed off — so this
+      # job must refuse rather than pass. A new trigger added to `on:` lands
+      # here too, and has to decide its own semantics before it can be attested.
+      - name: Refuse to attest a run that is neither a pull request nor a merge queue entry
+        if: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' }}
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          echo "::error::Attestation cannot be established by a ${EVENT_NAME} run: there is no pull request to read a head commit from, and no queue-entry gate behind it. Push to the pull request and run make signoff on the pushed HEAD; see docs/dev/ci_signoff.md."
+          exit 1
 
   # The jobs below run ONLY in the merge queue (merge_group) and on manual
   # dispatch — never on a pull request. They stay required, so the full suite

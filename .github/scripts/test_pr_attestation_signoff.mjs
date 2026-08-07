@@ -300,6 +300,149 @@ test('an unsigned non-merge commit cannot inherit', async () => {
   assert.match(result.failed[0], /not a two-parent merge/);
 });
 
+// --- Which triggers can reach a green Attestation (#12679) ------------------
+//
+// Attestation is the only required quality gate on a PR, so a trigger that
+// reaches the end of this job without inspecting a sign-off mints that gate for
+// free. The steps above are gated on `pull_request`; the checks below assert
+// that every *other* trigger declared in `on:` is either the merge queue — whose
+// entry was itself gated on a green Attestation — or refused outright.
+
+const PASSTHROUGH_STEP = 'Merge queue passthrough';
+
+/** The event names declared in the workflow's `on:` block. */
+function triggers(workflow) {
+  const lines = workflow.split('\n');
+  const start = lines.findIndex((line) => /^on:\s*$/.test(line));
+  assert.notEqual(start, -1, 'pr.yml no longer declares an `on:` block');
+
+  const names = [];
+  for (const line of lines.slice(start + 1)) {
+    // A key at column 0 ends the block.
+    if (/^[A-Za-z_]/.test(line)) {
+      break;
+    }
+    const match = /^ {2}([A-Za-z_][A-Za-z0-9_]*):/.exec(line);
+    if (match) {
+      names.push(match[1]);
+    }
+  }
+  assert.ok(names.length > 0, 'could not read any trigger out of the `on:` block');
+  return names;
+}
+
+/** A step's `if:` expression, or null when it is unconditional. */
+function stepCondition(jobLines, stepName) {
+  const line = stepLines(jobLines, stepName).find((candidate) => /^ {8}if: /.test(candidate));
+  return line === undefined ? null : line.replace(/^ {8}if: /, '').trim();
+}
+
+/** Every step name declared in the job, in order. */
+function stepNames(jobLines) {
+  return jobLines
+    .filter((line) => /^ {6}- name: /.test(line))
+    .map((line) => line.replace(/^ {6}- name: /, '').trim());
+}
+
+/**
+ * Whether a step's condition can hold for `eventName`.
+ *
+ * Only the `github.event_name` comparisons are modelled; every other term (a
+ * `steps.*.outputs.*` fast-track flag) is treated as possibly true, which is
+ * what makes this an over-approximation of what runs — the safe direction for
+ * asking "could this trigger reach a step that reports success?".
+ *
+ * The conditions in this job are pure conjunctions. A `||` would make that
+ * reading wrong, so it is rejected rather than guessed at.
+ */
+function admitsEvent(condition, eventName) {
+  if (condition === null) {
+    return true;
+  }
+  assert.doesNotMatch(
+    condition,
+    /\|\|/,
+    `this check cannot model the disjunction in \`${condition}\`; teach it the new shape`
+  );
+
+  for (const [, operator, value] of condition.matchAll(
+    /github\.event_name\s*(==|!=)\s*'([^']*)'/g
+  )) {
+    if (operator === '==' && value !== eventName) {
+      return false;
+    }
+    if (operator === '!=' && value === eventName) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** The steps that could run for `eventName`. */
+const admittedSteps = (eventName) =>
+  stepNames(job).filter((name) => admitsEvent(stepCondition(job, name), eventName));
+
+/** Whether a step fails the job rather than reporting success. */
+const stepFails = (stepName) => /(^|\n)\s*exit 1\s*(\n|$)/.test(stepLines(job, stepName).join('\n'));
+
+test('the merge queue passthrough names merge_group instead of negating pull_request', () => {
+  const condition = stepCondition(job, PASSTHROUGH_STEP);
+  assert.match(
+    condition,
+    /github\.event_name\s*==\s*'merge_group'/,
+    `"${PASSTHROUGH_STEP}" must name merge_group explicitly; its premise is that queue ` +
+      `entry already validated the sign-off, which no other trigger provides`
+  );
+  assert.doesNotMatch(
+    condition,
+    /github\.event_name\s*!=\s*'pull_request'/,
+    `"${PASSTHROUGH_STEP}" must not admit a trigger by negating pull_request`
+  );
+});
+
+test('a pull request still reaches the sign-off inspection', () => {
+  const admitted = admittedSteps('pull_request');
+  for (const step of [REJECT_STEP, INSPECT_STEP]) {
+    assert.ok(admitted.includes(step), `a pull_request must still reach "${step}"`);
+  }
+  assert.ok(
+    !admitted.includes(PASSTHROUGH_STEP),
+    `a pull_request must not reach "${PASSTHROUGH_STEP}"`
+  );
+});
+
+test('the merge queue passes through without inspecting a sign-off', () => {
+  const admitted = admittedSteps('merge_group');
+  assert.deepEqual(
+    admitted,
+    [PASSTHROUGH_STEP],
+    'a merge_group run must reach the passthrough and nothing else'
+  );
+});
+
+// The regression guard. On a workflow_dispatch every inspecting step is gated
+// out, so if the only step left standing reports success, the dispatch posts a
+// green required Attestation having verified nothing.
+test('no other trigger can reach a green Attestation', () => {
+  const others = triggers(workflow).filter(
+    (event) => event !== 'pull_request' && event !== 'merge_group'
+  );
+  assert.ok(others.length > 0, 'expected pr.yml to declare a trigger beyond pull_request/merge_group');
+
+  for (const event of others) {
+    const admitted = admittedSteps(event);
+    assert.ok(
+      admitted.length > 0,
+      `a ${event} run reaches no step at all, so Attestation reports success for free`
+    );
+    assert.ok(
+      admitted.some((step) => stepFails(step)),
+      `a ${event} run reaches only [${admitted.join(', ')}], none of which fails the job, so ` +
+        `it posts a green required Attestation without inspecting any sign-off`
+    );
+  }
+});
+
 let failures = 0;
 for (const { name, body } of tests) {
   try {
