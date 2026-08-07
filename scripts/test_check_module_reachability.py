@@ -39,6 +39,16 @@ def check(name: str, got, want) -> None:
         print(f"  FAIL: {name}\n    got:  {got!r}\n    want: {want!r}")
 
 
+def tmp_src(d: str) -> Path:
+    """The `src` root under temp directory `d`, resolved.
+
+    `walk_from_root` records resolved paths, and on macOS a temp directory sits
+    behind the `/var` -> `/private/var` symlink, so measuring those paths against
+    an unresolved root makes `relative_to` raise instead of compare.
+    """
+    return (Path(d) / "src").resolve()
+
+
 def mods_of(source: str) -> list[tuple[str, str, tuple[str, ...], tuple[str, ...]]]:
     """Every file-module declaration in `source`, as parse_mods returns them."""
     with tempfile.TemporaryDirectory() as d:
@@ -174,7 +184,7 @@ print()
 print("resolve_child / walk_from_root")
 
 with tempfile.TemporaryDirectory() as d:
-    src = Path(d) / "src"
+    src = tmp_src(d)
     (src / "nested").mkdir(parents=True)
     (src / "shared").mkdir(parents=True)
 
@@ -226,7 +236,7 @@ with tempfile.TemporaryDirectory() as d:
 # file and so owns a differently-named module directory. Resolving it against
 # the module directory instead reports `tools/spidapter`'s live sources as dead.
 with tempfile.TemporaryDirectory() as d:
-    src = Path(d) / "src"
+    src = tmp_src(d)
     (src / "sources").mkdir(parents=True)
     (src / "main.rs").write_text("mod server;\n", encoding="utf-8")
     (src / "server.rs").write_text(
@@ -247,7 +257,7 @@ with tempfile.TemporaryDirectory() as d:
 # reaches a different file under each configuration, and every one of them is
 # live source. Following only the last candidate fails the gate on the rest.
 with tempfile.TemporaryDirectory() as d:
-    src = Path(d) / "src"
+    src = tmp_src(d)
     (src / "platform" / "unix").mkdir(parents=True)
     (src / "lib.rs").write_text(
         '#[cfg_attr(unix, path = "platform/unix.rs")]\n'
