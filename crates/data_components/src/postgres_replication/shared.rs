@@ -1553,6 +1553,29 @@ async fn attach_member(
         });
     }
 
+    // Slot lifetime is not a connection parameter, but it *is* a property of
+    // the slot rather than of one member: the slot is released on shutdown, and
+    // its history discarded when re-bootstrapping, exactly when
+    // `slot_is_disposable` holds. A member that needs the history retained --
+    // because it does not re-snapshot, whether its accelerator persists or its
+    // initial snapshot is disabled -- would resume from a `confirmed_flush_lsn`
+    // no longer backed by retained WAL, and silently serve a gap.
+    //
+    // Compare the same predicate the two action sites use (`drop_slot_if_ephemeral`
+    // and `slot::advance_slot_for_rebootstrap`) rather than `ephemeral_accelerator`
+    // alone. Both act on the params of whichever member opened the source, so a
+    // pair that agrees on ephemerality but disagrees on `snapshot_on_resume`
+    // would otherwise have its slot's fate decided by join order -- and in one
+    // order that discards history the non-snapshotting member depends on.
+    if params.slot_is_disposable() != source.params.slot_is_disposable() {
+        return Err(Error::SharedSlotDurabilityMismatch {
+            dataset: dataset_name,
+            slot: source.key.slot_name.clone(),
+            joining: slot_lifetime_description(params.slot_is_disposable()),
+            existing: slot_lifetime_description(source.params.slot_is_disposable()),
+        });
+    }
+
     if let Some(existing) = source.member(&member_key) {
         if existing.sender.is_closed() {
             // The previous subscription's receiver is gone (dataset reload,
@@ -1714,6 +1737,22 @@ async fn attach_member(
     Ok(Box::pin(head.chain(receiver)))
 }
 
+/// Render the slot lifetime a member needs for
+/// [`Error::SharedSlotDurabilityMismatch`], which describes both sides of the
+/// disagreement in one sentence. Keyed on `slot_is_disposable`, so a member is
+/// described by what it needs of the *slot*, not by its accelerator alone: a
+/// dataset with `pg_replication_initial_snapshot: disabled` needs the history
+/// retained even though its accelerator starts empty.
+fn slot_lifetime_description(disposable: bool) -> &'static str {
+    if disposable {
+        "can be discarded at shutdown (an acceleration `mode` that starts empty on every restart, \
+         and an initial snapshot that re-runs to rebuild it)"
+    } else {
+        "is retained across restarts so its history can be replayed (a file-backed acceleration \
+         `mode`, or `pg_replication_initial_snapshot: disabled`)"
+    }
+}
+
 /// Compare connection-level params of a joining member against the shared
 /// source's. Returns the name of the first mismatched parameter, never its
 /// value — passwords and certificate paths must not leak into error messages.
@@ -1774,6 +1813,22 @@ fn finish_pump(source: &Arc<SharedSource>) {
         && Arc::ptr_eq(current, source)
     {
         registry.remove(&source.key);
+    }
+}
+
+/// Drop the shared slot when the pump stops for runtime shutdown and no member
+/// needs it to survive.
+///
+/// Reading the source's own params is authoritative for every member: a member
+/// whose accelerator durability disagrees is rejected at join time with
+/// [`Error::SharedSlotDurabilityMismatch`], so all members of a live slot share
+/// this value.
+///
+/// Best-effort and time-bounded — shutdown never blocks on the source, and a
+/// surviving slot costs retained WAL, not correctness.
+async fn drop_slot_if_ephemeral(source: &Arc<SharedSource>) {
+    if source.params.slot_is_disposable() {
+        slot::drop_slot_after_shutdown(&source.params).await;
     }
 }
 
@@ -1888,6 +1943,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                 "runtime shutdown; releasing shared replication connection and slot"
             );
             finish_pump(&source);
+            drop_slot_if_ephemeral(&source).await;
             return;
         }
         source.reap_closed_members();
@@ -1998,6 +2054,9 @@ async fn run_pump(source: Arc<SharedSource>) {
                 );
                 drop(client);
                 finish_pump(&source);
+                // After `drop(client)`: Postgres refuses to drop a slot its
+                // walsender still holds.
+                drop_slot_if_ephemeral(&source).await;
                 return;
             }
             if source.restart_requested.swap(false, Ordering::AcqRel) {
@@ -3041,6 +3100,7 @@ mod tests {
             publication_name: "pub".to_string(),
             initial_snapshot: true,
             snapshot_on_resume: false,
+            ephemeral_accelerator: false,
             status_interval: std::time::Duration::from_secs(5),
             bootstrap_batch_size: 8192,
             shared: true,
@@ -3048,6 +3108,87 @@ mod tests {
             pg_output_format: crate::postgres_replication::PgOutputFormat::Binary,
             ready_lag: crate::cdc::DEFAULT_READY_LAG,
         }
+    }
+
+    /// The two slot lifetimes must render as distinguishable prose -- the
+    /// mismatch error states both sides in one sentence, and identical (or
+    /// vague) text would leave an operator unable to tell which dataset to move.
+    #[test]
+    fn slot_lifetime_descriptions_distinguish_the_two_cases() {
+        let disposable = slot_lifetime_description(true);
+        let retained = slot_lifetime_description(false);
+        assert_ne!(disposable, retained);
+        assert!(disposable.contains("discarded at shutdown"), "{disposable}");
+        assert!(retained.contains("retained across restarts"), "{retained}");
+        // Both name a setting an operator would actually change.
+        assert!(disposable.contains("`mode`"), "{disposable}");
+        assert!(retained.contains("`mode`"), "{retained}");
+        // The retained side must surface the non-obvious half of the predicate:
+        // a disabled initial snapshot needs the history even though the
+        // accelerator starts empty.
+        assert!(
+            retained.contains("pg_replication_initial_snapshot"),
+            "{retained}"
+        );
+    }
+
+    /// The mismatch error must name the slot and describe both lifetimes, so an
+    /// operator can tell which dataset to move without reading the source.
+    #[test]
+    fn durability_mismatch_error_is_actionable() {
+        let message = Error::SharedSlotDurabilityMismatch {
+            dataset: "orders".to_string(),
+            slot: "spice_shared".to_string(),
+            joining: slot_lifetime_description(false),
+            existing: slot_lifetime_description(true),
+        }
+        .to_string();
+
+        assert!(message.contains("orders"), "{message}");
+        assert!(message.contains("spice_shared"), "{message}");
+        assert!(message.contains("pg_replication_slot"), "{message}");
+        assert!(message.contains("acceleration `mode`"), "{message}");
+        assert!(message.contains("https://spiceai.org/docs"), "{message}");
+    }
+
+    /// The guard must key on the SAME predicate that releases the slot at
+    /// shutdown and fast-forwards it on re-bootstrap (`slot_is_disposable`), not
+    /// on `ephemeral_accelerator` alone.
+    ///
+    /// Two members can agree on ephemerality and still want opposite slot
+    /// lifetimes: `pg_replication_initial_snapshot: disabled` leaves an
+    /// empty-starting accelerator with no way to rebuild itself, so it needs the
+    /// slot's history replayed. Both action sites read the params of whichever
+    /// member opened the source, so admitting that pair would let join order
+    /// decide whether the history survives -- and one order silently drops the
+    /// non-snapshotting member's changes.
+    #[test]
+    fn slot_lifetime_conflicts_are_keyed_on_disposability_not_ephemerality() {
+        let member = |ephemeral, snapshot_on_resume| {
+            let mut p = test_params();
+            p.ephemeral_accelerator = ephemeral;
+            p.snapshot_on_resume = snapshot_on_resume;
+            p
+        };
+
+        // Same ephemerality, opposite disposability -- the case the old
+        // `ephemeral_accelerator` comparison waved through.
+        let re_snapshots = member(true, true);
+        let needs_history = member(true, false);
+        assert!(re_snapshots.slot_is_disposable());
+        assert!(!needs_history.slot_is_disposable());
+        assert_eq!(
+            re_snapshots.ephemeral_accelerator, needs_history.ephemeral_accelerator,
+            "the pair must be indistinguishable to the old comparison for this to be a regression test"
+        );
+
+        // Opposite ephemerality, same disposability: neither can discard the
+        // slot's history, so they can share it.
+        let durable = member(false, false);
+        assert_eq!(
+            durable.slot_is_disposable(),
+            needs_history.slot_is_disposable()
+        );
     }
 
     type MemberProbe = (
