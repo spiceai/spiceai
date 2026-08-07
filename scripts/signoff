@@ -1463,10 +1463,29 @@ cmd_status() {
 # same false `failure` as reading once does, and the run that wrote it is gone,
 # so no wait can be long enough to be *required*.
 #
-# Seeded from the environment so the unit tests can exercise the polling without
-# spending the window on every case that never reaches it.
-CANCELLED_SETTLE_ATTEMPTS="${CANCELLED_SETTLE_ATTEMPTS:-5}"
-CANCELLED_SETTLE_SLEEP_SECONDS="${CANCELLED_SETTLE_SLEEP_SECONDS:-3}"
+# Overridable from the environment so the unit tests can exercise the polling
+# without spending the window on every case that never reaches it.
+readonly DEFAULT_CANCELLED_SETTLE_ATTEMPTS=5
+readonly DEFAULT_CANCELLED_SETTLE_SLEEP_SECONDS=3
+
+# One of the two settle knobs, as a base-10 integer: $1 the environment variable
+# to read, $2 the default to fall back to when it is unset or unusable.
+#
+# Validated for the same reason preflight_disk validates its floor, and it
+# matters more here: an unvalidated value reaches an arithmetic context, where a
+# non-integer is a `set -e` abort — and aborting in *this* command would leave
+# the false `failure` it exists to withdraw standing on the commit. A bad value
+# falls back rather than failing.
+settle_knob() {
+  local name="$1" fallback="$2" value="${!1:-$2}"
+  if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+    info "warning: ${name}='${value}' is not an integer — using ${fallback}"
+    value="$fallback"
+  fi
+  # Force base 10: bash arithmetic reads a leading zero as octal, so a
+  # well-meaning `05` is an arithmetic error rather than 5.
+  printf '%s\n' "$((10#$value))"
+}
 
 # The STATUS_CONTEXT state on a commit, once a dying run has had a chance to
 # finish writing it. Prints the state ("" when the context is unset) and returns
@@ -1480,14 +1499,19 @@ CANCELLED_SETTLE_SLEEP_SECONDS="${CANCELLED_SETTLE_SLEEP_SECONDS:-3}"
 # immediately on all three keeps the wait off every path that cannot benefit
 # from it.
 settled_signoff_state() {
-  local repo="$1" sha="$2" combined state attempt
+  local repo="$1" sha="$2" combined state attempt attempts sleep_seconds
+  attempts=$(settle_knob CANCELLED_SETTLE_ATTEMPTS "$DEFAULT_CANCELLED_SETTLE_ATTEMPTS")
+  sleep_seconds=$(settle_knob CANCELLED_SETTLE_SLEEP_SECONDS "$DEFAULT_CANCELLED_SETTLE_SLEEP_SECONDS")
+  # Zero attempts would read nothing at all and report the commit as unset,
+  # which is the one answer that is never true — the loop must run at least once.
+  (( attempts >= 1 )) || attempts=1
 
-  for (( attempt = 1; attempt <= CANCELLED_SETTLE_ATTEMPTS; attempt++ )); do
+  for (( attempt = 1; attempt <= attempts; attempt++ )); do
     combined=$(gh api "repos/${repo}/commits/${sha}/status" 2>/dev/null) || return 1
     state=$(combined_status_state "$combined" 2>/dev/null) || state=""
     [[ "$state" == "pending" ]] || { printf '%s\n' "$state"; return 0; }
-    (( attempt < CANCELLED_SETTLE_ATTEMPTS )) || break
-    sleep "$CANCELLED_SETTLE_SLEEP_SECONDS"
+    (( attempt < attempts )) || break
+    sleep "$sleep_seconds"
   done
 
   # Still `pending` after the wait: either the run reached no verdict and

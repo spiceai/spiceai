@@ -234,6 +234,22 @@ assert_correction "a success posted after the first read is still left alone" \
 assert_correction "a status that stays pending is left alone once the window closes" \
   "is 'pending', not a failure this run posted" nopost \
   STUB_COMBINED="$(combined_with_signoff pending)"
+# A malformed window must not cost the correction. Both knobs reach an
+# arithmetic context, where a non-integer is a `set -e` abort — and aborting
+# *here* leaves the false `failure` this command exists to withdraw standing on
+# the commit. So a bad value falls back to the default and the repair still
+# happens, which is what these assert: the rewrite lands either way.
+assert_correction "a non-integer attempt count falls back and still withdraws the failure" \
+  "Reset signoff=failure" post \
+  STUB_COMBINED="$(combined_with_signoff failure)" CANCELLED_SETTLE_ATTEMPTS="not-a-number"
+assert_correction "a leading-zero sleep is read as base 10, not octal" \
+  "Reset signoff=failure" post \
+  STUB_COMBINED="$(combined_with_signoff failure)" CANCELLED_SETTLE_SLEEP_SECONDS="08"
+# Zero attempts would read nothing and report the commit as unset — the one
+# answer that is never true — so the loop still runs once.
+assert_correction "a zero attempt count still reads the status once" \
+  "Reset signoff=failure" post \
+  STUB_COMBINED="$(combined_with_signoff failure)" CANCELLED_SETTLE_ATTEMPTS=0
 echo
 
 echo "Every other state is somebody else's to write:"
