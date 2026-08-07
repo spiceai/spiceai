@@ -38,6 +38,15 @@ use runtime_drasi::{
 };
 
 use crate::drasi::dead_letter::{DEFAULT_MAX_BATCHES, DeadLetterStore, store_path};
+
+/// The policy every sink behind a [`DeliveryQueue`] is built with.
+///
+/// Bounded retry then **surface** the error: a transient blip is absorbed
+/// without touching the disk, and anything that outlives the budget becomes an
+/// `Err` the queue can retain. `Skip` would swallow it into `Ok(())` — the
+/// queue would then treat a lost batch as delivered and never retain it, which
+/// made the dead-letter store dead code on every path that used it.
+pub(crate) const QUEUED_SINK_POLICY: OnDeliveryError = OnDeliveryError::Fail;
 use crate::drasi::queue::{DEFAULT_QUEUE_DEPTH, DeliveryQueue, QueuedBatch};
 use spicepod::drasi::{Drasi as DrasiSpec, DrasiTransport as DrasiTransportSpec};
 
@@ -63,7 +72,22 @@ pub(crate) async fn sink_for_dataset(
         &spec.source_id,
         labels_for(dataset, spec),
         spec.transport,
-        on_delivery_error(spec.on_delivery_error),
+        // `on_delivery_error` describes what a failure does to the *change
+        // stream*, which only means anything while the stream is still holding
+        // the replication position — that is, under `acknowledged`.
+        //
+        // Under `queued` the position is already released and the queue and its
+        // dead-letter store are the durability mechanism, so the sink must
+        // *surface* a failure for them to act on. Honouring `block` here instead
+        // parked the single delivery task on an unbounded retry, filled the
+        // queue behind it, and dropped the overflow — losing changes in the mode
+        // documented as the one that cannot lose them.
+        match spec.delivery {
+            spicepod::drasi::DrasiDelivery::Acknowledged => {
+                on_delivery_error(spec.on_delivery_error)
+            }
+            spicepod::drasi::DrasiDelivery::Queued => QUEUED_SINK_POLICY,
+        },
         spec.params.as_ref(),
     )?;
 
@@ -376,7 +400,8 @@ pub(crate) async fn forward_change_envelope(
                         .collect(),
                     data: data.clone(),
                     source_commit_ts_ms: batch.source_commit_ts_ms(),
-                });
+                })
+                .await;
             }
         }
     }

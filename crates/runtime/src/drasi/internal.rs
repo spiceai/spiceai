@@ -37,7 +37,6 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use datafusion::common::Constraints;
 use datafusion::sql::TableReference;
-use runtime_drasi::OnDeliveryError;
 use runtime_query_engine::query_engine::UpdateType;
 use spicepod::drasi::{RuntimeDrasi, RuntimeDrasiTable};
 
@@ -78,10 +77,11 @@ impl InternalForwarders {
                 &spec.source_id,
                 labels_for(table, &name),
                 spec.transport,
-                // A runtime table has no replication position to replay, so
-                // there is nothing for blocking to protect — the queue absorbs
-                // an outage and counts what it drops.
-                OnDeliveryError::Skip,
+                // Surfaced, not skipped: a runtime table has no replication
+                // position to replay, so the dead-letter store is the only
+                // thing that can retain a failed batch — and it only sees one
+                // if the sink reports it.
+                super::QUEUED_SINK_POLICY,
                 spec.params.as_ref(),
             )?;
 
@@ -106,10 +106,11 @@ impl InternalForwarders {
 
     /// Queues a committed write for delivery.
     ///
-    /// Returns as soon as the batches are queued — it never awaits Drasi, and
-    /// never fails the write. A caller that retried a "failed" write would
-    /// duplicate the rows it already wrote.
-    pub(crate) fn forward(
+    /// Never awaits Drasi and never fails the write — a caller that retried a
+    /// "failed" write would duplicate the rows it already wrote. It can wait on
+    /// one local file write when the queue is full, which is what keeps an
+    /// overflowing batch from being lost.
+    pub(crate) async fn forward(
         &self,
         table: &TableReference,
         update_type: &UpdateType,
@@ -151,12 +152,10 @@ impl InternalForwarders {
             // Cloning a `RecordBatch` clones `Arc`s over its arrays, not the
             // data. The runtime writes these as they happen, so arrival time is
             // the event time — letting Drasi stamp it keeps one clock.
-            forwarder.queue.enqueue(QueuedBatch::uniform(
-                op_code,
-                &key,
-                batch.clone(),
-                None,
-            ));
+            forwarder
+                .queue
+                .enqueue(QueuedBatch::uniform(op_code, &key, batch.clone(), None))
+                .await;
         }
     }
 }
@@ -413,13 +412,15 @@ mod tests {
                 .await
                 .expect("builds");
 
-        forwarders.forward(
-            &TableReference::bare("orders"),
-            &UpdateType::Append,
-            None,
-            &schema(),
-            &[],
-        );
+        forwarders
+            .forward(
+                &TableReference::bare("orders"),
+                &UpdateType::Append,
+                None,
+                &schema(),
+                &[],
+            )
+            .await;
     }
 
     /// An overwrite cannot be expressed as element changes, so it is counted as
@@ -431,13 +432,15 @@ mod tests {
                 .await
                 .expect("builds");
 
-        forwarders.forward(
-            &table_ref("task_history"),
-            &UpdateType::Overwrite,
-            None,
-            &schema(),
-            &[],
-        );
+        forwarders
+            .forward(
+                &table_ref("task_history"),
+                &UpdateType::Overwrite,
+                None,
+                &schema(),
+                &[],
+            )
+            .await;
 
         let forwarder = forwarders
             .by_table
@@ -446,10 +449,11 @@ mod tests {
         assert_eq!(forwarder.queue.dead_lettered(), 1);
     }
 
-    /// The writer must hand off and return; a full queue drops rather than
-    /// applying backpressure to the runtime's telemetry writer.
+    /// The writer must hand off and return rather than waiting on Drasi. A full
+    /// queue is retained durably instead of being dropped — the runtime has
+    /// already committed these rows, so losing them here loses them for good.
     #[tokio::test]
-    async fn a_full_queue_drops_rather_than_blocking_the_writer() {
+    async fn a_full_queue_is_retained_rather_than_blocking_the_writer() {
         let forwarders =
             InternalForwarders::try_new(&spec(vec![table("task_history")]))
                 .await
@@ -473,18 +477,21 @@ mod tests {
         let constraints = Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![1])]);
 
         for _ in 0..(DEFAULT_QUEUE_DEPTH * 2) {
-            forwarders.forward(
-                &table_ref("task_history"),
-                &UpdateType::Append,
-                Some(&constraints),
-                &schema(),
-                std::slice::from_ref(&batch),
-            );
+            forwarders
+                .forward(
+                    &table_ref("task_history"),
+                    &UpdateType::Append,
+                    Some(&constraints),
+                    &schema(),
+                    std::slice::from_ref(&batch),
+                )
+                .await;
         }
 
-        assert!(
-            forwarder.queue.dead_lettered() > 0,
-            "a full queue must drop and count rather than block"
-        );
+        // The assertion is that the loop above returned at all: every enqueue
+        // completed without waiting on Drasi, which is unreachable here. Where
+        // the overflow *went* is asserted directly, against an explicit store,
+        // by `queue::tests::a_full_queue_retains_overflow_in_the_store`.
+        let _ = forwarder;
     }
 }

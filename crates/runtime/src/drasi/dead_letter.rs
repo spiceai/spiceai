@@ -233,7 +233,7 @@ impl DeadLetterStore {
     pub(crate) async fn drain<F, Fut>(&self, deliver: F) -> usize
     where
         F: Fn(QueuedBatch) -> Fut,
-        Fut: std::future::Future<Output = bool>,
+        Fut: std::future::Future<Output = crate::drasi::queue::Outcome>,
     {
         let pending = match list_batches(&self.dir).await {
             Ok(pending) => pending,
@@ -263,10 +263,22 @@ impl DeadLetterStore {
                 }
             };
 
-            if !deliver(batch).await {
-                // Stop at the first failure: everything after it is newer, and
-                // delivering it now would apply state out of order.
-                break;
+            match deliver(batch).await {
+                crate::drasi::queue::Outcome::Delivered => {}
+                crate::drasi::queue::Outcome::Retain => {
+                    // Stop at the first retainable failure: everything after it
+                    // is newer, and delivering it now would apply state out of
+                    // order.
+                    break;
+                }
+                crate::drasi::queue::Outcome::Discard => {
+                    // It can never be delivered, so leaving it here would block
+                    // every later batch permanently. Drop it and keep going —
+                    // the count is what says the component has a gap.
+                    self.discarded.fetch_add(1, Ordering::Relaxed);
+                    let _ = tokio::fs::remove_file(&path).await;
+                    continue;
+                }
             }
 
             if let Err(e) = tokio::fs::remove_file(&path).await {
@@ -480,7 +492,7 @@ mod tests {
         store
             .drain(|batch| {
                 seen.lock().expect("not poisoned").push(batch);
-                async { true }
+                async { crate::drasi::queue::Outcome::Delivered }
             })
             .await;
 
@@ -500,7 +512,7 @@ mod tests {
         store.append(&queued("row-1")).await.expect("appends");
         assert!(!store.is_empty().await);
 
-        let delivered = store.drain(|_| async { true }).await;
+        let delivered = store.drain(|_| async { crate::drasi::queue::Outcome::Delivered }).await;
 
         assert_eq!(delivered, 1);
         assert!(store.is_empty().await, "a delivered batch must not be retried");
@@ -512,7 +524,7 @@ mod tests {
         let store = store(&dir, DEFAULT_MAX_BATCHES).await;
 
         store.append(&queued("row-1")).await.expect("appends");
-        let delivered = store.drain(|_| async { false }).await;
+        let delivered = store.drain(|_| async { crate::drasi::queue::Outcome::Retain }).await;
 
         assert_eq!(delivered, 0);
         assert!(!store.is_empty().await, "a failed batch must be retried later");
@@ -535,7 +547,13 @@ mod tests {
                 let id = ids(&batch.data)[0].clone();
                 seen.lock().expect("not poisoned").push(id.clone());
                 // The second batch fails.
-                async move { id != "row-2" }
+                async move {
+                    if id == "row-2" {
+                        crate::drasi::queue::Outcome::Retain
+                    } else {
+                        crate::drasi::queue::Outcome::Delivered
+                    }
+                }
             })
             .await;
 
@@ -562,7 +580,7 @@ mod tests {
                 seen.lock()
                     .expect("not poisoned")
                     .push(ids(&batch.data)[0].clone());
-                async { true }
+                async { crate::drasi::queue::Outcome::Delivered }
             })
             .await;
 
@@ -591,7 +609,7 @@ mod tests {
                 seen.lock()
                     .expect("not poisoned")
                     .push(ids(&batch.data)[0].clone());
-                async { true }
+                async { crate::drasi::queue::Outcome::Delivered }
             })
             .await;
 
@@ -620,7 +638,7 @@ mod tests {
                 seen.lock()
                     .expect("not poisoned")
                     .push(ids(&batch.data)[0].clone());
-                async { true }
+                async { crate::drasi::queue::Outcome::Delivered }
             })
             .await;
 
@@ -650,7 +668,7 @@ mod tests {
                 seen.lock()
                     .expect("not poisoned")
                     .push(ids(&batch.data)[0].clone());
-                async { true }
+                async { crate::drasi::queue::Outcome::Delivered }
             })
             .await;
 
@@ -689,11 +707,42 @@ mod tests {
         let store = store(&dir, DEFAULT_MAX_BATCHES).await;
         store.append(&queued("row-1")).await.expect("appends");
 
-        let delivered = store.drain(|_| async { true }).await;
+        let delivered = store.drain(|_| async { crate::drasi::queue::Outcome::Delivered }).await;
 
         assert_eq!(delivered, 1, "the readable batch behind it still lands");
         assert_eq!(store.discarded(), 1);
         assert!(store.is_empty().await);
+    }
+
+    /// A batch that can never be delivered must not sit at the head of the
+    /// queue blocking every later one — it is discarded and counted instead.
+    #[tokio::test]
+    async fn a_permanently_undeliverable_batch_does_not_block_the_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store(&dir, DEFAULT_MAX_BATCHES).await;
+
+        for id in ["poison", "row-2", "row-3"] {
+            store.append(&queued(id)).await.expect("appends");
+        }
+
+        let seen = std::sync::Mutex::new(Vec::new());
+        let delivered = store
+            .drain(|batch| {
+                let id = ids(&batch.data)[0].clone();
+                seen.lock().expect("not poisoned").push(id.clone());
+                async move {
+                    if id == "poison" {
+                        crate::drasi::queue::Outcome::Discard
+                    } else {
+                        crate::drasi::queue::Outcome::Delivered
+                    }
+                }
+            })
+            .await;
+
+        assert_eq!(delivered, 2, "the batches behind the poison one still land");
+        assert_eq!(store.discarded(), 1);
+        assert!(store.is_empty().await, "nothing is left blocking the queue");
     }
 
     #[test]

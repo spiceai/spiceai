@@ -46,5 +46,5 @@ pub mod transport;
 
 pub use config::{DrasiSinkConfig, OnDeliveryError, TransportConfig, redact_url};
 pub use element::ElementMapping;
-pub use error::{Error, Result};
+pub use error::{Error, Result, Retryable};
 pub use sink::{DrasiChangeRows, DrasiSink};

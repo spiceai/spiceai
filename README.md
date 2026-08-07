@@ -342,7 +342,7 @@ datasets:
 | `delivery` | Replication | On failure |
 | ---------- | ----------- | ---------- |
 | `acknowledged` (default) | Advances only once Drasi has the change, so nothing is lost — a stall or crash replays it. A slow or unreachable Drasi slows or stops replication. | `on_delivery_error`: `block` (default) retries indefinitely; `skip` gives up after a bounded budget and continues; `fail` stops the stream. |
-| `queued` | Never waits for Drasi — the change is queued locally and the replication position acknowledged immediately, with delivery retried in the background. | Written to a durable dead-letter store under `.spice/data/drasi` and retried until it lands, surviving a restart. |
+| `queued` | Never waits for Drasi — the change is queued locally and the replication position acknowledged immediately, with delivery retried in the background. `on_delivery_error` does not apply. | A failure that could clear is written to a durable dead-letter store under `.spice/data/drasi` and retried until it lands, surviving a restart. One that never clears is counted and discarded, so it cannot block later changes. |
 
 Use `queued` when Drasi is a downstream consumer whose availability should not pace replication; keep `acknowledged` when no change may be missed.
 

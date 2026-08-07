@@ -2333,13 +2333,15 @@ impl DataFusion {
         // a queue rather than an await, so a Drasi outage cannot stall the
         // writer or fail a write a caller would then retry and duplicate.
         if let Some(forwarders) = self.drasi_forwarders.get() {
-            forwarders.forward(
-                table_reference,
-                &update_type,
-                table_provider.constraints(),
-                &update_schema,
-                &update_data,
-            );
+            forwarders
+                .forward(
+                    table_reference,
+                    &update_type,
+                    table_provider.constraints(),
+                    &update_schema,
+                    &update_data,
+                )
+                .await;
         }
 
         // Invalidate cached query state for this table.

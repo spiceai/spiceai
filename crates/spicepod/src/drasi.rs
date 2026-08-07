@@ -136,8 +136,14 @@ pub enum DrasiDelivery {
     /// for that component queue behind it and delivery resumes only once the
     /// store drains. Drasi's view therefore advances in order or not at all.
     ///
-    /// `on_delivery_error` does not apply, since there is no replication
-    /// position left to hold.
+    /// A change Drasi will *never* accept — a rejected payload, or an operation
+    /// with no Drasi equivalent — is counted and discarded rather than retained,
+    /// since retaining it would block every later change behind something that
+    /// cannot succeed.
+    ///
+    /// `on_delivery_error` does not apply and is ignored here: there is no
+    /// replication position left to hold, and the queue is what decides a
+    /// failure's fate.
     Queued,
 }
 
