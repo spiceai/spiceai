@@ -88,26 +88,18 @@ impl MetricsReader {
         }
     }
 
-    /// Creates a reader that reports what changed since the last collection
-    /// rather than running totals.
+    /// Creates a reader that reports cumulative totals rather than per-interval
+    /// deltas.
     ///
     /// Pinned rather than inherited because a consumer that pushes on a timer
-    /// depends on it: a series nothing recorded into during the interval is
-    /// omitted entirely, so an idle instrument stops producing points instead of
-    /// restating the same total forever. Restating it is not free — a histogram
-    /// whose buckets never move reads downstream as an interval that observed
-    /// nothing, which is indistinguishable from one that observed the same thing
-    /// again, and quantiles over it come back undefined.
-    ///
-    /// The cost is that a push which never lands takes its interval's
-    /// observations with it, since no later push restates them. The export is
-    /// therefore delivered rather than offered — see the client's export task.
+    /// depends on it: with cumulative totals a skipped or dropped push loses a
+    /// data point but no data, since the next one carries the running total.
     #[must_use]
-    pub fn new_delta() -> Self {
+    pub fn new_cumulative() -> Self {
         Self {
             reader: Arc::new(
                 ManualReader::builder()
-                    .with_temporality(Temporality::Delta)
+                    .with_temporality(Temporality::Cumulative)
                     .build(),
             ),
         }
@@ -115,12 +107,11 @@ impl MetricsReader {
 
     /// Collects the current metrics as an OTLP payload.
     ///
-    /// `Ok(None)` means there is nothing to report — nothing recorded into any
-    /// instrument since the last collection. That is deliberately a different
-    /// outcome from a failed collection: a caller exporting on a timer has no one
-    /// watching its return value, so conflating the two would let a permanently
-    /// broken collection look exactly like an idle runtime — which is the symptom
-    /// the export exists to remove.
+    /// `Ok(None)` means there is nothing to report. That is deliberately a
+    /// different outcome from a failed collection: a caller exporting on a timer
+    /// has no one watching its return value, so conflating the two would let a
+    /// permanently broken collection look exactly like an idle runtime — which
+    /// is the symptom the export exists to remove.
     ///
     /// Every attribute the SDK aggregated on is carried through. Dropping a
     /// label is an aggregation — the series that shared it have to be summed —
@@ -146,12 +137,11 @@ impl MetricsReader {
         clear_units(&mut request);
         stamp_app_id(&mut request, app_id);
 
-        // The conversion always emits one ResourceMetrics, so an interval that
-        // recorded nothing encodes to a resource with no data points rather than
-        // to nothing. Sending that would spend a round trip to say nothing, and
-        // would put a sample on the wire for a period that observed none.
+        // The conversion always emits one ResourceMetrics, so an idle runtime
+        // encodes to a resource with no data points rather than to nothing.
+        // Sending that would spend a round trip to say nothing.
         if !has_data_points(&request) {
-            tracing::debug!("Metrics export: nothing recorded since the last export");
+            tracing::debug!("Metrics export: nothing to report (no data points collected)");
             return Ok(None);
         }
 
@@ -960,22 +950,15 @@ mod tests {
         );
     }
 
-    /// The export reader reports per-interval deltas, which is what keeps an
-    /// idle instrument from restating the same total every interval.
+    /// The export reader reports cumulative totals, which is what makes a
+    /// dropped push lose a data point rather than data.
     #[test]
-    fn the_export_reader_is_delta() {
-        let reader = MetricsReader::new_delta();
-        for kind in [
-            InstrumentKind::Counter,
-            InstrumentKind::UpDownCounter,
-            InstrumentKind::Histogram,
-        ] {
-            assert_eq!(
-                reader.temporality(kind),
-                Temporality::Delta,
-                "{kind:?} must report deltas, or its idle intervals reappear as points"
-            );
-        }
+    fn the_export_reader_is_cumulative() {
+        let reader = MetricsReader::new_cumulative();
+        assert_eq!(
+            reader.temporality(InstrumentKind::Counter),
+            Temporality::Cumulative
+        );
     }
 
     /// A collection that cannot run is an error, not silence.
@@ -985,7 +968,7 @@ mod tests {
     /// payload, indistinguishable from a runtime with nothing to say.
     #[test]
     fn a_failed_collection_is_not_reported_as_nothing_to_report() {
-        let reader = MetricsReader::new_delta();
+        let reader = MetricsReader::new_cumulative();
 
         reader
             .collect_otlp_export("4002")

@@ -481,21 +481,17 @@ pub trait RuntimeHandle: Send + Sync + 'static {
         ))
     }
 
-    /// What this instance recorded since the last call, as a serialized OTLP
+    /// The instance's current metrics, as a serialized OTLP
     /// `ExportMetricsServiceRequest`.
     ///
     /// Not a [`Capability`]: the client pushes these on its own cadence rather
     /// than answering a command, so there is nothing to advertise or dispatch.
     ///
-    /// Each call drains what it returns, so the caller must treat a returned
-    /// payload as the only copy — nothing restates it on the next call.
-    ///
     /// `Ok(None)` means this instance has nothing to report — either it does not
-    /// export metrics at all, which is the default, nothing was recorded since
-    /// the last call, or it has not been told which app to attribute them to (see
-    /// [`Self::apply_spicepod`]). An `Err` means collection was attempted and
-    /// failed; the two are distinct so a permanently broken collection cannot
-    /// pass for an idle runtime.
+    /// export metrics at all, which is the default, it has none yet, or it has not
+    /// been told which app to attribute them to (see [`Self::apply_spicepod`]). An
+    /// `Err` means collection was attempted and failed; the two are distinct so a
+    /// permanently broken collection cannot pass for an idle runtime.
     async fn collect_metrics(&self) -> Result<Option<Vec<u8>>, CommandError> {
         Ok(None)
     }
