@@ -79,12 +79,17 @@ pub fn build_changes_stream(
     // rows touched after startup. Force the snapshot on every start for such
     // accelerators (snapshot + WAL resume converges via the PK upsert). Only
     // applies when snapshots are enabled at all — `disabled` opts out entirely.
-    if params_for_stream.initial_snapshot
-        && dataset
-            .acceleration
-            .as_ref()
-            .is_some_and(accelerator_is_ephemeral)
-    {
+    //
+    // Recorded on the params either way (independently of `initial_snapshot`,
+    // which only governs snapshotting): such a slot also has no resume value
+    // across restarts, so the stream drops it on graceful shutdown instead of
+    // leaving it pinning WAL on the source.
+    let ephemeral = dataset
+        .acceleration
+        .as_ref()
+        .is_some_and(accelerator_is_ephemeral);
+    params_for_stream.ephemeral_accelerator = ephemeral;
+    if params_for_stream.initial_snapshot && ephemeral {
         params_for_stream.snapshot_on_resume = true;
         tracing::info!(
             dataset = %dataset_name,
@@ -685,18 +690,29 @@ fn accelerator_is_ephemeral(
     acceleration: &runtime::component::dataset::acceleration::Acceleration,
 ) -> bool {
     use runtime::component::dataset::acceleration::{Engine, Mode};
+    // Matched exhaustively (no `_` arm) so a newly added engine has to make an
+    // explicit durability claim here: defaulting a non-persistent engine to
+    // "persistent" silently skips its resume snapshot and leaves the accelerator
+    // missing every row written before startup.
     match acceleration.engine.to_unpartitioned() {
-        // Always in-memory.
-        Engine::Arrow => true,
+        // Always in-memory. `to_unpartitioned` already folded `PartitionedArrow`
+        // into `Arrow`, so it cannot reach the match; it is listed only to keep
+        // the match exhaustive.
+        Engine::Arrow | Engine::PartitionedArrow => true,
         // In-memory unless file-backed; `file_create` truncates on startup,
         // which is just as empty as memory from replication's point of view.
-        Engine::DuckDB | Engine::Sqlite | Engine::Turso => {
+        //
+        // Cayenne belongs here too: `mode: memory` is fully in-RAM (an in-memory
+        // `memdb` metastore and no data directory at all — see the accelerator's
+        // `memory_mode` branch), so nothing about it survives a restart. Only its
+        // file modes (local disk or S3 Express One Zone, both of which require a
+        // file mode) persist independently of this process.
+        Engine::DuckDB | Engine::Sqlite | Engine::Turso | Engine::Cayenne => {
             matches!(acceleration.mode, Mode::Memory | Mode::FileCreate)
         }
-        // External storage (another Postgres, object-store-backed Cayenne)
-        // persists independently of this process. `to_unpartitioned` already
-        // folded the partitioned variants into their base engines.
-        _ => false,
+        // External storage (another Postgres) persists independently of this
+        // process.
+        Engine::PostgreSQL => false,
     }
 }
 
@@ -779,6 +795,9 @@ fn replication_params_from_connector_params(
         publication_name,
         initial_snapshot,
         snapshot_on_resume,
+        // Derived from the dataset's accelerator, which this function does not
+        // see; `build_changes_stream` sets it right after.
+        ephemeral_accelerator: false,
         status_interval,
         ready_lag,
         bootstrap_batch_size,
@@ -1069,6 +1088,68 @@ TXTE85+Or9IUwDI9543jsyCvuQ8=
             repl.sslrootcert,
             Some(CaCertificate::Path("/etc/ssl/pg-ca.pem".into()))
         );
+    }
+
+    /// `accelerator_is_ephemeral` decides whether a slot resume re-snapshots.
+    /// Getting it wrong in the "persistent" direction is silent data loss: the
+    /// accelerator boots empty, the slot resumes from `confirmed_flush_lsn`, and
+    /// the dataset then serves only rows touched after startup. Each engine's
+    /// durability is asserted for every mode so a wrong answer fails here rather
+    /// than in production.
+    #[test]
+    fn accelerator_ephemerality_is_classified_per_engine_and_mode() {
+        use runtime::component::dataset::acceleration::{Acceleration, Engine, Mode};
+
+        let ephemeral = |engine: Engine, mode: Mode| {
+            accelerator_is_ephemeral(&Acceleration {
+                engine,
+                mode,
+                ..Acceleration::default()
+            })
+        };
+
+        // Cayenne `mode: memory` is fully in-RAM (in-memory `memdb` metastore, no
+        // data directory), so it must re-snapshot on every start. This is also
+        // the mode catalog-level CDC acceleration runs in, and `mode: memory` is
+        // the default for an acceleration block that doesn't name one.
+        assert!(
+            ephemeral(Engine::Cayenne, Mode::Memory),
+            "in-memory Cayenne does not survive a restart"
+        );
+        assert!(
+            ephemeral(Engine::Cayenne, Mode::FileCreate),
+            "`file_create` truncates on startup, which is as empty as memory"
+        );
+        // File-backed Cayenne (local disk, or S3 Express One Zone — which also
+        // requires a file mode) persists, so a plain slot resume is correct.
+        assert!(!ephemeral(Engine::Cayenne, Mode::File));
+        assert!(!ephemeral(Engine::Cayenne, Mode::FileUpdate));
+
+        for engine in [Engine::DuckDB, Engine::Sqlite, Engine::Turso] {
+            assert!(ephemeral(engine, Mode::Memory), "{engine} memory");
+            assert!(ephemeral(engine, Mode::FileCreate), "{engine} file_create");
+            assert!(!ephemeral(engine, Mode::File), "{engine} file");
+            assert!(!ephemeral(engine, Mode::FileUpdate), "{engine} file_update");
+        }
+
+        // Arrow is in-memory whatever `mode` says; Postgres is external storage.
+        for mode in [Mode::Memory, Mode::File, Mode::FileCreate, Mode::FileUpdate] {
+            assert!(ephemeral(Engine::Arrow, mode), "arrow {mode}");
+            assert!(ephemeral(Engine::PartitionedArrow, mode), "arrow {mode}");
+            assert!(!ephemeral(Engine::PostgreSQL, mode), "postgres {mode}");
+        }
+    }
+
+    /// `snapshot_on_resume` is only forced when snapshots are enabled at all;
+    /// `pg_replication_initial_snapshot: disabled` is an explicit opt-out that a
+    /// non-persistent accelerator must not override.
+    #[test]
+    fn disabled_initial_snapshot_is_not_overridden_by_ephemerality() {
+        let (initial_snapshot, snapshot_on_resume) =
+            parse_initial_snapshot(&params_with("replication_initial_snapshot", "disabled"))
+                .expect("`disabled` is a canonical value");
+        assert!(!initial_snapshot);
+        assert!(!snapshot_on_resume);
     }
 
     // Regression for #11994: CDC must honor `pg_connection_string` the same way
