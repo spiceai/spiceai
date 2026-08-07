@@ -20534,6 +20534,7 @@ dependencies = [
  "insta",
  "itertools 0.14.0",
  "parking_lot",
+ "parquet",
  "rand 0.10.1",
  "reqwest 0.13.4",
  "serde",
