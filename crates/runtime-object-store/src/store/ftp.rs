@@ -140,9 +140,7 @@ impl bb8::ManageConnection for FTPConnectionManager {
         let port = self.port.clone();
         let timeout = self.timeout;
 
-        Box::pin(async move {
-            connect_and_login(&host, &port, &user, &password, timeout).await
-        })
+        Box::pin(async move { connect_and_login(&host, &port, &user, &password, timeout).await })
     }
 
     fn is_valid(
@@ -665,11 +663,9 @@ mod tests {
 
     #[tokio::test]
     async fn connect_deadline_passes_a_completed_attempt_through() {
-        let value = with_connect_deadline(
-            "ftp.example.com:21",
-            Duration::from_secs(30),
-            async { Ok(7u8) },
-        )
+        let value = with_connect_deadline("ftp.example.com:21", Duration::from_secs(30), async {
+            Ok(7u8)
+        })
         .await
         .expect("an attempt that completes inside the bound should be returned as-is");
 
