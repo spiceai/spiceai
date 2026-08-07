@@ -82,7 +82,9 @@ mod recipient;
 pub mod suite;
 pub mod vectors;
 
-pub use aad::{AAD_SEPARATOR, SecretAddress};
+pub use aad::{
+    AAD_SEPARATOR, STANDALONE_SECRETS_NAME, STANDALONE_SECRETS_NAMESPACE, SecretAddress,
+};
 pub use error::{Error, Result};
 pub use key_id::{KEY_ID_DIGEST_BYTES, derive_key_id};
 pub use keypair::{EncryptionKeypair, EncryptionKeyring};
