@@ -29,7 +29,7 @@ use opentelemetry_sdk::{
     trace::{SdkTracerProvider, span_processor_with_async_runtime::BatchSpanProcessor},
 };
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
-use runtime::{Runtime, task_history::otel_exporter::TaskHistoryExporter};
+use runtime::{Runtime, status::ComponentStatus, task_history::otel_exporter::TaskHistoryExporter};
 use serde::Deserialize;
 use spicepod::component::runtime::{TaskHistoryCapturedContext, TaskHistoryCapturedOutput};
 use tracing::subscriber::DefaultGuard;
@@ -68,6 +68,25 @@ pub(crate) async fn runtime_ready_check_with_timeout_err(
     } else {
         Err(())
     }
+}
+
+/// Returns the error each dataset recorded when it failed to load, as `(dataset, message)`.
+///
+/// A connector that cannot initialize stores its error text in the dataset's component
+/// status, so a test that gave up waiting for readiness can report why readiness never
+/// arrived instead of only that it waited. Sorted, so the report reads the same way twice.
+pub(crate) fn dataset_load_errors(rt: &Runtime) -> Vec<(String, String)> {
+    let mut errors: Vec<(String, String)> = rt
+        .status()
+        .get_dataset_statuses()
+        .into_iter()
+        .filter_map(|(dataset, status)| match status {
+            ComponentStatus::Error(Some(message)) => Some((dataset.to_string(), message)),
+            _ => None,
+        })
+        .collect();
+    errors.sort();
+    errors
 }
 
 pub(crate) async fn wait_until_true<F, Fut>(max_wait: Duration, mut f: F) -> bool

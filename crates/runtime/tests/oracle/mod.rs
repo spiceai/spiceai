@@ -24,7 +24,8 @@ use crate::oracle::common::{
     make_oracle_cloud_dataset, make_oracle_dataset, start_oracle_docker_container,
 };
 use crate::utils::{
-    register_test_connectors, runtime_ready_check, test_request_context, verify_env_secret_exists,
+    dataset_load_errors, register_test_connectors, runtime_ready_check,
+    runtime_ready_check_with_timeout_err, test_request_context, verify_env_secret_exists,
 };
 
 pub mod common;
@@ -298,6 +299,92 @@ async fn oracle_test_direct_connection() -> Result<(), anyhow::Error> {
         .await
 }
 
+/// The Oracle server errors that mean the test account's own credential cannot be used,
+/// whatever the runtime does with it. Each is paired with the condition to report.
+///
+/// `ORA-28002` ("the password will expire within N days") is deliberately absent: it accompanies
+/// a logon that *succeeded*, so reading it as unusable would skip a test that can still run.
+const UNUSABLE_CREDENTIAL_ERRORS: [(&str, &str); 3] = [
+    ("ORA-01017", "invalid username or password"),
+    ("ORA-28000", "the account is locked"),
+    ("ORA-28001", "the password has expired"),
+];
+
+/// Returns the credential condition `message` names, if it names one.
+///
+/// Only the conditions in [`UNUSABLE_CREDENTIAL_ERRORS`] skip the test. Every other failure,
+/// a near-expiry warning included, has to keep failing.
+fn unusable_oracle_credential(message: &str) -> Option<&'static str> {
+    UNUSABLE_CREDENTIAL_ERRORS
+        .iter()
+        .find(|(code, _)| names_oracle_code(message, code))
+        .map(|(_, condition)| *condition)
+}
+
+/// Whether `message` names `code` itself, rather than a longer number beginning with it.
+///
+/// The recorded status text is free-form, so the character after the code is checked: matching
+/// `ORA-28001` inside `ORA-280015` would report an unusable credential for a different error.
+fn names_oracle_code(message: &str, code: &str) -> bool {
+    message.match_indices(code).any(|(index, _)| {
+        !message[index + code.len()..]
+            .chars()
+            .next()
+            .is_some_and(|next| next.is_ascii_digit())
+    })
+}
+
+#[test]
+fn expired_password_is_an_unusable_credential() {
+    assert_eq!(
+        unusable_oracle_credential(
+            "Failed to connect to the Oracle Server. Failed to establish connection: \
+             OCI Error: ORA-28001: the password has expired"
+        ),
+        Some("the password has expired")
+    );
+}
+
+#[test]
+fn a_locked_account_and_bad_credentials_are_unusable_credentials() {
+    assert_eq!(
+        unusable_oracle_credential("OCI Error: ORA-28000: the account is locked"),
+        Some("the account is locked")
+    );
+    assert_eq!(
+        unusable_oracle_credential("OCI Error: ORA-01017: invalid username/password; logon denied"),
+        Some("invalid username or password")
+    );
+}
+
+/// `ORA-28002` reports a password nearing expiry on a logon that *succeeded*. The test can still
+/// run, so this must not be read as an unusable credential.
+#[test]
+fn a_password_nearing_expiry_is_not_an_unusable_credential() {
+    assert_eq!(
+        unusable_oracle_credential("OCI Error: ORA-28002: the password will expire within 7 days"),
+        None
+    );
+}
+
+/// A longer number beginning with a listed code is a different error.
+#[test]
+fn a_longer_code_sharing_a_prefix_is_not_an_unusable_credential() {
+    assert_eq!(unusable_oracle_credential("OCI Error: ORA-280015"), None);
+}
+
+/// Every other failure has to keep failing: a connector regression must not be filed away as
+/// somebody else's expired password.
+#[test]
+fn an_unrelated_failure_is_not_a_credential_problem() {
+    assert_eq!(
+        unusable_oracle_credential("ORA-12541: TNS:no listener"),
+        None
+    );
+    assert_eq!(unusable_oracle_credential("Timed out waiting"), None);
+    assert_eq!(unusable_oracle_credential(""), None);
+}
+
 #[tokio::test]
 async fn oracle_test_cloud_mtls() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -328,14 +415,49 @@ async fn oracle_test_cloud_mtls() -> Result<(), anyhow::Error> {
             let cloned_rt = Arc::new(rt.clone());
 
             // Set a timeout for the test
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
-                    return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
-                }
-                () = cloned_rt.load_components() => {}
-            }
+            let loaded = tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => false,
+                () = cloned_rt.load_components() => true,
+            };
 
-            runtime_ready_check(&rt).await;
+            let ready = loaded
+                && runtime_ready_check_with_timeout_err(&rt, std::time::Duration::from_mins(2))
+                    .await
+                    .is_ok();
+
+            // A dataset the connector could not authenticate never reports ready, and the reason
+            // is only in the status the runtime recorded for it. Read that status, so an
+            // unusable test credential is told apart from a connector that is actually broken.
+            if !ready {
+                let errors = dataset_load_errors(&rt);
+
+                if let Some(condition) = errors
+                    .iter()
+                    .find_map(|(_, message)| unusable_oracle_credential(message))
+                {
+                    eprintln!(
+                        "Skipping oracle_test_cloud_mtls: the ORACLE_CLOUD_* test credential is \
+                         unusable ({condition}). Rotate the Oracle Cloud test account's password \
+                         and update the CI secret to restore this coverage."
+                    );
+                    return Ok(());
+                }
+
+                let reported = errors
+                    .iter()
+                    .map(|(dataset, message)| format!("{dataset}: {message}"))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+
+                return Err(anyhow::Error::msg(format!(
+                    "Timed out waiting for datasets to load ({})",
+                    if reported.is_empty() {
+                        "no dataset recorded an error"
+                    } else {
+                        &reported
+                    }
+                )));
+            }
 
             run_and_snapshot_query(
                 &rt,
