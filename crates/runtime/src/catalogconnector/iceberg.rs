@@ -752,6 +752,14 @@ pub fn parse_hadoop_table_url(
         .map(std::iter::Iterator::count)
         .context(UrlParseNoSourceSnafu)?;
 
+    // The segment offsets below — `count - 2` for the namespace and the warehouse leaves,
+    // `count - 1` for the nodes — require a path naming both a namespace and a table. Reject a
+    // shorter one explicitly: left to `usize` arithmetic the subtraction decides it instead,
+    // which aborts a debug build and elsewhere depends on the wrap landing out of range.
+    if count < 2 {
+        return MissingNamespaceSnafu.fail();
+    }
+
     let table_name = parsed
         .path_segments()
         .and_then(std::iter::Iterator::last)
@@ -783,8 +791,14 @@ pub fn parse_hadoop_table_url(
     let mut base_uri = if let Some(host) = parsed.host_str() {
         format!("{}://{host}/{warehouse_leaves}", parsed.scheme())
     } else {
-        // nodes includes the inferred namespace, which needs to be excluded from the inferred base URI
-        format!("{}://{warehouse_leaves}", parsed.scheme())
+        // nodes includes the inferred namespace, which needs to be excluded from the inferred base URI.
+        //
+        // `warehouse_leaves` never carries a leading `/`, so a host-less URL needs the third
+        // slash written back explicitly. With only two, the result re-parses with the first
+        // path segment as the authority and that segment then disappears from the path:
+        // `file:///home/u/wh/db/t` would yield `file://home/u/wh`, leaving every consumer
+        // that reads `.path()` off it with `/u/wh`.
+        format!("{}:///{warehouse_leaves}", parsed.scheme())
     };
 
     let mut namespace = Namespace::new(namespace_ident);
@@ -948,6 +962,59 @@ mod tests {
         let url = "s3a://my-bucket/my-prefix/warehouse/spiceai_sandbox/my_table";
         let result = parse_hadoop_table_url(url, Some("file:///my/local/path/to/warehouse"));
         result.expect_err("should error parsing url");
+    }
+
+    /// Regression test for #12533. Every previously covered host-less case passed a
+    /// `warehouse_uri`, which overwrites `base_uri` outright and hid the inferred form.
+    #[test]
+    fn test_parse_hadoop_table_url_infers_local_warehouse_root() {
+        let url = "file:///var/lib/spice/warehouse/db/events";
+        let (base_uri, namespace, table_name) =
+            parse_hadoop_table_url(url, None).expect("local warehouse path should parse");
+        assert_eq!(base_uri, "file:///var/lib/spice/warehouse");
+        assert_eq!(namespace.name().to_url_string().as_str(), "db");
+        assert_eq!(table_name, "events");
+
+        // The defect was only visible once something re-parsed the result, which both
+        // consumers do: `build_opendal_operator` reads `.path()` into `FsConfig.root`, and
+        // `HadoopCatalogBuilder::with_warehouse_root` checks the root exists. Written with
+        // two slashes, this URI re-parsed as host `var` with path `/lib/spice/warehouse`.
+        let reparsed = Url::parse(&base_uri).expect("inferred base URI should re-parse");
+        assert!(
+            reparsed.host_str().is_none(),
+            "a local warehouse path must not re-parse with an authority"
+        );
+        assert_eq!(reparsed.path(), "/var/lib/spice/warehouse");
+    }
+
+    #[test]
+    fn test_parse_hadoop_table_url_infers_local_warehouse_root_edges() {
+        // Deeper than the namespace/table pair: only the two trailing segments are stripped.
+        let url = "file:///a/b/c/d/e/ns/tbl";
+        let (base_uri, namespace, table_name) =
+            parse_hadoop_table_url(url, None).expect("deep path should parse");
+        assert_eq!(base_uri, "file:///a/b/c/d/e");
+        assert_eq!(namespace.name().to_url_string().as_str(), "ns");
+        assert_eq!(table_name, "tbl");
+
+        // Shortest path that still names a namespace and a table: the warehouse is the
+        // filesystem root, which stays a valid absolute path rather than becoming `file://`.
+        let url = "file:///ns/tbl";
+        let (base_uri, namespace, table_name) =
+            parse_hadoop_table_url(url, None).expect("root warehouse should parse");
+        assert_eq!(base_uri, "file:///");
+        assert_eq!(namespace.name().to_url_string().as_str(), "ns");
+        assert_eq!(table_name, "tbl");
+        let reparsed = Url::parse(&base_uri).expect("root base URI should re-parse");
+        assert_eq!(reparsed.path(), "/");
+
+        // An explicit warehouse still wins over the inferred one, unchanged by this fix.
+        let url = "file:///var/lib/spice/warehouse/db/events";
+        let warehouse = "file:///var/lib/spice/warehouse";
+        let (base_uri, namespace, _) =
+            parse_hadoop_table_url(url, Some(warehouse)).expect("explicit warehouse parses");
+        assert_eq!(base_uri, "file:///var/lib/spice/warehouse");
+        assert_eq!(namespace.name().to_url_string().as_str(), "db");
     }
 
     #[test]
@@ -1212,5 +1279,39 @@ mod tests {
         let props = HashMap::new();
         let op = build_opendal_operator("ftp://my-host/path", &props);
         assert!(op.is_err(), "Unsupported scheme should fail");
+    }
+
+    /// A Hadoop table URL must name both a namespace and a table. Anything shorter is rejected
+    /// as `MissingNamespace`, identically in every build profile. Regression test for #12539.
+    #[test]
+    fn test_parse_hadoop_table_url_rejects_short_paths() {
+        // A warehouse mounted at the filesystem root, or a namespace simply left out.
+        for url in [
+            "file:///events",
+            "file:///",
+            "s3a://my-bucket/table-with-no-namespace",
+            "s3a://my-bucket/",
+        ] {
+            let Err(err) = parse_hadoop_table_url(url, None) else {
+                panic!("{url} names no namespace and must be rejected");
+            };
+            assert!(
+                matches!(err, Error::MissingNamespace),
+                "{url} should be rejected as MissingNamespace, got: {err}"
+            );
+        }
+
+        // Supplying a warehouse URI does not rescue a short table URL: the namespace is read
+        // from the table URL before the warehouse is consulted at all.
+        let Err(err) = parse_hadoop_table_url("file:///events", Some("file:///")) else {
+            panic!("an explicit warehouse does not supply the missing namespace");
+        };
+        assert!(matches!(err, Error::MissingNamespace), "got: {err}");
+
+        // The shortest path that does name both still parses, so the guard is not off by one.
+        let (_, namespace, table_name) =
+            parse_hadoop_table_url("s3a://my-bucket/ns/tbl", None).expect("two segments parse");
+        assert_eq!(namespace.name().to_url_string().as_str(), "ns");
+        assert_eq!(table_name, "tbl");
     }
 }

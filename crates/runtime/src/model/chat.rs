@@ -16,6 +16,8 @@ limitations under the License.
 #![allow(clippy::implicit_hasher)]
 #[cfg(feature = "bedrock")]
 use llms::bedrock::chat::{BedrockConverse, guardrail::GuardRail};
+#[cfg(feature = "models")]
+use llms::chat::PagedAttentionMode;
 use llms::{
     HealthCheck,
     anthropic::Anthropic,
@@ -692,6 +694,8 @@ async fn file(
     let config_path = component.find_any_file_path(ModelFileType::Config);
     let generation_config = component.find_any_file_path(ModelFileType::GenerationConfig);
     let distributed = parse_distributed_config(params)?;
+    let context_length = parse_context_length(params)?;
+    let paged_attention = parse_paged_attention(params)?;
 
     let chat_template_literal = params.get("chat_template").expose().ok();
 
@@ -701,10 +705,59 @@ async fn file(
         tokenizer_path.as_deref(),
         tokenizer_config_path.as_deref(),
         generation_config.as_deref(),
-        chat_template_literal,
         distributed,
+        llms::chat::LocalModelOptions {
+            chat_template_literal,
+            context_length,
+            paged_attention,
+        },
     )
     .await
+}
+
+/// Parse the optional `context_length` model parameter (maximum sequence length,
+/// in tokens) for locally served models. Returns `None` when unset or empty, so
+/// the engine default applies. Rejects non-integer or zero values.
+#[cfg(feature = "models")]
+fn parse_context_length(params: &Parameters) -> Result<Option<usize>, LlmError> {
+    let raw = params
+        .get("context_length")
+        .expose()
+        .ok()
+        .unwrap_or_default();
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    match raw.parse::<usize>() {
+        Ok(n) if n > 0 => Ok(Some(n)),
+        _ => Err(LlmError::InvalidParamValueError {
+            param: "context_length".to_string(),
+            message: format!("Must be a positive integer number of tokens, got '{raw}'"),
+        }),
+    }
+}
+
+/// Parse the `paged_attention` model parameter. Defaults to `auto`: `PagedAttention`
+/// wherever the build and the model support it, dense attention where they do not —
+/// which covers the Multi-head Latent Attention GGUFs (GLM-4.x/5.x, DeepSeek-V4) whose
+/// loaders reject a `PagedAttention` config outright. `disabled` forces dense attention
+/// for any model.
+#[cfg(feature = "models")]
+fn parse_paged_attention(params: &Parameters) -> Result<PagedAttentionMode, LlmError> {
+    // `Parameters::try_new` substitutes the spec's `auto` default and rejects anything
+    // outside `VALUES` before this runs, so in production an absent value parses as the
+    // default and the error arm is unreachable.
+    params
+        .get("paged_attention")
+        .expose()
+        .ok()
+        .unwrap_or_default()
+        .parse::<PagedAttentionMode>()
+        .map_err(|message| LlmError::InvalidParamValueError {
+            param: "paged_attention".to_string(),
+            message,
+        })
 }
 
 /// Parse the boolean `trust_pickle` model parameter. Defaults to `false`
@@ -751,17 +804,117 @@ mod test {
     use serde_json::Number;
     use spicepod::component::model::Model;
 
-    fn parameters_with_responses_api(value: Option<&str>) -> Parameters {
+    /// A `Parameters` over the given key/value pairs. `spec` supplies the user-facing
+    /// parameter names only — `Parameters::new` applies neither `one_of` nor the spec
+    /// defaults, so a test built this way exercises the parser alone.
+    fn params_for(
+        component: &'static str,
+        spec: &'static [crate::parameters::ParameterSpec],
+        pairs: &[(&str, &str)],
+    ) -> Parameters {
         Parameters::new(
-            value.map_or_else(Vec::new, |value| {
-                vec![(
-                    "responses_api".to_string(),
-                    SecretString::from(value.to_string()),
-                )]
-            }),
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), SecretString::from((*v).to_string())))
+                .collect(),
+            component,
+            spec,
+        )
+    }
+
+    fn parameters_with_responses_api(value: Option<&str>) -> Parameters {
+        params_for(
             "openai",
             crate::model::params::openai::PARAMETERS,
+            &value.map_or_else(Vec::new, |value| vec![("responses_api", value)]),
         )
+    }
+
+    #[cfg(feature = "models")]
+    fn file_parameters(key: &str, value: Option<&str>) -> Parameters {
+        params_for(
+            "file",
+            crate::model::params::file::PARAMETERS,
+            &value.map_or_else(Vec::new, |value| vec![(key, value)]),
+        )
+    }
+
+    #[test]
+    #[cfg(feature = "models")]
+    fn context_length_defaults_to_none() {
+        assert_eq!(
+            parse_context_length(&file_parameters("context_length", None))
+                .expect("absent context_length is valid"),
+            None
+        );
+        // Whitespace-only is treated as unset rather than as a parse failure, so an empty
+        // template value falls back to the engine default.
+        assert_eq!(
+            parse_context_length(&file_parameters("context_length", Some("  ")))
+                .expect("blank context_length is valid"),
+            None
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "models")]
+    fn context_length_parses_positive_integers() {
+        assert_eq!(
+            parse_context_length(&file_parameters("context_length", Some(" 8192 ")))
+                .expect("positive context_length is valid"),
+            Some(8192)
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "models")]
+    fn context_length_rejects_zero_and_non_integers() {
+        for bad in ["0", "-1", "4096.5", "many"] {
+            let err = parse_context_length(&file_parameters("context_length", Some(bad)))
+                .expect_err("non-positive-integer context_length should be invalid");
+            assert!(
+                matches!(err, LlmError::InvalidParamValueError { ref param, .. } if param == "context_length"),
+                "unexpected error for {bad:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "models")]
+    fn paged_attention_defaults_to_auto() {
+        assert_eq!(
+            parse_paged_attention(&file_parameters("paged_attention", None))
+                .expect("absent paged_attention is valid"),
+            PagedAttentionMode::Auto
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "models")]
+    fn paged_attention_reads_the_configured_mode() {
+        // The accepted vocabulary and its case-insensitivity are covered where `FromStr`
+        // lives; what matters here is that the param reaches the parser at all.
+        assert_eq!(
+            parse_paged_attention(&file_parameters("paged_attention", Some("disabled")))
+                .expect("disabled is a valid mode"),
+            PagedAttentionMode::Disabled
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "models")]
+    fn paged_attention_rejects_values_outside_the_spec() {
+        // A Spicepod that spells this `true`/`false` has to fail loudly, naming the values
+        // it should have used, rather than have one of them quietly read as a mode.
+        let err = parse_paged_attention(&file_parameters("paged_attention", Some("true")))
+            .expect_err("a value outside the spec should be invalid");
+        assert!(
+            matches!(err, LlmError::InvalidParamValueError { ref param, .. } if param == "paged_attention"),
+            "unexpected error: {err}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("auto"), "{message}");
+        assert!(message.contains("disabled"), "{message}");
     }
 
     #[test]
@@ -891,13 +1044,10 @@ mod test {
 
     #[cfg(feature = "models")]
     fn distributed_params(pairs: &[(&str, &str)]) -> Parameters {
-        Parameters::new(
-            pairs
-                .iter()
-                .map(|&(k, v)| (k.to_string(), SecretString::from(v.to_string())))
-                .collect(),
+        params_for(
             "huggingface",
             crate::model::params::huggingface::PARAMETERS,
+            pairs,
         )
     }
 

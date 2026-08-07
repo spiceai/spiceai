@@ -19,7 +19,10 @@ use std::sync::Arc;
 use arrow::array::RecordBatch;
 use arrow_schema::Field;
 use async_trait::async_trait;
-use datafusion::{error::DataFusionError, logical_expr::LogicalPlan};
+use datafusion::{
+    error::DataFusionError,
+    logical_expr::{Expr, LogicalPlan, ident},
+};
 use runtime_datafusion_index::Index;
 
 pub mod chunking;
@@ -210,6 +213,31 @@ pub trait VectorIndex: SearchIndex {
     /// not be wrapped by [`VectorScanTableProvider`].
     fn list_table_provider(&self) -> Result<LogicalPlan, DataFusionError>;
 
+    /// A [`LogicalPlan`] identifying every entry the index holds, for maintenance paths that must
+    /// resolve *stored* entries rather than serve a read — currently resolving a chunked index's
+    /// chunk-keyed entries so they can be deleted.
+    ///
+    /// Distinct from [`VectorIndex::list_table_provider`], which serves reads and may deliberately
+    /// return less than the index holds: a [`compound`](crate::index::compound) index's read mode
+    /// can restrict listing to its warm primary, which is not authoritative for what is stored.
+    /// Resolving a delete against that narrowed listing silently leaves entries behind.
+    ///
+    /// The plan carries *at least* the [`SearchIndex::primary_fields`] columns, and callers must
+    /// not depend on any other column being present. Keeping the contract to the key columns is
+    /// what lets a multi-store implementation combine its stores: the key fields are the only ones
+    /// guaranteed to agree across them.
+    ///
+    /// **Keys may repeat.** A multi-store implementation combines its stores by union, so an entry
+    /// both stores hold appears once per store. Callers that need each key once must apply their
+    /// own `DISTINCT` — as the chunked delete resolution does, since deleting a key twice is
+    /// wasted work.
+    ///
+    /// Wrapper implementations MUST forward this to the index they wrap — inheriting the default
+    /// silently resolves maintenance work against a read-narrowed listing.
+    fn list_all_entry_keys(&self) -> Result<LogicalPlan, DataFusionError> {
+        self.list_table_provider()
+    }
+
     fn dimension(&self) -> i32;
 
     /// Returns column names in [`VectorIndex::list_table_provider`] and/or [`SearchIndex::query_table_provider`] that
@@ -222,6 +250,13 @@ pub trait VectorIndex: SearchIndex {
 
 fn embedding_col(search_column: &str) -> String {
     format!("{search_column}_embedding")
+}
+
+/// Projection expressions selecting `fields` by name — the key columns
+/// [`VectorIndex::list_all_entry_keys`] promises, used both to narrow a listing to them and to
+/// bring two stores' listings to a common schema before combining them.
+pub(crate) fn primary_key_projection(fields: &[Field]) -> Vec<Expr> {
+    fields.iter().map(|f| ident(f.name())).collect()
 }
 
 #[cfg(test)]

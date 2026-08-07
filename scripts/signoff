@@ -25,6 +25,9 @@
 #   scripts/signoff --no-verify     Sign off without running the checks (honor system)
 #   scripts/signoff status          Show the sign-off status of HEAD
 #   scripts/signoff mine            Show attestation status for all your open PRs
+#   scripts/signoff clear-pending   Turn a left-behind pending status into a failure
+#   scripts/signoff preflight-disk  Check the work volume's free space (CI: run
+#                                   before the toolchain setup steps)
 #   scripts/signoff check           Show whether trunk requires sign-off
 #   scripts/signoff install         Configure the trunk ruleset (maintainers)
 #   scripts/signoff install --yes   Apply the ruleset change (default is a dry-run)
@@ -40,6 +43,12 @@
 #   SIGNOFF_SKIP_TARGETED_LINT  Set to any value to skip the branch-scoped pre-lint
 #   SIGNOFF_SKIP_TARGETED_TESTS Set to any value to skip the branch-scoped unit
 #                     tests that run after the pre-lint
+#   SIGNOFF_MIN_FREE_GIB  Free space (GiB) the work volume must have before a
+#                     remote run starts its Rust checks (default: 25). Checked
+#                     twice: by the `preflight-disk` step before the toolchain
+#                     setup, and again inside the run. Below it a remote run
+#                     stops immediately as an infrastructure failure; a local
+#                     run only warns.
 #
 # Targeted pre-lint always diffs against trunk (not configurable).
 # When the branch has no Rust-affecting changes vs trunk (.rs, Cargo.toml,
@@ -53,7 +62,7 @@
 
 set -euo pipefail
 
-readonly VERSION="1.4.0"
+readonly VERSION="1.5.0"
 # Fixed, not configurable: it must match the hardcoded context the Attestation
 # workflow (pr.yml) looks for, so an env override would silently break the gate.
 readonly STATUS_CONTEXT="signoff"
@@ -100,10 +109,10 @@ readonly NO="✗"
 # Colors for `mine`'s human-facing report only — every other command's output
 # stays plain text (docs/scripts may grep it). Respects NO_COLOR and piping.
 if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != "dumb" ]]; then
-  readonly C_RED=$'\033[31m' C_GREEN=$'\033[32m' C_YELLOW=$'\033[33m' \
+  readonly C_RED=$'\033[31m' C_GREEN=$'\033[32m' C_YELLOW=$'\033[33m' C_CYAN=$'\033[36m' \
     C_DIM=$'\033[2m' C_BOLD=$'\033[1m' C_RESET=$'\033[0m'
 else
-  readonly C_RED='' C_GREEN='' C_YELLOW='' C_DIM='' C_BOLD='' C_RESET=''
+  readonly C_RED='' C_GREEN='' C_YELLOW='' C_CYAN='' C_DIM='' C_BOLD='' C_RESET=''
 fi
 
 debug() { [[ -n "$DEBUG" ]] && echo "debug: $*" >&2 || true; }
@@ -608,6 +617,50 @@ post_commit_status() {
     -f "description=${description}" >/dev/null
 }
 
+# The STATUS_CONTEXT state currently on a commit: success/pending/failure/error,
+# or "none" when it has none. Asks gh's own jq rather than the jq binary — the
+# remote sign-off path is otherwise free of that dependency (see require_jq).
+signoff_state() {
+  local repo="$1" sha="$2"
+  gh api "repos/${repo}/commits/${sha}/status" \
+    --jq ".statuses // [] | map(select(.context == \"${STATUS_CONTEXT}\")) | .[0].state // \"none\""
+}
+
+# Post the in-progress status for a remote run — unless the commit is already
+# signed off. A re-dispatch against an attested commit is routine
+# (`cancel-in-progress` makes it the normal way to recover from an evicted run),
+# and posting `pending` over the success discards an attestation a multi-hour run
+# earned — leaving the commit worse off than before if this run never reaches a
+# verdict of its own. Suppressing the post costs no
+# progress reporting: `mine` takes its ⟳ from the in-flight run list, not from
+# this status. A `failure` from the checks still overwrites, because that one is
+# this run's own verdict; a stale `failure` or `error` is likewise overwritten,
+# because a run that is retrying it has nothing to preserve.
+#
+# Read-then-write with no compare-and-set, same as cmd_clear_pending: a success
+# posted by another run on this SHA in the gap between the two calls is still
+# overwritten. Nothing closes that gap, so it stays narrow — one API round trip —
+# rather than the whole length of a run, which is what it was before.
+post_pending_status() {
+  local repo="$1" sha="$2" user="$3"
+  # Declared before it is assigned on purpose: `local state=$(…)` reports
+  # `local`'s own exit status, so the read's failure would go unnoticed.
+  local state
+
+  if ! state=$(signoff_state "$repo" "$sha"); then
+    info "warning: could not read the current sign-off status — not posting pending"
+    return 0
+  fi
+  if [[ "$state" == "success" ]]; then
+    info "${sha:0:12} is already signed off — leaving that status in place while this run re-verifies it"
+    return 0
+  fi
+
+  post_commit_status "$repo" "$sha" pending \
+    "Remote sign-off in progress (triggered by ${user})…" \
+    || info "warning: could not post pending sign-off status"
+}
+
 # --- commands ----------------------------------------------------------------
 
 # Paths that can change what cargo/clippy/fmt/nextest do — Rust sources, the
@@ -649,6 +702,294 @@ branch_has_rust_changes() {
   return 1
 }
 
+# --- disk guard ---------------------------------------------------------------
+#
+# A sign-off links every test binary in the workspace into a `target/` that the
+# self-hosted pool shares across branches. When that volume fills, the run does
+# not fail where the space ran out: nextest reports the whole suite green, and
+# then the *linker* dies with `errno=28` thousands of lines later, on a crate
+# the branch never touched. That failure has none of the tells of a real one —
+# no `-->` source pointers, no clippy diagnostic, a passing test summary — so
+# it reads as a defect in the branch, and the reader either hunts a
+# nonexistent bug or re-dispatches onto the same full disk. What follows makes
+# the run say which one it was: a floor it refuses to start below, a recorder
+# that catches the build saying it ran out, and a free-space backstop.
+
+# Refuse to *start* a run the volume cannot hold, rather than discovering it
+# three hours in. This is headroom for linking, not an estimate of a cold
+# build: `target/` is warm on the pool, so what a run actually needs is room
+# for the binaries it relinks.
+readonly DEFAULT_MIN_FREE_GIB=25
+# At failure time, this little free space means the volume is what broke, not
+# the branch. Deliberately far below the preflight floor: a genuine compile
+# error on a tight-but-workable disk must not be relabelled "infrastructure",
+# while the `errno=28` death this exists to catch leaves the volume at ~0.
+readonly DISK_CRITICAL_GIB=2
+# run_checks returns this when the preflight refuses to start.
+readonly EXIT_DISK_EXHAUSTED=70
+# Bash reports a foreground child killed by signal N as 128+N, and run_make_step
+# returns make's own status untouched. So a status at or above this means `make`
+# never reached a verdict of its own — the process tree was signalled. That is
+# how a `Sign off` step reads when its `timeout-minutes` budget expires (#12518)
+# and how a cancelled job reads (#12424); a recipe that genuinely fails exits 2.
+readonly EXIT_SIGNAL_BASE=128
+# How the linker's out-of-disk death actually reads in the run log:
+# `ld: write() failed, errno=28 (No space left on device)`. Either spelling is
+# enough; matching both survives a toolchain that words one of them differently.
+readonly DISK_FULL_PATTERN='No space left on device|errno=28'
+
+# Set to 1 on remote runs, where run_make_step watches build output for the
+# out-of-disk signature. Separates "watched, and it was not disk" from "nothing
+# watched at all", which failure_kind answers differently.
+SIGNOFF_DISK_WATCH="${SIGNOFF_DISK_WATCH:-}"
+
+# Set to 1 by run_make_step when the step it ran reported running out of disk.
+#
+# A shell variable rather than a file, because the signal has to survive the
+# condition it reports. Recording the line by appending to a marker file needed
+# an allocation at exactly the moment allocation is failing — and on macOS
+# $TMPDIR and the workspace are usually the same APFS container, so there was
+# nowhere to put that file that was reliably writable. An empty marker read as
+# "not a disk failure", so the branch was blamed for the volume (#12427). The
+# watcher's exit status needs no disk at all.
+#
+# Seeded from the environment so the unit tests can set up a classification
+# without running a build; run_make_step resets it per step, so an inherited
+# value cannot outlive a run that watched anything.
+SIGNOFF_DISK_HIT="${SIGNOFF_DISK_HIT:-}"
+
+# The status the watcher exits with to report an out-of-disk line. Deliberately
+# not 1 or 2: awk uses those for its own errors, and a watcher that itself died
+# must not be read as a volume that filled. Reserving a distinct status is also
+# what lets run_make_step tell "ran, saw nothing" (0) from "never reached a
+# verdict" (anything else), which it must not conflate — see run_make_step.
+readonly DISK_WATCH_HIT_STATUS=3
+
+# Run one `make` step, recording whether it died for want of disk. Returns
+# make's own status, never the watcher's. With the watch off — every local run —
+# make is invoked exactly as before, so local output is untouched.
+run_make_step() {
+  if [[ -z "$SIGNOFF_DISK_WATCH" ]]; then
+    make "$@"
+    return $?
+  fi
+  local status watch_status
+  local -a pipe_status
+  # Reset per step, so the verdict describes the step that actually failed. Left
+  # to accumulate, a step that merely *mentioned* running out of disk and then
+  # succeeded would still be blaming the volume for a genuine test failure two
+  # steps later.
+  SIGNOFF_DISK_HIT=""
+  # awk rather than a captured log: it passes every line straight through and
+  # keeps one bit of state, so watching costs nothing on a volume that is
+  # already short of space. fflush keeps the output streaming to the Actions log
+  # line by line, as it does unwatched.
+  make "$@" 2>&1 | awk -v pat="$DISK_FULL_PATTERN" -v hit_status="$DISK_WATCH_HIT_STATUS" '
+    $0 ~ pat { hit = 1 }
+    { print; fflush() }
+    END { if (hit) exit (hit_status + 0) }
+  '
+  # Copy the whole array in one statement: reading PIPESTATUS is itself a command,
+  # so a second `x="${PIPESTATUS[1]}"` would be reading the *assignment's* status
+  # and, under `set -u`, abort on the now-absent index.
+  pipe_status=("${PIPESTATUS[@]}")
+  status="${pipe_status[0]:-0}"
+  watch_status="${pipe_status[1]:-0}"
+  if [[ "$watch_status" -eq "$DISK_WATCH_HIT_STATUS" ]]; then
+    SIGNOFF_DISK_HIT=1
+  elif [[ "$watch_status" -ne 0 ]]; then
+    # The watcher died instead of reaching a verdict: no awk on the runner, a
+    # syntax error, a signal. Its silence is then not "no out-of-disk line went
+    # past" — nothing reliably read the output at all — so leaving the watch
+    # armed would let failure_kind assert "not disk" on the authority of a
+    # watcher that never ran, which is the same mislabelling in the other
+    # direction from #12427. Disarm it so classification falls back to the
+    # free-space backstop, exactly as on an unwatched local run.
+    info "warning: the out-of-disk watcher exited ${watch_status} rather than reporting a verdict — falling back to free-space classification"
+    SIGNOFF_DISK_WATCH=""
+  fi
+  return "$status"
+}
+
+# True when this run watched its build output at all, i.e. the watch's verdict —
+# including its "no ENOSPC line went past" — is worth something. run_make_step
+# clears the flag if the watcher itself failed, so this stays false for a run
+# whose watch was requested but never actually delivered a reading.
+disk_watch_armed() {
+  [[ -n "$SIGNOFF_DISK_WATCH" ]]
+}
+
+# True when this run's build actually reported running out of disk. This is the
+# authoritative signal — unlike a free-space reading taken after the fact, it
+# cannot be washed out by the partial artifacts cargo unlinks on its way out,
+# and unlike a marker file it costs no allocation at the moment allocation is
+# what is failing.
+build_hit_disk_full() {
+  [[ -n "$SIGNOFF_DISK_HIT" ]]
+}
+
+# Free space in GiB on the volume holding "$1" (default: the working tree).
+# Prints an integer. Returns non-zero when df is absent or its output does not
+# parse — every caller reads that as "unknown" and never as "full", so a runner
+# whose df we cannot read still gets to run its sign-off.
+free_disk_gib() {
+  # The volume that actually holds the build output: `target/` is what fills,
+  # and CARGO_TARGET_DIR can put it on a different filesystem than the checkout.
+  local path="${1:-${CARGO_TARGET_DIR:-.}}" free
+  command -v df >/dev/null 2>&1 || return 1
+  # -P: POSIX one-line-per-filesystem output, so Available is reliably field 4
+  # even when a long device name would wrap in df's default format.
+  # -k: 1024-byte blocks on both macOS (whose df defaults to 512) and Linux.
+  free=$(df -Pk "$path" 2>/dev/null | awk 'NR==2 { print int($4 / 1048576) }') || return 1
+  [[ "$free" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$free"
+}
+
+# True when the work volume is so empty that a failure is the volume's fault
+# rather than the branch's. Unknown free space answers false: without a reading
+# we cannot claim infrastructure, and mislabelling a real failure is worse.
+disk_is_critical() {
+  local free
+  free=$(free_disk_gib) || return 1
+  (( free < DISK_CRITICAL_GIB ))
+}
+
+# Names what broke in a check run that did not pass, given run_checks' exit
+# status: "signalled" when nothing judged the branch at all, "disk" when the work
+# volume is the cause, "checks" for everything else, which is the branch. Three
+# ways to reach "disk", in falling order of authority: the preflight refused to
+# start, the build said so itself, or the volume is at ~0 now. The last is a
+# backstop for a build whose output we did not record — a local run, or a remote
+# one whose watcher died before it could read anything — which is why it is not
+# the only signal.
+failure_kind() {
+  local check_status="$1"
+
+  # First, because it is the one kind that says the checks reached no verdict
+  # rather than which verdict they reached. The two disk signals below both
+  # describe a `make` that *returned*: the preflight refusing to start (70) and
+  # a build that printed ENOSPC and died. Neither can coexist with a status that
+  # says make itself was killed.
+  if [[ "$check_status" -ge "$EXIT_SIGNAL_BASE" ]]; then
+    echo "signalled"
+    return
+  fi
+
+  # The preflight's own refusal needs no corroboration.
+  if [[ "$check_status" -eq "$EXIT_DISK_EXHAUSTED" ]]; then
+    echo "disk"
+    return
+  fi
+
+  # If we watched the build, the watch decides — both ways. No ENOSPC line means
+  # the build ran out of many things but not disk, and a free-space reading must
+  # not overrule that: on a shared pool another run can drag the volume under any
+  # threshold while *this* branch fails for its own reasons, and calling that
+  # "infrastructure" tells the author to re-dispatch a branch that will fail
+  # again. Free space is consulted only when nothing watched.
+  if disk_watch_armed; then
+    if build_hit_disk_full; then echo "disk"; else echo "checks"; fi
+    return
+  fi
+
+  if disk_is_critical; then echo "disk"; else echo "checks"; fi
+}
+
+# What to publish about a check run that did not pass, given run_checks' exit
+# status, how long it ran, and who dispatched it. Sets three globals rather than
+# returning a packed string, the way run_make_step reports through
+# SIGNOFF_DISK_HIT:
+#
+#   SIGNOFF_FAILURE_STATUS_DESC  the commit-status description, or "" to publish
+#                                no verdict at all
+#   SIGNOFF_FAILURE_SUMMARY      the step summary
+#   SIGNOFF_FAILURE_MESSAGE      what `fail` says on the way out
+#
+# An empty description is the whole point of the "signalled" case and is not an
+# error path: see below.
+SIGNOFF_FAILURE_STATUS_DESC=""
+SIGNOFF_FAILURE_SUMMARY=""
+SIGNOFF_FAILURE_MESSAGE=""
+describe_check_failure() {
+  local check_status="$1" elapsed="$2" user="$3"
+
+  case "$(failure_kind "$check_status")" in
+    signalled)
+      # Publish nothing. Nothing judged this branch — the process tree was
+      # signalled — so the status this run left on its way in is still the most
+      # this run can honestly claim: the `pending` it posted before starting, or
+      # an earlier `success` post_pending_status declined to overwrite. A leftover
+      # `pending` is already what the workflow's "Resolve an incomplete sign-off"
+      # step is there to describe.
+      #
+      # Any verdict written here would assert something nothing established:
+      # "checks failed" about a suite the log shows still passing when the
+      # 353-minute budget expired (#12518), on a commit that may already carry a
+      # `signoff=success` an earlier run earned (#12520). Neither correction
+      # handler can take it back — both are gated on `cancelled()`, and a budget
+      # expiry is a *failed* step by #12343's design — so the only safe moment to
+      # decline is here.
+      SIGNOFF_FAILURE_STATUS_DESC=""
+      SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Did not complete** after ${elapsed}s — the run was signalled (its step budget expired, or the job was stopped), so **the checks reached no verdict** and no failure status is published. Nothing reported a failure; equally, nothing cleared the branch. The \`${STATUS_CONTEXT}\` status stands as this run left it — the \`pending\` posted at the start, or an earlier \`success\` this run declined to overwrite. Sign off again: a branch that repeatedly exhausts the budget is either contending for the pool or has lengthened the build itself."$'\n'
+      SIGNOFF_FAILURE_MESSAGE="sign-off did not complete: the run was signalled after ${elapsed}s, so the checks reached no verdict — sign off again"
+      ;;
+    disk)
+      # An out-of-disk run says nothing useful by default — the commit status is
+      # all most readers see, so it has to carry the distinction itself.
+      SIGNOFF_FAILURE_STATUS_DESC="Runner out of disk after ${elapsed}s — checks did not complete, re-dispatch (triggered by ${user})"
+      SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Infrastructure failure** after ${elapsed}s — the build ran out of disk on the runner work volume, so **the checks did not complete**. Re-dispatch once the runner has space. Only if this recurs for one branch alone is the diff worth suspecting: a build script or dependency change can consume the volume by itself."$'\n'
+      SIGNOFF_FAILURE_MESSAGE="sign-off aborted: the runner ran out of disk (the checks did not complete)"
+      ;;
+    *)
+      SIGNOFF_FAILURE_STATUS_DESC="Sign-off checks failed after ${elapsed}s (triggered by ${user})"
+      SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Failed** after ${elapsed}s."$'\n'
+      SIGNOFF_FAILURE_MESSAGE="sign-off checks failed"
+      ;;
+  esac
+}
+
+# Stop before the Rust checks when the work volume cannot hold them. Fatal only
+# on a remote run — that shared pool is where this happens, and it is where a
+# wasted run costs hours. A local run just warns: a developer's own disk is
+# theirs to manage, and blocking their sign-off on a floor tuned for the pool
+# would be wrong.
+preflight_disk() {
+  local free min="${SIGNOFF_MIN_FREE_GIB:-$DEFAULT_MIN_FREE_GIB}"
+
+  if [[ ! "$min" =~ ^[0-9]+$ ]]; then
+    info "warning: SIGNOFF_MIN_FREE_GIB='${min}' is not an integer — using ${DEFAULT_MIN_FREE_GIB}"
+    min="$DEFAULT_MIN_FREE_GIB"
+  fi
+  # Force base 10: bash arithmetic reads a leading zero as octal, so a
+  # well-meaning `SIGNOFF_MIN_FREE_GIB=08` is an arithmetic error, not 8.
+  min=$((10#$min))
+
+  if ! free=$(free_disk_gib); then
+    debug "could not measure free disk space — skipping the preflight check"
+    return 0
+  fi
+
+  debug "free space on the work volume: ${free} GiB (floor ${min} GiB)"
+  if (( free >= min )); then
+    return 0
+  fi
+
+  if ! is_remote_run; then
+    info "warning: only ${free} GiB free here and sign-off wants ${min} GiB — the build may die at the linker"
+    return 0
+  fi
+
+  info "${NO} Only ${free} GiB free on the work volume; a sign-off needs ${min} GiB."
+  info "  The branch was not evaluated. Reclaim space on this runner and re-dispatch."
+  # An Actions annotation as well as the step summary. Reached from the standalone
+  # `preflight-disk` step there is no commit status yet to carry the distinction —
+  # the pending status is posted later, inside the sign-off run — so the run page
+  # is the only place an operator can learn this was the volume and not the diff.
+  echo "::error title=Runner out of disk::Only ${free} GiB free on the work volume, below the ${min} GiB floor. The branch was not evaluated: reclaim space on this runner and re-dispatch."
+  append_step_summary "### Preflight: not enough disk"$'\n'"Only **${free} GiB** free on the runner work volume, below the **${min} GiB** floor, so the Rust checks did not run and **the branch was not evaluated**. This is an infrastructure failure, not a code failure: reclaim space on this runner (\`target/\` is shared across branches) and re-dispatch. Adjust the floor with \`SIGNOFF_MIN_FREE_GIB\`."$'\n'
+  return "$EXIT_DISK_EXHAUSTED"
+}
+
 # Unit tests for the packages a branch touched, run before the full workspace
 # lint. A broken test in the crate you just edited is the likeliest failure, and
 # it would otherwise surface only after the longest step in the gate.
@@ -683,7 +1024,7 @@ run_targeted_tests() {
   append_step_summary "### Targeted unit tests"$'\n'"Packages: \`${test_packages}\`"$'\n'
   # Explicit `|| return` so failures short-circuit even when the caller has
   # temporarily disabled `set -e` (see cmd_signoff).
-  make nextest-packages PACKAGES="$test_packages" FEATURES="$features" || return $?
+  run_make_step nextest-packages PACKAGES="$test_packages" FEATURES="$features" || return $?
   info "Targeted unit tests passed."
 }
 
@@ -723,6 +1064,10 @@ run_checks() {
     return 0
   fi
 
+  # Deliberately after the Rust-changes skip: a docs-only sign-off compiles
+  # nothing, so a full volume is no reason to refuse it.
+  preflight_disk || return $?
+
   if [[ -z "${SIGNOFF_SKIP_TARGETED_LINT:-}" && -n "$revision" ]]; then
     packages=$(changed_workspace_packages "$revision" || true)
   fi
@@ -744,7 +1089,7 @@ run_checks() {
     # FEATURES is set explicitly so a user-exported value cannot reintroduce a
     # workspace-only set. Explicit `|| return` so failures short-circuit even
     # when the caller has temporarily disabled `set -e` (see cmd_signoff).
-    make lint-rust PACKAGES="$packages" FEATURES="$features" || return $?
+    run_make_step lint-rust PACKAGES="$packages" FEATURES="$features" || return $?
     info "Targeted pre-lint passed."
     run_targeted_tests "$packages" "$features" || return $?
     info "Running full workspace lint…"
@@ -756,7 +1101,7 @@ run_checks() {
   info "Running Rust lint (make lint-rust)…"
   # Clear PACKAGES/FEATURES so a user-exported env cannot scope or re-feature
   # the full gate; empty values leave the Makefile on its workspace defaults.
-  make lint-rust PACKAGES= FEATURES= || return $?
+  run_make_step lint-rust PACKAGES= FEATURES= || return $?
 
   # build-cli-dev, not build-cli: the release CLI build shares no artifacts with
   # the profile the lint and test passes just warmed, so it recompiles its whole
@@ -765,27 +1110,73 @@ run_checks() {
   # CLI, spiced, and the release install for real, so release-only breakage is
   # still caught before trunk.
   info "Building the CLI and running unit tests (make build-cli-dev nextest)…"
-  make build-cli-dev nextest || return $?
+  run_make_step build-cli-dev nextest || return $?
 
   SIGNOFF_CHECK_SUMMARY="lint+test passed"
 }
 
-# After a successful sign-off, the PR's `Attestation` job (pr.yml) only
-# re-evaluates the `signoff` commit status when its workflow run executes. If
-# that run already completed — e.g. sign-off happened after the PR's checks
-# ran — `Attestation` is stuck showing a stale failure until something
-# re-triggers it. Re-run that job instead of making the developer open or
-# refresh the PR by hand. `gh` is already required by require_tools() before
-# cmd_signoff can reach this point, but the check stays here so this function
-# remains correct if it's ever called on its own.
+# The PR's `Attestation` job (pr.yml) only re-reads the `signoff` commit status
+# when its workflow run executes: pr.yml triggers on `pull_request`,
+# `merge_group` and `workflow_dispatch`, never on a status change. So a run that
+# already completed keeps whatever verdict it reached, however the status has
+# moved since. Re-run that job instead of making the developer open or refresh
+# the PR by hand. `gh` is already required by require_tools() before cmd_signoff
+# can reach this point, but the check stays here so this function remains
+# correct if it's ever called on its own.
+#
+# A run that concluded `success` needs no refresh when this sign-off also
+# succeeded — but it needs one precisely when the sign-off failed, or the gate
+# keeps reporting an attestation this run just overturned. Pass a non-empty
+# third argument to force the re-run past that short-circuit.
 refresh_attestation_check() {
-  local sha="$1" repo="$2"
-  local fallback="Open/refresh the PR and it will pick up the sign-off."
-  local run run_id run_status run_conclusion
+  local sha="$1" repo="$2" force="${3:-}"
+  # pr.yml runs on `pull_request`/`merge_group`/`workflow_dispatch`, so viewing
+  # the PR page does not start one — say what actually re-reads the status.
+  local fallback="Re-run the PR's 'Attestation' check from the Checks tab once it has reported — reloading the PR page does not re-read the sign-off status."
+  local run run_id run_status run_conclusion pr_heads head heads_short=""
+  local -a head_list=()
 
   if ! command -v gh >/dev/null 2>&1; then
     info "  Install the GitHub CLI (https://cli.github.com) so signoff can auto-refresh the 'Attestation' check."
     info "  ${fallback}"
+    return 0
+  fi
+
+  # Only refresh while $sha is still a PR head. A remote sign-off can run for
+  # hours (the job budget is 358 minutes), so the branch may have advanced
+  # underneath it — and re-running the *stale* commit's pr.yml run then cancels
+  # the current head's in-flight one: pr.yml's concurrency group is
+  # `pr-<ref_name>-<ref_name == 'trunk' && sha || 'any-sha'>`, and on a
+  # pull_request event ref_name is `<number>/merge` while the SHA term collapses
+  # to the literal `any-sha`, so every attempt for a PR shares one group whatever
+  # its commit. The re-run also keeps its original event payload, so the verdict
+  # it publishes is computed for the stale commit.
+  #
+  # Fixing it here rather than by making that group SHA-specific: the shared group
+  # is deliberate — it is what lets a new push cancel the run for the commit it
+  # superseded. A stale sign-off has nothing to propagate anyway (its status sits
+  # on a commit no longer under review), so skipping is the whole fix. See #12360.
+  #
+  # `gh --jq` (gh's built-in filter), not the jq binary: this path runs from
+  # cmd_signoff, which requires gh but not jq.
+  pr_heads=$(gh api "repos/${repo}/commits/${sha}/pulls" \
+    --jq '[.[] | select(.state == "open") | .head.sha] | join(" ")' 2>/dev/null) || pr_heads=""
+  # Empty means "no open PR yet" or "the lookup failed"; both fall through to the
+  # original behaviour, since signing off before the PR exists is ordinary and a
+  # blipped lookup is no reason to skip a refresh that would have worked. The
+  # membership test is space-delimited so a short SHA cannot partially match.
+  if [[ -n "$pr_heads" && " ${pr_heads} " != *" ${sha} "* ]]; then
+    # "not the head of any open PR", not "no longer the head of its PR": a commit
+    # can belong to several open PRs, so name every current head rather than
+    # implying there is one. `read -ra` rather than an unquoted `for` so the split
+    # cannot glob, regardless of what the API returned.
+    read -ra head_list <<<"$pr_heads"
+    for head in "${head_list[@]}"; do
+      heads_short="${heads_short:+${heads_short}, }${head:0:12}"
+    done
+    info "  ${sha:0:12} is not the head of any open PR that contains it (PR heads: ${heads_short}) — not refreshing 'Attestation'."
+    info "  Re-running this commit's check would cancel the current head's, and would report a verdict for the wrong commit."
+    info "  Sign off on the current head instead."
     return 0
   fi
 
@@ -803,10 +1194,21 @@ refresh_attestation_check() {
     return 0
   fi
   if [[ "$run_status" != "completed" ]]; then
-    info "  The 'Attestation' check (run ${run_id}) is still ${run_status} — it will evaluate the sign-off once it finishes."
+    # A run that is still going may already have read the status — the read is
+    # the first thing its job does, and validating an inherited sign-off keeps
+    # it busy long after. So "it will evaluate the sign-off once it finishes"
+    # holds only when the status it is about to report is the one we want; on
+    # the failure path an in-flight run can still land green on what it read
+    # before this verdict existed, and there is nothing to re-run yet.
+    if [[ -n "$force" ]]; then
+      info "  The 'Attestation' check (run ${run_id}) is still ${run_status} and may have read the previous sign-off already."
+      info "  Re-run it once it finishes if it lands green — this sign-off failed."
+    else
+      info "  The 'Attestation' check (run ${run_id}) is still ${run_status} — it will evaluate the sign-off once it finishes."
+    fi
     return 0
   fi
-  if [[ "$run_conclusion" == "success" ]]; then
+  if [[ "$run_conclusion" == "success" && -z "$force" ]]; then
     debug "run ${run_id} already succeeded — nothing to refresh"
     return 0
   fi
@@ -814,11 +1216,41 @@ refresh_attestation_check() {
   # Not `--failed`: that only reruns jobs with conclusion=failure and no-ops
   # on cancelled/skipped runs. Rerunning the whole run is fine here — on a
   # `pull_request` event, pr.yml executes nothing but the Attestation job.
+  local outcome="it will turn green shortly"
+  [[ -z "$force" ]] || outcome="it will pick up the failed sign-off"
   if gh run rerun "$run_id" --repo "$repo" >/dev/null 2>&1; then
-    echo "  Re-ran the 'Attestation' check (run ${run_id}) — it will turn green shortly."
+    echo "  Re-ran the 'Attestation' check (run ${run_id}) — ${outcome}."
   else
     info "  Could not auto-refresh the 'Attestation' check — ${fallback}"
   fi
+}
+
+# Post this run's failing verdict, then make the gate reflect it.
+#
+# The raw `signoff` status is not itself a required check — `Attestation` is,
+# and it only re-reads the status when its pr.yml run executes. A commit that
+# was already attested therefore keeps a green `Attestation` after a later run
+# overturns it, and the branch can still enter the merge queue on an attestation
+# this run contradicted. The merge queue re-runs the full suite, so that cannot
+# put broken code on trunk; it spends a queue slot learning what the sign-off
+# already knew. Hence the forced refresh — the inverse of the success path,
+# which is right to skip a run that already passed.
+#
+# When the post itself fails the commit still carries whatever it had before, so
+# there is nothing new for a re-run to read: warn and leave the check alone. The
+# caller aborts either way, with the more useful message.
+# `description` rather than user+elapsed: the caller already decides what the
+# failure was — an out-of-disk runner reads differently from a failing branch —
+# and the commit status is all most readers see, so that wording has to reach
+# them intact.
+post_failure_status() {
+  local repo="$1" sha="$2" description="$3"
+
+  if ! post_commit_status "$repo" "$sha" failure "$description"; then
+    info "warning: could not post the failed sign-off status — the 'Attestation' check still reflects the previous sign-off"
+    return 0
+  fi
+  refresh_attestation_check "$sha" "$repo" force
 }
 
 cmd_signoff() {
@@ -862,9 +1294,12 @@ cmd_signoff() {
     SIGNOFF_CHECK_SUMMARY="lint+test passed"
     start=$(date +%s)
     if is_remote_run; then
-      post_commit_status "$repo" "$sha" pending \
-        "Remote sign-off in progress (triggered by ${user})…" \
-        || info "warning: could not post pending sign-off status"
+      post_pending_status "$repo" "$sha" "$user"
+      # Watch for out-of-disk lines from here on, so a failure can say whether
+      # the volume or the branch was at fault. Remote only: a local run's output
+      # then stays byte-for-byte what it is today. Arming cannot fail — there is
+      # no file to create and so nothing to clean up on exit.
+      SIGNOFF_DISK_WATCH=1
     fi
     # Capture status without wrapping in `if`/`||` (those also disable set -e
     # for the LHS). run_checks uses explicit `|| return` so make failures still
@@ -875,13 +1310,18 @@ cmd_signoff() {
     set -e
     if [[ "$check_status" -ne 0 ]]; then
       elapsed=$(( $(date +%s) - start ))
+      describe_check_failure "$check_status" "$elapsed" "$user"
       if is_remote_run; then
-        post_commit_status "$repo" "$sha" failure \
-          "Sign-off checks failed after ${elapsed}s (triggered by ${user})" \
-          || true
-        append_step_summary "### Sign-off"$'\n'"**Failed** after ${elapsed}s."$'\n'
+        # An empty description means this run reached no verdict, so it has none
+        # to publish — leaving the status it posted at the start untouched. The
+        # summary still goes out: it is where an operator reads *why* the run
+        # ended without one.
+        if [[ -n "$SIGNOFF_FAILURE_STATUS_DESC" ]]; then
+          post_failure_status "$repo" "$sha" "$SIGNOFF_FAILURE_STATUS_DESC"
+        fi
+        append_step_summary "$SIGNOFF_FAILURE_SUMMARY"
       fi
-      fail "sign-off checks failed"
+      fail "$SIGNOFF_FAILURE_MESSAGE"
     fi
     elapsed=$(( $(date +%s) - start ))
     description="Signed off by ${user}${via} — ${SIGNOFF_CHECK_SUMMARY} in ${elapsed}s"
@@ -898,6 +1338,32 @@ cmd_signoff() {
   refresh_attestation_check "$sha" "$repo"
 }
 
+# Pick the current STATUS_CONTEXT state out of a combined-status payload. The
+# combined endpoint collapses each context to its latest status, so the first
+# matching entry is the current one. Prints "" when the context is unset.
+# Every reader of the sign-off status goes through this so they cannot disagree
+# about what "the current state" means (see cmd_correct_cancelled).
+combined_status_state() {
+  jq -r "first(.statuses[]? | select(.context==\"${STATUS_CONTEXT}\") | .state) // \"\"" <<<"${1}"
+}
+
+# Run the disk preflight on its own, for the workflow to call *before* the
+# toolchain setup steps.
+#
+# The guard reached through `run_checks` sits behind Rust, Nextest, sccache,
+# protoc, cc and spiceio setup, so a volume that was already below the floor
+# spent all of that first, and a volume that filled during those steps produced
+# an ordinary red job with none of the labelling (#12427). Running the same floor
+# check as the first step after checkout stops the already-full case immediately
+# and says why. It cannot catch a volume that fills mid-setup — that would need
+# the setup actions to report it — so this narrows the gap rather than closing it.
+#
+# Same floor, same `SIGNOFF_MIN_FREE_GIB` override, same remote-only fatality as
+# the in-run preflight, because it is the same function.
+cmd_preflight_disk() {
+  preflight_disk
+}
+
 cmd_status() {
   require_tools
   require_jq
@@ -910,7 +1376,7 @@ cmd_status() {
   # Fail on a real API error rather than falling back to {} → "not signed off".
   combined=$(gh api "repos/${repo}/commits/${sha}/status") \
     || fail "failed to read commit status for ${sha} on ${repo} (auth/rate-limit/network?)"
-  state=$(jq -r "first(.statuses[]? | select(.context==\"${STATUS_CONTEXT}\") | .state) // \"\"" <<<"$combined")
+  state=$(combined_status_state "$combined")
   if [[ "$state" == "success" ]]; then
     desc=$(jq -r "first(.statuses[]? | select(.context==\"${STATUS_CONTEXT}\") | .description) // \"\"" <<<"$combined")
     echo "${OK} ${sha:0:12} is signed off — ${desc}"
@@ -918,6 +1384,118 @@ cmd_status() {
     echo "${NO} ${sha:0:12} is not signed off — run: make signoff"
     exit 1
   fi
+}
+
+# Repair the sign-off status a *cancelled* Remote Sign-off run left behind.
+#
+# Usage: cmd_correct_cancelled [<sha>] [<owner/repo>]
+# Both default from the environment: the SHA from HEAD (what the cancelled run had
+# checked out, and so what it posted against), the repo from GITHUB_REPOSITORY —
+# authoritative inside Actions — falling back to the gh context for local use.
+#
+# A cancelled job is killed by signal, so `run_checks` returns non-zero under its
+# `set +e` and the script posts `signoff=failure` — "checks failed" about a branch
+# nothing actually judged. Attestation then reports a code failure that never
+# happened (#12424). `cancel-in-progress` makes that routine: every re-dispatch for
+# a branch cancels the one before it.
+#
+# But cancellation does not always mean that, so this must not write blindly
+# (#12428). Two ways a cancelled run can find a *legitimate* `success` on the SHA:
+#
+#   1. Its own `Sign off` step completed and posted success, and the cancel signal
+#      landed in the window before this correction runs.
+#   2. Another run signed the same commit off. `concurrency: signoff-<pr|branch>`
+#      keys on the dispatch input, so a `-f branch=x` run and a `-f pr_number=N`
+#      run for that same branch are in *different* groups: they do not cancel each
+#      other, and either can be cancelled after the other has succeeded.
+#
+# Overwriting either one throws away checks that genuinely passed and pushes the
+# branch back through a 1-4 hour re-dispatch. So: rewrite `failure`/`error` — the
+# only states a dying run posts — and leave everything else exactly as found.
+#
+# Best-effort by construction. This runs while a cancelled job is being torn down,
+# where the API may be unreachable and the exit status is not worth anything: it
+# must never mask the cancellation itself, so every path exits 0.
+cmd_correct_cancelled() {
+  local sha="${1:-}" repo="${2:-${GITHUB_REPOSITORY:-}}" combined state
+
+  # `|| true` on each fallback: a resolver that fails leaves the value empty, and
+  # the emptiness check below is what reports it. Splitting those into separate
+  # failure branches just duplicates the message.
+  [[ -n "$sha" ]] || sha=$(git rev-parse HEAD 2>/dev/null) || true
+  [[ -n "$sha" ]] || { info "no SHA given and HEAD is unreadable — nothing to correct."; return 0; }
+
+  command -v gh >/dev/null 2>&1 || { info "gh unavailable — leaving the ${STATUS_CONTEXT} status on ${sha} alone."; return 0; }
+  command -v jq >/dev/null 2>&1 || { info "jq unavailable — leaving the ${STATUS_CONTEXT} status on ${sha} alone."; return 0; }
+
+  [[ -n "$repo" ]] || repo=$(repo_slug 2>/dev/null) || true
+  [[ -n "$repo" ]] || { info "could not resolve the repo — leaving the ${STATUS_CONTEXT} status on ${sha} alone."; return 0; }
+
+  # A read failure must not be treated as "unset" — that would license a write over
+  # a status we simply could not see, which is the bug this command exists to fix.
+  if ! combined=$(gh api "repos/${repo}/commits/${sha}/status" 2>/dev/null); then
+    info "could not read the ${STATUS_CONTEXT} status on ${sha} — leaving it alone."
+    return 0
+  fi
+  state=$(combined_status_state "$combined" 2>/dev/null) || state=""
+
+  case "$state" in
+    failure | error)
+      # `pending` rather than `error`: pr.yml rejects failure/error but treats
+      # pending as "not signed off yet", which is exactly the state a cancelled
+      # run leaves behind. Attestation stays red — HEAD really is not signed off —
+      # but points at re-running sign-off instead of at a phantom defect.
+      if post_commit_status "$repo" "$sha" pending \
+        "Remote sign-off was cancelled (superseded or stopped) — no checks failed. HEAD is not signed off; re-dispatch." \
+        2>/dev/null; then
+        echo "${OK} Reset ${STATUS_CONTEXT}=${state} on ${sha:0:12} to pending — this run was cancelled, not failed."
+      else
+        info "could not reset the ${STATUS_CONTEXT} status on ${sha} — leaving it as ${state}."
+      fi
+      ;;
+    *)
+      echo "${STATUS_CONTEXT} on ${sha:0:12} is '${state:-unset}', not a failure this run posted — leaving it alone."
+      ;;
+  esac
+  return 0
+}
+
+# Replace a `pending` sign-off status with a failure.
+#
+# A remote run posts `pending` before it starts the checks, so a run that never
+# reaches a verdict — the job is terminated at its budget, the runner goes away —
+# leaves that `pending` on the commit for good. `status` and `mine` then render
+# the branch as a sign-off still in progress, which is the one thing it is not.
+#
+# Only `pending` is replaced. A run that finished has already posted its own
+# success or failure, and overwriting that would discard the real verdict; the
+# same guard makes this safe to run unconditionally at the end of a job.
+#
+# Read-then-write, and commit statuses have no compare-and-set, so a verdict
+# posted in the gap between the two calls is overwritten. Nothing closes that
+# gap — an ownership token in the status would still be read before the write —
+# so keep it narrow instead: this is one API round trip, and the caller runs it
+# once, at the end of a run that has already stopped working.
+cmd_clear_pending() {
+  local reason="${1:-Sign-off run ended before the checks completed — sign off again}"
+  require_tools
+
+  local revision sha repo state
+  revision=$(current_revision true)
+  sha=$(revision_sha "$revision") || fail "could not resolve ${revision}"
+  repo=$(repo_slug)
+  state=$(signoff_state "$repo" "$sha") \
+    || fail "failed to read commit status for ${sha} on ${repo} (auth/rate-limit/network?)"
+
+  if [[ "$state" != "pending" ]]; then
+    info "${STATUS_CONTEXT} on ${sha:0:12} is '${state}' — leaving it alone"
+    return 0
+  fi
+
+  post_commit_status "$repo" "$sha" failure "$reason" \
+    || fail "failed to post the sign-off status (do you have write access to ${repo}?)"
+  append_step_summary "### Sign-off"$'\n'"**Incomplete** on \`${sha:0:12}\` — ${reason}"$'\n'
+  echo "${NO} ${sha:0:12} — ${reason}"
 }
 
 # Truncate to at most `n` display columns, adding an ellipsis when cut.
@@ -937,16 +1515,30 @@ truncate_str() {
 # its current tip, since the workflow checks out the ref live); otherwise
 # `run_id`, if set, is the most recent *failed* run for a `failure`/`error`
 # state, so you can jump straight to its logs instead of re-triggering blind.
+# `in_queue`=1 means GitHub's merge queue already holds an entry for this PR —
+# distinguished from a plain attested-and-waiting PR by color, since both show
+# the same checkmark glyph. `review_decision`/`is_draft` drive a review-status
+# column: "draft" (not reviewable yet), "changes" (CHANGES_REQUESTED),
+# "needs review" (no approval yet), or "ready to merge" (approved, attested,
+# and not already queued — queued PRs leave the column blank, since the
+# checkmark color already says "already merging").
 print_pr_row() {
-  local number="$1" title="$2" state="$3" run_id="$4" running="$5" width="$6"
-  local icon room run_col run_color
+  local number="$1" title="$2" state="$3" run_id="$4" running="$5" width="$6" \
+    in_queue="$7" review_decision="$8" is_draft="$9"
+  local icon room run_col run_color review_col
 
   if [[ "$running" == "1" ]]; then
     icon="${C_YELLOW}⟳${C_RESET}"
     run_color="$C_YELLOW"
   else
     case "$state" in
-      success)       icon="${C_GREEN}${OK}${C_RESET}" ;;
+      success)
+        if [[ "$in_queue" == "1" ]]; then
+          icon="${C_CYAN}${OK}${C_RESET}"  # attested and already in the merge queue
+        else
+          icon="${C_GREEN}${OK}${C_RESET}"
+        fi
+        ;;
       pending)       icon="${C_YELLOW}…${C_RESET}" ;;
       failure|error) icon="${C_RED}${NO}${C_RESET}" ;;   # a sign-off attempt ran and failed
       *)             icon="${C_DIM}○${C_RESET}" ;;       # none: never attempted
@@ -960,9 +1552,38 @@ print_pr_row() {
     run_col="$(printf '%-12s' '')"
   fi
 
-  room=$(( width - 22 ))  # icon(1) + space + "#NNNNN"(6) + space + run id(12) + 2 spaces
+  if [[ "$is_draft" == "1" ]]; then
+    review_col="${C_DIM}$(printf '%-14s' 'draft')${C_RESET}"
+  elif [[ "$review_decision" == "CHANGES_REQUESTED" ]]; then
+    review_col="${C_RED}$(printf '%-14s' 'changes')${C_RESET}"
+  elif [[ "$review_decision" != "APPROVED" ]]; then
+    review_col="${C_YELLOW}$(printf '%-14s' 'needs review')${C_RESET}"
+  elif [[ "$state" == "success" && "$in_queue" != "1" ]]; then
+    review_col="${C_GREEN}${C_BOLD}$(printf '%-14s' 'ready to merge')${C_RESET}"
+  else
+    review_col="$(printf '%-14s' '')"
+  fi
+
+  room=$(( width - 37 ))  # icon(1) + space + "#NNNNN"(6) + space + run id(12) + review(14) + 3 spaces
   (( room < 20 )) && room=20
-  printf '%s %-6s %s %s\n' "$icon" "#${number}" "$run_col" "$(truncate_str "$title" "$room")"
+  printf '%s %-6s %s %s %s\n' "$icon" "#${number}" "$run_col" "$review_col" "$(truncate_str "$title" "$room")"
+}
+
+# Batched GraphQL lookup of merge-queue membership and review status for a set
+# of PR numbers, one round trip for all of them via aliases (a REST call per
+# PR would be N+1). `reviewDecision` reflects the trunk ruleset's required
+# approving review (currently 1, see docs/dev/ci_signoff.md) — null/empty when
+# GitHub hasn't computed a decision yet, which we treat like REVIEW_REQUIRED.
+# Returns `{}` on any failure so callers degrade to "not queued, needs review".
+fetch_merge_queue_status() {
+  local repo="$1" numbers="$2"
+  local owner name fields query
+  owner="${repo%%/*}"
+  name="${repo#*/}"
+  fields=$(jq -r '[.[] | "pr\(.): pullRequest(number: \(.)) { isInMergeQueue reviewDecision isDraft }"] | join("\n")' <<<"$numbers")
+  [[ -n "$fields" ]] || { echo '{}'; return; }
+  query="query(\$owner:String!,\$name:String!){repository(owner:\$owner,name:\$name){${fields}}}"
+  gh api graphql -f query="$query" -f owner="$owner" -f name="$name" 2>/dev/null || echo '{}'
 }
 
 # List the sign-off/attestation status of every open PR authored by the
@@ -994,13 +1615,17 @@ cmd_mine() {
   remote_runs=$(gh run list --repo "$repo" --workflow signoff.yml \
     --json displayTitle,status,conclusion,databaseId --limit 50) || remote_runs="[]"
 
+  # Fetch merge-queue membership once for all PRs, not once per PR.
+  local mq_status
+  mq_status=$(fetch_merge_queue_status "$repo" "$(jq '[.[].number]' <<<"$prs")")
+
   local width
   width=$(tput cols 2>/dev/null) || width=100
 
   echo "${C_BOLD}${repo}${C_RESET} — ${count} open PR(s)"
   echo
 
-  local i pr number title branch sha combined state run_id running
+  local i pr number title branch sha combined state run_id running in_queue review_decision is_draft
   for ((i = 0; i < count; i++)); do
     pr=$(jq -c ".[$i]" <<<"$prs")
     number=$(jq -r '.number' <<<"$pr")
@@ -1009,7 +1634,8 @@ cmd_mine() {
     sha=$(jq -r '.headRefOid' <<<"$pr")
 
     combined=$(gh api "repos/${repo}/commits/${sha}/status" 2>/dev/null) || combined='{}'
-    state=$(jq -r "first(.statuses[]? | select(.context==\"${STATUS_CONTEXT}\") | .state) // \"none\"" <<<"$combined")
+    state=$(combined_status_state "$combined")
+    state="${state:-none}"
 
     running=0
     run_id=$(jq -r --arg title "Remote Sign-off (${branch})" \
@@ -1025,11 +1651,19 @@ cmd_mine() {
         <<<"$remote_runs")
     fi
 
-    print_pr_row "$number" "$title" "$state" "$run_id" "$running" "$width"
+    in_queue=0
+    [[ "$(jq -r ".data.repository.pr${number}.isInMergeQueue // false" <<<"$mq_status")" == "true" ]] && in_queue=1
+    review_decision=$(jq -r ".data.repository.pr${number}.reviewDecision // \"\"" <<<"$mq_status")
+    is_draft=0
+    [[ "$(jq -r ".data.repository.pr${number}.isDraft // false" <<<"$mq_status")" == "true" ]] && is_draft=1
+
+    print_pr_row "$number" "$title" "$state" "$run_id" "$running" "$width" \
+      "$in_queue" "$review_decision" "$is_draft"
   done
 
   echo
-  echo "${C_DIM}○ not attested   ${NO} attestation failed   … pending   ⟳ remote sign-off running   ${OK} attested${C_RESET}"
+  echo "${C_DIM}○ not attested   ${NO} attestation failed   … pending   ⟳ remote sign-off running   ${OK} attested, awaiting queue   ${C_CYAN}${OK}${C_DIM} in merge queue${C_RESET}"
+  echo "${C_DIM}draft   ${C_RED}changes${C_DIM} requested   ${C_YELLOW}needs review${C_DIM}   ${C_GREEN}${C_BOLD}ready to merge${C_RESET}"
   echo "${C_DIM}Sign off with: make signoff  (or: scripts/signoff remote)${C_RESET}"
 }
 
@@ -1200,6 +1834,20 @@ Developers:
   scripts/signoff --no-verify  Sign off without running checks (honor system)
   scripts/signoff status       Show the sign-off status of HEAD
   scripts/signoff mine         Show attestation status for all your open PRs
+  scripts/signoff clear-pending [reason]
+                               Replace a left-behind '${STATUS_CONTEXT}' pending status
+                               on HEAD with a failure (no-op for any other state)
+
+CI (.github/workflows/signoff.yml):
+  scripts/signoff correct-cancelled [<sha>] [<owner/repo>]
+                               Repair the status a cancelled run left behind:
+                               rewrite '${STATUS_CONTEXT}=failure'/'error' to pending,
+                               and leave any other state (notably success) alone
+
+  scripts/signoff preflight-disk
+                               Check the work volume against the ${DEFAULT_MIN_FREE_GIB} GiB floor
+                               before the toolchain setup steps run; fatal only
+                               on a remote run (override: SIGNOFF_MIN_FREE_GIB)
 
 Maintainers:
   scripts/signoff check        Show whether '${TARGET_BRANCH}' requires sign-off
@@ -1244,6 +1892,9 @@ main() {
     remote)   shift; cmd_remote "$@" ;;
     status)   shift; cmd_status "$@" ;;
     mine)     shift; cmd_mine "$@" ;;
+    correct-cancelled) shift; cmd_correct_cancelled "$@" ;;
+    clear-pending) shift; cmd_clear_pending "$@" ;;
+    preflight-disk) shift; cmd_preflight_disk "$@" ;;
     check)    shift; cmd_check "$@" ;;
     install)  shift; cmd_install "$@" ;;
     version|--version) echo "signoff ${VERSION}" ;;
@@ -1252,4 +1903,11 @@ main() {
   esac
 }
 
-main "$@"
+# Only dispatch when executed. The unit tests source this file to call
+# individual functions, and sourcing must not run a command. BASH_SOURCE is unset
+# when the script's *contents* are fed to bash (`bash -c "$(cat …)"`, a piped
+# download), which `set -u` would abort on — default it to $0, which dispatches,
+# since that invocation means to run the thing.
+if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
+  main "$@"
+fi

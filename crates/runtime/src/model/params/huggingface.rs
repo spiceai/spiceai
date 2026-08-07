@@ -35,11 +35,11 @@ pub(crate) const HF_PARAMETERS: [ParameterSpec; HF_PARAM_LEN] = [
         .description("Customizes the transformation of OpenAI chat messages into a character stream for the model."),
     ParameterSpec::component("token").description("The Huggingface access token."),
     ParameterSpec::runtime("distributed_backend")
-        .description("Run the model tensor-parallel across multiple nodes (a Spice enterprise feature; standard builds are single-node only). Set to 'ring' to pool the model over the `nodes` list (the 'ring' backend currently supports exactly 2 nodes); omit or 'none' for single-node.")
+        .description("Run the model tensor-parallel across multiple nodes (a Spice enterprise feature; standard builds are single-node only). Set to 'ring' to pool the model over the `nodes` list; omit or 'none' for single-node.")
         .default("none")
-        .one_of(&["none", "ring"]),
+        .one_of_ignore_ascii_case(&["none", "ring"]),
     ParameterSpec::runtime("node_rank")
         .description("This node's 0-indexed rank in the distributed `nodes` list. Rank 0 is the head and serves the API; other ranks are compute replicas."),
     ParameterSpec::runtime("nodes")
-        .description("Comma-separated, rank-ordered node addresses for distributed inference (e.g. '10.0.0.1,10.0.0.2'). Identical on every node; only `node_rank` differs. The node count (world size) must be a power of two; the 'ring' backend requires exactly 2."),
+        .description("Comma-separated, rank-ordered node addresses for distributed inference (e.g. '10.0.0.1,10.0.0.2,10.0.0.3'). Identical on every node; only `node_rank` differs. Two or more nodes. Whether a given model can be split across that many nodes depends on the model and is reported when it loads."),
 ];

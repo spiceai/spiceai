@@ -29,18 +29,70 @@ use std::sync::Arc;
 use arrow::datatypes::{FieldRef, Schema, SchemaRef};
 use arrow_tools::schema_evolution::WideningPlan;
 use datafusion::common::{Constraint, Constraints};
+use opentelemetry::KeyValue;
 
-use crate::component::dataset::{
-    Dataset, OnSchemaChange,
+use crate::dataset::{
+    DatasetSpec, OnSchemaChange,
     acceleration::{Acceleration, Engine, Mode, RefreshMode},
 };
 
-// Schema-evolution metrics + label helpers are shared with the CDC apply loop;
-// re-export them so registration-path callers have a single import path.
-pub(crate) use crate::accelerated_table::refresh_task::changes::{
-    SCHEMA_EVOLUTION_APPLIED, SCHEMA_EVOLUTION_DETECTED, SCHEMA_EVOLUTION_FAILED,
-    schema_evolution_labels, widening_plan_kind,
-};
+static SCHEMA_EVOLUTION_METER: std::sync::LazyLock<opentelemetry::metrics::Meter> =
+    std::sync::LazyLock::new(|| opentelemetry::global::meter("schema_evolution"));
+
+pub static SCHEMA_EVOLUTION_DETECTED: std::sync::LazyLock<opentelemetry::metrics::Counter<u64>> =
+    std::sync::LazyLock::new(|| {
+        SCHEMA_EVOLUTION_METER
+        .u64_counter("schema_evolution_detected")
+        .with_description(
+            "Schema changes detected between an incoming source schema and the stored/accelerator schema.",
+        )
+        .build()
+    });
+
+pub static SCHEMA_EVOLUTION_APPLIED: std::sync::LazyLock<opentelemetry::metrics::Counter<u64>> =
+    std::sync::LazyLock::new(|| {
+        SCHEMA_EVOLUTION_METER
+            .u64_counter("schema_evolution_applied")
+            .with_description(
+                "Schema evolutions applied to the accelerator or cached source schema.",
+            )
+            .build()
+    });
+
+pub static SCHEMA_EVOLUTION_FAILED: std::sync::LazyLock<opentelemetry::metrics::Counter<u64>> =
+    std::sync::LazyLock::new(|| {
+        SCHEMA_EVOLUTION_METER
+        .u64_counter("schema_evolution_failed")
+        .with_description(
+            "Schema changes that were not applied: incompatible, blocked by policy, or requiring a restart.",
+        )
+        .build()
+    });
+
+#[must_use]
+pub fn schema_evolution_labels(
+    dataset: &str,
+    kind: &'static str,
+    action: &'static str,
+) -> [KeyValue; 3] {
+    [
+        KeyValue::new("dataset", dataset.to_string()),
+        KeyValue::new("kind", kind),
+        KeyValue::new("action", action),
+    ]
+}
+
+/// Dominant change kind of a widening plan for the `kind` metric label.
+#[must_use]
+pub fn widening_plan_kind(plan: &WideningPlan) -> &'static str {
+    if !plan.widened_columns.is_empty() {
+        "widened_types"
+    } else if !plan.relaxed_nullability.is_empty() {
+        "nullability"
+    } else {
+        "added_columns"
+    }
+}
 
 /// `on_schema_change` evolution-set gate: `append_new_columns` evolves
 /// added-nullable-columns-only plans; `sync_all_columns` evolves the full
@@ -69,7 +121,7 @@ pub fn policy_recreates_on_incompatible(policy: OnSchemaChange) -> bool {
     matches!(policy, OnSchemaChange::DropAndRecreate)
 }
 
-/// Engines with a v1 [`crate::dataaccelerator::DataAccelerator::evolve_table_schema`]
+/// Engines with a v1 [`data_accelerator_api::DataAccelerator::evolve_table_schema`]
 /// implementation. Partitioned engines are excluded: each partition table would
 /// need the DDL and the partition provider pins its schema. Arrow (memory-only)
 /// and Postgres rely on the trait default and degrade to block-equivalent.
@@ -81,7 +133,7 @@ pub fn engine_supports_in_place_evolution(engine: Engine) -> bool {
     )
 }
 
-/// Engines whose [`crate::dataaccelerator::DataAccelerator::drop_table`] actually drops the
+/// Engines whose [`data_accelerator_api::DataAccelerator::drop_table`] actually drops the
 /// stored table, so the accelerated table can be dropped and recreated with a new schema (the
 /// `on_schema_change: drop_and_recreate` path). Today this is exactly the in-place-evolution
 /// set: the four engines with a real `drop_table` (DuckDB/SQLite/Turso/Cayenne) are the same
@@ -152,7 +204,7 @@ pub fn emit_schema_evolution_event(dataset_name: &str, action: &str, change: &st
 /// because engines persist typed key encodings.
 #[must_use]
 pub fn dataset_constraint_columns(
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     provider_constraints: Option<&Constraints>,
     provider_schema: &Schema,
 ) -> Vec<String> {

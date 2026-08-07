@@ -73,6 +73,10 @@ Steps 1-2 exist to fail fast: a lint or test failure in the crate you edited is
 the likeliest outcome, and step 3 is by far the longest, so covering your own
 crates first turns a late failure into an early one.
 `SIGNOFF_SKIP_TARGETED_LINT=1` and `SIGNOFF_SKIP_TARGETED_TESTS=1` opt out.
+Remote sign-off sets both: fail-fast is worth an extra resolve of the changed
+crates' graph only while someone is watching the output, and nobody watches a
+self-hosted runner — dispatch `signoff.yml` with `run_targeted_prechecks=true`
+to get them back.
 
 **The scoped steps build each crate the way the workspace builds it.** The
 features come from a `cargo metadata` resolve of the whole workspace,
@@ -101,6 +105,22 @@ first CI run — or the rerun call fails, it falls back to prompting you to
 open/refresh the PR yourself.) That, together with a review, lets a
 maintainer add the PR to the merge queue.
 
+The refresh only fires while the commit it signed off is **still the head of an open
+PR**. If you pushed while a long sign-off was running, it says so, names the heads
+of every open PR that contains the commit, and refreshes nothing:
+
+```
+  1111111111aa is not the head of any open PR that contains it (PR heads: 2222222222bb) — not refreshing 'Attestation'.
+```
+
+That is deliberate. `pr.yml`'s concurrency group resolves its SHA term to the
+literal `any-sha` on a `pull_request` event, so every attempt for a PR shares one
+group — re-running the old commit's run would cancel the current head's in-flight
+one, and a re-run evaluates its *original* event payload, so the verdict it
+published would be for the superseded commit. The stale sign-off had nothing to
+propagate anyway (its status is on a commit no longer under review), so skipping
+loses nothing. Sign off again on the new head.
+
 The sign-off is normally bound to the **exact commit** you pushed. If you push a
 code change, the old sign-off no longer applies and you must run `make signoff`
 again. The only exception is merging the PR's base branch. **Attestation** walks
@@ -112,6 +132,14 @@ amended merge, octopus merge, or merge from another branch still requires a new
 sign-off.
 `scripts/signoff status` reports only a commit's own status; the inheritance
 check runs in the PR's **Attestation** workflow.
+
+A sign-off that **failed** on `HEAD` disqualifies that commit. **Attestation**
+rejects it before anything else, so an earlier sign-off cannot be inherited past
+it and the fast-track paths below cannot route around it: a merge of the base
+can be textually clean and still be semantically broken, and a sign-off run
+against the merge is exactly what finds that out. Fix what it reported and run
+`make signoff` again — the new status replaces the failed one. A `pending`
+status is not a verdict and does not block inheritance.
 
 ### Reverts are fast-tracked
 
@@ -230,17 +258,112 @@ corrupts the measurement.
 
 The Actions workflow:
 
+0. Resolves the dispatch input to a commit, in a small GitHub-hosted `resolve`
+   job, so the sign-off job can key its concurrency group on that commit
 1. Checks out your branch (full history) and fetches `trunk`
-2. Target-lints crates touched by the branch vs `trunk` (GitHub compare API as a
-   fallback when merge-base isn't available), or skips Rust checks when the
-   branch has no Rust-affecting files
+2. Skips Rust checks when the branch has no Rust-affecting files. The targeted
+   pre-lint and unit tests are off here (`run_targeted_prechecks` turns them on,
+   with the GitHub compare API as a fallback when merge-base isn't available)
 3. Runs full `make lint-rust` + `make build-cli-dev nextest` when Rust is affected
-4. Posts pending → success/failure `signoff` statuses, then re-runs
-   **Attestation** if needed
+4. Posts pending → success/failure `signoff` statuses (skipping the pending when
+   the commit is already signed off), then re-runs **Attestation** if needed
+
+The checks run under a 353-minute budget, inside a 358-minute job budget, so a
+run that overruns fails as a failed step rather than being terminated at the
+runner pool's ~360-minute wall (which reports as `cancelled`, with no failed
+step and no chance to clean up). A run that ends without a verdict — budget
+expired, evicted by a re-dispatch, cancelled — replaces its own `pending` status
+with a failure; otherwise `scripts/signoff status` and `scripts/signoff mine`
+would keep showing a sign-off in progress for a run that is long gone.
+Re-dispatch against the same HEAD to try again.
+
+That replacement is the workflow's job, not the dying script's. Being signalled is
+how a run learns its budget expired: `run_checks` returns `make`'s status and bash
+reports a killed child as 128+N, so the script classifies that as reaching **no
+verdict** and publishes nothing at all, saying why in its step summary. Treating it
+as a check result instead would assert a code failure nothing established — on a
+suite the log shows still passing, and over a `signoff=success` an earlier run may
+already have earned ([#12518](https://github.com/spiceai/spiceai/issues/12518),
+[#12520](https://github.com/spiceai/spiceai/issues/12520)). Declining to write is
+what leaves the `pending` for `Resolve an incomplete sign-off` to describe honestly,
+and leaves an existing success alone. The correction handlers cannot cover this case
+after the fact: both are gated on `cancelled()`, and a budget expiry is a *failed*
+step by the design above.
+
+Only one sign-off runs per commit. Both dispatch forms — `-f branch=<branch>` and
+`-f pr_number=<N>` — resolve to the same commit before the sign-off job starts,
+and its concurrency group is keyed on that commit, so a second dispatch for a
+commit already being signed off evicts the first rather than duplicating 1-4
+hours of identical work and racing it for the `signoff` status (#12472). Two open
+PRs that happen to share a head commit collapse into one run for the same reason.
+Dispatching after the branch tip has *moved* is a different commit, so it starts
+a fresh run (and the branch-keyed group evicts the run on the stale commit).
+
+Re-dispatching against a HEAD that is *already* signed off leaves that success in
+place: the run skips the in-progress `pending` and only replaces the status once
+it has a verdict of its own, so a run that never finishes cannot cost you an
+attestation. `mine` still shows ⟳ while it runs — that comes from the run list,
+not the commit status.
+
+A re-dispatch that *does* fail posts `signoff=failure` and then re-runs
+**Attestation** so the required check reflects that verdict. The status alone
+would not close the gate — **Attestation** is the required check and `pr.yml`
+does not run on commit-status changes — so the failure path forces the re-run
+even when the check is already green, which is the one case the success path
+deliberately skips. If the status post itself fails, the run says so and leaves
+**Attestation** showing the previous sign-off; re-dispatch or push to move it.
+
+Two cases the re-run cannot cover, both reported by the run rather than hidden:
+an **Attestation** run that is still in flight may already have read the status
+this verdict replaced, so it can finish green and needs re-running by hand; and
+a HEAD that only merges the base branch can *inherit* an earlier sign-off, which
+the failing status on HEAD does not veto ([#12357](https://github.com/spiceai/spiceai/issues/12357)).
+
+A branch whose sign-off keeps running out of budget is contending for the pool
+rather than doing anything wrong. `-f skip_targeted_lint=true` drops the
+branch-scoped pre-lint, which trades fail-fast feedback for a shorter run.
 
 Requires write access to the repository (same as local sign-off — fork
 contributors still need a maintainer to sign off). The lab SSH path also needs
 SSH key access to the host and `gh` auth on that machine.
+
+### A cancelled Remote Sign-off is not a failed one
+
+`signoff.yml` sets `concurrency: signoff-<pr|branch>` with `cancel-in-progress`, so
+re-dispatching sign-off for a branch cancels the run before it. A cancelled job is
+killed by signal, which makes the in-flight `run_checks` return non-zero — and the
+dying script posts `signoff=failure`, "Sign-off checks failed after Ns", about a
+branch nothing actually judged.
+
+So the workflow corrects the record on its way out. When the job ends cancelled it
+runs:
+
+```bash
+scripts/signoff correct-cancelled [<sha>] [<owner/repo>]
+```
+
+which rewrites the status to `pending` — not `success`, because HEAD really is not
+signed off, and not `error`, because `pending` is the state Attestation already
+describes as "re-dispatch sign-off" rather than as a defect in the diff.
+
+**It rewrites only `failure` and `error`.** A cancelled run can find a legitimate
+`success` on the commit two ways, and overwriting either would throw away checks
+that passed and cost another 1-4 hour run:
+
+- Its own `Sign off` step completed, and the cancel signal landed in the window
+  before the correction ran.
+- A second run signed the same commit off. The concurrency group keys on the
+  dispatch *input*, so `-f branch=my-branch` and `-f pr_number=123` for that same
+  branch are different groups: they do not cancel each other, and either can be
+  cancelled after the other has succeeded.
+
+A read failure is likewise not treated as "no status" — that would license the
+overwrite the guard exists to prevent. Every path exits 0, so the correction can
+never add a second failure to a job that was already cancelled.
+
+If you see `signoff=pending` with "Remote sign-off was cancelled", nothing is
+wrong with the branch: dispatch sign-off again. `scripts/test_signoff_cancelled_correction.sh`
+covers both directions.
 
 ### Jujutsu workspaces
 
@@ -273,6 +396,60 @@ base merges on the first-parent chain. Make sure the commit under review is
 pushed, then run `make signoff` again. Any new code or manual merge resolution
 needs a fresh sign-off.
 
+### "Runner out of disk — checks did not complete"
+
+The sign-off runner's work volume filled up, so the run stopped before finishing
+its judgement of your branch. **Re-dispatch it.** If it recurs on the same
+runner, that machine needs space reclaimed — `target/` is shared across every
+branch that pool signs off, so it grows without bound. If instead it follows
+*your branch* from runner to runner, suspect the diff: a new build script,
+a dependency bump, or a feature expansion can consume the volume by itself.
+
+Sign-off refuses to start when the volume has less than 25 GiB free, and a run
+whose build reports running out of disk is reported as an infrastructure failure
+rather than a check failure. Without that, the failure is nearly impossible to
+read correctly: the linker dies with `errno=28` thousands of lines after nextest
+has already reported every test passing, on a crate the branch never touched,
+with no `-->` source pointer anywhere in the log.
+
+The floor is checked twice: once as the job's first step after checkout
+(`scripts/signoff preflight-disk`), so an already-full runner is turned away
+before the toolchain setup rather than after it, and again inside the run. A stop
+at the early step has no commit status to explain itself — the `pending` status is
+posted later — so it annotates the run instead.
+
+A remote run watches its own build output for that error, and a watched run's
+verdict is final **in both directions**. It has to be: by the time anything
+measures free space again, cargo has unlinked the partial binaries it was
+writing and the volume can look healthy — and conversely, on a shared pool
+another run can drag the volume under any threshold while your branch is failing
+for its own reasons. Measured free space is consulted only when nothing watched,
+which is how a local run gets a classification at all. The verdict resets per
+build step, so only the step that actually failed speaks.
+
+"Final in both directions" applies only to a watcher that actually reported. The
+watcher exits with a reserved status to say it saw the error, so a watcher that
+exits any *other* non-zero way — no `awk` on the runner, a signal — is a watcher
+that reached no verdict rather than one that saw nothing. That disarms the watch
+and hands classification back to the free-space backstop; treating its silence as
+"not disk" would blame the branch for the volume just as surely as the unwritable
+marker did.
+
+Classification has a third answer, ranked above both disk signals: a run that was
+*signalled* judged nothing at all, where the two disk cases both describe a `make`
+that returned. That ordering matters when a budget expires on a tight volume —
+calling it disk would send you to reclaim space that was never the problem. See
+the budget paragraph above for what a signalled run publishes.
+
+The watch keeps its answer in a shell variable, not a file. Recording it on disk
+needed an allocation at the one moment allocation is failing — and on macOS
+`$TMPDIR` and the workspace are usually the same APFS container, so there was no
+reliably writable place to put it. An unwritable marker read as "not a disk
+failure", which blamed the branch for the volume.
+
+Set `SIGNOFF_MIN_FREE_GIB` to change the floor. Locally both checks only warn and
+the output is not watched — your own disk is yours to manage.
+
 ### External contributors (forks)
 
 Posting a commit status requires write access to this repository, so
@@ -288,7 +465,7 @@ merge queue is still the real gate.
 | Stage | Trigger | Checks |
 | --- | --- | --- |
 | Local | `make signoff` | skip Rust if no Rust-affecting files in the branch diff; else targeted `make lint-rust PACKAGES=… FEATURES=…` + `make nextest-packages PACKAGES=… FEATURES=…` (features from the workspace resolve), full `make lint-rust`, `make build-cli-dev nextest` |
-| Remote | `make signoff-remote` | same checks via the self-hosted `signoff.yml` workflow; posts `signoff` |
+| Remote | `make signoff-remote` | the same checks via the self-hosted `signoff.yml` workflow, without the targeted pre-checks (`run_targeted_prechecks=true` restores them); posts `signoff` |
 | Pull request | `pull_request` | **Attestation** (validates the sign-off, or auto-passes a branch with no Rust-affecting files, a pure revert, or a single-commit Dependabot bump) + PR hygiene; merge-queue check names report lightweight skipped/passthrough results |
 | Merge queue | `merge_group` | the full required suite (below) + advisory niche checks |
 
