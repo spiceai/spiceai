@@ -803,4 +803,26 @@ mod tests {
             .expect("should succeed");
         assert_eq!(assignments[0].0, "qty");
     }
+
+    #[test]
+    fn test_assignment_value_expression_is_preserved() {
+        // The second element of each pair is the SET right-hand side, rendered
+        // back to SQL and handed to `build_local_merge_plan_input` as the
+        // expression to evaluate. A compound expression must survive intact,
+        // and the pairs must stay in the order they were written.
+        let stmt = parse_merge(
+            "MERGE INTO target AS t USING source AS s ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET name = s.name, value = s.value + 1",
+        );
+        let (_, clauses) = extract_on_and_clauses(stmt);
+        let assignments = validate_and_extract_assignments(&clauses[0], "target", Some("t"))
+            .expect("should succeed");
+        assert_eq!(
+            assignments,
+            vec![
+                ("name".to_string(), "s.name".to_string()),
+                ("value".to_string(), "s.value + 1".to_string()),
+            ]
+        );
+    }
 }
