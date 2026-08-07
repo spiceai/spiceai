@@ -559,6 +559,7 @@ pub(crate) async fn acquire_identity(
         ca_bundle_pem: outcome.ca_bundle_pem,
         gateway_addr: outcome.gateway_addr,
         not_after_unix: Some(outcome.not_after_unix),
+        app_id: None,
         enc_private_key_pem: material.enc_private_key_pem,
         enc_public_key_pem: material.enc_public_key_pem,
         // A fresh enrollment has no prior key to retain.
@@ -920,6 +921,7 @@ mod tests {
             runtime_version: "v0-test".to_string(),
             heartbeat_interval: Duration::from_secs(30),
             telemetry_interval: Duration::from_mins(1),
+            metrics_interval: Duration::from_secs(30),
             renewal_lead: Duration::from_hours(12),
         }
     }

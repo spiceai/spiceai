@@ -555,7 +555,8 @@ async fn spawn_gateway(server: GatewayServer, ca: &TestCa) -> SocketAddr {
 
 #[derive(Default)]
 struct E2eRuntimeState {
-    applied_spicepod: Option<(std::path::PathBuf, String)>,
+    /// The path, spicepod, and app id of the last apply.
+    applied_spicepod: Option<(std::path::PathBuf, String, Option<String>)>,
     /// Names of the secrets delivered with the last applied spicepod, never
     /// values. `None` when the deployment carried no payload at all.
     delivered_secret_names: Option<Vec<String>>,
@@ -616,7 +617,11 @@ impl RuntimeHandle for E2eRuntime {
             .await
             .map_err(|e| CommandError::failed(e.to_string()))?;
         self.state.lock().await.applied_spicepod =
-            Some((path.clone(), deployment.spicepod_yaml.to_string()));
+            Some((
+                path.clone(),
+                deployment.spicepod_yaml.to_string(),
+                deployment.app_id.map(str::to_string),
+            ));
         Ok(ApplyOutcome::exit_to_apply(serde_json::json!({
             "path": path.display().to_string(),
             "applied": true,
@@ -694,6 +699,7 @@ impl Harness {
             // the periodic frame paths.
             heartbeat_interval: Duration::from_millis(150),
             telemetry_interval: Duration::from_millis(250),
+            metrics_interval: Duration::from_millis(200),
             renewal_lead,
         }
     }
@@ -1448,6 +1454,7 @@ async fn apply_spicepod_delivers_double_sealed_secrets() {
                 enc: outer_sealed.enc,
                 ciphertext: outer_sealed.ciphertext,
             }),
+            app_id: "4002".to_string(),
         }),
     ));
 
@@ -1524,6 +1531,7 @@ async fn apply_spicepod_refuses_an_unopenable_payload() {
                 enc: vec![0_u8; 32],
                 ciphertext: vec![0_u8; 64],
             }),
+            app_id: String::new(),
         }),
     ));
 
@@ -1571,6 +1579,7 @@ async fn apply_spicepod_persists_then_exits_to_restart() {
         proto::control_message::Body::ApplySpicepod(proto::ApplySpicepod {
             spicepod_yaml: yaml.to_string(),
             sealed_secret_payload: None,
+            app_id: "4002".to_string(),
         }),
     ));
 
@@ -1615,7 +1624,7 @@ async fn apply_spicepod_persists_then_exits_to_restart() {
 
     // The runtime persisted the YAML to the canonical cloud-managed path, which
     // is what the restart comes back up on.
-    let (path, written) = rt_state
+    let (path, written, app_id) = rt_state
         .lock()
         .await
         .applied_spicepod
@@ -1623,6 +1632,9 @@ async fn apply_spicepod_persists_then_exits_to_restart() {
         .expect("spicepod applied");
     assert_eq!(written, yaml);
     assert!(path.exists(), "spicepod file must be on disk");
+    // The app id rides the deploy: it is the only way the runtime learns which
+    // app to attribute its metrics to, and it exports none until it has one.
+    assert_eq!(app_id.as_deref(), Some("4002"));
 
     handle.shutdown().await;
 }
