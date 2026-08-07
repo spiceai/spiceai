@@ -1,19 +1,21 @@
 version: v1
 kind: Spicepod
-name: hf[all-minilm-l6-v2]-arrow
+name: model2vec[potion-multilingual-128M]-duckdb[file]
 datasets:
 
-  # MTEB Quora Retrieval dataset files (*.parquet) are automatically downloaded by the test operator.
-  # https://huggingface.co/datasets/mteb/QuoraRetrieval_test_top_250_only_w_correct-v2/tree/main
+  # MTEB Touche-2020 Retrieval dataset files (*.parquet) are automatically downloaded by the test operator.
+  # https://huggingface.co/datasets/mteb/touche2020
 
   - from: file:./corpus.parquet
     name: corpus
     acceleration:
       enabled: true
+      engine: duckdb
+      mode: file
     columns:
       - name: text
         embeddings:
-          - from: minilm_embed
+          - from: potion
             row_id:
               - _id
 
@@ -28,7 +30,5 @@ datasets:
       enabled: true
 
 embeddings:
-  - from: huggingface:huggingface.co/sentence-transformers/all-MiniLM-L6-v2
-    name: minilm_embed
-    params:
-      truncate: END
+  - from: model2vec:minishlab/potion-multilingual-128M
+    name: potion

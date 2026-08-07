@@ -3,8 +3,8 @@ kind: Spicepod
 name: hf[all-minilm-l6-v2]-arrow
 datasets:
 
-  # MTEB Quora Retrieval dataset files (*.parquet) are automatically downloaded by the test operator.
-  # https://huggingface.co/datasets/mteb/QuoraRetrieval_test_top_250_only_w_correct-v2/tree/main
+  # MTEB MIRACL English Retrieval dataset files (*.parquet) are automatically downloaded by the test operator.
+  # https://huggingface.co/datasets/mteb/MIRACLRetrieval_en_top_250_only_w_correct-v2/tree/main
 
   - from: file:./corpus.parquet
     name: corpus

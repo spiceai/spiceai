@@ -1,30 +1,14 @@
 tests:
   search:
-    - spicepod_path: test/spicepods/search/mteb/quora/openai[text-embedding-3-small]-arrow.yaml
-      runner_type: spiceai-dev-runners
-      benchmark_dataset: quora_retrieval
-      ready_wait: 1800
-    - spicepod_path: test/spicepods/search/mteb/quora/openai[text-embedding-3-small]-cayenne[file].yaml
-      runner_type: spiceai-dev-runners
-      benchmark_dataset: quora_retrieval
-      ready_wait: 1800
-    - spicepod_path: test/spicepods/search/mteb/quora/openai[text-embedding-3-small]-duckdb[file].yaml
-      runner_type: spiceai-dev-runners
-      benchmark_dataset: quora_retrieval
-      ready_wait: 1800
-    - spicepod_path: test/spicepods/search/mteb/quora/openai[text-embedding-3-small[chunking]]-duckdb[file].yaml
-      runner_type: spiceai-dev-runners
-      benchmark_dataset: quora_retrieval
-      ready_wait: 1800
-    - spicepod_path: test/spicepods/search/mteb/quora/openai[text-embedding-3-small]-s3_vectors.yaml
-      runner_type: spiceai-dev-runners
-      benchmark_dataset: quora_retrieval
-      ready_wait: 1800
     - spicepod_path: test/spicepods/search/mteb/quora/full_text_search-duckdb[file].yaml
       runner_type: spiceai-dev-runners
       benchmark_dataset: quora_retrieval
       ready_wait: 1800
     - spicepod_path: test/spicepods/search/mteb/quora/full_text_search-cayenne[file].yaml
+      runner_type: spiceai-dev-runners
+      benchmark_dataset: quora_retrieval
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/mteb/quora/hf[all-minilm-l6-v2]-arrow.yaml
       runner_type: spiceai-dev-runners
       benchmark_dataset: quora_retrieval
       ready_wait: 1800
@@ -37,6 +21,10 @@ tests:
       benchmark_dataset: quora_retrieval
       ready_wait: 1800
     - spicepod_path: test/spicepods/search/mteb/quora/model2vec[potion-multilingual-128M]-cayenne[file].yaml
+      runner_type: spiceai-dev-runners
+      benchmark_dataset: quora_retrieval
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/mteb/quora/model2vec[potion-multilingual-128M]-s3_vectors.yaml
       runner_type: spiceai-dev-runners
       benchmark_dataset: quora_retrieval
       ready_wait: 1800
