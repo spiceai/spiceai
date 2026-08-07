@@ -47,10 +47,10 @@ fn build_app(args: &spiced::Args) -> Option<std::sync::Arc<app::App>> {
         .enable_all()
         .build()
         .expect("builds the bootstrap runtime");
-    let (app, _) = bootstrap
+    bootstrap
         .block_on(spiced::build_app(args))
-        .expect("loads the spicepod");
-    app
+        .expect("loads the spicepod")
+        .app
 }
 
 fn configured_cores(app: Option<&app::App>) -> Option<String> {
