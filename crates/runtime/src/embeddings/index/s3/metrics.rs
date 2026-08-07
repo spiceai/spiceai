@@ -23,9 +23,11 @@ use opentelemetry::{
 
 /// Boundaries for the `s3_vectors_*_latency` histograms, in milliseconds.
 ///
-/// Sized for a round trip to the `S3Vectors` API rather than for in-process work: the floor sits
-/// at 1ms because no network call answers faster, and the 5-75ms boundaries resolve the band a
-/// query against a small index is answered in.
+/// Sized for a round trip to the `S3Vectors` API rather than for in-process work: the smallest
+/// positive boundary is 1ms because no network call answers faster, and the 5-75ms boundaries
+/// resolve the band a query against a small index is answered in. The `0` boundary is not a
+/// resolution floor and predates this set; it is kept because dropping it would redefine an
+/// already-published `le` series.
 ///
 /// A histogram needs a boundary wherever its observations land. A quantile interpolated inside a
 /// single bucket is a function of the requested percentile alone, so a p50 drawn from one bucket
