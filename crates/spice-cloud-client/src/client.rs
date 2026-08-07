@@ -716,20 +716,22 @@ mod tests {
     /// together and fails the second assertion loudly, instead of leaving the first one
     /// quietly passing on a client that no longer has the policy.
     ///
+    /// The comparison pins exactly the two settings `reqwest` 0.13 renders — the redirect
+    /// policy and the total timeout. It says nothing about `connect_timeout`, which is not
+    /// rendered at all; `https_only`, which is not rendered either, is covered
+    /// behaviourally by
+    /// [`test_both_constructors_refuse_a_plain_http_origin`] instead.
+    ///
     /// What the policy then *does* — refuse a cross-origin hop, follow a same-origin one,
     /// bound the chain — is asserted against a live server in [`crate::redirect`]. Those
-    /// tests cannot run through these constructors: `build_http_client` sets
-    /// `https_only(true)`, so a plain-HTTP stub is rejected before any redirect is
-    /// considered.
+    /// tests cannot run through these constructors, for the reason that other test
+    /// demonstrates.
     #[test]
     fn test_both_constructors_install_the_same_origin_redirect_policy() {
-        /// The settings `build_http_client` applies, minus the redirect policy, so the
-        /// comparison isolates it.
+        /// A builder carrying only the settings `reqwest` renders, minus the redirect
+        /// policy, so the comparison isolates it.
         fn reference_builder(timeout: std::time::Duration) -> reqwest::ClientBuilder {
-            reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .timeout(timeout)
-                .https_only(true)
+            reqwest::Client::builder().timeout(timeout)
         }
 
         fn rendering(builder: reqwest::ClientBuilder) -> String {
@@ -752,7 +754,8 @@ mod tests {
         assert_eq!(
             format!("{:?}", client.client),
             with_policy,
-            "CloudClient::new must build its client through build_http_client"
+            "CloudClient::new must install the same-origin redirect policy and the default \
+             timeout"
         );
 
         let retimed_timeout = std::time::Duration::from_secs(5);
@@ -762,7 +765,50 @@ mod tests {
         assert_eq!(
             format!("{:?}", retimed.client),
             rendering(reference_builder(retimed_timeout).redirect(same_origin_redirect_policy())),
-            "CloudClient::with_timeout must preserve the redirect policy"
+            "CloudClient::with_timeout must preserve the redirect policy while applying the \
+             new timeout"
+        );
+    }
+
+    /// `build_http_client` also sets `https_only(true)`, which `reqwest`'s `Debug` does not
+    /// render — so the comparison above cannot see it and it needs asserting by behaviour.
+    ///
+    /// The stub is a real server that answers `200`, so the refusal cannot be mistaken for
+    /// a connection failure: without `https_only` this request would succeed.
+    ///
+    /// This is also why the redirect-policy behaviour tests live in [`crate::redirect`]
+    /// rather than here — a constructed client rejects a plain-HTTP stub before any
+    /// redirect is considered.
+    #[tokio::test]
+    async fn test_both_constructors_refuse_a_plain_http_origin() {
+        let reachable = crate::test_support::Stub::serve(|_| crate::test_support::ok_with("ok"));
+
+        let client = CloudClient::new("https://api.spice.ai").expect("client should build");
+        let error = client
+            .client
+            .get(reachable.url("/anything"))
+            .send()
+            .await
+            .expect_err("a plain-http origin must be refused even when it answers");
+        assert!(
+            !error.is_connect(),
+            "the refusal should come from the scheme, not from failing to reach the stub: \
+             {error}"
+        );
+
+        let retimed = client
+            .with_timeout(std::time::Duration::from_secs(5))
+            .expect("client should rebuild with a new timeout");
+        let _ = retimed
+            .client
+            .get(reachable.url("/anything"))
+            .send()
+            .await
+            .expect_err("CloudClient::with_timeout must preserve https_only");
+
+        assert!(
+            reachable.requests().is_empty(),
+            "neither constructor's client should have reached a plain-http origin"
         );
     }
 
