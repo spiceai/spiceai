@@ -97,13 +97,19 @@ fn as_one_line(text: &str) -> String {
 /// was malformed, the peer simply never finished it. The address is named because a
 /// routing redirect means the attempt that stalled need not be the one the dataset
 /// configured, and it is bounded because that address can be server-supplied.
+///
+/// `bound` is the deadline for the attempt as a whole, not a budget the named address
+/// received on its own: one deadline is shared by every dial in a routing chain, so a
+/// redirected replica can expire it having been given only what earlier dials left. The
+/// report says so, because naming an address next to a duration it never had would
+/// implicate a replica that was answering as fast as it was allowed to.
 fn stalled(addr: &str, bound: Duration) -> TiberiusError {
     TiberiusError::Io {
         kind: IoErrorKind::TimedOut,
         message: format!(
-            "connecting to {} did not complete within {}s, so the attempt was abandoned rather than left holding a connection pool slot. A peer that accepts the connection and then stops answering the TDS login reaches this; check that the address is a reachable SQL Server instance. For details, visit: https://spiceai.org/docs/components/data-connectors/mssql",
-            as_one_line(addr),
-            bound.as_secs()
+            "connecting to SQL Server did not complete within {}s, so the attempt was abandoned rather than left holding a connection pool slot. That deadline covers the attempt as a whole, including any routing redirects, and it expired while dialling {}. A peer that accepts the connection and then stops answering the TDS login reaches this; check that the address is a reachable SQL Server instance. For details, visit: https://spiceai.org/docs/components/data-connectors/mssql",
+            bound.as_secs(),
+            as_one_line(addr)
         ),
     }
 }
