@@ -35,6 +35,7 @@ stub_dir="$(mktemp -d)"
 trap 'rm -rf "$stub_dir"' EXIT
 
 posted="$stub_dir/posted"
+reads="$stub_dir/reads"
 
 # A `gh` that answers the two calls this command makes and nothing else.
 #
@@ -44,6 +45,10 @@ posted="$stub_dir/posted"
 # Any other invocation is a hard error: the point of several cases is that *no*
 # write happens, and a stub that silently accepted an unexpected call would let
 # a regression pass as a success.
+#
+# Reads are counted into STUB_READS, and STUB_COMBINED_LATE (from read
+# STUB_COMBINED_LATE_FROM onward) lets a case serve a status that *changes*
+# between reads — the commit a dying run is still writing to.
 cat >"$stub_dir/gh" <<'STUB'
 #!/usr/bin/env bash
 set -uo pipefail
@@ -55,6 +60,15 @@ fi
 
 if [[ "${1:-}" == "api" && "${2:-}" == */commits/*/status ]]; then
   [[ "${STUB_GH_READ_RC:-0}" == "0" ]] || exit "${STUB_GH_READ_RC}"
+  reads=1
+  if [[ -n "${STUB_READS:-}" ]]; then
+    reads=$(( $(cat "$STUB_READS" 2>/dev/null || echo 0) + 1 ))
+    printf '%s' "$reads" >"$STUB_READS"
+  fi
+  if [[ -n "${STUB_COMBINED_LATE:-}" && "$reads" -ge "${STUB_COMBINED_LATE_FROM:-2}" ]]; then
+    printf '%s' "$STUB_COMBINED_LATE"
+    exit 0
+  fi
   printf '%s' "${STUB_COMBINED:-\{\}}"
   exit 0
 fi
@@ -91,7 +105,14 @@ run_correction() {
   local output rc
   # `env` rather than an assignment prefix: these come from "$@", and words that
   # only look like assignments after expansion are read as the command name.
-  output="$(env "PATH=$stub_dir:$PATH" "STUB_POSTED=$posted" "$@" \
+  #
+  # The settle sleep is zeroed first so a case can override it, and because no
+  # case here needs wall-clock time to pass: the stub decides what each read
+  # returns, so the polling is exercised by the read count alone. Left at its
+  # production value, every case that rests on `pending` would spend the whole
+  # window waiting for a status nothing is going to write.
+  output="$(env "PATH=$stub_dir:$PATH" "STUB_POSTED=$posted" "STUB_READS=$reads" \
+    CANCELLED_SETTLE_SLEEP_SECONDS=0 "$@" \
     bash "$subject" correct-cancelled "$sha" "$repo" 2>&1)"
   rc=$?
   printf '%s|%s' "$rc" "$output"
@@ -105,6 +126,7 @@ assert_correction() {
   tests_run=$((tests_run + 1))
 
   : >"$posted"
+  : >"$reads"
 
   local result rc output
   result="$(run_correction "deadbeefcafe1234" "spiceai/spiceai" "$@")"
@@ -180,6 +202,38 @@ assert_correction "success is left alone" \
 assert_correction "success posted by another run is left alone" \
   "leaving it alone" nopost \
   STUB_COMBINED="$(combined_with_signoff success)"
+echo
+
+echo "A verdict that lands while this handler is running (#12710):"
+# The `if: cancelled()` step starts when the `Sign off` step is *marked*
+# cancelled, which is before that step's process has finished writing. On run
+# 31144830314 the handler read `pending` at 05:16:20Z and the `failure` it
+# exists to withdraw was posted four seconds later — so it declined, correctly
+# on what it could see, and nothing was left to take the false verdict back.
+# Reading until the commit stops changing is what closes that window.
+assert_correction "a failure posted after the first read is still withdrawn" \
+  "Reset signoff=failure" post \
+  STUB_COMBINED="$(combined_with_signoff pending)" \
+  STUB_COMBINED_LATE="$(combined_with_signoff failure)" STUB_COMBINED_LATE_FROM=2
+# Late in the window, not just one read late: the gap is however long the dying
+# step takes to finish its post, and a handler that gave up after two reads
+# would pass the case above while still missing the slower half of them.
+assert_correction "a failure posted late in the window is still withdrawn" \
+  "Reset signoff=failure" post \
+  STUB_COMBINED="$(combined_with_signoff pending)" \
+  STUB_COMBINED_LATE="$(combined_with_signoff failure)" STUB_COMBINED_LATE_FROM=5
+# The other direction, and the one #12428 is about: waiting must not turn into
+# licence to write. A `success` that appears late is still a success.
+assert_correction "a success posted after the first read is still left alone" \
+  "is 'success', not a failure this run posted" nopost \
+  STUB_COMBINED="$(combined_with_signoff pending)" \
+  STUB_COMBINED_LATE="$(combined_with_signoff success)" STUB_COMBINED_LATE_FROM=2
+# And the wait must end. A commit that rests on `pending` — which is what a
+# cancelled run is now supposed to leave behind — is read as settled and left
+# alone, rather than polled until the step is killed.
+assert_correction "a status that stays pending is left alone once the window closes" \
+  "is 'pending', not a failure this run posted" nopost \
+  STUB_COMBINED="$(combined_with_signoff pending)"
 echo
 
 echo "Every other state is somebody else's to write:"

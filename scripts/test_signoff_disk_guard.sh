@@ -378,6 +378,78 @@ assert_failure_kind "leaves make's own recipe failure a check failure" 2 "checks
 assert_failure_kind "leaves status 127 a check failure" 127 "checks" \
   STUB_FREE_KB="$(gib_to_kb 200)"
 
+# 128+N is a sufficient test for "signalled", not a necessary one. Cancelling a
+# job signals the whole process group; when make handles that and exits with a
+# small status of its own, the status alone is indistinguishable from the
+# recipe failure directly above — and reading it as one published
+# `signoff=failure` about a branch nothing judged (#12710). The recorded signal
+# is what tells the two apart, so these cases pair with that one by design:
+# same status, opposite verdict, and the flag is the only difference.
+assert_failure_kind "calls a signalled run signalled even when make exited 2" 2 "signalled" \
+  SIGNOFF_SIGNALLED=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_failure_kind "calls a signalled run signalled on cargo's own status" 101 "signalled" \
+  SIGNOFF_SIGNALLED=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# "Reached no verdict" outranks naming a cause, so the recorded signal wins over
+# both disk signals — the free-space backstop and the preflight's own refusal.
+# A run signalled during the preflight judged nothing either, and sending its
+# author to reclaim space describes a problem it did not have.
+assert_failure_kind "keeps a signalled run signalled on a near-empty volume, whatever make returned" 2 "signalled" \
+  SIGNOFF_SIGNALLED=1 STUB_FREE_KB="$(gib_to_kb 1)"
+assert_failure_kind "keeps a signalled run signalled over the preflight's refusal" 70 "signalled" \
+  SIGNOFF_SIGNALLED=1 STUB_FREE_KB="$(gib_to_kb 1)"
+# An armed watch that saw no ENOSPC line is the strongest "this was the branch"
+# signal the script has, and it must still not overrule "nothing judged it".
+assert_failure_kind "keeps a signalled run signalled under an armed watch" 2 "signalled" \
+  SIGNOFF_SIGNALLED=1 SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+
+# The flag has to come from somewhere, and a classification test can only show
+# that the reading is right once it is set. This is the other half: arm the
+# handler the way the verify path does, signal the process the way a cancelled
+# job does, and let a child that traps the signal return a small status — the
+# exact shape run 31144830314 died in. Asserts on failure_kind's answer rather
+# than on the variable, so it fails if either the trap or the reading regresses.
+
+# Stands in for a `make` caught by a cancellation. Signals its parent the way a
+# process-group kill reaches every member, then handles its own signal and exits
+# 2 — so the status the caller sees carries no trace of a signal at all.
+cat >"$stub_dir/trapping_make" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+trap 'exit 2' TERM
+kill -TERM "$PPID" 2>/dev/null
+kill -TERM $$ 2>/dev/null
+# Only reached if neither signal was delivered, which is the test failing.
+sleep 5
+exit 0
+STUB
+chmod +x "$stub_dir/trapping_make"
+
+tests_run=$((tests_run + 1))
+signalled_result="$(call_subject '
+    watch_for_signals
+    # `set +e` around the call and back, exactly as the verify path captures
+    # run_checks: an `if` would disable set -e for the whole condition.
+    set +e
+    trapping_make
+    status=$?
+    set -e
+    echo "STATUS=${status} KIND=$(failure_kind "$status")"' \
+  STUB_FREE_KB="$(gib_to_kb 200)")"
+signalled_output="${signalled_result#*|}"
+if [[ "$signalled_output" != *"STATUS=2"* ]]; then
+  fail_test "the signal test did not reproduce a trapped-and-returned status: '${signalled_output}'"
+elif [[ "$signalled_output" != *"KIND=signalled"* ]]; then
+  fail_test "a signalled run whose make exited 2 must classify as signalled: '${signalled_output}'"
+else
+  echo "  ok: the armed handler makes a trapped-and-returned status read as signalled"
+fi
+
+# The mirror image, and the reason the handler is armed on the verify path only:
+# with no signal, the same status must still be the branch's failure. Without
+# this, a handler that set the flag unconditionally would pass everything above.
+assert_failure_kind "an unsignalled run with the same status is still a check failure" 2 "checks" \
+  STUB_FREE_KB="$(gib_to_kb 200)"
+
 echo
 echo "describe_check_failure"
 # Asserts what a failed run publishes. An empty SIGNOFF_FAILURE_STATUS_DESC is
@@ -431,6 +503,12 @@ assert_describe "still publishes the out-of-disk verdict" 101 \
 assert_describe "still publishes a genuine check failure" 101 \
   "Sign-off checks failed after 21195s (triggered by someone)" \
   "sign-off checks failed" STUB_FREE_KB="$(gib_to_kb 200)"
+# The published half of #12710, and the one an operator actually reads: a
+# cancelled run whose make returned 2 must publish no description at all. The
+# case directly above is the same status with no signal recorded and does
+# publish one, so this pins the difference to the signal and not to the status.
+assert_describe "publishes no verdict when a signalled run's make returned an ordinary status" 2 "" \
+  "the checks reached no verdict" SIGNOFF_SIGNALLED=1 STUB_FREE_KB="$(gib_to_kb 200)"
 echo
 
 # `08` passes the digit regex, but bash arithmetic reads a leading zero as
