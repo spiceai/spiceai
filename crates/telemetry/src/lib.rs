@@ -37,18 +37,14 @@ pub const ROWS_RETURNED_HISTOGRAM_BUCKETS: [f64; 18] = [
     50000.0, 100_000.0, 250_000.0, 500_000.0,
 ];
 
-// Boundaries for every millisecond-scale duration histogram, spanning a sub-millisecond point
-// lookup through a multi-hundred-second refresh.
+// Boundaries for every millisecond-scale duration histogram, from a sub-millisecond point lookup
+// to a multi-hundred-second refresh. The sub-100ms head resolves the band most requests finish in;
+// without it a 0.1ms lookup and a 99ms one share a bucket, and the interpolated quantile tracks the
+// requested percentile instead of any latency. The head matches `CONTENTION_MS_HISTOGRAM_BUCKETS`;
+// the 500s tail is why the two sets stay separate.
 //
-// The sub-100ms boundaries resolve the band most requests finish in. Without them a point lookup
-// answered in a fraction of a millisecond shares one bucket with a 99ms one, and a quantile
-// interpolated inside that bucket is a function of the requested percentile alone rather than of
-// any latency. The head matches `CONTENTION_MS_HISTOGRAM_BUCKETS` so the two agree where they
-// overlap; the tail reaches 500s, which is why the two sets are not one.
-//
-// Adding a boundary only subdivides an existing bucket, so `le` series recorded against any of
-// these keep their meaning. The quantiles derived from them do move, by orders of magnitude, for
-// exactly the histograms this resolves.
+// New boundaries only subdivide existing buckets, so recorded `le` series keep their meaning —
+// but the quantiles derived from them move by orders of magnitude, which is the point.
 pub const DURATION_MS_HISTOGRAM_BUCKETS: [f64; 24] = [
     0.0, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 750.0, 1000.0,
     2500.0, 5000.0, 7500.0, 10000.0, 25000.0, 50000.0, 100_000.0, 250_000.0, 500_000.0,

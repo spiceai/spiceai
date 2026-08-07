@@ -18,16 +18,10 @@ use opentelemetry::{
     metrics::{Counter, Gauge, Histogram, Meter},
 };
 
-// `dataset_acceleration_snapshot_write_duration_ms` is recorded to two separate pipelines: the
-// instruments below bind to the OpenTelemetry global provider `init_metrics` installs (the
-// operator's `/metrics`, OTLP push and `spice_metrics` readers), while the `telemetry::` calls in
-// each `record_*` bind to `telemetry::meter::METER`, the anonymous-telemetry provider that
-// `anonymous::start` builds and never publishes globally. The two never share an exporter, so this
-// is one observation each rather than a double count.
-//
-// They are still the same measurement, and a quantile is only comparable between them if both name
-// the same boundaries — hence the shared constant rather than a copy of it, which is what let the
-// two sets drift apart in the first place.
+// `dataset_acceleration_snapshot_write_duration_ms` reaches two providers that share no
+// exporter — the global one below and `telemetry`'s anonymous one — so it is one observation
+// each, not a double count. Its quantiles are only comparable across them while both name the
+// same boundaries, so share the constant rather than copy it; copying let the two sets drift.
 use telemetry::DURATION_MS_HISTOGRAM_BUCKETS;
 
 static METER: LazyLock<Meter> =
