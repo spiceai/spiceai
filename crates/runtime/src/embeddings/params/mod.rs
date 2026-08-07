@@ -281,8 +281,14 @@ mod tests {
     fn truncation_from_str_round_trips_and_maps_to_direction() {
         assert_eq!(Truncation::default(), Truncation::None);
         assert_eq!(Truncation::None.direction(), None);
-        assert_eq!(Truncation::End.direction(), Some(TruncationDirection::Right));
-        assert_eq!(Truncation::Start.direction(), Some(TruncationDirection::Left));
+        assert_eq!(
+            Truncation::End.direction(),
+            Some(TruncationDirection::Right)
+        );
+        assert_eq!(
+            Truncation::Start.direction(),
+            Some(TruncationDirection::Left)
+        );
 
         for variant in [Truncation::None, Truncation::End, Truncation::Start] {
             assert_eq!(
@@ -292,7 +298,9 @@ mod tests {
             );
         }
 
-        assert!("nonsense".parse::<Truncation>().is_err());
+        "nonsense"
+            .parse::<Truncation>()
+            .expect_err("nonsense is not truncation");
     }
 
     #[tokio::test]
