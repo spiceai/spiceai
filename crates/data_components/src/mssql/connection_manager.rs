@@ -474,7 +474,7 @@ mod tests {
             let (stream, _) = listener.accept().await.expect("the client to connect");
             // Hold the accepted socket open without answering the pre-login: a peer that
             // closed it would fail the attempt on its own, before any deadline.
-            sleep(Duration::from_secs(60)).await;
+            sleep(Duration::from_mins(1)).await;
             drop(stream);
         });
 
