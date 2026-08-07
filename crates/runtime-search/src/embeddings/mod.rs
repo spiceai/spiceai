@@ -35,17 +35,40 @@ pub type EmbeddingModelStore = HashMap<String, Arc<dyn Embed>>;
 /// The read behavior a warm search tier should be built with for a table with this
 /// `acceleration`, as `warm_index::with_memory_warm_index` takes it.
 ///
-/// `None` — no warm tier at all — when the table has no enabled acceleration: a warm tier
-/// starts empty on every process start and is filled by the acceleration write path, so
-/// without acceleration nothing hydrates it and serving searches from it would narrow
-/// results to whatever rows a scan happened to write, or to nothing at all.
+/// A warm tier starts empty on every process start and is only ever filled by the
+/// acceleration write path, and it is the compound index's *primary* read tier. It is
+/// therefore only sound when the accelerator also starts empty, so that repopulating the
+/// accelerator necessarily carries every row past the tier. `None` — no warm tier at all —
+/// whenever that does not hold:
+///
+/// - The table has no enabled acceleration, so nothing hydrates the tier at all (#12101).
+/// - The accelerator keeps its rows across a restart (#12102). The refresh that follows then
+///   loads only what the accelerator is missing — for `append` and `changes` a delta, and for
+///   `full` possibly nothing at all, since a checkpointed dataset with no
+///   `refresh_check_interval` skips its startup refresh outright. The accelerator and the
+///   vector engine still hold everything, so the tier settles at a strict subset and never
+///   catches up — and because it is the primary, a search answers from that subset. Neither
+///   read mode rescues it: `ReturnEmpty` never consults the engine index, and `UseSource`
+///   falls back only when the tier returns *exactly zero* rows, which a partly-filled tier
+///   does not.
+///
+/// Declining the tier costs a dataset the in-memory read path, not any results: the vector
+/// engine index holds the whole dataset and serves the search directly. The warm tier is an
+/// optimization, so where it cannot be complete it is not installed.
 #[must_use]
 pub fn warm_index_on_zero_results(
     acceleration: Option<&Acceleration>,
 ) -> Option<&ZeroResultsAction> {
-    acceleration
-        .filter(|acceleration| acceleration.enabled)
-        .map(|acceleration| &acceleration.on_zero_results)
+    let acceleration = acceleration.filter(|acceleration| acceleration.enabled)?;
+
+    if acceleration.mode.retains_data_across_restarts() {
+        tracing::debug!(
+            "Not adding an in-memory warm vector index: the accelerator keeps its rows across a restart, so the warm tier would hold only the rows refreshed since startup. Searches will be served by the vector engine directly."
+        );
+        return None;
+    }
+
+    Some(&acceleration.on_zero_results)
 }
 
 pub async fn construct_chunker(
@@ -65,6 +88,18 @@ pub async fn construct_chunker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use runtime_acceleration::acceleration::Mode;
+
+    /// An enabled acceleration in `mode`, whose `on_zero_results` is distinguishable from the
+    /// default so a passed-through value is visible in the assertion.
+    fn accelerated(mode: Mode) -> Acceleration {
+        Acceleration {
+            enabled: true,
+            mode,
+            on_zero_results: ZeroResultsAction::UseSource,
+            ..Acceleration::default()
+        }
+    }
 
     /// Regression test for #12101: the acceleration write path is the only thing that fills a
     /// warm search tier, so an absent or disabled acceleration must yield no warm tier at all.
@@ -97,5 +132,47 @@ mod tests {
             Some(&ZeroResultsAction::UseSource),
             "an enabled acceleration passes its on_zero_results through"
         );
+    }
+
+    /// Regression test for #12102: an accelerator that survives a restart is only ever refreshed
+    /// with what it is missing, so a warm tier — which does *not* survive — would hold that
+    /// remainder alone while serving as the primary read tier. It must be declined instead.
+    ///
+    /// This holds for every refresh mode, `full` included: a checkpointed dataset with no
+    /// `refresh_check_interval` skips its startup refresh entirely, so nothing at all reaches the
+    /// tier.
+    #[test]
+    fn on_zero_results_is_none_for_an_accelerator_that_survives_a_restart() {
+        for mode in [Mode::File, Mode::FileUpdate] {
+            assert_eq!(
+                warm_index_on_zero_results(Some(&accelerated(mode))),
+                None,
+                "{mode:?} keeps its rows across a restart, so the warm tier would hold only the \
+                 rows refreshed since startup"
+            );
+        }
+    }
+
+    /// An accelerator that starts empty is necessarily reloaded in full, so every row passes
+    /// through the warm tier and it stays sound. This is the default `mode: memory`
+    /// configuration, which must keep its warm tier.
+    #[test]
+    fn an_ephemeral_accelerator_keeps_its_warm_tier() {
+        for mode in [Mode::Memory, Mode::FileCreate] {
+            assert_eq!(
+                warm_index_on_zero_results(Some(&accelerated(mode))),
+                Some(&ZeroResultsAction::UseSource),
+                "{mode:?} starts empty, so repopulating it carries every row past the warm tier"
+            );
+        }
+    }
+
+    /// The modes that survive a restart are exactly the file modes that open an existing file.
+    #[test]
+    fn only_the_reopening_file_modes_retain_data_across_restarts() {
+        assert!(!Mode::Memory.retains_data_across_restarts());
+        assert!(!Mode::FileCreate.retains_data_across_restarts());
+        assert!(Mode::File.retains_data_across_restarts());
+        assert!(Mode::FileUpdate.retains_data_across_restarts());
     }
 }

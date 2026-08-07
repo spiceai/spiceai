@@ -137,6 +137,25 @@ pub enum Mode {
     FileUpdate,
 }
 
+impl Mode {
+    /// Whether an accelerator in this mode still holds the rows it held before a restart.
+    ///
+    /// This is what decides whether the refresh that follows a restart reloads the whole
+    /// dataset or only the part the accelerator is missing, so a caller reasoning about what
+    /// a fresh process observes should ask this rather than matching on the mode itself.
+    ///
+    /// `Memory` is ephemeral, and so is Cayenne's memory mode — it is "fully in-RAM and
+    /// ephemeral … the dataset reloads from its federated source on startup". `FileCreate`
+    /// truncates any existing file on startup, so it also begins empty.
+    #[must_use]
+    pub fn retains_data_across_restarts(self) -> bool {
+        match self {
+            Mode::Memory | Mode::FileCreate => false,
+            Mode::File | Mode::FileUpdate => true,
+        }
+    }
+}
+
 impl From<spicepod_acceleration::Mode> for Mode {
     fn from(mode: spicepod_acceleration::Mode) -> Self {
         match mode {
