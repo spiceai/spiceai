@@ -702,10 +702,7 @@ impl ReciprocalRankFusion {
         };
 
         // Defaults: exponential decay over days (86400s)
-        let recency_decay = args
-            .recency_decay
-            .clone()
-            .unwrap_or(RecencyDecay::Exponential);
+        let recency_decay = args.recency_decay.unwrap_or(RecencyDecay::Exponential);
         let decay_scale_secs = args.decay_scale_secs.unwrap_or(86400.0);
 
         // Lots of casting annoyances are avoided by treating everything as `long`.
