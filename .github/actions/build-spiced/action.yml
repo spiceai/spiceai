@@ -45,13 +45,16 @@ inputs:
     required: false
     default: '../../target'
   minio_endpoint:
-    description: 'MinIO endpoint for sccache'
+    description: 'MinIO endpoint for sccache (Linux/Windows)'
     required: false
   minio_access_key:
     description: 'MinIO access key for sccache'
     required: false
   minio_secret_key:
     description: 'MinIO secret key for sccache'
+    required: false
+  spiceio_endpoint:
+    description: 'Spiceio S3-compatible endpoint for sccache (macOS)'
     required: false
 
 outputs:
@@ -114,7 +117,7 @@ runs:
       id: check-sccache
       shell: bash
       run: |
-        if [ -z "${{ inputs.minio_endpoint }}" ]; then
+        if [ -z "${{ inputs.minio_endpoint }}" ] && [ -z "${{ inputs.spiceio_endpoint }}" ]; then
           echo "SCCACHE_SETUP=false" >> $GITHUB_OUTPUT
           echo "RUSTC_WRAPPER=" >> $GITHUB_OUTPUT
         else
@@ -127,6 +130,7 @@ runs:
       uses: ./.github/actions/setup-sccache
       with:
         minio_endpoint: ${{ inputs.minio_endpoint }}
+        spiceio_endpoint: ${{ inputs.spiceio_endpoint }}
 
     - name: Resolve build paths
       id: resolve-build-paths
