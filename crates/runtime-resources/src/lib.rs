@@ -111,7 +111,7 @@ pub fn get_total_memory() -> u64 {
 /// [`get_total_memory`], so the coordinated accelerator budget must project it from
 /// this value, not the cgroup total.
 #[must_use]
-pub(crate) fn get_host_memory() -> u64 {
+pub fn get_host_memory() -> u64 {
     let mut system = System::new();
     system.refresh_memory();
     system.total_memory()

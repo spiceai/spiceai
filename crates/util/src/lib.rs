@@ -46,6 +46,7 @@ pub mod time;
 pub mod time_format;
 #[cfg(feature = "datafusion")]
 pub mod timestamp_filter;
+pub mod timezone;
 
 pub const DATAFUSION_BUG_REPORT_MESSAGE: &str = "This issue was likely caused by a bug in DataFusion's code. Please help us to resolve this by filing a bug report in our issue tracker: https://github.com/apache/datafusion/issues";
 

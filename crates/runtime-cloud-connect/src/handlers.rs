@@ -31,6 +31,8 @@ use std::path::Path;
 use async_trait::async_trait;
 use snafu::Snafu;
 
+use crate::sealed_secrets::DeliveredSecrets;
+
 /// Why a command did not succeed.
 ///
 /// Each variant maps onto exactly one wire `ResultCode`, so the control plane
@@ -185,6 +187,73 @@ impl RuntimePhase {
     }
 }
 
+/// One deployment, as it reaches a [`RuntimeHandle`].
+///
+/// A struct rather than positional arguments: `apply_spicepod(dir, yaml, None)`
+/// reads as nothing at the call site, and a later field would be one more thing
+/// to thread through every implementation in the right order.
+pub struct SpicepodDeployment<'a> {
+    /// Where the cloud-managed spicepod lives.
+    pub config_dir: &'a Path,
+    /// The spicepod to apply, verbatim.
+    pub spicepod_yaml: &'a str,
+    /// App secrets that rode the same dispatch, already opened (see
+    /// [`crate::sealed_secrets`]). They arrive *with* the spicepod because
+    /// applying is a restart: secrets that landed afterwards would arrive after
+    /// the components that referenced them had already tried to load.
+    ///
+    /// `None` means the deployment carried none, which is distinct from an
+    /// empty map — an app whose secrets were all removed.
+    pub delivered_secrets: Option<DeliveredSecrets>,
+}
+
+/// What the client must do once the result of an apply has been sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PostApply {
+    /// Nothing. The instance is already serving this deployment, so there is
+    /// nothing left to make live.
+    #[default]
+    Nothing,
+    /// The spicepod is persisted but not live: exit the process
+    /// ([`RuntimeHandle::exit_to_apply`]) so the supervisor relaunches it on
+    /// the new configuration.
+    ExitToApply,
+}
+
+/// What an [`ApplySpicepod`](crate::proto::ApplySpicepod) produced: the document
+/// the control plane reads, and what has to happen next for it to take effect.
+///
+/// `Debug` carries only what already goes to the control plane — the result
+/// document and the follow-up action — so there is nothing here a log line
+/// could leak. A delivered secret never reaches this type.
+#[derive(Debug)]
+pub struct ApplyOutcome {
+    /// JSON summary of what was applied, returned as the command payload.
+    pub document: serde_json::Value,
+    pub post_apply: PostApply,
+}
+
+impl ApplyOutcome {
+    /// The deployment is already live; the result is the whole answer.
+    #[must_use]
+    pub fn settled(document: serde_json::Value) -> Self {
+        Self {
+            document,
+            post_apply: PostApply::Nothing,
+        }
+    }
+
+    /// The deployment is persisted and takes effect on the restart the client
+    /// triggers once this result is on the wire.
+    #[must_use]
+    pub fn exit_to_apply(document: serde_json::Value) -> Self {
+        Self {
+            document,
+            post_apply: PostApply::ExitToApply,
+        }
+    }
+}
+
 /// Runtime readiness: the reply to `GetStatus`, and the source of the phase
 /// stamped on every heartbeat.
 #[derive(Debug, Clone)]
@@ -277,40 +346,77 @@ pub trait RuntimeHandle: Send + Sync + 'static {
         })
     }
 
-    /// Apply a cloud-managed spicepod to disk and trigger a reload.
+    /// Persist a cloud-managed spicepod as the configuration this instance
+    /// starts on.
+    ///
+    /// Applying is **not** a hot reload: the spicepod is validated, persisted,
+    /// and made live by a restart ([`PostApply::ExitToApply`]), so a change to
+    /// any section takes effect by one path instead of some sections reloading
+    /// and the rest waiting for an operator. Redelivering a deployment the
+    /// instance is already serving must return [`PostApply::Nothing`] —
+    /// restarting for it would make a redelivery a restart loop.
     ///
     /// The default implementation writes the YAML to
     /// `config_dir/spicepod-cloud-managed.yml` via `tokio::fs` so the
-    /// filesystem write does not block the runtime worker thread. It
-    /// does NOT reload the spicepod into the running runtime — the
-    /// caller must restart spiced (or override this method) for the new
-    /// configuration to take effect.
+    /// filesystem write does not block the runtime worker thread. It cannot
+    /// restart the process, so it reports `applied: false` and
+    /// [`PostApply::Nothing`]: the file is on disk and the next start — whenever
+    /// that is — picks it up.
     ///
-    /// The returned envelope therefore advertises `reload: "deferred"`
-    /// and `applied: false` so the control plane can surface that the
-    /// runtime is still serving the previous configuration. Adapters
-    /// that can hot-reload (or that synchronously trigger a restart)
-    /// should override this and return `applied: true`.
+    /// The default **refuses** a deployment that carries secrets rather than
+    /// writing the spicepod and dropping them: an adapter that cannot apply
+    /// secrets would otherwise report success and then fail every referencing
+    /// component with a missing-parameter error that names nothing.
     async fn apply_spicepod(
         &self,
-        config_dir: &Path,
-        spicepod_yaml: &str,
-    ) -> Result<serde_json::Value, CommandError> {
-        let path = config_dir.join(crate::config::CLOUD_MANAGED_SPICEPOD_FILE);
+        deployment: SpicepodDeployment<'_>,
+    ) -> Result<ApplyOutcome, CommandError> {
+        if deployment
+            .delivered_secrets
+            .is_some_and(|secrets| !secrets.is_empty())
+        {
+            // `Unsupported`, not `Failed`: this adapter will never be able to
+            // apply secrets, so a retry cannot help and the control plane should
+            // not schedule one.
+            return Err(CommandError::unsupported(
+                "this runtime adapter cannot apply control-plane-delivered secrets; the spicepod \
+                 was NOT written. Implement RuntimeHandle::apply_spicepod to accept them.",
+            ));
+        }
+        let path = deployment
+            .config_dir
+            .join(crate::config::CLOUD_MANAGED_SPICEPOD_FILE);
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
                 .map_err(|e| CommandError::failed(format!("create config dir: {e}")))?;
         }
-        tokio::fs::write(&path, spicepod_yaml)
+        tokio::fs::write(&path, deployment.spicepod_yaml)
             .await
             .map_err(|e| CommandError::failed(format!("write spicepod: {e}")))?;
-        Ok(serde_json::json!({
+        Ok(ApplyOutcome::settled(serde_json::json!({
             "path": path.display().to_string(),
             "applied": false,
-            "reload": "deferred",
             "note": "spicepod written to disk; restart spiced (or implement RuntimeHandle::apply_spicepod) to take effect",
-        }))
+        })))
+    }
+
+    /// Exit the process so the supervisor relaunches it on the spicepod
+    /// [`RuntimeHandle::apply_spicepod`] just persisted.
+    ///
+    /// Called only after the command result has been flushed, and only for
+    /// [`PostApply::ExitToApply`]. It is not expected to return; an
+    /// implementation that returns has failed to exit, and the client says so
+    /// rather than leaving the control plane to infer it from a deployment that
+    /// never goes live.
+    ///
+    /// The default reports that this adapter cannot restart itself — which is
+    /// why the default `apply_spicepod` never asks for it.
+    async fn exit_to_apply(&self) {
+        tracing::error!(
+            "Spice Cloud Connect: this runtime adapter cannot restart itself, so the persisted \
+             spicepod stays pending until the process is restarted"
+        );
     }
 
     /// Restart the runtime with the requested `mode`.
@@ -427,6 +533,68 @@ mod tests {
             h.status().await,
             Err(CommandError::Unsupported { .. })
         ));
+    }
+
+    /// The default apply persists the spicepod but cannot make it live, so it
+    /// must not ask the client to exit — nothing would bring the process back.
+    #[tokio::test]
+    async fn default_apply_persists_without_asking_for_a_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "spice-handlers-default-apply-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let outcome = NoopRuntimeHandle
+            .apply_spicepod(SpicepodDeployment {
+                config_dir: &dir,
+                spicepod_yaml: "version: v2\nkind: Spicepod\nname: default-apply\n",
+                delivered_secrets: None,
+            })
+            .await
+            .expect("the default apply writes the spicepod");
+
+        assert_eq!(outcome.post_apply, PostApply::Nothing);
+        assert_eq!(outcome.document["applied"], false);
+        let written = std::fs::read_to_string(dir.join(crate::config::CLOUD_MANAGED_SPICEPOD_FILE))
+            .expect("spicepod written");
+        assert!(written.contains("name: default-apply"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Writing the spicepod and dropping the secrets it references would report
+    /// success and then fail every referencing component.
+    #[tokio::test]
+    async fn default_apply_refuses_delivered_secrets() {
+        let dir = std::env::temp_dir().join(format!(
+            "spice-handlers-refuse-secrets-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut secrets = crate::sealed_secrets::DeliveredSecrets::new();
+        secrets.insert(
+            "openai_key".to_string(),
+            zeroize::Zeroizing::new(b"value".to_vec()),
+        );
+
+        let err = NoopRuntimeHandle
+            .apply_spicepod(SpicepodDeployment {
+                config_dir: &dir,
+                spicepod_yaml: "version: v2\nkind: Spicepod\nname: refused\n",
+                delivered_secrets: Some(secrets),
+            })
+            .await
+            .expect_err("a handle that cannot apply secrets must refuse the deployment");
+        assert!(matches!(err, CommandError::Unsupported { .. }));
+        assert!(
+            !dir.join(crate::config::CLOUD_MANAGED_SPICEPOD_FILE)
+                .exists(),
+            "the spicepod must not be written when its secrets were refused"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

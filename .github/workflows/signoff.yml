@@ -12,7 +12,7 @@
 #      here — see the run_targeted_prechecks input)
 #   2. Targeted unit tests for those crates (runs only when step 1 does)
 #   3. Full workspace lint (make lint-rust)
-#   4. CLI build + unit tests (make build-cli-dev nextest)
+#   4. Unit tests + CLI verification (make nextest verify-cli)
 #   5. Post signoff status + re-run Attestation if needed
 #
 # The checks run under an explicit budget below the pool's ~360-minute job wall,
@@ -392,7 +392,7 @@ jobs:
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@dc53e1f5e2a92e64bfc785923b8f9471c42fbf46 # v0.5.10
+        uses: spiceai/spiceio/.github/actions/setup@97c3578dcf337786923da33cecd350e7335386b6 # v0.7.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -449,25 +449,21 @@ jobs:
       # is exactly the state a cancelled run leaves behind — so Attestation stays red (it
       # must; HEAD really is not signed off) and points at the documented remedy of
       # re-running sign-off instead of at a phantom defect in the diff. See #12424.
+      #
+      # The correction is conditional, and lives in scripts/signoff so it can be unit
+      # tested and so it reads the status through the same helper every other reader
+      # uses: a cancelled run rewrites only the `failure`/`error` its own death posted,
+      # and leaves a `success` — its own, or one another run posted for this commit —
+      # untouched. Overwriting that would discard checks that really passed and force a
+      # 1-4 hour re-dispatch. See #12428.
+      #
+      # `.trusted-ci/signoff`, not the working tree's copy: a fork PR must not be able
+      # to supply the code that repairs its own sign-off status.
       - name: Correct the sign-off status when this run is cancelled
         if: cancelled()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -uo pipefail
-
-          # The commit the cancelled run had checked out, which is what scripts/signoff
-          # posted against. Best-effort throughout: this runs while the job is being
-          # torn down, and failing here must not mask the cancellation itself.
-          sha="$(git rev-parse HEAD 2>/dev/null)" || exit 0
-          [ -n "${sha}" ] || exit 0
-
-          gh api --method POST "repos/${{ github.repository }}/statuses/${sha}" \
-            -f state=pending \
-            -f context=signoff \
-            -f "description=Remote sign-off was cancelled (superseded or stopped) — no checks failed. HEAD is not signed off; re-dispatch." \
-            >/dev/null 2>&1 || true
-          echo "Reset the signoff status on ${sha} to pending — this run was cancelled, not failed."
+        run: .trusted-ci/signoff correct-cancelled "" "${{ github.repository }}"
 
       # A run that does not reach a verdict — its budget expires, the runner dies —
       # never gets back to scripts/signoff, so the `pending` status it posted outlives

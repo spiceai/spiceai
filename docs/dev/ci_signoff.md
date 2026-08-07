@@ -67,7 +67,7 @@ crates and runs, in order:
 1. `make lint-rust PACKAGES="…" FEATURES="…"` — lint the crates you touched
 2. `make nextest-packages PACKAGES="…" FEATURES="…"` — their unit tests
 3. `make lint-rust` — the full workspace lint
-4. `make build-cli-dev nextest` — CLI build + all unit tests
+4. `make nextest verify-cli` — all unit tests, then assert the `spice` binary exists
 
 Steps 1-2 exist to fail fast: a lint or test failure in the crate you edited is
 the likeliest outcome, and step 3 is by far the longest, so covering your own
@@ -264,7 +264,7 @@ The Actions workflow:
 2. Skips Rust checks when the branch has no Rust-affecting files. The targeted
    pre-lint and unit tests are off here (`run_targeted_prechecks` turns them on,
    with the GitHub compare API as a fallback when merge-base isn't available)
-3. Runs full `make lint-rust` + `make build-cli-dev nextest` when Rust is affected
+3. Runs full `make lint-rust` + `make nextest verify-cli` when Rust is affected
 4. Posts pending → success/failure `signoff` statuses (skipping the pending when
    the commit is already signed off), then re-runs **Attestation** if needed
 
@@ -276,6 +276,19 @@ expired, evicted by a re-dispatch, cancelled — replaces its own `pending` stat
 with a failure; otherwise `scripts/signoff status` and `scripts/signoff mine`
 would keep showing a sign-off in progress for a run that is long gone.
 Re-dispatch against the same HEAD to try again.
+
+That replacement is the workflow's job, not the dying script's. Being signalled is
+how a run learns its budget expired: `run_checks` returns `make`'s status and bash
+reports a killed child as 128+N, so the script classifies that as reaching **no
+verdict** and publishes nothing at all, saying why in its step summary. Treating it
+as a check result instead would assert a code failure nothing established — on a
+suite the log shows still passing, and over a `signoff=success` an earlier run may
+already have earned ([#12518](https://github.com/spiceai/spiceai/issues/12518),
+[#12520](https://github.com/spiceai/spiceai/issues/12520)). Declining to write is
+what leaves the `pending` for `Resolve an incomplete sign-off` to describe honestly,
+and leaves an existing success alone. The correction handlers cannot cover this case
+after the fact: both are gated on `cancelled()`, and a budget expiry is a *failed*
+step by the design above.
 
 Only one sign-off runs per commit. Both dispatch forms — `-f branch=<branch>` and
 `-f pr_number=<N>` — resolve to the same commit before the sign-off job starts,
@@ -307,12 +320,51 @@ a HEAD that only merges the base branch can *inherit* an earlier sign-off, which
 the failing status on HEAD does not veto ([#12357](https://github.com/spiceai/spiceai/issues/12357)).
 
 A branch whose sign-off keeps running out of budget is contending for the pool
-rather than doing anything wrong. `-f skip_targeted_lint=true` drops the
-branch-scoped pre-lint, which trades fail-fast feedback for a shorter run.
+rather than doing anything wrong. Remote runs already skip the branch-scoped
+pre-checks; `-f run_targeted_prechecks=true` adds them back at the cost of a
+longer run.
 
 Requires write access to the repository (same as local sign-off — fork
 contributors still need a maintainer to sign off). The lab SSH path also needs
 SSH key access to the host and `gh` auth on that machine.
+
+### A cancelled Remote Sign-off is not a failed one
+
+`signoff.yml` sets `concurrency: signoff-<pr|branch>` with `cancel-in-progress`, so
+re-dispatching sign-off for a branch cancels the run before it. A cancelled job is
+killed by signal, which makes the in-flight `run_checks` return non-zero — and the
+dying script posts `signoff=failure`, "Sign-off checks failed after Ns", about a
+branch nothing actually judged.
+
+So the workflow corrects the record on its way out. When the job ends cancelled it
+runs:
+
+```bash
+scripts/signoff correct-cancelled [<sha>] [<owner/repo>]
+```
+
+which rewrites the status to `pending` — not `success`, because HEAD really is not
+signed off, and not `error`, because `pending` is the state Attestation already
+describes as "re-dispatch sign-off" rather than as a defect in the diff.
+
+**It rewrites only `failure` and `error`.** A cancelled run can find a legitimate
+`success` on the commit two ways, and overwriting either would throw away checks
+that passed and cost another 1-4 hour run:
+
+- Its own `Sign off` step completed, and the cancel signal landed in the window
+  before the correction ran.
+- A second run signed the same commit off. The concurrency group keys on the
+  dispatch *input*, so `-f branch=my-branch` and `-f pr_number=123` for that same
+  branch are different groups: they do not cancel each other, and either can be
+  cancelled after the other has succeeded.
+
+A read failure is likewise not treated as "no status" — that would license the
+overwrite the guard exists to prevent. Every path exits 0, so the correction can
+never add a second failure to a job that was already cancelled.
+
+If you see `signoff=pending` with "Remote sign-off was cancelled", nothing is
+wrong with the branch: dispatch sign-off again. `scripts/test_signoff_cancelled_correction.sh`
+covers both directions.
 
 ### Jujutsu workspaces
 
@@ -384,6 +436,12 @@ and hands classification back to the free-space backstop; treating its silence a
 "not disk" would blame the branch for the volume just as surely as the unwritable
 marker did.
 
+Classification has a third answer, ranked above both disk signals: a run that was
+*signalled* judged nothing at all, where the two disk cases both describe a `make`
+that returned. That ordering matters when a budget expires on a tight volume —
+calling it disk would send you to reclaim space that was never the problem. See
+the budget paragraph above for what a signalled run publishes.
+
 The watch keeps its answer in a shell variable, not a file. Recording it on disk
 needed an allocation at the one moment allocation is failing — and on macOS
 `$TMPDIR` and the workspace are usually the same APFS container, so there was no
@@ -407,7 +465,7 @@ merge queue is still the real gate.
 
 | Stage | Trigger | Checks |
 | --- | --- | --- |
-| Local | `make signoff` | skip Rust if no Rust-affecting files in the branch diff; else targeted `make lint-rust PACKAGES=… FEATURES=…` + `make nextest-packages PACKAGES=… FEATURES=…` (features from the workspace resolve), full `make lint-rust`, `make build-cli-dev nextest` |
+| Local | `make signoff` | skip Rust if no Rust-affecting files in the branch diff; else targeted `make lint-rust PACKAGES=… FEATURES=…` + `make nextest-packages PACKAGES=… FEATURES=…` (features from the workspace resolve), full `make lint-rust`, `make nextest verify-cli` |
 | Remote | `make signoff-remote` | the same checks via the self-hosted `signoff.yml` workflow, without the targeted pre-checks (`run_targeted_prechecks=true` restores them); posts `signoff` |
 | Pull request | `pull_request` | **Attestation** (validates the sign-off, or auto-passes a branch with no Rust-affecting files, a pure revert, or a single-commit Dependabot bump) + PR hygiene; merge-queue check names report lightweight skipped/passthrough results |
 | Merge queue | `merge_group` | the full required suite (below) + advisory niche checks |

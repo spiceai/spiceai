@@ -64,7 +64,7 @@ impl FromStr for Pooling {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use runtime_parameters::typed::TypedParams;
+    use runtime_parameters_typed::TypedParams;
     use secrecy::{ExposeSecret, SecretString};
     use std::collections::HashMap;
     use std::sync::Arc;
