@@ -1,0 +1,69 @@
+---
+name: Sign-off Trusted Helpers Tests
+
+# `signoff.yml`'s `Save trusted CI helpers` step decides which commit's
+# `scripts/signoff` and `.github/actions/**` the sign-off job actually runs.
+# Both properties it carries fail silently if it regresses: taking them from the
+# checked-out tree instead of the workflow's own commit lets a branch present an
+# older helper to newer call sites (a cancelled run then kept a `signoff=failure`
+# it could not withdraw — #12657), and it lets the code under test supply the
+# script that decides its own sign-off. Neither shows up as a red check; the
+# sign-off run just does the wrong thing.
+on:
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+    paths:
+      - '.github/workflows/signoff.yml'
+      - 'scripts/test_signoff_trusted_helpers.sh'
+      - '.github/workflows/signoff_trusted_helpers_test.yml'
+  push:
+    branches:
+      - trunk
+    paths:
+      - '.github/workflows/signoff.yml'
+      - 'scripts/test_signoff_trusted_helpers.sh'
+      - '.github/workflows/signoff_trusted_helpers_test.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  test-signoff-trusted-helpers:
+    name: Unit tests for the sign-off trusted-helper materialisation
+    # GitHub-hosted on purpose: this is a sub-second check and must not queue
+    # behind the saturated self-hosted pool the sign-off job runs on.
+    runs-on: ubuntu-24.04
+    # A checkout plus a local bash script against local git fixtures — the job
+    # reads the repository and nothing else, so it needs no write scope.
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        # The test extracts the step under test from signoff.yml rather than
+        # keeping a copy, so it needs a YAML parser.
+        #
+        # `python -m pip`, not a bare `pip`: it installs into the interpreter
+        # setup-python just put on PATH, rather than whichever `pip` the runner
+        # image happens to resolve first.
+        run: python -m pip install pyyaml
+
+      - name: Run tests
+        # Invoked through `bash` rather than as `./…` so the job does not depend
+        # on the script's executable bit surviving a checkout on every platform.
+        run: bash scripts/test_signoff_trusted_helpers.sh
